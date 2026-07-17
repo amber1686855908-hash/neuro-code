@@ -114,6 +114,7 @@ class AgentRuntime:
             for step in range(1, self._max_steps + 1):
                 await emit(AgentEventKind.MODEL_STEP_STARTED, {"step": step})
                 step_text: list[str] = []
+                step_reasoning: list[str] = []
                 tool_calls: list[ToolCall] = []
                 completion: ModelCompleted | None = None
 
@@ -125,6 +126,7 @@ class AgentRuntime:
                         response_parts.append(model_event.text)
                         await emit(AgentEventKind.TEXT_DELTA, {"text": model_event.text})
                     elif isinstance(model_event, ModelReasoningDelta):
+                        step_reasoning.append(model_event.text)
                         await emit(
                             AgentEventKind.REASONING_DELTA,
                             {"text": model_event.text},
@@ -140,6 +142,7 @@ class AgentRuntime:
                     Role.ASSISTANT,
                     "".join(step_text),
                     tool_calls=tuple(tool_calls),
+                    reasoning_content="".join(step_reasoning) or None,
                 )
                 messages.append(assistant_message)
 

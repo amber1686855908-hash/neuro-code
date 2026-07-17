@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 
-from pygrok_build.domain.messages import Message
+from pygrok_build.domain.messages import Message, SessionItem
 
 
 @dataclass(frozen=True, slots=True)
@@ -35,4 +35,11 @@ class SessionSummary:
 @dataclass(frozen=True, slots=True)
 class SessionSnapshot:
     summary: SessionSummary
-    messages: tuple[Message, ...]
+    items: tuple[SessionItem, ...]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "items", tuple(self.items))
+
+    @property
+    def messages(self) -> tuple[Message, ...]:
+        return tuple(item for item in self.items if isinstance(item, Message))

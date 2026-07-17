@@ -32,13 +32,16 @@ Exit: the project installs and the same contract suite passes on all targets.
 ### M2 — headless coding-agent vertical slice
 
 - OpenAI-compatible, Anthropic, and Gemini streaming providers behind one
-  normalized multi-provider port.
+  normalized multi-provider port, including validated provider-native image
+  projection with explicit fallback for unsupported roles and references,
+  bounded output tokens, and persisted reasoning continuity for thinking-mode
+  tool-call turns.
 - Agent/tool loop, structured tool calls, cancellation, step limit, bounded
   output, and owned process-tree cleanup.
 - Read/list/grep/search-replace/bash tools and a headless permission policy
   that evaluates every safely decomposable shell-command segment.
-- SQLite sessions, resume, JSON/Markdown export, and read-only Rust JSONL
-  session import foundation.
+- SQLite sessions, ordered message/provider-context items, prefix-safe resume,
+  JSON/Markdown export, and read-only Rust JSONL session import foundation.
 
 Exit: a fake-provider end-to-end test performs read, edit, command, and final
 response; an opt-in live test can do the same against a configured provider.

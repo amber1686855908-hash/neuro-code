@@ -5,7 +5,13 @@ import unittest
 
 import httpx
 
-from pygrok_build.domain.messages import Message, Role, ToolCall
+from pygrok_build.domain.messages import (
+    IMAGE_MODEL_PLACEHOLDER,
+    ContentPart,
+    Message,
+    Role,
+    ToolCall,
+)
 from pygrok_build.domain.model_events import (
     ModelCompleted,
     ModelReasoningDelta,
@@ -24,6 +30,88 @@ def _sse(*events: object) -> str:
 
 
 class AnthropicProviderTests(unittest.IsolatedAsyncioTestCase):
+    def test_structured_user_and_tool_images_use_native_content_blocks(self) -> None:
+        user = Message(
+            Role.USER,
+            content_parts=(
+                ContentPart.from_text("before"),
+                ContentPart.from_image("data:image/png;base64,aW1hZ2U="),
+                ContentPart.from_image("https://example.com/screenshot.webp"),
+            ),
+        )
+        tool = Message(
+            Role.TOOL,
+            tool_call_id="call-1",
+            content_parts=(
+                ContentPart.from_text("result"),
+                ContentPart.from_image("data:image/jpeg;base64,aW1hZ2U="),
+            ),
+        )
+
+        assistant = Message(
+            Role.ASSISTANT,
+            tool_calls=(ToolCall("call-1", "read_file", {"path": "screenshot.png"}),),
+        )
+
+        _, converted = AnthropicProvider._convert_messages((user, assistant, tool))
+
+        self.assertEqual(
+            converted[0]["content"],
+            [
+                {"type": "text", "text": "before"},
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/png",
+                        "data": "aW1hZ2U=",
+                    },
+                },
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "url",
+                        "url": "https://example.com/screenshot.webp",
+                    },
+                },
+            ],
+        )
+        self.assertEqual(
+            converted[2]["content"][0]["content"],
+            [
+                {"type": "text", "text": "result"},
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/jpeg",
+                        "data": "aW1hZ2U=",
+                    },
+                },
+            ],
+        )
+
+    def test_invalid_and_assistant_images_use_the_safe_text_projection(self) -> None:
+        user = Message(
+            Role.USER,
+            content_parts=(ContentPart.from_image("data:image/heic;base64,aW1hZ2U="),),
+        )
+        assistant = Message(
+            Role.ASSISTANT,
+            content_parts=(ContentPart.from_image("data:image/png;base64,aW1hZ2U="),),
+        )
+
+        _, converted = AnthropicProvider._convert_messages((user, assistant))
+
+        self.assertEqual(
+            converted[0]["content"][0],
+            {"type": "text", "text": IMAGE_MODEL_PLACEHOLDER},
+        )
+        self.assertEqual(
+            converted[1]["content"][0],
+            {"type": "text", "text": IMAGE_MODEL_PLACEHOLDER},
+        )
+
     async def test_stream_converts_messages_and_normalizes_all_core_events(self) -> None:
         captured: dict[str, object] = {}
 

@@ -188,8 +188,9 @@ class CliTests(unittest.TestCase):
             self.assertEqual(exit_code, 0)
             self.assertEqual(export_output.strip(), str(export_path.resolve()))
             exported = json.loads(export_path.read_text(encoding="utf-8"))
-            self.assertEqual(exported["schema_version"], 1)
+            self.assertEqual(exported["schema_version"], 2)
             self.assertEqual(exported["session"]["id"], session_id)
+            self.assertEqual(exported["conversation_items"], exported["messages"])
 
     def test_import_rust_session_is_available_to_list_and_export(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -214,10 +215,66 @@ class CliTests(unittest.TestCase):
                         json.dumps(
                             {
                                 "type": "user",
-                                "content": [{"type": "text", "text": "legacy prompt"}],
+                                "content": [
+                                    {"type": "text", "text": "legacy prompt"},
+                                    {
+                                        "type": "image",
+                                        "url": "data:image/png;base64,fixture",
+                                    },
+                                ],
                             }
                         ),
-                        json.dumps({"type": "assistant", "content": "legacy response"}),
+                        json.dumps(
+                            {
+                                "type": "reasoning",
+                                "id": "reasoning-cli",
+                                "summary": [{"type": "summary_text", "text": "careful thought"}],
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "type": "backend_tool_call",
+                                "kind": {
+                                    "tool_type": "web_search",
+                                    "id": "web-cli",
+                                    "action": {"type": "search", "query": "fixture query"},
+                                },
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "type": "assistant",
+                                "content": "legacy response",
+                                "raw_output": [
+                                    {
+                                        "type": "reasoning",
+                                        "id": "reasoning-recovered",
+                                        "summary": [
+                                            {
+                                                "type": "summary_text",
+                                                "text": "recovered thought",
+                                            }
+                                        ],
+                                    },
+                                    {
+                                        "type": "web_search_call",
+                                        "id": "web-cli",
+                                        "status": "completed",
+                                        "action": {
+                                            "type": "search",
+                                            "query": "duplicate query",
+                                        },
+                                    },
+                                    {
+                                        "type": "message",
+                                        "id": "message-cli",
+                                        "status": "completed",
+                                        "role": "assistant",
+                                        "content": [],
+                                    },
+                                ],
+                            }
+                        ),
                     )
                 )
                 + "\n",
@@ -241,6 +298,12 @@ class CliTests(unittest.TestCase):
             self.assertEqual(payload["session"]["id"], "rust-cli-id")
             self.assertEqual(payload["session"]["provider"], "grok-build-import")
             self.assertEqual(payload["imported_messages"], 2)
+            self.assertEqual(payload["preserved_context_records"], 3)
+            self.assertEqual(payload["recovered_context_records"], 1)
+            self.assertEqual(payload["deduplicated_context_records"], 1)
+            self.assertEqual(payload["invalid_embedded_records"], 0)
+            self.assertEqual(payload["unsupported_embedded_records"], 0)
+            self.assertEqual(payload["preserved_images"], 1)
 
             output = io.StringIO()
             with (
@@ -249,8 +312,32 @@ class CliTests(unittest.TestCase):
             ):
                 exit_code = main(("export", "rust-cli-id", "--cwd", str(root)))
             self.assertEqual(exit_code, 0)
-            self.assertIn("legacy prompt", output.getvalue())
-            self.assertIn("legacy response", output.getvalue())
+            markdown = output.getvalue()
+            self.assertIn("legacy prompt", markdown)
+            self.assertIn("image content preserved in session", markdown)
+            self.assertIn("## Reasoning\n\ncareful thought", markdown)
+            self.assertIn("## Reasoning\n\nrecovered thought", markdown)
+            self.assertIn("legacy response", markdown)
+            self.assertIn("## Backend tool call", markdown)
+            self.assertIn("fixture query", markdown)
+
+            output = io.StringIO()
+            with (
+                patch.dict("os.environ", environment, clear=True),
+                redirect_stdout(output),
+            ):
+                exit_code = main(("export", "rust-cli-id", "--format", "json", "--cwd", str(root)))
+            self.assertEqual(exit_code, 0)
+            exported = json.loads(output.getvalue())
+            self.assertEqual(exported["schema_version"], 2)
+            self.assertEqual(
+                [item.get("type") for item in exported["conversation_items"]],
+                [None, "reasoning", "backend_tool_call", "reasoning", None],
+            )
+            self.assertEqual(
+                exported["conversation_items"][0]["content_parts"][1]["url"],
+                "data:image/png;base64,fixture",
+            )
             self.assertEqual(
                 {
                     path.name: path.read_bytes()

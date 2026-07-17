@@ -57,7 +57,8 @@ contract; unreferenced fire-and-forget tasks are prohibited.
 - `Tool`: publishes a JSON schema and executes with a scoped `ToolContext`.
 - `ToolRegistry`: resolves canonical tool names and rejects duplicates.
 - `PermissionManager`: returns allow, deny, or ask before any side effect.
-- `SessionStore`: appends versioned events and reconstructs a session.
+- `SessionStore`: appends versioned events, preserves ordered `SessionItem`
+  values, and exposes an ordinary-message projection to the agent runtime.
 - `PlatformAdapter`: encapsulates PTY, process, signal, path, clipboard, and sandbox differences.
 
 Protocol models are versioned at external boundaries. Internal state prefers
@@ -67,7 +68,11 @@ boundaries except as validated JSON payloads.
 Provider adapters normalize text, reasoning, tool calls, completion reasons,
 and token usage. Provider-only state that must survive a tool round trip is
 stored in the optional `ToolCall.metadata` mapping under namespaced keys and is
-persisted with the message; application code treats it as opaque.
+persisted with the message; application code treats it as opaque. Streamed
+assistant reasoning that is part of a provider's tool-call continuity contract
+is stored separately in optional, assistant-only `Message.reasoning_content`.
+The OpenAI-compatible adapter replays that field only when the same assistant
+message contains tool calls; no-tool reasoning is never echoed to the provider.
 
 ## Safety invariants
 
@@ -93,16 +98,34 @@ events. JSON and Markdown are interchange/export formats. The database exposes
 an integer schema version; every change requires forward migration, fixture
 coverage, and a documented compatibility decision. Rust sessions are parsed by
 a separate read-only adapter. It validates format versions 0 and 1, reads
-bounded JSONL records, converts supported legacy/current messages into a
-`SessionSnapshot`, and reports corrupt or unsupported records instead of
-silently inventing content. The SQLite adapter inserts that snapshot in one
+bounded JSONL records, converts supported legacy/current records into an
+ordered `SessionSnapshot`, and reports corrupt or unsupported records instead
+of silently inventing content. The SQLite adapter inserts that snapshot in one
 transaction and preserves its ID, workspace, model, and timestamps; an existing
 ID fails without mutation. Source session files are never opened for writing.
 
-The first import contract intentionally maps images to visible text
-placeholders and omits reasoning/backend-tool records that the canonical
-message model cannot yet round-trip. These losses are counted in the import
-report and remain explicit compatibility work rather than hidden coercions.
+The canonical sequence is a union of ordinary `Message` values and opaque but
+validated `PreservedContextItem` values. Message content parts retain text/image
+ordering and image URLs. Reasoning and backend-tool payloads retain their
+provider JSON and relative order. The agent runtime consumes only the message
+projection; when it resumes an imported session, storage permits append-only
+extension but rejects rewriting the preserved prefix. JSON export schema 2
+includes both projections. Provider adapters validate image references and use
+native multimodal blocks only where the wire role and URI form are supported;
+all other images become a visible placeholder without adapter-side media I/O.
+Preserved context items are not yet sent. See
+[ADR 0004](adr/0004-ordered-session-items.md) and
+[ADR 0005](adr/0005-provider-native-image-replay.md). Newly generated
+thinking-mode tool turns use the typed message path instead; see
+[ADR 0006](adr/0006-thinking-tool-continuity.md).
+
+The Rust boundary also performs a bounded, in-memory upgrade for legacy
+assistant records. Context-bearing entries in `raw_output`, singular
+`reasoning`, and v0 `reasoning_content` are lifted immediately before their
+assistant. A stream-scoped set of standalone backend-tool IDs suppresses only
+duplicate embedded copies; reasoning items remain ordered and are never
+collapsed. Malformed and unknown embedded entries are counted separately
+without rejecting an otherwise valid assistant row.
 
 ## Platform policy
 

@@ -12,7 +12,16 @@ from typing import Any
 
 from pygrok_build.async_utils import run_blocking
 from pygrok_build.domain.events import AgentEvent
-from pygrok_build.domain.messages import Message, Role, ToolCall
+from pygrok_build.domain.messages import (
+    ContentPart,
+    ContentPartKind,
+    ContextItemKind,
+    Message,
+    PreservedContextItem,
+    Role,
+    SessionItem,
+    ToolCall,
+)
 from pygrok_build.domain.sessions import SessionSnapshot, SessionSummary
 from pygrok_build.errors import SessionError
 
@@ -99,11 +108,7 @@ class SqliteSessionStore:
 
     async def import_session(self, snapshot: SessionSnapshot) -> str:
         summary = snapshot.summary
-        payload = json.dumps(
-            [message.to_dict() for message in snapshot.messages],
-            ensure_ascii=False,
-            separators=(",", ":"),
-        )
+        payload = _serialize_session_items(snapshot.items)
 
         def import_snapshot() -> None:
             try:
@@ -163,14 +168,40 @@ class SqliteSessionStore:
             await run_blocking(append)
 
     async def save_messages(self, session_id: str, messages: Sequence[Message]) -> None:
-        payload = json.dumps(
-            [message.to_dict() for message in messages],
-            ensure_ascii=False,
-            separators=(",", ":"),
-        )
+        new_messages = list(messages)
 
         def save() -> None:
             with closing(self._connect()) as connection, connection:
+                row = connection.execute(
+                    "SELECT messages_json FROM sessions WHERE id = ?", (session_id,)
+                ).fetchone()
+                if row is None:
+                    raise SessionError(f"unknown session: {session_id}")
+                try:
+                    current_items = _session_items_from_json(row[0])
+                except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+                    raise SessionError(f"session {session_id} contains invalid messages") from error
+
+                preserved_context = any(
+                    isinstance(item, PreservedContextItem) for item in current_items
+                )
+                if preserved_context:
+                    current_messages = [item for item in current_items if isinstance(item, Message)]
+                    if (
+                        len(new_messages) < len(current_messages)
+                        or new_messages[: len(current_messages)] != current_messages
+                    ):
+                        raise SessionError(
+                            "cannot rewrite the imported prefix of a session with "
+                            "preserved context items"
+                        )
+                    items: list[SessionItem] = [
+                        *current_items,
+                        *new_messages[len(current_messages) :],
+                    ]
+                else:
+                    items = list(new_messages)
+                payload = _serialize_session_items(items)
                 cursor = connection.execute(
                     """
                     UPDATE sessions
@@ -186,7 +217,11 @@ class SqliteSessionStore:
             await run_blocking(save)
 
     async def load_messages(self, session_id: str) -> list[Message]:
-        def load() -> list[Message]:
+        items = await self.load_session_items(session_id)
+        return [item for item in items if isinstance(item, Message)]
+
+    async def load_session_items(self, session_id: str) -> list[SessionItem]:
+        def load() -> list[SessionItem]:
             with closing(self._connect()) as connection:
                 row = connection.execute(
                     "SELECT messages_json FROM sessions WHERE id = ?", (session_id,)
@@ -194,8 +229,7 @@ class SqliteSessionStore:
             if row is None:
                 raise SessionError(f"unknown session: {session_id}")
             try:
-                raw_messages = json.loads(row[0])
-                return [_message_from_dict(item) for item in raw_messages]
+                return _session_items_from_json(row[0])
             except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
                 raise SessionError(f"session {session_id} contains invalid messages") from error
 
@@ -274,6 +308,31 @@ class SqliteSessionStore:
         return await run_blocking(load)
 
 
+def _serialize_session_items(items: Sequence[SessionItem]) -> str:
+    return json.dumps(
+        [item.to_dict() for item in items],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+
+def _session_items_from_json(payload: object) -> list[SessionItem]:
+    loaded: object = json.loads(str(payload))
+    if not isinstance(loaded, list):
+        raise TypeError("session items must be a list")
+    return [_session_item_from_dict(item) for item in loaded]
+
+
+def _session_item_from_dict(raw: object) -> SessionItem:
+    if not isinstance(raw, dict):
+        raise TypeError("session item must be an object")
+    raw_type = raw.get("type")
+    if isinstance(raw_type, str):
+        kind = ContextItemKind(raw_type)
+        return PreservedContextItem(kind, raw)
+    return _message_from_dict(raw)
+
+
 def _message_from_dict(raw: object) -> Message:
     if not isinstance(raw, dict):
         raise TypeError("message must be an object")
@@ -294,13 +353,37 @@ def _message_from_dict(raw: object) -> Message:
                 metadata=metadata,
             )
         )
+    content_parts_raw = raw.get("content_parts", [])
+    if not isinstance(content_parts_raw, list):
+        raise TypeError("content_parts must be a list")
+    content_parts = tuple(_content_part_from_dict(item) for item in content_parts_raw)
+    raw_reasoning_content = raw.get("reasoning_content")
+    if raw_reasoning_content is not None and not isinstance(raw_reasoning_content, str):
+        raise TypeError("reasoning_content must be a string")
     return Message(
         role=Role(str(raw["role"])),
         content=str(raw.get("content", "")),
         name=str(raw["name"]) if raw.get("name") is not None else None,
         tool_call_id=(str(raw["tool_call_id"]) if raw.get("tool_call_id") is not None else None),
         tool_calls=tuple(tool_calls),
+        content_parts=content_parts,
+        reasoning_content=raw_reasoning_content,
     )
+
+
+def _content_part_from_dict(raw: object) -> ContentPart:
+    if not isinstance(raw, dict):
+        raise TypeError("content part must be an object")
+    kind = ContentPartKind(str(raw["type"]))
+    if kind is ContentPartKind.TEXT:
+        text = raw.get("text")
+        if not isinstance(text, str):
+            raise TypeError("text content part requires text")
+        return ContentPart.from_text(text)
+    url = raw.get("url")
+    if not isinstance(url, str):
+        raise TypeError("image content part requires url")
+    return ContentPart.from_image(url)
 
 
 def _summary_from_row(row: tuple[Any, ...]) -> SessionSummary:

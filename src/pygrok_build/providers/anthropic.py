@@ -5,7 +5,13 @@ from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass, field
 from typing import Any, cast
 
-from pygrok_build.domain.messages import Message, Role, ToolCall
+from pygrok_build.domain.messages import (
+    IMAGE_MODEL_PLACEHOLDER,
+    ContentPartKind,
+    Message,
+    Role,
+    ToolCall,
+)
 from pygrok_build.domain.model_events import (
     ModelCompleted,
     ModelEvent,
@@ -15,6 +21,12 @@ from pygrok_build.domain.model_events import (
 )
 from pygrok_build.domain.tools import ToolDefinition
 from pygrok_build.errors import ProviderError
+from pygrok_build.providers.image_references import (
+    ANTHROPIC_IMAGE_MEDIA_TYPES,
+    ANTHROPIC_MAX_INLINE_IMAGE_BYTES,
+    InlineImageReference,
+    parse_image_reference,
+)
 
 
 @dataclass(slots=True)
@@ -71,6 +83,45 @@ class AnthropicProvider:
         else:
             messages.append({"role": role, "content": blocks})
 
+    @staticmethod
+    def _content_blocks(message: Message) -> list[dict[str, Any]]:
+        if not message.content_parts:
+            return [{"type": "text", "text": message.content}]
+
+        blocks: list[dict[str, Any]] = []
+        for part in message.content_parts:
+            if part.kind is ContentPartKind.TEXT:
+                assert part.text is not None
+                blocks.append({"type": "text", "text": part.text})
+                continue
+            assert part.url is not None
+            reference = parse_image_reference(
+                part.url,
+                allowed_media_types=ANTHROPIC_IMAGE_MEDIA_TYPES,
+                max_inline_bytes=ANTHROPIC_MAX_INLINE_IMAGE_BYTES,
+            )
+            if reference is None:
+                blocks.append({"type": "text", "text": IMAGE_MODEL_PLACEHOLDER})
+            elif isinstance(reference, InlineImageReference):
+                blocks.append(
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": reference.media_type,
+                            "data": reference.data,
+                        },
+                    }
+                )
+            else:
+                blocks.append(
+                    {
+                        "type": "image",
+                        "source": {"type": "url", "url": reference.url},
+                    }
+                )
+        return blocks
+
     @classmethod
     def _convert_messages(
         cls, messages: Sequence[Message]
@@ -78,17 +129,18 @@ class AnthropicProvider:
         system_parts: list[str] = []
         converted: list[dict[str, Any]] = []
         for message in messages:
+            content = message.model_content()
             if message.role is Role.SYSTEM:
-                if message.content:
-                    system_parts.append(message.content)
+                if content:
+                    system_parts.append(content)
                 continue
             if message.role is Role.USER:
-                cls._append_content(converted, "user", [{"type": "text", "text": message.content}])
+                cls._append_content(converted, "user", cls._content_blocks(message))
                 continue
             if message.role is Role.ASSISTANT:
                 blocks: list[dict[str, Any]] = []
-                if message.content:
-                    blocks.append({"type": "text", "text": message.content})
+                if content:
+                    blocks.append({"type": "text", "text": content})
                 blocks.extend(
                     {
                         "type": "tool_use",
@@ -110,7 +162,14 @@ class AnthropicProvider:
                     {
                         "type": "tool_result",
                         "tool_use_id": message.tool_call_id,
-                        "content": message.content,
+                        "content": (
+                            cls._content_blocks(message)
+                            if message.content_parts
+                            and any(
+                                part.kind is ContentPartKind.IMAGE for part in message.content_parts
+                            )
+                            else content
+                        ),
                     }
                 ],
             )

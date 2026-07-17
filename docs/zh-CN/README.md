@@ -64,6 +64,24 @@ timeout_seconds = 120
 网关和兼容部署仍可自定义 `base_url` 与 `api_key_env`。Anthropic/Gemini 原生配置
 必须显式指定模型，以免把默认 xAI 模型错误发送到其他 API。
 
+DeepSeek 使用 OpenAI 兼容适配器。例如：
+
+```toml
+[provider.default]
+kind = "openai-compatible"
+model = "deepseek-v4-flash"
+base_url = "https://api.deepseek.com"
+api_key_env = "DEEPSEEK_API_KEY"
+max_output_tokens = 8192
+```
+
+启动 CLI 前须把 `DEEPSEEK_API_KEY` 放入进程环境。Neuro Code 有意不解析项目中的
+`.env` 文件；本地密钥文件继续由 Git 忽略，并应通过开发者使用的密钥管理器或 Shell
+载入。适配器会把 `max_output_tokens` 映射到 Chat Completions 请求的 `max_tokens`
+字段。在思考模式的工具调用中，流式推理会随 assistant 工具调用持久化，并在下一次
+请求中回传；已经完成且不含工具调用的 assistant 推理只保留在本地，不会回传给
+供应商。
+
 恢复、列出、导出和导入会话：
 
 ```bash
@@ -77,7 +95,14 @@ pygrok-build import-session ~/.grok/sessions/ENCODED_CWD/SESSION_ID --json
 `summary.json`。它只读解析 Rust JSONL 文件，不会修改源文件；随后在单个事务中创建
 SQLite 会话，并保留源会话 ID、工作区、模型和时间戳。已有相同会话 ID 时会拒绝导入，
 而不是覆盖数据。JSON 报告会列出跳过的损坏记录或暂不支持的记录。规范消息模型目前
-尚不能表示推理记录和后端工具记录，导入的图片也暂时使用明确的文本占位符。
+会按原顺序结构化保存推理记录、后端工具记录和图片 URL。JSON 导出格式版本 2 在普通
+`messages` 投影之外提供完整的 `conversation_items` 序列。受支持的图片引用会通过
+供应商原生内容块回放：OpenAI 兼容和 Gemini 的用户消息，以及 Anthropic 的用户消息
+和工具结果。无效引用及不受支持的角色会收到明确图片占位文本；保留的推理/后端工具
+记录回放仍待实现。旧 assistant 中的 `raw_output`、单体推理和 v0
+`reasoning_content` 会在内存中升级；后端工具 ID
+可阻止内嵌副本与此前的独立记录重复。导入报告会分别统计恢复项、去重项、损坏项和
+不支持的内嵌项。
 
 无头 Bash 权限支持兼容的 `Bash(...)` 写法。简单命令链中的每个命令都会独立判定，
 因此允许 `git status` 不会隐式允许后续命令：
