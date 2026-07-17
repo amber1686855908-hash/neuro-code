@@ -64,13 +64,20 @@ timeout_seconds = 120
 网关和兼容部署仍可自定义 `base_url` 与 `api_key_env`。Anthropic/Gemini 原生配置
 必须显式指定模型，以免把默认 xAI 模型错误发送到其他 API。
 
-恢复、列出和导出会话：
+恢复、列出、导出和导入会话：
 
 ```bash
 pygrok-build -p "Continue the work" --resume SESSION_ID
 pygrok-build sessions --json
 pygrok-build export SESSION_ID --format markdown --output transcript.md
+pygrok-build import-session ~/.grok/sessions/ENCODED_CWD/SESSION_ID --json
 ```
+
+`import-session` 既可以接收上游 Grok Build 会话目录，也可以直接接收其中的
+`summary.json`。它只读解析 Rust JSONL 文件，不会修改源文件；随后在单个事务中创建
+SQLite 会话，并保留源会话 ID、工作区、模型和时间戳。已有相同会话 ID 时会拒绝导入，
+而不是覆盖数据。JSON 报告会列出跳过的损坏记录或暂不支持的记录。规范消息模型目前
+尚不能表示推理记录和后端工具记录，导入的图片也暂时使用明确的文本占位符。
 
 无头 Bash 权限支持兼容的 `Bash(...)` 写法。简单命令链中的每个命令都会独立判定，
 因此允许 `git status` 不会隐式允许后续命令：

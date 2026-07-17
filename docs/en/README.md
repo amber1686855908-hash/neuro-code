@@ -67,13 +67,23 @@ The built-in endpoints and credential variables are:
 deployments. Native Anthropic/Gemini configurations require an explicit model
 to prevent accidentally sending the xAI default model to another API.
 
-Resume, list, and export sessions:
+Resume, list, export, and import sessions:
 
 ```bash
 pygrok-build -p "Continue the work" --resume SESSION_ID
 pygrok-build sessions --json
 pygrok-build export SESSION_ID --format markdown --output transcript.md
+pygrok-build import-session ~/.grok/sessions/ENCODED_CWD/SESSION_ID --json
 ```
+
+`import-session` accepts either an upstream Grok Build session directory or
+its `summary.json`. It reads the Rust JSONL files without modifying them and
+atomically creates a new SQLite session while preserving the source session
+ID, workspace, model, and timestamps. A duplicate session ID is rejected
+rather than overwritten. The JSON report identifies skipped corrupt or
+unsupported records. Reasoning/backend-tool records are not yet represented in
+the canonical message model, and imported images currently use explicit text
+placeholders.
 
 Headless Bash permissions accept the compatible `Bash(...)` spelling. Every
 command in a simple chain is evaluated independently, so allowing `git status`

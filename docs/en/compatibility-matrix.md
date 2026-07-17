@@ -20,7 +20,7 @@ Statuses: `unassessed`, `planned`, `partial`, `compatible`, or
 | Bash execution and cancellation | M2 | partial | Bounded streaming output, null stdin, timeout/cancel cleanup, POSIX process-group TERM/KILL, and Windows process-group/`taskkill` fallback implemented; Windows Job Object and background-task parity pending |
 | Permission rule precedence | M2 | partial | Deny/ask/allow precedence plus per-segment `&&`/`||`/`;`/pipe checks, wrapper peeling, nested `bash -c`, and fail-closed complex scripts implemented; full rule/file-access grammar pending |
 | SQLite session event store | M2 | partial | Versioned event/message store, list, resume and export implemented |
-| Rust session import | M2 | planned | Must remain read-only |
+| Rust session import | M2 | partial | `xai-grok-shell/src/session/storage/jsonl/mod.rs`, `session/persistence.rs`; read-only v0/v1 JSONL parsing, mixed legacy/current messages, bounded corrupt-line recovery, and atomic SQLite import implemented; lossless reasoning/backend-tool/image representation pending |
 | Full-screen/minimal TUI | M3 | planned | `xai-grok-pager`, `xai-grok-pager-minimal` |
 | Markdown/Mermaid/media rendering | M3/M5 | planned | Rendering crates and vendored notices apply |
 | PTY and process-tree parity | M3 | planned | `ptyctl`, shell terminal modules |

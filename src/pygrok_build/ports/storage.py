@@ -5,11 +5,13 @@ from typing import Protocol
 
 from pygrok_build.domain.events import AgentEvent
 from pygrok_build.domain.messages import Message
-from pygrok_build.domain.sessions import SessionSummary
+from pygrok_build.domain.sessions import SessionSnapshot, SessionSummary
 
 
 class SessionStore(Protocol):
     async def create_session(self, cwd: str, provider: str, model: str) -> str: ...
+
+    async def import_session(self, snapshot: SessionSnapshot) -> str: ...
 
     async def append_event(self, session_id: str, event: AgentEvent) -> None: ...
 

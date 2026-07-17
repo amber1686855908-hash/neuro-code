@@ -19,7 +19,7 @@
 | Bash 执行与取消 | M2 | partial | 已实现有界流式输出、空标准输入、超时/取消清理、POSIX 进程组 TERM/KILL，以及 Windows 进程组/`taskkill` 回退；仍需 Windows Job Object 和后台任务对齐 |
 | 权限规则优先级 | M2 | partial | 已实现 deny/ask/allow 优先级、逐片段检查 `&&`/`||`/`;`/管道、包装器剥离、嵌套 `bash -c`，复杂脚本按失败关闭处理；仍需完整规则与文件访问语法 |
 | SQLite 会话事件存储 | M2 | partial | 已实现版本化事件/消息存储、列表、恢复和导出 |
-| Rust 会话导入 | M2 | planned | 必须保持只读 |
+| Rust 会话导入 | M2 | partial | `xai-grok-shell/src/session/storage/jsonl/mod.rs`、`session/persistence.rs`；已实现只读解析 v0/v1 JSONL、兼容新旧消息混排、有界恢复损坏行和原子导入 SQLite；仍需无损表示推理、后端工具和图片记录 |
 | 全屏/精简 TUI | M3 | planned | `xai-grok-pager`、`xai-grok-pager-minimal` |
 | Markdown/Mermaid/媒体渲染 | M3/M5 | planned | 适用渲染 crate 及其随附声明 |
 | PTY 与进程树对齐 | M3 | planned | `ptyctl`、Shell 终端模块 |
