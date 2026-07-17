@@ -7,6 +7,7 @@ from neuro_code.permissions import (
     PermissionManager,
     PermissionMode,
     PermissionRule,
+    build_permission_request,
 )
 
 
@@ -103,6 +104,78 @@ class PermissionTests(unittest.TestCase):
             "bash", {"command": "echo $(dynamic-command)"}, side_effecting=True
         )
         self.assertEqual(decision.effect, PermissionEffect.ALLOW)
+
+    def test_permission_request_hides_edit_content_and_hashes_exact_arguments(self) -> None:
+        first = build_permission_request(
+            "call-1",
+            "search_replace",
+            {
+                "path": "settings.toml",
+                "old": "old-private-value",
+                "new": "new-private-value",
+            },
+            "interactive approval required",
+        )
+        same_action = build_permission_request(
+            "call-2",
+            "search_replace",
+            {
+                "path": "settings.toml",
+                "old": "old-private-value",
+                "new": "new-private-value",
+            },
+            "interactive approval required",
+        )
+        changed_action = build_permission_request(
+            "call-3",
+            "search_replace",
+            {
+                "path": "settings.toml",
+                "old": "old-private-value",
+                "new": "different-private-value",
+            },
+            "interactive approval required",
+        )
+
+        self.assertIn("settings.toml", first.summary)
+        self.assertNotIn("old-private-value", first.summary)
+        self.assertNotIn("new-private-value", first.summary)
+        self.assertEqual(first.scope_key, same_action.scope_key)
+        self.assertNotEqual(first.scope_key, changed_action.scope_key)
+        assert first.scope_key is not None
+        self.assertEqual(len(first.scope_key), 64)
+
+    def test_non_json_arguments_cannot_create_a_session_approval_scope(self) -> None:
+        request = build_permission_request(
+            "call-1",
+            "custom_tool",
+            {"value": object()},
+            "interactive approval required",
+        )
+
+        self.assertIsNone(request.scope_key)
+
+    def test_bash_permission_summary_is_bounded(self) -> None:
+        request = build_permission_request(
+            "call-1",
+            "bash",
+            {"command": f"echo {'x' * 3_000}"},
+            "interactive approval required",
+        )
+
+        self.assertTrue(request.summary.startswith("Run shell command:\necho "))
+        self.assertIn("[truncated]", request.summary)
+        self.assertLess(len(request.summary), 2_100)
+
+    def test_dynamic_bash_cannot_create_a_session_approval_scope(self) -> None:
+        request = build_permission_request(
+            "call-1",
+            "bash",
+            {"command": "echo $(dynamic-command)"},
+            "bash command could not be safely decomposed",
+        )
+
+        self.assertIsNone(request.scope_key)
 
 
 if __name__ == "__main__":

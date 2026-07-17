@@ -7,7 +7,7 @@ import unittest
 from collections.abc import AsyncIterator, Sequence
 from contextlib import redirect_stdout
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from neuro_code.cli import _normalize_rule, main
 from neuro_code.config import AppConfig
@@ -148,12 +148,148 @@ api_key_env = "FIXTURE_KEY"
                     records = [json.loads(line) for line in output.getvalue().splitlines()]
                     self.assertEqual(records[-1]["kind"], "turn_completed")
 
-    def test_missing_prompt_returns_configuration_error(self) -> None:
+    def test_agent_subcommand_requires_a_prompt(self) -> None:
         errors = io.StringIO()
         with patch("sys.stderr", errors):
-            exit_code = main(())
+            exit_code = main(("agent",))
         self.assertEqual(exit_code, 2)
-        self.assertIn("TUI is not implemented", errors.getvalue())
+        self.assertIn("agent subcommand requires", errors.getvalue())
+
+    def test_no_subcommand_launches_the_tui(self) -> None:
+        launch = AsyncMock(return_value=0)
+        with patch("neuro_code.cli._run_tui", launch):
+            exit_code = main(())
+        self.assertEqual(exit_code, 0)
+        launch.assert_awaited_once()
+
+    def test_tui_composition_uses_the_selected_provider_and_workspace(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._write_provider_config(root / "state")
+            captured: dict[str, object] = {}
+
+            class TuiFixture:
+                def __init__(
+                    self,
+                    runner: object,
+                    *,
+                    approval_controller: object,
+                    provider_controller: object,
+                    provider_name: str,
+                    model_name: str,
+                    cwd: Path,
+                ) -> None:
+                    captured.update(
+                        runner=runner,
+                        approval_controller=approval_controller,
+                        provider_controller=provider_controller,
+                        provider_name=provider_name,
+                        model_name=model_name,
+                        cwd=cwd,
+                    )
+
+                async def run_async(self) -> None:
+                    captured["ran"] = True
+
+            with (
+                patch.dict(
+                    "os.environ",
+                    {
+                        "HOME": str(root),
+                        "NEURO_CODE_HOME": str(root / "state"),
+                        "FIXTURE_KEY": "fixture-key",
+                    },
+                    clear=True,
+                ),
+                patch("neuro_code.cli.create_routed_provider", return_value=CliProvider()),
+                patch("neuro_code.tui.NeuroCodeApp", TuiFixture),
+            ):
+                exit_code = main(("--cwd", str(root)))
+
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(captured["provider_name"], "cli-fixture")
+            self.assertEqual(captured["model_name"], "fixture-model")
+            self.assertEqual(captured["cwd"], root.resolve())
+            self.assertIs(captured["runner"], captured["provider_controller"])
+            self.assertTrue(captured["ran"])
+
+    def test_tui_profile_controller_recomposes_a_fresh_selected_provider(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / "state"
+            state.mkdir()
+            (state / "config.toml").write_text(
+                """
+[routing]
+default = "first"
+
+[providers.first]
+protocol = "openai-chat"
+model = "first-model"
+base_url = "https://first.invalid/v1"
+api_key_env = "FIRST_KEY"
+
+[providers.second]
+protocol = "openai-chat"
+model = "second-model"
+base_url = "https://second.invalid/v1"
+api_key_env = "SECOND_KEY"
+""",
+                encoding="utf-8",
+            )
+            selected: list[str] = []
+            captured: dict[str, object] = {}
+
+            def create(config: AppConfig, *, failover: bool) -> CliProvider:
+                del failover
+                selected.append(config.provider.name)
+                provider = CliProvider()
+                provider.provider_name = config.provider.name
+                provider.model_name = config.provider.model
+                return provider
+
+            class TuiFixture:
+                def __init__(
+                    self,
+                    runner: object,
+                    *,
+                    approval_controller: object,
+                    provider_controller: object,
+                    provider_name: str,
+                    model_name: str,
+                    cwd: Path,
+                ) -> None:
+                    del approval_controller, provider_name, model_name, cwd
+                    self.runner = runner
+                    self.provider_controller = provider_controller
+
+                async def run_async(self) -> None:
+                    selection = await self.provider_controller.select_profile("second")
+                    captured["selection"] = selection
+                    captured["same_controller"] = self.runner is self.provider_controller
+
+            with (
+                patch.dict(
+                    "os.environ",
+                    {
+                        "HOME": str(root),
+                        "NEURO_CODE_HOME": str(state),
+                        "FIRST_KEY": "first-secret",
+                        "SECOND_KEY": "second-secret",
+                    },
+                    clear=True,
+                ),
+                patch("neuro_code.cli.create_routed_provider", side_effect=create),
+                patch("neuro_code.tui.NeuroCodeApp", TuiFixture),
+            ):
+                exit_code = main(("--cwd", str(root)))
+
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(selected, ["first", "second"])
+            self.assertTrue(captured["same_controller"])
+            selection = captured["selection"]
+            self.assertTrue(selection.changed)
+            self.assertIsNone(selection.previous_session_id)
 
     def test_resume_list_and_export_session(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

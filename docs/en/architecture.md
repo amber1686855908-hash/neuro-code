@@ -46,15 +46,63 @@ One agent turn is an append-only stream of typed events:
    text/reasoning deltas;
 3. zero or more provider-hosted tool lifecycle events and/or local tool-call
    requests;
-4. permission decision and local tool lifecycle events;
+4. permission decision, optional asynchronous approval, and local tool
+   lifecycle events;
 5. local tool results appended to model context;
-6. another model step or terminal completion;
-7. events committed to session storage.
+6. another model step or terminal completion/failure;
+7. events and the recoverable ordered context committed to session storage.
 
 The runtime owns step limits, cancellation, retries, and event ordering. A UI
 may render events but may not mutate runtime state directly. Background tasks
 must be owned by an `asyncio.TaskGroup` or an explicit registry with a shutdown
 contract; unreferenced fire-and-forget tasks are prohibited.
+
+## Conversation and interactive interface
+
+`AgentConversation` is the reusable application boundary above one-turn
+`AgentRuntime`. It serializes turns and carries the ordered session items,
+session identifier, and provider-origin metadata forward after each durable
+commit. Opening an existing conversation validates that its recorded workspace
+is the same filesystem location as the requested workspace. The headless CLI
+and Textual interface compose the same controller, so resume and provider replay
+rules cannot diverge by interface.
+
+On failure or cancellation, `AgentConversation` reloads the canonical ordered
+items and provider origin from `SessionStore` before releasing its turn lock.
+The next prompt therefore reuses durable state instead of a stale in-memory
+prefix. A cancelled user message remains part of that history; pre-token rewind
+is a separate, unimplemented interaction policy.
+
+The minimal TUI is a presentation adapter over `AgentEvent`. It owns prompt
+input, scrollback, a live text surface, and local slash commands. It reduces
+provider and tool lifecycle events to status messages and deliberately does not
+render raw reasoning, general tool argument mappings, or tool results in the
+transcript. See [ADR 0014](adr/0014-minimal-event-stream-tui.md).
+
+The TUI keeps its prompt available while a worker-owned turn runs. `Ctrl+C` and
+local `/cancel` cancel that worker; an approval modal gives `Ctrl+C` the narrower
+meaning of denying the pending request. Runtime-owned recovery and tool-result
+balancing are defined in
+[ADR 0016](adr/0016-recoverable-turn-cancellation.md).
+
+`ProfileConversationController` wraps the active `AgentConversation` for the
+interactive composition. It serializes selection with turns and exposes only
+redacted `ProviderOption` data to the TUI. Selecting a different configured
+profile composes a new provider/runtime/conversation binding with no resumed
+session; the old SQLite session remains untouched. This strict boundary avoids
+cross-provider replay of encrypted reasoning, hosted-tool state, dialect
+metadata, and profile-affine context. See
+[ADR 0017](adr/0017-safe-interactive-profile-selection.md).
+
+Permission policy and user interaction are separate boundaries.
+`PermissionManager` first returns a deterministic decision. An `ask` may then
+flow through the optional asynchronous `PermissionApprover` port; the runtime
+emits request/resolution audit events and cannot emit `tool_started` before an
+allowed response. The TUI's session broker remembers only hashes of exact
+tool/argument pairs in memory, and every later call is re-evaluated by policy so
+deny precedence remains intact. Headless composition provides no approver and
+continues to fail closed. See
+[ADR 0015](adr/0015-async-interactive-tool-approval.md).
 
 ## Stable ports
 
@@ -65,6 +113,8 @@ contract; unreferenced fire-and-forget tasks are prohibited.
 - `Tool`: publishes a JSON schema and executes with a scoped `ToolContext`.
 - `ToolRegistry`: resolves canonical tool names and rejects duplicates.
 - `PermissionManager`: returns allow, deny, or ask before any side effect.
+- `PermissionApprover`: optionally resolves an `ask` asynchronously without
+  overriding policy denial.
 - `SessionStore`: appends versioned events, preserves ordered `SessionItem`
   values, and exposes both the canonical sequence and an ordinary-message
   projection.
@@ -138,6 +188,12 @@ pair from terminal backend output when intermediate events were absent.
 
 - Deny rules override allow rules and bypass modes.
 - Headless execution converts an unresolved `ask` into denial.
+- A side-effecting tool cannot start while approval is pending or after denial
+  or cancellation. Session approvals cover only an identical tool/argument
+  digest, remain memory-only, and are subordinate to a fresh policy decision.
+- Every local tool call persisted in an assistant message has exactly one tool
+  result before the context is reused. Cancellation records an error result for
+  the active call and every remaining call in the same model batch.
 - Writes resolve and validate their target before mutation; a workspace-scoped
   tool cannot escape through `..` or symlinks.
 - Explicit sandbox requests fail closed when the platform cannot enforce them.
@@ -146,7 +202,11 @@ pair from terminal backend output when intermediate events were absent.
   remain adapter-local and are removed from network errors.
 - Provider failover may occur only before the candidate's first model event;
   after that boundary, errors propagate without replaying the step elsewhere.
-- Cancellation terminates child processes and commits a terminal event.
+- Interactive profile switching is serialized between turns and starts a fresh
+  conversation. It never relabels or replays the previous session under the new
+  profile.
+- Cancellation terminates owned child processes, commits a terminal failure,
+  saves balanced context, and reloads it before the next conversation turn.
 - Shell commands execute in an owned process group. Timeout and cancellation
   attempt graceful tree termination first, then force termination after a
   bounded grace period; output is drained with a fixed in-memory limit.

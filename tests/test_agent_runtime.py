@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import sys
 import tempfile
 import unittest
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Mapping, Sequence
 from pathlib import Path
+from typing import Any
 
 from neuro_code.adapters.sqlite_session import SqliteSessionStore
 from neuro_code.domain.events import AgentEventKind
@@ -25,13 +27,20 @@ from neuro_code.domain.model_events import (
     ModelTextDelta,
     ModelToolCall,
 )
-from neuro_code.domain.tools import ToolDefinition
+from neuro_code.domain.tools import ToolDefinition, ToolResult
 from neuro_code.errors import ProviderError
-from neuro_code.permissions import PermissionManager, PermissionMode
+from neuro_code.permissions import (
+    PermissionApproval,
+    PermissionEffect,
+    PermissionManager,
+    PermissionMode,
+    PermissionRequest,
+    PermissionRule,
+)
 from neuro_code.ports.tools import ToolContext
 from neuro_code.providers.failover import FailoverModelProvider, ProviderCandidate
 from neuro_code.runtime import AgentRuntime
-from neuro_code.tools import default_tool_registry
+from neuro_code.tools import ToolRegistry, default_tool_registry
 
 
 class ScriptedProvider:
@@ -69,6 +78,79 @@ class FailingProvider:
         raise ProviderError(f"{self.provider_name} unavailable")
         if False:
             yield ModelCompleted("stop")
+
+
+class GateApprover:
+    def __init__(self) -> None:
+        self.requested = asyncio.Event()
+        self.requests: list[PermissionRequest] = []
+        self._responses: asyncio.Queue[PermissionApproval] = asyncio.Queue()
+
+    async def request(self, request: PermissionRequest) -> PermissionApproval:
+        self.requests.append(request)
+        self.requested.set()
+        return await self._responses.get()
+
+    def resolve(self, approval: PermissionApproval) -> None:
+        self._responses.put_nowait(approval)
+
+
+class ImmediateApprover:
+    def __init__(self, approval: PermissionApproval) -> None:
+        self.approval = approval
+        self.requests: list[PermissionRequest] = []
+
+    async def request(self, request: PermissionRequest) -> PermissionApproval:
+        self.requests.append(request)
+        return self.approval
+
+
+class BlockingTool:
+    definition = ToolDefinition(
+        name="blocking_tool",
+        description="Wait until the fixture turn is cancelled.",
+        input_schema={"type": "object", "additionalProperties": False},
+    )
+    side_effecting = True
+
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.cancelled = False
+
+    async def execute(
+        self,
+        arguments: Mapping[str, Any],
+        context: ToolContext,
+    ) -> ToolResult:
+        del arguments, context
+        self.started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            self.cancelled = True
+            raise
+        raise AssertionError("unreachable")
+
+
+class NeverStartedTool:
+    definition = ToolDefinition(
+        name="never_started_tool",
+        description="Record an unexpected fixture execution.",
+        input_schema={"type": "object", "additionalProperties": False},
+    )
+    side_effecting = True
+
+    def __init__(self) -> None:
+        self.executed = False
+
+    async def execute(
+        self,
+        arguments: Mapping[str, Any],
+        context: ToolContext,
+    ) -> ToolResult:
+        del arguments, context
+        self.executed = True
+        return ToolResult("unexpected")
 
 
 class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
@@ -331,6 +413,284 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
             second_request = provider.calls[1].messages
             denial = [message for message in second_request if message.role is Role.TOOL]
             self.assertIn("permission denied", denial[0].content)
+
+    async def test_interactive_approval_blocks_the_tool_until_user_allows(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "note.txt"
+            target.write_text("original", encoding="utf-8")
+            provider = ScriptedProvider(
+                (
+                    (
+                        ModelToolCall(
+                            ToolCall(
+                                "edit",
+                                "search_replace",
+                                {"path": "note.txt", "old": "original", "new": "changed"},
+                            )
+                        ),
+                        ModelCompleted("tool_calls"),
+                    ),
+                    (ModelTextDelta("Edit approved and completed."), ModelCompleted("stop")),
+                )
+            )
+            approver = GateApprover()
+            store = SqliteSessionStore(root / ".state" / "sessions.db")
+            await store.initialize()
+            runtime = AgentRuntime(
+                provider=provider,
+                tools=default_tool_registry(),
+                permissions=PermissionManager(interactive=True),
+                tool_context=ToolContext(root),
+                approver=approver,
+                session_store=store,
+            )
+
+            turn = asyncio.create_task(runtime.run("Edit note.txt"))
+            await asyncio.wait_for(approver.requested.wait(), timeout=1)
+            self.assertEqual(target.read_text(encoding="utf-8"), "original")
+            self.assertNotIn("changed", approver.requests[0].summary)
+
+            approver.resolve(PermissionApproval.allow_once())
+            result = await turn
+
+            self.assertEqual(target.read_text(encoding="utf-8"), "changed")
+            kinds = [event.kind for event in result.events]
+            self.assertLess(
+                kinds.index(AgentEventKind.TOOL_APPROVAL_REQUESTED),
+                kinds.index(AgentEventKind.TOOL_APPROVAL_RESOLVED),
+            )
+            self.assertLess(
+                kinds.index(AgentEventKind.TOOL_APPROVAL_RESOLVED),
+                kinds.index(AgentEventKind.TOOL_STARTED),
+            )
+            resolved = next(
+                event
+                for event in result.events
+                if event.kind is AgentEventKind.TOOL_APPROVAL_RESOLVED
+            )
+            self.assertEqual(resolved.data["outcome"], "allow_once")
+            self.assertEqual(resolved.data["effect"], "allow")
+            assert result.session_id is not None
+            persisted_kinds = [
+                event["kind"] for event in await store.load_events(result.session_id)
+            ]
+            self.assertIn(AgentEventKind.TOOL_APPROVAL_REQUESTED.value, persisted_kinds)
+            self.assertIn(AgentEventKind.TOOL_APPROVAL_RESOLVED.value, persisted_kinds)
+
+    async def test_interactive_denial_prevents_the_tool_and_returns_a_tool_error(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "note.txt"
+            target.write_text("original", encoding="utf-8")
+            provider = ScriptedProvider(
+                (
+                    (
+                        ModelToolCall(
+                            ToolCall(
+                                "edit",
+                                "search_replace",
+                                {"path": "note.txt", "old": "original", "new": "changed"},
+                            )
+                        ),
+                        ModelCompleted("tool_calls"),
+                    ),
+                    (ModelTextDelta("The user denied the edit."), ModelCompleted("stop")),
+                )
+            )
+            approver = ImmediateApprover(PermissionApproval.deny("not now"))
+            runtime = AgentRuntime(
+                provider=provider,
+                tools=default_tool_registry(),
+                permissions=PermissionManager(interactive=True),
+                tool_context=ToolContext(root),
+                approver=approver,
+            )
+
+            result = await runtime.run("Edit note.txt")
+
+            self.assertEqual(target.read_text(encoding="utf-8"), "original")
+            self.assertEqual(len(approver.requests), 1)
+            self.assertNotIn(AgentEventKind.TOOL_STARTED, [event.kind for event in result.events])
+            denial = [
+                message for message in provider.calls[1].messages if message.role is Role.TOOL
+            ]
+            self.assertEqual(denial[0].content, "permission denied: not now")
+
+    async def test_cancelling_an_approval_wait_never_starts_the_tool(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "note.txt"
+            target.write_text("original", encoding="utf-8")
+            provider = ScriptedProvider(
+                (
+                    (
+                        ModelToolCall(
+                            ToolCall(
+                                "edit",
+                                "search_replace",
+                                {"path": "note.txt", "old": "original", "new": "changed"},
+                            )
+                        ),
+                        ModelCompleted("tool_calls"),
+                    ),
+                )
+            )
+            approver = GateApprover()
+            observed: list[AgentEventKind] = []
+            store = SqliteSessionStore(root / ".state" / "sessions.db")
+            await store.initialize()
+            runtime = AgentRuntime(
+                provider=provider,
+                tools=default_tool_registry(),
+                permissions=PermissionManager(interactive=True),
+                tool_context=ToolContext(root),
+                approver=approver,
+                session_store=store,
+            )
+
+            turn = asyncio.create_task(
+                runtime.run("Edit note.txt", sink=lambda event: observed.append(event.kind))
+            )
+            await asyncio.wait_for(approver.requested.wait(), timeout=1)
+            turn.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await turn
+
+            self.assertEqual(target.read_text(encoding="utf-8"), "original")
+            self.assertIn(AgentEventKind.TOOL_APPROVAL_REQUESTED, observed)
+            self.assertIn(AgentEventKind.TOOL_FAILED, observed)
+            self.assertIn(AgentEventKind.TURN_FAILED, observed)
+            self.assertNotIn(AgentEventKind.TOOL_STARTED, observed)
+            sessions = await store.list_sessions()
+            self.assertEqual(len(sessions), 1)
+            items = await store.load_session_items(sessions[0].id)
+            tool_messages = [
+                item for item in items if isinstance(item, Message) and item.role is Role.TOOL
+            ]
+            self.assertEqual(len(tool_messages), 1)
+            self.assertEqual(tool_messages[0].tool_call_id, "edit")
+            self.assertIn("cancelled", tool_messages[0].content)
+            persisted_events = await store.load_events(sessions[0].id)
+            cancelled_failure = next(
+                event
+                for event in persisted_events
+                if event["kind"] == AgentEventKind.TOOL_FAILED.value
+            )
+            self.assertTrue(cancelled_failure["data"]["cancelled"])
+
+    async def test_cancelling_a_running_tool_balances_all_calls_for_resume(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            blocking = BlockingTool()
+            pending = NeverStartedTool()
+            provider = ScriptedProvider(
+                (
+                    (
+                        ModelToolCall(ToolCall("active", "blocking_tool", {})),
+                        ModelToolCall(ToolCall("pending", "never_started_tool", {})),
+                        ModelCompleted("tool_calls"),
+                    ),
+                    (ModelTextDelta("Recovered after cancellation."), ModelCompleted("stop")),
+                )
+            )
+            store = SqliteSessionStore(root / ".state" / "sessions.db")
+            await store.initialize()
+            runtime = AgentRuntime(
+                provider=provider,
+                tools=ToolRegistry((blocking, pending)),
+                permissions=PermissionManager(mode=PermissionMode.BYPASS),
+                tool_context=ToolContext(root),
+                session_store=store,
+            )
+
+            turn = asyncio.create_task(runtime.run("Run both tools"))
+            await asyncio.wait_for(blocking.started.wait(), timeout=1)
+            turn.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await turn
+
+            self.assertTrue(blocking.cancelled)
+            self.assertFalse(pending.executed)
+            sessions = await store.list_sessions()
+            self.assertEqual(len(sessions), 1)
+            items = await store.load_session_items(sessions[0].id)
+            assistant = next(
+                item for item in items if isinstance(item, Message) and item.role is Role.ASSISTANT
+            )
+            tool_messages = [
+                item for item in items if isinstance(item, Message) and item.role is Role.TOOL
+            ]
+            self.assertEqual([call.id for call in assistant.tool_calls], ["active", "pending"])
+            self.assertEqual(
+                [message.tool_call_id for message in tool_messages],
+                ["active", "pending"],
+            )
+            self.assertTrue(all("cancelled" in message.content for message in tool_messages))
+            events = await store.load_events(sessions[0].id)
+            failures = [
+                event for event in events if event["kind"] == AgentEventKind.TOOL_FAILED.value
+            ]
+            self.assertEqual(len(failures), 2)
+            self.assertTrue(all(event["data"]["cancelled"] for event in failures))
+            self.assertTrue(failures[1]["data"]["not_started"])
+
+            recovered = await runtime.run(
+                "Continue in the same session",
+                initial_items=items,
+                session_id=sessions[0].id,
+            )
+
+            self.assertEqual(recovered.session_id, sessions[0].id)
+            self.assertEqual(recovered.response, "Recovered after cancellation.")
+            retry_messages = provider.calls[1].messages
+            retry_assistant = next(
+                message for message in retry_messages if message.role is Role.ASSISTANT
+            )
+            retry_results = [message for message in retry_messages if message.role is Role.TOOL]
+            self.assertEqual(len(retry_assistant.tool_calls), len(retry_results))
+
+    async def test_explicit_deny_never_reaches_or_is_overridden_by_the_approver(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "note.txt"
+            target.write_text("original", encoding="utf-8")
+            provider = ScriptedProvider(
+                (
+                    (
+                        ModelToolCall(
+                            ToolCall(
+                                "edit",
+                                "search_replace",
+                                {"path": "note.txt", "old": "original", "new": "changed"},
+                            )
+                        ),
+                        ModelCompleted("tool_calls"),
+                    ),
+                    (ModelTextDelta("The edit was denied by policy."), ModelCompleted("stop")),
+                )
+            )
+            approver = ImmediateApprover(PermissionApproval.allow_session())
+            runtime = AgentRuntime(
+                provider=provider,
+                tools=default_tool_registry(),
+                permissions=PermissionManager(
+                    mode=PermissionMode.BYPASS,
+                    rules=(PermissionRule(PermissionEffect.DENY, "search_replace"),),
+                    interactive=True,
+                ),
+                tool_context=ToolContext(root),
+                approver=approver,
+            )
+
+            result = await runtime.run("Edit note.txt")
+
+            self.assertEqual(target.read_text(encoding="utf-8"), "original")
+            self.assertEqual(approver.requests, [])
+            self.assertNotIn(
+                AgentEventKind.TOOL_APPROVAL_REQUESTED,
+                [event.kind for event in result.events],
+            )
 
     async def test_imported_context_and_origin_reach_every_model_step(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

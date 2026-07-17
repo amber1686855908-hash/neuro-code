@@ -9,7 +9,7 @@
 | 软件包与 CLI 组合根 | M1 | partial | 已在独立 `neuro-code` 命令下实现 Python CLI 骨架 |
 | `version` 与 JSON 版本输出 | M1 | partial | 已实现独立软件包元数据 |
 | 生效配置检查 | M1 | partial | `neuro-code inspect`；已实现隐藏密钥的 Python 视图 |
-| 命名供应商 profile 与选择 | M2 | partial | 已实现四种显式线路协议、默认/单次选择、旧 TOML 兼容以及脱敏的 `providers list/inspect`；交互选择器有意延后 |
+| 命名供应商 profile 与选择 | M2/M3 | partial | 已实现四种显式线路协议、默认/单次选择、旧 TOML 兼容、脱敏的 `providers list/inspect`，以及带 `/provider`、`/model` 和 Ctrl+P 的 TUI 已配置 profile 选择器；远程模型目录、推理强度选择和应用内持久配置编辑仍待实现 |
 | CC Switch 兼容 | M2 | partial | 已实现只读映射 `NEURO_CODE_CC_SWITCH_CONFIG`、三种 backend 格式、回环 `PROXY_MANAGED`、环境变量引用、内联密钥拒绝和项目配置覆盖；仍不包含 CC Switch 数据库/进程控制及其内部故障转移 |
 | 安全供应商故障转移 | M2 | partial | 已实现有序按需备用 profile、第一个事件提交边界、单次运行单向选择、可审计失败/选择事件、`--no-failover`、汇总错误和不透明会话来源保护；重试、熔断和持久化健康状态仍待实现 |
 | 供应商 HTTP 代理策略 | M2 | partial | 已实现按 profile 配置环境/直连/显式环境变量模式、按需 URL 校验、四适配器统一 HTTPX 选项、检查/错误脱敏和含义不明 SOCKS scheme 的严格诊断；保留无效继承 `ALL_PROXY` 时，显式路由已通过 DeepSeek 手动验证；PAC、多代理挂载和内置 SOCKS 支持仍待实现 |
@@ -22,10 +22,10 @@
 | 读取/列举/grep 工具 | M2 | partial | 已实现限制在工作区内的 UTF-8 基线 |
 | 搜索/替换编辑 | M2 | partial | 已实现原子精确替换与路径边界检查 |
 | Bash 执行与取消 | M2 | partial | 已实现有界流式输出、空标准输入、超时/取消清理、POSIX 进程组 TERM/KILL，以及 Windows 进程组/`taskkill` 回退；仍需 Windows Job Object 和后台任务对齐 |
-| 权限规则优先级 | M2 | partial | 已实现 deny/ask/allow 优先级、逐片段检查 `&&`/`||`/`;`/管道、包装器剥离、嵌套 `bash -c`，复杂脚本按失败关闭处理；仍需完整规则与文件访问语法 |
+| 权限规则优先级 | M2/M3 | partial | 已实现 deny/ask/allow 优先级、逐片段检查 `&&`/`||`/`;`/管道、包装器剥离、嵌套 `bash -c`、复杂脚本失败关闭、异步单次允许/拒绝，以及仅保存在内存中的精确操作会话批准；每次审批前都会重新判定 deny，仍需持久化审查规则和完整规则/文件访问语法 |
 | SQLite 会话事件存储 | M2 | partial | 已实现 schema v2、事务化 v1 迁移、profile 亲和元数据、规范有序会话项持久化、消息投影、只追加前缀检查、列表、恢复、导出，以及跨平台路径别名的文件系统身份工作区匹配 |
 | Rust 会话导入 | M2 | partial | 已实现只读解析 v0/v1、新旧消息混排、结构化图片、有序推理/后端工具载荷、内嵌 `raw_output`/单体推理恢复与后端 ID 去重、有界损坏行恢复、SQLite 原子导入、前缀安全恢复、导出 v2、供应商原生图片回放、可信来源的 xAI Chat 回放，以及严格亲和的 Responses 原生加密/后端工具回放；压缩与有状态 ID 仍待实现 |
-| 全屏/精简 TUI | M3 | planned | 独立终端 UI 实现 |
+| 全屏/精简 TUI | M3 | partial | 已实现 Textual 提示输入、滚动记录、流式文本、有界供应商/工具状态、持久多轮上下文、支持单次允许/精确会话允许/拒绝的失败关闭审批框、安全的已配置 profile 选择器、本地 `/help`/`status`/`provider`/`model`/`cancel`/`clear`/`quit`、Ctrl+C 运行中取消、同会话重试、当前/未启动本地调用的取消结果配对及无头 UI 测试；远程模型目录/推理强度选择、首 token 前无痕回退/插话队列、富工具卡片/渲染和跨平台终端冒烟测试仍待实现 |
 | Markdown/Mermaid/媒体渲染 | M3/M5 | planned | 适用渲染 crate 及其随附声明 |
 | PTY 与进程树对齐 | M3 | planned | `ptyctl`、Shell 终端模块 |
 | 操作系统沙箱配置 | M3 | planned | Landlock/bwrap、Seatbelt、Windows 适配器 |

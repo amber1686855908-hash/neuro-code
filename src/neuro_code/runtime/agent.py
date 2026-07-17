@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import inspect
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
@@ -25,7 +26,14 @@ from neuro_code.domain.model_events import (
 )
 from neuro_code.domain.tools import ToolResult
 from neuro_code.errors import ProviderError, ToolError
-from neuro_code.permissions import PermissionManager
+from neuro_code.permissions import (
+    PermissionApproval,
+    PermissionDecision,
+    PermissionEffect,
+    PermissionManager,
+    build_permission_request,
+)
+from neuro_code.ports.approval import PermissionApprover
 from neuro_code.ports.model import ModelProvider
 from neuro_code.ports.storage import SessionStore
 from neuro_code.ports.tools import ToolContext
@@ -58,6 +66,7 @@ class AgentRuntime:
         tools: ToolRegistry,
         permissions: PermissionManager,
         tool_context: ToolContext,
+        approver: PermissionApprover | None = None,
         session_store: SessionStore | None = None,
         system_prompt: str = DEFAULT_SYSTEM_PROMPT,
         max_steps: int = 24,
@@ -68,6 +77,7 @@ class AgentRuntime:
         self._tools = tools
         self._permissions = permissions
         self._tool_context = tool_context
+        self._approver = approver
         self._session_store = session_store
         self._system_prompt = system_prompt
         self._max_steps = max_steps
@@ -123,21 +133,34 @@ class AgentRuntime:
                     await outcome
             return event
 
-        await emit(
-            AgentEventKind.SESSION_STARTED,
-            {
-                "session_id": session_id or "",
-                "provider": self._provider.provider_name,
-                "model": self._provider.model_name,
-            },
-        )
-        user_message = Message(Role.USER, prompt)
-        context_items.append(user_message)
-        messages.append(user_message)
-        await emit(AgentEventKind.USER_MESSAGE, {"content": prompt})
+        async def record_turn_failure(error: BaseException) -> None:
+            cancelled = isinstance(error, asyncio.CancelledError)
+            await emit(
+                AgentEventKind.TURN_FAILED,
+                {
+                    "error_type": type(error).__name__,
+                    "message": "turn cancelled" if cancelled else str(error),
+                    "cancelled": cancelled,
+                },
+            )
+            if self._session_store is not None and session_id is not None:
+                await self._session_store.save_session_items(session_id, context_items)
 
         response_parts: list[str] = []
         try:
+            await emit(
+                AgentEventKind.SESSION_STARTED,
+                {
+                    "session_id": session_id or "",
+                    "provider": self._provider.provider_name,
+                    "model": self._provider.model_name,
+                },
+            )
+            user_message = Message(Role.USER, prompt)
+            context_items.append(user_message)
+            messages.append(user_message)
+            await emit(AgentEventKind.USER_MESSAGE, {"content": prompt})
+
             for step in range(1, self._max_steps + 1):
                 await emit(AgentEventKind.MODEL_STEP_STARTED, {"step": step})
                 step_text: list[str] = []
@@ -254,20 +277,25 @@ class AgentRuntime:
                         step,
                     )
 
-                for call in tool_calls:
-                    await self._execute_tool(call, messages, context_items, emit)
+                for index, call in enumerate(tool_calls):
+                    try:
+                        await self._execute_tool(call, messages, context_items, emit)
+                    except BaseException as error:
+                        await self._record_unstarted_tool_calls(
+                            tool_calls[index + 1 :],
+                            messages,
+                            context_items,
+                            emit,
+                            cancelled=isinstance(error, asyncio.CancelledError),
+                        )
+                        raise
                 if self._session_store is not None and session_id is not None:
                     await self._session_store.save_session_items(session_id, context_items)
 
             raise ProviderError(f"agent exceeded the maximum of {self._max_steps} model steps")
         except BaseException as error:
             # Preserve cancellation semantics while still making the session auditable.
-            await emit(
-                AgentEventKind.TURN_FAILED,
-                {"error_type": type(error).__name__, "message": str(error)},
-            )
-            if self._session_store is not None and session_id is not None:
-                await self._session_store.save_session_items(session_id, context_items)
+            await record_turn_failure(error)
             raise
 
     async def _execute_tool(
@@ -277,54 +305,150 @@ class AgentRuntime:
         context_items: list[SessionItem],
         emit: Callable[[AgentEventKind, dict[str, object]], Awaitable[AgentEvent]],
     ) -> None:
-        await emit(
-            AgentEventKind.TOOL_REQUESTED,
-            {"id": call.id, "name": call.name, "arguments": dict(call.arguments)},
-        )
-        tool = self._tools.get(call.name)
-        if tool is None:
-            result = ToolResult(f"unknown tool: {call.name}", is_error=True)
-            await emit(
-                AgentEventKind.TOOL_FAILED,
-                {"id": call.id, "name": call.name, **result.to_dict()},
-            )
+        resolved = False
+
+        def record_result(result: ToolResult) -> None:
+            nonlocal resolved
+            if resolved:
+                return
             message = Message(Role.TOOL, result.content, name=call.name, tool_call_id=call.id)
             messages.append(message)
             context_items.append(message)
-            return
+            resolved = True
 
-        decision = self._permissions.decide(
-            call.name,
-            call.arguments,
-            side_effecting=tool.side_effecting,
-        )
-        await emit(
-            AgentEventKind.TOOL_PERMISSION,
-            {
-                "id": call.id,
-                "name": call.name,
-                "effect": decision.effect.value,
-                "reason": decision.reason,
-            },
-        )
-        if not decision.allowed:
-            result = ToolResult(f"permission denied: {decision.reason}", is_error=True)
-            await emit(
-                AgentEventKind.TOOL_FAILED,
-                {"id": call.id, "name": call.name, **result.to_dict()},
-            )
-            message = Message(Role.TOOL, result.content, name=call.name, tool_call_id=call.id)
-            messages.append(message)
-            context_items.append(message)
-            return
-
-        await emit(AgentEventKind.TOOL_STARTED, {"id": call.id, "name": call.name})
         try:
-            result = await tool.execute(call.arguments, self._tool_context)
-        except (ToolError, OSError, UnicodeError) as error:
-            result = ToolResult(f"{type(error).__name__}: {error}", is_error=True)
-        kind = AgentEventKind.TOOL_FAILED if result.is_error else AgentEventKind.TOOL_COMPLETED
-        await emit(kind, {"id": call.id, "name": call.name, **result.to_dict()})
-        message = Message(Role.TOOL, result.content, name=call.name, tool_call_id=call.id)
-        messages.append(message)
-        context_items.append(message)
+            await emit(
+                AgentEventKind.TOOL_REQUESTED,
+                {"id": call.id, "name": call.name, "arguments": dict(call.arguments)},
+            )
+            tool = self._tools.get(call.name)
+            if tool is None:
+                result = ToolResult(f"unknown tool: {call.name}", is_error=True)
+                record_result(result)
+                await emit(
+                    AgentEventKind.TOOL_FAILED,
+                    {"id": call.id, "name": call.name, **result.to_dict()},
+                )
+                return
+
+            decision = self._permissions.decide(
+                call.name,
+                call.arguments,
+                side_effecting=tool.side_effecting,
+            )
+            await emit(
+                AgentEventKind.TOOL_PERMISSION,
+                {
+                    "id": call.id,
+                    "name": call.name,
+                    "effect": decision.effect.value,
+                    "reason": decision.reason,
+                },
+            )
+            if decision.effect is PermissionEffect.ASK:
+                request = build_permission_request(
+                    call.id,
+                    call.name,
+                    call.arguments,
+                    decision.reason,
+                )
+                await emit(
+                    AgentEventKind.TOOL_APPROVAL_REQUESTED,
+                    {
+                        "id": call.id,
+                        "name": call.name,
+                        "reason": request.reason,
+                        "summary": request.summary,
+                    },
+                )
+                approval = (
+                    await self._approver.request(request)
+                    if self._approver is not None
+                    else PermissionApproval.deny("interactive approval interface is unavailable")
+                )
+                effect = PermissionEffect.ALLOW if approval.allowed else PermissionEffect.DENY
+                decision = PermissionDecision(effect, approval.reason)
+                await emit(
+                    AgentEventKind.TOOL_APPROVAL_RESOLVED,
+                    {
+                        "id": call.id,
+                        "name": call.name,
+                        "effect": effect.value,
+                        "outcome": approval.kind.value,
+                        "reason": approval.reason,
+                    },
+                )
+            if not decision.allowed:
+                result = ToolResult(f"permission denied: {decision.reason}", is_error=True)
+                record_result(result)
+                await emit(
+                    AgentEventKind.TOOL_FAILED,
+                    {"id": call.id, "name": call.name, **result.to_dict()},
+                )
+                return
+
+            await emit(AgentEventKind.TOOL_STARTED, {"id": call.id, "name": call.name})
+            try:
+                result = await tool.execute(call.arguments, self._tool_context)
+            except (ToolError, OSError, UnicodeError) as error:
+                result = ToolResult(f"{type(error).__name__}: {error}", is_error=True)
+            kind = AgentEventKind.TOOL_FAILED if result.is_error else AgentEventKind.TOOL_COMPLETED
+            record_result(result)
+            await emit(kind, {"id": call.id, "name": call.name, **result.to_dict()})
+        except BaseException as error:
+            if not resolved:
+                cancelled = isinstance(error, asyncio.CancelledError)
+                result = ToolResult(
+                    (
+                        "tool call cancelled before completion"
+                        if cancelled
+                        else "tool call interrupted before completion"
+                    ),
+                    is_error=True,
+                )
+                record_result(result)
+                await emit(
+                    AgentEventKind.TOOL_FAILED,
+                    {
+                        "id": call.id,
+                        "name": call.name,
+                        **result.to_dict(),
+                        "cancelled": cancelled,
+                    },
+                )
+            raise
+
+    @staticmethod
+    async def _record_unstarted_tool_calls(
+        calls: Sequence[ToolCall],
+        messages: list[Message],
+        context_items: list[SessionItem],
+        emit: Callable[[AgentEventKind, dict[str, object]], Awaitable[AgentEvent]],
+        *,
+        cancelled: bool,
+    ) -> None:
+        if not calls:
+            return
+        result = ToolResult(
+            (
+                "tool call cancelled before execution"
+                if cancelled
+                else "tool call skipped because the turn stopped"
+            ),
+            is_error=True,
+        )
+        for call in calls:
+            message = Message(Role.TOOL, result.content, name=call.name, tool_call_id=call.id)
+            messages.append(message)
+            context_items.append(message)
+        for call in calls:
+            await emit(
+                AgentEventKind.TOOL_FAILED,
+                {
+                    "id": call.id,
+                    "name": call.name,
+                    **result.to_dict(),
+                    "cancelled": cancelled,
+                    "not_started": True,
+                },
+            )

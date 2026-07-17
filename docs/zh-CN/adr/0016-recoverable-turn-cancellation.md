@@ -1,0 +1,54 @@
+# ADR 0016 — 可恢复的轮次取消
+
+**简体中文** · [English](../../en/adr/0016-recoverable-turn-cancellation.md)
+
+## 状态
+
+已接受。
+
+## 背景
+
+取消流式模型请求、审批等待或本地工具时，既要停止受所有权管理的工作，也不能损坏持久
+会话。一次模型响应可能包含多个本地工具调用；如果取消后留下没有对应工具结果的助手
+工具调用，下一次供应商请求可能无效。`asyncio.CancelledError` 还会绕过普通 `Exception`
+恢复，因此运行时保存终态之后，会话控制器仍可能保留过期的内存项。
+
+历史终端行为证明，取消后界面必须能接受下一条提示。首 token 前的无痕回退、草稿恢复
+和排队插话属于范围更大的交互策略，不是本纵向切片的必要条件。
+
+## 决策
+
+- Textual 通过单个 `Worker` 管理每一轮。运行期间提示框保持可用；应用级 `Ctrl+C` 与
+  本地 `/cancel` 会取消该 Worker。没有活动轮次时，`Ctrl+C` 会清空草稿，或报告当前
+  没有运行中的轮次。
+- 审批模态框保留范围更窄的失败关闭绑定：`Ctrl+C` 只拒绝待处理请求，不取消整轮。
+- 运行时把 `CancelledError` 视为终态失败，而不是完成。它以协作方式取消当前适配器，
+  为当前本地调用记录 `tool_failed` 事件和错误结果，为同一模型批次中后续所有调用记录
+  错误结果，产生带取消标记的 `turn_failed`，然后保存有序会话项。正常工具结果会先追加
+  再产生终态审计事件，从而避免事件接收器被取消时留下孤立调用。
+- `AgentConversation` 单独捕获取消，并在释放轮次锁之前从 `SessionStore` 重新加载规范项
+  和供应商来源元数据。因此，下一条提示会继续使用同一个 SQLite 会话。
+- 除非供应商提供终态完成事件，已流出的部分文本只用于表现层。被取消的用户消息继续
+  持久保存。本切片不承诺回滚取消之前已经完成的副作用。
+- 本地适配器继续负责有界清理，尤其是 Bash 取消必须终止它拥有的进程树。取消客户端
+  流无法保证停止已经在供应商托管工具内部执行的工作。
+
+## 后果
+
+取消后，本地工具调用/结果顺序现在仍符合供应商要求，并且会话可立即运行下一条提示。
+审计消费者可以通过 `tool_failed` 和 `turn_failed` 数据中的 `cancelled: true` 识别取消。
+无头运行时调用者仍会收到原始 `CancelledError`；取消绝不会报告为成功。
+
+这仍是 M3 的部分行为。首 token 前无痕回退、草稿恢复、缓冲插话处理、供应商托管远程
+取消保证，以及跨平台 PTY 冒烟覆盖仍属于后续切片。
+
+## 历史源代码证据
+
+固定提交 `c68e39f60462f28d9be5e683d9cbe2c57b1a5027` 中的以下只读路径用于确定恢复边界；
+本项目不会复制其传输和组件实现：
+
+- `crates/codegen/xai-grok-pager/src/app/agent_view/interactions.rs`；
+- `crates/codegen/xai-grok-pager/src/app/event_loop.rs`；
+- `crates/codegen/xai-grok-pager/tests/pty_e2e/ctrl_c_cancel_during_stream_recovers_cleanly.rs`；
+- `crates/codegen/xai-grok-pager/tests/pty_e2e/cancel_then_resend_prompt_appears_once.rs`；
+- `crates/codegen/xai-grok-pager/tests/pty_e2e/cancel_discards_buffered_interjection.rs`。

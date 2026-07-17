@@ -20,6 +20,8 @@ class AgentEventKind(StrEnum):
     BACKEND_TOOL_COMPLETED = "backend_tool_completed"
     TOOL_REQUESTED = "tool_requested"
     TOOL_PERMISSION = "tool_permission"
+    TOOL_APPROVAL_REQUESTED = "tool_approval_requested"
+    TOOL_APPROVAL_RESOLVED = "tool_approval_resolved"
     TOOL_STARTED = "tool_started"
     TOOL_COMPLETED = "tool_completed"
     TOOL_FAILED = "tool_failed"

@@ -5,8 +5,8 @@
 Neuro Code 是一个可扩展的 Python 终端编码智能体。项目使用 Python 原生内部架构，
 并以 CLI、配置、会话、工具、MCP 和 ACP 等边界上的稳定行为为目标。
 
-当前实现处于 pre-alpha 阶段。第一个受支持的纵向切片是无头代理运行时；TUI 与协议
-集成的进度记录在[兼容矩阵](compatibility-matrix.md)中。
+当前实现处于 pre-alpha 阶段。无头代理运行时与第一版最小 Textual TUI 已成为受支持的
+纵向切片；其余界面和协议工作记录在[兼容矩阵](compatibility-matrix.md)中。
 
 ## 开发环境
 
@@ -31,6 +31,50 @@ PYTHONPATH=src python -m unittest discover -s tests
 
 ```bash
 PYTHONPATH=src python -m neuro_code inspect --json
+```
+
+## 交互式 TUI
+
+开发依赖组已经包含 Textual。配置好供应商后，不带子命令即可启动交互界面：
+
+```bash
+uv sync --extra dev
+uv run neuro-code
+```
+
+在开发环境之外安装构建产物时，使用 `pip install 'neuro-code[tui]'` 加入可选 UI 依赖。
+第一版 TUI 提供提示输入、滚动记录、assistant 流式文本、供应商/工具状态，以及本地
+`/help`、`/status`、`/provider`、`/model`、`/cancel`、`/clear`、`/quit` 和 `/exit`
+命令。同一次启动中的提示会共享一个持久会话；`--resume SESSION_ID` 会在工作区校验
+通过后打开已有会话。
+
+使用 `Ctrl+P`、不带参数的 `/provider` 或 `/model` 可以打开已配置 profile 选择器；
+`/provider PROFILE` 与 `/model PROFILE` 可以直接选择。选择器只展示 profile 名称、模型、
+协议和就绪状态；不可用或缺少凭据的 profile 会被禁用。它选择的是已配置 profile，而非
+任意远程模型 ID，也不会修改配置。轮次运行期间禁止切换。切换到不同 profile 时，旧的
+SQLite 会话仍可恢复，下一条提示使用全新会话，从而避免把供应商亲和或加密上下文带到
+另一个供应商。
+
+轮次运行期间可使用 `Ctrl+C` 或 `/cancel` 请求取消。运行时会记录取消，把当前以及同批
+尚未启动的本地工具调用补齐为错误结果，重载持久会话，并让同一个会话继续接受下一条
+提示。当前切片会在会话历史中保留被取消的用户消息；尚未实现首个 token 之前的无痕
+回退与草稿恢复。
+
+具有副作用的工具判定为 `ask` 时，TUI 会打开失败关闭的审批模态框，默认焦点是拒绝。
+可以选择仅允许本次、在本进程会话中允许完全相同的工具/参数操作，或者拒绝；`Esc` 也会
+拒绝，模态框打开时 `Ctrl+C` 也会拒绝。编辑摘要显示工作区路径但隐藏替换/patch 内容，
+Bash 则显示待授权的有界命令。
+会话批准只保存内存中的精确操作摘要，并且在策略判定之后生效，因此永远不能覆盖显式
+deny。关闭或取消审批都不会启动工具。
+
+审批模态框内的 `Ctrl+C` 只拒绝当前请求，不会触发整轮取消。
+
+只有确实希望工具在该工作区不受限制地执行时，才应使用 `--always-approve`。脚本和机器
+可读输出继续使用无头路径；其中未解决的审批仍会被拒绝：
+
+```bash
+neuro-code -p "Explain this repository"
+neuro-code agent -p "Explain this repository" --output-format jsonl
 ```
 
 ## 模型供应商
