@@ -4,6 +4,9 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   test:
     strategy:
@@ -13,9 +16,10 @@ jobs:
         python: ["3.12", "3.14"]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@v7.0.0
+      - uses: astral-sh/setup-uv@v8.3.2
         with:
+          version: "0.11.29"
           python-version: ${{ matrix.python }}
           enable-cache: true
       - run: uv sync --extra dev --locked
@@ -24,9 +28,10 @@ jobs:
   quality:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@v7.0.0
+      - uses: astral-sh/setup-uv@v8.3.2
         with:
+          version: "0.11.29"
           python-version: "3.12"
           enable-cache: true
       - run: uv lock --check
