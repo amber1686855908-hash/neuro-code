@@ -23,7 +23,7 @@
 | 搜索/替换编辑 | M2 | partial | 已实现原子精确替换与路径边界检查 |
 | Bash 执行与取消 | M2 | partial | 已实现有界流式输出、空标准输入、超时/取消清理、POSIX 进程组 TERM/KILL，以及 Windows 进程组/`taskkill` 回退；仍需 Windows Job Object 和后台任务对齐 |
 | 权限规则优先级 | M2 | partial | 已实现 deny/ask/allow 优先级、逐片段检查 `&&`/`||`/`;`/管道、包装器剥离、嵌套 `bash -c`，复杂脚本按失败关闭处理；仍需完整规则与文件访问语法 |
-| SQLite 会话事件存储 | M2 | partial | 已实现 schema v2、事务化 v1 迁移、profile 亲和元数据、规范有序会话项持久化、消息投影、只追加前缀检查、列表、恢复和导出 |
+| SQLite 会话事件存储 | M2 | partial | 已实现 schema v2、事务化 v1 迁移、profile 亲和元数据、规范有序会话项持久化、消息投影、只追加前缀检查、列表、恢复、导出，以及跨平台路径别名的文件系统身份工作区匹配 |
 | Rust 会话导入 | M2 | partial | 已实现只读解析 v0/v1、新旧消息混排、结构化图片、有序推理/后端工具载荷、内嵌 `raw_output`/单体推理恢复与后端 ID 去重、有界损坏行恢复、SQLite 原子导入、前缀安全恢复、导出 v2、供应商原生图片回放、可信来源的 xAI Chat 回放，以及严格亲和的 Responses 原生加密/后端工具回放；压缩与有状态 ID 仍待实现 |
 | 全屏/精简 TUI | M3 | planned | 独立终端 UI 实现 |
 | Markdown/Mermaid/媒体渲染 | M3/M5 | planned | 适用渲染 crate 及其随附声明 |

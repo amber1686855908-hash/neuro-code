@@ -8,7 +8,7 @@ from pathlib import Path
 from neuro_code.errors import ToolError
 from neuro_code.ports.tools import ToolContext
 from neuro_code.tools.filesystem import GrepTool, ReadFileTool, SearchReplaceTool
-from neuro_code.workspace import resolve_workspace_path
+from neuro_code.workspace import resolve_workspace_path, workspaces_match
 
 
 class FilesystemToolTests(unittest.IsolatedAsyncioTestCase):
@@ -48,6 +48,23 @@ class FilesystemToolTests(unittest.IsolatedAsyncioTestCase):
             root = Path(directory)
             with self.assertRaises(ToolError):
                 resolve_workspace_path(root, "../outside.txt")
+
+    def test_workspace_identity_rejects_different_directories(self) -> None:
+        with tempfile.TemporaryDirectory() as first, tempfile.TemporaryDirectory() as second:
+            self.assertFalse(workspaces_match(first, second))
+
+    @unittest.skipUnless(hasattr(os, "symlink"), "symlink support required")
+    def test_workspace_identity_accepts_filesystem_alias(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            alias = root / "workspace-alias"
+            try:
+                alias.symlink_to(workspace, target_is_directory=True)
+            except OSError as error:
+                self.skipTest(f"cannot create symlink: {error}")
+            self.assertTrue(workspaces_match(alias, workspace))
 
     @unittest.skipUnless(hasattr(os, "symlink"), "symlink support required")
     def test_workspace_path_rejects_symlink_escape(self) -> None:

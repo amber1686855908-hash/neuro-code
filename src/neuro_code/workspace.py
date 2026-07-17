@@ -1,8 +1,33 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 from neuro_code.errors import ToolError
+
+
+def workspaces_match(recorded: str | Path, requested: str | Path) -> bool:
+    """Return whether two workspace spellings identify the same filesystem location."""
+
+    try:
+        recorded_path = Path(recorded).expanduser()
+        requested_path = Path(requested).expanduser()
+    except RuntimeError:
+        return False
+
+    try:
+        return recorded_path.samefile(requested_path)
+    except (OSError, ValueError):
+        pass
+
+    try:
+        recorded_resolved = recorded_path.resolve(strict=False)
+        requested_resolved = requested_path.resolve(strict=False)
+    except (OSError, RuntimeError):
+        return False
+    return os.path.normcase(os.fspath(recorded_resolved)) == os.path.normcase(
+        os.fspath(requested_resolved)
+    )
 
 
 def resolve_workspace_path(cwd: Path, requested: str, *, must_exist: bool = False) -> Path:

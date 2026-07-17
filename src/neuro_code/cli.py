@@ -31,6 +31,7 @@ from neuro_code.ports.tools import ToolContext
 from neuro_code.providers import create_routed_provider
 from neuro_code.runtime import AgentRuntime
 from neuro_code.tools import default_tool_registry
+from neuro_code.workspace import workspaces_match
 
 
 def _add_run_arguments(parser: argparse.ArgumentParser) -> None:
@@ -225,7 +226,7 @@ async def _run_agent(args: argparse.Namespace) -> int:
     source_context_affinity: str | None = None
     if args.resume:
         summary = await store.get_session(args.resume)
-        if summary.cwd != str(config.cwd):
+        if not workspaces_match(summary.cwd, config.cwd):
             raise ConfigurationError(
                 f"session workspace is {summary.cwd}, not the requested cwd {config.cwd}"
             )

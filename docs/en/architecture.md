@@ -166,7 +166,10 @@ bounded JSONL records, converts supported legacy/current records into an
 ordered `SessionSnapshot`, and reports corrupt or unsupported records instead
 of silently inventing content. The SQLite adapter inserts that snapshot in one
 transaction and preserves its ID, workspace, model, and timestamps; an existing
-ID fails without mutation. Source session files are never opened for writing.
+ID fails without mutation. Resume authorization compares the recorded and
+requested workspaces by filesystem identity, with canonical normalized paths as
+a fallback, so platform aliases are accepted without admitting a different
+workspace. Source session files are never opened for writing.
 
 The canonical sequence is a union of ordinary `Message` values and opaque but
 validated `PreservedContextItem` values. Message content parts retain text/image
