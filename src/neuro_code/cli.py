@@ -27,11 +27,19 @@ from neuro_code.permissions import (
     PermissionMode,
     PermissionRule,
 )
+from neuro_code.ports.approval import PermissionApprover
+from neuro_code.ports.model import ModelProvider
 from neuro_code.ports.tools import ToolContext
 from neuro_code.providers import create_routed_provider
-from neuro_code.runtime import AgentRuntime
+from neuro_code.runtime import (
+    AgentConversation,
+    AgentRuntime,
+    ConversationBinding,
+    ProfileConversationController,
+    ProviderOption,
+    SessionApprovalBroker,
+)
 from neuro_code.tools import default_tool_registry
-from neuro_code.workspace import workspaces_match
 
 
 def _add_run_arguments(parser: argparse.ArgumentParser) -> None:
@@ -208,42 +216,10 @@ def _completion_script(shell: str) -> str:
 async def _run_agent(args: argparse.Namespace) -> int:
     if not args.prompt:
         raise ConfigurationError(
-            "the interactive TUI is not implemented yet; provide -p/--single for headless mode"
+            "the agent subcommand requires -p/--single; run neuro-code without a subcommand "
+            "for the interactive TUI"
         )
-    config = load_config(args.cwd)
-    config = override_provider(
-        config,
-        provider=args.provider,
-        model=args.model,
-        base_url=args.base_url,
-    )
-    provider = create_routed_provider(config, failover=not args.no_failover)
-    store = SqliteSessionStore(config.state_dir / "sessions.db")
-    await store.initialize()
-    initial_items: list[SessionItem] = []
-    source_provider: str | None = None
-    source_model: str | None = None
-    source_context_affinity: str | None = None
-    if args.resume:
-        summary = await store.get_session(args.resume)
-        if not workspaces_match(summary.cwd, config.cwd):
-            raise ConfigurationError(
-                f"session workspace is {summary.cwd}, not the requested cwd {config.cwd}"
-            )
-        initial_items = await store.load_session_items(args.resume)
-        source_provider = summary.provider
-        source_model = summary.model
-        source_context_affinity = summary.context_affinity
-    mode = PermissionMode.BYPASS if args.always_approve else PermissionMode.DEFAULT
-    permissions = PermissionManager(mode=mode, rules=_rules(args), interactive=False)
-    runtime = AgentRuntime(
-        provider=provider,
-        tools=default_tool_registry(),
-        permissions=permissions,
-        tool_context=ToolContext(config.cwd),
-        session_store=store,
-        max_steps=args.max_steps,
-    )
+    _, _, conversation = await _prepare_conversation(args)
 
     async def stream_event(event: AgentEvent) -> None:
         if args.output_format == "plain" and event.kind is AgentEventKind.TEXT_DELTA:
@@ -253,15 +229,7 @@ async def _run_agent(args: argparse.Namespace) -> int:
         elif args.output_format == "jsonl":
             print(json.dumps(event.to_dict(), ensure_ascii=False), flush=True)
 
-    result = await runtime.run(
-        args.prompt,
-        sink=stream_event,
-        initial_items=initial_items,
-        source_provider=source_provider,
-        source_model=source_model,
-        source_context_affinity=source_context_affinity,
-        session_id=args.resume,
-    )
+    result = await conversation.run(args.prompt, sink=stream_event)
     if args.output_format == "plain":
         print()
     elif args.output_format == "json":
@@ -276,6 +244,139 @@ async def _run_agent(args: argparse.Namespace) -> int:
                 ensure_ascii=False,
             )
         )
+    return 0
+
+
+async def _prepare_conversation(
+    args: argparse.Namespace,
+    *,
+    approver: PermissionApprover | None = None,
+) -> tuple[AppConfig, ModelProvider, AgentConversation]:
+    config = _effective_config(args)
+    store = SqliteSessionStore(config.state_dir / "sessions.db")
+    await store.initialize()
+    provider, conversation = await _compose_conversation(
+        args,
+        config,
+        store=store,
+        approver=approver,
+        resume_id=args.resume,
+    )
+    return config, provider, conversation
+
+
+def _effective_config(args: argparse.Namespace) -> AppConfig:
+    config = load_config(args.cwd)
+    return override_provider(
+        config,
+        provider=args.provider,
+        model=args.model,
+        base_url=args.base_url,
+    )
+
+
+async def _compose_conversation(
+    args: argparse.Namespace,
+    config: AppConfig,
+    *,
+    store: SqliteSessionStore,
+    approver: PermissionApprover | None,
+    resume_id: str | None,
+) -> tuple[ModelProvider, AgentConversation]:
+    provider = create_routed_provider(config, failover=not args.no_failover)
+    mode = PermissionMode.BYPASS if args.always_approve else PermissionMode.DEFAULT
+    permissions = PermissionManager(
+        mode=mode,
+        rules=_rules(args),
+        interactive=approver is not None,
+    )
+    runtime = AgentRuntime(
+        provider=provider,
+        tools=default_tool_registry(),
+        permissions=permissions,
+        tool_context=ToolContext(config.cwd),
+        approver=approver,
+        session_store=store,
+        max_steps=args.max_steps,
+    )
+    conversation = await AgentConversation.open(
+        runtime=runtime,
+        store=store,
+        cwd=config.cwd,
+        resume_id=resume_id,
+    )
+    return provider, conversation
+
+
+def _provider_options(config: AppConfig) -> tuple[ProviderOption, ...]:
+    options: list[ProviderOption] = []
+    for name, profile in config.providers.items():
+        redacted = profile.redacted_dict()
+        credential_configured = redacted.get("credential_configured") is True
+        options.append(
+            ProviderOption(
+                name=name,
+                protocol=profile.protocol,
+                model=profile.model,
+                available=profile.available,
+                credential_configured=credential_configured,
+                default=name == config.default_provider,
+            )
+        )
+    return tuple(options)
+
+
+async def _run_tui(args: argparse.Namespace) -> int:
+    try:
+        from neuro_code.tui import NeuroCodeApp
+    except ModuleNotFoundError as error:
+        if error.name in {"rich", "textual"}:
+            raise ConfigurationError(
+                "interactive TUI dependencies are missing; install 'neuro-code[tui]'"
+            ) from error
+        raise
+
+    approvals = SessionApprovalBroker()
+    config = _effective_config(args)
+    store = SqliteSessionStore(config.state_dir / "sessions.db")
+    await store.initialize()
+    provider, conversation = await _compose_conversation(
+        args,
+        config,
+        store=store,
+        approver=approvals,
+        resume_id=args.resume,
+    )
+    selected_profile = config.selected_provider
+    if selected_profile is None:
+        raise ConfigurationError("no provider profile is selected")
+
+    async def bind_profile(profile_name: str) -> ConversationBinding:
+        selected_config = override_provider(config, provider=profile_name)
+        selected_provider, selected_conversation = await _compose_conversation(
+            args,
+            selected_config,
+            store=store,
+            approver=approvals,
+            resume_id=None,
+        )
+        return ConversationBinding(selected_conversation, selected_provider)
+
+    controller = ProfileConversationController(
+        options=_provider_options(config),
+        selected_profile=selected_profile,
+        binding=ConversationBinding(conversation, provider),
+        binding_factory=bind_profile,
+    )
+    app = NeuroCodeApp(
+        controller,
+        approval_controller=approvals,
+        provider_controller=controller,
+        provider_name=controller.provider_name,
+        model_name=controller.model_name,
+        cwd=config.cwd,
+    )
+    await app.run_async()
     return 0
 
 
@@ -511,6 +612,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return asyncio.run(_export_session(args))
         if args.command == "import-session":
             return asyncio.run(_import_session(args))
+        if args.command is None and args.prompt is None:
+            return asyncio.run(_run_tui(args))
         return asyncio.run(_run_agent(args))
     except KeyboardInterrupt:
         print("interrupted", file=sys.stderr)

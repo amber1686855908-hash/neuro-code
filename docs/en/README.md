@@ -6,9 +6,9 @@ Neuro Code is an extensible Python terminal coding agent. The project targets
 stable behavior at the CLI, configuration, session, tool, MCP, and ACP
 boundaries while using a Python-native internal architecture.
 
-The implementation is pre-alpha. The first supported vertical slice is the
-headless agent runtime; TUI and protocol integrations are tracked in the
-[compatibility matrix](compatibility-matrix.md).
+The implementation is pre-alpha. The headless agent runtime and an initial
+minimal Textual TUI are supported vertical slices; remaining interface and
+protocol work is tracked in the [compatibility matrix](compatibility-matrix.md).
 
 ## Development
 
@@ -33,6 +33,62 @@ Inspect effective configuration without exposing secrets:
 
 ```bash
 PYTHONPATH=src python -m neuro_code inspect --json
+```
+
+## Interactive TUI
+
+The development extra includes Textual. After configuring a provider, launch
+the interactive interface without a subcommand:
+
+```bash
+uv sync --extra dev
+uv run neuro-code
+```
+
+When installing the built package outside the development environment, include
+the optional UI dependency with `pip install 'neuro-code[tui]'`. The initial TUI
+provides prompt input, scrollback, streamed assistant text, provider/tool status,
+and local `/help`, `/status`, `/provider`, `/model`, `/cancel`, `/clear`, `/quit`,
+and `/exit` commands. Prompts in one launch share a durable session;
+`--resume SESSION_ID` opens an existing session after workspace validation.
+
+Use `Ctrl+P`, bare `/provider` or bare `/model` to open the configured-profile
+picker. `/provider PROFILE` and `/model PROFILE` select directly. The picker
+shows only profile name, model, protocol, and readiness; unavailable profiles
+or profiles with missing credentials are disabled. It selects configured
+profiles, not arbitrary remote model IDs, and does not edit configuration.
+Switching is rejected during a turn. Switching to a different profile keeps
+the previous SQLite session available and gives the next prompt a fresh
+conversation, preventing provider-affine or encrypted context from crossing
+provider boundaries.
+
+While a turn is running, use `Ctrl+C` or `/cancel` to request cancellation. The
+runtime records cancellation, balances any active and not-yet-started local tool
+calls with error results, reloads the durable conversation, and leaves the same
+session ready for another prompt. The current slice retains the cancelled user
+message in session history; pristine pre-token rewind and draft restoration are
+not implemented yet.
+
+When a side-effecting tool resolves to `ask`, the TUI opens a fail-closed
+approval modal. Deny is focused by default. Choose allow once, allow the
+identical tool/argument action for this process session, or deny; `Esc` also
+denies, as does `Ctrl+C` while the modal is open. Edit summaries show the
+workspace path but hide replacement/patch content, while Bash shows the bounded
+command being authorized. Session grants
+store only an in-memory exact-action digest and are checked after policy, so an
+explicit deny can never be overridden. Closing or cancelling approval never
+starts the tool.
+
+`Ctrl+C` inside the approval modal denies that one request; it does not invoke
+whole-turn cancellation.
+
+Use `--always-approve` only in a workspace where unrestricted tool execution is
+intentional. For scripts and machine-readable output, retain the headless path;
+unresolved approval remains denied there:
+
+```bash
+neuro-code -p "Explain this repository"
+neuro-code agent -p "Explain this repository" --output-format jsonl
 ```
 
 ## Model providers
