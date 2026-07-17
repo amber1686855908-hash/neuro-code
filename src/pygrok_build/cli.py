@@ -13,7 +13,13 @@ from pygrok_build.adapters.sqlite_session import SqliteSessionStore
 from pygrok_build.async_utils import run_blocking
 from pygrok_build.config import AppConfig, load_config, override_provider
 from pygrok_build.domain.events import AgentEvent, AgentEventKind
-from pygrok_build.domain.messages import Message, Role
+from pygrok_build.domain.messages import (
+    ContextItemKind,
+    Message,
+    PreservedContextItem,
+    Role,
+    SessionItem,
+)
 from pygrok_build.errors import ConfigurationError, PyGrokBuildError
 from pygrok_build.permissions import (
     PermissionEffect,
@@ -244,9 +250,55 @@ async def _list_sessions(args: argparse.Namespace) -> int:
     return 0
 
 
-def _session_markdown(messages: Sequence[Message]) -> str:
+def _reasoning_markdown(item: PreservedContextItem) -> str:
+    payload = item.to_dict()
+    text_parts: list[str] = []
+    for field in ("content", "summary"):
+        blocks = payload.get(field)
+        if not isinstance(blocks, list):
+            continue
+        for block in blocks:
+            if isinstance(block, dict) and isinstance(block.get("text"), str):
+                text_parts.append(block["text"])
+    if text_parts:
+        return "\n\n".join(text_parts)
+    if payload.get("encrypted_content") is not None:
+        return "_(encrypted reasoning preserved in JSON export)_"
+    return "_(reasoning metadata preserved in JSON export)_"
+
+
+def _backend_tool_markdown(item: PreservedContextItem) -> str:
+    payload = item.to_dict()
+    kind = payload.get("kind")
+    if not isinstance(kind, dict):
+        return "_(backend tool metadata preserved in JSON export)_"
+    tool_type = kind.get("tool_type", "unknown")
+    identifier = kind.get("id")
+    lines = [f"Type: `{tool_type}`"]
+    if isinstance(identifier, str) and identifier:
+        lines.append(f"ID: `{identifier}`")
+    action = kind.get("action")
+    if isinstance(action, dict):
+        action_type = action.get("type")
+        if isinstance(action_type, str):
+            lines.append(f"Action: `{action_type}`")
+        for field in ("query", "url", "pattern"):
+            value = action.get(field)
+            if isinstance(value, str) and value:
+                lines.append(f"{field.replace('_', ' ').title()}: {value}")
+    return "\n\n".join(lines)
+
+
+def _session_markdown(items: Sequence[SessionItem]) -> str:
     sections = ["# PyGrokBuild session export", ""]
-    for message in messages:
+    for item in items:
+        if isinstance(item, PreservedContextItem):
+            if item.kind is ContextItemKind.REASONING:
+                sections.extend(("## Reasoning", "", _reasoning_markdown(item), ""))
+            else:
+                sections.extend(("## Backend tool call", "", _backend_tool_markdown(item), ""))
+            continue
+        message = item
         if message.role is Role.SYSTEM:
             continue
         title = {
@@ -254,7 +306,7 @@ def _session_markdown(messages: Sequence[Message]) -> str:
             Role.ASSISTANT: "Assistant",
             Role.TOOL: f"Tool: {message.name or 'unknown'}",
         }[message.role]
-        sections.extend((f"## {title}", "", message.content or "_(no text)_", ""))
+        sections.extend((f"## {title}", "", message.model_content() or "_(no text)_", ""))
         for call in message.tool_calls:
             sections.extend(
                 (
@@ -274,15 +326,17 @@ async def _export_session(args: argparse.Namespace) -> int:
     store = SqliteSessionStore(config.state_dir / "sessions.db")
     await store.initialize()
     summary = await store.get_session(args.session_id)
-    messages = await store.load_messages(args.session_id)
+    items = await store.load_session_items(args.session_id)
+    messages = [item for item in items if isinstance(item, Message)]
     if args.format == "json":
         events = await store.load_events(args.session_id)
         content = (
             json.dumps(
                 {
-                    "schema_version": 1,
+                    "schema_version": 2,
                     "session": summary.to_dict(),
                     "messages": [message.to_dict() for message in messages],
+                    "conversation_items": [item.to_dict() for item in items],
                     "events": events,
                 },
                 ensure_ascii=False,
@@ -291,7 +345,7 @@ async def _export_session(args: argparse.Namespace) -> int:
             + "\n"
         )
     else:
-        content = _session_markdown(messages)
+        content = _session_markdown(items)
     if args.output is None:
         print(content, end="")
     else:
@@ -314,8 +368,13 @@ async def _import_session(args: argparse.Namespace) -> int:
         print(
             f"Imported Grok Build session {imported.snapshot.summary.id}: "
             f"{imported.imported_messages}/{imported.total_records} messages, "
+            f"{imported.preserved_context_records} context records preserved "
+            f"({imported.recovered_context_records} recovered, "
+            f"{imported.deduplicated_context_records} duplicates skipped), "
             f"{imported.invalid_records} invalid and "
-            f"{imported.unsupported_records} unsupported records skipped."
+            f"{imported.unsupported_records} unsupported records skipped; "
+            f"{imported.invalid_embedded_records} invalid and "
+            f"{imported.unsupported_embedded_records} unsupported embedded items ignored."
         )
     return 0
 

@@ -6,12 +6,19 @@ import unittest
 from pathlib import Path
 
 from pygrok_build.adapters.rust_session import (
-    IMAGE_PLACEHOLDER,
     RUST_IMPORT_PROVIDER,
     load_rust_session,
 )
-from pygrok_build.domain.messages import Role
+from pygrok_build.domain.messages import (
+    IMAGE_MODEL_PLACEHOLDER,
+    ContentPartKind,
+    ContextItemKind,
+    Message,
+    PreservedContextItem,
+    Role,
+)
 from pygrok_build.errors import SessionError
+from pygrok_build.providers.anthropic import AnthropicProvider
 
 
 def _write_session(
@@ -49,7 +56,7 @@ class RustSessionImportTests(unittest.TestCase):
                     "type": "user",
                     "content": [
                         {"type": "text", "text": "inspect"},
-                        {"type": "image", "url": "data:image/png;base64,fixture"},
+                        {"type": "image", "url": "data:image/png;base64,aW1hZ2U="},
                         {"type": "text", "text": "continue"},
                     ],
                 }
@@ -78,7 +85,7 @@ class RustSessionImportTests(unittest.TestCase):
                     "type": "tool_result",
                     "tool_call_id": "call-1",
                     "content": "file contents",
-                    "images": [{"type": "image", "url": "data:image/png;base64,fixture"}],
+                    "images": [{"type": "image", "url": "data:image/png;base64,aW1hZ2U="}],
                 }
             ),
             json.dumps({"type": "backend_tool_call", "kind": {"tool_type": "web_search"}}),
@@ -107,18 +114,51 @@ class RustSessionImportTests(unittest.TestCase):
             self.assertEqual(imported.imported_messages, 4)
             self.assertEqual(imported.total_records, 8)
             self.assertEqual(imported.invalid_records, 1)
-            self.assertEqual(imported.unsupported_records, 3)
-            self.assertEqual(imported.omitted_images, 2)
+            self.assertEqual(imported.unsupported_records, 1)
+            self.assertEqual(imported.preserved_context_records, 2)
+            self.assertEqual(imported.recovered_context_records, 0)
+            self.assertEqual(imported.deduplicated_context_records, 0)
+            self.assertEqual(imported.invalid_embedded_records, 0)
+            self.assertEqual(imported.preserved_images, 2)
             self.assertEqual(imported.omitted_tool_calls, 1)
 
             system, user, assistant, tool = imported.snapshot.messages
             self.assertEqual(system.role, Role.SYSTEM)
-            self.assertEqual(user.content, f"inspect\n{IMAGE_PLACEHOLDER}\ncontinue")
+            self.assertEqual(user.content, "inspect\ncontinue")
+            self.assertEqual(
+                [part.kind for part in user.content_parts],
+                [ContentPartKind.TEXT, ContentPartKind.IMAGE, ContentPartKind.TEXT],
+            )
+            self.assertEqual(
+                user.model_content(),
+                f"inspect\n{IMAGE_MODEL_PLACEHOLDER}\ncontinue",
+            )
             self.assertEqual(assistant.tool_calls[0].arguments, {"path": "src/main.rs"})
             self.assertEqual(tool.role, Role.TOOL)
             self.assertEqual(tool.name, "read_file")
             self.assertEqual(tool.tool_call_id, "call-1")
-            self.assertEqual(tool.content, f"file contents\n{IMAGE_PLACEHOLDER}")
+            self.assertEqual(tool.content, "file contents")
+            self.assertEqual(tool.content_parts[1].kind, ContentPartKind.IMAGE)
+
+            _, anthropic_messages = AnthropicProvider._convert_messages(imported.snapshot.messages)
+            self.assertEqual(anthropic_messages[0]["content"][1]["type"], "image")
+            self.assertEqual(
+                anthropic_messages[2]["content"][0]["content"][1]["type"],
+                "image",
+            )
+
+            items = imported.snapshot.items
+            self.assertEqual(len(items), 6)
+            self.assertIsInstance(items[0], Message)
+            reasoning = items[2]
+            backend_call = items[5]
+            self.assertIsInstance(reasoning, PreservedContextItem)
+            self.assertIsInstance(backend_call, PreservedContextItem)
+            assert isinstance(reasoning, PreservedContextItem)
+            assert isinstance(backend_call, PreservedContextItem)
+            self.assertEqual(reasoning.kind, ContextItemKind.REASONING)
+            self.assertEqual(reasoning.to_dict()["id"], "reasoning-1")
+            self.assertEqual(backend_call.kind, ContextItemKind.BACKEND_TOOL_CALL)
 
             self.assertEqual((session_dir / "summary.json").read_bytes(), summary_before)
             self.assertEqual((session_dir / "chat_history.jsonl").read_bytes(), chat_before)
@@ -141,6 +181,7 @@ class RustSessionImportTests(unittest.TestCase):
                 {
                     "role": "assistant",
                     "content": "",
+                    "reasoning_content": "legacy thinking",
                     "tool_calls": [
                         {
                             "id": "legacy-call",
@@ -170,13 +211,153 @@ class RustSessionImportTests(unittest.TestCase):
             self.assertEqual(imported.imported_messages, 4)
             self.assertEqual(imported.invalid_records, 0)
             self.assertEqual(imported.unsupported_records, 0)
-            self.assertEqual(imported.omitted_images, 1)
+            self.assertEqual(imported.preserved_context_records, 1)
+            self.assertEqual(imported.recovered_context_records, 1)
+            self.assertEqual(imported.preserved_images, 1)
+            self.assertEqual(imported.snapshot.messages[1].content, "legacy question")
             self.assertEqual(
-                imported.snapshot.messages[1].content,
-                f"legacy question\n{IMAGE_PLACEHOLDER}",
+                imported.snapshot.messages[1].content_parts[1].url,
+                "fixture",
             )
             self.assertEqual(imported.snapshot.messages[2].tool_calls[0].name, "bash")
             self.assertEqual(imported.snapshot.messages[3].name, "bash")
+            reasoning = imported.snapshot.items[2]
+            self.assertIsInstance(reasoning, PreservedContextItem)
+            assert isinstance(reasoning, PreservedContextItem)
+            self.assertEqual(
+                reasoning.to_dict()["summary"][0]["text"],
+                "legacy thinking",
+            )
+
+    def test_raw_output_recovers_ordered_context_and_deduplicates_backend_calls(self) -> None:
+        records = [
+            json.dumps(
+                {
+                    "type": "backend_tool_call",
+                    "kind": {
+                        "tool_type": "web_search",
+                        "id": "web-existing",
+                        "status": "completed",
+                        "action": {"type": "search", "query": "existing"},
+                    },
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "assistant",
+                    "content": "answer",
+                    "reasoning": {
+                        "text": "ignored because raw_output is authoritative",
+                        "id": "reasoning-ignored",
+                    },
+                    "raw_output": [
+                        {
+                            "type": "reasoning",
+                            "id": "reasoning-parallel",
+                            "summary": [],
+                            "encrypted_content": "opaque",
+                        },
+                        {
+                            "type": "web_search_call",
+                            "id": "web-existing",
+                            "status": "completed",
+                            "action": {"type": "search", "query": "duplicate"},
+                        },
+                        {
+                            "type": "custom_tool_call",
+                            "id": "x-new",
+                            "status": "completed",
+                            "name": "x_keyword_search",
+                            "input": '{"query":"fixture"}',
+                        },
+                        {
+                            "type": "code_interpreter_call",
+                            "id": "code-new",
+                            "status": "completed",
+                            "code": "print('fixture')",
+                            "outputs": [],
+                        },
+                        {
+                            "type": "web_search_call",
+                            "status": "completed",
+                            "action": {"type": "search", "query": "missing id"},
+                        },
+                        {"type": "reasoning", "id": "invalid", "summary": "bad"},
+                        {"type": "future_output_item", "id": "future-1"},
+                        42,
+                        {
+                            "type": "message",
+                            "id": "message-1",
+                            "status": "completed",
+                            "role": "assistant",
+                            "content": [],
+                        },
+                    ],
+                }
+            ),
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            session_dir = _write_session(Path(directory), records)
+
+            imported = load_rust_session(session_dir)
+
+            self.assertEqual(imported.imported_messages, 1)
+            self.assertEqual(imported.preserved_context_records, 4)
+            self.assertEqual(imported.recovered_context_records, 3)
+            self.assertEqual(imported.deduplicated_context_records, 1)
+            self.assertEqual(imported.invalid_embedded_records, 3)
+            self.assertEqual(imported.unsupported_embedded_records, 1)
+            self.assertEqual(imported.invalid_records, 0)
+            self.assertEqual(
+                [
+                    item.kind.value if isinstance(item, PreservedContextItem) else "assistant"
+                    for item in imported.snapshot.items
+                ],
+                [
+                    "backend_tool_call",
+                    "reasoning",
+                    "backend_tool_call",
+                    "backend_tool_call",
+                    "assistant",
+                ],
+            )
+            payloads = [
+                item.to_dict()
+                for item in imported.snapshot.items
+                if isinstance(item, PreservedContextItem)
+            ]
+            self.assertEqual(payloads[1]["id"], "reasoning-parallel")
+            self.assertEqual(payloads[2]["kind"]["tool_type"], "x_search")
+            self.assertEqual(payloads[2]["kind"]["id"], "x-new")
+            self.assertEqual(payloads[3]["kind"]["tool_type"], "code_interpreter")
+            self.assertNotIn("reasoning-ignored", json.dumps(payloads))
+
+    def test_singular_v1_reasoning_is_recovered_before_the_assistant(self) -> None:
+        records = [
+            json.dumps(
+                {
+                    "type": "assistant",
+                    "content": "answer",
+                    "reasoning": {
+                        "text": "visible reasoning",
+                        "encrypted": "opaque signature",
+                        "id": "reasoning-legacy",
+                    },
+                }
+            )
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            imported = load_rust_session(_write_session(Path(directory), records))
+
+            self.assertEqual(imported.recovered_context_records, 1)
+            self.assertEqual(len(imported.snapshot.items), 2)
+            reasoning = imported.snapshot.items[0]
+            self.assertIsInstance(reasoning, PreservedContextItem)
+            assert isinstance(reasoning, PreservedContextItem)
+            payload = reasoning.to_dict()
+            self.assertEqual(payload["id"], "reasoning-legacy")
+            self.assertEqual(payload["summary"][0]["text"], "visible reasoning")
+            self.assertEqual(payload["encrypted_content"], "opaque signature")
 
     def test_empty_session_without_chat_file_is_importable(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

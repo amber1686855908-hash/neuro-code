@@ -7,7 +7,13 @@ from unittest import mock
 import httpx
 
 from pygrok_build.config import ProviderConfig
-from pygrok_build.domain.messages import Message, Role, ToolCall
+from pygrok_build.domain.messages import (
+    IMAGE_MODEL_PLACEHOLDER,
+    ContentPart,
+    Message,
+    Role,
+    ToolCall,
+)
 from pygrok_build.domain.model_events import (
     ModelCompleted,
     ModelReasoningDelta,
@@ -29,6 +35,85 @@ def _sse(*chunks: object) -> str:
 
 
 class OpenAICompatibleProviderTests(unittest.IsolatedAsyncioTestCase):
+    def test_structured_user_images_use_native_content_blocks(self) -> None:
+        provider = OpenAICompatibleProvider(
+            model="fixture-model",
+            base_url="https://provider.invalid/v1",
+            api_key="fixture",
+        )
+        message = Message(
+            Role.USER,
+            content_parts=(
+                ContentPart.from_text("before"),
+                ContentPart.from_image("data:image/png;base64,aW1hZ2U="),
+                ContentPart.from_image("https://example.com/screenshot.png"),
+                ContentPart.from_text("after"),
+            ),
+        )
+
+        self.assertEqual(
+            provider._message_payload(message)["content"],
+            [
+                {"type": "text", "text": "before"},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "data:image/png;base64,aW1hZ2U="},
+                },
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "https://example.com/screenshot.png"},
+                },
+                {"type": "text", "text": "after"},
+            ],
+        )
+
+    def test_images_fall_back_for_invalid_input_and_non_user_roles(self) -> None:
+        provider = OpenAICompatibleProvider(
+            model="fixture-model",
+            base_url="https://provider.invalid/v1",
+            api_key="fixture",
+        )
+        invalid = Message(
+            Role.USER,
+            content_parts=(ContentPart.from_image("data:image/png;base64,not-base64"),),
+        )
+        assistant = Message(
+            Role.ASSISTANT,
+            content_parts=(ContentPart.from_image("data:image/png;base64,aW1hZ2U="),),
+        )
+
+        self.assertEqual(
+            provider._message_payload(invalid)["content"],
+            [{"type": "text", "text": IMAGE_MODEL_PLACEHOLDER}],
+        )
+        self.assertEqual(
+            provider._message_payload(assistant)["content"],
+            IMAGE_MODEL_PLACEHOLDER,
+        )
+
+    def test_reasoning_is_replayed_only_for_assistant_tool_calls(self) -> None:
+        provider = OpenAICompatibleProvider(
+            model="fixture-model",
+            base_url="https://provider.invalid/v1",
+            api_key="fixture",
+        )
+        tool_turn = Message(
+            Role.ASSISTANT,
+            tool_calls=(ToolCall("call-1", "read_file", {"path": "a.py"}),),
+            reasoning_content="Need to inspect a.py.",
+        )
+        completed_turn = Message(
+            Role.ASSISTANT,
+            "Done.",
+            reasoning_content="The tool result is sufficient.",
+        )
+
+        self.assertEqual(
+            provider._message_payload(tool_turn)["reasoning_content"],
+            "Need to inspect a.py.",
+        )
+        self.assertNotIn("reasoning_content", provider._message_payload(completed_turn))
+
     async def test_stream_normalizes_text_reasoning_tool_calls_and_usage(self) -> None:
         captured: dict[str, object] = {}
 
@@ -81,6 +166,7 @@ class OpenAICompatibleProviderTests(unittest.IsolatedAsyncioTestCase):
             model="fixture-model",
             base_url="https://provider.invalid/v1/",
             api_key="secret-key",
+            max_output_tokens=512,
             transport=httpx.MockTransport(handler),
         )
         messages = (
@@ -88,6 +174,7 @@ class OpenAICompatibleProviderTests(unittest.IsolatedAsyncioTestCase):
             Message(
                 Role.ASSISTANT,
                 tool_calls=(ToolCall("old", "old_tool", {"value": 1}),),
+                reasoning_content="prior tool reasoning",
             ),
             Message(Role.TOOL, "done", tool_call_id="old"),
         )
@@ -130,6 +217,8 @@ class OpenAICompatibleProviderTests(unittest.IsolatedAsyncioTestCase):
         body = captured["body"]
         assert isinstance(body, dict)
         self.assertEqual(body["model"], "fixture-model")
+        self.assertEqual(body["max_tokens"], 512)
+        self.assertEqual(body["messages"][1]["reasoning_content"], "prior tool reasoning")
         self.assertEqual(body["messages"][2]["tool_call_id"], "old")
         self.assertEqual(body["tools"][0]["function"]["name"], "read_file")
 

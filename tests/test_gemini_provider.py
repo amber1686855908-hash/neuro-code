@@ -5,7 +5,13 @@ import unittest
 
 import httpx
 
-from pygrok_build.domain.messages import Message, Role, ToolCall
+from pygrok_build.domain.messages import (
+    IMAGE_MODEL_PLACEHOLDER,
+    ContentPart,
+    Message,
+    Role,
+    ToolCall,
+)
 from pygrok_build.domain.model_events import (
     ModelCompleted,
     ModelReasoningDelta,
@@ -22,6 +28,62 @@ def _sse(*chunks: object) -> str:
 
 
 class GeminiProviderTests(unittest.IsolatedAsyncioTestCase):
+    def test_structured_user_images_use_native_inline_and_file_parts(self) -> None:
+        message = Message(
+            Role.USER,
+            content_parts=(
+                ContentPart.from_text("before"),
+                ContentPart.from_image("data:image/png;base64,aW1hZ2U="),
+                ContentPart.from_image(
+                    "https://generativelanguage.googleapis.com/v1beta/files/file-1"
+                ),
+            ),
+        )
+
+        _, converted = GeminiProvider._convert_messages((message,))
+
+        self.assertEqual(
+            converted[0]["parts"],
+            [
+                {"text": "before"},
+                {"inlineData": {"mimeType": "image/png", "data": "aW1hZ2U="}},
+                {
+                    "fileData": {
+                        "fileUri": ("https://generativelanguage.googleapis.com/v1beta/files/file-1")
+                    }
+                },
+            ],
+        )
+
+    def test_public_url_invalid_and_tool_images_use_the_safe_text_projection(self) -> None:
+        user = Message(
+            Role.USER,
+            content_parts=(
+                ContentPart.from_image("https://example.com/screenshot.png"),
+                ContentPart.from_image("data:image/png;base64,not-base64"),
+            ),
+        )
+        tool = Message(
+            Role.TOOL,
+            name="read_file",
+            tool_call_id="call-1",
+            content_parts=(
+                ContentPart.from_text("result"),
+                ContentPart.from_image("data:image/png;base64,aW1hZ2U="),
+            ),
+        )
+
+        _, converted = GeminiProvider._convert_messages((user, tool))
+
+        self.assertEqual(
+            converted[0]["parts"][:2],
+            [{"text": IMAGE_MODEL_PLACEHOLDER}, {"text": IMAGE_MODEL_PLACEHOLDER}],
+        )
+        self.assertEqual(
+            converted[0]["parts"][2]["functionResponse"]["response"],
+            {"result": f"result\n{IMAGE_MODEL_PLACEHOLDER}"},
+        )
+
     async def test_stream_converts_messages_and_preserves_provider_tool_metadata(self) -> None:
         captured: dict[str, object] = {}
 

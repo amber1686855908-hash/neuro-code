@@ -12,6 +12,7 @@ from pygrok_build.domain.messages import Message, Role, ToolCall
 from pygrok_build.domain.model_events import (
     ModelCompleted,
     ModelEvent,
+    ModelReasoningDelta,
     ModelTextDelta,
     ModelToolCall,
 )
@@ -108,6 +109,7 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
             provider = ScriptedProvider(
                 (
                     (
+                        ModelReasoningDelta("Need to inspect the file."),
                         ModelToolCall(ToolCall("call-1", "read_file", {"path": "note.txt"})),
                         ModelCompleted("tool_calls"),
                     ),
@@ -133,10 +135,15 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(tool_messages), 1)
             self.assertIn("source evidence", tool_messages[0].content)
             self.assertIn(AgentEventKind.TOOL_COMPLETED, [event.kind for event in result.events])
+            self.assertIn(AgentEventKind.REASONING_DELTA, [event.kind for event in result.events])
             assert result.session_id is not None
             persisted = await store.load_messages(result.session_id)
             self.assertEqual(persisted, list(result.messages))
             self.assertEqual(len(provider.calls), 2)
+            prior_assistant = next(
+                message for message in provider.calls[1] if message.role is Role.ASSISTANT
+            )
+            self.assertEqual(prior_assistant.reasoning_content, "Need to inspect the file.")
 
     async def test_default_headless_policy_denies_edit_and_agent_can_recover(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

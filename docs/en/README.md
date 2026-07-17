@@ -67,6 +67,26 @@ The built-in endpoints and credential variables are:
 deployments. Native Anthropic/Gemini configurations require an explicit model
 to prevent accidentally sending the xAI default model to another API.
 
+DeepSeek uses the OpenAI-compatible adapter. For example:
+
+```toml
+[provider.default]
+kind = "openai-compatible"
+model = "deepseek-v4-flash"
+base_url = "https://api.deepseek.com"
+api_key_env = "DEEPSEEK_API_KEY"
+max_output_tokens = 8192
+```
+
+Set `DEEPSEEK_API_KEY` in the process environment before starting the CLI.
+Neuro Code deliberately does not parse project `.env` files; local secret files
+remain ignored by Git and must be loaded by the developer's secret manager or
+shell. The adapter maps `max_output_tokens` to the Chat Completions
+`max_tokens` request field. During thinking-mode tool use, streamed reasoning is
+persisted with the assistant tool call and replayed on the following request;
+completed assistant reasoning is retained locally but is not echoed back to the
+provider.
+
 Resume, list, export, and import sessions:
 
 ```bash
@@ -81,9 +101,17 @@ its `summary.json`. It reads the Rust JSONL files without modifying them and
 atomically creates a new SQLite session while preserving the source session
 ID, workspace, model, and timestamps. A duplicate session ID is rejected
 rather than overwritten. The JSON report identifies skipped corrupt or
-unsupported records. Reasoning/backend-tool records are not yet represented in
-the canonical message model, and imported images currently use explicit text
-placeholders.
+unsupported records. Ordered reasoning/backend-tool records and image URLs are
+preserved structurally. JSON export schema version 2 exposes the complete
+`conversation_items` sequence alongside its ordinary `messages` projection.
+Legacy assistant `raw_output`, singular reasoning, and v0
+`reasoning_content` are upgraded in memory; backend-tool IDs prevent an
+embedded copy from duplicating an earlier standalone record. The import report
+counts recovered, deduplicated, malformed, and unsupported embedded records.
+Supported image references are replayed through native provider blocks:
+OpenAI-compatible and Gemini user messages, plus Anthropic user and tool-result
+messages. Invalid references and unsupported roles receive an explicit image
+placeholder. Preserved reasoning/backend-tool replay is still pending.
 
 Headless Bash permissions accept the compatible `Bash(...)` spelling. Every
 command in a simple chain is evaluated independently, so allowing `git status`

@@ -4,7 +4,7 @@ from collections.abc import Sequence
 from typing import Protocol
 
 from pygrok_build.domain.events import AgentEvent
-from pygrok_build.domain.messages import Message
+from pygrok_build.domain.messages import Message, SessionItem
 from pygrok_build.domain.sessions import SessionSnapshot, SessionSummary
 
 
@@ -18,6 +18,8 @@ class SessionStore(Protocol):
     async def save_messages(self, session_id: str, messages: Sequence[Message]) -> None: ...
 
     async def load_messages(self, session_id: str) -> list[Message]: ...
+
+    async def load_session_items(self, session_id: str) -> list[SessionItem]: ...
 
     async def next_event_sequence(self, session_id: str) -> int: ...
 

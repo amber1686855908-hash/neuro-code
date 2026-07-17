@@ -5,7 +5,13 @@ from collections.abc import AsyncIterator, Sequence
 from typing import Any, cast
 from urllib.parse import quote
 
-from pygrok_build.domain.messages import Message, Role, ToolCall
+from pygrok_build.domain.messages import (
+    IMAGE_MODEL_PLACEHOLDER,
+    ContentPartKind,
+    Message,
+    Role,
+    ToolCall,
+)
 from pygrok_build.domain.model_events import (
     ModelCompleted,
     ModelEvent,
@@ -15,6 +21,14 @@ from pygrok_build.domain.model_events import (
 )
 from pygrok_build.domain.tools import ToolDefinition
 from pygrok_build.errors import ProviderError
+from pygrok_build.providers.image_references import (
+    GEMINI_IMAGE_MEDIA_TYPES,
+    GEMINI_MAX_INLINE_IMAGE_BYTES,
+    InlineImageReference,
+    RemoteImageReference,
+    is_gemini_file_uri,
+    parse_image_reference,
+)
 
 
 class GeminiProvider:
@@ -70,6 +84,38 @@ class GeminiProvider:
             return {"result": content}
         return parsed if isinstance(parsed, dict) else {"result": parsed}
 
+    @staticmethod
+    def _user_parts(message: Message) -> list[dict[str, Any]]:
+        if not message.content_parts:
+            return [{"text": message.content}]
+
+        parts: list[dict[str, Any]] = []
+        for part in message.content_parts:
+            if part.kind is ContentPartKind.TEXT:
+                assert part.text is not None
+                parts.append({"text": part.text})
+                continue
+            assert part.url is not None
+            reference = parse_image_reference(
+                part.url,
+                allowed_media_types=GEMINI_IMAGE_MEDIA_TYPES,
+                max_inline_bytes=GEMINI_MAX_INLINE_IMAGE_BYTES,
+            )
+            if isinstance(reference, InlineImageReference):
+                parts.append(
+                    {
+                        "inlineData": {
+                            "mimeType": reference.media_type,
+                            "data": reference.data,
+                        }
+                    }
+                )
+            elif isinstance(reference, RemoteImageReference) and is_gemini_file_uri(reference):
+                parts.append({"fileData": {"fileUri": reference.url}})
+            else:
+                parts.append({"text": IMAGE_MODEL_PLACEHOLDER})
+        return parts
+
     @classmethod
     def _convert_messages(
         cls, messages: Sequence[Message]
@@ -78,17 +124,18 @@ class GeminiProvider:
         contents: list[dict[str, Any]] = []
         calls_by_id: dict[str, ToolCall] = {}
         for message in messages:
+            content = message.model_content()
             if message.role is Role.SYSTEM:
-                if message.content:
-                    system_parts.append(message.content)
+                if content:
+                    system_parts.append(content)
                 continue
             if message.role is Role.USER:
-                cls._append_content(contents, "user", [{"text": message.content}])
+                cls._append_content(contents, "user", cls._user_parts(message))
                 continue
             if message.role is Role.ASSISTANT:
                 parts: list[dict[str, Any]] = []
-                if message.content:
-                    parts.append({"text": message.content})
+                if content:
+                    parts.append({"text": content})
                 for call in message.tool_calls:
                     calls_by_id[call.id] = call
                     function_call: dict[str, Any] = {
@@ -110,7 +157,7 @@ class GeminiProvider:
                 raise ProviderError("Gemini tool results require a tool name")
             function_response: dict[str, Any] = {
                 "name": message.name,
-                "response": cls._tool_response(message.content),
+                "response": cls._tool_response(content),
             }
             previous_call = calls_by_id.get(message.tool_call_id or "")
             if previous_call is not None:

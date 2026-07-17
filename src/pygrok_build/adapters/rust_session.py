@@ -1,12 +1,21 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
 
-from pygrok_build.domain.messages import Message, Role, ToolCall
+from pygrok_build.domain.messages import (
+    ContentPart,
+    ContextItemKind,
+    Message,
+    PreservedContextItem,
+    Role,
+    SessionItem,
+    ToolCall,
+)
 from pygrok_build.domain.sessions import SessionSnapshot, SessionSummary
 from pygrok_build.errors import SessionError
 
@@ -14,8 +23,13 @@ RUST_IMPORT_PROVIDER = "grok-build-import"
 MAX_SUMMARY_BYTES = 1024 * 1024
 MAX_CHAT_RECORD_BYTES = 16 * 1024 * 1024
 MAX_CHAT_RECORDS = 100_000
-IMAGE_PLACEHOLDER = "[image omitted during Grok Build session import]"
 UNKNOWN_CONTENT_PLACEHOLDER = "[unsupported content omitted during Grok Build session import]"
+RAW_OUTPUT_BACKEND_TYPES = {
+    "web_search_call": "web_search",
+    "custom_tool_call": "x_search",
+    "code_interpreter_call": "code_interpreter",
+}
+RAW_OUTPUT_NON_CONTEXT_TYPES = {"message", "function_call", "mcp_call"}
 
 
 class _InvalidRecord(ValueError):
@@ -27,9 +41,20 @@ class _ImportStats:
     total_records: int = 0
     invalid_records: int = 0
     unsupported_records: int = 0
-    omitted_images: int = 0
+    preserved_context_records: int = 0
+    recovered_context_records: int = 0
+    deduplicated_context_records: int = 0
+    invalid_embedded_records: int = 0
+    unsupported_embedded_records: int = 0
+    preserved_images: int = 0
     omitted_content_parts: int = 0
     omitted_tool_calls: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class _ParsedContent:
+    text: str
+    parts: tuple[ContentPart, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,7 +64,12 @@ class RustSessionImport:
     total_records: int
     invalid_records: int
     unsupported_records: int
-    omitted_images: int
+    preserved_context_records: int
+    recovered_context_records: int
+    deduplicated_context_records: int
+    invalid_embedded_records: int
+    unsupported_embedded_records: int
+    preserved_images: int
     omitted_content_parts: int
     omitted_tool_calls: int
 
@@ -55,7 +85,12 @@ class RustSessionImport:
             "total_records": self.total_records,
             "invalid_records": self.invalid_records,
             "unsupported_records": self.unsupported_records,
-            "omitted_images": self.omitted_images,
+            "preserved_context_records": self.preserved_context_records,
+            "recovered_context_records": self.recovered_context_records,
+            "deduplicated_context_records": self.deduplicated_context_records,
+            "invalid_embedded_records": self.invalid_embedded_records,
+            "unsupported_embedded_records": self.unsupported_embedded_records,
+            "preserved_images": self.preserved_images,
             "omitted_content_parts": self.omitted_content_parts,
             "omitted_tool_calls": self.omitted_tool_calls,
         }
@@ -89,7 +124,7 @@ def load_rust_session(source: Path) -> RustSessionImport:
     if chat_format_version not in (0, 1):
         raise SessionError(f"unsupported Rust chat format version: {chat_format_version}")
 
-    messages, stats = _read_chat_history(
+    items, stats = _read_chat_history(
         session_dir / "chat_history.jsonl",
         chat_format_version=chat_format_version,
     )
@@ -102,7 +137,7 @@ def load_rust_session(source: Path) -> RustSessionImport:
             created_at=created_at,
             updated_at=updated_at,
         ),
-        messages=tuple(messages),
+        items=tuple(items),
     )
     return RustSessionImport(
         source=session_dir,
@@ -110,7 +145,12 @@ def load_rust_session(source: Path) -> RustSessionImport:
         total_records=stats.total_records,
         invalid_records=stats.invalid_records,
         unsupported_records=stats.unsupported_records,
-        omitted_images=stats.omitted_images,
+        preserved_context_records=stats.preserved_context_records,
+        recovered_context_records=stats.recovered_context_records,
+        deduplicated_context_records=stats.deduplicated_context_records,
+        invalid_embedded_records=stats.invalid_embedded_records,
+        unsupported_embedded_records=stats.unsupported_embedded_records,
+        preserved_images=stats.preserved_images,
         omitted_content_parts=stats.omitted_content_parts,
         omitted_tool_calls=stats.omitted_tool_calls,
     )
@@ -137,12 +177,13 @@ def _read_chat_history(
     path: Path,
     *,
     chat_format_version: int,
-) -> tuple[list[Message], _ImportStats]:
+) -> tuple[list[SessionItem], _ImportStats]:
     stats = _ImportStats()
-    messages: list[Message] = []
+    items: list[SessionItem] = []
     tool_names: dict[str, str] = {}
+    backend_tool_ids_seen: set[str] = set()
     if not path.exists():
-        return messages, stats
+        return items, stats
     if not path.is_file():
         raise SessionError("Rust chat history path is not a regular file")
 
@@ -153,6 +194,10 @@ def _read_chat_history(
                     while raw_line and not raw_line.endswith(b"\n"):
                         raw_line = stream.readline(MAX_CHAT_RECORD_BYTES + 1)
                     stats.total_records += 1
+                    if stats.total_records > MAX_CHAT_RECORDS:
+                        raise SessionError(
+                            f"Rust chat history exceeds the {MAX_CHAT_RECORDS} record safety limit"
+                        )
                     stats.invalid_records += 1
                     continue
                 stripped = raw_line.strip()
@@ -168,20 +213,24 @@ def _read_chat_history(
                     if not isinstance(loaded, dict):
                         raise _InvalidRecord("record must be an object")
                     record = cast(dict[str, Any], loaded)
-                    message = _convert_record(
+                    converted = _convert_record(
                         record,
                         chat_format_version=chat_format_version,
                         tool_names=tool_names,
+                        backend_tool_ids_seen=backend_tool_ids_seen,
                         stats=stats,
                     )
                 except (UnicodeDecodeError, json.JSONDecodeError, _InvalidRecord):
                     stats.invalid_records += 1
                     continue
-                if message is not None:
-                    messages.append(message)
+                items.extend(converted)
+                for item in converted:
+                    identifier = _backend_tool_id(item)
+                    if identifier is not None:
+                        backend_tool_ids_seen.add(identifier)
     except OSError as error:
         raise SessionError(f"cannot read Rust chat history {path}: {error}") from error
-    return messages, stats
+    return items, stats
 
 
 def _convert_record(
@@ -189,41 +238,59 @@ def _convert_record(
     *,
     chat_format_version: int,
     tool_names: dict[str, str],
+    backend_tool_ids_seen: set[str],
     stats: _ImportStats,
-) -> Message | None:
+) -> tuple[SessionItem, ...]:
     record_type = record.get("type")
     role = record.get("role")
     if isinstance(role, str) and (chat_format_version == 0 or not isinstance(record_type, str)):
-        return _convert_legacy_message(record, role, tool_names, stats)
+        return _convert_legacy_message(
+            record,
+            role,
+            tool_names,
+            backend_tool_ids_seen,
+            stats,
+        )
     if not isinstance(record_type, str):
         raise _InvalidRecord("record has no type")
 
     if record_type == "system":
-        return Message(Role.SYSTEM, _text_content(record.get("content", ""), stats))
+        content = _text_content(record.get("content", ""), stats)
+        return (Message(Role.SYSTEM, content.text, content_parts=content.parts),)
     if record_type == "user":
-        return Message(Role.USER, _text_content(record.get("content", []), stats))
+        content = _text_content(record.get("content", []), stats)
+        return (Message(Role.USER, content.text, content_parts=content.parts),)
     if record_type == "assistant":
         tool_calls = _tool_calls(record.get("tool_calls", []), tool_names, stats)
-        return Message(
+        content = _text_content(record.get("content", ""), stats)
+        message = Message(
             Role.ASSISTANT,
-            _text_content(record.get("content", ""), stats),
+            content.text,
             tool_calls=tool_calls,
+            content_parts=content.parts,
         )
+        siblings = _recover_legacy_context(record, backend_tool_ids_seen, stats)
+        return (*siblings, message)
     if record_type == "tool_result":
-        return _tool_result_message(record, tool_names, stats)
-    if record_type in {"reasoning", "backend_tool_call"}:
-        stats.unsupported_records += 1
-        return None
+        tool_message = _tool_result_message(record, tool_names, stats)
+        return (tool_message,) if tool_message is not None else ()
+    if record_type == "reasoning":
+        stats.preserved_context_records += 1
+        return (PreservedContextItem(ContextItemKind.REASONING, record),)
+    if record_type == "backend_tool_call":
+        stats.preserved_context_records += 1
+        return (PreservedContextItem(ContextItemKind.BACKEND_TOOL_CALL, record),)
     stats.unsupported_records += 1
-    return None
+    return ()
 
 
 def _convert_legacy_message(
     record: dict[str, Any],
     role_name: str,
     tool_names: dict[str, str],
+    backend_tool_ids_seen: set[str],
     stats: _ImportStats,
-) -> Message | None:
+) -> tuple[SessionItem, ...]:
     try:
         role = Role(role_name.lower())
     except ValueError as error:
@@ -231,10 +298,160 @@ def _convert_legacy_message(
     content = _text_content(record.get("content", ""), stats)
     if role is Role.ASSISTANT:
         calls = _tool_calls(record.get("tool_calls", []), tool_names, stats)
-        return Message(role, content, tool_calls=calls)
+        message = Message(
+            role,
+            content.text,
+            tool_calls=calls,
+            content_parts=content.parts,
+        )
+        siblings = _recover_legacy_context(record, backend_tool_ids_seen, stats)
+        return (*siblings, message)
     if role is Role.TOOL:
-        return _tool_result_message(record, tool_names, stats)
-    return Message(role, content)
+        tool_message = _tool_result_message(record, tool_names, stats)
+        return (tool_message,) if tool_message is not None else ()
+    return (Message(role, content.text, content_parts=content.parts),)
+
+
+def _recover_legacy_context(
+    record: dict[str, Any],
+    backend_tool_ids_seen: set[str],
+    stats: _ImportStats,
+) -> tuple[PreservedContextItem, ...]:
+    raw_output = record.get("raw_output")
+    if isinstance(raw_output, list):
+        recovered: list[PreservedContextItem] = []
+        for raw_entry in raw_output:
+            if not isinstance(raw_entry, dict):
+                stats.invalid_embedded_records += 1
+                continue
+            entry = cast(dict[str, Any], raw_entry)
+            entry_type = entry.get("type")
+            if entry_type == "reasoning":
+                if not _valid_reasoning_entry(entry):
+                    stats.invalid_embedded_records += 1
+                    continue
+                recovered.append(PreservedContextItem(ContextItemKind.REASONING, entry))
+                stats.preserved_context_records += 1
+                stats.recovered_context_records += 1
+                continue
+            if isinstance(entry_type, str) and entry_type in RAW_OUTPUT_BACKEND_TYPES:
+                identifier = entry.get("id")
+                if not isinstance(identifier, str):
+                    stats.invalid_embedded_records += 1
+                    continue
+                if identifier in backend_tool_ids_seen:
+                    stats.deduplicated_context_records += 1
+                    continue
+                backend_tool_ids_seen.add(identifier)
+                kind = {
+                    **{key: value for key, value in entry.items() if key != "type"},
+                    "tool_type": RAW_OUTPUT_BACKEND_TYPES[entry_type],
+                }
+                recovered.append(
+                    PreservedContextItem(
+                        ContextItemKind.BACKEND_TOOL_CALL,
+                        {"type": "backend_tool_call", "kind": kind},
+                    )
+                )
+                stats.preserved_context_records += 1
+                stats.recovered_context_records += 1
+                continue
+            if isinstance(entry_type, str) and entry_type in RAW_OUTPUT_NON_CONTEXT_TYPES:
+                continue
+            if isinstance(entry_type, str):
+                stats.unsupported_embedded_records += 1
+            else:
+                stats.invalid_embedded_records += 1
+        return tuple(recovered)
+
+    is_v1_assistant = record.get("type") == "assistant"
+    reasoning = record.get("reasoning")
+    if is_v1_assistant and isinstance(reasoning, dict):
+        reasoning_data = cast(dict[str, Any], reasoning)
+        item = _synthetic_reasoning(
+            identifier=reasoning_data.get("id"),
+            text=reasoning_data.get("text"),
+            encrypted=reasoning_data.get("encrypted"),
+        )
+        if item is not None:
+            stats.preserved_context_records += 1
+            stats.recovered_context_records += 1
+            return (item,)
+        return ()
+
+    is_v0_assistant = record.get("role") == "assistant"
+    if is_v0_assistant:
+        item = _synthetic_reasoning(
+            identifier="",
+            text=record.get("reasoning_content"),
+            encrypted=None,
+        )
+        if item is not None:
+            stats.preserved_context_records += 1
+            stats.recovered_context_records += 1
+            return (item,)
+    return ()
+
+
+def _valid_reasoning_entry(entry: dict[str, Any]) -> bool:
+    if not isinstance(entry.get("id"), str) or not isinstance(entry.get("summary"), list):
+        return False
+    for field, expected_type in (("encrypted_content", str), ("status", str)):
+        value = entry.get(field)
+        if value is not None and not isinstance(value, expected_type):
+            return False
+    block_types = {
+        "summary": "summary_text",
+        "content": "reasoning_text",
+    }
+    for field, expected_block_type in block_types.items():
+        blocks = entry.get(field)
+        if blocks is None:
+            continue
+        if not isinstance(blocks, list):
+            return False
+        if any(
+            not isinstance(block, dict)
+            or block.get("type") != expected_block_type
+            or not isinstance(block.get("text"), str)
+            for block in blocks
+        ):
+            return False
+    return True
+
+
+def _synthetic_reasoning(
+    *,
+    identifier: object,
+    text: object,
+    encrypted: object,
+) -> PreservedContextItem | None:
+    visible_text = text if isinstance(text, str) and text else None
+    encrypted_text = encrypted if isinstance(encrypted, str) and encrypted else None
+    if visible_text is None and encrypted_text is None:
+        return None
+    payload: dict[str, Any] = {
+        "type": "reasoning",
+        "id": identifier if isinstance(identifier, str) else "",
+        "summary": (
+            [{"type": "summary_text", "text": visible_text}] if visible_text is not None else []
+        ),
+    }
+    if encrypted_text is not None:
+        payload["encrypted_content"] = encrypted_text
+    return PreservedContextItem(ContextItemKind.REASONING, payload)
+
+
+def _backend_tool_id(item: SessionItem) -> str | None:
+    if not isinstance(item, PreservedContextItem):
+        return None
+    if item.kind is not ContextItemKind.BACKEND_TOOL_CALL:
+        return None
+    kind = item.payload.get("kind")
+    if not isinstance(kind, Mapping):
+        return None
+    identifier = kind.get("id")
+    return identifier if isinstance(identifier, str) else None
 
 
 def _tool_calls(
@@ -303,43 +520,70 @@ def _tool_result_message(
     content = _text_content(record.get("content", ""), stats)
     images = record.get("images", [])
     if isinstance(images, list) and images:
-        content = _append_placeholders(content, len(images), stats)
+        image_content = _text_content(images, stats)
+        parts = list(content.parts)
+        if not parts and content.text:
+            parts.append(ContentPart.from_text(content.text))
+        parts.extend(image_content.parts)
+        content = _ParsedContent(
+            "\n".join(part.text for part in parts if part.text is not None),
+            tuple(parts),
+        )
+    elif not isinstance(images, list):
+        raise _InvalidRecord("tool result images must be a list")
     return Message(
         Role.TOOL,
-        content,
+        content.text,
         name=tool_names[call_id],
         tool_call_id=call_id,
+        content_parts=content.parts,
     )
 
 
-def _text_content(value: object, stats: _ImportStats) -> str:
+def _text_content(value: object, stats: _ImportStats) -> _ParsedContent:
     if isinstance(value, str):
-        return value
+        return _ParsedContent(value)
     if not isinstance(value, list):
         raise _InvalidRecord("message content must be text or content parts")
-    parts: list[str] = []
+    parts: list[ContentPart] = []
     for raw_part in value:
         if not isinstance(raw_part, dict):
             stats.omitted_content_parts += 1
-            parts.append(UNKNOWN_CONTENT_PLACEHOLDER)
+            parts.append(ContentPart.from_text(UNKNOWN_CONTENT_PLACEHOLDER))
             continue
         part = cast(dict[str, Any], raw_part)
         part_type = part.get("type")
         if part_type == "text" and isinstance(part.get("text"), str):
-            parts.append(cast(str, part["text"]))
+            parts.append(ContentPart.from_text(cast(str, part["text"])))
         elif part_type in {"image", "image_url"}:
-            stats.omitted_images += 1
-            parts.append(IMAGE_PLACEHOLDER)
+            url = _image_url(part)
+            if url is None:
+                stats.omitted_content_parts += 1
+                parts.append(ContentPart.from_text(UNKNOWN_CONTENT_PLACEHOLDER))
+            else:
+                stats.preserved_images += 1
+                parts.append(ContentPart.from_image(url))
         else:
             stats.omitted_content_parts += 1
-            parts.append(UNKNOWN_CONTENT_PLACEHOLDER)
-    return "\n".join(parts)
+            parts.append(ContentPart.from_text(UNKNOWN_CONTENT_PLACEHOLDER))
+    return _ParsedContent(
+        "\n".join(part.text for part in parts if part.text is not None),
+        tuple(parts),
+    )
 
 
-def _append_placeholders(content: str, count: int, stats: _ImportStats) -> str:
-    stats.omitted_images += count
-    suffix = "\n".join(IMAGE_PLACEHOLDER for _ in range(count))
-    return f"{content}\n{suffix}" if content else suffix
+def _image_url(part: dict[str, Any]) -> str | None:
+    value = part.get("url")
+    if isinstance(value, str) and value:
+        return value
+    image_url = part.get("image_url")
+    if isinstance(image_url, str) and image_url:
+        return image_url
+    if isinstance(image_url, dict):
+        nested = image_url.get("url")
+        if isinstance(nested, str) and nested:
+            return nested
+    return None
 
 
 def _object(value: object, field: str) -> dict[str, Any]:

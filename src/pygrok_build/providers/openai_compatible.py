@@ -5,7 +5,13 @@ from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from pygrok_build.domain.messages import Message, Role, ToolCall
+from pygrok_build.domain.messages import (
+    IMAGE_MODEL_PLACEHOLDER,
+    ContentPartKind,
+    Message,
+    Role,
+    ToolCall,
+)
 from pygrok_build.domain.model_events import (
     ModelCompleted,
     ModelEvent,
@@ -15,6 +21,12 @@ from pygrok_build.domain.model_events import (
 )
 from pygrok_build.domain.tools import ToolDefinition
 from pygrok_build.errors import ProviderError
+from pygrok_build.providers.image_references import (
+    OPENAI_IMAGE_MEDIA_TYPES,
+    OPENAI_MAX_INLINE_IMAGE_BYTES,
+    InlineImageReference,
+    parse_image_reference,
+)
 
 
 @dataclass(slots=True)
@@ -38,12 +50,14 @@ class OpenAICompatibleProvider:
         base_url: str,
         api_key: str,
         timeout_seconds: float = 120.0,
+        max_output_tokens: int = 8192,
         transport: Any | None = None,
     ) -> None:
         self._model = model
         self._base_url = base_url.rstrip("/")
         self._api_key = api_key
         self._timeout_seconds = timeout_seconds
+        self._max_output_tokens = max_output_tokens
         self._transport = transport
 
     @property
@@ -54,8 +68,43 @@ class OpenAICompatibleProvider:
     def model_name(self) -> str:
         return self._model
 
+    @staticmethod
+    def _user_content(message: Message) -> str | list[dict[str, Any]]:
+        if not message.content_parts or not any(
+            part.kind is ContentPartKind.IMAGE for part in message.content_parts
+        ):
+            return message.content
+
+        blocks: list[dict[str, Any]] = []
+        for part in message.content_parts:
+            if part.kind is ContentPartKind.TEXT:
+                assert part.text is not None
+                blocks.append({"type": "text", "text": part.text})
+                continue
+            assert part.url is not None
+            reference = parse_image_reference(
+                part.url,
+                allowed_media_types=OPENAI_IMAGE_MEDIA_TYPES,
+                max_inline_bytes=OPENAI_MAX_INLINE_IMAGE_BYTES,
+            )
+            if reference is None:
+                blocks.append({"type": "text", "text": IMAGE_MODEL_PLACEHOLDER})
+                continue
+            url = (
+                reference.data_uri if isinstance(reference, InlineImageReference) else reference.url
+            )
+            blocks.append({"type": "image_url", "image_url": {"url": url}})
+        return blocks
+
     def _message_payload(self, message: Message) -> dict[str, Any]:
-        payload: dict[str, Any] = {"role": message.role.value, "content": message.content}
+        payload: dict[str, Any] = {
+            "role": message.role.value,
+            "content": (
+                self._user_content(message)
+                if message.role is Role.USER
+                else message.model_content()
+            ),
+        }
         if message.role is Role.TOOL:
             payload["tool_call_id"] = message.tool_call_id
         if message.tool_calls:
@@ -70,6 +119,8 @@ class OpenAICompatibleProvider:
                 }
                 for call in message.tool_calls
             ]
+            if message.reasoning_content is not None:
+                payload["reasoning_content"] = message.reasoning_content
         return payload
 
     async def stream(
@@ -87,6 +138,7 @@ class OpenAICompatibleProvider:
         body: dict[str, Any] = {
             "model": self._model,
             "messages": [self._message_payload(message) for message in messages],
+            "max_tokens": self._max_output_tokens,
             "stream": True,
             "stream_options": {"include_usage": True},
         }
