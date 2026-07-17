@@ -1,0 +1,14 @@
+{
+  "source_repository": "https://github.com/xai-org/grok-build",
+  "source_commit": "c68e39f60462f28d9be5e683d9cbe2c57b1a5027",
+  "understand_anything_commit": "c68e39f60462f28d9be5e683d9cbe2c57b1a5027",
+  "understand_anything_analyzed_files": 2235,
+  "rust_file_count_observed": 2237,
+  "rust_line_count_observed": 418739,
+  "test_file_count_observed": 482,
+  "notes": [
+    "Counts are planning observations, not release invariants.",
+    "A local source clone and its .ua data are read-only inputs.",
+    "Source code and executable behavior override generated .ua summaries."
+  ]
+}

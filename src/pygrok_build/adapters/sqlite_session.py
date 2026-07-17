@@ -1,0 +1,284 @@
+from __future__ import annotations
+
+import asyncio
+import json
+import sqlite3
+import uuid
+from collections.abc import Sequence
+from contextlib import closing
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
+
+from pygrok_build.async_utils import run_blocking
+from pygrok_build.domain.events import AgentEvent
+from pygrok_build.domain.messages import Message, Role, ToolCall
+from pygrok_build.domain.sessions import SessionSummary
+from pygrok_build.errors import SessionError
+
+SCHEMA_VERSION = 1
+
+
+class SqliteSessionStore:
+    """SQLite-backed, append-only session event store.
+
+    Each operation owns a short-lived connection so it can safely run through
+    `asyncio.to_thread` without sharing SQLite objects between threads.
+    """
+
+    def __init__(self, database_path: Path) -> None:
+        self._database_path = database_path
+        self._write_lock = asyncio.Lock()
+
+    @property
+    def database_path(self) -> Path:
+        return self._database_path
+
+    def _connect(self) -> sqlite3.Connection:
+        connection = sqlite3.connect(self._database_path, timeout=30)
+        connection.execute("PRAGMA foreign_keys = ON")
+        connection.execute("PRAGMA journal_mode = WAL")
+        return connection
+
+    async def initialize(self) -> None:
+        def initialize_sync() -> None:
+            self._database_path.parent.mkdir(parents=True, exist_ok=True)
+            with closing(self._connect()) as connection, connection:
+                connection.executescript(
+                    """
+                    CREATE TABLE IF NOT EXISTS schema_meta (
+                        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                        version INTEGER NOT NULL
+                    );
+                    INSERT OR IGNORE INTO schema_meta(singleton, version) VALUES (1, 1);
+
+                    CREATE TABLE IF NOT EXISTS sessions (
+                        id TEXT PRIMARY KEY,
+                        cwd TEXT NOT NULL,
+                        provider TEXT NOT NULL,
+                        model TEXT NOT NULL,
+                        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        messages_json TEXT NOT NULL DEFAULT '[]'
+                    );
+
+                    CREATE TABLE IF NOT EXISTS events (
+                        session_id TEXT NOT NULL,
+                        sequence INTEGER NOT NULL,
+                        kind TEXT NOT NULL,
+                        created_at TEXT NOT NULL,
+                        data_json TEXT NOT NULL,
+                        PRIMARY KEY (session_id, sequence),
+                        FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+                    );
+                    """
+                )
+                version = connection.execute(
+                    "SELECT version FROM schema_meta WHERE singleton = 1"
+                ).fetchone()
+                if version is None or version[0] != SCHEMA_VERSION:
+                    raise SessionError(
+                        f"unsupported session schema version: {version[0] if version else 'missing'}"
+                    )
+
+        await run_blocking(initialize_sync)
+
+    async def create_session(self, cwd: str, provider: str, model: str) -> str:
+        session_id = str(uuid.uuid4())
+
+        def create() -> None:
+            with closing(self._connect()) as connection, connection:
+                connection.execute(
+                    "INSERT INTO sessions(id, cwd, provider, model) VALUES (?, ?, ?, ?)",
+                    (session_id, cwd, provider, model),
+                )
+
+        async with self._write_lock:
+            await run_blocking(create)
+        return session_id
+
+    async def append_event(self, session_id: str, event: AgentEvent) -> None:
+        payload = json.dumps(dict(event.data), ensure_ascii=False, separators=(",", ":"))
+
+        def append() -> None:
+            try:
+                with closing(self._connect()) as connection, connection:
+                    connection.execute(
+                        """
+                        INSERT INTO events(session_id, sequence, kind, created_at, data_json)
+                        VALUES (?, ?, ?, ?, ?)
+                        """,
+                        (
+                            session_id,
+                            event.sequence,
+                            event.kind.value,
+                            event.created_at.isoformat(),
+                            payload,
+                        ),
+                    )
+                    connection.execute(
+                        "UPDATE sessions SET updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                        (session_id,),
+                    )
+            except sqlite3.IntegrityError as error:
+                raise SessionError(
+                    f"cannot append event {event.sequence} to session {session_id}"
+                ) from error
+
+        async with self._write_lock:
+            await run_blocking(append)
+
+    async def save_messages(self, session_id: str, messages: Sequence[Message]) -> None:
+        payload = json.dumps(
+            [message.to_dict() for message in messages],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+
+        def save() -> None:
+            with closing(self._connect()) as connection, connection:
+                cursor = connection.execute(
+                    """
+                    UPDATE sessions
+                    SET messages_json = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """,
+                    (payload, session_id),
+                )
+                if cursor.rowcount != 1:
+                    raise SessionError(f"unknown session: {session_id}")
+
+        async with self._write_lock:
+            await run_blocking(save)
+
+    async def load_messages(self, session_id: str) -> list[Message]:
+        def load() -> list[Message]:
+            with closing(self._connect()) as connection:
+                row = connection.execute(
+                    "SELECT messages_json FROM sessions WHERE id = ?", (session_id,)
+                ).fetchone()
+            if row is None:
+                raise SessionError(f"unknown session: {session_id}")
+            try:
+                raw_messages = json.loads(row[0])
+                return [_message_from_dict(item) for item in raw_messages]
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+                raise SessionError(f"session {session_id} contains invalid messages") from error
+
+        return await run_blocking(load)
+
+    async def load_events(self, session_id: str) -> list[dict[str, Any]]:
+        def load() -> list[dict[str, Any]]:
+            with closing(self._connect()) as connection:
+                rows = connection.execute(
+                    """
+                    SELECT sequence, kind, created_at, data_json
+                    FROM events WHERE session_id = ? ORDER BY sequence
+                    """,
+                    (session_id,),
+                ).fetchall()
+            return [
+                {
+                    "sequence": row[0],
+                    "kind": row[1],
+                    "created_at": row[2],
+                    "data": json.loads(row[3]),
+                }
+                for row in rows
+            ]
+
+        return await run_blocking(load)
+
+    async def next_event_sequence(self, session_id: str) -> int:
+        def load() -> int:
+            with closing(self._connect()) as connection:
+                session_exists = connection.execute(
+                    "SELECT 1 FROM sessions WHERE id = ?", (session_id,)
+                ).fetchone()
+                if session_exists is None:
+                    raise SessionError(f"unknown session: {session_id}")
+                row = connection.execute(
+                    "SELECT COALESCE(MAX(sequence), 0) + 1 FROM events WHERE session_id = ?",
+                    (session_id,),
+                ).fetchone()
+            assert row is not None
+            return int(row[0])
+
+        return await run_blocking(load)
+
+    async def list_sessions(self, *, limit: int = 50) -> list[SessionSummary]:
+        if not 1 <= limit <= 1000:
+            raise SessionError("session list limit must be between 1 and 1000")
+
+        def load() -> list[SessionSummary]:
+            with closing(self._connect()) as connection:
+                rows = connection.execute(
+                    """
+                    SELECT id, cwd, provider, model, created_at, updated_at
+                    FROM sessions ORDER BY updated_at DESC, id DESC LIMIT ?
+                    """,
+                    (limit,),
+                ).fetchall()
+            return [_summary_from_row(row) for row in rows]
+
+        return await run_blocking(load)
+
+    async def get_session(self, session_id: str) -> SessionSummary:
+        def load() -> SessionSummary:
+            with closing(self._connect()) as connection:
+                row = connection.execute(
+                    """
+                    SELECT id, cwd, provider, model, created_at, updated_at
+                    FROM sessions WHERE id = ?
+                    """,
+                    (session_id,),
+                ).fetchone()
+            if row is None:
+                raise SessionError(f"unknown session: {session_id}")
+            return _summary_from_row(row)
+
+        return await run_blocking(load)
+
+
+def _message_from_dict(raw: object) -> Message:
+    if not isinstance(raw, dict):
+        raise TypeError("message must be an object")
+    tool_calls_raw = raw.get("tool_calls", [])
+    if not isinstance(tool_calls_raw, list):
+        raise TypeError("tool_calls must be a list")
+    tool_calls: list[ToolCall] = []
+    for item in tool_calls_raw:
+        if not isinstance(item, dict) or not isinstance(item.get("arguments"), dict):
+            raise TypeError("tool call must be an object")
+        raw_metadata = item.get("metadata")
+        metadata = raw_metadata if isinstance(raw_metadata, dict) else {}
+        tool_calls.append(
+            ToolCall(
+                id=str(item["id"]),
+                name=str(item["name"]),
+                arguments=item["arguments"],
+                metadata=metadata,
+            )
+        )
+    return Message(
+        role=Role(str(raw["role"])),
+        content=str(raw.get("content", "")),
+        name=str(raw["name"]) if raw.get("name") is not None else None,
+        tool_call_id=(str(raw["tool_call_id"]) if raw.get("tool_call_id") is not None else None),
+        tool_calls=tuple(tool_calls),
+    )
+
+
+def _summary_from_row(row: tuple[Any, ...]) -> SessionSummary:
+    def timestamp(value: object) -> datetime:
+        parsed = datetime.fromisoformat(str(value).replace(" ", "T"))
+        return parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else parsed
+
+    return SessionSummary(
+        id=str(row[0]),
+        cwd=str(row[1]),
+        provider=str(row[2]),
+        model=str(row[3]),
+        created_at=timestamp(row[4]),
+        updated_at=timestamp(row[5]),
+    )

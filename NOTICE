@@ -1,0 +1,19 @@
+PyGrokBuild
+Copyright 2026 PyGrokBuild contributors
+
+This product is an independent Python reimplementation informed by the
+Apache-2.0 licensed xai-org/grok-build source tree at source commit
+c68e39f60462f28d9be5e683d9cbe2c57b1a5027.
+
+The upstream tree contains additional third-party notices, including modified
+ports from openai/codex and sst/opencode and vendored Mermaid components.
+Any source-derived implementation must preserve the applicable copyright,
+license, attribution, and change notices before distribution. The authoritative
+inventory for the pinned source is:
+
+  https://github.com/xai-org/grok-build/blob/c68e39f60462f28d9be5e683d9cbe2c57b1a5027/THIRD-PARTY-NOTICES
+  https://github.com/xai-org/grok-build/blob/c68e39f60462f28d9be5e683d9cbe2c57b1a5027/crates/codegen/xai-grok-tools/THIRD_PARTY_NOTICES.md
+  https://github.com/xai-org/grok-build/blob/c68e39f60462f28d9be5e683d9cbe2c57b1a5027/third_party/NOTICE
+
+Grok Build, Grok, xAI, and SpaceXAI are names of their respective owners. This
+independent project is not affiliated with or endorsed by them.

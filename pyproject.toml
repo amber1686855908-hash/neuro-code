@@ -1,0 +1,84 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "pygrok-build"
+version = "0.1.0.dev0"
+description = "An independent Python reimplementation of the Grok Build terminal coding agent"
+readme = "README.md"
+requires-python = ">=3.12"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+authors = [{ name = "PyGrokBuild contributors" }]
+classifiers = [
+  "Development Status :: 2 - Pre-Alpha",
+  "Environment :: Console",
+  "License :: OSI Approved :: Apache Software License",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Topic :: Software Development",
+]
+dependencies = [
+  "httpx>=0.28,<1",
+  "pydantic>=2.10,<3",
+]
+
+[project.optional-dependencies]
+tui = ["textual>=1.0,<2"]
+dev = [
+  "mypy>=1.14",
+  "pytest>=8.3",
+  "pytest-asyncio>=0.25",
+  "pytest-cov>=6.0",
+  "ruff>=0.9",
+]
+
+[project.scripts]
+pygrok-build = "pygrok_build.cli:main"
+grok = "pygrok_build.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/pygrok_build"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC", "C4", "DTZ", "LOG", "PIE", "PT", "RUF", "SIM"]
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*.py" = ["PT009", "PT027"]
+
+[tool.ruff.format]
+docstring-code-format = true
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_unreachable = true
+show_error_codes = true
+packages = ["pygrok_build"]
+mypy_path = "src"
+
+[tool.pytest.ini_options]
+addopts = "-ra --strict-config --strict-markers"
+asyncio_mode = "auto"
+testpaths = ["tests"]
+markers = [
+  "contract: shared adapter contract tests",
+  "differential: tests that compare the Rust oracle",
+  "live: tests that require external credentials or services",
+]
+
+[tool.coverage.run]
+branch = true
+source = ["pygrok_build"]
+
+[tool.coverage.report]
+fail_under = 85
+show_missing = true

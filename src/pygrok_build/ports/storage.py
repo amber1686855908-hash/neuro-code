@@ -1,0 +1,24 @@
+from __future__ import annotations
+
+from collections.abc import Sequence
+from typing import Protocol
+
+from pygrok_build.domain.events import AgentEvent
+from pygrok_build.domain.messages import Message
+from pygrok_build.domain.sessions import SessionSummary
+
+
+class SessionStore(Protocol):
+    async def create_session(self, cwd: str, provider: str, model: str) -> str: ...
+
+    async def append_event(self, session_id: str, event: AgentEvent) -> None: ...
+
+    async def save_messages(self, session_id: str, messages: Sequence[Message]) -> None: ...
+
+    async def load_messages(self, session_id: str) -> list[Message]: ...
+
+    async def next_event_sequence(self, session_id: str) -> int: ...
+
+    async def list_sessions(self, *, limit: int = 50) -> list[SessionSummary]: ...
+
+    async def get_session(self, session_id: str) -> SessionSummary: ...
