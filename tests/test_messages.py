@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from pygrok_build.domain.messages import (
+from neuro_code.domain.messages import (
     IMAGE_MODEL_PLACEHOLDER,
     ContentPart,
     ContentPartKind,
@@ -12,6 +12,7 @@ from pygrok_build.domain.messages import (
     Role,
     ToolCall,
 )
+from neuro_code.domain.model_context import UPSTREAM_IMPORT_PROVIDER, ModelContext
 
 
 class MessageTests(unittest.TestCase):
@@ -96,6 +97,26 @@ class MessageTests(unittest.TestCase):
                 ContextItemKind.REASONING,
                 {"type": "backend_tool_call"},
             )
+
+    def test_model_context_retains_order_and_requires_complete_origin(self) -> None:
+        message = Message(Role.USER, "question")
+        preserved = PreservedContextItem(
+            ContextItemKind.REASONING,
+            {"type": "reasoning", "id": "reasoning-1", "summary": []},
+        )
+        context = ModelContext(
+            (message, preserved),
+            source_provider=UPSTREAM_IMPORT_PROVIDER,
+            source_model="xai-test-model",
+        )
+
+        self.assertEqual(context.items, (message, preserved))
+        self.assertEqual(context.messages, (message,))
+        self.assertEqual(context.preserved_items, (preserved,))
+        with self.assertRaisesRegex(ValueError, "must be set together"):
+            ModelContext((message,), source_provider=UPSTREAM_IMPORT_PROVIDER)
+        with self.assertRaisesRegex(ValueError, "must not be empty"):
+            ModelContext((message,), source_provider="", source_model="xai-test-model")
 
 
 if __name__ == "__main__":

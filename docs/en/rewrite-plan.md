@@ -23,6 +23,8 @@ Exit: every M1/M2 capability has an upstream evidence path and an owner status.
 
 ### M1 — installable engineering skeleton
 
+- One project-owned namespace across product, distribution, command, Python
+  package, environment variables, state directories, and errors.
 - Cross-platform package, CLI, configuration, errors, domain events, and ports.
 - `version`, `inspect`, and machine-readable output.
 - Ruff, mypy, pytest/unittest bootstrap and CI-ready commands.
@@ -31,17 +33,29 @@ Exit: the project installs and the same contract suite passes on all targets.
 
 ### M2 — headless coding-agent vertical slice
 
-- OpenAI-compatible, Anthropic, and Gemini streaming providers behind one
-  normalized multi-provider port, including validated provider-native image
-  projection with explicit fallback for unsupported roles and references,
-  bounded output tokens, and persisted reasoning continuity for thinking-mode
-  tool-call turns.
+- Named provider profiles, explicit wire protocols, optional read-only CC
+  Switch configuration/gateway compatibility, no implicit cloud default, and
+  ordered lazy fallback profiles that switch only before the first model event.
+  Per-profile HTTP transport policy supports inherited environment, direct, or
+  secret-safe explicit proxy routing across every provider adapter.
+- OpenAI Chat, generic Responses with an optional xAI dialect, Anthropic, and
+  Gemini streaming providers behind one normalized multi-provider port, including validated
+  provider-native image projection with explicit fallback for unsupported roles
+  and references, bounded output tokens, persisted reasoning continuity for
+  thinking-mode tool-call turns, and strict-affinity native xAI encrypted
+  context replay.
 - Agent/tool loop, structured tool calls, cancellation, step limit, bounded
-  output, and owned process-tree cleanup.
+  output, audited provider attempt/selection events, a per-run failover bypass,
+  a double-gated DeepSeek live regression path, and owned process-tree cleanup.
+- Opt-in xAI-hosted web, X, and code-interpreter tools with collision-safe wire
+  projection, provider-owned lifecycle events, and durable native output replay.
 - Read/list/grep/search-replace/bash tools and a headless permission policy
   that evaluates every safely decomposable shell-command segment.
 - SQLite sessions, ordered message/provider-context items, prefix-safe resume,
-  JSON/Markdown export, and read-only Rust JSONL session import foundation.
+  JSON/Markdown export, read-only Rust JSONL session import, and fail-closed
+  provider-affine context projection. Terminal provider output is canonical for
+  persisted assistant text and native items while streaming deltas remain the UI
+  surface.
 
 Exit: a fake-provider end-to-end test performs read, edit, command, and final
 response; an opt-in live test can do the same against a configured provider.

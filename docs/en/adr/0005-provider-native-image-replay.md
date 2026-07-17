@@ -8,7 +8,7 @@ Accepted.
 
 ## Context
 
-Imported Grok Build sessions preserve ordered text and image references in
+Imported upstream sessions preserve ordered text and image references in
 provider-independent `ContentPart` values. Flattening every image into text
 keeps requests valid but prevents a resumed model from seeing screenshots and
 tool-produced images. Sending every stored string as provider media is also

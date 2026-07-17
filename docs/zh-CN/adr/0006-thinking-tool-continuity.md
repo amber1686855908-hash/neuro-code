@@ -30,9 +30,10 @@ OpenAI 兼容适配器只会在序列化同时包含工具调用的 assistant �
 `max_output_tokens` 会作为 Chat Completions 的 `max_tokens` 发送，使该适配器获得与
 Anthropic 和 Gemini 原生适配器相同的显式响应上限。
 
-任何 `PreservedContextItem` 都不会投影到该字段。跨供应商回放必须等到建立显式的
-供应商亲和契约并补充模型专用夹具后再实现。真实凭据探针保持选择性启用，并位于仓库
-和 CI 之外；应用程序只读取指定的进程环境变量，绝不会自动解析项目 `.env` 文件。
+`PreservedContextItem` 默认不会投影到该字段。[ADR 0007](0007-provider-affine-context-replay.md)
+只允许在严格的 xAI/来源亲和契约下使用可见的导入推理；Responses 原生加密状态仍保持
+独立。真实凭据探针保持选择性启用，并位于仓库和 CI 之外；应用程序只读取指定的进程
+环境变量，绝不会自动解析项目 `.env` 文件。
 
 ## 影响
 
@@ -42,5 +43,6 @@ Anthropic 和 Gemini 原生适配器相同的显式响应上限。
 
 该变更不主张导入的 Rust 推理具备可移植性，也不会把推理回放扩展为所有供应商的通用
 行为。一次 DeepSeek V4 Flash 手动探针已经验证当前 OpenAI 兼容流式行为，以及只读
-`AgentRuntime`/SQLite 往返；可长期保留的选择性集成夹具和供应商亲和能力仍属于后续
-纵向切片。
+`AgentRuntime`/SQLite 往返。xAI 原生本地无状态回放现在由独立的
+[ADR 0008](0008-xai-responses-native-replay.md) 路径实现；可长期保留的选择性集成夹具仍
+属于后续工作。

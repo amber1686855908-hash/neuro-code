@@ -36,11 +36,12 @@ no-tool reasoning in later requests. The configured `max_output_tokens` is sent
 as Chat Completions `max_tokens`, placing the same explicit response bound on
 this adapter that the native Anthropic and Gemini adapters already enforce.
 
-No `PreservedContextItem` is projected into this field. Cross-provider replay
-waits for an explicit provider-affinity contract and model-specific fixtures.
-Real-credential probes remain opt-in and outside the repository and CI; the
-application reads only the named process environment variable and never parses
-project `.env` files automatically.
+`PreservedContextItem` values are not projected into this field by default.
+[ADR 0007](0007-provider-affine-context-replay.md) permits visible imported
+reasoning only under a strict xAI/source affinity contract; encrypted native
+Responses state remains separate. Real-credential probes remain opt-in and
+outside the repository and CI; the application reads only the named process
+environment variable and never parses project `.env` files automatically.
 
 ## Consequences
 
@@ -53,5 +54,6 @@ therefore be treated as potentially sensitive data.
 The change does not claim that imported Rust reasoning is portable, nor does it
 make reasoning replay universal across providers. A manual DeepSeek V4 Flash
 probe verifies the current OpenAI-compatible streaming behavior and a read-only
-`AgentRuntime`/SQLite round trip; durable opt-in integration fixtures and
-provider-affinity work remain future slices.
+`AgentRuntime`/SQLite round trip. Native local-stateless xAI replay is now the
+separate [ADR 0008](0008-xai-responses-native-replay.md) path; durable opt-in
+integration fixtures remain future work.

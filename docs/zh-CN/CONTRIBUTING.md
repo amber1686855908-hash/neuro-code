@@ -13,12 +13,26 @@ uv run python scripts/check_docs_parity.py
 uv run ruff check .
 uv run ruff format --check .
 uv run mypy
-uv run pytest --cov=pygrok_build --cov-report=term-missing
+uv run pytest --cov=neuro_code --cov-report=term-missing
 uv build
 ```
 
 所有检查必须在 Python 3.12 上通过。平台相关改动还必须通过 Linux、macOS 和 Windows
 CI 矩阵。
+
+## 凭据门控在线检查
+
+pytest 默认会排除带 `live` 标记的测试。运行这些测试必须同时显式选择标记，并打开
+费用/网络环境门禁：
+
+```bash
+export DEEPSEEK_API_KEY="provided-by-your-secret-manager"
+NEURO_CODE_RUN_LIVE_TESTS=1 uv run pytest -m live tests/live
+```
+
+不得提交已填写的 `.env`、响应录制、响应转储或失败产物。在线测试必须限制 Token 和
+超时时间，不使用破坏性工具，也不得输出凭据、请求头或完整请求体。缺少密钥时应跳过，
+而不是失败。`.env.example` 只记录变量名；应用和测试代码都不会隐式加载 `.env`。
 
 ## 代码规则
 

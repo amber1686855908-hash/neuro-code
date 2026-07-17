@@ -5,22 +5,23 @@ import unittest
 
 import httpx
 
-from pygrok_build.domain.messages import (
+from neuro_code.domain.messages import (
     IMAGE_MODEL_PLACEHOLDER,
     ContentPart,
     Message,
     Role,
     ToolCall,
 )
-from pygrok_build.domain.model_events import (
+from neuro_code.domain.model_context import ModelContext
+from neuro_code.domain.model_events import (
     ModelCompleted,
     ModelReasoningDelta,
     ModelTextDelta,
     ModelToolCall,
 )
-from pygrok_build.domain.tools import ToolDefinition
-from pygrok_build.errors import ProviderError
-from pygrok_build.providers.gemini import GeminiProvider
+from neuro_code.domain.tools import ToolDefinition
+from neuro_code.errors import ProviderError
+from neuro_code.providers.gemini import GeminiProvider
 
 
 def _sse(*chunks: object) -> str:
@@ -166,7 +167,7 @@ class GeminiProviderTests(unittest.IsolatedAsyncioTestCase):
             ),
         )
 
-        events = [event async for event in provider.stream(messages, tools)]
+        events = [event async for event in provider.stream(ModelContext(tuple(messages)), tools)]
 
         self.assertEqual(provider.provider_name, "gemini")
         self.assertEqual(provider.model_name, "gemini/fixture")
@@ -245,7 +246,12 @@ class GeminiProviderTests(unittest.IsolatedAsyncioTestCase):
                     transport=transport,
                 )
                 with self.assertRaisesRegex(ProviderError, expected) as raised:
-                    [event async for event in provider.stream((Message(Role.USER, "hi"),), ())]
+                    [
+                        event
+                        async for event in provider.stream(
+                            ModelContext((Message(Role.USER, "hi"),)), ()
+                        )
+                    ]
                 self.assertNotIn("must-not-leak", str(raised.exception))
 
         def fail(request: httpx.Request) -> httpx.Response:
@@ -258,7 +264,10 @@ class GeminiProviderTests(unittest.IsolatedAsyncioTestCase):
             transport=httpx.MockTransport(fail),
         )
         with self.assertRaisesRegex(ProviderError, "stream failed"):
-            [event async for event in provider.stream((Message(Role.USER, "hi"),), ())]
+            [
+                event
+                async for event in provider.stream(ModelContext((Message(Role.USER, "hi"),)), ())
+            ]
 
     async def test_stream_rejects_invalid_function_calls(self) -> None:
         cases = (
@@ -276,7 +285,12 @@ class GeminiProviderTests(unittest.IsolatedAsyncioTestCase):
                 ),
             )
             with self.subTest(expected=expected), self.assertRaisesRegex(ProviderError, expected):
-                [event async for event in provider.stream((Message(Role.USER, "hi"),), ())]
+                [
+                    event
+                    async for event in provider.stream(
+                        ModelContext((Message(Role.USER, "hi"),)), ()
+                    )
+                ]
 
     def test_message_validation_response_wrapping_and_endpoint_variants(self) -> None:
         with self.assertRaisesRegex(ProviderError, "tool name"):

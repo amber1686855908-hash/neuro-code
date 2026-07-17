@@ -9,26 +9,48 @@ from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
-from pygrok_build.cli import _normalize_rule, main
-from pygrok_build.domain.messages import Message
-from pygrok_build.domain.model_events import ModelCompleted, ModelEvent, ModelTextDelta
-from pygrok_build.domain.tools import ToolDefinition
+from neuro_code.cli import _normalize_rule, main
+from neuro_code.config import AppConfig
+from neuro_code.domain.model_context import ModelContext
+from neuro_code.domain.model_events import ModelCompleted, ModelEvent, ModelTextDelta
+from neuro_code.domain.tools import ToolDefinition
 
 
 class CliProvider:
     provider_name = "cli-fixture"
     model_name = "fixture-model"
 
+    def __init__(self) -> None:
+        self.contexts: list[ModelContext] = []
+
     async def stream(
         self,
-        messages: Sequence[Message],
+        context: ModelContext,
         tools: Sequence[ToolDefinition],
     ) -> AsyncIterator[ModelEvent]:
+        self.contexts.append(context)
         yield ModelTextDelta("fixture response")
         yield ModelCompleted("stop", 2, 3)
 
 
 class CliTests(unittest.TestCase):
+    @staticmethod
+    def _write_provider_config(state_dir: Path) -> None:
+        state_dir.mkdir(parents=True, exist_ok=True)
+        (state_dir / "config.toml").write_text(
+            """
+[routing]
+default = "fixture"
+
+[providers.fixture]
+protocol = "openai-chat"
+model = "fixture-model"
+base_url = "https://provider.invalid/v1"
+api_key_env = "FIXTURE_KEY"
+""",
+            encoding="utf-8",
+        )
+
     def test_native_bash_permission_patterns_are_normalized(self) -> None:
         self.assertEqual(_normalize_rule("Bash"), "bash:*")
         self.assertEqual(_normalize_rule("Bash(*)"), "bash:*")
@@ -41,17 +63,21 @@ class CliTests(unittest.TestCase):
             exit_code = main(("version", "--json"))
         self.assertEqual(exit_code, 0)
         payload = json.loads(output.getvalue())
-        self.assertEqual(payload["name"], "pygrok-build")
-        self.assertEqual(len(payload["source_oracle_commit"]), 40)
+        self.assertEqual(payload, {"name": "neuro-code", "version": "0.1.0.dev0"})
 
     def test_inspect_redacts_credentials(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
+            self._write_provider_config(root / "state")
             output = io.StringIO()
             with (
                 patch.dict(
                     "os.environ",
-                    {"PYGROK_HOME": str(root / "state"), "XAI_API_KEY": "never-print-this"},
+                    {
+                        "HOME": str(root),
+                        "NEURO_CODE_HOME": str(root / "state"),
+                        "FIXTURE_KEY": "never-print-this",
+                    },
                     clear=True,
                 ),
                 redirect_stdout(output),
@@ -65,8 +91,8 @@ class CliTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             for arguments, expected in (
-                (("version",), "pygrok-build"),
-                (("inspect", "--cwd", str(root)), "credential_configured: false"),
+                (("version",), "neuro-code"),
+                (("inspect", "--cwd", str(root)), "provider: (not configured)"),
                 (("completions", "bash"), "complete -F"),
                 (("completions", "zsh"), "#compdef"),
                 (("completions", "fish"), "complete -c"),
@@ -74,7 +100,11 @@ class CliTests(unittest.TestCase):
             ):
                 output = io.StringIO()
                 with (
-                    patch.dict("os.environ", {"PYGROK_HOME": str(root / "state")}, clear=True),
+                    patch.dict(
+                        "os.environ",
+                        {"HOME": str(root), "NEURO_CODE_HOME": str(root / "state")},
+                        clear=True,
+                    ),
                     redirect_stdout(output),
                 ):
                     exit_code = main(arguments)
@@ -85,17 +115,19 @@ class CliTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             for output_format in ("plain", "json", "jsonl"):
+                self._write_provider_config(root / output_format)
                 output = io.StringIO()
                 with (
                     patch.dict(
                         "os.environ",
                         {
-                            "PYGROK_HOME": str(root / output_format),
-                            "XAI_API_KEY": "fixture-key",
+                            "NEURO_CODE_HOME": str(root / output_format),
+                            "HOME": str(root),
+                            "FIXTURE_KEY": "fixture-key",
                         },
                         clear=True,
                     ),
-                    patch("pygrok_build.cli.create_provider", return_value=CliProvider()),
+                    patch("neuro_code.cli.create_routed_provider", return_value=CliProvider()),
                     redirect_stdout(output),
                 ):
                     exit_code = main(
@@ -127,15 +159,17 @@ class CliTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             environment = {
-                "PYGROK_HOME": str(root / "state"),
-                "XAI_API_KEY": "fixture-key",
+                "HOME": str(root),
+                "NEURO_CODE_HOME": str(root / "state"),
+                "FIXTURE_KEY": "fixture-key",
             }
+            self._write_provider_config(root / "state")
 
             def run(arguments: tuple[str, ...]) -> tuple[int, str]:
                 output = io.StringIO()
                 with (
                     patch.dict("os.environ", environment, clear=True),
-                    patch("pygrok_build.cli.create_provider", return_value=CliProvider()),
+                    patch("neuro_code.cli.create_routed_provider", return_value=CliProvider()),
                     redirect_stdout(output),
                 ):
                     return main(arguments), output.getvalue()
@@ -203,7 +237,7 @@ class CliTests(unittest.TestCase):
                         "info": {"id": "rust-cli-id", "cwd": str(root)},
                         "created_at": "2026-07-01T10:20:30Z",
                         "updated_at": "2026-07-02T11:22:33Z",
-                        "current_model_id": "grok-4.5",
+                        "current_model_id": "xai-test-model",
                         "chat_format_version": 1,
                     }
                 ),
@@ -284,7 +318,8 @@ class CliTests(unittest.TestCase):
                 path.name: path.read_bytes()
                 for path in (source / "summary.json", source / "chat_history.jsonl")
             }
-            environment = {"PYGROK_HOME": str(root / "state")}
+            environment = {"HOME": str(root), "NEURO_CODE_HOME": str(root / "state")}
+            self._write_provider_config(root / "state")
 
             output = io.StringIO()
             with (
@@ -296,7 +331,7 @@ class CliTests(unittest.TestCase):
             self.assertEqual(exit_code, 0)
             payload = json.loads(output.getvalue())
             self.assertEqual(payload["session"]["id"], "rust-cli-id")
-            self.assertEqual(payload["session"]["provider"], "grok-build-import")
+            self.assertEqual(payload["session"]["provider"], "upstream-rust-import")
             self.assertEqual(payload["imported_messages"], 2)
             self.assertEqual(payload["preserved_context_records"], 3)
             self.assertEqual(payload["recovered_context_records"], 1)
@@ -338,6 +373,34 @@ class CliTests(unittest.TestCase):
                 exported["conversation_items"][0]["content_parts"][1]["url"],
                 "data:image/png;base64,fixture",
             )
+
+            resume_provider = CliProvider()
+            output = io.StringIO()
+            with (
+                patch.dict(
+                    "os.environ",
+                    {**environment, "FIXTURE_KEY": "fixture-key"},
+                    clear=True,
+                ),
+                patch("neuro_code.cli.create_routed_provider", return_value=resume_provider),
+                redirect_stdout(output),
+            ):
+                exit_code = main(
+                    (
+                        "-p",
+                        "continue imported session",
+                        "--resume",
+                        "rust-cli-id",
+                        "--cwd",
+                        str(root),
+                    )
+                )
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(len(resume_provider.contexts), 1)
+            resumed_context = resume_provider.contexts[0]
+            self.assertEqual(resumed_context.source_provider, "upstream-rust-import")
+            self.assertEqual(resumed_context.source_model, "xai-test-model")
+            self.assertEqual(len(resumed_context.preserved_items), 3)
             self.assertEqual(
                 {
                     path.name: path.read_bytes()
@@ -345,6 +408,83 @@ class CliTests(unittest.TestCase):
                 },
                 source_before,
             )
+
+    def test_provider_list_inspect_and_one_shot_selection(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / "state"
+            state.mkdir()
+            (state / "config.toml").write_text(
+                """
+[routing]
+default = "first"
+fallbacks = ["second"]
+
+[providers.first]
+protocol = "openai-chat"
+model = "first-model"
+base_url = "https://first.invalid/v1"
+api_key_env = "FIRST_KEY"
+
+[providers.second]
+protocol = "openai-chat"
+model = "second-model"
+base_url = "https://second.invalid/v1"
+api_key_env = "SECOND_KEY"
+""",
+                encoding="utf-8",
+            )
+            environment = {
+                "HOME": str(root),
+                "NEURO_CODE_HOME": str(state),
+                "FIRST_KEY": "first-secret",
+                "SECOND_KEY": "second-secret",
+            }
+
+            output = io.StringIO()
+            with patch.dict("os.environ", environment, clear=True), redirect_stdout(output):
+                exit_code = main(("providers", "list", "--json", "--cwd", str(root)))
+            self.assertEqual(exit_code, 0)
+            profiles = json.loads(output.getvalue())
+            self.assertEqual([profile["name"] for profile in profiles], ["first", "second"])
+            self.assertTrue(profiles[0]["default"])
+            self.assertTrue(profiles[1]["fallback"])
+            self.assertNotIn("first-secret", output.getvalue())
+
+            output = io.StringIO()
+            with patch.dict("os.environ", environment, clear=True), redirect_stdout(output):
+                exit_code = main(("providers", "inspect", "second", "--json", "--cwd", str(root)))
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(json.loads(output.getvalue())["model"], "second-model")
+
+            selected: list[str] = []
+            failover_values: list[bool] = []
+
+            def create(config: AppConfig, *, failover: bool) -> CliProvider:
+                selected.append(config.provider.name)
+                failover_values.append(failover)
+                return CliProvider()
+
+            output = io.StringIO()
+            with (
+                patch.dict("os.environ", environment, clear=True),
+                patch("neuro_code.cli.create_routed_provider", side_effect=create),
+                redirect_stdout(output),
+            ):
+                exit_code = main(("-p", "hello", "--provider", "second", "--cwd", str(root)))
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(selected, ["second"])
+            self.assertEqual(failover_values, [True])
+
+            output = io.StringIO()
+            with (
+                patch.dict("os.environ", environment, clear=True),
+                patch("neuro_code.cli.create_routed_provider", side_effect=create),
+                redirect_stdout(output),
+            ):
+                exit_code = main(("-p", "hello", "--no-failover", "--cwd", str(root)))
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(failover_values, [True, False])
 
 
 if __name__ == "__main__":

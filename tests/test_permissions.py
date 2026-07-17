@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from pygrok_build.permissions import (
+from neuro_code.permissions import (
     PermissionEffect,
     PermissionManager,
     PermissionMode,

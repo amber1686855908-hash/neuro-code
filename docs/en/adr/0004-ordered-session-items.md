@@ -8,7 +8,7 @@ Accepted.
 
 ## Context
 
-Grok Build v1 JSONL is not a list of chat messages. It interleaves ordinary
+The upstream v1 JSONL format is not a list of chat messages. It interleaves ordinary
 messages with Responses-API reasoning and backend-executed tool-call records.
 User and tool messages can also contain ordered image parts. Flattening these
 values into strings loses provider context, record order, and image identity,

@@ -31,18 +31,18 @@ def main() -> int:
         "--source",
         type=Path,
         default=(
-            Path(os.environ["PYGROK_SOURCE_REPOSITORY"])
-            if os.environ.get("PYGROK_SOURCE_REPOSITORY")
+            Path(os.environ["NEURO_CODE_SOURCE_REPOSITORY"])
+            if os.environ.get("NEURO_CODE_SOURCE_REPOSITORY")
             else None
         ),
-        help="local read-only grok-build clone (or set PYGROK_SOURCE_REPOSITORY)",
+        help="local read-only upstream source clone (or set NEURO_CODE_SOURCE_REPOSITORY)",
     )
     parser.add_argument(
         "--ua-directory",
         type=Path,
         default=(
-            Path(os.environ["PYGROK_UA_DIRECTORY"])
-            if os.environ.get("PYGROK_UA_DIRECTORY")
+            Path(os.environ["NEURO_CODE_UA_DIRECTORY"])
+            if os.environ.get("NEURO_CODE_UA_DIRECTORY")
             else None
         ),
         help="Understand Anything analysis directory (defaults to SOURCE/.ua)",
@@ -51,7 +51,7 @@ def main() -> int:
     baseline = _load_json(args.baseline)
     if args.source is None:
         print(
-            "source baseline check requires --source or PYGROK_SOURCE_REPOSITORY",
+            "source baseline check requires --source or NEURO_CODE_SOURCE_REPOSITORY",
             file=sys.stderr,
         )
         return 2

@@ -3,14 +3,14 @@ requires = ["hatchling>=1.27"]
 build-backend = "hatchling.build"
 
 [project]
-name = "pygrok-build"
+name = "neuro-code"
 version = "0.1.0.dev0"
-description = "An independent Python reimplementation of the Grok Build terminal coding agent"
+description = "An extensible Python terminal coding agent"
 readme = "README.md"
 requires-python = ">=3.12"
 license = "Apache-2.0"
 license-files = ["LICENSE", "NOTICE"]
-authors = [{ name = "PyGrokBuild contributors" }]
+authors = [{ name = "Neuro Code contributors" }]
 classifiers = [
   "Development Status :: 2 - Pre-Alpha",
   "Environment :: Console",
@@ -36,11 +36,10 @@ dev = [
 ]
 
 [project.scripts]
-pygrok-build = "pygrok_build.cli:main"
-grok = "pygrok_build.cli:main"
+neuro-code = "neuro_code.cli:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/pygrok_build"]
+packages = ["src/neuro_code"]
 
 [tool.ruff]
 target-version = "py312"
@@ -62,22 +61,22 @@ python_version = "3.12"
 strict = true
 warn_unreachable = true
 show_error_codes = true
-packages = ["pygrok_build"]
+packages = ["neuro_code"]
 mypy_path = "src"
 
 [tool.pytest.ini_options]
-addopts = "-ra --strict-config --strict-markers"
+addopts = "-ra --strict-config --strict-markers -m 'not live'"
 asyncio_mode = "auto"
 testpaths = ["tests"]
 markers = [
   "contract: shared adapter contract tests",
   "differential: tests that compare the Rust oracle",
-  "live: tests that require external credentials or services",
+  "live: opt-in tests that require external credentials, network access, and may incur charges",
 ]
 
 [tool.coverage.run]
 branch = true
-source = ["pygrok_build"]
+source = ["neuro_code"]
 
 [tool.coverage.report]
 fail_under = 85

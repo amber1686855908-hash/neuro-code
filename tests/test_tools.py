@@ -5,10 +5,10 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from pygrok_build.errors import ToolError
-from pygrok_build.ports.tools import ToolContext
-from pygrok_build.tools.filesystem import GrepTool, ReadFileTool, SearchReplaceTool
-from pygrok_build.workspace import resolve_workspace_path
+from neuro_code.errors import ToolError
+from neuro_code.ports.tools import ToolContext
+from neuro_code.tools.filesystem import GrepTool, ReadFileTool, SearchReplaceTool
+from neuro_code.workspace import resolve_workspace_path
 
 
 class FilesystemToolTests(unittest.IsolatedAsyncioTestCase):

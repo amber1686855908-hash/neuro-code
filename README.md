@@ -1,15 +1,16 @@
-# Neuro Code（PyGrokBuild）
+# Neuro Code
 
 [简体中文](docs/zh-CN/README.md) · [English](docs/en/README.md)
 
-Neuro Code 是一个基于开源 Grok Build 行为边界、使用 Python 独立重写的终端编码智能体。
+Neuro Code 最初基于开源 Grok Build 的行为边界进行 Python 重写，目前正作为独立、
+可扩展的终端编码智能体继续演进。
 当前项目处于 pre-alpha 阶段，已经具备可安装 CLI、无头代理循环、多模型流式适配、
 工作区工具、权限控制和 SQLite 会话能力。
 
-Neuro Code is an independent Python reimplementation of the open-source Grok
-Build terminal coding agent. It is currently pre-alpha, with an installable
-CLI, a headless agent loop, multi-provider streaming, workspace tools,
-permissions, and SQLite sessions.
+Neuro Code began as a Python reimplementation of the open-source Grok Build
+terminal coding agent and now evolves as an independent, extensible project. It
+is currently pre-alpha, with an installable CLI, a headless agent loop,
+multi-provider streaming, workspace tools, permissions, and SQLite sessions.
 
 ## 文档 / Documentation
 
@@ -40,8 +41,8 @@ uv run mypy
 - 源基线 / Source baseline: [`xai-org/grok-build`](https://github.com/xai-org/grok-build) at `c68e39f60462f28d9be5e683d9cbe2c57b1a5027`
 - 目标平台 / Target platforms: Linux, macOS, Windows
 - 许可证 / License: Apache-2.0
-- 完整重写进度为粗略 25–30%；M2 无头代理约完成 80%。
-- Overall public-surface parity is roughly 25–30%; the M2 headless slice is about 80% complete.
+- 完整重写进度粗略为 31–36%；M2 无头代理约完成 91%。
+- Overall public-surface parity is roughly 31–36%; the M2 headless slice is about 91% complete.
 
 本项目与 xAI 或 SpaceXAI 没有关联，也未获得其认可。“Grok”等名称可能是其各自所有者的商标。
 

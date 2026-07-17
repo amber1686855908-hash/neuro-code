@@ -9,9 +9,9 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from pygrok_build.errors import ToolError
-from pygrok_build.ports.tools import ToolContext
-from pygrok_build.tools.bash import BashTool
+from neuro_code.errors import ToolError
+from neuro_code.ports.tools import ToolContext
+from neuro_code.tools.bash import BashTool
 
 
 class BashToolTests(unittest.IsolatedAsyncioTestCase):
@@ -163,7 +163,7 @@ class BashToolTests(unittest.IsolatedAsyncioTestCase):
             if stat.is_file():
                 try:
                     fields = stat.read_text(encoding="utf-8").split()
-                except FileNotFoundError:
+                except (FileNotFoundError, ProcessLookupError):
                     return False
                 return len(fields) < 3 or fields[2] != "Z"
             return True

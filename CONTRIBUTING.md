@@ -11,7 +11,7 @@ uv run python scripts/check_docs_parity.py
 uv run ruff check .
 uv run ruff format --check .
 uv run mypy
-uv run pytest --cov=pygrok_build --cov-report=term-missing
+uv run pytest --cov=neuro_code --cov-report=term-missing
 uv build
 ```
 

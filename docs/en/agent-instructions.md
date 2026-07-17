@@ -4,19 +4,20 @@
 
 ## Source of truth
 
-- The Rust source oracle is [`xai-org/grok-build`](https://github.com/xai-org/grok-build)
-  at commit `c68e39f60462f28d9be5e683d9cbe2c57b1a5027`.
+- The historical Rust source oracle is pinned to commit
+  `c68e39f60462f28d9be5e683d9cbe2c57b1a5027`; attribution is documented in the
+  root README.
 - Treat a local source checkout and its `.ua` directory as read-only.
 - Source code, tests, and executable behavior override generated `.ua` text.
 - Do not mechanically translate crates or synchronize files by path.
 
-For the optional baseline check, set `PYGROK_SOURCE_REPOSITORY` to the local
+For the optional baseline check, set `NEURO_CODE_SOURCE_REPOSITORY` to the local
 checkout or pass `--source` to `scripts/check_source_baseline.py`.
 
 ## Architecture
 
 - Deliver vertical user capabilities through the ports in
-  `src/pygrok_build/ports`.
+  `src/neuro_code/ports`.
 - Domain/application code must not depend on UI, provider, database, or
   platform implementations.
 - Preserve CLI/config/session/protocol compatibility at boundaries while using
@@ -35,7 +36,7 @@ uv run python scripts/check_docs_parity.py
 uv run ruff check .
 uv run ruff format --check .
 uv run mypy
-uv run pytest --cov=pygrok_build --cov-report=term-missing
+uv run pytest --cov=neuro_code --cov-report=term-missing
 uv build
 ```
 

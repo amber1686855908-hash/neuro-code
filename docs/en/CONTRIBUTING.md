@@ -14,12 +14,28 @@ uv run python scripts/check_docs_parity.py
 uv run ruff check .
 uv run ruff format --check .
 uv run mypy
-uv run pytest --cov=pygrok_build --cov-report=term-missing
+uv run pytest --cov=neuro_code --cov-report=term-missing
 uv build
 ```
 
 All checks must pass on Python 3.12. Platform-sensitive work also requires the
 Linux, macOS, and Windows CI matrix.
+
+## Credential-gated live checks
+
+The default pytest selection excludes tests marked `live`. Running them
+requires both explicit marker selection and the cost/network environment gate:
+
+```bash
+export DEEPSEEK_API_KEY="provided-by-your-secret-manager"
+NEURO_CODE_RUN_LIVE_TESTS=1 uv run pytest -m live tests/live
+```
+
+Never commit a populated `.env`, cassette, response dump, or failure artifact.
+Live tests must use bounded tokens and timeouts, avoid destructive tools, and
+must not print credentials, headers, or complete request bodies. A missing key
+is a skip, not a failure. `.env.example` documents variable names only; neither
+application nor test code loads `.env` implicitly.
 
 ## Code rules
 

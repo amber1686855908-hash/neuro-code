@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from pygrok_build.bash_commands import analyze_bash_command
+from neuro_code.bash_commands import analyze_bash_command
 
 
 class BashCommandAnalysisTests(unittest.TestCase):

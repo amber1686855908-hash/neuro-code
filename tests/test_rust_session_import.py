@@ -5,11 +5,11 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from pygrok_build.adapters.rust_session import (
-    RUST_IMPORT_PROVIDER,
+from neuro_code.adapters.rust_session import (
+    UPSTREAM_IMPORT_PROVIDER,
     load_rust_session,
 )
-from pygrok_build.domain.messages import (
+from neuro_code.domain.messages import (
     IMAGE_MODEL_PLACEHOLDER,
     ContentPartKind,
     ContextItemKind,
@@ -17,8 +17,8 @@ from pygrok_build.domain.messages import (
     PreservedContextItem,
     Role,
 )
-from pygrok_build.errors import SessionError
-from pygrok_build.providers.anthropic import AnthropicProvider
+from neuro_code.errors import SessionError
+from neuro_code.providers.anthropic import AnthropicProvider
 
 
 def _write_session(
@@ -33,7 +33,7 @@ def _write_session(
         "info": {"id": "rust-session-id", "cwd": "/source/workspace"},
         "created_at": "2026-07-01T10:20:30.123456789Z",
         "updated_at": "2026-07-02T11:22:33.987654321Z",
-        "current_model_id": "grok-4.5",
+        "current_model_id": "xai-test-model",
         "chat_format_version": chat_format_version,
     }
     (session_dir / "summary.json").write_text(
@@ -109,8 +109,8 @@ class RustSessionImportTests(unittest.TestCase):
 
             self.assertEqual(imported.snapshot.summary.id, "rust-session-id")
             self.assertEqual(imported.snapshot.summary.cwd, "/source/workspace")
-            self.assertEqual(imported.snapshot.summary.provider, RUST_IMPORT_PROVIDER)
-            self.assertEqual(imported.snapshot.summary.model, "grok-4.5")
+            self.assertEqual(imported.snapshot.summary.provider, UPSTREAM_IMPORT_PROVIDER)
+            self.assertEqual(imported.snapshot.summary.model, "xai-test-model")
             self.assertEqual(imported.imported_messages, 4)
             self.assertEqual(imported.total_records, 8)
             self.assertEqual(imported.invalid_records, 1)

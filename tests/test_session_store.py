@@ -1,13 +1,14 @@
 from __future__ import annotations
 
+import sqlite3
 import tempfile
 import unittest
 from datetime import UTC, datetime
 from pathlib import Path
 
-from pygrok_build.adapters.sqlite_session import SqliteSessionStore
-from pygrok_build.domain.events import AgentEvent, AgentEventKind
-from pygrok_build.domain.messages import (
+from neuro_code.adapters.sqlite_session import SqliteSessionStore
+from neuro_code.domain.events import AgentEvent, AgentEventKind
+from neuro_code.domain.messages import (
     ContentPart,
     ContextItemKind,
     Message,
@@ -15,8 +16,8 @@ from pygrok_build.domain.messages import (
     Role,
     ToolCall,
 )
-from pygrok_build.domain.sessions import SessionSnapshot, SessionSummary
-from pygrok_build.errors import SessionError
+from neuro_code.domain.sessions import SessionSnapshot, SessionSummary
+from neuro_code.errors import SessionError
 
 
 class SessionStoreTests(unittest.IsolatedAsyncioTestCase):
@@ -28,8 +29,8 @@ class SessionStoreTests(unittest.IsolatedAsyncioTestCase):
                 summary=SessionSummary(
                     id="imported-id",
                     cwd="/rust/workspace",
-                    provider="grok-build-import",
-                    model="grok-4.5",
+                    provider="upstream-rust-import",
+                    model="xai-test-model",
                     created_at=datetime(2026, 7, 1, tzinfo=UTC),
                     updated_at=datetime(2026, 7, 2, tzinfo=UTC),
                 ),
@@ -76,11 +77,33 @@ class SessionStoreTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaisesRegex(SessionError, "cannot rewrite the imported prefix"):
                 await store.save_messages(imported_id, [Message(Role.USER, "rewritten")])
 
+            native = PreservedContextItem(
+                ContextItemKind.REASONING,
+                {
+                    "type": "reasoning",
+                    "id": "reasoning-2",
+                    "summary": [],
+                    "encrypted_content": "native-opaque",
+                },
+            )
+            extended_items = [*snapshot.items, continued[-1], native, Message(Role.ASSISTANT, "ok")]
+            await store.save_session_items(imported_id, extended_items)
+            self.assertEqual(await store.load_session_items(imported_id), extended_items)
+            with self.assertRaisesRegex(
+                SessionError, "cannot rewrite the persisted session item prefix"
+            ):
+                await store.save_session_items(imported_id, [Message(Role.USER, "replacement")])
+
     async def test_round_trip_messages_and_ordered_events(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = SqliteSessionStore(Path(directory) / "sessions.db")
             await store.initialize()
-            session_id = await store.create_session("/workspace", "fake", "test-model")
+            session_id = await store.create_session(
+                "/workspace",
+                "fake",
+                "test-model",
+                "profile-v1:fixture",
+            )
             messages = [
                 Message(Role.USER, "inspect"),
                 Message(
@@ -115,7 +138,68 @@ class SessionStoreTests(unittest.IsolatedAsyncioTestCase):
             summary = await store.get_session(session_id)
             self.assertEqual(summary.id, session_id)
             self.assertEqual(summary.cwd, "/workspace")
+            self.assertEqual(summary.context_affinity, "profile-v1:fixture")
+            await store.update_session_provider(
+                session_id,
+                "fallback",
+                "fallback-model",
+                "profile-v1:fallback",
+            )
+            summary = await store.get_session(session_id)
+            self.assertEqual(summary.provider, "fallback")
+            self.assertEqual(summary.model, "fallback-model")
+            self.assertEqual(summary.context_affinity, "profile-v1:fallback")
             self.assertEqual((await store.list_sessions())[0], summary)
+
+    async def test_schema_v1_is_migrated_without_rewriting_existing_sessions(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "sessions.db"
+            connection = sqlite3.connect(database)
+            connection.executescript(
+                """
+                CREATE TABLE schema_meta (
+                    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                    version INTEGER NOT NULL
+                );
+                INSERT INTO schema_meta(singleton, version) VALUES (1, 1);
+                CREATE TABLE sessions (
+                    id TEXT PRIMARY KEY,
+                    cwd TEXT NOT NULL,
+                    provider TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    messages_json TEXT NOT NULL DEFAULT '[]'
+                );
+                CREATE TABLE events (
+                    session_id TEXT NOT NULL,
+                    sequence INTEGER NOT NULL,
+                    kind TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    data_json TEXT NOT NULL,
+                    PRIMARY KEY (session_id, sequence)
+                );
+                INSERT INTO sessions(id, cwd, provider, model)
+                VALUES ('legacy-id', '/legacy', 'xai-responses', 'xai-test-model');
+                """
+            )
+            connection.commit()
+            connection.close()
+
+            store = SqliteSessionStore(database)
+            await store.initialize()
+
+            summary = await store.get_session("legacy-id")
+            self.assertEqual(summary.provider, "xai-responses")
+            self.assertIsNone(summary.context_affinity)
+            migrated = sqlite3.connect(database)
+            version = migrated.execute(
+                "SELECT version FROM schema_meta WHERE singleton = 1"
+            ).fetchone()
+            columns = {row[1] for row in migrated.execute("PRAGMA table_info(sessions)").fetchall()}
+            migrated.close()
+            self.assertEqual(version, (2,))
+            self.assertIn("context_affinity", columns)
 
     async def test_unknown_sessions_and_invalid_limit_are_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -126,6 +210,7 @@ class SessionStoreTests(unittest.IsolatedAsyncioTestCase):
                 store.load_messages("missing"),
                 store.load_session_items("missing"),
                 store.next_event_sequence("missing"),
+                store.update_session_provider("missing", "provider", "model", None),
                 store.list_sessions(limit=0),
             ):
                 with self.assertRaises(SessionError):

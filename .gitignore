@@ -10,7 +10,7 @@ __pycache__/
 htmlcov/
 build/
 dist/
-.pygrok-build/
+.neuro-code/
 .env
 .env.*
 !.env.example
