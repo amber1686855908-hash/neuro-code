@@ -93,13 +93,33 @@ def load_config(
 ) -> AppConfig:
     env = os.environ if environ is None else environ
     resolved_cwd = (cwd or Path.cwd()).expanduser().resolve()
-    resolved_home = (home or Path.home()).expanduser().resolve()
-    state_dir = Path(env.get("PYGROK_HOME", resolved_home / ".pygrok-build")).expanduser()
+    if home is not None:
+        resolved_home: Path | None = home.expanduser().resolve()
+    else:
+        try:
+            resolved_home = Path.home().resolve()
+        except RuntimeError:
+            resolved_home = None
 
-    candidates = (
-        resolved_home / ".grok" / "config.toml",
-        state_dir / "config.toml",
-        resolved_cwd / ".pygrok-build" / "config.toml",
+    configured_state_dir = env.get("PYGROK_HOME")
+    if configured_state_dir:
+        try:
+            state_dir = Path(configured_state_dir).expanduser().resolve()
+        except RuntimeError as error:
+            raise ConfigurationError(f"cannot resolve PYGROK_HOME: {error}") from error
+    elif resolved_home is not None:
+        state_dir = resolved_home / ".pygrok-build"
+    else:
+        raise ConfigurationError("cannot determine user home; set PYGROK_HOME explicitly")
+
+    candidates: list[Path] = []
+    if resolved_home is not None:
+        candidates.append(resolved_home / ".grok" / "config.toml")
+    candidates.extend(
+        (
+            state_dir / "config.toml",
+            resolved_cwd / ".pygrok-build" / "config.toml",
+        )
     )
     data: dict[str, Any] = {}
     loaded_files: list[Path] = []
@@ -162,7 +182,7 @@ def load_config(
 
     return AppConfig(
         cwd=resolved_cwd,
-        state_dir=state_dir.resolve(),
+        state_dir=state_dir,
         provider=provider,
         loaded_files=tuple(loaded_files),
     )

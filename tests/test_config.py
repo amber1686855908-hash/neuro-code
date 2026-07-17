@@ -3,12 +3,44 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from pygrok_build.config import load_config
 from pygrok_build.errors import ConfigurationError
 
 
 class ConfigTests(unittest.TestCase):
+    def test_explicit_state_dir_works_without_a_discoverable_user_home(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state_dir = root / "state"
+            state_dir.mkdir()
+            (state_dir / "config.toml").write_text(
+                '[provider.default]\nmodel = "state-model"\n',
+                encoding="utf-8",
+            )
+
+            with patch(
+                "pygrok_build.config.Path.home",
+                side_effect=RuntimeError("home unavailable"),
+            ):
+                config = load_config(root, environ={"PYGROK_HOME": str(state_dir)})
+
+            self.assertEqual(config.state_dir, state_dir.resolve())
+            self.assertEqual(config.provider.model, "state-model")
+            self.assertEqual(config.loaded_files, (state_dir / "config.toml",))
+
+    def test_missing_home_and_state_dir_is_a_configuration_error(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch(
+                "pygrok_build.config.Path.home",
+                side_effect=RuntimeError("home unavailable"),
+            ),
+            self.assertRaisesRegex(ConfigurationError, "set PYGROK_HOME"),
+        ):
+            load_config(Path(directory), environ={})
+
     def test_native_project_config_overrides_legacy_user_config_and_environment(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
