@@ -28,7 +28,7 @@ class ConfigTests(unittest.TestCase):
 
             self.assertEqual(config.state_dir, state_dir.resolve())
             self.assertEqual(config.provider.model, "state-model")
-            self.assertEqual(config.loaded_files, (state_dir / "config.toml",))
+            self.assertEqual(config.loaded_files, ((state_dir / "config.toml").resolve(),))
 
     def test_missing_home_and_state_dir_is_a_configuration_error(self) -> None:
         with (

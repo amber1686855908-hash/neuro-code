@@ -186,7 +186,7 @@ class CliTests(unittest.TestCase):
                 )
             )
             self.assertEqual(exit_code, 0)
-            self.assertIn(str(export_path), export_output)
+            self.assertEqual(export_output.strip(), str(export_path.resolve()))
             exported = json.loads(export_path.read_text(encoding="utf-8"))
             self.assertEqual(exported["schema_version"], 1)
             self.assertEqual(exported["session"]["id"], session_id)
