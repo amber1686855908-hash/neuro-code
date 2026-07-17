@@ -13,7 +13,7 @@ from typing import Any
 from pygrok_build.async_utils import run_blocking
 from pygrok_build.domain.events import AgentEvent
 from pygrok_build.domain.messages import Message, Role, ToolCall
-from pygrok_build.domain.sessions import SessionSummary
+from pygrok_build.domain.sessions import SessionSnapshot, SessionSummary
 from pygrok_build.errors import SessionError
 
 SCHEMA_VERSION = 1
@@ -96,6 +96,40 @@ class SqliteSessionStore:
         async with self._write_lock:
             await run_blocking(create)
         return session_id
+
+    async def import_session(self, snapshot: SessionSnapshot) -> str:
+        summary = snapshot.summary
+        payload = json.dumps(
+            [message.to_dict() for message in snapshot.messages],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+
+        def import_snapshot() -> None:
+            try:
+                with closing(self._connect()) as connection, connection:
+                    connection.execute(
+                        """
+                        INSERT INTO sessions(
+                            id, cwd, provider, model, created_at, updated_at, messages_json
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            summary.id,
+                            summary.cwd,
+                            summary.provider,
+                            summary.model,
+                            summary.created_at.isoformat(),
+                            summary.updated_at.isoformat(),
+                            payload,
+                        ),
+                    )
+            except sqlite3.IntegrityError as error:
+                raise SessionError(f"session already exists: {summary.id}") from error
+
+        async with self._write_lock:
+            await run_blocking(import_snapshot)
+        return summary.id
 
     async def append_event(self, session_id: str, event: AgentEvent) -> None:
         payload = json.dumps(dict(event.data), ensure_ascii=False, separators=(",", ":"))

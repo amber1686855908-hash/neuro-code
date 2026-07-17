@@ -8,7 +8,9 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from pygrok_build import __version__
+from pygrok_build.adapters.rust_session import load_rust_session
 from pygrok_build.adapters.sqlite_session import SqliteSessionStore
+from pygrok_build.async_utils import run_blocking
 from pygrok_build.config import AppConfig, load_config, override_provider
 from pygrok_build.domain.events import AgentEvent, AgentEventKind
 from pygrok_build.domain.messages import Message, Role
@@ -78,6 +80,14 @@ def build_parser() -> argparse.ArgumentParser:
     export_parser.add_argument("--format", choices=("markdown", "json"), default="markdown")
     export_parser.add_argument("--output", type=Path)
     export_parser.add_argument("--cwd", type=Path, help="configuration working directory")
+
+    import_parser = subparsers.add_parser(
+        "import-session",
+        help="import a read-only Grok Build JSONL session",
+    )
+    import_parser.add_argument("source", type=Path, help="session directory or summary.json")
+    import_parser.add_argument("--json", action="store_true")
+    import_parser.add_argument("--cwd", type=Path, help="configuration working directory")
     return parser
 
 
@@ -137,7 +147,7 @@ def _plain_config(config: AppConfig) -> str:
 
 
 def _completion_script(shell: str) -> str:
-    commands = "version inspect completions agent"
+    commands = "version inspect completions agent sessions export import-session"
     if shell == "bash":
         return (
             "_pygrok_build() { COMPREPLY=( $(compgen -W '"
@@ -292,6 +302,24 @@ async def _export_session(args: argparse.Namespace) -> int:
     return 0
 
 
+async def _import_session(args: argparse.Namespace) -> int:
+    config = load_config(args.cwd)
+    imported = await run_blocking(load_rust_session, args.source)
+    store = SqliteSessionStore(config.state_dir / "sessions.db")
+    await store.initialize()
+    await store.import_session(imported.snapshot)
+    if args.json:
+        print(json.dumps(imported.to_dict(), ensure_ascii=False, indent=2))
+    else:
+        print(
+            f"Imported Grok Build session {imported.snapshot.summary.id}: "
+            f"{imported.imported_messages}/{imported.total_records} messages, "
+            f"{imported.invalid_records} invalid and "
+            f"{imported.unsupported_records} unsupported records skipped."
+        )
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -317,6 +345,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return asyncio.run(_list_sessions(args))
         if args.command == "export":
             return asyncio.run(_export_session(args))
+        if args.command == "import-session":
+            return asyncio.run(_import_session(args))
         return asyncio.run(_run_agent(args))
     except KeyboardInterrupt:
         print("interrupted", file=sys.stderr)

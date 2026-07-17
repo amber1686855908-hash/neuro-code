@@ -9,7 +9,7 @@ from pygrok_build.domain.model_events import (
     ModelTextDelta,
     ModelToolCall,
 )
-from pygrok_build.domain.sessions import SessionSummary
+from pygrok_build.domain.sessions import SessionSnapshot, SessionSummary
 from pygrok_build.domain.tools import ToolDefinition, ToolResult
 
 __all__ = [
@@ -22,6 +22,7 @@ __all__ = [
     "ModelTextDelta",
     "ModelToolCall",
     "Role",
+    "SessionSnapshot",
     "SessionSummary",
     "ToolCall",
     "ToolDefinition",

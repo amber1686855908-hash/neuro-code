@@ -92,7 +92,17 @@ SQLite is the canonical transactional store for sessions and their ordered
 events. JSON and Markdown are interchange/export formats. The database exposes
 an integer schema version; every change requires forward migration, fixture
 coverage, and a documented compatibility decision. Rust sessions are parsed by
-a separate import adapter and converted into the canonical model.
+a separate read-only adapter. It validates format versions 0 and 1, reads
+bounded JSONL records, converts supported legacy/current messages into a
+`SessionSnapshot`, and reports corrupt or unsupported records instead of
+silently inventing content. The SQLite adapter inserts that snapshot in one
+transaction and preserves its ID, workspace, model, and timestamps; an existing
+ID fails without mutation. Source session files are never opened for writing.
+
+The first import contract intentionally maps images to visible text
+placeholders and omits reasoning/backend-tool records that the canonical
+message model cannot yet round-trip. These losses are counted in the import
+report and remain explicit compatibility work rather than hidden coercions.
 
 ## Platform policy
 

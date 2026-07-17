@@ -191,6 +191,74 @@ class CliTests(unittest.TestCase):
             self.assertEqual(exported["schema_version"], 1)
             self.assertEqual(exported["session"]["id"], session_id)
 
+    def test_import_rust_session_is_available_to_list_and_export(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "rust-session"
+            source.mkdir()
+            (source / "summary.json").write_text(
+                json.dumps(
+                    {
+                        "info": {"id": "rust-cli-id", "cwd": str(root)},
+                        "created_at": "2026-07-01T10:20:30Z",
+                        "updated_at": "2026-07-02T11:22:33Z",
+                        "current_model_id": "grok-4.5",
+                        "chat_format_version": 1,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (source / "chat_history.jsonl").write_text(
+                "\n".join(
+                    (
+                        json.dumps(
+                            {
+                                "type": "user",
+                                "content": [{"type": "text", "text": "legacy prompt"}],
+                            }
+                        ),
+                        json.dumps({"type": "assistant", "content": "legacy response"}),
+                    )
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            source_before = {
+                path.name: path.read_bytes()
+                for path in (source / "summary.json", source / "chat_history.jsonl")
+            }
+            environment = {"PYGROK_HOME": str(root / "state")}
+
+            output = io.StringIO()
+            with (
+                patch.dict("os.environ", environment, clear=True),
+                redirect_stdout(output),
+            ):
+                exit_code = main(("import-session", str(source), "--json", "--cwd", str(root)))
+
+            self.assertEqual(exit_code, 0)
+            payload = json.loads(output.getvalue())
+            self.assertEqual(payload["session"]["id"], "rust-cli-id")
+            self.assertEqual(payload["session"]["provider"], "grok-build-import")
+            self.assertEqual(payload["imported_messages"], 2)
+
+            output = io.StringIO()
+            with (
+                patch.dict("os.environ", environment, clear=True),
+                redirect_stdout(output),
+            ):
+                exit_code = main(("export", "rust-cli-id", "--cwd", str(root)))
+            self.assertEqual(exit_code, 0)
+            self.assertIn("legacy prompt", output.getvalue())
+            self.assertIn("legacy response", output.getvalue())
+            self.assertEqual(
+                {
+                    path.name: path.read_bytes()
+                    for path in (source / "summary.json", source / "chat_history.jsonl")
+                },
+                source_before,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -37,7 +37,8 @@ Exit: the project installs and the same contract suite passes on all targets.
   output, and owned process-tree cleanup.
 - Read/list/grep/search-replace/bash tools and a headless permission policy
   that evaluates every safely decomposable shell-command segment.
-- SQLite sessions, resume, and JSON/Markdown export foundation.
+- SQLite sessions, resume, JSON/Markdown export, and read-only Rust JSONL
+  session import foundation.
 
 Exit: a fake-provider end-to-end test performs read, edit, command, and final
 response; an opt-in live test can do the same against a configured provider.
