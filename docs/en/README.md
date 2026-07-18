@@ -48,8 +48,8 @@ uv run neuro-code
 When installing the built package outside the development environment, include
 the optional UI dependency with `pip install 'neuro-code[tui]'`. The initial TUI
 provides prompt input, scrollback, streamed assistant text, provider/tool status,
-and local `/help`, `/status`, `/provider`, `/model`, `/cancel`, `/clear`, `/quit`,
-and `/exit` commands. Prompts in one launch share a durable session;
+and local `/help`, `/status`, `/provider`, `/model`, `/sessions`, `/resume`,
+`/cancel`, `/clear`, `/quit`, and `/exit` commands. Prompts in one launch share a durable session;
 `--resume SESSION_ID` opens an existing session after workspace validation.
 
 Use `Ctrl+P`, bare `/provider` or bare `/model` to open the configured-profile
@@ -61,6 +61,28 @@ Switching is rejected during a turn. Switching to a different profile keeps
 the previous SQLite session available and gives the next prompt a fresh
 conversation, preventing provider-affine or encrypted context from crossing
 provider boundaries.
+
+Use `Ctrl+R`, `/sessions`, or bare `/resume` to open the 50 most recent sessions
+for the active workspace; `/resume SESSION_ID` selects directly. The picker
+shows only a shortened ID, update time, stored provider/model, and resume
+profile—not prompts, endpoints, credentials, or other workspaces. Resume prefers
+a ready configured source profile. Otherwise it uses the current ready profile
+while stored source/model/affinity metadata continues to filter incompatible
+provider-native context fail closed. The previously active session remains
+unchanged.
+
+The picker also shows the saved sandbox profile. Because the process sandbox is
+already active, sessions created under a different profile are disabled and
+must be opened by restarting Neuro Code with `--resume SESSION_ID`. Sessions
+created before profile metadata existed remain selectable under the active
+profile.
+
+Startup and in-app resume replay canonical visible user/assistant messages,
+image placeholders, and name-only tool lifecycle entries. Persisted reasoning,
+provider-native items, tool arguments, image URLs, and raw tool-result content
+never enter the transcript; each restored message also has a 20,000-character
+UI bound. See
+[ADR 0018](adr/0018-workspace-scoped-interactive-session-resume.md).
 
 While a turn is running, use `Ctrl+C` or `/cancel` to request cancellation. The
 runtime records cancellation, balances any active and not-yet-started local tool
@@ -90,6 +112,98 @@ unresolved approval remains denied there:
 neuro-code -p "Explain this repository"
 neuro-code agent -p "Explain this repository" --output-format jsonl
 ```
+
+## Managed background commands
+
+Normal CLI/TUI composition advertises a process-owned background-command
+contract to the model. `bash` with `is_background=true` returns a task ID
+immediately. `task_output` returns its current status and output without
+waiting, or accepts `wait_seconds` up to 30 for event-driven bounded waiting.
+`wait_tasks` accepts up to 20 IDs and waits for any one or all known tasks with
+a bounded 30-second event-driven budget. Unknown or cross-conversation IDs are
+reported as `not_found`; a timeout returns partial state without stopping work.
+`kill_task` stops the whole owned process tree with TERM followed by KILL when
+needed. Starting and killing remain side-effecting operations and pass through
+the same permission/approval policy as other local actions.
+
+An omitted background `timeout_seconds` lets the task run until it exits, is
+killed, or the application closes; a positive explicit value creates a task
+deadline. Output is a bounded in-memory head/tail preview with a total-byte
+counter, not a persistent full log. At most 16 tasks run concurrently and at
+most 64 records are retained per conversation scope.
+
+Background records are not stored in SQLite. A task may be used across turns
+in the same running TUI conversation binding, but it cannot survive a profile
+switch, in-process session resume, restart, or startup resume. Switching a
+binding terminates its live tasks and reports the count; a one-shot headless run
+terminates any remaining tasks before returning, and TUI exit does the same.
+
+Use `/tasks` in the TUI for a read-only list of the current binding's task IDs,
+status, exit code, bounded-output size, and start time. The TUI emits one local
+terminal-state notice per task but does not print command text or raw output.
+`/tasks` cannot terminate work: ask the model to use `kill_task` so the action
+continues through permission/approval policy. Prefer `is_background=true` to an
+inner shell `&`; full cross-platform descendant ownership still requires
+Windows Job Object support. See
+[ADR 0021](adr/0021-owned-background-shell-tasks.md) and
+[ADR 0022](adr/0022-session-scoped-background-task-visibility.md). Multi-task
+wait semantics are defined by
+[ADR 0024](adr/0024-event-driven-multi-background-task-wait.md).
+
+Natural completion is also reported once at the next explicit model boundary:
+the next model step after tool execution or the next user-triggered turn while
+idle. Each model-only notice is capped at 20 tasks and contains escaped status
+metadata only—not command text, cwd, or output. A terminal `task_output` result
+or `wait_tasks`/`kill_task` result consumes the corresponding notice to prevent
+duplication.
+Notices are acknowledged only after a provider returns a valid completion, are
+not persisted as conversation messages, and never start an autonomous paid
+model turn. See
+[ADR 0023](adr/0023-model-visible-background-task-completion-reminders.md).
+
+## Operating-system sandbox profiles
+
+Sandboxing is opt-in and defaults to `off`. Select a persistent profile in
+user or project configuration, use `NEURO_CODE_SANDBOX`, or override one run:
+
+```toml
+[sandbox]
+profile = "workspace"
+```
+
+```bash
+neuro-code -p "Inspect and test this repository" --sandbox workspace
+```
+
+On Linux, non-`off` profiles require usable, non-workspace-controlled `bwrap`;
+`read-only` and `strict` also require `unshare`. Neuro Code probes these
+capabilities and re-executes before opening the session store or starting model
+work. It never falls back to an unsandboxed run after an explicit request.
+
+| Profile | Filesystem | Local Bash network |
+|---|---|---|
+| `off` | No OS sandbox | Available |
+| `workspace` | Host readable; workspace, state, and temporary paths writable | Available |
+| `read-only` | Host/workspace read-only; state and temporary paths writable; edit tool unavailable | Isolated |
+| `strict` | Only required system/runtime paths and workspace visible; workspace, state, and temporary paths writable | Isolated |
+
+The parent process retains network access for model APIs. Permissions still run
+before tools and remain necessary: a sandbox limits an approved action but does
+not decide whether to approve it. A user-level profile cannot be weakened by a
+project file. CLI and environment choices are explicit higher-priority
+selections for a new session; they cannot change a saved session's profile
+during resume. `neuro-code inspect` reports the canonical profile and its source.
+Local Bash also strips configured provider API-key variables and standard or
+explicit proxy variables instead of inheriting their secret values.
+
+macOS and Windows currently fail closed for explicit non-`off` profiles.
+Every new session, including `off`, stores its canonical profile. Resume without
+an explicit sandbox restores that value; a canonically different explicit
+`--sandbox` or `NEURO_CODE_SANDBOX` fails before sandbox enforcement and model
+composition. Legacy sessions without the field use normal configuration.
+Custom profiles remain unsupported. See
+[ADR 0019](adr/0019-fail-closed-linux-sandbox-profiles.md) and
+[ADR 0020](adr/0020-session-fixed-sandbox-profiles.md).
 
 ## Model providers
 
@@ -287,8 +401,11 @@ atomically creates a new SQLite session while preserving the source session
 ID, workspace, model, and timestamps. A duplicate session ID is rejected
 rather than overwritten. The JSON report identifies skipped corrupt or
 unsupported records. Ordered reasoning/backend-tool records and image URLs are
-preserved structurally. JSON export schema version 2 exposes the complete
+preserved structurally. JSON export schema version 3 exposes the complete
 `conversation_items` sequence alongside its ordinary `messages` projection.
+It also reports the canonical saved sandbox profile or `null` for a legacy
+session. A recognized built-in profile from an upstream summary is preserved;
+an unsupported custom profile is rejected instead of silently downgraded.
 Legacy assistant `raw_output`, singular reasoning, and v0
 `reasoning_content` are upgraded in memory; backend-tool IDs prevent an
 embedded copy from duplicating an earlier standalone record. The import report

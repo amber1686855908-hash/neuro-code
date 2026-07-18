@@ -17,6 +17,7 @@ class ProcessTree:
 
     process: asyncio.subprocess.Process
     _unix_process_group: int | None = None
+    _termination_requested: bool = False
 
     @classmethod
     async def spawn_shell(
@@ -25,13 +26,53 @@ class ProcessTree:
         *,
         cwd: Path,
         env: Mapping[str, str],
+        merge_output: bool = False,
+    ) -> ProcessTree:
+        return await cls._spawn(
+            command,
+            (),
+            shell=True,
+            cwd=cwd,
+            env=env,
+            merge_output=merge_output,
+        )
+
+    @classmethod
+    async def spawn_exec(
+        cls,
+        executable: str,
+        arguments: tuple[str, ...],
+        *,
+        cwd: Path,
+        env: Mapping[str, str],
+        merge_output: bool = False,
+    ) -> ProcessTree:
+        return await cls._spawn(
+            executable,
+            arguments,
+            shell=False,
+            cwd=cwd,
+            env=env,
+            merge_output=merge_output,
+        )
+
+    @classmethod
+    async def _spawn(
+        cls,
+        executable: str,
+        arguments: tuple[str, ...],
+        *,
+        shell: bool,
+        cwd: Path,
+        env: Mapping[str, str],
+        merge_output: bool,
     ) -> ProcessTree:
         options: dict[str, Any] = {
             "cwd": cwd,
             "env": dict(env),
             "stdin": asyncio.subprocess.DEVNULL,
             "stdout": asyncio.subprocess.PIPE,
-            "stderr": asyncio.subprocess.PIPE,
+            "stderr": asyncio.subprocess.STDOUT if merge_output else asyncio.subprocess.PIPE,
         }
         if os.name == "posix":
             options["start_new_session"] = True
@@ -40,7 +81,10 @@ class ProcessTree:
                 subprocess, "CREATE_NO_WINDOW", 0
             )
 
-        process = await asyncio.create_subprocess_shell(command, **options)
+        if shell:
+            process = await asyncio.create_subprocess_shell(executable, **options)
+        else:
+            process = await asyncio.create_subprocess_exec(executable, *arguments, **options)
         try:
             process_group = cls._validated_unix_group(process.pid) if os.name == "posix" else None
         except OSError:
@@ -48,6 +92,15 @@ class ProcessTree:
             await process.wait()
             raise
         return cls(process, process_group)
+
+    async def wait(self) -> int:
+        """Wait until the direct child and its POSIX process group have exited."""
+
+        returncode = await self.process.wait()
+        if os.name == "posix":
+            while not self._termination_requested and self._unix_group_exists():  # noqa: ASYNC110
+                await asyncio.sleep(0.02)
+        return returncode
 
     @staticmethod
     def _validated_unix_group(pid: int) -> int:
@@ -76,6 +129,7 @@ class ProcessTree:
     ) -> None:
         """Terminate the entire owned tree and reap the direct child."""
 
+        self._termination_requested = True
         if os.name == "posix":
             await self._terminate_posix(grace_seconds, force_wait_seconds)
         elif os.name == "nt":  # pragma: no cover - exercised by Windows CI
@@ -94,6 +148,17 @@ class ProcessTree:
         except ProcessLookupError:
             await self._wait_direct(force_wait_seconds)
             return
+        except PermissionError as error:
+            # Darwin can transiently report EPERM for a short-lived group whose
+            # direct leader has exited but has not yet been reaped by asyncio.
+            # Reap briefly, then retry the group signal. A persistent EPERM is
+            # still fatal so the ownership guarantee never degrades silently.
+            if not await self._wait_for_direct_exit(min(grace_seconds, 0.1)):
+                raise error
+            try:
+                os.killpg(process_group, signal.SIGTERM)
+            except ProcessLookupError:
+                return
 
         loop = asyncio.get_running_loop()
         deadline = loop.time() + grace_seconds
@@ -147,3 +212,15 @@ class ProcessTree:
         except TimeoutError:
             self.process.kill()
             await self.process.wait()
+
+    async def _wait_for_direct_exit(self, timeout_seconds: float) -> bool:
+        if self.process.returncode is not None:
+            return True
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(self.process.wait()),
+                timeout=timeout_seconds,
+            )
+        except TimeoutError:
+            return False
+        return True

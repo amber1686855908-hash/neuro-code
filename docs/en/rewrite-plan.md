@@ -49,8 +49,10 @@ Exit: the project installs and the same contract suite passes on all targets.
   a double-gated DeepSeek live regression path, and owned process-tree cleanup.
 - Opt-in xAI-hosted web, X, and code-interpreter tools with collision-safe wire
   projection, provider-owned lifecycle events, and durable native output replay.
-- Read/list/grep/search-replace/bash tools and a headless permission policy
-  that evaluates every safely decomposable shell-command segment.
+- Read/list/grep/search-replace/bash tools, an owned background-command
+  snapshot/event-driven single-or-multi-wait/kill lifecycle, and a headless
+  permission policy that evaluates
+  every safely decomposable shell-command segment.
 - SQLite sessions, ordered message/provider-context items, prefix-safe resume,
   JSON/Markdown export, read-only Rust JSONL session import, and fail-closed
   provider-affine context projection. Terminal provider output is canonical for
@@ -62,10 +64,16 @@ response; an opt-in live test can do the same against a configured provider.
 
 ### M3 — core TUI and platform safety
 
-- Textual UI over the same event stream: prompt, scrollback, tool cards,
-  approval, model picker, and essential slash commands.
-- PTY/process tree, resize, signals, clipboard, filesystem notifications.
+- Textual UI over the same event stream: prompt, scrollback, approval, safe
+  profile/session selection, session-scoped task metadata/notices, richer tool
+  cards, model picker, and essential slash commands.
+- Owned process trees, conversation-scoped managed background shell commands,
+  bounded any/all multi-task waits, and completion metadata at explicit model
+  boundaries; interactive PTY
+  creation/input/resize, signals, clipboard, and filesystem notifications.
 - `off`, `workspace`, `read-only`, and `strict` sandbox profiles.
+- Session-fixed built-in sandbox persistence, startup resume conflict checks,
+  and an in-process TUI restart boundary for different-profile sessions.
 
 Exit: interactive smoke suites pass on Linux, macOS, and Windows without leaked
 terminal state or child processes.
@@ -74,7 +82,8 @@ terminal state or child processes.
 
 - ACP stdio/WebSocket plus advertised `x.ai/*` extensions.
 - MCP lifecycle, skills, AGENTS.md, agent profiles, hooks, and plugins.
-- Subagents, plan mode, session fork, and background tasks.
+- Subagents, plan mode, session fork, and their integration with the common
+  task lifecycle.
 
 Exit: standard ACP clients pass conformance scenarios and extension failures do
 not corrupt the primary session.

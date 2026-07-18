@@ -50,6 +50,23 @@ Web 控制台后端。纯云端能力必须通过显式适配器接入；不可�
 状态。后台任务必须由 `asyncio.TaskGroup` 或具有关闭契约的显式注册表管理；禁止没有
 引用的即发即弃任务。
 
+受管 Shell 工作使用应用级 `BackgroundTaskSupervisor`，并为每个会话绑定分配隔离的
+`BackgroundTaskManager` 注册表。`bash` 可以不等待完成就返回任务 ID；`task_output` 读取
+有界快照或短暂等待，`wait_tasks` 通过完成事件等待最多 20 个 ID 中的任意一个或全部，
+`kill_task` 则通过普通权限边界终止受控进程树。绑定只能访问自己的
+任务 ID；替换绑定会关闭其作用域，组合根退出时一定关闭监督器。任务记录只存在于内存，
+不会成为持久会话上下文。详见 [ADR 0021](adr/0021-owned-background-shell-tasks.md) 和
+[ADR 0022](adr/0022-session-scoped-background-task-visibility.md)。
+[ADR 0024](adr/0024-event-driven-multi-background-task-wait.md) 定义多任务等待条件、超时、
+取消和输出边界。
+
+每次明确模型步骤时，`AgentRuntime` 会查询该作用域中尚未报告的终态任务，追加最多 20 条
+且仅供模型使用、只含元数据的提醒，并在供应商产生有效完成后确认该批次。终态
+`task_output`、`wait_tasks` 和 `kill_task` 结果会优先确认同一 ID，防止重复投递。提醒不进入
+`SessionItem` 持久化，只有有界审计事件会保存；空闲完成必须等待用户输入，绝不会自行启动
+模型轮次。详见
+[ADR 0023](adr/0023-model-visible-background-task-completion-reminders.md)。
+
 ## 会话与交互界面
 
 `AgentConversation` 是位于单轮 `AgentRuntime` 之上的可复用应用边界。它串行执行轮次，
@@ -66,6 +83,11 @@ Web 控制台后端。纯云端能力必须通过显式适配器接入；不可�
 通用工具参数映射或工具结果。详见
 [ADR 0014](adr/0014-minimal-event-stream-tui.md)。
 
+对于当前会话作用域，本地 `/tasks` 只渲染有界任务元数据，不显示命令文本或输出；周期
+只读轮询会为每个终态转换发出一次通知。它不能修改任务状态；`kill_task` 仍走普通模型
+工具与权限路径。详见
+[ADR 0022](adr/0022-session-scoped-background-task-visibility.md)。
+
 TUI 在 Worker 管理的轮次运行时保持提示框可用。`Ctrl+C` 与本地 `/cancel` 会取消该
 Worker；审批模态框则把 `Ctrl+C` 限定为拒绝待处理请求。运行时拥有的恢复与工具结果
 配对规则见 [ADR 0016](adr/0016-recoverable-turn-cancellation.md)。
@@ -75,6 +97,20 @@ Worker；审批模态框则把 `Ctrl+C` 限定为拒绝待处理请求。运行�
 profile 时，组合根创建不恢复任何会话的新供应商/运行时/会话绑定，旧 SQLite 会话保持
 不变。这条严格边界避免跨供应商回放加密推理、托管工具状态、方言元数据和 profile 亲和
 上下文。详见 [ADR 0017](adr/0017-safe-interactive-profile-selection.md)。
+
+同一控制器还暴露限定工作区的 `SessionOption` 目录，并让会话选择与轮次串行。组合根
+按文件系统身份过滤近期 SQLite 摘要，随后由 `AgentConversation.open` 再次校验所选 ID。
+恢复时优先使用已就绪且名称匹配来源的 profile，否则使用当前就绪 profile，同时保留
+保存的供应商、模型和亲和来源，以失败关闭地投影原生上下文。TUI 会把滚动记录替换为
+有界的可见消息投影，其中不包含推理、原生记录、参数、图片 URL 或原始工具结果内容。
+详见 [ADR 0018](adr/0018-workspace-scoped-interactive-session-resume.md)。
+
+操作系统沙箱也是会话身份的一部分。原生会话会保存创建时的规范 profile。按明确 ID 启动
+恢复时，会在强制进程沙箱之前通过 immutable 只读 SQLite 查询元数据；除非显式 CLI 或
+环境变量请求经规范化后不同并形成冲突，否则还原保存值。应用内 TUI 无法替换不可逆的
+进程沙箱，因此会禁用不同 profile 的选项并要求重启。普通摘要加载后，
+`AgentConversation.open` 还会再次校验。详见
+[ADR 0020](adr/0020-session-fixed-sandbox-profiles.md)。
 
 权限策略与用户交互是两个独立边界。`PermissionManager` 先返回确定性判定；`ask` 随后
 可以进入可选的异步 `PermissionApprover` 端口。运行时产生请求/结果审计事件，并且在
@@ -90,6 +126,12 @@ profile 时，组合根创建不恢复任何会话的新供应商/运行时/会�
   供适配器自行作出回放决策。
 - `Tool`：发布 JSON schema，并在受限 `ToolContext` 中执行。
 - `ToolRegistry`：解析规范工具名称并拒绝重复注册。
+- `ShellSandbox`：把 Shell 字符串转换为参数边界安全、由平台强制执行的启动计划，
+  无需向工具暴露命名空间实现细节。
+- `BackgroundTaskSupervisor`：创建隔离的会话任务作用域，并在应用关闭时终止每一棵仍存活
+  的进程树。
+- `BackgroundTaskManager`：在单个会话作用域内启动受控 Shell/exec 进程树，并提供有界
+  快照/单任务或多任务等待/终止及待报告完成确认操作。
 - `PermissionManager`：在任何副作用之前返回 allow、deny 或 ask。
 - `PermissionApprover`：可选地异步解决 `ask`，但不能覆盖策略拒绝。
 - `SessionStore`：追加带版本事件、保留有序 `SessionItem`，并同时提供规范序列与普通
@@ -153,17 +195,36 @@ CC Switch 是可选配置源和 HTTP 网关，不是应用依赖。其导出的�
   取消会给当前调用以及同一模型批次中的所有剩余调用记录错误结果。
 - 写入前必须解析并校验目标；工作区工具不能通过 `..` 或符号链接逃逸。
 - 平台无法实施显式沙箱要求时必须失败关闭。
+- 沙箱激活标记本身不足以作为证据。Linux 组合层会在暴露工具前校验根目录、工作区与
+  状态目录的挂载标志；`strict` 还会校验白名单根目录的文件系统类型。
+- `read-only` 会移除编辑工具并在直接调用时再次拒绝。`read-only` 与 `strict` 的 Shell
+  后代不继承父代理的网络命名空间，而父进程仍可执行供应商 HTTP 请求。
 - inspect 输出、日志、会话事件和异常都不得包含密钥。
+- Bash 后代不会继承已配置的供应商 API Key 环境变量，也不会继承标准/显式代理变量；
+  密钥访问以后必须通过显式能力提供，不能依赖进程环境。
 - API 与代理凭据只能通过环境变量引用；解析后的代理 URL 保留在适配器内部，并从网络
   异常中移除。
 - 只有在候选供应商产生第一个模型事件之前才能故障转移；越过该边界后，错误必须直接
   上抛，不得在其他供应商上重放当前步骤。
 - 交互式 profile 切换必须与轮次串行，并从全新会话开始；不得把旧会话重新标记或回放
   到新 profile 下。
+- 交互式会话选择只能列出文件系统身份相同的工作区，打开时重新校验 ID，并且只有成功
+  恢复后才替换活动绑定。即使用当前 profile 恢复普通消息，也必须保留保存的供应商/
+  模型/亲和来源。
+- 带沙箱元数据的会话始终使用创建 profile 恢复。显式 CLI/环境请求经规范化后不同、
+  应用内选择不同 profile、保存值损坏或不受支持时，都必须在模型轮次或工具动作前失败
+  关闭。
+- 恢复到 TUI 的历史绝不能渲染持久化推理、供应商原生记录、工具参数、图片 URL 或
+  原始工具结果内容。
 - 取消必须终止受所有权控制的子进程、提交终态失败、保存配对完整的上下文，并在下一轮
   会话开始前重新加载该上下文。
 - Shell 命令在受所有权控制的进程组中运行。超时和取消先尝试优雅终止整个进程树，
   有界宽限期后再强制终止；输出按固定内存上限持续排空。
+- 后台 Shell 命令始终归应用监督器所有，并且只能通过所属会话作用域访问。合并输出预览、
+  运行任务数、保留记录数、等待区间和生命周期均有上限；替换绑定或应用退出会终止对应的
+  存活进程树。
+- 面向模型的完成提醒只包含经过 JSON 转义的 ID/状态元数据，每个模型边界有数量上限，
+  排除命令/输出/cwd，并且只在供应商完成或规范终态任务工具结果后确认。
 - 限制性 Bash 规则检查每一个可安全分解的命令段，包括常见包装器和嵌套
   `bash -c`。deny/ask 策略可能适用时，无法分类的脚本必须失败关闭。
 - 旧上游状态只能只读导入，不能原地修改。
@@ -172,7 +233,9 @@ CC Switch 是可选配置源和 HTTP 网关，不是应用依赖。其导出的�
 
 SQLite 是会话及其有序事件的规范事务存储。JSON 和 Markdown 用作交换/导出格式。
 数据库暴露整数 schema 版本；每次变更必须包含前向迁移、fixture 覆盖和已记录的兼容
-决策。Rust 会话由独立的只读适配器解析。该适配器校验格式版本 0 和 1，以明确上限
+决策。schema v3 新增可空的规范沙箱 profile：新会话保存值，迁移后的旧会话保留
+`NULL`。启动时可通过 immutable 只读连接检查这一个字段，且发生在创建/迁移数据库或
+激活进程沙箱之前。Rust 会话由独立的只读适配器解析。该适配器校验格式版本 0 和 1，以明确上限
 读取 JSONL 记录，把受支持的新旧记录转换为有序 `SessionSnapshot`，并报告损坏或
 不支持的记录，而不是静默编造内容。SQLite 适配器在单个事务中插入快照，并保留其
 ID、工作区、模型和时间戳；ID 已存在时不做任何修改并返回失败。源会话文件永远不会
@@ -183,7 +246,7 @@ ID、工作区、模型和时间戳；ID 已存在时不做任何修改并返回
 消息内容项保留文本/图片顺序及图片 URL；推理和后端工具载荷保留供应商 JSON 与相对
 顺序。运行时会把完整有序序列带入每个模型步骤，应用层视图仍使用普通消息投影。恢复
 导入会话时，存储只允许在原前缀后追加，并拒绝改写已保存的上下文。JSON 导出格式
-版本 2 同时包含两个投影。供应商适配器会校验图片引用，并且只在协议角色和 URI 形式
+版本 3 同时包含两个投影和会话沙箱 profile。供应商适配器会校验图片引用，并且只在协议角色和 URI 形式
 受支持时使用原生多模态内容块；其他图片无需执行适配器侧媒体 I/O，直接降级为可见
 占位文本。保留上下文遵循失败关闭的亲和策略。只有来源标记可信的 Rust 导入会话才能
 向 xAI 官方 HTTPS Chat Completions 端点发送可见推理与后端工具摘要；不透明加密
@@ -212,3 +275,19 @@ Rust 边界还会对旧 assistant 记录执行有界的内存升级。`raw_outpu
 Linux、macOS 和 Windows 都是一等 CI 目标。平台专属代码隔离在适配器后。内核沙箱
 和进程隔离可以使用小型原生辅助程序或系统设施，但业务与编排逻辑必须保留在 Python
 中。不受支持的安全保证必须在启动时报告，绝不能静默降级。
+
+第一版具体实现会在 Linux 上使用 bubblewrap 重新执行 `workspace`、`read-only` 和
+`strict` 运行；`off` 仍是可移植默认值。文件系统挂载会同时约束进程内 Python 工具与
+后代进程。独立的 `ShellSandbox` 启动计划会把 `read-only` 和 `strict` 下的 Bash 后代
+放入嵌套网络命名空间。macOS 与 Windows 当前会拒绝显式非 `off` profile，而不会宣称
+未执行的安全能力。详见
+[ADR 0019](adr/0019-fail-closed-linux-sandbox-profiles.md) 和
+[ADR 0020](adr/0020-session-fixed-sandbox-profiles.md)。
+
+前台和受管后台 Shell 命令共享 `ProcessTree`。POSIX 等待会在 Shell 入口退出后继续观察
+受控进程组；终止使用有界 TERM→KILL 序列。Windows 目前仍使用进程组加
+`taskkill /T /F`，完整对齐还需要 Job Object 所有权。详见
+[ADR 0021](adr/0021-owned-background-shell-tasks.md) 和
+[ADR 0022](adr/0022-session-scoped-background-task-visibility.md)。面向模型的完成元数据由
+[ADR 0023](adr/0023-model-visible-background-task-completion-reminders.md) 定义，事件驱动的
+多任务等待由 [ADR 0024](adr/0024-event-driven-multi-background-task-wait.md) 定义。

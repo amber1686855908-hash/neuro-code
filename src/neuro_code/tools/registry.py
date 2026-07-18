@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 
+from neuro_code.domain.sandbox import SandboxProfile
 from neuro_code.domain.tools import ToolDefinition
 from neuro_code.errors import ToolError
 from neuro_code.ports.tools import Tool
@@ -29,10 +30,19 @@ class ToolRegistry:
         return tuple(self._tools)
 
 
-def default_tool_registry() -> ToolRegistry:
+def default_tool_registry(
+    sandbox_profile: SandboxProfile = SandboxProfile.OFF,
+    *,
+    enable_background_tasks: bool = False,
+) -> ToolRegistry:
+    from neuro_code.tools.background_tasks import KillTaskTool, TaskOutputTool, WaitTasksTool
     from neuro_code.tools.bash import BashTool
     from neuro_code.tools.filesystem import GrepTool, ListDirTool, ReadFileTool, SearchReplaceTool
 
-    return ToolRegistry(
-        (ReadFileTool(), ListDirTool(), GrepTool(), SearchReplaceTool(), BashTool())
-    )
+    tools: list[Tool] = [ReadFileTool(), ListDirTool(), GrepTool()]
+    if sandbox_profile.workspace_writable:
+        tools.append(SearchReplaceTool())
+    tools.append(BashTool(background_enabled=enable_background_tasks))
+    if enable_background_tasks:
+        tools.extend((TaskOutputTool(), WaitTasksTool(), KillTaskTool()))
+    return ToolRegistry(tools)

@@ -5,6 +5,7 @@ import inspect
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 
+from neuro_code.domain.background_tasks import BackgroundTaskSnapshot
 from neuro_code.domain.events import AgentEvent, AgentEventKind
 from neuro_code.domain.messages import (
     Message,
@@ -24,6 +25,7 @@ from neuro_code.domain.model_events import (
     ModelTextDelta,
     ModelToolCall,
 )
+from neuro_code.domain.sandbox import SandboxProfile
 from neuro_code.domain.tools import ToolResult
 from neuro_code.errors import ProviderError, ToolError
 from neuro_code.permissions import (
@@ -37,6 +39,10 @@ from neuro_code.ports.approval import PermissionApprover
 from neuro_code.ports.model import ModelProvider
 from neuro_code.ports.storage import SessionStore
 from neuro_code.ports.tools import ToolContext
+from neuro_code.runtime.background_task_reminders import (
+    BACKGROUND_TASK_COMPLETION_BATCH_LIMIT,
+    format_background_task_completion_reminder,
+)
 from neuro_code.tools.registry import ToolRegistry
 
 EventSink = Callable[[AgentEvent], Awaitable[None] | None]
@@ -82,6 +88,10 @@ class AgentRuntime:
         self._system_prompt = system_prompt
         self._max_steps = max_steps
 
+    @property
+    def sandbox_profile(self) -> SandboxProfile:
+        return self._tool_context.sandbox_profile
+
     async def run(
         self,
         prompt: str,
@@ -116,6 +126,7 @@ class AgentRuntime:
                 self._provider.provider_name,
                 self._provider.model_name,
                 getattr(self._provider, "context_affinity", None),
+                self._tool_context.sandbox_profile,
             )
         elif self._session_store is not None and session_id is not None:
             sequence = await self._session_store.next_event_sequence(session_id) - 1
@@ -147,6 +158,7 @@ class AgentRuntime:
                 await self._session_store.save_session_items(session_id, context_items)
 
         response_parts: list[str] = []
+        completion_reminders: list[Message] = []
         try:
             await emit(
                 AgentEventKind.SESSION_STARTED,
@@ -163,13 +175,46 @@ class AgentRuntime:
 
             for step in range(1, self._max_steps + 1):
                 await emit(AgentEventKind.MODEL_STEP_STARTED, {"step": step})
+                completion_batch: tuple[BackgroundTaskSnapshot, ...] = ()
+                background_tasks = self._tool_context.background_tasks
+                if background_tasks is not None:
+                    pending_completions = await background_tasks.pending_completions()
+                    completion_batch = pending_completions[:BACKGROUND_TASK_COMPLETION_BATCH_LIMIT]
+                    if completion_batch:
+                        remaining_count = len(pending_completions) - len(completion_batch)
+                        completion_reminders.append(
+                            Message(
+                                Role.USER,
+                                format_background_task_completion_reminder(
+                                    completion_batch,
+                                    remaining_count=remaining_count,
+                                    task_output_tool=(
+                                        "task_output"
+                                        if self._tools.get("task_output") is not None
+                                        else None
+                                    ),
+                                ),
+                            )
+                        )
+                        await emit(
+                            AgentEventKind.BACKGROUND_TASK_COMPLETION_REMINDER,
+                            {
+                                "task_ids": [snapshot.task_id for snapshot in completion_batch],
+                                "statuses": [
+                                    snapshot.status.value for snapshot in completion_batch
+                                ],
+                                "count": len(completion_batch),
+                                "remaining_count": remaining_count,
+                                "model_context_only": True,
+                            },
+                        )
                 step_text: list[str] = []
                 step_reasoning: list[str] = []
                 tool_calls: list[ToolCall] = []
                 completion: ModelCompleted | None = None
 
                 context = ModelContext(
-                    tuple(context_items),
+                    (*context_items, *completion_reminders),
                     context_source_provider,
                     context_source_model,
                     context_source_affinity,
@@ -234,6 +279,10 @@ class AgentRuntime:
 
                 if completion is None:
                     raise ProviderError("provider stream ended without a completion event")
+                if completion_batch and background_tasks is not None:
+                    await background_tasks.mark_completions_reported(
+                        tuple(snapshot.task_id for snapshot in completion_batch)
+                    )
                 if completion.context_items:
                     context_items.extend(completion.context_items)
                     if can_adopt_provider_origin:

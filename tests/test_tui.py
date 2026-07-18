@@ -4,11 +4,23 @@ import asyncio
 import inspect
 import unittest
 from dataclasses import replace
+from datetime import UTC, datetime
 from pathlib import Path
 
 from textual.widgets import Button, Input
 
+from neuro_code.domain.background_tasks import BackgroundTaskSnapshot, BackgroundTaskStatus
 from neuro_code.domain.events import AgentEvent, AgentEventKind
+from neuro_code.domain.messages import (
+    ContentPart,
+    ContextItemKind,
+    Message,
+    PreservedContextItem,
+    Role,
+    SessionItem,
+    ToolCall,
+)
+from neuro_code.domain.sandbox import SandboxProfile
 from neuro_code.permissions import (
     PermissionApproval,
     PermissionApprovalKind,
@@ -16,11 +28,17 @@ from neuro_code.permissions import (
 )
 from neuro_code.runtime import SessionApprovalBroker
 from neuro_code.runtime.agent import AgentRunResult, EventSink
-from neuro_code.runtime.profile_conversation import ProviderOption, ProviderSelectionResult
+from neuro_code.runtime.profile_conversation import (
+    ProviderOption,
+    ProviderSelectionResult,
+    SessionOption,
+    SessionSelectionResult,
+)
 from neuro_code.tui import (
     NeuroCodeApp,
     PermissionApprovalScreen,
     ProviderSelectionScreen,
+    SessionSelectionScreen,
 )
 
 
@@ -196,7 +214,209 @@ class ProfileTuiController:
         )
 
 
+def restored_history() -> tuple[SessionItem, ...]:
+    return (
+        Message(
+            Role.USER,
+            content_parts=(
+                ContentPart.from_text("restored prompt"),
+                ContentPart.from_image("data:image/png;base64,private-image"),
+            ),
+        ),
+        PreservedContextItem(
+            ContextItemKind.REASONING,
+            {
+                "type": "reasoning",
+                "id": "private-reasoning",
+                "summary": [{"type": "summary_text", "text": "never render this"}],
+            },
+        ),
+        Message(
+            Role.ASSISTANT,
+            tool_calls=(ToolCall("read-1", "read_file", {"path": "private.txt"}),),
+            reasoning_content="private assistant reasoning",
+        ),
+        Message(
+            Role.TOOL,
+            "private tool output",
+            name="read_file",
+            tool_call_id="read-1",
+        ),
+        Message(Role.ASSISTANT, "restored response"),
+    )
+
+
+class SessionTuiController:
+    def __init__(self, *, current_session: str = "current-session") -> None:
+        self._session_id = current_session
+        self.selected: list[str] = []
+        timestamp = datetime(2026, 7, 18, 9, 30, tzinfo=UTC)
+        self.options = (
+            SessionOption(
+                "current-session",
+                "first",
+                "first-model",
+                timestamp,
+                "first",
+                current_session == "current-session",
+                True,
+                True,
+            ),
+            SessionOption(
+                "target-session-123456789",
+                "second",
+                "second-model",
+                timestamp,
+                "second",
+                current_session == "target-session-123456789",
+                True,
+                True,
+            ),
+        )
+
+    @property
+    def session_id(self) -> str | None:
+        return self._session_id
+
+    async def run(self, prompt: str, *, sink: EventSink | None = None) -> AgentRunResult:
+        del prompt, sink
+        return AgentRunResult(self._session_id, "ok", (), (), (), 1)
+
+    async def list_sessions(self) -> tuple[SessionOption, ...]:
+        return self.options
+
+    async def select_session(self, session_id: str) -> SessionSelectionResult:
+        self.selected.append(session_id)
+        previous = self._session_id
+        changed = session_id != previous
+        self._session_id = session_id
+        return SessionSelectionResult(
+            session_id,
+            "second",
+            "second-model",
+            "second",
+            "second",
+            "second-model",
+            previous if changed else None,
+            changed,
+            True,
+            restored_history(),
+        )
+
+
+class TaskTuiController:
+    def __init__(self, snapshots: tuple[BackgroundTaskSnapshot, ...] = ()) -> None:
+        self.snapshots = snapshots
+        self.list_calls = 0
+
+    async def list_background_tasks(self) -> tuple[BackgroundTaskSnapshot, ...]:
+        self.list_calls += 1
+        return self.snapshots
+
+
+def background_snapshot(
+    task_id: str,
+    status: BackgroundTaskStatus,
+    *,
+    exit_code: int | None = None,
+) -> BackgroundTaskSnapshot:
+    started_at = datetime(2026, 7, 18, 9, 30, tzinfo=UTC)
+    return BackgroundTaskSnapshot(
+        task_id=task_id,
+        command="curl -H 'secret: private-command' https://example.invalid",
+        cwd="/workspace",
+        status=status,
+        output="private task output",
+        total_output_bytes=19,
+        truncated=False,
+        exit_code=exit_code,
+        started_at=started_at,
+        finished_at=started_at if status.terminal else None,
+    )
+
+
 class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
+    async def test_tasks_command_lists_current_scope_without_rendering_command_or_output(
+        self,
+    ) -> None:
+        runner = TuiConversation()
+        tasks = TaskTuiController(
+            (
+                background_snapshot("task-running", BackgroundTaskStatus.RUNNING),
+                background_snapshot(
+                    "task-failed",
+                    BackgroundTaskStatus.FAILED,
+                    exit_code=7,
+                ),
+            )
+        )
+        app = NeuroCodeApp(
+            runner,
+            task_controller=tasks,
+            provider_name="fixture",
+            model_name="fixture-model",
+            cwd=Path("/workspace"),
+        )
+
+        async with app.run_test(size=(110, 35)) as pilot:
+            prompt = app.query_one("#prompt", Input)
+            prompt.value = "/tasks"
+            await pilot.press("enter")
+            await pilot.pause()
+
+            rendered = app.entries[-1].text
+            self.assertIn("task-running · running", rendered)
+            self.assertIn("task-failed · failed · exit 7", rendered)
+            self.assertIn("19 output bytes", rendered)
+            self.assertNotIn("private-command", rendered)
+            self.assertNotIn("private task output", rendered)
+            self.assertEqual(runner.prompts, [])
+
+    async def test_terminal_task_notification_is_emitted_once_without_raw_output(
+        self,
+    ) -> None:
+        runner = TuiConversation()
+        tasks = TaskTuiController((background_snapshot("task-fast", BackgroundTaskStatus.RUNNING),))
+        app = NeuroCodeApp(
+            runner,
+            task_controller=tasks,
+            provider_name="fixture",
+            model_name="fixture-model",
+            cwd=Path("/workspace"),
+        )
+
+        async with app.run_test(size=(110, 35)):
+            await app._poll_background_tasks()
+            tasks.snapshots = (
+                background_snapshot(
+                    "task-fast",
+                    BackgroundTaskStatus.COMPLETED,
+                    exit_code=0,
+                ),
+            )
+            await app._poll_background_tasks()
+            await app._poll_background_tasks()
+
+            notifications = [
+                entry.text for entry in app.entries if "Background task task-fast" in entry.text
+            ]
+            self.assertEqual(notifications, ["Background task task-fast completed (exit 0)."])
+            self.assertNotIn("private task output", "\n".join(notifications))
+
+    def test_session_picker_labels_saved_and_mismatched_sandbox_profiles(self) -> None:
+        option = replace(
+            SessionTuiController().options[1],
+            selectable=False,
+            sandbox_profile=SandboxProfile.STRICT,
+            sandbox_profile_match=False,
+        )
+
+        label = SessionSelectionScreen._label(option)
+
+        self.assertIn("sandbox strict", label)
+        self.assertIn("restart required", label)
+        self.assertIn("unavailable", label)
+
     async def test_prompt_streams_events_and_commits_response(self) -> None:
         runner = TuiConversation()
         app = NeuroCodeApp(
@@ -247,6 +467,8 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             self.assertIn("/status", app.entries[-1].text)
             self.assertIn("/cancel", app.entries[-1].text)
+            self.assertIn("/sessions", app.entries[-1].text)
+            self.assertIn("/tasks", app.entries[-1].text)
 
             prompt.value = "/status"
             await pilot.press("enter")
@@ -474,6 +696,112 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(
                 blocking_app.entries[-1].text,
                 "Cannot switch provider while a turn is running.",
+            )
+            await pilot.press("ctrl+c")
+
+    async def test_initial_session_history_replays_without_private_context_or_tool_output(
+        self,
+    ) -> None:
+        controller = SessionTuiController(current_session="target-session-123456789")
+        app = NeuroCodeApp(
+            controller,
+            session_controller=controller,
+            initial_items=restored_history(),
+            provider_name="second",
+            model_name="second-model",
+            cwd=Path("/workspace"),
+        )
+
+        async with app.run_test(size=(110, 35)) as pilot:
+            await pilot.pause()
+
+            rendered = "\n".join(entry.text for entry in app.entries)
+            self.assertIn("restored prompt", rendered)
+            self.assertIn("image content preserved in session", rendered)
+            self.assertIn("Restored tool request: read_file.", rendered)
+            self.assertIn("Restored result for read_file.", rendered)
+            self.assertIn("restored response", rendered)
+            self.assertIn("Resumed session target-session-123456789", rendered)
+            self.assertNotIn("never render this", rendered)
+            self.assertNotIn("private assistant reasoning", rendered)
+            self.assertNotIn("private tool output", rendered)
+            self.assertNotIn("private-image", rendered)
+
+    async def test_workspace_session_picker_resumes_and_replaces_transcript(self) -> None:
+        controller = SessionTuiController()
+        app = NeuroCodeApp(
+            controller,
+            session_controller=controller,
+            provider_name="first",
+            model_name="first-model",
+            cwd=Path("/workspace"),
+        )
+
+        async with app.run_test(size=(115, 35)) as pilot:
+            await pilot.press("ctrl+r")
+            for _ in range(20):
+                await pilot.pause(0.01)
+                if isinstance(app.screen, SessionSelectionScreen):
+                    break
+
+            self.assertIsInstance(app.screen, SessionSelectionScreen)
+            labels = "\n".join(str(button.label) for button in app.screen.query(Button))
+            self.assertIn("current", labels)
+            self.assertIn("target-sessi", labels)
+            clicked = await pilot.click("#session-choice-1")
+            self.assertTrue(clicked)
+            for _ in range(20):
+                await pilot.pause(0.01)
+                if controller.selected:
+                    break
+
+            self.assertEqual(controller.selected, ["target-session-123456789"])
+            rendered = "\n".join(entry.text for entry in app.entries)
+            self.assertIn("restored prompt", rendered)
+            self.assertIn("Previous session current-session remains saved", rendered)
+            self.assertNotIn("Ready · first/first-model", rendered)
+
+            prompt = app.query_one("#prompt", Input)
+            prompt.value = "/status"
+            await pilot.press("enter")
+            await pilot.pause()
+            self.assertIn("second/second-model", app.entries[-1].text)
+            self.assertIn("target-session-123456789", app.entries[-1].text)
+
+            await pilot.press("ctrl+r")
+            for _ in range(20):
+                await pilot.pause(0.01)
+                if isinstance(app.screen, SessionSelectionScreen):
+                    break
+            await pilot.press("ctrl+c")
+            await pilot.pause()
+            self.assertNotIsInstance(app.screen, SessionSelectionScreen)
+
+    async def test_direct_session_resume_is_blocked_while_a_turn_is_running(self) -> None:
+        runner = CancellableTuiConversation()
+        sessions = SessionTuiController()
+        app = NeuroCodeApp(
+            runner,
+            session_controller=sessions,
+            provider_name="first",
+            model_name="first-model",
+            cwd=Path("/workspace"),
+        )
+
+        async with app.run_test(size=(100, 30)) as pilot:
+            prompt = app.query_one("#prompt", Input)
+            prompt.value = "long turn"
+            await pilot.press("enter")
+            await asyncio.wait_for(runner.started.wait(), timeout=1)
+
+            prompt.value = "/resume target-session-123456789"
+            await pilot.press("enter")
+            await pilot.pause()
+
+            self.assertEqual(sessions.selected, [])
+            self.assertEqual(
+                app.entries[-1].text,
+                "Cannot resume a session while a turn is running.",
             )
             await pilot.press("ctrl+c")
 

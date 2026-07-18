@@ -5,7 +5,14 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from neuro_code.config import ProviderProfile, load_config, override_provider
+from neuro_code.config import (
+    ProviderProfile,
+    load_config,
+    override_provider,
+    override_sandbox,
+    pin_resumed_sandbox,
+)
+from neuro_code.domain.sandbox import SandboxProfile
 from neuro_code.errors import ConfigurationError
 
 
@@ -52,6 +59,88 @@ class ConfigTests(unittest.TestCase):
             self.assertRaisesRegex(ConfigurationError, "set NEURO_CODE_HOME"),
         ):
             load_config(Path(directory), environ={})
+
+    def test_sandbox_profile_precedence_is_environment_user_project_default(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            home = root / "home"
+            project = root / "project"
+            state = home / ".neuro-code"
+            state.mkdir(parents=True)
+            (project / ".neuro-code").mkdir(parents=True)
+            (state / "config.toml").write_text(
+                '[sandbox]\nprofile = "strict"\n',
+                encoding="utf-8",
+            )
+            (project / ".neuro-code" / "config.toml").write_text(
+                '[sandbox]\nprofile = "off"\n',
+                encoding="utf-8",
+            )
+
+            user_pinned = load_config(project, home=home, environ={})
+            environment = load_config(
+                project,
+                home=home,
+                environ={"NEURO_CODE_SANDBOX": "readonly"},
+            )
+            cli = override_sandbox(user_pinned, "workspace")
+
+            self.assertIs(user_pinned.sandbox_profile, SandboxProfile.STRICT)
+            self.assertEqual(user_pinned.sandbox_profile_source, "user")
+            self.assertIs(environment.sandbox_profile, SandboxProfile.READ_ONLY)
+            self.assertEqual(environment.sandbox_profile_source, "environment")
+            self.assertIs(cli.sandbox_profile, SandboxProfile.WORKSPACE)
+            self.assertEqual(cli.sandbox_profile_source, "cli")
+
+    def test_project_sandbox_is_used_only_without_a_user_pin(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = root / "project"
+            (project / ".neuro-code").mkdir(parents=True)
+            (project / ".neuro-code" / "config.toml").write_text(
+                '[sandbox]\nprofile = "workspace"\n',
+                encoding="utf-8",
+            )
+            configured = load_config(project, home=root, environ={})
+            defaulted = load_config(root / "empty", home=root, environ={})
+
+            self.assertIs(configured.sandbox_profile, SandboxProfile.WORKSPACE)
+            self.assertEqual(configured.sandbox_profile_source, "project")
+            self.assertIs(defaulted.sandbox_profile, SandboxProfile.OFF)
+            self.assertEqual(defaulted.sandbox_profile_source, "default")
+
+    def test_invalid_sandbox_profile_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with self.assertRaisesRegex(ConfigurationError, "unsupported sandbox profile"):
+                load_config(root, home=root, environ={"NEURO_CODE_SANDBOX": "unsafe"})
+
+    def test_resumed_session_pins_sandbox_and_rejects_explicit_conflicts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            defaulted = load_config(root, home=root, environ={})
+            pinned = pin_resumed_sandbox(defaulted, SandboxProfile.STRICT)
+            matching = pin_resumed_sandbox(
+                override_sandbox(defaulted, "readonly"),
+                SandboxProfile.READ_ONLY,
+            )
+
+            self.assertIs(pinned.sandbox_profile, SandboxProfile.STRICT)
+            self.assertEqual(pinned.sandbox_profile_source, "session")
+            self.assertIs(matching.sandbox_profile, SandboxProfile.READ_ONLY)
+            self.assertEqual(matching.sandbox_profile_source, "session")
+            self.assertIs(pin_resumed_sandbox(defaulted, None), defaulted)
+
+            for explicit in (
+                override_sandbox(defaulted, "workspace"),
+                load_config(
+                    root,
+                    home=root,
+                    environ={"NEURO_CODE_SANDBOX": "workspace"},
+                ),
+            ):
+                with self.assertRaisesRegex(ConfigurationError, "created with 'strict'"):
+                    pin_resumed_sandbox(explicit, SandboxProfile.STRICT)
 
     def test_native_project_config_overrides_legacy_user_config_and_environment(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -143,6 +232,8 @@ api_key_env = "FIXTURE_KEY"
             serialized = repr(config.redacted_dict())
             self.assertNotIn("top-secret", serialized)
             self.assertIn("credential_configured", serialized)
+            self.assertIn("fixture_key", config.protected_environment_variables)
+            self.assertIn("https_proxy", config.protected_environment_variables)
 
     def test_proxy_modes_are_strict_resolved_and_secret_redacted(self) -> None:
         invalid_profiles = (

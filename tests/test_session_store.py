@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sqlite3
 import tempfile
 import unittest
@@ -16,6 +17,7 @@ from neuro_code.domain.messages import (
     Role,
     ToolCall,
 )
+from neuro_code.domain.sandbox import SandboxProfile
 from neuro_code.domain.sessions import SessionSnapshot, SessionSummary
 from neuro_code.errors import SessionError
 
@@ -33,6 +35,7 @@ class SessionStoreTests(unittest.IsolatedAsyncioTestCase):
                     model="xai-test-model",
                     created_at=datetime(2026, 7, 1, tzinfo=UTC),
                     updated_at=datetime(2026, 7, 2, tzinfo=UTC),
+                    sandbox_profile=SandboxProfile.STRICT,
                 ),
                 items=(
                     Message(
@@ -103,6 +106,7 @@ class SessionStoreTests(unittest.IsolatedAsyncioTestCase):
                 "fake",
                 "test-model",
                 "profile-v1:fixture",
+                SandboxProfile.READ_ONLY,
             )
             messages = [
                 Message(Role.USER, "inspect"),
@@ -139,6 +143,11 @@ class SessionStoreTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(summary.id, session_id)
             self.assertEqual(summary.cwd, "/workspace")
             self.assertEqual(summary.context_affinity, "profile-v1:fixture")
+            self.assertIs(summary.sandbox_profile, SandboxProfile.READ_ONLY)
+            self.assertIs(
+                await store.peek_session_sandbox_profile(session_id),
+                SandboxProfile.READ_ONLY,
+            )
             await store.update_session_provider(
                 session_id,
                 "fallback",
@@ -149,6 +158,7 @@ class SessionStoreTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(summary.provider, "fallback")
             self.assertEqual(summary.model, "fallback-model")
             self.assertEqual(summary.context_affinity, "profile-v1:fallback")
+            self.assertIs(summary.sandbox_profile, SandboxProfile.READ_ONLY)
             self.assertEqual((await store.list_sessions())[0], summary)
 
     async def test_schema_v1_is_migrated_without_rewriting_existing_sessions(self) -> None:
@@ -192,14 +202,124 @@ class SessionStoreTests(unittest.IsolatedAsyncioTestCase):
             summary = await store.get_session("legacy-id")
             self.assertEqual(summary.provider, "xai-responses")
             self.assertIsNone(summary.context_affinity)
+            self.assertIsNone(summary.sandbox_profile)
             migrated = sqlite3.connect(database)
             version = migrated.execute(
                 "SELECT version FROM schema_meta WHERE singleton = 1"
             ).fetchone()
             columns = {row[1] for row in migrated.execute("PRAGMA table_info(sessions)").fetchall()}
             migrated.close()
-            self.assertEqual(version, (2,))
+            self.assertEqual(version, (3,))
             self.assertIn("context_affinity", columns)
+            self.assertIn("sandbox_profile", columns)
+
+    async def test_schema_v2_peek_is_read_only_then_migrates_as_legacy(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "sessions.db"
+            connection = sqlite3.connect(database)
+            connection.executescript(
+                """
+                CREATE TABLE schema_meta (
+                    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                    version INTEGER NOT NULL
+                );
+                INSERT INTO schema_meta(singleton, version) VALUES (1, 2);
+                CREATE TABLE sessions (
+                    id TEXT PRIMARY KEY,
+                    cwd TEXT NOT NULL,
+                    provider TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    messages_json TEXT NOT NULL DEFAULT '[]',
+                    context_affinity TEXT
+                );
+                CREATE TABLE events (
+                    session_id TEXT NOT NULL,
+                    sequence INTEGER NOT NULL,
+                    kind TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    data_json TEXT NOT NULL,
+                    PRIMARY KEY (session_id, sequence)
+                );
+                INSERT INTO sessions(id, cwd, provider, model, context_affinity)
+                VALUES ('v2-id', '/legacy', 'fixture', 'model', 'profile-v1:old');
+                """
+            )
+            connection.commit()
+            connection.close()
+            before = database.read_bytes()
+
+            store = SqliteSessionStore(database)
+            self.assertIsNone(await store.peek_session_sandbox_profile("v2-id"))
+            self.assertEqual(database.read_bytes(), before)
+            before_migration = sqlite3.connect(database)
+            self.assertEqual(
+                before_migration.execute(
+                    "SELECT version FROM schema_meta WHERE singleton = 1"
+                ).fetchone(),
+                (2,),
+            )
+            before_migration.close()
+
+            await store.initialize()
+            summary = await store.get_session("v2-id")
+            self.assertEqual(summary.context_affinity, "profile-v1:old")
+            self.assertIsNone(summary.sandbox_profile)
+            migrated = sqlite3.connect(database)
+            self.assertEqual(
+                migrated.execute("SELECT version FROM schema_meta WHERE singleton = 1").fetchone(),
+                (3,),
+            )
+            migrated.close()
+
+    async def test_sandbox_peek_never_creates_state_and_rejects_corrupt_values(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            missing = root / "missing" / "sessions.db"
+            missing_store = SqliteSessionStore(missing)
+            self.assertIsNone(await missing_store.peek_session_sandbox_profile("absent"))
+            self.assertFalse(missing.parent.exists())
+
+            database = root / "sessions.db"
+            store = SqliteSessionStore(database)
+            await store.initialize()
+            session_id = await store.create_session(
+                "/workspace",
+                "fixture",
+                "model",
+                sandbox_profile=SandboxProfile.WORKSPACE,
+            )
+            names_before = set(os.listdir(root))
+            bytes_before = database.read_bytes()
+            self.assertIs(
+                await store.peek_session_sandbox_profile(session_id),
+                SandboxProfile.WORKSPACE,
+            )
+            self.assertEqual(database.read_bytes(), bytes_before)
+            self.assertEqual(set(os.listdir(root)), names_before)
+
+            active = sqlite3.connect(database)
+            active.execute(
+                "UPDATE sessions SET sandbox_profile = 'strict' WHERE id = ?",
+                (session_id,),
+            )
+            active.commit()
+            with self.assertRaisesRegex(SessionError, "active WAL"):
+                await store.peek_session_sandbox_profile(session_id)
+            active.close()
+
+            connection = sqlite3.connect(database)
+            connection.execute(
+                "UPDATE sessions SET sandbox_profile = 'custom-unsafe' WHERE id = ?",
+                (session_id,),
+            )
+            connection.commit()
+            connection.close()
+            with self.assertRaisesRegex(SessionError, "unsupported sandbox profile"):
+                await store.peek_session_sandbox_profile(session_id)
+            with self.assertRaisesRegex(SessionError, "unsupported sandbox profile"):
+                await store.get_session(session_id)
 
     async def test_unknown_sessions_and_invalid_limit_are_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

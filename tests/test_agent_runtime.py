@@ -5,10 +5,13 @@ import sys
 import tempfile
 import unittest
 from collections.abc import AsyncIterator, Mapping, Sequence
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
+from neuro_code.adapters.background_tasks import LocalBackgroundTaskManager
 from neuro_code.adapters.sqlite_session import SqliteSessionStore
+from neuro_code.domain.background_tasks import BackgroundTaskSnapshot, BackgroundTaskStatus
 from neuro_code.domain.events import AgentEventKind
 from neuro_code.domain.messages import (
     ContextItemKind,
@@ -37,10 +40,12 @@ from neuro_code.permissions import (
     PermissionRequest,
     PermissionRule,
 )
+from neuro_code.ports.background_tasks import BackgroundTaskManager
 from neuro_code.ports.tools import ToolContext
 from neuro_code.providers.failover import FailoverModelProvider, ProviderCandidate
 from neuro_code.runtime import AgentRuntime
 from neuro_code.tools import ToolRegistry, default_tool_registry
+from neuro_code.tools.background_tasks import TaskOutputTool
 
 
 class ScriptedProvider:
@@ -153,7 +158,186 @@ class NeverStartedTool:
         return ToolResult("unexpected")
 
 
+class ReleaseBackgroundTaskTool:
+    definition = ToolDefinition(
+        name="release_background_task",
+        description="Release the managed fixture task.",
+        input_schema={"type": "object", "additionalProperties": False},
+    )
+    side_effecting = True
+
+    def __init__(
+        self,
+        trigger: Path,
+        manager: LocalBackgroundTaskManager,
+        task_id: str,
+    ) -> None:
+        self._trigger = trigger
+        self._manager = manager
+        self._task_id = task_id
+
+    async def execute(
+        self,
+        arguments: Mapping[str, Any],
+        context: ToolContext,
+    ) -> ToolResult:
+        del arguments, context
+        self._trigger.write_text("release", encoding="utf-8")
+        snapshot = await self._manager.get(self._task_id, wait_seconds=2)
+        assert snapshot is not None
+        assert snapshot.status.terminal
+        return ToolResult("fixture task released")
+
+
+class FixtureCompletionManager:
+    def __init__(self, snapshots: Sequence[BackgroundTaskSnapshot]) -> None:
+        self._snapshots = tuple(snapshots)
+        self.reported: set[str] = set()
+
+    async def pending_completions(self) -> tuple[BackgroundTaskSnapshot, ...]:
+        return tuple(
+            snapshot for snapshot in self._snapshots if snapshot.task_id not in self.reported
+        )
+
+    async def mark_completions_reported(self, task_ids: tuple[str, ...]) -> None:
+        self.reported.update(task_ids)
+
+    def as_manager(self) -> BackgroundTaskManager:
+        return cast(BackgroundTaskManager, self)
+
+
+def completion_snapshot(task_id: str) -> BackgroundTaskSnapshot:
+    timestamp = datetime(2026, 7, 18, 12, 0, tzinfo=UTC)
+    return BackgroundTaskSnapshot(
+        task_id=task_id,
+        command="private command",
+        cwd="/private/workspace",
+        status=BackgroundTaskStatus.COMPLETED,
+        output="private output",
+        total_output_bytes=14,
+        truncated=False,
+        exit_code=0,
+        started_at=timestamp,
+        finished_at=timestamp,
+    )
+
+
 class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_completion_reminder_batch_is_bounded_and_defers_overflow(self) -> None:
+        snapshots = tuple(completion_snapshot(f"task-{index:02d}") for index in range(21))
+        manager = FixtureCompletionManager(snapshots)
+        provider = ScriptedProvider(
+            ((ModelTextDelta("Handled bounded reminder."), ModelCompleted("stop")),)
+        )
+        runtime = AgentRuntime(
+            provider=provider,
+            tools=ToolRegistry(),
+            permissions=PermissionManager(),
+            tool_context=ToolContext(
+                Path("/workspace"),
+                background_tasks=manager.as_manager(),
+            ),
+        )
+
+        result = await runtime.run("Inspect completions")
+
+        reminder = "\n".join(
+            message.content
+            for message in provider.calls[0].messages
+            if "<background-task-completions>" in message.content
+        )
+        self.assertIn('"task_id":"task-00"', reminder)
+        self.assertIn('"task_id":"task-19"', reminder)
+        self.assertNotIn('"task_id":"task-20"', reminder)
+        self.assertIn("1 additional completion(s)", reminder)
+        self.assertNotIn("Use task_output", reminder)
+        event = next(
+            event
+            for event in result.events
+            if event.kind is AgentEventKind.BACKGROUND_TASK_COMPLETION_REMINDER
+        )
+        self.assertEqual(event.data["count"], 20)
+        self.assertEqual(event.data["remaining_count"], 1)
+        self.assertEqual(manager.reported, {f"task-{index:02d}" for index in range(20)})
+        self.assertEqual(
+            [item.task_id for item in await manager.pending_completions()],
+            ["task-20"],
+        )
+
+    async def test_completion_during_tool_step_is_reported_at_next_model_boundary(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            trigger = root / "release-task"
+            manager = LocalBackgroundTaskManager()
+            task = await manager.start_exec(
+                sys.executable,
+                (
+                    "-c",
+                    "import pathlib,time;"
+                    "p=pathlib.Path('release-task');"
+                    'exec("while not p.exists():\\n time.sleep(0.01)");'
+                    "print('private background output')",
+                ),
+                display_command="private background command",
+                cwd=root,
+                env={},
+                output_byte_limit=2_000,
+                termination_grace_seconds=0.05,
+            )
+            provider = ScriptedProvider(
+                (
+                    (
+                        ModelToolCall(ToolCall("release", "release_background_task", {})),
+                        ModelCompleted("tool_calls"),
+                    ),
+                    (ModelTextDelta("Observed the completion."), ModelCompleted("stop")),
+                )
+            )
+            release = ReleaseBackgroundTaskTool(trigger, manager, task.task_id)
+            runtime = AgentRuntime(
+                provider=provider,
+                tools=ToolRegistry((release, TaskOutputTool())),
+                permissions=PermissionManager(mode=PermissionMode.BYPASS),
+                tool_context=ToolContext(root, background_tasks=manager),
+            )
+            try:
+                result = await runtime.run("Run the fixture workflow")
+
+                first_text = "\n".join(
+                    message.content
+                    for message in provider.calls[0].messages
+                    if message.role is Role.USER
+                )
+                second_text = "\n".join(
+                    message.content
+                    for message in provider.calls[1].messages
+                    if message.role is Role.USER
+                )
+                self.assertNotIn("<background-task-completions>", first_text)
+                self.assertIn("<background-task-completions>", second_text)
+                self.assertIn(task.task_id, second_text)
+                self.assertIn('"status":"completed"', second_text)
+                self.assertIn("Use task_output", second_text)
+                self.assertNotIn("private background command", second_text)
+                self.assertNotIn("private background output", second_text)
+                self.assertNotIn(
+                    "<background-task-completions>",
+                    "\n".join(item.content for item in result.items if isinstance(item, Message)),
+                )
+                reminders = [
+                    event
+                    for event in result.events
+                    if event.kind is AgentEventKind.BACKGROUND_TASK_COMPLETION_REMINDER
+                ]
+                self.assertEqual(len(reminders), 1)
+                self.assertEqual(reminders[0].data["task_ids"], [task.task_id])
+                self.assertTrue(reminders[0].data["model_context_only"])
+                self.assertEqual(await manager.pending_completions(), ())
+            finally:
+                await manager.shutdown()
+
     async def test_pre_output_failover_is_audited_and_updates_new_session_origin(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

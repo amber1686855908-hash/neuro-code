@@ -17,6 +17,7 @@ from neuro_code.domain.messages import (
     ToolCall,
 )
 from neuro_code.domain.model_context import UPSTREAM_IMPORT_PROVIDER
+from neuro_code.domain.sandbox import SandboxProfile
 from neuro_code.domain.sessions import SessionSnapshot, SessionSummary
 from neuro_code.errors import SessionError
 
@@ -118,6 +119,7 @@ def load_rust_session(source: Path) -> RustSessionImport:
     model = _required_text(raw_summary.get("current_model_id"), "summary.current_model_id")
     created_at = _timestamp(raw_summary.get("created_at"), "summary.created_at")
     updated_at = _timestamp(raw_summary.get("updated_at"), "summary.updated_at")
+    sandbox_profile = _sandbox_profile(raw_summary.get("sandbox_profile"))
     chat_format_version = raw_summary.get("chat_format_version", 0)
     if isinstance(chat_format_version, bool) or not isinstance(chat_format_version, int):
         raise SessionError("summary.chat_format_version must be an integer")
@@ -136,6 +138,7 @@ def load_rust_session(source: Path) -> RustSessionImport:
             model=model,
             created_at=created_at,
             updated_at=updated_at,
+            sandbox_profile=sandbox_profile,
         ),
         items=tuple(items),
     )
@@ -154,6 +157,17 @@ def load_rust_session(source: Path) -> RustSessionImport:
         omitted_content_parts=stats.omitted_content_parts,
         omitted_tool_calls=stats.omitted_tool_calls,
     )
+
+
+def _sandbox_profile(value: object) -> SandboxProfile | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise SessionError("summary sandbox profile must be a string")
+    try:
+        return SandboxProfile.parse(value)
+    except ValueError as error:
+        raise SessionError(f"unsupported Rust session sandbox profile: {value!r}") from error
 
 
 def _read_summary(path: Path) -> dict[str, Any]:

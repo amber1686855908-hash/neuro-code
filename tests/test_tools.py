@@ -5,8 +5,10 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from neuro_code.domain.sandbox import SandboxProfile
 from neuro_code.errors import ToolError
 from neuro_code.ports.tools import ToolContext
+from neuro_code.tools import default_tool_registry
 from neuro_code.tools.filesystem import GrepTool, ReadFileTool, SearchReplaceTool
 from neuro_code.workspace import resolve_workspace_path, workspaces_match
 
@@ -42,6 +44,21 @@ class FilesystemToolTests(unittest.IsolatedAsyncioTestCase):
                     ToolContext(root),
                 )
             self.assertEqual(target.read_text(encoding="utf-8"), "same\nsame\n")
+
+    async def test_read_only_profile_hides_and_rejects_the_edit_tool(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "values.txt"
+            target.write_text("before\n", encoding="utf-8")
+
+            registry = default_tool_registry(SandboxProfile.READ_ONLY)
+            self.assertNotIn("search_replace", registry.names())
+            with self.assertRaisesRegex(ToolError, "prohibits workspace edits"):
+                await SearchReplaceTool().execute(
+                    {"path": "values.txt", "old": "before", "new": "after"},
+                    ToolContext(root, sandbox_profile=SandboxProfile.READ_ONLY),
+                )
+            self.assertEqual(target.read_text(encoding="utf-8"), "before\n")
 
     def test_workspace_path_rejects_parent_escape(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

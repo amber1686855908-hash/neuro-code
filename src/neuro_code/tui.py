@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, ClassVar, Protocol
@@ -14,11 +14,22 @@ from textual.screen import ModalScreen
 from textual.widgets import Button, Footer, Header, Input, Label, RichLog, Static
 from textual.worker import Worker
 
+from neuro_code.domain.background_tasks import BackgroundTaskSnapshot, BackgroundTaskStatus
 from neuro_code.domain.events import AgentEvent, AgentEventKind
+from neuro_code.domain.messages import Message, Role, SessionItem
 from neuro_code.permissions import PermissionApproval, PermissionRequest
 from neuro_code.runtime.agent import AgentRunResult, EventSink
 from neuro_code.runtime.approval import ApprovalHandler
-from neuro_code.runtime.profile_conversation import ProviderOption, ProviderSelectionResult
+from neuro_code.runtime.profile_conversation import (
+    ProviderOption,
+    ProviderSelectionResult,
+    SessionOption,
+    SessionSelectionResult,
+)
+
+_RESTORED_MESSAGE_LIMIT = 20_000
+_TASK_LIST_LIMIT = 20
+_TASK_POLL_SECONDS = 0.5
 
 
 class ConversationRunner(Protocol):
@@ -40,6 +51,16 @@ class ProviderController(Protocol):
     def selected_profile(self) -> str: ...
 
     async def select_profile(self, name: str) -> ProviderSelectionResult: ...
+
+
+class SessionController(Protocol):
+    async def list_sessions(self) -> tuple[SessionOption, ...]: ...
+
+    async def select_session(self, session_id: str) -> SessionSelectionResult: ...
+
+
+class TaskController(Protocol):
+    async def list_background_tasks(self) -> tuple[BackgroundTaskSnapshot, ...]: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -262,6 +283,118 @@ class ProviderSelectionScreen(ModalScreen[str | None]):
         self.dismiss(None)
 
 
+class SessionSelectionScreen(ModalScreen[str | None]):
+    """Select one recent session already constrained to the active workspace."""
+
+    CSS = """
+    SessionSelectionScreen {
+        align: center middle;
+        background: $background 70%;
+    }
+
+    #session-dialog {
+        width: 90%;
+        max-width: 115;
+        height: 80%;
+        padding: 1 2;
+        border: heavy $primary;
+        background: $surface;
+    }
+
+    #session-title {
+        text-style: bold;
+        color: $primary;
+        margin-bottom: 1;
+    }
+
+    #session-options {
+        height: 1fr;
+    }
+
+    #session-options Button {
+        width: 100%;
+        margin-bottom: 1;
+    }
+
+    #session-help {
+        color: $text-muted;
+        margin-top: 1;
+    }
+    """
+    BINDINGS: ClassVar[list[BindingType]] = [
+        Binding("escape", "cancel", "Cancel", show=False),
+        Binding("ctrl+c", "cancel", "Cancel", show=False),
+    ]
+
+    def __init__(self, options: tuple[SessionOption, ...]) -> None:
+        super().__init__()
+        self.options = options
+        self._choice_ids = {
+            f"session-choice-{index}": option.session_id for index, option in enumerate(options)
+        }
+
+    @staticmethod
+    def _label(option: SessionOption) -> str:
+        markers: list[str] = []
+        if option.current:
+            markers.append("current")
+        if not option.source_profile_match:
+            markers.append(f"resume via {option.resume_profile}")
+        if option.sandbox_profile is None:
+            markers.append("legacy sandbox")
+        else:
+            markers.append(f"sandbox {option.sandbox_profile.value}")
+        if not option.sandbox_profile_match:
+            markers.append("restart required")
+        if not option.selectable:
+            markers.append("unavailable")
+        suffix = f" ({' · '.join(markers)})" if markers else ""
+        timestamp = option.updated_at.astimezone().strftime("%Y-%m-%d %H:%M")
+        short_id = option.session_id if len(option.session_id) <= 12 else option.session_id[:12]
+        return f"{short_id} · {timestamp} · {option.source_provider}/{option.source_model}{suffix}"
+
+    def compose(self) -> ComposeResult:
+        buttons = [
+            Button(
+                self._label(option),
+                id=f"session-choice-{index}",
+                variant="primary" if option.current else "default",
+                disabled=not option.selectable,
+                tooltip=option.session_id,
+            )
+            for index, option in enumerate(self.options)
+        ]
+        yield Vertical(
+            Label("Resume workspace session", id="session-title"),
+            VerticalScroll(*buttons, id="session-options"),
+            Static(
+                "Only sessions from this workspace are listed. Esc/Ctrl+C closes this picker.",
+                id="session-help",
+            ),
+            id="session-dialog",
+        )
+
+    def on_mount(self) -> None:
+        target: Button | None = None
+        for index, option in enumerate(self.options):
+            button = self.query_one(f"#session-choice-{index}", Button)
+            if option.current and not button.disabled:
+                target = button
+                break
+            if target is None and not button.disabled:
+                target = button
+        if target is not None:
+            target.focus()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        session_id = self._choice_ids.get(event.button.id or "")
+        if session_id is not None:
+            self.dismiss(session_id)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
 class NeuroCodeApp(App[None]):
     """Minimal Textual interface over the normalized agent event stream."""
 
@@ -294,6 +427,7 @@ class NeuroCodeApp(App[None]):
     BINDINGS: ClassVar[list[BindingType]] = [
         Binding("ctrl+c", "cancel_turn", "Cancel", priority=True),
         Binding("ctrl+p", "select_provider", "Provider", priority=True),
+        Binding("ctrl+r", "select_session", "Sessions", priority=True),
         Binding("ctrl+q", "quit", "Quit"),
         Binding("ctrl+l", "clear_transcript", "Clear"),
     ]
@@ -304,6 +438,9 @@ class NeuroCodeApp(App[None]):
         *,
         approval_controller: ApprovalController | None = None,
         provider_controller: ProviderController | None = None,
+        session_controller: SessionController | None = None,
+        task_controller: TaskController | None = None,
+        initial_items: Sequence[SessionItem] = (),
         provider_name: str,
         model_name: str,
         cwd: Path,
@@ -312,6 +449,9 @@ class NeuroCodeApp(App[None]):
         self._runner = runner
         self._approval_controller = approval_controller
         self._provider_controller = provider_controller
+        self._session_controller = session_controller
+        self._task_controller = task_controller
+        self._initial_items = tuple(initial_items)
         self._provider_name = provider_name
         self._model_name = model_name
         self._cwd = cwd
@@ -319,6 +459,8 @@ class NeuroCodeApp(App[None]):
         self._assistant_parts: list[str] = []
         self._reasoning_announced = False
         self._turn_worker: Worker[None] | None = None
+        self._announced_terminal_tasks: set[str] = set()
+        self._task_polling = False
 
     @property
     def entries(self) -> tuple[TranscriptEntry, ...]:
@@ -334,10 +476,20 @@ class NeuroCodeApp(App[None]):
     def on_mount(self) -> None:
         if self._approval_controller is not None:
             self._approval_controller.set_handler(self._request_approval)
-        self._write_entry(
-            "system",
-            f"Ready · {self._provider_name}/{self._model_name} · {self._cwd}",
-        )
+        if self._runner.session_id is not None:
+            self._replace_transcript(self._initial_items)
+            self._write_entry(
+                "system",
+                f"Resumed session {self._runner.session_id or 'unknown'} · "
+                f"{self._provider_name}/{self._model_name} · {self._cwd}",
+            )
+        else:
+            self._write_entry(
+                "system",
+                f"Ready · {self._provider_name}/{self._model_name} · {self._cwd}",
+            )
+        if self._task_controller is not None:
+            self.set_interval(_TASK_POLL_SECONDS, self._poll_background_tasks)
         self.query_one("#prompt", Input).focus()
 
     def on_unmount(self) -> None:
@@ -455,6 +607,19 @@ class NeuroCodeApp(App[None]):
         if command in {"model", "provider"}:
             await self._select_provider(arguments.strip() or None)
             return
+        if command in {"resume", "sessions"}:
+            requested = arguments.strip() or None
+            if command == "sessions" and requested is not None:
+                self._write_entry("error", "/sessions does not accept arguments.")
+                return
+            await self._select_session(requested)
+            return
+        if command == "tasks":
+            if arguments.strip():
+                self._write_entry("error", "/tasks does not accept arguments.")
+                return
+            await self._show_background_tasks()
+            return
         if arguments.strip():
             self._write_entry("error", f"/{command} does not accept arguments.")
             return
@@ -468,7 +633,8 @@ class NeuroCodeApp(App[None]):
             self._write_entry(
                 "system",
                 "Commands: /help, /status, /provider [PROFILE] (alias /model), "
-                "/cancel, /clear, /quit (alias /exit).",
+                "/sessions, /resume [SESSION_ID], /tasks, /cancel, /clear, "
+                "/quit (alias /exit).",
             )
         elif command == "status":
             session_id = self._runner.session_id or "not created"
@@ -497,6 +663,9 @@ class NeuroCodeApp(App[None]):
         if isinstance(self.screen, ProviderSelectionScreen):
             self.screen.action_cancel()
             return
+        if isinstance(self.screen, SessionSelectionScreen):
+            self.screen.action_cancel()
+            return
         if self._turn_worker is not None and self._turn_worker.is_running:
             self._write_entry("status", "Cancellation requested.")
             self._turn_worker.cancel()
@@ -510,6 +679,9 @@ class NeuroCodeApp(App[None]):
 
     async def action_select_provider(self) -> None:
         await self._select_provider(None)
+
+    async def action_select_session(self) -> None:
+        await self._select_session(None)
 
     async def _select_provider(self, requested: str | None) -> None:
         if self._provider_controller is None:
@@ -541,6 +713,8 @@ class NeuroCodeApp(App[None]):
 
         self._provider_name = result.provider_name
         self._model_name = result.model_name
+        if result.changed:
+            self._reset_background_task_tracking()
         if not result.changed:
             self._write_entry(
                 "status",
@@ -550,7 +724,8 @@ class NeuroCodeApp(App[None]):
             self._write_entry(
                 "status",
                 f"Provider profile switched to {result.profile_name} "
-                f"({result.provider_name}/{result.model_name}).",
+                f"({result.provider_name}/{result.model_name})."
+                f"{self._stopped_task_note(result.stopped_background_tasks)}",
             )
         else:
             self._write_entry(
@@ -558,8 +733,168 @@ class NeuroCodeApp(App[None]):
                 f"Provider profile switched to {result.profile_name} "
                 f"({result.provider_name}/{result.model_name}). The previous session "
                 f"{result.previous_session_id} remains saved; the next prompt starts "
-                "a new conversation.",
+                f"a new conversation.{self._stopped_task_note(result.stopped_background_tasks)}",
             )
+
+    async def _select_session(self, requested: str | None) -> None:
+        if self._session_controller is None:
+            self._write_entry("error", "Interactive session resume is unavailable.")
+            return
+        if self._turn_worker is not None and self._turn_worker.is_running:
+            self._write_entry("error", "Cannot resume a session while a turn is running.")
+            return
+        if requested is not None:
+            await self._apply_session_selection(requested)
+            return
+        try:
+            options = await self._session_controller.list_sessions()
+        except Exception as error:
+            self._write_entry("error", f"{type(error).__name__}: {error}")
+            return
+        if not options:
+            self._write_entry("status", "No sessions found for this workspace.")
+            return
+        self.push_screen(SessionSelectionScreen(options), self._session_selected)
+
+    async def _session_selected(self, session_id: str | None) -> None:
+        if session_id is not None:
+            await self._apply_session_selection(session_id)
+
+    async def _apply_session_selection(self, session_id: str) -> None:
+        assert self._session_controller is not None
+        try:
+            result = await self._session_controller.select_session(session_id)
+        except Exception as error:
+            self._write_entry("error", f"{type(error).__name__}: {error}")
+            return
+
+        self._provider_name = result.provider_name
+        self._model_name = result.model_name
+        if not result.changed:
+            self._write_entry("status", f"Session {result.session_id} is already open.")
+            return
+
+        self._reset_background_task_tracking()
+        self._replace_transcript(result.items)
+        profile_note = (
+            f"profile {result.profile_name}"
+            if result.source_profile_match
+            else (
+                f"profile {result.profile_name}; source profile "
+                f"{result.source_provider} is not ready locally"
+            )
+        )
+        previous_note = (
+            f" Previous session {result.previous_session_id} remains saved."
+            if result.previous_session_id is not None
+            else ""
+        )
+        self._write_entry(
+            "system",
+            f"Resumed session {result.session_id} with {profile_note} "
+            f"({result.provider_name}/{result.model_name}).{previous_note}"
+            f"{self._stopped_task_note(result.stopped_background_tasks)}",
+        )
+
+    async def _show_background_tasks(self) -> None:
+        if self._task_controller is None:
+            self._write_entry("error", "Background task visibility is unavailable.")
+            return
+        try:
+            snapshots = await self._task_controller.list_background_tasks()
+        except Exception as error:
+            self._write_entry("error", f"{type(error).__name__}: {error}")
+            return
+        if not snapshots:
+            self._write_entry("status", "No background tasks for the current session.")
+            return
+
+        visible = snapshots[-_TASK_LIST_LIMIT:]
+        omitted = len(snapshots) - len(visible)
+        lines = [self._task_summary(snapshot) for snapshot in visible]
+        if omitted:
+            lines.insert(0, f"… {omitted} older task(s) omitted")
+        self._write_entry("system", "Background tasks:\n" + "\n".join(lines))
+
+    async def _poll_background_tasks(self) -> None:
+        if self._task_controller is None or self._task_polling:
+            return
+        self._task_polling = True
+        try:
+            snapshots = await self._task_controller.list_background_tasks()
+        except Exception:
+            return
+        finally:
+            self._task_polling = False
+
+        for snapshot in snapshots:
+            if not snapshot.status.terminal:
+                continue
+            if snapshot.task_id in self._announced_terminal_tasks:
+                continue
+            self._announced_terminal_tasks.add(snapshot.task_id)
+            category = (
+                "status"
+                if snapshot.status
+                in {BackgroundTaskStatus.COMPLETED, BackgroundTaskStatus.CANCELLED}
+                else "error"
+            )
+            self._write_entry(category, self._task_completion_message(snapshot))
+
+    def _reset_background_task_tracking(self) -> None:
+        self._announced_terminal_tasks.clear()
+
+    @staticmethod
+    def _task_summary(snapshot: BackgroundTaskSnapshot) -> str:
+        exit_note = f" · exit {snapshot.exit_code}" if snapshot.exit_code is not None else ""
+        truncation_note = " (preview truncated)" if snapshot.truncated else ""
+        started = snapshot.started_at.astimezone().strftime("%H:%M:%S")
+        return (
+            f"{snapshot.task_id} · {snapshot.status.value}{exit_note} · "
+            f"{snapshot.total_output_bytes} output bytes{truncation_note} · started {started}"
+        )
+
+    @staticmethod
+    def _task_completion_message(snapshot: BackgroundTaskSnapshot) -> str:
+        descriptions = {
+            BackgroundTaskStatus.COMPLETED: "completed",
+            BackgroundTaskStatus.FAILED: "failed",
+            BackgroundTaskStatus.TIMED_OUT: "timed out",
+            BackgroundTaskStatus.CANCELLED: "was cancelled",
+        }
+        description = descriptions.get(snapshot.status, snapshot.status.value)
+        exit_note = f" (exit {snapshot.exit_code})" if snapshot.exit_code is not None else ""
+        return f"Background task {snapshot.task_id} {description}{exit_note}."
+
+    @staticmethod
+    def _stopped_task_note(count: int) -> str:
+        if count == 0:
+            return ""
+        noun = "task" if count == 1 else "tasks"
+        return f" Stopped {count} background {noun} from the previous session."
+
+    def _replace_transcript(self, items: Sequence[SessionItem]) -> None:
+        self.query_one("#transcript", RichLog).clear()
+        self._entries.clear()
+        for item in items:
+            if not isinstance(item, Message) or item.role is Role.SYSTEM:
+                continue
+            if item.role is Role.TOOL:
+                self._write_entry("tool", f"Restored result for {item.name or 'unknown'}.")
+                continue
+            content = self._bounded_restored_text(item.model_content())
+            if content:
+                category = "user" if item.role is Role.USER else "assistant"
+                self._write_entry(category, content)
+            if item.role is Role.ASSISTANT and item.tool_calls:
+                names = ", ".join(call.name for call in item.tool_calls)
+                self._write_entry("tool", f"Restored tool request: {names}.")
+
+    @staticmethod
+    def _bounded_restored_text(content: str) -> str:
+        if len(content) <= _RESTORED_MESSAGE_LIMIT:
+            return content
+        return f"{content[:_RESTORED_MESSAGE_LIMIT]}\n… [restored message truncated]"
 
     def _write_entry(self, category: str, content: str) -> None:
         entry = TranscriptEntry(category, content)
@@ -585,5 +920,8 @@ __all__ = [
     "PermissionApprovalScreen",
     "ProviderController",
     "ProviderSelectionScreen",
+    "SessionController",
+    "SessionSelectionScreen",
+    "TaskController",
     "TranscriptEntry",
 ]

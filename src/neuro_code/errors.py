@@ -25,5 +25,9 @@ class PermissionDenied(ToolError):
     """A tool call was rejected by the permission policy."""
 
 
+class SandboxError(NeuroCodeError):
+    """A requested operating-system sandbox could not be enforced."""
+
+
 class SessionError(NeuroCodeError):
     """Session persistence or reconstruction failed."""
