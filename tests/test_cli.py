@@ -27,6 +27,7 @@ from neuro_code.domain.model_events import (
 )
 from neuro_code.domain.sandbox import SandboxProfile
 from neuro_code.domain.tools import ToolDefinition
+from neuro_code.domain.ui_preferences import UiLanguage
 
 
 class CliProvider:
@@ -399,6 +400,10 @@ api_key_env = "FIXTURE_KEY"
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             self._write_provider_config(root / "state")
+            (root / "state" / "ui-preferences.json").write_text(
+                json.dumps({"version": 1, "language": "zh-CN"}),
+                encoding="utf-8",
+            )
             captured: dict[str, object] = {}
 
             class TuiFixture:
@@ -410,6 +415,8 @@ api_key_env = "FIXTURE_KEY"
                     provider_controller: object,
                     session_controller: object,
                     task_controller: object,
+                    ui_preferences: object,
+                    language: UiLanguage,
                     initial_items: object,
                     provider_name: str,
                     model_name: str,
@@ -421,6 +428,8 @@ api_key_env = "FIXTURE_KEY"
                         provider_controller=provider_controller,
                         session_controller=session_controller,
                         task_controller=task_controller,
+                        ui_preferences=ui_preferences,
+                        language=language,
                         initial_items=initial_items,
                         provider_name=provider_name,
                         model_name=model_name,
@@ -453,6 +462,7 @@ api_key_env = "FIXTURE_KEY"
             self.assertIs(captured["runner"], captured["session_controller"])
             self.assertIs(captured["runner"], captured["task_controller"])
             self.assertEqual(captured["initial_items"], ())
+            self.assertEqual(captured["language"], UiLanguage.SIMPLIFIED_CHINESE)
             self.assertTrue(captured["ran"])
 
     def test_tui_session_search_is_scoped_to_the_workspace_alias(self) -> None:
@@ -501,6 +511,8 @@ api_key_env = "FIXTURE_KEY"
                     provider_controller: object,
                     session_controller: object,
                     task_controller: object,
+                    ui_preferences: object,
+                    language: UiLanguage,
                     initial_items: object,
                     provider_name: str,
                     model_name: str,
@@ -511,6 +523,8 @@ api_key_env = "FIXTURE_KEY"
                         approval_controller,
                         provider_controller,
                         task_controller,
+                        ui_preferences,
+                        language,
                         initial_items,
                         provider_name,
                         model_name,
@@ -584,12 +598,22 @@ api_key_env = "SECOND_KEY"
                     provider_controller: object,
                     session_controller: object,
                     task_controller: object,
+                    ui_preferences: object,
+                    language: UiLanguage,
                     initial_items: object,
                     provider_name: str,
                     model_name: str,
                     cwd: Path,
                 ) -> None:
-                    del approval_controller, initial_items, provider_name, model_name, cwd
+                    del (
+                        approval_controller,
+                        ui_preferences,
+                        language,
+                        initial_items,
+                        provider_name,
+                        model_name,
+                        cwd,
+                    )
                     self.runner = runner
                     self.provider_controller = provider_controller
                     self.session_controller = session_controller
@@ -699,12 +723,21 @@ api_key_env = "SECOND_KEY"
                     provider_controller: object,
                     session_controller: object,
                     task_controller: object,
+                    ui_preferences: object,
+                    language: UiLanguage,
                     initial_items: object,
                     provider_name: str,
                     model_name: str,
                     cwd: Path,
                 ) -> None:
-                    del approval_controller, provider_name, model_name, cwd
+                    del (
+                        approval_controller,
+                        ui_preferences,
+                        language,
+                        provider_name,
+                        model_name,
+                        cwd,
+                    )
                     self.runner = runner
                     self.provider_controller = provider_controller
                     self.session_controller = session_controller

@@ -35,6 +35,7 @@ from neuro_code.domain.model_events import (
 from neuro_code.domain.session_search import SessionSearchHit, SessionSearchPage
 from neuro_code.domain.sessions import SessionSnapshot, SessionSummary
 from neuro_code.domain.tools import ToolDefinition, ToolResult
+from neuro_code.domain.ui_preferences import UiLanguage
 
 __all__ = [
     "MAX_BACKGROUND_TASK_WAIT_IDS",
@@ -70,4 +71,5 @@ __all__ = [
     "ToolCall",
     "ToolDefinition",
     "ToolResult",
+    "UiLanguage",
 ]

@@ -7,6 +7,7 @@ from neuro_code.ports.model import ModelProvider
 from neuro_code.ports.sandbox import ShellLaunch, ShellSandbox
 from neuro_code.ports.storage import SessionStore
 from neuro_code.ports.tools import Tool, ToolContext
+from neuro_code.ports.ui_preferences import UiPreferencesStore
 
 __all__ = [
     "BackgroundTaskManager",
@@ -19,4 +20,5 @@ __all__ = [
     "ShellSandbox",
     "Tool",
     "ToolContext",
+    "UiPreferencesStore",
 ]

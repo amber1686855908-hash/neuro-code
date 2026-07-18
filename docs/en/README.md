@@ -48,7 +48,8 @@ uv run neuro-code
 When installing the built package outside the development environment, include
 the optional UI dependency with `pip install 'neuro-code[tui]'`. The initial TUI
 provides prompt input, scrollback, streamed assistant text, provider/tool status,
-and local `/help`, `/status`, `/provider`, `/model`, `/sessions [QUERY]`, `/resume`,
+and local `/help`, `/status`, `/settings` (alias `/setting`), `/provider`, `/model`,
+`/sessions [QUERY]`, `/resume`,
 `/rename TITLE` (alias `/title`), `/cancel`, `/clear`, `/quit`, and `/exit`
 commands. Prompts in one launch share a durable session; `--resume SESSION_ID`
 opens an existing session after workspace validation.
@@ -60,6 +61,19 @@ the plain-text `/sessions QUERY` flow and does not display an emoji search icon.
 The app also reconciles the real TTY cell size when a terminal drops its normal
 resize notification, so maximizing or resizing the window repaints the entire
 viewport instead of leaving the previous canvas at the top left.
+
+User prompts render as full-width muted blocks, while assistant output uses a
+separate response block without `You:`/`Assistant:` log prefixes. A streamed
+response is mounted once in the conversation and updated in place through its
+final text, so completion does not move it from a temporary area into the
+scrollback. Automatic following stops when the user scrolls upward.
+
+Use `Ctrl+,`, `/settings`, or `/setting` to choose English or Simplified Chinese.
+The selected language immediately updates application-owned controls, dialogs,
+and status text; prompts and model/tool content are never translated. The choice
+is stored separately from provider configuration in
+`$NEURO_CODE_HOME/ui-preferences.json` (normally
+`~/.neuro-code/ui-preferences.json`) and is reused on later TUI launches.
 
 Use `Ctrl+P`, bare `/provider` or bare `/model` to open the configured-profile
 picker. `/provider PROFILE` and `/model PROFILE` select directly. The picker

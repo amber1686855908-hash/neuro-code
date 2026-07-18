@@ -23,7 +23,8 @@
   `NeuroCodeApp`；`neuro-code -p ...` 和 `neuro-code agent -p ...` 保留适合机器调用的
   无头路径。
 - TUI 渲染 `AgentEvent`，不得直接修改运行时状态。文本增量更新当前响应；供应商
-  选择/失败与工具生命周期事件转为有界状态行。
+  选择/失败与工具生命周期事件转为有界状态行。后续的稳定消息与本地化设计由
+  [ADR 0026](0026-stable-localized-tui-conversation.md) 规定。
 - 表现层使用一套由应用持有的中性深色主题。Textual 内建命令面板的 `Ctrl+P` 和表情符号
   搜索表面会与应用的供应商选择器及纯文字 `/sessions QUERY` 流程冲突，因此将其禁用。
 - 全屏终端模式会周期比较真实 TTY 单元格尺寸与当前 Textual Screen，并且只在二者不同时

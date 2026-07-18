@@ -4,7 +4,7 @@ import asyncio
 import os
 import sys
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, ClassVar, Protocol
 
@@ -16,14 +16,16 @@ from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.geometry import Size
 from textual.screen import ModalScreen
 from textual.theme import Theme
-from textual.widgets import Button, Footer, Header, Input, Label, RichLog, Static
+from textual.widgets import Button, Header, Input, Label, Static
 from textual.worker import Worker
 
 from neuro_code.domain.background_tasks import BackgroundTaskSnapshot, BackgroundTaskStatus
 from neuro_code.domain.events import AgentEvent, AgentEventKind
 from neuro_code.domain.messages import Message, Role, SessionItem
 from neuro_code.domain.sessions import SessionSummary
+from neuro_code.domain.ui_preferences import UiLanguage
 from neuro_code.permissions import PermissionApproval, PermissionRequest
+from neuro_code.ports.ui_preferences import UiPreferencesStore
 from neuro_code.runtime.agent import AgentRunResult, EventSink
 from neuro_code.runtime.approval import ApprovalHandler
 from neuro_code.runtime.profile_conversation import (
@@ -32,6 +34,7 @@ from neuro_code.runtime.profile_conversation import (
     SessionOption,
     SessionSelectionResult,
 )
+from neuro_code.tui_text import language_name, ui_text
 
 _RESTORED_MESSAGE_LIMIT = 20_000
 _TASK_LIST_LIMIT = 20
@@ -76,15 +79,6 @@ _NEURO_CODE_THEME = Theme(
         "scrollbar-hover": "#666b72",
     },
 )
-
-_ENTRY_LABELS: dict[str, tuple[str, str]] = {
-    "assistant": ("Assistant", "bold #e1e3e6"),
-    "error": ("Error", "bold #c76d6d"),
-    "status": ("Status", "#8e939a"),
-    "system": ("Neuro Code", "bold #c7a15a"),
-    "tool": ("Tool", "bold #b59663"),
-    "user": ("You", "bold #c8cbd0"),
-}
 
 
 def _read_terminal_size() -> Size | None:
@@ -139,6 +133,124 @@ class TaskController(Protocol):
 class TranscriptEntry:
     category: str
     text: str
+    ui_key: str | None = None
+    ui_values: tuple[tuple[str, object], ...] = ()
+
+
+class ConversationMessage(Static):
+    """One stable message node in the scrollable conversation."""
+
+    def __init__(self, category: str, rendered: Text, *, pending: bool = False) -> None:
+        classes = f"conversation-message message-{category}"
+        if pending:
+            classes += " message-pending"
+        super().__init__(rendered, markup=False, classes=classes)
+        self.category = category
+
+    def set_pending(self, pending: bool) -> None:
+        self.set_class(pending, "message-pending")
+
+
+class SettingsScreen(ModalScreen[UiLanguage | None]):
+    """Choose an application-owned interface language."""
+
+    CSS = """
+    SettingsScreen {
+        align: center middle;
+        background: $background 70%;
+    }
+
+    #settings-dialog {
+        width: 70%;
+        max-width: 72;
+        height: auto;
+        padding: 1 2;
+        border: heavy $primary;
+        background: $surface;
+    }
+
+    #settings-title {
+        text-style: bold;
+        color: $primary;
+        margin-bottom: 1;
+    }
+
+    #settings-description,
+    #settings-help {
+        color: $text-muted;
+        margin-bottom: 1;
+    }
+
+    #settings-languages {
+        height: auto;
+    }
+
+    #settings-languages Button {
+        width: 1fr;
+        margin-right: 1;
+    }
+    """
+    BINDINGS: ClassVar[list[BindingType]] = [
+        Binding("escape", "cancel", "Cancel", show=False),
+        Binding("ctrl+c", "cancel", "Cancel", show=False),
+    ]
+
+    def __init__(self, selected: UiLanguage, *, language: UiLanguage) -> None:
+        super().__init__()
+        self.selected = selected
+        self.language = language
+
+    def _choice_label(self, choice: UiLanguage) -> str:
+        label = language_name(choice, in_language=choice)
+        if choice is self.selected:
+            label += f" · {ui_text(self.language, 'settings.current')}"
+        return label
+
+    def compose(self) -> ComposeResult:
+        yield Vertical(
+            Label(ui_text(self.language, "settings.title"), id="settings-title"),
+            Static(
+                ui_text(self.language, "settings.description"),
+                id="settings-description",
+            ),
+            Horizontal(
+                Button(
+                    self._choice_label(UiLanguage.SIMPLIFIED_CHINESE),
+                    id="settings-language-zh-cn",
+                    variant=(
+                        "primary" if self.selected is UiLanguage.SIMPLIFIED_CHINESE else "default"
+                    ),
+                ),
+                Button(
+                    self._choice_label(UiLanguage.ENGLISH),
+                    id="settings-language-en",
+                    variant="primary" if self.selected is UiLanguage.ENGLISH else "default",
+                ),
+                id="settings-languages",
+            ),
+            Static(ui_text(self.language, "settings.help"), id="settings-help"),
+            id="settings-dialog",
+        )
+
+    def on_mount(self) -> None:
+        selector = (
+            "#settings-language-zh-cn"
+            if self.selected is UiLanguage.SIMPLIFIED_CHINESE
+            else "#settings-language-en"
+        )
+        self.query_one(selector, Button).focus()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        choices = {
+            "settings-language-zh-cn": UiLanguage.SIMPLIFIED_CHINESE,
+            "settings-language-en": UiLanguage.ENGLISH,
+        }
+        choice = choices.get(event.button.id or "")
+        if choice is not None:
+            self.dismiss(choice)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
 
 
 class PermissionApprovalScreen(ModalScreen[PermissionApproval]):
@@ -197,30 +309,61 @@ class PermissionApprovalScreen(ModalScreen[PermissionApproval]):
         Binding("s", "allow_session", "Allow for session", show=False),
     ]
 
-    def __init__(self, request: PermissionRequest) -> None:
+    def __init__(
+        self,
+        request: PermissionRequest,
+        *,
+        language: UiLanguage = UiLanguage.ENGLISH,
+    ) -> None:
         super().__init__()
         self.request = request
+        self.language = language
 
     def compose(self) -> ComposeResult:
         yield Vertical(
-            Label("Tool approval required", id="approval-title"),
-            Static(Text(f"Tool: {self.request.tool_name}")),
+            Label(ui_text(self.language, "approval.title"), id="approval-title"),
+            Static(
+                Text(
+                    ui_text(
+                        self.language,
+                        "approval.tool",
+                        tool=self.request.tool_name,
+                    )
+                )
+            ),
             Static(Text(self.request.summary), id="approval-summary"),
-            Static(Text(f"Policy: {self.request.reason}"), id="approval-reason"),
+            Static(
+                Text(
+                    ui_text(
+                        self.language,
+                        "approval.policy",
+                        policy=self.request.reason,
+                    )
+                ),
+                id="approval-reason",
+            ),
             Horizontal(
-                Button("Allow once [A]", variant="success", id="approval-allow-once"),
                 Button(
-                    "Allow identical action this session [S]",
+                    ui_text(self.language, "approval.allow_once"),
+                    variant="success",
+                    id="approval-allow-once",
+                ),
+                Button(
+                    ui_text(self.language, "approval.allow_session"),
                     variant="primary",
                     id="approval-allow-session",
                     disabled=self.request.scope_key is None,
                     tooltip=(
-                        "Session approval is unavailable for an action that cannot be scoped safely."
+                        ui_text(self.language, "approval.unscoped")
                         if self.request.scope_key is None
                         else None
                     ),
                 ),
-                Button("Deny [D/Esc/Ctrl+C]", variant="error", id="approval-deny"),
+                Button(
+                    ui_text(self.language, "approval.deny"),
+                    variant="error",
+                    id="approval-deny",
+                ),
                 id="approval-actions",
             ),
             id="approval-dialog",
@@ -293,31 +436,40 @@ class ProviderSelectionScreen(ModalScreen[str | None]):
         Binding("ctrl+c", "cancel", "Cancel", show=False),
     ]
 
-    def __init__(self, options: tuple[ProviderOption, ...]) -> None:
+    def __init__(
+        self,
+        options: tuple[ProviderOption, ...],
+        *,
+        language: UiLanguage = UiLanguage.ENGLISH,
+    ) -> None:
         super().__init__()
         self.options = options
+        self.language = language
         self._choice_ids = {
             f"provider-choice-{index}": option.name for index, option in enumerate(options)
         }
 
     @staticmethod
-    def _label(option: ProviderOption) -> str:
+    def _label(
+        option: ProviderOption,
+        language: UiLanguage = UiLanguage.ENGLISH,
+    ) -> str:
         markers: list[str] = []
         if option.selected:
-            markers.append("current")
+            markers.append(ui_text(language, "marker.current"))
         if option.default:
-            markers.append("default")
+            markers.append(ui_text(language, "marker.default"))
         if not option.available:
-            markers.append("unavailable")
+            markers.append(ui_text(language, "marker.unavailable"))
         elif not option.credential_configured:
-            markers.append("credential missing")
+            markers.append(ui_text(language, "marker.credential_missing"))
         suffix = f" ({' · '.join(markers)})" if markers else ""
         return f"{option.name} · {option.model} · {option.protocol}{suffix}"
 
     def compose(self) -> ComposeResult:
         buttons = [
             Button(
-                Text(self._label(option)),
+                Text(self._label(option, self.language)),
                 id=f"provider-choice-{index}",
                 variant="primary" if option.selected else "default",
                 disabled=not option.selectable,
@@ -325,10 +477,10 @@ class ProviderSelectionScreen(ModalScreen[str | None]):
             for index, option in enumerate(self.options)
         ]
         yield Vertical(
-            Label("Select provider profile", id="provider-title"),
+            Label(ui_text(self.language, "provider.title"), id="provider-title"),
             VerticalScroll(*buttons, id="provider-options"),
             Static(
-                "Switching profile starts a new conversation. Esc/Ctrl+C closes this picker.",
+                ui_text(self.language, "provider.help"),
                 id="provider-help",
             ),
             id="provider-dialog",
@@ -398,29 +550,45 @@ class SessionSelectionScreen(ModalScreen[str | None]):
         Binding("ctrl+c", "cancel", "Cancel", show=False),
     ]
 
-    def __init__(self, options: tuple[SessionOption, ...], *, query: str | None = None) -> None:
+    def __init__(
+        self,
+        options: tuple[SessionOption, ...],
+        *,
+        query: str | None = None,
+        language: UiLanguage = UiLanguage.ENGLISH,
+    ) -> None:
         super().__init__()
         self.options = options
         self.search_query = query
+        self.language = language
         self._choice_ids = {
             f"session-choice-{index}": option.session_id for index, option in enumerate(options)
         }
 
     @staticmethod
-    def _label(option: SessionOption) -> str:
+    def _label(
+        option: SessionOption,
+        language: UiLanguage = UiLanguage.ENGLISH,
+    ) -> str:
         markers: list[str] = []
         if option.current:
-            markers.append("current")
+            markers.append(ui_text(language, "marker.current"))
         if not option.source_profile_match:
-            markers.append(f"resume via {option.resume_profile}")
+            markers.append(ui_text(language, "session.resume_via", profile=option.resume_profile))
         if option.sandbox_profile is None:
-            markers.append("legacy sandbox")
+            markers.append(ui_text(language, "session.legacy_sandbox"))
         else:
-            markers.append(f"sandbox {option.sandbox_profile.value}")
+            markers.append(
+                ui_text(
+                    language,
+                    "session.sandbox",
+                    profile=option.sandbox_profile.value,
+                )
+            )
         if not option.sandbox_profile_match:
-            markers.append("restart required")
+            markers.append(ui_text(language, "session.restart_required"))
         if not option.selectable:
-            markers.append("unavailable")
+            markers.append(ui_text(language, "marker.unavailable"))
         suffix = f" ({' · '.join(markers)})" if markers else ""
         timestamp = option.updated_at.astimezone().strftime("%Y-%m-%d %H:%M")
         short_id = option.session_id if len(option.session_id) <= 12 else option.session_id[:12]
@@ -438,7 +606,7 @@ class SessionSelectionScreen(ModalScreen[str | None]):
     def compose(self) -> ComposeResult:
         buttons = [
             Button(
-                Text(self._label(option)),
+                Text(self._label(option, self.language)),
                 id=f"session-choice-{index}",
                 variant="primary" if option.current else "default",
                 disabled=not option.selectable,
@@ -449,16 +617,19 @@ class SessionSelectionScreen(ModalScreen[str | None]):
         yield Vertical(
             Label(
                 Text(
-                    f"Session search: {self.search_query}"
+                    ui_text(
+                        self.language,
+                        "session.search",
+                        query=self.search_query,
+                    )
                     if self.search_query is not None
-                    else "Workspace sessions"
+                    else ui_text(self.language, "session.title")
                 ),
                 id="session-title",
             ),
             VerticalScroll(*buttons, id="session-options"),
             Static(
-                "Only sessions from this workspace are listed. "
-                "Filter with /sessions QUERY. Esc/Ctrl+C closes this picker.",
+                ui_text(self.language, "session.help"),
                 id="session-help",
             ),
             id="session-dialog",
@@ -520,25 +691,59 @@ class NeuroCodeApp(App[None]):
     }
 
     #transcript {
+        width: 100%;
         height: 1fr;
-        padding: 1 2;
+        padding: 1 1;
         background: #101214;
         color: #d8dadd;
         border-bottom: solid #303338;
     }
 
-    #stream {
+    .conversation-message {
+        width: 100%;
         height: auto;
         min-height: 1;
-        max-height: 8;
-        padding: 0 2;
-        background: #141619;
+        margin-bottom: 1;
+        padding: 0 1;
         color: #d8dadd;
     }
 
+    .message-user {
+        padding: 1 1;
+        background: #292c30;
+        color: #e3e5e8;
+        border-left: solid #806b48;
+    }
+
+    .message-assistant {
+        background: #101214;
+        color: #e1e3e6;
+    }
+
+    .message-pending {
+        color: #8e939a;
+        text-style: italic;
+    }
+
+    .message-system {
+        color: #c7a15a;
+    }
+
+    .message-tool {
+        color: #b59663;
+    }
+
+    .message-status {
+        color: #8e939a;
+    }
+
+    .message-error {
+        color: #c76d6d;
+    }
+
     #prompt {
-        dock: bottom;
-        margin: 0 1 1 1;
+        height: 3;
+        margin: 0 1;
         background: #1a1c1f;
         color: #d8dadd;
         border: tall #3b3f44;
@@ -550,38 +755,28 @@ class NeuroCodeApp(App[None]):
         border: tall #806b48;
     }
 
-    Footer {
+    #shortcut-bar {
+        height: 1;
+        padding: 0 1;
         background: #141619;
         color: #a9adb3;
     }
 
-    FooterKey {
-        background: #141619;
-
-        .footer-key--key {
-            background: #141619;
-            color: #c7a15a;
-        }
-
-        .footer-key--description {
-            background: #141619;
-            color: #a9adb3;
-        }
-    }
-
     #provider-options Button:focus,
-    #session-options Button:focus {
+    #session-options Button:focus,
+    #settings-languages Button:focus {
         background: #292c30;
         color: #e1e3e6;
         border-left: solid #806b48;
     }
     """
     BINDINGS: ClassVar[list[BindingType]] = [
-        Binding("ctrl+c", "cancel_turn", "Cancel", priority=True),
-        Binding("ctrl+p", "select_provider", "Provider", priority=True),
-        Binding("ctrl+r", "select_session", "Sessions", priority=True),
-        Binding("ctrl+q", "quit", "Quit"),
-        Binding("ctrl+l", "clear_transcript", "Clear"),
+        Binding("ctrl+c", "cancel_turn", "Cancel", priority=True, show=False),
+        Binding("ctrl+p", "select_provider", "Provider", priority=True, show=False),
+        Binding("ctrl+r", "select_session", "Sessions", priority=True, show=False),
+        Binding("ctrl+comma", "open_settings", "Settings", priority=True, show=False),
+        Binding("ctrl+q", "quit", "Quit", show=False),
+        Binding("ctrl+l", "clear_transcript", "Clear", show=False),
     ]
 
     def __init__(
@@ -592,6 +787,8 @@ class NeuroCodeApp(App[None]):
         provider_controller: ProviderController | None = None,
         session_controller: SessionController | None = None,
         task_controller: TaskController | None = None,
+        ui_preferences: UiPreferencesStore | None = None,
+        language: UiLanguage = UiLanguage.ENGLISH,
         initial_items: Sequence[SessionItem] = (),
         provider_name: str,
         model_name: str,
@@ -605,12 +802,16 @@ class NeuroCodeApp(App[None]):
         self._provider_controller = provider_controller
         self._session_controller = session_controller
         self._task_controller = task_controller
+        self._ui_preferences = ui_preferences
+        self._language = language
         self._initial_items = tuple(initial_items)
         self._provider_name = provider_name
         self._model_name = model_name
         self._cwd = cwd
         self._entries: list[TranscriptEntry] = []
+        self._entry_widgets: list[ConversationMessage] = []
         self._assistant_parts: list[str] = []
+        self._pending_assistant: ConversationMessage | None = None
         self._reasoning_announced = False
         self._turn_worker: Worker[None] | None = None
         self._announced_terminal_tasks: set[str] = set()
@@ -622,25 +823,34 @@ class NeuroCodeApp(App[None]):
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True, icon="")
-        yield RichLog(id="transcript", wrap=True, highlight=False, markup=False)
-        yield Static("", id="stream")
-        yield Input(placeholder="Ask Neuro Code... (/help for commands)", id="prompt")
-        yield Footer()
+        yield VerticalScroll(id="transcript")
+        yield Input(
+            placeholder=ui_text(self._language, "prompt.placeholder"),
+            id="prompt",
+        )
+        yield Static(ui_text(self._language, "shortcuts"), id="shortcut-bar")
 
     def on_mount(self) -> None:
+        self._apply_language_to_chrome()
         if self._approval_controller is not None:
             self._approval_controller.set_handler(self._request_approval)
         if self._runner.session_id is not None:
             self._replace_transcript(self._initial_items)
-            self._write_entry(
+            self._write_ui_entry(
                 "system",
-                f"Resumed session {self._runner.session_id or 'unknown'} · "
-                f"{self._provider_name}/{self._model_name} · {self._cwd}",
+                "startup.resumed",
+                session_id=self._runner.session_id or ui_text(self._language, "value.unknown"),
+                provider=self._provider_name,
+                model=self._model_name,
+                cwd=self._cwd,
             )
         else:
-            self._write_entry(
+            self._write_ui_entry(
                 "system",
-                f"Ready · {self._provider_name}/{self._model_name} · {self._cwd}",
+                "startup.ready",
+                provider=self._provider_name,
+                model=self._model_name,
+                cwd=self._cwd,
             )
         if self._task_controller is not None:
             self.set_interval(_TASK_POLL_SECONDS, self._poll_background_tasks)
@@ -661,7 +871,9 @@ class NeuroCodeApp(App[None]):
             self._approval_controller.set_handler(None)
 
     async def _request_approval(self, request: PermissionRequest) -> PermissionApproval:
-        return await self.push_screen_wait(PermissionApprovalScreen(request))
+        return await self.push_screen_wait(
+            PermissionApprovalScreen(request, language=self._language)
+        )
 
     async def on_input_submitted(self, event: Input.Submitted) -> None:
         prompt = event.value.strip()
@@ -672,15 +884,13 @@ class NeuroCodeApp(App[None]):
             await self._dispatch_slash_command(prompt)
             return
         if self._turn_worker is not None and self._turn_worker.is_running:
-            self._write_entry("error", "A turn is already running.")
+            self._write_ui_entry("error", "turn.running")
             return
 
         self._write_entry("user", prompt)
         self._assistant_parts.clear()
         self._reasoning_announced = False
-        self.query_one("#stream", Static).update(
-            Text("Waiting for model response...", style="italic #8e939a")
-        )
+        self._begin_pending_assistant()
         self._turn_worker = self.run_worker(
             self._run_prompt(prompt),
             name="agent-turn",
@@ -691,18 +901,18 @@ class NeuroCodeApp(App[None]):
 
     async def _run_prompt(self, prompt: str) -> None:
         prompt_input = self.query_one("#prompt", Input)
-        stream = self.query_one("#stream", Static)
         try:
             result = await self._runner.run(prompt, sink=self._handle_event)
-            response = result.response or "(no text response)"
-            self._write_entry("assistant", response)
+            response = result.response or ui_text(self._language, "turn.no_response")
+            self._finish_pending_assistant(response)
         except asyncio.CancelledError:
-            self._write_entry("status", "Turn cancelled.")
+            await self._discard_pending_assistant()
+            self._write_ui_entry("status", "turn.cancelled")
             raise
         except Exception as error:
+            await self._discard_pending_assistant()
             self._write_entry("error", f"{type(error).__name__}: {error}")
         finally:
-            stream.update("")
             prompt_input.focus()
 
     async def _handle_event(self, event: AgentEvent) -> None:
@@ -711,60 +921,92 @@ class NeuroCodeApp(App[None]):
             text = data.get("text")
             if isinstance(text, str):
                 self._assistant_parts.append(text)
-                rendered = self._render_entry("assistant", "".join(self._assistant_parts))
-                self.query_one("#stream", Static).update(rendered)
+                self._update_pending_assistant("".join(self._assistant_parts))
         elif event.kind is AgentEventKind.REASONING_DELTA and not self._reasoning_announced:
             self._reasoning_announced = True
-            self._write_entry("status", "Reasoning...")
+            self._write_ui_entry("status", "turn.reasoning")
         elif event.kind is AgentEventKind.PROVIDER_ATTEMPT_FAILED:
             provider = self._field(data, "provider")
             message = self._field(data, "message")
-            self._write_entry("error", f"Provider {provider} failed before output: {message}")
+            self._write_ui_entry(
+                "error",
+                "provider.failed",
+                provider=provider,
+                message=message,
+            )
         elif event.kind is AgentEventKind.PROVIDER_SELECTED:
             provider = self._field(data, "provider")
             model = self._field(data, "model")
             self._provider_name = provider
             self._model_name = model
-            qualifier = "fallback selected" if data.get("failover") is True else "selected"
-            self._write_entry("status", f"Provider {provider}/{model} {qualifier}.")
+            key = (
+                "provider.fallback_selected"
+                if data.get("failover") is True
+                else "provider.selected"
+            )
+            self._write_ui_entry("status", key, provider=provider, model=model)
         elif event.kind is AgentEventKind.BACKEND_TOOL_STARTED:
-            self._write_entry("tool", f"Hosted tool {self._field(data, 'name')} started.")
+            self._write_ui_entry(
+                "tool",
+                "tool.hosted_started",
+                name=self._field(data, "name"),
+            )
         elif event.kind is AgentEventKind.BACKEND_TOOL_COMPLETED:
-            self._write_entry("tool", f"Hosted tool {self._field(data, 'name')} completed.")
+            self._write_ui_entry(
+                "tool",
+                "tool.hosted_completed",
+                name=self._field(data, "name"),
+            )
         elif event.kind is AgentEventKind.TOOL_REQUESTED:
-            self._write_entry("tool", f"Tool {self._field(data, 'name')} requested.")
+            self._write_ui_entry(
+                "tool",
+                "tool.requested",
+                name=self._field(data, "name"),
+            )
         elif event.kind is AgentEventKind.TOOL_PERMISSION:
             effect = self._field(data, "effect")
             if effect == "deny":
-                self._write_entry(
+                self._write_ui_entry(
                     "error",
-                    f"Tool {self._field(data, 'name')} permission: {effect} "
-                    f"({self._field(data, 'reason')}).",
+                    "tool.permission_denied",
+                    name=self._field(data, "name"),
+                    effect=effect,
+                    reason=self._field(data, "reason"),
                 )
         elif event.kind is AgentEventKind.TOOL_APPROVAL_REQUESTED:
-            self._write_entry(
+            self._write_ui_entry(
                 "status",
-                f"Tool {self._field(data, 'name')} is waiting for approval.",
+                "tool.awaiting_approval",
+                name=self._field(data, "name"),
             )
         elif event.kind is AgentEventKind.TOOL_APPROVAL_RESOLVED:
             effect = self._field(data, "effect")
             outcome = self._field(data, "outcome")
             category = "status" if effect == "allow" else "error"
-            self._write_entry(
+            self._write_ui_entry(
                 category,
-                f"Tool {self._field(data, 'name')} approval resolved: {outcome}.",
+                "tool.approval_resolved",
+                name=self._field(data, "name"),
+                outcome=outcome,
             )
         elif event.kind is AgentEventKind.TOOL_COMPLETED:
-            self._write_entry("tool", f"Tool {self._field(data, 'name')} completed.")
+            self._write_ui_entry(
+                "tool",
+                "tool.completed",
+                name=self._field(data, "name"),
+            )
         elif event.kind is AgentEventKind.TOOL_FAILED:
-            self._write_entry("error", f"Tool {self._field(data, 'name')} failed.")
+            self._write_ui_entry(
+                "error",
+                "tool.failed",
+                name=self._field(data, "name"),
+            )
 
-    @staticmethod
-    def _field(data: Mapping[str, Any], name: str) -> str:
+    def _field(self, data: Mapping[str, Any], name: str) -> str:
         value = data.get(name)
         if isinstance(value, str) and value:
             return value
-        return "unknown"
+        return ui_text(self._language, "value.unknown")
 
     async def _dispatch_slash_command(self, raw: str) -> None:
         command, _, arguments = raw[1:].partition(" ")
@@ -784,12 +1026,18 @@ class NeuroCodeApp(App[None]):
             return
         if command == "tasks":
             if arguments.strip():
-                self._write_entry("error", "/tasks does not accept arguments.")
+                self._write_ui_entry("error", "command.tasks_arguments")
                 return
             await self._show_background_tasks()
             return
+        if command in {"setting", "settings"}:
+            if arguments.strip():
+                self._write_ui_entry("error", "command.arguments", command=command)
+                return
+            await self.action_open_settings()
+            return
         if arguments.strip():
-            self._write_entry("error", f"/{command} does not accept arguments.")
+            self._write_ui_entry("error", "command.arguments", command=command)
             return
         if command in {"quit", "exit"}:
             self.exit()
@@ -798,31 +1046,36 @@ class NeuroCodeApp(App[None]):
         elif command == "clear":
             self.action_clear_transcript()
         elif command == "help":
-            self._write_entry(
-                "system",
-                "Commands: /help, /status, /provider [PROFILE] (alias /model), "
-                "/sessions [QUERY], /resume [SESSION_ID], /rename TITLE (alias /title), "
-                "/tasks, /cancel, /clear, /quit (alias /exit).",
-            )
+            self._write_ui_entry("system", "command.help")
         elif command == "status":
-            session_id = self._runner.session_id or "not created"
+            session_id = self._runner.session_id or ui_text(self._language, "command.not_created")
             profile = (
-                f" · Profile: {self._provider_controller.selected_profile}"
+                ui_text(
+                    self._language,
+                    "command.profile",
+                    profile=self._provider_controller.selected_profile,
+                )
                 if self._provider_controller is not None
                 else ""
             )
-            self._write_entry(
+            self._write_ui_entry(
                 "system",
-                f"Provider: {self._provider_name}/{self._model_name} · "
-                f"Session: {session_id}{profile} · CWD: {self._cwd}",
+                "command.status",
+                provider=self._provider_name,
+                model=self._model_name,
+                session=session_id,
+                profile=profile,
+                cwd=self._cwd,
             )
         else:
-            self._write_entry("error", f"Unknown command: /{command}. Use /help.")
+            self._write_ui_entry("error", "command.unknown", command=command)
 
     def action_clear_transcript(self) -> None:
-        self.query_one("#transcript", RichLog).clear()
+        transcript = self.query_one("#transcript", VerticalScroll)
+        transcript.remove_children(tuple(self._entry_widgets))
         self._entries.clear()
-        self._write_entry("system", "Transcript cleared.")
+        self._entry_widgets.clear()
+        self._write_ui_entry("system", "transcript.cleared")
 
     def action_cancel_turn(self) -> None:
         if isinstance(self.screen, PermissionApprovalScreen):
@@ -834,16 +1087,19 @@ class NeuroCodeApp(App[None]):
         if isinstance(self.screen, SessionSelectionScreen):
             self.screen.action_cancel()
             return
+        if isinstance(self.screen, SettingsScreen):
+            self.screen.action_cancel()
+            return
         if self._turn_worker is not None and self._turn_worker.is_running:
-            self._write_entry("status", "Cancellation requested.")
+            self._write_ui_entry("status", "turn.cancel_requested")
             self._turn_worker.cancel()
             return
         prompt = self.query_one("#prompt", Input)
         if prompt.value:
             prompt.value = ""
-            self._write_entry("status", "Draft cleared.")
+            self._write_ui_entry("status", "turn.draft_cleared")
         else:
-            self._write_entry("status", "No turn is running.")
+            self._write_ui_entry("status", "turn.none_running")
 
     async def action_select_provider(self) -> None:
         await self._select_provider(None)
@@ -851,17 +1107,47 @@ class NeuroCodeApp(App[None]):
     async def action_select_session(self) -> None:
         await self._select_session(None)
 
+    async def action_open_settings(self) -> None:
+        self.push_screen(
+            SettingsScreen(self._language, language=self._language),
+            self._settings_selected,
+        )
+
+    async def _settings_selected(self, language: UiLanguage | None) -> None:
+        if language is None or language is self._language:
+            return
+        self._language = language
+        self._refresh_localized_interface()
+        if self._ui_preferences is not None:
+            try:
+                await self._ui_preferences.save_language(language)
+            except Exception as error:
+                self._write_ui_entry(
+                    "error",
+                    "settings.save_failed",
+                    error=f"{type(error).__name__}: {error}",
+                )
+                return
+        self._write_ui_entry(
+            "system",
+            "settings.changed",
+            language=language_name(language, in_language=language),
+        )
+
     async def _select_provider(self, requested: str | None) -> None:
         if self._provider_controller is None:
-            self._write_entry("error", "Provider switching is unavailable.")
+            self._write_ui_entry("error", "provider.switch_unavailable")
             return
         if self._turn_worker is not None and self._turn_worker.is_running:
-            self._write_entry("error", "Cannot switch provider while a turn is running.")
+            self._write_ui_entry("error", "provider.switch_running")
             return
         profile_name = requested
         if profile_name is None:
             self.push_screen(
-                ProviderSelectionScreen(self._provider_controller.profiles),
+                ProviderSelectionScreen(
+                    self._provider_controller.profiles,
+                    language=self._language,
+                ),
                 self._provider_selected,
             )
             return
@@ -884,24 +1170,29 @@ class NeuroCodeApp(App[None]):
         if result.changed:
             self._reset_background_task_tracking()
         if not result.changed:
-            self._write_entry(
+            self._write_ui_entry(
                 "status",
-                f"Provider profile {result.profile_name} is already selected.",
+                "provider.already_selected",
+                profile=result.profile_name,
             )
         elif result.previous_session_id is None:
-            self._write_entry(
+            self._write_ui_entry(
                 "status",
-                f"Provider profile switched to {result.profile_name} "
-                f"({result.provider_name}/{result.model_name})."
-                f"{self._stopped_task_note(result.stopped_background_tasks)}",
+                "provider.switched",
+                profile=result.profile_name,
+                provider=result.provider_name,
+                model=result.model_name,
+                stopped=self._stopped_task_note(result.stopped_background_tasks),
             )
         else:
-            self._write_entry(
+            self._write_ui_entry(
                 "status",
-                f"Provider profile switched to {result.profile_name} "
-                f"({result.provider_name}/{result.model_name}). The previous session "
-                f"{result.previous_session_id} remains saved; the next prompt starts "
-                f"a new conversation.{self._stopped_task_note(result.stopped_background_tasks)}",
+                "provider.switched_saved",
+                profile=result.profile_name,
+                provider=result.provider_name,
+                model=result.model_name,
+                session_id=result.previous_session_id,
+                stopped=self._stopped_task_note(result.stopped_background_tasks),
             )
 
     async def _select_session(
@@ -911,10 +1202,10 @@ class NeuroCodeApp(App[None]):
         query: str | None = None,
     ) -> None:
         if self._session_controller is None:
-            self._write_entry("error", "Interactive session resume is unavailable.")
+            self._write_ui_entry("error", "session.resume_unavailable")
             return
         if self._turn_worker is not None and self._turn_worker.is_running:
-            self._write_entry("error", "Cannot resume a session while a turn is running.")
+            self._write_ui_entry("error", "session.resume_running")
             return
         if requested is not None:
             await self._apply_session_selection(requested)
@@ -925,32 +1216,37 @@ class NeuroCodeApp(App[None]):
             self._write_entry("error", f"{type(error).__name__}: {error}")
             return
         if not options:
-            qualifier = f" matching {query!r}" if query is not None else ""
-            self._write_entry(
-                "status",
-                f"No sessions found for this workspace{qualifier}.",
-            )
+            if query is None:
+                self._write_ui_entry("status", "session.none")
+            else:
+                self._write_ui_entry(
+                    "status",
+                    "session.none_matching",
+                    query=query,
+                )
             return
         self.push_screen(
-            SessionSelectionScreen(options, query=query),
+            SessionSelectionScreen(options, query=query, language=self._language),
             self._session_selected,
         )
 
     async def _rename_session(self, title: str) -> None:
         if self._session_controller is None:
-            self._write_entry("error", "Interactive session rename is unavailable.")
+            self._write_ui_entry("error", "session.rename_unavailable")
             return
         if self._turn_worker is not None and self._turn_worker.is_running:
-            self._write_entry("error", "Cannot rename a session while a turn is running.")
+            self._write_ui_entry("error", "session.rename_running")
             return
         try:
             summary = await self._session_controller.rename_session(title)
         except Exception as error:
             self._write_entry("error", f"{type(error).__name__}: {error}")
             return
-        self._write_entry(
+        self._write_ui_entry(
             "status",
-            f"Session {summary.id} renamed to {summary.title!r}.",
+            "session.renamed",
+            session_id=summary.id,
+            title=summary.title,
         )
 
     async def _session_selected(self, session_id: str | None) -> None:
@@ -968,34 +1264,52 @@ class NeuroCodeApp(App[None]):
         self._provider_name = result.provider_name
         self._model_name = result.model_name
         if not result.changed:
-            self._write_entry("status", f"Session {result.session_id} is already open.")
+            self._write_ui_entry(
+                "status",
+                "session.already_open",
+                session_id=result.session_id,
+            )
             return
 
         self._reset_background_task_tracking()
         self._replace_transcript(result.items)
         profile_note = (
-            f"profile {result.profile_name}"
+            ui_text(
+                self._language,
+                "session.profile",
+                profile=result.profile_name,
+            )
             if result.source_profile_match
-            else (
-                f"profile {result.profile_name}; source profile "
-                f"{result.source_provider} is not ready locally"
+            else ui_text(
+                self._language,
+                "session.profile_unavailable",
+                profile=result.profile_name,
+                source=result.source_provider,
             )
         )
         previous_note = (
-            f" Previous session {result.previous_session_id} remains saved."
+            ui_text(
+                self._language,
+                "session.previous_saved",
+                session_id=result.previous_session_id,
+            )
             if result.previous_session_id is not None
             else ""
         )
-        self._write_entry(
+        self._write_ui_entry(
             "system",
-            f"Resumed session {result.session_id} with {profile_note} "
-            f"({result.provider_name}/{result.model_name}).{previous_note}"
-            f"{self._stopped_task_note(result.stopped_background_tasks)}",
+            "session.resumed",
+            session_id=result.session_id,
+            profile_note=profile_note,
+            provider=result.provider_name,
+            model=result.model_name,
+            previous=previous_note,
+            stopped=self._stopped_task_note(result.stopped_background_tasks),
         )
 
     async def _show_background_tasks(self) -> None:
         if self._task_controller is None:
-            self._write_entry("error", "Background task visibility is unavailable.")
+            self._write_ui_entry("error", "tasks.unavailable")
             return
         try:
             snapshots = await self._task_controller.list_background_tasks()
@@ -1003,15 +1317,19 @@ class NeuroCodeApp(App[None]):
             self._write_entry("error", f"{type(error).__name__}: {error}")
             return
         if not snapshots:
-            self._write_entry("status", "No background tasks for the current session.")
+            self._write_ui_entry("status", "tasks.none")
             return
 
         visible = snapshots[-_TASK_LIST_LIMIT:]
         omitted = len(snapshots) - len(visible)
         lines = [self._task_summary(snapshot) for snapshot in visible]
         if omitted:
-            lines.insert(0, f"... {omitted} older task(s) omitted")
-        self._write_entry("system", "Background tasks:\n" + "\n".join(lines))
+            lines.insert(0, ui_text(self._language, "tasks.omitted", count=omitted))
+        self._write_ui_entry(
+            "system",
+            "tasks.heading",
+            lines="\n".join(lines),
+        )
 
     async def _poll_background_tasks(self) -> None:
         if self._task_controller is None or self._task_polling:
@@ -1041,43 +1359,61 @@ class NeuroCodeApp(App[None]):
     def _reset_background_task_tracking(self) -> None:
         self._announced_terminal_tasks.clear()
 
-    @staticmethod
-    def _task_summary(snapshot: BackgroundTaskSnapshot) -> str:
-        exit_note = f" · exit {snapshot.exit_code}" if snapshot.exit_code is not None else ""
-        truncation_note = " (preview truncated)" if snapshot.truncated else ""
+    def _task_summary(self, snapshot: BackgroundTaskSnapshot) -> str:
+        exit_note = (
+            ui_text(self._language, "tasks.exit", code=snapshot.exit_code)
+            if snapshot.exit_code is not None
+            else ""
+        )
+        truncation_note = ui_text(self._language, "tasks.truncated") if snapshot.truncated else ""
         started = snapshot.started_at.astimezone().strftime("%H:%M:%S")
-        return (
-            f"{snapshot.task_id} · {snapshot.status.value}{exit_note} · "
-            f"{snapshot.total_output_bytes} output bytes{truncation_note} · started {started}"
+        return ui_text(
+            self._language,
+            "tasks.summary",
+            task_id=snapshot.task_id,
+            status=ui_text(self._language, f"tasks.status.{snapshot.status.value}"),
+            exit_note=exit_note,
+            bytes=snapshot.total_output_bytes,
+            truncated=truncation_note,
+            started=started,
         )
 
-    @staticmethod
-    def _task_completion_message(snapshot: BackgroundTaskSnapshot) -> str:
-        descriptions = {
-            BackgroundTaskStatus.COMPLETED: "completed",
-            BackgroundTaskStatus.FAILED: "failed",
-            BackgroundTaskStatus.TIMED_OUT: "timed out",
-            BackgroundTaskStatus.CANCELLED: "was cancelled",
-        }
-        description = descriptions.get(snapshot.status, snapshot.status.value)
-        exit_note = f" (exit {snapshot.exit_code})" if snapshot.exit_code is not None else ""
-        return f"Background task {snapshot.task_id} {description}{exit_note}."
+    def _task_completion_message(self, snapshot: BackgroundTaskSnapshot) -> str:
+        exit_note = (
+            ui_text(self._language, "tasks.completion.exit", code=snapshot.exit_code)
+            if snapshot.exit_code is not None
+            else ""
+        )
+        return ui_text(
+            self._language,
+            f"tasks.completion.{snapshot.status.value}",
+            task_id=snapshot.task_id,
+            exit_note=exit_note,
+        )
 
-    @staticmethod
-    def _stopped_task_note(count: int) -> str:
+    def _stopped_task_note(self, count: int) -> str:
         if count == 0:
             return ""
-        noun = "task" if count == 1 else "tasks"
-        return f" Stopped {count} background {noun} from the previous session."
+        if count == 1:
+            return ui_text(self._language, "tasks.stopped_one")
+        return ui_text(self._language, "tasks.stopped_many", count=count)
 
     def _replace_transcript(self, items: Sequence[SessionItem]) -> None:
-        self.query_one("#transcript", RichLog).clear()
+        transcript = self.query_one("#transcript", VerticalScroll)
+        transcript.remove_children()
         self._entries.clear()
+        self._entry_widgets.clear()
+        self._pending_assistant = None
+        self._assistant_parts.clear()
         for item in items:
             if not isinstance(item, Message) or item.role is Role.SYSTEM:
                 continue
             if item.role is Role.TOOL:
-                self._write_entry("tool", f"Restored result for {item.name or 'unknown'}.")
+                self._write_ui_entry(
+                    "tool",
+                    "restore.result",
+                    name=item.name or ui_text(self._language, "value.unknown"),
+                )
                 continue
             content = self._bounded_restored_text(item.model_content())
             if content:
@@ -1085,29 +1421,148 @@ class NeuroCodeApp(App[None]):
                 self._write_entry(category, content)
             if item.role is Role.ASSISTANT and item.tool_calls:
                 names = ", ".join(call.name for call in item.tool_calls)
-                self._write_entry("tool", f"Restored tool request: {names}.")
+                self._write_ui_entry("tool", "restore.request", names=names)
 
-    @staticmethod
-    def _bounded_restored_text(content: str) -> str:
+    def _bounded_restored_text(self, content: str) -> str:
         if len(content) <= _RESTORED_MESSAGE_LIMIT:
             return content
-        return f"{content[:_RESTORED_MESSAGE_LIMIT]}\n... [restored message truncated]"
+        return (
+            f"{content[:_RESTORED_MESSAGE_LIMIT]}\n{ui_text(self._language, 'restore.truncated')}"
+        )
 
-    @staticmethod
-    def _render_entry(category: str, content: str) -> Text:
-        label, style = _ENTRY_LABELS.get(category, (category.title(), ""))
-        rendered = Text(f"{label}: ", style=style)
+    def _render_entry(self, category: str, content: str) -> Text:
+        if category == "user":
+            rendered = Text("> ", style="bold #a9adb3")
+            rendered.append(content, style="#e3e5e8")
+            return rendered
+        if category == "assistant":
+            rendered = Text("● ", style="bold #e1e3e6")
+            rendered.append(content, style="#e1e3e6")
+            return rendered
+
+        labels = {
+            "error": (ui_text(self._language, "label.error"), "bold #c76d6d"),
+            "status": (ui_text(self._language, "label.status"), "#8e939a"),
+            "system": ("Neuro Code", "bold #c7a15a"),
+            "tool": (ui_text(self._language, "label.tool"), "bold #b59663"),
+        }
+        label, style = labels.get(category, (category.title(), ""))
+        rendered = Text(f"{label}  ", style=style)
         rendered.append(content)
         return rendered
 
-    def _write_entry(self, category: str, content: str) -> None:
-        entry = TranscriptEntry(category, content)
+    def _write_ui_entry(self, category: str, key: str, **values: object) -> None:
+        self._write_entry(
+            category,
+            ui_text(self._language, key, **values),
+            ui_key=key,
+            ui_values=tuple(values.items()),
+        )
+
+    def _write_entry(
+        self,
+        category: str,
+        content: str,
+        *,
+        ui_key: str | None = None,
+        ui_values: tuple[tuple[str, object], ...] = (),
+    ) -> None:
+        entry = TranscriptEntry(category, content, ui_key, ui_values)
+        widget = ConversationMessage(category, self._render_entry(category, content))
+        transcript = self.query_one("#transcript", VerticalScroll)
+        follow = transcript.is_vertical_scroll_end
+        pending = self._pending_assistant
+        if pending is not None and pending.parent is transcript:
+            transcript.mount(widget, before=pending)
+        else:
+            transcript.mount(widget)
         self._entries.append(entry)
-        self.query_one("#transcript", RichLog).write(self._render_entry(category, content))
+        self._entry_widgets.append(widget)
+        if follow:
+            transcript.scroll_end(animate=False)
+
+    def _begin_pending_assistant(self) -> None:
+        if self._pending_assistant is not None:
+            return
+        waiting = ui_text(self._language, "turn.waiting")
+        pending = ConversationMessage(
+            "assistant",
+            self._render_entry("assistant", waiting),
+            pending=True,
+        )
+        self._pending_assistant = pending
+        transcript = self.query_one("#transcript", VerticalScroll)
+        transcript.mount(pending)
+        transcript.scroll_end(animate=False)
+
+    def _update_pending_assistant(self, content: str) -> None:
+        if self._pending_assistant is None:
+            self._begin_pending_assistant()
+        pending = self._pending_assistant
+        assert pending is not None
+        transcript = self.query_one("#transcript", VerticalScroll)
+        follow = transcript.is_vertical_scroll_end
+        pending.set_pending(False)
+        pending.update(self._render_entry("assistant", content))
+        if follow:
+            transcript.scroll_end(animate=False)
+
+    def _finish_pending_assistant(self, content: str) -> None:
+        if self._pending_assistant is None:
+            self._begin_pending_assistant()
+        pending = self._pending_assistant
+        assert pending is not None
+        transcript = self.query_one("#transcript", VerticalScroll)
+        follow = transcript.is_vertical_scroll_end
+        pending.set_pending(False)
+        pending.update(self._render_entry("assistant", content))
+        self._entries.append(TranscriptEntry("assistant", content))
+        self._entry_widgets.append(pending)
+        self._pending_assistant = None
+        if follow:
+            transcript.scroll_end(animate=False)
+
+    async def _discard_pending_assistant(self) -> None:
+        pending = self._pending_assistant
+        self._pending_assistant = None
+        self._assistant_parts.clear()
+        if pending is not None and pending.parent is not None:
+            await pending.remove()
+
+    def _apply_language_to_chrome(self) -> None:
+        self.sub_title = ui_text(self._language, "subtitle")
+        self.query_one("#prompt", Input).placeholder = ui_text(
+            self._language,
+            "prompt.placeholder",
+        )
+        self.query_one("#shortcut-bar", Static).update(ui_text(self._language, "shortcuts"))
+
+    def _refresh_localized_interface(self) -> None:
+        self._apply_language_to_chrome()
+        for index, (entry, widget) in enumerate(
+            zip(self._entries, self._entry_widgets, strict=True)
+        ):
+            if entry.ui_key is not None:
+                content = ui_text(
+                    self._language,
+                    entry.ui_key,
+                    **dict(entry.ui_values),
+                )
+                entry = replace(entry, text=content)
+                self._entries[index] = entry
+            widget.update(self._render_entry(entry.category, entry.text))
+        if self._pending_assistant is not None:
+            content = (
+                "".join(self._assistant_parts)
+                if self._assistant_parts
+                else ui_text(self._language, "turn.waiting")
+            )
+            self._pending_assistant.update(self._render_entry("assistant", content))
 
 
 __all__ = [
     "ApprovalController",
+    "ConversationMessage",
     "ConversationRunner",
     "NeuroCodeApp",
     "PermissionApprovalScreen",
@@ -1115,6 +1570,7 @@ __all__ = [
     "ProviderSelectionScreen",
     "SessionController",
     "SessionSelectionScreen",
+    "SettingsScreen",
     "TaskController",
     "TranscriptEntry",
 ]

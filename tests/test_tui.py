@@ -8,8 +8,9 @@ from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import patch
 
+from textual.containers import VerticalScroll
 from textual.geometry import Size
-from textual.widgets import Button, Input, Label, RichLog
+from textual.widgets import Button, Input, Label, Static
 
 from neuro_code.domain.background_tasks import BackgroundTaskSnapshot, BackgroundTaskStatus
 from neuro_code.domain.events import AgentEvent, AgentEventKind
@@ -24,6 +25,7 @@ from neuro_code.domain.messages import (
 )
 from neuro_code.domain.sandbox import SandboxProfile
 from neuro_code.domain.sessions import SessionSummary
+from neuro_code.domain.ui_preferences import UiLanguage
 from neuro_code.permissions import (
     PermissionApproval,
     PermissionApprovalKind,
@@ -38,10 +40,12 @@ from neuro_code.runtime.profile_conversation import (
     SessionSelectionResult,
 )
 from neuro_code.tui import (
+    ConversationMessage,
     NeuroCodeApp,
     PermissionApprovalScreen,
     ProviderSelectionScreen,
     SessionSelectionScreen,
+    SettingsScreen,
 )
 
 
@@ -173,6 +177,52 @@ class CancellableTuiConversation:
             self.cancelled = True
             raise
         raise AssertionError("unreachable")
+
+
+class StreamingTuiConversation:
+    def __init__(self) -> None:
+        self._session_id: str | None = None
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    @property
+    def session_id(self) -> str | None:
+        return self._session_id
+
+    async def run(self, prompt: str, *, sink: EventSink | None = None) -> AgentRunResult:
+        del prompt
+        self._session_id = "streaming-session"
+        first = AgentEvent.create(1, AgentEventKind.TEXT_DELTA, {"text": "partial"})
+        if sink is not None:
+            outcome = sink(first)
+            if inspect.isawaitable(outcome):
+                await outcome
+        self.started.set()
+        await self.release.wait()
+        second = AgentEvent.create(2, AgentEventKind.TEXT_DELTA, {"text": " response"})
+        if sink is not None:
+            outcome = sink(second)
+            if inspect.isawaitable(outcome):
+                await outcome
+        return AgentRunResult(
+            self._session_id,
+            "partial response",
+            (),
+            (),
+            (first, second),
+            1,
+        )
+
+
+class UiPreferencesFixture:
+    def __init__(self) -> None:
+        self.saved: list[UiLanguage] = []
+
+    async def load_language(self) -> UiLanguage:
+        return UiLanguage.ENGLISH
+
+    async def save_language(self, language: UiLanguage) -> None:
+        self.saved.append(language)
 
 
 class ProfileTuiController:
@@ -392,6 +442,116 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
                 )
             )
 
+    async def test_user_and_assistant_messages_use_distinct_unlabelled_blocks(self) -> None:
+        app = NeuroCodeApp(
+            TuiConversation(),
+            provider_name="fixture",
+            model_name="fixture-model",
+            cwd=Path("/workspace"),
+        )
+
+        async with app.run_test(size=(100, 30)) as pilot:
+            prompt = app.query_one("#prompt", Input)
+            prompt.value = "inspect the repository"
+            await pilot.press("enter")
+            for _ in range(20):
+                await pilot.pause(0.01)
+                if any(entry.category == "assistant" for entry in app.entries):
+                    break
+
+            messages = list(app.query(ConversationMessage))
+            user = next(message for message in messages if message.category == "user")
+            assistant = next(message for message in messages if message.category == "assistant")
+            user_text = str(user.renderable)
+            assistant_text = str(assistant.renderable)
+            self.assertTrue(user.has_class("message-user"))
+            self.assertTrue(assistant.has_class("message-assistant"))
+            self.assertTrue(user_text.startswith("> inspect the repository"))
+            self.assertIn("fixture response", assistant_text)
+            self.assertNotIn("You:", user_text)
+            self.assertNotIn("Assistant:", assistant_text)
+
+    async def test_streaming_response_updates_one_stable_transcript_node(self) -> None:
+        runner = StreamingTuiConversation()
+        app = NeuroCodeApp(
+            runner,
+            provider_name="fixture",
+            model_name="fixture-model",
+            cwd=Path("/workspace"),
+        )
+
+        async with app.run_test(size=(100, 30)) as pilot:
+            prompt = app.query_one("#prompt", Input)
+            prompt.value = "stream the answer"
+            await pilot.press("enter")
+            await asyncio.wait_for(runner.started.wait(), timeout=1)
+            await pilot.pause()
+
+            transcript = app.query_one("#transcript", VerticalScroll)
+            pending = app._pending_assistant
+            assert pending is not None
+            child_count = len(transcript.children)
+            self.assertIs(transcript.children[-1], pending)
+            self.assertEqual(prompt.value, "")
+            self.assertIn("partial", str(pending.renderable))
+            self.assertEqual(list(app.query("#stream")), [])
+
+            runner.release.set()
+            for _ in range(20):
+                await pilot.pause(0.01)
+                if any(entry.category == "assistant" for entry in app.entries):
+                    break
+
+            self.assertEqual(len(transcript.children), child_count)
+            self.assertIs(app._entry_widgets[-1], pending)
+            self.assertIs(pending.parent, transcript)
+            self.assertIn("partial response", str(pending.renderable))
+
+    async def test_settings_switches_and_persists_the_interface_language(self) -> None:
+        preferences = UiPreferencesFixture()
+        app = NeuroCodeApp(
+            TuiConversation(),
+            ui_preferences=preferences,
+            provider_name="fixture",
+            model_name="fixture-model",
+            cwd=Path("/workspace"),
+        )
+
+        async with app.run_test(size=(100, 30)) as pilot:
+            app._write_entry("assistant", "literal model response")
+            prompt = app.query_one("#prompt", Input)
+            prompt.value = "/setting"
+            await pilot.press("enter")
+            for _ in range(20):
+                await pilot.pause(0.01)
+                if isinstance(app.screen, SettingsScreen):
+                    break
+
+            self.assertIsInstance(app.screen, SettingsScreen)
+            clicked = await pilot.click("#settings-language-zh-cn")
+            self.assertTrue(clicked)
+            for _ in range(20):
+                await pilot.pause(0.01)
+                if preferences.saved:
+                    break
+
+            self.assertEqual(preferences.saved, [UiLanguage.SIMPLIFIED_CHINESE])
+            self.assertEqual(app.sub_title, "终端编程智能体")
+            self.assertIn("输入 /help", prompt.placeholder)
+            self.assertIn("设置", str(app.query_one("#shortcut-bar", Static).renderable))
+            self.assertTrue(app.entries[0].text.startswith("已就绪"))
+            self.assertIn(
+                "literal model response",
+                [entry.text for entry in app.entries if entry.category == "assistant"],
+            )
+            self.assertIn("界面语言已切换", app.entries[-1].text)
+
+            prompt.value = "/status"
+            await pilot.press("enter")
+            await pilot.pause()
+            self.assertIn("供应商", app.entries[-1].text)
+            self.assertIn("fixture/fixture-model", app.entries[-1].text)
+
     async def test_terminal_size_fallback_expands_the_full_screen_layout(self) -> None:
         app = NeuroCodeApp(
             TuiConversation(),
@@ -407,7 +567,11 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(app.screen.size, Size(132, 41))
             self.assertEqual(app.screen.region.size, Size(132, 41))
-            self.assertEqual(app.query_one("#transcript", RichLog).region.width, 132)
+            transcript = app.query_one("#transcript", VerticalScroll)
+            self.assertEqual(
+                transcript.region.width + transcript.scrollbar_size_vertical,
+                132,
+            )
             prompt = app.query_one("#prompt", Input)
             self.assertEqual(prompt.region.right, 131)
             self.assertEqual(prompt.region.bottom, 40)

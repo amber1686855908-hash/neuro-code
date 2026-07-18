@@ -65,10 +65,11 @@ response; an opt-in live test can do the same against a configured provider.
 
 ### M3 — core TUI and platform safety
 
-- Textual UI over the same event stream: prompt, scrollback, approval, safe
-  profile/session selection, workspace-scoped session search, session-scoped
-  task metadata/notices, richer tool cards, model picker, and essential slash
-  commands.
+- Textual UI over the same event stream: prompt, stable in-place streamed
+  conversation blocks, persistent English/Simplified-Chinese interface choice,
+  approval, safe profile/session selection, workspace-scoped session search,
+  session-scoped task metadata/notices, richer tool cards, model picker, and
+  essential slash commands.
 - Owned process trees, conversation-scoped managed background shell commands,
   bounded any/all multi-task waits, and completion metadata at explicit model
   boundaries; interactive PTY

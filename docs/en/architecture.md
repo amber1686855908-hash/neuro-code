@@ -102,6 +102,21 @@ provider and tool lifecycle events to status messages and deliberately does not
 render raw reasoning, general tool argument mappings, or tool results in the
 transcript. See [ADR 0014](adr/0014-minimal-event-stream-tui.md).
 
+The scrollback is a vertical conversation of stable message widgets rather
+than a pre-rendered log plus a temporary streaming surface. User prompts and
+assistant responses have distinct layouts. A pending assistant widget remains
+the final conversation node while lifecycle notices are inserted before it;
+text deltas and the terminal response update that same node. Auto-follow occurs
+only while the viewport is already at the end. See
+[ADR 0026](adr/0026-stable-localized-tui-conversation.md).
+
+Application-owned TUI text is selected through `UiLanguage`. The injected
+`UiPreferencesStore` port persists only that presentation choice, with the JSON
+adapter using an atomic user-state file separate from provider configuration.
+English and Simplified Chinese catalogs have identical keys. Switching language
+rerenders chrome and translatable local history, while user/model/tool payloads
+remain byte-for-byte presentation content and are never sent to a translator.
+
 The presentation adapter owns one fixed neutral-dark theme instead of exposing
 Textual's unrelated theme and command-palette surfaces. The built-in palette is
 disabled, provider and session discovery use the explicit application commands,

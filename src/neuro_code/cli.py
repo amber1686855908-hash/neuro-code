@@ -12,6 +12,7 @@ from neuro_code.adapters.background_tasks import LocalBackgroundTaskManager
 from neuro_code.adapters.rust_session import load_rust_session
 from neuro_code.adapters.sandbox import create_shell_sandbox, enforce_configured_sandbox
 from neuro_code.adapters.sqlite_session import SqliteSessionStore
+from neuro_code.adapters.ui_preferences import JsonUiPreferencesStore
 from neuro_code.async_utils import run_blocking
 from neuro_code.config import (
     AppConfig,
@@ -435,6 +436,8 @@ async def _run_tui(args: argparse.Namespace) -> int:
         store = SqliteSessionStore(config.state_dir / "sessions.db")
         config = await _pin_resume_sandbox(config, args.resume, store)
         _enforce_process_sandbox(config, args)
+        ui_preferences = JsonUiPreferencesStore(config.state_dir / "ui-preferences.json")
+        language = await ui_preferences.load_language()
         await store.initialize()
 
         async def compose_scoped(
@@ -529,6 +532,8 @@ async def _run_tui(args: argparse.Namespace) -> int:
             provider_controller=controller,
             session_controller=controller,
             task_controller=controller,
+            ui_preferences=ui_preferences,
+            language=language,
             initial_items=controller.items,
             provider_name=controller.provider_name,
             model_name=controller.model_name,

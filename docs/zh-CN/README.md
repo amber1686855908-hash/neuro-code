@@ -44,8 +44,9 @@ uv run neuro-code
 
 在开发环境之外安装构建产物时，使用 `pip install 'neuro-code[tui]'` 加入可选 UI 依赖。
 第一版 TUI 提供提示输入、滚动记录、assistant 流式文本、供应商/工具状态，以及本地
-`/help`、`/status`、`/provider`、`/model`、`/sessions [QUERY]`、`/resume`、`/cancel`、
-`/rename TITLE`（别名 `/title`）、`/clear`、`/quit` 和 `/exit` 命令。同一次启动中的提示
+`/help`、`/status`、`/settings`（别名 `/setting`）、`/provider`、`/model`、
+`/sessions [QUERY]`、`/resume`、`/cancel`、`/rename TITLE`（别名 `/title`）、`/clear`、
+`/quit` 和 `/exit` 命令。同一次启动中的提示
 会共享一个持久会话；`--resume SESSION_ID` 会在工作区校验通过后打开已有会话。
 
 全屏界面采用中性深色配色，只用克制的暖色表示焦点和系统状态。由于 `Ctrl+P` 已用于
@@ -53,6 +54,16 @@ uv run neuro-code
 `/sessions QUERY` 流程，不显示表情符号搜索图标。终端未正常送达尺寸变化通知时，应用还
 会校准真实 TTY 单元格尺寸，因此最大化或缩放窗口会重绘整个视口，不会把旧画布留在
 左上角。
+
+用户提示显示为占满整行的低对比度块，助手输出使用独立回答块，不再依靠 `You:` 与
+`Assistant:` 日志前缀区分。每条流式回答只在对话流中挂载一次，后续增量直到最终文本都
+原地更新，因此完成时不会再从临时区域移动到滚动记录；用户主动向上滚动后也不会被强制
+拉回底部。
+
+使用 `Ctrl+,`、`/settings` 或 `/setting` 可以选择英语或简体中文。切换会立即更新应用
+自有的控件、对话框和状态文案，但不会翻译用户提示、模型回答或工具内容。选择结果与
+供应商配置分开保存到 `$NEURO_CODE_HOME/ui-preferences.json`（通常为
+`~/.neuro-code/ui-preferences.json`），后续启动 TUI 时会继续使用。
 
 使用 `Ctrl+P`、不带参数的 `/provider` 或 `/model` 可以打开已配置 profile 选择器；
 `/provider PROFILE` 与 `/model PROFILE` 可以直接选择。选择器只展示 profile 名称、模型、

@@ -29,7 +29,9 @@ selection, rich rendering, or platform PTY behavior.
   `neuro-code agent -p ...` retain the machine-friendly headless path.
 - The TUI renders `AgentEvent` values and never mutates runtime state directly.
   Text deltas update the live response. Provider selection/failure and tool
-  lifecycle events become bounded status lines.
+  lifecycle events become bounded status lines. The later stable-message and
+  localization design is specified by
+  [ADR 0026](0026-stable-localized-tui-conversation.md).
 - The presentation uses one application-owned neutral-dark theme. Textual's
   built-in command palette is disabled because its `Ctrl+P` and emoji search
   surface conflict with the application's provider picker and plain-text
