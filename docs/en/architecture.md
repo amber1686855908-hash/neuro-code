@@ -134,6 +134,15 @@ reasoning, native records, arguments, image URLs, and raw tool-result content.
 See
 [ADR 0018](adr/0018-workspace-scoped-interactive-session-resume.md).
 
+The same catalog has a separate ranked-search path. `SessionStore` returns
+typed title/content hits from a synchronized SQLite FTS5 projection; the
+composition root applies filesystem-identity workspace filtering before the
+controller creates `SessionOption` values. `/sessions QUERY` displays the saved
+or deterministic first-prompt title plus an optional literal-text snippet.
+System messages, provider-preserved items, assistant private reasoning, tool
+arguments/metadata, raw tool-result content, and image URLs never enter that projection. See
+[ADR 0025](adr/0025-session-title-and-full-text-search.md).
+
 The operating-system sandbox is also part of session identity. Native sessions
 persist the canonical creation profile. Explicit-ID startup performs an
 immutable read-only SQLite metadata lookup before process sandbox enforcement;
@@ -173,8 +182,8 @@ continues to fail closed. See
 - `PermissionApprover`: optionally resolves an `ask` asynchronously without
   overriding policy denial.
 - `SessionStore`: appends versioned events, preserves ordered `SessionItem`
-  values, and exposes both the canonical sequence and an ordinary-message
-  projection.
+  values, exposes canonical and ordinary-message projections, and returns
+  typed, paginated session-title/content search pages.
 - `PlatformAdapter`: encapsulates PTY, process, signal, path, clipboard, and sandbox differences.
 
 Protocol models are versioned at external boundaries. Internal state prefers
@@ -281,6 +290,9 @@ pair from terminal backend output when intermediate events were absent.
   and unsupported stored values also fail closed.
 - Restored TUI history never renders persisted reasoning, native provider
   records, tool arguments, image URLs, or raw tool-result content.
+- Session search indexes only its visible local projection. Interactive hits
+  remain workspace-scoped and saved queries/titles/snippets are rendered as
+  literal text rather than UI markup.
 - Cancellation terminates owned child processes, commits a terminal failure,
   saves balanced context, and reloads it before the next conversation turn.
 - Shell commands execute in an owned process group. Timeout and cancellation
@@ -305,7 +317,11 @@ events. JSON and Markdown are interchange/export formats. The database exposes
 an integer schema version; every change requires forward migration, fixture
 coverage, and a documented compatibility decision. Schema v3 adds a nullable
 canonical sandbox profile: new sessions store a value, while migrated legacy
-sessions retain `NULL`. Startup can inspect that single field through an
+sessions retain `NULL`. Schema v4 adds stable optional titles and a
+trigger-synchronized external-content FTS5 projection. Migration derives a
+ten-word title from the first visible user message when no imported title
+exists and backfills escaped conversation content without indexing private
+provider items. Startup can inspect the sandbox field through an
 immutable read-only connection before any database creation, migration, or
 process sandbox activation. Rust sessions are parsed by
 a separate read-only adapter. It validates format versions 0 and 1, reads
@@ -325,7 +341,8 @@ provider JSON and relative order. The runtime carries the complete ordered
 sequence into each model step while application views continue to use the
 ordinary-message projection. When it resumes an imported session, storage
 permits append-only extension but rejects rewriting the preserved prefix. JSON
-export schema 3 includes both projections and the session sandbox profile.
+export schema 4 includes both projections, the session sandbox profile, and the
+optional title.
 Provider adapters validate image
 references and use native multimodal blocks only where the wire role and URI
 form are supported; all other images become a visible placeholder without

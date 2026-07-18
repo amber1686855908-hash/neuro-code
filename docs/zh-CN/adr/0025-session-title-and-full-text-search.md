@@ -1,0 +1,69 @@
+# ADR 0025：会话标题与全文搜索
+
+**简体中文** · [English](../../en/adr/0025-session-title-and-full-text-search.md)
+
+- 状态：已接受
+- 日期：2026-07-18
+- 源基线：`c68e39f60462f28d9be5e683d9cbe2c57b1a5027`
+
+## 背景
+
+当一个状态数据库积累很多对话后，仅列出近期会话已经不够。用户需要按照标题、提示、
+回复或工具活动找到会话，而不能让 UI 每次加载并解析所有 JSON 对话。TUI 搜索仍必须
+限定工作区，并且不能把供应商私有推理、加密原生上下文、图片 URL 或系统指令变成可见
+摘要。
+
+固定 Rust 基线通过
+`crates/codegen/xai-grok-shell/src/extensions/session_search.rs` 暴露带排序和分页的会话
+搜索，在 `crates/codegen/xai-grok-shell/src/session/storage/search_fts.rs` 中实现 SQLite
+FTS5 标题/内容索引，并在
+`crates/codegen/xai-grok-shell/src/session/helpers/session_summary.rs` 中于模型标题生成失败时
+回退到用户消息的前十个词。
+
+## 决策
+
+扩展带类型的 `SessionStore` 端口，增加 `search_sessions`，并返回由带类型
+`SessionSearchHit` 组成的 `SessionSearchPage`。每个结果把规范 `SessionSummary` 与有限
+分数、命中字段及可选有界 FTS 摘要组合起来。
+
+SQLite schema v4 为会话摘要增加稳定的可选标题，并增加由插入、更新、删除触发器同步的
+外部内容 FTS5 表。v3 到 v4 的迁移在同一个数据库事务内从已有有序会话项回填标题和搜索
+文档。初始化会修复缺失文档；每次消息/会话项保存或只读 Rust 导入，都在提交规范会话状态
+的同一事务中更新索引。
+
+原生会话从第一条可见用户消息生成确定性标题：先移除 system-reminder 块，再保留前十个
+词。后续轮次不会替换标题。只读导入会保留有效的上游 `generated_title`；本切片不需要
+辅助模型请求。
+
+可搜索投影包含用户/assistant 消息的可见文本与工具名称，并明确排除系统消息、原始工具
+结果内容、工具参数/元数据、`PreservedContextItem` 载荷、assistant
+`reasoning_content` 和图片 URL。
+搜索使用经过清理、支持 Unicode 的前缀 Token，先要求全部 Token 命中；只有交集为空时
+才改用 OR 查询。BM25 中标题权重是内容的十倍。精确 cwd 过滤、offset、总数和可选摘要
+属于适配器契约。
+
+脚本通过 `neuro-code sessions search QUERY` 使用该能力，TUI 则使用 `/sessions QUERY`。
+TUI 在显示结果前按文件系统身份过滤工作区，并把保存标题、用户查询及摘要作为字面
+`Text` 渲染，绝不解释为 Textual markup。控制器会保留搜索结果背后已经校验的摘要，
+因此较旧的命中无需同时出现在近期会话页中；选择时仍会重新计算当前 profile 与沙箱
+可用性，然后继续执行普通的打开阶段工作区校验。
+
+JSON 会话导出升级到 schema version 4，并包含可选标题。
+
+## 影响
+
+- 搜索采用增量索引和相关性排序，不需要反复扫描、解析所有 `messages_json`。
+- Python/SQLite 构建缺少 FTS5 时会明确阻止初始化，而不是悄悄声称没有匹配会话。
+- 搜索摘要只能显示已存在于本地可见对话投影中的内容；不会索引供应商私有或仅系统可见
+  上下文。
+- CLI 搜索覆盖所选状态数据库；交互搜索还会执行活动工作区身份限制和已有安全恢复校验。
+- 模型生成标题、手动重命名、带防抖的实时选择器搜索框、更完整的词干规则和 ACP 暴露
+  仍属于后续切片。
+
+## 被否决的方案
+
+- 不采用对序列化 JSON 执行 `LIKE` 扫描，因为它没有排序、容易受转义影响，并随完整
+  对话库线性增长。
+- 不索引完整供应商原生载荷，因为加密或私有连续性数据不能变成显示界面。
+- 本切片不让标题生成依赖第二次付费模型调用，因为在离线或供应商失败时，会话持久化与
+  搜索仍必须成功。

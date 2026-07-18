@@ -29,6 +29,7 @@ from neuro_code.domain.messages import (
     SessionItem,
 )
 from neuro_code.domain.sandbox import SandboxProfile
+from neuro_code.domain.session_search import SessionSearchHit
 from neuro_code.domain.sessions import SessionSummary
 from neuro_code.errors import ConfigurationError, NeuroCodeError
 from neuro_code.permissions import (
@@ -106,9 +107,18 @@ def build_parser() -> argparse.ArgumentParser:
     agent_parser = subparsers.add_parser("agent", help="run the headless agent")
     _add_run_arguments(agent_parser)
 
-    sessions_parser = subparsers.add_parser("sessions", help="list persisted sessions")
+    sessions_parser = subparsers.add_parser("sessions", help="list or search persisted sessions")
+    sessions_parser.add_argument(
+        "session_action",
+        nargs="?",
+        choices=("list", "search"),
+        default="list",
+    )
+    sessions_parser.add_argument("query", nargs="?")
     sessions_parser.add_argument("--json", action="store_true")
     sessions_parser.add_argument("--limit", type=int, default=50)
+    sessions_parser.add_argument("--offset", type=int, default=0)
+    sessions_parser.add_argument("--include-content", action="store_true")
     sessions_parser.add_argument("--cwd", type=Path, help="configuration working directory")
 
     export_parser = subparsers.add_parser("export", help="export a persisted session")
@@ -452,10 +462,20 @@ async def _run_tui(args: argparse.Namespace) -> int:
             )
 
         async def list_workspace_sessions() -> tuple[SessionSummary, ...]:
-            sessions = await store.list_sessions(limit=50)
+            sessions = await store.list_sessions(limit=1000)
             return tuple(
                 session for session in sessions if workspaces_match(session.cwd, config.cwd)
+            )[:50]
+
+        async def search_workspace_sessions(query: str) -> tuple[SessionSearchHit, ...]:
+            page = await store.search_sessions(
+                query,
+                limit=1000,
+                include_content=True,
             )
+            return tuple(
+                hit for hit in page.results if workspaces_match(hit.summary.cwd, config.cwd)
+            )[:50]
 
         async def bind_session(profile_name: str, session_id: str) -> ConversationBinding:
             selected_config = override_provider(config, provider=profile_name)
@@ -475,6 +495,7 @@ async def _run_tui(args: argparse.Namespace) -> int:
             binding=ConversationBinding(conversation, provider, task_scope),
             binding_factory=bind_profile,
             session_catalog=list_workspace_sessions,
+            session_search=search_workspace_sessions,
             session_binding_factory=bind_session,
             sandbox_profile=config.sandbox_profile,
         )
@@ -551,10 +572,41 @@ def _providers_command(args: argparse.Namespace) -> int:
     return 0
 
 
-async def _list_sessions(args: argparse.Namespace) -> int:
+async def _sessions_command(args: argparse.Namespace) -> int:
     config = load_config(args.cwd)
     store = SqliteSessionStore(config.state_dir / "sessions.db")
     await store.initialize()
+    if args.session_action == "search":
+        if args.query is None or not args.query.strip():
+            raise ConfigurationError("sessions search requires a non-empty query")
+        page = await store.search_sessions(
+            args.query,
+            limit=args.limit,
+            offset=args.offset,
+            include_content=args.include_content,
+        )
+        if args.json:
+            print(json.dumps(page.to_dict(), ensure_ascii=False))
+        elif not page.results:
+            print("No matching sessions found.")
+        else:
+            for hit in page.results:
+                session = hit.summary
+                title = session.title or "New session"
+                fields = ",".join(hit.matched_fields)
+                print(
+                    f"{session.id}\t{session.updated_at.isoformat()}\t"
+                    f"{session.provider}/{session.model}\t{title}\tmatch={fields}"
+                )
+                if hit.snippet is not None:
+                    print(f"  {hit.snippet}")
+        return 0
+    if args.query is not None:
+        raise ConfigurationError("sessions list does not accept a query")
+    if args.offset != 0 or args.include_content:
+        raise ConfigurationError(
+            "--offset and --include-content are only valid for sessions search"
+        )
     sessions = await store.list_sessions(limit=args.limit)
     if args.json:
         print(json.dumps([session.to_dict() for session in sessions], ensure_ascii=False))
@@ -566,7 +618,7 @@ async def _list_sessions(args: argparse.Namespace) -> int:
                 f"{session.id}\t{session.updated_at.isoformat()}\t"
                 f"{session.provider}/{session.model}\t"
                 f"sandbox={session.sandbox_profile.value if session.sandbox_profile else 'legacy'}"
-                f"\t{session.cwd}"
+                f"\t{session.title or 'New session'}\t{session.cwd}"
             )
     return 0
 
@@ -654,7 +706,7 @@ async def _export_session(args: argparse.Namespace) -> int:
         content = (
             json.dumps(
                 {
-                    "schema_version": 3,
+                    "schema_version": 4,
                     "session": summary.to_dict(),
                     "messages": [message.to_dict() for message in messages],
                     "conversation_items": [item.to_dict() for item in items],
@@ -726,7 +778,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command == "providers":
             return _providers_command(args)
         if args.command == "sessions":
-            return asyncio.run(_list_sessions(args))
+            return asyncio.run(_sessions_command(args))
         if args.command == "export":
             return asyncio.run(_export_session(args))
         if args.command == "import-session":

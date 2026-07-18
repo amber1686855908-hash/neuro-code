@@ -6,6 +6,7 @@ from typing import Protocol
 from neuro_code.domain.events import AgentEvent
 from neuro_code.domain.messages import Message, SessionItem
 from neuro_code.domain.sandbox import SandboxProfile
+from neuro_code.domain.session_search import SessionSearchPage
 from neuro_code.domain.sessions import SessionSnapshot, SessionSummary
 
 
@@ -42,5 +43,15 @@ class SessionStore(Protocol):
     async def next_event_sequence(self, session_id: str) -> int: ...
 
     async def list_sessions(self, *, limit: int = 50) -> list[SessionSummary]: ...
+
+    async def search_sessions(
+        self,
+        query: str,
+        *,
+        cwd: str | None = None,
+        limit: int = 20,
+        offset: int = 0,
+        include_content: bool = False,
+    ) -> SessionSearchPage: ...
 
     async def get_session(self, session_id: str) -> SessionSummary: ...

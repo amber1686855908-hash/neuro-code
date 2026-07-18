@@ -54,7 +54,7 @@ class ProviderController(Protocol):
 
 
 class SessionController(Protocol):
-    async def list_sessions(self) -> tuple[SessionOption, ...]: ...
+    async def list_sessions(self, query: str | None = None) -> tuple[SessionOption, ...]: ...
 
     async def select_session(self, session_id: str) -> SessionSelectionResult: ...
 
@@ -245,7 +245,7 @@ class ProviderSelectionScreen(ModalScreen[str | None]):
     def compose(self) -> ComposeResult:
         buttons = [
             Button(
-                self._label(option),
+                Text(self._label(option)),
                 id=f"provider-choice-{index}",
                 variant="primary" if option.selected else "default",
                 disabled=not option.selectable,
@@ -326,9 +326,10 @@ class SessionSelectionScreen(ModalScreen[str | None]):
         Binding("ctrl+c", "cancel", "Cancel", show=False),
     ]
 
-    def __init__(self, options: tuple[SessionOption, ...]) -> None:
+    def __init__(self, options: tuple[SessionOption, ...], *, query: str | None = None) -> None:
         super().__init__()
         self.options = options
+        self.search_query = query
         self._choice_ids = {
             f"session-choice-{index}": option.session_id for index, option in enumerate(options)
         }
@@ -351,12 +352,21 @@ class SessionSelectionScreen(ModalScreen[str | None]):
         suffix = f" ({' · '.join(markers)})" if markers else ""
         timestamp = option.updated_at.astimezone().strftime("%Y-%m-%d %H:%M")
         short_id = option.session_id if len(option.session_id) <= 12 else option.session_id[:12]
-        return f"{short_id} · {timestamp} · {option.source_provider}/{option.source_model}{suffix}"
+        title = option.title or short_id
+        identity = f"{short_id} · " if option.title is not None and option.title != short_id else ""
+        snippet = ""
+        if option.snippet:
+            bounded = " ".join(option.snippet.split())[:120]
+            snippet = f" · {bounded}"
+        return (
+            f"{title} · {identity}{timestamp} · "
+            f"{option.source_provider}/{option.source_model}{suffix}{snippet}"
+        )
 
     def compose(self) -> ComposeResult:
         buttons = [
             Button(
-                self._label(option),
+                Text(self._label(option)),
                 id=f"session-choice-{index}",
                 variant="primary" if option.current else "default",
                 disabled=not option.selectable,
@@ -365,10 +375,18 @@ class SessionSelectionScreen(ModalScreen[str | None]):
             for index, option in enumerate(self.options)
         ]
         yield Vertical(
-            Label("Resume workspace session", id="session-title"),
+            Label(
+                Text(
+                    f"Search workspace sessions: {self.search_query}"
+                    if self.search_query is not None
+                    else "Resume workspace session"
+                ),
+                id="session-title",
+            ),
             VerticalScroll(*buttons, id="session-options"),
             Static(
-                "Only sessions from this workspace are listed. Esc/Ctrl+C closes this picker.",
+                "Only sessions from this workspace are listed. "
+                "Use /sessions QUERY for content search. Esc/Ctrl+C closes this picker.",
                 id="session-help",
             ),
             id="session-dialog",
@@ -609,10 +627,10 @@ class NeuroCodeApp(App[None]):
             return
         if command in {"resume", "sessions"}:
             requested = arguments.strip() or None
-            if command == "sessions" and requested is not None:
-                self._write_entry("error", "/sessions does not accept arguments.")
-                return
-            await self._select_session(requested)
+            if command == "sessions":
+                await self._select_session(None, query=requested)
+            else:
+                await self._select_session(requested)
             return
         if command == "tasks":
             if arguments.strip():
@@ -633,7 +651,7 @@ class NeuroCodeApp(App[None]):
             self._write_entry(
                 "system",
                 "Commands: /help, /status, /provider [PROFILE] (alias /model), "
-                "/sessions, /resume [SESSION_ID], /tasks, /cancel, /clear, "
+                "/sessions [QUERY], /resume [SESSION_ID], /tasks, /cancel, /clear, "
                 "/quit (alias /exit).",
             )
         elif command == "status":
@@ -736,7 +754,12 @@ class NeuroCodeApp(App[None]):
                 f"a new conversation.{self._stopped_task_note(result.stopped_background_tasks)}",
             )
 
-    async def _select_session(self, requested: str | None) -> None:
+    async def _select_session(
+        self,
+        requested: str | None,
+        *,
+        query: str | None = None,
+    ) -> None:
         if self._session_controller is None:
             self._write_entry("error", "Interactive session resume is unavailable.")
             return
@@ -747,14 +770,21 @@ class NeuroCodeApp(App[None]):
             await self._apply_session_selection(requested)
             return
         try:
-            options = await self._session_controller.list_sessions()
+            options = await self._session_controller.list_sessions(query)
         except Exception as error:
             self._write_entry("error", f"{type(error).__name__}: {error}")
             return
         if not options:
-            self._write_entry("status", "No sessions found for this workspace.")
+            qualifier = f" matching {query!r}" if query is not None else ""
+            self._write_entry(
+                "status",
+                f"No sessions found for this workspace{qualifier}.",
+            )
             return
-        self.push_screen(SessionSelectionScreen(options), self._session_selected)
+        self.push_screen(
+            SessionSelectionScreen(options, query=query),
+            self._session_selected,
+        )
 
     async def _session_selected(self, session_id: str | None) -> None:
         if session_id is not None:

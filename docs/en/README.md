@@ -48,7 +48,7 @@ uv run neuro-code
 When installing the built package outside the development environment, include
 the optional UI dependency with `pip install 'neuro-code[tui]'`. The initial TUI
 provides prompt input, scrollback, streamed assistant text, provider/tool status,
-and local `/help`, `/status`, `/provider`, `/model`, `/sessions`, `/resume`,
+and local `/help`, `/status`, `/provider`, `/model`, `/sessions [QUERY]`, `/resume`,
 `/cancel`, `/clear`, `/quit`, and `/exit` commands. Prompts in one launch share a durable session;
 `--resume SESSION_ID` opens an existing session after workspace validation.
 
@@ -63,9 +63,14 @@ conversation, preventing provider-affine or encrypted context from crossing
 provider boundaries.
 
 Use `Ctrl+R`, `/sessions`, or bare `/resume` to open the 50 most recent sessions
-for the active workspace; `/resume SESSION_ID` selects directly. The picker
-shows only a shortened ID, update time, stored provider/model, and resume
-profile—not prompts, endpoints, credentials, or other workspaces. Resume prefers
+for the active workspace; `/resume SESSION_ID` selects directly.
+`/sessions QUERY` first performs workspace-scoped full-text search over saved
+titles and visible conversation content. The picker shows the deterministic
+first-prompt title (or an imported title), shortened ID, update time, stored
+provider/model, resume profile, and a bounded snippet for search results.
+Queries, titles, and snippets render as literal text. System messages,
+provider-private reasoning/native items, image URLs, tool arguments/metadata,
+and raw tool-result content are not indexed. Resume prefers
 a ready configured source profile. Otherwise it uses the current ready profile
 while stored source/model/affinity metadata continues to filter incompatible
 provider-native context fail closed. The previously active session remains
@@ -391,6 +396,8 @@ Resume, list, export, and import sessions:
 ```bash
 neuro-code -p "Continue the work" --resume SESSION_ID
 neuro-code sessions --json
+neuro-code sessions search "sqlite migration"
+neuro-code sessions search "sqlite migration" --json --include-content --limit 20
 neuro-code export SESSION_ID --format markdown --output transcript.md
 neuro-code import-session /path/to/upstream/session --json
 ```
@@ -401,10 +408,11 @@ atomically creates a new SQLite session while preserving the source session
 ID, workspace, model, and timestamps. A duplicate session ID is rejected
 rather than overwritten. The JSON report identifies skipped corrupt or
 unsupported records. Ordered reasoning/backend-tool records and image URLs are
-preserved structurally. JSON export schema version 3 exposes the complete
+preserved structurally. JSON export schema version 4 exposes the complete
 `conversation_items` sequence alongside its ordinary `messages` projection.
-It also reports the canonical saved sandbox profile or `null` for a legacy
-session. A recognized built-in profile from an upstream summary is preserved;
+It also reports the canonical saved sandbox profile and optional title, or
+`null` for a legacy sandbox profile. A recognized built-in profile and
+`generated_title` from an upstream summary are preserved;
 an unsupported custom profile is rejected instead of silently downgraded.
 Legacy assistant `raw_output`, singular reasoning, and v0
 `reasoning_content` are upgraded in memory; backend-tool IDs prevent an

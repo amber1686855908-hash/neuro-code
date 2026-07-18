@@ -32,6 +32,7 @@ from neuro_code.domain.model_events import (
     ModelTextDelta,
     ModelToolCall,
 )
+from neuro_code.domain.session_search import SessionSearchHit, SessionSearchPage
 from neuro_code.domain.sessions import SessionSnapshot, SessionSummary
 from neuro_code.domain.tools import ToolDefinition, ToolResult
 
@@ -62,6 +63,8 @@ __all__ = [
     "PreservedContextItem",
     "Role",
     "SessionItem",
+    "SessionSearchHit",
+    "SessionSearchPage",
     "SessionSnapshot",
     "SessionSummary",
     "ToolCall",

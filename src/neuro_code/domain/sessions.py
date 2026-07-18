@@ -6,6 +6,8 @@ from datetime import datetime
 from neuro_code.domain.messages import Message, SessionItem
 from neuro_code.domain.sandbox import SandboxProfile
 
+MAX_SESSION_TITLE_CHARS = 200
+
 
 @dataclass(frozen=True, slots=True)
 class SessionSummary:
@@ -17,6 +19,7 @@ class SessionSummary:
     updated_at: datetime
     context_affinity: str | None = None
     sandbox_profile: SandboxProfile | None = None
+    title: str | None = None
 
     def __post_init__(self) -> None:
         if not all((self.id, self.cwd, self.provider, self.model)):
@@ -25,6 +28,11 @@ class SessionSummary:
             raise ValueError("session timestamps must be timezone-aware")
         if self.context_affinity == "":
             raise ValueError("session context affinity must not be empty")
+        if self.title is not None:
+            normalized_title = " ".join(self.title.split())
+            if not normalized_title:
+                raise ValueError("session title must not be empty")
+            object.__setattr__(self, "title", normalized_title[:MAX_SESSION_TITLE_CHARS])
         if self.sandbox_profile is not None and not isinstance(
             self.sandbox_profile, SandboxProfile
         ):
@@ -42,6 +50,7 @@ class SessionSummary:
             "sandbox_profile": (
                 self.sandbox_profile.value if self.sandbox_profile is not None else None
             ),
+            "title": self.title,
         }
 
 

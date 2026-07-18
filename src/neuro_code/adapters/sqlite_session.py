@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
+import re
 import sqlite3
 import uuid
 from collections.abc import Sequence
@@ -23,10 +25,17 @@ from neuro_code.domain.messages import (
     ToolCall,
 )
 from neuro_code.domain.sandbox import SandboxProfile
+from neuro_code.domain.session_search import (
+    SessionSearchHit,
+    SessionSearchPage,
+    fallback_session_title,
+    searchable_session_text,
+)
 from neuro_code.domain.sessions import SessionSnapshot, SessionSummary
 from neuro_code.errors import SessionError
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
+_SEARCH_SNIPPET_LIMIT = 500
 
 
 class SqliteSessionStore:
@@ -104,10 +113,25 @@ class SqliteSessionStore:
                         connection.execute("ALTER TABLE sessions ADD COLUMN sandbox_profile TEXT")
                     connection.execute("UPDATE schema_meta SET version = 3 WHERE singleton = 1")
                     version = (3,)
+                if version is not None and version[0] == 3:
+                    columns = {
+                        str(row[1])
+                        for row in connection.execute("PRAGMA table_info(sessions)").fetchall()
+                    }
+                    if "title" not in columns:
+                        connection.execute(
+                            "ALTER TABLE sessions ADD COLUMN title TEXT NOT NULL DEFAULT ''"
+                        )
+                    _ensure_search_schema(connection)
+                    _backfill_search_documents(connection)
+                    connection.execute("UPDATE schema_meta SET version = 4 WHERE singleton = 1")
+                    version = (4,)
                 if version is None or version[0] != SCHEMA_VERSION:
                     raise SessionError(
                         f"unsupported session schema version: {version[0] if version else 'missing'}"
                     )
+                _ensure_search_schema(connection)
+                _backfill_search_documents(connection, missing_only=True)
 
         await run_blocking(initialize_sync)
 
@@ -146,6 +170,8 @@ class SqliteSessionStore:
     async def import_session(self, snapshot: SessionSnapshot) -> str:
         summary = snapshot.summary
         payload = _serialize_session_items(snapshot.items)
+        title = summary.title or fallback_session_title(snapshot.items)
+        search_content = searchable_session_text(snapshot.items)
 
         def import_snapshot() -> None:
             try:
@@ -154,8 +180,8 @@ class SqliteSessionStore:
                         """
                         INSERT INTO sessions(
                             id, cwd, provider, model, created_at, updated_at,
-                            messages_json, context_affinity, sandbox_profile
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            messages_json, context_affinity, sandbox_profile, title
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             summary.id,
@@ -171,7 +197,14 @@ class SqliteSessionStore:
                                 if summary.sandbox_profile is not None
                                 else None
                             ),
+                            title,
                         ),
+                    )
+                    _upsert_search_document(
+                        connection,
+                        session_id=summary.id,
+                        title=title,
+                        content=search_content,
                     )
             except sqlite3.IntegrityError as error:
                 raise SessionError(f"session already exists: {summary.id}") from error
@@ -241,7 +274,7 @@ class SqliteSessionStore:
         def save() -> None:
             with closing(self._connect()) as connection, connection:
                 row = connection.execute(
-                    "SELECT messages_json FROM sessions WHERE id = ?", (session_id,)
+                    "SELECT messages_json, title FROM sessions WHERE id = ?", (session_id,)
                 ).fetchone()
                 if row is None:
                     raise SessionError(f"unknown session: {session_id}")
@@ -270,16 +303,23 @@ class SqliteSessionStore:
                 else:
                     items = list(new_messages)
                 payload = _serialize_session_items(items)
+                title = str(row[1]) or fallback_session_title(items)
                 cursor = connection.execute(
                     """
                     UPDATE sessions
-                    SET messages_json = ?, updated_at = CURRENT_TIMESTAMP
+                    SET messages_json = ?, title = ?, updated_at = CURRENT_TIMESTAMP
                     WHERE id = ?
                     """,
-                    (payload, session_id),
+                    (payload, title, session_id),
                 )
                 if cursor.rowcount != 1:
                     raise SessionError(f"unknown session: {session_id}")
+                _upsert_search_document(
+                    connection,
+                    session_id=session_id,
+                    title=title,
+                    content=searchable_session_text(items),
+                )
 
         async with self._write_lock:
             await run_blocking(save)
@@ -294,7 +334,7 @@ class SqliteSessionStore:
         def save() -> None:
             with closing(self._connect()) as connection, connection:
                 row = connection.execute(
-                    "SELECT messages_json FROM sessions WHERE id = ?", (session_id,)
+                    "SELECT messages_json, title FROM sessions WHERE id = ?", (session_id,)
                 ).fetchone()
                 if row is None:
                     raise SessionError(f"unknown session: {session_id}")
@@ -310,16 +350,23 @@ class SqliteSessionStore:
                 ):
                     raise SessionError("cannot rewrite the persisted session item prefix")
                 payload = _serialize_session_items(new_items)
+                title = str(row[1]) or fallback_session_title(new_items)
                 cursor = connection.execute(
                     """
                     UPDATE sessions
-                    SET messages_json = ?, updated_at = CURRENT_TIMESTAMP
+                    SET messages_json = ?, title = ?, updated_at = CURRENT_TIMESTAMP
                     WHERE id = ?
                     """,
-                    (payload, session_id),
+                    (payload, title, session_id),
                 )
                 if cursor.rowcount != 1:
                     raise SessionError(f"unknown session: {session_id}")
+                _upsert_search_document(
+                    connection,
+                    session_id=session_id,
+                    title=title,
+                    content=searchable_session_text(new_items),
+                )
 
         async with self._write_lock:
             await run_blocking(save)
@@ -391,7 +438,7 @@ class SqliteSessionStore:
                 rows = connection.execute(
                     """
                     SELECT id, cwd, provider, model, created_at, updated_at,
-                           context_affinity, sandbox_profile
+                           context_affinity, sandbox_profile, title
                     FROM sessions ORDER BY updated_at DESC, id DESC LIMIT ?
                     """,
                     (limit,),
@@ -400,13 +447,58 @@ class SqliteSessionStore:
 
         return await run_blocking(load)
 
+    async def search_sessions(
+        self,
+        query: str,
+        *,
+        cwd: str | None = None,
+        limit: int = 20,
+        offset: int = 0,
+        include_content: bool = False,
+    ) -> SessionSearchPage:
+        normalized_query = query.strip()
+        if not normalized_query:
+            raise SessionError("session search query must not be empty")
+        if len(normalized_query) > 1000:
+            raise SessionError("session search query must not exceed 1000 characters")
+        if cwd == "":
+            raise SessionError("session search cwd must not be empty")
+        if not 1 <= limit <= 1000:
+            raise SessionError("session search limit must be between 1 and 1000")
+        if not 0 <= offset <= 1_000_000:
+            raise SessionError("session search offset must be between 0 and 1000000")
+        and_query, or_query = _search_match_queries(normalized_query)
+
+        def search() -> SessionSearchPage:
+            with closing(self._connect()) as connection:
+                page = _run_session_search(
+                    connection,
+                    match_query=and_query,
+                    cwd=cwd,
+                    limit=limit,
+                    offset=offset,
+                    include_content=include_content,
+                )
+                if page.total_estimate == 0 and and_query != or_query:
+                    return _run_session_search(
+                        connection,
+                        match_query=or_query,
+                        cwd=cwd,
+                        limit=limit,
+                        offset=offset,
+                        include_content=include_content,
+                    )
+                return page
+
+        return await run_blocking(search)
+
     async def get_session(self, session_id: str) -> SessionSummary:
         def load() -> SessionSummary:
             with closing(self._connect()) as connection:
                 row = connection.execute(
                     """
                     SELECT id, cwd, provider, model, created_at, updated_at,
-                           context_affinity, sandbox_profile
+                           context_affinity, sandbox_profile, title
                     FROM sessions WHERE id = ?
                     """,
                     (session_id,),
@@ -482,6 +574,209 @@ class SqliteSessionStore:
             return _parse_sandbox_profile(row[0], session_id=session_id)
 
         return await run_blocking(peek)
+
+
+def _ensure_search_schema(connection: sqlite3.Connection) -> None:
+    try:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS session_search_documents (
+                session_id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                content TEXT NOT NULL,
+                FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE VIRTUAL TABLE IF NOT EXISTS session_search_fts USING fts5(
+                title,
+                content,
+                content = 'session_search_documents',
+                content_rowid = 'rowid',
+                tokenize = 'unicode61 remove_diacritics 2'
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TRIGGER IF NOT EXISTS session_search_documents_ai
+            AFTER INSERT ON session_search_documents BEGIN
+                INSERT INTO session_search_fts(rowid, title, content)
+                VALUES (new.rowid, new.title, new.content);
+            END
+            """
+        )
+        connection.execute(
+            """
+            CREATE TRIGGER IF NOT EXISTS session_search_documents_ad
+            AFTER DELETE ON session_search_documents BEGIN
+                INSERT INTO session_search_fts(session_search_fts, rowid, title, content)
+                VALUES ('delete', old.rowid, old.title, old.content);
+            END
+            """
+        )
+        connection.execute(
+            """
+            CREATE TRIGGER IF NOT EXISTS session_search_documents_au
+            AFTER UPDATE OF title, content ON session_search_documents BEGIN
+                INSERT INTO session_search_fts(session_search_fts, rowid, title, content)
+                VALUES ('delete', old.rowid, old.title, old.content);
+                INSERT INTO session_search_fts(rowid, title, content)
+                VALUES (new.rowid, new.title, new.content);
+            END
+            """
+        )
+    except sqlite3.OperationalError as error:
+        if "fts5" in str(error).casefold():
+            raise SessionError("the installed SQLite build does not support FTS5") from error
+        raise
+
+
+def _backfill_search_documents(
+    connection: sqlite3.Connection,
+    *,
+    missing_only: bool = False,
+) -> None:
+    condition = "WHERE documents.session_id IS NULL" if missing_only else ""
+    rows = connection.execute(
+        f"""
+        SELECT sessions.id, sessions.messages_json, sessions.title
+        FROM sessions
+        LEFT JOIN session_search_documents AS documents
+          ON documents.session_id = sessions.id
+        {condition}
+        """
+    ).fetchall()
+    for session_id, payload, saved_title in rows:
+        try:
+            items = _session_items_from_json(payload)
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            items = []
+        title = str(saved_title) or fallback_session_title(items)
+        if not saved_title:
+            connection.execute(
+                "UPDATE sessions SET title = ? WHERE id = ?",
+                (title, session_id),
+            )
+        _upsert_search_document(
+            connection,
+            session_id=str(session_id),
+            title=title,
+            content=searchable_session_text(items),
+        )
+
+
+def _upsert_search_document(
+    connection: sqlite3.Connection,
+    *,
+    session_id: str,
+    title: str,
+    content: str,
+) -> None:
+    connection.execute(
+        """
+        INSERT INTO session_search_documents(session_id, title, content)
+        VALUES (?, ?, ?)
+        ON CONFLICT(session_id) DO UPDATE SET
+            title = excluded.title,
+            content = excluded.content
+        """,
+        (session_id, title, content),
+    )
+
+
+def _search_match_queries(query: str) -> tuple[str, str]:
+    tokens = [
+        token
+        for token in re.findall(r"[\w-]+", query, flags=re.UNICODE)
+        if any(character.isalnum() for character in token)
+    ]
+    if not tokens:
+        raise SessionError("session search query contains no searchable text")
+    prefixes = [_search_token_prefix(token) for token in tokens]
+    return " AND ".join(prefixes), " OR ".join(prefixes)
+
+
+def _search_token_prefix(token: str) -> str:
+    stem = token
+    lower = token.casefold()
+    if len(token) >= 4 and token.isascii() and token.isalpha():
+        if lower.endswith("es"):
+            stem = token[:-2]
+        elif lower.endswith("s") and not lower.endswith("ss"):
+            stem = token[:-1]
+    escaped = stem.replace('"', '""')
+    return f'"{escaped}"*'
+
+
+def _run_session_search(
+    connection: sqlite3.Connection,
+    *,
+    match_query: str,
+    cwd: str | None,
+    limit: int,
+    offset: int,
+    include_content: bool,
+) -> SessionSearchPage:
+    total_row = connection.execute(
+        """
+        SELECT COUNT(*)
+        FROM session_search_fts
+        JOIN session_search_documents AS documents
+          ON documents.rowid = session_search_fts.rowid
+        JOIN sessions ON sessions.id = documents.session_id
+        WHERE session_search_fts MATCH ?
+          AND (? IS NULL OR sessions.cwd = ?)
+        """,
+        (match_query, cwd, cwd),
+    ).fetchone()
+    total = int(total_row[0]) if total_row is not None else 0
+    snippet_expression = (
+        "snippet(session_search_fts, 1, '[', ']', ' … ', 18)" if include_content else "NULL"
+    )
+    rows = connection.execute(
+        f"""
+        SELECT sessions.id, sessions.cwd, sessions.provider, sessions.model,
+               sessions.created_at, sessions.updated_at, sessions.context_affinity,
+               sessions.sandbox_profile, sessions.title,
+               bm25(session_search_fts, 10.0, 1.0) AS rank,
+               {snippet_expression} AS snippet,
+               highlight(session_search_fts, 0, char(1), char(2)) AS title_highlight,
+               highlight(session_search_fts, 1, char(1), char(2)) AS content_highlight
+        FROM session_search_fts
+        JOIN session_search_documents AS documents
+          ON documents.rowid = session_search_fts.rowid
+        JOIN sessions ON sessions.id = documents.session_id
+        WHERE session_search_fts MATCH ?
+          AND (? IS NULL OR sessions.cwd = ?)
+        ORDER BY rank ASC, sessions.updated_at DESC, sessions.id ASC
+        LIMIT ? OFFSET ?
+        """,
+        (match_query, cwd, cwd, limit, offset),
+    ).fetchall()
+    results: list[SessionSearchHit] = []
+    for row in rows:
+        rank = float(row[9])
+        score = -rank if math.isfinite(rank) else 0.0
+        matched_fields: list[str] = []
+        if "\x01" in str(row[11]):
+            matched_fields.append("title")
+        if "\x01" in str(row[12]):
+            matched_fields.append("content")
+        if not matched_fields:
+            matched_fields.append("content")
+        results.append(
+            SessionSearchHit(
+                summary=_summary_from_row(row[:9]),
+                score=score,
+                matched_fields=tuple(matched_fields),
+                snippet=(str(row[10])[:_SEARCH_SNIPPET_LIMIT] if row[10] is not None else None),
+            )
+        )
+    next_offset = offset + len(results) if offset + len(results) < total else None
+    return SessionSearchPage(tuple(results), next_offset, total)
 
 
 def _serialize_session_items(items: Sequence[SessionItem]) -> str:
@@ -578,6 +873,7 @@ def _summary_from_row(row: tuple[Any, ...]) -> SessionSummary:
         sandbox_profile=(
             _parse_sandbox_profile(row[7], session_id=str(row[0])) if row[7] is not None else None
         ),
+        title=str(row[8]) if row[8] else None,
     )
 
 

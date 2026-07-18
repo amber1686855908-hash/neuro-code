@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import unittest
 from collections.abc import AsyncIterator, Sequence
+from dataclasses import replace
 from datetime import UTC, datetime
 from typing import cast
 
@@ -11,6 +12,7 @@ from neuro_code.domain.messages import Message, Role, SessionItem
 from neuro_code.domain.model_context import ModelContext
 from neuro_code.domain.model_events import ModelEvent
 from neuro_code.domain.sandbox import SandboxProfile
+from neuro_code.domain.session_search import SessionSearchHit
 from neuro_code.domain.sessions import SessionSummary
 from neuro_code.domain.tools import ToolDefinition
 from neuro_code.errors import ConfigurationError
@@ -142,6 +144,62 @@ def summary(
 
 
 class ProfileConversationControllerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_session_search_projects_ranked_metadata_into_picker_options(self) -> None:
+        searched: list[str] = []
+        result_summary = replace(
+            summary("search-result", "second", "second-model"),
+            title="Escaped SQLite search",
+        )
+
+        async def bind_profile(name: str) -> ConversationBinding:
+            return ConversationBinding(FixtureConversation(), FixtureProvider(name, "model"))
+
+        async def list_sessions() -> tuple[SessionSummary, ...]:
+            return ()
+
+        async def search_sessions(query: str) -> tuple[SessionSearchHit, ...]:
+            searched.append(query)
+            return (
+                SessionSearchHit(
+                    result_summary,
+                    2.5,
+                    ("title", "content"),
+                    "[SQLite] session content",
+                ),
+            )
+
+        async def bind_session(profile: str, session_id: str) -> ConversationBinding:
+            return ConversationBinding(
+                FixtureConversation(session_id),
+                FixtureProvider(profile, "model"),
+            )
+
+        controller = ProfileConversationController(
+            options=(option("first"), option("second")),
+            selected_profile="first",
+            binding=ConversationBinding(
+                FixtureConversation("current"),
+                FixtureProvider("first", "first-model"),
+            ),
+            binding_factory=bind_profile,
+            session_catalog=list_sessions,
+            session_search=search_sessions,
+            session_binding_factory=bind_session,
+        )
+
+        options = await controller.list_sessions("  SQLite quoted  ")
+
+        self.assertEqual(searched, ["SQLite quoted"])
+        self.assertEqual(len(options), 1)
+        self.assertEqual(options[0].title, "Escaped SQLite search")
+        self.assertEqual(options[0].matched_fields, ("title", "content"))
+        self.assertEqual(options[0].snippet, "[SQLite] session content")
+
+        selection = await controller.select_session("search-result")
+        self.assertTrue(selection.changed)
+        self.assertEqual(selection.session_id, "search-result")
+        self.assertEqual(controller.selected_profile, "second")
+
     async def test_task_visibility_tracks_binding_and_switch_closes_old_scope(self) -> None:
         old_tasks = FixtureTaskScope(
             (

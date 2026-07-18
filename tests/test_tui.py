@@ -250,6 +250,7 @@ class SessionTuiController:
     def __init__(self, *, current_session: str = "current-session") -> None:
         self._session_id = current_session
         self.selected: list[str] = []
+        self.queries: list[str | None] = []
         timestamp = datetime(2026, 7, 18, 9, 30, tzinfo=UTC)
         self.options = (
             SessionOption(
@@ -261,6 +262,7 @@ class SessionTuiController:
                 current_session == "current-session",
                 True,
                 True,
+                title="Current workspace session",
             ),
             SessionOption(
                 "target-session-123456789",
@@ -271,6 +273,9 @@ class SessionTuiController:
                 current_session == "target-session-123456789",
                 True,
                 True,
+                title="Escaped quoted session",
+                matched_fields=("title", "content"),
+                snippet="[quoted] content from the restored conversation",
             ),
         )
 
@@ -282,7 +287,14 @@ class SessionTuiController:
         del prompt, sink
         return AgentRunResult(self._session_id, "ok", (), (), (), 1)
 
-    async def list_sessions(self) -> tuple[SessionOption, ...]:
+    async def list_sessions(self, query: str | None = None) -> tuple[SessionOption, ...]:
+        self.queries.append(query)
+        if query is not None:
+            return tuple(
+                option
+                for option in self.options
+                if query.casefold() in f"{option.title or ''} {option.snippet or ''}".casefold()
+            )
         return self.options
 
     async def select_session(self, session_id: str) -> SessionSelectionResult:
@@ -776,6 +788,33 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
             await pilot.press("ctrl+c")
             await pilot.pause()
             self.assertNotIsInstance(app.screen, SessionSelectionScreen)
+
+    async def test_sessions_command_searches_titles_and_content_before_opening_picker(self) -> None:
+        controller = SessionTuiController()
+        app = NeuroCodeApp(
+            controller,
+            session_controller=controller,
+            provider_name="first",
+            model_name="first-model",
+            cwd=Path("/workspace"),
+        )
+
+        async with app.run_test(size=(120, 35)) as pilot:
+            prompt = app.query_one("#prompt", Input)
+            prompt.value = "/sessions quoted"
+            await pilot.press("enter")
+            for _ in range(20):
+                await pilot.pause(0.01)
+                if isinstance(app.screen, SessionSelectionScreen):
+                    break
+
+            self.assertIsInstance(app.screen, SessionSelectionScreen)
+            self.assertEqual(controller.queries, ["quoted"])
+            self.assertEqual(app.screen.search_query, "quoted")
+            labels = "\n".join(str(button.label) for button in app.screen.query(Button))
+            self.assertIn("Escaped quoted session", labels)
+            self.assertIn("[quoted] content", labels)
+            await pilot.press("escape")
 
     async def test_direct_session_resume_is_blocked_while_a_turn_is_running(self) -> None:
         runner = CancellableTuiConversation()

@@ -9,6 +9,7 @@ from typing import Protocol
 from neuro_code.domain.background_tasks import BackgroundTaskSnapshot, BackgroundTaskStatus
 from neuro_code.domain.messages import SessionItem
 from neuro_code.domain.sandbox import SandboxProfile
+from neuro_code.domain.session_search import SessionSearchHit
 from neuro_code.domain.sessions import SessionSummary
 from neuro_code.errors import ConfigurationError
 from neuro_code.ports.background_tasks import BackgroundTaskManager
@@ -70,6 +71,9 @@ class SessionOption:
     selectable: bool
     sandbox_profile: SandboxProfile | None = None
     sandbox_profile_match: bool = True
+    title: str | None = None
+    matched_fields: tuple[str, ...] = ()
+    snippet: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -89,6 +93,7 @@ class SessionSelectionResult:
 
 BindingFactory = Callable[[str], Awaitable[ConversationBinding]]
 SessionCatalog = Callable[[], Awaitable[Sequence[SessionSummary]]]
+SessionSearch = Callable[[str], Awaitable[Sequence[SessionSearchHit]]]
 SessionBindingFactory = Callable[[str, str], Awaitable[ConversationBinding]]
 
 
@@ -103,6 +108,7 @@ class ProfileConversationController:
         binding: ConversationBinding,
         binding_factory: BindingFactory,
         session_catalog: SessionCatalog | None = None,
+        session_search: SessionSearch | None = None,
         session_binding_factory: SessionBindingFactory | None = None,
         sandbox_profile: SandboxProfile = SandboxProfile.OFF,
     ) -> None:
@@ -120,7 +126,11 @@ class ProfileConversationController:
                 "session catalog and session binding factory must be configured together"
             )
         self._session_catalog = session_catalog
+        if session_search is not None and session_catalog is None:
+            raise ValueError("session search requires a session catalog")
+        self._session_search = session_search
         self._session_binding_factory = session_binding_factory
+        self._known_session_summaries: dict[str, SessionSummary] = {}
         self._sandbox_profile = sandbox_profile
         self._turn_lock = asyncio.Lock()
 
@@ -190,34 +200,32 @@ class ProfileConversationController:
                 stopped_background_tasks=stopped_background_tasks,
             )
 
-    async def list_sessions(self) -> tuple[SessionOption, ...]:
+    async def list_sessions(self, query: str | None = None) -> tuple[SessionOption, ...]:
         if self._session_catalog is None:
             raise ConfigurationError("interactive session resume is unavailable")
 
-        summaries = await self._session_catalog()
+        normalized_query = query.strip() if query is not None else None
+        entries: tuple[tuple[SessionSummary, SessionSearchHit | None], ...]
+        if normalized_query:
+            if self._session_search is None:
+                raise ConfigurationError("interactive session search is unavailable")
+            hits = await self._session_search(normalized_query)
+            entries = tuple((hit.summary, hit) for hit in hits)
+        else:
+            summaries = await self._session_catalog()
+            entries = tuple((summary, None) for summary in summaries)
         options: list[SessionOption] = []
         seen_ids: set[str] = set()
-        for summary in summaries:
+        for summary, hit in entries:
             if summary.id in seen_ids:
                 continue
             seen_ids.add(summary.id)
-            resume_profile, source_profile_match, selectable = self._resume_profile(summary)
-            current = summary.id == self.session_id
-            sandbox_profile_match = (
-                summary.sandbox_profile is None or summary.sandbox_profile is self._sandbox_profile
-            )
+            self._known_session_summaries[summary.id] = summary
             options.append(
-                SessionOption(
-                    session_id=summary.id,
-                    source_provider=summary.provider,
-                    source_model=summary.model,
-                    updated_at=summary.updated_at,
-                    resume_profile=resume_profile,
-                    current=current,
-                    source_profile_match=source_profile_match,
-                    selectable=current or (selectable and sandbox_profile_match),
-                    sandbox_profile=summary.sandbox_profile,
-                    sandbox_profile_match=sandbox_profile_match,
+                self._session_option(
+                    summary,
+                    matched_fields=hit.matched_fields if hit is not None else (),
+                    snippet=hit.snippet if hit is not None else None,
                 )
             )
         return tuple(options)
@@ -228,12 +236,15 @@ class ProfileConversationController:
         async with self._turn_lock:
             if self._session_binding_factory is None:
                 raise ConfigurationError("interactive session resume is unavailable")
-            options = {option.session_id: option for option in await self.list_sessions()}
-            option = options.get(session_id)
-            if option is None:
+            summary = self._known_session_summaries.get(session_id)
+            if summary is None:
+                await self.list_sessions()
+                summary = self._known_session_summaries.get(session_id)
+            if summary is None:
                 raise ConfigurationError(
                     f"session does not exist in the current workspace: {session_id}"
                 )
+            option = self._session_option(summary)
             if option.current:
                 return self._session_selection_result(
                     option,
@@ -297,6 +308,34 @@ class ProfileConversationController:
             return source_profile.name, True, True
         selected = profiles[self._selected_profile]
         return selected.name, False, selected.selectable
+
+    def _session_option(
+        self,
+        summary: SessionSummary,
+        *,
+        matched_fields: tuple[str, ...] = (),
+        snippet: str | None = None,
+    ) -> SessionOption:
+        resume_profile, source_profile_match, selectable = self._resume_profile(summary)
+        current = summary.id == self.session_id
+        sandbox_profile_match = (
+            summary.sandbox_profile is None or summary.sandbox_profile is self._sandbox_profile
+        )
+        return SessionOption(
+            session_id=summary.id,
+            source_provider=summary.provider,
+            source_model=summary.model,
+            updated_at=summary.updated_at,
+            resume_profile=resume_profile,
+            current=current,
+            source_profile_match=source_profile_match,
+            selectable=current or (selectable and sandbox_profile_match),
+            sandbox_profile=summary.sandbox_profile,
+            sandbox_profile_match=sandbox_profile_match,
+            title=summary.title,
+            matched_fields=matched_fields,
+            snippet=snippet,
+        )
 
     def _selection_result(
         self,

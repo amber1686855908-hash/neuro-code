@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 import tempfile
 import unittest
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -62,7 +64,12 @@ class SessionStoreTests(unittest.IsolatedAsyncioTestCase):
             imported_id = await store.import_session(snapshot)
 
             self.assertEqual(imported_id, "imported-id")
-            self.assertEqual(await store.get_session(imported_id), snapshot.summary)
+            imported_summary = await store.get_session(imported_id)
+            self.assertEqual(imported_summary.title, "imported")
+            self.assertEqual(
+                replace(imported_summary, title=None),
+                snapshot.summary,
+            )
             self.assertEqual(await store.load_messages(imported_id), list(snapshot.messages))
             self.assertEqual(await store.load_session_items(imported_id), list(snapshot.items))
             self.assertEqual(await store.load_events(imported_id), [])
@@ -209,7 +216,7 @@ class SessionStoreTests(unittest.IsolatedAsyncioTestCase):
             ).fetchone()
             columns = {row[1] for row in migrated.execute("PRAGMA table_info(sessions)").fetchall()}
             migrated.close()
-            self.assertEqual(version, (3,))
+            self.assertEqual(version, (4,))
             self.assertIn("context_affinity", columns)
             self.assertIn("sandbox_profile", columns)
 
@@ -269,9 +276,221 @@ class SessionStoreTests(unittest.IsolatedAsyncioTestCase):
             migrated = sqlite3.connect(database)
             self.assertEqual(
                 migrated.execute("SELECT version FROM schema_meta WHERE singleton = 1").fetchone(),
-                (3,),
+                (4,),
             )
             migrated.close()
+
+    async def test_schema_v3_migration_backfills_escaped_content_search(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "sessions.db"
+            messages = [
+                {
+                    "role": "user",
+                    "content": 'debug escaped newlines\nand "quoted" sqlite content',
+                }
+            ]
+            connection = sqlite3.connect(database)
+            connection.executescript(
+                """
+                CREATE TABLE schema_meta (
+                    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                    version INTEGER NOT NULL
+                );
+                INSERT INTO schema_meta(singleton, version) VALUES (1, 3);
+                CREATE TABLE sessions (
+                    id TEXT PRIMARY KEY,
+                    cwd TEXT NOT NULL,
+                    provider TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    messages_json TEXT NOT NULL DEFAULT '[]',
+                    context_affinity TEXT,
+                    sandbox_profile TEXT
+                );
+                CREATE TABLE events (
+                    session_id TEXT NOT NULL,
+                    sequence INTEGER NOT NULL,
+                    kind TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    data_json TEXT NOT NULL,
+                    PRIMARY KEY (session_id, sequence)
+                );
+                """
+            )
+            connection.execute(
+                """
+                INSERT INTO sessions(
+                    id, cwd, provider, model, messages_json, sandbox_profile
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "v3-id",
+                    "/workspace",
+                    "fixture",
+                    "model",
+                    json.dumps(messages),
+                    "workspace",
+                ),
+            )
+            connection.commit()
+            connection.close()
+
+            store = SqliteSessionStore(database)
+            await store.initialize()
+
+            summary = await store.get_session("v3-id")
+            self.assertEqual(
+                summary.title,
+                'debug escaped newlines and "quoted" sqlite content',
+            )
+            page = await store.search_sessions(
+                "escaped quoted",
+                cwd="/workspace",
+                include_content=True,
+            )
+            self.assertEqual([hit.summary.id for hit in page.results], ["v3-id"])
+            self.assertIn("content", page.results[0].matched_fields)
+            self.assertIsNotNone(page.results[0].snippet)
+
+            migrated = sqlite3.connect(database)
+            self.assertEqual(
+                migrated.execute("SELECT version FROM schema_meta WHERE singleton = 1").fetchone(),
+                (4,),
+            )
+            tables = {
+                row[0]
+                for row in migrated.execute(
+                    "SELECT name FROM sqlite_master WHERE type IN ('table', 'view')"
+                ).fetchall()
+            }
+            migrated.close()
+            self.assertIn("session_search_documents", tables)
+            self.assertIn("session_search_fts", tables)
+
+    async def test_search_indexes_visible_content_with_filters_and_pagination(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = SqliteSessionStore(Path(directory) / "sessions.db")
+            await store.initialize()
+            primary_id = await store.create_session(
+                "/workspace",
+                "fixture",
+                "model",
+                sandbox_profile=SandboxProfile.WORKSPACE,
+            )
+            primary_items = [
+                Message(
+                    Role.USER,
+                    "<system-reminder>private injected rules</system-reminder>\n"
+                    "Fix SQLite session search for escaped quoted content across all platforms",
+                ),
+                PreservedContextItem(
+                    ContextItemKind.REASONING,
+                    {
+                        "type": "reasoning",
+                        "id": "private",
+                        "summary": [{"type": "summary_text", "text": "privatecontextmarker"}],
+                        "encrypted_content": "privateciphermarker",
+                    },
+                ),
+                Message(
+                    Role.ASSISTANT,
+                    "I will inspect the index.",
+                    tool_calls=(
+                        ToolCall(
+                            "call-1",
+                            "read_file",
+                            {"path": "src/search_index.py", "purpose": "toolmarker"},
+                        ),
+                    ),
+                    reasoning_content="privatethoughtmarker",
+                ),
+                Message(
+                    Role.TOOL,
+                    "privatetoolresultmarker",
+                    name="read_file",
+                    tool_call_id="call-1",
+                ),
+            ]
+            await store.save_session_items(primary_id, primary_items)
+
+            second_id = await store.create_session("/workspace", "fixture", "model")
+            await store.save_messages(
+                second_id,
+                [Message(Role.USER, "SQLite migration notes for another session")],
+            )
+            other_workspace_id = await store.create_session("/other", "fixture", "model")
+            await store.save_messages(
+                other_workspace_id,
+                [Message(Role.USER, "SQLite search belongs to another workspace")],
+            )
+
+            summary = await store.get_session(primary_id)
+            self.assertEqual(
+                summary.title,
+                "Fix SQLite session search for escaped quoted content across all",
+            )
+            await store.save_session_items(
+                primary_id,
+                [*primary_items, Message(Role.USER, "a later title must not replace the first")],
+            )
+            self.assertEqual((await store.get_session(primary_id)).title, summary.title)
+
+            page = await store.search_sessions(
+                "escaped quoted",
+                cwd="/workspace",
+                include_content=True,
+            )
+            self.assertEqual([hit.summary.id for hit in page.results], [primary_id])
+            self.assertEqual(page.results[0].matched_fields, ("title", "content"))
+            self.assertIsNotNone(page.results[0].snippet)
+
+            tool_page = await store.search_sessions("read_file", cwd="/workspace")
+            self.assertEqual([hit.summary.id for hit in tool_page.results], [primary_id])
+            for private_query in (
+                "privatecontextmarker",
+                "privateciphermarker",
+                "privatethoughtmarker",
+                "privatetoolresultmarker",
+                "toolmarker",
+                "search_index",
+            ):
+                self.assertEqual(
+                    (await store.search_sessions(private_query)).results,
+                    (),
+                )
+
+            first_page = await store.search_sessions("SQLite", cwd="/workspace", limit=1)
+            self.assertEqual(first_page.total_estimate, 2)
+            self.assertEqual(first_page.next_offset, 1)
+            second_page = await store.search_sessions(
+                "SQLite",
+                cwd="/workspace",
+                limit=1,
+                offset=1,
+            )
+            self.assertEqual(second_page.total_estimate, 2)
+            self.assertIsNone(second_page.next_offset)
+            self.assertNotEqual(
+                first_page.results[0].summary.id,
+                second_page.results[0].summary.id,
+            )
+            self.assertNotIn(
+                other_workspace_id,
+                {hit.summary.id for hit in first_page.results + second_page.results},
+            )
+
+            fallback = await store.search_sessions("quoted migration", cwd="/workspace")
+            self.assertEqual(fallback.total_estimate, 2)
+
+            for operation in (
+                store.search_sessions(""),
+                store.search_sessions("***"),
+                store.search_sessions("query", limit=0),
+                store.search_sessions("query", offset=-1),
+            ):
+                with self.assertRaises(SessionError):
+                    await operation
 
     async def test_sandbox_peek_never_creates_state_and_rejects_corrupt_values(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

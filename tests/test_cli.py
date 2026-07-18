@@ -707,6 +707,25 @@ api_key_env = "SECOND_KEY"
             self.assertEqual(exit_code, 0)
             self.assertEqual(json.loads(list_output)[0]["id"], session_id)
             self.assertEqual(json.loads(list_output)[0]["sandbox_profile"], "off")
+            self.assertEqual(json.loads(list_output)[0]["title"], "first")
+
+            exit_code, search_output = run(
+                (
+                    "sessions",
+                    "search",
+                    "first second",
+                    "--json",
+                    "--include-content",
+                    "--cwd",
+                    str(root),
+                )
+            )
+            self.assertEqual(exit_code, 0)
+            search_page = json.loads(search_output)
+            self.assertEqual(search_page["total_estimate"], 1)
+            self.assertEqual(search_page["results"][0]["id"], session_id)
+            self.assertIn("content", search_page["results"][0]["matched_fields"])
+            self.assertIsNotNone(search_page["results"][0]["snippet"])
 
             exit_code, markdown = run(("export", session_id, "--cwd", str(root)))
             self.assertEqual(exit_code, 0)
@@ -729,7 +748,7 @@ api_key_env = "SECOND_KEY"
             self.assertEqual(exit_code, 0)
             self.assertEqual(export_output.strip(), str(export_path.resolve()))
             exported = json.loads(export_path.read_text(encoding="utf-8"))
-            self.assertEqual(exported["schema_version"], 3)
+            self.assertEqual(exported["schema_version"], 4)
             self.assertEqual(exported["session"]["id"], session_id)
             self.assertEqual(exported["session"]["sandbox_profile"], "off")
             self.assertEqual(exported["conversation_items"], exported["messages"])
@@ -872,7 +891,7 @@ api_key_env = "SECOND_KEY"
                 exit_code = main(("export", "rust-cli-id", "--format", "json", "--cwd", str(root)))
             self.assertEqual(exit_code, 0)
             exported = json.loads(output.getvalue())
-            self.assertEqual(exported["schema_version"], 3)
+            self.assertEqual(exported["schema_version"], 4)
             self.assertEqual(
                 [item.get("type") for item in exported["conversation_items"]],
                 [None, "reasoning", "backend_tool_call", "reasoning", None],

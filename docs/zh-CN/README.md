@@ -44,7 +44,7 @@ uv run neuro-code
 
 在开发环境之外安装构建产物时，使用 `pip install 'neuro-code[tui]'` 加入可选 UI 依赖。
 第一版 TUI 提供提示输入、滚动记录、assistant 流式文本、供应商/工具状态，以及本地
-`/help`、`/status`、`/provider`、`/model`、`/sessions`、`/resume`、`/cancel`、
+`/help`、`/status`、`/provider`、`/model`、`/sessions [QUERY]`、`/resume`、`/cancel`、
 `/clear`、`/quit` 和 `/exit` 命令。同一次启动中的提示会共享一个持久会话；
 `--resume SESSION_ID` 会在工作区校验通过后打开已有会话。
 
@@ -56,8 +56,12 @@ SQLite 会话仍可恢复，下一条提示使用全新会话，从而避免把�
 另一个供应商。
 
 使用 `Ctrl+R`、`/sessions` 或不带参数的 `/resume` 可以打开当前工作区最近 50 条会话
-的选择器；`/resume SESSION_ID` 可直接恢复。选择器只显示缩短的 ID、更新时间、保存的
-供应商/模型及恢复 profile，不显示提示内容、端点、凭据或其他工作区。恢复时优先使用
+的选择器；`/resume SESSION_ID` 可直接恢复。`/sessions QUERY` 会先按保存标题和可见对话
+内容执行工作区全文搜索。选择器显示确定性的首提示标题（或导入标题）、缩短的 ID、
+更新时间、保存的供应商/模型、恢复 profile，以及搜索时的有界摘要。查询、标题和摘要均
+按纯文本渲染；系统消息、供应商私有推理/原生项、图片 URL、工具参数/元数据和原始工具
+结果内容不进入搜索索引。
+恢复时优先使用
 名称匹配且就绪的来源 profile；否则使用当前就绪 profile，并继续由保存的来源/模型/亲和
 元数据失败关闭地过滤供应商原生上下文。原活动会话保持不变。
 
@@ -332,6 +336,8 @@ NEURO_CODE_RUN_LIVE_TESTS=1 uv run pytest -m live tests/live
 ```bash
 neuro-code -p "Continue the work" --resume SESSION_ID
 neuro-code sessions --json
+neuro-code sessions search "sqlite migration"
+neuro-code sessions search "sqlite migration" --json --include-content --limit 20
 neuro-code export SESSION_ID --format markdown --output transcript.md
 neuro-code import-session /path/to/upstream/session --json
 ```
@@ -340,9 +346,10 @@ neuro-code import-session /path/to/upstream/session --json
 `summary.json`。它只读解析 JSONL 文件，不会修改源文件；随后在单个事务中创建
 SQLite 会话，并保留源会话 ID、工作区、模型和时间戳。已有相同会话 ID 时会拒绝导入，
 而不是覆盖数据。JSON 报告会列出跳过的损坏记录或暂不支持的记录。规范消息模型目前
-会按原顺序结构化保存推理记录、后端工具记录和图片 URL。JSON 导出格式版本 3 在普通
-`messages` 投影之外提供完整的 `conversation_items` 序列，并报告规范保存的沙箱 profile，
-旧会话则为 `null`。上游摘要中可识别的内建 profile 会被保留；不支持的自定义 profile
+会按原顺序结构化保存推理记录、后端工具记录和图片 URL。JSON 导出格式版本 4 在普通
+`messages` 投影之外提供完整的 `conversation_items` 序列，并报告规范保存的沙箱 profile
+与可选标题；旧沙箱 profile 会话仍为 `null`。上游摘要中可识别的内建 profile 和
+`generated_title` 会被保留；不支持的自定义 profile
 会被拒绝而不会静默降级。受支持的图片引用会通过
 供应商原生内容块回放：OpenAI 兼容和 Gemini 的用户消息，以及 Anthropic 的用户消息
 和工具结果。无效引用及不受支持的角色会收到明确图片占位文本。只有来源标记可信且

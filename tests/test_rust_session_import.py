@@ -28,6 +28,7 @@ def _write_session(
     *,
     chat_format_version: int = 1,
     sandbox_profile: object | None = None,
+    generated_title: object | None = None,
 ) -> Path:
     session_dir = root / "rust-session-id"
     session_dir.mkdir()
@@ -40,6 +41,8 @@ def _write_session(
     }
     if sandbox_profile is not None:
         summary["sandbox_profile"] = sandbox_profile
+    if generated_title is not None:
+        summary["generated_title"] = generated_title
     (session_dir / "summary.json").write_text(
         json.dumps(summary),
         encoding="utf-8",
@@ -77,6 +80,21 @@ class RustSessionImportTests(unittest.TestCase):
                 )
                 with self.assertRaisesRegex(SessionError, "sandbox profile"):
                     load_rust_session(source)
+
+    def test_generated_title_is_preserved_and_invalid_title_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = _write_session(
+                Path(directory),
+                [],
+                generated_title="  Imported session title  ",
+            )
+            imported = load_rust_session(source)
+            self.assertEqual(imported.snapshot.summary.title, "Imported session title")
+
+        with tempfile.TemporaryDirectory() as directory:
+            source = _write_session(Path(directory), [], generated_title=42)
+            with self.assertRaisesRegex(SessionError, "generated_title"):
+                load_rust_session(source)
 
     def test_current_jsonl_format_is_converted_without_writing_the_source(self) -> None:
         records = [
