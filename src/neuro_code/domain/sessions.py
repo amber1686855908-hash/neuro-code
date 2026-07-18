@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime
 
 from neuro_code.domain.messages import Message, SessionItem
+from neuro_code.domain.sandbox import SandboxProfile
 
 
 @dataclass(frozen=True, slots=True)
@@ -15,6 +16,7 @@ class SessionSummary:
     created_at: datetime
     updated_at: datetime
     context_affinity: str | None = None
+    sandbox_profile: SandboxProfile | None = None
 
     def __post_init__(self) -> None:
         if not all((self.id, self.cwd, self.provider, self.model)):
@@ -23,6 +25,10 @@ class SessionSummary:
             raise ValueError("session timestamps must be timezone-aware")
         if self.context_affinity == "":
             raise ValueError("session context affinity must not be empty")
+        if self.sandbox_profile is not None and not isinstance(
+            self.sandbox_profile, SandboxProfile
+        ):
+            raise ValueError("session sandbox profile must be canonical")
 
     def to_dict(self) -> dict[str, str | None]:
         return {
@@ -33,6 +39,9 @@ class SessionSummary:
             "created_at": self.created_at.isoformat(),
             "updated_at": self.updated_at.isoformat(),
             "context_affinity": self.context_affinity,
+            "sandbox_profile": (
+                self.sandbox_profile.value if self.sandbox_profile is not None else None
+            ),
         }
 
 

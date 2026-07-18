@@ -6,6 +6,8 @@ from neuro_code.runtime.profile_conversation import (
     ProfileConversationController,
     ProviderOption,
     ProviderSelectionResult,
+    SessionOption,
+    SessionSelectionResult,
 )
 
 __all__ = [
@@ -17,4 +19,6 @@ __all__ = [
     "ProviderOption",
     "ProviderSelectionResult",
     "SessionApprovalBroker",
+    "SessionOption",
+    "SessionSelectionResult",
 ]

@@ -11,6 +11,7 @@ from types import MappingProxyType
 from typing import Any
 from urllib.parse import unquote, urlsplit, urlunsplit
 
+from neuro_code.domain.sandbox import SandboxProfile
 from neuro_code.errors import ConfigurationError
 from neuro_code.ports.http import HttpClientPolicy
 
@@ -327,6 +328,8 @@ class AppConfig:
     providers: Mapping[str, ProviderProfile]
     default_provider: str | None
     selected_provider: str | None
+    sandbox_profile: SandboxProfile = SandboxProfile.OFF
+    sandbox_profile_source: str = "default"
     fallback_providers: tuple[str, ...] = ()
     loaded_files: tuple[Path, ...] = ()
 
@@ -347,6 +350,16 @@ class AppConfig:
                 f"selected provider profile does not exist: {self.selected_provider}"
             ) from error
 
+    @property
+    def protected_environment_variables(self) -> frozenset[str]:
+        names = set(_PROXY_ENVIRONMENT_VARIABLES)
+        for profile in self.providers.values():
+            if profile.api_key_env is not None:
+                names.add(profile.api_key_env)
+            if profile.proxy_url_env is not None:
+                names.add(profile.proxy_url_env)
+        return frozenset(name.casefold() for name in names)
+
     def redacted_dict(self, environ: Mapping[str, str] | None = None) -> dict[str, Any]:
         profiles = {
             name: profile.redacted_dict(environ) for name, profile in self.providers.items()
@@ -359,6 +372,10 @@ class AppConfig:
                 "default": self.default_provider,
                 "selected": self.selected_provider,
                 "fallbacks": list(self.fallback_providers),
+            },
+            "sandbox": {
+                "profile": self.sandbox_profile.value,
+                "source": self.sandbox_profile_source,
             },
             "provider": selected,
             "providers": profiles,
@@ -414,6 +431,33 @@ def _string_array(value: object, *, name: str) -> tuple[str, ...]:
     if any(not isinstance(item, str) or not item for item in value):
         raise ConfigurationError(f"provider {name} entries must be non-empty strings")
     return tuple(value)
+
+
+def _sandbox_profile_from_data(data: Mapping[str, object]) -> SandboxProfile | None:
+    raw_sandbox = data.get("sandbox")
+    if raw_sandbox is None:
+        return None
+    if not isinstance(raw_sandbox, Mapping):
+        raise ConfigurationError("[sandbox] must be a TOML table")
+    raw_profile = raw_sandbox.get("profile")
+    if raw_profile is None:
+        return None
+    if not isinstance(raw_profile, str) or not raw_profile.strip():
+        raise ConfigurationError("sandbox profile must be a non-empty string")
+    try:
+        return SandboxProfile.parse(raw_profile)
+    except ValueError as error:
+        raise ConfigurationError(str(error)) from error
+
+
+def _sandbox_profile_from_environment(environ: Mapping[str, str]) -> SandboxProfile | None:
+    raw_profile = environ.get("NEURO_CODE_SANDBOX", "").strip()
+    if not raw_profile:
+        return None
+    try:
+        return SandboxProfile.parse(raw_profile)
+    except ValueError as error:
+        raise ConfigurationError(str(error)) from error
 
 
 def _native_profile(
@@ -618,13 +662,39 @@ def load_config(
             raise ConfigurationError(
                 f"cannot resolve NEURO_CODE_CC_SWITCH_CONFIG: {error}"
             ) from error
-    candidates.extend((state_dir / "config.toml", resolved_cwd / ".neuro-code" / "config.toml"))
+    user_config_path = state_dir / "config.toml"
+    project_config_path = resolved_cwd / ".neuro-code" / "config.toml"
+    candidates.extend((user_config_path, project_config_path))
     data: dict[str, Any] = {}
     loaded_files: list[Path] = []
+    user_data: Mapping[str, object] = {}
+    project_data: Mapping[str, object] = {}
     for candidate in candidates:
         if candidate.is_file():
-            data = _deep_merge(data, _read_toml(candidate))
+            loaded = _read_toml(candidate)
+            data = _deep_merge(data, loaded)
             loaded_files.append(candidate)
+            if candidate == user_config_path:
+                user_data = loaded
+            if candidate == project_config_path:
+                project_data = loaded
+
+    user_sandbox = _sandbox_profile_from_data(user_data)
+    project_sandbox = _sandbox_profile_from_data(project_data)
+    environment_sandbox = _sandbox_profile_from_environment(env)
+    if environment_sandbox is not None:
+        sandbox_profile = environment_sandbox
+        sandbox_profile_source = "environment"
+    elif user_sandbox is not None:
+        # A workspace cannot weaken a profile explicitly selected in user state.
+        sandbox_profile = user_sandbox
+        sandbox_profile_source = "user"
+    elif project_sandbox is not None:
+        sandbox_profile = project_sandbox
+        sandbox_profile_source = "project"
+    else:
+        sandbox_profile = SandboxProfile.OFF
+        sandbox_profile_source = "default"
 
     providers, cc_default = _profiles_from_data(data)
     routing = data.get("routing", {})
@@ -668,6 +738,8 @@ def load_config(
         providers=providers,
         default_provider=configured_default,
         selected_provider=selected,
+        sandbox_profile=sandbox_profile,
+        sandbox_profile_source=sandbox_profile_source,
         fallback_providers=fallback_providers,
         loaded_files=tuple(loaded_files),
     )
@@ -696,3 +768,37 @@ def override_provider(
         base_url=(base_url or profile.base_url).rstrip("/"),
     )
     return replace(config, providers=profiles, selected_provider=selected)
+
+
+def override_sandbox(config: AppConfig, profile: str | None) -> AppConfig:
+    if profile is None:
+        return config
+    try:
+        selected = SandboxProfile.parse(profile)
+    except ValueError as error:
+        raise ConfigurationError(str(error)) from error
+    return replace(config, sandbox_profile=selected, sandbox_profile_source="cli")
+
+
+def pin_resumed_sandbox(
+    config: AppConfig,
+    saved_profile: SandboxProfile | None,
+) -> AppConfig:
+    """Restore a session's fixed sandbox profile without silent CLI/env changes."""
+
+    if saved_profile is None:
+        return config
+    if (
+        config.sandbox_profile_source in {"cli", "environment"}
+        and config.sandbox_profile is not saved_profile
+    ):
+        raise ConfigurationError(
+            "resumed session sandbox profile conflict: "
+            f"requested {config.sandbox_profile.value!r}, "
+            f"but the session was created with {saved_profile.value!r}"
+        )
+    return replace(
+        config,
+        sandbox_profile=saved_profile,
+        sandbox_profile_source="session",
+    )

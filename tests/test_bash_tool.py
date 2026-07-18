@@ -9,12 +9,44 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from neuro_code.domain.sandbox import SandboxProfile
 from neuro_code.errors import ToolError
+from neuro_code.ports.sandbox import ShellLaunch
 from neuro_code.ports.tools import ToolContext
 from neuro_code.tools.bash import BashTool
 
 
 class BashToolTests(unittest.IsolatedAsyncioTestCase):
+    async def test_enabled_profile_requires_a_matching_shell_sandbox(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            context = ToolContext(
+                Path(directory),
+                sandbox_profile=SandboxProfile.WORKSPACE,
+            )
+            with self.assertRaisesRegex(ToolError, "is not enforced"):
+                await BashTool().execute({"command": "echo unsafe"}, context)
+
+    async def test_shell_sandbox_supplies_an_argv_safe_launch(self) -> None:
+        class FixtureSandbox:
+            profile = SandboxProfile.WORKSPACE
+
+            def shell_launch(self, command: str) -> ShellLaunch:
+                self.command = command
+                return ShellLaunch(sys.executable, ("-c", "print('sandbox launch')"))
+
+        with tempfile.TemporaryDirectory() as directory:
+            sandbox = FixtureSandbox()
+            result = await BashTool().execute(
+                {"command": "ignored by fixture"},
+                ToolContext(
+                    Path(directory),
+                    sandbox_profile=SandboxProfile.WORKSPACE,
+                    shell_sandbox=sandbox,
+                ),
+            )
+            self.assertEqual(sandbox.command, "ignored by fixture")
+            self.assertEqual(result.content.strip(), "sandbox launch")
+
     async def test_captures_stdout_stderr_and_exit_code(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             command = (
@@ -77,6 +109,35 @@ class BashToolTests(unittest.IsolatedAsyncioTestCase):
                 )
             self.assertEqual(result.content.strip(), "cat cat 0")
 
+    async def test_protected_provider_and_proxy_environment_values_are_not_inherited(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            code = (
+                "import os;"
+                "print(os.environ.get('FIXTURE_API_KEY','missing'));"
+                "print(os.environ.get('HTTPS_PROXY','missing'))"
+            )
+            command = f'"{sys.executable}" -c "{code}"'
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "FIXTURE_API_KEY": "provider-secret",
+                    "HTTPS_PROXY": "http://proxy-secret@127.0.0.1:8080",
+                },
+                clear=False,
+            ):
+                result = await BashTool().execute(
+                    {"command": command},
+                    ToolContext(
+                        Path(directory),
+                        protected_environment_variables=frozenset(
+                            {"fixture_api_key", "https_proxy"}
+                        ),
+                    ),
+                )
+            self.assertEqual(result.content.splitlines(), ["missing", "missing"])
+            self.assertNotIn("provider-secret", result.content)
+            self.assertNotIn("proxy-secret", result.content)
+
     async def test_argument_validation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             context = ToolContext(Path(directory))
@@ -87,6 +148,12 @@ class BashToolTests(unittest.IsolatedAsyncioTestCase):
                 await BashTool().execute({"command": "echo x", "timeout_seconds": 0}, context)
             with self.assertRaises(ToolError):
                 await BashTool().execute({"command": "echo x", "timeout_seconds": True}, context)
+            for invalid_timeout in (float("nan"), float("inf")):
+                with self.assertRaises(ToolError):
+                    await BashTool().execute(
+                        {"command": "echo x", "timeout_seconds": invalid_timeout},
+                        context,
+                    )
             with self.assertRaisesRegex(ToolError, "output_byte_limit"):
                 await BashTool().execute(
                     {"command": "echo x"}, ToolContext(Path(directory), output_byte_limit=0)

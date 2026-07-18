@@ -1,15 +1,18 @@
 from __future__ import annotations
 
 import asyncio
+import sys
 import tempfile
 import unittest
 from collections.abc import AsyncIterator, Sequence
 from pathlib import Path
 
+from neuro_code.adapters.background_tasks import LocalBackgroundTaskManager
 from neuro_code.adapters.sqlite_session import SqliteSessionStore
 from neuro_code.domain.messages import Message, Role
 from neuro_code.domain.model_context import ModelContext
 from neuro_code.domain.model_events import ModelCompleted, ModelEvent, ModelTextDelta
+from neuro_code.domain.sandbox import SandboxProfile
 from neuro_code.domain.tools import ToolDefinition
 from neuro_code.errors import ConfigurationError, ProviderError
 from neuro_code.permissions import PermissionManager
@@ -79,6 +82,123 @@ class CancelOnceConversationProvider(ConversationProvider):
 
 
 class AgentConversationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_failed_provider_attempt_does_not_consume_completion_reminder(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = SqliteSessionStore(root / "sessions.db")
+            await store.initialize()
+            manager = LocalBackgroundTaskManager()
+            task = await manager.start_exec(
+                sys.executable,
+                ("-c", "pass"),
+                display_command="fixture completion",
+                cwd=root,
+                env={},
+                output_byte_limit=2_000,
+                termination_grace_seconds=0.05,
+            )
+            await manager.get(task.task_id, wait_seconds=2)
+            provider = FailOnceConversationProvider()
+            runtime = AgentRuntime(
+                provider=provider,
+                tools=default_tool_registry(enable_background_tasks=True),
+                permissions=PermissionManager(),
+                tool_context=ToolContext(root, background_tasks=manager),
+                session_store=store,
+            )
+            conversation = await AgentConversation.open(
+                runtime=runtime,
+                store=store,
+                cwd=root,
+            )
+            try:
+                with self.assertRaisesRegex(ProviderError, "fixture provider failure"):
+                    await conversation.run("failed prompt")
+                self.assertEqual(
+                    [item.task_id for item in await manager.pending_completions()],
+                    [task.task_id],
+                )
+
+                await conversation.run("retry prompt")
+
+                for context in provider.contexts:
+                    reminder = "\n".join(
+                        message.content
+                        for message in context.messages
+                        if "<background-task-completions>" in message.content
+                    )
+                    self.assertIn(task.task_id, reminder)
+                self.assertEqual(await manager.pending_completions(), ())
+            finally:
+                await manager.shutdown()
+
+    async def test_between_turn_completion_is_model_only_and_never_auto_wakes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = SqliteSessionStore(root / "sessions.db")
+            await store.initialize()
+            manager = LocalBackgroundTaskManager()
+            provider = ConversationProvider(("first", "second", "third"))
+            runtime = AgentRuntime(
+                provider=provider,
+                tools=default_tool_registry(enable_background_tasks=True),
+                permissions=PermissionManager(),
+                tool_context=ToolContext(root, background_tasks=manager),
+                session_store=store,
+            )
+            conversation = await AgentConversation.open(
+                runtime=runtime,
+                store=store,
+                cwd=root,
+            )
+            try:
+                await conversation.run("first prompt")
+                task = await manager.start_exec(
+                    sys.executable,
+                    ("-c", "print('private completion output')"),
+                    display_command="private completion command",
+                    cwd=root,
+                    env={},
+                    output_byte_limit=2_000,
+                    termination_grace_seconds=0.05,
+                )
+                await manager.get(task.task_id, wait_seconds=2)
+
+                self.assertEqual(len(provider.contexts), 1)
+                await conversation.run("second prompt")
+                await conversation.run("third prompt")
+
+                second_reminders = [
+                    message.content
+                    for message in provider.contexts[1].messages
+                    if "<background-task-completions>" in message.content
+                ]
+                third_reminders = [
+                    message.content
+                    for message in provider.contexts[2].messages
+                    if "<background-task-completions>" in message.content
+                ]
+                self.assertEqual(len(second_reminders), 1)
+                self.assertIn(task.task_id, second_reminders[0])
+                self.assertNotIn("private completion command", second_reminders[0])
+                self.assertNotIn("private completion output", second_reminders[0])
+                self.assertEqual(third_reminders, [])
+                self.assertEqual(await manager.pending_completions(), ())
+                self.assertNotIn(
+                    "<background-task-completions>",
+                    "\n".join(
+                        item.content for item in conversation.items if isinstance(item, Message)
+                    ),
+                )
+                assert conversation.session_id is not None
+                persisted = await store.load_messages(conversation.session_id)
+                self.assertNotIn(
+                    "<background-task-completions>",
+                    "\n".join(message.content for message in persisted),
+                )
+            finally:
+                await manager.shutdown()
+
     async def test_multiple_turns_reuse_session_and_provider_origin(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -224,6 +344,36 @@ class AgentConversationTests(unittest.IsolatedAsyncioTestCase):
             )
 
             with self.assertRaisesRegex(ConfigurationError, "session workspace"):
+                await AgentConversation.open(
+                    runtime=runtime,
+                    store=store,
+                    cwd=root,
+                    resume_id=session_id,
+                )
+
+    async def test_resume_rejects_a_different_saved_sandbox_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = SqliteSessionStore(root / "sessions.db")
+            await store.initialize()
+            session_id = await store.create_session(
+                str(root),
+                "conversation-fixture",
+                "fixture-model",
+                sandbox_profile=SandboxProfile.STRICT,
+            )
+            runtime = AgentRuntime(
+                provider=ConversationProvider(("unused",)),
+                tools=default_tool_registry(SandboxProfile.WORKSPACE),
+                permissions=PermissionManager(),
+                tool_context=ToolContext(
+                    root,
+                    sandbox_profile=SandboxProfile.WORKSPACE,
+                ),
+                session_store=store,
+            )
+
+            with self.assertRaisesRegex(ConfigurationError, "not the active profile 'workspace'"):
                 await AgentConversation.open(
                     runtime=runtime,
                     store=store,

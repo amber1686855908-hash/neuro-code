@@ -44,9 +44,9 @@ uv run neuro-code
 
 在开发环境之外安装构建产物时，使用 `pip install 'neuro-code[tui]'` 加入可选 UI 依赖。
 第一版 TUI 提供提示输入、滚动记录、assistant 流式文本、供应商/工具状态，以及本地
-`/help`、`/status`、`/provider`、`/model`、`/cancel`、`/clear`、`/quit` 和 `/exit`
-命令。同一次启动中的提示会共享一个持久会话；`--resume SESSION_ID` 会在工作区校验
-通过后打开已有会话。
+`/help`、`/status`、`/provider`、`/model`、`/sessions`、`/resume`、`/cancel`、
+`/clear`、`/quit` 和 `/exit` 命令。同一次启动中的提示会共享一个持久会话；
+`--resume SESSION_ID` 会在工作区校验通过后打开已有会话。
 
 使用 `Ctrl+P`、不带参数的 `/provider` 或 `/model` 可以打开已配置 profile 选择器；
 `/provider PROFILE` 与 `/model PROFILE` 可以直接选择。选择器只展示 profile 名称、模型、
@@ -54,6 +54,21 @@ uv run neuro-code
 任意远程模型 ID，也不会修改配置。轮次运行期间禁止切换。切换到不同 profile 时，旧的
 SQLite 会话仍可恢复，下一条提示使用全新会话，从而避免把供应商亲和或加密上下文带到
 另一个供应商。
+
+使用 `Ctrl+R`、`/sessions` 或不带参数的 `/resume` 可以打开当前工作区最近 50 条会话
+的选择器；`/resume SESSION_ID` 可直接恢复。选择器只显示缩短的 ID、更新时间、保存的
+供应商/模型及恢复 profile，不显示提示内容、端点、凭据或其他工作区。恢复时优先使用
+名称匹配且就绪的来源 profile；否则使用当前就绪 profile，并继续由保存的来源/模型/亲和
+元数据失败关闭地过滤供应商原生上下文。原活动会话保持不变。
+
+选择器还会显示保存的沙箱 profile。由于进程沙箱已经生效，在不同 profile 下创建的会话
+会被禁用，必须用 `--resume SESSION_ID` 重启 Neuro Code 后打开。在 profile 元数据出现
+以前创建的会话仍可按当前活动 profile 选择。
+
+启动参数恢复和应用内恢复都会回放规范的可见用户/助手消息、图片占位和仅含名称的工具
+生命周期。保存的推理、供应商原生项、工具参数、图片 URL 及原始工具结果不会进入记录；
+每条恢复消息也有 20,000 字符的界面上限。详见
+[ADR 0018](adr/0018-workspace-scoped-interactive-session-resume.md)。
 
 轮次运行期间可使用 `Ctrl+C` 或 `/cancel` 请求取消。运行时会记录取消，把当前以及同批
 尚未启动的本地工具调用补齐为错误结果，重载持久会话，并让同一个会话继续接受下一条
@@ -76,6 +91,78 @@ deny。关闭或取消审批都不会启动工具。
 neuro-code -p "Explain this repository"
 neuro-code agent -p "Explain this repository" --output-format jsonl
 ```
+
+## 受管后台命令
+
+普通 CLI/TUI 组合会向模型提供由进程所有权约束的后台命令契约。`bash` 使用
+`is_background=true` 时立即返回任务 ID；`task_output` 可以不等待就返回当前状态和输出，
+也可以用最大 30 秒的 `wait_seconds` 执行事件驱动的有界等待。`wait_tasks` 最多接受 20 个
+ID，并在有界的 30 秒事件等待中选择任意一个或全部已知任务。未知或跨会话 ID 会报告为
+`not_found`；超时只返回部分状态，不会终止任务。`kill_task` 会终止整棵受控进程树，并在
+需要时从 TERM 升级到 KILL。启动与终止仍是有副作用的操作，和其他本地动作一样经过权限/
+审批策略。
+
+后台任务省略 `timeout_seconds` 时会一直运行到自然退出、被终止或应用关闭；显式正数会
+为任务设置截止时间。输出只是在内存中有界保留的首尾预览，同时记录总字节数，并非持久
+完整日志。一个应用进程最多同时运行 16 个任务，每个会话作用域最多保留 64 条记录。
+
+后台记录不会写入 SQLite。任务可以在仍运行的 TUI 同一会话绑定中跨轮次使用，但不能跨
+profile 切换、进程内会话恢复、重启或启动恢复。切换绑定会终止其中的活动任务并显示数量；
+单次无头运行会在返回前终止剩余任务，TUI 退出时也一样。
+
+在 TUI 中使用 `/tasks` 可以只读查看当前绑定的任务 ID、状态、退出码、有界输出大小和开始
+时间。每个任务进入终态时，TUI 会发出一次本地通知，但不会打印命令文本或原始输出。
+`/tasks` 不能终止任务；应让模型使用 `kill_task`，使该操作继续经过权限/审批策略。应优先
+使用 `is_background=true`，而不是在 Shell 内部追加 `&`；完整的跨平台后代进程所有权仍需
+Windows Job Object 支持。详见
+[ADR 0021](adr/0021-owned-background-shell-tasks.md) 和
+[ADR 0022](adr/0022-session-scoped-background-task-visibility.md)。多任务等待语义由
+[ADR 0024](adr/0024-event-driven-multi-background-task-wait.md) 定义。
+
+自然完成还会在下一次明确模型边界报告一次：工具执行后的下一模型步骤，或空闲时由下一条
+用户提示触发的轮次。仅供模型使用的每批通知最多包含 20 个任务，只携带经过转义的状态
+元数据，不包含命令文本、cwd 或输出。终态 `task_output`、`wait_tasks` 或 `kill_task` 结果
+会消费对应通知，防止重复。只有供应商返回有效完成后才确认通知；通知不会作为会话消息
+持久化，也绝不会自主启动付费模型轮次。详见
+[ADR 0023](adr/0023-model-visible-background-task-completion-reminders.md)。
+
+## 操作系统沙箱 profile
+
+沙箱需要主动启用，默认值为 `off`。可以在用户或项目配置中选择持久 profile，使用
+`NEURO_CODE_SANDBOX`，也可以只覆盖本次运行：
+
+```toml
+[sandbox]
+profile = "workspace"
+```
+
+```bash
+neuro-code -p "Inspect and test this repository" --sandbox workspace
+```
+
+Linux 上的非 `off` profile 要求存在可用且不受工作区控制的 `bwrap`；`read-only` 与
+`strict` 还需要 `unshare`。Neuro Code 会探测这些能力，并在打开会话存储或开始模型工作
+之前重新执行自身。显式请求之后绝不会回退到未启用沙箱的运行。
+
+| Profile | 文件系统 | 本地 Bash 网络 |
+|---|---|---|
+| `off` | 不启用操作系统沙箱 | 可用 |
+| `workspace` | 宿主可读；工作区、状态目录与临时路径可写 | 可用 |
+| `read-only` | 宿主/工作区只读；状态目录与临时路径可写；编辑工具不可用 | 隔离 |
+| `strict` | 仅暴露必需的系统/运行时路径和工作区；工作区、状态目录与临时路径可写 | 隔离 |
+
+父进程仍可访问模型 API。权限系统依然会在工具之前运行且仍有必要：沙箱限制获批操作的
+范围，但不负责决定是否批准。项目文件不能弱化用户级 profile；CLI 与环境变量是新会话
+中显式且优先级更高的选择，但恢复时不能改变已保存会话的 profile。
+`neuro-code inspect` 会报告规范 profile 及其来源。
+本地 Bash 还会移除已配置的供应商 API Key 变量和标准/显式代理变量，不继承其中的密钥值。
+
+macOS 与 Windows 当前会对显式非 `off` profile 失败关闭。每个新会话（包括 `off`）都会
+保存规范 profile。恢复时若未显式指定沙箱，就还原保存值；显式 `--sandbox` 或
+`NEURO_CODE_SANDBOX` 经规范化后若不同，会在执行沙箱和组合模型之前失败。没有该字段的
+旧会话使用普通配置。自定义 profile 仍不受支持。详见
+[ADR 0019](adr/0019-fail-closed-linux-sandbox-profiles.md) 和
+[ADR 0020](adr/0020-session-fixed-sandbox-profiles.md)。
 
 ## 模型供应商
 
@@ -253,8 +340,10 @@ neuro-code import-session /path/to/upstream/session --json
 `summary.json`。它只读解析 JSONL 文件，不会修改源文件；随后在单个事务中创建
 SQLite 会话，并保留源会话 ID、工作区、模型和时间戳。已有相同会话 ID 时会拒绝导入，
 而不是覆盖数据。JSON 报告会列出跳过的损坏记录或暂不支持的记录。规范消息模型目前
-会按原顺序结构化保存推理记录、后端工具记录和图片 URL。JSON 导出格式版本 2 在普通
-`messages` 投影之外提供完整的 `conversation_items` 序列。受支持的图片引用会通过
+会按原顺序结构化保存推理记录、后端工具记录和图片 URL。JSON 导出格式版本 3 在普通
+`messages` 投影之外提供完整的 `conversation_items` 序列，并报告规范保存的沙箱 profile，
+旧会话则为 `null`。上游摘要中可识别的内建 profile 会被保留；不支持的自定义 profile
+会被拒绝而不会静默降级。受支持的图片引用会通过
 供应商原生内容块回放：OpenAI 兼容和 Gemini 的用户消息，以及 Anthropic 的用户消息
 和工具结果。无效引用及不受支持的角色会收到明确图片占位文本。只有来源标记可信且
 目标为 xAI 官方 HTTPS 端点时，恢复导入会话才会回放可见推理与有序

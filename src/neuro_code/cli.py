@@ -8,10 +8,18 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from neuro_code import __version__
+from neuro_code.adapters.background_tasks import LocalBackgroundTaskManager
 from neuro_code.adapters.rust_session import load_rust_session
+from neuro_code.adapters.sandbox import create_shell_sandbox, enforce_configured_sandbox
 from neuro_code.adapters.sqlite_session import SqliteSessionStore
 from neuro_code.async_utils import run_blocking
-from neuro_code.config import AppConfig, load_config, override_provider
+from neuro_code.config import (
+    AppConfig,
+    load_config,
+    override_provider,
+    override_sandbox,
+    pin_resumed_sandbox,
+)
 from neuro_code.domain.events import AgentEvent, AgentEventKind
 from neuro_code.domain.messages import (
     ContextItemKind,
@@ -20,6 +28,8 @@ from neuro_code.domain.messages import (
     Role,
     SessionItem,
 )
+from neuro_code.domain.sandbox import SandboxProfile
+from neuro_code.domain.sessions import SessionSummary
 from neuro_code.errors import ConfigurationError, NeuroCodeError
 from neuro_code.permissions import (
     PermissionEffect,
@@ -28,6 +38,7 @@ from neuro_code.permissions import (
     PermissionRule,
 )
 from neuro_code.ports.approval import PermissionApprover
+from neuro_code.ports.background_tasks import BackgroundTaskManager
 from neuro_code.ports.model import ModelProvider
 from neuro_code.ports.tools import ToolContext
 from neuro_code.providers import create_routed_provider
@@ -40,6 +51,7 @@ from neuro_code.runtime import (
     SessionApprovalBroker,
 )
 from neuro_code.tools import default_tool_registry
+from neuro_code.workspace import workspaces_match
 
 
 def _add_run_arguments(parser: argparse.ArgumentParser) -> None:
@@ -59,6 +71,11 @@ def _add_run_arguments(parser: argparse.ArgumentParser) -> None:
         default="plain",
     )
     parser.add_argument("--always-approve", "--yolo", action="store_true")
+    parser.add_argument(
+        "--sandbox",
+        choices=tuple(profile.value for profile in SandboxProfile),
+        help="operating-system sandbox profile for this run",
+    )
     parser.add_argument("--allow", action="append", default=[], metavar="PATTERN")
     parser.add_argument("--deny", action="append", default=[], metavar="PATTERN")
     parser.add_argument("--max-steps", type=int, default=24)
@@ -164,12 +181,16 @@ def _plain_config(config: AppConfig) -> str:
     assert isinstance(routing, dict)
     fallbacks = routing["fallbacks"]
     assert isinstance(fallbacks, list)
+    sandbox = payload["sandbox"]
+    assert isinstance(sandbox, dict)
     lines = [
         f"cwd: {payload['cwd']}",
         f"state_dir: {payload['state_dir']}",
         f"default_provider: {routing['default'] or '(none)'}",
         f"selected_provider: {routing['selected'] or '(none)'}",
         f"fallback_providers: {', '.join(fallbacks) if fallbacks else '(none)'}",
+        f"sandbox_profile: {sandbox['profile']}",
+        f"sandbox_source: {sandbox['source']}",
     ]
     if isinstance(provider, dict):
         lines.extend(
@@ -219,54 +240,77 @@ async def _run_agent(args: argparse.Namespace) -> int:
             "the agent subcommand requires -p/--single; run neuro-code without a subcommand "
             "for the interactive TUI"
         )
-    _, _, conversation = await _prepare_conversation(args)
-
-    async def stream_event(event: AgentEvent) -> None:
-        if args.output_format == "plain" and event.kind is AgentEventKind.TEXT_DELTA:
-            text = event.data.get("text")
-            if isinstance(text, str):
-                print(text, end="", flush=True)
-        elif args.output_format == "jsonl":
-            print(json.dumps(event.to_dict(), ensure_ascii=False), flush=True)
-
-    result = await conversation.run(args.prompt, sink=stream_event)
-    if args.output_format == "plain":
-        print()
-    elif args.output_format == "json":
-        print(
-            json.dumps(
-                {
-                    "session_id": result.session_id,
-                    "response": result.response,
-                    "steps": result.steps,
-                    "events": [event.to_dict() for event in result.events],
-                },
-                ensure_ascii=False,
-            )
+    background_tasks = LocalBackgroundTaskManager()
+    try:
+        _, _, conversation = await _prepare_conversation(
+            args,
+            background_tasks=background_tasks,
         )
-    return 0
+
+        async def stream_event(event: AgentEvent) -> None:
+            if args.output_format == "plain" and event.kind is AgentEventKind.TEXT_DELTA:
+                text = event.data.get("text")
+                if isinstance(text, str):
+                    print(text, end="", flush=True)
+            elif args.output_format == "jsonl":
+                print(json.dumps(event.to_dict(), ensure_ascii=False), flush=True)
+
+        result = await conversation.run(args.prompt, sink=stream_event)
+        if args.output_format == "plain":
+            print()
+        elif args.output_format == "json":
+            print(
+                json.dumps(
+                    {
+                        "session_id": result.session_id,
+                        "response": result.response,
+                        "steps": result.steps,
+                        "events": [event.to_dict() for event in result.events],
+                    },
+                    ensure_ascii=False,
+                )
+            )
+        return 0
+    finally:
+        await asyncio.shield(background_tasks.shutdown())
 
 
 async def _prepare_conversation(
     args: argparse.Namespace,
     *,
+    background_tasks: BackgroundTaskManager,
     approver: PermissionApprover | None = None,
 ) -> tuple[AppConfig, ModelProvider, AgentConversation]:
     config = _effective_config(args)
     store = SqliteSessionStore(config.state_dir / "sessions.db")
+    config = await _pin_resume_sandbox(config, args.resume, store)
+    _enforce_process_sandbox(config, args)
     await store.initialize()
     provider, conversation = await _compose_conversation(
         args,
         config,
         store=store,
+        background_tasks=background_tasks,
         approver=approver,
         resume_id=args.resume,
     )
     return config, provider, conversation
 
 
+async def _pin_resume_sandbox(
+    config: AppConfig,
+    resume_id: str | None,
+    store: SqliteSessionStore,
+) -> AppConfig:
+    if resume_id is None:
+        return config
+    saved_profile = await store.peek_session_sandbox_profile(resume_id)
+    return pin_resumed_sandbox(config, saved_profile)
+
+
 def _effective_config(args: argparse.Namespace) -> AppConfig:
     config = load_config(args.cwd)
+    config = override_sandbox(config, args.sandbox)
     return override_provider(
         config,
         provider=args.provider,
@@ -275,15 +319,32 @@ def _effective_config(args: argparse.Namespace) -> AppConfig:
     )
 
 
+def _enforce_process_sandbox(config: AppConfig, args: argparse.Namespace) -> None:
+    raw_arguments = tuple(getattr(args, "launch_arguments", ()))
+    command = (sys.executable, "-m", "neuro_code", *raw_arguments)
+    enforce_configured_sandbox(
+        config.sandbox_profile,
+        config.cwd,
+        config.state_dir,
+        command,
+    )
+
+
 async def _compose_conversation(
     args: argparse.Namespace,
     config: AppConfig,
     *,
     store: SqliteSessionStore,
+    background_tasks: BackgroundTaskManager,
     approver: PermissionApprover | None,
     resume_id: str | None,
 ) -> tuple[ModelProvider, AgentConversation]:
     provider = create_routed_provider(config, failover=not args.no_failover)
+    shell_sandbox = create_shell_sandbox(
+        config.sandbox_profile,
+        config.cwd,
+        config.state_dir,
+    )
     mode = PermissionMode.BYPASS if args.always_approve else PermissionMode.DEFAULT
     permissions = PermissionManager(
         mode=mode,
@@ -292,9 +353,18 @@ async def _compose_conversation(
     )
     runtime = AgentRuntime(
         provider=provider,
-        tools=default_tool_registry(),
+        tools=default_tool_registry(
+            config.sandbox_profile,
+            enable_background_tasks=True,
+        ),
         permissions=permissions,
-        tool_context=ToolContext(config.cwd),
+        tool_context=ToolContext(
+            config.cwd,
+            sandbox_profile=config.sandbox_profile,
+            shell_sandbox=shell_sandbox,
+            protected_environment_variables=config.protected_environment_variables,
+            background_tasks=background_tasks,
+        ),
         approver=approver,
         session_store=store,
         max_steps=args.max_steps,
@@ -336,48 +406,93 @@ async def _run_tui(args: argparse.Namespace) -> int:
             ) from error
         raise
 
-    approvals = SessionApprovalBroker()
-    config = _effective_config(args)
-    store = SqliteSessionStore(config.state_dir / "sessions.db")
-    await store.initialize()
-    provider, conversation = await _compose_conversation(
-        args,
-        config,
-        store=store,
-        approver=approvals,
-        resume_id=args.resume,
-    )
-    selected_profile = config.selected_provider
-    if selected_profile is None:
-        raise ConfigurationError("no provider profile is selected")
+    background_tasks = LocalBackgroundTaskManager()
+    try:
+        approvals = SessionApprovalBroker()
+        config = _effective_config(args)
+        store = SqliteSessionStore(config.state_dir / "sessions.db")
+        config = await _pin_resume_sandbox(config, args.resume, store)
+        _enforce_process_sandbox(config, args)
+        await store.initialize()
 
-    async def bind_profile(profile_name: str) -> ConversationBinding:
-        selected_config = override_provider(config, provider=profile_name)
-        selected_provider, selected_conversation = await _compose_conversation(
-            args,
-            selected_config,
-            store=store,
-            approver=approvals,
-            resume_id=None,
+        async def compose_scoped(
+            selected_config: AppConfig,
+            resume_id: str | None,
+        ) -> tuple[ModelProvider, AgentConversation, BackgroundTaskManager]:
+            task_scope = background_tasks.open_scope()
+            try:
+                selected_provider, selected_conversation = await _compose_conversation(
+                    args,
+                    selected_config,
+                    store=store,
+                    background_tasks=task_scope,
+                    approver=approvals,
+                    resume_id=resume_id,
+                )
+            except BaseException:
+                await asyncio.shield(task_scope.shutdown())
+                raise
+            return selected_provider, selected_conversation, task_scope
+
+        provider, conversation, task_scope = await compose_scoped(config, args.resume)
+        selected_profile = config.selected_provider
+        if selected_profile is None:
+            raise ConfigurationError("no provider profile is selected")
+
+        async def bind_profile(profile_name: str) -> ConversationBinding:
+            selected_config = override_provider(config, provider=profile_name)
+            selected_provider, selected_conversation, selected_tasks = await compose_scoped(
+                selected_config,
+                None,
+            )
+            return ConversationBinding(
+                selected_conversation,
+                selected_provider,
+                selected_tasks,
+            )
+
+        async def list_workspace_sessions() -> tuple[SessionSummary, ...]:
+            sessions = await store.list_sessions(limit=50)
+            return tuple(
+                session for session in sessions if workspaces_match(session.cwd, config.cwd)
+            )
+
+        async def bind_session(profile_name: str, session_id: str) -> ConversationBinding:
+            selected_config = override_provider(config, provider=profile_name)
+            selected_provider, selected_conversation, selected_tasks = await compose_scoped(
+                selected_config,
+                session_id,
+            )
+            return ConversationBinding(
+                selected_conversation,
+                selected_provider,
+                selected_tasks,
+            )
+
+        controller = ProfileConversationController(
+            options=_provider_options(config),
+            selected_profile=selected_profile,
+            binding=ConversationBinding(conversation, provider, task_scope),
+            binding_factory=bind_profile,
+            session_catalog=list_workspace_sessions,
+            session_binding_factory=bind_session,
+            sandbox_profile=config.sandbox_profile,
         )
-        return ConversationBinding(selected_conversation, selected_provider)
-
-    controller = ProfileConversationController(
-        options=_provider_options(config),
-        selected_profile=selected_profile,
-        binding=ConversationBinding(conversation, provider),
-        binding_factory=bind_profile,
-    )
-    app = NeuroCodeApp(
-        controller,
-        approval_controller=approvals,
-        provider_controller=controller,
-        provider_name=controller.provider_name,
-        model_name=controller.model_name,
-        cwd=config.cwd,
-    )
-    await app.run_async()
-    return 0
+        app = NeuroCodeApp(
+            controller,
+            approval_controller=approvals,
+            provider_controller=controller,
+            session_controller=controller,
+            task_controller=controller,
+            initial_items=controller.items,
+            provider_name=controller.provider_name,
+            model_name=controller.model_name,
+            cwd=config.cwd,
+        )
+        await app.run_async()
+        return 0
+    finally:
+        await asyncio.shield(background_tasks.shutdown())
 
 
 def _provider_rows(config: AppConfig) -> list[dict[str, object]]:
@@ -449,7 +564,9 @@ async def _list_sessions(args: argparse.Namespace) -> int:
         for session in sessions:
             print(
                 f"{session.id}\t{session.updated_at.isoformat()}\t"
-                f"{session.provider}/{session.model}\t{session.cwd}"
+                f"{session.provider}/{session.model}\t"
+                f"sandbox={session.sandbox_profile.value if session.sandbox_profile else 'legacy'}"
+                f"\t{session.cwd}"
             )
     return 0
 
@@ -537,7 +654,7 @@ async def _export_session(args: argparse.Namespace) -> int:
         content = (
             json.dumps(
                 {
-                    "schema_version": 2,
+                    "schema_version": 3,
                     "session": summary.to_dict(),
                     "messages": [message.to_dict() for message in messages],
                     "conversation_items": [item.to_dict() for item in items],
@@ -585,7 +702,9 @@ async def _import_session(args: argparse.Namespace) -> int:
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
-    args = parser.parse_args(argv)
+    launch_arguments = tuple(sys.argv[1:] if argv is None else argv)
+    args = parser.parse_args(launch_arguments)
+    args.launch_arguments = launch_arguments
     try:
         if args.command == "version":
             payload = _version_payload()

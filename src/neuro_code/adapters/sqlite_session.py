@@ -22,10 +22,11 @@ from neuro_code.domain.messages import (
     SessionItem,
     ToolCall,
 )
+from neuro_code.domain.sandbox import SandboxProfile
 from neuro_code.domain.sessions import SessionSnapshot, SessionSummary
 from neuro_code.errors import SessionError
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 class SqliteSessionStore:
@@ -94,6 +95,15 @@ class SqliteSessionStore:
                         connection.execute("ALTER TABLE sessions ADD COLUMN context_affinity TEXT")
                     connection.execute("UPDATE schema_meta SET version = 2 WHERE singleton = 1")
                     version = (2,)
+                if version is not None and version[0] == 2:
+                    columns = {
+                        str(row[1])
+                        for row in connection.execute("PRAGMA table_info(sessions)").fetchall()
+                    }
+                    if "sandbox_profile" not in columns:
+                        connection.execute("ALTER TABLE sessions ADD COLUMN sandbox_profile TEXT")
+                    connection.execute("UPDATE schema_meta SET version = 3 WHERE singleton = 1")
+                    version = (3,)
                 if version is None or version[0] != SCHEMA_VERSION:
                     raise SessionError(
                         f"unsupported session schema version: {version[0] if version else 'missing'}"
@@ -107,6 +117,7 @@ class SqliteSessionStore:
         provider: str,
         model: str,
         context_affinity: str | None = None,
+        sandbox_profile: SandboxProfile = SandboxProfile.OFF,
     ) -> str:
         session_id = str(uuid.uuid4())
 
@@ -114,10 +125,18 @@ class SqliteSessionStore:
             with closing(self._connect()) as connection, connection:
                 connection.execute(
                     """
-                    INSERT INTO sessions(id, cwd, provider, model, context_affinity)
-                    VALUES (?, ?, ?, ?, ?)
+                    INSERT INTO sessions(
+                        id, cwd, provider, model, context_affinity, sandbox_profile
+                    ) VALUES (?, ?, ?, ?, ?, ?)
                     """,
-                    (session_id, cwd, provider, model, context_affinity),
+                    (
+                        session_id,
+                        cwd,
+                        provider,
+                        model,
+                        context_affinity,
+                        sandbox_profile.value,
+                    ),
                 )
 
         async with self._write_lock:
@@ -135,8 +154,8 @@ class SqliteSessionStore:
                         """
                         INSERT INTO sessions(
                             id, cwd, provider, model, created_at, updated_at,
-                            messages_json, context_affinity
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                            messages_json, context_affinity, sandbox_profile
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             summary.id,
@@ -147,6 +166,11 @@ class SqliteSessionStore:
                             summary.updated_at.isoformat(),
                             payload,
                             summary.context_affinity,
+                            (
+                                summary.sandbox_profile.value
+                                if summary.sandbox_profile is not None
+                                else None
+                            ),
                         ),
                     )
             except sqlite3.IntegrityError as error:
@@ -366,7 +390,8 @@ class SqliteSessionStore:
             with closing(self._connect()) as connection:
                 rows = connection.execute(
                     """
-                    SELECT id, cwd, provider, model, created_at, updated_at, context_affinity
+                    SELECT id, cwd, provider, model, created_at, updated_at,
+                           context_affinity, sandbox_profile
                     FROM sessions ORDER BY updated_at DESC, id DESC LIMIT ?
                     """,
                     (limit,),
@@ -380,7 +405,8 @@ class SqliteSessionStore:
             with closing(self._connect()) as connection:
                 row = connection.execute(
                     """
-                    SELECT id, cwd, provider, model, created_at, updated_at, context_affinity
+                    SELECT id, cwd, provider, model, created_at, updated_at,
+                           context_affinity, sandbox_profile
                     FROM sessions WHERE id = ?
                     """,
                     (session_id,),
@@ -390,6 +416,72 @@ class SqliteSessionStore:
             return _summary_from_row(row)
 
         return await run_blocking(load)
+
+    async def peek_session_sandbox_profile(
+        self,
+        session_id: str,
+    ) -> SandboxProfile | None:
+        """Read a saved profile without creating or migrating the database.
+
+        Startup uses this before entering an irreversible process sandbox. A
+        missing database, session, or v2-and-earlier column represents a legacy
+        session and therefore has no pinned profile.
+        """
+
+        def peek() -> SandboxProfile | None:
+            try:
+                resolved = self._database_path.expanduser().resolve(strict=True)
+            except FileNotFoundError:
+                return None
+            except OSError as error:
+                raise SessionError(
+                    f"cannot resolve session database {self._database_path}: {error}"
+                ) from error
+            if not resolved.is_file():
+                return None
+            sidecars = (
+                resolved.with_name(f"{resolved.name}-wal"),
+                resolved.with_name(f"{resolved.name}-shm"),
+            )
+            if any(path.exists() for path in sidecars):
+                raise SessionError(
+                    "cannot inspect saved session sandbox while the database has an active WAL"
+                )
+
+            try:
+                with closing(
+                    sqlite3.connect(
+                        f"{resolved.as_uri()}?mode=ro&immutable=1",
+                        uri=True,
+                        timeout=30,
+                    )
+                ) as connection:
+                    connection.execute("PRAGMA query_only = ON")
+                    tables = {
+                        str(row[0])
+                        for row in connection.execute(
+                            "SELECT name FROM sqlite_master WHERE type = 'table'"
+                        ).fetchall()
+                    }
+                    if "sessions" not in tables:
+                        return None
+                    columns = {
+                        str(row[1])
+                        for row in connection.execute("PRAGMA table_info(sessions)").fetchall()
+                    }
+                    if "sandbox_profile" not in columns:
+                        return None
+                    row = connection.execute(
+                        "SELECT sandbox_profile FROM sessions WHERE id = ?",
+                        (session_id,),
+                    ).fetchone()
+            except sqlite3.Error as error:
+                raise SessionError(f"cannot inspect saved session sandbox: {error}") from error
+            if row is None or row[0] is None:
+                return None
+            return _parse_sandbox_profile(row[0], session_id=session_id)
+
+        return await run_blocking(peek)
 
 
 def _serialize_session_items(items: Sequence[SessionItem]) -> str:
@@ -483,4 +575,16 @@ def _summary_from_row(row: tuple[Any, ...]) -> SessionSummary:
         created_at=timestamp(row[4]),
         updated_at=timestamp(row[5]),
         context_affinity=str(row[6]) if row[6] is not None else None,
+        sandbox_profile=(
+            _parse_sandbox_profile(row[7], session_id=str(row[0])) if row[7] is not None else None
+        ),
     )
+
+
+def _parse_sandbox_profile(value: object, *, session_id: str) -> SandboxProfile:
+    try:
+        return SandboxProfile.parse(str(value))
+    except ValueError as error:
+        raise SessionError(
+            f"session {session_id} contains unsupported sandbox profile {value!r}"
+        ) from error

@@ -57,6 +57,29 @@ may render events but may not mutate runtime state directly. Background tasks
 must be owned by an `asyncio.TaskGroup` or an explicit registry with a shutdown
 contract; unreferenced fire-and-forget tasks are prohibited.
 
+Managed shell work uses an application `BackgroundTaskSupervisor` and an
+isolated `BackgroundTaskManager` registry per conversation binding. `bash` can
+return a task ID without waiting; `task_output` reads or briefly waits for a
+bounded snapshot, `wait_tasks` waits through completion events for any or all
+of at most 20 IDs, and `kill_task` terminates the owned tree through the ordinary
+permission boundary. A binding can address only its own task IDs. Replacing a
+binding closes its scope; the composition root always closes the supervisor on
+exit. Records are memory-only and do not become durable session context. See
+[ADR 0021](adr/0021-owned-background-shell-tasks.md) and
+[ADR 0022](adr/0022-session-scoped-background-task-visibility.md). See
+[ADR 0024](adr/0024-event-driven-multi-background-task-wait.md) for multi-wait
+conditions, timeout, cancellation, and output bounds.
+
+At each explicit model step, `AgentRuntime` queries that scope for unreported
+terminal tasks. It appends a model-only, metadata-only reminder capped at 20
+records and acknowledges the batch after a valid provider completion. Terminal
+`task_output`, `wait_tasks`, and `kill_task` results acknowledge the same IDs
+first, preventing duplicate delivery. The reminder is excluded from
+`SessionItem` persistence;
+only its bounded audit event is durable. Idle completion waits for user input
+and never starts a model turn itself. See
+[ADR 0023](adr/0023-model-visible-background-task-completion-reminders.md).
+
 ## Conversation and interactive interface
 
 `AgentConversation` is the reusable application boundary above one-turn
@@ -79,6 +102,12 @@ provider and tool lifecycle events to status messages and deliberately does not
 render raw reasoning, general tool argument mappings, or tool results in the
 transcript. See [ADR 0014](adr/0014-minimal-event-stream-tui.md).
 
+For the active conversation scope, local `/tasks` renders bounded task metadata
+without command text or output and a periodic read-only poll emits one notice
+per terminal transition. It cannot mutate task state; `kill_task` remains on the
+ordinary model tool and permission path. See
+[ADR 0022](adr/0022-session-scoped-background-task-visibility.md).
+
 The TUI keeps its prompt available while a worker-owned turn runs. `Ctrl+C` and
 local `/cancel` cancel that worker; an approval modal gives `Ctrl+C` the narrower
 meaning of denying the pending request. Runtime-owned recovery and tool-result
@@ -93,6 +122,27 @@ session; the old SQLite session remains untouched. This strict boundary avoids
 cross-provider replay of encrypted reasoning, hosted-tool state, dialect
 metadata, and profile-affine context. See
 [ADR 0017](adr/0017-safe-interactive-profile-selection.md).
+
+The same controller exposes a workspace-scoped `SessionOption` catalog and
+serializes session selection with turns. The composition root filters recent
+SQLite summaries by filesystem identity, then `AgentConversation.open`
+revalidates the selected ID. Resume prefers a ready source-named profile and
+otherwise uses the current ready profile while retaining the stored provider,
+model, and affinity origin for fail-closed native-context projection. The TUI
+replaces scrollback with a bounded visible-message projection that omits
+reasoning, native records, arguments, image URLs, and raw tool-result content.
+See
+[ADR 0018](adr/0018-workspace-scoped-interactive-session-resume.md).
+
+The operating-system sandbox is also part of session identity. Native sessions
+persist the canonical creation profile. Explicit-ID startup performs an
+immutable read-only SQLite metadata lookup before process sandbox enforcement;
+the saved value is restored unless a canonically different explicit CLI or
+environment request causes a conflict. In-process TUI resume cannot replace an
+irreversible process sandbox, so a different-profile option is disabled and
+requires restart. `AgentConversation.open` verifies the profile again after the
+ordinary summary load. See
+[ADR 0020](adr/0020-session-fixed-sandbox-profiles.md).
 
 Permission policy and user interaction are separate boundaries.
 `PermissionManager` first returns a deterministic decision. An `ask` may then
@@ -112,6 +162,13 @@ continues to fail closed. See
   adapter-owned replay decisions.
 - `Tool`: publishes a JSON schema and executes with a scoped `ToolContext`.
 - `ToolRegistry`: resolves canonical tool names and rejects duplicates.
+- `ShellSandbox`: turns a shell string into an argv-safe, platform-enforced
+  launch without exposing namespace implementation details to tools.
+- `BackgroundTaskSupervisor`: creates isolated conversation task scopes and
+  terminates every live tree during application shutdown.
+- `BackgroundTaskManager`: starts owned shell/exec trees and exposes bounded
+  snapshot/single-or-multi-wait/kill and pending-completion acknowledgement
+  operations within one conversation scope.
 - `PermissionManager`: returns allow, deny, or ask before any side effect.
 - `PermissionApprover`: optionally resolves an `ask` asynchronously without
   overriding policy denial.
@@ -197,7 +254,16 @@ pair from terminal backend output when intermediate events were absent.
 - Writes resolve and validate their target before mutation; a workspace-scoped
   tool cannot escape through `..` or symlinks.
 - Explicit sandbox requests fail closed when the platform cannot enforce them.
+- A sandbox activation marker is insufficient evidence by itself. Linux
+  composition attests root, workspace, and state mount flags before tools are
+  exposed; `strict` also attests its allowlist-root filesystem type.
+- `read-only` removes and independently rejects the workspace edit tool.
+  `read-only` and `strict` shell descendants run without the parent agent's
+  network namespace, while provider HTTP remains available to the parent.
 - Secrets never appear in inspect output, logs, session events, or exceptions.
+- Bash descendants do not inherit configured provider API-key variables or
+  standard/explicit proxy variables; secret access requires a future explicit
+  capability rather than ambient process state.
 - API and proxy credentials are environment references; resolved proxy URLs
   remain adapter-local and are removed from network errors.
 - Provider failover may occur only before the candidate's first model event;
@@ -205,11 +271,28 @@ pair from terminal backend output when intermediate events were absent.
 - Interactive profile switching is serialized between turns and starts a fresh
   conversation. It never relabels or replays the previous session under the new
   profile.
+- Interactive session selection lists only filesystem-identical workspaces,
+  revalidates the ID while opening, and replaces the active binding only after
+  a successful resume. Stored provider/model/affinity origin is retained even
+  when ordinary messages resume through the current profile.
+- A session with sandbox metadata always resumes under its creation profile.
+  Canonically different explicit CLI/environment requests and in-process
+  different-profile selection fail before a model turn or tool action; corrupt
+  and unsupported stored values also fail closed.
+- Restored TUI history never renders persisted reasoning, native provider
+  records, tool arguments, image URLs, or raw tool-result content.
 - Cancellation terminates owned child processes, commits a terminal failure,
   saves balanced context, and reloads it before the next conversation turn.
 - Shell commands execute in an owned process group. Timeout and cancellation
   attempt graceful tree termination first, then force termination after a
   bounded grace period; output is drained with a fixed in-memory limit.
+- Background shell commands remain owned by the application supervisor and
+  visible only through their conversation scope. Their combined output preview,
+  running-task count, retained records, wait interval, and lifetime are bounded;
+  binding replacement or application exit terminates the affected live trees.
+- Model completion reminders contain only JSON-escaped IDs/status metadata, are
+  capped per model boundary, exclude commands/output/cwd, and are acknowledged
+  only after provider completion or a canonical terminal task-tool result.
 - Restrictive Bash rules inspect every safely decomposable command segment,
   including common wrappers and nested `bash -c` scripts. Unclassifiable
   scripts fail closed when a deny/ask policy could apply.
@@ -220,7 +303,11 @@ pair from terminal backend output when intermediate events were absent.
 SQLite is the canonical transactional store for sessions and their ordered
 events. JSON and Markdown are interchange/export formats. The database exposes
 an integer schema version; every change requires forward migration, fixture
-coverage, and a documented compatibility decision. Rust sessions are parsed by
+coverage, and a documented compatibility decision. Schema v3 adds a nullable
+canonical sandbox profile: new sessions store a value, while migrated legacy
+sessions retain `NULL`. Startup can inspect that single field through an
+immutable read-only connection before any database creation, migration, or
+process sandbox activation. Rust sessions are parsed by
 a separate read-only adapter. It validates format versions 0 and 1, reads
 bounded JSONL records, converts supported legacy/current records into an
 ordered `SessionSnapshot`, and reports corrupt or unsupported records instead
@@ -238,7 +325,8 @@ provider JSON and relative order. The runtime carries the complete ordered
 sequence into each model step while application views continue to use the
 ordinary-message projection. When it resumes an imported session, storage
 permits append-only extension but rejects rewriting the preserved prefix. JSON
-export schema 2 includes both projections. Provider adapters validate image
+export schema 3 includes both projections and the session sandbox profile.
+Provider adapters validate image
 references and use native multimodal blocks only where the wire role and URI
 form are supported; all other images become a visible placeholder without
 adapter-side media I/O. Preserved context follows a fail-closed affinity policy.
@@ -280,3 +368,23 @@ isolated behind adapters. A small native helper or system facility is allowed
 for kernel sandboxing and process containment, but business and orchestration
 logic remains Python. Unsupported security guarantees must be reported at
 startup, never silently weakened.
+
+The first concrete implementation re-executes Linux runs under bubblewrap for
+`workspace`, `read-only`, and `strict`; `off` remains the portable default.
+Filesystem mounts cover in-process Python tools and descendants. A separate
+`ShellSandbox` launch plan places Bash descendants of `read-only` and `strict`
+inside a nested network namespace. macOS and Windows currently reject explicit
+non-`off` profiles rather than advertising unenforced behavior. See
+[ADR 0019](adr/0019-fail-closed-linux-sandbox-profiles.md) and
+[ADR 0020](adr/0020-session-fixed-sandbox-profiles.md).
+
+Foreground and managed-background shell commands share `ProcessTree`. POSIX
+waiting observes the owned process group after its shell leader exits, while
+termination uses a bounded TERM-to-KILL sequence. Windows still uses a process
+group plus `taskkill /T /F`; Job Object ownership is required for full parity.
+See [ADR 0021](adr/0021-owned-background-shell-tasks.md) and
+[ADR 0022](adr/0022-session-scoped-background-task-visibility.md). Model-visible
+completion metadata is defined by
+[ADR 0023](adr/0023-model-visible-background-task-completion-reminders.md), and
+event-driven multi-task waits by
+[ADR 0024](adr/0024-event-driven-multi-background-task-wait.md).

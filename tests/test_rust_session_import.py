@@ -17,6 +17,7 @@ from neuro_code.domain.messages import (
     PreservedContextItem,
     Role,
 )
+from neuro_code.domain.sandbox import SandboxProfile
 from neuro_code.errors import SessionError
 from neuro_code.providers.anthropic import AnthropicProvider
 
@@ -26,6 +27,7 @@ def _write_session(
     records: list[str],
     *,
     chat_format_version: int = 1,
+    sandbox_profile: object | None = None,
 ) -> Path:
     session_dir = root / "rust-session-id"
     session_dir.mkdir()
@@ -36,6 +38,8 @@ def _write_session(
         "current_model_id": "xai-test-model",
         "chat_format_version": chat_format_version,
     }
+    if sandbox_profile is not None:
+        summary["sandbox_profile"] = sandbox_profile
     (session_dir / "summary.json").write_text(
         json.dumps(summary),
         encoding="utf-8",
@@ -48,6 +52,32 @@ def _write_session(
 
 
 class RustSessionImportTests(unittest.TestCase):
+    def test_saved_sandbox_profile_is_preserved_and_unsupported_profiles_fail_closed(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            supported = _write_session(
+                root,
+                [],
+                sandbox_profile="readonly",
+            )
+            imported = load_rust_session(supported)
+            self.assertIs(
+                imported.snapshot.summary.sandbox_profile,
+                SandboxProfile.READ_ONLY,
+            )
+
+        for unsupported in ("custom-development", 42):
+            with tempfile.TemporaryDirectory() as directory:
+                source = _write_session(
+                    Path(directory),
+                    [],
+                    sandbox_profile=unsupported,
+                )
+                with self.assertRaisesRegex(SessionError, "sandbox profile"):
+                    load_rust_session(source)
+
     def test_current_jsonl_format_is_converted_without_writing_the_source(self) -> None:
         records = [
             json.dumps({"type": "system", "content": "source system"}),

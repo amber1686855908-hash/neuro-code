@@ -12,6 +12,7 @@ class AgentEventKind(StrEnum):
     SESSION_STARTED = "session_started"
     USER_MESSAGE = "user_message"
     MODEL_STEP_STARTED = "model_step_started"
+    BACKGROUND_TASK_COMPLETION_REMINDER = "background_task_completion_reminder"
     PROVIDER_ATTEMPT_FAILED = "provider_attempt_failed"
     PROVIDER_SELECTED = "provider_selected"
     TEXT_DELTA = "text_delta"

@@ -5,6 +5,7 @@ from typing import Protocol
 
 from neuro_code.domain.events import AgentEvent
 from neuro_code.domain.messages import Message, SessionItem
+from neuro_code.domain.sandbox import SandboxProfile
 from neuro_code.domain.sessions import SessionSnapshot, SessionSummary
 
 
@@ -15,6 +16,7 @@ class SessionStore(Protocol):
         provider: str,
         model: str,
         context_affinity: str | None = None,
+        sandbox_profile: SandboxProfile = SandboxProfile.OFF,
     ) -> str: ...
 
     async def import_session(self, snapshot: SessionSnapshot) -> str: ...

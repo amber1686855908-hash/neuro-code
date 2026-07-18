@@ -53,6 +53,14 @@ class AgentConversation:
             raise ConfigurationError(
                 f"session workspace is {summary.cwd}, not the requested cwd {cwd}"
             )
+        if (
+            summary.sandbox_profile is not None
+            and summary.sandbox_profile is not runtime.sandbox_profile
+        ):
+            raise ConfigurationError(
+                f"session sandbox profile is {summary.sandbox_profile.value!r}, "
+                f"not the active profile {runtime.sandbox_profile.value!r}"
+            )
         return cls(
             runtime=runtime,
             store=store,

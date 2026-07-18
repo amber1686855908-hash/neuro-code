@@ -171,6 +171,10 @@ class SearchReplaceTool:
     side_effecting = True
 
     async def execute(self, arguments: Mapping[str, Any], context: ToolContext) -> ToolResult:
+        if not context.sandbox_profile.workspace_writable:
+            raise ToolError(
+                f"sandbox profile {context.sandbox_profile.value!r} prohibits workspace edits"
+            )
         path = resolve_workspace_path(
             context.cwd, _require_string(arguments, "path"), must_exist=True
         )
