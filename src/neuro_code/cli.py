@@ -22,6 +22,7 @@ from neuro_code.config import (
     pin_resumed_sandbox,
 )
 from neuro_code.domain.events import AgentEvent, AgentEventKind
+from neuro_code.domain.interaction_mode import InteractionMode
 from neuro_code.domain.messages import (
     ContextItemKind,
     Message,
@@ -29,6 +30,7 @@ from neuro_code.domain.messages import (
     Role,
     SessionItem,
 )
+from neuro_code.domain.reasoning import ReasoningEffort
 from neuro_code.domain.sandbox import SandboxProfile
 from neuro_code.domain.session_search import SessionSearchHit
 from neuro_code.domain.sessions import SessionSummary
@@ -81,6 +83,11 @@ def _add_run_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--allow", action="append", default=[], metavar="PATTERN")
     parser.add_argument("--deny", action="append", default=[], metavar="PATTERN")
     parser.add_argument("--max-steps", type=int, default=24)
+    parser.add_argument(
+        "--effort",
+        choices=tuple(effort.value for effort in ReasoningEffort),
+        help="agent review depth (default: high, or the saved TUI preference)",
+    )
     parser.add_argument("--resume", metavar="SESSION_ID", help="resume an existing session")
 
 
@@ -227,6 +234,7 @@ def _plain_config(config: AppConfig) -> str:
                 f"proxy_mode: {provider['proxy_mode']}",
                 f"proxy_env: {provider['proxy_url_env'] or '(none)'}",
                 f"proxy_url_configured: {str(provider['proxy_url_configured']).lower()}",
+                f"context_window_tokens: {provider['context_window_tokens'] or '(unknown)'}",
                 f"max_output_tokens: {provider['max_output_tokens']}",
             )
         )
@@ -361,6 +369,7 @@ async def _compose_conversation(
     background_tasks: BackgroundTaskManager,
     approver: PermissionApprover | None,
     resume_id: str | None,
+    reasoning_effort: ReasoningEffort | None = None,
 ) -> tuple[ModelProvider, AgentConversation]:
     provider = create_routed_provider(config, failover=not args.no_failover)
     shell_sandbox = create_shell_sandbox(
@@ -391,6 +400,11 @@ async def _compose_conversation(
         approver=approver,
         session_store=store,
         max_steps=args.max_steps,
+        reasoning_effort=(
+            ReasoningEffort(args.effort)
+            if getattr(args, "effort", None) is not None
+            else reasoning_effort or ReasoningEffort.HIGH
+        ),
     )
     conversation = await AgentConversation.open(
         runtime=runtime,
@@ -414,6 +428,7 @@ def _provider_options(config: AppConfig) -> tuple[ProviderOption, ...]:
                 available=profile.available,
                 credential_configured=credential_configured,
                 default=name == config.default_provider,
+                context_window_tokens=profile.context_window_tokens,
             )
         )
     return tuple(options)
@@ -438,6 +453,14 @@ async def _run_tui(args: argparse.Namespace) -> int:
         _enforce_process_sandbox(config, args)
         ui_preferences = JsonUiPreferencesStore(config.state_dir / "ui-preferences.json")
         language = await ui_preferences.load_language()
+        saved_reasoning_effort = await ui_preferences.load_reasoning_effort()
+        saved_interaction_mode = await ui_preferences.load_interaction_mode()
+        reasoning_effort = (
+            ReasoningEffort(args.effort)
+            if getattr(args, "effort", None) is not None
+            else saved_reasoning_effort
+        )
+        interaction_mode = InteractionMode.AUTO if args.always_approve else saved_interaction_mode
         await store.initialize()
 
         async def compose_scoped(
@@ -453,6 +476,7 @@ async def _run_tui(args: argparse.Namespace) -> int:
                     background_tasks=task_scope,
                     approver=approvals,
                     resume_id=resume_id,
+                    reasoning_effort=reasoning_effort,
                 )
             except BaseException:
                 await asyncio.shield(task_scope.shutdown())
@@ -525,6 +549,8 @@ async def _run_tui(args: argparse.Namespace) -> int:
             session_binding_factory=bind_session,
             session_rename=rename_workspace_session,
             sandbox_profile=config.sandbox_profile,
+            reasoning_effort=reasoning_effort,
+            interaction_mode=interaction_mode,
         )
         app = NeuroCodeApp(
             controller,

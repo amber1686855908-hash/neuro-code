@@ -36,10 +36,11 @@ English even though model and user content already supported Unicode.
   tool payloads, external error details, identifiers, and paths are not
   translated.
 - `UiPreferencesStore` is an injected persistence port. Its JSON adapter stores
-  only the selected language in `ui-preferences.json` under the configured
-  state directory. Writes are atomic and the resulting file mode is restricted
-  to the user. Provider configuration and credentials are not read or rewritten
-  by this adapter.
+  the selected language in `ui-preferences.json` under the configured state
+  directory. Writes are atomic and the resulting file mode is restricted to
+  the user. Provider configuration and credentials are not read or rewritten by
+  this adapter. ADR 0027 subsequently extends the same isolated preference file
+  with the requested application reasoning effort.
 - Both language catalogs must contain the same keys. Local entries retain their
   translation key and interpolation values so switching can rerender
   application-owned history without changing user or model entries.
@@ -51,9 +52,11 @@ the input remains a separate fixed control. Message roles are distinguishable
 by layout without adding noisy repeated labels. The language selection survives
 future launches while remaining isolated from provider routing and secrets.
 
-This decision does not add Markdown, Mermaid, media, or rich tool-card
-rendering. Assistant content continues to render as literal wrapped text; those
-capabilities remain separate M3/M5 slices.
+This decision did not originally add Markdown, Mermaid, media, or rich tool-card
+rendering. [ADR 0027](0027-semantic-tui-and-application-reasoning-effort.md)
+subsequently adds safe semantic Markdown for assistant text, and
+[ADR 0029](0029-auditable-in-place-tool-cards.md) adds bounded in-place tool
+cards. Mermaid, media, and interactive card expansion remain separate slices.
 
 ## Historical source evidence
 

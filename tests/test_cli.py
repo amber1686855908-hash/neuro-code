@@ -25,6 +25,7 @@ from neuro_code.domain.model_events import (
     ModelTextDelta,
     ModelToolCall,
 )
+from neuro_code.domain.reasoning import ReasoningEffort
 from neuro_code.domain.sandbox import SandboxProfile
 from neuro_code.domain.tools import ToolDefinition
 from neuro_code.domain.ui_preferences import UiLanguage
@@ -70,6 +71,45 @@ api_key_env = "FIXTURE_KEY"
         self.assertEqual(_normalize_rule("Bash(*)"), "bash:*")
         self.assertEqual(_normalize_rule("Bash(git:*)"), "bash:git*")
         self.assertEqual(_normalize_rule("Bash(git status)"), "bash:git status")
+
+    def test_headless_effort_flag_reaches_the_model_context(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / "state"
+            self._write_provider_config(state)
+            provider = CliProvider()
+            output = io.StringIO()
+            with (
+                patch.dict(
+                    "os.environ",
+                    {
+                        "HOME": str(root),
+                        "NEURO_CODE_HOME": str(state),
+                        "FIXTURE_KEY": "fixture-key",
+                    },
+                    clear=True,
+                ),
+                patch("neuro_code.cli.enforce_configured_sandbox"),
+                patch("neuro_code.cli.create_routed_provider", return_value=provider),
+                redirect_stdout(output),
+            ):
+                exit_code = main(
+                    (
+                        "-p",
+                        "answer directly",
+                        "--cwd",
+                        str(root),
+                        "--effort",
+                        "low",
+                    )
+                )
+
+            self.assertEqual(exit_code, 0)
+            self.assertIs(provider.contexts[0].reasoning_effort, ReasoningEffort.LOW)
+            system = next(
+                message for message in provider.contexts[0].messages if message.role is Role.SYSTEM
+            )
+            self.assertIn("low review depth", system.content)
 
     def test_version_json_is_machine_readable(self) -> None:
         output = io.StringIO()

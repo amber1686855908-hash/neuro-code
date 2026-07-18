@@ -9,7 +9,9 @@ from neuro_code.domain.background_tasks import (
     BackgroundTaskWaitMode,
     BackgroundTaskWaitResult,
 )
+from neuro_code.domain.context_usage import estimate_context_tokens, estimate_text_tokens
 from neuro_code.domain.events import AgentEvent, AgentEventKind
+from neuro_code.domain.interaction_mode import InteractionMode, interaction_mode_guidance
 from neuro_code.domain.messages import (
     ContentPart,
     ContentPartKind,
@@ -32,6 +34,7 @@ from neuro_code.domain.model_events import (
     ModelTextDelta,
     ModelToolCall,
 )
+from neuro_code.domain.reasoning import ReasoningEffort, reasoning_guidance
 from neuro_code.domain.session_search import SessionSearchHit, SessionSearchPage
 from neuro_code.domain.sessions import SessionSnapshot, SessionSummary
 from neuro_code.domain.tools import ToolDefinition, ToolResult
@@ -50,6 +53,7 @@ __all__ = [
     "ContentPart",
     "ContentPartKind",
     "ContextItemKind",
+    "InteractionMode",
     "Message",
     "ModelBackendToolCompleted",
     "ModelBackendToolStarted",
@@ -62,6 +66,7 @@ __all__ = [
     "ModelTextDelta",
     "ModelToolCall",
     "PreservedContextItem",
+    "ReasoningEffort",
     "Role",
     "SessionItem",
     "SessionSearchHit",
@@ -72,4 +77,8 @@ __all__ = [
     "ToolDefinition",
     "ToolResult",
     "UiLanguage",
+    "estimate_context_tokens",
+    "estimate_text_tokens",
+    "interaction_mode_guidance",
+    "reasoning_guidance",
 ]

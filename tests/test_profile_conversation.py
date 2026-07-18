@@ -8,9 +8,11 @@ from datetime import UTC, datetime
 from typing import cast
 
 from neuro_code.domain.background_tasks import BackgroundTaskSnapshot, BackgroundTaskStatus
+from neuro_code.domain.interaction_mode import InteractionMode
 from neuro_code.domain.messages import Message, Role, SessionItem
 from neuro_code.domain.model_context import ModelContext
 from neuro_code.domain.model_events import ModelEvent
+from neuro_code.domain.reasoning import ReasoningEffort
 from neuro_code.domain.sandbox import SandboxProfile
 from neuro_code.domain.session_search import SessionSearchHit
 from neuro_code.domain.sessions import SessionSummary
@@ -57,6 +59,9 @@ class FixtureConversation:
         self.blocked = blocked
         self.started = asyncio.Event()
         self.release = asyncio.Event()
+        self.reasoning_effort = ReasoningEffort.HIGH
+        self.interaction_mode = InteractionMode.NORMAL
+        self.auto_mode_unrestricted = False
 
     @property
     def session_id(self) -> str | None:
@@ -65,6 +70,12 @@ class FixtureConversation:
     @property
     def items(self) -> tuple[SessionItem, ...]:
         return self._items
+
+    def set_reasoning_effort(self, effort: ReasoningEffort) -> None:
+        self.reasoning_effort = effort
+
+    def set_interaction_mode(self, mode: InteractionMode) -> None:
+        self.interaction_mode = mode
 
     async def run(self, prompt: str, *, sink: EventSink | None = None) -> AgentRunResult:
         del sink
@@ -121,6 +132,7 @@ def option(
         available,
         credential_configured,
         default=name == "first",
+        context_window_tokens=100_000 if name == "first" else 200_000,
     )
 
 
@@ -144,6 +156,78 @@ def summary(
 
 
 class ProfileConversationControllerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_interaction_mode_updates_runner_and_survives_profile_switch(self) -> None:
+        first = FixtureConversation("old-session")
+        second = FixtureConversation()
+
+        async def bind(name: str) -> ConversationBinding:
+            return ConversationBinding(second, FixtureProvider(name, f"{name}-model"))
+
+        controller = ProfileConversationController(
+            options=(option("first"), option("second")),
+            selected_profile="first",
+            binding=ConversationBinding(first, FixtureProvider("first", "first-model")),
+            binding_factory=bind,
+        )
+
+        selection = await controller.set_interaction_mode(InteractionMode.PLAN)
+        await controller.select_profile("second")
+
+        self.assertTrue(selection.changed)
+        self.assertEqual(first.interaction_mode, InteractionMode.PLAN)
+        self.assertEqual(second.interaction_mode, InteractionMode.PLAN)
+
+    async def test_reasoning_effort_updates_runner_and_survives_profile_switch(self) -> None:
+        first = FixtureConversation("old-session")
+        second = FixtureConversation()
+
+        async def bind(name: str) -> ConversationBinding:
+            return ConversationBinding(second, FixtureProvider(name, f"{name}-model"))
+
+        controller = ProfileConversationController(
+            options=(option("first"), option("second")),
+            selected_profile="first",
+            binding=ConversationBinding(first, FixtureProvider("first", "first-model")),
+            binding_factory=bind,
+        )
+
+        selection = await controller.set_reasoning_effort(ReasoningEffort.ULTRACODE)
+        await controller.select_profile("second")
+
+        self.assertTrue(selection.changed)
+        self.assertIs(selection.requested, ReasoningEffort.ULTRACODE)
+        self.assertIs(selection.effective, ReasoningEffort.XHIGH)
+        self.assertFalse(selection.workflow_orchestration_active)
+        self.assertIs(first.reasoning_effort, ReasoningEffort.ULTRACODE)
+        self.assertIs(second.reasoning_effort, ReasoningEffort.ULTRACODE)
+        self.assertIs(controller.reasoning_effort, ReasoningEffort.ULTRACODE)
+        self.assertIs(controller.effective_reasoning_effort, ReasoningEffort.XHIGH)
+
+    async def test_reasoning_effort_change_is_rejected_during_a_turn(self) -> None:
+        runner = FixtureConversation(blocked=True)
+
+        async def bind(name: str) -> ConversationBinding:
+            return ConversationBinding(
+                FixtureConversation(),
+                FixtureProvider(name, f"{name}-model"),
+            )
+
+        controller = ProfileConversationController(
+            options=(option("first"),),
+            selected_profile="first",
+            binding=ConversationBinding(runner, FixtureProvider("first", "first-model")),
+            binding_factory=bind,
+        )
+        turn = asyncio.create_task(controller.run("blocked"))
+        await asyncio.wait_for(runner.started.wait(), timeout=1)
+
+        with self.assertRaisesRegex(ConfigurationError, "while a turn is running"):
+            await controller.set_reasoning_effort(ReasoningEffort.LOW)
+
+        runner.release.set()
+        await turn
+        self.assertIs(controller.reasoning_effort, ReasoningEffort.HIGH)
+
     async def test_manual_session_rename_updates_the_validated_summary_cache(self) -> None:
         renamed: list[tuple[str, str]] = []
         original = replace(
@@ -330,6 +414,7 @@ class ProfileConversationControllerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(selection.changed)
         self.assertEqual(selection.previous_session_id, "old-session")
+        self.assertEqual(selection.context_window_tokens, 200_000)
         self.assertEqual(requested, ["second"])
         self.assertEqual(controller.selected_profile, "second")
         self.assertEqual([profile.selected for profile in controller.profiles], [False, True])
@@ -484,6 +569,7 @@ class ProfileConversationControllerTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(sessions[0].source_profile_match)
         self.assertEqual(requested, [("second", "target-session")])
         self.assertEqual(selection.previous_session_id, "old-session")
+        self.assertEqual(selection.context_window_tokens, 200_000)
         self.assertEqual(selection.items, history)
         self.assertEqual(selection.stopped_background_tasks, 1)
         self.assertEqual(old_tasks.shutdown_calls, 1)

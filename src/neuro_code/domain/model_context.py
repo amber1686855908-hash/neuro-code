@@ -4,6 +4,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 
 from neuro_code.domain.messages import Message, PreservedContextItem, SessionItem
+from neuro_code.domain.reasoning import ReasoningEffort
 
 UPSTREAM_IMPORT_PROVIDER = "upstream-rust-import"
 
@@ -16,9 +17,12 @@ class ModelContext:
     source_provider: str | None = None
     source_model: str | None = None
     source_context_affinity: str | None = None
+    reasoning_effort: ReasoningEffort = ReasoningEffort.HIGH
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "items", tuple(self.items))
+        if not isinstance(self.reasoning_effort, ReasoningEffort):
+            raise TypeError("model context reasoning effort must be a ReasoningEffort")
         if (self.source_provider is None) != (self.source_model is None):
             raise ValueError("model context source provider and model must be set together")
         if self.source_provider == "" or self.source_model == "":

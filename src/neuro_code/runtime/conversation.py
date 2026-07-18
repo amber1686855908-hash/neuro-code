@@ -6,7 +6,9 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from neuro_code.domain.events import AgentEvent, AgentEventKind
+from neuro_code.domain.interaction_mode import InteractionMode
 from neuro_code.domain.messages import SessionItem
+from neuro_code.domain.reasoning import ReasoningEffort
 from neuro_code.errors import ConfigurationError
 from neuro_code.ports.storage import SessionStore
 from neuro_code.runtime.agent import AgentRunResult, AgentRuntime, EventSink
@@ -78,6 +80,24 @@ class AgentConversation:
     @property
     def items(self) -> tuple[SessionItem, ...]:
         return self._items
+
+    @property
+    def reasoning_effort(self) -> ReasoningEffort:
+        return self._runtime.reasoning_effort
+
+    def set_reasoning_effort(self, effort: ReasoningEffort) -> None:
+        self._runtime.set_reasoning_effort(effort)
+
+    @property
+    def interaction_mode(self) -> InteractionMode:
+        return self._runtime.interaction_mode
+
+    @property
+    def auto_mode_unrestricted(self) -> bool:
+        return self._runtime.auto_mode_unrestricted
+
+    def set_interaction_mode(self, mode: InteractionMode) -> None:
+        self._runtime.set_interaction_mode(mode)
 
     async def run(self, prompt: str, *, sink: EventSink | None = None) -> AgentRunResult:
         async with self._turn_lock:

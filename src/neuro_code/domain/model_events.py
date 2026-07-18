@@ -46,6 +46,7 @@ class ModelProviderSelected:
     model: str
     context_affinity: str | None
     failover: bool
+    context_window_tokens: int | None = None
 
 
 @dataclass(frozen=True, slots=True)

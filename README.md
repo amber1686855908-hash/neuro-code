@@ -8,7 +8,9 @@ Neuro Code 最初基于开源 Grok Build 的行为边界进行 Python 重写，�
 最小交互 TUI（含可恢复取消和安全 profile 选择）、多模型流式适配、工作区工具、
 权限控制、工作区会话选择/历史回放与标题/内容全文搜索、Linux 失败关闭沙箱 profile、
 会话固定沙箱恢复和 SQLite 会话能力，以及受管后台 Shell 任务的启动/查询/单任务或
-多任务等待/终止生命周期。
+多任务等待/终止生命周期。TUI 现已支持安全 Markdown 与语义配色、常驻模型/上下文占用/
+强度/模式/工作区状态栏、带参数的斜杠命令提示与 Tab 补全、模型步骤与整轮耗时、结构化
+工具反馈，以及可持久化的五档应用层审查强度和四种安全交互模式。
 
 Neuro Code began as a Python reimplementation of the open-source Grok Build
 terminal coding agent and now evolves as an independent, extensible project. It
@@ -20,7 +22,11 @@ profiles, session-fixed sandbox resume, and SQLite sessions.
 It also supports conversation-scoped, process-owned background shell task
 start, snapshot/event-driven single-or-multi-wait, termination, read-only TUI
 visibility, and bounded
-model-boundary completion metadata within one application lifetime.
+model-boundary completion metadata within one application lifetime. The TUI
+also provides safe Markdown with semantic colors, a persistent
+model/context-usage/effort/mode/workspace bar, parameter-aware slash-command
+hints with Tab completion, timed model steps and turns, structured tool
+feedback, five saved review-effort choices, and four safe interaction modes.
 
 ## 文档 / Documentation
 

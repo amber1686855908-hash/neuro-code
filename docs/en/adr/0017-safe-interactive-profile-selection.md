@@ -31,7 +31,10 @@ provider context is portable.
 - `Ctrl+P`, bare `/provider`, and bare `/model` open the picker.
   `/provider PROFILE` and `/model PROFILE` select a configured profile directly.
   The `/model` spelling is an alias for profile selection in this slice; it does
-  not accept arbitrary remote model IDs or reasoning-effort values.
+  not accept arbitrary remote model IDs or reasoning-effort values. Effort is a
+  separate application policy selected through `Ctrl+E`, `/effort`, or
+  `/reasoning` as defined by
+  [ADR 0027](0027-semantic-tui-and-application-reasoning-effort.md).
 - Reselecting the current profile is a no-op. Selecting a different profile
   asks the composition root to create a new provider, runtime, and
   `AgentConversation` against the same workspace and SQLite store. The factory
@@ -52,8 +55,10 @@ tradeoff is deliberate loss of conversational continuity in the new profile;
 the old conversation is retained in SQLite and can be resumed later.
 
 The profile inventory is a launch-time snapshot. Live configuration reload,
-remote model catalogs, reasoning-effort selection, compatible-context migration,
-and persistent default editing remain future vertical slices.
+remote model catalogs, compatible-context migration, and persistent default
+editing remain future vertical slices. The application-owned effort selection
+is independent of profile inventory and is reapplied to a new binding; native
+provider effort mapping remains unimplemented.
 
 ## Historical source evidence
 

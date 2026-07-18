@@ -23,6 +23,7 @@ class ProviderCandidate:
     model: str
     context_affinity: str | None
     factory: Callable[[], ModelProvider]
+    context_window_tokens: int | None = None
 
 
 class FailoverModelProvider:
@@ -121,6 +122,7 @@ class FailoverModelProvider:
                     provider.model_name,
                     provider.context_affinity,
                     failover=index > 0,
+                    context_window_tokens=candidate.context_window_tokens,
                 )
             yield first_event
             async for event in iterator:

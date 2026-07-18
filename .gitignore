@@ -11,6 +11,8 @@ htmlcov/
 build/
 dist/
 .neuro-code/
+# Local manual agent/TUI scratch workspace.
+testdp/
 .env
 .env.*
 !.env.example

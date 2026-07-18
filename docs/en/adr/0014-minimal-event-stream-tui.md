@@ -32,22 +32,37 @@ selection, rich rendering, or platform PTY behavior.
   lifecycle events become bounded status lines. The later stable-message and
   localization design is specified by
   [ADR 0026](0026-stable-localized-tui-conversation.md).
-- The presentation uses one application-owned neutral-dark theme. Textual's
+- Assistant responses use safe Markdown rendering with an application-owned
+  semantic theme, while local system/status/tool/error rows use an aligned
+  label gutter and semantic value highlights. Model text is not Rich/Textual
+  markup and hyperlink activation is disabled. The rendering boundary is
+  specified by
+  [ADR 0027](0027-semantic-tui-and-application-reasoning-effort.md).
+- The presentation uses one application-owned cool neutral-dark theme. Textual's
   built-in command palette is disabled because its `Ctrl+P` and emoji search
   surface conflict with the application's provider picker and plain-text
-  `/sessions QUERY` workflow.
+  `/sessions QUERY` workflow. A persistent bar above the prompt displays the
+  active provider/model, compact workspace path, context-window usage,
+  requested/effective reasoning effort, and interaction mode.
 - Full-screen terminal mode periodically compares the real TTY cell dimensions
   with the active Textual screen. It posts a normal resize event only when they
   differ, recovering from missing signal or in-band resize notifications. This
   fallback is not installed for headless, inline, or web drivers.
-- Raw reasoning deltas, general tool argument mappings, and tool results are not
-  rendered in the transcript. Approval modals receive only the bounded action
-  summary defined by ADR 0015.
-- `/help`, `/status`, `/provider`, `/model`, `/cancel`, `/clear`, `/quit`, and
-  `/exit` are handled locally and do not call a model. `Ctrl+C` and `/cancel`
-  route through the owned turn worker and the recovery contract in ADR 0016.
-  Configured-profile selection follows
-  [ADR 0017](0017-safe-interactive-profile-selection.md).
+- Raw reasoning deltas and general tool argument/result mappings are not
+  rendered. A bounded useful-argument allowlist supports invocation previews;
+  completed calls expose only control-safe, credential-redacted and bounded
+  output/change previews in the stable card defined by
+  [ADR 0029](0029-auditable-in-place-tool-cards.md). Model-step, tool, and
+  whole-turn durations use client monotonic clocks and follow
+  [ADR 0028](0028-timed-tool-feedback-and-interaction-modes.md). Approval modals
+  receive only the bounded action summary defined by ADR 0015.
+- `/help`, `/status`, `/provider`, `/model`, `/effort`, `/reasoning`, `/mode`, `/cancel`,
+  `/clear`, `/quit`, and `/exit` are handled locally and do not call a model.
+  `Ctrl+C` and `/cancel` route through the owned turn worker and the recovery
+  contract in ADR 0016. Configured-profile selection follows
+  [ADR 0017](0017-safe-interactive-profile-selection.md); application-owned
+  effort selection follows ADR 0027. `Shift+Tab` and `/mode` select the
+  application-owned permission behavior defined by ADR 0028.
 - Interactive composition uses the asynchronous, fail-closed approval boundary
   defined by [ADR 0015](0015-async-interactive-tool-approval.md). Explicit deny
   rules still take precedence. `--always-approve` remains an explicit,
@@ -59,11 +74,11 @@ Headless and TUI runs now share context, resume, storage, provider routing, and
 permission behavior. The UI can be exercised with Textual's headless test pilot,
 and the application controller can be tested without importing Textual.
 
-This is partial M3 support. Remote model-catalog and reasoning-effort selection,
-pristine pre-token rewind, interjection queues, richer tool cards and
-Markdown/media rendering, terminal-emulator smoke coverage, and cross-platform
-PTY integration remain separate vertical slices. Recoverable in-flight
-cancellation is defined by
+This is partial M3 support. Remote model catalogs, provider-native effort
+mapping and workflow orchestration, pristine pre-token rewind, interjection
+queues, interactive tool-card expansion, Mermaid/media rendering, terminal-emulator smoke
+coverage, and cross-platform PTY integration remain separate vertical slices.
+Recoverable in-flight cancellation is defined by
 [ADR 0016](0016-recoverable-turn-cancellation.md).
 
 ## Historical source evidence

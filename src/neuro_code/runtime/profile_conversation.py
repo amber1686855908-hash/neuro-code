@@ -7,7 +7,9 @@ from datetime import datetime
 from typing import Protocol
 
 from neuro_code.domain.background_tasks import BackgroundTaskSnapshot, BackgroundTaskStatus
+from neuro_code.domain.interaction_mode import InteractionMode
 from neuro_code.domain.messages import SessionItem
+from neuro_code.domain.reasoning import ReasoningEffort
 from neuro_code.domain.sandbox import SandboxProfile
 from neuro_code.domain.session_search import SessionSearchHit
 from neuro_code.domain.sessions import SessionSummary
@@ -24,6 +26,19 @@ class ConversationRunner(Protocol):
     @property
     def items(self) -> tuple[SessionItem, ...]: ...
 
+    @property
+    def reasoning_effort(self) -> ReasoningEffort: ...
+
+    def set_reasoning_effort(self, effort: ReasoningEffort) -> None: ...
+
+    @property
+    def interaction_mode(self) -> InteractionMode: ...
+
+    @property
+    def auto_mode_unrestricted(self) -> bool: ...
+
+    def set_interaction_mode(self, mode: InteractionMode) -> None: ...
+
     async def run(self, prompt: str, *, sink: EventSink | None = None) -> AgentRunResult: ...
 
 
@@ -36,6 +51,7 @@ class ProviderOption:
     credential_configured: bool
     default: bool = False
     selected: bool = False
+    context_window_tokens: int | None = None
 
     @property
     def selectable(self) -> bool:
@@ -57,6 +73,27 @@ class ProviderSelectionResult:
     previous_session_id: str | None
     changed: bool
     stopped_background_tasks: int = 0
+    context_window_tokens: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ReasoningEffortSelectionResult:
+    requested: ReasoningEffort
+    effective: ReasoningEffort
+    changed: bool
+    workflow_orchestration_active: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class InteractionModeSelectionResult:
+    requested: InteractionMode
+    changed: bool
+    auto_unrestricted: bool = False
+    safety_classifier_active: bool = False
+
+    @property
+    def limited_auto(self) -> bool:
+        return self.requested is InteractionMode.AUTO and not self.auto_unrestricted
 
 
 @dataclass(frozen=True, slots=True)
@@ -89,6 +126,7 @@ class SessionSelectionResult:
     source_profile_match: bool
     items: tuple[SessionItem, ...]
     stopped_background_tasks: int = 0
+    context_window_tokens: int | None = None
 
 
 BindingFactory = Callable[[str], Awaitable[ConversationBinding]]
@@ -113,6 +151,8 @@ class ProfileConversationController:
         session_binding_factory: SessionBindingFactory | None = None,
         session_rename: SessionRename | None = None,
         sandbox_profile: SandboxProfile = SandboxProfile.OFF,
+        reasoning_effort: ReasoningEffort = ReasoningEffort.HIGH,
+        interaction_mode: InteractionMode = InteractionMode.NORMAL,
     ) -> None:
         self._options = tuple(options)
         names = [option.name for option in self._options]
@@ -135,7 +175,10 @@ class ProfileConversationController:
         self._session_rename = session_rename
         self._known_session_summaries: dict[str, SessionSummary] = {}
         self._sandbox_profile = sandbox_profile
+        self._reasoning_effort = reasoning_effort
+        self._interaction_mode = interaction_mode
         self._turn_lock = asyncio.Lock()
+        self._apply_conversation_policies(self._binding)
 
     @property
     def profiles(self) -> tuple[ProviderOption, ...]:
@@ -157,6 +200,22 @@ class ProfileConversationController:
         return self._binding.provider.model_name
 
     @property
+    def reasoning_effort(self) -> ReasoningEffort:
+        return self._reasoning_effort
+
+    @property
+    def effective_reasoning_effort(self) -> ReasoningEffort:
+        return self._reasoning_effort.effective
+
+    @property
+    def interaction_mode(self) -> InteractionMode:
+        return self._interaction_mode
+
+    @property
+    def auto_mode_unrestricted(self) -> bool:
+        return self._binding.runner.auto_mode_unrestricted
+
+    @property
     def session_id(self) -> str | None:
         return self._binding.runner.session_id
 
@@ -173,6 +232,58 @@ class ProfileConversationController:
         if manager is None:
             raise ConfigurationError("background task visibility is unavailable")
         return await manager.list()
+
+    async def set_reasoning_effort(
+        self,
+        effort: ReasoningEffort,
+    ) -> ReasoningEffortSelectionResult:
+        if not isinstance(effort, ReasoningEffort):
+            raise TypeError("reasoning effort must be a ReasoningEffort")
+        if self._turn_lock.locked():
+            raise ConfigurationError("cannot change reasoning effort while a turn is running")
+        async with self._turn_lock:
+            changed = effort is not self._reasoning_effort
+            if changed:
+                previous = self._reasoning_effort
+                self._reasoning_effort = effort
+                try:
+                    self._apply_reasoning_effort(self._binding)
+                except BaseException:
+                    self._reasoning_effort = previous
+                    self._apply_reasoning_effort(self._binding)
+                    raise
+            return ReasoningEffortSelectionResult(
+                requested=effort,
+                effective=effort.effective,
+                changed=changed,
+                workflow_orchestration_active=False,
+            )
+
+    async def set_interaction_mode(
+        self,
+        mode: InteractionMode,
+    ) -> InteractionModeSelectionResult:
+        if not isinstance(mode, InteractionMode):
+            raise TypeError("interaction mode must be an InteractionMode")
+        if self._turn_lock.locked():
+            raise ConfigurationError("cannot change interaction mode while a turn is running")
+        async with self._turn_lock:
+            changed = mode is not self._interaction_mode
+            if changed:
+                previous = self._interaction_mode
+                self._interaction_mode = mode
+                try:
+                    self._binding.runner.set_interaction_mode(mode)
+                except BaseException:
+                    self._interaction_mode = previous
+                    self._binding.runner.set_interaction_mode(previous)
+                    raise
+            return InteractionModeSelectionResult(
+                requested=mode,
+                changed=changed,
+                auto_unrestricted=self._binding.runner.auto_mode_unrestricted,
+                safety_classifier_active=False,
+            )
 
     async def select_profile(self, name: str) -> ProviderSelectionResult:
         if self._turn_lock.locked():
@@ -194,6 +305,11 @@ class ProfileConversationController:
             if binding.runner.session_id is not None:
                 await self._shutdown_binding_tasks(binding)
                 raise ConfigurationError("provider profile switch must create a fresh conversation")
+            try:
+                self._apply_conversation_policies(binding)
+            except BaseException:
+                await self._shutdown_binding_tasks(binding)
+                raise
             stopped_background_tasks = await self._replace_binding(binding)
             self._selected_profile = name
             return self._selection_result(
@@ -275,6 +391,11 @@ class ProfileConversationController:
             if binding.runner.session_id != option.session_id:
                 await self._shutdown_binding_tasks(binding)
                 raise ConfigurationError("session resume binding returned the wrong session")
+            try:
+                self._apply_conversation_policies(binding)
+            except BaseException:
+                await self._shutdown_binding_tasks(binding)
+                raise
             stopped_background_tasks = await self._replace_binding(binding)
             self._selected_profile = option.resume_profile
             return self._session_selection_result(
@@ -308,6 +429,13 @@ class ProfileConversationController:
             raise
         self._binding = binding
         return stopped
+
+    def _apply_reasoning_effort(self, binding: ConversationBinding) -> None:
+        binding.runner.set_reasoning_effort(self._reasoning_effort)
+
+    def _apply_conversation_policies(self, binding: ConversationBinding) -> None:
+        self._apply_reasoning_effort(binding)
+        binding.runner.set_interaction_mode(self._interaction_mode)
 
     @staticmethod
     async def _shutdown_binding_tasks(binding: ConversationBinding) -> int:
@@ -363,13 +491,15 @@ class ProfileConversationController:
         changed: bool,
         stopped_background_tasks: int = 0,
     ) -> ProviderSelectionResult:
+        option = next(option for option in self._options if option.name == profile_name)
         return ProviderSelectionResult(
-            profile_name,
-            self.provider_name,
-            self.model_name,
-            previous_session_id,
-            changed,
-            stopped_background_tasks,
+            profile_name=profile_name,
+            provider_name=self.provider_name,
+            model_name=self.model_name,
+            previous_session_id=previous_session_id,
+            changed=changed,
+            stopped_background_tasks=stopped_background_tasks,
+            context_window_tokens=option.context_window_tokens,
         )
 
     def _session_selection_result(
@@ -393,14 +523,21 @@ class ProfileConversationController:
             source_profile_match=option.source_profile_match,
             items=items,
             stopped_background_tasks=stopped_background_tasks,
+            context_window_tokens=next(
+                option.context_window_tokens
+                for option in self._options
+                if option.name == self._selected_profile
+            ),
         )
 
 
 __all__ = [
     "ConversationBinding",
+    "InteractionModeSelectionResult",
     "ProfileConversationController",
     "ProviderOption",
     "ProviderSelectionResult",
+    "ReasoningEffortSelectionResult",
     "SessionOption",
     "SessionSelectionResult",
 ]

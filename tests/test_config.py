@@ -354,6 +354,7 @@ env_key = "LEGACY_KEY"
 [provider.default]
 kind = "{kind}"
 model = "{model}"
+context_window_tokens = 1000000
 max_output_tokens = 2048
 """,
                     encoding="utf-8",
@@ -368,13 +369,21 @@ max_output_tokens = 2048
                 self.assertEqual(config.provider.base_url, expected_url)
                 self.assertEqual(config.provider.api_key_env, expected_env)
                 self.assertEqual(config.provider.model, model)
+                self.assertEqual(config.provider.context_window_tokens, 1_000_000)
                 self.assertEqual(config.provider.max_output_tokens, 2048)
+                self.assertIsNone(
+                    override_provider(
+                        config, model="different-model"
+                    ).provider.context_window_tokens
+                )
 
     def test_native_provider_requires_model_and_numeric_limits_are_validated(self) -> None:
         invalid_tables = (
             ('kind = "anthropic"', "requires an explicit model"),
             ('kind = "xai-responses"', "requires an explicit model"),
             ('model = "fixture-model"\ntimeout_seconds = "slow"', "must be a number"),
+            ('model = "fixture-model"\ncontext_window_tokens = 0', "must be positive"),
+            ('model = "fixture-model"\ncontext_window_tokens = 1.5', "must be an integer"),
             ('model = "fixture-model"\nmax_output_tokens = 0', "must be positive"),
             ('model = "fixture-model"\nmax_output_tokens = 1.5', "must be an integer"),
         )
