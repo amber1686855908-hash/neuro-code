@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -49,7 +50,8 @@ class JsonUiPreferencesStoreTests(unittest.IsolatedAsyncioTestCase):
                 await JsonUiPreferencesStore(path).load_language(),
                 UiLanguage.SIMPLIFIED_CHINESE,
             )
-            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            if os.name == "posix":
+                self.assertEqual(path.stat().st_mode & 0o777, 0o600)
             self.assertEqual(
                 json.loads(path.read_text(encoding="utf-8")),
                 {
@@ -80,7 +82,8 @@ class JsonUiPreferencesStoreTests(unittest.IsolatedAsyncioTestCase):
                 ReasoningEffort.XHIGH,
             )
             self.assertEqual(await restored.load_interaction_mode(), InteractionMode.PLAN)
-            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            if os.name == "posix":
+                self.assertEqual(path.stat().st_mode & 0o777, 0o600)
 
 
 if __name__ == "__main__":

@@ -723,7 +723,7 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("CTX", str(context.renderable))
             self.assertIn("~0.0%", str(context.renderable))
             self.assertIn("CWD", str(workspace.renderable))
-            self.assertIn("/workspace", str(workspace.renderable))
+            self.assertIn(str(Path("/workspace")), str(workspace.renderable))
             self.assertIn("MODE", str(mode.renderable))
             self.assertIn("normal", str(mode.renderable))
 
