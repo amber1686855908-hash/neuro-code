@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import os
 import shlex
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -240,7 +241,10 @@ class LocalBackgroundTaskManagerTests(unittest.IsolatedAsyncioTestCase):
                 "print('second',file=sys.stderr,flush=True);"
                 "time.sleep(0.05)"
             )
-            command = f"{shlex.quote(sys.executable)} -u -c {shlex.quote(code)}"
+            arguments = [sys.executable, "-u", "-c", code]
+            command = (
+                subprocess.list2cmdline(arguments) if os.name == "nt" else shlex.join(arguments)
+            )
             try:
                 started = await manager.start_shell(
                     command,
