@@ -17,7 +17,7 @@ from unittest.mock import AsyncMock, patch
 from neuro_code.adapters.sqlite_session import SqliteSessionStore
 from neuro_code.cli import _normalize_rule, main
 from neuro_code.config import AppConfig
-from neuro_code.domain.messages import ToolCall
+from neuro_code.domain.messages import Message, Role, ToolCall
 from neuro_code.domain.model_context import ModelContext
 from neuro_code.domain.model_events import (
     ModelCompleted,
@@ -454,6 +454,91 @@ api_key_env = "FIXTURE_KEY"
             self.assertIs(captured["runner"], captured["task_controller"])
             self.assertEqual(captured["initial_items"], ())
             self.assertTrue(captured["ran"])
+
+    def test_tui_session_search_is_scoped_to_the_workspace_alias(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / "state"
+            workspace = root / "workspace"
+            workspace.mkdir()
+            other_workspace = root / "other"
+            other_workspace.mkdir()
+            workspace_alias = workspace / ".." / "workspace"
+            self._write_provider_config(state)
+
+            async def seed_sessions() -> tuple[str, str]:
+                store = SqliteSessionStore(state / "sessions.db")
+                await store.initialize()
+                local_id = await store.create_session(
+                    str(workspace_alias),
+                    "cli-fixture",
+                    "fixture-model",
+                )
+                await store.save_messages(
+                    local_id,
+                    [Message(Role.USER, "workspace scope marker")],
+                )
+                other_id = await store.create_session(
+                    str(other_workspace),
+                    "cli-fixture",
+                    "fixture-model",
+                )
+                await store.save_messages(
+                    other_id,
+                    [Message(Role.USER, "workspace scope marker")],
+                )
+                return local_id, other_id
+
+            local_id, other_id = asyncio.run(seed_sessions())
+            captured: dict[str, object] = {}
+
+            class TuiFixture:
+                def __init__(
+                    self,
+                    runner: object,
+                    *,
+                    approval_controller: object,
+                    provider_controller: object,
+                    session_controller: object,
+                    task_controller: object,
+                    initial_items: object,
+                    provider_name: str,
+                    model_name: str,
+                    cwd: Path,
+                ) -> None:
+                    del (
+                        runner,
+                        approval_controller,
+                        provider_controller,
+                        task_controller,
+                        initial_items,
+                        provider_name,
+                        model_name,
+                        cwd,
+                    )
+                    self.session_controller = session_controller
+
+                async def run_async(self) -> None:
+                    options = await self.session_controller.list_sessions("scope marker")
+                    captured["session_ids"] = [option.session_id for option in options]
+
+            with (
+                patch.dict(
+                    "os.environ",
+                    {
+                        "NEURO_CODE_HOME": str(state),
+                        "FIXTURE_KEY": "fixture-key",
+                    },
+                    clear=True,
+                ),
+                patch("neuro_code.cli.create_routed_provider", return_value=CliProvider()),
+                patch("neuro_code.tui.NeuroCodeApp", TuiFixture),
+            ):
+                exit_code = main(("--cwd", str(workspace)))
+
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(captured["session_ids"], [local_id])
+            self.assertNotIn(other_id, captured["session_ids"])
 
     def test_tui_profile_controller_recomposes_a_fresh_selected_provider(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

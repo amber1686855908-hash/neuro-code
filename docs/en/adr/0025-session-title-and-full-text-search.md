@@ -37,6 +37,13 @@ documents are repaired during initialization, and every message/item save or
 read-only Rust import updates the index in the same transaction as canonical
 session state.
 
+Initialization acquires a SQLite immediate write transaction before inspecting
+or changing the schema. Concurrent initializers therefore serialize across
+store instances and processes, while a migration or FTS backfill failure rolls
+back the schema, version marker, and derived documents together. Enabling WAL
+retries only transient database-lock errors up to the connection timeout; other
+SQLite failures remain fail-closed.
+
 Native sessions receive a deterministic title from the first visible user
 message: system-reminder blocks are removed and the first ten words are kept.
 The title remains stable on later turns. A valid upstream `generated_title` is
@@ -68,6 +75,8 @@ JSON session exports move to schema version 4 and include the optional title.
   every `messages_json` value.
 - A Python/SQLite build without FTS5 fails initialization explicitly rather
   than silently claiming that no sessions match.
+- Concurrent schema initialization is bounded and atomic; this does not claim
+  general cross-process coordination for all later session writes.
 - Search snippets can reveal only material already present in the visible local
   conversation projection; provider-private and system-only context is not
   indexed.

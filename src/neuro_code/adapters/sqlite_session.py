@@ -5,6 +5,7 @@ import json
 import math
 import re
 import sqlite3
+import time
 import uuid
 from collections.abc import Sequence
 from contextlib import closing
@@ -36,6 +37,7 @@ from neuro_code.errors import SessionError
 
 SCHEMA_VERSION = 4
 _SEARCH_SNIPPET_LIMIT = 500
+_SQLITE_TIMEOUT_SECONDS = 30.0
 
 
 class SqliteSessionStore:
@@ -54,84 +56,82 @@ class SqliteSessionStore:
         return self._database_path
 
     def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self._database_path, timeout=30)
-        connection.execute("PRAGMA foreign_keys = ON")
-        connection.execute("PRAGMA journal_mode = WAL")
-        return connection
+        connection = sqlite3.connect(self._database_path, timeout=_SQLITE_TIMEOUT_SECONDS)
+        try:
+            connection.execute("PRAGMA foreign_keys = ON")
+            connection.execute(f"PRAGMA busy_timeout = {int(_SQLITE_TIMEOUT_SECONDS * 1_000)}")
+            deadline = time.monotonic() + _SQLITE_TIMEOUT_SECONDS
+            while True:
+                try:
+                    connection.execute("PRAGMA journal_mode = WAL")
+                    return connection
+                except sqlite3.OperationalError as error:
+                    if "locked" not in str(error).casefold() or time.monotonic() >= deadline:
+                        raise
+                    time.sleep(0.01)
+        except BaseException:
+            connection.close()
+            raise
 
     async def initialize(self) -> None:
         def initialize_sync() -> None:
             self._database_path.parent.mkdir(parents=True, exist_ok=True)
-            with closing(self._connect()) as connection, connection:
-                connection.executescript(
-                    """
-                    CREATE TABLE IF NOT EXISTS schema_meta (
-                        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-                        version INTEGER NOT NULL
-                    );
-                    INSERT OR IGNORE INTO schema_meta(singleton, version) VALUES (1, 1);
-
-                    CREATE TABLE IF NOT EXISTS sessions (
-                        id TEXT PRIMARY KEY,
-                        cwd TEXT NOT NULL,
-                        provider TEXT NOT NULL,
-                        model TEXT NOT NULL,
-                        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                        messages_json TEXT NOT NULL DEFAULT '[]'
-                    );
-
-                    CREATE TABLE IF NOT EXISTS events (
-                        session_id TEXT NOT NULL,
-                        sequence INTEGER NOT NULL,
-                        kind TEXT NOT NULL,
-                        created_at TEXT NOT NULL,
-                        data_json TEXT NOT NULL,
-                        PRIMARY KEY (session_id, sequence),
-                        FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
-                    );
-                    """
-                )
-                version = connection.execute(
-                    "SELECT version FROM schema_meta WHERE singleton = 1"
-                ).fetchone()
-                if version is not None and version[0] == 1:
-                    columns = {
-                        str(row[1])
-                        for row in connection.execute("PRAGMA table_info(sessions)").fetchall()
-                    }
-                    if "context_affinity" not in columns:
-                        connection.execute("ALTER TABLE sessions ADD COLUMN context_affinity TEXT")
-                    connection.execute("UPDATE schema_meta SET version = 2 WHERE singleton = 1")
-                    version = (2,)
-                if version is not None and version[0] == 2:
-                    columns = {
-                        str(row[1])
-                        for row in connection.execute("PRAGMA table_info(sessions)").fetchall()
-                    }
-                    if "sandbox_profile" not in columns:
-                        connection.execute("ALTER TABLE sessions ADD COLUMN sandbox_profile TEXT")
-                    connection.execute("UPDATE schema_meta SET version = 3 WHERE singleton = 1")
-                    version = (3,)
-                if version is not None and version[0] == 3:
-                    columns = {
-                        str(row[1])
-                        for row in connection.execute("PRAGMA table_info(sessions)").fetchall()
-                    }
-                    if "title" not in columns:
-                        connection.execute(
-                            "ALTER TABLE sessions ADD COLUMN title TEXT NOT NULL DEFAULT ''"
+            with closing(self._connect()) as connection:
+                try:
+                    # Serialise schema inspection and migration across store instances and
+                    # processes. ``executescript`` is deliberately avoided because it
+                    # commits an open transaction before executing its script.
+                    connection.execute("BEGIN IMMEDIATE")
+                    _ensure_base_schema(connection)
+                    version = connection.execute(
+                        "SELECT version FROM schema_meta WHERE singleton = 1"
+                    ).fetchone()
+                    if version is not None and version[0] == 1:
+                        columns = {
+                            str(row[1])
+                            for row in connection.execute("PRAGMA table_info(sessions)").fetchall()
+                        }
+                        if "context_affinity" not in columns:
+                            connection.execute(
+                                "ALTER TABLE sessions ADD COLUMN context_affinity TEXT"
+                            )
+                        connection.execute("UPDATE schema_meta SET version = 2 WHERE singleton = 1")
+                        version = (2,)
+                    if version is not None and version[0] == 2:
+                        columns = {
+                            str(row[1])
+                            for row in connection.execute("PRAGMA table_info(sessions)").fetchall()
+                        }
+                        if "sandbox_profile" not in columns:
+                            connection.execute(
+                                "ALTER TABLE sessions ADD COLUMN sandbox_profile TEXT"
+                            )
+                        connection.execute("UPDATE schema_meta SET version = 3 WHERE singleton = 1")
+                        version = (3,)
+                    if version is not None and version[0] == 3:
+                        columns = {
+                            str(row[1])
+                            for row in connection.execute("PRAGMA table_info(sessions)").fetchall()
+                        }
+                        if "title" not in columns:
+                            connection.execute(
+                                "ALTER TABLE sessions ADD COLUMN title TEXT NOT NULL DEFAULT ''"
+                            )
+                        _ensure_search_schema(connection)
+                        _backfill_search_documents(connection)
+                        connection.execute("UPDATE schema_meta SET version = 4 WHERE singleton = 1")
+                        version = (4,)
+                    if version is None or version[0] != SCHEMA_VERSION:
+                        raise SessionError(
+                            "unsupported session schema version: "
+                            f"{version[0] if version else 'missing'}"
                         )
                     _ensure_search_schema(connection)
-                    _backfill_search_documents(connection)
-                    connection.execute("UPDATE schema_meta SET version = 4 WHERE singleton = 1")
-                    version = (4,)
-                if version is None or version[0] != SCHEMA_VERSION:
-                    raise SessionError(
-                        f"unsupported session schema version: {version[0] if version else 'missing'}"
-                    )
-                _ensure_search_schema(connection)
-                _backfill_search_documents(connection, missing_only=True)
+                    _backfill_search_documents(connection, missing_only=True)
+                    connection.commit()
+                except BaseException:
+                    connection.rollback()
+                    raise
 
         await run_blocking(initialize_sync)
 
@@ -574,6 +574,44 @@ class SqliteSessionStore:
             return _parse_sandbox_profile(row[0], session_id=session_id)
 
         return await run_blocking(peek)
+
+
+def _ensure_base_schema(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS schema_meta (
+            singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+            version INTEGER NOT NULL
+        )
+        """
+    )
+    connection.execute("INSERT OR IGNORE INTO schema_meta(singleton, version) VALUES (1, 1)")
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS sessions (
+            id TEXT PRIMARY KEY,
+            cwd TEXT NOT NULL,
+            provider TEXT NOT NULL,
+            model TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            messages_json TEXT NOT NULL DEFAULT '[]'
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS events (
+            session_id TEXT NOT NULL,
+            sequence INTEGER NOT NULL,
+            kind TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            data_json TEXT NOT NULL,
+            PRIMARY KEY (session_id, sequence),
+            FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+        )
+        """
+    )
 
 
 def _ensure_search_schema(connection: sqlite3.Connection) -> None:

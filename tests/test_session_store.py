@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import sqlite3
@@ -8,6 +9,7 @@ import unittest
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
+from unittest.mock import Mock, patch
 
 from neuro_code.adapters.sqlite_session import SqliteSessionStore
 from neuro_code.domain.events import AgentEvent, AgentEventKind
@@ -25,6 +27,51 @@ from neuro_code.errors import SessionError
 
 
 class SessionStoreTests(unittest.IsolatedAsyncioTestCase):
+    def test_connect_retries_only_transient_wal_locks_and_closes_on_failure(self) -> None:
+        store = SqliteSessionStore(Path("/unused/sessions.db"))
+        retry_connection = Mock(spec=sqlite3.Connection)
+        wal_attempts = 0
+
+        def execute_with_transient_lock(statement: str) -> Mock:
+            nonlocal wal_attempts
+            if statement == "PRAGMA journal_mode = WAL":
+                wal_attempts += 1
+                if wal_attempts < 3:
+                    raise sqlite3.OperationalError("database is locked")
+            return Mock()
+
+        retry_connection.execute.side_effect = execute_with_transient_lock
+        with (
+            patch(
+                "neuro_code.adapters.sqlite_session.sqlite3.connect",
+                return_value=retry_connection,
+            ),
+            patch("neuro_code.adapters.sqlite_session.time.sleep") as sleep,
+        ):
+            self.assertIs(store._connect(), retry_connection)
+
+        self.assertEqual(wal_attempts, 3)
+        self.assertEqual(sleep.call_count, 2)
+        retry_connection.close.assert_not_called()
+
+        failed_connection = Mock(spec=sqlite3.Connection)
+
+        def execute_with_permanent_failure(statement: str) -> Mock:
+            if statement == "PRAGMA journal_mode = WAL":
+                raise sqlite3.OperationalError("disk I/O error")
+            return Mock()
+
+        failed_connection.execute.side_effect = execute_with_permanent_failure
+        with (
+            patch(
+                "neuro_code.adapters.sqlite_session.sqlite3.connect",
+                return_value=failed_connection,
+            ),
+            self.assertRaisesRegex(sqlite3.OperationalError, "disk I/O error"),
+        ):
+            store._connect()
+        failed_connection.close.assert_called_once_with()
+
     async def test_import_snapshot_is_atomic_and_preserves_identity_and_timestamps(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = SqliteSessionStore(Path(directory) / "sessions.db")
@@ -368,6 +415,107 @@ class SessionStoreTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("session_search_documents", tables)
             self.assertIn("session_search_fts", tables)
 
+    async def test_initialize_is_atomic_when_search_backfill_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "sessions.db"
+            connection = sqlite3.connect(database)
+            connection.executescript(
+                """
+                CREATE TABLE schema_meta (
+                    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                    version INTEGER NOT NULL
+                );
+                INSERT INTO schema_meta(singleton, version) VALUES (1, 3);
+                CREATE TABLE sessions (
+                    id TEXT PRIMARY KEY,
+                    cwd TEXT NOT NULL,
+                    provider TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    messages_json TEXT NOT NULL DEFAULT '[]',
+                    context_affinity TEXT,
+                    sandbox_profile TEXT
+                );
+                CREATE TABLE events (
+                    session_id TEXT NOT NULL,
+                    sequence INTEGER NOT NULL,
+                    kind TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    data_json TEXT NOT NULL,
+                    PRIMARY KEY (session_id, sequence)
+                );
+                """
+            )
+            connection.close()
+
+            store = SqliteSessionStore(database)
+            with (
+                patch(
+                    "neuro_code.adapters.sqlite_session._backfill_search_documents",
+                    side_effect=RuntimeError("injected backfill failure"),
+                ),
+                self.assertRaisesRegex(RuntimeError, "injected backfill failure"),
+            ):
+                await store.initialize()
+
+            failed = sqlite3.connect(database)
+            self.assertEqual(
+                failed.execute("SELECT version FROM schema_meta WHERE singleton = 1").fetchone(),
+                (3,),
+            )
+            columns = {row[1] for row in failed.execute("PRAGMA table_info(sessions)")}
+            tables = {
+                row[0]
+                for row in failed.execute(
+                    "SELECT name FROM sqlite_master WHERE type IN ('table', 'view')"
+                )
+            }
+            failed.close()
+            self.assertNotIn("title", columns)
+            self.assertNotIn("session_search_documents", tables)
+            self.assertNotIn("session_search_fts", tables)
+
+            await store.initialize()
+            recovered = sqlite3.connect(database)
+            self.assertEqual(
+                recovered.execute("SELECT version FROM schema_meta WHERE singleton = 1").fetchone(),
+                (4,),
+            )
+            recovered.close()
+
+    async def test_concurrent_initialize_is_serialized_and_idempotent(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "sessions.db"
+            stores = [SqliteSessionStore(database) for _ in range(8)]
+
+            await asyncio.gather(*(store.initialize() for store in stores))
+            session_id = await stores[0].create_session("/workspace", "fixture", "model")
+            await stores[0].save_messages(
+                session_id,
+                [Message(Role.USER, "concurrent migration search marker")],
+            )
+            await asyncio.gather(*(store.initialize() for store in reversed(stores)))
+
+            page = await stores[-1].search_sessions("concurrent marker")
+            self.assertEqual([hit.summary.id for hit in page.results], [session_id])
+            connection = sqlite3.connect(database)
+            self.assertEqual(
+                connection.execute(
+                    "SELECT version FROM schema_meta WHERE singleton = 1"
+                ).fetchone(),
+                (4,),
+            )
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM session_search_documents").fetchone(),
+                (1,),
+            )
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM session_search_fts").fetchone(),
+                (1,),
+            )
+            connection.close()
+
     async def test_search_indexes_visible_content_with_filters_and_pagination(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = SqliteSessionStore(Path(directory) / "sessions.db")
@@ -488,6 +636,75 @@ class SessionStoreTests(unittest.IsolatedAsyncioTestCase):
                 store.search_sessions("***"),
                 store.search_sessions("query", limit=0),
                 store.search_sessions("query", offset=-1),
+            ):
+                with self.assertRaises(SessionError):
+                    await operation
+
+    async def test_search_handles_unicode_syntax_ranking_and_bounded_snippets(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = SqliteSessionStore(Path(directory) / "sessions.db")
+            await store.initialize()
+
+            title_id = await store.create_session("/workspace", "fixture", "model")
+            await store.save_messages(title_id, [Message(Role.USER, "priorityneedle")])
+            body_id = await store.create_session("/workspace", "fixture", "model")
+            await store.save_messages(
+                body_id,
+                [
+                    Message(Role.USER, "Discuss unrelated adapters"),
+                    Message(Role.ASSISTANT, "The body mentions priorityneedle once."),
+                ],
+            )
+            unicode_id = await store.create_session("/workspace", "fixture", "model")
+            await store.save_messages(
+                unicode_id,
+                [Message(Role.USER, "修复 中文会话 café 搜索")],
+            )
+            snippet_id = await store.create_session("/workspace", "fixture", "model")
+            await store.save_messages(
+                snippet_id,
+                [
+                    Message(Role.USER, "Bound the generated snippet"),
+                    Message(Role.ASSISTANT, "snippetneedle" + ("x" * 1_000)),
+                ],
+            )
+
+            ranked = await store.search_sessions("priorityneedle", cwd="/workspace")
+            self.assertEqual(
+                [hit.summary.id for hit in ranked.results],
+                [title_id, body_id],
+            )
+            self.assertIn("title", ranked.results[0].matched_fields)
+            self.assertEqual(ranked.results[1].matched_fields, ("content",))
+
+            unicode_page = await store.search_sessions(
+                "《中文会话》 CAFÉ",
+                cwd="/workspace",
+            )
+            self.assertEqual([hit.summary.id for hit in unicode_page.results], [unicode_id])
+            sanitized = await store.search_sessions(
+                'priorityneedle OR "*"',
+                cwd="/workspace",
+            )
+            self.assertEqual(
+                {hit.summary.id for hit in sanitized.results},
+                {title_id, body_id},
+            )
+
+            snippet_page = await store.search_sessions(
+                "snippetneedle",
+                cwd="/workspace",
+                include_content=True,
+            )
+            self.assertEqual([hit.summary.id for hit in snippet_page.results], [snippet_id])
+            self.assertIsNotNone(snippet_page.results[0].snippet)
+            self.assertEqual(len(snippet_page.results[0].snippet or ""), 500)
+
+            for operation in (
+                store.search_sessions("x" * 1_001),
+                store.search_sessions("query", cwd=""),
+                store.search_sessions("query", limit=1_001),
+                store.search_sessions("query", offset=1_000_001),
             ):
                 with self.assertRaises(SessionError):
                     await operation
