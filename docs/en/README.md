@@ -48,9 +48,105 @@ uv run neuro-code
 When installing the built package outside the development environment, include
 the optional UI dependency with `pip install 'neuro-code[tui]'`. The initial TUI
 provides prompt input, scrollback, streamed assistant text, provider/tool status,
-and local `/help`, `/status`, `/provider`, `/model`, `/sessions`, `/resume`,
-`/cancel`, `/clear`, `/quit`, and `/exit` commands. Prompts in one launch share a durable session;
-`--resume SESSION_ID` opens an existing session after workspace validation.
+and local `/help`, `/status`, `/settings` (alias `/setting`), `/provider`, `/model`,
+`/effort [LEVEL]` (alias `/reasoning`), `/mode [MODE]`, `/sessions [QUERY]`, `/resume`,
+`/rename TITLE` (alias `/title`), `/cancel`, `/clear`, `/quit`, and `/exit` commands.
+Prompts in one launch share a durable session; `--resume SESSION_ID` opens an
+existing session after workspace validation.
+
+The full-screen interface uses a neutral dark palette with cool blue, violet,
+cyan, and green semantic accents; warm colors are reserved for warnings and
+errors. Textual's separate command palette is
+disabled because `Ctrl+P` belongs to provider selection; session search remains
+the plain-text `/sessions QUERY` flow and does not display an emoji search icon.
+The app also reconciles the real TTY cell size when a terminal drops its normal
+resize notification, so maximizing or resizing the window repaints the entire
+viewport instead of leaving the previous canvas at the top left.
+
+User prompts render as full-width muted blocks, while assistant output uses a
+separate response block without `You:`/`Assistant:` log prefixes. A streamed
+response is mounted once in the conversation and updated in place through its
+final text, so completion does not move it from a temporary area into the
+scrollback. Automatic following stops when the user scrolls upward.
+
+Assistant text is rendered as Markdown with an application-owned semantic
+palette for headings, emphasis, code, lists, links, and tables. Model text is
+not interpreted as Rich/Textual markup, and hyperlink activation is disabled.
+User prompts and local/external values remain literal text. System, status,
+tool, and error notices use one aligned label gutter, while provider/model,
+tool/session, path, outcome, duration, mode, effort, and error values receive
+restrained semantic highlights. Each model step reports client-observed time to
+its first actionable output, each tool call owns one stable
+invocation/permission/result card with elapsed time, and a completed turn
+reports total elapsed time after the final assistant message. Completed cards
+show bounded, control-safe, credential-redacted previews of actual tool output.
+Side-effecting local tools also report bounded per-call workspace changes with
+file paths and unified text diffs; sensitive, binary, oversized, dependency,
+cache, and version-control-internal content stays hidden. Mermaid, inline media,
+and interactive expand/collapse controls are not part of this slice.
+
+A persistent one-line runtime bar above the prompt shows the active provider
+and model, compact working directory, current context-window use, requested
+reasoning effort, and interaction mode. The
+context percentage starts as a visibly approximate local estimate and switches
+to provider-reported input/output token usage after a model step. A configured
+`context_window_tokens` value supplies the denominator; unknown windows display
+`?` instead of inventing a percentage. When a requested effort has a different
+implemented policy, the bar shows both values, for example
+`⚡ ultracode → ⬤ xhigh`. The labels update with the selected UI language and
+remain visible in narrow layouts.
+
+Typing `/` shows command syntax and parameter hints. The suggestions include
+the five effort values, four modes, and currently selectable provider profile names; free
+text commands display placeholders such as `SESSION_ID`, `QUERY`, and `TITLE`.
+`Tab` applies the first valid completion while ordinary prompt text and modal
+focus traversal retain their normal behavior.
+
+Use `Ctrl+,`, `/settings`, or `/setting` to choose English or Simplified Chinese.
+The selected language immediately updates application-owned controls, dialogs,
+and status text; prompts and model/tool content are never translated. The choice
+is stored with the reasoning-effort and interaction-mode preferences, separately from provider
+configuration, in
+`$NEURO_CODE_HOME/ui-preferences.json` (normally
+`~/.neuro-code/ui-preferences.json`) and is reused on later TUI launches.
+
+Use `Ctrl+E`, bare `/effort`, or bare `/reasoning` to open the five-level effort
+picker. `/effort LEVEL` and `/reasoning LEVEL` select directly, and `--effort
+LEVEL` selects a level for an interactive launch or headless run. A TUI change
+is saved as a user preference and is reapplied after a later launch, profile
+switch, or in-process session resume. An explicit `--effort` takes precedence
+at TUI startup; without an explicit or valid saved choice the default is
+`high`. A headless run also defaults to `high`. Effort cannot change while a
+turn is active and applies from the next model step.
+
+| Level | Marker | Implemented application behavior |
+|---|---:|---|
+| `low` | ○ | Direct response with the minimum inspection and verification required for correctness |
+| `medium` | ◐ | Routine inspection, self-review, and focused verification |
+| `high` | ● | Deeper investigation and proactive regression checks; the default |
+| `xhigh` | ⬤ | Difficult edge cases, challenged assumptions, and multiple validation passes |
+| `ultracode` | ⚡ | Currently uses the `xhigh` policy; workflow orchestration is not implemented |
+
+These levels are currently Neuro Code review policies, not claims about a
+provider's private reasoning controls. For every model request, the runtime
+adds non-persistent policy guidance and carries the typed requested value in
+`ModelContext`. Provider adapters do not blindly translate it into proprietary
+API parameters; any future native mapping must be explicit and
+capability-gated. Selecting `ultracode` does not start sub-agents and explicitly
+reports its `xhigh` fallback. See
+[ADR 0027](adr/0027-semantic-tui-and-application-reasoning-effort.md).
+
+Use `Shift+Tab` to cycle `normal`, `accept-edits`, `plan`, and `auto`, or use
+`/mode MODE` to select directly. `normal` automatically permits reads and asks
+for side effects; `accept-edits` additionally permits workspace edit tools;
+`plan` denies side effects without prompting. Until a safety classifier is
+implemented, `auto` is an explicitly labelled safe preview with the same
+permission defaults as `accept-edits`, so commands and network effects still
+ask. Only an explicit startup `--always-approve` retains the existing bypass
+default; explicit rules and the process sandbox still win. Mode changes are
+rejected during a turn, persist as a UI preference, and are reapplied after
+profile/session switches. See
+[ADR 0028](adr/0028-timed-tool-feedback-and-interaction-modes.md).
 
 Use `Ctrl+P`, bare `/provider` or bare `/model` to open the configured-profile
 picker. `/provider PROFILE` and `/model PROFILE` select directly. The picker
@@ -63,13 +159,23 @@ conversation, preventing provider-affine or encrypted context from crossing
 provider boundaries.
 
 Use `Ctrl+R`, `/sessions`, or bare `/resume` to open the 50 most recent sessions
-for the active workspace; `/resume SESSION_ID` selects directly. The picker
-shows only a shortened ID, update time, stored provider/model, and resume
-profile—not prompts, endpoints, credentials, or other workspaces. Resume prefers
+for the active workspace; `/resume SESSION_ID` selects directly.
+`/sessions QUERY` first performs workspace-scoped full-text search over saved
+titles and visible conversation content. The picker shows the deterministic
+first-prompt title (or an imported title), shortened ID, update time, stored
+provider/model, resume profile, and a bounded snippet for search results.
+Queries, titles, and snippets render as literal text. System messages,
+provider-private reasoning/native items, image URLs, tool arguments/metadata,
+and raw tool-result content are not indexed. Resume prefers
 a ready configured source profile. Otherwise it uses the current ready profile
 while stored source/model/affinity metadata continues to filter incompatible
 provider-native context fail closed. The previously active session remains
 unchanged.
+
+`/rename TITLE` updates the current saved session title; `/title TITLE` is an
+alias. Rename is rejected before the first session is created or while a turn
+is running. Titles are whitespace-normalized and bounded to 200 characters,
+and SQLite updates the canonical summary and FTS title in one transaction.
 
 The picker also shows the saved sandbox profile. Because the process sandbox is
 already active, sessions created under a different profile are disabled and
@@ -218,10 +324,11 @@ fallbacks = ["anthropic"]
 
 [providers.deepseek]
 protocol = "openai-chat"
-model = "deepseek-chat"
+model = "deepseek-v4-pro"
 base_url = "https://api.deepseek.com"
 auth = "env"
 api_key_env = "DEEPSEEK_API_KEY"
+context_window_tokens = 1000000
 max_output_tokens = 8192
 timeout_seconds = 120
 proxy_mode = "environment"
@@ -237,6 +344,8 @@ Supported wire protocols are `openai-chat`, `openai-responses`,
 `anthropic-messages`, and `gemini-generate-content`. Configuration stores only
 an environment-variable name. Neuro Code never writes a raw API key, never
 loads project `.env` files, and redacts credentials from inspection and errors.
+`context_window_tokens` is local capability metadata used for budgeting and UI
+display; it is not sent as a provider request parameter.
 
 Inspect and select profiles without editing the default:
 
@@ -292,7 +401,7 @@ For example:
 ```toml
 [providers.deepseek]
 protocol = "openai-chat"
-model = "deepseek-chat"
+model = "deepseek-v4-pro"
 base_url = "https://api.deepseek.com"
 api_key_env = "DEEPSEEK_API_KEY"
 proxy_mode = "explicit"
@@ -386,11 +495,14 @@ them, or set `NEURO_CODE_LIVE_PROXY_MODE=explicit` together with the ephemeral
 is useful when a local `ALL_PROXY` uses a URL scheme rejected by HTTPX; never
 place proxy credentials in project configuration.
 
-Resume, list, export, and import sessions:
+Resume, list, rename, export, and import sessions:
 
 ```bash
 neuro-code -p "Continue the work" --resume SESSION_ID
 neuro-code sessions --json
+neuro-code sessions search "sqlite migration"
+neuro-code sessions search "sqlite migration" --json --include-content --limit 20
+neuro-code sessions rename SESSION_ID "Manual session title" --json
 neuro-code export SESSION_ID --format markdown --output transcript.md
 neuro-code import-session /path/to/upstream/session --json
 ```
@@ -401,10 +513,11 @@ atomically creates a new SQLite session while preserving the source session
 ID, workspace, model, and timestamps. A duplicate session ID is rejected
 rather than overwritten. The JSON report identifies skipped corrupt or
 unsupported records. Ordered reasoning/backend-tool records and image URLs are
-preserved structurally. JSON export schema version 3 exposes the complete
+preserved structurally. JSON export schema version 4 exposes the complete
 `conversation_items` sequence alongside its ordinary `messages` projection.
-It also reports the canonical saved sandbox profile or `null` for a legacy
-session. A recognized built-in profile from an upstream summary is preserved;
+It also reports the canonical saved sandbox profile and optional title, or
+`null` for a legacy sandbox profile. A recognized built-in profile and
+`generated_title` from an upstream summary are preserved;
 an unsupported custom profile is rejected instead of silently downgraded.
 Legacy assistant `raw_output`, singular reasoning, and v0
 `reasoning_content` are upgraded in memory; backend-tool IDs prevent an

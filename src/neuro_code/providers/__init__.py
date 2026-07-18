@@ -75,6 +75,7 @@ def create_routed_provider(config: AppConfig, *, failover: bool = True) -> Model
             profile.model,
             profile.context_affinity,
             partial(create_provider, profile),
+            context_window_tokens=profile.context_window_tokens,
         )
         for profile in profiles
     )

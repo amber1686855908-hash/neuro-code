@@ -49,6 +49,7 @@ def _candidate(provider: ScriptedModelProvider) -> ProviderCandidate:
         provider.model_name,
         provider.context_affinity,
         lambda: provider,
+        context_window_tokens=128_000,
     )
 
 
@@ -84,6 +85,7 @@ class FailoverModelProviderTests(unittest.IsolatedAsyncioTestCase):
         selected = events[1]
         assert isinstance(selected, ModelProviderSelected)
         self.assertTrue(selected.failover)
+        self.assertEqual(selected.context_window_tokens, 128_000)
         self.assertEqual(router.provider_name, "fallback")
         self.assertEqual(router.context_affinity, "profile-v1:fallback")
 

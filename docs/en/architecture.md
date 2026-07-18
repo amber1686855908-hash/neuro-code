@@ -97,10 +97,79 @@ prefix. A cancelled user message remains part of that history; pre-token rewind
 is a separate, unimplemented interaction policy.
 
 The minimal TUI is a presentation adapter over `AgentEvent`. It owns prompt
-input, scrollback, a live text surface, and local slash commands. It reduces
-provider and tool lifecycle events to status messages and deliberately does not
-render raw reasoning, general tool argument mappings, or tool results in the
-transcript. See [ADR 0014](adr/0014-minimal-event-stream-tui.md).
+input, scrollback, a live text surface, and local slash commands. It never
+renders raw reasoning or unrestricted argument/result mappings. A bounded
+allowlist supplies invocation previews such as path, command, pattern, query,
+and task ID. Each local tool call then owns one stable card, keyed by call ID,
+which is updated with its permission path, redacted result preview, elapsed
+time, and any bounded workspace-change report. See
+[ADR 0014](adr/0014-minimal-event-stream-tui.md) and
+[ADR 0029](adr/0029-auditable-in-place-tool-cards.md).
+
+The scrollback is a vertical conversation of stable message widgets rather
+than a pre-rendered log plus a temporary streaming surface. User prompts and
+assistant responses have distinct layouts. A pending assistant widget remains
+the final conversation node while lifecycle notices are inserted before it;
+text deltas and the terminal response update that same node. Auto-follow occurs
+only while the viewport is already at the end. See
+[ADR 0026](adr/0026-stable-localized-tui-conversation.md).
+
+Assistant widgets use Rich's Markdown document model with an application-owned
+semantic theme and disabled hyperlink activation; model output is never passed
+through Rich/Textual markup parsing. User content and application/external
+values use literal `Text`. Local system, status, tool, and error records are
+two-column grids with a fixed label gutter and a folding body. Semantic value
+classes—not arbitrary payload markup—select restrained colors for provider,
+model, tool, session, path, outcome, duration, mode, effort, and error fields.
+Tool output and diffs are literal application-styled `Text`, never payload
+markup. Mermaid, media, and interactive card expansion remain outside this
+renderer. See [ADR 0027](adr/0027-semantic-tui-and-application-reasoning-effort.md).
+
+Application-owned TUI text is selected through `UiLanguage`. The injected
+`UiPreferencesStore` port persists the language, requested reasoning effort, and
+interaction mode,
+with the JSON adapter using an atomic, user-only state file separate from
+provider configuration. Invalid or absent values fall back independently to
+English, `high`, and `normal`. English and Simplified Chinese catalogs have identical
+keys. Switching language rerenders chrome and translatable local history, while
+visible user/model text and already-sanitized tool previews remain untranslated
+and are never sent to a translator.
+
+The presentation adapter owns one fixed cool neutral-dark theme instead of exposing
+Textual's unrelated theme and command-palette surfaces. The built-in palette is
+disabled, provider and session discovery use the explicit application commands,
+and session queries are rendered as literal plain text. A persistent runtime
+bar above the prompt renders the active provider/model, compact working path,
+context-window usage, requested/effective effort, and interaction mode from
+controller state; it updates on
+localization, profile failover, and selection rather than scraping transcript
+messages. Context starts with a provider-neutral estimate over canonical
+session items. Each model completion with token metadata emits
+`CONTEXT_USAGE_UPDATED`, replacing that estimate with the provider-reported
+input plus output count. The denominator is explicit profile metadata named
+`context_window_tokens`; an absent value stays unknown.
+
+Slash completion is a deterministic presentation catalog, separate from
+command execution. It projects effort/mode choices and selectable redacted profile
+names, shows placeholders for free-form arguments, and feeds both the inline
+suggester and the visible hint row. The TUI's priority Tab action applies the
+first candidate only while the main prompt contains a slash command; modal
+focus traversal remains intact. In full-screen terminal mode, a low-frequency
+viewport reconciliation reads the actual TTY dimensions and posts the normal
+Textual resize event only when the active screen is stale. Headless tests,
+inline mode, and web mode do not install that fallback.
+
+Runtime timing uses monotonic clocks. `MODEL_THINKING_COMPLETED` measures each
+model step from dispatch to the first visible/actionable result; it does not
+claim access to private provider reasoning telemetry. Tool terminal events carry
+elapsed time, while `TURN_COMPLETED` places the whole-turn summary after the
+stable assistant node. Tool invocation, permission path, output preview,
+workspace changes, and terminal status are rendered in one bounded, in-place
+tree. For a side-effecting local tool, the runtime compares bounded read-only
+workspace snapshots taken after permission succeeds and immediately around the
+execution. The report is audit metadata, not a permission or success signal.
+See [ADR 0028](adr/0028-timed-tool-feedback-and-interaction-modes.md) and
+[ADR 0029](adr/0029-auditable-in-place-tool-cards.md).
 
 For the active conversation scope, local `/tasks` renders bounded task metadata
 without command text or output and a periodic read-only poll emits one notice
@@ -114,6 +183,14 @@ meaning of denying the pending request. Runtime-owned recovery and tool-result
 balancing are defined in
 [ADR 0016](adr/0016-recoverable-turn-cancellation.md).
 
+`ProfileConversationController` also owns `InteractionMode`, serializes mode
+changes with active turns, and reapplies the selected mode to replacement
+bindings. `normal`, `accept-edits`, and `plan` map to deterministic permission
+manager modes. `auto` defaults to the safe `accept-edits` preview until a safety
+classifier exists; only an explicitly authorized `--always-approve` launch
+retains bypass defaults. Prompt guidance describes the mode, but actual authority
+comes exclusively from permission/workspace/sandbox adapters. See ADR 0028.
+
 `ProfileConversationController` wraps the active `AgentConversation` for the
 interactive composition. It serializes selection with turns and exposes only
 redacted `ProviderOption` data to the TUI. Selecting a different configured
@@ -122,6 +199,23 @@ session; the old SQLite session remains untouched. This strict boundary avoids
 cross-provider replay of encrypted reasoning, hosted-tool state, dialect
 metadata, and profile-affine context. See
 [ADR 0017](adr/0017-safe-interactive-profile-selection.md).
+
+The controller also owns one process-local `ReasoningEffort` selection and
+serializes changes with turns. It reapplies the requested value whenever a
+profile or session replacement installs a new conversation binding. `low`,
+`medium`, `high`, and `xhigh` map to application review guidance;
+`ultracode` has an explicit effective value of `xhigh` until workflow
+orchestration exists. The TUI exposes the selection through `Ctrl+E`, `/effort`,
+and `/reasoning`; the CLI exposes `--effort`. Selection does not rewrite
+provider configuration or session identity.
+
+At each model step, `AgentRuntime` adds the selected guidance to a request-only
+system message and places the typed requested value on `ModelContext`. The
+guidance is not added to canonical `SessionItem` history. Provider adapters may
+inspect the typed value, but the current adapters do not translate it into
+provider-private reasoning parameters. A future native mapping must declare and
+test its capability explicitly. See
+[ADR 0027](adr/0027-semantic-tui-and-application-reasoning-effort.md).
 
 The same controller exposes a workspace-scoped `SessionOption` catalog and
 serializes session selection with turns. The composition root filters recent
@@ -133,6 +227,22 @@ replaces scrollback with a bounded visible-message projection that omits
 reasoning, native records, arguments, image URLs, and raw tool-result content.
 See
 [ADR 0018](adr/0018-workspace-scoped-interactive-session-resume.md).
+
+The same catalog has a separate ranked-search path. `SessionStore` returns
+typed title/content hits from a synchronized SQLite FTS5 projection; the
+composition root applies filesystem-identity workspace filtering before the
+controller creates `SessionOption` values. `/sessions QUERY` displays the saved
+or deterministic first-prompt title plus an optional literal-text snippet.
+System messages, provider-preserved items, assistant private reasoning, tool
+arguments/metadata, raw tool-result content, and image URLs never enter that projection. See
+[ADR 0025](adr/0025-session-title-and-full-text-search.md).
+
+Manual rename follows the same boundary. `SessionStore.update_session_title`
+returns the updated canonical summary and changes the SQLite title, update
+timestamp, and synchronized FTS document atomically. The TUI composition root
+permits rename only for the current filesystem-identity workspace, while the
+controller serializes it with model turns. CLI callers can rename an explicit
+ID in the selected state database.
 
 The operating-system sandbox is also part of session identity. Native sessions
 persist the canonical creation profile. Explicit-ID startup performs an
@@ -159,7 +269,8 @@ continues to fail closed. See
 - `ModelProvider`: turns an ordered `ModelContext` and tool schemas into model
   events. It exposes the selected profile identity and a non-secret affinity
   fingerprint; context carries the session's profile/model/affinity origin for
-  adapter-owned replay decisions.
+  adapter-owned replay decisions and the provider-neutral requested reasoning
+  effort for explicit capability handling.
 - `Tool`: publishes a JSON schema and executes with a scoped `ToolContext`.
 - `ToolRegistry`: resolves canonical tool names and rejects duplicates.
 - `ShellSandbox`: turns a shell string into an argv-safe, platform-enforced
@@ -173,8 +284,8 @@ continues to fail closed. See
 - `PermissionApprover`: optionally resolves an `ask` asynchronously without
   overriding policy denial.
 - `SessionStore`: appends versioned events, preserves ordered `SessionItem`
-  values, and exposes both the canonical sequence and an ordinary-message
-  projection.
+  values, exposes canonical and ordinary-message projections, and returns
+  typed, paginated session-title/content search pages.
 - `PlatformAdapter`: encapsulates PTY, process, signal, path, clipboard, and sandbox differences.
 
 Protocol models are versioned at external boundaries. Internal state prefers
@@ -189,6 +300,11 @@ branches on a commercial provider name. Profiles separate wire protocol
 `gemini-generate-content`) from optional dialect behavior such as xAI Responses.
 Credentials are environment references or a validated loopback-proxy
 placeholder, never persisted secrets.
+
+An optional positive `context_window_tokens` field records provider/model
+capability metadata. It is propagated through redacted profile selection and
+failover events for local budgeting, but is never serialized as an API request
+parameter. The model endpoint itself enforces its real context limit.
 
 CC Switch is an optional configuration source and HTTP gateway, not an
 application dependency. Its exported active profile is translated in memory at
@@ -281,6 +397,9 @@ pair from terminal backend output when intermediate events were absent.
   and unsupported stored values also fail closed.
 - Restored TUI history never renders persisted reasoning, native provider
   records, tool arguments, image URLs, or raw tool-result content.
+- Session search indexes only its visible local projection. Interactive hits
+  remain workspace-scoped and saved queries/titles/snippets are rendered as
+  literal text rather than UI markup.
 - Cancellation terminates owned child processes, commits a terminal failure,
   saves balanced context, and reloads it before the next conversation turn.
 - Shell commands execute in an owned process group. Timeout and cancellation
@@ -305,7 +424,11 @@ events. JSON and Markdown are interchange/export formats. The database exposes
 an integer schema version; every change requires forward migration, fixture
 coverage, and a documented compatibility decision. Schema v3 adds a nullable
 canonical sandbox profile: new sessions store a value, while migrated legacy
-sessions retain `NULL`. Startup can inspect that single field through an
+sessions retain `NULL`. Schema v4 adds stable optional titles and a
+trigger-synchronized external-content FTS5 projection. Migration derives a
+ten-word title from the first visible user message when no imported title
+exists and backfills escaped conversation content without indexing private
+provider items. Startup can inspect the sandbox field through an
 immutable read-only connection before any database creation, migration, or
 process sandbox activation. Rust sessions are parsed by
 a separate read-only adapter. It validates format versions 0 and 1, reads
@@ -325,7 +448,8 @@ provider JSON and relative order. The runtime carries the complete ordered
 sequence into each model step while application views continue to use the
 ordinary-message projection. When it resumes an imported session, storage
 permits append-only extension but rejects rewriting the preserved prefix. JSON
-export schema 3 includes both projections and the session sandbox profile.
+export schema 4 includes both projections, the session sandbox profile, and the
+optional title.
 Provider adapters validate image
 references and use native multimodal blocks only where the wire role and URI
 form are supported; all other images become a visible placeholder without

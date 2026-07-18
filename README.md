@@ -6,20 +6,27 @@ Neuro Code 最初基于开源 Grok Build 的行为边界进行 Python 重写，�
 可扩展的终端编码智能体继续演进。
 当前项目处于 pre-alpha 阶段，已经具备可安装 CLI、无头代理循环、带失败关闭审批的
 最小交互 TUI（含可恢复取消和安全 profile 选择）、多模型流式适配、工作区工具、
-权限控制、工作区会话选择/历史回放、Linux 失败关闭沙箱 profile、会话固定沙箱恢复和
-SQLite 会话能力，以及受管后台 Shell 任务的启动/查询/单任务或多任务等待/终止生命周期。
+权限控制、工作区会话选择/历史回放与标题/内容全文搜索、Linux 失败关闭沙箱 profile、
+会话固定沙箱恢复和 SQLite 会话能力，以及受管后台 Shell 任务的启动/查询/单任务或
+多任务等待/终止生命周期。TUI 现已支持安全 Markdown 与语义配色、常驻模型/上下文占用/
+强度/模式/工作区状态栏、带参数的斜杠命令提示与 Tab 补全、模型步骤与整轮耗时、结构化
+工具反馈，以及可持久化的五档应用层审查强度和四种安全交互模式。
 
 Neuro Code began as a Python reimplementation of the open-source Grok Build
 terminal coding agent and now evolves as an independent, extensible project. It
 is currently pre-alpha, with an installable CLI, a headless agent loop, a
 minimal interactive TUI with fail-closed approvals, recoverable in-flight
 cancellation, and safe profile selection, multi-provider streaming, workspace
-session selection/history replay, tools, permissions, fail-closed Linux sandbox
+session selection/history replay and title/content search, tools, permissions, fail-closed Linux sandbox
 profiles, session-fixed sandbox resume, and SQLite sessions.
 It also supports conversation-scoped, process-owned background shell task
 start, snapshot/event-driven single-or-multi-wait, termination, read-only TUI
 visibility, and bounded
-model-boundary completion metadata within one application lifetime.
+model-boundary completion metadata within one application lifetime. The TUI
+also provides safe Markdown with semantic colors, a persistent
+model/context-usage/effort/mode/workspace bar, parameter-aware slash-command
+hints with Tab completion, timed model steps and turns, structured tool
+feedback, five saved review-effort choices, and four safe interaction modes.
 
 ## 文档 / Documentation
 
@@ -50,15 +57,16 @@ uv run mypy
 - 源基线 / Source baseline: [`xai-org/grok-build`](https://github.com/xai-org/grok-build) at `c68e39f60462f28d9be5e683d9cbe2c57b1a5027`
 - 目标平台 / Target platforms: Linux, macOS, Windows
 - 许可证 / License: Apache-2.0
-- 完整重写进度粗略为 45–50%；M2 退出测试已经满足，M3 最小 TUI、交互审批、可恢复
+- 完整重写进度粗略为 48–52%；M2 退出测试已经满足，M3 最小 TUI、交互审批、可恢复
   取消、安全 profile 选择、工作区会话恢复、Linux 沙箱、会话固定沙箱及受管后台命令
-  会话作用域、TUI 可见性、事件驱动多任务等待和模型完成提醒切片已实现。
-- Overall public-surface parity is roughly 45–50%; the M2 exit test is satisfied
+  会话作用域、TUI 可见性、事件驱动多任务等待、模型完成提醒、会话全文搜索和手动重命名
+  切片已实现。
+- Overall public-surface parity is roughly 48–52%; the M2 exit test is satisfied
   and the M3 minimal-TUI, interactive-approval, recoverable-cancellation, and
   safe-profile-selection, workspace-session-resume, Linux-sandbox, and
   session-fixed-sandbox and session-scoped managed-background-command/TUI-
-  visibility/event-driven-multi-wait/model-completion-reminder slices are
-  implemented.
+  visibility/event-driven-multi-wait/model-completion-reminder/session-search/manual-rename
+  slices are implemented.
 
 本项目与 xAI 或 SpaceXAI 没有关联，也未获得其认可。“Grok”等名称可能是其各自所有者的商标。
 

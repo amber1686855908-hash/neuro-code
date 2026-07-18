@@ -17,7 +17,7 @@ from unittest.mock import AsyncMock, patch
 from neuro_code.adapters.sqlite_session import SqliteSessionStore
 from neuro_code.cli import _normalize_rule, main
 from neuro_code.config import AppConfig
-from neuro_code.domain.messages import ToolCall
+from neuro_code.domain.messages import Message, Role, ToolCall
 from neuro_code.domain.model_context import ModelContext
 from neuro_code.domain.model_events import (
     ModelCompleted,
@@ -25,8 +25,10 @@ from neuro_code.domain.model_events import (
     ModelTextDelta,
     ModelToolCall,
 )
+from neuro_code.domain.reasoning import ReasoningEffort
 from neuro_code.domain.sandbox import SandboxProfile
 from neuro_code.domain.tools import ToolDefinition
+from neuro_code.domain.ui_preferences import UiLanguage
 
 
 class CliProvider:
@@ -69,6 +71,45 @@ api_key_env = "FIXTURE_KEY"
         self.assertEqual(_normalize_rule("Bash(*)"), "bash:*")
         self.assertEqual(_normalize_rule("Bash(git:*)"), "bash:git*")
         self.assertEqual(_normalize_rule("Bash(git status)"), "bash:git status")
+
+    def test_headless_effort_flag_reaches_the_model_context(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / "state"
+            self._write_provider_config(state)
+            provider = CliProvider()
+            output = io.StringIO()
+            with (
+                patch.dict(
+                    "os.environ",
+                    {
+                        "HOME": str(root),
+                        "NEURO_CODE_HOME": str(state),
+                        "FIXTURE_KEY": "fixture-key",
+                    },
+                    clear=True,
+                ),
+                patch("neuro_code.cli.enforce_configured_sandbox"),
+                patch("neuro_code.cli.create_routed_provider", return_value=provider),
+                redirect_stdout(output),
+            ):
+                exit_code = main(
+                    (
+                        "-p",
+                        "answer directly",
+                        "--cwd",
+                        str(root),
+                        "--effort",
+                        "low",
+                    )
+                )
+
+            self.assertEqual(exit_code, 0)
+            self.assertIs(provider.contexts[0].reasoning_effort, ReasoningEffort.LOW)
+            system = next(
+                message for message in provider.contexts[0].messages if message.role is Role.SYSTEM
+            )
+            self.assertIn("low review depth", system.content)
 
     def test_version_json_is_machine_readable(self) -> None:
         output = io.StringIO()
@@ -399,6 +440,10 @@ api_key_env = "FIXTURE_KEY"
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             self._write_provider_config(root / "state")
+            (root / "state" / "ui-preferences.json").write_text(
+                json.dumps({"version": 1, "language": "zh-CN"}),
+                encoding="utf-8",
+            )
             captured: dict[str, object] = {}
 
             class TuiFixture:
@@ -410,6 +455,8 @@ api_key_env = "FIXTURE_KEY"
                     provider_controller: object,
                     session_controller: object,
                     task_controller: object,
+                    ui_preferences: object,
+                    language: UiLanguage,
                     initial_items: object,
                     provider_name: str,
                     model_name: str,
@@ -421,6 +468,8 @@ api_key_env = "FIXTURE_KEY"
                         provider_controller=provider_controller,
                         session_controller=session_controller,
                         task_controller=task_controller,
+                        ui_preferences=ui_preferences,
+                        language=language,
                         initial_items=initial_items,
                         provider_name=provider_name,
                         model_name=model_name,
@@ -453,7 +502,97 @@ api_key_env = "FIXTURE_KEY"
             self.assertIs(captured["runner"], captured["session_controller"])
             self.assertIs(captured["runner"], captured["task_controller"])
             self.assertEqual(captured["initial_items"], ())
+            self.assertEqual(captured["language"], UiLanguage.SIMPLIFIED_CHINESE)
             self.assertTrue(captured["ran"])
+
+    def test_tui_session_search_is_scoped_to_the_workspace_alias(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / "state"
+            workspace = root / "workspace"
+            workspace.mkdir()
+            other_workspace = root / "other"
+            other_workspace.mkdir()
+            workspace_alias = workspace / ".." / "workspace"
+            self._write_provider_config(state)
+
+            async def seed_sessions() -> tuple[str, str]:
+                store = SqliteSessionStore(state / "sessions.db")
+                await store.initialize()
+                local_id = await store.create_session(
+                    str(workspace_alias),
+                    "cli-fixture",
+                    "fixture-model",
+                )
+                await store.save_messages(
+                    local_id,
+                    [Message(Role.USER, "workspace scope marker")],
+                )
+                other_id = await store.create_session(
+                    str(other_workspace),
+                    "cli-fixture",
+                    "fixture-model",
+                )
+                await store.save_messages(
+                    other_id,
+                    [Message(Role.USER, "workspace scope marker")],
+                )
+                return local_id, other_id
+
+            local_id, other_id = asyncio.run(seed_sessions())
+            captured: dict[str, object] = {}
+
+            class TuiFixture:
+                def __init__(
+                    self,
+                    runner: object,
+                    *,
+                    approval_controller: object,
+                    provider_controller: object,
+                    session_controller: object,
+                    task_controller: object,
+                    ui_preferences: object,
+                    language: UiLanguage,
+                    initial_items: object,
+                    provider_name: str,
+                    model_name: str,
+                    cwd: Path,
+                ) -> None:
+                    del (
+                        runner,
+                        approval_controller,
+                        provider_controller,
+                        task_controller,
+                        ui_preferences,
+                        language,
+                        initial_items,
+                        provider_name,
+                        model_name,
+                        cwd,
+                    )
+                    self.session_controller = session_controller
+
+                async def run_async(self) -> None:
+                    options = await self.session_controller.list_sessions("scope marker")
+                    captured["session_ids"] = [option.session_id for option in options]
+
+            with (
+                patch.dict(
+                    "os.environ",
+                    {
+                        "NEURO_CODE_HOME": str(state),
+                        "FIXTURE_KEY": "fixture-key",
+                    },
+                    clear=True,
+                ),
+                patch("neuro_code.cli.create_routed_provider", return_value=CliProvider()),
+                patch("neuro_code.tui.NeuroCodeApp", TuiFixture),
+            ):
+                exit_code = main(("--cwd", str(workspace)))
+
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(captured["session_ids"], [local_id])
+            self.assertNotIn(other_id, captured["session_ids"])
 
     def test_tui_profile_controller_recomposes_a_fresh_selected_provider(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -499,12 +638,22 @@ api_key_env = "SECOND_KEY"
                     provider_controller: object,
                     session_controller: object,
                     task_controller: object,
+                    ui_preferences: object,
+                    language: UiLanguage,
                     initial_items: object,
                     provider_name: str,
                     model_name: str,
                     cwd: Path,
                 ) -> None:
-                    del approval_controller, initial_items, provider_name, model_name, cwd
+                    del (
+                        approval_controller,
+                        ui_preferences,
+                        language,
+                        initial_items,
+                        provider_name,
+                        model_name,
+                        cwd,
+                    )
                     self.runner = runner
                     self.provider_controller = provider_controller
                     self.session_controller = session_controller
@@ -614,12 +763,21 @@ api_key_env = "SECOND_KEY"
                     provider_controller: object,
                     session_controller: object,
                     task_controller: object,
+                    ui_preferences: object,
+                    language: UiLanguage,
                     initial_items: object,
                     provider_name: str,
                     model_name: str,
                     cwd: Path,
                 ) -> None:
-                    del approval_controller, provider_name, model_name, cwd
+                    del (
+                        approval_controller,
+                        ui_preferences,
+                        language,
+                        provider_name,
+                        model_name,
+                        cwd,
+                    )
                     self.runner = runner
                     self.provider_controller = provider_controller
                     self.session_controller = session_controller
@@ -631,6 +789,9 @@ api_key_env = "SECOND_KEY"
                     captured["session_ids"] = [option.session_id for option in options]
                     captured["selection"] = await self.session_controller.select_session(
                         captured["root_session"]
+                    )
+                    captured["renamed"] = await self.session_controller.rename_session(
+                        "Renamed from TUI"
                     )
                     captured["same_controller"] = (
                         self.runner
@@ -658,6 +819,7 @@ api_key_env = "SECOND_KEY"
             self.assertEqual(selection.session_id, root_session)
             self.assertEqual(selection.profile_name, "second")
             self.assertTrue(selection.source_profile_match)
+            self.assertEqual(captured["renamed"].title, "Renamed from TUI")
             self.assertGreaterEqual(len(selection.items), 2)
             self.assertEqual(created_profiles[-2:], ["first", "second"])
 
@@ -707,6 +869,56 @@ api_key_env = "SECOND_KEY"
             self.assertEqual(exit_code, 0)
             self.assertEqual(json.loads(list_output)[0]["id"], session_id)
             self.assertEqual(json.loads(list_output)[0]["sandbox_profile"], "off")
+            self.assertEqual(json.loads(list_output)[0]["title"], "first")
+
+            exit_code, search_output = run(
+                (
+                    "sessions",
+                    "search",
+                    "first second",
+                    "--json",
+                    "--include-content",
+                    "--cwd",
+                    str(root),
+                )
+            )
+            self.assertEqual(exit_code, 0)
+            search_page = json.loads(search_output)
+            self.assertEqual(search_page["total_estimate"], 1)
+            self.assertEqual(search_page["results"][0]["id"], session_id)
+            self.assertIn("content", search_page["results"][0]["matched_fields"])
+            self.assertIsNotNone(search_page["results"][0]["snippet"])
+
+            exit_code, rename_output = run(
+                (
+                    "sessions",
+                    "rename",
+                    session_id,
+                    "Manual CLI title",
+                    "--json",
+                    "--cwd",
+                    str(root),
+                )
+            )
+            self.assertEqual(exit_code, 0)
+            renamed = json.loads(rename_output)
+            self.assertEqual(renamed["id"], session_id)
+            self.assertEqual(renamed["title"], "Manual CLI title")
+
+            exit_code, renamed_search_output = run(
+                (
+                    "sessions",
+                    "search",
+                    "manual CLI",
+                    "--json",
+                    "--cwd",
+                    str(root),
+                )
+            )
+            self.assertEqual(exit_code, 0)
+            renamed_search = json.loads(renamed_search_output)
+            self.assertEqual(renamed_search["results"][0]["id"], session_id)
+            self.assertIn("title", renamed_search["results"][0]["matched_fields"])
 
             exit_code, markdown = run(("export", session_id, "--cwd", str(root)))
             self.assertEqual(exit_code, 0)
@@ -729,9 +941,10 @@ api_key_env = "SECOND_KEY"
             self.assertEqual(exit_code, 0)
             self.assertEqual(export_output.strip(), str(export_path.resolve()))
             exported = json.loads(export_path.read_text(encoding="utf-8"))
-            self.assertEqual(exported["schema_version"], 3)
+            self.assertEqual(exported["schema_version"], 4)
             self.assertEqual(exported["session"]["id"], session_id)
             self.assertEqual(exported["session"]["sandbox_profile"], "off")
+            self.assertEqual(exported["session"]["title"], "Manual CLI title")
             self.assertEqual(exported["conversation_items"], exported["messages"])
 
     def test_import_rust_session_is_available_to_list_and_export(self) -> None:
@@ -872,7 +1085,7 @@ api_key_env = "SECOND_KEY"
                 exit_code = main(("export", "rust-cli-id", "--format", "json", "--cwd", str(root)))
             self.assertEqual(exit_code, 0)
             exported = json.loads(output.getvalue())
-            self.assertEqual(exported["schema_version"], 3)
+            self.assertEqual(exported["schema_version"], 4)
             self.assertEqual(
                 [item.get("type") for item in exported["conversation_items"]],
                 [None, "reasoning", "backend_tool_call", "reasoning", None],

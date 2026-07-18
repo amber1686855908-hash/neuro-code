@@ -189,6 +189,15 @@ class PermissionManager:
         self._rules = rules
         self._interactive = interactive
 
+    @property
+    def mode(self) -> PermissionMode:
+        return self._mode
+
+    def set_mode(self, mode: PermissionMode) -> None:
+        if not isinstance(mode, PermissionMode):
+            raise TypeError("permission mode must be a PermissionMode")
+        self._mode = mode
+
     def decide(
         self,
         tool_name: str,

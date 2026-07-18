@@ -13,6 +13,7 @@ from neuro_code.adapters.background_tasks import LocalBackgroundTaskManager
 from neuro_code.adapters.sqlite_session import SqliteSessionStore
 from neuro_code.domain.background_tasks import BackgroundTaskSnapshot, BackgroundTaskStatus
 from neuro_code.domain.events import AgentEventKind
+from neuro_code.domain.interaction_mode import InteractionMode
 from neuro_code.domain.messages import (
     ContextItemKind,
     Message,
@@ -30,6 +31,7 @@ from neuro_code.domain.model_events import (
     ModelTextDelta,
     ModelToolCall,
 )
+from neuro_code.domain.reasoning import ReasoningEffort
 from neuro_code.domain.tools import ToolDefinition, ToolResult
 from neuro_code.errors import ProviderError
 from neuro_code.permissions import (
@@ -223,6 +225,46 @@ def completion_snapshot(task_id: str) -> BackgroundTaskSnapshot:
 
 
 class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_reasoning_policy_is_request_scoped_and_not_persisted(self) -> None:
+        provider = ScriptedProvider(((ModelTextDelta("done"), ModelCompleted("stop")),))
+        runtime = AgentRuntime(
+            provider=provider,
+            tools=ToolRegistry(),
+            permissions=PermissionManager(),
+            tool_context=ToolContext(Path("/workspace")),
+            reasoning_effort=ReasoningEffort.XHIGH,
+        )
+
+        result = await runtime.run("Solve a difficult problem")
+
+        context = provider.calls[0]
+        self.assertIs(context.reasoning_effort, ReasoningEffort.XHIGH)
+        system = next(message for message in context.messages if message.role is Role.SYSTEM)
+        self.assertIn("extra-high review depth", system.content)
+        persisted_system = next(
+            message for message in result.messages if message.role is Role.SYSTEM
+        )
+        self.assertNotIn("extra-high review depth", persisted_system.content)
+
+    async def test_provider_usage_emits_current_context_metadata(self) -> None:
+        provider = ScriptedProvider(((ModelTextDelta("done"), ModelCompleted("stop", 900, 100)),))
+        runtime = AgentRuntime(
+            provider=provider,
+            tools=ToolRegistry(),
+            permissions=PermissionManager(),
+            tool_context=ToolContext(Path("/workspace")),
+        )
+
+        result = await runtime.run("Measure the context")
+
+        usage = next(
+            event for event in result.events if event.kind is AgentEventKind.CONTEXT_USAGE_UPDATED
+        )
+        self.assertEqual(usage.data["input_tokens"], 900)
+        self.assertEqual(usage.data["output_tokens"], 100)
+        self.assertEqual(usage.data["used_tokens"], 1_000)
+        self.assertFalse(usage.data["estimated"])
+
     async def test_completion_reminder_batch_is_bounded_and_defers_overflow(self) -> None:
         snapshots = tuple(completion_snapshot(f"task-{index:02d}") for index in range(21))
         manager = FixtureCompletionManager(snapshots)
@@ -518,7 +560,59 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
                     "bash",
                 ],
             )
+            self.assertTrue(all(event.data["duration_seconds"] >= 0 for event in completed_tools))
+            edit_report = completed_tools[1].data["workspace_changes"]
+            self.assertIsInstance(edit_report, dict)
+            assert isinstance(edit_report, dict)
+            edit_changes = edit_report["files"]
+            self.assertIsInstance(edit_changes, list)
+            assert isinstance(edit_changes, list)
+            self.assertEqual(edit_changes[0]["path"], "note.txt")
+            self.assertEqual(edit_changes[0]["status"], "modified")
+            self.assertIn("-original", edit_changes[0]["diff"])
+            self.assertIn("+changed", edit_changes[0]["diff"])
             self.assertEqual(result.response, "Read, edited, and verified note.txt.")
+
+    async def test_bash_file_creation_emits_an_auditable_workspace_diff(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            provider = ScriptedProvider(
+                (
+                    (
+                        ModelToolCall(
+                            ToolCall(
+                                "write",
+                                "bash",
+                                {"command": "printf 'hello\\n' > generated.txt"},
+                            )
+                        ),
+                        ModelCompleted("tool_calls"),
+                    ),
+                    (ModelTextDelta("Created generated.txt."), ModelCompleted("stop")),
+                )
+            )
+            runtime = AgentRuntime(
+                provider=provider,
+                tools=default_tool_registry(),
+                permissions=PermissionManager(mode=PermissionMode.BYPASS),
+                tool_context=ToolContext(root),
+            )
+
+            result = await runtime.run("Create generated.txt")
+
+            completed = next(
+                event for event in result.events if event.kind is AgentEventKind.TOOL_COMPLETED
+            )
+            report = completed.data["workspace_changes"]
+            self.assertIsInstance(report, dict)
+            assert isinstance(report, dict)
+            changes = report["files"]
+            self.assertIsInstance(changes, list)
+            assert isinstance(changes, list)
+            self.assertEqual(changes[0]["path"], "generated.txt")
+            self.assertEqual(changes[0]["status"], "created")
+            self.assertIn("+++ b/generated.txt", changes[0]["diff"])
+            self.assertIn("+hello", changes[0]["diff"])
 
     async def test_read_tool_round_trip_and_session_persistence(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1032,18 +1126,14 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 }
             ]
             self.assertEqual(
-                [(event.kind, dict(event.data)) for event in backend_events],
+                [event.kind for event in backend_events],
                 [
-                    (
-                        AgentEventKind.BACKEND_TOOL_STARTED,
-                        {"id": "server-1", "name": "web_search"},
-                    ),
-                    (
-                        AgentEventKind.BACKEND_TOOL_COMPLETED,
-                        {"id": "server-1", "name": "web_search"},
-                    ),
+                    AgentEventKind.BACKEND_TOOL_STARTED,
+                    AgentEventKind.BACKEND_TOOL_COMPLETED,
                 ],
             )
+            self.assertEqual(dict(backend_events[0].data), {"id": "server-1", "name": "web_search"})
+            self.assertGreaterEqual(backend_events[1].data["duration_seconds"], 0)
             self.assertFalse(any(message.role is Role.TOOL for message in result.messages))
             self.assertFalse(
                 any(
@@ -1058,6 +1148,67 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
                     for event in result.events
                 )
             )
+
+    async def test_timing_events_cover_thinking_tools_and_the_complete_turn(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            provider = ScriptedProvider(
+                (
+                    (
+                        ModelReasoningDelta("private reasoning"),
+                        ModelTextDelta("done"),
+                        ModelCompleted("stop"),
+                    ),
+                )
+            )
+            runtime = AgentRuntime(
+                provider=provider,
+                tools=default_tool_registry(),
+                permissions=PermissionManager(),
+                tool_context=ToolContext(Path(directory)),
+            )
+
+            result = await runtime.run("inspect")
+
+            thinking = next(
+                event
+                for event in result.events
+                if event.kind is AgentEventKind.MODEL_THINKING_COMPLETED
+            )
+            completed = next(
+                event for event in result.events if event.kind is AgentEventKind.TURN_COMPLETED
+            )
+            self.assertEqual(thinking.data["step"], 1)
+            self.assertGreaterEqual(thinking.data["duration_seconds"], 0)
+            self.assertGreaterEqual(completed.data["duration_seconds"], 0)
+
+    def test_interaction_modes_map_to_fail_closed_permission_policies(self) -> None:
+        permissions = PermissionManager(interactive=True)
+        runtime = AgentRuntime(
+            provider=ScriptedProvider(()),
+            tools=default_tool_registry(),
+            permissions=permissions,
+            tool_context=ToolContext(Path("/workspace")),
+        )
+
+        runtime.set_interaction_mode(InteractionMode.PLAN)
+        self.assertEqual(permissions.mode, PermissionMode.DONT_ASK)
+        runtime.set_interaction_mode(InteractionMode.ACCEPT_EDITS)
+        self.assertEqual(permissions.mode, PermissionMode.ACCEPT_EDITS)
+        runtime.set_interaction_mode(InteractionMode.AUTO)
+        self.assertEqual(permissions.mode, PermissionMode.ACCEPT_EDITS)
+        self.assertFalse(runtime.auto_mode_unrestricted)
+
+        explicit = PermissionManager(mode=PermissionMode.BYPASS, interactive=True)
+        explicit_runtime = AgentRuntime(
+            provider=ScriptedProvider(()),
+            tools=default_tool_registry(),
+            permissions=explicit,
+            tool_context=ToolContext(Path("/workspace")),
+        )
+        self.assertTrue(explicit_runtime.auto_mode_unrestricted)
+        explicit_runtime.set_interaction_mode(InteractionMode.NORMAL)
+        explicit_runtime.set_interaction_mode(InteractionMode.AUTO)
+        self.assertEqual(explicit.mode, PermissionMode.BYPASS)
 
 
 if __name__ == "__main__":

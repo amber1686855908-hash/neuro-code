@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import asyncio
+import json
 import os
 import sqlite3
 import tempfile
 import unittest
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
+from unittest.mock import Mock, patch
 
 from neuro_code.adapters.sqlite_session import SqliteSessionStore
 from neuro_code.domain.events import AgentEvent, AgentEventKind
@@ -23,6 +27,51 @@ from neuro_code.errors import SessionError
 
 
 class SessionStoreTests(unittest.IsolatedAsyncioTestCase):
+    def test_connect_retries_only_transient_wal_locks_and_closes_on_failure(self) -> None:
+        store = SqliteSessionStore(Path("/unused/sessions.db"))
+        retry_connection = Mock(spec=sqlite3.Connection)
+        wal_attempts = 0
+
+        def execute_with_transient_lock(statement: str) -> Mock:
+            nonlocal wal_attempts
+            if statement == "PRAGMA journal_mode = WAL":
+                wal_attempts += 1
+                if wal_attempts < 3:
+                    raise sqlite3.OperationalError("database is locked")
+            return Mock()
+
+        retry_connection.execute.side_effect = execute_with_transient_lock
+        with (
+            patch(
+                "neuro_code.adapters.sqlite_session.sqlite3.connect",
+                return_value=retry_connection,
+            ),
+            patch("neuro_code.adapters.sqlite_session.time.sleep") as sleep,
+        ):
+            self.assertIs(store._connect(), retry_connection)
+
+        self.assertEqual(wal_attempts, 3)
+        self.assertEqual(sleep.call_count, 2)
+        retry_connection.close.assert_not_called()
+
+        failed_connection = Mock(spec=sqlite3.Connection)
+
+        def execute_with_permanent_failure(statement: str) -> Mock:
+            if statement == "PRAGMA journal_mode = WAL":
+                raise sqlite3.OperationalError("disk I/O error")
+            return Mock()
+
+        failed_connection.execute.side_effect = execute_with_permanent_failure
+        with (
+            patch(
+                "neuro_code.adapters.sqlite_session.sqlite3.connect",
+                return_value=failed_connection,
+            ),
+            self.assertRaisesRegex(sqlite3.OperationalError, "disk I/O error"),
+        ):
+            store._connect()
+        failed_connection.close.assert_called_once_with()
+
     async def test_import_snapshot_is_atomic_and_preserves_identity_and_timestamps(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = SqliteSessionStore(Path(directory) / "sessions.db")
@@ -62,7 +111,12 @@ class SessionStoreTests(unittest.IsolatedAsyncioTestCase):
             imported_id = await store.import_session(snapshot)
 
             self.assertEqual(imported_id, "imported-id")
-            self.assertEqual(await store.get_session(imported_id), snapshot.summary)
+            imported_summary = await store.get_session(imported_id)
+            self.assertEqual(imported_summary.title, "imported")
+            self.assertEqual(
+                replace(imported_summary, title=None),
+                snapshot.summary,
+            )
             self.assertEqual(await store.load_messages(imported_id), list(snapshot.messages))
             self.assertEqual(await store.load_session_items(imported_id), list(snapshot.items))
             self.assertEqual(await store.load_events(imported_id), [])
@@ -161,6 +215,61 @@ class SessionStoreTests(unittest.IsolatedAsyncioTestCase):
             self.assertIs(summary.sandbox_profile, SandboxProfile.READ_ONLY)
             self.assertEqual((await store.list_sessions())[0], summary)
 
+    async def test_manual_title_update_is_atomic_persistent_and_searchable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = SqliteSessionStore(Path(directory) / "sessions.db")
+            await store.initialize()
+            session_id = await store.create_session("/workspace", "fixture", "model")
+            await store.save_messages(
+                session_id,
+                [Message(Role.USER, "original visible prompt")],
+            )
+
+            renamed = await store.update_session_title(
+                session_id,
+                "  Manual\n  searchable   title  ",
+            )
+
+            self.assertEqual(renamed.title, "Manual searchable title")
+            manual_search = await store.search_sessions("manual searchable")
+            self.assertEqual([hit.summary.id for hit in manual_search.results], [session_id])
+            self.assertEqual(manual_search.results[0].matched_fields, ("title",))
+            original_search = await store.search_sessions("original visible")
+            self.assertEqual(original_search.results[0].matched_fields, ("content",))
+
+            await store.save_messages(
+                session_id,
+                [
+                    Message(Role.USER, "original visible prompt"),
+                    Message(Role.ASSISTANT, "continued after rename"),
+                ],
+            )
+            self.assertEqual(
+                (await store.get_session(session_id)).title,
+                "Manual searchable title",
+            )
+
+            with (
+                patch(
+                    "neuro_code.adapters.sqlite_session._upsert_search_document",
+                    side_effect=RuntimeError("injected index failure"),
+                ),
+                self.assertRaisesRegex(RuntimeError, "injected index failure"),
+            ):
+                await store.update_session_title(session_id, "Rolled back title")
+            self.assertEqual(
+                (await store.get_session(session_id)).title,
+                "Manual searchable title",
+            )
+            self.assertEqual((await store.search_sessions("rolled back")).results, ())
+
+            truncated = await store.update_session_title(session_id, "x" * 250)
+            self.assertEqual(truncated.title, "x" * 200)
+            with self.assertRaisesRegex(SessionError, "title must not be empty"):
+                await store.update_session_title(session_id, " \n\t ")
+            with self.assertRaisesRegex(SessionError, "unknown session"):
+                await store.update_session_title("missing", "Valid title")
+
     async def test_schema_v1_is_migrated_without_rewriting_existing_sessions(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             database = Path(directory) / "sessions.db"
@@ -209,7 +318,7 @@ class SessionStoreTests(unittest.IsolatedAsyncioTestCase):
             ).fetchone()
             columns = {row[1] for row in migrated.execute("PRAGMA table_info(sessions)").fetchall()}
             migrated.close()
-            self.assertEqual(version, (3,))
+            self.assertEqual(version, (4,))
             self.assertIn("context_affinity", columns)
             self.assertIn("sandbox_profile", columns)
 
@@ -269,9 +378,391 @@ class SessionStoreTests(unittest.IsolatedAsyncioTestCase):
             migrated = sqlite3.connect(database)
             self.assertEqual(
                 migrated.execute("SELECT version FROM schema_meta WHERE singleton = 1").fetchone(),
-                (3,),
+                (4,),
             )
             migrated.close()
+
+    async def test_schema_v3_migration_backfills_escaped_content_search(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "sessions.db"
+            messages = [
+                {
+                    "role": "user",
+                    "content": 'debug escaped newlines\nand "quoted" sqlite content',
+                }
+            ]
+            connection = sqlite3.connect(database)
+            connection.executescript(
+                """
+                CREATE TABLE schema_meta (
+                    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                    version INTEGER NOT NULL
+                );
+                INSERT INTO schema_meta(singleton, version) VALUES (1, 3);
+                CREATE TABLE sessions (
+                    id TEXT PRIMARY KEY,
+                    cwd TEXT NOT NULL,
+                    provider TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    messages_json TEXT NOT NULL DEFAULT '[]',
+                    context_affinity TEXT,
+                    sandbox_profile TEXT
+                );
+                CREATE TABLE events (
+                    session_id TEXT NOT NULL,
+                    sequence INTEGER NOT NULL,
+                    kind TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    data_json TEXT NOT NULL,
+                    PRIMARY KEY (session_id, sequence)
+                );
+                """
+            )
+            connection.execute(
+                """
+                INSERT INTO sessions(
+                    id, cwd, provider, model, messages_json, sandbox_profile
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "v3-id",
+                    "/workspace",
+                    "fixture",
+                    "model",
+                    json.dumps(messages),
+                    "workspace",
+                ),
+            )
+            connection.commit()
+            connection.close()
+
+            store = SqliteSessionStore(database)
+            await store.initialize()
+
+            summary = await store.get_session("v3-id")
+            self.assertEqual(
+                summary.title,
+                'debug escaped newlines and "quoted" sqlite content',
+            )
+            page = await store.search_sessions(
+                "escaped quoted",
+                cwd="/workspace",
+                include_content=True,
+            )
+            self.assertEqual([hit.summary.id for hit in page.results], ["v3-id"])
+            self.assertIn("content", page.results[0].matched_fields)
+            self.assertIsNotNone(page.results[0].snippet)
+
+            migrated = sqlite3.connect(database)
+            self.assertEqual(
+                migrated.execute("SELECT version FROM schema_meta WHERE singleton = 1").fetchone(),
+                (4,),
+            )
+            tables = {
+                row[0]
+                for row in migrated.execute(
+                    "SELECT name FROM sqlite_master WHERE type IN ('table', 'view')"
+                ).fetchall()
+            }
+            migrated.close()
+            self.assertIn("session_search_documents", tables)
+            self.assertIn("session_search_fts", tables)
+
+    async def test_initialize_is_atomic_when_search_backfill_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "sessions.db"
+            connection = sqlite3.connect(database)
+            connection.executescript(
+                """
+                CREATE TABLE schema_meta (
+                    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                    version INTEGER NOT NULL
+                );
+                INSERT INTO schema_meta(singleton, version) VALUES (1, 3);
+                CREATE TABLE sessions (
+                    id TEXT PRIMARY KEY,
+                    cwd TEXT NOT NULL,
+                    provider TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    messages_json TEXT NOT NULL DEFAULT '[]',
+                    context_affinity TEXT,
+                    sandbox_profile TEXT
+                );
+                CREATE TABLE events (
+                    session_id TEXT NOT NULL,
+                    sequence INTEGER NOT NULL,
+                    kind TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    data_json TEXT NOT NULL,
+                    PRIMARY KEY (session_id, sequence)
+                );
+                """
+            )
+            connection.close()
+
+            store = SqliteSessionStore(database)
+            with (
+                patch(
+                    "neuro_code.adapters.sqlite_session._backfill_search_documents",
+                    side_effect=RuntimeError("injected backfill failure"),
+                ),
+                self.assertRaisesRegex(RuntimeError, "injected backfill failure"),
+            ):
+                await store.initialize()
+
+            failed = sqlite3.connect(database)
+            self.assertEqual(
+                failed.execute("SELECT version FROM schema_meta WHERE singleton = 1").fetchone(),
+                (3,),
+            )
+            columns = {row[1] for row in failed.execute("PRAGMA table_info(sessions)")}
+            tables = {
+                row[0]
+                for row in failed.execute(
+                    "SELECT name FROM sqlite_master WHERE type IN ('table', 'view')"
+                )
+            }
+            failed.close()
+            self.assertNotIn("title", columns)
+            self.assertNotIn("session_search_documents", tables)
+            self.assertNotIn("session_search_fts", tables)
+
+            await store.initialize()
+            recovered = sqlite3.connect(database)
+            self.assertEqual(
+                recovered.execute("SELECT version FROM schema_meta WHERE singleton = 1").fetchone(),
+                (4,),
+            )
+            recovered.close()
+
+    async def test_concurrent_initialize_is_serialized_and_idempotent(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "sessions.db"
+            stores = [SqliteSessionStore(database) for _ in range(8)]
+
+            await asyncio.gather(*(store.initialize() for store in stores))
+            session_id = await stores[0].create_session("/workspace", "fixture", "model")
+            await stores[0].save_messages(
+                session_id,
+                [Message(Role.USER, "concurrent migration search marker")],
+            )
+            await asyncio.gather(*(store.initialize() for store in reversed(stores)))
+
+            page = await stores[-1].search_sessions("concurrent marker")
+            self.assertEqual([hit.summary.id for hit in page.results], [session_id])
+            connection = sqlite3.connect(database)
+            self.assertEqual(
+                connection.execute(
+                    "SELECT version FROM schema_meta WHERE singleton = 1"
+                ).fetchone(),
+                (4,),
+            )
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM session_search_documents").fetchone(),
+                (1,),
+            )
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM session_search_fts").fetchone(),
+                (1,),
+            )
+            connection.close()
+
+    async def test_search_indexes_visible_content_with_filters_and_pagination(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = SqliteSessionStore(Path(directory) / "sessions.db")
+            await store.initialize()
+            primary_id = await store.create_session(
+                "/workspace",
+                "fixture",
+                "model",
+                sandbox_profile=SandboxProfile.WORKSPACE,
+            )
+            primary_items = [
+                Message(
+                    Role.USER,
+                    "<system-reminder>private injected rules</system-reminder>\n"
+                    "Fix SQLite session search for escaped quoted content across all platforms",
+                ),
+                PreservedContextItem(
+                    ContextItemKind.REASONING,
+                    {
+                        "type": "reasoning",
+                        "id": "private",
+                        "summary": [{"type": "summary_text", "text": "privatecontextmarker"}],
+                        "encrypted_content": "privateciphermarker",
+                    },
+                ),
+                Message(
+                    Role.ASSISTANT,
+                    "I will inspect the index.",
+                    tool_calls=(
+                        ToolCall(
+                            "call-1",
+                            "read_file",
+                            {"path": "src/search_index.py", "purpose": "toolmarker"},
+                        ),
+                    ),
+                    reasoning_content="privatethoughtmarker",
+                ),
+                Message(
+                    Role.TOOL,
+                    "privatetoolresultmarker",
+                    name="read_file",
+                    tool_call_id="call-1",
+                ),
+            ]
+            await store.save_session_items(primary_id, primary_items)
+
+            second_id = await store.create_session("/workspace", "fixture", "model")
+            await store.save_messages(
+                second_id,
+                [Message(Role.USER, "SQLite migration notes for another session")],
+            )
+            other_workspace_id = await store.create_session("/other", "fixture", "model")
+            await store.save_messages(
+                other_workspace_id,
+                [Message(Role.USER, "SQLite search belongs to another workspace")],
+            )
+
+            summary = await store.get_session(primary_id)
+            self.assertEqual(
+                summary.title,
+                "Fix SQLite session search for escaped quoted content across all",
+            )
+            await store.save_session_items(
+                primary_id,
+                [*primary_items, Message(Role.USER, "a later title must not replace the first")],
+            )
+            self.assertEqual((await store.get_session(primary_id)).title, summary.title)
+
+            page = await store.search_sessions(
+                "escaped quoted",
+                cwd="/workspace",
+                include_content=True,
+            )
+            self.assertEqual([hit.summary.id for hit in page.results], [primary_id])
+            self.assertEqual(page.results[0].matched_fields, ("title", "content"))
+            self.assertIsNotNone(page.results[0].snippet)
+
+            tool_page = await store.search_sessions("read_file", cwd="/workspace")
+            self.assertEqual([hit.summary.id for hit in tool_page.results], [primary_id])
+            for private_query in (
+                "privatecontextmarker",
+                "privateciphermarker",
+                "privatethoughtmarker",
+                "privatetoolresultmarker",
+                "toolmarker",
+                "search_index",
+            ):
+                self.assertEqual(
+                    (await store.search_sessions(private_query)).results,
+                    (),
+                )
+
+            first_page = await store.search_sessions("SQLite", cwd="/workspace", limit=1)
+            self.assertEqual(first_page.total_estimate, 2)
+            self.assertEqual(first_page.next_offset, 1)
+            second_page = await store.search_sessions(
+                "SQLite",
+                cwd="/workspace",
+                limit=1,
+                offset=1,
+            )
+            self.assertEqual(second_page.total_estimate, 2)
+            self.assertIsNone(second_page.next_offset)
+            self.assertNotEqual(
+                first_page.results[0].summary.id,
+                second_page.results[0].summary.id,
+            )
+            self.assertNotIn(
+                other_workspace_id,
+                {hit.summary.id for hit in first_page.results + second_page.results},
+            )
+
+            fallback = await store.search_sessions("quoted migration", cwd="/workspace")
+            self.assertEqual(fallback.total_estimate, 2)
+
+            for operation in (
+                store.search_sessions(""),
+                store.search_sessions("***"),
+                store.search_sessions("query", limit=0),
+                store.search_sessions("query", offset=-1),
+            ):
+                with self.assertRaises(SessionError):
+                    await operation
+
+    async def test_search_handles_unicode_syntax_ranking_and_bounded_snippets(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = SqliteSessionStore(Path(directory) / "sessions.db")
+            await store.initialize()
+
+            title_id = await store.create_session("/workspace", "fixture", "model")
+            await store.save_messages(title_id, [Message(Role.USER, "priorityneedle")])
+            body_id = await store.create_session("/workspace", "fixture", "model")
+            await store.save_messages(
+                body_id,
+                [
+                    Message(Role.USER, "Discuss unrelated adapters"),
+                    Message(Role.ASSISTANT, "The body mentions priorityneedle once."),
+                ],
+            )
+            unicode_id = await store.create_session("/workspace", "fixture", "model")
+            await store.save_messages(
+                unicode_id,
+                [Message(Role.USER, "修复 中文会话 café 搜索")],
+            )
+            snippet_id = await store.create_session("/workspace", "fixture", "model")
+            await store.save_messages(
+                snippet_id,
+                [
+                    Message(Role.USER, "Bound the generated snippet"),
+                    Message(Role.ASSISTANT, "snippetneedle" + ("x" * 1_000)),
+                ],
+            )
+
+            ranked = await store.search_sessions("priorityneedle", cwd="/workspace")
+            self.assertEqual(
+                [hit.summary.id for hit in ranked.results],
+                [title_id, body_id],
+            )
+            self.assertIn("title", ranked.results[0].matched_fields)
+            self.assertEqual(ranked.results[1].matched_fields, ("content",))
+
+            unicode_page = await store.search_sessions(
+                "《中文会话》 CAFÉ",
+                cwd="/workspace",
+            )
+            self.assertEqual([hit.summary.id for hit in unicode_page.results], [unicode_id])
+            sanitized = await store.search_sessions(
+                'priorityneedle OR "*"',
+                cwd="/workspace",
+            )
+            self.assertEqual(
+                {hit.summary.id for hit in sanitized.results},
+                {title_id, body_id},
+            )
+
+            snippet_page = await store.search_sessions(
+                "snippetneedle",
+                cwd="/workspace",
+                include_content=True,
+            )
+            self.assertEqual([hit.summary.id for hit in snippet_page.results], [snippet_id])
+            self.assertIsNotNone(snippet_page.results[0].snippet)
+            self.assertEqual(len(snippet_page.results[0].snippet or ""), 500)
+
+            for operation in (
+                store.search_sessions("x" * 1_001),
+                store.search_sessions("query", cwd=""),
+                store.search_sessions("query", limit=1_001),
+                store.search_sessions("query", offset=1_000_001),
+            ):
+                with self.assertRaises(SessionError):
+                    await operation
 
     async def test_sandbox_peek_never_creates_state_and_rejects_corrupt_values(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

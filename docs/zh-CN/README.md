@@ -44,9 +44,80 @@ uv run neuro-code
 
 在开发环境之外安装构建产物时，使用 `pip install 'neuro-code[tui]'` 加入可选 UI 依赖。
 第一版 TUI 提供提示输入、滚动记录、assistant 流式文本、供应商/工具状态，以及本地
-`/help`、`/status`、`/provider`、`/model`、`/sessions`、`/resume`、`/cancel`、
-`/clear`、`/quit` 和 `/exit` 命令。同一次启动中的提示会共享一个持久会话；
-`--resume SESSION_ID` 会在工作区校验通过后打开已有会话。
+`/help`、`/status`、`/settings`（别名 `/setting`）、`/provider`、`/model`、
+`/effort [LEVEL]`（别名 `/reasoning`）、`/mode [MODE]`、`/sessions [QUERY]`、`/resume`、
+`/rename TITLE`（别名 `/title`）、`/cancel`、`/clear`、`/quit` 和 `/exit` 命令。同一次
+启动中的提示会共享一个持久会话；`--resume SESSION_ID` 会在工作区校验通过后打开已有
+会话。
+
+全屏界面采用中性深色配色，以冷色蓝、紫、青、绿承担语义强调；暖色只保留给警告和
+错误。由于 `Ctrl+P` 已用于
+供应商选择，Textual 自带的另一套命令面板会被禁用；会话搜索继续使用纯文字
+`/sessions QUERY` 流程，不显示表情符号搜索图标。终端未正常送达尺寸变化通知时，应用还
+会校准真实 TTY 单元格尺寸，因此最大化或缩放窗口会重绘整个视口，不会把旧画布留在
+左上角。
+
+用户提示显示为占满整行的低对比度块，助手输出使用独立回答块，不再依靠 `You:` 与
+`Assistant:` 日志前缀区分。每条流式回答只在对话流中挂载一次，后续增量直到最终文本都
+原地更新，因此完成时不会再从临时区域移动到滚动记录；用户主动向上滚动后也不会被强制
+拉回底部。
+
+助手文本使用应用自有的语义配色渲染 Markdown，对标题、强调、代码、列表、链接和表格
+进行克制区分。模型文本不会作为 Rich/Textual markup 解释，同时禁用链接点击；用户提示
+以及本地或外部值继续按字面文本显示。系统、状态、工具和错误通知使用固定宽度且对齐的
+标签栏，供应商/模型、工具/会话、路径、结果、耗时、模式、强度和错误等值再按语义着色。
+每个模型步骤会显示客户端观测到首个可行动结果前的耗时；每次工具调用只占用一张原地更新
+的调用/权限/结果卡片并显示耗时；整轮完成后会在最终回答下方显示总耗时。完成后的卡片会
+显示真实工具输出经过控制字符清理、凭据脱敏和长度限制后的预览。带副作用的本地工具还会
+按调用显示有界的工作区变更、文件路径和统一文本差异；敏感、二进制、过大、依赖、缓存及
+版本库内部内容保持隐藏。当前切片尚不包含 Mermaid、内嵌媒体和交互式展开/折叠控件。
+
+提示框上方常驻一行运行信息，显示当前供应商与模型、压缩后的工作目录、上下文窗口占用、
+请求的思考强度和交互模式。
+上下文百分比启动时会明确标为本地估算；模型步骤返回用量后，改用供应商报告的输入/输出
+token。配置中的 `context_window_tokens` 提供分母；窗口未知时显示 `?`，不会编造百分比。
+请求等级与当前实际策略不同时会同时显示两者，例如 `⚡ ultracode → ⬤ xhigh`。标签会随
+界面语言切换，并且在窄窗口中仍保留关键信息。
+
+输入 `/` 时会显示命令语法和参数提示。候选项包含五档强度、四种模式和当前可选择的供应商 profile
+名称；自由文本命令则显示 `SESSION_ID`、`QUERY`、`TITLE` 等占位符。按 `Tab` 会应用第一
+项有效补全，普通提示文字和模态框中的焦点切换仍保持原行为。
+
+使用 `Ctrl+,`、`/settings` 或 `/setting` 可以选择英语或简体中文。切换会立即更新应用
+自有的控件、对话框和状态文案，但不会翻译用户提示、模型回答或工具内容。选择结果与
+思考强度及交互模式偏好一起保存到 `$NEURO_CODE_HOME/ui-preferences.json`（通常为
+`~/.neuro-code/ui-preferences.json`），该文件与供应商配置分离，后续启动 TUI 时会继续
+使用。
+
+使用 `Ctrl+E`、不带参数的 `/effort` 或 `/reasoning` 可以打开五级强度选择器；
+`/effort LEVEL` 与 `/reasoning LEVEL` 可直接选择，`--effort LEVEL` 则可用于交互启动或
+无头运行。TUI 内的修改会保存为用户偏好，并在以后启动、切换 profile 或进程内恢复会话
+后继续应用。交互启动时，显式 `--effort` 优先于保存值；没有显式值或有效保存值时默认
+为 `high`，无头运行未指定时同样默认 `high`。活动轮次中不能切换强度，新选择从下一次
+模型步骤开始生效。
+
+| 等级 | 标记 | 当前已实现的应用行为 |
+|---|---:|---|
+| `low` | ○ | 直接回答，只执行保证正确性所必需的最少检查与验证 |
+| `medium` | ◐ | 常规检查、自我审查和有针对性的验证 |
+| `high` | ● | 更深入地调查并主动检查可能的回归；默认等级 |
+| `xhigh` | ⬤ | 面向困难边界情况，主动质疑假设并执行多轮验证 |
+| `ultracode` | ⚡ | 当前实际采用 `xhigh` 策略；工作流编排尚未实现 |
+
+这些等级目前表示 Neuro Code 的应用层审查策略，并不宣称控制了供应商私有的模型推理
+参数。每次模型请求都会收到不持久化的策略指引，同时在 `ModelContext` 中携带有类型的
+请求等级；供应商适配器不会把它盲目翻译成私有 API 参数。未来若增加供应商原生映射，
+必须显式声明并按能力启用。选择 `ultracode` 不会启动子代理，界面会明确显示其回退到
+`xhigh`。详见
+[ADR 0027](adr/0027-semantic-tui-and-application-reasoning-effort.md)。
+
+使用 `Shift+Tab` 可在 `normal`、`accept-edits`、`plan` 和 `auto` 之间循环，也可用
+`/mode MODE` 直接选择。`normal` 自动允许读取并询问副作用操作；`accept-edits` 还会自动
+允许工作区编辑工具；`plan` 不弹出授权而是直接拒绝副作用。安全分类器实现前，`auto`
+会明确标为安全预览，并采用与 `accept-edits` 相同的默认权限，因此命令和网络操作仍需
+授权。只有启动时显式使用 `--always-approve` 才保留现有绕过默认值；显式规则和进程沙箱
+仍然优先。活动轮次中不能切换模式；模式会保存为 UI 偏好，并在 profile/会话切换后重新
+应用。详见 [ADR 0028](adr/0028-timed-tool-feedback-and-interaction-modes.md)。
 
 使用 `Ctrl+P`、不带参数的 `/provider` 或 `/model` 可以打开已配置 profile 选择器；
 `/provider PROFILE` 与 `/model PROFILE` 可以直接选择。选择器只展示 profile 名称、模型、
@@ -56,10 +127,18 @@ SQLite 会话仍可恢复，下一条提示使用全新会话，从而避免把�
 另一个供应商。
 
 使用 `Ctrl+R`、`/sessions` 或不带参数的 `/resume` 可以打开当前工作区最近 50 条会话
-的选择器；`/resume SESSION_ID` 可直接恢复。选择器只显示缩短的 ID、更新时间、保存的
-供应商/模型及恢复 profile，不显示提示内容、端点、凭据或其他工作区。恢复时优先使用
+的选择器；`/resume SESSION_ID` 可直接恢复。`/sessions QUERY` 会先按保存标题和可见对话
+内容执行工作区全文搜索。选择器显示确定性的首提示标题（或导入标题）、缩短的 ID、
+更新时间、保存的供应商/模型、恢复 profile，以及搜索时的有界摘要。查询、标题和摘要均
+按纯文本渲染；系统消息、供应商私有推理/原生项、图片 URL、工具参数/元数据和原始工具
+结果内容不进入搜索索引。
+恢复时优先使用
 名称匹配且就绪的来源 profile；否则使用当前就绪 profile，并继续由保存的来源/模型/亲和
 元数据失败关闭地过滤供应商原生上下文。原活动会话保持不变。
+
+`/rename TITLE` 会更新当前已保存会话的标题，`/title TITLE` 是其别名。首个会话尚未创建
+或轮次正在运行时会拒绝重命名。标题会合并多余空白并限制为 200 个字符；SQLite 会在
+同一个事务中更新规范摘要和 FTS 标题。
 
 选择器还会显示保存的沙箱 profile。由于进程沙箱已经生效，在不同 profile 下创建的会话
 会被禁用，必须用 `--resume SESSION_ID` 重启 Neuro Code 后打开。在 profile 元数据出现
@@ -177,10 +256,11 @@ fallbacks = ["anthropic"]
 
 [providers.deepseek]
 protocol = "openai-chat"
-model = "deepseek-chat"
+model = "deepseek-v4-pro"
 base_url = "https://api.deepseek.com"
 auth = "env"
 api_key_env = "DEEPSEEK_API_KEY"
+context_window_tokens = 1000000
 max_output_tokens = 8192
 timeout_seconds = 120
 proxy_mode = "environment"
@@ -195,6 +275,8 @@ api_key_env = "ANTHROPIC_API_KEY"
 支持的线路协议为 `openai-chat`、`openai-responses`、`anthropic-messages` 和
 `gemini-generate-content`。配置只保存环境变量名称。Neuro Code 不写入原始 API Key，
 不自动读取项目 `.env`，并在检查输出和异常中隐藏凭据。
+`context_window_tokens` 是用于本地预算和界面显示的能力元数据，不会作为供应商请求参数
+发送。
 
 无需修改默认项即可检查和临时选择 profile：
 
@@ -245,7 +327,7 @@ neuro-code -p "Explain this repository" --no-failover
 ```toml
 [providers.deepseek]
 protocol = "openai-chat"
-model = "deepseek-chat"
+model = "deepseek-v4-pro"
 base_url = "https://api.deepseek.com"
 api_key_env = "DEEPSEEK_API_KEY"
 proxy_mode = "explicit"
@@ -327,11 +409,14 @@ NEURO_CODE_RUN_LIVE_TESTS=1 uv run pytest -m live tests/live
 作用于这些检查。该方式适用于本地 `ALL_PROXY` 使用 HTTPX 拒绝的 URL scheme 的情况；
 不能把代理凭据写入项目配置。
 
-恢复、列出、导出和导入会话：
+恢复、列出、重命名、导出和导入会话：
 
 ```bash
 neuro-code -p "Continue the work" --resume SESSION_ID
 neuro-code sessions --json
+neuro-code sessions search "sqlite migration"
+neuro-code sessions search "sqlite migration" --json --include-content --limit 20
+neuro-code sessions rename SESSION_ID "手动会话标题" --json
 neuro-code export SESSION_ID --format markdown --output transcript.md
 neuro-code import-session /path/to/upstream/session --json
 ```
@@ -340,9 +425,10 @@ neuro-code import-session /path/to/upstream/session --json
 `summary.json`。它只读解析 JSONL 文件，不会修改源文件；随后在单个事务中创建
 SQLite 会话，并保留源会话 ID、工作区、模型和时间戳。已有相同会话 ID 时会拒绝导入，
 而不是覆盖数据。JSON 报告会列出跳过的损坏记录或暂不支持的记录。规范消息模型目前
-会按原顺序结构化保存推理记录、后端工具记录和图片 URL。JSON 导出格式版本 3 在普通
-`messages` 投影之外提供完整的 `conversation_items` 序列，并报告规范保存的沙箱 profile，
-旧会话则为 `null`。上游摘要中可识别的内建 profile 会被保留；不支持的自定义 profile
+会按原顺序结构化保存推理记录、后端工具记录和图片 URL。JSON 导出格式版本 4 在普通
+`messages` 投影之外提供完整的 `conversation_items` 序列，并报告规范保存的沙箱 profile
+与可选标题；旧沙箱 profile 会话仍为 `null`。上游摘要中可识别的内建 profile 和
+`generated_title` 会被保留；不支持的自定义 profile
 会被拒绝而不会静默降级。受支持的图片引用会通过
 供应商原生内容块回放：OpenAI 兼容和 Gemini 的用户消息，以及 Anthropic 的用户消息
 和工具结果。无效引用及不受支持的角色会收到明确图片占位文本。只有来源标记可信且

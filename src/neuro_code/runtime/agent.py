@@ -2,11 +2,15 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import os
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
+from time import monotonic
 
+from neuro_code.async_utils import run_blocking
 from neuro_code.domain.background_tasks import BackgroundTaskSnapshot
 from neuro_code.domain.events import AgentEvent, AgentEventKind
+from neuro_code.domain.interaction_mode import InteractionMode, interaction_mode_guidance
 from neuro_code.domain.messages import (
     Message,
     PreservedContextItem,
@@ -25,6 +29,7 @@ from neuro_code.domain.model_events import (
     ModelTextDelta,
     ModelToolCall,
 )
+from neuro_code.domain.reasoning import ReasoningEffort, reasoning_guidance
 from neuro_code.domain.sandbox import SandboxProfile
 from neuro_code.domain.tools import ToolResult
 from neuro_code.errors import ProviderError, ToolError
@@ -33,6 +38,7 @@ from neuro_code.permissions import (
     PermissionDecision,
     PermissionEffect,
     PermissionManager,
+    PermissionMode,
     build_permission_request,
 )
 from neuro_code.ports.approval import PermissionApprover
@@ -44,6 +50,11 @@ from neuro_code.runtime.background_task_reminders import (
     format_background_task_completion_reminder,
 )
 from neuro_code.tools.registry import ToolRegistry
+from neuro_code.workspace_changes import (
+    WorkspaceSnapshot,
+    capture_workspace_snapshot,
+    compare_workspace_snapshots,
+)
 
 EventSink = Callable[[AgentEvent], Awaitable[None] | None]
 
@@ -51,7 +62,8 @@ EventSink = Callable[[AgentEvent], Awaitable[None] | None]
 DEFAULT_SYSTEM_PROMPT = """You are Neuro Code, a terminal coding agent.
 Use tools when repository evidence is needed. Read before editing. Never claim a
 tool action succeeded unless its result confirms success. Keep the final answer
-concise and state which files or checks changed."""
+concise and state which files or checks changed. Prefer workspace edit tools over
+shell redirection when changing files so the resulting changes remain auditable."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,6 +88,8 @@ class AgentRuntime:
         session_store: SessionStore | None = None,
         system_prompt: str = DEFAULT_SYSTEM_PROMPT,
         max_steps: int = 24,
+        reasoning_effort: ReasoningEffort = ReasoningEffort.HIGH,
+        interaction_mode: InteractionMode | None = None,
     ) -> None:
         if max_steps < 1:
             raise ValueError("max_steps must be positive")
@@ -87,10 +101,76 @@ class AgentRuntime:
         self._session_store = session_store
         self._system_prompt = system_prompt
         self._max_steps = max_steps
+        self._reasoning_effort = reasoning_effort
+        self._auto_permission_mode = (
+            PermissionMode.BYPASS
+            if permissions.mode is PermissionMode.BYPASS
+            else PermissionMode.ACCEPT_EDITS
+        )
+        inferred_mode = {
+            PermissionMode.DEFAULT: InteractionMode.NORMAL,
+            PermissionMode.ACCEPT_EDITS: InteractionMode.ACCEPT_EDITS,
+            PermissionMode.DONT_ASK: InteractionMode.PLAN,
+            PermissionMode.BYPASS: InteractionMode.AUTO,
+        }[permissions.mode]
+        self._interaction_mode = interaction_mode or inferred_mode
+        self._apply_interaction_mode_permissions()
 
     @property
     def sandbox_profile(self) -> SandboxProfile:
         return self._tool_context.sandbox_profile
+
+    @property
+    def reasoning_effort(self) -> ReasoningEffort:
+        return self._reasoning_effort
+
+    def set_reasoning_effort(self, effort: ReasoningEffort) -> None:
+        if not isinstance(effort, ReasoningEffort):
+            raise TypeError("reasoning effort must be a ReasoningEffort")
+        self._reasoning_effort = effort
+
+    @property
+    def interaction_mode(self) -> InteractionMode:
+        return self._interaction_mode
+
+    @property
+    def auto_mode_unrestricted(self) -> bool:
+        return self._auto_permission_mode is PermissionMode.BYPASS
+
+    def set_interaction_mode(self, mode: InteractionMode) -> None:
+        if not isinstance(mode, InteractionMode):
+            raise TypeError("interaction mode must be an InteractionMode")
+        self._interaction_mode = mode
+        self._apply_interaction_mode_permissions()
+
+    def _apply_interaction_mode_permissions(self) -> None:
+        permission_mode = {
+            InteractionMode.NORMAL: PermissionMode.DEFAULT,
+            InteractionMode.ACCEPT_EDITS: PermissionMode.ACCEPT_EDITS,
+            InteractionMode.PLAN: PermissionMode.DONT_ASK,
+            InteractionMode.AUTO: self._auto_permission_mode,
+        }[self._interaction_mode]
+        self._permissions.set_mode(permission_mode)
+
+    def _model_items_with_reasoning_guidance(
+        self,
+        items: Sequence[SessionItem],
+    ) -> tuple[SessionItem, ...]:
+        """Apply the selected policy to a request without persisting control text."""
+
+        instruction = "\n\n".join(
+            (
+                reasoning_guidance(self._reasoning_effort),
+                interaction_mode_guidance(self._interaction_mode),
+            )
+        )
+        rendered = tuple(items)
+        for index, item in enumerate(rendered):
+            if not isinstance(item, Message) or item.role is not Role.SYSTEM:
+                continue
+            guided = Message(Role.SYSTEM, f"{item.model_content()}\n\n{instruction}")
+            return (*rendered[:index], guided, *rendered[index + 1 :])
+        return (Message(Role.SYSTEM, instruction), *rendered)
 
     async def run(
         self,
@@ -105,6 +185,7 @@ class AgentRuntime:
     ) -> AgentRunResult:
         if not prompt.strip():
             raise ValueError("prompt must not be empty")
+        turn_started_at = monotonic()
         context_items = list(initial_items)
         messages = [item for item in context_items if isinstance(item, Message)]
         context_source_provider = source_provider
@@ -152,6 +233,7 @@ class AgentRuntime:
                     "error_type": type(error).__name__,
                     "message": "turn cancelled" if cancelled else str(error),
                     "cancelled": cancelled,
+                    "duration_seconds": monotonic() - turn_started_at,
                 },
             )
             if self._session_store is not None and session_id is not None:
@@ -174,6 +256,25 @@ class AgentRuntime:
             await emit(AgentEventKind.USER_MESSAGE, {"content": prompt})
 
             for step in range(1, self._max_steps + 1):
+                step_started_at = monotonic()
+                thinking_completed = False
+
+                async def complete_thinking(
+                    step_number: int = step,
+                    started_at: float = step_started_at,
+                ) -> None:
+                    nonlocal thinking_completed
+                    if thinking_completed:
+                        return
+                    thinking_completed = True
+                    await emit(
+                        AgentEventKind.MODEL_THINKING_COMPLETED,
+                        {
+                            "step": step_number,
+                            "duration_seconds": monotonic() - started_at,
+                        },
+                    )
+
                 await emit(AgentEventKind.MODEL_STEP_STARTED, {"step": step})
                 completion_batch: tuple[BackgroundTaskSnapshot, ...] = ()
                 background_tasks = self._tool_context.background_tasks
@@ -212,12 +313,16 @@ class AgentRuntime:
                 step_reasoning: list[str] = []
                 tool_calls: list[ToolCall] = []
                 completion: ModelCompleted | None = None
+                backend_tool_started_at: dict[str, float] = {}
 
                 context = ModelContext(
-                    (*context_items, *completion_reminders),
+                    self._model_items_with_reasoning_guidance(
+                        (*context_items, *completion_reminders)
+                    ),
                     context_source_provider,
                     context_source_model,
                     context_source_affinity,
+                    self._reasoning_effort,
                 )
                 async for model_event in self._provider.stream(context, self._tools.definitions()):
                     if isinstance(model_event, ModelProviderAttemptFailed):
@@ -249,11 +354,13 @@ class AgentRuntime:
                             {
                                 "provider": model_event.provider,
                                 "model": model_event.model,
+                                "context_window_tokens": model_event.context_window_tokens,
                                 "failover": model_event.failover,
                                 "session_origin_updated": origin_updated,
                             },
                         )
                     elif isinstance(model_event, ModelTextDelta):
+                        await complete_thinking()
                         step_text.append(model_event.text)
                         await emit(AgentEventKind.TEXT_DELTA, {"text": model_event.text})
                     elif isinstance(model_event, ModelReasoningDelta):
@@ -263,22 +370,46 @@ class AgentRuntime:
                             {"text": model_event.text},
                         )
                     elif isinstance(model_event, ModelBackendToolStarted):
+                        await complete_thinking()
+                        backend_tool_started_at[model_event.call_id] = monotonic()
                         await emit(
                             AgentEventKind.BACKEND_TOOL_STARTED,
                             {"id": model_event.call_id, "name": model_event.name},
                         )
                     elif isinstance(model_event, ModelBackendToolCompleted):
+                        await complete_thinking()
+                        started_at = backend_tool_started_at.pop(
+                            model_event.call_id,
+                            step_started_at,
+                        )
                         await emit(
                             AgentEventKind.BACKEND_TOOL_COMPLETED,
-                            {"id": model_event.call_id, "name": model_event.name},
+                            {
+                                "id": model_event.call_id,
+                                "name": model_event.name,
+                                "duration_seconds": monotonic() - started_at,
+                            },
                         )
                     elif isinstance(model_event, ModelToolCall):
+                        await complete_thinking()
                         tool_calls.append(model_event.call)
                     elif isinstance(model_event, ModelCompleted):
+                        await complete_thinking()
                         completion = model_event
 
                 if completion is None:
                     raise ProviderError("provider stream ended without a completion event")
+                if completion.input_tokens is not None:
+                    output_tokens = completion.output_tokens or 0
+                    await emit(
+                        AgentEventKind.CONTEXT_USAGE_UPDATED,
+                        {
+                            "input_tokens": completion.input_tokens,
+                            "output_tokens": completion.output_tokens,
+                            "used_tokens": completion.input_tokens + output_tokens,
+                            "estimated": completion.output_tokens is None,
+                        },
+                    )
                 if completion_batch and background_tasks is not None:
                     await background_tasks.mark_completions_reported(
                         tuple(snapshot.task_id for snapshot in completion_batch)
@@ -313,6 +444,7 @@ class AgentRuntime:
                             "stop_reason": completion.stop_reason,
                             "input_tokens": completion.input_tokens,
                             "output_tokens": completion.output_tokens,
+                            "duration_seconds": monotonic() - turn_started_at,
                         },
                     )
                     if self._session_store is not None and session_id is not None:
@@ -355,6 +487,17 @@ class AgentRuntime:
         emit: Callable[[AgentEventKind, dict[str, object]], Awaitable[AgentEvent]],
     ) -> None:
         resolved = False
+        tool_requested_at = monotonic()
+        workspace_before: WorkspaceSnapshot | None = None
+
+        def terminal_event_data(result: ToolResult, **extra: object) -> dict[str, object]:
+            return {
+                "id": call.id,
+                "name": call.name,
+                **result.to_dict(),
+                "duration_seconds": monotonic() - tool_requested_at,
+                **extra,
+            }
 
         def record_result(result: ToolResult) -> None:
             nonlocal resolved
@@ -376,7 +519,7 @@ class AgentRuntime:
                 record_result(result)
                 await emit(
                     AgentEventKind.TOOL_FAILED,
-                    {"id": call.id, "name": call.name, **result.to_dict()},
+                    terminal_event_data(result),
                 )
                 return
 
@@ -432,18 +575,24 @@ class AgentRuntime:
                 record_result(result)
                 await emit(
                     AgentEventKind.TOOL_FAILED,
-                    {"id": call.id, "name": call.name, **result.to_dict()},
+                    terminal_event_data(result),
                 )
                 return
 
             await emit(AgentEventKind.TOOL_STARTED, {"id": call.id, "name": call.name})
+            if tool.side_effecting:
+                workspace_before = await self._capture_workspace_snapshot()
             try:
                 result = await tool.execute(call.arguments, self._tool_context)
             except (ToolError, OSError, UnicodeError) as error:
                 result = ToolResult(f"{type(error).__name__}: {error}", is_error=True)
             kind = AgentEventKind.TOOL_FAILED if result.is_error else AgentEventKind.TOOL_COMPLETED
             record_result(result)
-            await emit(kind, {"id": call.id, "name": call.name, **result.to_dict()})
+            terminal_data = terminal_event_data(result)
+            change_report = await self._workspace_change_report(workspace_before)
+            if change_report is not None:
+                terminal_data["workspace_changes"] = change_report
+            await emit(kind, terminal_data)
         except BaseException as error:
             if not resolved:
                 cancelled = isinstance(error, asyncio.CancelledError)
@@ -456,16 +605,51 @@ class AgentRuntime:
                     is_error=True,
                 )
                 record_result(result)
+                terminal_data = terminal_event_data(result, cancelled=cancelled)
+                change_report = await self._workspace_change_report(workspace_before)
+                if change_report is not None:
+                    terminal_data["workspace_changes"] = change_report
                 await emit(
                     AgentEventKind.TOOL_FAILED,
-                    {
-                        "id": call.id,
-                        "name": call.name,
-                        **result.to_dict(),
-                        "cancelled": cancelled,
-                    },
+                    terminal_data,
                 )
             raise
+
+    async def _capture_workspace_snapshot(self) -> WorkspaceSnapshot | None:
+        try:
+            return await run_blocking(capture_workspace_snapshot, self._tool_context.cwd)
+        except (OSError, RuntimeError):
+            return None
+
+    async def _workspace_change_report(
+        self,
+        before: WorkspaceSnapshot | None,
+    ) -> dict[str, object] | None:
+        if before is None:
+            return None
+        after = await self._capture_workspace_snapshot()
+        if after is None:
+            return None
+        protected_names = {
+            name.casefold() for name in self._tool_context.protected_environment_variables
+        }
+        redactions = tuple(
+            dict.fromkeys(
+                value
+                for name, value in os.environ.items()
+                if name.casefold() in protected_names and value
+            )
+        )
+        report = await run_blocking(
+            compare_workspace_snapshots,
+            before,
+            after,
+            explicit_redactions=redactions,
+        )
+        files = report.get("files")
+        if files or report.get("scan_limited"):
+            return report
+        return None
 
     @staticmethod
     async def _record_unstarted_tool_calls(

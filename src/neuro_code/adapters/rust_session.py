@@ -119,6 +119,7 @@ def load_rust_session(source: Path) -> RustSessionImport:
     model = _required_text(raw_summary.get("current_model_id"), "summary.current_model_id")
     created_at = _timestamp(raw_summary.get("created_at"), "summary.created_at")
     updated_at = _timestamp(raw_summary.get("updated_at"), "summary.updated_at")
+    title = _optional_title(raw_summary.get("generated_title"))
     sandbox_profile = _sandbox_profile(raw_summary.get("sandbox_profile"))
     chat_format_version = raw_summary.get("chat_format_version", 0)
     if isinstance(chat_format_version, bool) or not isinstance(chat_format_version, int):
@@ -139,6 +140,7 @@ def load_rust_session(source: Path) -> RustSessionImport:
             created_at=created_at,
             updated_at=updated_at,
             sandbox_profile=sandbox_profile,
+            title=title,
         ),
         items=tuple(items),
     )
@@ -168,6 +170,15 @@ def _sandbox_profile(value: object) -> SandboxProfile | None:
         return SandboxProfile.parse(value)
     except ValueError as error:
         raise SessionError(f"unsupported Rust session sandbox profile: {value!r}") from error
+
+
+def _optional_title(value: object) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise SessionError("summary.generated_title must be a string")
+    title = value.strip()
+    return title or None
 
 
 def _read_summary(path: Path) -> dict[str, Any]:

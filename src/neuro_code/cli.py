@@ -12,6 +12,7 @@ from neuro_code.adapters.background_tasks import LocalBackgroundTaskManager
 from neuro_code.adapters.rust_session import load_rust_session
 from neuro_code.adapters.sandbox import create_shell_sandbox, enforce_configured_sandbox
 from neuro_code.adapters.sqlite_session import SqliteSessionStore
+from neuro_code.adapters.ui_preferences import JsonUiPreferencesStore
 from neuro_code.async_utils import run_blocking
 from neuro_code.config import (
     AppConfig,
@@ -21,6 +22,7 @@ from neuro_code.config import (
     pin_resumed_sandbox,
 )
 from neuro_code.domain.events import AgentEvent, AgentEventKind
+from neuro_code.domain.interaction_mode import InteractionMode
 from neuro_code.domain.messages import (
     ContextItemKind,
     Message,
@@ -28,7 +30,9 @@ from neuro_code.domain.messages import (
     Role,
     SessionItem,
 )
+from neuro_code.domain.reasoning import ReasoningEffort
 from neuro_code.domain.sandbox import SandboxProfile
+from neuro_code.domain.session_search import SessionSearchHit
 from neuro_code.domain.sessions import SessionSummary
 from neuro_code.errors import ConfigurationError, NeuroCodeError
 from neuro_code.permissions import (
@@ -79,6 +83,11 @@ def _add_run_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--allow", action="append", default=[], metavar="PATTERN")
     parser.add_argument("--deny", action="append", default=[], metavar="PATTERN")
     parser.add_argument("--max-steps", type=int, default=24)
+    parser.add_argument(
+        "--effort",
+        choices=tuple(effort.value for effort in ReasoningEffort),
+        help="agent review depth (default: high, or the saved TUI preference)",
+    )
     parser.add_argument("--resume", metavar="SESSION_ID", help="resume an existing session")
 
 
@@ -106,9 +115,30 @@ def build_parser() -> argparse.ArgumentParser:
     agent_parser = subparsers.add_parser("agent", help="run the headless agent")
     _add_run_arguments(agent_parser)
 
-    sessions_parser = subparsers.add_parser("sessions", help="list persisted sessions")
+    sessions_parser = subparsers.add_parser("sessions", help="list or search persisted sessions")
+    sessions_parser.add_argument(
+        "session_action",
+        nargs="?",
+        choices=("list", "search", "rename"),
+        default="list",
+        help="session operation (default: list)",
+    )
+    sessions_parser.add_argument(
+        "query",
+        nargs="?",
+        metavar="QUERY_OR_SESSION_ID",
+        help="search query or session ID to rename",
+    )
+    sessions_parser.add_argument(
+        "title",
+        nargs="?",
+        metavar="TITLE",
+        help="new title for the rename operation",
+    )
     sessions_parser.add_argument("--json", action="store_true")
     sessions_parser.add_argument("--limit", type=int, default=50)
+    sessions_parser.add_argument("--offset", type=int, default=0)
+    sessions_parser.add_argument("--include-content", action="store_true")
     sessions_parser.add_argument("--cwd", type=Path, help="configuration working directory")
 
     export_parser = subparsers.add_parser("export", help="export a persisted session")
@@ -204,6 +234,7 @@ def _plain_config(config: AppConfig) -> str:
                 f"proxy_mode: {provider['proxy_mode']}",
                 f"proxy_env: {provider['proxy_url_env'] or '(none)'}",
                 f"proxy_url_configured: {str(provider['proxy_url_configured']).lower()}",
+                f"context_window_tokens: {provider['context_window_tokens'] or '(unknown)'}",
                 f"max_output_tokens: {provider['max_output_tokens']}",
             )
         )
@@ -338,6 +369,7 @@ async def _compose_conversation(
     background_tasks: BackgroundTaskManager,
     approver: PermissionApprover | None,
     resume_id: str | None,
+    reasoning_effort: ReasoningEffort | None = None,
 ) -> tuple[ModelProvider, AgentConversation]:
     provider = create_routed_provider(config, failover=not args.no_failover)
     shell_sandbox = create_shell_sandbox(
@@ -368,6 +400,11 @@ async def _compose_conversation(
         approver=approver,
         session_store=store,
         max_steps=args.max_steps,
+        reasoning_effort=(
+            ReasoningEffort(args.effort)
+            if getattr(args, "effort", None) is not None
+            else reasoning_effort or ReasoningEffort.HIGH
+        ),
     )
     conversation = await AgentConversation.open(
         runtime=runtime,
@@ -391,6 +428,7 @@ def _provider_options(config: AppConfig) -> tuple[ProviderOption, ...]:
                 available=profile.available,
                 credential_configured=credential_configured,
                 default=name == config.default_provider,
+                context_window_tokens=profile.context_window_tokens,
             )
         )
     return tuple(options)
@@ -413,6 +451,16 @@ async def _run_tui(args: argparse.Namespace) -> int:
         store = SqliteSessionStore(config.state_dir / "sessions.db")
         config = await _pin_resume_sandbox(config, args.resume, store)
         _enforce_process_sandbox(config, args)
+        ui_preferences = JsonUiPreferencesStore(config.state_dir / "ui-preferences.json")
+        language = await ui_preferences.load_language()
+        saved_reasoning_effort = await ui_preferences.load_reasoning_effort()
+        saved_interaction_mode = await ui_preferences.load_interaction_mode()
+        reasoning_effort = (
+            ReasoningEffort(args.effort)
+            if getattr(args, "effort", None) is not None
+            else saved_reasoning_effort
+        )
+        interaction_mode = InteractionMode.AUTO if args.always_approve else saved_interaction_mode
         await store.initialize()
 
         async def compose_scoped(
@@ -428,6 +476,7 @@ async def _run_tui(args: argparse.Namespace) -> int:
                     background_tasks=task_scope,
                     approver=approvals,
                     resume_id=resume_id,
+                    reasoning_effort=reasoning_effort,
                 )
             except BaseException:
                 await asyncio.shield(task_scope.shutdown())
@@ -452,10 +501,20 @@ async def _run_tui(args: argparse.Namespace) -> int:
             )
 
         async def list_workspace_sessions() -> tuple[SessionSummary, ...]:
-            sessions = await store.list_sessions(limit=50)
+            sessions = await store.list_sessions(limit=1000)
             return tuple(
                 session for session in sessions if workspaces_match(session.cwd, config.cwd)
+            )[:50]
+
+        async def search_workspace_sessions(query: str) -> tuple[SessionSearchHit, ...]:
+            page = await store.search_sessions(
+                query,
+                limit=1000,
+                include_content=True,
             )
+            return tuple(
+                hit for hit in page.results if workspaces_match(hit.summary.cwd, config.cwd)
+            )[:50]
 
         async def bind_session(profile_name: str, session_id: str) -> ConversationBinding:
             selected_config = override_provider(config, provider=profile_name)
@@ -469,14 +528,29 @@ async def _run_tui(args: argparse.Namespace) -> int:
                 selected_tasks,
             )
 
+        async def rename_workspace_session(
+            session_id: str,
+            title: str,
+        ) -> SessionSummary:
+            summary = await store.get_session(session_id)
+            if not workspaces_match(summary.cwd, config.cwd):
+                raise ConfigurationError(
+                    f"session does not exist in the current workspace: {session_id}"
+                )
+            return await store.update_session_title(session_id, title)
+
         controller = ProfileConversationController(
             options=_provider_options(config),
             selected_profile=selected_profile,
             binding=ConversationBinding(conversation, provider, task_scope),
             binding_factory=bind_profile,
             session_catalog=list_workspace_sessions,
+            session_search=search_workspace_sessions,
             session_binding_factory=bind_session,
+            session_rename=rename_workspace_session,
             sandbox_profile=config.sandbox_profile,
+            reasoning_effort=reasoning_effort,
+            interaction_mode=interaction_mode,
         )
         app = NeuroCodeApp(
             controller,
@@ -484,6 +558,8 @@ async def _run_tui(args: argparse.Namespace) -> int:
             provider_controller=controller,
             session_controller=controller,
             task_controller=controller,
+            ui_preferences=ui_preferences,
+            language=language,
             initial_items=controller.items,
             provider_name=controller.provider_name,
             model_name=controller.model_name,
@@ -551,10 +627,60 @@ def _providers_command(args: argparse.Namespace) -> int:
     return 0
 
 
-async def _list_sessions(args: argparse.Namespace) -> int:
+async def _sessions_command(args: argparse.Namespace) -> int:
     config = load_config(args.cwd)
     store = SqliteSessionStore(config.state_dir / "sessions.db")
     await store.initialize()
+    if args.session_action == "search":
+        if args.title is not None:
+            raise ConfigurationError("sessions search accepts exactly one query")
+        if args.query is None or not args.query.strip():
+            raise ConfigurationError("sessions search requires a non-empty query")
+        page = await store.search_sessions(
+            args.query,
+            limit=args.limit,
+            offset=args.offset,
+            include_content=args.include_content,
+        )
+        if args.json:
+            print(json.dumps(page.to_dict(), ensure_ascii=False))
+        elif not page.results:
+            print("No matching sessions found.")
+        else:
+            for hit in page.results:
+                session = hit.summary
+                title = session.title or "New session"
+                fields = ",".join(hit.matched_fields)
+                print(
+                    f"{session.id}\t{session.updated_at.isoformat()}\t"
+                    f"{session.provider}/{session.model}\t{title}\tmatch={fields}"
+                )
+                if hit.snippet is not None:
+                    print(f"  {hit.snippet}")
+        return 0
+    if args.session_action == "rename":
+        if args.query is None or not args.query.strip():
+            raise ConfigurationError("sessions rename requires a session ID")
+        if args.title is None or not args.title.strip():
+            raise ConfigurationError("sessions rename requires a non-empty title")
+        if args.limit != 50 or args.offset != 0 or args.include_content:
+            raise ConfigurationError(
+                "--limit, --offset and --include-content are not valid for sessions rename"
+            )
+        summary = await store.update_session_title(args.query, args.title)
+        if args.json:
+            print(json.dumps(summary.to_dict(), ensure_ascii=False))
+        else:
+            print(f"Renamed session {summary.id} to {summary.title!r}.")
+        return 0
+    if args.query is not None:
+        raise ConfigurationError("sessions list does not accept a query")
+    if args.title is not None:
+        raise ConfigurationError("sessions list does not accept a title")
+    if args.offset != 0 or args.include_content:
+        raise ConfigurationError(
+            "--offset and --include-content are only valid for sessions search"
+        )
     sessions = await store.list_sessions(limit=args.limit)
     if args.json:
         print(json.dumps([session.to_dict() for session in sessions], ensure_ascii=False))
@@ -566,7 +692,7 @@ async def _list_sessions(args: argparse.Namespace) -> int:
                 f"{session.id}\t{session.updated_at.isoformat()}\t"
                 f"{session.provider}/{session.model}\t"
                 f"sandbox={session.sandbox_profile.value if session.sandbox_profile else 'legacy'}"
-                f"\t{session.cwd}"
+                f"\t{session.title or 'New session'}\t{session.cwd}"
             )
     return 0
 
@@ -654,7 +780,7 @@ async def _export_session(args: argparse.Namespace) -> int:
         content = (
             json.dumps(
                 {
-                    "schema_version": 3,
+                    "schema_version": 4,
                     "session": summary.to_dict(),
                     "messages": [message.to_dict() for message in messages],
                     "conversation_items": [item.to_dict() for item in items],
@@ -726,7 +852,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command == "providers":
             return _providers_command(args)
         if args.command == "sessions":
-            return asyncio.run(_list_sessions(args))
+            return asyncio.run(_sessions_command(args))
         if args.command == "export":
             return asyncio.run(_export_session(args))
         if args.command == "import-session":

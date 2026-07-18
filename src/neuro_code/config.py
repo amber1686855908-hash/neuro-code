@@ -161,6 +161,7 @@ class ProviderProfile:
     auth: str = "env"
     api_key_env: str | None = None
     timeout_seconds: float = 120.0
+    context_window_tokens: int | None = None
     max_output_tokens: int = 8192
     builtin_tools: tuple[str, ...] = ()
     native_context: str = "disabled"
@@ -193,6 +194,8 @@ class ProviderProfile:
             raise ConfigurationError("proxy-managed authentication requires an HTTP loopback URL")
         if self.timeout_seconds <= 0:
             raise ConfigurationError("provider timeout_seconds must be positive")
+        if self.context_window_tokens is not None and self.context_window_tokens <= 0:
+            raise ConfigurationError("provider context_window_tokens must be positive")
         if self.max_output_tokens <= 0:
             raise ConfigurationError("provider max_output_tokens must be positive")
         if self.native_context not in SUPPORTED_NATIVE_CONTEXT:
@@ -305,6 +308,7 @@ class ProviderProfile:
             "api_key_env": self.api_key_env,
             "credential_configured": credential_configured,
             "timeout_seconds": self.timeout_seconds,
+            "context_window_tokens": self.context_window_tokens,
             "max_output_tokens": self.max_output_tokens,
             "builtin_tools": list(self.builtin_tools),
             "native_context": self.native_context,
@@ -503,6 +507,15 @@ def _native_profile(
         auth=auth,
         api_key_env=api_key_env,
         timeout_seconds=_number(raw.get("timeout_seconds"), name="timeout_seconds", default=120.0),
+        context_window_tokens=(
+            None
+            if raw.get("context_window_tokens") is None
+            else _integer(
+                raw.get("context_window_tokens"),
+                name="context_window_tokens",
+                default=0,
+            )
+        ),
         max_output_tokens=_integer(
             raw.get("max_output_tokens"), name="max_output_tokens", default=8192
         ),
@@ -766,6 +779,9 @@ def override_provider(
         profile,
         model=model or profile.model,
         base_url=(base_url or profile.base_url).rstrip("/"),
+        context_window_tokens=(
+            profile.context_window_tokens if model is None or model == profile.model else None
+        ),
     )
     return replace(config, providers=profiles, selected_provider=selected)
 
