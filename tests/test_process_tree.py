@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import signal
 import unittest
 from typing import cast
@@ -20,6 +21,7 @@ class _FastExitProcess:
         return 0
 
 
+@unittest.skipUnless(hasattr(os, "killpg"), "POSIX process-group API required")
 class ProcessTreeTests(unittest.IsolatedAsyncioTestCase):
     async def test_posix_termination_retries_transient_permission_error_after_reap(self) -> None:
         process = _FastExitProcess()
