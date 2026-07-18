@@ -95,6 +95,7 @@ BindingFactory = Callable[[str], Awaitable[ConversationBinding]]
 SessionCatalog = Callable[[], Awaitable[Sequence[SessionSummary]]]
 SessionSearch = Callable[[str], Awaitable[Sequence[SessionSearchHit]]]
 SessionBindingFactory = Callable[[str, str], Awaitable[ConversationBinding]]
+SessionRename = Callable[[str, str], Awaitable[SessionSummary]]
 
 
 class ProfileConversationController:
@@ -110,6 +111,7 @@ class ProfileConversationController:
         session_catalog: SessionCatalog | None = None,
         session_search: SessionSearch | None = None,
         session_binding_factory: SessionBindingFactory | None = None,
+        session_rename: SessionRename | None = None,
         sandbox_profile: SandboxProfile = SandboxProfile.OFF,
     ) -> None:
         self._options = tuple(options)
@@ -130,6 +132,7 @@ class ProfileConversationController:
             raise ValueError("session search requires a session catalog")
         self._session_search = session_search
         self._session_binding_factory = session_binding_factory
+        self._session_rename = session_rename
         self._known_session_summaries: dict[str, SessionSummary] = {}
         self._sandbox_profile = sandbox_profile
         self._turn_lock = asyncio.Lock()
@@ -281,6 +284,21 @@ class ProfileConversationController:
                 items=self.items,
                 stopped_background_tasks=stopped_background_tasks,
             )
+
+    async def rename_session(self, title: str) -> SessionSummary:
+        if self._turn_lock.locked():
+            raise ConfigurationError("cannot rename a session while a turn is running")
+        async with self._turn_lock:
+            if self._session_rename is None:
+                raise ConfigurationError("interactive session rename is unavailable")
+            session_id = self.session_id
+            if session_id is None:
+                raise ConfigurationError("cannot rename a session before it is created")
+            summary = await self._session_rename(session_id, title)
+            if summary.id != session_id:
+                raise ConfigurationError("session rename returned the wrong session")
+            self._known_session_summaries[session_id] = summary
+            return summary
 
     async def _replace_binding(self, binding: ConversationBinding) -> int:
         try:

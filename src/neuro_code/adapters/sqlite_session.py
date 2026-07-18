@@ -32,7 +32,11 @@ from neuro_code.domain.session_search import (
     fallback_session_title,
     searchable_session_text,
 )
-from neuro_code.domain.sessions import SessionSnapshot, SessionSummary
+from neuro_code.domain.sessions import (
+    SessionSnapshot,
+    SessionSummary,
+    normalize_session_title,
+)
 from neuro_code.errors import SessionError
 
 SCHEMA_VERSION = 4
@@ -267,6 +271,59 @@ class SqliteSessionStore:
 
         async with self._write_lock:
             await run_blocking(update)
+
+    async def update_session_title(
+        self,
+        session_id: str,
+        title: str,
+    ) -> SessionSummary:
+        try:
+            normalized_title = normalize_session_title(title)
+        except ValueError as error:
+            raise SessionError(str(error)) from error
+
+        def update() -> SessionSummary:
+            with closing(self._connect()) as connection, connection:
+                row = connection.execute(
+                    "SELECT messages_json FROM sessions WHERE id = ?",
+                    (session_id,),
+                ).fetchone()
+                if row is None:
+                    raise SessionError(f"unknown session: {session_id}")
+                try:
+                    items = _session_items_from_json(row[0])
+                except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+                    raise SessionError(
+                        f"session {session_id} contains invalid session items"
+                    ) from error
+                search_content = searchable_session_text(items)
+                connection.execute(
+                    """
+                    UPDATE sessions
+                    SET title = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """,
+                    (normalized_title, session_id),
+                )
+                _upsert_search_document(
+                    connection,
+                    session_id=session_id,
+                    title=normalized_title,
+                    content=search_content,
+                )
+                summary_row = connection.execute(
+                    """
+                    SELECT id, cwd, provider, model, created_at, updated_at,
+                           context_affinity, sandbox_profile, title
+                    FROM sessions WHERE id = ?
+                    """,
+                    (session_id,),
+                ).fetchone()
+                assert summary_row is not None
+                return _summary_from_row(summary_row)
+
+        async with self._write_lock:
+            return await run_blocking(update)
 
     async def save_messages(self, session_id: str, messages: Sequence[Message]) -> None:
         new_messages = list(messages)

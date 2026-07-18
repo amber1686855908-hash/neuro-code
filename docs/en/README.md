@@ -49,8 +49,9 @@ When installing the built package outside the development environment, include
 the optional UI dependency with `pip install 'neuro-code[tui]'`. The initial TUI
 provides prompt input, scrollback, streamed assistant text, provider/tool status,
 and local `/help`, `/status`, `/provider`, `/model`, `/sessions [QUERY]`, `/resume`,
-`/cancel`, `/clear`, `/quit`, and `/exit` commands. Prompts in one launch share a durable session;
-`--resume SESSION_ID` opens an existing session after workspace validation.
+`/rename TITLE` (alias `/title`), `/cancel`, `/clear`, `/quit`, and `/exit`
+commands. Prompts in one launch share a durable session; `--resume SESSION_ID`
+opens an existing session after workspace validation.
 
 Use `Ctrl+P`, bare `/provider` or bare `/model` to open the configured-profile
 picker. `/provider PROFILE` and `/model PROFILE` select directly. The picker
@@ -75,6 +76,11 @@ a ready configured source profile. Otherwise it uses the current ready profile
 while stored source/model/affinity metadata continues to filter incompatible
 provider-native context fail closed. The previously active session remains
 unchanged.
+
+`/rename TITLE` updates the current saved session title; `/title TITLE` is an
+alias. Rename is rejected before the first session is created or while a turn
+is running. Titles are whitespace-normalized and bounded to 200 characters,
+and SQLite updates the canonical summary and FTS title in one transaction.
 
 The picker also shows the saved sandbox profile. Because the process sandbox is
 already active, sessions created under a different profile are disabled and
@@ -391,13 +397,14 @@ them, or set `NEURO_CODE_LIVE_PROXY_MODE=explicit` together with the ephemeral
 is useful when a local `ALL_PROXY` uses a URL scheme rejected by HTTPX; never
 place proxy credentials in project configuration.
 
-Resume, list, export, and import sessions:
+Resume, list, rename, export, and import sessions:
 
 ```bash
 neuro-code -p "Continue the work" --resume SESSION_ID
 neuro-code sessions --json
 neuro-code sessions search "sqlite migration"
 neuro-code sessions search "sqlite migration" --json --include-content --limit 20
+neuro-code sessions rename SESSION_ID "Manual session title" --json
 neuro-code export SESSION_ID --format markdown --output transcript.md
 neuro-code import-session /path/to/upstream/session --json
 ```

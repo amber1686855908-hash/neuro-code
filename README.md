@@ -53,13 +53,14 @@ uv run mypy
 - 许可证 / License: Apache-2.0
 - 完整重写进度粗略为 48–52%；M2 退出测试已经满足，M3 最小 TUI、交互审批、可恢复
   取消、安全 profile 选择、工作区会话恢复、Linux 沙箱、会话固定沙箱及受管后台命令
-  会话作用域、TUI 可见性、事件驱动多任务等待、模型完成提醒和会话全文搜索切片已实现。
+  会话作用域、TUI 可见性、事件驱动多任务等待、模型完成提醒、会话全文搜索和手动重命名
+  切片已实现。
 - Overall public-surface parity is roughly 48–52%; the M2 exit test is satisfied
   and the M3 minimal-TUI, interactive-approval, recoverable-cancellation, and
   safe-profile-selection, workspace-session-resume, Linux-sandbox, and
   session-fixed-sandbox and session-scoped managed-background-command/TUI-
-  visibility/event-driven-multi-wait/model-completion-reminder/session-search slices are
-  implemented.
+  visibility/event-driven-multi-wait/model-completion-reminder/session-search/manual-rename
+  slices are implemented.
 
 本项目与 xAI 或 SpaceXAI 没有关联，也未获得其认可。“Grok”等名称可能是其各自所有者的商标。
 

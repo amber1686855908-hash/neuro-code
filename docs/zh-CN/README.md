@@ -45,8 +45,8 @@ uv run neuro-code
 在开发环境之外安装构建产物时，使用 `pip install 'neuro-code[tui]'` 加入可选 UI 依赖。
 第一版 TUI 提供提示输入、滚动记录、assistant 流式文本、供应商/工具状态，以及本地
 `/help`、`/status`、`/provider`、`/model`、`/sessions [QUERY]`、`/resume`、`/cancel`、
-`/clear`、`/quit` 和 `/exit` 命令。同一次启动中的提示会共享一个持久会话；
-`--resume SESSION_ID` 会在工作区校验通过后打开已有会话。
+`/rename TITLE`（别名 `/title`）、`/clear`、`/quit` 和 `/exit` 命令。同一次启动中的提示
+会共享一个持久会话；`--resume SESSION_ID` 会在工作区校验通过后打开已有会话。
 
 使用 `Ctrl+P`、不带参数的 `/provider` 或 `/model` 可以打开已配置 profile 选择器；
 `/provider PROFILE` 与 `/model PROFILE` 可以直接选择。选择器只展示 profile 名称、模型、
@@ -64,6 +64,10 @@ SQLite 会话仍可恢复，下一条提示使用全新会话，从而避免把�
 恢复时优先使用
 名称匹配且就绪的来源 profile；否则使用当前就绪 profile，并继续由保存的来源/模型/亲和
 元数据失败关闭地过滤供应商原生上下文。原活动会话保持不变。
+
+`/rename TITLE` 会更新当前已保存会话的标题，`/title TITLE` 是其别名。首个会话尚未创建
+或轮次正在运行时会拒绝重命名。标题会合并多余空白并限制为 200 个字符；SQLite 会在
+同一个事务中更新规范摘要和 FTS 标题。
 
 选择器还会显示保存的沙箱 profile。由于进程沙箱已经生效，在不同 profile 下创建的会话
 会被禁用，必须用 `--resume SESSION_ID` 重启 Neuro Code 后打开。在 profile 元数据出现
@@ -331,13 +335,14 @@ NEURO_CODE_RUN_LIVE_TESTS=1 uv run pytest -m live tests/live
 作用于这些检查。该方式适用于本地 `ALL_PROXY` 使用 HTTPX 拒绝的 URL scheme 的情况；
 不能把代理凭据写入项目配置。
 
-恢复、列出、导出和导入会话：
+恢复、列出、重命名、导出和导入会话：
 
 ```bash
 neuro-code -p "Continue the work" --resume SESSION_ID
 neuro-code sessions --json
 neuro-code sessions search "sqlite migration"
 neuro-code sessions search "sqlite migration" --json --include-content --limit 20
+neuro-code sessions rename SESSION_ID "手动会话标题" --json
 neuro-code export SESSION_ID --format markdown --output transcript.md
 neuro-code import-session /path/to/upstream/session --json
 ```

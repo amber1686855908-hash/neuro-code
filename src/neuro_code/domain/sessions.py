@@ -9,6 +9,15 @@ from neuro_code.domain.sandbox import SandboxProfile
 MAX_SESSION_TITLE_CHARS = 200
 
 
+def normalize_session_title(title: str) -> str:
+    """Normalize a persisted display title and enforce the domain invariant."""
+
+    normalized = " ".join(title.split())
+    if not normalized:
+        raise ValueError("session title must not be empty")
+    return normalized[:MAX_SESSION_TITLE_CHARS]
+
+
 @dataclass(frozen=True, slots=True)
 class SessionSummary:
     id: str
@@ -29,10 +38,7 @@ class SessionSummary:
         if self.context_affinity == "":
             raise ValueError("session context affinity must not be empty")
         if self.title is not None:
-            normalized_title = " ".join(self.title.split())
-            if not normalized_title:
-                raise ValueError("session title must not be empty")
-            object.__setattr__(self, "title", normalized_title[:MAX_SESSION_TITLE_CHARS])
+            object.__setattr__(self, "title", normalize_session_title(self.title))
         if self.sandbox_profile is not None and not isinstance(
             self.sandbox_profile, SandboxProfile
         ):

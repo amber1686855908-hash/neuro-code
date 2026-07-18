@@ -144,6 +144,49 @@ def summary(
 
 
 class ProfileConversationControllerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_manual_session_rename_updates_the_validated_summary_cache(self) -> None:
+        renamed: list[tuple[str, str]] = []
+        original = replace(
+            summary("current", "first", "first-model"),
+            title="Original title",
+        )
+
+        async def bind_profile(name: str) -> ConversationBinding:
+            return ConversationBinding(FixtureConversation(), FixtureProvider(name, "model"))
+
+        async def list_sessions() -> tuple[SessionSummary, ...]:
+            return (original,)
+
+        async def bind_session(profile: str, session_id: str) -> ConversationBinding:
+            return ConversationBinding(
+                FixtureConversation(session_id),
+                FixtureProvider(profile, "model"),
+            )
+
+        async def rename_session(session_id: str, title: str) -> SessionSummary:
+            renamed.append((session_id, title))
+            return replace(original, title="Manual title")
+
+        controller = ProfileConversationController(
+            options=(option("first"),),
+            selected_profile="first",
+            binding=ConversationBinding(
+                FixtureConversation("current"),
+                FixtureProvider("first", "first-model"),
+            ),
+            binding_factory=bind_profile,
+            session_catalog=list_sessions,
+            session_binding_factory=bind_session,
+            session_rename=rename_session,
+        )
+
+        result = await controller.rename_session("  Manual title  ")
+
+        self.assertEqual(renamed, [("current", "  Manual title  ")])
+        self.assertEqual(result.title, "Manual title")
+        selection = await controller.select_session("current")
+        self.assertFalse(selection.changed)
+
     async def test_session_search_projects_ranked_metadata_into_picker_options(self) -> None:
         searched: list[str] = []
         result_summary = replace(
@@ -370,6 +413,9 @@ class ProfileConversationControllerTests(unittest.IsolatedAsyncioTestCase):
                 FixtureProvider(profile, f"{profile}-model"),
             )
 
+        async def rename_session(session_id: str, title: str) -> SessionSummary:
+            return replace(summary(session_id, "first", "first-model"), title=title)
+
         controller = ProfileConversationController(
             options=(option("first"), option("second")),
             selected_profile="first",
@@ -377,6 +423,7 @@ class ProfileConversationControllerTests(unittest.IsolatedAsyncioTestCase):
             binding_factory=bind,
             session_catalog=list_sessions,
             session_binding_factory=bind_session,
+            session_rename=rename_session,
         )
 
         turn = asyncio.create_task(controller.run("blocked"))
@@ -385,6 +432,8 @@ class ProfileConversationControllerTests(unittest.IsolatedAsyncioTestCase):
             await controller.select_profile("second")
         with self.assertRaisesRegex(ConfigurationError, "while a turn is running"):
             await controller.select_session("target")
+        with self.assertRaisesRegex(ConfigurationError, "while a turn is running"):
+            await controller.rename_session("Blocked rename")
         runner.release.set()
         await turn
 

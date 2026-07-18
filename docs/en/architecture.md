@@ -143,6 +143,13 @@ System messages, provider-preserved items, assistant private reasoning, tool
 arguments/metadata, raw tool-result content, and image URLs never enter that projection. See
 [ADR 0025](adr/0025-session-title-and-full-text-search.md).
 
+Manual rename follows the same boundary. `SessionStore.update_session_title`
+returns the updated canonical summary and changes the SQLite title, update
+timestamp, and synchronized FTS document atomically. The TUI composition root
+permits rename only for the current filesystem-identity workspace, while the
+controller serializes it with model turns. CLI callers can rename an explicit
+ID in the selected state database.
+
 The operating-system sandbox is also part of session identity. Native sessions
 persist the canonical creation profile. Explicit-ID startup performs an
 immutable read-only SQLite metadata lookup before process sandbox enforcement;

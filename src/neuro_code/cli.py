@@ -111,10 +111,22 @@ def build_parser() -> argparse.ArgumentParser:
     sessions_parser.add_argument(
         "session_action",
         nargs="?",
-        choices=("list", "search"),
+        choices=("list", "search", "rename"),
         default="list",
+        help="session operation (default: list)",
     )
-    sessions_parser.add_argument("query", nargs="?")
+    sessions_parser.add_argument(
+        "query",
+        nargs="?",
+        metavar="QUERY_OR_SESSION_ID",
+        help="search query or session ID to rename",
+    )
+    sessions_parser.add_argument(
+        "title",
+        nargs="?",
+        metavar="TITLE",
+        help="new title for the rename operation",
+    )
     sessions_parser.add_argument("--json", action="store_true")
     sessions_parser.add_argument("--limit", type=int, default=50)
     sessions_parser.add_argument("--offset", type=int, default=0)
@@ -489,6 +501,17 @@ async def _run_tui(args: argparse.Namespace) -> int:
                 selected_tasks,
             )
 
+        async def rename_workspace_session(
+            session_id: str,
+            title: str,
+        ) -> SessionSummary:
+            summary = await store.get_session(session_id)
+            if not workspaces_match(summary.cwd, config.cwd):
+                raise ConfigurationError(
+                    f"session does not exist in the current workspace: {session_id}"
+                )
+            return await store.update_session_title(session_id, title)
+
         controller = ProfileConversationController(
             options=_provider_options(config),
             selected_profile=selected_profile,
@@ -497,6 +520,7 @@ async def _run_tui(args: argparse.Namespace) -> int:
             session_catalog=list_workspace_sessions,
             session_search=search_workspace_sessions,
             session_binding_factory=bind_session,
+            session_rename=rename_workspace_session,
             sandbox_profile=config.sandbox_profile,
         )
         app = NeuroCodeApp(
@@ -577,6 +601,8 @@ async def _sessions_command(args: argparse.Namespace) -> int:
     store = SqliteSessionStore(config.state_dir / "sessions.db")
     await store.initialize()
     if args.session_action == "search":
+        if args.title is not None:
+            raise ConfigurationError("sessions search accepts exactly one query")
         if args.query is None or not args.query.strip():
             raise ConfigurationError("sessions search requires a non-empty query")
         page = await store.search_sessions(
@@ -601,8 +627,25 @@ async def _sessions_command(args: argparse.Namespace) -> int:
                 if hit.snippet is not None:
                     print(f"  {hit.snippet}")
         return 0
+    if args.session_action == "rename":
+        if args.query is None or not args.query.strip():
+            raise ConfigurationError("sessions rename requires a session ID")
+        if args.title is None or not args.title.strip():
+            raise ConfigurationError("sessions rename requires a non-empty title")
+        if args.limit != 50 or args.offset != 0 or args.include_content:
+            raise ConfigurationError(
+                "--limit, --offset and --include-content are not valid for sessions rename"
+            )
+        summary = await store.update_session_title(args.query, args.title)
+        if args.json:
+            print(json.dumps(summary.to_dict(), ensure_ascii=False))
+        else:
+            print(f"Renamed session {summary.id} to {summary.title!r}.")
+        return 0
     if args.query is not None:
         raise ConfigurationError("sessions list does not accept a query")
+    if args.title is not None:
+        raise ConfigurationError("sessions list does not accept a title")
     if args.offset != 0 or args.include_content:
         raise ConfigurationError(
             "--offset and --include-content are only valid for sessions search"

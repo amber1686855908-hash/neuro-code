@@ -21,6 +21,7 @@ from neuro_code.domain.messages import (
     ToolCall,
 )
 from neuro_code.domain.sandbox import SandboxProfile
+from neuro_code.domain.sessions import SessionSummary
 from neuro_code.permissions import (
     PermissionApproval,
     PermissionApprovalKind,
@@ -250,6 +251,7 @@ class SessionTuiController:
     def __init__(self, *, current_session: str = "current-session") -> None:
         self._session_id = current_session
         self.selected: list[str] = []
+        self.renamed: list[str] = []
         self.queries: list[str | None] = []
         timestamp = datetime(2026, 7, 18, 9, 30, tzinfo=UTC)
         self.options = (
@@ -313,6 +315,19 @@ class SessionTuiController:
             changed,
             True,
             restored_history(),
+        )
+
+    async def rename_session(self, title: str) -> SessionSummary:
+        self.renamed.append(title)
+        timestamp = datetime(2026, 7, 18, 9, 30, tzinfo=UTC)
+        return SessionSummary(
+            self._session_id,
+            "/workspace",
+            "first",
+            "first-model",
+            timestamp,
+            timestamp,
+            title=title,
         )
 
 
@@ -480,6 +495,7 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("/status", app.entries[-1].text)
             self.assertIn("/cancel", app.entries[-1].text)
             self.assertIn("/sessions", app.entries[-1].text)
+            self.assertIn("/rename", app.entries[-1].text)
             self.assertIn("/tasks", app.entries[-1].text)
 
             prompt.value = "/status"
@@ -816,6 +832,34 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("[quoted] content", labels)
             await pilot.press("escape")
 
+    async def test_rename_and_title_commands_update_the_current_session(self) -> None:
+        controller = SessionTuiController()
+        app = NeuroCodeApp(
+            controller,
+            session_controller=controller,
+            provider_name="first",
+            model_name="first-model",
+            cwd=Path("/workspace"),
+        )
+
+        async with app.run_test(size=(100, 30)) as pilot:
+            prompt = app.query_one("#prompt", Input)
+            prompt.value = "/rename   Manual session title"
+            await pilot.press("enter")
+            await pilot.pause()
+
+            self.assertEqual(controller.renamed, ["  Manual session title"])
+            self.assertIn("renamed to 'Manual session title'", app.entries[-1].text)
+
+            prompt.value = "/title Alias title"
+            await pilot.press("enter")
+            await pilot.pause()
+            self.assertEqual(
+                controller.renamed,
+                ["  Manual session title", "Alias title"],
+            )
+            self.assertIn("renamed to 'Alias title'", app.entries[-1].text)
+
     async def test_direct_session_resume_is_blocked_while_a_turn_is_running(self) -> None:
         runner = CancellableTuiConversation()
         sessions = SessionTuiController()
@@ -841,6 +885,14 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(
                 app.entries[-1].text,
                 "Cannot resume a session while a turn is running.",
+            )
+            prompt.value = "/rename Blocked title"
+            await pilot.press("enter")
+            await pilot.pause()
+            self.assertEqual(sessions.renamed, [])
+            self.assertEqual(
+                app.entries[-1].text,
+                "Cannot rename a session while a turn is running.",
             )
             await pilot.press("ctrl+c")
 

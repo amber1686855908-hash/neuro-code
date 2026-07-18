@@ -17,6 +17,7 @@ from textual.worker import Worker
 from neuro_code.domain.background_tasks import BackgroundTaskSnapshot, BackgroundTaskStatus
 from neuro_code.domain.events import AgentEvent, AgentEventKind
 from neuro_code.domain.messages import Message, Role, SessionItem
+from neuro_code.domain.sessions import SessionSummary
 from neuro_code.permissions import PermissionApproval, PermissionRequest
 from neuro_code.runtime.agent import AgentRunResult, EventSink
 from neuro_code.runtime.approval import ApprovalHandler
@@ -57,6 +58,8 @@ class SessionController(Protocol):
     async def list_sessions(self, query: str | None = None) -> tuple[SessionOption, ...]: ...
 
     async def select_session(self, session_id: str) -> SessionSelectionResult: ...
+
+    async def rename_session(self, title: str) -> SessionSummary: ...
 
 
 class TaskController(Protocol):
@@ -632,6 +635,9 @@ class NeuroCodeApp(App[None]):
             else:
                 await self._select_session(requested)
             return
+        if command in {"rename", "title"}:
+            await self._rename_session(arguments)
+            return
         if command == "tasks":
             if arguments.strip():
                 self._write_entry("error", "/tasks does not accept arguments.")
@@ -651,8 +657,8 @@ class NeuroCodeApp(App[None]):
             self._write_entry(
                 "system",
                 "Commands: /help, /status, /provider [PROFILE] (alias /model), "
-                "/sessions [QUERY], /resume [SESSION_ID], /tasks, /cancel, /clear, "
-                "/quit (alias /exit).",
+                "/sessions [QUERY], /resume [SESSION_ID], /rename TITLE (alias /title), "
+                "/tasks, /cancel, /clear, /quit (alias /exit).",
             )
         elif command == "status":
             session_id = self._runner.session_id or "not created"
@@ -784,6 +790,23 @@ class NeuroCodeApp(App[None]):
         self.push_screen(
             SessionSelectionScreen(options, query=query),
             self._session_selected,
+        )
+
+    async def _rename_session(self, title: str) -> None:
+        if self._session_controller is None:
+            self._write_entry("error", "Interactive session rename is unavailable.")
+            return
+        if self._turn_worker is not None and self._turn_worker.is_running:
+            self._write_entry("error", "Cannot rename a session while a turn is running.")
+            return
+        try:
+            summary = await self._session_controller.rename_session(title)
+        except Exception as error:
+            self._write_entry("error", f"{type(error).__name__}: {error}")
+            return
+        self._write_entry(
+            "status",
+            f"Session {summary.id} renamed to {summary.title!r}.",
         )
 
     async def _session_selected(self, session_id: str | None) -> None:

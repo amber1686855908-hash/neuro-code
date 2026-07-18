@@ -215,6 +215,61 @@ class SessionStoreTests(unittest.IsolatedAsyncioTestCase):
             self.assertIs(summary.sandbox_profile, SandboxProfile.READ_ONLY)
             self.assertEqual((await store.list_sessions())[0], summary)
 
+    async def test_manual_title_update_is_atomic_persistent_and_searchable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = SqliteSessionStore(Path(directory) / "sessions.db")
+            await store.initialize()
+            session_id = await store.create_session("/workspace", "fixture", "model")
+            await store.save_messages(
+                session_id,
+                [Message(Role.USER, "original visible prompt")],
+            )
+
+            renamed = await store.update_session_title(
+                session_id,
+                "  Manual\n  searchable   title  ",
+            )
+
+            self.assertEqual(renamed.title, "Manual searchable title")
+            manual_search = await store.search_sessions("manual searchable")
+            self.assertEqual([hit.summary.id for hit in manual_search.results], [session_id])
+            self.assertEqual(manual_search.results[0].matched_fields, ("title",))
+            original_search = await store.search_sessions("original visible")
+            self.assertEqual(original_search.results[0].matched_fields, ("content",))
+
+            await store.save_messages(
+                session_id,
+                [
+                    Message(Role.USER, "original visible prompt"),
+                    Message(Role.ASSISTANT, "continued after rename"),
+                ],
+            )
+            self.assertEqual(
+                (await store.get_session(session_id)).title,
+                "Manual searchable title",
+            )
+
+            with (
+                patch(
+                    "neuro_code.adapters.sqlite_session._upsert_search_document",
+                    side_effect=RuntimeError("injected index failure"),
+                ),
+                self.assertRaisesRegex(RuntimeError, "injected index failure"),
+            ):
+                await store.update_session_title(session_id, "Rolled back title")
+            self.assertEqual(
+                (await store.get_session(session_id)).title,
+                "Manual searchable title",
+            )
+            self.assertEqual((await store.search_sessions("rolled back")).results, ())
+
+            truncated = await store.update_session_title(session_id, "x" * 250)
+            self.assertEqual(truncated.title, "x" * 200)
+            with self.assertRaisesRegex(SessionError, "title must not be empty"):
+                await store.update_session_title(session_id, " \n\t ")
+            with self.assertRaisesRegex(SessionError, "unknown session"):
+                await store.update_session_title("missing", "Valid title")
+
     async def test_schema_v1_is_migrated_without_rewriting_existing_sessions(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             database = Path(directory) / "sessions.db"

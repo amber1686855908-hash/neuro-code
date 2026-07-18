@@ -717,6 +717,9 @@ api_key_env = "SECOND_KEY"
                     captured["selection"] = await self.session_controller.select_session(
                         captured["root_session"]
                     )
+                    captured["renamed"] = await self.session_controller.rename_session(
+                        "Renamed from TUI"
+                    )
                     captured["same_controller"] = (
                         self.runner
                         is self.provider_controller
@@ -743,6 +746,7 @@ api_key_env = "SECOND_KEY"
             self.assertEqual(selection.session_id, root_session)
             self.assertEqual(selection.profile_name, "second")
             self.assertTrue(selection.source_profile_match)
+            self.assertEqual(captured["renamed"].title, "Renamed from TUI")
             self.assertGreaterEqual(len(selection.items), 2)
             self.assertEqual(created_profiles[-2:], ["first", "second"])
 
@@ -812,6 +816,37 @@ api_key_env = "SECOND_KEY"
             self.assertIn("content", search_page["results"][0]["matched_fields"])
             self.assertIsNotNone(search_page["results"][0]["snippet"])
 
+            exit_code, rename_output = run(
+                (
+                    "sessions",
+                    "rename",
+                    session_id,
+                    "Manual CLI title",
+                    "--json",
+                    "--cwd",
+                    str(root),
+                )
+            )
+            self.assertEqual(exit_code, 0)
+            renamed = json.loads(rename_output)
+            self.assertEqual(renamed["id"], session_id)
+            self.assertEqual(renamed["title"], "Manual CLI title")
+
+            exit_code, renamed_search_output = run(
+                (
+                    "sessions",
+                    "search",
+                    "manual CLI",
+                    "--json",
+                    "--cwd",
+                    str(root),
+                )
+            )
+            self.assertEqual(exit_code, 0)
+            renamed_search = json.loads(renamed_search_output)
+            self.assertEqual(renamed_search["results"][0]["id"], session_id)
+            self.assertIn("title", renamed_search["results"][0]["matched_fields"])
+
             exit_code, markdown = run(("export", session_id, "--cwd", str(root)))
             self.assertEqual(exit_code, 0)
             self.assertIn("## User\n\nfirst", markdown)
@@ -836,6 +871,7 @@ api_key_env = "SECOND_KEY"
             self.assertEqual(exported["schema_version"], 4)
             self.assertEqual(exported["session"]["id"], session_id)
             self.assertEqual(exported["session"]["sandbox_profile"], "off")
+            self.assertEqual(exported["session"]["title"], "Manual CLI title")
             self.assertEqual(exported["conversation_items"], exported["messages"])
 
     def test_import_rust_session_is_available_to_list_and_export(self) -> None:

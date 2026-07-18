@@ -50,6 +50,13 @@ The title remains stable on later turns. A valid upstream `generated_title` is
 preserved during read-only import; no auxiliary model request is required for
 this slice.
 
+`SessionStore.update_session_title` implements unconditional manual rename.
+It rejects blank input, normalizes whitespace, applies the 200-character domain
+bound, and updates the canonical title, update timestamp, and synchronized FTS
+document in one SQLite transaction. A failed index write therefore rolls back
+the summary change. Later message saves preserve every non-empty title, so a
+manual rename cannot be replaced by deterministic fallback generation.
+
 The searchable projection includes visible user/assistant message text and tool
 names. It deliberately excludes system messages, raw tool-result content, tool
 arguments/metadata, `PreservedContextItem` payloads, assistant
@@ -59,13 +66,16 @@ matches. BM25 weights title matches ten times more strongly than content. Exact
 cwd filtering, offsets, totals, and optional snippets are part of the adapter
 contract.
 
-Expose the capability as `neuro-code sessions search QUERY` for scripts and as
-`/sessions QUERY` for the TUI. The TUI applies filesystem-identity workspace
-filtering before showing hits and renders saved titles, user queries, and
-snippets as literal `Text`, never as Textual markup. The controller retains the
-validated summary behind a search result so an older hit need not also appear
-in the recent-session page; selecting it recomputes current profile and sandbox
-availability before the ordinary open-time workspace validation.
+Expose search as `neuro-code sessions search QUERY` for scripts and as
+`/sessions QUERY` for the TUI. Expose manual rename as
+`neuro-code sessions rename SESSION_ID TITLE` and current-session
+`/rename TITLE`, with `/title` as an alias. The TUI applies filesystem-identity
+workspace filtering to search and rename, and serializes rename with active
+turns. It renders saved titles, user queries, and snippets as literal `Text`,
+never as Textual markup. The controller retains the validated summary behind a
+search result so an older hit need not also appear in the recent-session page;
+selecting it recomputes current profile and sandbox availability before the
+ordinary open-time workspace validation.
 
 JSON session exports move to schema version 4 and include the optional title.
 
@@ -82,9 +92,8 @@ JSON session exports move to schema version 4 and include the optional title.
   indexed.
 - CLI search spans the selected state database. Interactive search additionally
   enforces the active workspace identity and the existing safe-resume checks.
-- Model-generated titles, manual rename, a live debounced picker search field,
-  stemming beyond the bounded prefix rules, and ACP exposure remain future
-  slices.
+- Model-generated titles, a live debounced picker search field, stemming beyond
+  the bounded prefix rules, and ACP exposure remain future slices.
 
 ## Rejected alternatives
 
