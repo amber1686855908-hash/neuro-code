@@ -102,6 +102,14 @@ provider and tool lifecycle events to status messages and deliberately does not
 render raw reasoning, general tool argument mappings, or tool results in the
 transcript. See [ADR 0014](adr/0014-minimal-event-stream-tui.md).
 
+The presentation adapter owns one fixed neutral-dark theme instead of exposing
+Textual's unrelated theme and command-palette surfaces. The built-in palette is
+disabled, provider and session discovery use the explicit application commands,
+and session queries are rendered as literal plain text. In full-screen terminal
+mode, a low-frequency viewport reconciliation reads the actual TTY dimensions
+and posts the normal Textual resize event only when the active screen is stale.
+Headless tests, inline mode, and web mode do not install that fallback.
+
 For the active conversation scope, local `/tasks` renders bounded task metadata
 without command text or output and a periodic read-only poll emits one notice
 per terminal transition. It cannot mutate task state; `kill_task` remains on the

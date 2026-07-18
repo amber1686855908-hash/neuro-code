@@ -53,6 +53,14 @@ and local `/help`, `/status`, `/provider`, `/model`, `/sessions [QUERY]`, `/resu
 commands. Prompts in one launch share a durable session; `--resume SESSION_ID`
 opens an existing session after workspace validation.
 
+The full-screen interface uses a neutral dark palette with restrained warm
+accents for focus and system state. Textual's separate command palette is
+disabled because `Ctrl+P` belongs to provider selection; session search remains
+the plain-text `/sessions QUERY` flow and does not display an emoji search icon.
+The app also reconciles the real TTY cell size when a terminal drops its normal
+resize notification, so maximizing or resizing the window repaints the entire
+viewport instead of leaving the previous canvas at the top left.
+
 Use `Ctrl+P`, bare `/provider` or bare `/model` to open the configured-profile
 picker. `/provider PROFILE` and `/model PROFILE` select directly. The picker
 shows only profile name, model, protocol, and readiness; unavailable profiles

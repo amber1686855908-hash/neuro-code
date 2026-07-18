@@ -30,6 +30,14 @@ selection, rich rendering, or platform PTY behavior.
 - The TUI renders `AgentEvent` values and never mutates runtime state directly.
   Text deltas update the live response. Provider selection/failure and tool
   lifecycle events become bounded status lines.
+- The presentation uses one application-owned neutral-dark theme. Textual's
+  built-in command palette is disabled because its `Ctrl+P` and emoji search
+  surface conflict with the application's provider picker and plain-text
+  `/sessions QUERY` workflow.
+- Full-screen terminal mode periodically compares the real TTY cell dimensions
+  with the active Textual screen. It posts a normal resize event only when they
+  differ, recovering from missing signal or in-band resize notifications. This
+  fallback is not installed for headless, inline, or web drivers.
 - Raw reasoning deltas, general tool argument mappings, and tool results are not
   rendered in the transcript. Approval modals receive only the bounded action
   summary defined by ADR 0015.
@@ -51,9 +59,9 @@ and the application controller can be tested without importing Textual.
 
 This is partial M3 support. Remote model-catalog and reasoning-effort selection,
 pristine pre-token rewind, interjection queues, richer tool cards and
-Markdown/media rendering, terminal recovery tests, and cross-platform PTY
-integration remain separate vertical slices. Recoverable in-flight cancellation
-is defined by
+Markdown/media rendering, terminal-emulator smoke coverage, and cross-platform
+PTY integration remain separate vertical slices. Recoverable in-flight
+cancellation is defined by
 [ADR 0016](0016-recoverable-turn-cancellation.md).
 
 ## Historical source evidence

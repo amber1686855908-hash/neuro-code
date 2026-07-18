@@ -48,6 +48,12 @@ uv run neuro-code
 `/rename TITLE`（别名 `/title`）、`/clear`、`/quit` 和 `/exit` 命令。同一次启动中的提示
 会共享一个持久会话；`--resume SESSION_ID` 会在工作区校验通过后打开已有会话。
 
+全屏界面采用中性深色配色，只用克制的暖色表示焦点和系统状态。由于 `Ctrl+P` 已用于
+供应商选择，Textual 自带的另一套命令面板会被禁用；会话搜索继续使用纯文字
+`/sessions QUERY` 流程，不显示表情符号搜索图标。终端未正常送达尺寸变化通知时，应用还
+会校准真实 TTY 单元格尺寸，因此最大化或缩放窗口会重绘整个视口，不会把旧画布留在
+左上角。
+
 使用 `Ctrl+P`、不带参数的 `/provider` 或 `/model` 可以打开已配置 profile 选择器；
 `/provider PROFILE` 与 `/model PROFILE` 可以直接选择。选择器只展示 profile 名称、模型、
 协议和就绪状态；不可用或缺少凭据的 profile 会被禁用。它选择的是已配置 profile，而非

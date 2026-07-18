@@ -1,16 +1,21 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import sys
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, ClassVar, Protocol
 
 from rich.text import Text
+from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding, BindingType
 from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.geometry import Size
 from textual.screen import ModalScreen
+from textual.theme import Theme
 from textual.widgets import Button, Footer, Header, Input, Label, RichLog, Static
 from textual.worker import Worker
 
@@ -31,6 +36,70 @@ from neuro_code.runtime.profile_conversation import (
 _RESTORED_MESSAGE_LIMIT = 20_000
 _TASK_LIST_LIMIT = 20
 _TASK_POLL_SECONDS = 0.5
+_TERMINAL_SIZE_POLL_SECONDS = 0.25
+
+_NEURO_CODE_THEME = Theme(
+    name="neuro-code-dark",
+    primary="#c7a15a",
+    secondary="#777c83",
+    accent="#c7a15a",
+    warning="#d0a45a",
+    error="#c76d6d",
+    success="#8fa481",
+    foreground="#d8dadd",
+    background="#101214",
+    surface="#1a1c1f",
+    panel="#16181b",
+    boost="#2a2d31",
+    luminosity_spread=0.08,
+    text_alpha=0.96,
+    variables={
+        "border": "#806b48",
+        "border-blurred": "#3b3f44",
+        "block-cursor-background": "#c7a15a",
+        "block-cursor-foreground": "#101214",
+        "block-hover-background": "#2a2d31",
+        "button-color-foreground": "#101214",
+        "button-focus-text-style": "bold",
+        "footer-background": "#141619",
+        "footer-description-background": "#141619",
+        "footer-description-foreground": "#a9adb3",
+        "footer-item-background": "#141619",
+        "footer-key-background": "#141619",
+        "footer-key-foreground": "#c7a15a",
+        "input-cursor-background": "#d8dadd",
+        "input-cursor-foreground": "#101214",
+        "input-selection-background": "#806b48 55%",
+        "scrollbar": "#50555b",
+        "scrollbar-active": "#806b48",
+        "scrollbar-background": "#101214",
+        "scrollbar-hover": "#666b72",
+    },
+)
+
+_ENTRY_LABELS: dict[str, tuple[str, str]] = {
+    "assistant": ("Assistant", "bold #e1e3e6"),
+    "error": ("Error", "bold #c76d6d"),
+    "status": ("Status", "#8e939a"),
+    "system": ("Neuro Code", "bold #c7a15a"),
+    "tool": ("Tool", "bold #b59663"),
+    "user": ("You", "bold #c8cbd0"),
+}
+
+
+def _read_terminal_size() -> Size | None:
+    """Read the real TTY viewport without trusting possibly stale shell variables."""
+
+    for stream in (sys.__stdin__, sys.__stderr__, sys.__stdout__):
+        if stream is None:
+            continue
+        try:
+            terminal_size = os.get_terminal_size(stream.fileno())
+        except (AttributeError, OSError, ValueError):
+            continue
+        if terminal_size.columns > 0 and terminal_size.lines > 0:
+            return Size(terminal_size.columns, terminal_size.lines)
+    return None
 
 
 class ConversationRunner(Protocol):
@@ -380,16 +449,16 @@ class SessionSelectionScreen(ModalScreen[str | None]):
         yield Vertical(
             Label(
                 Text(
-                    f"Search workspace sessions: {self.search_query}"
+                    f"Session search: {self.search_query}"
                     if self.search_query is not None
-                    else "Resume workspace session"
+                    else "Workspace sessions"
                 ),
                 id="session-title",
             ),
             VerticalScroll(*buttons, id="session-options"),
             Static(
                 "Only sessions from this workspace are listed. "
-                "Use /sessions QUERY for content search. Esc/Ctrl+C closes this picker.",
+                "Filter with /sessions QUERY. Esc/Ctrl+C closes this picker.",
                 id="session-help",
             ),
             id="session-dialog",
@@ -421,15 +490,41 @@ class NeuroCodeApp(App[None]):
 
     TITLE = "Neuro Code"
     SUB_TITLE = "Terminal coding agent"
+    ENABLE_COMMAND_PALETTE = False
     CSS = """
     Screen {
         layout: vertical;
+        width: 100%;
+        height: 100%;
+        background: #101214;
+        color: #d8dadd;
+    }
+
+    Header {
+        background: #16181b;
+        color: #d8dadd;
+    }
+
+    HeaderIcon {
+        display: none;
+    }
+
+    HeaderTitle {
+        padding-left: 2;
+        content-align: left middle;
+    }
+
+    HeaderClock {
+        background: #1a1c1f;
+        color: #989da4;
     }
 
     #transcript {
         height: 1fr;
         padding: 1 2;
-        border-bottom: solid $primary-darken-2;
+        background: #101214;
+        color: #d8dadd;
+        border-bottom: solid #303338;
     }
 
     #stream {
@@ -437,12 +532,48 @@ class NeuroCodeApp(App[None]):
         min-height: 1;
         max-height: 8;
         padding: 0 2;
-        color: $text;
+        background: #141619;
+        color: #d8dadd;
     }
 
     #prompt {
         dock: bottom;
         margin: 0 1 1 1;
+        background: #1a1c1f;
+        color: #d8dadd;
+        border: tall #3b3f44;
+    }
+
+    #prompt:focus {
+        background: #1d1f22;
+        background-tint: #ffffff 2%;
+        border: tall #806b48;
+    }
+
+    Footer {
+        background: #141619;
+        color: #a9adb3;
+    }
+
+    FooterKey {
+        background: #141619;
+
+        .footer-key--key {
+            background: #141619;
+            color: #c7a15a;
+        }
+
+        .footer-key--description {
+            background: #141619;
+            color: #a9adb3;
+        }
+    }
+
+    #provider-options Button:focus,
+    #session-options Button:focus {
+        background: #292c30;
+        color: #e1e3e6;
+        border-left: solid #806b48;
     }
     """
     BINDINGS: ClassVar[list[BindingType]] = [
@@ -467,6 +598,8 @@ class NeuroCodeApp(App[None]):
         cwd: Path,
     ) -> None:
         super().__init__()
+        self.register_theme(_NEURO_CODE_THEME)
+        self.theme = _NEURO_CODE_THEME.name
         self._runner = runner
         self._approval_controller = approval_controller
         self._provider_controller = provider_controller
@@ -488,10 +621,10 @@ class NeuroCodeApp(App[None]):
         return tuple(self._entries)
 
     def compose(self) -> ComposeResult:
-        yield Header(show_clock=True)
+        yield Header(show_clock=True, icon="")
         yield RichLog(id="transcript", wrap=True, highlight=False, markup=False)
         yield Static("", id="stream")
-        yield Input(placeholder="Ask Neuro Code… (/help for commands)", id="prompt")
+        yield Input(placeholder="Ask Neuro Code... (/help for commands)", id="prompt")
         yield Footer()
 
     def on_mount(self) -> None:
@@ -511,7 +644,17 @@ class NeuroCodeApp(App[None]):
             )
         if self._task_controller is not None:
             self.set_interval(_TASK_POLL_SECONDS, self._poll_background_tasks)
+        if not self.is_headless and not self.is_inline and not self.is_web:
+            self.set_interval(_TERMINAL_SIZE_POLL_SECONDS, self._synchronize_terminal_size)
         self.query_one("#prompt", Input).focus()
+
+    def _synchronize_terminal_size(self) -> None:
+        """Recover when a terminal drops its normal resize notification."""
+
+        terminal_size = _read_terminal_size()
+        if terminal_size is None or terminal_size == self.screen.size:
+            return
+        self.post_message(events.Resize(terminal_size, terminal_size, terminal_size))
 
     def on_unmount(self) -> None:
         if self._approval_controller is not None:
@@ -535,7 +678,9 @@ class NeuroCodeApp(App[None]):
         self._write_entry("user", prompt)
         self._assistant_parts.clear()
         self._reasoning_announced = False
-        self.query_one("#stream", Static).update(Text("Assistant: …", style="italic"))
+        self.query_one("#stream", Static).update(
+            Text("Waiting for model response...", style="italic #8e939a")
+        )
         self._turn_worker = self.run_worker(
             self._run_prompt(prompt),
             name="agent-turn",
@@ -566,12 +711,11 @@ class NeuroCodeApp(App[None]):
             text = data.get("text")
             if isinstance(text, str):
                 self._assistant_parts.append(text)
-                rendered = Text("Assistant: ", style="bold cyan")
-                rendered.append("".join(self._assistant_parts))
+                rendered = self._render_entry("assistant", "".join(self._assistant_parts))
                 self.query_one("#stream", Static).update(rendered)
         elif event.kind is AgentEventKind.REASONING_DELTA and not self._reasoning_announced:
             self._reasoning_announced = True
-            self._write_entry("status", "Reasoning…")
+            self._write_entry("status", "Reasoning...")
         elif event.kind is AgentEventKind.PROVIDER_ATTEMPT_FAILED:
             provider = self._field(data, "provider")
             message = self._field(data, "message")
@@ -866,7 +1010,7 @@ class NeuroCodeApp(App[None]):
         omitted = len(snapshots) - len(visible)
         lines = [self._task_summary(snapshot) for snapshot in visible]
         if omitted:
-            lines.insert(0, f"… {omitted} older task(s) omitted")
+            lines.insert(0, f"... {omitted} older task(s) omitted")
         self._write_entry("system", "Background tasks:\n" + "\n".join(lines))
 
     async def _poll_background_tasks(self) -> None:
@@ -947,23 +1091,19 @@ class NeuroCodeApp(App[None]):
     def _bounded_restored_text(content: str) -> str:
         if len(content) <= _RESTORED_MESSAGE_LIMIT:
             return content
-        return f"{content[:_RESTORED_MESSAGE_LIMIT]}\n… [restored message truncated]"
+        return f"{content[:_RESTORED_MESSAGE_LIMIT]}\n... [restored message truncated]"
+
+    @staticmethod
+    def _render_entry(category: str, content: str) -> Text:
+        label, style = _ENTRY_LABELS.get(category, (category.title(), ""))
+        rendered = Text(f"{label}: ", style=style)
+        rendered.append(content)
+        return rendered
 
     def _write_entry(self, category: str, content: str) -> None:
         entry = TranscriptEntry(category, content)
         self._entries.append(entry)
-        labels = {
-            "assistant": ("Assistant", "bold cyan"),
-            "error": ("Error", "bold red"),
-            "status": ("Status", "dim"),
-            "system": ("Neuro Code", "bold magenta"),
-            "tool": ("Tool", "bold yellow"),
-            "user": ("You", "bold green"),
-        }
-        label, style = labels.get(category, (category.title(), ""))
-        rendered = Text(f"{label}: ", style=style)
-        rendered.append(content)
-        self.query_one("#transcript", RichLog).write(rendered)
+        self.query_one("#transcript", RichLog).write(self._render_entry(category, content))
 
 
 __all__ = [

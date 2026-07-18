@@ -6,8 +6,10 @@ import unittest
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
+from unittest.mock import patch
 
-from textual.widgets import Button, Input
+from textual.geometry import Size
+from textual.widgets import Button, Input, Label, RichLog
 
 from neuro_code.domain.background_tasks import BackgroundTaskSnapshot, BackgroundTaskStatus
 from neuro_code.domain.events import AgentEvent, AgentEventKind
@@ -363,6 +365,53 @@ def background_snapshot(
 
 
 class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
+    async def test_neutral_theme_disables_the_builtin_emoji_command_palette(self) -> None:
+        app = NeuroCodeApp(
+            TuiConversation(),
+            provider_name="fixture",
+            model_name="fixture-model",
+            cwd=Path("/workspace"),
+        )
+
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.pause()
+
+            self.assertEqual(app.theme, "neuro-code-dark")
+            self.assertEqual(app.screen.styles.background.hex, "#101214")
+            self.assertFalse(app.ENABLE_COMMAND_PALETTE)
+            self.assertEqual(app.query_one("HeaderIcon").styles.display, "none")
+            entry_styles = {
+                str(app._render_entry(category, "content").style)
+                for category in ("assistant", "system", "tool", "user")
+            }
+            self.assertFalse(
+                any(
+                    color in style
+                    for style in entry_styles
+                    for color in ("cyan", "green", "magenta", "yellow")
+                )
+            )
+
+    async def test_terminal_size_fallback_expands_the_full_screen_layout(self) -> None:
+        app = NeuroCodeApp(
+            TuiConversation(),
+            provider_name="fixture",
+            model_name="fixture-model",
+            cwd=Path("/workspace"),
+        )
+
+        async with app.run_test(size=(80, 24)) as pilot:
+            with patch("neuro_code.tui._read_terminal_size", return_value=Size(132, 41)):
+                app._synchronize_terminal_size()
+                await pilot.pause()
+
+            self.assertEqual(app.screen.size, Size(132, 41))
+            self.assertEqual(app.screen.region.size, Size(132, 41))
+            self.assertEqual(app.query_one("#transcript", RichLog).region.width, 132)
+            prompt = app.query_one("#prompt", Input)
+            self.assertEqual(prompt.region.right, 131)
+            self.assertEqual(prompt.region.bottom, 40)
+
     async def test_tasks_command_lists_current_scope_without_rendering_command_or_output(
         self,
     ) -> None:
@@ -466,7 +515,7 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(runner.prompts, ["inspect the repository"])
             entries = [(entry.category, entry.text) for entry in app.entries]
             self.assertIn(("user", "inspect the repository"), entries)
-            self.assertIn(("status", "Reasoning…"), entries)
+            self.assertIn(("status", "Reasoning..."), entries)
             self.assertIn(("tool", "Tool read_file requested."), entries)
             self.assertIn(("status", "Tool read_file is waiting for approval."), entries)
             self.assertIn(
@@ -827,6 +876,9 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsInstance(app.screen, SessionSelectionScreen)
             self.assertEqual(controller.queries, ["quoted"])
             self.assertEqual(app.screen.search_query, "quoted")
+            title = app.screen.query_one("#session-title", Label)
+            self.assertEqual(str(title.renderable), "Session search: quoted")
+            self.assertNotIn("🔎", str(title.renderable))
             labels = "\n".join(str(button.label) for button in app.screen.query(Button))
             self.assertIn("Escaped quoted session", labels)
             self.assertIn("[quoted] content", labels)
