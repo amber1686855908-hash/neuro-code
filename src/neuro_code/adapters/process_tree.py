@@ -148,6 +148,17 @@ class ProcessTree:
         except ProcessLookupError:
             await self._wait_direct(force_wait_seconds)
             return
+        except PermissionError as error:
+            # Darwin can transiently report EPERM for a short-lived group whose
+            # direct leader has exited but has not yet been reaped by asyncio.
+            # Reap briefly, then retry the group signal. A persistent EPERM is
+            # still fatal so the ownership guarantee never degrades silently.
+            if not await self._wait_for_direct_exit(min(grace_seconds, 0.1)):
+                raise error
+            try:
+                os.killpg(process_group, signal.SIGTERM)
+            except ProcessLookupError:
+                return
 
         loop = asyncio.get_running_loop()
         deadline = loop.time() + grace_seconds
@@ -201,3 +212,15 @@ class ProcessTree:
         except TimeoutError:
             self.process.kill()
             await self.process.wait()
+
+    async def _wait_for_direct_exit(self, timeout_seconds: float) -> bool:
+        if self.process.returncode is not None:
+            return True
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(self.process.wait()),
+                timeout=timeout_seconds,
+            )
+        except TimeoutError:
+            return False
+        return True
