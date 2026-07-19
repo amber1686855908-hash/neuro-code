@@ -564,6 +564,10 @@ class NativeWindowsConPtyApiContractTests(unittest.TestCase):
                     ctypes.wstring_at(environment_pointer),
                     cwd,
                     int(startup.StartupInfo.cb),
+                    int(startup.StartupInfo.dwFlags),
+                    startup.StartupInfo.hStdInput,
+                    startup.StartupInfo.hStdOutput,
+                    startup.StartupInfo.hStdError,
                     bool(startup.lpAttributeList),
                 )
             )
@@ -630,9 +634,11 @@ class NativeWindowsConPtyApiContractTests(unittest.TestCase):
         self.assertFalse(creation[5])
         self.assertEqual(creation[6], 0x00080400)
         self.assertEqual(creation[7], "A=first")
-        self.assertEqual(creation[8], "C:/workspace")
+        self.assertEqual(creation[8], str(Path("C:/workspace")))
         self.assertEqual(creation[9], ctypes.sizeof(_StartupInfoExW))
-        self.assertTrue(creation[10])
+        self.assertEqual(creation[10], 0x100)
+        self.assertEqual(creation[11:14], (None, None, None))
+        self.assertTrue(creation[14])
         self.assertEqual(calls[-1], ("delete", True))
 
     def test_create_process_failure_deletes_the_initialized_attribute_list(self) -> None:

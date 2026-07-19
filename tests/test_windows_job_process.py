@@ -534,7 +534,7 @@ class NativeWindowsJobProcessApiContractTests(unittest.TestCase):
         self.assertTrue(creation[5])
         self.assertEqual(creation[6], 0x08080600)
         self.assertEqual(creation[7], "A=first")
-        self.assertEqual(creation[8], "C:/workspace")
+        self.assertEqual(creation[8], str(Path("C:/workspace")))
         self.assertEqual(creation[9], ctypes.sizeof(_StartupInfoExW))
         self.assertEqual(creation[10:14], (0x100, 14, 11, 13))
         self.assertTrue(creation[14])

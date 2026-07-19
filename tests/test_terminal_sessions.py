@@ -197,7 +197,9 @@ class LocalInteractiveTerminalManagerTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(session.process_id, 4242)
                 self.assertEqual(session.size, TerminalSize(90, 25))
                 spawn = platform.spawn_calls[0]
-                self.assertEqual(spawn["cwd"], child)
+                spawn_cwd = spawn["cwd"]
+                assert isinstance(spawn_cwd, Path)
+                self.assertEqual(spawn_cwd.resolve(), child.resolve())
                 self.assertEqual(spawn["executable"], "/usr/bin/python")
                 self.assertEqual(spawn["arguments"], ("-u", "-c", "print('ok')"))
                 environment = spawn["env"]

@@ -20,6 +20,7 @@ _DWORD_MAX = (1 << 32) - 1
 _COORD_MAX = (1 << 15) - 1
 _CREATE_UNICODE_ENVIRONMENT = 0x00000400
 _EXTENDED_STARTUPINFO_PRESENT = 0x00080000
+_STARTF_USESTDHANDLES = 0x00000100
 _PROC_THREAD_ATTRIBUTE_JOB_LIST = 0x0002000D
 _PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE = 0x00020016
 _WAIT_OBJECT_0 = 0
@@ -370,6 +371,13 @@ class _NativeWindowsConPtyApi:
 
             startup = _StartupInfoExW()
             startup.StartupInfo.cb = ctypes.sizeof(startup)
+            # Do not let a console-hosting parent leak its standard handles
+            # into the child. ConPTY replaces these null placeholders while
+            # attaching the new process to the pseudoconsole.
+            startup.StartupInfo.dwFlags = _STARTF_USESTDHANDLES
+            startup.StartupInfo.hStdInput = None
+            startup.StartupInfo.hStdOutput = None
+            startup.StartupInfo.hStdError = None
             startup.lpAttributeList = attribute_list.value
             process = _ProcessInformation()
             command_line = ctypes.create_unicode_buffer(subprocess.list2cmdline(arguments))
