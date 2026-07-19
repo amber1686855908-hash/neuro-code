@@ -32,6 +32,7 @@ from acp.schema import (
 from acp.stdio import spawn_agent_process
 
 from neuro_code.adapters.sqlite_session import SqliteSessionStore
+from neuro_code.workspace import workspaces_match
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 MCP_FIXTURE = REPOSITORY_ROOT / "tests" / "fixtures" / "mcp_stdio_server.py"
@@ -435,7 +436,7 @@ context_window_tokens = 32000
                 listed = await connection.list_sessions()
                 self.assertEqual(len(listed.sessions), 1)
                 self.assertEqual(listed.sessions[0].session_id, created.session_id)
-                self.assertEqual(Path(listed.sessions[0].cwd), root)
+                self.assertTrue(workspaces_match(listed.sessions[0].cwd, root))
                 self.assertTrue(listed.sessions[0].title.startswith("Use the tools."))
                 self.assertIsNotNone(listed.sessions[0].updated_at)
                 self.assertIsNone(listed.sessions[0].additional_directories)
