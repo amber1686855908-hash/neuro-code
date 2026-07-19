@@ -13,13 +13,15 @@ from neuro_code.adapters.rust_session import load_rust_session
 from neuro_code.adapters.sandbox import create_shell_sandbox, enforce_configured_sandbox
 from neuro_code.adapters.sqlite_session import SqliteSessionStore
 from neuro_code.adapters.ui_preferences import JsonUiPreferencesStore
+from neuro_code.application import (
+    ApplicationComposition,
+    ApplicationSettings,
+)
 from neuro_code.async_utils import run_blocking
 from neuro_code.config import (
     AppConfig,
     load_config,
     override_provider,
-    override_sandbox,
-    pin_resumed_sandbox,
 )
 from neuro_code.domain.events import AgentEvent, AgentEventKind
 from neuro_code.domain.interaction_mode import InteractionMode
@@ -37,24 +39,16 @@ from neuro_code.domain.sessions import SessionSummary
 from neuro_code.errors import ConfigurationError, NeuroCodeError
 from neuro_code.permissions import (
     PermissionEffect,
-    PermissionManager,
     PermissionMode,
     PermissionRule,
 )
-from neuro_code.ports.approval import PermissionApprover
-from neuro_code.ports.background_tasks import BackgroundTaskManager
-from neuro_code.ports.model import ModelProvider
-from neuro_code.ports.tools import ToolContext
 from neuro_code.providers import create_routed_provider
 from neuro_code.runtime import (
-    AgentConversation,
-    AgentRuntime,
     ConversationBinding,
     ProfileConversationController,
     ProviderOption,
     SessionApprovalBroker,
 )
-from neuro_code.tools import default_tool_registry
 from neuro_code.workspace import workspaces_match
 
 
@@ -91,6 +85,31 @@ def _add_run_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--resume", metavar="SESSION_ID", help="resume an existing session")
 
 
+def _add_acp_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--cwd", type=Path, help="connection workspace")
+    parser.add_argument("-m", "--model", help="model identifier")
+    parser.add_argument("--provider", help="named provider profile")
+    parser.add_argument("--base-url", help="provider API base URL")
+    parser.add_argument(
+        "--no-failover",
+        action="store_true",
+        help="disable configured provider fallbacks for this process",
+    )
+    parser.add_argument(
+        "--sandbox",
+        choices=tuple(profile.value for profile in SandboxProfile),
+        help="operating-system sandbox profile for this process",
+    )
+    parser.add_argument("--allow", action="append", default=[], metavar="PATTERN")
+    parser.add_argument("--deny", action="append", default=[], metavar="PATTERN")
+    parser.add_argument("--max-steps", type=int, default=24)
+    parser.add_argument(
+        "--effort",
+        choices=tuple(effort.value for effort in ReasoningEffort),
+        help="agent review depth (default: high)",
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="neuro-code",
@@ -114,6 +133,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     agent_parser = subparsers.add_parser("agent", help="run the headless agent")
     _add_run_arguments(agent_parser)
+
+    acp_parser = subparsers.add_parser("acp", help="serve partial ACP v1 over stdio")
+    _add_acp_arguments(acp_parser)
 
     sessions_parser = subparsers.add_parser("sessions", help="list or search persisted sessions")
     sessions_parser.add_argument(
@@ -248,7 +270,7 @@ def _plain_config(config: AppConfig) -> str:
 
 
 def _completion_script(shell: str) -> str:
-    commands = "version inspect completions agent providers sessions export import-session"
+    commands = "version inspect completions agent acp providers sessions export import-session"
     if shell == "bash":
         return (
             "_neuro_code() { COMPREPLY=( $(compgen -W '"
@@ -271,12 +293,9 @@ async def _run_agent(args: argparse.Namespace) -> int:
             "the agent subcommand requires -p/--single; run neuro-code without a subcommand "
             "for the interactive TUI"
         )
-    background_tasks = LocalBackgroundTaskManager()
+    application = await _open_application(args)
     try:
-        _, _, conversation = await _prepare_conversation(
-            args,
-            background_tasks=background_tasks,
-        )
+        binding = await application.create_binding(resume_id=args.resume)
 
         async def stream_event(event: AgentEvent) -> None:
             if args.output_format == "plain" and event.kind is AgentEventKind.TEXT_DELTA:
@@ -286,7 +305,7 @@ async def _run_agent(args: argparse.Namespace) -> int:
             elif args.output_format == "jsonl":
                 print(json.dumps(event.to_dict(), ensure_ascii=False), flush=True)
 
-        result = await conversation.run(args.prompt, sink=stream_event)
+        result = await binding.runner.run(args.prompt, sink=stream_event)
         if args.output_format == "plain":
             print()
         elif args.output_format == "json":
@@ -303,116 +322,66 @@ async def _run_agent(args: argparse.Namespace) -> int:
             )
         return 0
     finally:
-        await asyncio.shield(background_tasks.shutdown())
+        await asyncio.shield(application.close())
 
 
-async def _prepare_conversation(
+async def _run_acp(args: argparse.Namespace) -> int:
+    from neuro_code.acp import serve_acp
+
+    application = await _open_application(args)
+    try:
+        await serve_acp(application)
+        return 0
+    finally:
+        await asyncio.shield(application.close())
+
+
+def _application_settings(
     args: argparse.Namespace,
     *,
-    background_tasks: BackgroundTaskManager,
-    approver: PermissionApprover | None = None,
-) -> tuple[AppConfig, ModelProvider, AgentConversation]:
-    config = _effective_config(args)
-    store = SqliteSessionStore(config.state_dir / "sessions.db")
-    config = await _pin_resume_sandbox(config, args.resume, store)
-    _enforce_process_sandbox(config, args)
-    await store.initialize()
-    provider, conversation = await _compose_conversation(
-        args,
-        config,
-        store=store,
-        background_tasks=background_tasks,
-        approver=approver,
-        resume_id=args.resume,
-    )
-    return config, provider, conversation
-
-
-async def _pin_resume_sandbox(
-    config: AppConfig,
-    resume_id: str | None,
-    store: SqliteSessionStore,
-) -> AppConfig:
-    if resume_id is None:
-        return config
-    saved_profile = await store.peek_session_sandbox_profile(resume_id)
-    return pin_resumed_sandbox(config, saved_profile)
-
-
-def _effective_config(args: argparse.Namespace) -> AppConfig:
-    config = load_config(args.cwd)
-    config = override_sandbox(config, args.sandbox)
-    return override_provider(
-        config,
+    reasoning_effort: ReasoningEffort | None = None,
+) -> ApplicationSettings:
+    raw_arguments = tuple(getattr(args, "launch_arguments", ()))
+    return ApplicationSettings(
+        cwd=args.cwd,
         provider=args.provider,
         model=args.model,
         base_url=args.base_url,
-    )
-
-
-def _enforce_process_sandbox(config: AppConfig, args: argparse.Namespace) -> None:
-    raw_arguments = tuple(getattr(args, "launch_arguments", ()))
-    command = (sys.executable, "-m", "neuro_code", *raw_arguments)
-    enforce_configured_sandbox(
-        config.sandbox_profile,
-        config.cwd,
-        config.state_dir,
-        command,
-    )
-
-
-async def _compose_conversation(
-    args: argparse.Namespace,
-    config: AppConfig,
-    *,
-    store: SqliteSessionStore,
-    background_tasks: BackgroundTaskManager,
-    approver: PermissionApprover | None,
-    resume_id: str | None,
-    reasoning_effort: ReasoningEffort | None = None,
-) -> tuple[ModelProvider, AgentConversation]:
-    provider = create_routed_provider(config, failover=not args.no_failover)
-    shell_sandbox = create_shell_sandbox(
-        config.sandbox_profile,
-        config.cwd,
-        config.state_dir,
-    )
-    mode = PermissionMode.BYPASS if args.always_approve else PermissionMode.DEFAULT
-    permissions = PermissionManager(
-        mode=mode,
-        rules=_rules(args),
-        interactive=approver is not None,
-    )
-    runtime = AgentRuntime(
-        provider=provider,
-        tools=default_tool_registry(
-            config.sandbox_profile,
-            enable_background_tasks=True,
+        sandbox=args.sandbox,
+        failover=not args.no_failover,
+        permission_mode=(
+            PermissionMode.BYPASS
+            if getattr(args, "always_approve", False)
+            else PermissionMode.DEFAULT
         ),
-        permissions=permissions,
-        tool_context=ToolContext(
-            config.cwd,
-            sandbox_profile=config.sandbox_profile,
-            shell_sandbox=shell_sandbox,
-            protected_environment_variables=config.protected_environment_variables,
-            background_tasks=background_tasks,
-        ),
-        approver=approver,
-        session_store=store,
+        permission_rules=_rules(args),
         max_steps=args.max_steps,
         reasoning_effort=(
             ReasoningEffort(args.effort)
             if getattr(args, "effort", None) is not None
             else reasoning_effort or ReasoningEffort.HIGH
         ),
+        resume_id=getattr(args, "resume", None),
+        launch_command=(sys.executable, "-m", "neuro_code", *raw_arguments),
     )
-    conversation = await AgentConversation.open(
-        runtime=runtime,
-        store=store,
-        cwd=config.cwd,
-        resume_id=resume_id,
+
+
+async def _open_application(
+    args: argparse.Namespace,
+    *,
+    reasoning_effort: ReasoningEffort | None = None,
+) -> ApplicationComposition:
+    return await ApplicationComposition.open(
+        _application_settings(args, reasoning_effort=reasoning_effort),
+        provider_factory=lambda config, failover: create_routed_provider(
+            config,
+            failover=failover,
+        ),
+        shell_sandbox_factory=create_shell_sandbox,
+        process_sandbox_enforcer=enforce_configured_sandbox,
+        store_factory=SqliteSessionStore,
+        background_supervisor_factory=LocalBackgroundTaskManager,
     )
-    return provider, conversation
 
 
 def _provider_options(config: AppConfig) -> tuple[ProviderOption, ...]:
@@ -444,13 +413,11 @@ async def _run_tui(args: argparse.Namespace) -> int:
             ) from error
         raise
 
-    background_tasks = LocalBackgroundTaskManager()
+    application = await _open_application(args)
     try:
         approvals = SessionApprovalBroker()
-        config = _effective_config(args)
-        store = SqliteSessionStore(config.state_dir / "sessions.db")
-        config = await _pin_resume_sandbox(config, args.resume, store)
-        _enforce_process_sandbox(config, args)
+        config = application.config
+        store = application.store
         ui_preferences = JsonUiPreferencesStore(config.state_dir / "ui-preferences.json")
         language = await ui_preferences.load_language()
         saved_reasoning_effort = await ui_preferences.load_reasoning_effort()
@@ -461,43 +428,28 @@ async def _run_tui(args: argparse.Namespace) -> int:
             else saved_reasoning_effort
         )
         interaction_mode = InteractionMode.AUTO if args.always_approve else saved_interaction_mode
-        await store.initialize()
 
         async def compose_scoped(
             selected_config: AppConfig,
             resume_id: str | None,
-        ) -> tuple[ModelProvider, AgentConversation, BackgroundTaskManager]:
-            task_scope = background_tasks.open_scope()
-            try:
-                selected_provider, selected_conversation = await _compose_conversation(
-                    args,
-                    selected_config,
-                    store=store,
-                    background_tasks=task_scope,
-                    approver=approvals,
-                    resume_id=resume_id,
-                    reasoning_effort=reasoning_effort,
-                )
-            except BaseException:
-                await asyncio.shield(task_scope.shutdown())
-                raise
-            return selected_provider, selected_conversation, task_scope
+        ) -> ConversationBinding:
+            return await application.create_binding(
+                config=selected_config,
+                approver=approvals,
+                resume_id=resume_id,
+                reasoning_effort=reasoning_effort,
+            )
 
-        provider, conversation, task_scope = await compose_scoped(config, args.resume)
+        binding = await compose_scoped(config, args.resume)
         selected_profile = config.selected_provider
         if selected_profile is None:
             raise ConfigurationError("no provider profile is selected")
 
         async def bind_profile(profile_name: str) -> ConversationBinding:
             selected_config = override_provider(config, provider=profile_name)
-            selected_provider, selected_conversation, selected_tasks = await compose_scoped(
+            return await compose_scoped(
                 selected_config,
                 None,
-            )
-            return ConversationBinding(
-                selected_conversation,
-                selected_provider,
-                selected_tasks,
             )
 
         async def list_workspace_sessions() -> tuple[SessionSummary, ...]:
@@ -518,14 +470,9 @@ async def _run_tui(args: argparse.Namespace) -> int:
 
         async def bind_session(profile_name: str, session_id: str) -> ConversationBinding:
             selected_config = override_provider(config, provider=profile_name)
-            selected_provider, selected_conversation, selected_tasks = await compose_scoped(
+            return await compose_scoped(
                 selected_config,
                 session_id,
-            )
-            return ConversationBinding(
-                selected_conversation,
-                selected_provider,
-                selected_tasks,
             )
 
         async def rename_workspace_session(
@@ -542,7 +489,7 @@ async def _run_tui(args: argparse.Namespace) -> int:
         controller = ProfileConversationController(
             options=_provider_options(config),
             selected_profile=selected_profile,
-            binding=ConversationBinding(conversation, provider, task_scope),
+            binding=binding,
             binding_factory=bind_profile,
             session_catalog=list_workspace_sessions,
             session_search=search_workspace_sessions,
@@ -568,7 +515,7 @@ async def _run_tui(args: argparse.Namespace) -> int:
         await app.run_async()
         return app.return_code if app.return_code is not None else 0
     finally:
-        await asyncio.shield(background_tasks.shutdown())
+        await asyncio.shield(application.close())
 
 
 def _provider_rows(config: AppConfig) -> list[dict[str, object]]:
@@ -857,6 +804,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return asyncio.run(_export_session(args))
         if args.command == "import-session":
             return asyncio.run(_import_session(args))
+        if args.command == "acp":
+            return asyncio.run(_run_acp(args))
         if args.command is None and args.prompt is None:
             return asyncio.run(_run_tui(args))
         return asyncio.run(_run_agent(args))

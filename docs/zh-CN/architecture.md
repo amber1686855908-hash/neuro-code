@@ -34,6 +34,11 @@ Web 控制台后端。纯云端能力必须通过显式适配器接入；不可�
 依赖只能向下。领域模块和应用模块不得导入 UI 框架、供应商 SDK、数据库驱动或平台
 实现。适配器实现带类型端口，并且只能在组合根中选择。
 
+`ApplicationComposition` 是与界面无关的进程组合服务。它解析配置与供应商 override，
+执行会话沙箱预检，初始化 SQLite，创建供应商、工具、权限管理器和会话作用域后台任务
+注册表，并持有监督器关闭责任。CLI、TUI 和 ACP 只负责把各自参数或协议值转换给该服务。
+应用模块不依赖 argparse、Textual、ACP Schema 类型、ACP Client 或 stdio。
+
 ## 运行时事件模型
 
 一次代理轮次是只追加的带类型事件流：
@@ -77,6 +82,48 @@ Web 控制台后端。纯云端能力必须通过显式适配器接入；不可�
 发生失败或取消时，`AgentConversation` 会在释放轮次锁之前，从 `SessionStore` 重新加载
 规范有序项和供应商来源。所以下一条提示会复用持久状态，而不是过期的内存前缀。取消的
 用户消息仍保留在历史中；首 token 前回退是另一项尚未实现的交互策略。
+
+## Partial ACP v1 适配器
+
+`neuro-code acp` 是位于 `ApplicationComposition` 与官方
+`agent-client-protocol` Python SDK 之上的协议适配器。生产 framing、JSON-RPC
+路由、换行分隔 stdio、`session/update` notification 和
+`session/request_permission` request 均继续由 SDK 持有。适配器只声明
+`sessionCapabilities.close = {}`，实现 `initialize`、`session/new`、
+`session/prompt`、`session/cancel` notification 和 `session/close`。SDK 0.11
+将 `session/close` 路由置于 `use_unstable_protocol` 门后；进程只为使已声明的 close
+方法可达而打开该路由门，不实现其他 unstable 方法。
+
+每条 ACP 连接固定绑定到规范化后的启动工作区。每个成功 session 拥有稳定随机 ACP ID、
+一个 `AgentConversation`、一个后台任务 scope、一个活动 prompt 槽位，以及独立审批/
+取消/关闭状态。内部 SQLite ID 与 ACP ID 保持分离，并在首次 prompt 时按需记录。
+所有资源就绪前不会发布 session。close 会先应用 cancel 语义，等待必须的工具终态更新和
+prompt 响应，关闭 scope，释放运行时绑定，同时保留持久历史。EOF 或连接故障会对全部
+活动 session 执行相同的幂等清理。
+
+提示转换只接受 ACP 基线 Text 与 ResourceLink。block 数量、单字段大小、annotations
+序列化、ResourceLink 汇总字节和整轮提示字节都有上限。只有 `uri`、`name`、`title`、
+`description`、`mimeType`、`size` 和标准 annotations 字段会进入模型可见的引用描述；
+`_meta` 会被忽略。本地 `file:` 与远程链接都不会被读取、下载或解引用；模型随后主动
+读取文件时仍必须经过普通工作区/工具边界。
+
+事件投影采用显式白名单：
+
+| 运行时事件 | ACP 投影 |
+|---|---|
+| `TEXT_DELTA` | 带同一回答稳定 `messageId` 的 `agent_message_chunk` |
+| `TOOL_REQUESTED` | `tool_call` / `pending` |
+| `TOOL_STARTED` | `tool_call_update` / `in_progress` |
+| `TOOL_COMPLETED` | 有界且脱敏的 `tool_call_update` / `completed` |
+| `TOOL_FAILED` | 有界且脱敏的 `tool_call_update` / `failed` |
+| 有效 `CONTEXT_USAGE_UPDATED` | 上下文窗口已知时发送标准 `usage_update` |
+| `REASONING_DELTA`、`TURN_COMPLETED`、`TURN_FAILED` | 不发送自定义 update |
+
+原始 prompt 响应承载 `end_turn`、`max_tokens`、`max_turn_requests`、`refusal` 或
+`cancelled`。审批沿用现有失败关闭权限管理器：本地 deny、工作区和沙箱结论始终拥有最终
+优先级，pending 工具更新先于客户端请求，批准返回前不能开始执行。本切片会保存协商到的
+客户端文件系统与终端能力，但绝不调用这些方法。详见
+[ADR 0035](adr/0035-partial-acp-v1-stdio.md)。
 
 最小 TUI 是 `AgentEvent` 之上的表现适配器，负责提示输入、滚动记录、实时文本表面和
 本地斜杠命令。它绝不渲染原始推理或不受限制的参数/结果映射；只有路径、命令、模式、

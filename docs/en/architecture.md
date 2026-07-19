@@ -37,6 +37,14 @@ Dependencies point downward. Domain and application modules must not import a
 UI framework, provider SDK, database driver, or platform implementation.
 Adapters implement typed ports and are selected only at the composition root.
 
+`ApplicationComposition` is the interface-neutral process composition service.
+It resolves configuration and provider overrides, performs session-sandbox
+preflight, initializes SQLite, creates providers/tools/permission managers and
+conversation-scoped background-task registries, and owns supervisor shutdown.
+CLI, TUI, and ACP translate their own arguments or protocol values into this
+service. The application module has no dependency on argparse, Textual, ACP
+schema types, ACP clients, or stdio.
+
 ## Runtime event model
 
 One agent turn is an append-only stream of typed events:
@@ -95,6 +103,56 @@ items and provider origin from `SessionStore` before releasing its turn lock.
 The next prompt therefore reuses durable state instead of a stale in-memory
 prefix. A cancelled user message remains part of that history; pre-token rewind
 is a separate, unimplemented interaction policy.
+
+## Partial ACP v1 adapter
+
+`neuro-code acp` is a protocol adapter over `ApplicationComposition` and the
+official `agent-client-protocol` Python SDK. Production framing, JSON-RPC
+routing, newline-delimited stdio, `session/update` notifications, and
+`session/request_permission` requests remain SDK-owned. The adapter declares
+only `sessionCapabilities.close = {}` and implements `initialize`,
+`session/new`, `session/prompt`, the `session/cancel` notification, and
+`session/close`. SDK 0.11 gates its `session/close` route behind
+`use_unstable_protocol`; the process enables that router gate only so the
+declared close method is reachable and implements no other unstable method.
+
+One ACP connection is bound to the normalized launch workspace. Each accepted
+session owns a stable random ACP ID, one `AgentConversation`, one background
+task scope, one active-prompt slot, and independent approval/cancel/close
+state. The internal SQLite ID stays separate and is recorded lazily when the
+first prompt starts. Session creation publishes nothing until every resource is
+ready. Close first applies cancel semantics, waits for required terminal tool
+updates and the prompt response, closes the scope, drops the runtime binding,
+and leaves durable history intact. EOF or connection failure runs the same
+idempotent cleanup for every active session.
+
+Prompt conversion accepts only ACP baseline Text and ResourceLink blocks.
+Counts, per-field sizes, annotation serialization, ResourceLink aggregate
+bytes, and total prompt bytes are bounded. Only `uri`, `name`, `title`,
+`description`, `mimeType`, `size`, and standard annotation fields reach the
+model-visible reference description. `_meta` is ignored. Neither local
+`file:` links nor remote links are read, downloaded, or dereferenced; later
+model-selected file access still crosses the ordinary workspace/tool boundary.
+
+The event projection is an explicit allowlist:
+
+| Runtime event | ACP projection |
+|---|---|
+| `TEXT_DELTA` | `agent_message_chunk` with one stable per-answer `messageId` |
+| `TOOL_REQUESTED` | `tool_call` / `pending` |
+| `TOOL_STARTED` | `tool_call_update` / `in_progress` |
+| `TOOL_COMPLETED` | bounded, redacted `tool_call_update` / `completed` |
+| `TOOL_FAILED` | bounded, redacted `tool_call_update` / `failed` |
+| valid `CONTEXT_USAGE_UPDATED` | standard `usage_update` when the context window is known |
+| `REASONING_DELTA`, `TURN_COMPLETED`, `TURN_FAILED` | no custom update |
+
+The original prompt response carries `end_turn`, `max_tokens`,
+`max_turn_requests`, `refusal`, or `cancelled`. Approval follows the existing
+fail-closed permission manager: local deny/workspace/sandbox decisions remain
+authoritative, a pending tool update precedes the client request, and execution
+cannot start until approval returns. Client filesystem and terminal methods are
+remembered as negotiated capabilities but are never invoked in this slice. See
+[ADR 0035](adr/0035-partial-acp-v1-stdio.md).
 
 The minimal TUI is a presentation adapter over `AgentEvent`. It owns prompt
 input, scrollback, a live text surface, and local slash commands. It never
