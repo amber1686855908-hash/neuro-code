@@ -4,6 +4,7 @@ import asyncio
 import tempfile
 import unittest
 from collections.abc import AsyncIterator, Sequence
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
 from unittest.mock import AsyncMock, patch
@@ -15,8 +16,10 @@ from acp.schema import (
     AllowedOutcome,
     ClientCapabilities,
     DeniedOutcome,
+    EnvVariable,
     ImageContentBlock,
     Implementation,
+    McpServerStdio,
     PermissionOption,
     RequestPermissionResponse,
     ResourceContentBlock,
@@ -24,8 +27,10 @@ from acp.schema import (
     ToolCallProgress,
     ToolCallStart,
     ToolCallUpdate,
+    UserMessageChunk,
 )
 
+import neuro_code.acp as acp_module
 from neuro_code.acp import (
     ACP_STDIO_BUFFER_LIMIT_BYTES,
     MAX_ANNOTATION_AUDIENCE,
@@ -42,13 +47,21 @@ from neuro_code.application import ApplicationComposition
 from neuro_code.config import AppConfig, ProviderProfile
 from neuro_code.domain.events import AgentEvent, AgentEventKind
 from neuro_code.domain.interaction_mode import InteractionMode
-from neuro_code.domain.messages import Message, Role, SessionItem
+from neuro_code.domain.messages import (
+    ContextItemKind,
+    Message,
+    PreservedContextItem,
+    Role,
+    SessionItem,
+    ToolCall,
+)
 from neuro_code.domain.model_context import ModelContext
 from neuro_code.domain.model_events import ModelEvent
 from neuro_code.domain.reasoning import ReasoningEffort
 from neuro_code.domain.sandbox import SandboxProfile
-from neuro_code.domain.tools import ToolDefinition
-from neuro_code.errors import ProviderError
+from neuro_code.domain.sessions import SessionSummary
+from neuro_code.domain.tools import ToolDefinition, ToolResult
+from neuro_code.errors import ConfigurationError, ProviderError, SessionError
 from neuro_code.permissions import PermissionApproval, PermissionRequest
 from neuro_code.ports.approval import PermissionApprover
 from neuro_code.ports.model import ModelProvider
@@ -108,6 +121,28 @@ class BackgroundTasksFixture:
         self.shutdown_calls += 1
 
 
+class McpToolFixture:
+    definition = ToolDefinition(
+        "remote_echo",
+        "Fixture MCP tool",
+        {"type": "object", "properties": {}},
+    )
+    side_effecting = True
+
+    async def execute(self, arguments: object, context: object) -> ToolResult:
+        del arguments, context
+        return ToolResult("ok")
+
+
+class McpCollectionFixture:
+    def __init__(self) -> None:
+        self.tools = (McpToolFixture(),)
+        self.close_calls = 0
+
+    async def close(self) -> None:
+        self.close_calls += 1
+
+
 class RunnerFixture:
     def __init__(
         self,
@@ -118,8 +153,11 @@ class RunnerFixture:
         approval_scope: str | None = "scope",
         failure: BaseException | None = None,
         wrap_cancellation: bool = False,
+        session_id: str | None = None,
+        items: Sequence[SessionItem] = (),
     ) -> None:
-        self._session_id: str | None = None
+        self._session_id = session_id
+        self._items = tuple(items)
         self._events = tuple(events)
         self._block = block
         self._request_approval = request_approval
@@ -137,7 +175,7 @@ class RunnerFixture:
 
     @property
     def items(self) -> tuple[SessionItem, ...]:
-        return ()
+        return self._items
 
     @property
     def reasoning_effort(self) -> ReasoningEffort:
@@ -163,7 +201,8 @@ class RunnerFixture:
         *,
         sink: EventSink | None = None,
     ) -> AgentRunResult:
-        self._session_id = "internal-session"
+        if self._session_id is None:
+            self._session_id = f"internal-session-{id(self)}"
         self._started.set()
         events = list(self._events)
         if self._request_approval:
@@ -215,8 +254,8 @@ class RunnerFixture:
         return AgentRunResult(
             self._session_id,
             prompt,
-            (Message(Role.USER, prompt),),
-            (Message(Role.USER, prompt),),
+            (*self._items, Message(Role.USER, prompt)),
+            (*self._items, Message(Role.USER, prompt)),
             tuple(events),
             1,
         )
@@ -251,13 +290,27 @@ class ApplicationFixture:
         )
         self._runners = list(runners)
         self.background_scopes: list[BackgroundTasksFixture] = []
+        self.store = SessionAliasStoreFixture()
+        self.resume_ids: list[str | None] = []
+        self.additional_tool_names: list[tuple[str, ...]] = []
+        self.resume_error: ConfigurationError | None = None
+
+    async def config_for_session_resume(self, session_id: str) -> AppConfig:
+        del session_id
+        if self.resume_error is not None:
+            raise self.resume_error
+        return self.config
 
     async def create_binding(
         self,
         *,
         approver: PermissionApprover | None = None,
+        resume_id: str | None = None,
+        additional_tools: Sequence[Any] = (),
         **_kwargs: Any,
     ) -> ConversationBinding:
+        self.resume_ids.append(resume_id)
+        self.additional_tool_names.append(tuple(tool.definition.name for tool in additional_tools))
         runner = self._runners.pop(0)
         runner.attach_approver(approver)
         background = BackgroundTasksFixture()
@@ -267,6 +320,78 @@ class ApplicationFixture:
             cast(ModelProvider, ProviderFixture()),
             cast(Any, background),
         )
+
+
+class SessionAliasStoreFixture:
+    def __init__(self) -> None:
+        self.aliases: dict[tuple[str, str], str] = {}
+        self.session_ids: set[str] = set()
+        self.summaries: list[SessionSummary] = []
+
+    async def bind_session_alias(
+        self,
+        namespace: str,
+        external_id: str,
+        session_id: str,
+    ) -> None:
+        key = (namespace, external_id)
+        current = self.aliases.get(key)
+        if current is not None and current != session_id:
+            raise SessionError("session alias is already bound")
+        if any(
+            saved_namespace == namespace
+            and saved_session_id == session_id
+            and saved_external_id != external_id
+            for (saved_namespace, saved_external_id), saved_session_id in self.aliases.items()
+        ):
+            raise SessionError("session already has an alias in this namespace")
+        self.session_ids.add(session_id)
+        self.aliases[key] = session_id
+
+    async def resolve_session_alias(self, namespace: str, external_id: str) -> str:
+        resolved = self.aliases.get((namespace, external_id))
+        if resolved is not None:
+            return resolved
+        if external_id in self.session_ids:
+            return external_id
+        raise SessionError("unknown session alias")
+
+    async def get_or_create_session_alias(
+        self,
+        namespace: str,
+        session_id: str,
+        proposed_external_id: str,
+    ) -> str:
+        for (saved_namespace, external_id), saved_session_id in self.aliases.items():
+            if saved_namespace == namespace and saved_session_id == session_id:
+                return external_id
+        if session_id not in self.session_ids:
+            raise SessionError("unknown session")
+        if (namespace, proposed_external_id) in self.aliases:
+            raise SessionError("proposed session alias is unavailable")
+        self.aliases[(namespace, proposed_external_id)] = session_id
+        return proposed_external_id
+
+    async def list_sessions_page(
+        self,
+        *,
+        limit: int,
+        before_updated_at: datetime | None = None,
+        before_id: str | None = None,
+    ) -> list[SessionSummary]:
+        summaries = sorted(
+            self.summaries,
+            key=lambda summary: (summary.updated_at, summary.id),
+            reverse=True,
+        )
+        if before_updated_at is not None:
+            assert before_id is not None
+            summaries = [
+                summary
+                for summary in summaries
+                if (summary.updated_at, summary.id) < (before_updated_at, before_id)
+            ]
+        return summaries[:limit]
 
 
 async def initialized_agent(
@@ -476,8 +601,159 @@ class PromptContentTests(unittest.TestCase):
         self.assertIn('"size":12', converted)
 
 
+class McpConfigurationTests(unittest.TestCase):
+    @staticmethod
+    def _server(
+        *,
+        name: str = "fixture",
+        command: str = "fixture-command",
+        args: list[str] | None = None,
+        env: list[EnvVariable] | None = None,
+    ) -> McpServerStdio:
+        return McpServerStdio(
+            name=name,
+            command=command,
+            args=[] if args is None else args,
+            env=[] if env is None else env,
+        )
+
+    def _assert_reason(
+        self,
+        servers: list[Any],
+        reason: str,
+        *,
+        protected: frozenset[str] = frozenset(),
+    ) -> None:
+        with self.assertRaises(RequestError) as error:
+            acp_module._mcp_server_configurations(
+                servers,
+                protected_environment_variables=protected,
+            )
+        self.assertEqual(error.exception.data["reason"], reason)
+
+    def test_server_name_command_and_argument_limits(self) -> None:
+        valid = self._server(args=["", "--stdio"])
+        self.assertEqual(
+            acp_module._mcp_server_configurations(
+                [valid],
+                protected_environment_variables=frozenset(),
+            )[0].args,
+            ("", "--stdio"),
+        )
+        cases = (
+            (
+                [self._server()] * (acp_module.MAX_MCP_SERVERS + 1),
+                "too_many_mcp_servers",
+            ),
+            (
+                [self._server(name="same"), self._server(name="SAME")],
+                "mcp_server_name_duplicate",
+            ),
+            ([self._server(name="bad\nname")], "mcp_server_name_invalid"),
+            ([self._server(command="bad\ncommand")], "mcp_server_command_invalid"),
+            (
+                [self._server(args=["x"] * (acp_module.MAX_MCP_ARGUMENTS + 1))],
+                "too_many_mcp_server_arguments",
+            ),
+            (
+                [self._server(args=["x" * (acp_module.MAX_MCP_ARGUMENT_BYTES + 1)])],
+                "mcp_server_argument_invalid",
+            ),
+            (
+                [
+                    self._server(
+                        args=["x" * acp_module.MAX_MCP_ARGUMENT_BYTES]
+                        * acp_module.MAX_MCP_ARGUMENTS
+                    )
+                ],
+                "mcp_server_arguments_too_large",
+            ),
+        )
+        for servers, reason in cases:
+            with self.subTest(reason=reason):
+                self._assert_reason(servers, reason)
+
+    def test_environment_and_aggregate_limits(self) -> None:
+        cases = (
+            (
+                [
+                    self._server(
+                        env=[
+                            EnvVariable(name=f"VALUE_{index}", value="x")
+                            for index in range(acp_module.MAX_MCP_ENVIRONMENT_VARIABLES + 1)
+                        ]
+                    )
+                ],
+                "too_many_mcp_environment_variables",
+                frozenset(),
+            ),
+            (
+                [
+                    self._server(
+                        env=[
+                            EnvVariable(name="VALUE", value="one"),
+                            EnvVariable(name="value", value="two"),
+                        ]
+                    )
+                ],
+                "mcp_environment_name_invalid",
+                frozenset(),
+            ),
+            (
+                [self._server(env=[EnvVariable(name="BAD-NAME", value="x")])],
+                "mcp_environment_name_invalid",
+                frozenset(),
+            ),
+            (
+                [self._server(env=[EnvVariable(name="SECRET", value="x")])],
+                "mcp_environment_protected",
+                frozenset({"secret"}),
+            ),
+            (
+                [
+                    self._server(
+                        env=[
+                            EnvVariable(
+                                name="VALUE",
+                                value="x" * (acp_module.MAX_MCP_ENVIRONMENT_VALUE_BYTES + 1),
+                            )
+                        ]
+                    )
+                ],
+                "mcp_environment_value_invalid",
+                frozenset(),
+            ),
+            (
+                [
+                    self._server(
+                        env=[
+                            EnvVariable(
+                                name=f"VALUE_{index}",
+                                value="x" * acp_module.MAX_MCP_ENVIRONMENT_VALUE_BYTES,
+                            )
+                            for index in range(5)
+                        ]
+                    )
+                ],
+                "mcp_environment_too_large",
+                frozenset(),
+            ),
+        )
+        for servers, reason, protected in cases:
+            with self.subTest(reason=reason):
+                self._assert_reason(servers, reason, protected=protected)
+
+        with patch.object(acp_module, "MAX_MCP_CONFIGURATION_BYTES", 1):
+            self._assert_reason(
+                [self._server()],
+                "mcp_configuration_too_large",
+            )
+
+
 class AcpAgentTests(unittest.IsolatedAsyncioTestCase):
-    async def test_initialize_declares_only_close_and_saves_client_details(self) -> None:
+    async def test_initialize_declares_only_load_list_close_and_saves_client_details(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             application = ApplicationFixture(root, [])
@@ -499,7 +775,10 @@ class AcpAgentTests(unittest.IsolatedAsyncioTestCase):
                 exclude_none=True,
                 exclude_unset=True,
             ),
-            {"sessionCapabilities": {"close": {}}},
+            {
+                "loadSession": True,
+                "sessionCapabilities": {"list": {}, "close": {}},
+            },
         )
 
     async def test_initialize_negotiates_v1_and_rejects_duplicate_initialization(self) -> None:
@@ -539,7 +818,7 @@ class AcpAgentTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             runner = RunnerFixture()
-            agent, _, _ = await initialized_agent(root, [runner])
+            agent, application, _ = await initialized_agent(root, [runner])
 
             with self.assertRaises(RequestError) as relative:
                 await agent.new_session("relative")
@@ -558,7 +837,7 @@ class AcpAgentTests(unittest.IsolatedAsyncioTestCase):
 
             with self.assertRaises(RequestError) as mcp:
                 await agent.new_session(str(root), mcp_servers=[cast(Any, object())])
-            self.assertEqual(mcp.exception.data["reason"], "mcp_servers_unsupported")
+            self.assertEqual(mcp.exception.data["reason"], "mcp_transport_unsupported")
 
             created = await agent.new_session(
                 str(root),
@@ -570,10 +849,354 @@ class AcpAgentTests(unittest.IsolatedAsyncioTestCase):
                 acp_id,
                 [TextContentBlock(type="text", text="hello")],
             )
+            persisted_mapping = await application.store.resolve_session_alias(
+                "acp-v1",
+                acp_id,
+            )
 
         self.assertTrue(acp_id.startswith("acp-"))
         self.assertNotEqual(acp_id, runner.session_id)
+        self.assertEqual(persisted_mapping, runner.session_id)
         self.assertEqual(response.stop_reason, "end_turn")
+
+    async def test_stdio_mcp_is_bounded_session_owned_and_available_to_new_and_load(
+        self,
+    ) -> None:
+        first_collection = McpCollectionFixture()
+        second_collection = McpCollectionFixture()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            agent, application, _ = await initialized_agent(
+                root,
+                [RunnerFixture(), RunnerFixture(session_id="persisted-id")],
+            )
+            await application.store.bind_session_alias(
+                "acp-v1",
+                "acp-durable",
+                "persisted-id",
+            )
+            server = McpServerStdio.model_validate(
+                {
+                    "name": "fixture",
+                    "command": "fixture-command",
+                    "args": ["--stdio"],
+                    "env": [{"name": "MCP_TOKEN", "value": "fixture-secret"}],
+                    "_meta": {"must": "be ignored"},
+                }
+            )
+            open_mcp = AsyncMock(
+                side_effect=(first_collection, second_collection),
+            )
+            with patch(
+                "neuro_code.acp.McpStdioToolCollection.open",
+                new=open_mcp,
+            ):
+                created = await agent.new_session(str(root), mcp_servers=[server])
+                await agent.close_session(created.session_id)
+                await agent.load_session(
+                    str(root),
+                    "acp-durable",
+                    mcp_servers=[server],
+                )
+                await agent.close_session("acp-durable")
+
+            configurations = open_mcp.await_args_list[0].args[0]
+            self.assertEqual(configurations[0].name, "fixture")
+            self.assertEqual(configurations[0].command, "fixture-command")
+            self.assertEqual(configurations[0].args, ("--stdio",))
+            self.assertEqual(configurations[0].env, (("MCP_TOKEN", "fixture-secret"),))
+            self.assertNotIn("must", repr(configurations))
+            self.assertEqual(
+                application.additional_tool_names,
+                [("remote_echo",), ("remote_echo",)],
+            )
+            self.assertEqual(first_collection.close_calls, 1)
+            self.assertEqual(second_collection.close_calls, 1)
+
+            protected_server = McpServerStdio(
+                name="protected",
+                command="fixture-command",
+                args=[],
+                env=[EnvVariable(name="FIXTURE_KEY", value="must-not-override")],
+            )
+            with self.assertRaises(RequestError) as protected:
+                await agent.new_session(
+                    str(root),
+                    mcp_servers=[protected_server],
+                )
+            self.assertEqual(
+                protected.exception.data["reason"],
+                "mcp_environment_protected",
+            )
+
+    async def test_session_load_replays_bounded_visible_history_and_resumes(self) -> None:
+        history = (
+            Message(Role.SYSTEM, "hidden system instructions"),
+            Message(Role.USER, "previous question"),
+            PreservedContextItem(
+                ContextItemKind.REASONING,
+                {
+                    "type": "reasoning",
+                    "id": "reasoning-1",
+                    "encrypted_content": "hidden preserved reasoning",
+                },
+            ),
+            Message(
+                Role.ASSISTANT,
+                "previous answer",
+                reasoning_content="hidden assistant reasoning",
+                tool_calls=(
+                    ToolCall(
+                        "call-read",
+                        "read_file",
+                        {"path": "safe.txt", "secret": "sk-secretvalue"},
+                    ),
+                ),
+            ),
+            Message(
+                Role.TOOL,
+                "token=sk-secretvalue",
+                name="read_file",
+                tool_call_id="call-read",
+            ),
+            Message(
+                Role.ASSISTANT,
+                tool_calls=(ToolCall("call-pending", "bash", {"command": "pwd"}),),
+            ),
+        )
+        first_runner = RunnerFixture(session_id="persisted-id", items=history)
+        second_runner = RunnerFixture(session_id="persisted-id", items=history)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            agent, application, client = await initialized_agent(
+                root,
+                [first_runner, second_runner],
+            )
+            await application.store.bind_session_alias(
+                "acp-v1",
+                "acp-durable",
+                "persisted-id",
+            )
+
+            loaded = await agent.load_session(str(root), "acp-durable", mcp_servers=[])
+            self.assertIsNotNone(loaded)
+            replay = [update for _, update in client.updates]
+            self.assertEqual(
+                [update.session_update for update in replay],
+                [
+                    "user_message_chunk",
+                    "agent_message_chunk",
+                    "tool_call",
+                    "tool_call_update",
+                    "tool_call",
+                    "tool_call_update",
+                ],
+            )
+            self.assertIsInstance(replay[0], UserMessageChunk)
+            self.assertEqual(replay[0].content.text, "previous question")
+            self.assertEqual(replay[1].content.text, "previous answer")
+            self.assertEqual([replay[2].status, replay[3].status], ["pending", "completed"])
+            self.assertEqual([replay[4].status, replay[5].status], ["pending", "failed"])
+            self.assertEqual(replay[2].locations[0].path, "safe.txt")
+            self.assertNotIn("secretvalue", repr(replay))
+            self.assertNotIn("hidden", repr(replay))
+            self.assertIsNone(replay[2].raw_input)
+            self.assertIsNone(replay[3].raw_output)
+            self.assertTrue(all(session_id == "acp-durable" for session_id, _ in client.updates))
+
+            prompted = await agent.prompt(
+                "acp-durable",
+                [TextContentBlock(type="text", text="continue")],
+            )
+            self.assertEqual(prompted.stop_reason, "end_turn")
+            await agent.close_session("acp-durable")
+            client.updates.clear()
+            await agent.load_session(str(root), "acp-durable", mcp_servers=[])
+            await agent.close_session("acp-durable")
+
+        self.assertEqual(application.resume_ids, ["persisted-id", "persisted-id"])
+        self.assertEqual([scope.shutdown_calls for scope in application.background_scopes], [1, 1])
+
+    async def test_session_load_validates_inputs_identity_and_active_state(self) -> None:
+        loaded_runner = RunnerFixture(session_id="persisted-id")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            agent, application, _ = await initialized_agent(root, [loaded_runner])
+
+            cases = (
+                (
+                    lambda: agent.load_session("relative", "missing", mcp_servers=[]),
+                    "cwd_not_absolute",
+                ),
+                (
+                    lambda: agent.load_session(
+                        str(root),
+                        "missing",
+                        mcp_servers=[],
+                        additional_directories=[str(root)],
+                    ),
+                    "additional_directories_unsupported",
+                ),
+                (
+                    lambda: agent.load_session(
+                        str(root),
+                        "missing",
+                        mcp_servers=[cast(Any, object())],
+                    ),
+                    "mcp_transport_unsupported",
+                ),
+                (
+                    lambda: agent.load_session(str(root), "bad\nid", mcp_servers=[]),
+                    "session_id_invalid",
+                ),
+                (
+                    lambda: agent.load_session(str(root), "界" * 200, mcp_servers=[]),
+                    "session_id_too_large",
+                ),
+                (
+                    lambda: agent.load_session(str(root), "missing", mcp_servers=[]),
+                    "session_not_found",
+                ),
+            )
+            for operation, reason in cases:
+                with self.subTest(reason=reason), self.assertRaises(RequestError) as error:
+                    await operation()
+                self.assertEqual(error.exception.data["reason"], reason)
+
+            await application.store.bind_session_alias(
+                "acp-v1",
+                "acp-durable",
+                "persisted-id",
+            )
+            application.resume_error = ConfigurationError(
+                "session does not belong to the application workspace"
+            )
+            with self.assertRaises(RequestError) as mismatch:
+                await agent.load_session(str(root), "acp-durable", mcp_servers=[])
+            self.assertEqual(mismatch.exception.data["reason"], "session_workspace_mismatch")
+            application.resume_error = None
+
+            await agent.load_session(str(root), "acp-durable", mcp_servers=[])
+            with self.assertRaises(RequestError) as active:
+                await agent.load_session(str(root), "acp-durable", mcp_servers=[])
+            self.assertEqual(active.exception.data["reason"], "session_already_active")
+            await agent.close_session("acp-durable")
+
+    async def test_session_load_history_limit_fails_before_replay_and_cleans_scope(self) -> None:
+        oversized = tuple(Message(Role.USER, f"history-{index}") for index in range(2_001))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            agent, application, client = await initialized_agent(
+                root,
+                [RunnerFixture(session_id="persisted-id", items=oversized)],
+            )
+            await application.store.bind_session_alias(
+                "acp-v1",
+                "acp-durable",
+                "persisted-id",
+            )
+            with self.assertRaises(RequestError) as error:
+                await agent.load_session(str(root), "acp-durable", mcp_servers=[])
+
+        self.assertEqual(error.exception.data["reason"], "session_history_too_large")
+        self.assertEqual(client.updates, [])
+        self.assertEqual(application.background_scopes[0].shutdown_calls, 1)
+
+    async def test_session_list_is_workspace_scoped_paginated_and_loadable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            agent, application, _ = await initialized_agent(root, [])
+            summaries = [
+                SessionSummary(
+                    id=f"internal-{index}",
+                    cwd=str(root),
+                    provider="fixture",
+                    model="fixture-model",
+                    created_at=datetime(2026, 7, index, tzinfo=UTC),
+                    updated_at=datetime(2026, 7, index, tzinfo=UTC),
+                    title=f"Session {index}",
+                )
+                for index in (3, 2, 1)
+            ]
+            summaries.extend(
+                (
+                    SessionSummary(
+                        id="other-workspace",
+                        cwd=str(root.parent),
+                        provider="fixture",
+                        model="fixture-model",
+                        created_at=datetime(2026, 7, 4, tzinfo=UTC),
+                        updated_at=datetime(2026, 7, 4, tzinfo=UTC),
+                        title="Must stay hidden",
+                    ),
+                    SessionSummary(
+                        id="relative-workspace",
+                        cwd="relative",
+                        provider="fixture",
+                        model="fixture-model",
+                        created_at=datetime(2026, 7, 5, tzinfo=UTC),
+                        updated_at=datetime(2026, 7, 5, tzinfo=UTC),
+                        title="Invalid metadata",
+                    ),
+                )
+            )
+            application.store.summaries.extend(summaries)
+            application.store.session_ids.update(summary.id for summary in summaries)
+            await application.store.bind_session_alias(
+                "acp-v1",
+                "acp-existing",
+                "internal-3",
+            )
+
+            with patch("neuro_code.acp.ACP_SESSION_LIST_PAGE_SIZE", 2):
+                first = await agent.list_sessions()
+                self.assertIsNotNone(first.next_cursor)
+                second = await agent.list_sessions(
+                    str(root),
+                    cursor=first.next_cursor,
+                )
+                repeated = await agent.list_sessions(str(root))
+
+            self.assertEqual(
+                [session.title for session in first.sessions],
+                ["Session 3", "Session 2"],
+            )
+            self.assertEqual(first.sessions[0].session_id, "acp-existing")
+            self.assertEqual([session.title for session in second.sessions], ["Session 1"])
+            self.assertIsNone(second.next_cursor)
+            self.assertEqual(
+                [session.session_id for session in repeated.sessions],
+                [session.session_id for session in first.sessions],
+            )
+            self.assertEqual(application.resume_ids, [])
+            self.assertEqual(application.background_scopes, [])
+            self.assertTrue(
+                all(session.cwd == str(root) for session in (*first.sessions, *second.sessions))
+            )
+            self.assertTrue(
+                all(
+                    session.additional_directories is None and session.field_meta is None
+                    for session in (*first.sessions, *second.sessions)
+                )
+            )
+            for listed in (*first.sessions, *second.sessions):
+                self.assertIn(
+                    await application.store.resolve_session_alias(
+                        "acp-v1",
+                        listed.session_id,
+                    ),
+                    {"internal-1", "internal-2", "internal-3"},
+                )
+
+            with self.assertRaises(RequestError) as relative:
+                await agent.list_sessions("relative")
+            self.assertEqual(relative.exception.data["reason"], "cwd_not_absolute")
+            with self.assertRaises(RequestError) as mismatch:
+                await agent.list_sessions(str(root.parent))
+            self.assertEqual(mismatch.exception.data["reason"], "cwd_workspace_mismatch")
+            with self.assertRaises(RequestError) as invalid_cursor:
+                await agent.list_sessions(cursor="unknown-cursor")
+            self.assertEqual(invalid_cursor.exception.data["reason"], "cursor_invalid")
 
     async def test_event_mapping_has_stable_message_id_and_bounded_tool_fields(self) -> None:
         events = (

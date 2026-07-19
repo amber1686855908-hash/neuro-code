@@ -17,15 +17,22 @@ from neuro_code.config import (
 )
 from neuro_code.domain.reasoning import ReasoningEffort
 from neuro_code.domain.sandbox import SandboxProfile
-from neuro_code.permissions import PermissionManager, PermissionMode, PermissionRule
+from neuro_code.errors import ConfigurationError
+from neuro_code.permissions import (
+    PermissionEffect,
+    PermissionManager,
+    PermissionMode,
+    PermissionRule,
+)
 from neuro_code.ports.approval import PermissionApprover
 from neuro_code.ports.background_tasks import BackgroundTaskSupervisor
 from neuro_code.ports.model import ModelProvider
 from neuro_code.ports.sandbox import ShellSandbox
-from neuro_code.ports.tools import ToolContext
+from neuro_code.ports.tools import Tool, ToolContext
 from neuro_code.providers import create_routed_provider
 from neuro_code.runtime import AgentConversation, AgentRuntime, ConversationBinding
 from neuro_code.tools import default_tool_registry
+from neuro_code.workspace import workspaces_match
 
 ProviderFactory = Callable[[AppConfig, bool], ModelProvider]
 ShellSandboxFactory = Callable[[SandboxProfile, Path, Path], ShellSandbox | None]
@@ -130,10 +137,17 @@ class ApplicationComposition:
         approver: PermissionApprover | None = None,
         resume_id: str | None = None,
         reasoning_effort: ReasoningEffort | None = None,
+        additional_tools: Sequence[Tool] = (),
     ) -> ConversationBinding:
         if self._closed:
             raise RuntimeError("application composition is closed")
         selected_config = config or self.config
+        tools = default_tool_registry(
+            selected_config.sandbox_profile,
+            enable_background_tasks=True,
+        )
+        for tool in additional_tools:
+            tools.register(tool)
         task_scope = self.background_tasks.open_scope()
         try:
             provider = self._provider_factory(selected_config, self.settings.failover)
@@ -144,15 +158,18 @@ class ApplicationComposition:
             )
             permissions = PermissionManager(
                 mode=self.settings.permission_mode,
-                rules=self.settings.permission_rules,
+                rules=(
+                    *self.settings.permission_rules,
+                    *(
+                        PermissionRule(PermissionEffect.ASK, tool.definition.name)
+                        for tool in additional_tools
+                    ),
+                ),
                 interactive=approver is not None,
             )
             runtime = AgentRuntime(
                 provider=provider,
-                tools=default_tool_registry(
-                    selected_config.sandbox_profile,
-                    enable_background_tasks=True,
-                ),
+                tools=tools,
                 permissions=permissions,
                 tool_context=ToolContext(
                     selected_config.cwd,
@@ -178,6 +195,38 @@ class ApplicationComposition:
         except BaseException:
             await asyncio.shield(task_scope.shutdown())
             raise
+
+    async def config_for_session_resume(self, session_id: str) -> AppConfig:
+        """Select a safe application configuration for a persisted session."""
+
+        if self._closed:
+            raise RuntimeError("application composition is closed")
+        summary = await self.store.get_session(session_id)
+        if not workspaces_match(summary.cwd, self.config.cwd):
+            raise ConfigurationError("session does not belong to the application workspace")
+        if (
+            summary.sandbox_profile is not None
+            and summary.sandbox_profile is not self.config.sandbox_profile
+        ):
+            raise ConfigurationError("session sandbox profile does not match the active profile")
+
+        if summary.provider in self.config.providers:
+            selected = override_provider(
+                self.config,
+                provider=summary.provider,
+                model=summary.model,
+            )
+        elif summary.context_affinity is None:
+            selected = self.config
+        else:
+            raise ConfigurationError("session provider profile is unavailable")
+
+        if (
+            summary.context_affinity is not None
+            and selected.provider.context_affinity != summary.context_affinity
+        ):
+            raise ConfigurationError("session provider affinity is unavailable")
+        return selected
 
     async def close(self) -> None:
         if self._closed:

@@ -15,6 +15,7 @@ from typing import NoReturn, Protocol, Self, cast
 from neuro_code.adapters.windows_process import (
     windows_environment_block as _environment_block,
 )
+from neuro_code.async_utils import run_blocking
 
 _DWORD_MAX = (1 << 32) - 1
 _CREATE_NEW_PROCESS_GROUP = 0x00000200
@@ -94,6 +95,8 @@ class _CreatedProcess:
 class _WindowsJobProcessApi(Protocol):
     def create_output_pipe(self) -> tuple[int, int]: ...
 
+    def create_input_pipe(self) -> tuple[int, int]: ...
+
     def open_null_input(self) -> int: ...
 
     def create_process(
@@ -111,6 +114,8 @@ class _WindowsJobProcessApi(Protocol):
     ) -> _CreatedProcess: ...
 
     def read_file(self, handle: int, byte_count: int) -> bytes: ...
+
+    def write_file(self, handle: int, data: bytes) -> int: ...
 
     def wait_process(self, handle: int) -> None: ...
 
@@ -241,6 +246,18 @@ class _NativeWindowsJobProcessApi:
                 ],
                 ctypes.c_int32,
             )
+            self._write_file = _load_function(
+                kernel32,
+                "WriteFile",
+                [
+                    ctypes.c_void_p,
+                    ctypes.c_void_p,
+                    ctypes.c_uint32,
+                    ctypes.POINTER(ctypes.c_uint32),
+                    ctypes.c_void_p,
+                ],
+                ctypes.c_int32,
+            )
             self._wait_for_single_object = _load_function(
                 kernel32,
                 "WaitForSingleObject",
@@ -271,6 +288,12 @@ class _NativeWindowsJobProcessApi:
             ) from error
 
     def create_output_pipe(self) -> tuple[int, int]:
+        return self._create_directional_pipe(parent_is_read=True)
+
+    def create_input_pipe(self) -> tuple[int, int]:
+        return self._create_directional_pipe(parent_is_read=False)
+
+    def _create_directional_pipe(self, *, parent_is_read: bool) -> tuple[int, int]:
         security = _inheritable_security_attributes()
         read_handle = ctypes.c_void_p()
         write_handle = ctypes.c_void_p()
@@ -285,8 +308,9 @@ class _NativeWindowsJobProcessApi:
             raise OSError("CreatePipe returned an invalid handle")
         read_value = int(read_handle.value)
         write_value = int(write_handle.value)
+        parent_handle = read_value if parent_is_read else write_value
         try:
-            if not self._set_handle_information(read_value, _HANDLE_FLAG_INHERIT, 0):
+            if not self._set_handle_information(parent_handle, _HANDLE_FLAG_INHERIT, 0):
                 self._raise_last_error("SetHandleInformation")
         except BaseException:
             with contextlib.suppress(BaseException):
@@ -425,6 +449,25 @@ class _NativeWindowsJobProcessApi:
             raise OSError(error_code, f"ReadFile failed with Windows error {error_code}")
         return buffer.raw[: bytes_read.value]
 
+    def write_file(self, handle: int, data: bytes) -> int:
+        if not data:
+            return 0
+        byte_count = min(len(data), _DWORD_MAX)
+        buffer = ctypes.create_string_buffer(data[:byte_count], byte_count)
+        bytes_written = ctypes.c_uint32()
+        if not self._write_file(
+            handle,
+            buffer,
+            byte_count,
+            ctypes.byref(bytes_written),
+            None,
+        ):
+            error_code = self._last_error()
+            if error_code in {_ERROR_BROKEN_PIPE, _ERROR_NO_DATA}:
+                raise BrokenPipeError(error_code, "process stdin pipe is closed")
+            raise OSError(error_code, f"WriteFile failed with Windows error {error_code}")
+        return int(bytes_written.value)
+
     def wait_process(self, handle: int) -> None:
         result = cast(int, self._wait_for_single_object(handle, _INFINITE))
         if result != _WAIT_OBJECT_0:
@@ -462,6 +505,7 @@ class WindowsJobProcess:
         *,
         api: _WindowsJobProcessApi,
         created: _CreatedProcess,
+        stdin_handle: int | None,
         stdout_handle: int,
         stderr_handle: int | None,
     ) -> None:
@@ -474,6 +518,8 @@ class WindowsJobProcess:
         self._returncode: int | None = None
         self._wait_error: BaseException | None = None
         self._handle_lock = threading.Lock()
+        self._stdin_handle: int | None = stdin_handle
+        self._stdin_lock = asyncio.Lock()
         self._loop = asyncio.get_running_loop()
         self._reader_threads = [
             self._reader_thread(stdout_handle, self.stdout, "stdout"),
@@ -499,6 +545,7 @@ class WindowsJobProcess:
         env: Mapping[str, str],
         job_handle: int,
         merge_output: bool = False,
+        pipe_stdin: bool = False,
         api: _WindowsJobProcessApi | None = None,
     ) -> Self:
         if isinstance(arguments, str | bytes):
@@ -511,6 +558,7 @@ class WindowsJobProcess:
             env=env,
             job_handle=job_handle,
             merge_output=merge_output,
+            pipe_stdin=pipe_stdin,
             api=api,
         )
 
@@ -523,6 +571,7 @@ class WindowsJobProcess:
         env: Mapping[str, str],
         job_handle: int,
         merge_output: bool = False,
+        pipe_stdin: bool = False,
         api: _WindowsJobProcessApi | None = None,
     ) -> Self:
         if not isinstance(command, str):
@@ -538,6 +587,7 @@ class WindowsJobProcess:
             env=env,
             job_handle=job_handle,
             merge_output=merge_output,
+            pipe_stdin=pipe_stdin,
             api=api,
         )
 
@@ -551,6 +601,7 @@ class WindowsJobProcess:
         env: Mapping[str, str],
         job_handle: int,
         merge_output: bool,
+        pipe_stdin: bool,
         api: _WindowsJobProcessApi | None,
     ) -> Self:
         if not isinstance(cwd, Path):
@@ -566,7 +617,8 @@ class WindowsJobProcess:
         stdout_write: int | None = None
         stderr_read: int | None = None
         stderr_write: int | None = None
-        stdin_handle: int | None = None
+        stdin_child: int | None = None
+        stdin_parent: int | None = None
         created: _CreatedProcess | None = None
         try:
             stdout_read, stdout_write = process_api.create_output_pipe()
@@ -574,14 +626,17 @@ class WindowsJobProcess:
                 stderr_write = stdout_write
             else:
                 stderr_read, stderr_write = process_api.create_output_pipe()
-            stdin_handle = process_api.open_null_input()
-            inherited = tuple(dict.fromkeys((stdin_handle, stdout_write, stderr_write)))
+            if pipe_stdin:
+                stdin_child, stdin_parent = process_api.create_input_pipe()
+            else:
+                stdin_child = process_api.open_null_input()
+            inherited = tuple(dict.fromkeys((stdin_child, stdout_write, stderr_write)))
             created = process_api.create_process(
                 application_name=application_name,
                 command_line=command_line,
                 cwd=cwd,
                 env=env,
-                stdin_handle=stdin_handle,
+                stdin_handle=stdin_child,
                 stdout_handle=stdout_write,
                 stderr_handle=stderr_write,
                 inherited_handles=inherited,
@@ -589,8 +644,8 @@ class WindowsJobProcess:
             )
             process_api.close_handle(created.thread_handle)
             created = _CreatedProcess(created.process_handle, 0, created.process_id)
-            process_api.close_handle(stdin_handle)
-            stdin_handle = None
+            process_api.close_handle(stdin_child)
+            stdin_child = None
             process_api.close_handle(stdout_write)
             stdout_write = None
             if merge_output:
@@ -602,9 +657,11 @@ class WindowsJobProcess:
             process = cls(
                 api=process_api,
                 created=created,
+                stdin_handle=stdin_parent,
                 stdout_handle=stdout_read,
                 stderr_handle=stderr_read,
             )
+            stdin_parent = None
             stdout_read = None
             stderr_read = None
             created = None
@@ -625,11 +682,42 @@ class WindowsJobProcess:
                 stdout_write,
                 stderr_read,
                 stderr_write,
-                stdin_handle,
+                stdin_child,
+                stdin_parent,
             ):
                 with contextlib.suppress(BaseException):
                     process_api.close_handle(handle)
             raise
+
+    async def write_stdin(self, data: bytes) -> None:
+        if not isinstance(data, bytes):
+            raise TypeError("process stdin data must be bytes")
+        if not data:
+            return
+        async with self._stdin_lock:
+            handle = self._stdin_handle
+            if handle is None:
+                raise RuntimeError("process stdin is not piped or has been closed")
+            await run_blocking(self._write_all, handle, data)
+
+    async def close_stdin(self) -> None:
+        async with self._stdin_lock:
+            handle = self._stdin_handle
+            if handle is None:
+                return
+            self._stdin_handle = None
+            # CloseHandle is a short, non-blocking kernel operation. Keeping it
+            # on the event-loop thread also avoids racing executor shutdown
+            # while the process's native waiter completes.
+            self._api.close_handle(handle)
+
+    def _write_all(self, handle: int, data: bytes) -> None:
+        offset = 0
+        while offset < len(data):
+            written = self._api.write_file(handle, data[offset:])
+            if written <= 0 or written > len(data) - offset:
+                raise OSError("WriteFile returned an invalid byte count")
+            offset += written
 
     @property
     def returncode(self) -> int | None:

@@ -66,12 +66,14 @@
 ### M4 — 协议与扩展能力
 
 - Partial ACP v1 stdio 核心：已实现官方 Python SDK framing/router、
-  initialize/new/prompt/cancel/close、有界 Text/ResourceLink 输入、失败关闭权限请求、
-  标准事件 update、session 级并发和断连清理。
-- 完整 ACP 一致性仍待完成：session load/list/resume/delete/fork、额外目录、MCP、
-  客户端文件系统/终端方法、多媒体与 embedded prompt、WebSocket，以及任何明确声明的
-  `x.ai/*` 扩展。
-- MCP 生命周期、技能、AGENTS.md、代理配置、钩子和插件。
+  initialize/new/list/load/prompt/cancel/close、持久化外部到内部 session alias、工作区
+  范围有界 cursor 发现、有界/脱敏可见历史回放、有界 Text/ResourceLink 输入、失败关闭
+  权限请求、标准事件 update、session 级并发、断连清理，以及有界且由 session 持有的
+  stdio MCP 工具 server。
+- 完整 ACP 一致性仍待完成：session resume/delete/fork、额外目录、MCP HTTP/SSE/ACP
+  传输与非工具 MCP 能力、客户端文件系统/终端方法、多媒体 prompt/历史、embedded
+  prompt、WebSocket，以及任何明确声明的 `x.ai/*` 扩展。
+- 其余 MCP 传输/能力、技能、AGENTS.md、代理配置、钩子和插件。
 - 子代理、计划模式、会话分叉，以及它们与公共任务生命周期的整合。
 
 退出条件：标准 ACP 客户端通过完整一致性场景；扩展失败不会破坏主会话。当前 partial

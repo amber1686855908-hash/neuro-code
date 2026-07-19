@@ -45,29 +45,52 @@ the official Python SDK's newline-delimited stdio transport:
 uv run neuro-code acp --cwd /absolute/workspace
 ```
 
-The slice implements `initialize`, `session/new`, `session/prompt`,
-`session/cancel` (notification), and `session/close`, sends
+The slice implements `initialize`, `session/new`, `session/list`, `session/load`,
+`session/prompt`, `session/cancel` (notification), and `session/close`, sends
 `session/update` notifications, and requests interactive authority through
-`session/request_permission`. It advertises only
-`sessionCapabilities.close = {}`. Text and ResourceLink prompt blocks preserve
-their order and are bounded; ResourceLink metadata is allowlisted, `_meta` is
-not sent to the model, and links are never downloaded or dereferenced during
-prompt conversion.
+`session/request_permission`. It advertises `loadSession: true` and
+`sessionCapabilities.list = {}` / `close = {}`. Text and ResourceLink prompt
+blocks preserve their order and are bounded; ResourceLink metadata is
+allowlisted, `_meta` is not sent to the model, and links are never downloaded
+or dereferenced during prompt conversion.
 
 Each connection remains bound to its launch workspace. `session/new` rejects a
-different or relative `cwd`, non-empty `additionalDirectories`, and non-empty
-`mcpServers`. ACP session IDs are stable and separate from the internal SQLite
-ID that is created lazily on the first prompt. Concurrent prompts are allowed
-across sessions but not within one session. Cancel, close, stdin EOF, and
-connection failure cancel owned work and session-scoped background tasks;
-close never deletes persisted history.
+different or relative `cwd` and non-empty `additionalDirectories`. It accepts
+bounded stdio `mcpServers`, fully initializes and lists their tools before
+publishing the session, and rejects HTTP, SSE, and ACP MCP transports. ACP
+session IDs are stable and separate from the internal SQLite
+ID that is created lazily on the first prompt; their durable mapping allows a
+later process to load the same ID. Load revalidates workspace, fixed sandbox,
+and provider affinity, then replays only bounded/redacted visible user,
+assistant, and tool history. System prompts, private reasoning, provider-native
+context, arbitrary arguments, and raw tool data are not replayed. List returns
+only safe metadata for the connection workspace, assigns durable ACP IDs to
+legacy sessions, and uses bounded opaque cursor pagination. Concurrent prompts
+are allowed across sessions but not within one session. Cancel, close, stdin
+EOF, and connection failure cancel owned work and session-scoped background
+tasks; close never deletes persisted history.
 
-This is explicitly not complete ACP v1 support. Session load/list/resume/
-delete/fork, additional directories, MCP transports, image/audio/embedded
-prompt content, client `fs/*` and `terminal/*`, WebSocket transport, and custom
+Each accepted MCP server and its tools are owned by that ACP session. The
+official MCP Python SDK owns schemas, `ClientSession`, negotiation, and
+JSON-RPC dispatch; a bounded transport bridge uses Neuro Code's `ProcessTree`
+so POSIX process groups and atomic Windows Job ownership remain fail-closed.
+Only MCP tools are projected. Every invocation is treated as side-effecting and
+requires ACP client approval even under local bypass mode; explicit local deny
+still wins. Arguments, schemas, results, stderr, environment, frame sizes,
+counts, and pagination are bounded, `_meta` is ignored, configured environment
+values are redacted, and cancellation terminates the complete server tree
+before the prompt returns.
+
+This is explicitly not complete ACP v1 support. Session resume/delete/fork,
+additional directories, MCP HTTP/SSE/ACP transports, MCP resources/prompts/
+sampling/elicitation, image/audio/embedded prompt content and multimedia
+history replay, client `fs/*` and `terminal/*`, WebSocket transport, and custom
 extensions remain unsupported and are not advertised. See the
 [compatibility matrix](compatibility-matrix.md) and
-[ADR 0035](adr/0035-partial-acp-v1-stdio.md).
+[ADR 0035](adr/0035-partial-acp-v1-stdio.md) plus
+[ADR 0036](adr/0036-durable-acp-session-load.md) and
+[ADR 0037](adr/0037-workspace-scoped-acp-session-list.md), plus
+[ADR 0038](adr/0038-session-owned-stdio-mcp-tools.md).
 
 ## Interactive TUI
 

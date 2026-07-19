@@ -23,12 +23,16 @@ Neuro Code 需要标准编辑器/客户端协议界面，但不应重复实现 A
   调度、notification、request 和 framing 全部使用官方 SDK。
 - 只为使 `session/close` 可达而打开 SDK unstable router 开关；不实现或声明其他
   unstable 方法与自定义扩展。
-- 只声明 `sessionCapabilities.close = {}`。实现 `initialize`、`session/new`、
+- 声明 `sessionCapabilities.close = {}`。实现 `initialize`、`session/new`、
   `session/prompt`、`session/cancel` 和 `session/close`；发送标准
-  `session/update` notification，并使用 `session/request_permission`。
+  `session/update` notification，并使用 `session/request_permission`。ADR 0036
+  随后加入标准 `session/load` 与真实的 `loadSession: true` 能力声明；ADR 0037 加入
+  标准 `session/list` 与 `sessionCapabilities.list = {}`。
 - 每条连接绑定到规范化后的启动工作区。拒绝相对或不同的 `cwd`，以及非空
-  `additionalDirectories` 或 `mcpServers`。
-- 为每个协议 session 生成稳定 ACP ID，并单独维护到按需创建的内部 SQLite ID 的关系。
+  `additionalDirectories`。本 ADR 原先对非空 `mcpServers` 的拒绝已由 ADR 0038 针对
+  有界 stdio server 部分取代；HTTP、SSE 与 ACP MCP 传输仍会被拒绝。
+- 为每个协议 session 生成稳定 ACP ID，并单独维护到按需创建的内部 SQLite ID 的关系；
+  ADR 0036 将该关系持久化。
 - 只接受有界 Text 与 ResourceLink prompt block。保持顺序，只投影标准白名单字段，
   忽略 `_meta`，转换期间绝不解引用 URI。
 - 通过显式、有界、脱敏白名单投影运行时事件。默认保持 reasoning 私有，同一回答使用
@@ -46,9 +50,10 @@ Neuro Code 需要标准编辑器/客户端协议界面，但不应重复实现 A
 - 即使持久化仍按需发生，ACP ID 也保持稳定，内部 ID 继续使用现有格式。
 - ResourceLink 是模型可见引用，不是隐式 I/O 授权。
 - 审批与取消按 session 隔离，close 不等于删除会话。
-- 进程仍是 partial ACP v1 实现。完整一致性、WebSocket、MCP、额外目录、
-  load/list/resume/delete/fork、多媒体/embedded prompt 和客户端文件系统/终端调用仍是
-  后续切片。
+- 进程仍是 partial ACP v1 实现。完整一致性、WebSocket、非 stdio MCP 传输与非工具
+  MCP 能力、额外目录、
+  resume/delete/fork、多媒体/embedded prompt 与历史，以及客户端文件系统/终端
+  调用仍是后续切片。
 - 原始 stdio 测试会记录官方 0.11 SDK 的 malformed frame 与 JSON-RPC 版本行为。不会
   用私有生产 parser 或 dispatcher 作为绕过方案；后续可在单独评审的依赖升级中吸收上游
   SDK 变化。

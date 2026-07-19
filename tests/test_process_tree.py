@@ -150,6 +150,7 @@ class WindowsProcessTreeLifecycleTests(unittest.IsolatedAsyncioTestCase):
             env={"NAME": "value"},
             job_handle=101,
             merge_output=False,
+            pipe_stdin=False,
         )
         self.assertTrue(job.closed)
 

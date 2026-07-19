@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from collections.abc import AsyncIterator, Sequence
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 from unittest.mock import patch
 
 from neuro_code.application import ApplicationComposition, ApplicationSettings
@@ -13,7 +13,14 @@ from neuro_code.domain.model_context import ModelContext
 from neuro_code.domain.model_events import ModelEvent
 from neuro_code.domain.reasoning import ReasoningEffort
 from neuro_code.domain.sandbox import SandboxProfile
-from neuro_code.domain.tools import ToolDefinition
+from neuro_code.domain.tools import ToolDefinition, ToolResult
+from neuro_code.errors import ConfigurationError, ToolError
+from neuro_code.permissions import (
+    PermissionEffect,
+    PermissionMode,
+    PermissionRule,
+)
+from neuro_code.ports.approval import PermissionApprover
 from neuro_code.ports.background_tasks import (
     BackgroundTaskManager,
     BackgroundTaskSupervisor,
@@ -34,6 +41,21 @@ class ApplicationProviderFixture:
         del context, tools
         if False:
             yield
+
+
+class ApplicationToolFixture:
+    side_effecting = True
+
+    def __init__(self, name: str) -> None:
+        self.definition = ToolDefinition(
+            name,
+            "Application composition fixture",
+            {"type": "object", "properties": {}},
+        )
+
+    async def execute(self, arguments: object, context: object) -> ToolResult:
+        del arguments, context
+        return ToolResult("ok")
 
 
 class ApplicationTaskScopeFixture:
@@ -77,6 +99,12 @@ default = "fixture"
 protocol = "openai-chat"
 model = "fixture-model"
 base_url = "https://provider.invalid/v1"
+api_key_env = "FIXTURE_KEY"
+
+[providers.alternate]
+protocol = "openai-chat"
+model = "alternate-model"
+base_url = "https://alternate.invalid/v1"
 api_key_env = "FIXTURE_KEY"
 """,
             encoding="utf-8",
@@ -170,6 +198,136 @@ api_key_env = "FIXTURE_KEY"
                 await application.close()
 
         self.assertEqual(supervisor.scopes[0].shutdown_calls, 1)
+
+    async def test_additional_tools_force_interactive_approval_and_reject_collisions(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / "state"
+            self._write_config(state)
+            supervisor = ApplicationSupervisorFixture()
+            with patch.dict(
+                "os.environ",
+                {
+                    "HOME": str(root),
+                    "NEURO_CODE_HOME": str(state),
+                    "FIXTURE_KEY": "fixture-key",
+                },
+                clear=True,
+            ):
+                application = await ApplicationComposition.open(
+                    ApplicationSettings(
+                        cwd=root,
+                        permission_mode=PermissionMode.BYPASS,
+                        permission_rules=(PermissionRule(PermissionEffect.DENY, "remote_deny"),),
+                    ),
+                    provider_factory=lambda config, failover: cast(
+                        ModelProvider,
+                        ApplicationProviderFixture(),
+                    ),
+                    process_sandbox_enforcer=lambda *args: None,
+                    background_supervisor_factory=lambda: cast(
+                        BackgroundTaskSupervisor,
+                        supervisor,
+                    ),
+                )
+                binding = await application.create_binding(
+                    approver=cast(PermissionApprover, object()),
+                    additional_tools=(
+                        ApplicationToolFixture("remote_ask"),
+                        ApplicationToolFixture("remote_deny"),
+                    ),
+                )
+                runtime = cast(Any, cast(Any, binding.runner)._runtime)
+                ask = runtime._permissions.decide(
+                    "remote_ask",
+                    {},
+                    side_effecting=True,
+                )
+                denied = runtime._permissions.decide(
+                    "remote_deny",
+                    {},
+                    side_effecting=True,
+                )
+                self.assertEqual(ask.effect, PermissionEffect.ASK)
+                self.assertEqual(denied.effect, PermissionEffect.DENY)
+
+                with self.assertRaisesRegex(ToolError, "duplicate"):
+                    await application.create_binding(
+                        additional_tools=(ApplicationToolFixture("read_file"),)
+                    )
+                self.assertEqual(len(supervisor.scopes), 1)
+                await application.close()
+
+    async def test_resume_configuration_restores_provider_and_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / "state"
+            self._write_config(state)
+            with patch.dict(
+                "os.environ",
+                {
+                    "HOME": str(root),
+                    "NEURO_CODE_HOME": str(state),
+                    "FIXTURE_KEY": "fixture-key",
+                },
+                clear=True,
+            ):
+                application = await ApplicationComposition.open(
+                    ApplicationSettings(cwd=root),
+                    provider_factory=lambda config, failover: cast(
+                        ModelProvider,
+                        ApplicationProviderFixture(),
+                    ),
+                    process_sandbox_enforcer=lambda *args: None,
+                )
+                restored_id = await application.store.create_session(
+                    str(root),
+                    "alternate",
+                    "saved-model",
+                )
+                restored = await application.config_for_session_resume(restored_id)
+                self.assertEqual(restored.selected_provider, "alternate")
+                self.assertEqual(restored.provider.model, "saved-model")
+
+                legacy_id = await application.store.create_session(
+                    str(root),
+                    "removed-profile",
+                    "legacy-model",
+                )
+                legacy = await application.config_for_session_resume(legacy_id)
+                self.assertEqual(
+                    legacy.selected_provider,
+                    application.config.selected_provider,
+                )
+
+                wrong_workspace = await application.store.create_session(
+                    str(root / "other"),
+                    "fixture",
+                    "fixture-model",
+                )
+                with self.assertRaisesRegex(ConfigurationError, "workspace"):
+                    await application.config_for_session_resume(wrong_workspace)
+
+                wrong_sandbox = await application.store.create_session(
+                    str(root),
+                    "fixture",
+                    "fixture-model",
+                    sandbox_profile=SandboxProfile.WORKSPACE,
+                )
+                with self.assertRaisesRegex(ConfigurationError, "sandbox"):
+                    await application.config_for_session_resume(wrong_sandbox)
+
+                missing_affinity = await application.store.create_session(
+                    str(root),
+                    "removed-profile",
+                    "legacy-model",
+                    "profile-v1:missing",
+                )
+                with self.assertRaisesRegex(ConfigurationError, "provider"):
+                    await application.config_for_session_resume(missing_affinity)
+                await application.close()
 
     async def test_failed_open_closes_the_process_supervisor(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

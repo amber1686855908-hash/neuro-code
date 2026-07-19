@@ -215,6 +215,114 @@ class SessionStoreTests(unittest.IsolatedAsyncioTestCase):
             self.assertIs(summary.sandbox_profile, SandboxProfile.READ_ONLY)
             self.assertEqual((await store.list_sessions())[0], summary)
 
+    async def test_session_aliases_are_durable_unique_and_support_legacy_ids(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = SqliteSessionStore(Path(directory) / "sessions.db")
+            await store.initialize()
+            first_id = await store.create_session("/workspace", "fixture", "model")
+            second_id = await store.create_session("/workspace", "fixture", "model")
+            third_id = await store.create_session("/workspace", "fixture", "model")
+
+            await store.bind_session_alias("acp-v1", "acp-visible", first_id)
+            await store.bind_session_alias("acp-v1", "acp-visible", first_id)
+
+            reopened = SqliteSessionStore(store.database_path)
+            await reopened.initialize()
+            self.assertEqual(
+                await reopened.resolve_session_alias("acp-v1", "acp-visible"),
+                first_id,
+            )
+            self.assertEqual(
+                await reopened.resolve_session_alias("acp-v1", second_id),
+                second_id,
+            )
+            self.assertEqual(
+                await reopened.get_or_create_session_alias(
+                    "acp-v1",
+                    first_id,
+                    "unused-proposal",
+                ),
+                "acp-visible",
+            )
+            concurrent = await asyncio.gather(
+                reopened.get_or_create_session_alias(
+                    "acp-v1",
+                    third_id,
+                    "acp-third-a",
+                ),
+                store.get_or_create_session_alias(
+                    "acp-v1",
+                    third_id,
+                    "acp-third-b",
+                ),
+            )
+            self.assertEqual(len(set(concurrent)), 1)
+            self.assertIn(concurrent[0], {"acp-third-a", "acp-third-b"})
+            with self.assertRaisesRegex(SessionError, "already bound"):
+                await reopened.bind_session_alias("acp-v1", "acp-visible", second_id)
+            with self.assertRaisesRegex(SessionError, "already has an alias"):
+                await reopened.bind_session_alias("acp-v1", "another-alias", first_id)
+            with self.assertRaisesRegex(SessionError, "unknown session"):
+                await reopened.bind_session_alias("acp-v1", "missing", "missing")
+            with self.assertRaisesRegex(SessionError, "unknown session alias"):
+                await reopened.resolve_session_alias("acp-v1", "missing")
+            with self.assertRaisesRegex(SessionError, "must not be empty"):
+                await reopened.resolve_session_alias("", "acp-visible")
+            with self.assertRaisesRegex(SessionError, "contains control"):
+                await reopened.resolve_session_alias("acp-v1", "bad\nid")
+            with self.assertRaisesRegex(SessionError, "too large"):
+                await reopened.resolve_session_alias("acp-v1", "界" * 200)
+
+    async def test_session_list_page_uses_stable_keyset_order_and_validates_cursor(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = SqliteSessionStore(Path(directory) / "sessions.db")
+            await store.initialize()
+            for session_id, day in (
+                ("session-newest", 3),
+                ("session-middle", 2),
+                ("session-oldest", 1),
+            ):
+                timestamp = datetime(2026, 7, day, 12, tzinfo=UTC)
+                await store.import_session(
+                    SessionSnapshot(
+                        SessionSummary(
+                            id=session_id,
+                            cwd="/workspace",
+                            provider="fixture",
+                            model="model",
+                            created_at=timestamp,
+                            updated_at=timestamp,
+                        ),
+                        (Message(Role.USER, session_id),),
+                    )
+                )
+
+            first = await store.list_sessions_page(limit=2)
+            second = await store.list_sessions_page(
+                limit=2,
+                before_updated_at=first[-1].updated_at,
+                before_id=first[-1].id,
+            )
+
+            self.assertEqual(
+                [summary.id for summary in first],
+                ["session-newest", "session-middle"],
+            )
+            self.assertEqual([summary.id for summary in second], ["session-oldest"])
+            with self.assertRaisesRegex(SessionError, "provided together"):
+                await store.list_sessions_page(
+                    limit=2,
+                    before_updated_at=first[-1].updated_at,
+                )
+            with self.assertRaisesRegex(SessionError, "timezone-aware"):
+                await store.list_sessions_page(
+                    limit=2,
+                    before_updated_at=datetime(2026, 7, 1, tzinfo=UTC).replace(tzinfo=None),
+                    before_id="session-oldest",
+                )
+
     async def test_manual_title_update_is_atomic_persistent_and_searchable(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = SqliteSessionStore(Path(directory) / "sessions.db")
@@ -318,7 +426,7 @@ class SessionStoreTests(unittest.IsolatedAsyncioTestCase):
             ).fetchone()
             columns = {row[1] for row in migrated.execute("PRAGMA table_info(sessions)").fetchall()}
             migrated.close()
-            self.assertEqual(version, (4,))
+            self.assertEqual(version, (5,))
             self.assertIn("context_affinity", columns)
             self.assertIn("sandbox_profile", columns)
 
@@ -378,7 +486,7 @@ class SessionStoreTests(unittest.IsolatedAsyncioTestCase):
             migrated = sqlite3.connect(database)
             self.assertEqual(
                 migrated.execute("SELECT version FROM schema_meta WHERE singleton = 1").fetchone(),
-                (4,),
+                (5,),
             )
             migrated.close()
 
@@ -458,7 +566,7 @@ class SessionStoreTests(unittest.IsolatedAsyncioTestCase):
             migrated = sqlite3.connect(database)
             self.assertEqual(
                 migrated.execute("SELECT version FROM schema_meta WHERE singleton = 1").fetchone(),
-                (4,),
+                (5,),
             )
             tables = {
                 row[0]
@@ -469,6 +577,41 @@ class SessionStoreTests(unittest.IsolatedAsyncioTestCase):
             migrated.close()
             self.assertIn("session_search_documents", tables)
             self.assertIn("session_search_fts", tables)
+
+    async def test_schema_v4_migration_adds_session_aliases_without_rewriting_sessions(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "sessions.db"
+            store = SqliteSessionStore(database)
+            await store.initialize()
+            session_id = await store.create_session("/workspace", "fixture", "model")
+            await store.save_messages(session_id, [Message(Role.USER, "preserved")])
+            connection = sqlite3.connect(database)
+            connection.execute("DROP TABLE session_aliases")
+            connection.execute("UPDATE schema_meta SET version = 4 WHERE singleton = 1")
+            connection.commit()
+            connection.close()
+
+            migrated = SqliteSessionStore(database)
+            await migrated.initialize()
+            self.assertEqual(
+                await migrated.load_messages(session_id),
+                [Message(Role.USER, "preserved")],
+            )
+            await migrated.bind_session_alias("acp-v1", "acp-visible", session_id)
+            self.assertEqual(
+                await migrated.resolve_session_alias("acp-v1", "acp-visible"),
+                session_id,
+            )
+            connection = sqlite3.connect(database)
+            self.assertEqual(
+                connection.execute(
+                    "SELECT version FROM schema_meta WHERE singleton = 1"
+                ).fetchone(),
+                (5,),
+            )
+            connection.close()
 
     async def test_initialize_is_atomic_when_search_backfill_fails(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -535,7 +678,7 @@ class SessionStoreTests(unittest.IsolatedAsyncioTestCase):
             recovered = sqlite3.connect(database)
             self.assertEqual(
                 recovered.execute("SELECT version FROM schema_meta WHERE singleton = 1").fetchone(),
-                (4,),
+                (5,),
             )
             recovered.close()
 
@@ -559,7 +702,7 @@ class SessionStoreTests(unittest.IsolatedAsyncioTestCase):
                 connection.execute(
                     "SELECT version FROM schema_meta WHERE singleton = 1"
                 ).fetchone(),
-                (4,),
+                (5,),
             )
             self.assertEqual(
                 connection.execute("SELECT COUNT(*) FROM session_search_documents").fetchone(),

@@ -73,6 +73,7 @@ class ProcessTree:
         cwd: Path,
         env: Mapping[str, str],
         merge_output: bool = False,
+        pipe_stdin: bool = False,
     ) -> ProcessTree:
         return await cls._spawn(
             executable,
@@ -81,6 +82,7 @@ class ProcessTree:
             cwd=cwd,
             env=env,
             merge_output=merge_output,
+            pipe_stdin=pipe_stdin,
         )
 
     @classmethod
@@ -93,11 +95,12 @@ class ProcessTree:
         cwd: Path,
         env: Mapping[str, str],
         merge_output: bool,
+        pipe_stdin: bool = False,
     ) -> ProcessTree:
         options: dict[str, Any] = {
             "cwd": cwd,
             "env": dict(env),
-            "stdin": asyncio.subprocess.DEVNULL,
+            "stdin": asyncio.subprocess.PIPE if pipe_stdin else asyncio.subprocess.DEVNULL,
             "stdout": asyncio.subprocess.PIPE,
             "stderr": asyncio.subprocess.STDOUT if merge_output else asyncio.subprocess.PIPE,
         }
@@ -116,6 +119,7 @@ class ProcessTree:
                         env=env,
                         job_handle=windows_job.process_creation_handle,
                         merge_output=merge_output,
+                        pipe_stdin=pipe_stdin,
                     )
                 else:
                     process = WindowsJobProcess.spawn_exec(
@@ -125,6 +129,7 @@ class ProcessTree:
                         env=env,
                         job_handle=windows_job.process_creation_handle,
                         merge_output=merge_output,
+                        pipe_stdin=pipe_stdin,
                     )
             elif shell:
                 process = await asyncio.create_subprocess_shell(executable, **options)
@@ -143,10 +148,48 @@ class ProcessTree:
             raise
         return cls(process, process_group, windows_job)
 
+    async def write_stdin(self, data: bytes) -> None:
+        """Write one bounded protocol chunk to a process with piped stdin."""
+
+        if not isinstance(data, bytes):
+            raise TypeError("process stdin data must be bytes")
+        if not data:
+            return
+        if isinstance(self.process, WindowsJobProcess):
+            await self.process.write_stdin(data)
+            return
+        writer = getattr(self.process, "stdin", None)
+        if writer is None:
+            raise RuntimeError("process stdin is not piped")
+        writer.write(data)
+        await writer.drain()
+
+    async def close_stdin(self) -> None:
+        """Close a piped stdin once, allowing a protocol child to exit cleanly."""
+
+        if isinstance(self.process, WindowsJobProcess):
+            await self.process.close_stdin()
+            return
+        writer = getattr(self.process, "stdin", None)
+        if writer is None or writer.is_closing():
+            return
+        writer.close()
+        await writer.wait_closed()
+
     async def wait(self) -> int:
         """Wait until the direct child and its owned platform tree have exited."""
 
-        returncode = await self.process.wait()
+        stdin_error: BaseException | None = None
+        try:
+            returncode = await self.process.wait()
+        except BaseException:
+            with contextlib.suppress(BaseException):
+                await self.close_stdin()
+            raise
+        try:
+            await self.close_stdin()
+        except BaseException as error:
+            stdin_error = error
         if os.name == "posix":
             while not self._termination_requested and self._unix_group_exists():  # noqa: ASYNC110
                 await asyncio.sleep(0.02)
@@ -166,6 +209,8 @@ class ProcessTree:
                     job.close()
                 finally:
                     self._windows_job = None
+        if stdin_error is not None:
+            raise stdin_error
         return returncode
 
     @staticmethod
@@ -197,15 +242,25 @@ class ProcessTree:
 
         self._termination_requested = True
         async with self._termination_lock:
-            if os.name == "posix":
-                await self._terminate_posix(grace_seconds, force_wait_seconds)
-            elif os.name == "nt":  # pragma: no cover - exercised by Windows CI
-                if self._windows_job is not None:
-                    await self._terminate_windows_job(grace_seconds, force_wait_seconds)
-                else:
+            stdin_error: BaseException | None = None
+            try:
+                await self.close_stdin()
+            except BaseException as error:
+                stdin_error = error
+            try:
+                if os.name == "posix":
+                    await self._terminate_posix(grace_seconds, force_wait_seconds)
+                elif os.name == "nt":  # pragma: no cover - exercised by Windows CI
+                    if self._windows_job is not None:
+                        await self._terminate_windows_job(grace_seconds, force_wait_seconds)
+                    else:
+                        await self._terminate_direct(grace_seconds, force_wait_seconds)
+                else:  # pragma: no cover - Python currently supports posix/nt here
                     await self._terminate_direct(grace_seconds, force_wait_seconds)
-            else:  # pragma: no cover - Python currently supports posix/nt here
-                await self._terminate_direct(grace_seconds, force_wait_seconds)
+            except BaseException:
+                raise
+            if stdin_error is not None:
+                raise stdin_error
 
     async def _terminate_posix(self, grace_seconds: float, force_wait_seconds: float) -> None:
         process_group = self._unix_process_group
