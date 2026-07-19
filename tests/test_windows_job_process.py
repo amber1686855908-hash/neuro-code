@@ -35,9 +35,14 @@ class _FakeWindowsJobProcessApi:
         self.wait_gate: threading.Event | None = None
         self.calls: list[tuple[object, ...]] = []
         self.creation: dict[str, Any] | None = None
+        self.writes: dict[int, list[bytes]] = {}
 
     def create_output_pipe(self) -> tuple[int, int]:
         self.calls.append(("create_pipe",))
+        return self.pipes.pop(0)
+
+    def create_input_pipe(self) -> tuple[int, int]:
+        self.calls.append(("create_input_pipe",))
         return self.pipes.pop(0)
 
     def open_null_input(self) -> int:
@@ -57,6 +62,11 @@ class _FakeWindowsJobProcessApi:
         if isinstance(item, BaseException):
             raise item
         return item
+
+    def write_file(self, handle: int, data: bytes) -> int:
+        self.calls.append(("write", handle, data))
+        self.writes.setdefault(handle, []).append(data)
+        return min(len(data), 3)
 
     def wait_process(self, handle: int) -> None:
         self.calls.append(("wait", handle))
@@ -139,6 +149,31 @@ class WindowsJobProcessTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(api.creation["inherited_handles"], (14, 11))
         self.assertEqual(api.calls.count(("create_pipe",)), 1)
         self.assertEqual(api.calls.count(("close", 11)), 1)
+
+    async def test_piped_stdin_is_parent_owned_supports_partial_writes_and_closes(self) -> None:
+        api = _FakeWindowsJobProcessApi()
+        api.pipes = [(10, 11), (12, 13), (30, 31)]
+
+        process = WindowsJobProcess.spawn_exec(
+            "python.exe",
+            (),
+            cwd=Path("C:/workspace"),
+            env={},
+            job_handle=99,
+            pipe_stdin=True,
+            api=api,
+        )
+        await process.write_stdin(b"abcdef")
+        await process.close_stdin()
+        await process.close_stdin()
+        await process.wait()
+
+        assert api.creation is not None
+        self.assertEqual(api.creation["stdin_handle"], 30)
+        self.assertEqual(api.creation["inherited_handles"], (30, 11, 13))
+        self.assertEqual(api.writes[31], [b"abcdef", b"def"])
+        self.assertEqual(api.calls.count(("close", 30)), 1)
+        self.assertEqual(api.calls.count(("close", 31)), 1)
 
     async def test_shell_uses_absolute_comspec_from_child_environment(self) -> None:
         api = _FakeWindowsJobProcessApi()

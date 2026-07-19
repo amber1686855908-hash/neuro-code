@@ -29,15 +29,18 @@ incoming `jsonrpc` version before normalizing its response to 2.0.
   framing.
 - Enable the SDK unstable-router flag only to make `session/close` reachable;
   do not implement or advertise another unstable method or custom extension.
-- Advertise only `sessionCapabilities.close = {}`. Implement `initialize`,
+- Advertise `sessionCapabilities.close = {}`. Implement `initialize`,
   `session/new`, `session/prompt`, `session/cancel`, and `session/close`; send
   standard `session/update` notifications and use
-  `session/request_permission`.
+  `session/request_permission`. ADR 0036 subsequently adds standard
+  `session/load` and the truthful `loadSession: true` capability; ADR 0037 adds
+  standard `session/list` and `sessionCapabilities.list = {}`.
 - Bind one connection to its normalized launch workspace. Reject relative or
-  different `cwd` values and non-empty `additionalDirectories` or
-  `mcpServers`.
+  different `cwd` values and non-empty `additionalDirectories`. This ADR's
+  original rejection of non-empty `mcpServers` is superseded for bounded stdio
+  servers by ADR 0038; HTTP, SSE, and ACP MCP transports remain rejected.
 - Generate one stable ACP ID per protocol session and keep a separate mapping
-  to the lazily created internal SQLite ID.
+  to the lazily created internal SQLite ID. ADR 0036 makes that mapping durable.
 - Accept only bounded Text and ResourceLink prompt blocks. Preserve ordering,
   project only standard allowlisted ResourceLink fields, ignore `_meta`, and
   never dereference a URI during conversion.
@@ -65,9 +68,10 @@ incoming `jsonrpc` version before normalizing its response to 2.0.
 - Approval and cancellation are isolated per session, and close is not
   session deletion.
 - The process remains a partial ACP v1 implementation. Complete conformance,
-  WebSocket, MCP, additional directories, load/list/resume/delete/fork,
-  multimedia/embedded prompt content, and client filesystem/terminal calls
-  remain future slices.
+  WebSocket, non-stdio MCP transports and non-tool MCP features, additional
+  directories, resume/delete/fork,
+  multimedia/embedded prompt content and history, and client
+  filesystem/terminal calls remain future slices.
 - Raw stdio tests record the official 0.11 SDK's malformed-frame and JSON-RPC
   version behavior. Replacing it with a private production parser or dispatcher
   is not an accepted workaround; upstream SDK changes can be adopted within a

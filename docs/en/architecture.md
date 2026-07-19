@@ -110,9 +110,10 @@ is a separate, unimplemented interaction policy.
 official `agent-client-protocol` Python SDK. Production framing, JSON-RPC
 routing, newline-delimited stdio, `session/update` notifications, and
 `session/request_permission` requests remain SDK-owned. The adapter declares
-only `sessionCapabilities.close = {}` and implements `initialize`,
-`session/new`, `session/prompt`, the `session/cancel` notification, and
-`session/close`. SDK 0.11 gates its `session/close` route behind
+`loadSession: true` plus `sessionCapabilities.list = {}` / `close = {}` and
+implements `initialize`, `session/new`, `session/list`, `session/load`,
+`session/prompt`, the `session/cancel` notification, and `session/close`. SDK
+0.11 gates its `session/close` route behind
 `use_unstable_protocol`; the process enables that router gate only so the
 declared close method is reachable and implements no other unstable method.
 
@@ -120,11 +121,56 @@ One ACP connection is bound to the normalized launch workspace. Each accepted
 session owns a stable random ACP ID, one `AgentConversation`, one background
 task scope, one active-prompt slot, and independent approval/cancel/close
 state. The internal SQLite ID stays separate and is recorded lazily when the
-first prompt starts. Session creation publishes nothing until every resource is
-ready. Close first applies cancel semantics, waits for required terminal tool
-updates and the prompt response, closes the scope, drops the runtime binding,
-and leaves durable history intact. EOF or connection failure runs the same
-idempotent cleanup for every active session.
+first prompt starts; SQLite schema v5 persists a unique namespaced alias so a
+later process can load the same ACP ID. Session creation publishes nothing
+until every resource is ready. Load reserves the requested ACP ID, revalidates
+workspace, fixed sandbox, and provider affinity, reconstructs the conversation
+and background scope, replays history, and only then publishes the session.
+Close first applies cancel semantics, waits for required terminal tool updates
+and the prompt response, closes the scope, drops the runtime binding, and
+leaves durable history and the alias intact. EOF or connection failure runs
+the same idempotent cleanup for every active or creating session.
+
+Non-empty `mcpServers` are accepted only for the ACP baseline stdio shape.
+HTTP, SSE, and ACP transports are rejected deterministically. Each server is
+initialized and its bounded, paginated tool catalog is validated before the
+session is published; duplicate server names, invalid tool names, collisions
+between remote tools or with built-ins, protected environment overrides, and
+oversized configuration fail the complete session creation. The same ephemeral
+MCP configuration may be supplied when loading a durable ACP session, but it is
+not persisted as session history or authority.
+
+The official `mcp>=1.28.1,<2` SDK owns MCP schemas, `ClientSession`, version
+negotiation, JSON-RPC dispatch, and tool result types. A project-owned
+newline-delimited transport bridge deliberately reuses `ProcessTree`: the
+official SDK's post-spawn Windows Job attachment cannot meet Neuro Code's
+atomic Job-list requirement. Frames, schemas, tool counts, JSON depth/nodes,
+arguments, output, and timeouts are bounded; MCP stderr is drained without
+entering ACP stdout; `_meta`, image/audio/embedded bodies, and unbounded raw
+values are never projected. ResourceLink results remain metadata and are not
+dereferenced. Explicit server environment values and application credentials
+are redacted from model-visible text.
+
+MCP annotations are untrusted hints, so every projected MCP tool is marked
+side-effecting. `ApplicationComposition` installs an exact ASK rule above
+bypass/always-approve behavior while retaining explicit local DENY precedence.
+The ordinary runtime therefore emits pending, requests ACP permission, and
+only then emits in-progress and calls the server. A declined request never
+executes. Prompt cancellation aborts the SDK request and terminates the whole
+server process tree before the tool failure update and `cancelled` prompt
+response complete. Close, load failure, creation failure, EOF, and disconnect
+close the same session-owned collection idempotently. MCP resources, prompts,
+sampling, elicitation, and transport-specific capabilities are not exposed.
+
+List is discovery-only and remains scoped to the connection workspace even
+when `cwd` is omitted. It returns only durable ACP ID, absolute recorded cwd,
+bounded title, and ISO update time. Sessions without an alias receive one
+through an atomic schema-v5 get-or-create operation. SQLite keyset pages are
+filtered through filesystem-identity workspace comparison. A request returns
+at most 50 matches while scanning at most 5,000 rows; random connection-local
+cursor tokens retain only the keyset position in memory, are capped at 256,
+and reveal no internal ID. List never opens a conversation/background scope or
+returns content, provider metadata, `_meta`, or additional directories.
 
 Prompt conversion accepts only ACP baseline Text and ResourceLink blocks.
 Counts, per-field sizes, annotation serialization, ResourceLink aggregate
@@ -133,6 +179,15 @@ bytes, and total prompt bytes are bounded. Only `uri`, `name`, `title`,
 model-visible reference description. `_meta` is ignored. Neither local
 `file:` links nor remote links are read, downloaded, or dereferenced; later
 model-selected file access still crosses the ordinary workspace/tool boundary.
+
+Load history uses a second explicit projection. Visible user and assistant text
+become standard message chunks with fresh UUID message IDs. Tool calls expose
+only bounded/redacted name, kind, allowlisted path, and result content, with
+balanced pending-to-terminal updates. System messages, reasoning, preserved
+provider context, images, arbitrary arguments, `_meta`, and raw input/output
+are omitted. The complete replay is validated before its first update and is
+bounded by stored-item, update-count, per-field, and aggregate serialized-byte
+limits.
 
 The event projection is an explicit allowlist:
 
@@ -152,7 +207,10 @@ fail-closed permission manager: local deny/workspace/sandbox decisions remain
 authoritative, a pending tool update precedes the client request, and execution
 cannot start until approval returns. Client filesystem and terminal methods are
 remembered as negotiated capabilities but are never invoked in this slice. See
-[ADR 0035](adr/0035-partial-acp-v1-stdio.md).
+[ADR 0035](adr/0035-partial-acp-v1-stdio.md) and
+[ADR 0036](adr/0036-durable-acp-session-load.md) plus
+[ADR 0037](adr/0037-workspace-scoped-acp-session-list.md), plus
+[ADR 0038](adr/0038-session-owned-stdio-mcp-tools.md).
 
 The minimal TUI is a presentation adapter over `AgentEvent`. It owns prompt
 input, scrollback, a live text surface, and local slash commands. It never
@@ -524,9 +582,11 @@ sessions retain `NULL`. Schema v4 adds stable optional titles and a
 trigger-synchronized external-content FTS5 projection. Migration derives a
 ten-word title from the first visible user message when no imported title
 exists and backfills escaped conversation content without indexing private
-provider items. Startup can inspect the sandbox field through an
-immutable read-only connection before any database creation, migration, or
-process sandbox activation. Rust sessions are parsed by
+provider items. Startup can inspect the sandbox field through an immutable
+read-only connection before any database creation, migration, or process
+sandbox activation. Schema v5 adds namespaced, foreign-keyed, one-to-one
+external session aliases used by protocol adapters; it does not change JSON
+export schema version 4. Rust sessions are parsed by
 a separate read-only adapter. It validates format versions 0 and 1, reads
 bounded JSONL records, converts supported legacy/current records into an
 ordered `SessionSnapshot`, and reports corrupt or unsupported records instead

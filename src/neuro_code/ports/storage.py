@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from datetime import datetime
 from typing import Protocol
 
 from neuro_code.domain.events import AgentEvent
@@ -46,9 +47,37 @@ class SessionStore(Protocol):
 
     async def load_session_items(self, session_id: str) -> list[SessionItem]: ...
 
+    async def bind_session_alias(
+        self,
+        namespace: str,
+        external_id: str,
+        session_id: str,
+    ) -> None: ...
+
+    async def resolve_session_alias(
+        self,
+        namespace: str,
+        external_id: str,
+    ) -> str: ...
+
+    async def get_or_create_session_alias(
+        self,
+        namespace: str,
+        session_id: str,
+        proposed_external_id: str,
+    ) -> str: ...
+
     async def next_event_sequence(self, session_id: str) -> int: ...
 
     async def list_sessions(self, *, limit: int = 50) -> list[SessionSummary]: ...
+
+    async def list_sessions_page(
+        self,
+        *,
+        limit: int,
+        before_updated_at: datetime | None = None,
+        before_id: str | None = None,
+    ) -> list[SessionSummary]: ...
 
     async def search_sessions(
         self,

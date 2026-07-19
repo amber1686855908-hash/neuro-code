@@ -84,14 +84,19 @@ terminal state or child processes.
 ### M4 — protocols and extensibility
 
 - Partial ACP v1 stdio core: official Python SDK framing/router,
-  initialize/new/prompt/cancel/close, bounded Text/ResourceLink input,
+  initialize/new/list/load/prompt/cancel/close, durable external-to-internal
+  session aliases, workspace-scoped bounded cursor discovery,
+  bounded/redacted visible-history replay, bounded Text/ResourceLink input,
   fail-closed permission requests, standard event updates, per-session
-  concurrency, and disconnect cleanup are implemented.
-- Complete ACP conformance remains open: session load/list/resume/delete/fork,
-  additional directories, MCP, client filesystem/terminal methods, multimedia
-  and embedded prompt content, WebSocket, and any advertised `x.ai/*`
-  extensions.
-- MCP lifecycle, skills, AGENTS.md, agent profiles, hooks, and plugins.
+  concurrency, disconnect cleanup, and bounded session-owned stdio MCP tool
+  servers are implemented.
+- Complete ACP conformance remains open: session resume/delete/fork, additional
+  directories, MCP HTTP/SSE/ACP transports and non-tool MCP features, client
+  filesystem/terminal methods, multimedia
+  prompt/history content, embedded prompt content, WebSocket, and any
+  advertised `x.ai/*` extensions.
+- Remaining MCP transports/features, skills, AGENTS.md, agent profiles, hooks,
+  and plugins.
 - Subagents, plan mode, session fork, and their integration with the common
   task lifecycle.
 

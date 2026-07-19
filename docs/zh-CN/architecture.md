@@ -88,24 +88,63 @@ Web 控制台后端。纯云端能力必须通过显式适配器接入；不可�
 `neuro-code acp` 是位于 `ApplicationComposition` 与官方
 `agent-client-protocol` Python SDK 之上的协议适配器。生产 framing、JSON-RPC
 路由、换行分隔 stdio、`session/update` notification 和
-`session/request_permission` request 均继续由 SDK 持有。适配器只声明
-`sessionCapabilities.close = {}`，实现 `initialize`、`session/new`、
-`session/prompt`、`session/cancel` notification 和 `session/close`。SDK 0.11
+`session/request_permission` request 均继续由 SDK 持有。适配器声明
+`loadSession: true` 与 `sessionCapabilities.list = {}` / `close = {}`，实现
+`initialize`、`session/new`、`session/list`、`session/load`、`session/prompt`、
+`session/cancel` notification 和 `session/close`。SDK 0.11
 将 `session/close` 路由置于 `use_unstable_protocol` 门后；进程只为使已声明的 close
 方法可达而打开该路由门，不实现其他 unstable 方法。
 
 每条 ACP 连接固定绑定到规范化后的启动工作区。每个成功 session 拥有稳定随机 ACP ID、
 一个 `AgentConversation`、一个后台任务 scope、一个活动 prompt 槽位，以及独立审批/
-取消/关闭状态。内部 SQLite ID 与 ACP ID 保持分离，并在首次 prompt 时按需记录。
-所有资源就绪前不会发布 session。close 会先应用 cancel 语义，等待必须的工具终态更新和
-prompt 响应，关闭 scope，释放运行时绑定，同时保留持久历史。EOF 或连接故障会对全部
-活动 session 执行相同的幂等清理。
+取消/关闭状态。内部 SQLite ID 与 ACP ID 保持分离，并在首次 prompt 时按需记录；
+SQLite schema v5 会持久化唯一且带 namespace 的 alias，使后续进程可加载同一个 ACP
+ID。所有资源就绪前不会发布 session。load 会预留请求的 ACP ID，重新校验工作区、固定
+sandbox 与 provider 亲和，重建 conversation 和后台 scope，回放历史，然后才发布
+session。close 会先应用 cancel 语义，等待必须的工具终态更新和 prompt 响应，关闭
+scope，释放运行时绑定，同时保留持久历史与 alias。EOF 或连接故障会对全部活动中或
+创建中的 session 执行相同的幂等清理。
+
+非空 `mcpServers` 只接受 ACP 基线 stdio 结构；HTTP、SSE 和 ACP 传输会被确定性拒绝。
+每个 server 都必须在 session 发布前完成初始化，并通过有界分页枚举和校验工具目录；
+server 重名、非法工具名、远端工具之间或与内建工具冲突、覆盖受保护环境变量、配置超限
+都会使整个 session 创建失败。加载持久 ACP session 时可以重新提供相同的临时 MCP
+配置，但它不会作为历史或授权被持久化。
+
+官方 `mcp>=1.28.1,<2` SDK 持有 MCP Schema、`ClientSession`、版本协商、JSON-RPC 调度
+和工具结果类型。有界的项目自有换行分隔传输桥接会复用 `ProcessTree`：官方 SDK 在
+Windows 上采用 spawn 后再附加 Job 的方式，无法满足 Neuro Code 创建时原子加入 Job
+列表的要求。frame、Schema、工具数、JSON 深度/节点、参数、输出和超时均有上限；MCP
+stderr 会被排空但不会进入 ACP stdout；`_meta`、图片/音频/embedded body 与无界 raw
+值不会被投影。ResourceLink 结果只保留引用元数据，不会被解引用。显式 server 环境变量
+值与应用凭据会从模型可见文本中脱敏。
+
+MCP annotations 只是不可被信任的提示，因此所有投影后的 MCP 工具均标记为有副作用。
+`ApplicationComposition` 会在 bypass/always-approve 行为之上安装精确 ASK 规则，同时
+保留本地显式 DENY 的优先级。普通运行时因此先发送 pending、请求 ACP 审批，随后才发送
+in-progress 并调用 server；拒绝审批绝不会执行。prompt 取消会中止 SDK request 并终止
+整个 server 进程树，然后才完成工具失败 update 与 `cancelled` prompt 响应。close、load
+失败、创建失败、EOF 与断连都幂等关闭同一 session-owned collection。MCP resources、
+prompts、sampling、elicitation 与传输特定能力均未公开。
+
+list 只用于发现；即使省略 `cwd`，也始终限制在连接工作区。它只返回持久 ACP ID、记录的
+绝对 cwd、有界标题和 ISO 更新时间。尚无 alias 的 session 通过 schema v5 原子
+get-or-create 获得一个。SQLite keyset page 经过文件系统身份工作区比较过滤；每个 request
+最多返回 50 个匹配并扫描 5,000 行。随机连接局部 cursor token 只在内存中保存 keyset
+位置，最多 256 个，不暴露内部 ID。list 不会打开 conversation/background scope，也不
+返回内容、provider 元数据、`_meta` 或额外目录。
 
 提示转换只接受 ACP 基线 Text 与 ResourceLink。block 数量、单字段大小、annotations
 序列化、ResourceLink 汇总字节和整轮提示字节都有上限。只有 `uri`、`name`、`title`、
 `description`、`mimeType`、`size` 和标准 annotations 字段会进入模型可见的引用描述；
 `_meta` 会被忽略。本地 `file:` 与远程链接都不会被读取、下载或解引用；模型随后主动
 读取文件时仍必须经过普通工作区/工具边界。
+
+load 历史使用另一组显式投影。可见用户与助手文本使用新的 UUID message ID 映射为标准
+message chunk。工具调用只暴露有界/脱敏的名称、类型、白名单路径和结果内容，并确保
+pending 到终态 update 配对。system message、reasoning、供应商保留上下文、图片、任意
+参数、`_meta` 和 raw input/output 全部省略。发送第一条 update 前先校验完整回放，并
+限制持久项数、update 数、单字段和序列化总字节。
 
 事件投影采用显式白名单：
 
@@ -123,7 +162,10 @@ prompt 响应，关闭 scope，释放运行时绑定，同时保留持久历史�
 `cancelled`。审批沿用现有失败关闭权限管理器：本地 deny、工作区和沙箱结论始终拥有最终
 优先级，pending 工具更新先于客户端请求，批准返回前不能开始执行。本切片会保存协商到的
 客户端文件系统与终端能力，但绝不调用这些方法。详见
-[ADR 0035](adr/0035-partial-acp-v1-stdio.md)。
+[ADR 0035](adr/0035-partial-acp-v1-stdio.md)与
+[ADR 0036](adr/0036-durable-acp-session-load.md)及
+[ADR 0037](adr/0037-workspace-scoped-acp-session-list.md)，以及
+[ADR 0038](adr/0038-session-owned-stdio-mcp-tools.md)。
 
 最小 TUI 是 `AgentEvent` 之上的表现适配器，负责提示输入、滚动记录、实时文本表面和
 本地斜杠命令。它绝不渲染原始推理或不受限制的参数/结果映射；只有路径、命令、模式、
@@ -390,7 +432,9 @@ SQLite 是会话及其有序事件的规范事务存储。JSON 和 Markdown 用�
 `NULL`。schema v4 新增稳定的可选标题和由触发器同步的外部内容 FTS5 投影；迁移会在
 没有导入标题时从第一条可见用户消息生成十词标题，并回填包含转义字符的对话内容，但
 不索引供应商私有项。启动时可通过 immutable 只读连接检查沙箱字段，且发生在创建/迁移数据库或
-激活进程沙箱之前。Rust 会话由独立的只读适配器解析。该适配器校验格式版本 0 和 1，以明确上限
+激活进程沙箱之前。schema v5 新增带 namespace、外键和一对一约束的外部 session
+alias，供协议适配器使用；JSON export schema version 4 不变。Rust 会话由独立的只读
+适配器解析。该适配器校验格式版本 0 和 1，以明确上限
 读取 JSONL 记录，把受支持的新旧记录转换为有序 `SessionSnapshot`，并报告损坏或
 不支持的记录，而不是静默编造内容。SQLite 适配器在单个事务中插入快照，并保留其
 ID、工作区、模型和时间戳；ID 已存在时不做任何修改并返回失败。源会话文件永远不会

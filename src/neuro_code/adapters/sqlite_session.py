@@ -39,9 +39,11 @@ from neuro_code.domain.sessions import (
 )
 from neuro_code.errors import SessionError
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 _SEARCH_SNIPPET_LIMIT = 500
 _SQLITE_TIMEOUT_SECONDS = 30.0
+_SESSION_ALIAS_NAMESPACE_LIMIT = 64
+_SESSION_ALIAS_ID_LIMIT = 512
 
 
 class SqliteSessionStore:
@@ -125,12 +127,17 @@ class SqliteSessionStore:
                         _backfill_search_documents(connection)
                         connection.execute("UPDATE schema_meta SET version = 4 WHERE singleton = 1")
                         version = (4,)
+                    if version is not None and version[0] == 4:
+                        _ensure_session_alias_schema(connection)
+                        connection.execute("UPDATE schema_meta SET version = 5 WHERE singleton = 1")
+                        version = (5,)
                     if version is None or version[0] != SCHEMA_VERSION:
                         raise SessionError(
                             "unsupported session schema version: "
                             f"{version[0] if version else 'missing'}"
                         )
                     _ensure_search_schema(connection)
+                    _ensure_session_alias_schema(connection)
                     _backfill_search_documents(connection, missing_only=True)
                     connection.commit()
                 except BaseException:
@@ -447,6 +454,151 @@ class SqliteSessionStore:
 
         return await run_blocking(load)
 
+    async def bind_session_alias(
+        self,
+        namespace: str,
+        external_id: str,
+        session_id: str,
+    ) -> None:
+        normalized_namespace = _session_alias_value(
+            namespace,
+            field_name="namespace",
+            limit=_SESSION_ALIAS_NAMESPACE_LIMIT,
+        )
+        normalized_external_id = _session_alias_value(
+            external_id,
+            field_name="external ID",
+            limit=_SESSION_ALIAS_ID_LIMIT,
+        )
+
+        def bind() -> None:
+            with closing(self._connect()) as connection, connection:
+                exists = connection.execute(
+                    "SELECT 1 FROM sessions WHERE id = ?",
+                    (session_id,),
+                ).fetchone()
+                if exists is None:
+                    raise SessionError(f"unknown session: {session_id}")
+                connection.execute(
+                    """
+                    INSERT OR IGNORE INTO session_aliases(
+                        namespace, external_id, session_id
+                    ) VALUES (?, ?, ?)
+                    """,
+                    (normalized_namespace, normalized_external_id, session_id),
+                )
+                current = connection.execute(
+                    """
+                    SELECT session_id
+                    FROM session_aliases
+                    WHERE namespace = ? AND external_id = ?
+                    """,
+                    (normalized_namespace, normalized_external_id),
+                ).fetchone()
+                reverse = connection.execute(
+                    """
+                    SELECT external_id
+                    FROM session_aliases
+                    WHERE namespace = ? AND session_id = ?
+                    """,
+                    (normalized_namespace, session_id),
+                ).fetchone()
+                if current is not None and str(current[0]) != session_id:
+                    raise SessionError("session alias is already bound")
+                if reverse is not None and str(reverse[0]) != normalized_external_id:
+                    raise SessionError("session already has an alias in this namespace")
+                if current is None or reverse is None:
+                    raise SessionError("cannot bind session alias")
+
+        async with self._write_lock:
+            await run_blocking(bind)
+
+    async def resolve_session_alias(
+        self,
+        namespace: str,
+        external_id: str,
+    ) -> str:
+        normalized_namespace = _session_alias_value(
+            namespace,
+            field_name="namespace",
+            limit=_SESSION_ALIAS_NAMESPACE_LIMIT,
+        )
+        normalized_external_id = _session_alias_value(
+            external_id,
+            field_name="external ID",
+            limit=_SESSION_ALIAS_ID_LIMIT,
+        )
+
+        def resolve() -> str:
+            with closing(self._connect()) as connection:
+                row = connection.execute(
+                    """
+                    SELECT session_id
+                    FROM session_aliases
+                    WHERE namespace = ? AND external_id = ?
+                    """,
+                    (normalized_namespace, normalized_external_id),
+                ).fetchone()
+                if row is not None:
+                    return str(row[0])
+                legacy = connection.execute(
+                    "SELECT id FROM sessions WHERE id = ?",
+                    (normalized_external_id,),
+                ).fetchone()
+            if legacy is not None:
+                return str(legacy[0])
+            raise SessionError(f"unknown session alias: {normalized_external_id}")
+
+        return await run_blocking(resolve)
+
+    async def get_or_create_session_alias(
+        self,
+        namespace: str,
+        session_id: str,
+        proposed_external_id: str,
+    ) -> str:
+        normalized_namespace = _session_alias_value(
+            namespace,
+            field_name="namespace",
+            limit=_SESSION_ALIAS_NAMESPACE_LIMIT,
+        )
+        normalized_external_id = _session_alias_value(
+            proposed_external_id,
+            field_name="external ID",
+            limit=_SESSION_ALIAS_ID_LIMIT,
+        )
+
+        def get_or_create() -> str:
+            with closing(self._connect()) as connection, connection:
+                exists = connection.execute(
+                    "SELECT 1 FROM sessions WHERE id = ?",
+                    (session_id,),
+                ).fetchone()
+                if exists is None:
+                    raise SessionError(f"unknown session: {session_id}")
+                connection.execute(
+                    """
+                    INSERT OR IGNORE INTO session_aliases(
+                        namespace, external_id, session_id
+                    ) VALUES (?, ?, ?)
+                    """,
+                    (normalized_namespace, normalized_external_id, session_id),
+                )
+                row = connection.execute(
+                    """
+                    SELECT external_id
+                    FROM session_aliases
+                    WHERE namespace = ? AND session_id = ?
+                    """,
+                    (normalized_namespace, session_id),
+                ).fetchone()
+                if row is None:
+                    raise SessionError("proposed session alias is unavailable")
+                return str(row[0])
+
+        async with self._write_lock:
+            return await run_blocking(get_or_create)
+
     async def load_events(self, session_id: str) -> list[dict[str, Any]]:
         def load() -> list[dict[str, Any]]:
             with closing(self._connect()) as connection:
@@ -499,6 +651,59 @@ class SqliteSessionStore:
                     FROM sessions ORDER BY updated_at DESC, id DESC LIMIT ?
                     """,
                     (limit,),
+                ).fetchall()
+            return [_summary_from_row(row) for row in rows]
+
+        return await run_blocking(load)
+
+    async def list_sessions_page(
+        self,
+        *,
+        limit: int,
+        before_updated_at: datetime | None = None,
+        before_id: str | None = None,
+    ) -> list[SessionSummary]:
+        if not 1 <= limit <= 1000:
+            raise SessionError("session list limit must be between 1 and 1000")
+        if (before_updated_at is None) != (before_id is None):
+            raise SessionError("session list cursor fields must be provided together")
+        if before_updated_at is not None and before_updated_at.tzinfo is None:
+            raise SessionError("session list cursor timestamp must be timezone-aware")
+        if before_id is not None and not before_id:
+            raise SessionError("session list cursor ID must not be empty")
+
+        def load() -> list[SessionSummary]:
+            parameters: tuple[object, ...]
+            if before_updated_at is None:
+                where = ""
+                parameters = (limit,)
+            else:
+                assert before_id is not None
+                rendered_timestamp = before_updated_at.isoformat()
+                where = """
+                    WHERE julianday(updated_at) < julianday(?)
+                       OR (
+                           julianday(updated_at) = julianday(?)
+                           AND id < ?
+                       )
+                """
+                parameters = (
+                    rendered_timestamp,
+                    rendered_timestamp,
+                    before_id,
+                    limit,
+                )
+            with closing(self._connect()) as connection:
+                rows = connection.execute(
+                    f"""
+                    SELECT id, cwd, provider, model, created_at, updated_at,
+                           context_affinity, sandbox_profile, title
+                    FROM sessions
+                    {where}
+                    ORDER BY julianday(updated_at) DESC, id DESC
+                    LIMIT ?
+                    """,
+                    parameters,
                 ).fetchall()
             return [_summary_from_row(row) for row in rows]
 
@@ -727,6 +932,32 @@ def _ensure_search_schema(connection: sqlite3.Connection) -> None:
         if "fts5" in str(error).casefold():
             raise SessionError("the installed SQLite build does not support FTS5") from error
         raise
+
+
+def _ensure_session_alias_schema(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS session_aliases (
+            namespace TEXT NOT NULL,
+            external_id TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (namespace, external_id),
+            UNIQUE (namespace, session_id),
+            FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+        )
+        """
+    )
+
+
+def _session_alias_value(value: str, *, field_name: str, limit: int) -> str:
+    if not value or "\x00" in value:
+        raise SessionError(f"session alias {field_name} must not be empty")
+    if len(value.encode("utf-8")) > limit:
+        raise SessionError(f"session alias {field_name} is too large")
+    if any(ord(character) < 32 or ord(character) == 127 for character in value):
+        raise SessionError(f"session alias {field_name} contains control characters")
+    return value
 
 
 def _backfill_search_documents(
