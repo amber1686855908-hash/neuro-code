@@ -6,9 +6,10 @@ Neuro Code is an extensible Python terminal coding agent. The project targets
 stable behavior at the CLI, configuration, session, tool, MCP, and ACP
 boundaries while using a Python-native internal architecture.
 
-The implementation is pre-alpha. The headless agent runtime and an initial
-minimal Textual TUI are supported vertical slices; remaining interface and
-protocol work is tracked in the [compatibility matrix](compatibility-matrix.md).
+The implementation is pre-alpha. The headless agent runtime, an initial
+minimal Textual TUI, and a partial ACP v1 stdio core are supported vertical
+slices; remaining interface and protocol work is tracked in the
+[compatibility matrix](compatibility-matrix.md).
 
 ## Development
 
@@ -34,6 +35,39 @@ Inspect effective configuration without exposing secrets:
 ```bash
 PYTHONPATH=src python -m neuro_code inspect --json
 ```
+
+## Partial ACP v1 stdio
+
+`neuro-code acp` serves a workspace-bound partial ACP v1 implementation over
+the official Python SDK's newline-delimited stdio transport:
+
+```bash
+uv run neuro-code acp --cwd /absolute/workspace
+```
+
+The slice implements `initialize`, `session/new`, `session/prompt`,
+`session/cancel` (notification), and `session/close`, sends
+`session/update` notifications, and requests interactive authority through
+`session/request_permission`. It advertises only
+`sessionCapabilities.close = {}`. Text and ResourceLink prompt blocks preserve
+their order and are bounded; ResourceLink metadata is allowlisted, `_meta` is
+not sent to the model, and links are never downloaded or dereferenced during
+prompt conversion.
+
+Each connection remains bound to its launch workspace. `session/new` rejects a
+different or relative `cwd`, non-empty `additionalDirectories`, and non-empty
+`mcpServers`. ACP session IDs are stable and separate from the internal SQLite
+ID that is created lazily on the first prompt. Concurrent prompts are allowed
+across sessions but not within one session. Cancel, close, stdin EOF, and
+connection failure cancel owned work and session-scoped background tasks;
+close never deletes persisted history.
+
+This is explicitly not complete ACP v1 support. Session load/list/resume/
+delete/fork, additional directories, MCP transports, image/audio/embedded
+prompt content, client `fs/*` and `terminal/*`, WebSocket transport, and custom
+extensions remain unsupported and are not advertised. See the
+[compatibility matrix](compatibility-matrix.md) and
+[ADR 0035](adr/0035-partial-acp-v1-stdio.md).
 
 ## Interactive TUI
 
@@ -76,7 +110,9 @@ adapters. It provides bounded cursor-based output with explicit drop counts,
 raw input, resize, signals, wait and close, and refuses to spawn until
 permission, workspace and any configured sandbox checks pass. POSIX owns the
 complete PTY process group; Windows creates the ConPTY leader atomically inside
-a kill-on-close Job. ACP protocol exposure remains pending. See
+a kill-on-close Job. The partial ACP core does not expose this interactive
+terminal substrate through client `terminal/*`; that protocol slice remains
+pending. See
 [ADR 0034](adr/0034-bounded-owned-interactive-terminal-sessions.md).
 
 User prompts render as full-width muted blocks, while assistant output uses a

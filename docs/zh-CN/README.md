@@ -5,8 +5,9 @@
 Neuro Code 是一个可扩展的 Python 终端编码智能体。项目使用 Python 原生内部架构，
 并以 CLI、配置、会话、工具、MCP 和 ACP 等边界上的稳定行为为目标。
 
-当前实现处于 pre-alpha 阶段。无头代理运行时与第一版最小 Textual TUI 已成为受支持的
-纵向切片；其余界面和协议工作记录在[兼容矩阵](compatibility-matrix.md)中。
+当前实现处于 pre-alpha 阶段。无头代理运行时、第一版最小 Textual TUI 和 partial ACP
+v1 stdio 核心已成为受支持的纵向切片；其余界面和协议工作记录在
+[兼容矩阵](compatibility-matrix.md)中。
 
 ## 开发环境
 
@@ -32,6 +33,34 @@ PYTHONPATH=src python -m unittest discover -s tests
 ```bash
 PYTHONPATH=src python -m neuro_code inspect --json
 ```
+
+## Partial ACP v1 stdio
+
+`neuro-code acp` 通过官方 Python SDK 的换行分隔 stdio 传输提供绑定单一工作区的
+partial ACP v1 实现：
+
+```bash
+uv run neuro-code acp --cwd /absolute/workspace
+```
+
+本切片实现 `initialize`、`session/new`、`session/prompt`、
+`session/cancel`（notification）和 `session/close`，发送
+`session/update` notification，并通过 `session/request_permission`
+请求交互授权。它只声明 `sessionCapabilities.close = {}`。Text 与 ResourceLink
+提示块会保持输入顺序并受数量/字节限制；ResourceLink 元数据采用字段白名单，`_meta`
+不会进入模型，提示转换期间也绝不会下载或解引用链接。
+
+每条连接固定绑定到启动工作区。`session/new` 会拒绝不同或非绝对的 `cwd`、非空
+`additionalDirectories` 和非空 `mcpServers`。ACP session ID 稳定且独立于首次
+prompt 时才按需创建的内部 SQLite ID。不同 session 可以并行，同一 session 不能并发
+prompt。取消、关闭、stdin EOF 和连接故障都会取消受控工作与 session 作用域后台任务；
+close 不会删除持久化历史。
+
+这明确不是完整 ACP v1 支持。会话 load/list/resume/delete/fork、额外目录、MCP
+传输、图片/音频/embedded prompt、客户端 `fs/*` 与 `terminal/*`、WebSocket 传输和
+自定义扩展仍不支持，也不会被声明。详见
+[兼容矩阵](compatibility-matrix.md)和
+[ADR 0035](adr/0035-partial-acp-v1-stdio.md)。
 
 ## 交互式 TUI
 
@@ -66,7 +95,8 @@ Linux/macOS 使用标准库 PTY，Windows 使用标准库 `ctypes` ConPTY 适配
 可复用的交互式终端底座现在位于这些原生适配器之上，提供带显式丢弃计数的有界游标输出、
 原始输入、resize、信号、等待和关闭；权限、工作区和任何已配置沙箱检查通过前不会启动。
 POSIX 持有完整 PTY 进程组，Windows 则把 ConPTY 入口原子创建到关闭即终止的 Job 中。
-ACP 协议暴露仍待实现。详见
+partial ACP 核心不会通过客户端 `terminal/*` 暴露该交互式终端底座；这部分协议切片
+仍待实现。详见
 [ADR 0034](adr/0034-bounded-owned-interactive-terminal-sessions.md)。
 
 用户提示显示为占满整行的低对比度块，助手输出使用独立回答块，不再依靠 `You:` 与

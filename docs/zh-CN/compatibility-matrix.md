@@ -6,7 +6,7 @@
 
 | 能力 | 目标 | 状态 | 证据 / 备注 |
 |---|---|---|---|
-| 软件包与 CLI 组合根 | M1 | partial | 已在独立 `neuro-code` 命令下实现 Python CLI 骨架 |
+| 软件包与 CLI 组合根 | M1 | partial | 已在独立 `neuro-code` 命令下实现 Python CLI 骨架；CLI、TUI 和 ACP 现共享与界面无关的 `ApplicationComposition`，统一配置、供应商/存储/工具/权限创建、工作区/沙箱绑定、后台 scope 和关闭 |
 | `version` 与 JSON 版本输出 | M1 | partial | 已实现独立软件包元数据 |
 | 生效配置检查 | M1 | partial | `neuro-code inspect`；已实现隐藏密钥的 Python 视图 |
 | 命名供应商 profile 与选择 | M2/M3 | partial | 已实现四种显式线路协议、默认/单次选择、旧 TOML 兼容、脱敏的 `providers list/inspect`，以及带 `/provider`、`/model` 和 Ctrl+P 的 TUI 已配置 profile 选择器；远程模型目录和应用内持久供应商配置编辑仍待实现 |
@@ -26,15 +26,15 @@
 | 读取/列举/grep 工具 | M2 | partial | 已实现限制在工作区内的 UTF-8 基线 |
 | 搜索/替换编辑 | M2 | partial | 已实现原子精确替换与路径边界检查 |
 | Bash 执行与取消 | M2/M3 | partial | 已实现有界前台输出、空标准输入、已配置供应商/代理凭据剥离、超时/取消清理、POSIX 进程组 TERM/KILL、失败关闭的 Windows Job Object 创建与原子 `PROC_THREAD_ATTRIBUTE_JOB_LIST` 加入/受限标准句柄继承/后代等待/整 Job 终止、会话作用域受管后台启动/快照/有界单任务与多任务事件等待/超时/幂等终止/绑定切换/应用关闭生命周期，以及带任务输出/多任务等待/终止去重的有界模型专用完成提醒；仍需显式审查后的密钥注入、完整输出文件和模型自动唤醒/自动转后台 |
-| 权限规则优先级 | M2/M3 | partial | 已实现 deny/ask/allow 优先级、逐片段检查 `&&`/`||`/`;`/管道、包装器剥离、嵌套 `bash -c`、复杂脚本失败关闭、异步单次允许/拒绝，以及仅保存在内存中的精确操作会话批准；每次审批前都会重新判定 deny，仍需持久化审查规则和完整规则/文件访问语法 |
+| 权限规则优先级 | M2/M3 | partial | 已实现 deny/ask/allow 优先级、逐片段检查 `&&`/`||`/`;`/管道、包装器剥离、嵌套 `bash -c`、复杂脚本失败关闭、异步单次允许/拒绝、仅保存在内存中的精确操作会话批准，以及每个 ACP session 独立的 `session/request_permission` 适配；本地 deny/工作区/沙箱结论始终拥有最终优先级，客户端审批前会先发送 pending 工具 update。仍需持久化审查规则和完整规则/文件访问语法 |
 | SQLite 会话事件存储 | M2/M3 | partial | 已实现 schema v4、原子且会串行处理并发初始化器的 v1/v2/v3 迁移、profile 亲和与固定沙箱元数据、稳定标题、同步 FTS5 文档、immutable 只读恢复预读、规范有序会话项持久化、消息投影、只追加前缀检查、列表、恢复、导出，以及跨平台路径别名的文件系统身份工作区匹配 |
 | 会话标题与全文搜索 | M3 | partial | 已实现首条可见用户提示的确定性十词标题、上游 `generated_title` 保留、通过 `sessions rename` 和 TUI `/rename`/`/title` 原子更新手动标题与 FTS、标题十倍权重的 SQLite FTS5、多词 AND 到 OR 回退、cwd 过滤、分页、命中字段、可选摘要、`sessions search` 和 TUI `/sessions QUERY` 工作区结果；系统消息、私有推理/原生保留项、工具参数/原始结果和图片 URL 不进入索引。模型生成标题、实时防抖搜索框及 ACP 方法仍待实现 |
 | Rust 会话导入 | M2 | partial | 已实现只读解析 v0/v1、新旧消息混排、结构化图片、有序推理/后端工具载荷、内嵌 `raw_output`/单体推理恢复与后端 ID 去重、有界损坏行恢复、SQLite 原子导入、内建沙箱 profile 与生成标题保留、自定义 profile 拒绝、前缀安全恢复、导出 v4、供应商原生图片回放、可信来源的 xAI Chat 回放，以及严格亲和的 Responses 原生加密/后端工具回放；压缩与有状态 ID 仍待实现 |
 | 全屏/精简 TUI | M3 | partial | 已实现 Textual 提示输入、带参数的斜杠命令提示/行内建议/Tab 首项补全、占满整行且明确区分的用户/助手消息块、带滚动跟随保护的原地稳定流式回答、安全助手 Markdown 与冷色语义配色、对齐的系统/状态/错误标签栏、只有一个标签且原地更新、显示有界脱敏输出/文件差异并支持单击/键盘切换详情的工具卡片、重点值着色、结构化计时、常驻且可本地化的供应商/模型/工作区/上下文占用/强度/模式栏、五级 Ctrl+E 与 `/effort`/`/reasoning` 选择、四模式 Shift+Tab 与 `/mode` 选择、通过 Ctrl+, 和 `/settings`/`/setting` 持久选择英语/简体中文应用界面、缺失 resize 事件时的视口校准、禁用冲突表情符号命令面板的纯文字搜索、持久多轮上下文、失败关闭审批、安全的已配置 profile/会话选择与历史回放/搜索/重命名、只读 `/tasks` 可见性、本地生命周期命令、Ctrl+C 运行中取消、同会话重试、调用取消结果配对、Textual 退出码传播、`finally` 监督器清理、跨平台无头生命周期测试，以及选择性运行、通过 POSIX PTY 或 Windows ConPTY 发送真实 `Ctrl+Q`、验证成对终端清理、比较完整 POSIX `termios`，并覆盖 Windows 空闲 `Ctrl+C`、resize、非零退出及可用父控制台 mode 的生产 CLI 测试；实时防抖搜索框、远程模型目录、首 token 前无痕回退/插话队列和模型完成自动唤醒仍待实现，因此 M3 尚未完成 |
 | Markdown/Mermaid/媒体渲染 | M3/M5 | partial | 助手 Markdown 使用应用自有语义主题，不把模型文本解释为 Rich/Textual markup，并禁用链接点击；已渲染标题、强调、代码、列表、链接和表格。工具输出与差异使用应用赋予样式的字面文本。Mermaid 和内嵌媒体仍待实现 |
-| PTY 与进程树对齐 | M3/M4 | partial | 前台/后台命令共享受控 `ProcessTree`；POSIX 会等待仍存活的进程组，Windows 则在关闭即终止的 Job Object 中原子创建入口、限制继承的标准句柄、在入口退出后等待后代，并使用基于句柄的整树终止。新的共享交互式终端领域/端口和管理器提供有界且按游标寻址的尾部输出、显式截断、输入/resize/信号/等待/关闭、权限/工作区/沙箱门禁、取消安全创建与注册表关闭。POSIX 会话持有 PTY 进程组；生产 Windows 会话原子组合 ConPTY 与 Job 列表属性，并终止整个 Job。可移植属性/句柄/错误测试、真实 Linux PTY 测试、原生进程树测试和选择性三平台 CLI 终端冒烟覆盖该边界。ACP 协议暴露、framing 与背压仍待实现 |
+| PTY 与进程树对齐 | M3/M4 | partial | 前台/后台命令共享受控 `ProcessTree`；POSIX 会等待仍存活的进程组，Windows 则在关闭即终止的 Job Object 中原子创建入口、限制继承的标准句柄、在入口退出后等待后代，并使用基于句柄的整树终止。新的共享交互式终端领域/端口和管理器提供有界且按游标寻址的尾部输出、显式截断、输入/resize/信号/等待/关闭、权限/工作区/沙箱门禁、取消安全创建与注册表关闭。POSIX 会话持有 PTY 进程组；生产 Windows 会话原子组合 ConPTY 与 Job 列表属性，并终止整个 Job。可移植属性/句柄/错误测试、真实 Linux PTY 测试、原生进程树测试和选择性三平台 CLI 终端冒烟覆盖该边界。partial ACP 核心仍不调用客户端 `terminal/*`，也未暴露交互式 PTY framing/背压 |
 | 操作系统沙箱配置 | M3 | partial | 已实现规范的 `off`/`workspace`/`read-only`/`strict` 配置与 CLI 覆盖、防止项目弱化用户 profile、Linux bubblewrap 整进程文件系统强制、挂载校验、只读编辑 schema/运行时门禁、仅限子进程的网络命名空间、可信辅助程序检查、不支持平台的失败关闭，以及会话固定 profile 保存/恢复冲突检测；自定义 profile、`devbox`、deny glob、Landlock/Seatbelt 与 Windows 强制仍待实现 |
-| ACP stdio/WebSocket | M4 | planned | `xai-acp-lib`、pager/shell ACP 模块 |
+| ACP stdio/WebSocket | M4 | partial | 已通过官方 `agent-client-protocol==0.11.0` stdio SDK 实现协议版本协商、客户端能力/info 保存、绑定工作区且稳定的 ACP ID 与按需 ACP-to-SQLite-ID 映射、`session/new`、保持顺序且有界的 Text/ResourceLink 提示转换、文本/工具/usage 流 update、失败关闭权限请求、同 session 单活动 prompt 与跨 session 并行、静默 cancel notification、不删除历史的 close，以及 EOF/断连清理。只声明 `sessionCapabilities.close = {}`。非空 `mcpServers` 和 `additionalDirectories` 会被拒绝。Load/list/resume/delete/fork、MCP、图片/音频/embedded content、客户端 `fs/*`/`terminal/*`、WebSocket 和扩展仍不支持。SDK 0.11 需要打开其 unstable router 门才能暴露 `session/close`，会忽略 malformed JSON frame，也会接受错误的入站 `jsonrpc` 版本再输出规范化 2.0 响应；生产实现不会用自制调度器掩盖这些 SDK 行为 |
 | MCP 服务器 | M4 | planned | MCP 生命周期与传输实现 |
 | 技能与 AGENTS.md | M4 | planned | 代理提示词/发现机制及用户指南 |
 | 钩子与插件 | M4 | planned | 钩子和插件市场 crate |
