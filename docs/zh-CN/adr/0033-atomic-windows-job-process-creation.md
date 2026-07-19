@@ -51,8 +51,9 @@ Unicode 环境排序、Shell 命令边界、流投影、非零状态和全部主
   后代逃逸窗口已经消除。
 - 不支持的扩展属性、不兼容的嵌套 Job 策略或无效标准句柄继承会显式导致命令创建失败；
   不存在 `taskkill`、breakaway 或启动后回退。
-- 适配器不增加运行依赖，也可以在非 Windows 平台安全导入。原生行为仍需要 Windows CI
-  证据。
+- 适配器不增加运行依赖，也可以在非 Windows 平台安全导入。PR #6 的
+  [CI 运行 29680149723](https://github.com/amber1686855908-hash/neuro-code/actions/runs/29680149723)
+  已在 Windows 3.12 和 3.14 上成功执行原生 Job 路径。
 - 非 PTY Shell 流与 ConPTY 终端会话继续拥有各自的生命周期所有者。ADR 0034 现在会为
   生产 ConPTY 复用 Job 列表创建规则，并通过共享终端端口投影；ACP 协议暴露仍是独立能力。
 

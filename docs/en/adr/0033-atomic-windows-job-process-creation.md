@@ -67,7 +67,9 @@ background-shutdown tests now execute through this atomic launcher.
   standard-handle inheritance fail command creation visibly; there is no
   `taskkill`, breakaway, or post-launch fallback.
 - The adapter adds no runtime dependency and remains safe to import on
-  non-Windows platforms. Native behavior still requires Windows CI evidence.
+  non-Windows platforms. PR #6
+  [CI run 29680149723](https://github.com/amber1686855908-hash/neuro-code/actions/runs/29680149723)
+  executed the native Job-backed paths successfully on Windows 3.12 and 3.14.
 - Non-PTY shell streams and ConPTY terminal sessions retain separate lifecycle
   owners. ADR 0034 now reuses the Job-list creation rule for production ConPTY
   and projects it through a shared terminal port; ACP protocol exposure remains

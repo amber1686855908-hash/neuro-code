@@ -91,8 +91,9 @@ allowed.
   process they are authorizing.
 - Linux tests execute real PTY input, resize, signal and non-zero exit behavior.
   Portable fake/ctypes contracts cover Windows callbacks, Job ownership,
-  attributes and cleanup; native Windows behavior still requires Windows CI
-  evidence.
+  attributes and cleanup. PR #6
+  [CI run 29680149723](https://github.com/amber1686855908-hash/neuro-code/actions/runs/29680149723)
+  supplied successful native Windows full-suite and ConPTY smoke evidence.
 - This slice deliberately does not publish an ACP method. ACP stdio/WebSocket
   framing, session authorization and protocol-level backpressure remain the
   next M4 capability.

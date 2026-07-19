@@ -31,6 +31,11 @@ starts the hosted process with a mutable command line, a sorted Unicode
 environment block, `EXTENDED_STARTUPINFO_PRESENT`, and the pseudoconsole process
 attribute. No Windows-specific runtime package is added.
 
+The hosted `STARTUPINFO` also sets `STARTF_USESTDHANDLES` with null standard
+handle placeholders. This prevents a console-hosting parent such as a CI runner
+from leaking its own standard handles into the child while ConPTY establishes
+the hosted console connection.
+
 The adapter owns the pseudoconsole, host pipe ends, process handle, and one
 dedicated output-drain thread. Input writes handle partial progress; resize,
 wait, non-zero exit codes, explicit termination, and close are observable
@@ -81,7 +86,10 @@ byte through the PTY after observing application-mode entry.
   while remaining separate from the owner of non-PTY shell streams.
 - Native Windows results require a Windows runner. Linux development executes
   the portable API and structure contracts and reports the native tests as
-  platform skips; CI supplies the Windows execution evidence.
+  platform skips. PR #6
+  [CI run 29680149723](https://github.com/amber1686855908-hash/neuro-code/actions/runs/29680149723)
+  supplied successful Windows 3.12/3.14 full-suite and native ConPTY terminal
+  smoke evidence.
 
 The Win32 lifecycle follows Microsoft's
 [pseudoconsole session guidance](https://learn.microsoft.com/en-us/windows/console/creating-a-pseudoconsole-session)

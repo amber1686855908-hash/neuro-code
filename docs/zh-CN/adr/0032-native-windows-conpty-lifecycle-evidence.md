@@ -25,6 +25,10 @@ ConPTY 使用同步输入与输出通道。Microsoft 明确要求关闭期间在
 的 Unicode 环境块、`EXTENDED_STARTUPINFO_PRESENT` 与伪控制台进程属性启动托管进程。
 项目不会因此增加 Windows 专用运行依赖。
 
+托管进程的 `STARTUPINFO` 还会设置 `STARTF_USESTDHANDLES` 和空标准句柄占位符，避免 CI
+runner 等拥有控制台的父进程在 ConPTY 建立托管控制台连接期间把自身标准句柄泄漏给
+子进程。
+
 适配器掌控伪控制台、宿主管道端、进程句柄和一个专用输出排空线程。输入写入会处理部分
 进度；resize、等待、非零退出码、显式终止与关闭均为可观察操作。捕获结果只保留有界
 首尾，但读取线程仍会排空全部字节。每个创建阶段都有清理测试。正常关闭会先停止仍存活
@@ -62,7 +66,9 @@ POSIX 原生测试也同时得到加固：只有无头测试使用 Textual 自�
   `PROC_THREAD_ATTRIBUTE_JOB_LIST`。生产 ConPTY 现在会在同一次创建调用中组合伪控制台
   与 Job 列表属性，同时仍与非 PTY Shell 流所有者保持分离。
 - Windows 原生结果需要 Windows runner。Linux 开发环境会执行可移植 API/结构契约，并把
-  原生用例报告为平台跳过；Windows 执行证据由 CI 提供。
+  原生用例报告为平台跳过。PR #6 的
+  [CI 运行 29680149723](https://github.com/amber1686855908-hash/neuro-code/actions/runs/29680149723)
+  已提供成功的 Windows 3.12/3.14 全量测试和原生 ConPTY 终端冒烟证据。
 
 Win32 生命周期遵循 Microsoft 的
 [伪控制台会话指南](https://learn.microsoft.com/zh-cn/windows/console/creating-a-pseudoconsole-session)
