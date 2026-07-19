@@ -13,6 +13,8 @@ dist/
 .neuro-code/
 # Local manual agent/TUI scratch workspace.
 testdp/
+# Local agent handoff memory.
+/docs/agent_memory/
 .env
 .env.*
 !.env.example

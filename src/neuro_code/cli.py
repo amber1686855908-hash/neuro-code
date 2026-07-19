@@ -566,7 +566,7 @@ async def _run_tui(args: argparse.Namespace) -> int:
             cwd=config.cwd,
         )
         await app.run_async()
-        return 0
+        return app.return_code if app.return_code is not None else 0
     finally:
         await asyncio.shield(background_tasks.shutdown())
 

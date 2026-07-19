@@ -48,6 +48,17 @@ class CliProvider:
         yield ModelCompleted("stop", 2, 3)
 
 
+class BackgroundTaskSupervisorFixture:
+    def __init__(self) -> None:
+        self.shutdown_calls = 0
+
+    def open_scope(self) -> BackgroundTaskSupervisorFixture:
+        return self
+
+    async def shutdown(self) -> None:
+        self.shutdown_calls += 1
+
+
 class CliTests(unittest.TestCase):
     @staticmethod
     def _write_provider_config(state_dir: Path) -> None:
@@ -447,6 +458,8 @@ api_key_env = "FIXTURE_KEY"
             captured: dict[str, object] = {}
 
             class TuiFixture:
+                return_code: int | None = None
+
                 def __init__(
                     self,
                     runner: object,
@@ -505,6 +518,82 @@ api_key_env = "FIXTURE_KEY"
             self.assertEqual(captured["language"], UiLanguage.SIMPLIFIED_CHINESE)
             self.assertTrue(captured["ran"])
 
+    def test_tui_propagates_textual_return_code_and_shuts_down_tasks(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / "state"
+            self._write_provider_config(state)
+            supervisor = BackgroundTaskSupervisorFixture()
+
+            class TuiFixture:
+                return_code: int | None = 7
+
+                def __init__(self, *_args: object, **_kwargs: object) -> None:
+                    pass
+
+                async def run_async(self) -> None:
+                    pass
+
+            with (
+                patch.dict(
+                    "os.environ",
+                    {
+                        "HOME": str(root),
+                        "NEURO_CODE_HOME": str(state),
+                        "FIXTURE_KEY": "fixture-key",
+                    },
+                    clear=True,
+                ),
+                patch(
+                    "neuro_code.cli.LocalBackgroundTaskManager",
+                    return_value=supervisor,
+                ),
+                patch("neuro_code.cli.create_routed_provider", return_value=CliProvider()),
+                patch("neuro_code.tui.NeuroCodeApp", TuiFixture),
+            ):
+                exit_code = main(("--cwd", str(root)))
+
+            self.assertEqual(exit_code, 7)
+            self.assertEqual(supervisor.shutdown_calls, 1)
+
+    def test_tui_launch_exception_still_shuts_down_tasks(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / "state"
+            self._write_provider_config(state)
+            supervisor = BackgroundTaskSupervisorFixture()
+
+            class TuiFixture:
+                return_code: int | None = None
+
+                def __init__(self, *_args: object, **_kwargs: object) -> None:
+                    pass
+
+                async def run_async(self) -> None:
+                    raise RuntimeError("fixture TUI failure")
+
+            with (
+                patch.dict(
+                    "os.environ",
+                    {
+                        "HOME": str(root),
+                        "NEURO_CODE_HOME": str(state),
+                        "FIXTURE_KEY": "fixture-key",
+                    },
+                    clear=True,
+                ),
+                patch(
+                    "neuro_code.cli.LocalBackgroundTaskManager",
+                    return_value=supervisor,
+                ),
+                patch("neuro_code.cli.create_routed_provider", return_value=CliProvider()),
+                patch("neuro_code.tui.NeuroCodeApp", TuiFixture),
+                self.assertRaisesRegex(RuntimeError, "fixture TUI failure"),
+            ):
+                main(("--cwd", str(root)))
+
+            self.assertEqual(supervisor.shutdown_calls, 1)
+
     def test_tui_session_search_is_scoped_to_the_workspace_alias(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -543,6 +632,8 @@ api_key_env = "FIXTURE_KEY"
             captured: dict[str, object] = {}
 
             class TuiFixture:
+                return_code: int | None = None
+
                 def __init__(
                     self,
                     runner: object,
@@ -630,6 +721,8 @@ api_key_env = "SECOND_KEY"
                 return provider
 
             class TuiFixture:
+                return_code: int | None = None
+
                 def __init__(
                     self,
                     runner: object,
@@ -755,6 +848,8 @@ api_key_env = "SECOND_KEY"
             captured: dict[str, object] = {}
 
             class TuiFixture:
+                return_code: int | None = None
+
                 def __init__(
                     self,
                     runner: object,

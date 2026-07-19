@@ -90,9 +90,10 @@ guarantee a provider's internal reasoning depth, token allocation, latency, or
 cost. The policy instruction adds a small amount of request context and is
 deliberately regenerated rather than persisted.
 
-ADR 0029 subsequently adds bounded in-place tool cards. Mermaid, inline media,
-interactive card expansion, provider-native effort mapping, and workflow/
-sub-agent orchestration remain later vertical slices.
+ADR 0029 subsequently adds bounded in-place tool cards, and ADR 0030 adds
+bounded interactive detail toggling. Mermaid, inline media, provider-native
+effort mapping, and workflow/sub-agent orchestration remain later vertical
+slices.
 
 ## Compatibility note
 

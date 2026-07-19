@@ -11,6 +11,10 @@ from neuro_code.runtime.profile_conversation import (
     SessionOption,
     SessionSelectionResult,
 )
+from neuro_code.runtime.terminal_sessions import (
+    LocalInteractiveTerminalManager,
+    LocalInteractiveTerminalSession,
+)
 
 __all__ = [
     "AgentConversation",
@@ -18,6 +22,8 @@ __all__ = [
     "AgentRuntime",
     "ConversationBinding",
     "InteractionModeSelectionResult",
+    "LocalInteractiveTerminalManager",
+    "LocalInteractiveTerminalSession",
     "ProfileConversationController",
     "ProviderOption",
     "ProviderSelectionResult",

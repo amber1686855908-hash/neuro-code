@@ -483,6 +483,52 @@ class LocalBackgroundTaskManagerTests(unittest.IsolatedAsyncioTestCase):
             await manager.shutdown()
             await self._assert_process_stopped(child_pid)
 
+    @unittest.skipUnless(os.name == "nt", "native Windows Job Object required")
+    async def test_windows_shutdown_terminates_atomically_owned_descendant(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            gate = root / "spawn-descendant"
+            started = root / "descendant-started"
+            leaked = root / "descendant-leaked"
+            child_code = (
+                "import pathlib,time;"
+                f"pathlib.Path({str(started)!r}).write_text('started');"
+                "time.sleep(1);"
+                f"pathlib.Path({str(leaked)!r}).write_text('leaked')"
+            )
+            parent_code = (
+                "import pathlib,subprocess,sys,time;"
+                f"gate=pathlib.Path({str(gate)!r});"
+                "deadline=time.monotonic()+5;"
+                "\nwhile not gate.exists() and time.monotonic()<deadline: time.sleep(0.01);"
+                "\nif not gate.exists(): raise SystemExit(2)\n"
+                f"subprocess.Popen([sys.executable,'-c',{child_code!r}]);"
+                "time.sleep(60)"
+            )
+            manager = LocalBackgroundTaskManager()
+            try:
+                await manager.start_exec(
+                    sys.executable,
+                    ("-c", parent_code),
+                    display_command="Windows Job Object descendant fixture",
+                    cwd=root,
+                    env=os.environ,
+                    output_byte_limit=2_000,
+                    termination_grace_seconds=0.05,
+                )
+                gate.write_text("go", encoding="utf-8")
+                for _ in range(500):
+                    if started.exists():
+                        break
+                    await asyncio.sleep(0.01)
+                self.assertTrue(started.exists())
+
+                await manager.shutdown()
+                await asyncio.sleep(1.25)
+                self.assertFalse(leaked.exists())
+            finally:
+                await manager.shutdown()
+
     async def _assert_process_stopped(self, pid: int) -> None:
         def running() -> bool:
             try:

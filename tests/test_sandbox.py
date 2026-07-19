@@ -73,6 +73,12 @@ class LinuxBubblewrapSandboxTests(unittest.TestCase):
             with mock.patch.object(sandbox, "verify_current_process"):
                 launch = sandbox.shell_launch("echo isolated")
             self.assertEqual(launch.arguments[:4], ("--net", "--map-root-user", "--", "/bin/sh"))
+            with mock.patch.object(sandbox, "verify_current_process"):
+                exec_launch = sandbox.exec_launch("python", ("-c", "pass"))
+            self.assertEqual(
+                exec_launch.arguments,
+                ("--net", "--map-root-user", "--", "python", "-c", "pass"),
+            )
 
     def test_strict_plan_uses_an_allowlist_root_and_remounts_it_read_only(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

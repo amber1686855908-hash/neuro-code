@@ -57,6 +57,18 @@ uv run neuro-code
 会校准真实 TTY 单元格尺寸，因此最大化或缩放窗口会重绘整个视口，不会把旧画布留在
 左上角。
 
+选择性运行的生产 CLI 冒烟测试现在会发送真实终端输入，而不是依赖无头按键 hook。
+Linux/macOS 使用标准库 PTY，Windows 使用标准库 `ctypes` ConPTY 适配器。Windows 路径
+覆盖空闲 `Ctrl+C`、`Ctrl+Q`、resize、零/非零退出、有界输出、控制台句柄可用时的父 mode
+保持，以及备用屏幕、光标和 focus tracking 按顺序清理。详见
+[ADR 0032](adr/0032-native-windows-conpty-lifecycle-evidence.md)。
+
+可复用的交互式终端底座现在位于这些原生适配器之上，提供带显式丢弃计数的有界游标输出、
+原始输入、resize、信号、等待和关闭；权限、工作区和任何已配置沙箱检查通过前不会启动。
+POSIX 持有完整 PTY 进程组，Windows 则把 ConPTY 入口原子创建到关闭即终止的 Job 中。
+ACP 协议暴露仍待实现。详见
+[ADR 0034](adr/0034-bounded-owned-interactive-terminal-sessions.md)。
+
 用户提示显示为占满整行的低对比度块，助手输出使用独立回答块，不再依靠 `You:` 与
 `Assistant:` 日志前缀区分。每条流式回答只在对话流中挂载一次，后续增量直到最终文本都
 原地更新，因此完成时不会再从临时区域移动到滚动记录；用户主动向上滚动后也不会被强制
@@ -70,7 +82,8 @@ uv run neuro-code
 的调用/权限/结果卡片并显示耗时；整轮完成后会在最终回答下方显示总耗时。完成后的卡片会
 显示真实工具输出经过控制字符清理、凭据脱敏和长度限制后的预览。带副作用的本地工具还会
 按调用显示有界的工作区变更、文件路径和统一文本差异；敏感、二进制、过大、依赖、缓存及
-版本库内部内容保持隐藏。当前切片尚不包含 Mermaid、内嵌媒体和交互式展开/折叠控件。
+版本库内部内容保持隐藏。卡片默认展开这些安全详情，可通过单击，或聚焦后按 `Enter`/
+`Space` 原地收起和重新展开；摘要与终态始终可见。当前切片尚不包含 Mermaid 和内嵌媒体。
 
 提示框上方常驻一行运行信息，显示当前供应商与模型、压缩后的工作目录、上下文窗口占用、
 请求的思考强度和交互模式。
@@ -192,9 +205,13 @@ profile 切换、进程内会话恢复、重启或启动恢复。切换绑定会
 在 TUI 中使用 `/tasks` 可以只读查看当前绑定的任务 ID、状态、退出码、有界输出大小和开始
 时间。每个任务进入终态时，TUI 会发出一次本地通知，但不会打印命令文本或原始输出。
 `/tasks` 不能终止任务；应让模型使用 `kill_task`，使该操作继续经过权限/审批策略。应优先
-使用 `is_background=true`，而不是在 Shell 内部追加 `&`；完整的跨平台后代进程所有权仍需
-Windows Job Object 支持。详见
-[ADR 0021](adr/0021-owned-background-shell-tasks.md) 和
+使用 `is_background=true`，而不是在 Shell 内部追加 `&`。Windows 上每个 `ProcessTree`
+都会掌控一个关闭即终止的 Job Object，通过 `CreateProcessW` 在创建时原子加入入口进程，
+并在入口退出后继续等待后代；如果扩展创建无法维持该边界，命令启动会显式失败。子进程只
+继承显式句柄列表中的空输入和输出管道句柄。详见
+[ADR 0021](adr/0021-owned-background-shell-tasks.md)、
+[ADR 0031](adr/0031-fail-closed-windows-job-objects.md)、
+[ADR 0033](adr/0033-atomic-windows-job-process-creation.md) 和
 [ADR 0022](adr/0022-session-scoped-background-task-visibility.md)。多任务等待语义由
 [ADR 0024](adr/0024-event-driven-multi-background-task-wait.md) 定义。
 

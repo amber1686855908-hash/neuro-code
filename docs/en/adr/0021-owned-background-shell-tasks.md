@@ -53,14 +53,16 @@ operating system's pipe order. Provider and proxy credentials are stripped
 before both foreground and background launches, and sandboxed launches use the
 same `ShellSandbox` plan.
 
-`ProcessTree.wait` waits for the direct child and, on POSIX, the owned process
-group. This keeps a shell command containing an internal background operator
-owned even after its shell leader exits. Explicit timeout, `kill_task`,
-cancellation while a launch is in flight, and manager shutdown use the existing
-bounded TERM-to-KILL sequence. Headless shutdown and TUI exit always call
-supervisor shutdown. Switching a TUI provider profile or session closes the
-previous conversation scope after the new binding has been validated. No task
-is deliberately detached from its conversation or application.
+`ProcessTree.wait` waits for the direct child and then the owned POSIX process
+group or Windows Job Object. This keeps a shell command containing an internal
+background operator owned even after its shell leader exits. POSIX explicit
+timeout, `kill_task`, cancellation while a launch is in flight, and manager
+shutdown use the existing bounded TERM-to-KILL sequence; Windows uses immediate
+whole-Job termination with kill-on-close as a backstop. Headless shutdown and
+TUI exit always call supervisor shutdown. Switching a TUI provider profile or
+session closes the previous conversation scope after the new binding has been
+validated. No task is deliberately detached from its conversation or
+application.
 
 ## Consequences
 
@@ -81,9 +83,10 @@ is deliberately detached from its conversation or application.
 - ACP PTY create/input/resize/ring-buffer/close behavior remains separate. It
   will build on the process-ownership boundary rather than changing this tool
   contract.
-- Windows still needs Job Object ownership for full descendant-wait and kill
-  parity; the existing process-group and `taskkill /T /F` fallback remains
-  partial.
+- Windows Job Object ownership and failure behavior are specified by
+  [ADR 0031](0031-fail-closed-windows-job-objects.md); atomic creation-time Job
+  assignment and restricted standard-handle inheritance are specified by
+  [ADR 0033](0033-atomic-windows-job-process-creation.md).
 
 Source evidence is the historical Bash, task-output, kill-task, local-terminal,
 and background-task user-guide behavior at the pinned commit.

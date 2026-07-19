@@ -20,6 +20,7 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding, BindingType
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.geometry import Size
+from textual.message import Message as TextualMessage
 from textual.screen import ModalScreen
 from textual.suggester import Suggester
 from textual.theme import Theme
@@ -243,6 +244,7 @@ class ToolFeedbackState:
     is_error: bool = False
     metadata: dict[str, Any] | None = None
     workspace_changes: dict[str, Any] | None = None
+    expanded: bool = True
 
 
 class AssistantMarkdown(Markdown):
@@ -287,6 +289,34 @@ class ConversationMessage(Static):
 
     def set_pending(self, pending: bool) -> None:
         self.set_class(pending, "message-pending")
+
+
+class ToolFeedbackMessage(ConversationMessage, can_focus=True):
+    """A stable tool card whose already-bounded details can be toggled."""
+
+    BINDINGS: ClassVar[list[BindingType]] = [
+        Binding("enter", "toggle_details", "Toggle details", show=False),
+        Binding("space", "toggle_details", "Toggle details", show=False),
+    ]
+
+    class ToggleRequested(TextualMessage):
+        """Request that the owning app toggle one tool card."""
+
+        def __init__(self, card: ToolFeedbackMessage) -> None:
+            self.card = card
+            super().__init__()
+
+    def __init__(self, rendered: RenderableType, *, entry_index: int) -> None:
+        super().__init__("tool", rendered)
+        self.entry_index = entry_index
+
+    async def _on_click(self, event: events.Click) -> None:
+        event.stop()
+        self.focus()
+        self.post_message(self.ToggleRequested(self))
+
+    def action_toggle_details(self) -> None:
+        self.post_message(self.ToggleRequested(self))
 
 
 class SettingsScreen(ModalScreen[UiLanguage | None]):
@@ -981,6 +1011,12 @@ class NeuroCodeApp(App[None]):
         color: #78c2a4;
     }
 
+    .message-tool.tool-interactive:hover,
+    .message-tool.tool-interactive:focus {
+        background: #161a1c;
+        border-left: solid #5866a3;
+    }
+
     .message-status {
         padding: 0 1;
         color: #8e939a;
@@ -1305,6 +1341,20 @@ class NeuroCodeApp(App[None]):
         if event.input.id == "prompt" and event.input.screen is self.screen:
             self._refresh_command_hints(event.value)
 
+    def on_tool_feedback_message_toggle_requested(
+        self,
+        event: ToolFeedbackMessage.ToggleRequested,
+    ) -> None:
+        state = self._tool_feedback_by_entry.get(event.card.entry_index)
+        if state is None or not self._tool_details_available(
+            state,
+            self._tool_change_report(state),
+        ):
+            return
+        state.expanded = not state.expanded
+        self._refresh_tool_feedback(state)
+        event.card.focus()
+
     def action_complete_slash_command(self) -> None:
         if isinstance(self.screen, ModalScreen):
             self.screen.focus_next()
@@ -1503,8 +1553,7 @@ class NeuroCodeApp(App[None]):
         self._tool_feedback_by_call[(hosted, call_id)] = state
         self._tool_feedback_by_entry[state.entry_index] = state
         content = self._tool_feedback_body(state).plain
-        self._write_entry("tool", content)
-        self._entry_widgets[state.entry_index].update(self._render_tool_feedback(state))
+        self._write_entry("tool", content, tool_state=state)
         return state
 
     def _find_or_start_tool_feedback(
@@ -1549,7 +1598,10 @@ class NeuroCodeApp(App[None]):
         follow = transcript.is_vertical_scroll_end
         body = self._tool_feedback_body(state)
         self._entries[state.entry_index] = TranscriptEntry("tool", body.plain)
-        self._entry_widgets[state.entry_index].update(self._render_tool_feedback(state, body=body))
+        widget = self._entry_widgets[state.entry_index]
+        widget.update(self._render_tool_feedback(state, body=body))
+        if isinstance(widget, ToolFeedbackMessage):
+            self._configure_tool_feedback_widget(widget, state)
         if follow:
             transcript.scroll_end(animate=False)
 
@@ -1668,10 +1720,25 @@ class NeuroCodeApp(App[None]):
                 )
 
         change_report = self._tool_change_report(state)
+        details_available = self._tool_details_available(state, change_report)
         if state.content is not None and (state.content or change_report is None):
-            self._append_tool_output(body, state)
+            self._append_tool_output(body, state, expanded=state.expanded)
         if change_report is not None:
-            self._append_tool_changes(body, change_report)
+            self._append_tool_changes(body, change_report, expanded=state.expanded)
+        if details_available:
+            self._append_tool_line(
+                body,
+                "├",
+                ui_text(
+                    self._language,
+                    (
+                        "tool.card.details_expanded"
+                        if state.expanded
+                        else "tool.card.details_collapsed"
+                    ),
+                ),
+                style="#8b9cff",
+            )
 
         if state.phase == "running":
             self._append_tool_line(
@@ -1726,7 +1793,51 @@ class NeuroCodeApp(App[None]):
     def _known_approval_outcome(outcome: str) -> str:
         return outcome if outcome in {"allow_once", "allow_session", "deny"} else "unknown"
 
-    def _append_tool_output(self, body: Text, state: ToolFeedbackState) -> None:
+    @classmethod
+    def _tool_details_available(
+        cls,
+        state: ToolFeedbackState,
+        change_report: Mapping[str, Any] | None,
+    ) -> bool:
+        if state.content is not None and cls._safe_tool_text(state.content).strip():
+            return True
+        if change_report is None:
+            return False
+        raw_files = change_report.get("files")
+        if not isinstance(raw_files, Sequence) or isinstance(raw_files, str | bytes):
+            return False
+        return any(
+            isinstance(change, Mapping)
+            and isinstance(change.get("diff"), str)
+            and bool(cls._safe_tool_text(change["diff"]).strip())
+            for change in raw_files
+        )
+
+    def _configure_tool_feedback_widget(
+        self,
+        widget: ToolFeedbackMessage,
+        state: ToolFeedbackState,
+    ) -> None:
+        available = self._tool_details_available(state, self._tool_change_report(state))
+        widget.can_focus = available
+        widget.set_class(available, "tool-interactive")
+        widget.set_class(available and state.expanded, "tool-expanded")
+        widget.tooltip = (
+            ui_text(
+                self._language,
+                ("tool.card.details_expanded" if state.expanded else "tool.card.details_collapsed"),
+            )
+            if available
+            else None
+        )
+
+    def _append_tool_output(
+        self,
+        body: Text,
+        state: ToolFeedbackState,
+        *,
+        expanded: bool,
+    ) -> None:
         content = state.content or ""
         lines, total_lines, omitted_lines, truncated = self._bounded_tool_preview(content)
         if not lines:
@@ -1746,6 +1857,8 @@ class NeuroCodeApp(App[None]):
             heading,
             style="#d58b8b" if state.is_error else "#9aa3b2",
         )
+        if not expanded:
+            return
         for line in lines:
             body.append("\n│   ", style="#505860")
             body.append(line, style="#c5c9ce")
@@ -1867,7 +1980,13 @@ class NeuroCodeApp(App[None]):
                 }
         return None
 
-    def _append_tool_changes(self, body: Text, report: Mapping[str, Any]) -> None:
+    def _append_tool_changes(
+        self,
+        body: Text,
+        report: Mapping[str, Any],
+        *,
+        expanded: bool,
+    ) -> None:
         raw_files = report.get("files")
         if not isinstance(raw_files, Sequence) or isinstance(raw_files, str | bytes):
             return
@@ -1890,7 +2009,7 @@ class NeuroCodeApp(App[None]):
             body.highlight_words((path,), style="bold #8ed1e6", case_sensitive=True)
 
             raw_diff = change.get("diff")
-            if isinstance(raw_diff, str) and raw_diff:
+            if expanded and isinstance(raw_diff, str) and raw_diff:
                 diff_lines, _, omitted, truncated = self._bounded_tool_preview(raw_diff)
                 for line in diff_lines:
                     body.append("\n│   ", style="#505860")
@@ -2657,17 +2776,26 @@ class NeuroCodeApp(App[None]):
         *,
         ui_key: str | None = None,
         ui_values: tuple[tuple[str, object], ...] = (),
+        tool_state: ToolFeedbackState | None = None,
     ) -> None:
         entry = TranscriptEntry(category, content, ui_key, ui_values)
-        widget = ConversationMessage(
-            category,
-            self._render_entry(
+        if tool_state is not None:
+            tool_widget = ToolFeedbackMessage(
+                self._render_tool_feedback(tool_state),
+                entry_index=tool_state.entry_index,
+            )
+            self._configure_tool_feedback_widget(tool_widget, tool_state)
+            widget: ConversationMessage = tool_widget
+        else:
+            widget = ConversationMessage(
                 category,
-                content,
-                ui_key=ui_key,
-                ui_values=ui_values,
-            ),
-        )
+                self._render_entry(
+                    category,
+                    content,
+                    ui_key=ui_key,
+                    ui_values=ui_values,
+                ),
+            )
         transcript = self.query_one("#transcript", VerticalScroll)
         follow = transcript.is_vertical_scroll_end
         pending = self._pending_assistant
@@ -2919,6 +3047,8 @@ class NeuroCodeApp(App[None]):
                 body = self._tool_feedback_body(tool_state)
                 self._entries[index] = TranscriptEntry("tool", body.plain)
                 widget.update(self._render_tool_feedback(tool_state, body=body))
+                if isinstance(widget, ToolFeedbackMessage):
+                    self._configure_tool_feedback_widget(widget, tool_state)
                 continue
             if entry.ui_key is not None:
                 content = ui_text(
@@ -2960,5 +3090,6 @@ __all__ = [
     "SessionSelectionScreen",
     "SettingsScreen",
     "TaskController",
+    "ToolFeedbackMessage",
     "TranscriptEntry",
 ]

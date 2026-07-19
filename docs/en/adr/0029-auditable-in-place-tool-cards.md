@@ -72,8 +72,9 @@ concurrent external write can be attributed to the same interval; changes in
 excluded or over-budget paths may be reported without content or missed after a
 scan limit. Background commands can change files after their start call has
 returned, so those later changes are not part of the launch card. Interactive
-expansion, durable full tool transcripts, and checkpoint-grade rollback remain
-future vertical slices.
+expansion is specified by
+[ADR 0030](0030-bounded-interactive-tool-card-details.md); durable full tool
+transcripts and checkpoint-grade rollback remain future vertical slices.
 
 ## Verification
 

@@ -73,6 +73,7 @@ markers = [
   "contract: shared adapter contract tests",
   "differential: tests that compare the Rust oracle",
   "live: opt-in tests that require external credentials, network access, and may incur charges",
+  "terminal: opt-in tests that require a native terminal or PTY",
 ]
 
 [tool.coverage.run]

@@ -56,7 +56,9 @@ This decision did not originally add Markdown, Mermaid, media, or rich tool-card
 rendering. [ADR 0027](0027-semantic-tui-and-application-reasoning-effort.md)
 subsequently adds safe semantic Markdown for assistant text, and
 [ADR 0029](0029-auditable-in-place-tool-cards.md) adds bounded in-place tool
-cards. Mermaid, media, and interactive card expansion remain separate slices.
+cards. [ADR 0030](0030-bounded-interactive-tool-card-details.md) subsequently
+adds bounded expansion/collapse controls; Mermaid and media remain separate
+slices.
 
 ## Historical source evidence
 

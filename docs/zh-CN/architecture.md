@@ -95,8 +95,9 @@ Web 控制台后端。纯云端能力必须通过显式适配器接入；不可�
 本地系统、状态、工具和错误记录统一使用两列表格：固定宽度标签栏配合可折行正文。
 颜色由供应商、模型、工具、会话、路径、结果、耗时、模式、强度和错误等语义值类型决定，
 而不是由任意载荷 markup 决定。工具输出与差异使用应用赋予样式的字面 `Text`，绝不会把
-载荷当作 markup。Mermaid、媒体和交互式卡片展开仍在该渲染器边界之外。详见
-[ADR 0027](adr/0027-semantic-tui-and-application-reasoning-effort.md)。
+载荷当作 markup。有界详情可以聚焦并收起或展开，且不会获取新数据；详见
+[ADR 0030](adr/0030-bounded-interactive-tool-card-details.md)。Mermaid 与媒体仍在该渲染器
+边界之外。另见 [ADR 0027](adr/0027-semantic-tui-and-application-reasoning-effort.md)。
 
 应用自有 TUI 文案通过 `UiLanguage` 选择。注入的 `UiPreferencesStore` 端口持久化界面
 语言、请求的思考强度和交互模式；JSON 适配器使用与供应商配置分离、原子写入且仅用户可访问的状态
@@ -117,6 +118,27 @@ token 元数据时，运行时发出 `CONTEXT_USAGE_UPDATED`，并用供应商�
 时，TUI 的高优先级 Tab 动作才会应用第一项候选；模态框焦点切换保持原行为。在全屏终端
 模式中，低频视口校准会读取真实 TTY 尺寸，并且只在当前 Screen 尺寸过期时发送正常的
 Textual resize 事件；无头测试、行内模式和 Web 模式不会安装该兜底。
+
+Textual 的平台驱动持有 raw/应用模式并负责恢复终端状态；应用不会重复持有转义序列或
+`termios`。`run_async` 返回后，CLI 传播 Textual 的公开 `return_code`；组合根则通过
+`finally` 在正常退出、Textual 非零结果或启动异常时关闭后台任务监督器。选择性运行的生产
+CLI 冒烟测试会在 Linux/macOS 标准库 PTY 与 Windows ConPTY 中发送真实 `Ctrl+Q`，且不
+提交模型提示。测试验证备用屏幕、光标与 focus tracking 按顺序退出；POSIX 还会比较完整
+`termios`，Windows 则覆盖 resize、空闲 `Ctrl+C`、非零退出码保持，以及任何可用父控制台
+mode 的比较。私有标准库 `windows_conpty` 适配器掌控同步管道、扩展进程创建、有界捕获和
+一个在 `ClosePseudoConsole` 期间继续工作的专用输出排空线程。详见
+[ADR 0032](adr/0032-native-windows-conpty-lifecycle-evidence.md)。该进程边界沿用固定历史
+基线中只读 `crates/codegen/xai-grok-pager/tests/pty_e2e_minimal.rs` 的行为证据，但不复制其
+Rust 实现。
+
+原生适配器之上，`LocalInteractiveTerminalManager` 实现共享
+`InteractiveTerminalManager` 端口。创建必须在启动前依次经过权限、工作区和匹配沙箱
+检查；线程安全的有界尾部环形缓冲通过单调输出游标暴露准确丢弃字节数，输入、resize、
+信号、等待和关闭共享同一条受控生命周期。POSIX 作用于完整 PTY 进程组；生产 Windows
+ConPTY 创建会原子组合伪控制台与 Job 列表属性，终止/关闭作用于整个 Job。取消会等待进行中
+的原生创建并关闭任何返回的所有者；shutdown 会等待创建中会话并关闭全部注册会话。在
+协议 framing、授权和背压定义完成前，该基础有意不通过 ACP 暴露。详见
+[ADR 0034](adr/0034-bounded-owned-interactive-terminal-sessions.md)。
 
 运行时计时使用单调时钟。`MODEL_THINKING_COMPLETED` 测量每个模型步骤从发出请求到首个
 可见或可行动结果的时间，并不宣称能够读取供应商私有推理遥测。工具终态事件携带耗时，
@@ -206,6 +228,10 @@ TUI 通过 `Ctrl+E`、`/effort` 和 `/reasoning` 暴露选择，CLI 则使用 `-
   的进程树。
 - `BackgroundTaskManager`：在单个会话作用域内启动受控 Shell/exec 进程树，并提供有界
   快照/单任务或多任务等待/终止及待报告完成确认操作。
+- `InteractiveTerminalManager`：创建经过权限、工作区与沙箱门禁的有界交互式 exec
+  会话，并持有其关闭生命周期。
+- `TerminalPlatform`：在一个同步适配器端口后统一 POSIX PTY 或 Windows ConPTY/Job 的
+  输入、输出、resize、信号、等待和关闭行为。
 - `PermissionManager`：在任何副作用之前返回 allow、deny 或 ask。
 - `PermissionApprover`：可选地异步解决 `ask`，但不能覆盖策略拒绝。
 - `SessionStore`：追加带版本事件、保留有序 `SessionItem`，提供规范序列与普通消息
@@ -367,9 +393,16 @@ Linux、macOS 和 Windows 都是一等 CI 目标。平台专属代码隔离在�
 [ADR 0020](adr/0020-session-fixed-sandbox-profiles.md)。
 
 前台和受管后台 Shell 命令共享 `ProcessTree`。POSIX 等待会在 Shell 入口退出后继续观察
-受控进程组；终止使用有界 TERM→KILL 序列。Windows 目前仍使用进程组加
-`taskkill /T /F`，完整对齐还需要 Job Object 所有权。详见
-[ADR 0021](adr/0021-owned-background-shell-tasks.md) 和
+受控进程组；终止使用有界 TERM→KILL 序列。Windows 上的惰性 ctypes 平台适配器会在
+启动进程前创建关闭即终止的 Job Object，通过 `PROC_THREAD_ATTRIBUTE_JOB_LIST` 传入借用
+句柄，并创建一个已经属于该 Job 的入口进程。同一次 `STARTUPINFOEXW` 调用还通过
+`PROC_THREAD_ATTRIBUTE_HANDLE_LIST` 把继承范围限制为空输入与选定输出管道句柄。独立的
+读取和等待线程会把同步 Win32 句柄投影到现有 `asyncio.StreamReader` 与进程等待契约，
+不依赖 asyncio 私有 transport。创建、属性、管道、等待、记账和关闭失败都会失败关闭；
+系统不会用 `taskkill`、挂起进程竞态或 breakaway 回退弱化宿主约束。详见
+[ADR 0021](adr/0021-owned-background-shell-tasks.md)、
+[ADR 0031](adr/0031-fail-closed-windows-job-objects.md)、
+[ADR 0033](adr/0033-atomic-windows-job-process-creation.md) 和
 [ADR 0022](adr/0022-session-scoped-background-task-visibility.md)。面向模型的完成元数据由
 [ADR 0023](adr/0023-model-visible-background-task-completion-reminders.md) 定义，事件驱动的
 多任务等待由 [ADR 0024](adr/0024-event-driven-multi-background-task-wait.md) 定义。

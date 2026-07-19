@@ -37,11 +37,24 @@ from neuro_code.domain.model_events import (
 from neuro_code.domain.reasoning import ReasoningEffort, reasoning_guidance
 from neuro_code.domain.session_search import SessionSearchHit, SessionSearchPage
 from neuro_code.domain.sessions import SessionSnapshot, SessionSummary
+from neuro_code.domain.terminal import (
+    MAX_TERMINAL_DIMENSION,
+    MAX_TERMINAL_OUTPUT_BYTES,
+    MAX_TERMINAL_READ_BYTES,
+    MAX_TERMINAL_WRITE_BYTES,
+    TerminalOutputChunk,
+    TerminalSignal,
+    TerminalSize,
+)
 from neuro_code.domain.tools import ToolDefinition, ToolResult
 from neuro_code.domain.ui_preferences import UiLanguage
 
 __all__ = [
     "MAX_BACKGROUND_TASK_WAIT_IDS",
+    "MAX_TERMINAL_DIMENSION",
+    "MAX_TERMINAL_OUTPUT_BYTES",
+    "MAX_TERMINAL_READ_BYTES",
+    "MAX_TERMINAL_WRITE_BYTES",
     "AgentEvent",
     "AgentEventKind",
     "BackgroundTaskKillOutcome",
@@ -73,6 +86,9 @@ __all__ = [
     "SessionSearchPage",
     "SessionSnapshot",
     "SessionSummary",
+    "TerminalOutputChunk",
+    "TerminalSignal",
+    "TerminalSize",
     "ToolCall",
     "ToolDefinition",
     "ToolResult",
