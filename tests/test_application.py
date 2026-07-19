@@ -19,6 +19,7 @@ from neuro_code.ports.background_tasks import (
     BackgroundTaskSupervisor,
 )
 from neuro_code.ports.model import ModelProvider
+from neuro_code.workspace import workspaces_match
 
 
 class ApplicationProviderFixture:
@@ -124,7 +125,7 @@ api_key_env = "FIXTURE_KEY"
                 )
                 binding = await application.create_binding(reasoning_effort=ReasoningEffort.LOW)
                 self.assertEqual(binding.runner.reasoning_effort, ReasoningEffort.LOW)
-                self.assertEqual(application.config.cwd, root)
+                self.assertTrue(workspaces_match(application.config.cwd, root))
                 self.assertEqual(enforced[0][0], SandboxProfile.OFF)
                 await application.close()
                 await application.close()

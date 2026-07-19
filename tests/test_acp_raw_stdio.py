@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -39,6 +40,13 @@ proxy_mode = "direct"
 """,
             encoding="utf-8",
         )
+        environment = os.environ.copy()
+        environment.update(
+            {
+                "HOME": str(root),
+                "NEURO_CODE_HOME": str(state),
+            }
+        )
         process = await asyncio.create_subprocess_exec(
             sys.executable,
             "-m",
@@ -50,11 +58,7 @@ proxy_mode = "direct"
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=REPOSITORY_ROOT,
-            env={
-                "HOME": str(root),
-                "NEURO_CODE_HOME": str(state),
-                "PATH": str(Path(sys.executable).parent),
-            },
+            env=environment,
         )
         return cls(process)
 
