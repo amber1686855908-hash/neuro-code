@@ -52,6 +52,7 @@ from neuro_code.tui import (
     ReasoningEffortScreen,
     SessionSelectionScreen,
     SettingsScreen,
+    ToolFeedbackMessage,
 )
 
 
@@ -258,6 +259,14 @@ class UiPreferencesFixture:
 
     async def save_interaction_mode(self, mode: InteractionMode) -> None:
         self.saved_modes.append(mode)
+
+
+class ApprovalControllerFixture:
+    def __init__(self) -> None:
+        self.handlers: list[object | None] = []
+
+    def set_handler(self, handler: object | None) -> None:
+        self.handlers.append(handler)
 
 
 class ProfileTuiController:
@@ -508,6 +517,28 @@ def background_snapshot(
 
 
 class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
+    async def test_local_quit_skips_the_model_and_detaches_approval_handler(self) -> None:
+        runner = TuiConversation()
+        approvals = ApprovalControllerFixture()
+        app = NeuroCodeApp(
+            runner,
+            approval_controller=approvals,
+            provider_name="fixture",
+            model_name="fixture-model",
+            cwd=Path("/workspace"),
+        )
+
+        async with app.run_test(size=(80, 24)) as pilot:
+            self.assertTrue(approvals.handlers)
+            self.assertIsNotNone(approvals.handlers[-1])
+            prompt = app.query_one("#prompt", Input)
+            prompt.value = "/quit"
+            await pilot.press("enter")
+
+        self.assertEqual(runner.prompts, [])
+        self.assertEqual(app.return_code, 0)
+        self.assertIsNone(approvals.handlers[-1])
+
     async def test_neutral_theme_disables_the_builtin_emoji_command_palette(self) -> None:
         app = NeuroCodeApp(
             TuiConversation(),
@@ -1201,6 +1232,28 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("└ Completed · 125ms", card)
             self.assertNotIn("sk-fixturesecret123", card)
 
+            card_widget = app.query_one(ToolFeedbackMessage)
+            self.assertTrue(card_widget.can_focus)
+            self.assertIn("Details shown", card)
+            card_widget.focus()
+            await pilot.press("enter")
+            await pilot.pause()
+
+            collapsed_card = next(entry.text for entry in app.entries if entry.category == "tool")
+            self.assertIn("Created src/new.py (+2)", collapsed_card)
+            self.assertIn("Details hidden", collapsed_card)
+            self.assertIn("Completed · 125ms", collapsed_card)
+            self.assertNotIn("+++ b/src/new.py", collapsed_card)
+            self.assertNotIn('+print("ready")', collapsed_card)
+            self.assertNotIn("sk-fixturesecret123", collapsed_card)
+
+            self.assertTrue(await pilot.click(card_widget, offset=(12, 0)))
+            await pilot.pause()
+            expanded_card = next(entry.text for entry in app.entries if entry.category == "tool")
+            self.assertIn("+++ b/src/new.py", expanded_card)
+            self.assertIn('+print("ready")', expanded_card)
+            self.assertNotIn("sk-fixturesecret123", expanded_card)
+
             await app._settings_selected(UiLanguage.SIMPLIFIED_CHINESE)
             await pilot.pause()
             localized_card = next(entry.text for entry in app.entries if entry.category == "tool")
@@ -1208,6 +1261,7 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("新建 src/new.py", localized_card)
             self.assertIn("+2", localized_card)
             self.assertIn("完成 · 125ms", localized_card)
+            self.assertIn("已展开详细信息", localized_card)
 
     async def test_local_slash_commands_do_not_call_the_model(self) -> None:
         runner = TuiConversation()

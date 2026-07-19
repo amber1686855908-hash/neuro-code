@@ -177,6 +177,26 @@ class PermissionTests(unittest.TestCase):
 
         self.assertIsNone(request.scope_key)
 
+    def test_terminal_permission_summary_shows_command_but_not_environment_values(self) -> None:
+        request = build_permission_request(
+            "call-1",
+            "create_terminal",
+            {
+                "command": "python -m fixture",
+                "cwd": "/workspace",
+                "environment_fingerprint": "opaque-digest",
+                "rows": 24,
+                "columns": 80,
+            },
+            "interactive approval required",
+        )
+
+        self.assertIn("Create interactive terminal", request.summary)
+        self.assertIn("python -m fixture", request.summary)
+        self.assertIn("/workspace", request.summary)
+        self.assertNotIn("opaque-digest", request.summary)
+        self.assertIsNotNone(request.scope_key)
+
 
 if __name__ == "__main__":
     unittest.main()

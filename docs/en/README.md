@@ -63,6 +63,22 @@ The app also reconciles the real TTY cell size when a terminal drops its normal
 resize notification, so maximizing or resizing the window repaints the entire
 viewport instead of leaving the previous canvas at the top left.
 
+Opt-in production-CLI smoke tests now drive real terminal input rather than a
+headless key hook. Linux/macOS use a standard-library PTY; Windows uses the
+standard-library `ctypes` ConPTY adapter. The Windows path exercises idle
+`Ctrl+C`, `Ctrl+Q`, resize, zero and non-zero exits, bounded output, parent
+console-mode preservation where handles are available, and ordered teardown of
+the alternate screen, cursor, and focus tracking. See
+[ADR 0032](adr/0032-native-windows-conpty-lifecycle-evidence.md).
+
+The reusable interactive-terminal substrate now sits above those native
+adapters. It provides bounded cursor-based output with explicit drop counts,
+raw input, resize, signals, wait and close, and refuses to spawn until
+permission, workspace and any configured sandbox checks pass. POSIX owns the
+complete PTY process group; Windows creates the ConPTY leader atomically inside
+a kill-on-close Job. ACP protocol exposure remains pending. See
+[ADR 0034](adr/0034-bounded-owned-interactive-terminal-sessions.md).
+
 User prompts render as full-width muted blocks, while assistant output uses a
 separate response block without `You:`/`Assistant:` log prefixes. A streamed
 response is mounted once in the conversation and updated in place through its
@@ -82,8 +98,10 @@ reports total elapsed time after the final assistant message. Completed cards
 show bounded, control-safe, credential-redacted previews of actual tool output.
 Side-effecting local tools also report bounded per-call workspace changes with
 file paths and unified text diffs; sensitive, binary, oversized, dependency,
-cache, and version-control-internal content stays hidden. Mermaid, inline media,
-and interactive expand/collapse controls are not part of this slice.
+cache, and version-control-internal content stays hidden. Cards keep those safe
+details expanded by default and can be collapsed or reopened in place by click,
+or by focusing them and pressing `Enter`/`Space`; summaries and terminal status
+remain visible. Mermaid and inline media are not part of this slice.
 
 A persistent one-line runtime bar above the prompt shows the active provider
 and model, compact working directory, current context-window use, requested
@@ -249,9 +267,14 @@ status, exit code, bounded-output size, and start time. The TUI emits one local
 terminal-state notice per task but does not print command text or raw output.
 `/tasks` cannot terminate work: ask the model to use `kill_task` so the action
 continues through permission/approval policy. Prefer `is_background=true` to an
-inner shell `&`; full cross-platform descendant ownership still requires
-Windows Job Object support. See
+inner shell `&`. On Windows, each `ProcessTree` owns a kill-on-close Job Object,
+assigns the leader atomically during `CreateProcessW`, waits for descendants
+after the leader exits, and fails command launch if extended creation cannot
+preserve that boundary. Only the null-input and output-pipe handles in the
+explicit handle list are inherited. See
 [ADR 0021](adr/0021-owned-background-shell-tasks.md) and
+[ADR 0031](adr/0031-fail-closed-windows-job-objects.md),
+[ADR 0033](adr/0033-atomic-windows-job-process-creation.md), plus
 [ADR 0022](adr/0022-session-scoped-background-task-visibility.md). Multi-task
 wait semantics are defined by
 [ADR 0024](adr/0024-event-driven-multi-background-task-wait.md).

@@ -29,5 +29,9 @@ class SandboxError(NeuroCodeError):
     """A requested operating-system sandbox could not be enforced."""
 
 
+class TerminalError(NeuroCodeError):
+    """An interactive terminal request or owned session failed."""
+
+
 class SessionError(NeuroCodeError):
     """Session persistence or reconstruction failed."""

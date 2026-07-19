@@ -48,6 +48,19 @@ selection, rich rendering, or platform PTY behavior.
   with the active Textual screen. It posts a normal resize event only when they
   differ, recovering from missing signal or in-band resize notifications. This
   fallback is not installed for headless, inline, or web drivers.
+- Textual owns terminal application-mode setup and restoration; Neuro Code does
+  not duplicate raw-mode, alternate-screen, cursor, or focus-tracking control.
+  After `run_async` completes, the CLI propagates Textual's public
+  `return_code`, while its composition-root `finally` always shuts down the
+  background-task supervisor, including launch failures.
+- Opt-in production-CLI smoke tests send a real `Ctrl+Q` through a Python-
+  standard-library PTY on Linux/macOS and through the private stdlib ConPTY
+  adapter on Windows. Without submitting a model prompt, they verify process
+  exit codes and ordered enable/disable sequences for the alternate screen,
+  cursor visibility, and focus tracking. POSIX compares complete `termios`;
+  Windows also exercises idle `Ctrl+C`, resize, a non-zero console probe, and
+  any available parent console modes. The ConPTY lifecycle is defined by
+  [ADR 0032](0032-native-windows-conpty-lifecycle-evidence.md).
 - Raw reasoning deltas and general tool argument/result mappings are not
   rendered. A bounded useful-argument allowlist supports invocation previews;
   completed calls expose only control-safe, credential-redacted and bounded
@@ -76,8 +89,11 @@ and the application controller can be tested without importing Textual.
 
 This is partial M3 support. Remote model catalogs, provider-native effort
 mapping and workflow orchestration, pristine pre-token rewind, interjection
-queues, interactive tool-card expansion, Mermaid/media rendering, terminal-emulator smoke
-coverage, and cross-platform PTY integration remain separate vertical slices.
+queues, Mermaid/media rendering, and the public cross-platform interactive ACP
+PTY integration remain separate vertical slices. Three-platform production
+terminal smoke coverage does not implement that user-facing PTY capability or
+complete the broader remaining M3 work. Bounded interactive tool-card details were subsequently added by
+[ADR 0030](0030-bounded-interactive-tool-card-details.md).
 Recoverable in-flight cancellation is defined by
 [ADR 0016](0016-recoverable-turn-cancellation.md).
 
@@ -91,4 +107,6 @@ their crate layout is not copied:
 - `crates/codegen/xai-grok-pager/src/views/prompt_widget/mod.rs`;
 - `crates/codegen/xai-grok-pager/src/app/event_loop.rs`;
 - `crates/codegen/xai-grok-pager/src/slash/command.rs`;
-- `crates/codegen/xai-grok-pager/tests/pty_e2e_minimal.rs`.
+- `crates/codegen/xai-grok-pager/tests/pty_e2e_minimal.rs`, whose process-level
+  PTY harness establishes that terminal startup and exit restoration must be
+  tested at the executable boundary rather than inferred from headless widgets.

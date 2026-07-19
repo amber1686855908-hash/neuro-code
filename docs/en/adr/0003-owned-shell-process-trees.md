@@ -23,10 +23,14 @@ decomposed command form.
 
 `ProcessTree` is the platform adapter for shell lifecycle ownership. POSIX
 children start in a new session and the adapter signals the whole process
-group. Windows children start in a new process group and currently use the
-system `taskkill /T /F` tree fallback after a graceful attempt. The Bash tool
-drains stdout and stderr concurrently while retaining at most the configured
-byte limit per stream.
+group. Windows children start in a new process group and are atomically assigned
+to an anonymous kill-on-close Job Object by the same `CreateProcessW` call;
+waiting and termination use that stable handle rather than later PID-based tree
+discovery. The Bash tool drains stdout and stderr concurrently while retaining
+at most the configured byte limit per stream.
+[ADR 0031](0031-fail-closed-windows-job-objects.md) and
+[ADR 0033](0033-atomic-windows-job-process-creation.md) refine the Windows
+ownership, creation, and failure semantics.
 
 The permission layer uses a conservative shell lexer for simple sequences. It
 checks all `&&`, `||`, `;`, and pipe segments, both wrapped and unwrapped
@@ -43,5 +47,6 @@ headless mode.
 - Output retention is bounded independently of command output volume.
 - Some valid complex Bash scripts are conservatively denied under restrictive
   policies until a full parser and shell file-access model are added.
-- Windows Job Object ownership remains required before process-tree behavior
-  can be marked fully compatible.
+- Windows Job Object ownership starts atomically at process creation and covers
+  all descendants. Native ConPTY lifecycle evidence is covered by ADR 0032;
+  interactive ACP PTY ownership remains a separate M4 capability.

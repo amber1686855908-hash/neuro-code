@@ -42,7 +42,8 @@
 本决策最初不包含 Markdown、Mermaid、媒体或富工具卡片渲染。
 [ADR 0027](0027-semantic-tui-and-application-reasoning-effort.md) 随后为助手文本加入安全的
 语义 Markdown，[ADR 0029](0029-auditable-in-place-tool-cards.md) 随后加入有界的原地工具
-卡片。Mermaid、媒体和交互式卡片展开仍是独立切片。
+卡片，[ADR 0030](0030-bounded-interactive-tool-card-details.md) 再加入有界的展开/收起
+控件；Mermaid 和媒体仍是独立切片。
 
 ## 历史源代码证据
 

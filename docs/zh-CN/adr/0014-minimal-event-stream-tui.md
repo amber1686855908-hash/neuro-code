@@ -35,6 +35,14 @@
 - 全屏终端模式会周期比较真实 TTY 单元格尺寸与当前 Textual Screen，并且只在二者不同时
   发送正常 resize 事件，用于从缺失的信号或带内尺寸通知中恢复。无头、行内或 Web 驱动
   不安装这项兜底。
+- 终端应用模式的建立与恢复由 Textual 持有；Neuro Code 不重复控制 raw 模式、备用屏幕、
+  光标或 focus tracking。`run_async` 完成后，CLI 传播 Textual 的公开 `return_code`；组合根
+  的 `finally` 则始终关闭后台任务监督器，包括启动失败路径。
+- 选择性运行的生产 CLI 冒烟测试会通过 Linux/macOS Python 标准库 PTY 和 Windows 私有
+  标准库 ConPTY 适配器发送真实 `Ctrl+Q`。测试不提交模型提示，并验证进程退出码以及备用
+  屏幕、光标可见性和 focus tracking 的启用/禁用序列顺序。POSIX 会比较完整 `termios`；
+  Windows 还会覆盖空闲 `Ctrl+C`、resize、非零控制台探针和任何可用父控制台 mode。
+  ConPTY 生命周期由 [ADR 0032](0032-native-windows-conpty-lifecycle-evidence.md) 定义。
 - 原始推理增量以及通用工具参数/结果映射不会渲染；有界的有用参数白名单用于调用摘要。
   完成后的调用只会在 [ADR 0029](0029-auditable-in-place-tool-cards.md) 定义的稳定卡片中
   暴露经过控制字符清理、凭据脱敏和长度限制的输出/变更预览。模型步骤、工具和整轮耗时
@@ -56,8 +64,10 @@
 Textual 的无头测试 pilot 验证，应用控制器也可以在不导入 Textual 的情况下测试。
 
 这只是 M3 的部分支持。远程模型目录、供应商原生强度映射与工作流编排、首 token 前
-无痕回退、插话队列、交互式工具卡片展开、Mermaid/媒体渲染、终端模拟器冒烟覆盖以及
-跨平台 PTY 集成仍是独立的后续纵向切片。可恢复的运行中取消由
+无痕回退、插话队列、Mermaid/媒体渲染，以及面向用户公开的跨平台 ACP 交互式 PTY 集成
+仍是独立的后续纵向切片。三平台生产终端冒烟覆盖不会实现这项用户 PTY 能力，也不足以
+完成更广泛的剩余 M3 工作。有界交互式工具卡片详情随后由
+[ADR 0030](0030-bounded-interactive-tool-card-details.md) 加入。可恢复的运行中取消由
 [ADR 0016](0016-recoverable-turn-cancellation.md) 定义。
 
 ## 历史源代码证据
@@ -69,4 +79,5 @@ Textual 的无头测试 pilot 验证，应用控制器也可以在不导入 Text
 - `crates/codegen/xai-grok-pager/src/views/prompt_widget/mod.rs`；
 - `crates/codegen/xai-grok-pager/src/app/event_loop.rs`；
 - `crates/codegen/xai-grok-pager/src/slash/command.rs`；
-- `crates/codegen/xai-grok-pager/tests/pty_e2e_minimal.rs`。
+- `crates/codegen/xai-grok-pager/tests/pty_e2e_minimal.rs`；其中的进程级 PTY 夹具证明终端
+  启动与退出恢复必须在可执行文件边界测试，不能仅从无头组件测试推断。

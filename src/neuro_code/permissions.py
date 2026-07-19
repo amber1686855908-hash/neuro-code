@@ -131,6 +131,10 @@ def build_permission_request(
         command = arguments.get("command")
         summary = f"Run shell command:\n{_bounded_text(command, limit=2_000)}"
         cacheable = isinstance(command, str) and analyze_bash_command(command).complete
+    elif tool_name == "create_terminal":
+        command = _bounded_text(arguments.get("command"), limit=2_000)
+        cwd = _bounded_text(arguments.get("cwd"), limit=500)
+        summary = f"Create interactive terminal:\n{command}\nWorking directory: {cwd}"
     elif tool_name == "search_replace":
         path = _bounded_text(arguments.get("path"), limit=500)
         qualifier = (

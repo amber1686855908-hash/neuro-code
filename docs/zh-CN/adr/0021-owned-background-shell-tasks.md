@@ -40,11 +40,12 @@ Shell 入口进程，CLI 退出后还可能留下后代进程。
 预览。创建进程时把 stderr 合并到 stdout，使捕获结果遵循操作系统管道顺序。前台与后台
 启动前都会移除供应商及代理凭据；启用沙箱时也使用同一个 `ShellSandbox` 启动计划。
 
-`ProcessTree.wait` 会等待直接子进程；在 POSIX 上还会等待受控进程组。因此，即使命令内部
-使用后台运算符并且 Shell 入口先退出，该任务仍由系统掌控。显式超时、`kill_task`、启动
-仍在进行时的取消和管理器关闭都会复用已有的有界 TERM→KILL 序列。无头运行结束与 TUI
-退出一定会调用监督器关闭。切换 TUI provider profile 或会话时，会先验证新绑定，再关闭
-旧会话作用域；系统不会有意把任务从所属会话或应用中分离出去。
+`ProcessTree.wait` 会等待直接子进程，再等待受控 POSIX 进程组或 Windows Job Object。
+因此，即使命令内部使用后台运算符并且 Shell 入口先退出，该任务仍由系统掌控。POSIX 上的
+显式超时、`kill_task`、启动仍在进行时的取消和管理器关闭会复用已有的有界 TERM→KILL
+序列；Windows 则立即终止整个 Job，并以 kill-on-close 作为兜底。无头运行结束与 TUI 退出
+一定会调用监督器关闭。切换 TUI provider profile 或会话时，会先验证新绑定，再关闭旧
+会话作用域；系统不会有意把任务从所属会话或应用中分离出去。
 
 ## 影响
 
@@ -60,7 +61,8 @@ Shell 入口进程，CLI 退出后还可能留下后代进程。
   模型自动唤醒、前台自动转后台，以及与子代理共享任务命名空间仍是后续切片。
 - ACP PTY 的创建/输入/尺寸调整/环形缓冲/关闭仍是独立能力；后续会复用进程所有权边界，
   而不是改变当前工具契约。
-- Windows 仍需 Job Object 才能完整对齐后代等待与终止；当前进程组及 `taskkill /T /F`
-  回退仍属于部分支持。
+- Windows Job Object 的所有权与失败行为由
+  [ADR 0031](0031-fail-closed-windows-job-objects.md) 规定；创建时原子加入 Job 和受限
+  标准句柄继承由 [ADR 0033](0033-atomic-windows-job-process-creation.md) 规定。
 
 源证据来自固定提交中的历史 Bash、任务输出、任务终止、本地终端及后台任务用户指南行为。

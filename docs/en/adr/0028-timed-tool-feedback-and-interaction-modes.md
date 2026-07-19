@@ -65,6 +65,6 @@ the existing explicit `--always-approve` switch remains the only way to request
 unrestricted permission defaults.
 
 Durations are process-local observations and may include network scheduling,
-provider queueing, approval wait time, or streaming overhead. Interactive card
-expansion, provider-native reasoning telemetry, and an automatic safety
-classifier remain future vertical slices.
+provider queueing, approval wait time, or streaming overhead. ADR 0030
+subsequently adds bounded interactive card details; provider-native reasoning
+telemetry and an automatic safety classifier remain future vertical slices.

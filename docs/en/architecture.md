@@ -122,8 +122,11 @@ two-column grids with a fixed label gutter and a folding body. Semantic value
 classes—not arbitrary payload markup—select restrained colors for provider,
 model, tool, session, path, outcome, duration, mode, effort, and error fields.
 Tool output and diffs are literal application-styled `Text`, never payload
-markup. Mermaid, media, and interactive card expansion remain outside this
-renderer. See [ADR 0027](adr/0027-semantic-tui-and-application-reasoning-effort.md).
+markup. Bounded details are focusable and can be collapsed or expanded without
+fetching new data, as specified by
+[ADR 0030](adr/0030-bounded-interactive-tool-card-details.md). Mermaid and media
+remain outside this renderer. See
+[ADR 0027](adr/0027-semantic-tui-and-application-reasoning-effort.md).
 
 Application-owned TUI text is selected through `UiLanguage`. The injected
 `UiPreferencesStore` port persists the language, requested reasoning effort, and
@@ -158,6 +161,37 @@ focus traversal remains intact. In full-screen terminal mode, a low-frequency
 viewport reconciliation reads the actual TTY dimensions and posts the normal
 Textual resize event only when the active screen is stale. Headless tests,
 inline mode, and web mode do not install that fallback.
+
+Textual's platform driver owns raw/application mode and restores terminal state;
+the application does not duplicate escape-sequence or `termios` ownership. The
+CLI returns Textual's public `return_code` after `run_async`, and its composition
+root shuts down the background-task supervisor from a `finally` block on normal
+exit, a non-zero Textual result, or a launch exception. Opt-in production CLI
+smoke tests drive a real `Ctrl+Q` through a standard-library PTY on Linux/macOS
+and through ConPTY on Windows. They submit no model prompt and verify ordered
+alternate-screen, cursor, and focus-tracking teardown; POSIX also compares full
+`termios`, while Windows tests resize, inject idle `Ctrl+C`, preserve non-zero
+exit codes, and compare any available parent console modes. The private
+standard-library `windows_conpty` adapter owns synchronous pipes, extended
+process creation, bounded capture, and a dedicated output-drain thread that
+remains active across `ClosePseudoConsole`. See
+[ADR 0032](adr/0032-native-windows-conpty-lifecycle-evidence.md). The
+process-boundary shape follows the read-only pinned baseline evidence in
+`crates/codegen/xai-grok-pager/tests/pty_e2e_minimal.rs` without copying its Rust
+implementation.
+
+Above the native adapters, `LocalInteractiveTerminalManager` implements the
+shared `InteractiveTerminalManager` port. Creation crosses permission,
+workspace and matching-sandbox checks before spawn. A thread-safe bounded tail
+ring exposes monotonic output cursors and exact dropped-byte counts; input,
+resize, signals, wait and close share one owned lifecycle. POSIX targets the
+complete PTY process group. Production Windows ConPTY creation combines the
+pseudoconsole and Job-list attributes atomically, and terminate/close target
+the complete Job. Cancellation waits for an in-progress native creation and
+closes any resulting owner; shutdown waits for pending creations and closes all
+registered sessions. The substrate is intentionally not exposed through ACP
+until protocol framing, authorization and backpressure are defined. See
+[ADR 0034](adr/0034-bounded-owned-interactive-terminal-sessions.md).
 
 Runtime timing uses monotonic clocks. `MODEL_THINKING_COMPLETED` measures each
 model step from dispatch to the first visible/actionable result; it does not
@@ -280,6 +314,10 @@ continues to fail closed. See
 - `BackgroundTaskManager`: starts owned shell/exec trees and exposes bounded
   snapshot/single-or-multi-wait/kill and pending-completion acknowledgement
   operations within one conversation scope.
+- `InteractiveTerminalManager`: creates permission/workspace/sandbox-gated,
+  bounded interactive exec sessions and owns their shutdown.
+- `TerminalPlatform`: projects POSIX PTY or Windows ConPTY/Job input, output,
+  resize, signal, wait and close behavior behind one synchronous adapter port.
 - `PermissionManager`: returns allow, deny, or ask before any side effect.
 - `PermissionApprover`: optionally resolves an `ask` asynchronously without
   overriding policy denial.
@@ -504,9 +542,19 @@ non-`off` profiles rather than advertising unenforced behavior. See
 
 Foreground and managed-background shell commands share `ProcessTree`. POSIX
 waiting observes the owned process group after its shell leader exits, while
-termination uses a bounded TERM-to-KILL sequence. Windows still uses a process
-group plus `taskkill /T /F`; Job Object ownership is required for full parity.
-See [ADR 0021](adr/0021-owned-background-shell-tasks.md) and
+termination uses a bounded TERM-to-KILL sequence. On Windows, a lazy ctypes
+platform adapter creates a kill-on-close Job Object before process launch,
+passes its borrowed handle through `PROC_THREAD_ATTRIBUTE_JOB_LIST`, and creates
+the leader already assigned to the Job. The same `STARTUPINFOEXW` call restricts
+inheritance to null input and the selected output-pipe handles through
+`PROC_THREAD_ATTRIBUTE_HANDLE_LIST`. Dedicated reader and waiter threads project
+the synchronous Win32 handles into the existing `asyncio.StreamReader` and
+process-wait contract without a private asyncio transport. Creation, attribute,
+pipe, wait, accounting, and closure failures fail closed; no `taskkill`,
+suspended-process race, or breakaway fallback weakens host containment.
+See [ADR 0021](adr/0021-owned-background-shell-tasks.md),
+[ADR 0031](adr/0031-fail-closed-windows-job-objects.md),
+[ADR 0033](adr/0033-atomic-windows-job-process-creation.md), and
 [ADR 0022](adr/0022-session-scoped-background-task-visibility.md). Model-visible
 completion metadata is defined by
 [ADR 0023](adr/0023-model-visible-background-task-completion-reminders.md), and

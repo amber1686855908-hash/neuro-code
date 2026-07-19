@@ -274,6 +274,19 @@ class LinuxBubblewrapSandbox(ShellSandbox):
             ("--net", "--map-root-user", "--", "/bin/sh", "-c", command),
         )
 
+    def exec_launch(self, executable: str, arguments: tuple[str, ...]) -> ShellLaunch:
+        """Prepare an argv-safe child while preserving the active sandbox boundary."""
+
+        self.verify_current_process()
+        if not executable or "\x00" in executable or any("\x00" in item for item in arguments):
+            raise SandboxError("sandbox executable and arguments must not contain null bytes")
+        if self._unshare is None:
+            return ShellLaunch(executable, arguments)
+        return ShellLaunch(
+            str(self._unshare),
+            ("--net", "--map-root-user", "--", executable, *arguments),
+        )
+
 
 def create_shell_sandbox(
     profile: SandboxProfile,
