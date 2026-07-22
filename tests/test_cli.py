@@ -447,6 +447,41 @@ api_key_env = "FIXTURE_KEY"
         self.assertEqual(exit_code, 0)
         launch.assert_awaited_once()
 
+    def test_code_alias_launches_the_tui(self) -> None:
+        launch = AsyncMock(return_value=0)
+        with patch("neuro_code.cli._run_tui", launch):
+            exit_code = main(("code",))
+        self.assertEqual(exit_code, 0)
+        launch.assert_awaited_once()
+
+    def test_unconfigured_tui_launches_first_run_provider_setup(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / "state"
+            captured: dict[str, object] = {}
+
+            class SetupFixture:
+                def __init__(self, **kwargs: object) -> None:
+                    captured.update(kwargs)
+
+                async def run_async(self) -> bool:
+                    captured["ran"] = True
+                    return False
+
+            with (
+                patch.dict(
+                    "os.environ",
+                    {"HOME": str(root), "NEURO_CODE_HOME": str(state)},
+                    clear=True,
+                ),
+                patch("neuro_code.tui.ProviderSetupApp", SetupFixture),
+            ):
+                exit_code = main(("--cwd", str(root)))
+
+            self.assertEqual(exit_code, 0)
+            self.assertTrue(captured["ran"])
+            self.assertIn("provider_settings_store", captured)
+
     def test_tui_composition_uses_the_selected_provider_and_workspace(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -469,6 +504,8 @@ api_key_env = "FIXTURE_KEY"
                     session_controller: object,
                     task_controller: object,
                     ui_preferences: object,
+                    provider_settings_store: object,
+                    managed_provider_settings: object,
                     language: UiLanguage,
                     initial_items: object,
                     provider_name: str,
@@ -482,6 +519,8 @@ api_key_env = "FIXTURE_KEY"
                         session_controller=session_controller,
                         task_controller=task_controller,
                         ui_preferences=ui_preferences,
+                        provider_settings_store=provider_settings_store,
+                        managed_provider_settings=managed_provider_settings,
                         language=language,
                         initial_items=initial_items,
                         provider_name=provider_name,
@@ -643,6 +682,8 @@ api_key_env = "FIXTURE_KEY"
                     session_controller: object,
                     task_controller: object,
                     ui_preferences: object,
+                    provider_settings_store: object,
+                    managed_provider_settings: object,
                     language: UiLanguage,
                     initial_items: object,
                     provider_name: str,
@@ -655,6 +696,8 @@ api_key_env = "FIXTURE_KEY"
                         provider_controller,
                         task_controller,
                         ui_preferences,
+                        provider_settings_store,
+                        managed_provider_settings,
                         language,
                         initial_items,
                         provider_name,
@@ -732,6 +775,8 @@ api_key_env = "SECOND_KEY"
                     session_controller: object,
                     task_controller: object,
                     ui_preferences: object,
+                    provider_settings_store: object,
+                    managed_provider_settings: object,
                     language: UiLanguage,
                     initial_items: object,
                     provider_name: str,
@@ -741,6 +786,8 @@ api_key_env = "SECOND_KEY"
                     del (
                         approval_controller,
                         ui_preferences,
+                        provider_settings_store,
+                        managed_provider_settings,
                         language,
                         initial_items,
                         provider_name,
@@ -859,6 +906,8 @@ api_key_env = "SECOND_KEY"
                     session_controller: object,
                     task_controller: object,
                     ui_preferences: object,
+                    provider_settings_store: object,
+                    managed_provider_settings: object,
                     language: UiLanguage,
                     initial_items: object,
                     provider_name: str,
@@ -868,6 +917,8 @@ api_key_env = "SECOND_KEY"
                     del (
                         approval_controller,
                         ui_preferences,
+                        provider_settings_store,
+                        managed_provider_settings,
                         language,
                         provider_name,
                         model_name,

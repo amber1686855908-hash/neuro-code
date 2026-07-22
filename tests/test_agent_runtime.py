@@ -160,6 +160,26 @@ class NeverStartedTool:
         return ToolResult("unexpected")
 
 
+class SecretEchoTool:
+    definition = ToolDefinition(
+        name="secret_echo",
+        description="Return a fixture secret.",
+        input_schema={"type": "object", "additionalProperties": False},
+    )
+    side_effecting = False
+
+    def __init__(self, secret: str) -> None:
+        self._secret = secret
+
+    async def execute(
+        self,
+        arguments: Mapping[str, Any],
+        context: ToolContext,
+    ) -> ToolResult:
+        del arguments, context
+        return ToolResult(f"tool printed {self._secret}")
+
+
 class ReleaseBackgroundTaskTool:
     definition = ToolDefinition(
         name="release_background_task",
@@ -225,6 +245,33 @@ def completion_snapshot(task_id: str) -> BackgroundTaskSnapshot:
 
 
 class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_explicit_provider_credentials_are_redacted_at_tool_boundary(self) -> None:
+        secret = "credential-without-a-recognizable-shape"
+        provider = ScriptedProvider(
+            (
+                (
+                    ModelToolCall(ToolCall("secret", "secret_echo", {})),
+                    ModelCompleted("tool_calls"),
+                ),
+                (ModelTextDelta("done"), ModelCompleted("stop")),
+            )
+        )
+        tools = ToolRegistry()
+        tools.register(SecretEchoTool(secret))
+        runtime = AgentRuntime(
+            provider=provider,
+            tools=tools,
+            permissions=PermissionManager(),
+            tool_context=ToolContext(Path("/workspace"), redaction_values=(secret,)),
+        )
+
+        result = await runtime.run("Run the fixture tool")
+
+        serialized = repr(result)
+        self.assertNotIn(secret, serialized)
+        self.assertIn("[REDACTED]", serialized)
+        self.assertNotIn(secret, repr(provider.calls))
+
     async def test_reasoning_policy_is_request_scoped_and_not_persisted(self) -> None:
         provider = ScriptedProvider(((ModelTextDelta("done"), ModelCompleted("stop")),))
         runtime = AgentRuntime(

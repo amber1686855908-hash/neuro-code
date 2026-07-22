@@ -45,8 +45,9 @@ sandbox boundary.
 - Snapshot comparison reports created, modified, and deleted relative paths.
   Eligible text uses a credential-redacted unified diff bounded to 20 changed
   files and 240 lines/24,000 characters per file before the tighter TUI display
-  bound is applied. The card gives additions/deletions, colors application-owned
-  diff roles, and labels every hidden or truncated case.
+  bound is applied. The card gives additions/deletions, uses green/red
+  foregrounds with distinct tinted backgrounds for inserted/deleted lines, and
+  labels every hidden or truncated case.
 - Snapshotting starts only after the normal permission/approval decision and
   immediately before tool execution. It does not grant access, change the tool
   result sent to the model, or turn an observed change into proof of successful
@@ -60,9 +61,10 @@ sandbox boundary.
 
 ## Consequences
 
-Read/list/search/Bash calls now show useful bounded results, and edit or shell
-file writes show where and how files changed. A call contributes one transcript
-entry rather than repeating the tool label for every lifecycle transition.
+Read/list/search calls now default to a concise action sentence while retaining
+their bounded result for interactive expansion. Edit or shell file writes show
+where and how files changed. A call contributes one transcript entry rather
+than repeating the tool label for every lifecycle transition.
 Credentials and terminal control data remain outside the rendered preview, and
 large or sensitive changes degrade to explicit metadata instead of disappearing
 silently.

@@ -236,6 +236,7 @@ class ApplicationComposition:
                     protected_environment_variables=(
                         selected_config.protected_environment_variables
                     ),
+                    redaction_values=selected_config.redaction_values(),
                     background_tasks=task_scope,
                     instruction_tracker=tracker,
                     skill_tracker=skill_tracker,

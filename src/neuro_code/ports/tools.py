@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -22,6 +22,7 @@ class ToolContext:
     sandbox_profile: SandboxProfile = SandboxProfile.OFF
     shell_sandbox: ShellSandbox | None = None
     protected_environment_variables: frozenset[str] = frozenset()
+    redaction_values: tuple[str, ...] = field(default=(), repr=False)
     background_tasks: BackgroundTaskManager | None = None
     instruction_tracker: InstructionContextTracker | None = None
     skill_tracker: SkillContextTracker | None = None

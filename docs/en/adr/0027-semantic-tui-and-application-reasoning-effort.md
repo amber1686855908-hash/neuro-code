@@ -38,7 +38,11 @@ sub-agent workflow is active when only Neuro Code's own review policy exists.
   step. A positive profile `context_window_tokens` value supplies the denominator;
   unknown windows remain `?`. This metadata is never sent as an API parameter.
   The bar is controller-owned, localized, refreshed on provider selection/failover
-  and effort changes, and retained in narrow layouts.
+  and effort changes, and retained in narrow layouts. While the TUI is waiting
+  for model output, a seven-cell collapsing pulse appears before the localized
+  pending-assistant text. It is a Textual timer-driven port of the supplied
+  terminal demo, stops on completion/cancellation/failure, and never writes
+  ANSI cursor controls directly.
 - Typing `/` opens a plain-text hint row backed by the same deterministic catalog
   as the inline suggester. Syntax includes parameters, effort choices, selectable
   profile names, and placeholders for free-form arguments. `Tab` applies the

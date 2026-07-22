@@ -446,7 +446,10 @@ renders raw reasoning or unrestricted argument/result mappings. A bounded
 allowlist supplies invocation previews such as path, command, pattern, query,
 and task ID. Each local tool call then owns one stable card, keyed by call ID,
 which is updated with its permission path, redacted result preview, elapsed
-time, and any bounded workspace-change report. See
+time, and any bounded workspace-change report. Read-like calls project a
+one-line completed summary until the user opens the existing bounded details;
+edit reports open their changed slices automatically. Diff roles use both
+foreground and tinted-background styling. See
 [ADR 0014](adr/0014-minimal-event-stream-tui.md) and
 [ADR 0029](adr/0029-auditable-in-place-tool-cards.md).
 
@@ -490,7 +493,10 @@ bar above the prompt renders the active provider/model, compact working path,
 context-window usage, requested/effective effort, and interaction mode from
 controller state; it updates on
 localization, profile failover, and selection rather than scraping transcript
-messages. Context starts with a provider-neutral estimate over canonical
+messages. A pure collapsing-pulse state machine is advanced by a Textual timer
+and rendered before the pending-assistant text only while waiting for model
+output. Context
+starts with a provider-neutral estimate over canonical
 session items. Each model completion with token metadata emits
 `CONTEXT_USAGE_UPDATED`, replacing that estimate with the provider-reported
 input plus output count. The denominator is explicit profile metadata named
@@ -692,7 +698,27 @@ branches on a commercial provider name. Profiles separate wire protocol
 (`openai-chat`, `openai-responses`, `anthropic-messages`, or
 `gemini-generate-content`) from optional dialect behavior such as xAI Responses.
 Credentials are environment references or a validated loopback-proxy
-placeholder, never persisted secrets.
+placeholder for manual TOML profiles. The TUI additionally uses a
+`ProviderSettingsStore` port for user-managed profiles. Its JSON adapter writes
+non-secret metadata and credentials to separate atomic owner-private files;
+`ProviderProfile.stored_api_key` is excluded from representations and redacted
+inspection, and explicit configured values are scrubbed at the runtime
+tool-result boundary before they reach model context, events, or persistence.
+The current file-backed secret store is not encryption and can be replaced by a
+platform-keychain adapter.
+
+Managed profiles are loaded after TOML. A same-name managed profile replaces
+the whole provider table instead of deep-merging it, so a project cannot reuse
+a stored key with a workspace-controlled endpoint, proxy, or tool option. TUI
+save-and-use exits at a bounded application restart code; the composition and
+all background scopes close before configuration and the provider binding are
+rebuilt. First-run setup occurs before application composition, so an absent
+provider never creates a partial runtime. Normal Settings routes through a
+category screen to separate language/provider detail screens. Presets map
+explicitly to wire behavior: OpenAI Responses uses `openai-responses`, while
+Compatible Chat and DeepSeek use `openai-chat`; the adapter also deletes profile
+metadata and its credential entry together. See
+[ADR 0046](adr/0046-global-cli-and-managed-provider-settings.md).
 
 An optional positive `context_window_tokens` field records provider/model
 capability metadata. It is propagated through redacted profile selection and

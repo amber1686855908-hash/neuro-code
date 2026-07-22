@@ -32,10 +32,12 @@ from neuro_code.domain.context_usage import estimate_context_tokens, estimate_te
 from neuro_code.domain.events import AgentEvent, AgentEventKind
 from neuro_code.domain.interaction_mode import InteractionMode
 from neuro_code.domain.messages import Message, Role, SessionItem
+from neuro_code.domain.provider_settings import ManagedProviderProfile, ManagedProviderSettings
 from neuro_code.domain.reasoning import ReasoningEffort
 from neuro_code.domain.sessions import SessionSummary
 from neuro_code.domain.ui_preferences import UiLanguage
 from neuro_code.permissions import PermissionApproval, PermissionRequest
+from neuro_code.ports.provider_settings import ProviderSettingsStore
 from neuro_code.ports.ui_preferences import UiPreferencesStore
 from neuro_code.redaction import redact_sensitive_text
 from neuro_code.runtime.agent import AgentRunResult, EventSink
@@ -55,10 +57,13 @@ _RESTORED_MESSAGE_LIMIT = 20_000
 _TASK_LIST_LIMIT = 20
 _TASK_POLL_SECONDS = 0.5
 _TERMINAL_SIZE_POLL_SECONDS = 0.25
+_LOADING_ANIMATION_TICK_SECONDS = 0.05
 _COMMAND_HINT_LIMIT = 5
 _TOOL_OUTPUT_MAX_LINES = 40
 _TOOL_OUTPUT_MAX_CHARACTERS = 6_000
 _TOOL_DIFF_MAX_FILES = 8
+_COMPACT_READ_TOOLS = frozenset({"grep", "list_dir", "read_file", "skill", "view_image"})
+TUI_RELOAD_PROVIDER_SETTINGS = 75
 _ANSI_ESCAPE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
 
 _EFFORT_COLORS = {
@@ -75,6 +80,106 @@ _MODE_COLORS = {
     InteractionMode.PLAN: "#8b9cff",
     InteractionMode.AUTO: "#d58cc8",
 }
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderPreset:
+    name: str
+    protocol: str
+    dialect: str
+    base_url: str
+
+
+@dataclass(slots=True)
+class CollapsingPulseAnimation:
+    """Textual-friendly port of the user-supplied collapsing pulse demo."""
+
+    width: int = 7
+    level_by_distance: tuple[int, ...] = (7, 5, 3, 1)
+    peak_position: int = 0
+    direction: int = 1
+    merged_trail_count: int = 0
+    phase: str = "moving"
+
+    @property
+    def delay_seconds(self) -> float:
+        return {
+            "moving": 0.09,
+            "edge-hold": 0.14,
+            "collapsing": 0.10,
+            "merged-hold": 0.22,
+        }.get(self.phase, 0.09)
+
+    def reset(self) -> None:
+        self.peak_position = 0
+        self.direction = 1
+        self.merged_trail_count = 0
+        self.phase = "moving"
+
+    def advance(self) -> None:
+        trail_length = max(0, len(self.level_by_distance) - 1)
+        if self.phase == "moving":
+            self.peak_position += self.direction
+            self.merged_trail_count = 0
+            reached_edge = (self.direction == 1 and self.peak_position >= self.width - 1) or (
+                self.direction == -1 and self.peak_position <= 0
+            )
+            if reached_edge:
+                self.peak_position = max(0, min(self.width - 1, self.peak_position))
+                self.phase = "edge-hold"
+            return
+        if self.phase == "edge-hold":
+            if trail_length == 0:
+                self.phase = "merged-hold"
+                return
+            self.merged_trail_count = 1
+            self.phase = "merged-hold" if self.merged_trail_count >= trail_length else "collapsing"
+            return
+        if self.phase == "collapsing":
+            self.merged_trail_count = min(
+                trail_length,
+                self.merged_trail_count + 1,
+            )
+            if self.merged_trail_count >= trail_length:
+                self.phase = "merged-hold"
+            return
+        if self.phase == "merged-hold":
+            self.direction *= -1
+            self.peak_position += self.direction
+            self.merged_trail_count = 0
+            self.phase = "moving"
+            return
+        self.reset()
+
+    def levels(self) -> tuple[int, ...]:
+        trail = self.level_by_distance[1 + self.merged_trail_count :]
+        rendered: list[int] = []
+        for position in range(self.width):
+            if position == self.peak_position:
+                rendered.append(self.level_by_distance[0])
+                continue
+            if self.direction == 1:
+                distance = self.peak_position - position
+            else:
+                distance = position - self.peak_position
+            trail_index = distance - 1
+            rendered.append(trail[trail_index] if 0 <= trail_index < len(trail) else 0)
+        return tuple(rendered)
+
+
+_PROVIDER_PRESETS: tuple[ProviderPreset, ...] = (
+    ProviderPreset("openai", "openai-responses", "standard", "https://api.openai.com/v1"),
+    ProviderPreset("compatible", "openai-chat", "standard", ""),
+    ProviderPreset("deepseek", "openai-chat", "standard", "https://api.deepseek.com"),
+    ProviderPreset("anthropic", "anthropic-messages", "standard", "https://api.anthropic.com"),
+    ProviderPreset(
+        "gemini",
+        "gemini-generate-content",
+        "standard",
+        "https://generativelanguage.googleapis.com/v1beta",
+    ),
+    ProviderPreset("xai", "openai-responses", "xai", "https://api.x.ai/v1"),
+)
 
 _MARKDOWN_THEME = RichTheme(
     {
@@ -244,7 +349,12 @@ class ToolFeedbackState:
     is_error: bool = False
     metadata: dict[str, Any] | None = None
     workspace_changes: dict[str, Any] | None = None
-    expanded: bool = True
+    expanded: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderSettingsSubmission:
+    profile_name: str
 
 
 class AssistantMarkdown(Markdown):
@@ -319,8 +429,8 @@ class ToolFeedbackMessage(ConversationMessage, can_focus=True):
         self.post_message(self.ToggleRequested(self))
 
 
-class SettingsScreen(ModalScreen[UiLanguage | None]):
-    """Choose an application-owned interface language."""
+class SettingsScreen(ModalScreen[str | None]):
+    """First-level settings navigation; detailed forms live on child screens."""
 
     CSS = """
     SettingsScreen {
@@ -329,9 +439,10 @@ class SettingsScreen(ModalScreen[UiLanguage | None]):
     }
 
     #settings-dialog {
-        width: 70%;
-        max-width: 72;
+        width: 82%;
+        max-width: 78;
         height: auto;
+        max-height: 85%;
         padding: 1 2;
         border: heavy $primary;
         background: $surface;
@@ -343,13 +454,116 @@ class SettingsScreen(ModalScreen[UiLanguage | None]):
         margin-bottom: 1;
     }
 
-    #settings-description,
-    #settings-help {
+    #settings-description {
         color: $text-muted;
         margin-bottom: 1;
     }
 
-    #settings-languages {
+    #settings-categories {
+        height: auto;
+    }
+
+    #settings-categories Button {
+        width: 100%;
+        margin-bottom: 1;
+        content-align: left middle;
+    }
+
+    #settings-help {
+        color: $text-muted;
+    }
+    """
+    BINDINGS: ClassVar[list[BindingType]] = [
+        Binding("escape", "cancel", "Cancel", show=False),
+        Binding("ctrl+c", "cancel", "Cancel", show=False),
+    ]
+
+    def __init__(
+        self,
+        selected: UiLanguage,
+        *,
+        language: UiLanguage,
+        provider_settings_available: bool,
+    ) -> None:
+        super().__init__()
+        self.selected = selected
+        self.language = language
+        self.provider_settings_available = provider_settings_available
+
+    def compose(self) -> ComposeResult:
+        language_summary = language_name(self.selected, in_language=self.language)
+        yield Vertical(
+            Label(ui_text(self.language, "settings.title"), id="settings-title"),
+            Static(ui_text(self.language, "settings.description"), id="settings-description"),
+            Vertical(
+                Button(
+                    ui_text(
+                        self.language,
+                        "settings.category.language",
+                        current=language_summary,
+                    ),
+                    id="settings-category-language",
+                    variant="primary",
+                ),
+                Button(
+                    ui_text(self.language, "settings.category.providers"),
+                    id="settings-category-providers",
+                    disabled=not self.provider_settings_available,
+                ),
+                id="settings-categories",
+            ),
+            Static(ui_text(self.language, "settings.help"), id="settings-help"),
+            id="settings-dialog",
+        )
+
+    def on_mount(self) -> None:
+        self.query_one("#settings-category-language", Button).focus()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        categories = {
+            "settings-category-language": "language",
+            "settings-category-providers": "providers",
+        }
+        category = categories.get(event.button.id or "")
+        if category is not None:
+            self.dismiss(category)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class LanguageSettingsScreen(ModalScreen[UiLanguage | None]):
+    """Edit one interface preference without rendering unrelated provider fields."""
+
+    CSS = """
+    LanguageSettingsScreen {
+        align: center middle;
+        background: $background 70%;
+    }
+
+    #language-settings-dialog {
+        width: 82%;
+        max-width: 78;
+        height: auto;
+        padding: 1 2;
+        border: heavy $primary;
+        background: $surface;
+    }
+
+    #language-settings-title {
+        text-style: bold;
+        color: $primary;
+        margin-bottom: 1;
+    }
+
+    #language-settings-description,
+    #language-settings-help {
+        color: $text-muted;
+        margin-bottom: 1;
+    }
+
+    #settings-languages,
+    #language-settings-actions {
         height: auto;
     }
 
@@ -357,10 +571,14 @@ class SettingsScreen(ModalScreen[UiLanguage | None]):
         width: 1fr;
         margin-right: 1;
     }
+
+    #language-settings-actions {
+        align-horizontal: right;
+    }
     """
     BINDINGS: ClassVar[list[BindingType]] = [
-        Binding("escape", "cancel", "Cancel", show=False),
-        Binding("ctrl+c", "cancel", "Cancel", show=False),
+        Binding("escape", "cancel", "Back", show=False),
+        Binding("ctrl+c", "cancel", "Back", show=False),
     ]
 
     def __init__(self, selected: UiLanguage, *, language: UiLanguage) -> None:
@@ -376,10 +594,13 @@ class SettingsScreen(ModalScreen[UiLanguage | None]):
 
     def compose(self) -> ComposeResult:
         yield Vertical(
-            Label(ui_text(self.language, "settings.title"), id="settings-title"),
+            Label(
+                ui_text(self.language, "settings.language.title"),
+                id="language-settings-title",
+            ),
             Static(
-                ui_text(self.language, "settings.description"),
-                id="settings-description",
+                ui_text(self.language, "settings.language.description"),
+                id="language-settings-description",
             ),
             Horizontal(
                 Button(
@@ -396,8 +617,15 @@ class SettingsScreen(ModalScreen[UiLanguage | None]):
                 ),
                 id="settings-languages",
             ),
-            Static(ui_text(self.language, "settings.help"), id="settings-help"),
-            id="settings-dialog",
+            Static(
+                ui_text(self.language, "settings.language.help"),
+                id="language-settings-help",
+            ),
+            Horizontal(
+                Button(ui_text(self.language, "settings.back"), id="language-settings-back"),
+                id="language-settings-actions",
+            ),
+            id="language-settings-dialog",
         )
 
     def on_mount(self) -> None:
@@ -416,9 +644,404 @@ class SettingsScreen(ModalScreen[UiLanguage | None]):
         choice = choices.get(event.button.id or "")
         if choice is not None:
             self.dismiss(choice)
+        elif event.button.id == "language-settings-back":
+            self.dismiss(None)
 
     def action_cancel(self) -> None:
         self.dismiss(None)
+
+
+class ProviderSettingsScreen(ModalScreen[ProviderSettingsSubmission | None]):
+    """Create and edit user-owned provider profiles on a focused detail screen."""
+
+    CSS = """
+    ProviderSettingsScreen {
+        align: center middle;
+        background: $background 70%;
+    }
+
+    #provider-settings-dialog {
+        width: 90%;
+        max-width: 105;
+        height: 95%;
+        max-height: 95%;
+        padding: 1 2;
+        border: heavy $primary;
+        background: $surface;
+    }
+
+    #provider-settings-content {
+        height: 1fr;
+    }
+
+    #provider-settings-title {
+        text-style: bold;
+        color: $accent;
+        margin-bottom: 1;
+    }
+
+    #provider-settings-description,
+    #provider-settings-protocol-hint,
+    #provider-settings-error,
+    #provider-settings-empty {
+        color: $text-muted;
+        margin-bottom: 1;
+    }
+
+    #provider-settings-protocol-hint {
+        color: #9cc4cc;
+    }
+
+    #provider-settings-error {
+        color: $error;
+    }
+
+    #provider-settings-profiles {
+        height: auto;
+        max-height: 8;
+        margin-bottom: 1;
+    }
+
+    #provider-settings-profiles Button {
+        width: 100%;
+        margin-bottom: 1;
+    }
+
+    #provider-settings-presets,
+    #provider-settings-presets-row-one,
+    #provider-settings-presets-row-two,
+    #provider-settings-form,
+    #provider-settings-actions {
+        height: auto;
+    }
+
+    #provider-settings-presets {
+        margin-bottom: 1;
+    }
+
+    #provider-settings-presets Button {
+        width: 1fr;
+        margin-right: 1;
+    }
+
+    #provider-settings-presets-row-one {
+        margin-bottom: 1;
+    }
+
+    #provider-settings-form Input {
+        margin-bottom: 0;
+    }
+
+    #provider-settings-form {
+        margin-bottom: 1;
+    }
+
+    #provider-settings-actions {
+        align-horizontal: right;
+    }
+
+    #provider-settings-actions Button {
+        margin-left: 1;
+    }
+    """
+    BINDINGS: ClassVar[list[BindingType]] = [
+        Binding("escape", "cancel", "Back", show=False),
+        Binding("ctrl+c", "cancel", "Back", show=False),
+    ]
+
+    def __init__(
+        self,
+        *,
+        language: UiLanguage,
+        provider_settings: ManagedProviderSettings,
+        provider_settings_store: ProviderSettingsStore,
+        first_run: bool = False,
+    ) -> None:
+        super().__init__()
+        self.language = language
+        self.provider_settings = provider_settings
+        self.provider_settings_store = provider_settings_store
+        self.first_run = first_run
+        self._editing_profile: str | None = None
+        self._active_preset = "openai"
+        self._profile_ids = {
+            f"provider-settings-profile-{index}": profile.name
+            for index, profile in enumerate(provider_settings.profiles)
+        }
+
+    def compose(self) -> ComposeResult:
+        profile_widgets: list[Any] = [
+            Button(
+                self._provider_label(profile),
+                id=f"provider-settings-profile-{index}",
+                variant=(
+                    "primary"
+                    if profile.name == self.provider_settings.default_provider
+                    else "default"
+                ),
+            )
+            for index, profile in enumerate(self.provider_settings.profiles)
+        ]
+        if not profile_widgets:
+            profile_widgets.append(
+                Static(
+                    ui_text(self.language, "provider_settings.empty"), id="provider-settings-empty"
+                )
+            )
+        preset_buttons = [
+            Button(
+                ui_text(self.language, f"provider_settings.preset.{preset.name}"),
+                id=f"provider-settings-preset-{preset.name}",
+                variant="primary" if preset.name == self._active_preset else "default",
+            )
+            for preset in _PROVIDER_PRESETS
+        ]
+        actions: list[Any] = []
+        if not self.first_run:
+            actions.append(
+                Button(ui_text(self.language, "settings.back"), id="provider-settings-back")
+            )
+        actions.extend(
+            (
+                Button(
+                    ui_text(self.language, "provider_settings.new"),
+                    id="provider-settings-new",
+                ),
+                Button(
+                    ui_text(self.language, "provider_settings.save_use"),
+                    id="provider-settings-save",
+                    variant="success",
+                ),
+            )
+        )
+        yield Vertical(
+            VerticalScroll(
+                Label(
+                    ui_text(
+                        self.language,
+                        "provider_settings.first_run_title"
+                        if self.first_run
+                        else "provider_settings.title",
+                    ),
+                    id="provider-settings-title",
+                ),
+                Static(
+                    ui_text(self.language, "provider_settings.description"),
+                    id="provider-settings-description",
+                ),
+                VerticalScroll(*profile_widgets, id="provider-settings-profiles"),
+                Vertical(
+                    Horizontal(*preset_buttons[:3], id="provider-settings-presets-row-one"),
+                    Horizontal(*preset_buttons[3:], id="provider-settings-presets-row-two"),
+                    id="provider-settings-presets",
+                ),
+                Static(
+                    ui_text(self.language, "provider_settings.protocol.openai"),
+                    id="provider-settings-protocol-hint",
+                ),
+                Vertical(
+                    Input(
+                        placeholder=ui_text(self.language, "provider_settings.name"),
+                        id="provider-settings-name",
+                    ),
+                    Input(
+                        placeholder=ui_text(self.language, "provider_settings.model.openai"),
+                        id="provider-settings-model",
+                    ),
+                    Input(
+                        value="https://api.openai.com/v1",
+                        placeholder=ui_text(self.language, "provider_settings.base_url"),
+                        id="provider-settings-base-url",
+                    ),
+                    Input(
+                        placeholder=ui_text(self.language, "provider_settings.api_key"),
+                        password=True,
+                        id="provider-settings-api-key",
+                    ),
+                    id="provider-settings-form",
+                ),
+                Static("", id="provider-settings-error"),
+                id="provider-settings-content",
+            ),
+            Horizontal(*actions, id="provider-settings-actions"),
+            id="provider-settings-dialog",
+        )
+
+    def _provider_label(self, profile: ManagedProviderProfile) -> str:
+        suffix = (
+            f" · {ui_text(self.language, 'marker.default')}"
+            if profile.name == self.provider_settings.default_provider
+            else ""
+        )
+        return f"{profile.name} · {profile.model}{suffix}"
+
+    def on_mount(self) -> None:
+        self.query_one("#provider-settings-name", Input).focus()
+
+    async def on_button_pressed(self, event: Button.Pressed) -> None:
+        button_id = event.button.id or ""
+        profile_name = self._profile_ids.get(button_id)
+        if profile_name is not None:
+            self._edit_profile(profile_name)
+            return
+        if button_id.startswith("provider-settings-preset-"):
+            self._select_preset(button_id.removeprefix("provider-settings-preset-"))
+            return
+        if button_id == "provider-settings-new":
+            self._new_profile()
+            return
+        if button_id == "provider-settings-save":
+            await self._save_provider()
+            return
+        if button_id == "provider-settings-back":
+            self.dismiss(None)
+
+    def _edit_profile(self, name: str) -> None:
+        profile = self.provider_settings.profile(name)
+        if profile is None:
+            return
+        self._editing_profile = name
+        name_input = self.query_one("#provider-settings-name", Input)
+        name_input.value = profile.name
+        name_input.disabled = True
+        self.query_one("#provider-settings-model", Input).value = profile.model
+        self.query_one("#provider-settings-base-url", Input).value = profile.base_url
+        self.query_one("#provider-settings-api-key", Input).value = ""
+        self._select_preset(self._preset_for_profile(profile), update_endpoint=False)
+        self._show_provider_error("")
+        self.query_one("#provider-settings-model", Input).focus()
+
+    @staticmethod
+    def _preset_for_profile(profile: ManagedProviderProfile) -> str:
+        base_url = profile.base_url.rstrip("/").casefold()
+        if base_url == "https://api.deepseek.com":
+            return "deepseek"
+        exact = next(
+            (
+                preset.name
+                for preset in _PROVIDER_PRESETS
+                if preset.base_url
+                and base_url == preset.base_url.rstrip("/").casefold()
+                and preset.protocol == profile.protocol
+                and preset.dialect == profile.dialect
+            ),
+            None,
+        )
+        if exact is not None:
+            return exact
+        return next(
+            (
+                preset.name
+                for preset in _PROVIDER_PRESETS
+                if preset.protocol == profile.protocol and preset.dialect == profile.dialect
+            ),
+            "compatible",
+        )
+
+    def _new_profile(self) -> None:
+        self._editing_profile = None
+        name_input = self.query_one("#provider-settings-name", Input)
+        name_input.disabled = False
+        name_input.value = ""
+        self.query_one("#provider-settings-model", Input).value = ""
+        self.query_one("#provider-settings-api-key", Input).value = ""
+        self._select_preset("openai")
+        self._show_provider_error("")
+        name_input.focus()
+
+    def _select_preset(self, preset_name: str, *, update_endpoint: bool = True) -> None:
+        preset = next(
+            (entry for entry in _PROVIDER_PRESETS if entry.name == preset_name),
+            None,
+        )
+        if preset is None:
+            return
+        self._active_preset = preset_name
+        for candidate in _PROVIDER_PRESETS:
+            button = self.query_one(f"#provider-settings-preset-{candidate.name}", Button)
+            button.variant = "primary" if candidate.name == preset_name else "default"
+        self.query_one("#provider-settings-protocol-hint", Static).update(
+            ui_text(self.language, f"provider_settings.protocol.{preset_name}")
+        )
+        self.query_one("#provider-settings-model", Input).placeholder = ui_text(
+            self.language,
+            f"provider_settings.model.{preset_name}",
+        )
+        if update_endpoint:
+            self.query_one("#provider-settings-base-url", Input).value = preset.base_url
+
+    async def _save_provider(self) -> None:
+        preset = next(entry for entry in _PROVIDER_PRESETS if entry.name == self._active_preset)
+        api_key = self.query_one("#provider-settings-api-key", Input).value.strip() or None
+        name = self.query_one("#provider-settings-name", Input).value.strip()
+        base_url = self.query_one("#provider-settings-base-url", Input).value.strip()
+        try:
+            if (
+                base_url.rstrip("/").casefold() == "https://api.deepseek.com"
+                and preset.protocol != "openai-chat"
+            ):
+                raise ValueError(
+                    ui_text(self.language, "provider_settings.deepseek_protocol_required")
+                )
+            profile = ManagedProviderProfile(
+                name=name,
+                protocol=preset.protocol,
+                dialect=preset.dialect,
+                model=self.query_one("#provider-settings-model", Input).value.strip(),
+                base_url=base_url,
+                api_key=api_key,
+            )
+            existing = self.provider_settings.profile(name)
+            if existing is None and api_key is None:
+                raise ValueError(ui_text(self.language, "provider_settings.api_key_required"))
+            await self.provider_settings_store.save_profile(profile, make_default=True)
+        except Exception as error:
+            self._show_provider_error(f"{type(error).__name__}: {error}")
+            return
+        self.dismiss(ProviderSettingsSubmission(profile.name))
+
+    def _show_provider_error(self, message: str) -> None:
+        self.query_one("#provider-settings-error", Static).update(message)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class ProviderSetupApp(App[bool]):
+    """First-run TUI that creates the initial usable provider profile."""
+
+    CSS = "Screen { background: $background; }"
+
+    def __init__(
+        self,
+        *,
+        provider_settings: ManagedProviderSettings,
+        provider_settings_store: ProviderSettingsStore,
+        language: UiLanguage = UiLanguage.ENGLISH,
+    ) -> None:
+        super().__init__()
+        self.register_theme(_NEURO_CODE_THEME)
+        self.theme = _NEURO_CODE_THEME.name
+        self._provider_settings = provider_settings
+        self._provider_settings_store = provider_settings_store
+        self._language = language
+
+    def on_mount(self) -> None:
+        self.push_screen(
+            ProviderSettingsScreen(
+                language=self._language,
+                provider_settings=self._provider_settings,
+                provider_settings_store=self._provider_settings_store,
+                first_run=True,
+            ),
+            self._setup_finished,
+        )
+
+    def _setup_finished(
+        self,
+        result: ProviderSettingsSubmission | None,
+    ) -> None:
+        self.exit(isinstance(result, ProviderSettingsSubmission))
 
 
 class ReasoningEffortScreen(ModalScreen[ReasoningEffort | None]):
@@ -1143,6 +1766,8 @@ class NeuroCodeApp(App[None]):
         session_controller: SessionController | None = None,
         task_controller: TaskController | None = None,
         ui_preferences: UiPreferencesStore | None = None,
+        provider_settings_store: ProviderSettingsStore | None = None,
+        managed_provider_settings: ManagedProviderSettings | None = None,
         language: UiLanguage = UiLanguage.ENGLISH,
         initial_items: Sequence[SessionItem] = (),
         provider_name: str,
@@ -1197,6 +1822,8 @@ class NeuroCodeApp(App[None]):
         self._session_controller = session_controller
         self._task_controller = task_controller
         self._ui_preferences = ui_preferences
+        self._provider_settings_store = provider_settings_store
+        self._managed_provider_settings = managed_provider_settings
         self._language = language
         self._initial_items = tuple(initial_items)
         self._provider_name = provider_name
@@ -1235,6 +1862,9 @@ class NeuroCodeApp(App[None]):
         self._turn_completion: tuple[str, int] | None = None
         self._turn_usage_reported = False
         self._turn_worker: Worker[None] | None = None
+        self._model_loading = False
+        self._loading_animation = CollapsingPulseAnimation()
+        self._loading_animation_elapsed = 0.0
         self._announced_terminal_tasks: set[str] = set()
         self._task_polling = False
 
@@ -1286,6 +1916,10 @@ class NeuroCodeApp(App[None]):
             )
         if self._task_controller is not None:
             self.set_interval(_TASK_POLL_SECONDS, self._poll_background_tasks)
+        self.set_interval(
+            _LOADING_ANIMATION_TICK_SECONDS,
+            self._advance_model_loading_animation,
+        )
         if not self.is_headless and not self.is_inline and not self.is_web:
             self.set_interval(_TERMINAL_SIZE_POLL_SECONDS, self._synchronize_terminal_size)
         self.query_one("#prompt", Input).focus()
@@ -1299,6 +1933,7 @@ class NeuroCodeApp(App[None]):
         self.post_message(events.Resize(terminal_size, terminal_size, terminal_size))
 
     def on_unmount(self) -> None:
+        self._model_loading = False
         if self._approval_controller is not None:
             self._approval_controller.set_handler(None)
         self.console.pop_theme()
@@ -1405,6 +2040,7 @@ class NeuroCodeApp(App[None]):
             await self._discard_pending_assistant()
             self._write_entry("error", f"{type(error).__name__}: {error}")
         finally:
+            self._stop_model_loading()
             prompt_input.focus()
 
     async def _handle_event(self, event: AgentEvent) -> None:
@@ -1530,6 +2166,11 @@ class NeuroCodeApp(App[None]):
             raw_changes = data.get("workspace_changes")
             state.workspace_changes = (
                 dict(raw_changes) if isinstance(raw_changes, Mapping) else None
+            )
+            state.expanded = (
+                state.is_error
+                or state.workspace_changes is not None
+                or state.name in {"apply_patch", "search_replace"}
             )
         self._refresh_tool_feedback(state)
 
@@ -1669,6 +2310,16 @@ class NeuroCodeApp(App[None]):
         return f"{name}({', '.join(values)})" if values else name
 
     def _tool_feedback_body(self, state: ToolFeedbackState) -> Text:
+        compact_summary = self._compact_read_summary(state)
+        if compact_summary is not None and not state.expanded:
+            body = Text(overflow="fold")
+            marker_style = "bold #78c2a4" if state.phase == "completed" else "bold #8b9cff"
+            body.append("● ", style=marker_style)
+            body.append(compact_summary, style="#c5c9ce")
+            if state.phase == "completed" and state.duration is not None:
+                body.append(f" · {state.duration}", style="#7f8790")
+            return body
+
         body = Text(overflow="fold")
         body.append("● ", style="bold #78c2a4")
         if state.hosted:
@@ -1782,6 +2433,33 @@ class NeuroCodeApp(App[None]):
                 style="#d58b8b",
             )
         return body
+
+    def _compact_read_summary(self, state: ToolFeedbackState) -> str | None:
+        if (
+            state.hosted
+            or state.name not in _COMPACT_READ_TOOLS
+            or state.is_error
+            or state.phase
+            in {"failed", "permission_denied", "approval_denied", "awaiting_approval"}
+        ):
+            return None
+        key = "completed" if state.phase == "completed" else "running"
+        if state.name == "grep":
+            query = self._bounded_inline(state.arguments.get("query"), limit=80)
+            path = self._bounded_inline(state.arguments.get("path"), limit=80)
+            return ui_text(
+                self._language,
+                f"tool.compact.grep.{key}",
+                query=query,
+                path=path,
+            )
+        target_key = "name" if state.name == "skill" else "path"
+        target = self._bounded_inline(state.arguments.get(target_key), limit=120)
+        return ui_text(
+            self._language,
+            f"tool.compact.{state.name}.{key}",
+            target=target,
+        )
 
     @staticmethod
     def _append_tool_line(body: Text, connector: str, content: str, *, style: str) -> None:
@@ -2005,8 +2683,25 @@ class NeuroCodeApp(App[None]):
                 additions=additions,
                 deletions=deletions,
             )
+            content_start = len(body) + 3
             self._append_tool_line(body, "├", summary, style="#8ed1e6")
             body.highlight_words((path,), style="bold #8ed1e6", case_sensitive=True)
+            addition_text = f"+{additions}"
+            addition_offset = summary.find(addition_text)
+            if addition_offset >= 0:
+                body.stylize(
+                    "bold #9ce7b5 on #213a2b",
+                    content_start + addition_offset,
+                    content_start + addition_offset + len(addition_text),
+                )
+            deletion_text = f"-{deletions}"
+            deletion_offset = summary.find(deletion_text)
+            if deletion_offset >= 0:
+                body.stylize(
+                    "bold #ffb4ab on #4a221d",
+                    content_start + deletion_offset,
+                    content_start + deletion_offset + len(deletion_text),
+                )
 
             raw_diff = change.get("diff")
             if expanded and isinstance(raw_diff, str) and raw_diff:
@@ -2058,13 +2753,13 @@ class NeuroCodeApp(App[None]):
     @staticmethod
     def _diff_line_style(line: str) -> str:
         if line.startswith("@@"):
-            return "#8b9cff"
+            return "bold #b6c2ff on #232637"
         if line.startswith(("+++", "---")):
             return "bold #7da7d9"
         if line.startswith("+"):
-            return "#78c2a4"
+            return "#b7f7ca on #213a2b"
         if line.startswith("-"):
-            return "#d07878"
+            return "#ffb4ab on #4a221d"
         return "#b8bcc2"
 
     async def _dispatch_slash_command(self, raw: str) -> None:
@@ -2193,7 +2888,10 @@ class NeuroCodeApp(App[None]):
         if isinstance(self.screen, SessionSelectionScreen):
             self.screen.action_cancel()
             return
-        if isinstance(self.screen, SettingsScreen):
+        if isinstance(
+            self.screen,
+            (SettingsScreen, LanguageSettingsScreen, ProviderSettingsScreen),
+        ):
             self.screen.action_cancel()
             return
         if self._turn_worker is not None and self._turn_worker.is_running:
@@ -2224,9 +2922,44 @@ class NeuroCodeApp(App[None]):
 
     async def action_open_settings(self) -> None:
         self.push_screen(
-            SettingsScreen(self._language, language=self._language),
-            self._settings_selected,
+            SettingsScreen(
+                self._language,
+                language=self._language,
+                provider_settings_available=(
+                    self._managed_provider_settings is not None
+                    and self._provider_settings_store is not None
+                ),
+            ),
+            self._settings_category_selected,
         )
+
+    async def _settings_category_selected(self, category: str | None) -> None:
+        if category == "language":
+            self.push_screen(
+                LanguageSettingsScreen(self._language, language=self._language),
+                self._language_settings_selected,
+            )
+            return
+        if category == "providers":
+            if self._managed_provider_settings is None or self._provider_settings_store is None:
+                return
+            self.push_screen(
+                ProviderSettingsScreen(
+                    language=self._language,
+                    provider_settings=self._managed_provider_settings,
+                    provider_settings_store=self._provider_settings_store,
+                ),
+                self._provider_settings_selected,
+            )
+
+    async def _provider_settings_selected(
+        self,
+        result: ProviderSettingsSubmission | None,
+    ) -> None:
+        if result is not None:
+            self.exit(return_code=TUI_RELOAD_PROVIDER_SETTINGS)
+            return
+        await self.action_open_settings()
 
     async def _select_reasoning_effort(
         self,
@@ -2340,8 +3073,15 @@ class NeuroCodeApp(App[None]):
                     error=f"{type(error).__name__}: {error}",
                 )
 
-    async def _settings_selected(self, language: UiLanguage | None) -> None:
-        if language is None or language is self._language:
+    async def _language_settings_selected(
+        self,
+        result: UiLanguage | None,
+    ) -> None:
+        language = result
+        if language is None:
+            await self.action_open_settings()
+            return
+        if language is self._language:
             return
         self._language = language
         self._refresh_localized_interface()
@@ -2391,6 +3131,22 @@ class NeuroCodeApp(App[None]):
         except Exception as error:
             self._write_entry("error", f"{type(error).__name__}: {error}")
             return
+
+        if (
+            self._provider_settings_store is not None
+            and self._managed_provider_settings is not None
+            and self._managed_provider_settings.profile(profile_name) is not None
+        ):
+            try:
+                self._managed_provider_settings = await self._provider_settings_store.set_default(
+                    profile_name
+                )
+            except Exception as error:
+                self._write_ui_entry(
+                    "error",
+                    "provider.default_save_failed",
+                    error=f"{type(error).__name__}: {error}",
+                )
 
         self._provider_name = result.provider_name
         self._model_name = result.model_name
@@ -2811,10 +3567,10 @@ class NeuroCodeApp(App[None]):
     def _begin_pending_assistant(self) -> None:
         if self._pending_assistant is not None:
             return
-        waiting = ui_text(self._language, "turn.waiting")
+        self._start_model_loading()
         pending = ConversationMessage(
             "assistant",
-            self._render_entry("assistant", waiting),
+            self._render_model_loading(),
             pending=True,
         )
         self._pending_assistant = pending
@@ -2846,6 +3602,7 @@ class NeuroCodeApp(App[None]):
         self._entries.append(TranscriptEntry("assistant", content))
         self._entry_widgets.append(pending)
         self._pending_assistant = None
+        self._stop_model_loading()
         if follow:
             transcript.scroll_end(animate=False)
 
@@ -2853,8 +3610,32 @@ class NeuroCodeApp(App[None]):
         pending = self._pending_assistant
         self._pending_assistant = None
         self._assistant_parts.clear()
+        self._stop_model_loading()
         if pending is not None and pending.parent is not None:
             await pending.remove()
+
+    def _start_model_loading(self) -> None:
+        self._model_loading = True
+        self._loading_animation.reset()
+        self._loading_animation_elapsed = 0.0
+
+    def _stop_model_loading(self) -> None:
+        if not self._model_loading:
+            return
+        self._model_loading = False
+        self._loading_animation_elapsed = 0.0
+
+    def _advance_model_loading_animation(self) -> None:
+        if not self._model_loading:
+            return
+        self._loading_animation_elapsed += _LOADING_ANIMATION_TICK_SECONDS
+        if self._loading_animation_elapsed + 1e-9 < self._loading_animation.delay_seconds:
+            return
+        self._loading_animation_elapsed = 0.0
+        self._loading_animation.advance()
+        pending = self._pending_assistant
+        if pending is not None and not self._assistant_parts and pending.parent is not None:
+            pending.update(self._render_model_loading())
 
     def _apply_language_to_chrome(self) -> None:
         self.sub_title = ui_text(self._language, "subtitle")
@@ -2925,6 +3706,41 @@ class NeuroCodeApp(App[None]):
             f"{self._context_percentage()} "
             f"({approximation}{self._context_used_tokens:,}/{window:,})"
         )
+
+    @staticmethod
+    def _loading_color(level: int) -> str:
+        inactive = (72, 72, 72)
+        active = (230, 230, 230)
+        peak = (255, 255, 255)
+        intensity = max(0.0, min(1.0, level / 7))
+        color = tuple(
+            round(background + (foreground - background) * intensity)
+            for foreground, background in zip(active, inactive, strict=True)
+        )
+        if level >= 6:
+            peak_amount = min(1.0, (level - 5) / 2)
+            color = tuple(
+                round(background + (foreground - background) * peak_amount)
+                for foreground, background in zip(peak, color, strict=True)
+            )
+        return f"#{color[0]:02x}{color[1]:02x}{color[2]:02x}"
+
+    def _loading_wave(self) -> Text:
+        symbols = ("▁", "▂", "▃", "▄", "▅", "▆", "▇", "█")
+        wave = Text()
+        for level in self._loading_animation.levels():
+            safe_level = max(0, min(7, level))
+            style = self._loading_color(safe_level)
+            if safe_level == 7:
+                style = f"bold {style}"
+            wave.append(symbols[safe_level], style=style)
+        return wave
+
+    def _render_model_loading(self) -> Text:
+        loading = self._loading_wave()
+        loading.append("  ")
+        loading.append(ui_text(self._language, "turn.waiting"), style="#a9adb3")
+        return loading
 
     def _refresh_runtime_bar(self) -> None:
         model = Text()
@@ -3067,23 +3883,28 @@ class NeuroCodeApp(App[None]):
                 )
             )
         if self._pending_assistant is not None:
-            content = (
-                "".join(self._assistant_parts)
-                if self._assistant_parts
-                else ui_text(self._language, "turn.waiting")
-            )
-            self._pending_assistant.update(self._render_entry("assistant", content))
+            if self._assistant_parts:
+                self._pending_assistant.update(
+                    self._render_entry("assistant", "".join(self._assistant_parts))
+                )
+            else:
+                self._pending_assistant.update(self._render_model_loading())
 
 
 __all__ = [
+    "TUI_RELOAD_PROVIDER_SETTINGS",
     "ApprovalController",
     "AssistantMarkdown",
     "ConversationMessage",
     "ConversationRunner",
+    "LanguageSettingsScreen",
     "NeuroCodeApp",
     "PermissionApprovalScreen",
     "ProviderController",
     "ProviderSelectionScreen",
+    "ProviderSettingsScreen",
+    "ProviderSettingsSubmission",
+    "ProviderSetupApp",
     "ReasoningController",
     "ReasoningEffortScreen",
     "SessionController",

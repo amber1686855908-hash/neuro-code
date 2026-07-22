@@ -4,11 +4,12 @@ import argparse
 import asyncio
 import json
 import sys
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from pathlib import Path
 
 from neuro_code import __version__
 from neuro_code.adapters.background_tasks import LocalBackgroundTaskManager
+from neuro_code.adapters.provider_settings import JsonProviderSettingsStore
 from neuro_code.adapters.rust_session import load_rust_session
 from neuro_code.adapters.sandbox import create_shell_sandbox, enforce_configured_sandbox
 from neuro_code.adapters.sqlite_session import SqliteSessionStore
@@ -112,7 +113,7 @@ def _add_acp_arguments(parser: argparse.ArgumentParser) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="neuro-code",
+        prog="neuro",
         description="Independent Python terminal coding agent",
     )
     parser.add_argument("--version", action="version", version=__version__)
@@ -133,6 +134,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     agent_parser = subparsers.add_parser("agent", help="run the headless agent")
     _add_run_arguments(agent_parser)
+
+    code_parser = subparsers.add_parser("code", help="launch Neuro Code in this directory")
+    _add_run_arguments(code_parser)
 
     acp_parser = subparsers.add_parser("acp", help="serve partial ACP v1 over stdio")
     _add_acp_arguments(acp_parser)
@@ -319,19 +323,23 @@ def _skill_lines(cwd: Path) -> list[str]:
 
 
 def _completion_script(shell: str) -> str:
-    commands = "version inspect completions agent acp providers sessions export import-session"
+    commands = "code version inspect completions agent acp providers sessions export import-session"
     if shell == "bash":
         return (
             "_neuro_code() { COMPREPLY=( $(compgen -W '"
             + commands
-            + '\' -- "${COMP_WORDS[1]}") ); }; complete -F _neuro_code neuro-code'
+            + '\' -- "${COMP_WORDS[1]}") ); }; complete -F _neuro_code neuro neuro-code'
         )
     if shell == "zsh":
-        return f"#compdef neuro-code\n_arguments '1:command:({commands})'"
+        return f"#compdef neuro neuro-code\n_arguments '1:command:({commands})'"
     if shell == "fish":
-        return "\n".join(f"complete -c neuro-code -f -a {command}" for command in commands.split())
+        return "\n".join(
+            f"complete -c {executable} -f -a {command}"
+            for executable in ("neuro", "neuro-code")
+            for command in commands.split()
+        )
     return (
-        "Register-ArgumentCompleter -CommandName neuro-code -ScriptBlock { "
+        "Register-ArgumentCompleter -CommandName neuro,neuro-code -ScriptBlock { "
         f"'{commands}'.Split(' ') | Where-Object {{ $_ -like \"$wordToComplete*\" }} }}"
     )
 
@@ -339,7 +347,7 @@ def _completion_script(shell: str) -> str:
 async def _run_agent(args: argparse.Namespace) -> int:
     if not args.prompt:
         raise ConfigurationError(
-            "the agent subcommand requires -p/--single; run neuro-code without a subcommand "
+            "the agent subcommand requires -p/--single; run neuro without a subcommand "
             "for the interactive TUI"
         )
     application = await _open_application(args)
@@ -454,117 +462,189 @@ def _provider_options(config: AppConfig) -> tuple[ProviderOption, ...]:
 
 async def _run_tui(args: argparse.Namespace) -> int:
     try:
-        from neuro_code.tui import NeuroCodeApp
+        from neuro_code.tui import (
+            TUI_RELOAD_PROVIDER_SETTINGS,
+            NeuroCodeApp,
+            ProviderSetupApp,
+        )
     except ModuleNotFoundError as error:
         if error.name in {"rich", "textual"}:
             raise ConfigurationError(
-                "interactive TUI dependencies are missing; install 'neuro-code[tui]'"
+                "interactive TUI dependencies are missing; reinstall neuro-code"
             ) from error
         raise
 
-    application = await _open_application(args)
-    try:
-        approvals = SessionApprovalBroker()
-        config = application.config
-        store = application.store
-        ui_preferences = JsonUiPreferencesStore(config.state_dir / "ui-preferences.json")
-        language = await ui_preferences.load_language()
-        saved_reasoning_effort = await ui_preferences.load_reasoning_effort()
-        saved_interaction_mode = await ui_preferences.load_interaction_mode()
-        reasoning_effort = (
-            ReasoningEffort(args.effort)
-            if getattr(args, "effort", None) is not None
-            else saved_reasoning_effort
+    preflight_config = load_config(args.cwd)
+    if args.provider is not None or args.model is not None or args.base_url is not None:
+        preflight_config = override_provider(
+            preflight_config,
+            provider=args.provider,
+            model=args.model,
+            base_url=args.base_url,
         )
-        interaction_mode = InteractionMode.AUTO if args.always_approve else saved_interaction_mode
+    provider_settings_store = JsonProviderSettingsStore(preflight_config.state_dir)
+    ui_preferences = JsonUiPreferencesStore(preflight_config.state_dir / "ui-preferences.json")
+    selected_profile = (
+        preflight_config.providers.get(preflight_config.selected_provider)
+        if preflight_config.selected_provider is not None
+        else None
+    )
+    selected_ready = (
+        selected_profile is not None
+        and selected_profile.available
+        and selected_profile.redacted_dict().get("credential_configured") is True
+    )
+    if not selected_ready:
+        setup = ProviderSetupApp(
+            provider_settings=await provider_settings_store.load(),
+            provider_settings_store=provider_settings_store,
+            language=await ui_preferences.load_language(),
+        )
+        configured = await setup.run_async()
+        if not configured:
+            return 0
 
-        async def compose_scoped(
-            selected_config: AppConfig,
-            resume_id: str | None,
-        ) -> ConversationBinding:
-            return await application.create_binding(
-                config=selected_config,
-                approver=approvals,
-                resume_id=resume_id,
-                reasoning_effort=reasoning_effort,
+    while True:
+        application = await _open_application(args)
+        try:
+            approvals = SessionApprovalBroker()
+            config = application.config
+            store = application.store
+            managed_provider_settings = await provider_settings_store.load()
+            language = await ui_preferences.load_language()
+            saved_reasoning_effort = await ui_preferences.load_reasoning_effort()
+            saved_interaction_mode = await ui_preferences.load_interaction_mode()
+            reasoning_effort = (
+                ReasoningEffort(args.effort)
+                if getattr(args, "effort", None) is not None
+                else saved_reasoning_effort
+            )
+            interaction_mode = (
+                InteractionMode.AUTO if args.always_approve else saved_interaction_mode
             )
 
-        binding = await compose_scoped(config, args.resume)
-        selected_profile = config.selected_provider
-        if selected_profile is None:
-            raise ConfigurationError("no provider profile is selected")
-
-        async def bind_profile(profile_name: str) -> ConversationBinding:
-            selected_config = override_provider(config, provider=profile_name)
-            return await compose_scoped(
-                selected_config,
-                None,
-            )
-
-        async def list_workspace_sessions() -> tuple[SessionSummary, ...]:
-            sessions = await store.list_sessions(limit=1000)
-            return tuple(
-                session for session in sessions if workspaces_match(session.cwd, config.cwd)
-            )[:50]
-
-        async def search_workspace_sessions(query: str) -> tuple[SessionSearchHit, ...]:
-            page = await store.search_sessions(
-                query,
-                limit=1000,
-                include_content=True,
-            )
-            return tuple(
-                hit for hit in page.results if workspaces_match(hit.summary.cwd, config.cwd)
-            )[:50]
-
-        async def bind_session(profile_name: str, session_id: str) -> ConversationBinding:
-            selected_config = override_provider(config, provider=profile_name)
-            return await compose_scoped(
-                selected_config,
-                session_id,
-            )
-
-        async def rename_workspace_session(
-            session_id: str,
-            title: str,
-        ) -> SessionSummary:
-            summary = await store.get_session(session_id)
-            if not workspaces_match(summary.cwd, config.cwd):
-                raise ConfigurationError(
-                    f"session does not exist in the current workspace: {session_id}"
+            async def compose_scoped(
+                selected_config: AppConfig,
+                resume_id: str | None,
+                *,
+                application_: ApplicationComposition = application,
+                approvals_: SessionApprovalBroker = approvals,
+                reasoning_effort_: ReasoningEffort = reasoning_effort,
+            ) -> ConversationBinding:
+                return await application_.create_binding(
+                    config=selected_config,
+                    approver=approvals_,
+                    resume_id=resume_id,
+                    reasoning_effort=reasoning_effort_,
                 )
-            return await store.update_session_title(session_id, title)
 
-        controller = ProfileConversationController(
-            options=_provider_options(config),
-            selected_profile=selected_profile,
-            binding=binding,
-            binding_factory=bind_profile,
-            session_catalog=list_workspace_sessions,
-            session_search=search_workspace_sessions,
-            session_binding_factory=bind_session,
-            session_rename=rename_workspace_session,
-            sandbox_profile=config.sandbox_profile,
-            reasoning_effort=reasoning_effort,
-            interaction_mode=interaction_mode,
-        )
-        app = NeuroCodeApp(
-            controller,
-            approval_controller=approvals,
-            provider_controller=controller,
-            session_controller=controller,
-            task_controller=controller,
-            ui_preferences=ui_preferences,
-            language=language,
-            initial_items=controller.items,
-            provider_name=controller.provider_name,
-            model_name=controller.model_name,
-            cwd=config.cwd,
-        )
-        await app.run_async()
-        return app.return_code if app.return_code is not None else 0
-    finally:
-        await asyncio.shield(application.close())
+            binding = await compose_scoped(config, args.resume)
+            selected_profile_name = config.selected_provider
+            if selected_profile_name is None:
+                raise ConfigurationError("no provider profile is selected")
+
+            async def bind_profile(
+                profile_name: str,
+                *,
+                config_: AppConfig = config,
+                compose_scoped_: Callable[
+                    [AppConfig, str | None], Awaitable[ConversationBinding]
+                ] = compose_scoped,
+            ) -> ConversationBinding:
+                selected_config = override_provider(config_, provider=profile_name)
+                return await compose_scoped_(
+                    selected_config,
+                    None,
+                )
+
+            async def list_workspace_sessions(
+                *,
+                store_: SqliteSessionStore = store,
+                config_: AppConfig = config,
+            ) -> tuple[SessionSummary, ...]:
+                sessions = await store_.list_sessions(limit=1000)
+                return tuple(
+                    session for session in sessions if workspaces_match(session.cwd, config_.cwd)
+                )[:50]
+
+            async def search_workspace_sessions(
+                query: str,
+                *,
+                store_: SqliteSessionStore = store,
+                config_: AppConfig = config,
+            ) -> tuple[SessionSearchHit, ...]:
+                page = await store_.search_sessions(
+                    query,
+                    limit=1000,
+                    include_content=True,
+                )
+                return tuple(
+                    hit for hit in page.results if workspaces_match(hit.summary.cwd, config_.cwd)
+                )[:50]
+
+            async def bind_session(
+                profile_name: str,
+                session_id: str,
+                *,
+                config_: AppConfig = config,
+                compose_scoped_: Callable[
+                    [AppConfig, str | None], Awaitable[ConversationBinding]
+                ] = compose_scoped,
+            ) -> ConversationBinding:
+                selected_config = override_provider(config_, provider=profile_name)
+                return await compose_scoped_(
+                    selected_config,
+                    session_id,
+                )
+
+            async def rename_workspace_session(
+                session_id: str,
+                title: str,
+                *,
+                store_: SqliteSessionStore = store,
+                config_: AppConfig = config,
+            ) -> SessionSummary:
+                summary = await store_.get_session(session_id)
+                if not workspaces_match(summary.cwd, config_.cwd):
+                    raise ConfigurationError(
+                        f"session does not exist in the current workspace: {session_id}"
+                    )
+                return await store_.update_session_title(session_id, title)
+
+            controller = ProfileConversationController(
+                options=_provider_options(config),
+                selected_profile=selected_profile_name,
+                binding=binding,
+                binding_factory=bind_profile,
+                session_catalog=list_workspace_sessions,
+                session_search=search_workspace_sessions,
+                session_binding_factory=bind_session,
+                session_rename=rename_workspace_session,
+                sandbox_profile=config.sandbox_profile,
+                reasoning_effort=reasoning_effort,
+                interaction_mode=interaction_mode,
+            )
+            app = NeuroCodeApp(
+                controller,
+                approval_controller=approvals,
+                provider_controller=controller,
+                session_controller=controller,
+                task_controller=controller,
+                ui_preferences=ui_preferences,
+                provider_settings_store=provider_settings_store,
+                managed_provider_settings=managed_provider_settings,
+                language=language,
+                initial_items=controller.items,
+                provider_name=controller.provider_name,
+                model_name=controller.model_name,
+                cwd=config.cwd,
+            )
+            await app.run_async()
+            return_code = app.return_code if app.return_code is not None else 0
+        finally:
+            await asyncio.shield(application.close())
+        if return_code != TUI_RELOAD_PROVIDER_SETTINGS:
+            return return_code
 
 
 def _provider_rows(config: AppConfig) -> list[dict[str, object]]:
@@ -903,7 +983,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             return asyncio.run(_import_session(args))
         if args.command == "acp":
             return asyncio.run(_run_acp(args))
-        if args.command is None and args.prompt is None:
+        if args.command in {None, "code"} and args.prompt is None:
             return asyncio.run(_run_tui(args))
         return asyncio.run(_run_agent(args))
     except KeyboardInterrupt:

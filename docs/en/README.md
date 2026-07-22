@@ -11,6 +11,28 @@ minimal Textual TUI, and a partial ACP v1 stdio core are supported vertical
 slices; remaining interface and protocol work is tracked in the
 [compatibility matrix](compatibility-matrix.md).
 
+## Install and launch
+
+Install the released package once with a tool that exposes Python console
+scripts globally, without activating a virtual environment for each use:
+
+```bash
+uv tool install neuro-code
+# or: pipx install neuro-code
+```
+
+Then open a terminal in any directory and use any equivalent TUI launch form;
+that directory becomes the workspace:
+
+```bash
+neuro
+neuro code
+neuro-code
+```
+
+Textual is a normal package dependency, so a standard installation includes
+the TUI. During source development, use `uv run neuro` instead.
+
 ## Development
 
 Python 3.12 or newer is required. The canonical environment manager is `uv`:
@@ -94,17 +116,21 @@ extensions remain unsupported and are not advertised. See the
 
 ## Interactive TUI
 
-The development extra includes Textual. After configuring a provider, launch
-the interactive interface without a subcommand:
+During source development, launch the interactive interface without a
+subcommand:
 
 ```bash
 uv sync --extra dev
-uv run neuro-code
+uv run neuro
 ```
 
-When installing the built package outside the development environment, include
-the optional UI dependency with `pip install 'neuro-code[tui]'`. The initial TUI
-provides prompt input, scrollback, streamed assistant text, provider/tool status,
+On a first launch with no ready provider, the TUI opens its provider setup form
+before composing an agent runtime. Normal Settings first shows language and
+model-provider categories, then opens only the selected detail screen. Provider
+settings can create or edit OpenAI Responses, OpenAI-compatible Chat, DeepSeek,
+Anthropic, Gemini, or xAI profiles and save-and-use one immediately. The initial
+TUI provides prompt input, scrollback, streamed
+assistant text, provider/tool status,
 and local `/help`, `/status`, `/settings` (alias `/setting`), `/provider`, `/model`,
 `/effort [LEVEL]` (alias `/reasoning`), `/mode [MODE]`, `/sessions [QUERY]`, `/resume`,
 `/rename TITLE` (alias `/title`), `/cancel`, `/clear`, `/quit`, and `/exit` commands.
@@ -154,17 +180,21 @@ restrained semantic highlights. Each model step reports client-observed time to
 its first actionable output, each tool call owns one stable
 invocation/permission/result card with elapsed time, and a completed turn
 reports total elapsed time after the final assistant message. Completed cards
-show bounded, control-safe, credential-redacted previews of actual tool output.
+retain bounded, control-safe, credential-redacted previews of actual tool output.
+Read/list/search/image/skill calls default to one concise action line; their safe
+preview can still be opened in place.
 Side-effecting local tools also report bounded per-call workspace changes with
 file paths and unified text diffs; sensitive, binary, oversized, dependency,
-cache, and version-control-internal content stays hidden. Cards keep those safe
-details expanded by default and can be collapsed or reopened in place by click,
-or by focusing them and pressing `Enter`/`Space`; summaries and terminal status
-remain visible. Mermaid and inline media are not part of this slice.
+cache, and version-control-internal content stays hidden. Successful edits
+automatically show their changed slices. Added and removed lines use green/red
+foregrounds plus distinct tinted backgrounds. Safe details can be collapsed or
+reopened in place by click, or by focusing the card and pressing
+`Enter`/`Space`. Mermaid and inline media are not part of this slice.
 
 A persistent one-line runtime bar above the prompt shows the active provider
 and model, compact working directory, current context-window use, requested
-reasoning effort, and interaction mode. The
+reasoning effort, and interaction mode. While waiting for model output, the
+supplied seven-cell collapsing pulse animates before the pending-assistant text. The
 context percentage starts as a visibly approximate local estimate and switches
 to provider-reported input/output token usage after a model step. A configured
 `context_window_tokens` value supplies the denominator; unknown windows display
@@ -179,13 +209,28 @@ text commands display placeholders such as `SESSION_ID`, `QUERY`, and `TITLE`.
 `Tab` applies the first valid completion while ordinary prompt text and modal
 focus traversal retain their normal behavior.
 
-Use `Ctrl+,`, `/settings`, or `/setting` to choose English or Simplified Chinese.
+Use `Ctrl+,`, `/settings`, or `/setting` to open a first-level category page,
+then choose interface language or model providers. Provider details distinguish
+OpenAI Responses (`/responses`) from OpenAI-compatible Chat Completions
+(`/chat/completions`); the DeepSeek preset selects the latter and fills
+`https://api.deepseek.com`.
 The selected language immediately updates application-owned controls, dialogs,
 and status text; prompts and model/tool content are never translated. The choice
 is stored with the reasoning-effort and interaction-mode preferences, separately from provider
 configuration, in
 `$NEURO_CODE_HOME/ui-preferences.json` (normally
 `~/.neuro-code/ui-preferences.json`) and is reused on later TUI launches.
+
+TUI-managed provider metadata is stored atomically in
+`~/.neuro-code/providers.json`; API keys are kept out of that file and ordinary
+`config.toml`, in a separate private `~/.neuro-code/credentials.json` file.
+Both files use owner-only permissions where POSIX modes are supported, and
+configured values are redacted again at the tool-result boundary. Manual
+`~/.neuro-code/config.toml` profiles remain supported. A same-name TUI-managed
+profile replaces the complete TOML provider table so a workspace cannot
+redirect its stored key to another endpoint. The storage port is replaceable
+by a future OS-keychain adapter; the current credential file is not encrypted
+at rest.
 
 Use `Ctrl+E`, bare `/effort`, or bare `/reasoning` to open the five-level effort
 picker. `/effort LEVEL` and `/reasoning LEVEL` select directly, and `--effort
@@ -229,7 +274,9 @@ Use `Ctrl+P`, bare `/provider` or bare `/model` to open the configured-profile
 picker. `/provider PROFILE` and `/model PROFILE` select directly. The picker
 shows only profile name, model, protocol, and readiness; unavailable profiles
 or profiles with missing credentials are disabled. It selects configured
-profiles, not arbitrary remote model IDs, and does not edit configuration.
+profiles, not arbitrary remote model IDs. Selecting a TUI-managed profile also
+saves it as the default for later launches; profile creation and editing remain
+in Settings.
 Switching is rejected during a turn. Switching to a different profile keeps
 the previous SQLite session available and gives the next prompt a fresh
 conversation, preventing provider-affine or encrypted context from crossing

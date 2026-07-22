@@ -621,6 +621,7 @@ dependencies = [
     { name = "httpx" },
     { name = "mcp" },
     { name = "pydantic" },
+    { name = "textual" },
 ]
 
 [package.optional-dependencies]
@@ -630,9 +631,6 @@ dev = [
     { name = "pytest-asyncio" },
     { name = "pytest-cov" },
     { name = "ruff" },
-    { name = "textual" },
-]
-tui = [
     { name = "textual" },
 ]
 
@@ -647,8 +645,8 @@ requires-dist = [
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.25" },
     { name = "pytest-cov", marker = "extra == 'dev'", specifier = ">=6.0" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.9" },
+    { name = "textual", specifier = ">=1.0,<2" },
     { name = "textual", marker = "extra == 'dev'", specifier = ">=1.0,<2" },
-    { name = "textual", marker = "extra == 'tui'", specifier = ">=1.0,<2" },
 ]
 provides-extras = ["tui", "dev"]
 

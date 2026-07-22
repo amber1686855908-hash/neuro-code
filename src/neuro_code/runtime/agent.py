@@ -48,6 +48,7 @@ from neuro_code.ports.approval import PermissionApprover
 from neuro_code.ports.model import ModelProvider
 from neuro_code.ports.storage import SessionStore
 from neuro_code.ports.tools import ToolContext
+from neuro_code.redaction import redact_sensitive_text
 from neuro_code.runtime.background_task_reminders import (
     BACKGROUND_TASK_COMPLETION_BATCH_LIMIT,
     format_background_task_completion_reminder,
@@ -678,6 +679,16 @@ class AgentRuntime:
                 result = await tool.execute(call.arguments, self._tool_context)
             except (ToolError, OSError, UnicodeError) as error:
                 result = ToolResult(f"{type(error).__name__}: {error}", is_error=True)
+            safe_content = redact_sensitive_text(
+                result.content,
+                explicit_values=self._tool_context.redaction_values,
+            )
+            if safe_content != result.content:
+                result = ToolResult(
+                    safe_content,
+                    is_error=result.is_error,
+                    metadata=result.metadata,
+                )
             kind = AgentEventKind.TOOL_FAILED if result.is_error else AgentEventKind.TOOL_COMPLETED
             record_result(result)
             terminal_data = terminal_event_data(result)

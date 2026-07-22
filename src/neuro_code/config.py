@@ -4,13 +4,14 @@ import hashlib
 import os
 import tomllib
 from collections.abc import Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from importlib.util import find_spec
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 from urllib.parse import unquote, urlsplit, urlunsplit
 
+from neuro_code.adapters.provider_settings import load_managed_provider_settings
 from neuro_code.domain.sandbox import SandboxProfile
 from neuro_code.errors import ConfigurationError
 from neuro_code.ports.http import HttpClientPolicy
@@ -24,7 +25,7 @@ SUPPORTED_PROTOCOLS = frozenset(
     }
 )
 SUPPORTED_DIALECTS = frozenset({"standard", "xai"})
-SUPPORTED_AUTH = frozenset({"env", "proxy-managed", "unsupported-inline"})
+SUPPORTED_AUTH = frozenset({"env", "stored", "proxy-managed", "unsupported-inline"})
 SUPPORTED_NATIVE_CONTEXT = frozenset({"disabled", "profile"})
 SUPPORTED_PROXY_MODES = frozenset({"environment", "direct", "explicit"})
 
@@ -169,6 +170,7 @@ class ProviderProfile:
     proxy_url_env: str | None = None
     source: str = "native"
     unavailable_reason: str | None = None
+    stored_api_key: str | None = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if not self.name:
@@ -190,6 +192,10 @@ class ProviderProfile:
             raise ConfigurationError(
                 f"provider profile {self.name!r} requires api_key_env for env authentication"
             )
+        if self.auth == "stored" and not self.stored_api_key and self.unavailable_reason is None:
+            raise ConfigurationError(f"provider profile {self.name!r} requires a stored API key")
+        if self.auth != "stored" and self.stored_api_key is not None:
+            raise ConfigurationError("stored API keys require stored authentication")
         if self.auth == "proxy-managed" and not _is_loopback_url(self.base_url):
             raise ConfigurationError("proxy-managed authentication requires an HTTP loopback URL")
         if self.timeout_seconds <= 0:
@@ -251,6 +257,9 @@ class ProviderProfile:
             )
         if self.auth == "proxy-managed":
             return "PROXY_MANAGED"
+        if self.auth == "stored":
+            assert self.stored_api_key is not None
+            return self.stored_api_key
         assert self.api_key_env is not None
         source = os.environ if environ is None else environ
         value = source.get(self.api_key_env, "").strip()
@@ -287,8 +296,10 @@ class ProviderProfile:
 
     def redacted_dict(self, environ: Mapping[str, str] | None = None) -> dict[str, Any]:
         env = os.environ if environ is None else environ
-        credential_configured = self.auth == "proxy-managed" or bool(
-            self.api_key_env and env.get(self.api_key_env)
+        credential_configured = (
+            self.auth == "proxy-managed"
+            or (self.auth == "stored" and bool(self.stored_api_key))
+            or bool(self.api_key_env and env.get(self.api_key_env))
         )
         proxy_url_configured = (
             bool(env.get(self.proxy_url_env, ""))
@@ -363,6 +374,20 @@ class AppConfig:
             if profile.proxy_url_env is not None:
                 names.add(profile.proxy_url_env)
         return frozenset(name.casefold() for name in names)
+
+    def redaction_values(self, environ: Mapping[str, str] | None = None) -> tuple[str, ...]:
+        """Return credential values that must never cross a tool-result boundary."""
+
+        env = os.environ if environ is None else environ
+        values: list[str] = []
+        for profile in self.providers.values():
+            if profile.stored_api_key:
+                values.append(profile.stored_api_key)
+            if profile.api_key_env and env.get(profile.api_key_env):
+                values.append(env[profile.api_key_env])
+            if profile.proxy_url_env and env.get(profile.proxy_url_env):
+                values.append(env[profile.proxy_url_env])
+        return tuple(dict.fromkeys(value for value in values if value))
 
     def redacted_dict(self, environ: Mapping[str, str] | None = None) -> dict[str, Any]:
         profiles = {
@@ -469,6 +494,7 @@ def _native_profile(
     raw: Mapping[str, object],
     *,
     legacy_table: bool = False,
+    stored_api_key: str | None = None,
 ) -> ProviderProfile:
     legacy_kind = _string(raw.get("kind"))
     if legacy_table and not legacy_kind and not _string(raw.get("protocol")):
@@ -498,6 +524,11 @@ def _native_profile(
         raw.get("native_context"),
         "profile" if dialect == "xai" else "disabled",
     )
+    unavailable_reason = (
+        f"managed provider profile {name!r} is missing its stored API key"
+        if auth == "stored" and stored_api_key is None
+        else None
+    )
     return ProviderProfile(
         name=name,
         protocol=protocol,
@@ -524,6 +555,8 @@ def _native_profile(
         proxy_mode=_string(raw.get("proxy_mode"), "environment"),
         proxy_url_env=_string(raw.get("proxy_url_env")) or None,
         source="legacy" if legacy_kind else "native",
+        unavailable_reason=unavailable_reason,
+        stored_api_key=stored_api_key,
     )
 
 
@@ -587,6 +620,8 @@ def _cc_switch_profile(alias: str, raw: Mapping[str, object]) -> ProviderProfile
 
 def _profiles_from_data(
     data: Mapping[str, object],
+    *,
+    stored_api_keys: Mapping[str, str] | None = None,
 ) -> tuple[dict[str, ProviderProfile], str | None]:
     profiles: dict[str, ProviderProfile] = {}
     raw_profiles = data.get("providers", {})
@@ -595,7 +630,11 @@ def _profiles_from_data(
     for name, raw in raw_profiles.items():
         if not isinstance(name, str) or not isinstance(raw, Mapping):
             raise ConfigurationError("each [providers.<name>] entry must be a TOML table")
-        profiles[name] = _native_profile(name, raw)
+        profiles[name] = _native_profile(
+            name,
+            raw,
+            stored_api_key=(stored_api_keys or {}).get(name),
+        )
 
     raw_model_profiles = data.get("model", {})
     legacy_provider = data.get("provider", {})
@@ -692,6 +731,32 @@ def load_config(
             if candidate == project_config_path:
                 project_data = loaded
 
+    managed = load_managed_provider_settings(state_dir)
+    if managed.profiles:
+        raw_provider_table = data.get("providers", {})
+        if not isinstance(raw_provider_table, Mapping):
+            raise ConfigurationError("[providers] must be a TOML table")
+        managed_provider_table = dict(raw_provider_table)
+        for managed_profile in managed.profiles:
+            # Replace the complete same-name table. In particular, do not inherit a
+            # workspace-controlled endpoint, proxy, or tool flag for a stored key.
+            managed_provider_table[managed_profile.name] = {
+                "protocol": managed_profile.protocol,
+                "dialect": managed_profile.dialect,
+                "model": managed_profile.model,
+                "base_url": managed_profile.base_url,
+                "auth": "stored",
+            }
+        data = dict(data)
+        data["providers"] = managed_provider_table
+        if managed.default_provider is not None:
+            raw_routing = data.get("routing", {})
+            if not isinstance(raw_routing, Mapping):
+                raise ConfigurationError("[routing] must be a TOML table")
+            data["routing"] = {**raw_routing, "default": managed.default_provider}
+        # User-managed profiles deliberately win name collisions so that a workspace
+        # cannot redirect a private stored credential to a different endpoint.
+
     user_sandbox = _sandbox_profile_from_data(user_data)
     project_sandbox = _sandbox_profile_from_data(project_data)
     environment_sandbox = _sandbox_profile_from_environment(env)
@@ -709,7 +774,14 @@ def load_config(
         sandbox_profile = SandboxProfile.OFF
         sandbox_profile_source = "default"
 
-    providers, cc_default = _profiles_from_data(data)
+    providers, cc_default = _profiles_from_data(
+        data,
+        stored_api_keys={
+            managed_profile.name: managed_profile.api_key
+            for managed_profile in managed.profiles
+            if managed_profile.api_key is not None
+        },
+    )
     routing = data.get("routing", {})
     if not isinstance(routing, Mapping):
         raise ConfigurationError("[routing] must be a TOML table")
