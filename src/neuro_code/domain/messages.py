@@ -26,6 +26,21 @@ class ContextItemKind(StrEnum):
     BACKEND_TOOL_CALL = "backend_tool_call"
 
 
+class SyntheticReason(StrEnum):
+    """Marks a message as synthetic (not a genuine user/assistant turn).
+
+    Synthetic messages are injected by the application for context shaping
+    but must never masquerade as real conversation turns.
+
+    This is deliberately an in-memory annotation. Synthetic context is
+    rebuilt before every model step and is neither persisted nor projected
+    through ACP/UI conversation history.
+    """
+
+    PROJECT_INSTRUCTIONS = "project-instructions"
+    AVAILABLE_SKILLS = "available-skills"
+
+
 def _freeze_mapping(value: Mapping[str, Any]) -> Mapping[str, Any]:
     return MappingProxyType(dict(value))
 
@@ -113,10 +128,24 @@ class Message:
     tool_calls: tuple[ToolCall, ...] = field(default_factory=tuple)
     content_parts: tuple[ContentPart, ...] = field(default_factory=tuple)
     reasoning_content: str | None = None
+    synthetic_reason: SyntheticReason | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "tool_calls", tuple(self.tool_calls))
         object.__setattr__(self, "content_parts", tuple(self.content_parts))
+        if self.synthetic_reason is not None:
+            if self.role is not Role.USER:
+                raise ValueError("synthetic context must use the user role")
+            if not self.content:
+                raise ValueError("synthetic context must not be empty")
+            if (
+                self.name is not None
+                or self.tool_call_id is not None
+                or self.tool_calls
+                or self.content_parts
+                or self.reasoning_content is not None
+            ):
+                raise ValueError("synthetic context must be a plain text user message")
         if self.reasoning_content is not None:
             if self.role is not Role.ASSISTANT:
                 raise ValueError("reasoning content is only valid on assistant messages")

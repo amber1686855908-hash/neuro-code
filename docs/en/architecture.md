@@ -104,6 +104,234 @@ The next prompt therefore reuses durable state instead of a stale in-memory
 prefix. A cancelled user message remains part of that history; pre-token rewind
 is a separate, unimplemented interaction policy.
 
+## Repository-level AGENTS.md instruction discovery
+
+Repository-level AGENTS.md files are project-owned, non-system instructions that
+guide agent behaviour within the workspace boundary. They are never loaded from
+the network, never executed, and never allowed to impersonate system or user
+messages. All discovery is deterministic, bounded, fail-closed, and walks only
+from the workspace root toward the target directory.
+
+The discovery service is defined by the `InstructionDiscovery` port; the
+default adapter is `FilesystemInstructionDiscovery`. The composition root
+constructs the adapter through an `InstructionDiscoveryFactory` and installs a
+per-binding `instruction_provider` closure for each conversation. File tools
+move a binding-local target, and the closure re-discovers from the workspace
+root toward that target before each model step. The bounded filesystem work
+runs outside the event-loop thread, so AGENTS.md changes take effect on the
+next step without restarting the process. Discovery results are not cached
+across sessions, do not enter the durable `SessionItem` history, and the
+injected instruction message is a transient, per-step synthetic item.
+
+`InstructionTracker` separately records the last result actually injected
+into a model step. Before `search_replace`, it compares the target directory's
+current instructions with that snapshot by path and content. A new or changed
+instruction aborts the write as an error, allowing the next model step to see
+the new rules before retrying. Arbitrary Bash paths cannot be inferred safely,
+so Bash writes retain this documented limitation.
+
+Discovered instructions are not appended to the system message. They are
+injected as a separate synthetic `User` message after the system message and
+before any genuine user messages, tagged with
+`SyntheticReason.PROJECT_INSTRUCTIONS`. This structured source marker ensures
+repository content does not share the trust level of the application system
+prompt. `Message.synthetic_reason` exists only in memory: synthetic items are
+rebuilt per step and never enter storage, UI, or protocol conversation history.
+
+Discovery walks root-to-target and returns instructions shallowest-first.
+Filesystem work is capped at 20 directory levels, 10 loaded files, 64 KiB per
+file, and 256 KiB total. UTF-8, C0/C1/DEL controls, regular-file identity, and
+workspace boundaries are validated. All symlinks and Windows reparse points
+are rejected; audit output distinguishes escape, circular/broken, and
+otherwise in-bound links. Rejection paths escape control characters before
+they reach a terminal or JSON output.
+
+File reads are bounded and best-effort symlink-resistant: `lstat()` rejects
+symlinks and Windows reparse points; `os.open()` with `O_NOFOLLOW` (POSIX)
+opens the handle; handle-level `fstat()` verifies a regular file and
+compares `st_dev`/`st_ino` with the lstat result to detect path
+substitution between lstat and open; `os.read()` reads at most
+`MAX_SINGLE_FILE_BYTES + 1` bytes (the +1 detects over-limit files); a
+post-read `fstat()` verifies handle identity unchanged. This is not a
+fully TOCTOU-safe implementation -- POSIX `O_NOFOLLOW` only protects the
+last path component and Windows lacks `O_NOFOLLOW` -- but the combination
+of lstat rejection, bounded read, and lstat-with-fstat identity comparison
+provides strong defence against common attack vectors. A target directory
+that escapes the workspace is rejected as a whole with `ESCAPES_WORKSPACE`,
+not silently clamped to the root. All rejection reasons are enum values so
+that inspect and audit surfaces can distinguish them.
+
+The CLI `inspect` command renders loaded file paths, depths, content byte
+counts, the fingerprint, and all rejections from the same discovery service.
+JSON mode includes an `instructions` field; plain mode renders one item per
+line. ACP and TUI inject the `InstructionDiscovery` instance via
+`ApplicationComposition`; CLI inspect uses
+`ApplicationComposition.default_instruction_discovery()` to construct an
+instance from the same default factory. They share the same port contract
+and default factory, so discovery rules do not diverge by interface, though
+inspect does not use the same runtime instance as a live session. See
+[ADR 0039](adr/0039-repository-instruction-discovery.md).
+
+## Read-only skill file discovery
+
+Project, repository, and user `SKILL.md` files are read-only metadata that
+inform the model of available skills. Skill discovery follows the same
+ports-and-adapters pattern as instruction discovery: a `SkillDiscovery` port,
+a `FilesystemSkillDiscovery` default adapter, an
+`ApplicationComposition`-injected factory, and a per-binding
+`skill_provider` closure that re-discovers before each model step. The
+adapter imports the filesystem safety helpers (`_toctou_safe_read`,
+`_is_symlink_or_reparse_point`, `_resolve_within_workspace`) from the
+instruction discovery adapter, so both share the same bounded, best-effort
+symlink-resistant read pattern.
+
+The adapter scans `.neuro/skills/`, `.agents/skills/`, `.grok/skills/`, and
+`.claude/skills/` for `SKILL.md` files, walking up to
+`MAX_SKILL_WALK_DEPTH = 5` directory levels. Skills are deduplicated by name
+(first-seen wins, ordered by config-directory priority within each scope) and
+ordered by scope priority (`LOCAL` > `REPO` > `USER`). All three scopes
+are implemented: `LOCAL` (the moving target up through the workspace root),
+`REPO` (every ancestor above the workspace through the git root), and `USER`
+(the user home directory). Each `SKILL.md`
+frontmatter block is handled by a bounded, dependency-free line parser for
+common `key: value` scalars, quotes, and inline comments. Delimiters must
+occupy complete lines. Missing or malformed metadata falls back to the skill
+directory name and first prose body line.
+
+The model receives a byte-bounded compact catalog -- skill name, description,
+and when-to-use -- not full skill bodies. The listing is injected as a separate
+synthetic `User` message tagged with
+`SyntheticReason.AVAILABLE_SKILLS`, inserted after the instruction message
+(or after the system message if no instructions were discovered). This
+preserves the "repository content does not share system prompt trust level"
+safety invariant. The `Message.synthetic_reason` field is an in-memory
+marker only; skill listings do not enter `SessionItem` persistence and are
+re-discovered on each model step. The runtime `SkillTracker` is
+session-scoped and maintains a moving target (mirroring the
+`InstructionTracker` design): when file-access tools touch a path,
+`check_path()` updates the target so that `SKILL.md` files from the
+accessed directory upward to the workspace root (inclusive) are
+discovered in the next `current_result()` call. The adapter also scans every
+repository ancestor above the workspace through the git root (`REPO` scope)
+and user home (`USER` scope) on each call.
+
+The CLI `inspect` command renders discovered skill file paths, scopes,
+depths, rejections, and the SHA-256 fingerprint through the same
+`application.skill_result` property used by the runtime. See
+[ADR 0040](adr/0040-read-only-skill-discovery.md).
+
+## Skill body loading tool
+
+The `SkillTool` (`tools/skills.py`) allows the model to load the full body
+of a discovered skill by name. The model first sees a compact skill catalog
+via the `AVAILABLE_SKILLS` synthetic message; when it decides a skill is
+relevant, it calls the `skill` tool with the skill name to load the
+complete SKILL.md body.
+
+The tool follows the same bounded, symlink-resistant read pattern as
+discovery. It resolves `skill.root / skill.relative_path`, checks the relevant
+LOCAL, REPO, or USER boundary, and verifies that the loaded content still
+matches the discovery fingerprint. It strips BOM and YAML frontmatter, then
+returns a bounded `<skill_content>` block. The bundled-file sample contains at
+most 10 direct regular-file names; links, directories, control-character
+names, and oversized directory listings are omitted.
+
+The `ToolContext` dataclass depends on the `SkillContextTracker` port (the
+concrete runtime tracker is not imported into the port layer), wired by
+`ApplicationComposition.create_binding()`. The `SkillTracker` re-discovers
+on each `current_result()` call, so skill file changes take effect on the
+next tool invocation without a session restart. Variable substitution is
+performed at load time: the `SkillTool` accepts an optional `args`
+parameter and expands `$ARGUMENTS`, `$ARGUMENTS[N]`, `$N`, and
+`${SKILL_DIR}` tokens in the body via `apply_skill_substitutions()` in
+`domain/skills.py`. When the body contains no argument tokens but args are
+non-empty, the args are appended as a `**ARGUMENTS:**` suffix for backward
+compatibility. Arguments, substitution count, and rendered output are byte or
+count bounded; unsupported positional tokens such as `$100` remain literal.
+See
+[ADR 0041](adr/0041-skill-body-loading-tool.md) and
+[ADR 0045](adr/0045-skill-variable-substitution.md).
+
+## User-level skill discovery
+
+`FilesystemSkillDiscovery` accepts an optional `user_home: Path | None`
+constructor parameter. When `None`, the adapter resolves the user home at
+discovery time via `Path.home()`. LOCAL discovery uses the workspace as its
+common boundary, REPO discovery uses the detected git root, and USER discovery
+uses the resolved user home. When the workspace root and user home are the same path
+(e.g. when the session is launched from the home directory), the USER pass
+is skipped to avoid double-scanning. The candidate tuple carries both the
+discovery root and the scope so the processing loop can compute
+POSIX-relative paths and perform boundary checks against the correct root
+for each candidate.
+
+`SkillInfo` gained a `root: Path | None` field (defaulting to `None` for
+backward compatibility) that stores the discovery root the skill was found
+under. `SkillTool` resolves the absolute path via
+`skill.root / skill.relative_path` (falling back to
+`tracker.workspace_root` when `root` is `None`) and performs the boundary
+check against the discovery root rather than the workspace root. This keeps
+path resolution correct for both LOCAL skills (root = workspace) and USER
+skills (root = user home) without changing the tool's public contract.
+
+Cross-scope priority is scope-first: LOCAL candidates are collected and
+processed before REPO candidates, which are collected before USER
+candidates. The same first-seen-wins dedup by name ensures a LOCAL skill
+shadows a REPO skill shadows a USER skill with the same name. Within each
+scope, the config-directory priority (`.neuro` → `.agents` → `.grok` →
+`.claude`) still applies. See
+[ADR 0042](adr/0042-user-level-skill-discovery.md) and
+[ADR 0044](adr/0044-repository-level-skill-discovery.md).
+
+## Dynamic mid-session skill discovery
+
+The `SkillTracker` maintains a moving target, mirroring the
+`InstructionTracker` design. When file-access tools (`read_file`,
+`list_dir`, `grep`) touch a path, `check_path()` updates the target so
+that `SKILL.md` files from the accessed directory **upward** to the
+workspace root (inclusive) are discovered in the next `current_result()`
+call. This finds skills located at any nesting depth in the workspace,
+not just at the workspace root — for example,
+`src/foo/.neuro/skills/commit/SKILL.md` is discovered when the model
+reads a file in `src/foo/`.
+
+The adapter walks **upward** from `target` to `workspace_root`
+(inclusive), checking each ancestor directory for config dirs. Deeper
+ancestors are scanned first so first-seen-wins name deduplication gives
+precedence to more specific (deeper) skills over general (root) skills,
+matching the grok-build "deepest-first" model. When `target` is `None`
+or equals the workspace root (e.g. CLI inspect, `rediscover_skills`),
+the walk degenerates to scanning just the root level.
+
+Sibling subtrees are isolated: switching from `src/foo/` to `src/bar/`
+moves the target, and skills from `src/foo/`'s config dirs are no longer
+included. The `SkillTracker.check_path()` is called by `ReadFileTool`,
+`ListDirTool`, and `GrepTool` alongside their existing
+`InstructionTracker.check_path()` calls. `SearchReplaceTool` does not move the
+skill target (its instruction tracker has a separate write preflight), and
+`BashTool` does not attempt to infer paths from arbitrary shell syntax. See
+[ADR 0043](adr/0043-dynamic-session-skill-discovery.md).
+
+## Repository-level skill discovery
+
+When the workspace is a subdirectory of a git repository (e.g.
+`myrepo/packages/frontend/`), the adapter detects the git root by walking
+upward from the workspace root looking for a regular, non-link ``.git``
+directory or file. It scans every ancestor above the workspace through the
+git root, nearest first, and tags those skills with `SkillScope.REPO`. Thus a
+package-level repository skill can shadow a git-root default while both remain
+visible to a nested workspace.
+
+The REPO scan is skipped when the git root equals the workspace root
+(already covered by LOCAL discovery), or when no acceptable ``.git`` marker
+is found within the bounded upward walk. The
+`FilesystemSkillDiscovery.__init__` accepts an optional `git_root` parameter
+(defaulting to `None` for auto-detection) following the same pattern as
+`user_home`. Every REPO `SkillInfo.root` is the common git root, so paths from
+intermediate ancestors remain unique and `SkillTool` resolves them against
+one stable boundary. See
+[ADR 0044](adr/0044-repository-level-skill-discovery.md).
+
 ## Partial ACP v1 adapter
 
 `neuro-code acp` is a protocol adapter over `ApplicationComposition` and the
@@ -440,6 +668,17 @@ continues to fail closed. See
 - `SessionStore`: appends versioned events, preserves ordered `SessionItem`
   values, exposes canonical and ordinary-message projections, and returns
   typed, paginated session-title/content search pages.
+- `InstructionDiscovery`: deterministically, bounded, fail-closed discovers
+  AGENTS.md instruction files within the workspace boundary, returning an
+  ordered list of `InstructionFile`s, `InstructionRejection`s, and a stable
+  fingerprint. Adapters must not read from the network, must not execute
+  discovered files, and must not follow symlinks that escape the workspace.
+- `SkillDiscovery`: deterministically, bounded, fail-closed discovers
+  read-only `SKILL.md` skill files at LOCAL, REPO, and USER roots, returning
+  an ordered list of `SkillInfo`s, `SkillRejection`s,
+  and a stable body-sensitive fingerprint. Adapters must not read from the
+  network, execute discovered files, or place full bodies in model context;
+  all links and reparse points are rejected.
 - `PlatformAdapter`: encapsulates PTY, process, signal, path, clipboard, and sandbox differences.
 
 Protocol models are versioned at external boundaries. Internal state prefers

@@ -269,6 +269,55 @@ def _plain_config(config: AppConfig) -> str:
     return "\n".join(lines)
 
 
+def _instruction_lines(cwd: Path) -> list[str]:
+    """Discover instruction files and format them for inspect output."""
+    from neuro_code.application import ApplicationComposition
+
+    discovery = ApplicationComposition.default_instruction_discovery()
+    result = discovery.discover(cwd)
+    lines: list[str] = ["instruction_files:"]
+    if result.files:
+        for instruction_file in result.files:
+            byte_count = len(instruction_file.content.encode("utf-8"))
+            lines.append(
+                f"  - {instruction_file.relative_path} "
+                f"(depth={instruction_file.depth}, bytes={byte_count})"
+            )
+    else:
+        lines.append("  - (none)")
+    if result.rejections:
+        lines.append("instruction_rejections:")
+        for rejection in result.rejections:
+            lines.append(f"  - {rejection.relative_path}: {rejection.reason.value}")
+    lines.append(f"instruction_fingerprint: {result.fingerprint[:16]}...")
+    return lines
+
+
+def _skill_lines(cwd: Path) -> list[str]:
+    """Discover skill files and format them for inspect output."""
+    from neuro_code.application import ApplicationComposition
+
+    discovery = ApplicationComposition.default_skill_discovery()
+    result = discovery.discover(cwd)
+    lines: list[str] = ["skill_files:"]
+    if result.files:
+        for skill in result.files:
+            desc = f": {skill.description}" if skill.description else ""
+            lines.append(
+                f"  - [{skill.scope.name.lower()}] {skill.name} "
+                f"({skill.relative_path}, depth={skill.depth}){desc}"
+            )
+    else:
+        lines.append("  - (none)")
+    if result.rejections:
+        lines.append("skill_rejections:")
+        for rejection in result.rejections:
+            scope = rejection.scope.name.lower() if rejection.scope is not None else "unknown"
+            lines.append(f"  - [{scope}] {rejection.relative_path}: {rejection.reason.value}")
+    lines.append(f"skill_fingerprint: {result.fingerprint[:16]}...")
+    return lines
+
+
 def _completion_script(shell: str) -> str:
     commands = "version inspect completions agent acp providers sessions export import-session"
     if shell == "bash":
@@ -789,9 +838,57 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command == "inspect":
             config = load_config(args.cwd)
             if args.json:
-                print(json.dumps(config.redacted_dict(), ensure_ascii=False, indent=2))
+                from neuro_code.application import ApplicationComposition
+
+                inspect_payload: dict[str, object] = config.redacted_dict()
+                discovery = ApplicationComposition.default_instruction_discovery()
+                result = discovery.discover(config.cwd)
+                inspect_payload["instructions"] = {
+                    "files": [
+                        {
+                            "path": f.relative_path,
+                            "depth": f.depth,
+                            "bytes": len(f.content.encode("utf-8")),
+                        }
+                        for f in result.files
+                    ],
+                    "rejections": [
+                        {"path": r.relative_path, "reason": r.reason.value}
+                        for r in result.rejections
+                    ],
+                    "fingerprint": result.fingerprint,
+                }
+                skill_discovery = ApplicationComposition.default_skill_discovery()
+                skill_result = skill_discovery.discover(config.cwd)
+                inspect_payload["skills"] = {
+                    "files": [
+                        {
+                            "name": s.name,
+                            "path": s.relative_path,
+                            "description": s.description,
+                            "when_to_use": s.when_to_use,
+                            "scope": s.scope.name.lower(),
+                            "depth": s.depth,
+                        }
+                        for s in skill_result.files
+                    ],
+                    "rejections": [
+                        {
+                            "path": r.relative_path,
+                            "reason": r.reason.value,
+                            "scope": r.scope.name.lower() if r.scope is not None else None,
+                        }
+                        for r in skill_result.rejections
+                    ],
+                    "fingerprint": skill_result.fingerprint,
+                }
+                print(json.dumps(inspect_payload, ensure_ascii=False, indent=2))
             else:
                 print(_plain_config(config))
+                print()
+                print("\n".join(_instruction_lines(config.cwd)))
+                print()
+                print("\n".join(_skill_lines(config.cwd)))
             return 0
         if args.command == "completions":
             print(_completion_script(args.shell))

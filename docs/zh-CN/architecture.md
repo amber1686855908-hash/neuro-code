@@ -83,6 +83,186 @@ Web 控制台后端。纯云端能力必须通过显式适配器接入；不可�
 规范有序项和供应商来源。所以下一条提示会复用持久状态，而不是过期的内存前缀。取消的
 用户消息仍保留在历史中；首 token 前回退是另一项尚未实现的交互策略。
 
+## 仓库级 AGENTS.md 指令发现
+
+仓库级 AGENTS.md 文件是项目自有的非系统指令，在工作区边界内指导代理行为。它们
+不会从网络加载，不会被执行，也不会被允许冒充 system 或 user 消息。所有发现过程都是
+确定性的、有界的、失败关闭的，并且只在工作区根目录向目标目录的方向上单向展开。
+
+发现服务由 `InstructionDiscovery` 端口定义，默认适配器是
+`FilesystemInstructionDiscovery`。应用组合根通过 `InstructionDiscoveryFactory`
+构造适配器，并为每个会话绑定安装独立的 `instruction_provider` 闭包。文件工具会移动
+绑定内的目标；该闭包在每次模型步骤前从工作区根重新发现到该目标。有界文件系统工作
+在线程中执行，不阻塞事件循环；同会话内的 AGENTS.md 变更会在下一步生效。发现结果
+不会缓存到跨会话状态，也不会进入持久化
+`SessionItem` 历史；注入的指令消息是临时的、每步重算的合成项。
+
+`InstructionTracker` 会另行记录最近一次真正注入模型步骤的结果。在
+`search_replace` 写入前，它按路径和内容对比目标目录的当前指令与该快照；新增或
+变更的指令会让写入以错误中止，使下一模型步骤先看到新规则再重试。任意 Bash
+命令涉及的路径无法可靠推断，因此 Bash 写入仍保留这一已记录限制。
+
+发现的指令不会追加到系统消息，而是作为独立的合成 `User` 消息注入到系统消息之后、
+真实用户消息之前，并标记为 `SyntheticReason.PROJECT_INSTRUCTIONS`。这个结构化来源
+标记保证仓库内容不会共享应用系统提示的信任级别。`Message.synthetic_reason` 仅存在
+于内存中；合成项每步重建，不会进入存储、UI 或协议会话历史。
+
+发现过程从根到目标逐层收集 AGENTS.md，并按浅到深返回。文件系统工作上限为 20 层
+目录、10 个已加载文件、单文件 64 KiB、总计 256 KiB；同时校验 UTF-8、C0/C1/DEL
+控制字符、常规文件身份和工作区边界。所有符号链接与 Windows reparse point 都会被
+拒绝；审计输出区分逃逸、循环/损坏和仍位于边界内的链接。拒绝路径中的控制字符会先
+转义，再进入终端或 JSON 输出。
+
+文件读取使用有界、尽力抗符号链接的方式：`lstat()` 拒绝符号链接和 Windows
+reparse point；`os.open()` 配合 `O_NOFOLLOW`（POSIX）打开句柄；句柄级 `fstat()`
+校验为常规文件并与 `lstat` 的 `st_dev`/`st_ino` 比较，检测 lstat→open 之间的路径
+替换；`os.read()` 最多读取 `MAX_SINGLE_FILE_BYTES + 1` 字节（+1 检测超限）；读取后
+再次 `fstat()` 验证句柄身份未变。这不是完全 TOCTOU 安全的实现——POSIX 的
+`O_NOFOLLOW` 只保护最后一个路径组件，Windows 无 `O_NOFOLLOW`——但 lstat 拒绝、
+有界读取和 lstat↔fstat 身份比较的组合为常见攻击向量提供了强防御。目标目录逃逸
+工作区会被整条拒绝为 `ESCAPES_WORKSPACE`，而不是被静默 clamp 到根目录。所有拒绝
+原因都是枚举值，便于 inspect 与审计。
+
+CLI 的 `inspect` 命令在同一发现服务上输出已加载文件路径、深度、内容字节数、指纹
+和所有拒绝项。JSON 模式包含 `instructions` 字段；纯文本模式按行渲染。ACP 与 TUI
+通过 `ApplicationComposition` 注入 `InstructionDiscovery` 实例；CLI inspect 通过
+`ApplicationComposition.default_instruction_discovery()` 使用相同的默认工厂构造
+实例。它们共享相同的端口契约和默认工厂，因此发现规则不会因界面不同而分叉，但
+inspect 不使用与活动会话相同的运行时实例。详见
+[ADR 0039](adr/0039-repository-instruction-discovery.md)。
+
+## 只读技能文件发现
+
+只读技能文件发现遵循与指令发现相同的端口与适配器架构模式。技能文件
+（`SKILL.md`）是仓库提供的最佳实践参考文档，描述如何处理特定任务。与
+AGENTS.md 指令文件一样，它们不会从网络加载，不会被执行，也不会被允许冒充
+system 或 user 消息。所有发现过程都是确定性的、有界的、失败关闭的。
+
+发现服务由 `SkillDiscovery` 端口定义，默认适配器是
+`FilesystemSkillDiscovery`。适配器扫描配置目录
+（`.neuro/skills/`、`.agents/skills/`、`.grok/skills/`、`.claude/skills/`），
+递归遍历每个 `skills/` 目录树（最大深度 5）查找 `SKILL.md` 文件。配置目录
+按产品特定优先级扫描（`.neuro` 先于 `.agents` 先于 `.grok` 先于 `.claude`），
+子目录按字典序遍历。技能按名称去重（先见为准，按各范围内的配置目录优先级），
+再按范围优先级（Local > Repo > User）和名称排序。
+
+技能发现适配器从指令发现适配器导入文件系统安全辅助函数
+（`_toctou_safe_read`、`_is_symlink_or_reparse_point`、
+`_resolve_within_workspace`、`_relative_posix`），复用相同的有界、尽力抗符号
+链接读取模式。符号链接全部拒绝，但按逃逸、循环和安全分类给出不同拒绝原因。
+所有拒绝原因都是 `SkillRejectionReason` 枚举值，便于 inspect 与审计。
+
+每个 `SKILL.md` 的 frontmatter 由有界、无依赖的行解析器处理，支持常见的
+`key: value` 标量、引号值和行内注释；分隔符必须独占整行。缺失或格式错误的
+元数据会回退到技能目录名和正文首个散文行。
+
+模型收到的是受字节上限约束的精简技能目录（name + description + when-to-use），不是完整
+的技能正文。技能列表作为独立的合成 `User` 消息注入，标记为
+`SyntheticReason.AVAILABLE_SKILLS`，插入在指令消息之后（若无指令则插入在
+系统消息之后）。这使模型在看到仓库项目约定后、真实用户消息前看到可用技能。
+与指令注入相同，该合成消息不进入 `SessionItem` 持久化，是临时的、每步重算
+的合成项。`Message.synthetic_reason` 是仅模型上下文中的内部标记，从不写入
+持久化会话。
+
+当前已实现 `LOCAL` 范围（从移动目标向上到工作区根）、`REPO` 范围（工作区之上
+到 git 根的每个祖先）和 `USER` 范围（用户主目录）。服务器同步和插件技能保留给
+未来的切片。动态会话中发现已实现——追踪器维护移动目标，每次调用时从目标向上
+遍历到工作区根（含）重新扫描。
+
+应用组合根通过 `SkillDiscoveryFactory` 构造适配器，并为每个会话绑定安装
+独立的 `skill_provider` 闭包。该闭包在每次模型步骤前由
+`AgentRuntime._refresh_skills()` 调用，使同会话内的技能文件变更能在下一步
+生效。CLI inspect 通过 `ApplicationComposition.default_skill_discovery()`
+使用相同的默认工厂构造实例，与指令发现共享相同的模式：inspect 与会话
+使用不同的运行时实例，但共享端口契约和默认工厂。详见
+[ADR 0040](adr/0040-read-only-skill-discovery.md)。
+
+## 技能正文加载工具
+
+`SkillTool`（`tools/skills.py`）允许模型按名称加载已发现技能的完整正文。
+模型首先通过 `AVAILABLE_SKILLS` 合成消息看到精简的技能目录；当它决定某个
+技能与当前任务相关时，调用 `skill` 工具并传入技能名称来加载完整的 SKILL.md
+正文。
+
+该工具遵循与发现相同的有界、抗符号链接读取模式：解析
+`skill.root / skill.relative_path`，按 LOCAL、REPO 或 USER 的相应根校验边界，
+并确认加载内容仍与发现指纹一致。工具剥离 BOM 和 YAML frontmatter，返回有界的
+`<skill_content>` 块。捆绑文件样本最多包含 10 个直属常规文件名；链接、目录、含
+控制字符的名称和条目过多的目录会被省略。
+
+`ToolContext` dataclass 依赖 `SkillContextTracker` 端口，不把具体运行时追踪器
+导入端口层；该端口由
+`ApplicationComposition.create_binding()` 接线。`SkillTracker` 在每次
+`current_result()` 调用时重新发现，因此技能文件变更在下次工具调用时生效，
+无需重启会话。变量替换在加载时执行：`SkillTool` 接受可选的 `args` 参数，
+通过 `domain/skills.py` 中的 `apply_skill_substitutions()` 展开正文中的
+`$ARGUMENTS`、`$ARGUMENTS[N]`、`$N` 和 `${SKILL_DIR}` 令牌。当正文不包含
+参数令牌但 args 非空时，args 作为 `**ARGUMENTS:**` 后缀追加以保持向后兼容。
+参数字节数、替换次数和渲染输出都有上限；不支持的位置令牌（如 `$100`）保持原样。
+详见 [ADR 0041](adr/0041-skill-body-loading-tool.md) 和
+[ADR 0045](adr/0045-skill-variable-substitution.md)。
+
+## 用户级技能发现
+
+`FilesystemSkillDiscovery` 接受可选的 `user_home: Path | None` 构造参数。
+当为 `None` 时，适配器在发现时通过 `Path.home()` 解析用户主目录。LOCAL 发现以
+工作区为公共边界，REPO 发现以检测到的 git 根为公共边界，USER 发现以解析后的
+用户主目录为边界。当工作区根与用户主目录是同一路径时（例如会话从主目录
+启动），跳过 USER 遍历以避免重复扫描。候选元组同时携带发现根和范围，使
+处理循环能为每个候选项针对正确的根计算 POSIX 相对路径并执行边界检查。
+
+`SkillInfo` 新增 `root: Path | None` 字段（默认为 `None` 以保持向后兼容），
+存储发现该技能时所用的发现根。`SkillTool` 通过
+`skill.root / skill.relative_path` 解析绝对路径（当 `root` 为 `None` 时回退
+到 `tracker.workspace_root`），并针对发现根而非工作区根执行边界检查。这使
+LOCAL 技能（根 = 工作区）和 USER 技能（根 = 用户主目录）的路径解析都正确，
+而无需更改工具的公共契约。
+
+跨范围优先级以范围为先：LOCAL 候选先于 REPO 候选收集和处理，REPO 候选先于
+USER 候选。按名称先见为准的去重确保 LOCAL 技能遮蔽同名 REPO 技能遮蔽同名 USER
+技能。在每个范围内，配置目录优先级（`.neuro` → `.agents` → `.grok` →
+`.claude`）仍然适用。详见
+[ADR 0042](adr/0042-user-level-skill-discovery.md) 和
+[ADR 0044](adr/0044-repository-level-skill-discovery.md)。
+
+## 动态会话中技能发现
+
+`SkillTracker` 维护一个移动目标，镜像 `InstructionTracker` 设计。当文件
+访问工具（`read_file`、`list_dir`、`grep`）触碰某路径时，`check_path()`
+更新目标，使从被访问目录**向上**到工作区根（含）的 `SKILL.md` 文件在下一次
+`current_result()` 调用时被发现。这能发现工作区内任何嵌套深度的技能，不仅
+限于工作区根——例如，当模型读取 `src/foo/` 中的文件时，
+`src/foo/.neuro/skills/commit/SKILL.md` 会被发现。
+
+适配器从 `target` **向上**遍历到 `workspace_root`（含），检查每个祖先目录
+的配置目录。更深的祖先先被扫描，因此先见为准的名称去重使更具体（更深）的
+技能优先于一般（根）的技能，匹配 grok-build 的"最深优先"模型。当 `target`
+为 `None` 或等于工作区根时（如 CLI inspect、`rediscover_skills`），遍历退化
+为仅扫描根层级。
+
+子树隔离适用：从 `src/foo/` 切换到 `src/bar/` 会移动目标，`src/foo/` 配置
+目录中的技能不再被包含。`SkillTracker.check_path()` 由 `ReadFileTool`、
+`ListDirTool` 和 `GrepTool` 在已有的 `InstructionTracker.check_path()` 调用
+旁边调用。`SearchReplaceTool` 不移动技能目标（其指令追踪器另有写入预检），
+`BashTool` 则不尝试从任意 shell 语法推导路径。详见
+[ADR 0043](adr/0043-dynamic-session-skill-discovery.md)。
+
+## 仓库级技能发现
+
+当工作区是 git 仓库的子目录（如 `myrepo/packages/frontend/`）时，适配器从
+工作区根向上查找常规且非链接的 ``.git`` 目录或文件来检测 git 根。随后按由近到远
+的顺序扫描工作区之上的每个祖先，直至并包含 git 根，并把技能标记为
+`SkillScope.REPO`。因此包级仓库技能可以遮蔽 git 根默认技能，两者对嵌套工作区
+仍然可见。
+
+当 git 根等于工作区根（已被 LOCAL 发现覆盖）或在有界向上遍历中未找到可接受的
+``.git`` 标记时，跳过 REPO 扫描。
+`FilesystemSkillDiscovery.__init__` 接受可选的 `git_root` 参数（默认为
+`None` 以自动检测），遵循与 `user_home` 相同的模式。所有 REPO 技能的
+`SkillInfo.root` 都设置为公共 git 根，使中间祖先路径保持唯一，并让
+`SkillTool` 始终针对同一稳定边界解析。详见
+[ADR 0044](adr/0044-repository-level-skill-discovery.md)。
+
 ## Partial ACP v1 适配器
 
 `neuro-code acp` 是位于 `ApplicationComposition` 与官方
@@ -325,6 +505,13 @@ TUI 通过 `Ctrl+E`、`/effort` 和 `/reasoning` 暴露选择，CLI 则使用 `-
 - `PermissionApprover`：可选地异步解决 `ask`，但不能覆盖策略拒绝。
 - `SessionStore`：追加带版本事件、保留有序 `SessionItem`，提供规范序列与普通消息
   投影，并返回带类型、可分页的会话标题/内容搜索页。
+- `InstructionDiscovery`：在工作区边界内确定性地、有界地、失败关闭地发现 AGENTS.md
+  指令文件，返回有序的 `InstructionFile` 列表、`InstructionRejection` 列表和稳定指纹。
+  适配器不得从网络读取、不得执行发现的文件、不得跟随逃逸工作区的符号链接。
+- `SkillDiscovery`：在 LOCAL、REPO 和 USER 根下确定性地、有界地、失败关闭地发现
+  `SKILL.md` 技能文件，返回有序的 `SkillInfo` 列表、`SkillRejection` 列表和正文敏感的稳定指纹。
+  适配器不得从网络读取、不得执行发现的文件，也不得把完整正文放入模型上下文；所有
+  链接与 reparse point 都会被拒绝。
 - `PlatformAdapter`：封装 PTY、进程、信号、路径、剪贴板和沙箱差异。
 
 外部边界的协议模型必须版本化。内部状态优先使用冻结 dataclass 和枚举。未经校验的

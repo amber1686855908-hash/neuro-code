@@ -10,6 +10,7 @@ from neuro_code.domain.messages import (
     Message,
     PreservedContextItem,
     Role,
+    SyntheticReason,
     ToolCall,
 )
 from neuro_code.domain.model_context import UPSTREAM_IMPORT_PROVIDER, ModelContext
@@ -67,6 +68,33 @@ class MessageTests(unittest.TestCase):
             message.to_dict()["reasoning_content"],
             "Need repository evidence.",
         )
+
+    def test_synthetic_context_is_plain_user_text_and_not_serialized(self) -> None:
+        message = Message(
+            Role.USER,
+            "repository guidance",
+            synthetic_reason=SyntheticReason.PROJECT_INSTRUCTIONS,
+        )
+
+        self.assertNotIn("synthetic_reason", message.to_dict())
+        with self.assertRaisesRegex(ValueError, "user role"):
+            Message(
+                Role.SYSTEM,
+                "repository guidance",
+                synthetic_reason=SyntheticReason.PROJECT_INSTRUCTIONS,
+            )
+        with self.assertRaisesRegex(ValueError, "must not be empty"):
+            Message(
+                Role.USER,
+                synthetic_reason=SyntheticReason.PROJECT_INSTRUCTIONS,
+            )
+        with self.assertRaisesRegex(ValueError, "plain text"):
+            Message(
+                Role.USER,
+                "repository guidance",
+                name="instructions",
+                synthetic_reason=SyntheticReason.PROJECT_INSTRUCTIONS,
+            )
 
     def test_preserved_context_payload_is_deeply_immutable_and_round_trips(self) -> None:
         payload = {

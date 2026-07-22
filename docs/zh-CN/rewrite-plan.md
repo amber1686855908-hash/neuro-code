@@ -73,7 +73,9 @@
 - 完整 ACP 一致性仍待完成：session resume/delete/fork、额外目录、MCP HTTP/SSE/ACP
   传输与非工具 MCP 能力、客户端文件系统/终端方法、多媒体 prompt/历史、embedded
   prompt、WebSocket，以及任何明确声明的 `x.ai/*` 扩展。
-- 其余 MCP 传输/能力、技能、AGENTS.md、代理配置、钩子和插件。
+- 已实现有界精确名称 `AGENTS.md` 继承，以及只读 LOCAL/REPO/USER 技能发现与正文加载，
+  包括动态会话目标、内容变化检查和有界变量替换。远程/服务器/捆绑技能、代理配置、
+  钩子和可执行插件仍待完成，其他 MCP 传输/能力也仍待完成。
 - 子代理、计划模式、会话分叉，以及它们与公共任务生命周期的整合。
 
 退出条件：标准 ACP 客户端通过完整一致性场景；扩展失败不会破坏主会话。当前 partial

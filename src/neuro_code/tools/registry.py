@@ -38,8 +38,9 @@ def default_tool_registry(
     from neuro_code.tools.background_tasks import KillTaskTool, TaskOutputTool, WaitTasksTool
     from neuro_code.tools.bash import BashTool
     from neuro_code.tools.filesystem import GrepTool, ListDirTool, ReadFileTool, SearchReplaceTool
+    from neuro_code.tools.skills import SkillTool
 
-    tools: list[Tool] = [ReadFileTool(), ListDirTool(), GrepTool()]
+    tools: list[Tool] = [ReadFileTool(), ListDirTool(), GrepTool(), SkillTool()]
     if sandbox_profile.workspace_writable:
         tools.append(SearchReplaceTool())
     tools.append(BashTool(background_enabled=enable_background_tasks))
