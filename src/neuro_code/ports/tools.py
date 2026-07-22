@@ -8,7 +8,9 @@ from typing import Any, Protocol
 from neuro_code.domain.sandbox import SandboxProfile
 from neuro_code.domain.tools import ToolDefinition, ToolResult
 from neuro_code.ports.background_tasks import BackgroundTaskManager
+from neuro_code.ports.instructions import InstructionContextTracker
 from neuro_code.ports.sandbox import ShellSandbox
+from neuro_code.ports.skills import SkillContextTracker
 
 
 @dataclass(frozen=True, slots=True)
@@ -21,6 +23,8 @@ class ToolContext:
     shell_sandbox: ShellSandbox | None = None
     protected_environment_variables: frozenset[str] = frozenset()
     background_tasks: BackgroundTaskManager | None = None
+    instruction_tracker: InstructionContextTracker | None = None
+    skill_tracker: SkillContextTracker | None = None
 
 
 class Tool(Protocol):

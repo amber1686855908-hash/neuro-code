@@ -6,7 +6,9 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from neuro_code.adapters.background_tasks import LocalBackgroundTaskManager
+from neuro_code.adapters.instruction_discovery import FilesystemInstructionDiscovery
 from neuro_code.adapters.sandbox import create_shell_sandbox, enforce_configured_sandbox
+from neuro_code.adapters.skill_discovery import FilesystemSkillDiscovery
 from neuro_code.adapters.sqlite_session import SqliteSessionStore
 from neuro_code.config import (
     AppConfig,
@@ -15,8 +17,10 @@ from neuro_code.config import (
     override_sandbox,
     pin_resumed_sandbox,
 )
+from neuro_code.domain.instructions import InstructionDiscoveryResult
 from neuro_code.domain.reasoning import ReasoningEffort
 from neuro_code.domain.sandbox import SandboxProfile
+from neuro_code.domain.skills import SkillDiscoveryResult
 from neuro_code.errors import ConfigurationError
 from neuro_code.permissions import (
     PermissionEffect,
@@ -26,11 +30,15 @@ from neuro_code.permissions import (
 )
 from neuro_code.ports.approval import PermissionApprover
 from neuro_code.ports.background_tasks import BackgroundTaskSupervisor
+from neuro_code.ports.instructions import InstructionDiscovery
 from neuro_code.ports.model import ModelProvider
 from neuro_code.ports.sandbox import ShellSandbox
+from neuro_code.ports.skills import SkillDiscovery
 from neuro_code.ports.tools import Tool, ToolContext
 from neuro_code.providers import create_routed_provider
 from neuro_code.runtime import AgentConversation, AgentRuntime, ConversationBinding
+from neuro_code.runtime.instruction_tracker import InstructionTracker
+from neuro_code.runtime.skill_tracker import SkillTracker
 from neuro_code.tools import default_tool_registry
 from neuro_code.workspace import workspaces_match
 
@@ -39,6 +47,8 @@ ShellSandboxFactory = Callable[[SandboxProfile, Path, Path], ShellSandbox | None
 ProcessSandboxEnforcer = Callable[[SandboxProfile, Path, Path, Sequence[str]], None]
 SessionStoreFactory = Callable[[Path], SqliteSessionStore]
 BackgroundSupervisorFactory = Callable[[], BackgroundTaskSupervisor]
+InstructionDiscoveryFactory = Callable[[], InstructionDiscovery]
+SkillDiscoveryFactory = Callable[[], SkillDiscovery]
 
 
 def _default_provider_factory(config: AppConfig, failover: bool) -> ModelProvider:
@@ -75,6 +85,8 @@ class ApplicationComposition:
         background_tasks: BackgroundTaskSupervisor,
         provider_factory: ProviderFactory,
         shell_sandbox_factory: ShellSandboxFactory,
+        instruction_discovery: InstructionDiscovery | None = None,
+        skill_discovery: SkillDiscovery | None = None,
     ) -> None:
         self.settings = settings
         self.config = config
@@ -82,6 +94,14 @@ class ApplicationComposition:
         self.background_tasks = background_tasks
         self._provider_factory = provider_factory
         self._shell_sandbox_factory = shell_sandbox_factory
+        self._instruction_discovery = (
+            instruction_discovery
+            if instruction_discovery is not None
+            else FilesystemInstructionDiscovery()
+        )
+        self._skill_discovery = (
+            skill_discovery if skill_discovery is not None else FilesystemSkillDiscovery()
+        )
         self._closed = False
 
     @classmethod
@@ -94,6 +114,8 @@ class ApplicationComposition:
         process_sandbox_enforcer: ProcessSandboxEnforcer = enforce_configured_sandbox,
         store_factory: SessionStoreFactory = SqliteSessionStore,
         background_supervisor_factory: BackgroundSupervisorFactory = (LocalBackgroundTaskManager),
+        instruction_discovery_factory: InstructionDiscoveryFactory = FilesystemInstructionDiscovery,
+        skill_discovery_factory: SkillDiscoveryFactory = FilesystemSkillDiscovery,
     ) -> ApplicationComposition:
         background_tasks = background_supervisor_factory()
         try:
@@ -125,6 +147,8 @@ class ApplicationComposition:
                 background_tasks=background_tasks,
                 provider_factory=provider_factory,
                 shell_sandbox_factory=shell_sandbox_factory,
+                instruction_discovery=instruction_discovery_factory(),
+                skill_discovery=skill_discovery_factory(),
             )
         except BaseException:
             await asyncio.shield(background_tasks.shutdown())
@@ -156,6 +180,40 @@ class ApplicationComposition:
                 selected_config.cwd,
                 selected_config.state_dir,
             )
+            # Build a per-binding instruction tracker that re-discovers
+            # AGENTS.md files from the workspace root toward the current
+            # focus directory.  File-access tools call ``check_path()`` to
+            # move the target deeper, enabling deep-directory AGENTS.md
+            # discovery.  The ``instruction_provider`` closure reads the
+            # tracker's current result before each model step, so file
+            # content changes take effect on the next turn without a restart.
+            tracker = InstructionTracker(
+                discovery=self._instruction_discovery,
+                workspace_root=selected_config.cwd,
+                initial_target=selected_config.cwd,
+            )
+
+            def instruction_provider() -> InstructionDiscoveryResult | None:
+                return tracker.model_context_result()
+
+            # Build a per-binding skill tracker that re-discovers SKILL.md
+            # files from the workspace's skills directories.  Like the
+            # instruction tracker, the skill tracker maintains a moving
+            # target that shifts as tools access different paths.  Discovery
+            # walks upward from the target to the workspace root (inclusive),
+            # finding skills at any depth.  The ``skill_provider`` closure
+            # reads the tracker's current result before each model step, so
+            # skill file changes take effect on the next turn without a
+            # restart.
+            skill_tracker = SkillTracker(
+                discovery=self._skill_discovery,
+                workspace_root=selected_config.cwd,
+                initial_target=selected_config.cwd,
+            )
+
+            def skill_provider() -> SkillDiscoveryResult | None:
+                return skill_tracker.current_result()
+
             permissions = PermissionManager(
                 mode=self.settings.permission_mode,
                 rules=(
@@ -179,11 +237,15 @@ class ApplicationComposition:
                         selected_config.protected_environment_variables
                     ),
                     background_tasks=task_scope,
+                    instruction_tracker=tracker,
+                    skill_tracker=skill_tracker,
                 ),
                 approver=approver,
                 session_store=self.store,
                 max_steps=self.settings.max_steps,
                 reasoning_effort=reasoning_effort or self.settings.reasoning_effort,
+                instruction_provider=instruction_provider,
+                skill_provider=skill_provider,
             )
             conversation = await AgentConversation.open(
                 runtime=runtime,
@@ -228,6 +290,60 @@ class ApplicationComposition:
             raise ConfigurationError("session provider affinity is unavailable")
         return selected
 
+    @property
+    def instruction_result(self) -> InstructionDiscoveryResult | None:
+        """Return a fresh instruction discovery result for the application workspace.
+
+        This uses the same ``InstructionDiscovery`` adapter that per-binding
+        trackers use, but with a fresh target of the application CWD.  CLI
+        ``inspect`` uses this to render what would be discovered at the
+        workspace root level.
+        """
+        return self._instruction_discovery.discover(self.config.cwd, target=self.config.cwd)
+
+    @property
+    def skill_result(self) -> SkillDiscoveryResult | None:
+        """Return a fresh skill discovery result for the application workspace.
+
+        This uses the same ``SkillDiscovery`` adapter that per-binding
+        trackers use.  CLI ``inspect`` uses this to render what would be
+        discovered at the workspace root level.
+        """
+        return self._skill_discovery.discover(self.config.cwd)
+
+    @staticmethod
+    def default_instruction_discovery() -> InstructionDiscovery:
+        """Return the default instruction discovery adapter.
+
+        This is the same factory default that ``ApplicationComposition.open()``
+        uses when no explicit ``instruction_discovery_factory`` is provided.
+        CLI ``inspect`` calls this so that it uses the same discovery
+        implementation and port contract as a full application session,
+        without the overhead of opening a store or background task scope.
+        """
+        return FilesystemInstructionDiscovery()
+
+    @staticmethod
+    def default_skill_discovery() -> SkillDiscovery:
+        """Return the default skill discovery adapter.
+
+        This is the same factory default that ``ApplicationComposition.open()``
+        uses when no explicit ``skill_discovery_factory`` is provided.
+        CLI ``inspect`` calls this so that it uses the same discovery
+        implementation and port contract as a full application session.
+        """
+        return FilesystemSkillDiscovery()
+
+    def rediscover_instructions(self, cwd: Path | None = None) -> InstructionDiscoveryResult:
+        """Re-run instruction discovery, detecting changes since the last pass."""
+        workspace = cwd or self.config.cwd
+        return self._instruction_discovery.discover(workspace, target=workspace)
+
+    def rediscover_skills(self, cwd: Path | None = None) -> SkillDiscoveryResult:
+        """Re-run skill discovery, detecting changes since the last pass."""
+        workspace = cwd or self.config.cwd
+        return self._skill_discovery.discover(workspace, target=workspace)
+
     async def close(self) -> None:
         if self._closed:
             return
@@ -239,8 +355,10 @@ __all__ = [
     "ApplicationComposition",
     "ApplicationSettings",
     "BackgroundSupervisorFactory",
+    "InstructionDiscoveryFactory",
     "ProcessSandboxEnforcer",
     "ProviderFactory",
     "SessionStoreFactory",
     "ShellSandboxFactory",
+    "SkillDiscoveryFactory",
 ]

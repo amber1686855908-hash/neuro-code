@@ -4,6 +4,7 @@ import os
 import re
 import tempfile
 from collections.abc import Mapping
+from pathlib import Path
 from typing import Any
 
 from neuro_code.async_utils import run_blocking
@@ -43,6 +44,15 @@ class ReadFileTool:
         )
         if not path.is_file():
             raise ToolError(f"not a file: {path}")
+        # Notify the instruction tracker so AGENTS.md files from root to this
+        # directory are discovered for the next model step.
+        if context.instruction_tracker is not None:
+            context.instruction_tracker.check_path(path)
+        # Notify the skill tracker so SKILL.md files from this directory
+        # upward to the workspace root are discovered for the next model
+        # step.
+        if context.skill_tracker is not None:
+            context.skill_tracker.check_path(path)
         start_line = arguments.get("start_line", 1)
         max_lines = arguments.get("max_lines", 500)
         if not isinstance(start_line, int) or start_line < 1:
@@ -85,6 +95,10 @@ class ListDirTool:
         path = resolve_workspace_path(context.cwd, raw_path, must_exist=True)
         if not path.is_dir():
             raise ToolError(f"not a directory: {path}")
+        if context.instruction_tracker is not None:
+            context.instruction_tracker.check_path(path)
+        if context.skill_tracker is not None:
+            context.skill_tracker.check_path(path)
 
         def list_entries() -> list[str]:
             entries: list[str] = []
@@ -129,10 +143,15 @@ class GrepTool:
         except re.error as error:
             raise ToolError(f"invalid regular expression: {error}") from error
         root = resolve_workspace_path(context.cwd, raw_path, must_exist=True)
+        if context.instruction_tracker is not None:
+            context.instruction_tracker.check_path(root)
+        if context.skill_tracker is not None:
+            context.skill_tracker.check_path(root)
 
-        def search() -> list[str]:
+        def search() -> tuple[list[str], Path | None]:
             paths = (root,) if root.is_file() else root.rglob("*")
             matches: list[str] = []
+            last_matched_path: Path | None = None
             for path in paths:
                 if not path.is_file() or ".git" in path.parts:
                     continue
@@ -142,13 +161,22 @@ class GrepTool:
                             if pattern.search(line):
                                 relative = path.relative_to(context.cwd.resolve())
                                 matches.append(f"{relative}:{line_number}:{line.rstrip()}")
+                                last_matched_path = path
                                 if len(matches) >= max_results:
-                                    return matches
+                                    return matches, last_matched_path
                 except (OSError, UnicodeError):
                     continue
-            return matches
+            return matches, last_matched_path
 
-        matches = await run_blocking(search)
+        matches, last_matched_path = await run_blocking(search)
+        # Trackers are binding-local mutable state. Update them on the event
+        # loop after the blocking filesystem walk rather than from a worker
+        # thread. The last match retains the documented single-target policy.
+        if last_matched_path is not None:
+            if context.instruction_tracker is not None:
+                context.instruction_tracker.check_path(last_matched_path)
+            if context.skill_tracker is not None:
+                context.skill_tracker.check_path(last_matched_path)
         return ToolResult("\n".join(matches), metadata={"count": len(matches)})
 
 
@@ -187,6 +215,23 @@ class SearchReplaceTool:
             raise ToolError("replace_all must be a boolean")
         if not path.is_file():
             raise ToolError(f"not a file: {path}")
+        # Pre-flight check: if the tracker discovers new AGENTS.md files
+        # in the target directory that the model has not yet seen, abort
+        # the write and present the instructions.  The model can review
+        # them and re-issue the command on the next step.
+        if context.instruction_tracker is not None:
+            new_instructions = context.instruction_tracker.check_path_for_write(path)
+            if new_instructions is not None:
+                instructions_text = new_instructions.model_context_text()
+                rel = path.relative_to(context.cwd.resolve())
+                return ToolResult(
+                    "I discovered project instructions in the target directory "
+                    f"that you haven't seen yet ({rel}). "
+                    "Please review them before proceeding with the write. "
+                    "Re-issue the command if you wish to proceed.\n\n" + instructions_text,
+                    is_error=True,
+                    metadata={"path": str(path), "preflight": "new_instructions"},
+                )
 
         def replace_text() -> int:
             original = path.read_text(encoding="utf-8")

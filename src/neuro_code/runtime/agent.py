@@ -10,12 +10,14 @@ from time import monotonic
 from neuro_code.async_utils import run_blocking
 from neuro_code.domain.background_tasks import BackgroundTaskSnapshot
 from neuro_code.domain.events import AgentEvent, AgentEventKind
+from neuro_code.domain.instructions import InstructionDiscoveryResult
 from neuro_code.domain.interaction_mode import InteractionMode, interaction_mode_guidance
 from neuro_code.domain.messages import (
     Message,
     PreservedContextItem,
     Role,
     SessionItem,
+    SyntheticReason,
     ToolCall,
 )
 from neuro_code.domain.model_context import ModelContext
@@ -31,6 +33,7 @@ from neuro_code.domain.model_events import (
 )
 from neuro_code.domain.reasoning import ReasoningEffort, reasoning_guidance
 from neuro_code.domain.sandbox import SandboxProfile
+from neuro_code.domain.skills import SkillDiscoveryResult
 from neuro_code.domain.tools import ToolResult
 from neuro_code.errors import ProviderError, ToolError
 from neuro_code.permissions import (
@@ -90,6 +93,8 @@ class AgentRuntime:
         max_steps: int = 24,
         reasoning_effort: ReasoningEffort = ReasoningEffort.HIGH,
         interaction_mode: InteractionMode | None = None,
+        instruction_provider: Callable[[], InstructionDiscoveryResult | None] | None = None,
+        skill_provider: Callable[[], SkillDiscoveryResult | None] | None = None,
     ) -> None:
         if max_steps < 1:
             raise ValueError("max_steps must be positive")
@@ -102,6 +107,10 @@ class AgentRuntime:
         self._system_prompt = system_prompt
         self._max_steps = max_steps
         self._reasoning_effort = reasoning_effort
+        self._instruction_provider = instruction_provider
+        self._skill_provider = skill_provider
+        self._last_instruction_result: InstructionDiscoveryResult | None = None
+        self._last_skill_result: SkillDiscoveryResult | None = None
         self._auto_permission_mode = (
             PermissionMode.BYPASS
             if permissions.mode is PermissionMode.BYPASS
@@ -156,21 +165,102 @@ class AgentRuntime:
         self,
         items: Sequence[SessionItem],
     ) -> tuple[SessionItem, ...]:
-        """Apply the selected policy to a request without persisting control text."""
+        """Apply the selected policy to a request without persisting control text.
 
-        instruction = "\n\n".join(
-            (
-                reasoning_guidance(self._reasoning_effort),
-                interaction_mode_guidance(self._interaction_mode),
-            )
-        )
-        rendered = tuple(items)
+        Reasoning effort and interaction mode guidance are appended to the
+        system message.  Repository AGENTS.md instructions are injected as a
+        separate synthetic ``User`` message tagged with
+        ``SyntheticReason.PROJECT_INSTRUCTIONS``, placed after the system
+        message and before the first genuine user message.  This follows the
+        Rust baseline's ``ProjectInstructions`` synthetic user item pattern:
+        the instruction content never masquerades as a system or genuine user
+        message.
+        """
+
+        guidance_parts = [
+            reasoning_guidance(self._reasoning_effort),
+            interaction_mode_guidance(self._interaction_mode),
+        ]
+        guidance = "\n\n".join(guidance_parts)
+        rendered = list(items)
+
+        # Apply guidance to the system message (or create one if missing).
+        system_index: int | None = None
         for index, item in enumerate(rendered):
-            if not isinstance(item, Message) or item.role is not Role.SYSTEM:
-                continue
-            guided = Message(Role.SYSTEM, f"{item.model_content()}\n\n{instruction}")
-            return (*rendered[:index], guided, *rendered[index + 1 :])
-        return (Message(Role.SYSTEM, instruction), *rendered)
+            if isinstance(item, Message) and item.role is Role.SYSTEM:
+                system_index = index
+                break
+        if system_index is not None:
+            original = rendered[system_index]
+            assert isinstance(original, Message)
+            guided = Message(Role.SYSTEM, f"{original.model_content()}\n\n{guidance}")
+            rendered[system_index] = guided
+        else:
+            rendered.insert(0, Message(Role.SYSTEM, guidance))
+            system_index = 0
+
+        # Refresh and inject repository instructions as a synthetic User message.
+        instruction_result = self._refresh_instructions()
+        if instruction_result is not None and instruction_result.files:
+            instruction_msg = instruction_result.instruction_message()
+            # Insert after the system message.
+            rendered.insert(system_index + 1, instruction_msg)
+
+        # Refresh and inject available skills as a synthetic User message.
+        # Inserted after the instruction message (or after the system message
+        # if no instructions were found) so the model sees skills after
+        # project conventions.
+        skill_result = self._refresh_skills()
+        if skill_result is not None and skill_result.files:
+            skill_msg = skill_result.skill_message()
+            # Find the insertion point: after the instruction message if
+            # present, otherwise after the system message.
+            insert_at = system_index + 1
+            for i in range(system_index + 1, min(len(rendered), system_index + 3)):
+                item = rendered[i]
+                if (
+                    isinstance(item, Message)
+                    and item.synthetic_reason is SyntheticReason.PROJECT_INSTRUCTIONS
+                ):
+                    insert_at = i + 1
+                    break
+            rendered.insert(insert_at, skill_msg)
+
+        return tuple(rendered)
+
+    def _refresh_instructions(self) -> InstructionDiscoveryResult | None:
+        """Call the instruction provider to get fresh discovered instructions.
+
+        This is called before each model step so that instruction file changes
+        within the same session are picked up on the next turn.
+        """
+        if self._instruction_provider is None:
+            self._last_instruction_result = None
+            return None
+        self._last_instruction_result = self._instruction_provider()
+        return self._last_instruction_result
+
+    @property
+    def instruction_result(self) -> InstructionDiscoveryResult | None:
+        """Return the most recent instruction discovery result, if any."""
+        return self._last_instruction_result
+
+    def _refresh_skills(self) -> SkillDiscoveryResult | None:
+        """Call the skill provider to get fresh discovered skills.
+
+        This is called before each model step so that skill file changes
+        within the same session are picked up on the next turn.
+        """
+        if self._skill_provider is None:
+            self._last_skill_result = None
+            return None
+        self._last_skill_result = self._skill_provider()
+        return self._last_skill_result
+
+    @property
+    def skill_result(self) -> SkillDiscoveryResult | None:
+        """Return the most recent skill discovery result, if any."""
+        return self._last_skill_result
 
     async def run(
         self,
@@ -315,10 +405,12 @@ class AgentRuntime:
                 completion: ModelCompleted | None = None
                 backend_tool_started_at: dict[str, float] = {}
 
+                model_items = await run_blocking(
+                    self._model_items_with_reasoning_guidance,
+                    (*context_items, *completion_reminders),
+                )
                 context = ModelContext(
-                    self._model_items_with_reasoning_guidance(
-                        (*context_items, *completion_reminders)
-                    ),
+                    model_items,
                     context_source_provider,
                     context_source_model,
                     context_source_affinity,

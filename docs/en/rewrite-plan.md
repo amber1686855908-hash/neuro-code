@@ -95,8 +95,11 @@ terminal state or child processes.
   filesystem/terminal methods, multimedia
   prompt/history content, embedded prompt content, WebSocket, and any
   advertised `x.ai/*` extensions.
-- Remaining MCP transports/features, skills, AGENTS.md, agent profiles, hooks,
-  and plugins.
+- Bounded exact-name `AGENTS.md` inheritance and read-only LOCAL/REPO/USER
+  skill discovery/body loading are implemented, including dynamic session
+  targets, content-change checks, and bounded variable substitution.
+  Remote/server/bundled skills, agent profiles, hooks, and executable plugins
+  remain open alongside the remaining MCP transports/features.
 - Subagents, plan mode, session fork, and their integration with the common
   task lifecycle.
 

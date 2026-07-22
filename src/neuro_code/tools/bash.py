@@ -55,6 +55,19 @@ class BashTool:
         return bytes(captured), truncated
 
     async def execute(self, arguments: Mapping[str, Any], context: ToolContext) -> ToolResult:
+        # Bash does not call instruction_tracker.check_path() because:
+        # 1. Bash runs in context.cwd (workspace root), so calling
+        #    check_path(context.cwd) would reset the tracker target to the
+        #    root, losing any deep directory context gained from prior
+        #    read_file/list_dir/grep calls.
+        # 2. Bash can access files in any directory (via cd, paths, pipes),
+        #    and parsing the command to extract target paths is fragile and
+        #    out of scope for the instruction tracker's design.
+        # As a result, bash is a coarse-grained tool: deep AGENTS.md files
+        # in directories that bash writes to are NOT guaranteed to be in the
+        # model's instruction context before the write happens.  Models that
+        # need instruction-aware writes should use search_replace (which has
+        # a pre-flight check) or read the target directory first.
         command = arguments.get("command")
         has_explicit_timeout = "timeout_seconds" in arguments
         explicit_timeout = arguments.get("timeout_seconds")
