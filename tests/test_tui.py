@@ -700,7 +700,7 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
             cwd=Path("/workspace"),
         )
 
-        async with app.run_test(size=(100, 30)) as pilot:
+        async with app.run_test(size=(100, 30)):
             app._begin_pending_assistant()
             pending = app._pending_assistant
             assert pending is not None
@@ -708,7 +708,8 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("█", first_frame)
             self.assertIn("Thinking", first_frame)
 
-            await pilot.pause(0.12)
+            app._advance_model_loading_animation()
+            app._advance_model_loading_animation()
 
             second_frame = str(pending.renderable)
             self.assertNotEqual(first_frame, second_frame)
