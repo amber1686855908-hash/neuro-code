@@ -23,10 +23,11 @@ invocation back into several transcript entries.
 - Runtime tool entries use a focusable `ToolFeedbackMessage` whenever bounded
   details are available. Mouse click, `Enter`, or `Space` toggles the card in
   place. Application-owned hints and tooltips are localized.
-- Cards remain expanded by default so the existing auditable result is preserved.
-  Collapsing hides only output lines and unified-diff hunks. The invocation,
-  permission/approval route, output line count, changed-file paths and line
-  counts, hidden/truncated notices, final status, and duration remain visible.
+- New cards start compact. Successful edits with a workspace-change report and
+  failures expand automatically; completed read/list/search/image/skill calls
+  collapse to one localized action sentence plus elapsed time. Other compact
+  cards retain their invocation, summaries, terminal status, and duration.
+  Opening any card reveals only its already-bounded output or unified diff.
 - Expansion never fetches more data. Both states render from the same
   `ToolFeedbackState` after ANSI/control cleanup, credential redaction, workspace
   report filtering, and the existing 40-line/6,000-character TUI bound. Payload
@@ -47,7 +48,7 @@ future capability.
 
 ## Verification
 
-Textual tests complete one tool lifecycle, verify the default redacted diff,
-collapse it with the keyboard while retaining the file summary, expand it by
-mouse click, and confirm that the credential remains absent after both renders
-and after English-to-Chinese relocalization.
+Textual tests verify a one-line completed read, then complete an edit lifecycle,
+verify its automatically expanded redacted diff, collapse it with the keyboard,
+expand it by mouse click, and confirm that the credential remains absent after
+both renders and after English-to-Chinese relocalization.

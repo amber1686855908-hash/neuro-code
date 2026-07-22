@@ -9,6 +9,26 @@ Neuro Code 是一个可扩展的 Python 终端编码智能体。项目使用 Pyt
 v1 stdio 核心已成为受支持的纵向切片；其余界面和协议工作记录在
 [兼容矩阵](compatibility-matrix.md)中。
 
+## 安装与启动
+
+正式发行后，只需用能暴露全局 Python 控制台命令的工具安装一次；以后使用时无需激活
+虚拟环境：
+
+```bash
+uv tool install neuro-code
+# 或：pipx install neuro-code
+```
+
+随后在任意目录打开终端，以下三种形式都会启动 TUI，并把该目录作为工作区：
+
+```bash
+neuro
+neuro code
+neuro-code
+```
+
+Textual 已是普通依赖，因此标准安装会包含 TUI。源码开发阶段使用 `uv run neuro`。
+
 ## 开发环境
 
 项目要求 Python 3.12 或更高版本，并统一使用 `uv` 管理环境：
@@ -81,15 +101,18 @@ frame、数量与分页都有上限，`_meta` 被忽略，显式环境变量值�
 
 ## 交互式 TUI
 
-开发依赖组已经包含 Textual。配置好供应商后，不带子命令即可启动交互界面：
+源码开发时，不带子命令即可启动交互界面：
 
 ```bash
 uv sync --extra dev
-uv run neuro-code
+uv run neuro
 ```
 
-在开发环境之外安装构建产物时，使用 `pip install 'neuro-code[tui]'` 加入可选 UI 依赖。
-第一版 TUI 提供提示输入、滚动记录、assistant 流式文本、供应商/工具状态，以及本地
+首次启动且没有就绪供应商时，TUI 会先打开供应商设置表单，再组合代理运行时。普通设置
+入口先显示“界面语言”和“模型供应商”一级分类，再只打开所选详情页。供应商详情可新建或
+编辑多个 OpenAI Responses、OpenAI 兼容 Chat、DeepSeek、Anthropic、Gemini 或 xAI
+profile，并立即“保存并使用”。第一版 TUI 提供提示输入、滚动记录、assistant 流式文本、供应商/
+工具状态，以及本地
 `/help`、`/status`、`/settings`（别名 `/setting`）、`/provider`、`/model`、
 `/effort [LEVEL]`（别名 `/reasoning`）、`/mode [MODE]`、`/sessions [QUERY]`、`/resume`、
 `/rename TITLE`（别名 `/title`）、`/cancel`、`/clear`、`/quit` 和 `/exit` 命令。同一次
@@ -127,13 +150,15 @@ partial ACP 核心不会通过客户端 `terminal/*` 暴露该交互式终端底
 标签栏，供应商/模型、工具/会话、路径、结果、耗时、模式、强度和错误等值再按语义着色。
 每个模型步骤会显示客户端观测到首个可行动结果前的耗时；每次工具调用只占用一张原地更新
 的调用/权限/结果卡片并显示耗时；整轮完成后会在最终回答下方显示总耗时。完成后的卡片会
-显示真实工具输出经过控制字符清理、凭据脱敏和长度限制后的预览。带副作用的本地工具还会
+保留真实工具输出经过控制字符清理、凭据脱敏和长度限制后的预览；读取、列举、搜索、图片
+和技能调用默认只占一条动作说明，仍可原地打开安全预览。带副作用的本地工具还会
 按调用显示有界的工作区变更、文件路径和统一文本差异；敏感、二进制、过大、依赖、缓存及
-版本库内部内容保持隐藏。卡片默认展开这些安全详情，可通过单击，或聚焦后按 `Enter`/
-`Space` 原地收起和重新展开；摘要与终态始终可见。当前切片尚不包含 Mermaid 和内嵌媒体。
+版本库内部内容保持隐藏。成功编辑会自动显示变更切片；新增/删除行分别使用绿色/红色前景
+和不同的淡色背景。安全详情可通过单击，或聚焦后按 `Enter`/`Space` 原地收起和重新展开。
+当前切片尚不包含 Mermaid 和内嵌媒体。
 
 提示框上方常驻一行运行信息，显示当前供应商与模型、压缩后的工作目录、上下文窗口占用、
-请求的思考强度和交互模式。
+请求的思考强度和交互模式。等待模型输出时，用户提供的七格折叠脉冲会在待完成助手文案前动画。
 上下文百分比启动时会明确标为本地估算；模型步骤返回用量后，改用供应商报告的输入/输出
 token。配置中的 `context_window_tokens` 提供分母；窗口未知时显示 `?`，不会编造百分比。
 请求等级与当前实际策略不同时会同时显示两者，例如 `⚡ ultracode → ⬤ xhigh`。标签会随
@@ -143,11 +168,22 @@ token。配置中的 `context_window_tokens` 提供分母；窗口未知时显�
 名称；自由文本命令则显示 `SESSION_ID`、`QUERY`、`TITLE` 等占位符。按 `Tab` 会应用第一
 项有效补全，普通提示文字和模态框中的焦点切换仍保持原行为。
 
-使用 `Ctrl+,`、`/settings` 或 `/setting` 可以选择英语或简体中文。切换会立即更新应用
+使用 `Ctrl+,`、`/settings` 或 `/setting` 会先打开一级分类页，再选择界面语言或模型供应商。
+供应商详情明确区分 OpenAI Responses（`/responses`）与 OpenAI 兼容 Chat Completions
+（`/chat/completions`）；DeepSeek 预设会选择后者并填入 `https://api.deepseek.com`。
+切换语言会立即更新应用
 自有的控件、对话框和状态文案，但不会翻译用户提示、模型回答或工具内容。选择结果与
 思考强度及交互模式偏好一起保存到 `$NEURO_CODE_HOME/ui-preferences.json`（通常为
 `~/.neuro-code/ui-preferences.json`），该文件与供应商配置分离，后续启动 TUI 时会继续
 使用。
+
+TUI 管理的供应商元数据会原子写入 `~/.neuro-code/providers.json`；API 密钥不会进入该
+文件或普通 `config.toml`，而是单独写入私有的
+`~/.neuro-code/credentials.json`。平台支持 POSIX mode 时，两者均使用仅所有者可读写
+权限；工具结果边界还会再次按已配置值脱敏。手工维护
+`~/.neuro-code/config.toml` 仍受支持。同名 TUI profile 会完整替换 TOML 供应商表，防止
+工作区把已保存密钥重定向到另一个端点。存储端口以后可替换为操作系统钥匙串适配器；
+当前凭据文件本身不做静态加密。
 
 使用 `Ctrl+E`、不带参数的 `/effort` 或 `/reasoning` 可以打开五级强度选择器；
 `/effort LEVEL` 与 `/reasoning LEVEL` 可直接选择，`--effort LEVEL` 则可用于交互启动或
@@ -182,7 +218,8 @@ token。配置中的 `context_window_tokens` 提供分母；窗口未知时显�
 使用 `Ctrl+P`、不带参数的 `/provider` 或 `/model` 可以打开已配置 profile 选择器；
 `/provider PROFILE` 与 `/model PROFILE` 可以直接选择。选择器只展示 profile 名称、模型、
 协议和就绪状态；不可用或缺少凭据的 profile 会被禁用。它选择的是已配置 profile，而非
-任意远程模型 ID，也不会修改配置。轮次运行期间禁止切换。切换到不同 profile 时，旧的
+任意远程模型 ID。选择 TUI 管理的 profile 时还会保存为以后启动的默认项；新建和编辑
+仍在设置页完成。轮次运行期间禁止切换。切换到不同 profile 时，旧的
 SQLite 会话仍可恢复，下一条提示使用全新会话，从而避免把供应商亲和或加密上下文带到
 另一个供应商。
 

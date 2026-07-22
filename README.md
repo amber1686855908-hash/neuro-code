@@ -47,6 +47,28 @@ and four safe interaction modes.
 | 贡献指南 / Contributing | [中文](docs/zh-CN/CONTRIBUTING.md) | [English](docs/en/CONTRIBUTING.md) |
 | 架构决策 / ADRs | [中文](docs/zh-CN/adr/) | [English](docs/en/adr/) |
 
+## 安装与启动 / Install and launch
+
+正式发行后可全局安装一次，无需为每次使用激活虚拟环境：
+
+Install the released package globally once; no per-use virtual-environment
+activation is required:
+
+```bash
+uv tool install neuro-code
+# or / 或：pipx install neuro-code
+```
+
+在任意目录中使用 `neuro`、`neuro code` 或 `neuro-code` 都会以该目录为工作区启动
+TUI。首次启动可在 TUI 内配置模型供应商和 API 密钥；普通设置先显示一级分类，再进入
+语言或供应商详情。供应商页支持保存、编辑和切换多个 profile，并明确区分 OpenAI
+Responses、兼容 Chat 与 DeepSeek。
+
+From any directory, `neuro`, `neuro code`, and `neuro-code` launch the TUI with
+that directory as the workspace. First-run setup and category-first Settings can
+save, edit, and switch multiple provider profiles and their API keys, with
+distinct OpenAI Responses, compatible Chat, and DeepSeek presets.
+
 ## 快速验证 / Quick verification
 
 需要 Python 3.12 或更高版本，并推荐使用 `uv`：

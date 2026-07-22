@@ -26,6 +26,8 @@ Exit: every M1/M2 capability has an upstream evidence path and an owner status.
 - One project-owned namespace across product, distribution, command, Python
   package, environment variables, state directories, and errors.
 - Cross-platform package, CLI, configuration, errors, domain events, and ports.
+- Equivalent globally installed `neuro`/`neuro-code` entry points, the
+  `neuro code` TUI alias, and a normal dependency set that includes the TUI.
 - `version`, `inspect`, and machine-readable output.
 - Ruff, mypy, pytest/unittest bootstrap and CI-ready commands.
 
@@ -67,7 +69,8 @@ response; an opt-in live test can do the same against a configured provider.
 
 - Textual UI over the same event stream: prompt, stable in-place streamed
   conversation blocks, persistent English/Simplified-Chinese interface choice,
-  approval, safe profile/session selection, workspace-scoped session search,
+  first-run and Settings-based multi-provider management, approval, safe
+  profile/session selection, workspace-scoped session search,
   session-scoped task metadata/notices, richer tool cards, model picker, and
   essential slash commands.
 - Owned process trees, conversation-scoped managed background shell commands,

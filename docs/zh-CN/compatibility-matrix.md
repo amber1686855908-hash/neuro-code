@@ -6,17 +6,17 @@
 
 | 能力 | 目标 | 状态 | 证据 / 备注 |
 |---|---|---|---|
-| 软件包与 CLI 组合根 | M1 | partial | 已在独立 `neuro-code` 命令下实现 Python CLI 骨架；CLI、TUI 和 ACP 现共享与界面无关的 `ApplicationComposition`，统一配置、供应商/存储/工具/权限创建、工作区/沙箱绑定、后台 scope 和关闭 |
+| 软件包与 CLI 组合根 | M1 | partial | 普通软件包已包含 Textual，并发布等价的 `neuro` 和 `neuro-code` 控制台脚本；`neuro code` 是显式 TUI 别名，三者都把启动目录作为工作区，全局工具安装后无需每次激活虚拟环境。CLI、TUI 和 ACP 共享与界面无关的 `ApplicationComposition`；独立原生安装程序仍待实现 |
 | `version` 与 JSON 版本输出 | M1 | partial | 已实现独立软件包元数据 |
 | 生效配置检查 | M1 | partial | `neuro-code inspect`；已实现隐藏密钥的 Python 视图 |
-| 命名供应商 profile 与选择 | M2/M3 | partial | 已实现四种显式线路协议、默认/单次选择、旧 TOML 兼容、脱敏的 `providers list/inspect`，以及带 `/provider`、`/model` 和 Ctrl+P 的 TUI 已配置 profile 选择器；远程模型目录和应用内持久供应商配置编辑仍待实现 |
+| 命名供应商 profile 与选择 | M2/M3 | partial | 已实现四种显式线路协议、默认/单次选择、旧 TOML 兼容、脱敏的 `providers list/inspect`、首次启动 TUI 设置、分类优先的设置流程、多 profile 新建/编辑/保存并使用、显式 OpenAI Responses/兼容 Chat/DeepSeek 预设，以及通过 `/provider`、`/model` 和 Ctrl+P 选择并持久保存受管默认项。元数据与 API 密钥经端口分别写入原子私有文件；已保存值不进入对象表示，并在工具结果边界脱敏。同名受管 profile 会完整替换 TOML 表以阻止工作区重定向端点，存储删除会一并移除 profile 元数据及其凭据条目。操作系统钥匙串、删除界面和远程模型目录仍待实现 |
 | CC Switch 兼容 | M2 | partial | 已实现只读映射 `NEURO_CODE_CC_SWITCH_CONFIG`、三种 backend 格式、回环 `PROXY_MANAGED`、环境变量引用、内联密钥拒绝和项目配置覆盖；仍不包含 CC Switch 数据库/进程控制及其内部故障转移 |
 | 安全供应商故障转移 | M2 | partial | 已实现有序按需备用 profile、第一个事件提交边界、单次运行单向选择、可审计失败/选择事件、`--no-failover`、汇总错误和不透明会话来源保护；重试、熔断和持久化健康状态仍待实现 |
 | 供应商 HTTP 代理策略 | M2 | partial | 已实现按 profile 配置环境/直连/显式环境变量模式、按需 URL 校验、四适配器统一 HTTPX 选项、检查/错误脱敏和含义不明 SOCKS scheme 的严格诊断；保留无效继承 `ALL_PROXY` 时，显式路由已通过 DeepSeek 手动验证；PAC、多代理挂载和内置 SOCKS 支持仍待实现 |
 | 无头单次提示 | M2 | partial | 已实现流式文本/工具循环，以及纯文本、JSON、JSONL 输出 |
 | 应用自有思考强度 | M3 | partial | 已实现供应商中立的 `low`/`medium`/`high`/`xhigh`/`ultracode`、默认 `high`、仅请求生效的审查指引、有类型的 `ModelContext` 传递、`--effort`、TUI Ctrl+E 与 `/effort`/`/reasoning`、请求/实际等级显示及原子用户偏好持久化。当前适配器不会发送供应商私有强度参数；`ultracode` 明确回退到 `xhigh`，也不会启动子代理工作流。按能力启用的原生映射以及工作流/子代理编排仍待实现 |
 | 交互工作模式 | M3 | partial | 已实现应用自有 `normal`/`accept-edits`/`plan`/`auto`、`Shift+Tab` 循环、`/mode MODE` 补全、常驻显示、原子偏好持久化、profile/会话重新应用、仅请求生效的模型指引和确定性权限模式映射。除非启动时显式授权 `--always-approve`，`auto` 会标为采用 accept-edits 默认值的安全预览；模型安全分类器仍待实现，显式规则和进程沙箱始终有效 |
-| 轮次与工具计时反馈 | M3 | partial | 已实现每个模型步骤的单调时钟首个可行动结果耗时、整轮完成/失败耗时、本地/托管工具耗时、每个调用 ID 一张稳定卡片、有界调用摘要和脱敏真实结果预览、权限路径反馈、有界副作用工作区差异、助手回答后的最终耗时行，以及通过单击/键盘原地收起和展开详情。这些耗时是客户端观测，不是供应商私有推理遥测；持久化完整工具记录仍待实现 |
+| 轮次与工具计时反馈 | M3 | partial | 已实现每个模型步骤的单调时钟首个可行动结果耗时、整轮完成/失败耗时、本地/托管工具耗时、每个调用 ID 一张稳定卡片、可展开有界结果的一行读取反馈、权限路径反馈、自动展开且带绿色/红色淡色背景的编辑切片、助手回答后的最终耗时行，以及通过单击/键盘原地收起和展开详情。这些耗时是客户端观测，不是供应商私有推理遥测；持久化完整工具记录仍待实现 |
 | 上下文窗口预算与用量显示 | M3 | partial | 已实现可选的 profile 正整数 `context_window_tokens`、脱敏选择/故障转移传播、启动/恢复估算、供应商报告的输入加输出用量事件、可本地化的常驻百分比/提示、`/status` 报告及 50%/80% 警示配色。该字段是本地元数据，不会作为 API 参数发送；精确的供应商请求前分词与自动上下文压缩仍待实现 |
 | OpenAI 兼容/xAI Chat 端点 | M2 | partial | 已实现 Chat Completions 流式响应、有界 `max_tokens`、工具、经过校验的原生用户图片块、思考模式工具往返连续性，以及失败关闭的上游导入可见上下文回放；双门禁 DeepSeek 在线流式/故障转移/读取工具测试已实现并手动通过，仍需可提交的模型专用录制夹具 |
 | OpenAI Responses/xAI 方言 | M2 | partial | 已实现通用可移植 Responses 子集，以及可选 xAI 加密推理、网页/X/代码托管工具、profile 亲和原生回放、严格旧官方主机回退、终态权威输出、SSE 生命周期统一、状态剥离、回退修复和错误脱敏；仍需托管工具高级筛选、有状态 response ID、压缩项和选择性在线夹具 |

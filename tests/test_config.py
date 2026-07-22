@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from neuro_code.adapters.provider_settings import JsonProviderSettingsStore
 from neuro_code.config import (
     ProviderProfile,
     load_config,
@@ -12,6 +14,7 @@ from neuro_code.config import (
     override_sandbox,
     pin_resumed_sandbox,
 )
+from neuro_code.domain.provider_settings import ManagedProviderProfile
 from neuro_code.domain.sandbox import SandboxProfile
 from neuro_code.errors import ConfigurationError
 
@@ -312,6 +315,99 @@ api_key_env = "FIXTURE_KEY"
             self.assertEqual(config.providers, {})
             with self.assertRaisesRegex(ConfigurationError, "no model provider is configured"):
                 _ = config.provider
+
+    def test_managed_profiles_load_stored_credentials_without_exposing_them(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / ".neuro-code"
+            secret = "managed-super-secret"
+            store = JsonProviderSettingsStore(state)
+            asyncio.run(
+                store.save_profile(
+                    ManagedProviderProfile(
+                        name="managed",
+                        protocol="openai-chat",
+                        model="managed-model",
+                        base_url="https://managed.invalid/v1",
+                        api_key=secret,
+                    )
+                )
+            )
+
+            config = load_config(root, home=root, environ={})
+
+            self.assertEqual(config.selected_provider, "managed")
+            self.assertEqual(config.provider.auth, "stored")
+            self.assertEqual(config.provider.api_key(), secret)
+            self.assertTrue(config.provider.redacted_dict({})["credential_configured"])
+            self.assertNotIn(secret, repr(config))
+            self.assertNotIn(secret, repr(config.redacted_dict()))
+
+    def test_workspace_cannot_redirect_a_managed_profile_credential(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = root / "project"
+            state = root / ".neuro-code"
+            (project / ".neuro-code").mkdir(parents=True)
+            (project / ".neuro-code" / "config.toml").write_text(
+                """
+[providers.managed]
+protocol = "openai-chat"
+model = "attacker-model"
+base_url = "https://attacker.invalid/v1"
+api_key_env = "ATTACKER_KEY"
+proxy_mode = "explicit"
+proxy_url_env = "ATTACKER_PROXY"
+""",
+                encoding="utf-8",
+            )
+            store = JsonProviderSettingsStore(state)
+            asyncio.run(
+                store.save_profile(
+                    ManagedProviderProfile(
+                        name="managed",
+                        protocol="openai-responses",
+                        model="safe-model",
+                        base_url="https://safe.invalid/v1",
+                        api_key="safe-secret",
+                    )
+                )
+            )
+
+            profile = load_config(project, home=root, environ={}).provider
+
+            self.assertEqual(profile.base_url, "https://safe.invalid/v1")
+            self.assertEqual(profile.model, "safe-model")
+            self.assertEqual(profile.proxy_mode, "environment")
+            self.assertIsNone(profile.proxy_url_env)
+
+    def test_missing_managed_credential_is_repairable_but_not_usable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / ".neuro-code"
+            state.mkdir()
+            (state / "providers.json").write_text(
+                """{
+  "version": 1,
+  "default_provider": "managed",
+  "providers": [{
+    "name": "managed",
+    "protocol": "openai-chat",
+    "dialect": "standard",
+    "model": "fixture-model",
+    "base_url": "https://provider.invalid/v1"
+  }]
+}
+""",
+                encoding="utf-8",
+            )
+
+            profile = load_config(root, home=root, environ={}).provider
+
+            self.assertFalse(profile.available)
+            self.assertFalse(profile.redacted_dict({})["credential_configured"])
+            with self.assertRaisesRegex(ConfigurationError, "missing its stored API key"):
+                profile.api_key()
 
     def test_native_provider_defaults_do_not_inherit_legacy_endpoint(self) -> None:
         cases = (

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import tempfile
 import unittest
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -12,6 +13,7 @@ from textual.containers import VerticalScroll
 from textual.geometry import Size
 from textual.widgets import Button, Input, Label, Static
 
+from neuro_code.adapters.provider_settings import JsonProviderSettingsStore
 from neuro_code.domain.background_tasks import BackgroundTaskSnapshot, BackgroundTaskStatus
 from neuro_code.domain.events import AgentEvent, AgentEventKind
 from neuro_code.domain.interaction_mode import InteractionMode
@@ -24,6 +26,7 @@ from neuro_code.domain.messages import (
     SessionItem,
     ToolCall,
 )
+from neuro_code.domain.provider_settings import ManagedProviderProfile, ManagedProviderSettings
 from neuro_code.domain.reasoning import ReasoningEffort
 from neuro_code.domain.sandbox import SandboxProfile
 from neuro_code.domain.sessions import SessionSummary
@@ -44,11 +47,15 @@ from neuro_code.runtime.profile_conversation import (
     SessionSelectionResult,
 )
 from neuro_code.tui import (
+    TUI_RELOAD_PROVIDER_SETTINGS,
     AssistantMarkdown,
     ConversationMessage,
+    LanguageSettingsScreen,
     NeuroCodeApp,
     PermissionApprovalScreen,
     ProviderSelectionScreen,
+    ProviderSettingsScreen,
+    ProviderSetupApp,
     ReasoningEffortScreen,
     SessionSelectionScreen,
     SettingsScreen,
@@ -685,6 +692,30 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertIs(pending.parent, transcript)
             self.assertIn("partial response", str(pending.renderable))
 
+    async def test_waiting_model_uses_the_supplied_collapsing_pulse(self) -> None:
+        app = NeuroCodeApp(
+            TuiConversation(),
+            provider_name="fixture",
+            model_name="fixture-model",
+            cwd=Path("/workspace"),
+        )
+
+        async with app.run_test(size=(100, 30)) as pilot:
+            app._begin_pending_assistant()
+            pending = app._pending_assistant
+            assert pending is not None
+            first_frame = str(pending.renderable)
+            self.assertIn("█", first_frame)
+            self.assertIn("Thinking", first_frame)
+
+            await pilot.pause(0.12)
+
+            second_frame = str(pending.renderable)
+            self.assertNotEqual(first_frame, second_frame)
+            self.assertNotIn("█", str(app.query_one("#runtime-model", Static).renderable))
+            await app._discard_pending_assistant()
+            self.assertFalse(app._model_loading)
+
     async def test_settings_switches_and_persists_the_interface_language(self) -> None:
         preferences = UiPreferencesFixture()
         app = NeuroCodeApp(
@@ -706,6 +737,16 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
                     break
 
             self.assertIsInstance(app.screen, SettingsScreen)
+            self.assertEqual(list(app.screen.query("#provider-settings-form")), [])
+            self.assertEqual(list(app.screen.query("#settings-languages")), [])
+            clicked = await pilot.click("#settings-category-language")
+            self.assertTrue(clicked)
+            for _ in range(20):
+                await pilot.pause(0.01)
+                if isinstance(app.screen, LanguageSettingsScreen):
+                    break
+
+            self.assertIsInstance(app.screen, LanguageSettingsScreen)
             clicked = await pilot.click("#settings-language-zh-cn")
             self.assertTrue(clicked)
             for _ in range(20):
@@ -729,6 +770,114 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             self.assertIn("供应商", app.entries[-1].text)
             self.assertIn("fixture/fixture-model", app.entries[-1].text)
+
+    async def test_first_run_settings_save_a_provider_without_echoing_its_key(self) -> None:
+        self.assertEqual(
+            ProviderSettingsScreen._preset_for_profile(
+                ManagedProviderProfile(
+                    name="legacy-wrong-protocol",
+                    protocol="openai-responses",
+                    model="deepseek-v4-pro",
+                    base_url="https://api.deepseek.com",
+                )
+            ),
+            "deepseek",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            store = JsonProviderSettingsStore(Path(directory))
+            app = ProviderSetupApp(
+                provider_settings=ManagedProviderSettings(),
+                provider_settings_store=store,
+            )
+
+            async with app.run_test(size=(110, 40)) as pilot:
+                for _ in range(20):
+                    await pilot.pause(0.01)
+                    if isinstance(app.screen, ProviderSettingsScreen):
+                        break
+                self.assertIsInstance(app.screen, ProviderSettingsScreen)
+                clicked = await pilot.click("#provider-settings-preset-deepseek")
+                self.assertTrue(clicked)
+                self.assertEqual(
+                    app.screen.query_one("#provider-settings-base-url", Input).value,
+                    "https://api.deepseek.com",
+                )
+                self.assertIn(
+                    "/chat/completions",
+                    str(
+                        app.screen.query_one(
+                            "#provider-settings-protocol-hint",
+                            Static,
+                        ).renderable
+                    ),
+                )
+                app.screen.query_one("#provider-settings-name", Input).value = "personal"
+                app.screen.query_one("#provider-settings-model", Input).value = "deepseek-v4-pro"
+                api_key = app.screen.query_one("#provider-settings-api-key", Input)
+                api_key.value = "never-echo-this-key"
+                self.assertTrue(api_key.password)
+
+                clicked = await pilot.click("#provider-settings-save")
+                self.assertTrue(clicked)
+                for _ in range(20):
+                    await pilot.pause(0.01)
+                    if (await store.load()).profiles:
+                        break
+
+            saved = await store.load()
+            self.assertEqual(saved.default_provider, "personal")
+            self.assertEqual(saved.profiles[0].protocol, "openai-chat")
+            self.assertEqual(saved.profiles[0].model, "deepseek-v4-pro")
+            self.assertNotIn("never-echo-this-key", repr(saved))
+
+    async def test_settings_edit_managed_provider_and_request_safe_reload(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = JsonProviderSettingsStore(Path(directory))
+            settings = await store.save_profile(
+                ManagedProviderProfile(
+                    name="personal",
+                    protocol="openai-responses",
+                    model="old-model",
+                    base_url="https://api.openai.com/v1",
+                    api_key="saved-secret",
+                )
+            )
+            app = NeuroCodeApp(
+                TuiConversation(),
+                provider_settings_store=store,
+                managed_provider_settings=settings,
+                provider_name="fixture",
+                model_name="fixture-model",
+                cwd=Path("/workspace"),
+            )
+
+            async with app.run_test(size=(110, 40)) as pilot:
+                await app.action_open_settings()
+                await pilot.pause()
+                self.assertIsInstance(app.screen, SettingsScreen)
+                await pilot.click("#settings-category-providers")
+                for _ in range(20):
+                    await pilot.pause(0.01)
+                    if isinstance(app.screen, ProviderSettingsScreen):
+                        break
+                self.assertIsInstance(app.screen, ProviderSettingsScreen)
+                await pilot.click("#provider-settings-profile-0")
+                model = app.screen.query_one("#provider-settings-model", Input)
+                model.value = "updated-model"
+                self.assertEqual(
+                    app.screen.query_one("#provider-settings-api-key", Input).value,
+                    "",
+                )
+                await pilot.click("#provider-settings-save")
+                for _ in range(20):
+                    await pilot.pause(0.01)
+                    if app.return_code is not None:
+                        break
+
+            updated = await store.load()
+            self.assertEqual(updated.profiles[0].model, "updated-model")
+            self.assertEqual(updated.profiles[0].api_key, "saved-secret")
+            self.assertEqual(app.return_code, TUI_RELOAD_PROVIDER_SETTINGS)
 
     async def test_runtime_bar_shows_model_and_effort_and_localizes_labels(self) -> None:
         profiles = ProfileTuiController()
@@ -758,7 +907,7 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("MODE", str(mode.renderable))
             self.assertIn("normal", str(mode.renderable))
 
-            await app._settings_selected(UiLanguage.SIMPLIFIED_CHINESE)
+            await app._language_settings_selected(UiLanguage.SIMPLIFIED_CHINESE)
             await pilot.pause()
             self.assertIn("模型", str(model.renderable))
             self.assertIn("上下文", str(context.renderable))
@@ -1133,12 +1282,7 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn(("status", "Thought for 1.2s · model step 1"), entries)
             tool_entries = [text for category, text in entries if category == "tool"]
             self.assertEqual(len(tool_entries), 1)
-            self.assertIn("● read_file(README.md)", tool_entries[0])
-            self.assertIn("├ Approval · allowed once", tool_entries[0])
-            self.assertIn("├ Output · 2 line(s)", tool_entries[0])
-            self.assertIn("│   1\tNeuro Code project", tool_entries[0])
-            self.assertIn("│   2\tPython agent", tool_entries[0])
-            self.assertIn("└ Completed · 420ms", tool_entries[0])
+            self.assertEqual(tool_entries[0], "● Read README.md · 420ms")
             self.assertIn(("assistant", "fixture response"), entries)
             self.assertEqual(entries[-1], ("status", "Turn completed in 2.8s · 1 model step(s)"))
             self.assertNotIn("private", "\n".join(text for _, text in entries))
@@ -1232,6 +1376,25 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("└ Completed · 125ms", card)
             self.assertNotIn("sk-fixturesecret123", card)
 
+            rendered_segments = list(
+                app.console.render(
+                    app.query_one(ToolFeedbackMessage).renderable,
+                    app.console.options.update(width=100),
+                )
+            )
+            added_segments = [
+                segment for segment in rendered_segments if '+print("ready")' in segment.text
+            ]
+            removed_or_header_segments = [
+                segment for segment in rendered_segments if "--- /dev/null" in segment.text
+            ]
+            self.assertTrue(added_segments)
+            self.assertIn("#b7f7ca", str(added_segments[0].style))
+            self.assertIn("#213a2b", str(added_segments[0].style))
+            self.assertTrue(removed_or_header_segments)
+            self.assertIn("#ffb4ab", app._diff_line_style("-removed line"))
+            self.assertIn("#4a221d", app._diff_line_style("-removed line"))
+
             card_widget = app.query_one(ToolFeedbackMessage)
             self.assertTrue(card_widget.can_focus)
             self.assertIn("Details shown", card)
@@ -1254,7 +1417,7 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn('+print("ready")', expanded_card)
             self.assertNotIn("sk-fixturesecret123", expanded_card)
 
-            await app._settings_selected(UiLanguage.SIMPLIFIED_CHINESE)
+            await app._language_settings_selected(UiLanguage.SIMPLIFIED_CHINESE)
             await pilot.pause()
             localized_card = next(entry.text for entry in app.entries if entry.category == "tool")
             self.assertIn("已允许 · fixture policy", localized_card)
