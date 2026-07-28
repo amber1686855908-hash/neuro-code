@@ -83,7 +83,7 @@ class FilesystemToolTests(unittest.IsolatedAsyncioTestCase):
                 {"query": "bet.", "path": str(extra)},
                 context,
             )
-            self.assertIn(f"{target}:2:beta", grep_result.content)
+            self.assertIn(f"{target.resolve()}:2:beta", grep_result.content)
             with self.assertRaisesRegex(ToolError, "escapes the workspace"):
                 await ReadFileTool().execute({"path": str(outside_target)}, context)
 
