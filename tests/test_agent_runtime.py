@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import sys
 import tempfile
 import unittest
@@ -11,6 +12,15 @@ from typing import Any, cast
 
 from neuro_code.adapters.background_tasks import LocalBackgroundTaskManager
 from neuro_code.adapters.sqlite_session import SqliteSessionStore
+from neuro_code.application.permissions.contracts import PermissionApproval, PermissionRequest
+from neuro_code.application.ports.background_tasks import BackgroundTaskManager
+from neuro_code.application.ports.tools import Tool, ToolContext
+from neuro_code.application.ports.workspace_changes import (
+    WorkspaceChangeCheckpoint,
+    WorkspaceChangeReport,
+    WorkspaceFileChange,
+)
+from neuro_code.application.runtime.agent import AgentRuntime
 from neuro_code.domain.background_tasks import BackgroundTaskSnapshot, BackgroundTaskStatus
 from neuro_code.domain.events import AgentEventKind
 from neuro_code.domain.interaction_mode import InteractionMode
@@ -33,21 +43,18 @@ from neuro_code.domain.model_events import (
 )
 from neuro_code.domain.reasoning import ReasoningEffort
 from neuro_code.domain.tools import ToolDefinition, ToolResult
-from neuro_code.errors import ProviderError
 from neuro_code.permissions import (
-    PermissionApproval,
     PermissionEffect,
     PermissionManager,
     PermissionMode,
-    PermissionRequest,
     PermissionRule,
 )
-from neuro_code.ports.background_tasks import BackgroundTaskManager
-from neuro_code.ports.tools import ToolContext
 from neuro_code.providers.failover import FailoverModelProvider, ProviderCandidate
-from neuro_code.runtime import AgentRuntime
+from neuro_code.shared.errors import ProviderError
 from neuro_code.tools import ToolRegistry, default_tool_registry
 from neuro_code.tools.background_tasks import TaskOutputTool
+from neuro_code.workspace_changes import FilesystemWorkspaceChangeObserver
+from tests.fakes import EmptyWorkspaceChangeObserver
 
 
 class ScriptedProvider:
@@ -58,6 +65,7 @@ class ScriptedProvider:
     def __init__(self, scripts: Sequence[Sequence[ModelEvent]]) -> None:
         self._scripts = list(scripts)
         self.calls: list[ModelContext] = []
+        self.tool_definitions: list[tuple[ToolDefinition, ...]] = []
 
     async def stream(
         self,
@@ -65,6 +73,7 @@ class ScriptedProvider:
         tools: Sequence[ToolDefinition],
     ) -> AsyncIterator[ModelEvent]:
         self.calls.append(context)
+        self.tool_definitions.append(tuple(tools))
         script = self._scripts.pop(0)
         for event in script:
             yield event
@@ -180,6 +189,126 @@ class SecretEchoTool:
         return ToolResult(f"tool printed {self._secret}")
 
 
+class CollectionFixtureTool:
+    def __init__(self, name: str, content: str) -> None:
+        self.definition = ToolDefinition(
+            name=name,
+            description=f"Run the {name} fixture.",
+            input_schema={"type": "object", "additionalProperties": False},
+        )
+        self.side_effecting = False
+        self.calls: list[dict[str, object]] = []
+        self._content = content
+
+    async def execute(
+        self,
+        arguments: Mapping[str, object],
+        context: ToolContext,
+    ) -> ToolResult:
+        del context
+        self.calls.append(dict(arguments))
+        return ToolResult(self._content)
+
+
+class MinimalToolCollection:
+    """A structural ToolCollection fixture with no registry-specific API."""
+
+    def __init__(self, tools: Sequence[Tool]) -> None:
+        self._tools = {tool.definition.name: tool for tool in tools}
+
+    def get(self, name: str) -> Tool | None:
+        return self._tools.get(name)
+
+    def definitions(self) -> tuple[ToolDefinition, ...]:
+        return tuple(tool.definition for tool in self._tools.values())
+
+
+class FixtureWorkspaceChangeCheckpoint(WorkspaceChangeCheckpoint):
+    """Opaque checkpoint used to prove the runtime does not need snapshots."""
+
+    __slots__ = ("sequence",)
+
+    def __init__(self, sequence: int) -> None:
+        self.sequence = sequence
+
+
+class RecordingWorkspaceChangeObserver:
+    def __init__(
+        self,
+        report: WorkspaceChangeReport,
+        *,
+        capture_error_at: int | None = None,
+        capture_error: OSError | RuntimeError | None = None,
+        compare_error: BaseException | None = None,
+        event_log: list[str] | None = None,
+    ) -> None:
+        self._report = report
+        self._capture_error_at = capture_error_at
+        self._capture_error = capture_error
+        self._compare_error = compare_error
+        self._event_log = event_log
+        self.capture_roots: list[Path] = []
+        self.comparisons: list[tuple[WorkspaceChangeCheckpoint, WorkspaceChangeCheckpoint]] = []
+        self.explicit_redactions: list[tuple[str, ...]] = []
+
+    def capture(self, root: Path, /) -> WorkspaceChangeCheckpoint:
+        self.capture_roots.append(root)
+        if self._event_log is not None:
+            self._event_log.append("capture")
+        if self._capture_error_at == len(self.capture_roots):
+            assert self._capture_error is not None
+            raise self._capture_error
+        return FixtureWorkspaceChangeCheckpoint(len(self.capture_roots))
+
+    def compare(
+        self,
+        before: WorkspaceChangeCheckpoint,
+        after: WorkspaceChangeCheckpoint,
+        *,
+        explicit_redactions: tuple[str, ...],
+    ) -> WorkspaceChangeReport:
+        self.comparisons.append((before, after))
+        self.explicit_redactions.append(explicit_redactions)
+        if self._event_log is not None:
+            self._event_log.append("compare")
+        if self._compare_error is not None:
+            raise self._compare_error
+        return self._report
+
+
+class OrderedSideEffectTool:
+    definition = ToolDefinition(
+        name="ordered_side_effect",
+        description="Record workspace observation order.",
+        input_schema={"type": "object", "additionalProperties": False},
+    )
+    side_effecting = True
+
+    def __init__(self, event_log: list[str], result: ToolResult | None = None) -> None:
+        self._event_log = event_log
+        self._result = result or ToolResult("completed")
+
+    async def execute(
+        self,
+        arguments: Mapping[str, object],
+        context: ToolContext,
+    ) -> ToolResult:
+        del arguments, context
+        self._event_log.append("execute")
+        return self._result
+
+
+class OSErrorSideEffectTool(OrderedSideEffectTool):
+    async def execute(
+        self,
+        arguments: Mapping[str, object],
+        context: ToolContext,
+    ) -> ToolResult:
+        del arguments, context
+        self._event_log.append("execute")
+        raise OSError("fixture tool failure")
+
+
 class ReleaseBackgroundTaskTool:
     definition = ToolDefinition(
         name="release_background_task",
@@ -245,6 +374,270 @@ def completion_snapshot(task_id: str) -> BackgroundTaskSnapshot:
 
 
 class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_structural_tool_collection_preserves_order_and_known_tool_dispatch(self) -> None:
+        first = CollectionFixtureTool("first", "first completed")
+        second = CollectionFixtureTool("second", "second completed")
+        provider = ScriptedProvider(
+            (
+                (
+                    ModelToolCall(ToolCall("first-call", "first", {})),
+                    ModelToolCall(ToolCall("second-call", "second", {})),
+                    ModelCompleted("tool_calls"),
+                ),
+                (ModelTextDelta("done"), ModelCompleted("stop")),
+            )
+        )
+        observer = RecordingWorkspaceChangeObserver(
+            WorkspaceChangeReport(files=(), omitted_files=0, scan_limited=False)
+        )
+        runtime = AgentRuntime(
+            provider=provider,
+            tools=MinimalToolCollection((first, second)),
+            workspace_change_observer=observer,
+            permissions=PermissionManager(mode=PermissionMode.BYPASS),
+            tool_context=ToolContext(Path("/workspace")),
+        )
+
+        result = await runtime.run("Run both fixture tools")
+
+        self.assertEqual(
+            [definition.name for definition in provider.tool_definitions[0]],
+            ["first", "second"],
+        )
+        self.assertEqual(first.calls, [{}])
+        self.assertEqual(second.calls, [{}])
+        self.assertEqual(observer.capture_roots, [])
+        completed = [
+            event for event in result.events if event.kind is AgentEventKind.TOOL_COMPLETED
+        ]
+        self.assertEqual([event.data["name"] for event in completed], ["first", "second"])
+
+    async def test_structural_tool_collection_preserves_unknown_tool_failure(self) -> None:
+        provider = ScriptedProvider(
+            (
+                (
+                    ModelToolCall(ToolCall("missing-call", "missing", {})),
+                    ModelCompleted("tool_calls"),
+                ),
+                (ModelTextDelta("done"), ModelCompleted("stop")),
+            )
+        )
+        observer = RecordingWorkspaceChangeObserver(
+            WorkspaceChangeReport(files=(), omitted_files=0, scan_limited=False)
+        )
+        runtime = AgentRuntime(
+            provider=provider,
+            tools=MinimalToolCollection(()),
+            workspace_change_observer=observer,
+            permissions=PermissionManager(mode=PermissionMode.BYPASS),
+            tool_context=ToolContext(Path("/workspace")),
+        )
+
+        result = await runtime.run("Run an unknown fixture tool")
+
+        failed = next(event for event in result.events if event.kind is AgentEventKind.TOOL_FAILED)
+        self.assertEqual(failed.data["name"], "missing")
+        self.assertEqual(failed.data["content"], "unknown tool: missing")
+        self.assertEqual(observer.capture_roots, [])
+
+    async def test_workspace_observer_preserves_side_effect_timing_and_payload(self) -> None:
+        event_log: list[str] = []
+        report = WorkspaceChangeReport(
+            files=(
+                WorkspaceFileChange(
+                    path="note.txt",
+                    status="modified",
+                    additions=1,
+                    deletions=1,
+                    diff="--- a/note.txt\n+++ b/note.txt\n-old\n+new",
+                    diff_truncated=False,
+                    hidden_reason="redacted",
+                ),
+            ),
+            omitted_files=2,
+            scan_limited=False,
+        )
+        observer = RecordingWorkspaceChangeObserver(report, event_log=event_log)
+        tool = OrderedSideEffectTool(event_log)
+        provider = ScriptedProvider(
+            (
+                (
+                    ModelToolCall(ToolCall("change", tool.definition.name, {})),
+                    ModelCompleted("tool_calls"),
+                ),
+                (ModelTextDelta("done"), ModelCompleted("stop")),
+            )
+        )
+        secret_name = "NEURO_CODE_WORKSPACE_CHANGE_TEST_SECRET"
+        secret_value = "workspace-observer-secret"
+        previous_secret = os.environ.get(secret_name)
+        os.environ[secret_name] = secret_value
+        try:
+            runtime = AgentRuntime(
+                provider=provider,
+                tools=MinimalToolCollection((tool,)),
+                workspace_change_observer=observer,
+                permissions=PermissionManager(mode=PermissionMode.BYPASS),
+                tool_context=ToolContext(
+                    Path("/workspace"),
+                    protected_environment_variables=frozenset({secret_name}),
+                ),
+            )
+
+            def record_started(event: object) -> None:
+                if getattr(event, "kind", None) is AgentEventKind.TOOL_STARTED:
+                    event_log.append("started")
+
+            result = await runtime.run("Change the fixture file", sink=record_started)
+        finally:
+            if previous_secret is None:
+                del os.environ[secret_name]
+            else:
+                os.environ[secret_name] = previous_secret
+
+        self.assertEqual(event_log, ["started", "capture", "execute", "capture", "compare"])
+        self.assertEqual(len(observer.capture_roots), 2)
+        self.assertEqual(observer.explicit_redactions, [(secret_value,)])
+        completed = next(
+            event for event in result.events if event.kind is AgentEventKind.TOOL_COMPLETED
+        )
+        payload = completed.data["workspace_changes"]
+        self.assertEqual(payload, report.to_event_payload())
+        assert isinstance(payload, dict)
+        self.assertEqual(list(payload), ["files", "omitted_files", "scan_limited"])
+        file_payload = payload["files"][0]
+        self.assertEqual(
+            list(file_payload),
+            [
+                "path",
+                "status",
+                "additions",
+                "deletions",
+                "diff",
+                "diff_truncated",
+                "hidden_reason",
+            ],
+        )
+
+    async def test_workspace_observer_report_survives_a_converted_tool_failure(self) -> None:
+        event_log: list[str] = []
+        report = WorkspaceChangeReport(
+            files=(
+                WorkspaceFileChange(
+                    path="failed.txt",
+                    status="created",
+                    additions=1,
+                    deletions=0,
+                    diff="+++ b/failed.txt\n+partial",
+                    diff_truncated=False,
+                ),
+            ),
+            omitted_files=0,
+            scan_limited=False,
+        )
+        observer = RecordingWorkspaceChangeObserver(report, event_log=event_log)
+        tool = OSErrorSideEffectTool(event_log)
+        provider = ScriptedProvider(
+            (
+                (
+                    ModelToolCall(ToolCall("change", tool.definition.name, {})),
+                    ModelCompleted("tool_calls"),
+                ),
+                (ModelTextDelta("recovered"), ModelCompleted("stop")),
+            )
+        )
+        runtime = AgentRuntime(
+            provider=provider,
+            tools=MinimalToolCollection((tool,)),
+            workspace_change_observer=observer,
+            permissions=PermissionManager(mode=PermissionMode.BYPASS),
+            tool_context=ToolContext(Path("/workspace")),
+        )
+
+        result = await runtime.run("Run the failing fixture")
+
+        self.assertEqual(event_log, ["capture", "execute", "capture", "compare"])
+        failed = next(event for event in result.events if event.kind is AgentEventKind.TOOL_FAILED)
+        self.assertIn("OSError: fixture tool failure", failed.data["content"])
+        self.assertEqual(failed.data["workspace_changes"], report.to_event_payload())
+
+    async def test_workspace_capture_failures_do_not_block_the_tool_or_emit_a_report(self) -> None:
+        for capture_error_at, error_type in (
+            (1, OSError),
+            (1, RuntimeError),
+            (2, OSError),
+            (2, RuntimeError),
+        ):
+            with self.subTest(capture_error_at=capture_error_at, error_type=error_type):
+                event_log: list[str] = []
+                observer = RecordingWorkspaceChangeObserver(
+                    WorkspaceChangeReport(files=(), omitted_files=0, scan_limited=False),
+                    capture_error_at=capture_error_at,
+                    capture_error=error_type("fixture capture failure"),
+                    event_log=event_log,
+                )
+                tool = OrderedSideEffectTool(event_log)
+                provider = ScriptedProvider(
+                    (
+                        (
+                            ModelToolCall(ToolCall("change", tool.definition.name, {})),
+                            ModelCompleted("tool_calls"),
+                        ),
+                        (ModelTextDelta("done"), ModelCompleted("stop")),
+                    )
+                )
+                runtime = AgentRuntime(
+                    provider=provider,
+                    tools=MinimalToolCollection((tool,)),
+                    workspace_change_observer=observer,
+                    permissions=PermissionManager(mode=PermissionMode.BYPASS),
+                    tool_context=ToolContext(Path("/workspace")),
+                )
+
+                result = await runtime.run("Run the fixture")
+
+                completed = next(
+                    event for event in result.events if event.kind is AgentEventKind.TOOL_COMPLETED
+                )
+                self.assertNotIn("workspace_changes", completed.data)
+                self.assertEqual(len(observer.capture_roots), capture_error_at)
+                self.assertEqual(observer.comparisons, [])
+                self.assertEqual(event_log.count("execute"), 1)
+
+    async def test_workspace_compare_failure_propagates_before_the_terminal_tool_event(
+        self,
+    ) -> None:
+        event_log: list[str] = []
+        observer = RecordingWorkspaceChangeObserver(
+            WorkspaceChangeReport(files=(), omitted_files=0, scan_limited=False),
+            compare_error=ValueError("fixture compare failure"),
+            event_log=event_log,
+        )
+        tool = OrderedSideEffectTool(event_log)
+        provider = ScriptedProvider(
+            (
+                (
+                    ModelToolCall(ToolCall("change", tool.definition.name, {})),
+                    ModelCompleted("tool_calls"),
+                ),
+            )
+        )
+        observed: list[AgentEventKind] = []
+        runtime = AgentRuntime(
+            provider=provider,
+            tools=MinimalToolCollection((tool,)),
+            workspace_change_observer=observer,
+            permissions=PermissionManager(mode=PermissionMode.BYPASS),
+            tool_context=ToolContext(Path("/workspace")),
+        )
+
+        with self.assertRaisesRegex(ValueError, "fixture compare failure"):
+            await runtime.run("Run the fixture", sink=lambda event: observed.append(event.kind))
+
+        self.assertEqual(event_log, ["capture", "execute", "capture", "compare"])
+        self.assertNotIn(AgentEventKind.TOOL_COMPLETED, observed)
+        self.assertIn(AgentEventKind.TURN_FAILED, observed)
+
     async def test_explicit_provider_credentials_are_redacted_at_tool_boundary(self) -> None:
         secret = "credential-without-a-recognizable-shape"
         provider = ScriptedProvider(
@@ -261,6 +654,7 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
         runtime = AgentRuntime(
             provider=provider,
             tools=tools,
+            workspace_change_observer=EmptyWorkspaceChangeObserver(),
             permissions=PermissionManager(),
             tool_context=ToolContext(Path("/workspace"), redaction_values=(secret,)),
         )
@@ -277,6 +671,7 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
         runtime = AgentRuntime(
             provider=provider,
             tools=ToolRegistry(),
+            workspace_change_observer=EmptyWorkspaceChangeObserver(),
             permissions=PermissionManager(),
             tool_context=ToolContext(Path("/workspace")),
             reasoning_effort=ReasoningEffort.XHIGH,
@@ -298,6 +693,7 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
         runtime = AgentRuntime(
             provider=provider,
             tools=ToolRegistry(),
+            workspace_change_observer=EmptyWorkspaceChangeObserver(),
             permissions=PermissionManager(),
             tool_context=ToolContext(Path("/workspace")),
         )
@@ -321,6 +717,7 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
         runtime = AgentRuntime(
             provider=provider,
             tools=ToolRegistry(),
+            workspace_change_observer=EmptyWorkspaceChangeObserver(),
             permissions=PermissionManager(),
             tool_context=ToolContext(
                 Path("/workspace"),
@@ -387,7 +784,8 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
             release = ReleaseBackgroundTaskTool(trigger, manager, task.task_id)
             runtime = AgentRuntime(
                 provider=provider,
-                tools=ToolRegistry((release, TaskOutputTool())),
+                tools=MinimalToolCollection((release, TaskOutputTool())),
+                workspace_change_observer=EmptyWorkspaceChangeObserver(),
                 permissions=PermissionManager(mode=PermissionMode.BYPASS),
                 tool_context=ToolContext(root, background_tasks=manager),
             )
@@ -458,6 +856,7 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
             runtime = AgentRuntime(
                 provider=provider,
                 tools=default_tool_registry(),
+                workspace_change_observer=EmptyWorkspaceChangeObserver(),
                 permissions=PermissionManager(),
                 tool_context=ToolContext(root),
                 session_store=store,
@@ -528,6 +927,7 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
             runtime = AgentRuntime(
                 provider=provider,
                 tools=default_tool_registry(),
+                workspace_change_observer=EmptyWorkspaceChangeObserver(),
                 permissions=PermissionManager(),
                 tool_context=ToolContext(root),
                 session_store=store,
@@ -588,6 +988,7 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
             runtime = AgentRuntime(
                 provider=provider,
                 tools=default_tool_registry(),
+                workspace_change_observer=FilesystemWorkspaceChangeObserver(),
                 permissions=PermissionManager(mode=PermissionMode.BYPASS),
                 tool_context=ToolContext(root),
             )
@@ -641,6 +1042,7 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
             runtime = AgentRuntime(
                 provider=provider,
                 tools=default_tool_registry(),
+                workspace_change_observer=FilesystemWorkspaceChangeObserver(),
                 permissions=PermissionManager(mode=PermissionMode.BYPASS),
                 tool_context=ToolContext(root),
             )
@@ -680,6 +1082,7 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
             runtime = AgentRuntime(
                 provider=provider,
                 tools=default_tool_registry(),
+                workspace_change_observer=EmptyWorkspaceChangeObserver(),
                 permissions=PermissionManager(),
                 tool_context=ToolContext(root),
                 session_store=store,
@@ -724,9 +1127,13 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
                     (ModelTextDelta("I could not edit without approval."), ModelCompleted("stop")),
                 )
             )
+            observer = RecordingWorkspaceChangeObserver(
+                WorkspaceChangeReport(files=(), omitted_files=0, scan_limited=False)
+            )
             runtime = AgentRuntime(
                 provider=provider,
                 tools=default_tool_registry(),
+                workspace_change_observer=observer,
                 permissions=PermissionManager(mode=PermissionMode.DEFAULT, interactive=False),
                 tool_context=ToolContext(root),
             )
@@ -738,6 +1145,7 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
             second_request = provider.calls[1].messages
             denial = [message for message in second_request if message.role is Role.TOOL]
             self.assertIn("permission denied", denial[0].content)
+            self.assertEqual(observer.capture_roots, [])
 
     async def test_interactive_approval_blocks_the_tool_until_user_allows(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -765,6 +1173,7 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
             runtime = AgentRuntime(
                 provider=provider,
                 tools=default_tool_registry(),
+                workspace_change_observer=EmptyWorkspaceChangeObserver(),
                 permissions=PermissionManager(interactive=True),
                 tool_context=ToolContext(root),
                 approver=approver,
@@ -824,9 +1233,13 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 )
             )
             approver = ImmediateApprover(PermissionApproval.deny("not now"))
+            observer = RecordingWorkspaceChangeObserver(
+                WorkspaceChangeReport(files=(), omitted_files=0, scan_limited=False)
+            )
             runtime = AgentRuntime(
                 provider=provider,
                 tools=default_tool_registry(),
+                workspace_change_observer=observer,
                 permissions=PermissionManager(interactive=True),
                 tool_context=ToolContext(root),
                 approver=approver,
@@ -841,6 +1254,7 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 message for message in provider.calls[1].messages if message.role is Role.TOOL
             ]
             self.assertEqual(denial[0].content, "permission denied: not now")
+            self.assertEqual(observer.capture_roots, [])
 
     async def test_cancelling_an_approval_wait_never_starts_the_tool(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -863,11 +1277,15 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
             )
             approver = GateApprover()
             observed: list[AgentEventKind] = []
+            observer = RecordingWorkspaceChangeObserver(
+                WorkspaceChangeReport(files=(), omitted_files=0, scan_limited=False)
+            )
             store = SqliteSessionStore(root / ".state" / "sessions.db")
             await store.initialize()
             runtime = AgentRuntime(
                 provider=provider,
                 tools=default_tool_registry(),
+                workspace_change_observer=observer,
                 permissions=PermissionManager(interactive=True),
                 tool_context=ToolContext(root),
                 approver=approver,
@@ -887,6 +1305,7 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn(AgentEventKind.TOOL_FAILED, observed)
             self.assertIn(AgentEventKind.TURN_FAILED, observed)
             self.assertNotIn(AgentEventKind.TOOL_STARTED, observed)
+            self.assertEqual(observer.capture_roots, [])
             sessions = await store.list_sessions()
             self.assertEqual(len(sessions), 1)
             items = await store.load_session_items(sessions[0].id)
@@ -921,9 +1340,25 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
             )
             store = SqliteSessionStore(root / ".state" / "sessions.db")
             await store.initialize()
+            report = WorkspaceChangeReport(
+                files=(
+                    WorkspaceFileChange(
+                        path="cancelled.txt",
+                        status="created",
+                        additions=1,
+                        deletions=0,
+                        diff="+++ b/cancelled.txt\n+partial",
+                        diff_truncated=False,
+                    ),
+                ),
+                omitted_files=0,
+                scan_limited=False,
+            )
+            observer = RecordingWorkspaceChangeObserver(report)
             runtime = AgentRuntime(
                 provider=provider,
-                tools=ToolRegistry((blocking, pending)),
+                tools=MinimalToolCollection((blocking, pending)),
+                workspace_change_observer=observer,
                 permissions=PermissionManager(mode=PermissionMode.BYPASS),
                 tool_context=ToolContext(root),
                 session_store=store,
@@ -958,7 +1393,11 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
             ]
             self.assertEqual(len(failures), 2)
             self.assertTrue(all(event["data"]["cancelled"] for event in failures))
+            self.assertEqual(failures[0]["data"]["workspace_changes"], report.to_event_payload())
+            self.assertNotIn("workspace_changes", failures[1]["data"])
             self.assertTrue(failures[1]["data"]["not_started"])
+            self.assertEqual(len(observer.capture_roots), 2)
+            self.assertEqual(len(observer.comparisons), 1)
 
             recovered = await runtime.run(
                 "Continue in the same session",
@@ -999,6 +1438,7 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
             runtime = AgentRuntime(
                 provider=provider,
                 tools=default_tool_registry(),
+                workspace_change_observer=EmptyWorkspaceChangeObserver(),
                 permissions=PermissionManager(
                     mode=PermissionMode.BYPASS,
                     rules=(PermissionRule(PermissionEffect.DENY, "search_replace"),),
@@ -1038,6 +1478,7 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
             runtime = AgentRuntime(
                 provider=provider,
                 tools=default_tool_registry(),
+                workspace_change_observer=EmptyWorkspaceChangeObserver(),
                 permissions=PermissionManager(),
                 tool_context=ToolContext(Path(directory)),
             )
@@ -1086,6 +1527,7 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
             runtime = AgentRuntime(
                 provider=provider,
                 tools=default_tool_registry(),
+                workspace_change_observer=EmptyWorkspaceChangeObserver(),
                 permissions=PermissionManager(),
                 tool_context=ToolContext(root),
                 session_store=store,
@@ -1127,6 +1569,7 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
             runtime = AgentRuntime(
                 provider=provider,
                 tools=default_tool_registry(),
+                workspace_change_observer=EmptyWorkspaceChangeObserver(),
                 permissions=PermissionManager(),
                 tool_context=ToolContext(Path(directory)),
             )
@@ -1157,6 +1600,7 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
             runtime = AgentRuntime(
                 provider=provider,
                 tools=default_tool_registry(),
+                workspace_change_observer=EmptyWorkspaceChangeObserver(),
                 permissions=PermissionManager(),
                 tool_context=ToolContext(Path(directory)),
             )
@@ -1210,6 +1654,7 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
             runtime = AgentRuntime(
                 provider=provider,
                 tools=default_tool_registry(),
+                workspace_change_observer=EmptyWorkspaceChangeObserver(),
                 permissions=PermissionManager(),
                 tool_context=ToolContext(Path(directory)),
             )
@@ -1233,6 +1678,7 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
         runtime = AgentRuntime(
             provider=ScriptedProvider(()),
             tools=default_tool_registry(),
+            workspace_change_observer=EmptyWorkspaceChangeObserver(),
             permissions=permissions,
             tool_context=ToolContext(Path("/workspace")),
         )
@@ -1249,6 +1695,7 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
         explicit_runtime = AgentRuntime(
             provider=ScriptedProvider(()),
             tools=default_tool_registry(),
+            workspace_change_observer=EmptyWorkspaceChangeObserver(),
             permissions=explicit,
             tool_context=ToolContext(Path("/workspace")),
         )

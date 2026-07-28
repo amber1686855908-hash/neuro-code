@@ -19,7 +19,7 @@ from neuro_code.domain.messages import (
 from neuro_code.domain.model_context import UPSTREAM_IMPORT_PROVIDER
 from neuro_code.domain.sandbox import SandboxProfile
 from neuro_code.domain.sessions import SessionSnapshot, SessionSummary
-from neuro_code.errors import SessionError
+from neuro_code.shared.errors import SessionError
 
 MAX_SUMMARY_BYTES = 1024 * 1024
 MAX_CHAT_RECORD_BYTES = 16 * 1024 * 1024

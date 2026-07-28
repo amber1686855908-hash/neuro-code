@@ -8,9 +8,9 @@ import sys
 from collections.abc import Sequence
 from pathlib import Path
 
+from neuro_code.application.ports.sandbox import ShellLaunch, ShellSandbox
 from neuro_code.domain.sandbox import SandboxProfile
-from neuro_code.errors import SandboxError
-from neuro_code.ports.sandbox import ShellLaunch, ShellSandbox
+from neuro_code.shared.errors import SandboxError
 
 _ACTIVE_PROFILE_ENV = "NEURO_CODE_SANDBOX_ACTIVE"
 _STRICT_SYSTEM_READ_PATHS = (

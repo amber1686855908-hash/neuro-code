@@ -1,14 +1,13 @@
 from functools import partial
 
+from neuro_code.application.ports.model import ModelProvider
 from neuro_code.config import AppConfig, ProviderProfile
-from neuro_code.errors import ConfigurationError
-from neuro_code.ports.model import ModelProvider
 from neuro_code.providers.anthropic import AnthropicProvider
 from neuro_code.providers.failover import FailoverModelProvider, ProviderCandidate
 from neuro_code.providers.gemini import GeminiProvider
 from neuro_code.providers.openai_compatible import OpenAICompatibleProvider
 from neuro_code.providers.openai_responses import OpenAIResponsesProvider
-from neuro_code.providers.xai_responses import XAIResponsesProvider
+from neuro_code.shared.errors import ConfigurationError
 
 
 def create_provider(config: ProviderProfile) -> ModelProvider:
@@ -90,7 +89,6 @@ __all__ = [
     "GeminiProvider",
     "OpenAICompatibleProvider",
     "OpenAIResponsesProvider",
-    "XAIResponsesProvider",
     "create_provider",
     "create_routed_provider",
 ]

@@ -4,13 +4,14 @@ import re
 from dataclasses import dataclass, field
 from urllib.parse import urlsplit
 
-from neuro_code.errors import ConfigurationError
+from neuro_code.shared.errors import ConfigurationError
 
 _PROFILE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
 _MAX_PROFILES = 64
 _MAX_MODEL_CHARACTERS = 512
 _MAX_URL_CHARACTERS = 2_048
 _MAX_API_KEY_CHARACTERS = 16_384
+_ENVIRONMENT_VARIABLE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 _SUPPORTED_PROTOCOLS = frozenset(
     {
         "openai-chat",
@@ -19,6 +20,7 @@ _SUPPORTED_PROTOCOLS = frozenset(
         "gemini-generate-content",
     }
 )
+_SUPPORTED_PROXY_MODES = frozenset({"environment", "direct", "explicit"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -30,6 +32,8 @@ class ManagedProviderProfile:
     model: str
     base_url: str
     dialect: str = "standard"
+    proxy_mode: str = "environment"
+    proxy_url_env: str | None = None
     api_key: str | None = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
@@ -66,6 +70,22 @@ class ManagedProviderProfile:
             raise ConfigurationError("provider base URL must not contain user information")
         if parsed.query or parsed.fragment:
             raise ConfigurationError("provider base URL must not contain a query or fragment")
+        if self.proxy_mode not in _SUPPORTED_PROXY_MODES:
+            raise ConfigurationError(
+                "provider proxy_mode must be 'environment', 'direct', or 'explicit'"
+            )
+        if self.proxy_mode == "explicit":
+            if (
+                self.proxy_url_env is None
+                or _ENVIRONMENT_VARIABLE.fullmatch(self.proxy_url_env) is None
+            ):
+                raise ConfigurationError(
+                    "provider explicit proxy mode requires a valid proxy environment variable"
+                )
+        elif self.proxy_url_env is not None:
+            raise ConfigurationError(
+                "provider proxy environment variable requires proxy_mode 'explicit'"
+            )
         if self.api_key is not None and not self.api_key.strip():
             object.__setattr__(self, "api_key", None)
         if self.api_key is not None and len(self.api_key) > _MAX_API_KEY_CHARACTERS:

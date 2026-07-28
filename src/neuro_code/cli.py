@@ -4,28 +4,15 @@ import argparse
 import asyncio
 import json
 import sys
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Sequence
 from pathlib import Path
+from typing import TYPE_CHECKING, Any, Protocol
 
 from neuro_code import __version__
-from neuro_code.adapters.background_tasks import LocalBackgroundTaskManager
-from neuro_code.adapters.provider_settings import JsonProviderSettingsStore
-from neuro_code.adapters.rust_session import load_rust_session
-from neuro_code.adapters.sandbox import create_shell_sandbox, enforce_configured_sandbox
-from neuro_code.adapters.sqlite_session import SqliteSessionStore
-from neuro_code.adapters.ui_preferences import JsonUiPreferencesStore
-from neuro_code.application import (
-    ApplicationComposition,
-    ApplicationSettings,
-)
-from neuro_code.async_utils import run_blocking
-from neuro_code.config import (
-    AppConfig,
-    load_config,
-    override_provider,
-)
+from neuro_code.application.ports.storage import SessionStore
+from neuro_code.application.settings import ApplicationSettings
 from neuro_code.domain.events import AgentEvent, AgentEventKind
-from neuro_code.domain.interaction_mode import InteractionMode
+from neuro_code.domain.instructions import InstructionDiscoveryResult
 from neuro_code.domain.messages import (
     ContextItemKind,
     Message,
@@ -35,22 +22,81 @@ from neuro_code.domain.messages import (
 )
 from neuro_code.domain.reasoning import ReasoningEffort
 from neuro_code.domain.sandbox import SandboxProfile
-from neuro_code.domain.session_search import SessionSearchHit
-from neuro_code.domain.sessions import SessionSummary
-from neuro_code.errors import ConfigurationError, NeuroCodeError
+from neuro_code.domain.sessions import SessionSnapshot
+from neuro_code.domain.skills import SkillDiscoveryResult
 from neuro_code.permissions import (
     PermissionEffect,
     PermissionMode,
     PermissionRule,
 )
-from neuro_code.providers import create_routed_provider
-from neuro_code.runtime import (
-    ConversationBinding,
-    ProfileConversationController,
-    ProviderOption,
-    SessionApprovalBroker,
-)
-from neuro_code.workspace import workspaces_match
+from neuro_code.shared.errors import ConfigurationError, NeuroCodeError
+
+if TYPE_CHECKING:
+    from neuro_code.config import AppConfig
+
+
+class ImportedRustSession(Protocol):
+    """CLI-facing view of an imported historical session."""
+
+    @property
+    def snapshot(self) -> SessionSnapshot: ...
+
+    @property
+    def total_records(self) -> int: ...
+
+    @property
+    def invalid_records(self) -> int: ...
+
+    @property
+    def unsupported_records(self) -> int: ...
+
+    @property
+    def preserved_context_records(self) -> int: ...
+
+    @property
+    def recovered_context_records(self) -> int: ...
+
+    @property
+    def deduplicated_context_records(self) -> int: ...
+
+    @property
+    def invalid_embedded_records(self) -> int: ...
+
+    @property
+    def unsupported_embedded_records(self) -> int: ...
+
+    @property
+    def imported_messages(self) -> int: ...
+
+    def to_dict(self) -> dict[str, object]: ...
+
+
+class CliServices(Protocol):
+    """Capabilities selected by bootstrap for CLI command handling."""
+
+    async def open_application(self, settings: ApplicationSettings) -> Any: ...
+
+    def load_config(self, cwd: Path | None) -> AppConfig: ...
+
+    def discover_instructions(self, cwd: Path) -> InstructionDiscoveryResult: ...
+
+    def discover_skills(self, cwd: Path) -> SkillDiscoveryResult: ...
+
+    async def create_session_store(self, config: AppConfig) -> SessionStore: ...
+
+    async def load_rust_session(self, source: Path) -> ImportedRustSession: ...
+
+    async def run_acp(
+        self,
+        args: argparse.Namespace,
+        settings: ApplicationSettings,
+    ) -> int: ...
+
+    async def run_tui(
+        self,
+        args: argparse.Namespace,
+        settings: ApplicationSettings,
+    ) -> int: ...
 
 
 def _add_run_arguments(parser: argparse.ArgumentParser) -> None:
@@ -273,12 +319,9 @@ def _plain_config(config: AppConfig) -> str:
     return "\n".join(lines)
 
 
-def _instruction_lines(cwd: Path) -> list[str]:
+def _instruction_lines(cwd: Path, services: CliServices) -> list[str]:
     """Discover instruction files and format them for inspect output."""
-    from neuro_code.application import ApplicationComposition
-
-    discovery = ApplicationComposition.default_instruction_discovery()
-    result = discovery.discover(cwd)
+    result = services.discover_instructions(cwd)
     lines: list[str] = ["instruction_files:"]
     if result.files:
         for instruction_file in result.files:
@@ -297,12 +340,9 @@ def _instruction_lines(cwd: Path) -> list[str]:
     return lines
 
 
-def _skill_lines(cwd: Path) -> list[str]:
+def _skill_lines(cwd: Path, services: CliServices) -> list[str]:
     """Discover skill files and format them for inspect output."""
-    from neuro_code.application import ApplicationComposition
-
-    discovery = ApplicationComposition.default_skill_discovery()
-    result = discovery.discover(cwd)
+    result = services.discover_skills(cwd)
     lines: list[str] = ["skill_files:"]
     if result.files:
         for skill in result.files:
@@ -344,13 +384,13 @@ def _completion_script(shell: str) -> str:
     )
 
 
-async def _run_agent(args: argparse.Namespace) -> int:
+async def _run_agent(args: argparse.Namespace, services: CliServices) -> int:
     if not args.prompt:
         raise ConfigurationError(
             "the agent subcommand requires -p/--single; run neuro without a subcommand "
             "for the interactive TUI"
         )
-    application = await _open_application(args)
+    application = await services.open_application(_application_settings(args))
     try:
         binding = await application.create_binding(resume_id=args.resume)
 
@@ -382,15 +422,8 @@ async def _run_agent(args: argparse.Namespace) -> int:
         await asyncio.shield(application.close())
 
 
-async def _run_acp(args: argparse.Namespace) -> int:
-    from neuro_code.acp import serve_acp
-
-    application = await _open_application(args)
-    try:
-        await serve_acp(application)
-        return 0
-    finally:
-        await asyncio.shield(application.close())
+async def _run_acp(args: argparse.Namespace, services: CliServices) -> int:
+    return await services.run_acp(args, _application_settings(args))
 
 
 def _application_settings(
@@ -423,230 +456,6 @@ def _application_settings(
     )
 
 
-async def _open_application(
-    args: argparse.Namespace,
-    *,
-    reasoning_effort: ReasoningEffort | None = None,
-) -> ApplicationComposition:
-    return await ApplicationComposition.open(
-        _application_settings(args, reasoning_effort=reasoning_effort),
-        provider_factory=lambda config, failover: create_routed_provider(
-            config,
-            failover=failover,
-        ),
-        shell_sandbox_factory=create_shell_sandbox,
-        process_sandbox_enforcer=enforce_configured_sandbox,
-        store_factory=SqliteSessionStore,
-        background_supervisor_factory=LocalBackgroundTaskManager,
-    )
-
-
-def _provider_options(config: AppConfig) -> tuple[ProviderOption, ...]:
-    options: list[ProviderOption] = []
-    for name, profile in config.providers.items():
-        redacted = profile.redacted_dict()
-        credential_configured = redacted.get("credential_configured") is True
-        options.append(
-            ProviderOption(
-                name=name,
-                protocol=profile.protocol,
-                model=profile.model,
-                available=profile.available,
-                credential_configured=credential_configured,
-                default=name == config.default_provider,
-                context_window_tokens=profile.context_window_tokens,
-            )
-        )
-    return tuple(options)
-
-
-async def _run_tui(args: argparse.Namespace) -> int:
-    try:
-        from neuro_code.tui import (
-            TUI_RELOAD_PROVIDER_SETTINGS,
-            NeuroCodeApp,
-            ProviderSetupApp,
-        )
-    except ModuleNotFoundError as error:
-        if error.name in {"rich", "textual"}:
-            raise ConfigurationError(
-                "interactive TUI dependencies are missing; reinstall neuro-code"
-            ) from error
-        raise
-
-    preflight_config = load_config(args.cwd)
-    if args.provider is not None or args.model is not None or args.base_url is not None:
-        preflight_config = override_provider(
-            preflight_config,
-            provider=args.provider,
-            model=args.model,
-            base_url=args.base_url,
-        )
-    provider_settings_store = JsonProviderSettingsStore(preflight_config.state_dir)
-    ui_preferences = JsonUiPreferencesStore(preflight_config.state_dir / "ui-preferences.json")
-    selected_profile = (
-        preflight_config.providers.get(preflight_config.selected_provider)
-        if preflight_config.selected_provider is not None
-        else None
-    )
-    selected_ready = (
-        selected_profile is not None
-        and selected_profile.available
-        and selected_profile.redacted_dict().get("credential_configured") is True
-    )
-    if not selected_ready:
-        setup = ProviderSetupApp(
-            provider_settings=await provider_settings_store.load(),
-            provider_settings_store=provider_settings_store,
-            language=await ui_preferences.load_language(),
-        )
-        configured = await setup.run_async()
-        if not configured:
-            return 0
-
-    while True:
-        application = await _open_application(args)
-        try:
-            approvals = SessionApprovalBroker()
-            config = application.config
-            store = application.store
-            managed_provider_settings = await provider_settings_store.load()
-            language = await ui_preferences.load_language()
-            saved_reasoning_effort = await ui_preferences.load_reasoning_effort()
-            saved_interaction_mode = await ui_preferences.load_interaction_mode()
-            reasoning_effort = (
-                ReasoningEffort(args.effort)
-                if getattr(args, "effort", None) is not None
-                else saved_reasoning_effort
-            )
-            interaction_mode = (
-                InteractionMode.AUTO if args.always_approve else saved_interaction_mode
-            )
-
-            async def compose_scoped(
-                selected_config: AppConfig,
-                resume_id: str | None,
-                *,
-                application_: ApplicationComposition = application,
-                approvals_: SessionApprovalBroker = approvals,
-                reasoning_effort_: ReasoningEffort = reasoning_effort,
-            ) -> ConversationBinding:
-                return await application_.create_binding(
-                    config=selected_config,
-                    approver=approvals_,
-                    resume_id=resume_id,
-                    reasoning_effort=reasoning_effort_,
-                )
-
-            binding = await compose_scoped(config, args.resume)
-            selected_profile_name = config.selected_provider
-            if selected_profile_name is None:
-                raise ConfigurationError("no provider profile is selected")
-
-            async def bind_profile(
-                profile_name: str,
-                *,
-                config_: AppConfig = config,
-                compose_scoped_: Callable[
-                    [AppConfig, str | None], Awaitable[ConversationBinding]
-                ] = compose_scoped,
-            ) -> ConversationBinding:
-                selected_config = override_provider(config_, provider=profile_name)
-                return await compose_scoped_(
-                    selected_config,
-                    None,
-                )
-
-            async def list_workspace_sessions(
-                *,
-                store_: SqliteSessionStore = store,
-                config_: AppConfig = config,
-            ) -> tuple[SessionSummary, ...]:
-                sessions = await store_.list_sessions(limit=1000)
-                return tuple(
-                    session for session in sessions if workspaces_match(session.cwd, config_.cwd)
-                )[:50]
-
-            async def search_workspace_sessions(
-                query: str,
-                *,
-                store_: SqliteSessionStore = store,
-                config_: AppConfig = config,
-            ) -> tuple[SessionSearchHit, ...]:
-                page = await store_.search_sessions(
-                    query,
-                    limit=1000,
-                    include_content=True,
-                )
-                return tuple(
-                    hit for hit in page.results if workspaces_match(hit.summary.cwd, config_.cwd)
-                )[:50]
-
-            async def bind_session(
-                profile_name: str,
-                session_id: str,
-                *,
-                config_: AppConfig = config,
-                compose_scoped_: Callable[
-                    [AppConfig, str | None], Awaitable[ConversationBinding]
-                ] = compose_scoped,
-            ) -> ConversationBinding:
-                selected_config = override_provider(config_, provider=profile_name)
-                return await compose_scoped_(
-                    selected_config,
-                    session_id,
-                )
-
-            async def rename_workspace_session(
-                session_id: str,
-                title: str,
-                *,
-                store_: SqliteSessionStore = store,
-                config_: AppConfig = config,
-            ) -> SessionSummary:
-                summary = await store_.get_session(session_id)
-                if not workspaces_match(summary.cwd, config_.cwd):
-                    raise ConfigurationError(
-                        f"session does not exist in the current workspace: {session_id}"
-                    )
-                return await store_.update_session_title(session_id, title)
-
-            controller = ProfileConversationController(
-                options=_provider_options(config),
-                selected_profile=selected_profile_name,
-                binding=binding,
-                binding_factory=bind_profile,
-                session_catalog=list_workspace_sessions,
-                session_search=search_workspace_sessions,
-                session_binding_factory=bind_session,
-                session_rename=rename_workspace_session,
-                sandbox_profile=config.sandbox_profile,
-                reasoning_effort=reasoning_effort,
-                interaction_mode=interaction_mode,
-            )
-            app = NeuroCodeApp(
-                controller,
-                approval_controller=approvals,
-                provider_controller=controller,
-                session_controller=controller,
-                task_controller=controller,
-                ui_preferences=ui_preferences,
-                provider_settings_store=provider_settings_store,
-                managed_provider_settings=managed_provider_settings,
-                language=language,
-                initial_items=controller.items,
-                provider_name=controller.provider_name,
-                model_name=controller.model_name,
-                cwd=config.cwd,
-            )
-            await app.run_async()
-            return_code = app.return_code if app.return_code is not None else 0
-        finally:
-            await asyncio.shield(application.close())
-        if return_code != TUI_RELOAD_PROVIDER_SETTINGS:
-            return return_code
-
-
 def _provider_rows(config: AppConfig) -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
     for name, profile in config.providers.items():
@@ -658,8 +467,8 @@ def _provider_rows(config: AppConfig) -> list[dict[str, object]]:
     return rows
 
 
-def _providers_command(args: argparse.Namespace) -> int:
-    config = load_config(args.cwd)
+def _providers_command(args: argparse.Namespace, services: CliServices) -> int:
+    config = services.load_config(args.cwd)
     if args.provider_command == "list":
         rows = _provider_rows(config)
         if args.json:
@@ -703,10 +512,9 @@ def _providers_command(args: argparse.Namespace) -> int:
     return 0
 
 
-async def _sessions_command(args: argparse.Namespace) -> int:
-    config = load_config(args.cwd)
-    store = SqliteSessionStore(config.state_dir / "sessions.db")
-    await store.initialize()
+async def _sessions_command(args: argparse.Namespace, services: CliServices) -> int:
+    config = services.load_config(args.cwd)
+    store = await services.create_session_store(config)
     if args.session_action == "search":
         if args.title is not None:
             raise ConfigurationError("sessions search accepts exactly one query")
@@ -844,10 +652,9 @@ def _session_markdown(items: Sequence[SessionItem]) -> str:
     return "\n".join(sections).rstrip() + "\n"
 
 
-async def _export_session(args: argparse.Namespace) -> int:
-    config = load_config(args.cwd)
-    store = SqliteSessionStore(config.state_dir / "sessions.db")
-    await store.initialize()
+async def _export_session(args: argparse.Namespace, services: CliServices) -> int:
+    config = services.load_config(args.cwd)
+    store = await services.create_session_store(config)
     summary = await store.get_session(args.session_id)
     items = await store.load_session_items(args.session_id)
     messages = [item for item in items if isinstance(item, Message)]
@@ -879,11 +686,10 @@ async def _export_session(args: argparse.Namespace) -> int:
     return 0
 
 
-async def _import_session(args: argparse.Namespace) -> int:
-    config = load_config(args.cwd)
-    imported = await run_blocking(load_rust_session, args.source)
-    store = SqliteSessionStore(config.state_dir / "sessions.db")
-    await store.initialize()
+async def _import_session(args: argparse.Namespace, services: CliServices) -> int:
+    config = services.load_config(args.cwd)
+    imported = await services.load_rust_session(args.source)
+    store = await services.create_session_store(config)
     await store.import_session(imported.snapshot)
     if args.json:
         print(json.dumps(imported.to_dict(), ensure_ascii=False, indent=2))
@@ -902,7 +708,8 @@ async def _import_session(args: argparse.Namespace) -> int:
     return 0
 
 
-def main(argv: Sequence[str] | None = None) -> int:
+def run(argv: Sequence[str] | None, *, services: CliServices) -> int:
+    """Parse arguments and render CLI responses with bootstrap-provided services."""
     parser = build_parser()
     launch_arguments = tuple(sys.argv[1:] if argv is None else argv)
     args = parser.parse_args(launch_arguments)
@@ -916,13 +723,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 print(f"{payload['name']} {payload['version']}")
             return 0
         if args.command == "inspect":
-            config = load_config(args.cwd)
+            config = services.load_config(args.cwd)
             if args.json:
-                from neuro_code.application import ApplicationComposition
-
                 inspect_payload: dict[str, object] = config.redacted_dict()
-                discovery = ApplicationComposition.default_instruction_discovery()
-                result = discovery.discover(config.cwd)
+                result = services.discover_instructions(config.cwd)
                 inspect_payload["instructions"] = {
                     "files": [
                         {
@@ -938,8 +742,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     ],
                     "fingerprint": result.fingerprint,
                 }
-                skill_discovery = ApplicationComposition.default_skill_discovery()
-                skill_result = skill_discovery.discover(config.cwd)
+                skill_result = services.discover_skills(config.cwd)
                 inspect_payload["skills"] = {
                     "files": [
                         {
@@ -966,26 +769,26 @@ def main(argv: Sequence[str] | None = None) -> int:
             else:
                 print(_plain_config(config))
                 print()
-                print("\n".join(_instruction_lines(config.cwd)))
+                print("\n".join(_instruction_lines(config.cwd, services)))
                 print()
-                print("\n".join(_skill_lines(config.cwd)))
+                print("\n".join(_skill_lines(config.cwd, services)))
             return 0
         if args.command == "completions":
             print(_completion_script(args.shell))
             return 0
         if args.command == "providers":
-            return _providers_command(args)
+            return _providers_command(args, services)
         if args.command == "sessions":
-            return asyncio.run(_sessions_command(args))
+            return asyncio.run(_sessions_command(args, services))
         if args.command == "export":
-            return asyncio.run(_export_session(args))
+            return asyncio.run(_export_session(args, services))
         if args.command == "import-session":
-            return asyncio.run(_import_session(args))
+            return asyncio.run(_import_session(args, services))
         if args.command == "acp":
-            return asyncio.run(_run_acp(args))
+            return asyncio.run(_run_acp(args, services))
         if args.command in {None, "code"} and args.prompt is None:
-            return asyncio.run(_run_tui(args))
-        return asyncio.run(_run_agent(args))
+            return asyncio.run(services.run_tui(args, _application_settings(args)))
+        return asyncio.run(_run_agent(args, services))
     except KeyboardInterrupt:
         print("interrupted", file=sys.stderr)
         return 130
@@ -995,7 +798,3 @@ def main(argv: Sequence[str] | None = None) -> int:
     except NeuroCodeError as error:
         print(f"error: {error}", file=sys.stderr)
         return 1
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

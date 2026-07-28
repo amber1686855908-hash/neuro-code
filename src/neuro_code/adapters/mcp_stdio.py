@@ -22,11 +22,11 @@ from mcp.client.stdio import get_default_environment
 from mcp.shared.message import SessionMessage
 
 from neuro_code.adapters.process_tree import ProcessTree
-from neuro_code.async_utils import run_blocking
+from neuro_code.application.ports.tools import ToolContext
 from neuro_code.domain.tools import ToolDefinition, ToolResult
-from neuro_code.errors import ToolError
-from neuro_code.ports.tools import ToolContext
-from neuro_code.redaction import redact_sensitive_text
+from neuro_code.shared.async_utils import run_blocking
+from neuro_code.shared.errors import ToolError
+from neuro_code.shared.redaction import redact_sensitive_text
 
 MAX_MCP_SERVERS = 8
 MAX_MCP_SERVER_TOOLS = 128

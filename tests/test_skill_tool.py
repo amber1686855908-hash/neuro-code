@@ -17,6 +17,8 @@ from pathlib import Path
 import pytest
 
 from neuro_code.adapters.skill_discovery import FilesystemSkillDiscovery
+from neuro_code.application.ports.tools import ToolContext
+from neuro_code.application.runtime.skill_tracker import SkillTracker
 from neuro_code.domain.skills import (
     MAX_SKILL_ARGUMENT_BYTES,
     MAX_SKILL_SUBSTITUTIONS,
@@ -27,9 +29,7 @@ from neuro_code.domain.skills import (
     extract_skill_body,
 )
 from neuro_code.domain.tools import ToolResult
-from neuro_code.errors import ToolError
-from neuro_code.ports.tools import ToolContext
-from neuro_code.runtime.skill_tracker import SkillTracker
+from neuro_code.shared.errors import ToolError
 from neuro_code.tools.skills import SkillTool
 
 # ---------------------------------------------------------------------------

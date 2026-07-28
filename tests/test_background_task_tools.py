@@ -8,10 +8,10 @@ from pathlib import Path
 from unittest import mock
 
 from neuro_code.adapters.background_tasks import LocalBackgroundTaskManager
+from neuro_code.application.ports.sandbox import ShellLaunch
+from neuro_code.application.ports.tools import ToolContext
 from neuro_code.domain.sandbox import SandboxProfile
-from neuro_code.errors import ToolError
-from neuro_code.ports.sandbox import ShellLaunch
-from neuro_code.ports.tools import ToolContext
+from neuro_code.shared.errors import ToolError
 from neuro_code.tools import default_tool_registry
 from neuro_code.tools.background_tasks import KillTaskTool, TaskOutputTool, WaitTasksTool
 from neuro_code.tools.bash import BashTool

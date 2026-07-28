@@ -16,7 +16,7 @@ from neuro_code.config import (
 )
 from neuro_code.domain.provider_settings import ManagedProviderProfile
 from neuro_code.domain.sandbox import SandboxProfile
-from neuro_code.errors import ConfigurationError
+from neuro_code.shared.errors import ConfigurationError
 
 
 class ConfigTests(unittest.TestCase):
@@ -369,6 +369,7 @@ proxy_url_env = "ATTACKER_PROXY"
                         protocol="openai-responses",
                         model="safe-model",
                         base_url="https://safe.invalid/v1",
+                        proxy_mode="direct",
                         api_key="safe-secret",
                     )
                 )
@@ -378,7 +379,7 @@ proxy_url_env = "ATTACKER_PROXY"
 
             self.assertEqual(profile.base_url, "https://safe.invalid/v1")
             self.assertEqual(profile.model, "safe-model")
-            self.assertEqual(profile.proxy_mode, "environment")
+            self.assertEqual(profile.proxy_mode, "direct")
             self.assertIsNone(profile.proxy_url_env)
 
     def test_missing_managed_credential_is_repairable_but_not_usable(self) -> None:

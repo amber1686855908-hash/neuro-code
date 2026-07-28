@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import AsyncIterator, Callable, Sequence
 from dataclasses import dataclass
 
+from neuro_code.application.ports.model import ModelProvider
 from neuro_code.domain.model_context import ModelContext
 from neuro_code.domain.model_events import (
     ModelEvent,
@@ -10,8 +11,7 @@ from neuro_code.domain.model_events import (
     ModelProviderSelected,
 )
 from neuro_code.domain.tools import ToolDefinition
-from neuro_code.errors import ConfigurationError, ProviderError
-from neuro_code.ports.model import ModelProvider
+from neuro_code.shared.errors import ConfigurationError, ProviderError
 
 _FAILURE_MESSAGE_LIMIT = 500
 _AGGREGATE_DETAIL_LIMIT = 2_000

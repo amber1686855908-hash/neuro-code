@@ -15,9 +15,9 @@ from neuro_code.adapters.mcp_stdio import (
     McpStdioServerConfig,
     McpStdioToolCollection,
 )
+from neuro_code.application.ports.tools import ToolContext
 from neuro_code.domain.sandbox import SandboxProfile
-from neuro_code.errors import ToolError
-from neuro_code.ports.tools import ToolContext
+from neuro_code.shared.errors import ToolError
 
 _FIXTURE = Path(__file__).parent / "fixtures" / "mcp_stdio_server.py"
 

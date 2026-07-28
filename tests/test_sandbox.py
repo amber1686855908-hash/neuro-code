@@ -10,7 +10,7 @@ from unittest import mock
 
 from neuro_code.adapters.sandbox import LinuxBubblewrapSandbox
 from neuro_code.domain.sandbox import SandboxProfile
-from neuro_code.errors import SandboxError
+from neuro_code.shared.errors import SandboxError
 
 
 class SandboxProfileTests(unittest.TestCase):

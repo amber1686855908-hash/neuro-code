@@ -3,7 +3,13 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from tests.fakes import EmptyWorkspaceChangeObserver
 
+from neuro_code.adapters.provider_catalog import HttpProviderCatalog
+from neuro_code.application.ports.model import ModelProvider
+from neuro_code.application.ports.tools import ToolContext
+from neuro_code.application.runtime.agent import AgentRuntime
+from neuro_code.config import ProviderProfile
 from neuro_code.domain.events import AgentEventKind
 from neuro_code.domain.messages import Message, Role
 from neuro_code.domain.model_context import ModelContext
@@ -13,12 +19,10 @@ from neuro_code.domain.model_events import (
     ModelProviderSelected,
     ModelTextDelta,
 )
-from neuro_code.errors import ConfigurationError
+from neuro_code.domain.provider_catalog import ProviderConnectionSpec
 from neuro_code.permissions import PermissionManager
-from neuro_code.ports.model import ModelProvider
-from neuro_code.ports.tools import ToolContext
 from neuro_code.providers.failover import FailoverModelProvider, ProviderCandidate
-from neuro_code.runtime import AgentRuntime
+from neuro_code.shared.errors import ConfigurationError
 from neuro_code.tools.filesystem import ReadFileTool
 from neuro_code.tools.registry import ToolRegistry
 
@@ -26,6 +30,23 @@ pytestmark = pytest.mark.live
 
 _STREAM_MARKER = "NEURO_CODE_DEEPSEEK_STREAM_OK"
 _TOOL_MARKER = "NEURO_CODE_DEEPSEEK_TOOL_ROUNDTRIP_7F3A91"
+
+
+@pytest.mark.asyncio
+async def test_deepseek_model_catalog_connection(
+    deepseek_profile: ProviderProfile,
+) -> None:
+    result = await HttpProviderCatalog().discover_models(
+        ProviderConnectionSpec(
+            protocol=deepseek_profile.protocol,
+            dialect=deepseek_profile.dialect,
+            base_url=deepseek_profile.base_url,
+            api_key=deepseek_profile.api_key(),
+        ),
+        http_policy=deepseek_profile.http_client_policy(),
+    )
+
+    assert deepseek_profile.model in result.models
 
 
 @pytest.mark.asyncio
@@ -78,6 +99,7 @@ async def test_deepseek_performs_a_read_only_local_tool_roundtrip(
     runtime = AgentRuntime(
         provider=deepseek_provider,
         tools=ToolRegistry((ReadFileTool(),)),
+        workspace_change_observer=EmptyWorkspaceChangeObserver(),
         permissions=PermissionManager(),
         tool_context=ToolContext(tmp_path),
         system_prompt=(

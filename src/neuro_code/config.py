@@ -11,10 +11,12 @@ from types import MappingProxyType
 from typing import Any
 from urllib.parse import unquote, urlsplit, urlunsplit
 
-from neuro_code.adapters.provider_settings import load_managed_provider_settings
+from neuro_code.application.ports.http import HttpClientPolicy
+from neuro_code.configuration.managed_provider_settings import (
+    load_managed_provider_settings as _load_managed_provider_settings,
+)
 from neuro_code.domain.sandbox import SandboxProfile
-from neuro_code.errors import ConfigurationError
-from neuro_code.ports.http import HttpClientPolicy
+from neuro_code.shared.errors import ConfigurationError
 
 SUPPORTED_PROTOCOLS = frozenset(
     {
@@ -152,6 +154,52 @@ def _validate_proxy_url(value: str, *, source: str) -> None:
         raise ConfigurationError(f"proxy URL from {source} must not contain a path or query")
 
 
+def resolve_http_client_policy(
+    *,
+    proxy_mode: str,
+    proxy_url_env: str | None = None,
+    environ: Mapping[str, str] | None = None,
+) -> HttpClientPolicy:
+    """Resolve and validate one provider's proxy policy without exposing its URL."""
+
+    source = os.environ if environ is None else environ
+    if proxy_mode == "direct":
+        if proxy_url_env is not None:
+            raise ConfigurationError(
+                "provider proxy environment variable requires proxy_mode 'explicit'"
+            )
+        return HttpClientPolicy(trust_env=False)
+    if proxy_mode == "explicit":
+        if not proxy_url_env:
+            raise ConfigurationError("provider explicit proxy mode requires proxy_url_env")
+        proxy_url = source.get(proxy_url_env, "").strip()
+        if not proxy_url:
+            raise ConfigurationError(
+                f"proxy URL is missing; set environment variable {proxy_url_env}"
+            )
+        _validate_proxy_url(proxy_url, source=proxy_url_env)
+        return HttpClientPolicy(
+            trust_env=False,
+            proxy_url=proxy_url,
+            redaction_values=_proxy_redaction_values(proxy_url),
+        )
+    if proxy_mode != "environment":
+        raise ConfigurationError(
+            "provider proxy_mode must be 'environment', 'direct', or 'explicit'"
+        )
+    if proxy_url_env is not None:
+        raise ConfigurationError(
+            "provider proxy environment variable requires proxy_mode 'explicit'"
+        )
+
+    configured = _proxy_environment_values(source)
+    redactions: list[str] = []
+    for name, proxy_url in configured:
+        _validate_proxy_url(proxy_url, source=name)
+        redactions.extend(_proxy_redaction_values(proxy_url))
+    return HttpClientPolicy(trust_env=True, redaction_values=tuple(redactions))
+
+
 @dataclass(frozen=True, slots=True)
 class ProviderProfile:
     name: str
@@ -270,29 +318,11 @@ class ProviderProfile:
         return value
 
     def http_client_policy(self, environ: Mapping[str, str] | None = None) -> HttpClientPolicy:
-        source = os.environ if environ is None else environ
-        if self.proxy_mode == "direct":
-            return HttpClientPolicy(trust_env=False)
-        if self.proxy_mode == "explicit":
-            assert self.proxy_url_env is not None
-            proxy_url = source.get(self.proxy_url_env, "").strip()
-            if not proxy_url:
-                raise ConfigurationError(
-                    f"proxy URL is missing; set environment variable {self.proxy_url_env}"
-                )
-            _validate_proxy_url(proxy_url, source=self.proxy_url_env)
-            return HttpClientPolicy(
-                trust_env=False,
-                proxy_url=proxy_url,
-                redaction_values=_proxy_redaction_values(proxy_url),
-            )
-
-        configured = _proxy_environment_values(source)
-        redactions: list[str] = []
-        for name, proxy_url in configured:
-            _validate_proxy_url(proxy_url, source=name)
-            redactions.extend(_proxy_redaction_values(proxy_url))
-        return HttpClientPolicy(trust_env=True, redaction_values=tuple(redactions))
+        return resolve_http_client_policy(
+            proxy_mode=self.proxy_mode,
+            proxy_url_env=self.proxy_url_env,
+            environ=environ,
+        )
 
     def redacted_dict(self, environ: Mapping[str, str] | None = None) -> dict[str, Any]:
         env = os.environ if environ is None else environ
@@ -330,10 +360,6 @@ class ProviderProfile:
             "available": self.available,
             "unavailable_reason": self.unavailable_reason,
         }
-
-
-# Kept as an import-compatible name while callers migrate to ProviderProfile.
-ProviderConfig = ProviderProfile
 
 
 @dataclass(frozen=True, slots=True)
@@ -731,7 +757,7 @@ def load_config(
             if candidate == project_config_path:
                 project_data = loaded
 
-    managed = load_managed_provider_settings(state_dir)
+    managed = _load_managed_provider_settings(state_dir)
     if managed.profiles:
         raw_provider_table = data.get("providers", {})
         if not isinstance(raw_provider_table, Mapping):
@@ -740,13 +766,17 @@ def load_config(
         for managed_profile in managed.profiles:
             # Replace the complete same-name table. In particular, do not inherit a
             # workspace-controlled endpoint, proxy, or tool flag for a stored key.
-            managed_provider_table[managed_profile.name] = {
+            managed_provider = {
                 "protocol": managed_profile.protocol,
                 "dialect": managed_profile.dialect,
                 "model": managed_profile.model,
                 "base_url": managed_profile.base_url,
                 "auth": "stored",
+                "proxy_mode": managed_profile.proxy_mode,
             }
+            if managed_profile.proxy_url_env is not None:
+                managed_provider["proxy_url_env"] = managed_profile.proxy_url_env
+            managed_provider_table[managed_profile.name] = managed_provider
         data = dict(data)
         data["providers"] = managed_provider_table
         if managed.default_provider is not None:

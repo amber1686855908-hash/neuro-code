@@ -2,10 +2,10 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 
+from neuro_code.application.ports.tools import Tool
 from neuro_code.domain.sandbox import SandboxProfile
 from neuro_code.domain.tools import ToolDefinition
-from neuro_code.errors import ToolError
-from neuro_code.ports.tools import Tool
+from neuro_code.shared.errors import ToolError
 
 
 class ToolRegistry:

@@ -3,10 +3,18 @@ from __future__ import annotations
 import difflib
 import hashlib
 import os
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
-from neuro_code.redaction import redact_sensitive_text
+from neuro_code.application.ports.workspace_changes import (
+    WorkspaceChangeCheckpoint,
+    WorkspaceChangeHiddenReason,
+    WorkspaceChangeReport,
+    WorkspaceChangeStatus,
+    WorkspaceFileChange,
+)
+from neuro_code.shared.redaction import redact_sensitive_text
 
 _MAX_FILES = 4_000
 _MAX_TEXT_FILE_BYTES = 256_000
@@ -249,7 +257,170 @@ def compare_workspace_snapshots(
     }
 
 
+class _FilesystemWorkspaceChangeCheckpoint(WorkspaceChangeCheckpoint):
+    """Keep filesystem snapshots private to the filesystem observer."""
+
+    __slots__ = ("_snapshot",)
+
+    def __init__(self, snapshot: WorkspaceSnapshot) -> None:
+        self._snapshot = snapshot
+
+
+class FilesystemWorkspaceChangeObserver:
+    """Adapt bounded filesystem snapshots to the application observer contract."""
+
+    def capture(self, root: Path, /) -> WorkspaceChangeCheckpoint:
+        return _FilesystemWorkspaceChangeCheckpoint(capture_workspace_snapshot(root))
+
+    def compare(
+        self,
+        before: WorkspaceChangeCheckpoint,
+        after: WorkspaceChangeCheckpoint,
+        *,
+        explicit_redactions: tuple[str, ...],
+    ) -> WorkspaceChangeReport:
+        before_checkpoint = self._filesystem_checkpoint(before)
+        after_checkpoint = self._filesystem_checkpoint(after)
+        comparison = compare_workspace_snapshots(
+            before_checkpoint._snapshot,
+            after_checkpoint._snapshot,
+            explicit_redactions=explicit_redactions,
+        )
+        return _workspace_change_report_from_comparison(comparison)
+
+    @staticmethod
+    def _filesystem_checkpoint(
+        checkpoint: WorkspaceChangeCheckpoint,
+    ) -> _FilesystemWorkspaceChangeCheckpoint:
+        if not isinstance(checkpoint, _FilesystemWorkspaceChangeCheckpoint):
+            raise TypeError("workspace checkpoint belongs to a different observer")
+        return checkpoint
+
+
+def _workspace_change_report_from_comparison(
+    comparison: Mapping[str, object],
+) -> WorkspaceChangeReport:
+    files_value = _required_value(comparison, "files")
+    if not isinstance(files_value, list):
+        raise TypeError("workspace comparison files must be a list")
+    return WorkspaceChangeReport(
+        files=tuple(_workspace_file_change_from_comparison(value) for value in files_value),
+        omitted_files=_required_int(comparison, "omitted_files"),
+        scan_limited=_required_bool(comparison, "scan_limited"),
+    )
+
+
+def _workspace_file_change_from_comparison(value: object) -> WorkspaceFileChange:
+    comparison = _string_keyed_mapping(value)
+    status = _workspace_change_status(_required_value(comparison, "status"))
+    hidden_reason = _optional_hidden_reason(comparison, "hidden_reason")
+    diff = _optional_string(comparison, "diff")
+    diff_truncated = _optional_bool(comparison, "diff_truncated")
+    if hidden_reason in ("sensitive", "large", "binary", "budget"):
+        if diff is not None or diff_truncated is not None:
+            raise TypeError("hidden workspace changes must not include diff details")
+    elif diff is None or diff_truncated is None:
+        raise TypeError("visible workspace changes must include diff details")
+    return WorkspaceFileChange(
+        path=_required_string(comparison, "path"),
+        status=status,
+        additions=_required_int(comparison, "additions"),
+        deletions=_required_int(comparison, "deletions"),
+        diff=diff,
+        diff_truncated=diff_truncated,
+        hidden_reason=hidden_reason,
+    )
+
+
+def _string_keyed_mapping(value: object) -> Mapping[str, object]:
+    if not isinstance(value, Mapping):
+        raise TypeError("workspace comparison file detail must be a mapping")
+    result: dict[str, object] = {}
+    for key, item in value.items():
+        if not isinstance(key, str):
+            raise TypeError("workspace comparison mapping keys must be strings")
+        result[key] = item
+    return result
+
+
+def _required_value(comparison: Mapping[str, object], name: str) -> object:
+    try:
+        return comparison[name]
+    except KeyError as error:
+        raise TypeError(f"workspace comparison is missing {name!r}") from error
+
+
+def _required_string(comparison: Mapping[str, object], name: str) -> str:
+    value = _required_value(comparison, name)
+    if not isinstance(value, str):
+        raise TypeError(f"workspace comparison {name!r} must be a string")
+    return value
+
+
+def _optional_string(comparison: Mapping[str, object], name: str) -> str | None:
+    if name not in comparison:
+        return None
+    value = comparison[name]
+    if not isinstance(value, str):
+        raise TypeError(f"workspace comparison {name!r} must be a string")
+    return value
+
+
+def _required_int(comparison: Mapping[str, object], name: str) -> int:
+    value = _required_value(comparison, name)
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise TypeError(f"workspace comparison {name!r} must be an integer")
+    return value
+
+
+def _required_bool(comparison: Mapping[str, object], name: str) -> bool:
+    value = _required_value(comparison, name)
+    if not isinstance(value, bool):
+        raise TypeError(f"workspace comparison {name!r} must be a boolean")
+    return value
+
+
+def _optional_bool(comparison: Mapping[str, object], name: str) -> bool | None:
+    if name not in comparison:
+        return None
+    value = comparison[name]
+    if not isinstance(value, bool):
+        raise TypeError(f"workspace comparison {name!r} must be a boolean")
+    return value
+
+
+def _workspace_change_status(value: object) -> WorkspaceChangeStatus:
+    if value == "created":
+        return "created"
+    if value == "deleted":
+        return "deleted"
+    if value == "modified":
+        return "modified"
+    raise TypeError("workspace comparison status is invalid")
+
+
+def _optional_hidden_reason(
+    comparison: Mapping[str, object],
+    name: str,
+) -> WorkspaceChangeHiddenReason | None:
+    if name not in comparison:
+        return None
+    value = comparison[name]
+    if value == "sensitive":
+        return "sensitive"
+    if value == "large":
+        return "large"
+    if value == "binary":
+        return "binary"
+    if value == "budget":
+        return "budget"
+    if value == "redacted":
+        return "redacted"
+    raise TypeError("workspace comparison hidden reason is invalid")
+
+
 __all__ = [
+    "FilesystemWorkspaceChangeObserver",
     "WorkspaceFileSnapshot",
     "WorkspaceSnapshot",
     "capture_workspace_snapshot",

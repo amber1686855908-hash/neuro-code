@@ -23,7 +23,7 @@ from neuro_code.domain.messages import (
 )
 from neuro_code.domain.sandbox import SandboxProfile
 from neuro_code.domain.sessions import SessionSnapshot, SessionSummary
-from neuro_code.errors import SessionError
+from neuro_code.shared.errors import SessionError
 
 
 class SessionStoreTests(unittest.IsolatedAsyncioTestCase):

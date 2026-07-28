@@ -25,13 +25,13 @@ from neuro_code.domain.model_events import (
     ModelToolCall,
 )
 from neuro_code.domain.tools import ToolDefinition
-from neuro_code.errors import ConfigurationError, ProviderError
 from neuro_code.providers import create_provider, create_routed_provider
 from neuro_code.providers.anthropic import AnthropicProvider
 from neuro_code.providers.failover import FailoverModelProvider
 from neuro_code.providers.gemini import GeminiProvider
 from neuro_code.providers.openai_compatible import OpenAICompatibleProvider, _ToolCallBuffer
 from neuro_code.providers.openai_responses import OpenAIResponsesProvider
+from neuro_code.shared.errors import ConfigurationError, ProviderError
 
 
 def _sse(*chunks: object) -> str:

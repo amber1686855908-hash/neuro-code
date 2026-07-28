@@ -4,6 +4,7 @@ import math
 from collections.abc import Mapping
 from typing import Any
 
+from neuro_code.application.ports.tools import ToolContext
 from neuro_code.domain.background_tasks import (
     MAX_BACKGROUND_TASK_WAIT_IDS,
     BackgroundTaskSnapshot,
@@ -12,8 +13,7 @@ from neuro_code.domain.background_tasks import (
     BackgroundTaskWaitResult,
 )
 from neuro_code.domain.tools import ToolDefinition, ToolResult
-from neuro_code.errors import ToolError
-from neuro_code.ports.tools import ToolContext
+from neuro_code.shared.errors import ToolError
 
 _MAX_TASK_WAIT_SECONDS = 30.0
 

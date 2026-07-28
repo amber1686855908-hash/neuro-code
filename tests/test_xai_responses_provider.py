@@ -23,14 +23,18 @@ from neuro_code.domain.model_events import (
     ModelToolCall,
 )
 from neuro_code.domain.tools import ToolDefinition
-from neuro_code.errors import ConfigurationError, ProviderError
-from neuro_code.providers.xai_responses import XAIResponsesProvider
+from neuro_code.providers.openai_responses import OpenAIResponsesProvider
+from neuro_code.shared.errors import ConfigurationError, ProviderError
 
 
 def _sse(*events: object) -> str:
     lines = [f"data: {json.dumps(event)}" for event in events]
     lines.append("data: [DONE]")
     return "\n\n".join(lines) + "\n\n"
+
+
+def _xai_provider(**kwargs: object) -> OpenAIResponsesProvider:
+    return OpenAIResponsesProvider(dialect="xai", **kwargs)
 
 
 def _reasoning(*, encrypted: str = "opaque") -> PreservedContextItem:
@@ -47,9 +51,9 @@ def _reasoning(*, encrypted: str = "opaque") -> PreservedContextItem:
     )
 
 
-class XAIResponsesProviderTests(unittest.IsolatedAsyncioTestCase):
+class XaiDialectResponsesProviderTests(unittest.IsolatedAsyncioTestCase):
     def test_official_native_affinity_is_independent_of_model_spelling(self) -> None:
-        provider = XAIResponsesProvider(
+        provider = _xai_provider(
             model="future-xai-model",
             base_url="https://api.x.ai/v1",
             api_key="fixture",
@@ -63,7 +67,7 @@ class XAIResponsesProviderTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(provider._has_native_affinity(context))
 
     def test_request_body_replays_native_items_messages_images_and_tools(self) -> None:
-        provider = XAIResponsesProvider(
+        provider = _xai_provider(
             model="xai-test-model",
             base_url="https://api.x.ai/v1/responses/",
             api_key="fixture",
@@ -114,7 +118,7 @@ class XAIResponsesProviderTests(unittest.IsolatedAsyncioTestCase):
 
         body = provider._request_body(context, tools)
 
-        self.assertEqual(provider.provider_name, "xai-responses")
+        self.assertEqual(provider.provider_name, "openai-responses")
         self.assertEqual(provider.model_name, "xai-test-model")
         self.assertEqual(provider._endpoint, "https://api.x.ai/v1/responses")
         self.assertFalse(body["store"])
@@ -147,7 +151,7 @@ class XAIResponsesProviderTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("function", body["tools"][0])
 
     def test_builtin_tools_precede_functions_and_win_name_collisions(self) -> None:
-        provider = XAIResponsesProvider(
+        provider = _xai_provider(
             model="xai-test-model",
             base_url="https://api.x.ai/v1",
             api_key="fixture",
@@ -197,7 +201,7 @@ class XAIResponsesProviderTests(unittest.IsolatedAsyncioTestCase):
                 self.subTest(builtin_tools=builtin_tools),
                 self.assertRaisesRegex(ConfigurationError, expected),
             ):
-                XAIResponsesProvider(
+                _xai_provider(
                     model="xai-test-model",
                     base_url="https://api.x.ai/v1",
                     api_key="fixture",
@@ -254,7 +258,7 @@ class XAIResponsesProviderTests(unittest.IsolatedAsyncioTestCase):
         )
         for base_url, model, source_provider, source_model in cases:
             with self.subTest(base_url=base_url, model=model, source_provider=source_provider):
-                provider = XAIResponsesProvider(
+                provider = _xai_provider(
                     model=model,
                     base_url=base_url,
                     api_key="fixture",
@@ -319,7 +323,7 @@ class XAIResponsesProviderTests(unittest.IsolatedAsyncioTestCase):
             )
             return httpx.Response(200, text=body, headers={"content-type": "text/event-stream"})
 
-        provider = XAIResponsesProvider(
+        provider = _xai_provider(
             model="xai-test-model",
             base_url="https://api.x.ai/v1",
             api_key="secret-key",
@@ -414,7 +418,7 @@ class XAIResponsesProviderTests(unittest.IsolatedAsyncioTestCase):
             {"type": "response.code_interpreter_call.completed", "item_id": "code-1"},
             terminal,
         )
-        provider = XAIResponsesProvider(
+        provider = _xai_provider(
             model="xai-test-model",
             base_url="https://api.x.ai/v1",
             api_key="fixture",
@@ -462,7 +466,7 @@ class XAIResponsesProviderTests(unittest.IsolatedAsyncioTestCase):
                 ],
             },
         }
-        provider = XAIResponsesProvider(
+        provider = _xai_provider(
             model="xai-test-model",
             base_url="https://api.x.ai/v1",
             api_key="fixture",
@@ -503,7 +507,7 @@ class XAIResponsesProviderTests(unittest.IsolatedAsyncioTestCase):
                 ],
             },
         }
-        provider = XAIResponsesProvider(
+        provider = _xai_provider(
             model="xai-test-model",
             base_url="https://api.x.ai/v1",
             api_key="fixture",
@@ -549,7 +553,7 @@ class XAIResponsesProviderTests(unittest.IsolatedAsyncioTestCase):
                 ],
             },
         }
-        provider = XAIResponsesProvider(
+        provider = _xai_provider(
             model="xai-test-model",
             base_url="https://gateway.invalid/v1",
             api_key="fixture",
@@ -620,7 +624,7 @@ class XAIResponsesProviderTests(unittest.IsolatedAsyncioTestCase):
         )
         for transport, expected in cases:
             with self.subTest(expected=expected):
-                provider = XAIResponsesProvider(
+                provider = _xai_provider(
                     model="xai-test-model",
                     base_url="https://api.x.ai/v1",
                     api_key="secret-key",
@@ -670,10 +674,10 @@ class XAIResponsesProviderTests(unittest.IsolatedAsyncioTestCase):
         )
         for response, expected in responses:
             with self.subTest(expected=expected), self.assertRaisesRegex(ProviderError, expected):
-                XAIResponsesProvider._response_tool_calls(response)
+                OpenAIResponsesProvider._response_tool_calls(response)
 
         with self.assertRaisesRegex(ProviderError, "require a tool call id"):
-            XAIResponsesProvider._message_input_items(Message(Role.TOOL, "orphan"))
+            OpenAIResponsesProvider._message_input_items(Message(Role.TOOL, "orphan"))
 
 
 if __name__ == "__main__":

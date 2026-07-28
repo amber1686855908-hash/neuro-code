@@ -14,6 +14,22 @@ from textual.geometry import Size
 from textual.widgets import Button, Input, Label, Static
 
 from neuro_code.adapters.provider_settings import JsonProviderSettingsStore
+from neuro_code.application.permissions.contracts import (
+    PermissionApproval,
+    PermissionApprovalKind,
+    build_permission_request,
+)
+from neuro_code.application.ports.http import HttpClientPolicy
+from neuro_code.application.runtime.agent import AgentRunResult, EventSink
+from neuro_code.application.runtime.approval import SessionApprovalBroker
+from neuro_code.application.runtime.profile_conversation import (
+    InteractionModeSelectionResult,
+    ProviderOption,
+    ProviderSelectionResult,
+    ReasoningEffortSelectionResult,
+    SessionOption,
+    SessionSelectionResult,
+)
 from neuro_code.domain.background_tasks import BackgroundTaskSnapshot, BackgroundTaskStatus
 from neuro_code.domain.events import AgentEvent, AgentEventKind
 from neuro_code.domain.interaction_mode import InteractionMode
@@ -26,26 +42,16 @@ from neuro_code.domain.messages import (
     SessionItem,
     ToolCall,
 )
+from neuro_code.domain.provider_catalog import (
+    ProviderCatalogError,
+    ProviderCatalogResult,
+    ProviderConnectionSpec,
+)
 from neuro_code.domain.provider_settings import ManagedProviderProfile, ManagedProviderSettings
 from neuro_code.domain.reasoning import ReasoningEffort
 from neuro_code.domain.sandbox import SandboxProfile
 from neuro_code.domain.sessions import SessionSummary
 from neuro_code.domain.ui_preferences import UiLanguage
-from neuro_code.permissions import (
-    PermissionApproval,
-    PermissionApprovalKind,
-    build_permission_request,
-)
-from neuro_code.runtime import SessionApprovalBroker
-from neuro_code.runtime.agent import AgentRunResult, EventSink
-from neuro_code.runtime.profile_conversation import (
-    InteractionModeSelectionResult,
-    ProviderOption,
-    ProviderSelectionResult,
-    ReasoningEffortSelectionResult,
-    SessionOption,
-    SessionSelectionResult,
-)
 from neuro_code.tui import (
     TUI_RELOAD_PROVIDER_SETTINGS,
     AssistantMarkdown,
@@ -266,6 +272,46 @@ class UiPreferencesFixture:
 
     async def save_interaction_mode(self, mode: InteractionMode) -> None:
         self.saved_modes.append(mode)
+
+
+class ProviderCatalogFixture:
+    def __init__(
+        self,
+        result: ProviderCatalogResult | None = None,
+        error: ProviderCatalogError | None = None,
+    ) -> None:
+        self.result = result or ProviderCatalogResult(())
+        self.error = error
+        self.calls: list[tuple[ProviderConnectionSpec, HttpClientPolicy]] = []
+
+    async def discover_models(
+        self,
+        spec: ProviderConnectionSpec,
+        *,
+        http_policy: HttpClientPolicy,
+    ) -> ProviderCatalogResult:
+        self.calls.append((spec, http_policy))
+        if self.error is not None:
+            raise self.error
+        return self.result
+
+
+class BlockingProviderCatalogFixture(ProviderCatalogFixture):
+    def __init__(self, result: ProviderCatalogResult) -> None:
+        super().__init__(result)
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def discover_models(
+        self,
+        spec: ProviderConnectionSpec,
+        *,
+        http_policy: HttpClientPolicy,
+    ) -> ProviderCatalogResult:
+        self.calls.append((spec, http_policy))
+        self.started.set()
+        await self.release.wait()
+        return self.result
 
 
 class ApprovalControllerFixture:
@@ -779,12 +825,12 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
                     name="legacy-wrong-protocol",
                     protocol="openai-responses",
                     model="deepseek-v4-pro",
-                    base_url="https://api.deepseek.com",
+                    base_url="https://api.deepseek.com/v1",
                 )
             ),
             "deepseek",
         )
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory() as directory, patch.dict("os.environ", {}, clear=True):
             store = JsonProviderSettingsStore(Path(directory))
             app = ProviderSetupApp(
                 provider_settings=ManagedProviderSettings(),
@@ -831,6 +877,275 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(saved.profiles[0].model, "deepseek-v4-pro")
             self.assertNotIn("never-echo-this-key", repr(saved))
 
+    async def test_invalid_environment_proxy_stays_in_settings_and_direct_mode_recovers(
+        self,
+    ) -> None:
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch.dict(
+                "os.environ",
+                {"ALL_PROXY": "socks://127.0.0.1:7890"},
+                clear=True,
+            ),
+        ):
+            store = JsonProviderSettingsStore(Path(directory))
+            app = ProviderSetupApp(
+                provider_settings=ManagedProviderSettings(),
+                provider_settings_store=store,
+            )
+
+            async with app.run_test(size=(110, 44)) as pilot:
+                for _ in range(20):
+                    await pilot.pause(0.01)
+                    if isinstance(app.screen, ProviderSettingsScreen):
+                        break
+                screen = app.screen
+                self.assertIsInstance(screen, ProviderSettingsScreen)
+                await pilot.click("#provider-settings-preset-deepseek")
+                screen.query_one("#provider-settings-name", Input).value = "deepseek"
+                screen.query_one("#provider-settings-model", Input).value = "deepseek-v4-flash"
+                screen.query_one("#provider-settings-api-key", Input).value = "secret"
+
+                await pilot.click("#provider-settings-save")
+                await pilot.pause()
+
+                self.assertIs(app.screen, screen)
+                self.assertEqual((await store.load()).profiles, ())
+                self.assertIn(
+                    "ALL_PROXY",
+                    str(screen.query_one("#provider-settings-error", Static).renderable),
+                )
+
+                app.screen._select_proxy_mode("direct")
+                await app.screen._save_provider()
+                for _ in range(20):
+                    await pilot.pause(0.01)
+                    if (await store.load()).profiles:
+                        break
+
+            saved = await store.load()
+            self.assertEqual(saved.default_provider, "deepseek")
+            self.assertEqual(saved.profiles[0].proxy_mode, "direct")
+            self.assertIsNone(saved.profiles[0].proxy_url_env)
+
+    async def test_provider_connection_loads_models_and_selects_without_saving_secret(
+        self,
+    ) -> None:
+        catalog = ProviderCatalogFixture(
+            ProviderCatalogResult(("deepseek-chat", "deepseek-reasoner"))
+        )
+        with tempfile.TemporaryDirectory() as directory, patch.dict("os.environ", {}, clear=True):
+            store = JsonProviderSettingsStore(Path(directory))
+            app = ProviderSetupApp(
+                provider_settings=ManagedProviderSettings(),
+                provider_settings_store=store,
+                provider_catalog=catalog,
+            )
+
+            async with app.run_test(size=(110, 48)) as pilot:
+                for _ in range(20):
+                    await pilot.pause(0.01)
+                    if isinstance(app.screen, ProviderSettingsScreen):
+                        break
+                screen = app.screen
+                self.assertIsInstance(screen, ProviderSettingsScreen)
+                screen._select_preset("deepseek")
+                screen._select_proxy_mode("direct")
+                screen.query_one("#provider-settings-name", Input).value = "deepseek"
+                screen.query_one("#provider-settings-api-key", Input).value = "never-render-key"
+
+                clicked = await pilot.click("#provider-settings-test")
+                self.assertTrue(clicked)
+                for _ in range(20):
+                    await pilot.pause(0.01)
+                    if (
+                        catalog.calls
+                        and not screen.query_one("#provider-settings-test", Button).disabled
+                    ):
+                        break
+
+                self.assertEqual(len(catalog.calls), 1)
+                spec, policy = catalog.calls[0]
+                self.assertEqual(spec.protocol, "openai-chat")
+                self.assertEqual(spec.base_url, "https://api.deepseek.com")
+                self.assertFalse(policy.trust_env)
+                self.assertNotIn("never-render-key", repr(spec))
+                status = str(
+                    screen.query_one("#provider-settings-connection-status", Static).renderable
+                )
+                self.assertIn("Loaded 2 models", status)
+                self.assertNotIn("never-render-key", status)
+                self.assertTrue(screen.query_one("#provider-settings-models").display)
+
+                model_button = screen.query_one("#provider-settings-catalog-model-1", Button)
+                await screen.on_button_pressed(Button.Pressed(model_button))
+                await pilot.pause()
+                self.assertEqual(
+                    screen.query_one("#provider-settings-model", Input).value,
+                    "deepseek-reasoner",
+                )
+
+    async def test_provider_connection_error_is_localized_redacted_and_keeps_screen_open(
+        self,
+    ) -> None:
+        catalog = ProviderCatalogFixture(
+            error=ProviderCatalogError("authentication", status_code=401)
+        )
+        with tempfile.TemporaryDirectory() as directory, patch.dict("os.environ", {}, clear=True):
+            store = JsonProviderSettingsStore(Path(directory))
+            app = ProviderSetupApp(
+                provider_settings=ManagedProviderSettings(),
+                provider_settings_store=store,
+                provider_catalog=catalog,
+                language=UiLanguage.SIMPLIFIED_CHINESE,
+            )
+
+            async with app.run_test(size=(110, 48)) as pilot:
+                for _ in range(20):
+                    await pilot.pause(0.01)
+                    if isinstance(app.screen, ProviderSettingsScreen):
+                        break
+                screen = app.screen
+                self.assertIsInstance(screen, ProviderSettingsScreen)
+                screen._select_preset("deepseek")
+                screen.query_one("#provider-settings-name", Input).value = "deepseek"
+                screen.query_one("#provider-settings-api-key", Input).value = "never-render-key"
+
+                await screen._test_connection()
+                await pilot.pause()
+
+                self.assertIs(app.screen, screen)
+                self.assertEqual((await store.load()).profiles, ())
+                status = str(
+                    screen.query_one("#provider-settings-connection-status", Static).renderable
+                )
+                self.assertIn("认证失败", status)
+                self.assertIn("401", status)
+                self.assertNotIn("never-render-key", status)
+                self.assertFalse(screen.query_one("#provider-settings-test", Button).disabled)
+
+    async def test_provider_connection_reuses_saved_key_without_echoing_it(self) -> None:
+        catalog = ProviderCatalogFixture(ProviderCatalogResult(("updated-model",)))
+        with tempfile.TemporaryDirectory() as directory, patch.dict("os.environ", {}, clear=True):
+            store = JsonProviderSettingsStore(Path(directory))
+            settings = await store.save_profile(
+                ManagedProviderProfile(
+                    name="personal",
+                    protocol="openai-responses",
+                    model="old-model",
+                    base_url="https://api.openai.com/v1",
+                    proxy_mode="direct",
+                    api_key="saved-secret",
+                )
+            )
+            app = ProviderSetupApp(
+                provider_settings=settings,
+                provider_settings_store=store,
+                provider_catalog=catalog,
+                first_run=False,
+                initial_profile="personal",
+            )
+
+            async with app.run_test(size=(110, 48)) as pilot:
+                for _ in range(20):
+                    await pilot.pause(0.01)
+                    if isinstance(app.screen, ProviderSettingsScreen):
+                        break
+                screen = app.screen
+                self.assertIsInstance(screen, ProviderSettingsScreen)
+                self.assertEqual(
+                    screen.query_one("#provider-settings-api-key", Input).value,
+                    "",
+                )
+
+                await screen._test_connection()
+
+                self.assertEqual(catalog.calls[0][0].api_key, "saved-secret")
+                self.assertNotIn(
+                    "saved-secret",
+                    str(
+                        screen.query_one("#provider-settings-connection-status", Static).renderable
+                    ),
+                )
+
+    async def test_provider_connection_discards_result_after_draft_changes(self) -> None:
+        catalog = BlockingProviderCatalogFixture(ProviderCatalogResult(("stale-model",)))
+        with tempfile.TemporaryDirectory() as directory, patch.dict("os.environ", {}, clear=True):
+            app = ProviderSetupApp(
+                provider_settings=ManagedProviderSettings(),
+                provider_settings_store=JsonProviderSettingsStore(Path(directory)),
+                provider_catalog=catalog,
+            )
+
+            async with app.run_test(size=(110, 48)) as pilot:
+                for _ in range(20):
+                    await pilot.pause(0.01)
+                    if isinstance(app.screen, ProviderSettingsScreen):
+                        break
+                screen = app.screen
+                self.assertIsInstance(screen, ProviderSettingsScreen)
+                screen._select_preset("deepseek")
+                screen.query_one("#provider-settings-name", Input).value = "deepseek"
+                screen.query_one("#provider-settings-api-key", Input).value = "secret"
+
+                await pilot.click("#provider-settings-test")
+                await catalog.started.wait()
+                screen.query_one(
+                    "#provider-settings-base-url", Input
+                ).value = "https://changed.invalid/v1"
+                catalog.release.set()
+                for _ in range(20):
+                    await pilot.pause(0.01)
+                    if not screen.query_one("#provider-settings-test", Button).disabled:
+                        break
+
+                status = str(
+                    screen.query_one("#provider-settings-connection-status", Static).renderable
+                )
+                self.assertIn("Discarded the old result", status)
+                self.assertFalse(screen.query_one("#provider-settings-models").display)
+
+    async def test_startup_proxy_error_opens_the_saved_profile_for_repair(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = JsonProviderSettingsStore(Path(directory))
+            settings = await store.save_profile(
+                ManagedProviderProfile(
+                    name="deepseek",
+                    protocol="openai-chat",
+                    model="deepseek-v4-flash",
+                    base_url="https://api.deepseek.com",
+                    api_key="secret",
+                )
+            )
+            app = ProviderSetupApp(
+                provider_settings=settings,
+                provider_settings_store=store,
+                first_run=False,
+                initial_profile="deepseek",
+                initial_error="ALL_PROXY uses unsupported scheme 'socks'",
+            )
+
+            async with app.run_test(size=(110, 44)) as pilot:
+                for _ in range(20):
+                    await pilot.pause(0.01)
+                    if isinstance(app.screen, ProviderSettingsScreen):
+                        break
+                screen = app.screen
+                self.assertIsInstance(screen, ProviderSettingsScreen)
+                self.assertTrue(screen.query_one("#provider-settings-name", Input).disabled)
+                self.assertEqual(
+                    screen.query_one("#provider-settings-name", Input).value,
+                    "deepseek",
+                )
+                self.assertIn(
+                    "ALL_PROXY",
+                    str(screen.query_one("#provider-settings-error", Static).renderable),
+                )
+                self.assertEqual(
+                    screen.query_one("#provider-settings-proxy-environment", Button).variant,
+                    "primary",
+                )
+
     async def test_settings_edit_managed_provider_and_request_safe_reload(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = JsonProviderSettingsStore(Path(directory))
@@ -869,6 +1184,7 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
                     app.screen.query_one("#provider-settings-api-key", Input).value,
                     "",
                 )
+                app.screen._select_proxy_mode("direct")
                 await pilot.click("#provider-settings-save")
                 for _ in range(20):
                     await pilot.pause(0.01)
@@ -878,6 +1194,68 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
             updated = await store.load()
             self.assertEqual(updated.profiles[0].model, "updated-model")
             self.assertEqual(updated.profiles[0].api_key, "saved-secret")
+            self.assertEqual(updated.profiles[0].proxy_mode, "direct")
+            self.assertEqual(app.return_code, TUI_RELOAD_PROVIDER_SETTINGS)
+
+    async def test_settings_delete_requires_confirmation_and_reloads_safe_default(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = JsonProviderSettingsStore(Path(directory))
+            await store.save_profile(
+                ManagedProviderProfile(
+                    name="first",
+                    protocol="openai-chat",
+                    model="first-model",
+                    base_url="https://first.invalid/v1",
+                    proxy_mode="direct",
+                    api_key="first-secret",
+                )
+            )
+            settings = await store.save_profile(
+                ManagedProviderProfile(
+                    name="second",
+                    protocol="openai-chat",
+                    model="second-model",
+                    base_url="https://second.invalid/v1",
+                    proxy_mode="direct",
+                    api_key="second-secret",
+                )
+            )
+            app = NeuroCodeApp(
+                TuiConversation(),
+                provider_settings_store=store,
+                managed_provider_settings=settings,
+                provider_name="fixture",
+                model_name="fixture-model",
+                cwd=Path("/workspace"),
+            )
+
+            async with app.run_test(size=(110, 44)) as pilot:
+                await app.action_open_settings()
+                await pilot.pause()
+                await pilot.click("#settings-category-providers")
+                for _ in range(20):
+                    await pilot.pause(0.01)
+                    if isinstance(app.screen, ProviderSettingsScreen):
+                        break
+                self.assertIsInstance(app.screen, ProviderSettingsScreen)
+                await pilot.click("#provider-settings-profile-1")
+                delete = app.screen.query_one("#provider-settings-delete", Button)
+                self.assertFalse(delete.disabled)
+
+                await pilot.click("#provider-settings-delete")
+                self.assertEqual(len((await store.load()).profiles), 2)
+                self.assertIn("Confirm", str(delete.label))
+                await pilot.pause()
+
+                await app.screen._delete_provider()
+                for _ in range(20):
+                    await pilot.pause(0.01)
+                    if app.return_code is not None:
+                        break
+
+            remaining = await store.load()
+            self.assertEqual([profile.name for profile in remaining.profiles], ["first"])
+            self.assertEqual(remaining.default_provider, "first")
             self.assertEqual(app.return_code, TUI_RELOAD_PROVIDER_SETTINGS)
 
     async def test_runtime_bar_shows_model_and_effort_and_localizes_labels(self) -> None:

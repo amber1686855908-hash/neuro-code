@@ -7,26 +7,29 @@ from pathlib import Path
 from typing import Any, cast
 from unittest.mock import patch
 
-from neuro_code.application import ApplicationComposition, ApplicationSettings
+import neuro_code.config as config_module
+from neuro_code.application.ports.approval import PermissionApprover
+from neuro_code.application.ports.background_tasks import (
+    BackgroundTaskManager,
+    BackgroundTaskSupervisor,
+)
+from neuro_code.application.ports.model import ModelProvider
+from neuro_code.application.settings import ApplicationSettings
+from neuro_code.bootstrap.composition import ApplicationComposition
 from neuro_code.config import AppConfig
 from neuro_code.domain.model_context import ModelContext
 from neuro_code.domain.model_events import ModelEvent
 from neuro_code.domain.reasoning import ReasoningEffort
 from neuro_code.domain.sandbox import SandboxProfile
 from neuro_code.domain.tools import ToolDefinition, ToolResult
-from neuro_code.errors import ConfigurationError, ToolError
 from neuro_code.permissions import (
     PermissionEffect,
     PermissionMode,
     PermissionRule,
 )
-from neuro_code.ports.approval import PermissionApprover
-from neuro_code.ports.background_tasks import (
-    BackgroundTaskManager,
-    BackgroundTaskSupervisor,
-)
-from neuro_code.ports.model import ModelProvider
+from neuro_code.shared.errors import ConfigurationError, ToolError
 from neuro_code.workspace import workspaces_match
+from tests.fakes import EmptyWorkspaceChangeObserver
 
 
 class ApplicationProviderFixture:
@@ -84,6 +87,22 @@ class ApplicationSupervisorFixture:
         self.shutdown_calls += 1
         for scope in self.scopes:
             await scope.shutdown()
+
+
+class OrderedSessionStoreFixture:
+    def __init__(self, calls: list[str]) -> None:
+        self._calls = calls
+
+    async def peek_session_sandbox_profile(
+        self,
+        session_id: str,
+    ) -> SandboxProfile | None:
+        del session_id
+        self._calls.append("peek session sandbox")
+        return SandboxProfile.WORKSPACE
+
+    async def initialize(self) -> None:
+        self._calls.append("initialize session store")
 
 
 class ApplicationCompositionTests(unittest.IsolatedAsyncioTestCase):
@@ -164,6 +183,120 @@ api_key_env = "FIXTURE_KEY"
         self.assertEqual(supervisor.shutdown_calls, 1)
         self.assertEqual(supervisor.scopes[0].shutdown_calls, 1)
 
+    async def test_open_preserves_preflight_and_resource_creation_order(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / "state"
+            self._write_config(state)
+            calls: list[str] = []
+            store = OrderedSessionStoreFixture(calls)
+            original_load_config = config_module.load_config
+            original_override_provider = config_module.override_provider
+            original_override_sandbox = config_module.override_sandbox
+            original_pin_resumed_sandbox = config_module.pin_resumed_sandbox
+
+            def load_config(cwd: Path | None) -> AppConfig:
+                calls.append("load config")
+                return original_load_config(cwd)
+
+            def override_sandbox(config: AppConfig, sandbox: str | None) -> AppConfig:
+                calls.append("override sandbox")
+                return original_override_sandbox(config, sandbox)
+
+            def override_provider(
+                config: AppConfig,
+                *,
+                provider: str | None = None,
+                model: str | None = None,
+                base_url: str | None = None,
+            ) -> AppConfig:
+                calls.append("override provider")
+                return original_override_provider(
+                    config,
+                    provider=provider,
+                    model=model,
+                    base_url=base_url,
+                )
+
+            def pin_resumed_sandbox(
+                config: AppConfig,
+                saved_profile: SandboxProfile | None,
+            ) -> AppConfig:
+                calls.append("pin resumed sandbox")
+                return original_pin_resumed_sandbox(config, saved_profile)
+
+            def store_factory(path: Path) -> OrderedSessionStoreFixture:
+                del path
+                calls.append("create session store")
+                return store
+
+            def enforce(*args: object) -> None:
+                del args
+                calls.append("enforce process sandbox")
+
+            def instruction_discovery_factory() -> object:
+                calls.append("create instruction discovery")
+                return object()
+
+            def skill_discovery_factory() -> object:
+                calls.append("create skill discovery")
+                return object()
+
+            with patch.dict(
+                "os.environ",
+                {
+                    "HOME": str(root),
+                    "NEURO_CODE_HOME": str(state),
+                    "FIXTURE_KEY": "fixture-key",
+                },
+                clear=True,
+            ):
+                with (
+                    patch("neuro_code.config.load_config", side_effect=load_config),
+                    patch(
+                        "neuro_code.config.override_sandbox",
+                        side_effect=override_sandbox,
+                    ),
+                    patch(
+                        "neuro_code.config.override_provider",
+                        side_effect=override_provider,
+                    ),
+                    patch(
+                        "neuro_code.config.pin_resumed_sandbox",
+                        side_effect=pin_resumed_sandbox,
+                    ),
+                ):
+                    application = await ApplicationComposition.open(
+                        ApplicationSettings(
+                            cwd=root,
+                            sandbox="workspace",
+                            resume_id="saved-session",
+                            launch_command=("neuro-code", "agent"),
+                        ),
+                        process_sandbox_enforcer=enforce,
+                        store_factory=store_factory,
+                        background_supervisor_factory=ApplicationSupervisorFixture,
+                        instruction_discovery_factory=instruction_discovery_factory,
+                        skill_discovery_factory=skill_discovery_factory,
+                    )
+                await application.close()
+
+        self.assertEqual(
+            calls,
+            [
+                "load config",
+                "override sandbox",
+                "override provider",
+                "create session store",
+                "peek session sandbox",
+                "pin resumed sandbox",
+                "enforce process sandbox",
+                "initialize session store",
+                "create instruction discovery",
+                "create skill discovery",
+            ],
+        )
+
     async def test_failed_binding_closes_its_background_scope(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -194,6 +327,83 @@ api_key_env = "FIXTURE_KEY"
                     ),
                 )
                 with self.assertRaisesRegex(RuntimeError, "composition failed"):
+                    await application.create_binding()
+                await application.close()
+
+        self.assertEqual(supervisor.scopes[0].shutdown_calls, 1)
+
+    async def test_workspace_change_observer_factory_is_lazy_and_per_binding(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / "state"
+            self._write_config(state)
+            supervisor = ApplicationSupervisorFixture()
+            created: list[EmptyWorkspaceChangeObserver] = []
+
+            def observer_factory() -> EmptyWorkspaceChangeObserver:
+                observer = EmptyWorkspaceChangeObserver()
+                created.append(observer)
+                return observer
+
+            with patch.dict(
+                "os.environ",
+                {
+                    "HOME": str(root),
+                    "NEURO_CODE_HOME": str(state),
+                    "FIXTURE_KEY": "fixture-key",
+                },
+                clear=True,
+            ):
+                application = await ApplicationComposition.open(
+                    ApplicationSettings(cwd=root),
+                    provider_factory=lambda config, failover: ApplicationProviderFixture(),
+                    process_sandbox_enforcer=lambda *args: None,
+                    background_supervisor_factory=lambda: cast(
+                        BackgroundTaskSupervisor,
+                        supervisor,
+                    ),
+                    workspace_change_observer_factory=observer_factory,
+                )
+                self.assertEqual(created, [])
+                await application.create_binding()
+                await application.create_binding()
+                await application.close()
+
+        self.assertEqual(len(created), 2)
+        self.assertIsNot(created[0], created[1])
+
+    async def test_workspace_change_observer_factory_failure_closes_its_background_scope(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / "state"
+            self._write_config(state)
+            supervisor = ApplicationSupervisorFixture()
+
+            def fail_observer_factory() -> EmptyWorkspaceChangeObserver:
+                raise RuntimeError("workspace observer factory failed")
+
+            with patch.dict(
+                "os.environ",
+                {
+                    "HOME": str(root),
+                    "NEURO_CODE_HOME": str(state),
+                    "FIXTURE_KEY": "fixture-key",
+                },
+                clear=True,
+            ):
+                application = await ApplicationComposition.open(
+                    ApplicationSettings(cwd=root),
+                    provider_factory=lambda config, failover: ApplicationProviderFixture(),
+                    process_sandbox_enforcer=lambda *args: None,
+                    background_supervisor_factory=lambda: cast(
+                        BackgroundTaskSupervisor,
+                        supervisor,
+                    ),
+                    workspace_change_observer_factory=fail_observer_factory,
+                )
+                with self.assertRaisesRegex(RuntimeError, "workspace observer factory failed"):
                     await application.create_binding()
                 await application.close()
 
@@ -335,6 +545,12 @@ api_key_env = "FIXTURE_KEY"
             state = root / "state"
             self._write_config(state)
             supervisor = ApplicationSupervisorFixture()
+            sandbox_preflight_calls = 0
+
+            def enforce(*args: object) -> None:
+                nonlocal sandbox_preflight_calls
+                del args
+                sandbox_preflight_calls += 1
 
             with (
                 patch.dict(
@@ -350,7 +566,7 @@ api_key_env = "FIXTURE_KEY"
             ):
                 await ApplicationComposition.open(
                     ApplicationSettings(cwd=root, sandbox="workspace"),
-                    process_sandbox_enforcer=lambda *args: None,
+                    process_sandbox_enforcer=enforce,
                     background_supervisor_factory=lambda: cast(
                         BackgroundTaskSupervisor,
                         supervisor,
@@ -358,6 +574,7 @@ api_key_env = "FIXTURE_KEY"
                 )
 
         self.assertEqual(supervisor.shutdown_calls, 1)
+        self.assertEqual(sandbox_preflight_calls, 0)
 
 
 if __name__ == "__main__":
