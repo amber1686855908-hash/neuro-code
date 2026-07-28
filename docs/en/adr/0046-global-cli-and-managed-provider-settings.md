@@ -38,8 +38,9 @@ able to redirect a user-owned stored key.
   `Compatible Chat` selects `/chat/completions`, and the dedicated DeepSeek
   preset selects Chat Completions with `https://api.deepseek.com`.
 - Expose atomic profile deletion through the storage port so a profile and its
-  separate credential entry are removed together. A deletion UI remains a
-  later slice.
+  separate credential entry are removed together. This slice deferred the
+  deletion UI; [ADR 0047](0047-recoverable-managed-provider-proxy-settings.md)
+  later adds it with confirmation.
 - Carry configured credential values in a representation-safe
   `ToolContext.redaction_values` field and redact actual tool results before
   they enter model context, events, or persistence.
@@ -51,5 +52,6 @@ able to redirect a user-owned stored key.
 - The current credentials file is private but not encrypted at rest. The port
   deliberately permits a future OS-keychain adapter without changing TUI or
   application contracts.
-- A provider deletion UI, remote model discovery, native installers, and
-  migration to an OS keychain remain outside this slice.
+- Remote model discovery, native installers, and migration to an OS keychain
+  remain outside this slice. Confirmed deletion and proxy recovery are covered
+  by [ADR 0047](0047-recoverable-managed-provider-proxy-settings.md).

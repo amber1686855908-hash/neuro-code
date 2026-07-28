@@ -111,7 +111,10 @@ uv run neuro
 首次启动且没有就绪供应商时，TUI 会先打开供应商设置表单，再组合代理运行时。普通设置
 入口先显示“界面语言”和“模型供应商”一级分类，再只打开所选详情页。供应商详情可新建或
 编辑多个 OpenAI Responses、OpenAI 兼容 Chat、DeepSeek、Anthropic、Gemini 或 xAI
-profile，并立即“保存并使用”。第一版 TUI 提供提示输入、滚动记录、assistant 流式文本、供应商/
+profile，并立即“保存并使用”。每个受管 profile 可选择继承环境代理、直连或从命名环境
+变量读取显式代理；删除需要二次确认，并同时移除对应凭据。如果受管默认 profile 因代理
+配置无法启动，TUI 会直接打开该 profile 显示错误并允许修复，而不是退出到终端。第一版
+TUI 提供提示输入、滚动记录、assistant 流式文本、供应商/
 工具状态，以及本地
 `/help`、`/status`、`/settings`（别名 `/setting`）、`/provider`、`/model`、
 `/effort [LEVEL]`（别名 `/reasoning`）、`/mode [MODE]`、`/sessions [QUERY]`、`/resume`、
@@ -171,6 +174,12 @@ token。配置中的 `context_window_tokens` 提供分母；窗口未知时显�
 使用 `Ctrl+,`、`/settings` 或 `/setting` 会先打开一级分类页，再选择界面语言或模型供应商。
 供应商详情明确区分 OpenAI Responses（`/responses`）与 OpenAI 兼容 Chat Completions
 （`/chat/completions`）；DeepSeek 预设会选择后者并填入 `https://api.deepseek.com`。
+供应商详情还会在写入前使用与运行时相同的代理策略解析器进行本地校验；该检查不会发送
+网络请求。显式点击“测试连接并加载模型”后，应用才会使用草稿中的端点、凭据和代理策略
+发送只读目录请求；它不会发送对话，也不会产生模型生成费用。成功结果会成为只存在内存、
+数量有界的模型选择器，同时保留手动输入。认证、端点/协议、超时、限流、服务端、代理、
+网络和异常目录响应会脱敏留在当前设置页，响应正文不会显示或持久化。受管配置删除仍要求
+二次确认。
 切换语言会立即更新应用
 自有的控件、对话框和状态文案，但不会翻译用户提示、模型回答或工具内容。选择结果与
 思考强度及交互模式偏好一起保存到 `$NEURO_CODE_HOME/ui-preferences.json`（通常为
@@ -437,7 +446,9 @@ proxy_url_env = "NEURO_DEEPSEEK_PROXY_URL"
 
 配置检查只暴露模式、环境变量名和“是否已配置”布尔值；代理 URL 与认证信息会从异常中
 脱敏。含义不明确的 `socks://` 会被拒绝，不会擅自猜测；应在安装 HTTPX 可选 SOCKS
-依赖后使用 `socks5://` 或 `socks5h://`，或者改用 HTTP 代理。详见
+依赖后使用 `socks5://` 或 `socks5h://`，或者改用 HTTP 代理。发行包可通过
+`neuro-code[socks]` 安装这一可选依赖。TUI 保存受管 profile 前会执行同一校验；如果
+当前默认受管 profile 在启动预检中失败，会打开设置页供修复。详见
 [ADR 0012](adr/0012-provider-http-proxy-policy.md) 和 HTTPX 官方
 [环境变量文档](https://www.python-httpx.org/environment_variables/)。
 

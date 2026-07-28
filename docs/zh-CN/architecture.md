@@ -20,24 +20,75 @@ Web 控制台后端。纯云端能力必须通过显式适配器接入；不可�
 ## 依赖方向
 
 ```text
-界面层（CLI、TUI、ACP、WebSocket）
-                    |
-应用层（代理循环、会话、命令、任务）
-                    |
-领域层（消息、事件、工具、权限、错误）
-                    |
-端口层（模型、存储、工具、工作区、沙箱、钩子）
-                    |
-适配器（供应商、SQLite、MCP、Git、PTY、操作系统、HTTP）
+interfaces ------> application ------> domain
+                         |
+                         +-----------> application/ports <------- infrastructure
+
+bootstrap ------> interfaces + application + infrastructure
+domain + application + infrastructure + interfaces ------> shared
 ```
 
-依赖只能向下。领域模块和应用模块不得导入 UI 框架、供应商 SDK、数据库驱动或平台
-实现。适配器实现带类型端口，并且只能在组合根中选择。
+目标包边界包括：承载纯值与规则的 `domain`、负责编排的 `application`、定义应用所需
+抽象的 `application/ports`、包含具体出站适配器的 `infrastructure`、包含入站适配器的
+`interfaces`、负责配置/工厂/装配的 `bootstrap`，以及容纳小型跨层原语的 `shared`。
+bootstrap 是唯一允许同时依赖 interfaces、application 和 infrastructure 的层。domain
+和 application 不得导入具体 infrastructure 实现。
+canonical 进程入口位于 bootstrap。少数从入站层到 bootstrap 的兼容和启动边由 AST 护栏逐条
+记录；这不授予任何界面自行装配具体依赖的权限。
 
-`ApplicationComposition` 是与界面无关的进程组合服务。它解析配置与供应商 override，
-执行会话沙箱预检，初始化 SQLite，创建供应商、工具、权限管理器和会话作用域后台任务
-注册表，并持有监督器关闭责任。CLI、TUI 和 ACP 只负责把各自参数或协议值转换给该服务。
-应用模块不依赖 argparse、Textual、ACP Schema 类型、ACP Client 或 stdio。
+阶段 1 已将 `neuro_code.shared.{errors,async_utils,redaction}` 和
+`neuro_code.application.ports.*` 建立为 canonical 路径。开发阶段的 breaking cleanup 已移除
+根级 shared compatibility 模块 `neuro_code.{errors,async_utils,redaction}` 和
+`neuro_code.ports`；shared 原语和端口契约仅可通过各自的 canonical 路径获得。
+阶段 2A 将 `neuro_code.application.settings.ApplicationSettings` 和
+`neuro_code.bootstrap.composition.ApplicationComposition` 建立为 canonical 路径。
+`neuro_code.application` 仅保留惰性的 `ApplicationSettings` 包级导出；组合必须从
+`bootstrap.composition` 显式导入，因此普通的 `application.ports` 导入不会加载 bootstrap 或
+具体 infrastructure。审批交互契约现在只位于 `neuro_code.application.permissions.contracts`。
+开发阶段的 breaking cleanup 已移除根级的 `PermissionApproval`、`PermissionApprovalKind`、
+`PermissionRequest` 和 `build_permission_request` re-export；
+`neuro_code.permissions` 只保留同步权限策略实现。
+
+阶段 2B 将 `neuro_code.bootstrap.entrypoints` 建立为 canonical 的 CLI/TUI 启动入口，console
+scripts 和 `python -m neuro_code` 都直接使用它。它只在相应命令实际需要时选择应用组合、SQLite
+会话存储、历史会话导入器、TUI 设置/目录/偏好端口和工作区身份行为。`neuro_code.cli` 保留参数
+解析、分发、渲染和退出码处理；其注入式 `run` 函数由 canonical bootstrap entrypoint 调用。导入
+CLI 不会加载 bootstrap、adapters 或 providers，也不会创建资源。
+
+阶段 2C 保持 `neuro_code.acp` 原位置，作为 ACP/JSON-RPC 入站适配器，但只向它提供
+`application.acp` 契约和 ACP 专用应用服务。该服务暴露绑定创建和安全恢复准备、会话别名与列表、
+工作区校验、协议元数据以及按会话惰性创建的 MCP 工具上下文。`bootstrap.entrypoints` 将
+`ApplicationComposition`、会话存储、工作区身份校验和具体 stdio MCP 工具集合适配到这些契约，
+随后启动 server。`serve_acp` 只接受所得的 `AcpApplicationService`，不再适配
+`ApplicationComposition` 调用方。ACP 不再导入 MCP 或工作区实现，也不再直接读取组合根配置或存储；导入 ACP 不会
+加载 bootstrap、MCP adapter、SQLite 存储或 providers。
+
+应用运行时行为现阶段位于 `neuro_code.application.runtime` 的明确 canonical 子模块：
+`background_task_reminders`、`agent`、`conversation`、`profile_conversation`、
+`terminal_sessions`、`approval`、`instruction_tracker` 和 `skill_tracker`。
+开发阶段的 breaking cleanup 已移除 `neuro_code.runtime`；运行时应用行为仅可通过这些
+明确的 canonical 子模块获得。`neuro_code.application.runtime.__init__` 现阶段保持最小，
+不提供 aggregate API；内部生产代码直接导入 canonical 子模块。
+
+`neuro_code.config` 现阶段负责 `AppConfig` 和 `ProviderProfile`、TOML 与 CC Switch
+配置、环境覆盖、路由、managed overlay、sandbox 策略、stored credential 注入以及 HTTP
+proxy policy。`neuro_code.configuration.managed_provider_settings` 中的同步 managed JSON
+reader 负责 schema、protocol 和 dialect 检查、文件大小限制、metadata/credentials 合并、
+结构校验以及 `ManagedProviderSettings` 构造。`neuro_code.adapters.provider_settings` 负责
+`JsonProviderSettingsStore`、异步持久化、原子写入和 POSIX 私有权限。它通过私有绑定使用
+canonical reader，不再 re-export 它。`neuro_code.config` 同样通过私有绑定使用 reader，且不再
+导入 provider-settings adapter；该边界中的 `ProviderProfile` 和 `AppConfig` 取代已移除的
+`ProviderConfig` alias。当前 active temporary allowlist 为空。唯一剩余的 raw forbidden edge
+是 canonical package-executable entrypoint：
+`neuro_code.__main__ -> neuro_code.bootstrap.entrypoints`；它不属于待清除的兼容债务。
+
+`bootstrap.composition` 中的 `ApplicationComposition` 会解析配置与供应商 override、执行
+会话沙箱预检、初始化 SQLite、创建供应商/工具/权限管理器和会话作用域后台任务注册表，并持有
+监督器关闭责任。阶段 2A 只改变其结构归属，初始化和失败清理顺序保持不变。CLI、TUI 和 ACP
+继续共享同一服务和带类型运行时事件流。
+
+完整依赖规则、兼容迁移策略和 allowlist 纪律见
+[ADR 0049](adr/0049-progressive-architecture-boundaries.md)。
 
 ## 运行时事件模型
 
@@ -417,7 +468,8 @@ ConPTY 创建会原子组合伪控制台与 Job 列表属性，终止/关闭作�
 `TURN_COMPLETED` 则在稳定助手节点之后显示整轮摘要。工具调用、权限路径、输出预览、
 工作区变更和终态会在同一张原地更新的有界树状卡片中渲染。对于带副作用的本地工具，
 运行时只在权限通过后、紧邻执行前后比较有界的只读工作区快照；这份报告只是审计元数据，
-既不授予权限，也不代表执行成功。详见
+既不授予权限，也不代表执行成功。`WorkspaceChangeObserver` 是由 bootstrap 为每个 binding
+创建的应用组合依赖；`AgentRuntime` 的构造不承诺为稳定的外部 Python API。详见
 [ADR 0028](adr/0028-timed-tool-feedback-and-interaction-modes.md) 与
 [ADR 0029](adr/0029-auditable-in-place-tool-cards.md)。
 
@@ -524,9 +576,13 @@ TUI 通过 `Ctrl+E`、`/effort` 和 `/reasoning` 暴露选择，CLI 则使用 `-
 
 组合根选择命名 `ProviderProfile`；代理运行时不会按商业供应商名称分支。profile 将线路
 协议（`openai-chat`、`openai-responses`、`anthropic-messages` 或
-`gemini-generate-content`）与 xAI Responses 等可选方言行为分离。凭据只能是环境变量
-引用或通过校验的回环代理占位符。TUI 还通过 `ProviderSettingsStore` 端口管理用户级
+`gemini-generate-content`）与 xAI Responses 等可选方言行为分离。通用 Responses 适配器实现位于
+`neuro_code.providers.openai_responses.OpenAIResponsesProvider`；xAI 行为通过
+`dialect = "xai"` 选择，而不是独立的 Python provider 类。开发阶段的 breaking cleanup 已移除
+`neuro_code.providers.xai_responses` 和 `XAIResponsesProvider`。
+凭据只能是环境变量引用或通过校验的回环代理占位符。TUI 还通过 `ProviderSettingsStore` 端口管理用户级
 profile；其 JSON 适配器把非密钥元数据和凭据分别原子写入仅所有者可访问的文件。
+代理模式及可选环境变量名属于非密钥元数据；解析后的代理 URL 仍只存在于环境/适配器边界。
 `ProviderProfile.stored_api_key` 不参与对象表示和脱敏配置检查；运行时还会在工具结果进入
 模型上下文、事件或持久化之前，按显式配置值再次清除凭据。当前文件型凭据存储不等同于
 加密，后续可替换为平台钥匙串适配器。
@@ -536,9 +592,19 @@ profile；其 JSON 适配器把非密钥元数据和凭据分别原子写入仅�
 会以有界应用重启码退出；组合根和全部后台 scope 关闭后，才会重新加载配置并创建供应商
 绑定。首次设置在应用组合之前执行，所以缺失供应商时不会创建半成品运行时。
 普通设置通过一级分类页进入独立的语言/供应商详情页。预设显式映射线路行为：OpenAI
-Responses 使用 `openai-responses`，兼容 Chat 与 DeepSeek 使用 `openai-chat`；适配器还会
-一并删除 profile 元数据及其凭据条目。详见
-[ADR 0046](adr/0046-global-cli-and-managed-provider-settings.md)。
+Responses 使用 `openai-responses`，兼容 Chat 与 DeepSeek 使用 `openai-chat`。供应商详情
+会在持久化前运行与运行时相同的 `HttpClientPolicy` 解析器；删除元数据与凭据前需要二次
+确认，随后请求安全重载。启动预检会把无效的受管默认项送回该详情页，带上脱敏错误并选中
+对应 profile；显式 CLI 覆盖和非受管配置仍在 CLI 边界失败。详见
+[ADR 0046](adr/0046-global-cli-and-managed-provider-settings.md)和
+[ADR 0047](adr/0047-recoverable-managed-provider-proxy-settings.md)。注入的
+`ProviderCatalog` 端口为详情页提供独立、由用户触发的只读网络边界。其 HTTPX 适配器会
+复用草稿的 `HttpClientPolicy`，只通过协议原生请求头发送凭据，并把 OpenAI 兼容/
+Responses、Anthropic 与 Gemini profile 映射到各自模型列表端点。适配器最多读取一兆
+字节、返回最多 200 个唯一模型标识，绝不显示错误响应正文，并分类错误供界面本地化恢复。
+目录值只存在于当前设置页；凭据和远程响应都不会写入供应商元数据。没有目录接口的兼容
+服务仍可手动输入模型。只读连接发现详见
+[ADR 0048](adr/0048-bounded-provider-connection-discovery.md)。
 
 可选的正整数 `context_window_tokens` 记录供应商/模型能力元数据。它通过脱敏 profile 选择
 和故障转移事件传播，用于本地预算，但绝不会序列化为 API 请求参数；真实上限仍由模型
