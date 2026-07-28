@@ -3,13 +3,14 @@ from __future__ import annotations
 import difflib
 import hashlib
 import os
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
 from neuro_code.application.ports.workspace_changes import (
     WorkspaceChangeCheckpoint,
     WorkspaceChangeHiddenReason,
+    WorkspaceChangeObserver,
     WorkspaceChangeReport,
     WorkspaceChangeStatus,
     WorkspaceFileChange,
@@ -293,6 +294,90 @@ class FilesystemWorkspaceChangeObserver:
         checkpoint: WorkspaceChangeCheckpoint,
     ) -> _FilesystemWorkspaceChangeCheckpoint:
         if not isinstance(checkpoint, _FilesystemWorkspaceChangeCheckpoint):
+            raise TypeError("workspace checkpoint belongs to a different observer")
+        return checkpoint
+
+
+class _MultiRootWorkspaceChangeCheckpoint(WorkspaceChangeCheckpoint):
+    """Opaque checkpoints for one primary and bounded additional roots."""
+
+    __slots__ = ("checkpoints",)
+
+    def __init__(self, checkpoints: tuple[WorkspaceChangeCheckpoint, ...]) -> None:
+        self.checkpoints = checkpoints
+
+
+class MultiRootWorkspaceChangeObserver:
+    """Add bounded extra-root snapshots without changing the application port.
+
+    The primary root retains its normal relative paths.  Changes below an ACP
+    additional directory are rendered with their absolute root prefix, which
+    makes their origin unambiguous in a tool card and avoids path collisions.
+    """
+
+    def __init__(
+        self,
+        observer: WorkspaceChangeObserver,
+        additional_roots: Sequence[Path],
+    ) -> None:
+        self._observer = observer
+        self._additional_roots = tuple(root.expanduser().resolve() for root in additional_roots)
+
+    def capture(self, root: Path, /) -> WorkspaceChangeCheckpoint:
+        roots = (root, *self._additional_roots)
+        return _MultiRootWorkspaceChangeCheckpoint(
+            tuple(self._observer.capture(candidate) for candidate in roots)
+        )
+
+    def compare(
+        self,
+        before: WorkspaceChangeCheckpoint,
+        after: WorkspaceChangeCheckpoint,
+        *,
+        explicit_redactions: tuple[str, ...],
+    ) -> WorkspaceChangeReport:
+        previous = self._checkpoint(before)
+        current = self._checkpoint(after)
+        if len(previous.checkpoints) != len(current.checkpoints):
+            raise TypeError("multi-root workspace checkpoints do not match")
+        reports = tuple(
+            self._observer.compare(
+                earlier,
+                later,
+                explicit_redactions=explicit_redactions,
+            )
+            for earlier, later in zip(previous.checkpoints, current.checkpoints, strict=True)
+        )
+        changes: list[WorkspaceFileChange] = []
+        omitted_files = 0
+        for index, report in enumerate(reports):
+            omitted_files += report.omitted_files
+            root = self._additional_roots[index - 1] if index else None
+            for change in report.files:
+                if len(changes) >= _MAX_CHANGED_FILES:
+                    omitted_files += 1
+                    continue
+                path = change.path if root is None else str(root / change.path)
+                changes.append(
+                    WorkspaceFileChange(
+                        path=path,
+                        status=change.status,
+                        additions=change.additions,
+                        deletions=change.deletions,
+                        diff=change.diff,
+                        diff_truncated=change.diff_truncated,
+                        hidden_reason=change.hidden_reason,
+                    )
+                )
+        return WorkspaceChangeReport(
+            files=tuple(changes),
+            omitted_files=omitted_files,
+            scan_limited=any(report.scan_limited for report in reports),
+        )
+
+    @staticmethod
+    def _checkpoint(checkpoint: WorkspaceChangeCheckpoint) -> _MultiRootWorkspaceChangeCheckpoint:
+        if not isinstance(checkpoint, _MultiRootWorkspaceChangeCheckpoint):
             raise TypeError("workspace checkpoint belongs to a different observer")
         return checkpoint
 

@@ -20,6 +20,8 @@ from neuro_code.adapters.rust_session import load_rust_session
 from neuro_code.adapters.sqlite_session import SqliteSessionStore
 from neuro_code.adapters.ui_preferences import JsonUiPreferencesStore
 from neuro_code.application.acp.contracts import (
+    MAX_ADDITIONAL_DIRECTORIES,
+    MAX_ADDITIONAL_DIRECTORY_BYTES,
     AcpBinding,
     AcpMcpServerConfig,
     AcpMcpToolError,
@@ -44,6 +46,7 @@ from neuro_code.bootstrap.composition import ApplicationComposition
 from neuro_code.config import AppConfig, load_config, override_provider
 from neuro_code.domain.interaction_mode import InteractionMode
 from neuro_code.domain.reasoning import ReasoningEffort
+from neuro_code.domain.sandbox import SandboxProfile
 from neuro_code.domain.session_search import SessionSearchHit
 from neuro_code.domain.sessions import SessionSummary
 from neuro_code.shared.async_utils import run_blocking
@@ -59,10 +62,15 @@ if TYPE_CHECKING:
 class _BootstrapWorkspaceValidator:
     """Concrete workspace identity behavior selected only by bootstrap."""
 
-    def __init__(self, workspace: Path) -> None:
+    def __init__(self, workspace: Path, sandbox_profile: SandboxProfile) -> None:
         self._workspace = workspace
+        self._sandbox_profile = sandbox_profile
 
-    async def validate(self, cwd: str) -> None:
+    async def validate(
+        self,
+        cwd: str,
+        additional_directories: Sequence[str],
+    ) -> tuple[Path, ...]:
         try:
             requested = Path(cwd)
         except (OSError, RuntimeError, TypeError, ValueError) as error:
@@ -75,6 +83,52 @@ class _BootstrapWorkspaceValidator:
             raise AcpWorkspaceValidationError("cwd_invalid", type(error).__name__) from None
         if not workspaces_match(normalized, self._workspace):
             raise AcpWorkspaceValidationError("cwd_workspace_mismatch")
+        if not additional_directories:
+            return ()
+        if self._sandbox_profile.enabled:
+            raise AcpWorkspaceValidationError("additional_directories_sandbox_unsupported")
+        if len(additional_directories) > MAX_ADDITIONAL_DIRECTORIES:
+            raise AcpWorkspaceValidationError("additional_directories_too_many")
+
+        resolved_directories: list[Path] = []
+        for directory in additional_directories:
+            if not isinstance(directory, str) or not directory:
+                raise AcpWorkspaceValidationError("additional_directory_invalid")
+            try:
+                directory_size = len(directory.encode("utf-8"))
+            except UnicodeError:
+                raise AcpWorkspaceValidationError("additional_directory_invalid") from None
+            if directory_size > MAX_ADDITIONAL_DIRECTORY_BYTES:
+                raise AcpWorkspaceValidationError("additional_directory_too_large")
+            try:
+                requested_directory = Path(directory)
+            except (OSError, RuntimeError, TypeError, ValueError) as error:
+                raise AcpWorkspaceValidationError(
+                    "additional_directory_invalid", type(error).__name__
+                ) from None
+            if not requested_directory.is_absolute():
+                raise AcpWorkspaceValidationError("additional_directory_not_absolute")
+            try:
+                resolved_directory = await run_blocking(
+                    requested_directory.resolve,
+                    strict=True,
+                )
+                is_directory = await run_blocking(resolved_directory.is_dir)
+            except (OSError, RuntimeError) as error:
+                raise AcpWorkspaceValidationError(
+                    "additional_directory_invalid", type(error).__name__
+                ) from None
+            if not is_directory:
+                raise AcpWorkspaceValidationError("additional_directory_not_directory")
+            if any(
+                resolved_directory == root
+                or resolved_directory.is_relative_to(root)
+                or root.is_relative_to(resolved_directory)
+                for root in (normalized, *resolved_directories)
+            ):
+                raise AcpWorkspaceValidationError("additional_directory_overlaps_workspace")
+            resolved_directories.append(resolved_directory)
+        return tuple(resolved_directories)
 
     def matches(self, cwd: Path) -> bool:
         return workspaces_match(cwd, self._workspace)
@@ -124,12 +178,14 @@ class _PreparedCompositionAcpSession:
         *,
         approver: PermissionApprover | None,
         additional_tools: Sequence[Tool],
+        additional_workspace_roots: Sequence[Path],
     ) -> ConversationBinding:
         return await self.application.create_binding(
             config=self.config,
             approver=approver,
             resume_id=self.session_id,
             additional_tools=additional_tools,
+            additional_workspace_roots=additional_workspace_roots,
         )
 
 
@@ -144,10 +200,12 @@ class _CompositionAcpBindingFactory:
         *,
         approver: PermissionApprover | None,
         additional_tools: Sequence[Tool],
+        additional_workspace_roots: Sequence[Path],
     ) -> AcpBinding:
         binding = await self._application.create_binding(
             approver=approver,
             additional_tools=additional_tools,
+            additional_workspace_roots=additional_workspace_roots,
         )
         return AcpBinding(
             binding=binding,
@@ -207,7 +265,7 @@ class BootstrapCliServices:
             store=application.store,
             bindings=_CompositionAcpBindingFactory(application),
             mcp_tools=_BootstrapMcpToolFactory(),
-            workspace=_BootstrapWorkspaceValidator(config.cwd),
+            workspace=_BootstrapWorkspaceValidator(config.cwd, config.sandbox_profile),
         )
 
     async def run_acp(

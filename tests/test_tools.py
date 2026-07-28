@@ -60,6 +60,62 @@ class FilesystemToolTests(unittest.IsolatedAsyncioTestCase):
                 )
             self.assertEqual(target.read_text(encoding="utf-8"), "before\n")
 
+    async def test_explicit_additional_directory_is_accessible_but_not_an_escape_hatch(
+        self,
+    ) -> None:
+        with (
+            tempfile.TemporaryDirectory() as primary_directory,
+            tempfile.TemporaryDirectory() as extra_directory,
+            tempfile.TemporaryDirectory() as outside_directory,
+        ):
+            root = Path(primary_directory)
+            extra = Path(extra_directory)
+            outside = Path(outside_directory)
+            target = extra / "shared.txt"
+            target.write_text("alpha\nbeta\n", encoding="utf-8")
+            outside_target = outside / "private.txt"
+            outside_target.write_text("private", encoding="utf-8")
+            context = ToolContext(root, additional_workspace_roots=(extra,))
+
+            read_result = await ReadFileTool().execute({"path": str(target)}, context)
+            self.assertIn("2\tbeta", read_result.content)
+            grep_result = await GrepTool().execute(
+                {"query": "bet.", "path": str(extra)},
+                context,
+            )
+            self.assertIn(f"{target.resolve()}:2:beta", grep_result.content)
+            with self.assertRaisesRegex(ToolError, "escapes the workspace"):
+                await ReadFileTool().execute({"path": str(outside_target)}, context)
+
+    async def test_additional_directory_edits_follow_the_sandbox_policy(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as primary_directory,
+            tempfile.TemporaryDirectory() as extra_directory,
+        ):
+            root = Path(primary_directory)
+            extra = Path(extra_directory)
+            target = extra / "shared.txt"
+            target.write_text("before\n", encoding="utf-8")
+            arguments = {"path": str(target), "old": "before", "new": "after"}
+
+            result = await SearchReplaceTool().execute(
+                arguments,
+                ToolContext(root, additional_workspace_roots=(extra,)),
+            )
+            self.assertFalse(result.is_error)
+            self.assertEqual(target.read_text(encoding="utf-8"), "after\n")
+
+            with self.assertRaisesRegex(ToolError, "only read access"):
+                await SearchReplaceTool().execute(
+                    {"path": str(target), "old": "after", "new": "blocked"},
+                    ToolContext(
+                        root,
+                        additional_workspace_roots=(extra,),
+                        sandbox_profile=SandboxProfile.WORKSPACE,
+                    ),
+                )
+            self.assertEqual(target.read_text(encoding="utf-8"), "after\n")
+
     def test_workspace_path_rejects_parent_escape(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

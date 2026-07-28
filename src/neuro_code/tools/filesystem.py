@@ -8,10 +8,15 @@ from pathlib import Path
 from typing import Any
 
 from neuro_code.application.ports.tools import ToolContext
+from neuro_code.domain.sandbox import SandboxProfile
 from neuro_code.domain.tools import ToolDefinition, ToolResult
 from neuro_code.shared.async_utils import run_blocking
 from neuro_code.shared.errors import ToolError
-from neuro_code.workspace import resolve_workspace_path
+from neuro_code.workspace import (
+    is_additional_workspace_path,
+    resolve_workspace_path,
+    workspace_display_path,
+)
 
 
 def _require_string(arguments: Mapping[str, Any], key: str) -> str:
@@ -19,6 +24,48 @@ def _require_string(arguments: Mapping[str, Any], key: str) -> str:
     if not isinstance(value, str) or not value:
         raise ToolError(f"{key} must be a non-empty string")
     return value
+
+
+def _resolve_path(context: ToolContext, requested: str, *, must_exist: bool) -> Path:
+    return resolve_workspace_path(
+        context.cwd,
+        requested,
+        must_exist=must_exist,
+        additional_workspace_roots=context.additional_workspace_roots,
+    )
+
+
+def _is_primary_workspace_path(context: ToolContext, path: Path) -> bool:
+    return not is_additional_workspace_path(
+        context.cwd,
+        path,
+        context.additional_workspace_roots,
+    )
+
+
+def _display_path(context: ToolContext, path: Path) -> str:
+    return workspace_display_path(
+        context.cwd,
+        path,
+        context.additional_workspace_roots,
+    )
+
+
+def _track_primary_workspace_path(context: ToolContext, path: Path) -> None:
+    """Refresh primary-workspace instructions only.
+
+    ACP's additional directories are explicit file-access roots, not an
+    instruction or skill-discovery expansion.  Treating their AGENTS.md or
+    SKILL.md files as project policy would silently cross the primary
+    workspace's trust boundary.
+    """
+
+    if not _is_primary_workspace_path(context, path):
+        return
+    if context.instruction_tracker is not None:
+        context.instruction_tracker.check_path(path)
+    if context.skill_tracker is not None:
+        context.skill_tracker.check_path(path)
 
 
 class ReadFileTool:
@@ -39,20 +86,12 @@ class ReadFileTool:
     side_effecting = False
 
     async def execute(self, arguments: Mapping[str, Any], context: ToolContext) -> ToolResult:
-        path = resolve_workspace_path(
-            context.cwd, _require_string(arguments, "path"), must_exist=True
-        )
+        path = _resolve_path(context, _require_string(arguments, "path"), must_exist=True)
         if not path.is_file():
             raise ToolError(f"not a file: {path}")
         # Notify the instruction tracker so AGENTS.md files from root to this
         # directory are discovered for the next model step.
-        if context.instruction_tracker is not None:
-            context.instruction_tracker.check_path(path)
-        # Notify the skill tracker so SKILL.md files from this directory
-        # upward to the workspace root are discovered for the next model
-        # step.
-        if context.skill_tracker is not None:
-            context.skill_tracker.check_path(path)
+        _track_primary_workspace_path(context, path)
         start_line = arguments.get("start_line", 1)
         max_lines = arguments.get("max_lines", 500)
         if not isinstance(start_line, int) or start_line < 1:
@@ -92,13 +131,10 @@ class ListDirTool:
         raw_path = arguments.get("path", ".")
         if not isinstance(raw_path, str):
             raise ToolError("path must be a string")
-        path = resolve_workspace_path(context.cwd, raw_path, must_exist=True)
+        path = _resolve_path(context, raw_path, must_exist=True)
         if not path.is_dir():
             raise ToolError(f"not a directory: {path}")
-        if context.instruction_tracker is not None:
-            context.instruction_tracker.check_path(path)
-        if context.skill_tracker is not None:
-            context.skill_tracker.check_path(path)
+        _track_primary_workspace_path(context, path)
 
         def list_entries() -> list[str]:
             entries: list[str] = []
@@ -142,11 +178,8 @@ class GrepTool:
             pattern = re.compile(query)
         except re.error as error:
             raise ToolError(f"invalid regular expression: {error}") from error
-        root = resolve_workspace_path(context.cwd, raw_path, must_exist=True)
-        if context.instruction_tracker is not None:
-            context.instruction_tracker.check_path(root)
-        if context.skill_tracker is not None:
-            context.skill_tracker.check_path(root)
+        root = _resolve_path(context, raw_path, must_exist=True)
+        _track_primary_workspace_path(context, root)
 
         def search() -> tuple[list[str], Path | None]:
             paths = (root,) if root.is_file() else root.rglob("*")
@@ -159,8 +192,8 @@ class GrepTool:
                     with path.open("r", encoding="utf-8") as file:
                         for line_number, line in enumerate(file, start=1):
                             if pattern.search(line):
-                                relative = path.relative_to(context.cwd.resolve())
-                                matches.append(f"{relative}:{line_number}:{line.rstrip()}")
+                                display_path = _display_path(context, path)
+                                matches.append(f"{display_path}:{line_number}:{line.rstrip()}")
                                 last_matched_path = path
                                 if len(matches) >= max_results:
                                     return matches, last_matched_path
@@ -173,10 +206,7 @@ class GrepTool:
         # loop after the blocking filesystem walk rather than from a worker
         # thread. The last match retains the documented single-target policy.
         if last_matched_path is not None:
-            if context.instruction_tracker is not None:
-                context.instruction_tracker.check_path(last_matched_path)
-            if context.skill_tracker is not None:
-                context.skill_tracker.check_path(last_matched_path)
+            _track_primary_workspace_path(context, last_matched_path)
         return ToolResult("\n".join(matches), metadata={"count": len(matches)})
 
 
@@ -203,9 +233,7 @@ class SearchReplaceTool:
             raise ToolError(
                 f"sandbox profile {context.sandbox_profile.value!r} prohibits workspace edits"
             )
-        path = resolve_workspace_path(
-            context.cwd, _require_string(arguments, "path"), must_exist=True
-        )
+        path = _resolve_path(context, _require_string(arguments, "path"), must_exist=True)
         old = _require_string(arguments, "old")
         new = arguments.get("new")
         replace_all = arguments.get("replace_all", False)
@@ -215,15 +243,22 @@ class SearchReplaceTool:
             raise ToolError("replace_all must be a boolean")
         if not path.is_file():
             raise ToolError(f"not a file: {path}")
+        if (
+            _is_primary_workspace_path(context, path) is False
+            and context.sandbox_profile is not SandboxProfile.OFF
+        ):
+            raise ToolError(
+                "sandboxed sessions permit only read access to additional workspace directories"
+            )
         # Pre-flight check: if the tracker discovers new AGENTS.md files
         # in the target directory that the model has not yet seen, abort
         # the write and present the instructions.  The model can review
         # them and re-issue the command on the next step.
-        if context.instruction_tracker is not None:
+        if context.instruction_tracker is not None and _is_primary_workspace_path(context, path):
             new_instructions = context.instruction_tracker.check_path_for_write(path)
             if new_instructions is not None:
                 instructions_text = new_instructions.model_context_text()
-                rel = path.relative_to(context.cwd.resolve())
+                rel = _display_path(context, path)
                 return ToolResult(
                     "I discovered project instructions in the target directory "
                     f"that you haven't seen yet ({rel}). "
@@ -265,6 +300,6 @@ class SearchReplaceTool:
 
         replaced = await run_blocking(replace_text)
         return ToolResult(
-            f"replaced {replaced} occurrence(s) in {path.relative_to(context.cwd.resolve())}",
+            f"replaced {replaced} occurrence(s) in {_display_path(context, path)}",
             metadata={"path": str(path), "replacements": replaced},
         )

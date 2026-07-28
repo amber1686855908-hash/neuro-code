@@ -18,6 +18,7 @@ from neuro_code.domain.tools import ToolDefinition, ToolResult
 @dataclass(frozen=True, slots=True)
 class ToolContext:
     cwd: Path
+    additional_workspace_roots: tuple[Path, ...] = ()
     output_byte_limit: int = 200_000
     command_timeout_seconds: float = 120.0
     termination_grace_seconds: float = 1.0

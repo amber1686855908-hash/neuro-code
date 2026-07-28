@@ -444,6 +444,19 @@ leaves durable history and the alias intact. EOF or connection failure runs
 the same idempotent cleanup for every active or creating session.
 See [ADR 0050](adr/0050-acp-session-lifecycle.md).
 
+`additionalDirectories` may declare at most four existing, absolute,
+non-overlapping directory roots for a particular new, loaded, resumed, or
+forked ACP binding. They are validated after the connection workspace and are
+not persisted with the durable session; clients must declare them again for a
+later binding. File tools accept paths within the primary or one of these
+explicit roots, while instruction and skill discovery remain confined to the
+primary workspace. Change reports snapshot each declared root and label extra
+root paths absolutely. `off` sessions retain their ordinary permission flow.
+Every enabled sandbox rejects non-empty additions because its mount namespace
+was fixed before the ACP request; this also avoids treating a platform's
+writable temporary or state mounts as a late-declared directory root. This
+preserves the explicit sandbox boundary rather than adding late host mounts.
+
 Non-empty `mcpServers` are accepted only for the ACP baseline stdio shape.
 HTTP, SSE, and ACP transports are rejected deterministically. Each server is
 initialized and its bounded, paginated tool catalog is validated before the

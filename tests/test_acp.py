@@ -4,6 +4,7 @@ import asyncio
 import tempfile
 import unittest
 from collections.abc import AsyncIterator, Sequence
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
@@ -301,6 +302,7 @@ class ApplicationFixture:
         self.store = SessionAliasStoreFixture()
         self.resume_ids: list[str | None] = []
         self.additional_tool_names: list[tuple[str, ...]] = []
+        self.additional_workspace_roots: list[tuple[Path, ...]] = []
         self.resume_error: ConfigurationError | None = None
         self.cleanup_events: list[str] | None = None
 
@@ -316,10 +318,12 @@ class ApplicationFixture:
         approver: PermissionApprover | None = None,
         resume_id: str | None = None,
         additional_tools: Sequence[Any] = (),
+        additional_workspace_roots: Sequence[Path] = (),
         **_kwargs: Any,
     ) -> ConversationBinding:
         self.resume_ids.append(resume_id)
         self.additional_tool_names.append(tuple(tool.definition.name for tool in additional_tools))
+        self.additional_workspace_roots.append(tuple(additional_workspace_roots))
         runner = self._runners.pop(0)
         runner.attach_approver(approver)
         background = BackgroundTasksFixture(self.cleanup_events)
@@ -891,16 +895,18 @@ class AcpAgentTests(unittest.IsolatedAsyncioTestCase):
                 await agent.new_session(str(root), additional_directories=[str(root)])
             self.assertEqual(
                 directories.exception.data["reason"],
-                "additional_directories_unsupported",
+                "additional_directory_overlaps_workspace",
             )
 
             with self.assertRaises(RequestError) as mcp:
                 await agent.new_session(str(root), mcp_servers=[cast(Any, object())])
             self.assertEqual(mcp.exception.data["reason"], "mcp_transport_unsupported")
 
+            additional = root.parent / f"{root.name}-additional"
+            additional.mkdir()
             created = await agent.new_session(
                 str(root),
-                additional_directories=[],
+                additional_directories=[str(additional)],
                 mcp_servers=[],
             )
             acp_id = created.session_id
@@ -915,8 +921,53 @@ class AcpAgentTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(acp_id.startswith("acp-"))
         self.assertNotEqual(acp_id, runner.session_id)
+        self.assertEqual(application.additional_workspace_roots, [(additional.resolve(),)])
         self.assertEqual(persisted_mapping, runner.session_id)
         self.assertEqual(response.stop_reason, "end_turn")
+
+    async def test_additional_directories_have_bounded_and_sandboxed_validation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            extra = root.parent / f"{root.name}-extra"
+            extra.mkdir()
+            agent, _, _ = await initialized_agent(root, [RunnerFixture()])
+
+            with self.assertRaises(RequestError) as relative:
+                await agent.new_session(str(root), additional_directories=["relative"])
+            self.assertEqual(relative.exception.data["reason"], "additional_directory_not_absolute")
+
+            with self.assertRaises(RequestError) as missing:
+                await agent.new_session(
+                    str(root),
+                    additional_directories=[str(extra / "missing")],
+                )
+            self.assertEqual(missing.exception.data["reason"], "additional_directory_invalid")
+
+            with self.assertRaises(RequestError) as too_many:
+                await agent.new_session(
+                    str(root),
+                    additional_directories=[str(extra)] * 5,
+                )
+            self.assertEqual(too_many.exception.data["reason"], "additional_directories_too_many")
+
+            for profile in (
+                SandboxProfile.WORKSPACE,
+                SandboxProfile.READ_ONLY,
+                SandboxProfile.STRICT,
+            ):
+                application = ApplicationFixture(root, [])
+                application.config = replace(application.config, sandbox_profile=profile)
+                sandboxed_agent = NeuroCodeAcpAgent(_acp_service(application))
+                await sandboxed_agent.initialize(1)
+                with self.subTest(profile=profile), self.assertRaises(RequestError) as sandboxed:
+                    await sandboxed_agent.new_session(
+                        str(root),
+                        additional_directories=[str(extra)],
+                    )
+                self.assertEqual(
+                    sandboxed.exception.data["reason"],
+                    "additional_directories_sandbox_unsupported",
+                )
 
     async def test_stdio_mcp_is_bounded_session_owned_and_available_to_new_and_load(
         self,
@@ -1102,6 +1153,8 @@ class AcpAgentTests(unittest.IsolatedAsyncioTestCase):
         second_runner = RunnerFixture(session_id="persisted-id", items=history)
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
+            additional = root.parent / f"{root.name}-additional"
+            additional.mkdir()
             agent, application, client = await initialized_agent(
                 root,
                 [first_runner, second_runner],
@@ -1112,7 +1165,12 @@ class AcpAgentTests(unittest.IsolatedAsyncioTestCase):
                 "persisted-id",
             )
 
-            loaded = await agent.load_session(str(root), "acp-durable", mcp_servers=[])
+            loaded = await agent.load_session(
+                str(root),
+                "acp-durable",
+                mcp_servers=[],
+                additional_directories=[str(additional)],
+            )
             self.assertIsNotNone(loaded)
             replay = [update for _, update in client.updates]
             self.assertEqual(
@@ -1145,10 +1203,19 @@ class AcpAgentTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(prompted.stop_reason, "end_turn")
             await agent.close_session("acp-durable")
             client.updates.clear()
-            await agent.load_session(str(root), "acp-durable", mcp_servers=[])
+            await agent.load_session(
+                str(root),
+                "acp-durable",
+                mcp_servers=[],
+                additional_directories=[str(additional)],
+            )
             await agent.close_session("acp-durable")
 
         self.assertEqual(application.resume_ids, ["persisted-id", "persisted-id"])
+        self.assertEqual(
+            application.additional_workspace_roots,
+            [(additional.resolve(),), (additional.resolve(),)],
+        )
         self.assertEqual([scope.shutdown_calls for scope in application.background_scopes], [1, 1])
 
     async def test_session_load_validates_inputs_identity_and_active_state(self) -> None:
@@ -1169,7 +1236,7 @@ class AcpAgentTests(unittest.IsolatedAsyncioTestCase):
                         mcp_servers=[],
                         additional_directories=[str(root)],
                     ),
-                    "additional_directories_unsupported",
+                    "additional_directory_overlaps_workspace",
                 ),
                 (
                     lambda: agent.load_session(
@@ -1244,6 +1311,8 @@ class AcpAgentTests(unittest.IsolatedAsyncioTestCase):
         runner = RunnerFixture(session_id="persisted-id", items=history)
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
+            additional = root.parent / f"{root.name}-additional"
+            additional.mkdir()
             agent, application, client = await initialized_agent(root, [runner])
             await application.store.bind_session_alias(
                 "acp-v1",
@@ -1255,11 +1324,13 @@ class AcpAgentTests(unittest.IsolatedAsyncioTestCase):
                 "acp-durable",
                 str(root),
                 mcp_servers=[],
+                additional_directories=[str(additional)],
             )
 
             self.assertEqual(resumed.model_dump(exclude_none=True), {})
             self.assertEqual(client.updates, [])
             self.assertEqual(application.resume_ids, ["persisted-id"])
+            self.assertEqual(application.additional_workspace_roots, [(additional.resolve(),)])
             prompted = await agent.prompt(
                 "acp-durable",
                 [TextContentBlock(type="text", text="continue")],
@@ -1433,6 +1504,8 @@ class AcpAgentTests(unittest.IsolatedAsyncioTestCase):
         )
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
+            additional = root.parent / f"{root.name}-additional"
+            additional.mkdir()
             agent, application, client = await initialized_agent(
                 root,
                 [RunnerFixture(session_id="forked-1", items=history)],
@@ -1454,6 +1527,7 @@ class AcpAgentTests(unittest.IsolatedAsyncioTestCase):
                 "acp-source",
                 str(root),
                 mcp_servers=[],
+                additional_directories=[str(additional)],
             )
 
             self.assertNotEqual(forked.session_id, "acp-source")
@@ -1469,6 +1543,7 @@ class AcpAgentTests(unittest.IsolatedAsyncioTestCase):
                 "forked-1",
             )
             self.assertEqual(application.resume_ids, ["forked-1"])
+            self.assertEqual(application.additional_workspace_roots, [(additional.resolve(),)])
             self.assertEqual(client.updates, [])
             prompted = await agent.prompt(
                 forked.session_id,
