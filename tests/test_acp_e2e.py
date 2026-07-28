@@ -327,7 +327,13 @@ context_window_tokens = 32000
                     capabilities,
                     {
                         "loadSession": True,
-                        "sessionCapabilities": {"list": {}, "close": {}},
+                        "sessionCapabilities": {
+                            "list": {},
+                            "delete": {},
+                            "fork": {},
+                            "resume": {},
+                            "close": {},
+                        },
                     },
                 )
 
@@ -433,6 +439,9 @@ context_window_tokens = 32000
                 self.assertTrue(initialized.agent_capabilities.load_session)
                 self.assertIsNotNone(initialized.agent_capabilities.session_capabilities)
                 self.assertIsNotNone(initialized.agent_capabilities.session_capabilities.list)
+                self.assertIsNotNone(initialized.agent_capabilities.session_capabilities.delete)
+                self.assertIsNotNone(initialized.agent_capabilities.session_capabilities.fork)
+                self.assertIsNotNone(initialized.agent_capabilities.session_capabilities.resume)
                 listed = await connection.list_sessions()
                 self.assertEqual(len(listed.sessions), 1)
                 self.assertEqual(listed.sessions[0].session_id, created.session_id)
@@ -492,6 +501,54 @@ context_window_tokens = 32000
             self.assertTrue(
                 any(message.get("role") == "tool" for message in resumed_model_messages)
             )
+
+            lifecycle_client = E2eClient()
+            async with spawn_agent_process(
+                cast(Client, lifecycle_client),
+                sys.executable,
+                "-m",
+                "neuro_code",
+                "acp",
+                "--cwd",
+                str(root),
+                env=environment,
+                cwd=REPOSITORY_ROOT,
+            ) as (connection, _):
+                await connection.initialize(1)
+                await connection.resume_session(
+                    created.session_id,
+                    str(root),
+                    mcp_servers=[],
+                )
+                self.assertEqual(lifecycle_client.updates, [])
+                await connection.close_session(created.session_id)
+
+                forked = await connection.fork_session(
+                    created.session_id,
+                    str(root),
+                    mcp_servers=[],
+                )
+                self.assertNotEqual(forked.session_id, created.session_id)
+                self.assertEqual(lifecycle_client.updates, [])
+                await connection.close_session(forked.session_id)
+
+                listed_after_fork = await connection.list_sessions()
+                self.assertEqual(
+                    {session.session_id for session in listed_after_fork.sessions},
+                    {created.session_id, forked.session_id},
+                )
+
+            persisted_after_fork = await store.list_sessions()
+            self.assertEqual(len(persisted_after_fork), 2)
+            forked_internal_id = await store.resolve_session_alias(
+                "acp-v1",
+                forked.session_id,
+            )
+            self.assertEqual(
+                await store.load_session_items(forked_internal_id),
+                await store.load_session_items(persisted[0].id),
+            )
+            self.assertEqual(await store.load_events(forked_internal_id), [])
 
     async def test_official_cancel_notification_returns_cancelled_stop_reason(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

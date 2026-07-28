@@ -413,12 +413,15 @@ one stable boundary. See
 official `agent-client-protocol` Python SDK. Production framing, JSON-RPC
 routing, newline-delimited stdio, `session/update` notifications, and
 `session/request_permission` requests remain SDK-owned. The adapter declares
-`loadSession: true` plus `sessionCapabilities.list = {}` / `close = {}` and
+`loadSession: true` plus list/delete/fork/resume/close session capabilities and
 implements `initialize`, `session/new`, `session/list`, `session/load`,
-`session/prompt`, the `session/cancel` notification, and `session/close`. SDK
-0.11 gates its `session/close` route behind
-`use_unstable_protocol`; the process enables that router gate only so the
-declared close method is reachable and implements no other unstable method.
+`session/delete`, `session/fork`, `session/resume`, `session/prompt`, the
+`session/cancel` notification, and `session/close`. SDK 0.11 gates fork,
+resume, and close behind `use_unstable_protocol`. Its generated schema includes
+stable delete models but its Agent router omits that route, so Neuro Code adds
+only the generated delete request to the official `MessageRouter`; SDK streams,
+`Connection`, dispatcher, schemas, framing, and error normalization remain
+unchanged.
 
 One ACP connection is bound to the normalized launch workspace. Each accepted
 session owns a stable random ACP ID, one `AgentConversation`, one background
@@ -429,10 +432,17 @@ later process can load the same ACP ID. Session creation publishes nothing
 until every resource is ready. Load reserves the requested ACP ID, revalidates
 workspace, fixed sandbox, and provider affinity, reconstructs the conversation
 and background scope, replays history, and only then publishes the session.
+Resume follows the same checks and reconstruction but does not replay history.
+Fork copies a persisted ordered context and its provider/sandbox affinity into
+new internal and external IDs, then builds an independent session without
+replaying history; source prompts must be idle, and failed publication deletes
+the copied row. Delete first closes active resources and then removes the
+workspace-local durable session, whose events, alias, and search rows cascade.
 Close first applies cancel semantics, waits for required terminal tool updates
 and the prompt response, closes the scope, drops the runtime binding, and
 leaves durable history and the alias intact. EOF or connection failure runs
 the same idempotent cleanup for every active or creating session.
+See [ADR 0050](adr/0050-acp-session-lifecycle.md).
 
 Non-empty `mcpServers` are accepted only for the ACP baseline stdio shape.
 HTTP, SSE, and ACP transports are rejected deterministically. Each server is

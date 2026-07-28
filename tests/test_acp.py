@@ -336,6 +336,8 @@ class SessionAliasStoreFixture:
         self.aliases: dict[tuple[str, str], str] = {}
         self.session_ids: set[str] = set()
         self.summaries: list[SessionSummary] = []
+        self.deleted_session_ids: list[str] = []
+        self.forked_session_ids: list[tuple[str, str]] = []
 
     async def bind_session_alias(
         self,
@@ -380,6 +382,44 @@ class SessionAliasStoreFixture:
             raise SessionError("proposed session alias is unavailable")
         self.aliases[(namespace, proposed_external_id)] = session_id
         return proposed_external_id
+
+    async def get_session(self, session_id: str) -> SessionSummary:
+        for summary in self.summaries:
+            if summary.id == session_id:
+                return summary
+        raise SessionError(f"unknown session: {session_id}")
+
+    async def delete_session(self, session_id: str) -> None:
+        await self.get_session(session_id)
+        self.summaries = [summary for summary in self.summaries if summary.id != session_id]
+        self.session_ids.discard(session_id)
+        self.aliases = {
+            key: saved_session_id
+            for key, saved_session_id in self.aliases.items()
+            if saved_session_id != session_id
+        }
+        self.deleted_session_ids.append(session_id)
+
+    async def fork_session(self, session_id: str) -> str:
+        source = await self.get_session(session_id)
+        forked_session_id = f"forked-{len(self.forked_session_ids) + 1}"
+        timestamp = datetime.now(UTC)
+        self.summaries.append(
+            SessionSummary(
+                id=forked_session_id,
+                cwd=source.cwd,
+                provider=source.provider,
+                model=source.model,
+                created_at=timestamp,
+                updated_at=timestamp,
+                context_affinity=source.context_affinity,
+                sandbox_profile=source.sandbox_profile,
+                title=source.title,
+            )
+        )
+        self.session_ids.add(forked_session_id)
+        self.forked_session_ids.append((session_id, forked_session_id))
+        return forked_session_id
 
     async def list_sessions_page(
         self,
@@ -764,7 +804,7 @@ class McpConfigurationTests(unittest.TestCase):
 
 
 class AcpAgentTests(unittest.IsolatedAsyncioTestCase):
-    async def test_initialize_declares_only_load_list_close_and_saves_client_details(
+    async def test_initialize_declares_session_lifecycle_and_saves_client_details(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -790,7 +830,13 @@ class AcpAgentTests(unittest.IsolatedAsyncioTestCase):
             ),
             {
                 "loadSession": True,
-                "sessionCapabilities": {"list": {}, "close": {}},
+                "sessionCapabilities": {
+                    "list": {},
+                    "delete": {},
+                    "fork": {},
+                    "resume": {},
+                    "close": {},
+                },
             },
         )
 
@@ -1190,6 +1236,37 @@ class AcpAgentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client.updates, [])
         self.assertEqual(application.background_scopes[0].shutdown_calls, 1)
 
+    async def test_session_resume_restores_context_without_history_replay(self) -> None:
+        history = (
+            Message(Role.USER, "previous question"),
+            Message(Role.ASSISTANT, "previous answer"),
+        )
+        runner = RunnerFixture(session_id="persisted-id", items=history)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            agent, application, client = await initialized_agent(root, [runner])
+            await application.store.bind_session_alias(
+                "acp-v1",
+                "acp-durable",
+                "persisted-id",
+            )
+
+            resumed = await agent.resume_session(
+                "acp-durable",
+                str(root),
+                mcp_servers=[],
+            )
+
+            self.assertEqual(resumed.model_dump(exclude_none=True), {})
+            self.assertEqual(client.updates, [])
+            self.assertEqual(application.resume_ids, ["persisted-id"])
+            prompted = await agent.prompt(
+                "acp-durable",
+                [TextContentBlock(type="text", text="continue")],
+            )
+            self.assertEqual(prompted.stop_reason, "end_turn")
+            await agent.close_session("acp-durable")
+
     async def test_session_list_is_workspace_scoped_paginated_and_loadable(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1285,6 +1362,147 @@ class AcpAgentTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(RequestError) as invalid_cursor:
                 await agent.list_sessions(cursor="unknown-cursor")
             self.assertEqual(invalid_cursor.exception.data["reason"], "cursor_invalid")
+
+    async def test_session_delete_removes_listed_state_and_closes_unpersisted_active_session(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            agent, application, _ = await initialized_agent(root, [RunnerFixture()])
+            summary = SessionSummary(
+                id="persisted-id",
+                cwd=str(root),
+                provider="fixture",
+                model="fixture-model",
+                created_at=datetime(2026, 7, 1, tzinfo=UTC),
+                updated_at=datetime(2026, 7, 1, tzinfo=UTC),
+                title="Delete me",
+            )
+            application.store.summaries.append(summary)
+            application.store.session_ids.add(summary.id)
+            await application.store.bind_session_alias(
+                "acp-v1",
+                "acp-durable",
+                summary.id,
+            )
+
+            deleted = await agent.delete_session("acp-durable")
+
+            self.assertEqual(deleted.model_dump(exclude_none=True), {})
+            self.assertEqual(application.store.deleted_session_ids, ["persisted-id"])
+            with self.assertRaises(RequestError) as missing:
+                await agent.delete_session("acp-durable")
+            self.assertEqual(missing.exception.data["reason"], "session_not_found")
+
+            active = await agent.new_session(str(root))
+            await agent.delete_session(active.session_id)
+            self.assertEqual(application.background_scopes[0].shutdown_calls, 1)
+            with self.assertRaises(RequestError) as inactive:
+                await agent.prompt(
+                    active.session_id,
+                    [TextContentBlock(type="text", text="closed")],
+                )
+            self.assertEqual(inactive.exception.data["reason"], "session_not_active")
+
+    async def test_session_delete_hides_other_workspace_as_not_found(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            agent, application, _ = await initialized_agent(root, [])
+            summary = SessionSummary(
+                id="other-id",
+                cwd=str(root.parent),
+                provider="fixture",
+                model="fixture-model",
+                created_at=datetime(2026, 7, 1, tzinfo=UTC),
+                updated_at=datetime(2026, 7, 1, tzinfo=UTC),
+            )
+            application.store.summaries.append(summary)
+            application.store.session_ids.add(summary.id)
+            await application.store.bind_session_alias("acp-v1", "acp-other", summary.id)
+
+            with self.assertRaises(RequestError) as hidden:
+                await agent.delete_session("acp-other")
+
+            self.assertEqual(hidden.exception.data["reason"], "session_not_found")
+            self.assertEqual(application.store.deleted_session_ids, [])
+
+    async def test_session_fork_creates_independent_active_context_without_replay(self) -> None:
+        history = (
+            Message(Role.USER, "source question"),
+            Message(Role.ASSISTANT, "source answer"),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            agent, application, client = await initialized_agent(
+                root,
+                [RunnerFixture(session_id="forked-1", items=history)],
+            )
+            summary = SessionSummary(
+                id="source-id",
+                cwd=str(root),
+                provider="fixture",
+                model="fixture-model",
+                created_at=datetime(2026, 7, 1, tzinfo=UTC),
+                updated_at=datetime(2026, 7, 1, tzinfo=UTC),
+                title="Source title",
+            )
+            application.store.summaries.append(summary)
+            application.store.session_ids.add(summary.id)
+            await application.store.bind_session_alias("acp-v1", "acp-source", summary.id)
+
+            forked = await agent.fork_session(
+                "acp-source",
+                str(root),
+                mcp_servers=[],
+            )
+
+            self.assertNotEqual(forked.session_id, "acp-source")
+            self.assertEqual(
+                application.store.forked_session_ids,
+                [("source-id", "forked-1")],
+            )
+            self.assertEqual(
+                await application.store.resolve_session_alias(
+                    "acp-v1",
+                    forked.session_id,
+                ),
+                "forked-1",
+            )
+            self.assertEqual(application.resume_ids, ["forked-1"])
+            self.assertEqual(client.updates, [])
+            prompted = await agent.prompt(
+                forked.session_id,
+                [TextContentBlock(type="text", text="fork continues")],
+            )
+            self.assertEqual(prompted.stop_reason, "end_turn")
+            self.assertIn("source-id", application.store.session_ids)
+            await agent.close_session(forked.session_id)
+
+    async def test_session_fork_rolls_back_persisted_copy_when_binding_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            agent, application, _ = await initialized_agent(
+                root,
+                [RunnerFixture(session_id="wrong-fork-id")],
+            )
+            summary = SessionSummary(
+                id="source-id",
+                cwd=str(root),
+                provider="fixture",
+                model="fixture-model",
+                created_at=datetime(2026, 7, 1, tzinfo=UTC),
+                updated_at=datetime(2026, 7, 1, tzinfo=UTC),
+            )
+            application.store.summaries.append(summary)
+            application.store.session_ids.add(summary.id)
+            await application.store.bind_session_alias("acp-v1", "acp-source", summary.id)
+
+            with self.assertRaises(RequestError) as mismatch:
+                await agent.fork_session("acp-source", str(root), mcp_servers=[])
+
+            self.assertEqual(mismatch.exception.data["reason"], "session_identity_mismatch")
+            self.assertEqual(application.store.deleted_session_ids, ["forked-1"])
+            self.assertEqual(application.background_scopes[0].shutdown_calls, 1)
 
     async def test_event_mapping_has_stable_message_id_and_bounded_tool_fields(self) -> None:
         events = (
@@ -1626,17 +1844,55 @@ class AcpAgentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(second_response.stop_reason, "end_turn")
         self.assertEqual(application.background_scopes[1].shutdown_calls, 1)
 
-    async def test_serve_uses_official_sdk_settings_and_always_cleans_up(self) -> None:
+    async def test_sdk_router_exposes_stable_session_delete(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            agent, application, _ = await initialized_agent(root, [])
+            summary = SessionSummary(
+                id="persisted-id",
+                cwd=str(root),
+                provider="fixture",
+                model="fixture-model",
+                created_at=datetime(2026, 7, 1, tzinfo=UTC),
+                updated_at=datetime(2026, 7, 1, tzinfo=UTC),
+            )
+            application.store.summaries.append(summary)
+            application.store.session_ids.add(summary.id)
+            await application.store.bind_session_alias(
+                "acp-v1",
+                "acp-durable",
+                summary.id,
+            )
+
+            result = await acp_module._build_acp_router(agent)(
+                "session/delete",
+                {"sessionId": "acp-durable"},
+                False,
+            )
+
+        self.assertEqual(result, {})
+        self.assertEqual(application.store.deleted_session_ids, ["persisted-id"])
+
+    async def test_serve_uses_official_sdk_streams_and_always_closes_connection(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             application = ApplicationFixture(Path(directory), [])
-            with patch("neuro_code.acp.run_agent", new_callable=AsyncMock) as run:
+            connection = AsyncMock()
+            with (
+                patch(
+                    "neuro_code.acp.stdio_streams",
+                    new=AsyncMock(return_value=(object(), object())),
+                ) as streams,
+                patch(
+                    "neuro_code.acp._AcpSdkConnection",
+                    return_value=connection,
+                ) as connection_type,
+            ):
                 await serve_acp(_acp_service(application))
 
-        self.assertTrue(run.await_args.kwargs["use_unstable_protocol"])
-        self.assertEqual(
-            run.await_args.kwargs["stdio_buffer_limit_bytes"],
-            ACP_STDIO_BUFFER_LIMIT_BYTES,
-        )
+        streams.assert_awaited_once_with(limit=ACP_STDIO_BUFFER_LIMIT_BYTES)
+        connection_type.assert_called_once()
+        connection.listen.assert_awaited_once_with()
+        connection.close.assert_awaited_once_with()
 
 
 if __name__ == "__main__":

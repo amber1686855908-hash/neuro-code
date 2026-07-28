@@ -13,9 +13,12 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Literal, cast
 
-from acp.core import run_agent
+from acp.agent.router import build_agent_router
+from acp.core import Connection
 from acp.exceptions import RequestError
 from acp.interfaces import Agent, Client
+from acp.meta import AGENT_METHODS, CLIENT_METHODS
+from acp.router import MessageRouter
 from acp.schema import (
     AcpMcpServer,
     AgentCapabilities,
@@ -25,8 +28,11 @@ from acp.schema import (
     ClientCapabilities,
     CloseSessionResponse,
     ContentToolCallContent,
+    DeleteSessionRequest,
+    DeleteSessionResponse,
     EmbeddedResourceContentBlock,
     FileEditToolCallContent,
+    ForkSessionResponse,
     HttpMcpServer,
     ImageContentBlock,
     Implementation,
@@ -37,11 +43,18 @@ from acp.schema import (
     NewSessionResponse,
     PermissionOption,
     PromptResponse,
+    RequestPermissionRequest,
+    RequestPermissionResponse,
     ResourceContentBlock,
+    ResumeSessionResponse,
     SessionCapabilities,
     SessionCloseCapabilities,
+    SessionDeleteCapabilities,
+    SessionForkCapabilities,
     SessionInfo,
     SessionListCapabilities,
+    SessionNotification,
+    SessionResumeCapabilities,
     SseMcpServer,
     TerminalToolCallContent,
     TextContentBlock,
@@ -52,6 +65,8 @@ from acp.schema import (
     UsageUpdate,
     UserMessageChunk,
 )
+from acp.stdio import stdio_streams
+from acp.utils import normalize_result, notify_model, request_model
 
 from neuro_code import __version__
 from neuro_code.application.acp.contracts import (
@@ -887,6 +902,9 @@ class NeuroCodeAcpAgent:
                 auth=None,
                 session_capabilities=SessionCapabilities(
                     list=SessionListCapabilities(),
+                    delete=SessionDeleteCapabilities(),
+                    fork=SessionForkCapabilities(),
+                    resume=SessionResumeCapabilities(),
                     close=SessionCloseCapabilities(),
                 ),
             ),
@@ -1028,10 +1046,48 @@ class NeuroCodeAcpAgent:
             mcp_servers,
         )
         external_session_id = _validated_session_id(session_id)
-        client = self._client
-        if client is None:
-            raise RequestError.internal_error({"reason": "client_unavailable"})
+        await self._activate_persisted_session(
+            external_session_id,
+            mcp_configurations,
+            replay_history=True,
+            failure_reason="session_load_failed",
+        )
+        return LoadSessionResponse()
 
+    async def resume_session(
+        self,
+        session_id: str,
+        cwd: str,
+        additional_directories: list[str] | None = None,
+        mcp_servers: list[McpServer] | None = None,
+        **_kwargs: Any,
+    ) -> ResumeSessionResponse:
+        self._require_initialized()
+        mcp_configurations = await self._validate_session_workspace(
+            cwd,
+            additional_directories,
+            mcp_servers,
+        )
+        external_session_id = _validated_session_id(session_id)
+        await self._activate_persisted_session(
+            external_session_id,
+            mcp_configurations,
+            replay_history=False,
+            failure_reason="session_resume_failed",
+        )
+        return ResumeSessionResponse()
+
+    async def _activate_persisted_session(
+        self,
+        external_session_id: str,
+        mcp_configurations: tuple[AcpMcpServerConfig, ...],
+        *,
+        replay_history: bool,
+        failure_reason: str,
+    ) -> None:
+        client = self._client
+        if replay_history and client is None:
+            raise RequestError.internal_error({"reason": "client_unavailable"})
         await self._reserve_session_id(external_session_id)
         binding: ConversationBinding | None = None
         mcp_tools: AcpMcpTools | None = None
@@ -1068,14 +1124,10 @@ class NeuroCodeAcpAgent:
             except ConfigurationError:
                 raise _invalid_params("session_provider_unavailable") from None
             except Exception:
-                raise RequestError.internal_error({"reason": "session_load_failed"}) from None
+                raise RequestError.internal_error({"reason": failure_reason}) from None
 
             if binding.runner.session_id != internal_session_id:
                 raise RequestError.internal_error({"reason": "session_identity_mismatch"})
-            updates = _history_updates(
-                binding.runner.items,
-                explicit_redactions=self._explicit_redactions(),
-            )
             try:
                 await self._service.bind_session_alias(
                     _ACP_SESSION_ALIAS_NAMESPACE,
@@ -1084,15 +1136,21 @@ class NeuroCodeAcpAgent:
                 )
             except SessionError:
                 raise RequestError.internal_error({"reason": "session_alias_failed"}) from None
-            try:
-                for update in updates:
-                    await client.session_update(external_session_id, update)
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                raise RequestError.internal_error(
-                    {"reason": "session_history_replay_failed"}
-                ) from None
+            if replay_history:
+                assert client is not None
+                updates = _history_updates(
+                    binding.runner.items,
+                    explicit_redactions=self._explicit_redactions(),
+                )
+                try:
+                    for update in updates:
+                        await client.session_update(external_session_id, update)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    raise RequestError.internal_error(
+                        {"reason": "session_history_replay_failed"}
+                    ) from None
 
             session = _AcpSession(
                 external_session_id,
@@ -1105,7 +1163,7 @@ class NeuroCodeAcpAgent:
             if await self._publish_session(session):
                 binding = None
                 mcp_tools = None
-                return LoadSessionResponse()
+                return
             raise RequestError.internal_error({"reason": "connection_closing"})
         finally:
             await self._release_session_reservation(external_session_id)
@@ -1241,6 +1299,165 @@ class NeuroCodeAcpAgent:
             sessions=sessions,
             next_cursor=next_cursor,
         )
+
+    async def delete_session(
+        self,
+        session_id: str,
+        **_kwargs: Any,
+    ) -> DeleteSessionResponse:
+        self._require_initialized()
+        external_session_id = _validated_session_id(session_id)
+        async with self._registry_lock:
+            if external_session_id in self._pending_session_tasks:
+                raise _session_busy(external_session_id, "session_creation_in_progress")
+            active = self._sessions.get(external_session_id)
+
+        internal_session_id: str | None = None
+        if active is not None:
+            async with active.state_lock:
+                if active.closed or active.closing:
+                    raise _session_not_active(external_session_id)
+                active.closing = True
+                active.cancel_requested = True
+                internal_session_id = active.internal_session_id
+            await self._cleanup_session(active)
+            async with self._registry_lock:
+                if self._sessions.get(external_session_id) is active:
+                    del self._sessions[external_session_id]
+
+        if internal_session_id is None:
+            try:
+                internal_session_id = await self._service.resolve_session_alias(
+                    _ACP_SESSION_ALIAS_NAMESPACE,
+                    external_session_id,
+                )
+            except SessionError:
+                if active is not None:
+                    return DeleteSessionResponse()
+                raise _session_not_found(external_session_id) from None
+
+        try:
+            await self._service.delete_session(internal_session_id)
+        except SessionError:
+            raise _session_not_found(external_session_id) from None
+        return DeleteSessionResponse()
+
+    async def fork_session(
+        self,
+        session_id: str,
+        cwd: str,
+        additional_directories: list[str] | None = None,
+        mcp_servers: list[McpServer] | None = None,
+        **_kwargs: Any,
+    ) -> ForkSessionResponse:
+        self._require_initialized()
+        mcp_configurations = await self._validate_session_workspace(
+            cwd,
+            additional_directories,
+            mcp_servers,
+        )
+        source_external_session_id = _validated_session_id(session_id)
+        source_internal_session_id = await self._fork_source_session_id(source_external_session_id)
+        forked_external_session_id = f"acp-{uuid.uuid4().hex}"
+        await self._reserve_session_id(forked_external_session_id)
+
+        binding: ConversationBinding | None = None
+        mcp_tools: AcpMcpTools | None = None
+        forked_internal_session_id: str | None = None
+        try:
+            try:
+                forked_internal_session_id = await self._service.fork_session(
+                    source_internal_session_id
+                )
+            except SessionError:
+                raise _session_not_found(source_external_session_id) from None
+
+            try:
+                prepared_session = await self._service.prepare_session_resume(
+                    forked_internal_session_id
+                )
+            except AcpResumeUnavailableError as error:
+                raise _invalid_params(error.reason) from None
+
+            approvals = SessionApprovalBroker()
+            approvals.set_handler(
+                lambda request: self._request_permission(
+                    forked_external_session_id,
+                    request,
+                )
+            )
+            try:
+                mcp_tools = await self._open_mcp_tools(mcp_configurations)
+                binding = await prepared_session.create_binding(
+                    approver=approvals,
+                    additional_tools=mcp_tools.tools if mcp_tools is not None else (),
+                )
+            except asyncio.CancelledError:
+                raise
+            except AcpMcpToolError as error:
+                raise _invalid_params(error.reason) from None
+            except ToolError:
+                raise _invalid_params("mcp_tool_name_collision") from None
+            except ConfigurationError:
+                raise _invalid_params("session_provider_unavailable") from None
+            except Exception:
+                raise RequestError.internal_error({"reason": "session_fork_failed"}) from None
+
+            if binding.runner.session_id != forked_internal_session_id:
+                raise RequestError.internal_error({"reason": "session_identity_mismatch"})
+            try:
+                await self._service.bind_session_alias(
+                    _ACP_SESSION_ALIAS_NAMESPACE,
+                    forked_external_session_id,
+                    forked_internal_session_id,
+                )
+            except SessionError:
+                raise RequestError.internal_error({"reason": "session_alias_failed"}) from None
+
+            session = _AcpSession(
+                forked_external_session_id,
+                binding,
+                approvals,
+                prepared_session.context_window_tokens,
+                mcp_tools,
+                internal_session_id=forked_internal_session_id,
+            )
+            if await self._publish_session(session):
+                binding = None
+                mcp_tools = None
+                forked_internal_session_id = None
+                return ForkSessionResponse(session_id=forked_external_session_id)
+            raise RequestError.internal_error({"reason": "connection_closing"})
+        finally:
+            await self._release_session_reservation(forked_external_session_id)
+            if binding is not None and binding.background_tasks is not None:
+                await asyncio.shield(binding.background_tasks.shutdown())
+            if mcp_tools is not None:
+                await asyncio.shield(mcp_tools.close())
+            if forked_internal_session_id is not None:
+                with contextlib.suppress(SessionError):
+                    await asyncio.shield(self._service.delete_session(forked_internal_session_id))
+
+    async def _fork_source_session_id(self, external_session_id: str) -> str:
+        async with self._registry_lock:
+            if external_session_id in self._pending_session_tasks:
+                raise _session_busy(external_session_id, "session_creation_in_progress")
+            active = self._sessions.get(external_session_id)
+        if active is not None:
+            async with active.state_lock:
+                task = active.prompt_task
+                if task is not None and not task.done():
+                    raise _session_busy(external_session_id, "session_prompt_active")
+                if active.internal_session_id is None:
+                    raise _session_not_found(external_session_id)
+                return active.internal_session_id
+        try:
+            return await self._service.resolve_session_alias(
+                _ACP_SESSION_ALIAS_NAMESPACE,
+                external_session_id,
+            )
+        except SessionError:
+            raise _session_not_found(external_session_id) from None
 
     async def _active_session(self, session_id: str) -> _AcpSession:
         async with self._registry_lock:
@@ -1500,17 +1717,95 @@ class NeuroCodeAcpAgent:
             )
 
 
+def _build_acp_router(agent: NeuroCodeAcpAgent) -> MessageRouter:
+    """Extend the SDK 0.11 router with its generated stable delete route."""
+
+    router = build_agent_router(cast(Agent, agent), use_unstable_protocol=True)
+    router.route_request(
+        AGENT_METHODS["session_delete"],
+        DeleteSessionRequest,
+        agent,
+        "delete_session",
+        adapt_result=normalize_result,
+    )
+    return router
+
+
+class _AcpSdkConnection:
+    """Small SDK connection adapter until its agent router registers delete."""
+
+    def __init__(
+        self,
+        agent: NeuroCodeAcpAgent,
+        writer: asyncio.StreamWriter,
+        reader: asyncio.StreamReader,
+    ) -> None:
+        self._connection = Connection(
+            _build_acp_router(agent),
+            writer,
+            reader,
+            listening=False,
+        )
+        agent.on_connect(cast(Client, self))
+
+    async def listen(self) -> None:
+        await self._connection.main_loop()
+
+    async def close(self) -> None:
+        await self._connection.close()
+
+    async def session_update(
+        self,
+        session_id: str,
+        update: Any,
+        **kwargs: Any,
+    ) -> None:
+        await notify_model(
+            self._connection,
+            CLIENT_METHODS["session_update"],
+            SessionNotification(
+                session_id=session_id,
+                update=update,
+                field_meta=kwargs or None,
+            ),
+        )
+
+    async def request_permission(
+        self,
+        session_id: str,
+        tool_call: ToolCallUpdate,
+        options: list[PermissionOption],
+        **kwargs: Any,
+    ) -> RequestPermissionResponse:
+        return await request_model(
+            self._connection,
+            CLIENT_METHODS["session_request_permission"],
+            RequestPermissionRequest(
+                session_id=session_id,
+                tool_call=tool_call,
+                options=options,
+                field_meta=kwargs or None,
+            ),
+            RequestPermissionResponse,
+        )
+
+
 async def serve_acp(service: AcpApplicationService) -> None:
-    """Serve ACP on stdio using only the official SDK transport and router."""
+    """Serve ACP on stdio through the official SDK framing and router."""
 
     agent = NeuroCodeAcpAgent(service)
+    connection: _AcpSdkConnection | None = None
     try:
-        await run_agent(
-            cast(Agent, agent),
-            use_unstable_protocol=True,
-            stdio_buffer_limit_bytes=ACP_STDIO_BUFFER_LIMIT_BYTES,
+        reader, writer = await stdio_streams(limit=ACP_STDIO_BUFFER_LIMIT_BYTES)
+        connection = _AcpSdkConnection(
+            agent,
+            writer,
+            reader,
         )
+        await connection.listen()
     finally:
+        if connection is not None:
+            await asyncio.shield(connection.close())
         await asyncio.shield(agent.shutdown())
 
 

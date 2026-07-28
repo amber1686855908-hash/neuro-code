@@ -215,6 +215,69 @@ class SessionStoreTests(unittest.IsolatedAsyncioTestCase):
             self.assertIs(summary.sandbox_profile, SandboxProfile.READ_ONLY)
             self.assertEqual((await store.list_sessions())[0], summary)
 
+    async def test_fork_copies_context_without_events_and_delete_cascades_indexes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = SqliteSessionStore(Path(directory) / "sessions.db")
+            await store.initialize()
+            source_id = await store.create_session(
+                "/workspace",
+                "fixture",
+                "model",
+                "profile-v1:fixture",
+                SandboxProfile.WORKSPACE,
+            )
+            items = [
+                Message(Role.USER, "fork searchable context"),
+                PreservedContextItem(
+                    ContextItemKind.REASONING,
+                    {
+                        "type": "reasoning",
+                        "id": "reasoning-fork",
+                        "encrypted_content": "opaque",
+                    },
+                ),
+                Message(Role.ASSISTANT, "source answer"),
+            ]
+            await store.save_session_items(source_id, items)
+            await store.update_session_title(source_id, "Shared fork title")
+            await store.append_event(
+                source_id,
+                AgentEvent.create(1, AgentEventKind.TURN_COMPLETED, {"step": 1}),
+            )
+            await store.bind_session_alias("acp-v1", "acp-source", source_id)
+
+            forked_id = await store.fork_session(source_id)
+
+            self.assertNotEqual(forked_id, source_id)
+            forked = await store.get_session(forked_id)
+            source = await store.get_session(source_id)
+            self.assertEqual(forked.cwd, source.cwd)
+            self.assertEqual(forked.provider, source.provider)
+            self.assertEqual(forked.model, source.model)
+            self.assertEqual(forked.context_affinity, source.context_affinity)
+            self.assertIs(forked.sandbox_profile, source.sandbox_profile)
+            self.assertEqual(forked.title, "Shared fork title")
+            self.assertEqual(await store.load_session_items(forked_id), items)
+            self.assertEqual(await store.load_events(forked_id), [])
+            search = await store.search_sessions("fork searchable")
+            self.assertEqual(
+                {hit.summary.id for hit in search.results},
+                {source_id, forked_id},
+            )
+
+            await store.delete_session(source_id)
+
+            with self.assertRaisesRegex(SessionError, "unknown session"):
+                await store.get_session(source_id)
+            with self.assertRaisesRegex(SessionError, "unknown session alias"):
+                await store.resolve_session_alias("acp-v1", "acp-source")
+            search = await store.search_sessions("fork searchable")
+            self.assertEqual([hit.summary.id for hit in search.results], [forked_id])
+            with self.assertRaisesRegex(SessionError, "unknown session"):
+                await store.delete_session(source_id)
+            with self.assertRaisesRegex(SessionError, "unknown session"):
+                await store.fork_session(source_id)
+
     async def test_session_aliases_are_durable_unique_and_support_legacy_ids(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = SqliteSessionStore(Path(directory) / "sessions.db")

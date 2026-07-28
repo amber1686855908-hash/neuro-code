@@ -9,6 +9,9 @@ import unittest
 from pathlib import Path
 from typing import Any
 
+from neuro_code.adapters.sqlite_session import SqliteSessionStore
+from neuro_code.shared.errors import SessionError
+
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -197,6 +200,36 @@ class RawStdioTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response["jsonrpc"], "2.0")
         self.assertEqual(response["id"], 7)
         self.assertIn("result", response)
+
+    async def test_session_delete_route_removes_durable_workspace_session(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            process = await RawAcpProcess.start(root)
+            try:
+                await process.initialize()
+                store = SqliteSessionStore(root / "state" / "sessions.db")
+                await store.initialize()
+                internal_session_id = await store.create_session(
+                    str(root),
+                    "fixture",
+                    "fixture-model",
+                )
+                await store.bind_session_alias(
+                    "acp-v1",
+                    "acp-delete",
+                    internal_session_id,
+                )
+                await process.send(
+                    b'{"jsonrpc":"2.0","id":2,"method":"session/delete",'
+                    b'"params":{"sessionId":"acp-delete"}}\n'
+                )
+                response = await process.response()
+            finally:
+                await process.close()
+
+            self.assertEqual(response["result"], {})
+            with self.assertRaisesRegex(SessionError, "unknown session"):
+                await store.get_session(internal_session_id)
 
 
 if __name__ == "__main__":

@@ -45,3 +45,5 @@
 - ACP 实现仍是 partial。session resume/delete/fork、非 stdio MCP 传输与非工具 MCP
   能力、额外目录、多媒体 prompt/历史、客户端文件系统/终端调用、WebSocket 传输和
   自定义扩展仍不支持。
+- ADR 0050 后续实现了 resume/delete/fork，同时保持本 ADR 的工作区范围、持久 alias
+  与有界 list 行为。

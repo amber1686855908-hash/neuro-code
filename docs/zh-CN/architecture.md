@@ -320,11 +320,13 @@ USER 候选。按名称先见为准的去重确保 LOCAL 技能遮蔽同名 REPO
 `agent-client-protocol` Python SDK 之上的协议适配器。生产 framing、JSON-RPC
 路由、换行分隔 stdio、`session/update` notification 和
 `session/request_permission` request 均继续由 SDK 持有。适配器声明
-`loadSession: true` 与 `sessionCapabilities.list = {}` / `close = {}`，实现
-`initialize`、`session/new`、`session/list`、`session/load`、`session/prompt`、
-`session/cancel` notification 和 `session/close`。SDK 0.11
-将 `session/close` 路由置于 `use_unstable_protocol` 门后；进程只为使已声明的 close
-方法可达而打开该路由门，不实现其他 unstable 方法。
+`loadSession: true` 与 list/delete/fork/resume/close session capability，实现
+`initialize`、`session/new`、`session/list`、`session/load`、`session/delete`、
+`session/fork`、`session/resume`、`session/prompt`、`session/cancel` notification
+和 `session/close`。SDK 0.11 把 fork、resume 和 close 置于
+`use_unstable_protocol` 门后；其生成 Schema 已包含稳定 delete 模型，但 Agent router
+漏掉了该路由，因此 Neuro Code 只把生成的 delete request 加到官方 `MessageRouter`，
+SDK stream、`Connection`、dispatcher、Schema、framing 与错误规范化保持不变。
 
 每条 ACP 连接固定绑定到规范化后的启动工作区。每个成功 session 拥有稳定随机 ACP ID、
 一个 `AgentConversation`、一个后台任务 scope、一个活动 prompt 槽位，以及独立审批/
@@ -332,9 +334,14 @@ USER 候选。按名称先见为准的去重确保 LOCAL 技能遮蔽同名 REPO
 SQLite schema v5 会持久化唯一且带 namespace 的 alias，使后续进程可加载同一个 ACP
 ID。所有资源就绪前不会发布 session。load 会预留请求的 ACP ID，重新校验工作区、固定
 sandbox 与 provider 亲和，重建 conversation 和后台 scope，回放历史，然后才发布
-session。close 会先应用 cancel 语义，等待必须的工具终态更新和 prompt 响应，关闭
+session。resume 执行相同检查与重建，但不回放历史。fork 把持久有序上下文与
+provider/sandbox 亲和复制到新的内部和外部 ID，再创建不回放历史的独立 session；来源
+prompt 必须空闲，发布失败会删除复制行。delete 先关闭活动资源，再删除工作区内持久
+session，其 event、alias 和搜索行通过级联清理。close 会先应用 cancel 语义，等待必须的
+工具终态更新和 prompt 响应，关闭
 scope，释放运行时绑定，同时保留持久历史与 alias。EOF 或连接故障会对全部活动中或
 创建中的 session 执行相同的幂等清理。
+详见 [ADR 0050](adr/0050-acp-session-lifecycle.md)。
 
 非空 `mcpServers` 只接受 ACP 基线 stdio 结构；HTTP、SSE 和 ACP 传输会被确定性拒绝。
 每个 server 都必须在 session 发布前完成初始化，并通过有界分页枚举和校验工具目录；

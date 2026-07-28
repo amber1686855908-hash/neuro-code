@@ -21,6 +21,7 @@ from neuro_code.application.ports.approval import PermissionApprover
 from neuro_code.application.ports.storage import SessionStore
 from neuro_code.application.ports.tools import Tool
 from neuro_code.domain.sessions import SessionSummary
+from neuro_code.shared.errors import SessionError
 
 
 class AcpApplicationService:
@@ -83,6 +84,14 @@ class AcpApplicationService:
     async def prepare_session_resume(self, session_id: str) -> AcpPreparedSession:
         return await self._bindings.prepare_session_resume(session_id)
 
+    async def delete_session(self, session_id: str) -> None:
+        await self._require_current_workspace_session(session_id)
+        await self._store.delete_session(session_id)
+
+    async def fork_session(self, session_id: str) -> str:
+        await self._require_current_workspace_session(session_id)
+        return await self._store.fork_session(session_id)
+
     async def bind_session_alias(
         self,
         namespace: str,
@@ -118,6 +127,12 @@ class AcpApplicationService:
             before_updated_at=before_updated_at,
             before_id=before_id,
         )
+
+    async def _require_current_workspace_session(self, session_id: str) -> SessionSummary:
+        summary = await self._store.get_session(session_id)
+        if not self.is_current_workspace(summary.cwd):
+            raise SessionError(f"unknown session: {session_id}")
+        return summary
 
     def explicit_redactions(self) -> tuple[str, ...]:
         protected = {name.casefold() for name in self._metadata.protected_environment_variables}
