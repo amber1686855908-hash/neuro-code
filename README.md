@@ -62,12 +62,17 @@ uv tool install neuro-code
 在任意目录中使用 `neuro`、`neuro code` 或 `neuro-code` 都会以该目录为工作区启动
 TUI。首次启动可在 TUI 内配置模型供应商和 API 密钥；普通设置先显示一级分类，再进入
 语言或供应商详情。供应商页支持保存、编辑和切换多个 profile，并明确区分 OpenAI
-Responses、兼容 Chat 与 DeepSeek。
+Responses、兼容 Chat 与 DeepSeek；还可按 profile 选择环境代理、直连或命名环境变量，
+按需测试连接并加载有界模型目录，以及经二次确认删除配置。认证、端点、限流、代理和网络
+错误会脱敏留在设置页；可修复的受管供应商启动错误也不会退出 TUI。
 
 From any directory, `neuro`, `neuro code`, and `neuro-code` launch the TUI with
 that directory as the workspace. First-run setup and category-first Settings can
 save, edit, and switch multiple provider profiles and their API keys, with
-distinct OpenAI Responses, compatible Chat, and DeepSeek presets.
+distinct OpenAI Responses, compatible Chat, and DeepSeek presets. Per-profile
+proxy modes, on-demand connection testing with a bounded model catalog,
+confirmed deletion, and in-TUI recovery from redacted managed-provider startup
+errors are included.
 
 ## 快速验证 / Quick verification
 

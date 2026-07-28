@@ -1,4 +1,4 @@
-from neuro_code.redaction import redact_sensitive_text
+from neuro_code.shared.redaction import redact_sensitive_text
 
 
 def test_redacts_explicit_values_and_common_credential_shapes() -> None:

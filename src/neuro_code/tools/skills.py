@@ -35,7 +35,7 @@ from neuro_code.adapters.instruction_discovery import (
     _resolve_within_workspace,
     _toctou_safe_read,
 )
-from neuro_code.async_utils import run_blocking
+from neuro_code.application.ports.tools import ToolContext
 from neuro_code.domain.instructions import InstructionRejectionReason
 from neuro_code.domain.skills import (
     MAX_SINGLE_SKILL_BYTES,
@@ -45,8 +45,8 @@ from neuro_code.domain.skills import (
     extract_skill_body,
 )
 from neuro_code.domain.tools import ToolDefinition, ToolResult
-from neuro_code.errors import ToolError
-from neuro_code.ports.tools import ToolContext
+from neuro_code.shared.async_utils import run_blocking
+from neuro_code.shared.errors import ToolError
 
 # Maximum number of bundled files to list alongside the skill body.
 _MAX_BUNDLED_FILES = 10

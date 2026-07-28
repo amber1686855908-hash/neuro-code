@@ -29,8 +29,9 @@ profile。既有手工 TOML 和环境变量 profile 必须继续有效，工作�
 - 供应商预设按线路行为命名，不把所有兼容 OpenAI SDK 的服务当成同一种协议。
   `OpenAI Responses` 选择 `/responses`，`兼容 Chat` 选择 `/chat/completions`，专用
   DeepSeek 预设则使用 Chat Completions 与 `https://api.deepseek.com`。
-- 存储端口提供原子 profile 删除，使 profile 与单独保存的凭据条目一并移除；删除界面仍
-  属于后续切片。
+- 存储端口提供原子 profile 删除，使 profile 与单独保存的凭据条目一并移除；本切片延后
+  删除界面，后续由带确认流程的
+  [ADR 0047](0047-recoverable-managed-provider-proxy-settings.md)补齐。
 - 把已配置凭据值放入不会出现在对象表示中的 `ToolContext.redaction_values`，并在真实工具
   结果进入模型上下文、事件或持久化之前执行脱敏。
 
@@ -40,4 +41,5 @@ profile。既有手工 TOML 和环境变量 profile 必须继续有效，工作�
   覆盖在该次启动中仍然优先。
 - 当前凭据文件是私有文件，但不会做静态加密。端口设计允许以后替换为操作系统钥匙串，
   而无需修改 TUI 或应用契约。
-- 供应商删除界面、远程模型发现、原生安装程序和操作系统钥匙串迁移不在本切片范围内。
+- 远程模型发现、原生安装程序和操作系统钥匙串迁移不在本切片范围内；确认删除与代理恢复
+  由[ADR 0047](0047-recoverable-managed-provider-proxy-settings.md)覆盖。

@@ -20,8 +20,8 @@ from neuro_code.domain.model_events import (
     ModelToolCall,
 )
 from neuro_code.domain.tools import ToolDefinition
-from neuro_code.errors import ProviderError
 from neuro_code.providers.anthropic import AnthropicProvider
+from neuro_code.shared.errors import ProviderError
 
 
 def _sse(*events: object) -> str:

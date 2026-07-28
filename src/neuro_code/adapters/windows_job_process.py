@@ -15,7 +15,7 @@ from typing import NoReturn, Protocol, Self, cast
 from neuro_code.adapters.windows_process import (
     windows_environment_block as _environment_block,
 )
-from neuro_code.async_utils import run_blocking
+from neuro_code.shared.async_utils import run_blocking
 
 _DWORD_MAX = (1 << 32) - 1
 _CREATE_NEW_PROCESS_GROUP = 0x00000200

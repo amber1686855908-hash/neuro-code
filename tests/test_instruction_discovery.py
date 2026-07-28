@@ -20,6 +20,7 @@ from neuro_code.domain.instructions import (
     InstructionRejectionReason,
     compute_instruction_fingerprint,
 )
+from tests.fakes import EmptyWorkspaceChangeObserver
 
 # ---------------------------------------------------------------------------
 # Domain model tests
@@ -476,14 +477,14 @@ class TestRuntimeInstructionInjection:
         """Verify instructions are injected as a synthetic User message, not System."""
         from collections.abc import AsyncIterator, Sequence
 
+        from neuro_code.application.ports.tools import ToolContext
+        from neuro_code.application.runtime.agent import AgentRuntime
         from neuro_code.domain.messages import Message, Role, SyntheticReason
         from neuro_code.domain.model_context import ModelContext
         from neuro_code.domain.model_events import ModelCompleted, ModelEvent, ModelTextDelta
         from neuro_code.domain.reasoning import ReasoningEffort
         from neuro_code.domain.tools import ToolDefinition
         from neuro_code.permissions import PermissionManager, PermissionMode
-        from neuro_code.ports.tools import ToolContext
-        from neuro_code.runtime.agent import AgentRuntime
         from neuro_code.tools.registry import ToolRegistry
 
         (tmp_path / INSTRUCTION_FILENAME).write_text("Use tabs.", encoding="utf-8")
@@ -511,6 +512,7 @@ class TestRuntimeInstructionInjection:
         runtime = AgentRuntime(
             provider=ScriptedProvider(),
             tools=ToolRegistry(),
+            workspace_change_observer=EmptyWorkspaceChangeObserver(),
             permissions=PermissionManager(mode=PermissionMode.BYPASS),
             tool_context=ToolContext(tmp_path),
             max_steps=1,
@@ -549,14 +551,14 @@ class TestRuntimeInstructionInjection:
         """Without an instruction provider, no synthetic User message is injected."""
         from collections.abc import AsyncIterator, Sequence
 
+        from neuro_code.application.ports.tools import ToolContext
+        from neuro_code.application.runtime.agent import AgentRuntime
         from neuro_code.domain.messages import Message, SyntheticReason
         from neuro_code.domain.model_context import ModelContext
         from neuro_code.domain.model_events import ModelCompleted, ModelEvent, ModelTextDelta
         from neuro_code.domain.reasoning import ReasoningEffort
         from neuro_code.domain.tools import ToolDefinition
         from neuro_code.permissions import PermissionManager, PermissionMode
-        from neuro_code.ports.tools import ToolContext
-        from neuro_code.runtime.agent import AgentRuntime
         from neuro_code.tools.registry import ToolRegistry
 
         captured_contexts: list[ModelContext] = []
@@ -578,6 +580,7 @@ class TestRuntimeInstructionInjection:
         runtime = AgentRuntime(
             provider=ScriptedProvider(),
             tools=ToolRegistry(),
+            workspace_change_observer=EmptyWorkspaceChangeObserver(),
             permissions=PermissionManager(mode=PermissionMode.BYPASS),
             tool_context=ToolContext(tmp_path),
             max_steps=1,
@@ -600,14 +603,14 @@ class TestRuntimeInstructionInjection:
         """Verify that instruction content changes are picked up on the next call."""
         from collections.abc import AsyncIterator, Sequence
 
+        from neuro_code.application.ports.tools import ToolContext
+        from neuro_code.application.runtime.agent import AgentRuntime
         from neuro_code.domain.messages import Message, SyntheticReason
         from neuro_code.domain.model_context import ModelContext
         from neuro_code.domain.model_events import ModelCompleted, ModelEvent, ModelTextDelta
         from neuro_code.domain.reasoning import ReasoningEffort
         from neuro_code.domain.tools import ToolDefinition
         from neuro_code.permissions import PermissionManager, PermissionMode
-        from neuro_code.ports.tools import ToolContext
-        from neuro_code.runtime.agent import AgentRuntime
         from neuro_code.tools.registry import ToolRegistry
 
         agents_file = tmp_path / INSTRUCTION_FILENAME
@@ -636,6 +639,7 @@ class TestRuntimeInstructionInjection:
         runtime = AgentRuntime(
             provider=ScriptedProvider(),
             tools=ToolRegistry(),
+            workspace_change_observer=EmptyWorkspaceChangeObserver(),
             permissions=PermissionManager(mode=PermissionMode.BYPASS),
             tool_context=ToolContext(tmp_path),
             max_steps=1,
@@ -685,7 +689,7 @@ class TestInstructionTracker:
     """
 
     def test_initial_target_is_workspace_root(self, tmp_path: Path) -> None:
-        from neuro_code.runtime.instruction_tracker import InstructionTracker
+        from neuro_code.application.runtime.instruction_tracker import InstructionTracker
 
         discovery = FilesystemInstructionDiscovery()
         tracker = InstructionTracker(
@@ -696,7 +700,7 @@ class TestInstructionTracker:
         assert tracker.workspace_root == tmp_path.resolve()
 
     def test_check_path_file_moves_to_parent(self, tmp_path: Path) -> None:
-        from neuro_code.runtime.instruction_tracker import InstructionTracker
+        from neuro_code.application.runtime.instruction_tracker import InstructionTracker
 
         deep_dir = tmp_path / "src" / "deep"
         deep_dir.mkdir(parents=True)
@@ -712,7 +716,7 @@ class TestInstructionTracker:
         assert tracker.target == deep_dir.resolve()
 
     def test_check_path_directory_moves_to_self(self, tmp_path: Path) -> None:
-        from neuro_code.runtime.instruction_tracker import InstructionTracker
+        from neuro_code.application.runtime.instruction_tracker import InstructionTracker
 
         deep_dir = tmp_path / "src" / "deep"
         deep_dir.mkdir(parents=True)
@@ -726,7 +730,7 @@ class TestInstructionTracker:
         assert tracker.target == deep_dir.resolve()
 
     def test_check_path_outside_workspace_ignored(self, tmp_path: Path) -> None:
-        from neuro_code.runtime.instruction_tracker import InstructionTracker
+        from neuro_code.application.runtime.instruction_tracker import InstructionTracker
 
         outside = tmp_path.parent / "outside_workspace_dir"
         outside.mkdir(exist_ok=True)
@@ -745,7 +749,7 @@ class TestInstructionTracker:
 
     def test_subtree_isolation_sibling_excluded(self, tmp_path: Path) -> None:
         """Moving from src/foo/ to src/bar/ must exclude src/foo/AGENTS.md."""
-        from neuro_code.runtime.instruction_tracker import InstructionTracker
+        from neuro_code.application.runtime.instruction_tracker import InstructionTracker
 
         foo_dir = tmp_path / "src" / "foo"
         bar_dir = tmp_path / "src" / "bar"
@@ -776,7 +780,7 @@ class TestInstructionTracker:
 
     def test_current_result_includes_root_and_deep(self, tmp_path: Path) -> None:
         """When target is deep, result includes AGENTS.md from root to target."""
-        from neuro_code.runtime.instruction_tracker import InstructionTracker
+        from neuro_code.application.runtime.instruction_tracker import InstructionTracker
 
         deep_dir = tmp_path / "packages" / "api"
         deep_dir.mkdir(parents=True)
@@ -796,7 +800,7 @@ class TestInstructionTracker:
 
     def test_current_result_not_cached(self, tmp_path: Path) -> None:
         """current_result() re-runs discovery on each call (no caching)."""
-        from neuro_code.runtime.instruction_tracker import InstructionTracker
+        from neuro_code.application.runtime.instruction_tracker import InstructionTracker
 
         agents = tmp_path / INSTRUCTION_FILENAME
         agents.write_text("version 1", encoding="utf-8")
@@ -831,6 +835,9 @@ class TestAgentRuntimeDeepScope:
         step sees both root and deep AGENTS.md instructions."""
         from collections.abc import AsyncIterator, Sequence
 
+        from neuro_code.application.ports.tools import ToolContext
+        from neuro_code.application.runtime.agent import AgentRuntime
+        from neuro_code.application.runtime.instruction_tracker import InstructionTracker
         from neuro_code.domain.messages import Message, SyntheticReason, ToolCall
         from neuro_code.domain.model_context import ModelContext
         from neuro_code.domain.model_events import (
@@ -842,9 +849,6 @@ class TestAgentRuntimeDeepScope:
         from neuro_code.domain.reasoning import ReasoningEffort
         from neuro_code.domain.tools import ToolDefinition
         from neuro_code.permissions import PermissionManager, PermissionMode
-        from neuro_code.ports.tools import ToolContext
-        from neuro_code.runtime.agent import AgentRuntime
-        from neuro_code.runtime.instruction_tracker import InstructionTracker
         from neuro_code.tools import default_tool_registry
 
         # Workspace layout:
@@ -903,6 +907,7 @@ class TestAgentRuntimeDeepScope:
         runtime = AgentRuntime(
             provider=ScriptedProvider(),
             tools=default_tool_registry(),
+            workspace_change_observer=EmptyWorkspaceChangeObserver(),
             permissions=PermissionManager(mode=PermissionMode.BYPASS),
             tool_context=ToolContext(tmp_path, instruction_tracker=tracker),
             max_steps=5,
@@ -940,6 +945,9 @@ class TestAgentRuntimeDeepScope:
         from src/foo/ is excluded on the next step (subtree isolation)."""
         from collections.abc import AsyncIterator, Sequence
 
+        from neuro_code.application.ports.tools import ToolContext
+        from neuro_code.application.runtime.agent import AgentRuntime
+        from neuro_code.application.runtime.instruction_tracker import InstructionTracker
         from neuro_code.domain.messages import Message, SyntheticReason, ToolCall
         from neuro_code.domain.model_context import ModelContext
         from neuro_code.domain.model_events import (
@@ -951,9 +959,6 @@ class TestAgentRuntimeDeepScope:
         from neuro_code.domain.reasoning import ReasoningEffort
         from neuro_code.domain.tools import ToolDefinition
         from neuro_code.permissions import PermissionManager, PermissionMode
-        from neuro_code.ports.tools import ToolContext
-        from neuro_code.runtime.agent import AgentRuntime
-        from neuro_code.runtime.instruction_tracker import InstructionTracker
         from neuro_code.tools import default_tool_registry
 
         foo_dir = tmp_path / "src" / "foo"
@@ -1018,6 +1023,7 @@ class TestAgentRuntimeDeepScope:
         runtime = AgentRuntime(
             provider=ScriptedProvider(),
             tools=default_tool_registry(),
+            workspace_change_observer=EmptyWorkspaceChangeObserver(),
             permissions=PermissionManager(mode=PermissionMode.BYPASS),
             tool_context=ToolContext(tmp_path, instruction_tracker=tracker),
             max_steps=5,
@@ -1115,8 +1121,8 @@ class TestSearchReplacePreFlight:
         """search_replace on a deep file with unseen AGENTS.md must NOT
         modify the file -- it should return the instructions instead.
         """
-        from neuro_code.ports.tools import ToolContext
-        from neuro_code.runtime.instruction_tracker import InstructionTracker
+        from neuro_code.application.ports.tools import ToolContext
+        from neuro_code.application.runtime.instruction_tracker import InstructionTracker
         from neuro_code.tools.filesystem import SearchReplaceTool
 
         # Workspace layout:
@@ -1158,8 +1164,8 @@ class TestSearchReplacePreFlight:
         the tracker there), a subsequent search_replace should proceed because
         the deep AGENTS.md was already in the model instruction context.
         """
-        from neuro_code.ports.tools import ToolContext
-        from neuro_code.runtime.instruction_tracker import InstructionTracker
+        from neuro_code.application.ports.tools import ToolContext
+        from neuro_code.application.runtime.instruction_tracker import InstructionTracker
         from neuro_code.tools.filesystem import ReadFileTool, SearchReplaceTool
 
         (tmp_path / INSTRUCTION_FILENAME).write_text("root rules", encoding="utf-8")
@@ -1199,8 +1205,8 @@ class TestSearchReplacePreFlight:
         self,
         tmp_path: Path,
     ) -> None:
-        from neuro_code.ports.tools import ToolContext
-        from neuro_code.runtime.instruction_tracker import InstructionTracker
+        from neuro_code.application.ports.tools import ToolContext
+        from neuro_code.application.runtime.instruction_tracker import InstructionTracker
         from neuro_code.tools.filesystem import SearchReplaceTool
 
         instructions = tmp_path / INSTRUCTION_FILENAME
@@ -1233,8 +1239,8 @@ class TestGrepRecursiveTracker:
     """
 
     async def test_grep_recursive_moves_tracker_for_deep_matches(self, tmp_path: Path) -> None:
-        from neuro_code.ports.tools import ToolContext
-        from neuro_code.runtime.instruction_tracker import InstructionTracker
+        from neuro_code.application.ports.tools import ToolContext
+        from neuro_code.application.runtime.instruction_tracker import InstructionTracker
         from neuro_code.tools.filesystem import GrepTool
 
         # Workspace layout:

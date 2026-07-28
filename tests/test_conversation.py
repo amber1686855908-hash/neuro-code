@@ -6,19 +6,22 @@ import tempfile
 import unittest
 from collections.abc import AsyncIterator, Sequence
 from pathlib import Path
+from unittest.mock import patch
 
 from neuro_code.adapters.background_tasks import LocalBackgroundTaskManager
 from neuro_code.adapters.sqlite_session import SqliteSessionStore
+from neuro_code.application.ports.tools import ToolContext
+from neuro_code.application.runtime.agent import AgentRuntime
+from neuro_code.application.runtime.conversation import AgentConversation
 from neuro_code.domain.messages import Message, Role
 from neuro_code.domain.model_context import ModelContext
 from neuro_code.domain.model_events import ModelCompleted, ModelEvent, ModelTextDelta
 from neuro_code.domain.sandbox import SandboxProfile
 from neuro_code.domain.tools import ToolDefinition
-from neuro_code.errors import ConfigurationError, ProviderError
 from neuro_code.permissions import PermissionManager
-from neuro_code.ports.tools import ToolContext
-from neuro_code.runtime import AgentConversation, AgentRuntime
+from neuro_code.shared.errors import ConfigurationError, ProviderError
 from neuro_code.tools import default_tool_registry
+from tests.fakes import EmptyWorkspaceChangeObserver, FakeWorkspaceIdentity
 
 
 class ConversationProvider:
@@ -102,6 +105,7 @@ class AgentConversationTests(unittest.IsolatedAsyncioTestCase):
             runtime = AgentRuntime(
                 provider=provider,
                 tools=default_tool_registry(enable_background_tasks=True),
+                workspace_change_observer=EmptyWorkspaceChangeObserver(),
                 permissions=PermissionManager(),
                 tool_context=ToolContext(root, background_tasks=manager),
                 session_store=store,
@@ -110,6 +114,7 @@ class AgentConversationTests(unittest.IsolatedAsyncioTestCase):
                 runtime=runtime,
                 store=store,
                 cwd=root,
+                workspace_identity=FakeWorkspaceIdentity(),
             )
             try:
                 with self.assertRaisesRegex(ProviderError, "fixture provider failure"):
@@ -142,6 +147,7 @@ class AgentConversationTests(unittest.IsolatedAsyncioTestCase):
             runtime = AgentRuntime(
                 provider=provider,
                 tools=default_tool_registry(enable_background_tasks=True),
+                workspace_change_observer=EmptyWorkspaceChangeObserver(),
                 permissions=PermissionManager(),
                 tool_context=ToolContext(root, background_tasks=manager),
                 session_store=store,
@@ -150,6 +156,7 @@ class AgentConversationTests(unittest.IsolatedAsyncioTestCase):
                 runtime=runtime,
                 store=store,
                 cwd=root,
+                workspace_identity=FakeWorkspaceIdentity(),
             )
             try:
                 await conversation.run("first prompt")
@@ -208,6 +215,7 @@ class AgentConversationTests(unittest.IsolatedAsyncioTestCase):
             runtime = AgentRuntime(
                 provider=provider,
                 tools=default_tool_registry(),
+                workspace_change_observer=EmptyWorkspaceChangeObserver(),
                 permissions=PermissionManager(),
                 tool_context=ToolContext(root),
                 session_store=store,
@@ -216,6 +224,7 @@ class AgentConversationTests(unittest.IsolatedAsyncioTestCase):
                 runtime=runtime,
                 store=store,
                 cwd=root,
+                workspace_identity=FakeWorkspaceIdentity(),
             )
 
             first = await conversation.run("first prompt")
@@ -250,6 +259,7 @@ class AgentConversationTests(unittest.IsolatedAsyncioTestCase):
             runtime = AgentRuntime(
                 provider=provider,
                 tools=default_tool_registry(),
+                workspace_change_observer=EmptyWorkspaceChangeObserver(),
                 permissions=PermissionManager(),
                 tool_context=ToolContext(root),
                 session_store=store,
@@ -258,6 +268,7 @@ class AgentConversationTests(unittest.IsolatedAsyncioTestCase):
                 runtime=runtime,
                 store=store,
                 cwd=root,
+                workspace_identity=FakeWorkspaceIdentity(),
             )
 
             with self.assertRaisesRegex(ProviderError, "fixture provider failure"):
@@ -284,6 +295,7 @@ class AgentConversationTests(unittest.IsolatedAsyncioTestCase):
             runtime = AgentRuntime(
                 provider=provider,
                 tools=default_tool_registry(),
+                workspace_change_observer=EmptyWorkspaceChangeObserver(),
                 permissions=PermissionManager(),
                 tool_context=ToolContext(root),
                 session_store=store,
@@ -292,6 +304,7 @@ class AgentConversationTests(unittest.IsolatedAsyncioTestCase):
                 runtime=runtime,
                 store=store,
                 cwd=root,
+                workspace_identity=FakeWorkspaceIdentity(),
             )
 
             turn = asyncio.create_task(conversation.run("cancelled prompt"))
@@ -338,18 +351,29 @@ class AgentConversationTests(unittest.IsolatedAsyncioTestCase):
             runtime = AgentRuntime(
                 provider=provider,
                 tools=default_tool_registry(),
+                workspace_change_observer=EmptyWorkspaceChangeObserver(),
                 permissions=PermissionManager(),
                 tool_context=ToolContext(root),
                 session_store=store,
             )
 
-            with self.assertRaisesRegex(ConfigurationError, "session workspace"):
+            workspace_identity = FakeWorkspaceIdentity(matches_result=False)
+            with (
+                patch.object(
+                    store,
+                    "load_session_items",
+                    side_effect=AssertionError("workspace mismatch must not load session items"),
+                ),
+                self.assertRaisesRegex(ConfigurationError, "session workspace"),
+            ):
                 await AgentConversation.open(
                     runtime=runtime,
                     store=store,
                     cwd=root,
+                    workspace_identity=workspace_identity,
                     resume_id=session_id,
                 )
+            self.assertEqual(workspace_identity.calls, [(str(other), root)])
 
     async def test_resume_rejects_a_different_saved_sandbox_profile(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -365,6 +389,7 @@ class AgentConversationTests(unittest.IsolatedAsyncioTestCase):
             runtime = AgentRuntime(
                 provider=ConversationProvider(("unused",)),
                 tools=default_tool_registry(SandboxProfile.WORKSPACE),
+                workspace_change_observer=EmptyWorkspaceChangeObserver(),
                 permissions=PermissionManager(),
                 tool_context=ToolContext(
                     root,
@@ -373,13 +398,77 @@ class AgentConversationTests(unittest.IsolatedAsyncioTestCase):
                 session_store=store,
             )
 
+            workspace_identity = FakeWorkspaceIdentity()
             with self.assertRaisesRegex(ConfigurationError, "not the active profile 'workspace'"):
                 await AgentConversation.open(
                     runtime=runtime,
                     store=store,
                     cwd=root,
+                    workspace_identity=workspace_identity,
                     resume_id=session_id,
                 )
+            self.assertEqual(workspace_identity.calls, [(str(root), root)])
+
+    async def test_resume_accepts_an_injected_workspace_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = SqliteSessionStore(root / "sessions.db")
+            await store.initialize()
+            session_id = await store.create_session(
+                str(root),
+                "conversation-fixture",
+                "fixture-model",
+            )
+            runtime = AgentRuntime(
+                provider=ConversationProvider(("unused",)),
+                tools=default_tool_registry(),
+                workspace_change_observer=EmptyWorkspaceChangeObserver(),
+                permissions=PermissionManager(),
+                tool_context=ToolContext(root),
+                session_store=store,
+            )
+            workspace_identity = FakeWorkspaceIdentity()
+
+            conversation = await AgentConversation.open(
+                runtime=runtime,
+                store=store,
+                cwd=root,
+                workspace_identity=workspace_identity,
+                resume_id=session_id,
+            )
+
+            self.assertEqual(conversation.session_id, session_id)
+            self.assertEqual(workspace_identity.calls, [(str(root), root)])
+
+    async def test_workspace_identity_exceptions_propagate_from_resume(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = SqliteSessionStore(root / "sessions.db")
+            await store.initialize()
+            session_id = await store.create_session(
+                str(root),
+                "conversation-fixture",
+                "fixture-model",
+            )
+            runtime = AgentRuntime(
+                provider=ConversationProvider(("unused",)),
+                tools=default_tool_registry(),
+                workspace_change_observer=EmptyWorkspaceChangeObserver(),
+                permissions=PermissionManager(),
+                tool_context=ToolContext(root),
+                session_store=store,
+            )
+            workspace_identity = FakeWorkspaceIdentity(error=RuntimeError("identity failure"))
+
+            with self.assertRaisesRegex(RuntimeError, "identity failure"):
+                await AgentConversation.open(
+                    runtime=runtime,
+                    store=store,
+                    cwd=root,
+                    workspace_identity=workspace_identity,
+                    resume_id=session_id,
+                )
+            self.assertEqual(workspace_identity.calls, [(str(root), root)])
 
 
 if __name__ == "__main__":

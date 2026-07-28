@@ -5,14 +5,12 @@ import contextlib
 import hashlib
 import json
 import math
-import os
 import re
 import uuid
 from collections import OrderedDict
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
-from pathlib import Path
 from typing import Any, Literal, cast
 
 from acp.core import run_agent
@@ -56,25 +54,26 @@ from acp.schema import (
 )
 
 from neuro_code import __version__
-from neuro_code.adapters.mcp_stdio import (
+from neuro_code.application.acp.contracts import (
     MAX_MCP_SERVERS,
-    McpStdioError,
-    McpStdioServerConfig,
-    McpStdioToolCollection,
+    AcpMcpServerConfig,
+    AcpMcpToolError,
+    AcpMcpTools,
+    AcpResumeUnavailableError,
+    AcpWorkspaceValidationError,
 )
-from neuro_code.application import ApplicationComposition
-from neuro_code.async_utils import run_blocking
-from neuro_code.domain.events import AgentEvent, AgentEventKind
-from neuro_code.domain.messages import Message, Role, SessionItem, ToolCall
-from neuro_code.domain.sessions import SessionSummary
-from neuro_code.errors import ConfigurationError, ProviderError, SessionError, ToolError
-from neuro_code.permissions import (
+from neuro_code.application.acp.service import AcpApplicationService
+from neuro_code.application.permissions.contracts import (
     PermissionApproval,
     PermissionRequest,
 )
-from neuro_code.redaction import redact_sensitive_text
-from neuro_code.runtime import ConversationBinding, SessionApprovalBroker
-from neuro_code.workspace import workspaces_match
+from neuro_code.application.runtime.approval import SessionApprovalBroker
+from neuro_code.application.runtime.profile_conversation import ConversationBinding
+from neuro_code.domain.events import AgentEvent, AgentEventKind
+from neuro_code.domain.messages import Message, Role, SessionItem, ToolCall
+from neuro_code.domain.sessions import SessionSummary
+from neuro_code.shared.errors import ConfigurationError, ProviderError, SessionError, ToolError
+from neuro_code.shared.redaction import redact_sensitive_text
 
 ACP_PROTOCOL_VERSION = 1
 ACP_STDIO_BUFFER_LIMIT_BYTES = 1024 * 1024
@@ -273,14 +272,14 @@ def _mcp_server_configurations(
     servers: list[McpServer] | None,
     *,
     protected_environment_variables: frozenset[str],
-) -> tuple[McpStdioServerConfig, ...]:
+) -> tuple[AcpMcpServerConfig, ...]:
     if not servers:
         return ()
     if len(servers) > MAX_MCP_SERVERS:
         raise _invalid_params("too_many_mcp_servers")
 
     protected = {name.casefold() for name in protected_environment_variables}
-    configurations: list[McpStdioServerConfig] = []
+    configurations: list[AcpMcpServerConfig] = []
     server_names: set[str] = set()
     serialized: list[dict[str, object]] = []
     for server in servers:
@@ -358,7 +357,7 @@ def _mcp_server_configurations(
             }
         )
         configurations.append(
-            McpStdioServerConfig(
+            AcpMcpServerConfig(
                 name=name,
                 command=command,
                 args=tuple(arguments),
@@ -817,7 +816,7 @@ class _AcpSession:
     binding: ConversationBinding | None
     approvals: SessionApprovalBroker
     context_window_tokens: int | None
-    mcp_tools: McpStdioToolCollection | None
+    mcp_tools: AcpMcpTools | None
     internal_session_id: str | None = None
     prompt_task: asyncio.Task[Any] | None = None
     mapper: _AcpEventMapper | None = None
@@ -838,8 +837,8 @@ class _SessionListCursor:
 class NeuroCodeAcpAgent:
     """Official-SDK ACP v1 adapter for one workspace-bound process."""
 
-    def __init__(self, application: ApplicationComposition) -> None:
-        self._application = application
+    def __init__(self, service: AcpApplicationService) -> None:
+        self._service = service
         self._client: Client | None = None
         self._client_capabilities: ClientCapabilities | None = None
         self._client_info: Implementation | None = None
@@ -908,42 +907,28 @@ class NeuroCodeAcpAgent:
         cwd: str,
         additional_directories: list[str] | None,
         mcp_servers: list[McpServer] | None,
-    ) -> tuple[McpStdioServerConfig, ...]:
+    ) -> tuple[AcpMcpServerConfig, ...]:
         if additional_directories:
             raise _invalid_params("additional_directories_unsupported")
         await self._validate_workspace(cwd)
         return _mcp_server_configurations(
             mcp_servers,
-            protected_environment_variables=(
-                self._application.config.protected_environment_variables
-            ),
+            protected_environment_variables=(self._service.protected_environment_variables),
         )
 
     async def _open_mcp_tools(
         self,
-        configurations: tuple[McpStdioServerConfig, ...],
-    ) -> McpStdioToolCollection | None:
+        configurations: tuple[AcpMcpServerConfig, ...],
+    ) -> AcpMcpTools | None:
         if not configurations:
             return None
-        return await McpStdioToolCollection.open(
-            configurations,
-            cwd=self._application.config.cwd,
-            explicit_redactions=self._explicit_redactions(),
-        )
+        return await self._service.open_mcp_tools(configurations)
 
     async def _validate_workspace(self, cwd: str) -> None:
         try:
-            requested = Path(cwd)
-        except (OSError, RuntimeError, TypeError, ValueError) as error:
-            raise _invalid_params("cwd_invalid", type(error).__name__) from None
-        if not requested.is_absolute():
-            raise _invalid_params("cwd_not_absolute")
-        try:
-            normalized = await run_blocking(requested.resolve, strict=False)
-        except (OSError, RuntimeError) as error:
-            raise _invalid_params("cwd_invalid", type(error).__name__) from None
-        if not workspaces_match(normalized, self._application.config.cwd):
-            raise _invalid_params("cwd_workspace_mismatch")
+            await self._service.validate_workspace(cwd)
+        except AcpWorkspaceValidationError as error:
+            raise _invalid_params(error.reason, error.details) from None
 
     async def _reserve_session_id(self, session_id: str) -> None:
         task = asyncio.current_task()
@@ -992,16 +977,17 @@ class NeuroCodeAcpAgent:
         approvals = SessionApprovalBroker()
         approvals.set_handler(lambda request: self._request_permission(session_id, request))
         binding: ConversationBinding | None = None
-        mcp_tools: McpStdioToolCollection | None = None
+        mcp_tools: AcpMcpTools | None = None
         try:
             mcp_tools = await self._open_mcp_tools(mcp_configurations)
-            binding = await self._application.create_binding(
+            opened_binding = await self._service.create_binding(
                 approver=approvals,
                 additional_tools=mcp_tools.tools if mcp_tools is not None else (),
             )
+            binding = opened_binding.binding
         except asyncio.CancelledError:
             raise
-        except McpStdioError as error:
+        except AcpMcpToolError as error:
             raise _invalid_params(error.reason) from None
         except ToolError:
             raise _invalid_params("mcp_tool_name_collision") from None
@@ -1012,7 +998,7 @@ class NeuroCodeAcpAgent:
                 session_id,
                 binding,
                 approvals,
-                self._application.config.provider.context_window_tokens,
+                opened_binding.context_window_tokens,
                 mcp_tools,
             )
             if await self._publish_session(session):
@@ -1048,10 +1034,10 @@ class NeuroCodeAcpAgent:
 
         await self._reserve_session_id(external_session_id)
         binding: ConversationBinding | None = None
-        mcp_tools: McpStdioToolCollection | None = None
+        mcp_tools: AcpMcpTools | None = None
         try:
             try:
-                internal_session_id = await self._application.store.resolve_session_alias(
+                internal_session_id = await self._service.resolve_session_alias(
                     _ACP_SESSION_ALIAS_NAMESPACE,
                     external_session_id,
                 )
@@ -1059,18 +1045,9 @@ class NeuroCodeAcpAgent:
                 raise _session_not_found(external_session_id) from None
 
             try:
-                selected_config = await self._application.config_for_session_resume(
-                    internal_session_id
-                )
-            except ConfigurationError as error:
-                message = str(error)
-                if "workspace" in message:
-                    reason = "session_workspace_mismatch"
-                elif "sandbox" in message:
-                    reason = "session_sandbox_mismatch"
-                else:
-                    reason = "session_provider_unavailable"
-                raise _invalid_params(reason) from None
+                prepared_session = await self._service.prepare_session_resume(internal_session_id)
+            except AcpResumeUnavailableError as error:
+                raise _invalid_params(error.reason) from None
 
             approvals = SessionApprovalBroker()
             approvals.set_handler(
@@ -1078,15 +1055,13 @@ class NeuroCodeAcpAgent:
             )
             try:
                 mcp_tools = await self._open_mcp_tools(mcp_configurations)
-                binding = await self._application.create_binding(
-                    config=selected_config,
+                binding = await prepared_session.create_binding(
                     approver=approvals,
-                    resume_id=internal_session_id,
                     additional_tools=mcp_tools.tools if mcp_tools is not None else (),
                 )
             except asyncio.CancelledError:
                 raise
-            except McpStdioError as error:
+            except AcpMcpToolError as error:
                 raise _invalid_params(error.reason) from None
             except ToolError:
                 raise _invalid_params("mcp_tool_name_collision") from None
@@ -1102,7 +1077,7 @@ class NeuroCodeAcpAgent:
                 explicit_redactions=self._explicit_redactions(),
             )
             try:
-                await self._application.store.bind_session_alias(
+                await self._service.bind_session_alias(
                     _ACP_SESSION_ALIAS_NAMESPACE,
                     external_session_id,
                     internal_session_id,
@@ -1123,7 +1098,7 @@ class NeuroCodeAcpAgent:
                 external_session_id,
                 binding,
                 approvals,
-                selected_config.provider.context_window_tokens,
+                prepared_session.context_window_tokens,
                 mcp_tools,
                 internal_session_id=internal_session_id,
             )
@@ -1175,7 +1150,7 @@ class NeuroCodeAcpAgent:
     async def _listed_session_id(self, internal_session_id: str) -> str:
         for _attempt in range(4):
             try:
-                return await self._application.store.get_or_create_session_alias(
+                return await self._service.get_or_create_session_alias(
                     _ACP_SESSION_ALIAS_NAMESPACE,
                     internal_session_id,
                     f"acp-{uuid.uuid4().hex}",
@@ -1185,14 +1160,7 @@ class NeuroCodeAcpAgent:
         raise RequestError.internal_error({"reason": "session_alias_allocation_failed"})
 
     def _is_listable_session(self, summary: SessionSummary) -> bool:
-        try:
-            recorded_cwd = Path(summary.cwd)
-        except (OSError, RuntimeError, ValueError):
-            return False
-        return recorded_cwd.is_absolute() and workspaces_match(
-            recorded_cwd,
-            self._application.config.cwd,
-        )
+        return self._service.is_current_workspace(summary.cwd)
 
     async def list_sessions(
         self,
@@ -1214,7 +1182,7 @@ class NeuroCodeAcpAgent:
         try:
             while len(matches) <= ACP_SESSION_LIST_PAGE_SIZE and remaining_scan > 0:
                 batch_limit = min(SESSION_LIST_SCAN_BATCH_SIZE, remaining_scan)
-                batch = await self._application.store.list_sessions_page(
+                batch = await self._service.list_sessions_page(
                     limit=batch_limit,
                     before_updated_at=before_updated_at,
                     before_id=before_id,
@@ -1282,16 +1250,7 @@ class NeuroCodeAcpAgent:
         return session
 
     def _explicit_redactions(self) -> tuple[str, ...]:
-        protected = {
-            name.casefold() for name in self._application.config.protected_environment_variables
-        }
-        return tuple(
-            dict.fromkeys(
-                value
-                for name, value in os.environ.items()
-                if name.casefold() in protected and value
-            )
-        )
+        return self._service.explicit_redactions()
 
     async def _bind_internal_session(
         self,
@@ -1303,7 +1262,7 @@ class NeuroCodeAcpAgent:
             and session.internal_session_id != internal_session_id
         ):
             raise SessionError("ACP session changed its internal session identity")
-        await self._application.store.bind_session_alias(
+        await self._service.bind_session_alias(
             _ACP_SESSION_ALIAS_NAMESPACE,
             session.session_id,
             internal_session_id,
@@ -1541,10 +1500,10 @@ class NeuroCodeAcpAgent:
             )
 
 
-async def serve_acp(application: ApplicationComposition) -> None:
+async def serve_acp(service: AcpApplicationService) -> None:
     """Serve ACP on stdio using only the official SDK transport and router."""
 
-    agent = NeuroCodeAcpAgent(application)
+    agent = NeuroCodeAcpAgent(service)
     try:
         await run_agent(
             cast(Agent, agent),

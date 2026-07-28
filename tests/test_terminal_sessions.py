@@ -3,11 +3,20 @@ from __future__ import annotations
 import asyncio
 import threading
 import unittest
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import mock
 
+from neuro_code.application.permissions.contracts import PermissionApproval, PermissionRequest
+from neuro_code.application.ports.sandbox import ShellLaunch
+from neuro_code.application.ports.terminal import (
+    TerminalEofHandler,
+    TerminalErrorHandler,
+    TerminalOutputHandler,
+)
+from neuro_code.application.ports.workspace import WorkspacePathResolver
+from neuro_code.application.runtime.terminal_sessions import LocalInteractiveTerminalManager
 from neuro_code.domain.sandbox import SandboxProfile
 from neuro_code.domain.terminal import (
     MAX_TERMINAL_OUTPUT_BYTES,
@@ -16,21 +25,25 @@ from neuro_code.domain.terminal import (
     TerminalSignal,
     TerminalSize,
 )
-from neuro_code.errors import PermissionDenied, TerminalError, ToolError
 from neuro_code.permissions import (
-    PermissionApproval,
     PermissionManager,
     PermissionMode,
-    PermissionRequest,
 )
-from neuro_code.ports.sandbox import ShellLaunch
-from neuro_code.ports.terminal import (
-    TerminalEofHandler,
-    TerminalErrorHandler,
-    TerminalOutputHandler,
-)
-from neuro_code.runtime import terminal_sessions
-from neuro_code.runtime.terminal_sessions import LocalInteractiveTerminalManager
+from neuro_code.shared.errors import PermissionDenied, TerminalError, ToolError
+from neuro_code.workspace import FilesystemWorkspacePathResolver
+from tests.fakes import FakeWorkspacePathResolver
+
+
+def _record_resolver_event(events: list[str]) -> Callable[[Path, str], None]:
+    def record(workspace: Path, requested: str) -> None:
+        del workspace, requested
+        events.append("resolver")
+
+    return record
+
+
+def _normalized_workspace(workspace: Path) -> Path:
+    return workspace.expanduser().resolve()
 
 
 class _FakePlatformSession:
@@ -72,7 +85,7 @@ class _FakePlatformSession:
 
 
 class _FakeTerminalPlatform:
-    def __init__(self) -> None:
+    def __init__(self, *, events: list[str] | None = None) -> None:
         self.session = _FakePlatformSession()
         self.spawn_calls: list[dict[str, object]] = []
         self.on_output: TerminalOutputHandler | None = None
@@ -81,6 +94,7 @@ class _FakeTerminalPlatform:
         self.spawn_started = threading.Event()
         self.spawn_release: threading.Event | None = None
         self.spawn_error: BaseException | None = None
+        self._events = events
 
     def spawn_exec(
         self,
@@ -94,6 +108,8 @@ class _FakeTerminalPlatform:
         on_eof: TerminalEofHandler,
         on_error: TerminalErrorHandler,
     ) -> _FakePlatformSession:
+        if self._events is not None:
+            self._events.append("spawn")
         self.spawn_calls.append(
             {
                 "arguments": tuple(arguments),
@@ -127,24 +143,35 @@ class _FakeTerminalPlatform:
 
 
 class _FakeApprover:
-    def __init__(self, approval: PermissionApproval) -> None:
+    def __init__(
+        self,
+        approval: PermissionApproval,
+        *,
+        events: list[str] | None = None,
+    ) -> None:
         self.approval = approval
         self.requests: list[PermissionRequest] = []
+        self._events = events
 
     async def request(self, request: PermissionRequest) -> PermissionApproval:
+        if self._events is not None:
+            self._events.append("approval")
         self.requests.append(request)
         return self.approval
 
 
 class _FakeSandbox:
-    def __init__(self, profile: SandboxProfile) -> None:
+    def __init__(self, profile: SandboxProfile, *, events: list[str] | None = None) -> None:
         self.profile = profile
         self.calls: list[tuple[str, tuple[str, ...]]] = []
+        self._events = events
 
     def shell_launch(self, command: str) -> ShellLaunch:
         raise AssertionError(f"terminal manager must not use shell_launch: {command}")
 
     def exec_launch(self, executable: str, arguments: tuple[str, ...]) -> ShellLaunch:
+        if self._events is not None:
+            self._events.append("sandbox")
         self.calls.append((executable, arguments))
         return ShellLaunch("/sandbox/exec", ("--", executable, *arguments))
 
@@ -159,10 +186,16 @@ class LocalInteractiveTerminalManagerTests(unittest.IsolatedAsyncioTestCase):
         approver: _FakeApprover | None = None,
         sandbox_profile: SandboxProfile = SandboxProfile.OFF,
         shell_sandbox: _FakeSandbox | None = None,
+        workspace_path_resolver: WorkspacePathResolver | None = None,
         max_sessions: int = 8,
     ) -> LocalInteractiveTerminalManager:
         return LocalInteractiveTerminalManager(
             workspace=root,
+            workspace_path_resolver=(
+                FilesystemWorkspacePathResolver()
+                if workspace_path_resolver is None
+                else workspace_path_resolver
+            ),
             permissions=permissions or PermissionManager(mode=PermissionMode.BYPASS),
             approver=approver,
             sandbox_profile=sandbox_profile,
@@ -445,6 +478,168 @@ class LocalInteractiveTerminalManagerTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 outside.rmdir()
 
+    async def test_injected_workspace_resolver_precedes_approval_sandbox_and_spawn(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            expected_workspace = _normalized_workspace(root)
+            child = root / "child"
+            child.mkdir()
+            events: list[str] = []
+            resolver = FakeWorkspacePathResolver(
+                resolved_path=child,
+                on_resolve=_record_resolver_event(events),
+            )
+            platform = _FakeTerminalPlatform(events=events)
+            approver = _FakeApprover(PermissionApproval.allow_once(), events=events)
+            sandbox = _FakeSandbox(SandboxProfile.WORKSPACE, events=events)
+            manager = self._manager(
+                root,
+                platform,
+                permissions=PermissionManager(interactive=True),
+                approver=approver,
+                sandbox_profile=SandboxProfile.WORKSPACE,
+                shell_sandbox=sandbox,
+                workspace_path_resolver=resolver,
+            )
+            try:
+                session = await manager.create_exec(
+                    "call-resolver-order",
+                    "python",
+                    (),
+                    cwd="requested-by-caller",
+                    env={},
+                    size=TerminalSize(80, 24),
+                    output_capacity=100,
+                )
+                self.assertEqual(
+                    resolver.calls,
+                    [(expected_workspace, "requested-by-caller")],
+                )
+                self.assertEqual(events, ["resolver", "approval", "sandbox", "spawn"])
+                await session.close()
+            finally:
+                await manager.shutdown()
+
+    async def test_injected_workspace_resolver_keeps_directory_validation_in_runtime(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            expected_workspace = _normalized_workspace(root)
+            file_path = root / "file.txt"
+            file_path.write_text("fixture", encoding="utf-8")
+            platform = _FakeTerminalPlatform()
+            resolver = FakeWorkspacePathResolver(resolved_path=file_path)
+            manager = self._manager(root, platform, workspace_path_resolver=resolver)
+            try:
+                with self.assertRaisesRegex(
+                    TerminalError,
+                    "terminal working directory is not a directory: 'file.txt'",
+                ):
+                    await manager.create_exec(
+                        "call-file-resolver",
+                        "python",
+                        (),
+                        cwd="file.txt",
+                        env={},
+                        size=TerminalSize(80, 24),
+                        output_capacity=100,
+                    )
+                self.assertEqual(
+                    resolver.calls,
+                    [(expected_workspace, "file.txt")],
+                )
+                self.assertEqual(platform.spawn_calls, [])
+                self.assertEqual(manager._pending_creations, 0)
+            finally:
+                await manager.shutdown()
+
+    async def test_workspace_resolver_failures_have_no_later_side_effects(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            expected_workspace = _normalized_workspace(root)
+            for error in (
+                ToolError("resolver tool failure"),
+                RuntimeError("resolver runtime failure"),
+            ):
+                with self.subTest(error=type(error).__name__):
+                    events: list[str] = []
+                    resolver = FakeWorkspacePathResolver(
+                        resolved_path=root,
+                        error=error,
+                        on_resolve=_record_resolver_event(events),
+                    )
+                    platform = _FakeTerminalPlatform(events=events)
+                    approver = _FakeApprover(PermissionApproval.allow_once(), events=events)
+                    sandbox = _FakeSandbox(SandboxProfile.WORKSPACE, events=events)
+                    manager = self._manager(
+                        root,
+                        platform,
+                        permissions=PermissionManager(interactive=True),
+                        approver=approver,
+                        sandbox_profile=SandboxProfile.WORKSPACE,
+                        shell_sandbox=sandbox,
+                        workspace_path_resolver=resolver,
+                    )
+                    try:
+                        with self.assertRaises(type(error)):
+                            await manager.create_exec(
+                                "call-resolver-error",
+                                "python",
+                                (),
+                                cwd="requested-by-caller",
+                                env={},
+                                size=TerminalSize(80, 24),
+                                output_capacity=100,
+                            )
+                        self.assertEqual(
+                            resolver.calls,
+                            [(expected_workspace, "requested-by-caller")],
+                        )
+                        self.assertEqual(events, ["resolver"])
+                        self.assertEqual(approver.requests, [])
+                        self.assertEqual(sandbox.calls, [])
+                        self.assertEqual(platform.spawn_calls, [])
+                        self.assertEqual(manager._pending_creations, 0)
+                        self.assertTrue(manager._pending_done.is_set())
+                    finally:
+                        await manager.shutdown()
+
+    async def test_workspace_root_resolution_still_fails_during_construction(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            resolver = FakeWorkspacePathResolver(resolved_path=root)
+            platform = _FakeTerminalPlatform()
+            with (
+                mock.patch.object(Path, "resolve", side_effect=OSError("resolver failure")),
+                self.assertRaisesRegex(OSError, "resolver failure"),
+            ):
+                LocalInteractiveTerminalManager(
+                    workspace=root,
+                    workspace_path_resolver=resolver,
+                    permissions=PermissionManager(),
+                    platform=platform,
+                )
+            with (
+                mock.patch.object(Path, "resolve", side_effect=RuntimeError("resolver failure")),
+                self.assertRaisesRegex(RuntimeError, "resolver failure"),
+            ):
+                LocalInteractiveTerminalManager(
+                    workspace=root,
+                    workspace_path_resolver=resolver,
+                    permissions=PermissionManager(),
+                    platform=platform,
+                )
+
+    async def test_platform_is_required(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            resolver = FakeWorkspacePathResolver(resolved_path=root)
+            with self.assertRaises(TypeError):
+                LocalInteractiveTerminalManager(
+                    workspace=root,
+                    workspace_path_resolver=resolver,
+                    permissions=PermissionManager(),
+                )
+
     async def test_limit_close_and_shutdown_pending_creation_do_not_leak_sessions(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)
@@ -627,6 +822,7 @@ class LocalInteractiveTerminalManagerTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(TypeError):
                 LocalInteractiveTerminalManager(
                     workspace="not-a-path",  # type: ignore[arg-type]
+                    workspace_path_resolver=FakeWorkspacePathResolver(resolved_path=root),
                     permissions=PermissionManager(),
                     platform=platform,
                 )
@@ -690,12 +886,6 @@ class LocalInteractiveTerminalManagerTests(unittest.IsolatedAsyncioTestCase):
                     size=TerminalSize(80, 24),
                     output_capacity=100,
                 )
-
-            with (
-                mock.patch.object(terminal_sessions.os, "name", "unsupported"),
-                self.assertRaisesRegex(TerminalError, "unsupported"),
-            ):
-                terminal_sessions._default_platform()
 
 
 if __name__ == "__main__":

@@ -16,8 +16,9 @@ checkout or pass `--source` to `scripts/check_source_baseline.py`.
 
 ## Architecture
 
-- Deliver vertical user capabilities through the ports in
-  `src/neuro_code/ports`.
+- Deliver vertical user capabilities through the canonical ports in
+  `src/neuro_code/application/ports` (`neuro_code.application.ports.*`).
+  New production code must use the canonical application ports paths.
 - Domain/application code must not depend on UI, provider, database, or
   platform implementations.
 - Preserve CLI/config/session/protocol compatibility at boundaries while using

@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import unittest
 
+from neuro_code.application.permissions.contracts import build_permission_request
 from neuro_code.permissions import (
     PermissionEffect,
     PermissionManager,
     PermissionMode,
     PermissionRule,
-    build_permission_request,
 )
 
 

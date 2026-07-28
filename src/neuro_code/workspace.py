@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from neuro_code.errors import ToolError
+from neuro_code.shared.errors import ToolError
 
 
 def workspaces_match(recorded: str | Path, requested: str | Path) -> bool:
@@ -30,6 +30,18 @@ def workspaces_match(recorded: str | Path, requested: str | Path) -> bool:
     )
 
 
+class FilesystemWorkspaceIdentity:
+    """Filesystem-backed workspace identity implementation."""
+
+    def matches(
+        self,
+        recorded: str | Path,
+        requested: str | Path,
+        /,
+    ) -> bool:
+        return workspaces_match(recorded, requested)
+
+
 def resolve_workspace_path(cwd: Path, requested: str, *, must_exist: bool = False) -> Path:
     if not requested or "\x00" in requested:
         raise ToolError("path must be a non-empty filesystem path")
@@ -46,3 +58,15 @@ def resolve_workspace_path(cwd: Path, requested: str, *, must_exist: bool = Fals
     except ValueError as error:
         raise ToolError(f"path escapes the workspace: {requested!r}") from error
     return resolved
+
+
+class FilesystemWorkspacePathResolver:
+    """Filesystem-backed resolver for existing workspace paths."""
+
+    def resolve_existing(
+        self,
+        workspace: Path,
+        requested: str,
+        /,
+    ) -> Path:
+        return resolve_workspace_path(workspace, requested, must_exist=True)

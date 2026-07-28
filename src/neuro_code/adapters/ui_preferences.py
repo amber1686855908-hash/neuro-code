@@ -7,10 +7,10 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-from neuro_code.async_utils import run_blocking
 from neuro_code.domain.interaction_mode import InteractionMode
 from neuro_code.domain.reasoning import ReasoningEffort
 from neuro_code.domain.ui_preferences import UiLanguage
+from neuro_code.shared.async_utils import run_blocking
 
 _SCHEMA_VERSION = 1
 

@@ -34,6 +34,7 @@ from neuro_code.domain.skills import (
     normalize_skill_name,
     parse_frontmatter,
 )
+from tests.fakes import EmptyWorkspaceChangeObserver
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -848,7 +849,7 @@ class TestSkillTracker:
     def test_current_result_reruns_discovery(self, tmp_path: Path) -> None:
         workspace = _make_workspace(tmp_path)
         discovery = FilesystemSkillDiscovery()
-        from neuro_code.runtime.skill_tracker import SkillTracker
+        from neuro_code.application.runtime.skill_tracker import SkillTracker
 
         tracker = SkillTracker(discovery=discovery, workspace_root=workspace)
         result = tracker.current_result()
@@ -863,7 +864,7 @@ class TestSkillTracker:
     def test_workspace_root_property(self, tmp_path: Path) -> None:
         workspace = _make_workspace(tmp_path)
         discovery = FilesystemSkillDiscovery()
-        from neuro_code.runtime.skill_tracker import SkillTracker
+        from neuro_code.application.runtime.skill_tracker import SkillTracker
 
         tracker = SkillTracker(discovery=discovery, workspace_root=workspace)
         assert tracker.workspace_root == workspace.resolve()
@@ -899,10 +900,10 @@ class TestAgentRuntimeSkillInjection:
 
         # Build a minimal AgentRuntime mock to test the injection logic.
         # We test _model_items_with_reasoning_guidance directly.
+        from neuro_code.application.ports.model import ModelProvider
+        from neuro_code.application.runtime.agent import AgentRuntime
         from neuro_code.domain.messages import Role
         from neuro_code.permissions import PermissionManager, PermissionMode
-        from neuro_code.ports.model import ModelProvider
-        from neuro_code.runtime.agent import AgentRuntime
         from neuro_code.tools.registry import ToolRegistry
 
         provider = MagicMock(spec=ModelProvider)
@@ -912,6 +913,7 @@ class TestAgentRuntimeSkillInjection:
         runtime = AgentRuntime(
             provider=provider,
             tools=tools,
+            workspace_change_observer=EmptyWorkspaceChangeObserver(),
             permissions=permissions,
             tool_context=tool_context,
             skill_provider=skill_provider,
@@ -929,11 +931,11 @@ class TestAgentRuntimeSkillInjection:
     def test_no_skills_no_injection(self) -> None:
         from unittest.mock import MagicMock
 
+        from neuro_code.application.ports.model import ModelProvider
+        from neuro_code.application.runtime.agent import AgentRuntime
         from neuro_code.domain.messages import Role
         from neuro_code.domain.skills import SkillDiscoveryResult
         from neuro_code.permissions import PermissionManager, PermissionMode
-        from neuro_code.ports.model import ModelProvider
-        from neuro_code.runtime.agent import AgentRuntime
         from neuro_code.tools.registry import ToolRegistry
 
         def skill_provider() -> SkillDiscoveryResult | None:
@@ -946,6 +948,7 @@ class TestAgentRuntimeSkillInjection:
         runtime = AgentRuntime(
             provider=provider,
             tools=tools,
+            workspace_change_observer=EmptyWorkspaceChangeObserver(),
             permissions=permissions,
             tool_context=tool_context,
             skill_provider=skill_provider,
@@ -959,10 +962,10 @@ class TestAgentRuntimeSkillInjection:
     def test_skill_provider_none_no_injection(self) -> None:
         from unittest.mock import MagicMock
 
+        from neuro_code.application.ports.model import ModelProvider
+        from neuro_code.application.runtime.agent import AgentRuntime
         from neuro_code.domain.messages import Role
         from neuro_code.permissions import PermissionManager, PermissionMode
-        from neuro_code.ports.model import ModelProvider
-        from neuro_code.runtime.agent import AgentRuntime
         from neuro_code.tools.registry import ToolRegistry
 
         provider = MagicMock(spec=ModelProvider)
@@ -972,6 +975,7 @@ class TestAgentRuntimeSkillInjection:
         runtime = AgentRuntime(
             provider=provider,
             tools=tools,
+            workspace_change_observer=EmptyWorkspaceChangeObserver(),
             permissions=permissions,
             tool_context=tool_context,
         )
@@ -1527,7 +1531,7 @@ class TestSkillTrackerDynamicTarget:
     """Tests for SkillTracker's moving target (check_path / current_result)."""
 
     def test_initial_target_defaults_to_workspace_root(self, tmp_path: Path) -> None:
-        from neuro_code.runtime.skill_tracker import SkillTracker
+        from neuro_code.application.runtime.skill_tracker import SkillTracker
 
         workspace = _make_workspace(tmp_path)
         discovery = FilesystemSkillDiscovery()
@@ -1535,7 +1539,7 @@ class TestSkillTrackerDynamicTarget:
         assert tracker.target == workspace.resolve()
 
     def test_initial_target_can_be_set(self, tmp_path: Path) -> None:
-        from neuro_code.runtime.skill_tracker import SkillTracker
+        from neuro_code.application.runtime.skill_tracker import SkillTracker
 
         workspace = _make_workspace(tmp_path)
         sub = workspace / "src" / "foo"
@@ -1549,7 +1553,7 @@ class TestSkillTrackerDynamicTarget:
         assert tracker.target == sub.resolve()
 
     def test_check_path_updates_target(self, tmp_path: Path) -> None:
-        from neuro_code.runtime.skill_tracker import SkillTracker
+        from neuro_code.application.runtime.skill_tracker import SkillTracker
 
         workspace = _make_workspace(tmp_path)
         sub = workspace / "src" / "foo"
@@ -1560,7 +1564,7 @@ class TestSkillTrackerDynamicTarget:
         assert tracker.target == sub.resolve()
 
     def test_check_path_file_uses_parent(self, tmp_path: Path) -> None:
-        from neuro_code.runtime.skill_tracker import SkillTracker
+        from neuro_code.application.runtime.skill_tracker import SkillTracker
 
         workspace = _make_workspace(tmp_path)
         sub = workspace / "src" / "foo"
@@ -1573,7 +1577,7 @@ class TestSkillTrackerDynamicTarget:
         assert tracker.target == sub.resolve()
 
     def test_check_path_outside_workspace_ignored(self, tmp_path: Path) -> None:
-        from neuro_code.runtime.skill_tracker import SkillTracker
+        from neuro_code.application.runtime.skill_tracker import SkillTracker
 
         workspace = _make_workspace(tmp_path)
         outside = tmp_path / "outside"
@@ -1585,7 +1589,7 @@ class TestSkillTrackerDynamicTarget:
         assert tracker.target == workspace.resolve()
 
     def test_initial_target_outside_workspace_falls_back(self, tmp_path: Path) -> None:
-        from neuro_code.runtime.skill_tracker import SkillTracker
+        from neuro_code.application.runtime.skill_tracker import SkillTracker
 
         workspace = _make_workspace(tmp_path)
         outside = tmp_path / "outside"
@@ -1602,7 +1606,7 @@ class TestSkillTrackerDynamicTarget:
     def test_check_path_resolve_error_ignored(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        from neuro_code.runtime.skill_tracker import SkillTracker
+        from neuro_code.application.runtime.skill_tracker import SkillTracker
 
         workspace = _make_workspace(tmp_path)
         discovery = FilesystemSkillDiscovery()
@@ -1620,7 +1624,7 @@ class TestSkillTrackerDynamicTarget:
         assert tracker.target == workspace.resolve()
 
     def test_current_result_uses_target(self, tmp_path: Path) -> None:
-        from neuro_code.runtime.skill_tracker import SkillTracker
+        from neuro_code.application.runtime.skill_tracker import SkillTracker
 
         workspace = _make_workspace(tmp_path)
         _make_nested_skill(workspace, "src/foo", ".neuro", "nested")
@@ -1636,7 +1640,7 @@ class TestSkillTrackerDynamicTarget:
         assert result.files[0].name == "nested"
 
     def test_target_moves_between_subtrees(self, tmp_path: Path) -> None:
-        from neuro_code.runtime.skill_tracker import SkillTracker
+        from neuro_code.application.runtime.skill_tracker import SkillTracker
 
         workspace = _make_workspace(tmp_path)
         _make_nested_skill(workspace, "src/foo", ".neuro", "foo-skill")

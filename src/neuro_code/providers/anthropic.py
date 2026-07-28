@@ -5,6 +5,7 @@ from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass, field
 from typing import Any, cast
 
+from neuro_code.application.ports.http import HttpClientPolicy
 from neuro_code.domain.messages import (
     IMAGE_MODEL_PLACEHOLDER,
     ContentPartKind,
@@ -21,14 +22,13 @@ from neuro_code.domain.model_events import (
     ModelToolCall,
 )
 from neuro_code.domain.tools import ToolDefinition
-from neuro_code.errors import ProviderError
-from neuro_code.ports.http import HttpClientPolicy
 from neuro_code.providers.image_references import (
     ANTHROPIC_IMAGE_MEDIA_TYPES,
     ANTHROPIC_MAX_INLINE_IMAGE_BYTES,
     InlineImageReference,
     parse_image_reference,
 )
+from neuro_code.shared.errors import ProviderError
 
 
 @dataclass(slots=True)

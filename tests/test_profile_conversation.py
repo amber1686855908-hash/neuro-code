@@ -7,6 +7,13 @@ from dataclasses import replace
 from datetime import UTC, datetime
 from typing import cast
 
+from neuro_code.application.ports.background_tasks import BackgroundTaskManager
+from neuro_code.application.runtime.agent import AgentRunResult, EventSink
+from neuro_code.application.runtime.profile_conversation import (
+    ConversationBinding,
+    ProfileConversationController,
+    ProviderOption,
+)
 from neuro_code.domain.background_tasks import BackgroundTaskSnapshot, BackgroundTaskStatus
 from neuro_code.domain.interaction_mode import InteractionMode
 from neuro_code.domain.messages import Message, Role, SessionItem
@@ -17,15 +24,7 @@ from neuro_code.domain.sandbox import SandboxProfile
 from neuro_code.domain.session_search import SessionSearchHit
 from neuro_code.domain.sessions import SessionSummary
 from neuro_code.domain.tools import ToolDefinition
-from neuro_code.errors import ConfigurationError
-from neuro_code.ports.background_tasks import BackgroundTaskManager
-from neuro_code.runtime import (
-    AgentRunResult,
-    ConversationBinding,
-    ProfileConversationController,
-    ProviderOption,
-)
-from neuro_code.runtime.agent import EventSink
+from neuro_code.shared.errors import ConfigurationError
 
 
 class FixtureProvider:

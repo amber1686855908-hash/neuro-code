@@ -16,7 +16,7 @@ from neuro_code.domain.background_tasks import (
     BackgroundTaskStatus,
     BackgroundTaskWaitMode,
 )
-from neuro_code.errors import ToolError
+from neuro_code.shared.errors import ToolError
 
 
 class LocalBackgroundTaskManagerTests(unittest.IsolatedAsyncioTestCase):

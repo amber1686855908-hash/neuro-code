@@ -5,6 +5,7 @@ from collections.abc import AsyncIterator, Sequence
 from typing import Any, cast
 from urllib.parse import quote
 
+from neuro_code.application.ports.http import HttpClientPolicy
 from neuro_code.domain.messages import (
     IMAGE_MODEL_PLACEHOLDER,
     ContentPartKind,
@@ -21,8 +22,6 @@ from neuro_code.domain.model_events import (
     ModelToolCall,
 )
 from neuro_code.domain.tools import ToolDefinition
-from neuro_code.errors import ProviderError
-from neuro_code.ports.http import HttpClientPolicy
 from neuro_code.providers.image_references import (
     GEMINI_IMAGE_MEDIA_TYPES,
     GEMINI_MAX_INLINE_IMAGE_BYTES,
@@ -31,6 +30,7 @@ from neuro_code.providers.image_references import (
     is_gemini_file_uri,
     parse_image_reference,
 )
+from neuro_code.shared.errors import ProviderError
 
 
 class GeminiProvider:

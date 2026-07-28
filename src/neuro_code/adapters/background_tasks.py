@@ -10,6 +10,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from neuro_code.adapters.process_tree import ProcessTree
+from neuro_code.application.ports.background_tasks import BackgroundTaskManager
 from neuro_code.domain.background_tasks import (
     MAX_BACKGROUND_TASK_WAIT_IDS,
     BackgroundTaskKillOutcome,
@@ -19,8 +20,7 @@ from neuro_code.domain.background_tasks import (
     BackgroundTaskWaitMode,
     BackgroundTaskWaitResult,
 )
-from neuro_code.errors import ToolError
-from neuro_code.ports.background_tasks import BackgroundTaskManager
+from neuro_code.shared.errors import ToolError
 
 
 class _BoundedOutput:

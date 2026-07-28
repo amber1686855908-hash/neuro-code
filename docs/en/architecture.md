@@ -22,28 +22,103 @@ explicit adapters and must report unavailable rather than simulate success.
 ## Dependency direction
 
 ```text
-interfaces (CLI, TUI, ACP, WebSocket)
-                    |
-application (agent loop, sessions, commands, tasks)
-                    |
-domain (messages, events, tools, permissions, errors)
-                    |
-ports (model, storage, tool, workspace, sandbox, hooks)
-                    |
-adapters (providers, SQLite, MCP, Git, PTY, OS, HTTP)
+interfaces ------> application ------> domain
+                         |
+                         +-----------> application/ports <------- infrastructure
+
+bootstrap ------> interfaces + application + infrastructure
+domain + application + infrastructure + interfaces ------> shared
 ```
 
-Dependencies point downward. Domain and application modules must not import a
-UI framework, provider SDK, database driver, or platform implementation.
-Adapters implement typed ports and are selected only at the composition root.
+The target package boundaries are `domain` for pure values and rules,
+`application` for orchestration, `application/ports` for required abstractions,
+`infrastructure` for concrete outbound adapters, `interfaces` for inbound
+adapters, `bootstrap` for configuration/factories/assembly, and `shared` for
+small cross-cutting primitives. Bootstrap is the only layer allowed to depend
+on interfaces, application, and infrastructure together. Domain and
+application must not import concrete infrastructure implementations.
+Canonical process entry points live in bootstrap. The few inbound-to-bootstrap
+compatibility and launch edges are individually recorded by the AST guard; they
+do not permit an interface to assemble concrete dependencies itself.
 
-`ApplicationComposition` is the interface-neutral process composition service.
-It resolves configuration and provider overrides, performs session-sandbox
-preflight, initializes SQLite, creates providers/tools/permission managers and
-conversation-scoped background-task registries, and owns supervisor shutdown.
-CLI, TUI, and ACP translate their own arguments or protocol values into this
-service. The application module has no dependency on argparse, Textual, ACP
-schema types, ACP clients, or stdio.
+Stage 1 established `neuro_code.shared.{errors,async_utils,redaction}` and
+`neuro_code.application.ports.*` as canonical paths. The development-stage
+breaking cleanup removed the root shared compatibility modules
+`neuro_code.{errors,async_utils,redaction}` and `neuro_code.ports`; shared
+primitives and port contracts are available only from their canonical paths.
+Stage 2A establishes
+`neuro_code.application.settings.ApplicationSettings` and
+`neuro_code.bootstrap.composition.ApplicationComposition` as canonical paths.
+`neuro_code.application` retains only its lazy `ApplicationSettings` package
+export; composition must be imported explicitly from `bootstrap.composition`,
+so an ordinary `application.ports` import does not load bootstrap or concrete
+infrastructure. Approval interaction contracts now live only in
+`neuro_code.application.permissions.contracts`. The development-stage breaking
+cleanup removed the root `PermissionApproval`, `PermissionApprovalKind`,
+`PermissionRequest`, and `build_permission_request` re-exports;
+`neuro_code.permissions` retains only synchronous permission policy
+implementation.
+
+Stage 2B establishes `neuro_code.bootstrap.entrypoints` as the canonical CLI
+and TUI launcher, and the console scripts plus `python -m neuro_code` now use
+it directly. It selects application composition, SQLite session storage, the
+historical session importer, TUI settings/catalog/preferences ports, and
+workspace identity behavior only when the corresponding command needs them.
+`neuro_code.cli` retains parsing, dispatch, rendering, and exit-code handling;
+its injected `run` function is invoked by the canonical bootstrap entrypoint.
+Importing the CLI does not load bootstrap, adapters, providers, or create
+resources.
+
+Stage 2C keeps `neuro_code.acp` in place as the ACP/JSON-RPC inbound adapter,
+but gives it only `application.acp` contracts and an ACP-specific application
+service. The service exposes binding creation and safe resume preparation,
+session aliases and listing, workspace validation, protocol metadata, and a
+session-lazy MCP tool context. `bootstrap.entrypoints` adapts
+`ApplicationComposition`, the session store, workspace identity checks, and
+the concrete stdio MCP collection to those contracts, then starts the server.
+`serve_acp` accepts only the resulting `AcpApplicationService`; it no longer
+adapts an `ApplicationComposition` caller. ACP no longer imports MCP or workspace implementations, or reads composition
+configuration or storage directly; importing ACP does not load bootstrap, the
+MCP adapter, SQLite storage, or providers.
+
+Application runtime behavior currently lives in the explicit canonical
+submodules of `neuro_code.application.runtime`:
+`background_task_reminders`, `agent`, `conversation`, `profile_conversation`,
+`terminal_sessions`, `approval`, `instruction_tracker`, and `skill_tracker`.
+The development-stage breaking cleanup removed `neuro_code.runtime`; runtime
+application behavior is available only from these explicit canonical
+submodules. `neuro_code.application.runtime.__init__` currently remains minimal
+and provides no aggregate API, and internal production code imports the
+canonical submodules directly.
+
+`neuro_code.config` currently owns `AppConfig` and `ProviderProfile`, TOML and
+CC Switch configuration, environment overrides, routing, managed overlays,
+sandbox policy, stored-credential injection, and HTTP proxy policy. The
+synchronous managed JSON reader in
+`neuro_code.configuration.managed_provider_settings` owns schema, protocol,
+and dialect checks, the file-size limit, metadata/credentials merging,
+structural validation, and `ManagedProviderSettings` construction.
+`neuro_code.adapters.provider_settings` owns `JsonProviderSettingsStore`,
+asynchronous persistence, atomic writes, and POSIX private permissions. It uses
+the canonical reader through a private binding and no longer re-exports it.
+`neuro_code.config` likewise uses the reader through a private binding and no
+longer imports the provider-settings adapter; `ProviderProfile` and `AppConfig`
+replace its removed `ProviderConfig` alias for this boundary.
+The active temporary allowlist is empty. The only remaining raw forbidden edge
+is the canonical package-executable entrypoint,
+`neuro_code.__main__ -> neuro_code.bootstrap.entrypoints`; it is not
+compatibility debt.
+
+`ApplicationComposition` in `bootstrap.composition` resolves configuration and
+provider overrides, performs session-sandbox preflight, initializes SQLite,
+creates providers/tools/permission managers and conversation-scoped
+background-task registries, and owns supervisor shutdown. Stage 2A changes only
+its structural ownership: the initialization and failure-cleanup ordering is
+unchanged. CLI, TUI, and ACP continue to share the same service and typed
+runtime event stream.
+
+See [ADR 0049](adr/0049-progressive-architecture-boundaries.md) for the complete
+dependency rules, compatibility migration policy, and allowlist discipline.
 
 ## Runtime event model
 
@@ -552,6 +627,9 @@ workspace changes, and terminal status are rendered in one bounded, in-place
 tree. For a side-effecting local tool, the runtime compares bounded read-only
 workspace snapshots taken after permission succeeds and immediately around the
 execution. The report is audit metadata, not a permission or success signal.
+`WorkspaceChangeObserver` is an application-composition dependency created per
+binding by bootstrap; `AgentRuntime` construction is not promised as a stable
+external Python API.
 See [ADR 0028](adr/0028-timed-tool-feedback-and-interaction-modes.md) and
 [ADR 0029](adr/0029-auditable-in-place-tool-cards.md).
 
@@ -697,10 +775,17 @@ The composition root selects a named `ProviderProfile`; the agent runtime never
 branches on a commercial provider name. Profiles separate wire protocol
 (`openai-chat`, `openai-responses`, `anthropic-messages`, or
 `gemini-generate-content`) from optional dialect behavior such as xAI Responses.
+The generic Responses adapter is implemented at
+`neuro_code.providers.openai_responses.OpenAIResponsesProvider`; xAI behavior
+is selected through `dialect = "xai"`, not through a separate Python provider
+class. The development-stage breaking cleanup removed
+`neuro_code.providers.xai_responses` and `XAIResponsesProvider`.
 Credentials are environment references or a validated loopback-proxy
 placeholder for manual TOML profiles. The TUI additionally uses a
 `ProviderSettingsStore` port for user-managed profiles. Its JSON adapter writes
 non-secret metadata and credentials to separate atomic owner-private files;
+proxy mode and an optional environment-variable name are non-secret metadata,
+while the resolved proxy URL remains environment-only;
 `ProviderProfile.stored_api_key` is excluded from representations and redacted
 inspection, and explicit configured values are scrubbed at the runtime
 tool-result boundary before they reach model context, events, or persistence.
@@ -716,9 +801,25 @@ rebuilt. First-run setup occurs before application composition, so an absent
 provider never creates a partial runtime. Normal Settings routes through a
 category screen to separate language/provider detail screens. Presets map
 explicitly to wire behavior: OpenAI Responses uses `openai-responses`, while
-Compatible Chat and DeepSeek use `openai-chat`; the adapter also deletes profile
-metadata and its credential entry together. See
-[ADR 0046](adr/0046-global-cli-and-managed-provider-settings.md).
+Compatible Chat and DeepSeek use `openai-chat`. The provider detail screen runs
+the same `HttpClientPolicy` resolver before persistence, requires a second
+confirmation before deleting metadata plus credentials, and requests a safe
+reload afterward. Startup preflight routes an invalid managed default back to
+this focused screen with the redacted error and selected profile; explicit CLI
+overrides and unmanaged configuration continue to fail at the CLI boundary.
+An injected `ProviderCatalog` port gives the detail screen a separate,
+user-triggered read-only network boundary. Its HTTPX adapter reuses the draft
+`HttpClientPolicy`, sends credentials only in protocol-native headers, and maps
+OpenAI-compatible/Responses, Anthropic, and Gemini profiles to their model-list
+endpoints. It reads at most one MiB, returns at most 200 unique model IDs, never
+renders an error response body, and classifies failures for localized recovery.
+Catalog values live only in the current screen; neither credentials nor remote
+responses are added to provider metadata. Manual model input remains available
+for compatible services without a catalog endpoint.
+See [ADR 0046](adr/0046-global-cli-and-managed-provider-settings.md) and
+[ADR 0047](adr/0047-recoverable-managed-provider-proxy-settings.md). Read-only
+connection discovery is defined by
+[ADR 0048](adr/0048-bounded-provider-connection-discovery.md).
 
 An optional positive `context_window_tokens` field records provider/model
 capability metadata. It is propagated through redacted profile selection and

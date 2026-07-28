@@ -5,9 +5,9 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from neuro_code.application.ports.tools import ToolContext
 from neuro_code.domain.sandbox import SandboxProfile
-from neuro_code.errors import ToolError
-from neuro_code.ports.tools import ToolContext
+from neuro_code.shared.errors import ToolError
 from neuro_code.tools import default_tool_registry
 from neuro_code.tools.filesystem import GrepTool, ReadFileTool, SearchReplaceTool
 from neuro_code.workspace import resolve_workspace_path, workspaces_match

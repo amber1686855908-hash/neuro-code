@@ -4,13 +4,13 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 from neuro_code.adapters.windows_conpty import WindowsPseudoConsoleSession
-from neuro_code.domain.terminal import TerminalSignal, TerminalSize
-from neuro_code.ports.terminal import (
+from neuro_code.application.ports.terminal import (
     TerminalEofHandler,
     TerminalErrorHandler,
     TerminalOutputHandler,
     TerminalPlatformSession,
 )
+from neuro_code.domain.terminal import TerminalSignal, TerminalSize
 
 
 class WindowsConPtySession:

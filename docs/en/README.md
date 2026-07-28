@@ -128,7 +128,12 @@ On a first launch with no ready provider, the TUI opens its provider setup form
 before composing an agent runtime. Normal Settings first shows language and
 model-provider categories, then opens only the selected detail screen. Provider
 settings can create or edit OpenAI Responses, OpenAI-compatible Chat, DeepSeek,
-Anthropic, Gemini, or xAI profiles and save-and-use one immediately. The initial
+Anthropic, Gemini, or xAI profiles and save-and-use one immediately. Each
+managed profile can inherit environment proxies, connect directly, or read an
+explicit proxy from a named environment variable. Deletion requires a second
+confirmation and removes the corresponding credential. If a managed default
+profile cannot start because of its proxy configuration, the TUI opens that
+profile with the error ready to repair instead of exiting to the terminal. The initial
 TUI provides prompt input, scrollback, streamed
 assistant text, provider/tool status,
 and local `/help`, `/status`, `/settings` (alias `/setting`), `/provider`, `/model`,
@@ -214,6 +219,16 @@ then choose interface language or model providers. Provider details distinguish
 OpenAI Responses (`/responses`) from OpenAI-compatible Chat Completions
 (`/chat/completions`); the DeepSeek preset selects the latter and fills
 `https://api.deepseek.com`.
+Provider details run the same local proxy-policy resolver used by the runtime
+before writing settings; this does not send a network request. An explicit
+**Test and load models** action performs a read-only catalog request with the
+draft endpoint, credential, and proxy policy. It sends no conversation and
+creates no model generation charge. Successful results appear as an in-memory,
+bounded model picker while manual identifiers remain available.
+Authentication, endpoint/protocol, timeout, rate-limit, server, proxy, network,
+and malformed-catalog failures remain redacted on the current settings screen;
+response bodies are never rendered or persisted. Managed deletion requires a
+second confirmation.
 The selected language immediately updates application-owned controls, dialogs,
 and status text; prompts and model/tool content are never translated. The choice
 is stored with the reasoning-effort and interaction-mode preferences, separately from provider
@@ -540,7 +555,10 @@ proxy_url_env = "NEURO_DEEPSEEK_PROXY_URL"
 Inspection exposes only the mode, environment-variable name, and a configured
 boolean. Proxy URLs and credentials are redacted from errors. The ambiguous
 `socks://` scheme is rejected instead of guessed; use `socks5://` or
-`socks5h://` with HTTPX's optional SOCKS dependency, or use an HTTP proxy.
+`socks5h://` with HTTPX's optional SOCKS dependency, or use an HTTP proxy. The
+released package exposes that dependency as `neuro-code[socks]`. The TUI runs
+the same validation before saving a managed profile; a failing managed default
+opens provider settings for repair during startup preflight.
 See [ADR 0012](adr/0012-provider-http-proxy-policy.md) and the official
 [HTTPX environment-variable documentation](https://www.python-httpx.org/environment_variables/).
 

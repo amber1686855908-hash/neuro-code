@@ -3,10 +3,11 @@ from __future__ import annotations
 import unittest
 from datetime import UTC, datetime
 
-from neuro_code.domain.background_tasks import BackgroundTaskSnapshot, BackgroundTaskStatus
-from neuro_code.runtime.background_task_reminders import (
+from neuro_code.application.runtime.background_task_reminders import (
+    BACKGROUND_TASK_COMPLETION_BATCH_LIMIT,
     format_background_task_completion_reminder,
 )
+from neuro_code.domain.background_tasks import BackgroundTaskSnapshot, BackgroundTaskStatus
 
 
 def snapshot(status: BackgroundTaskStatus) -> BackgroundTaskSnapshot:
@@ -26,6 +27,9 @@ def snapshot(status: BackgroundTaskStatus) -> BackgroundTaskSnapshot:
 
 
 class BackgroundTaskReminderTests(unittest.TestCase):
+    def test_batch_limit_remains_twenty(self) -> None:
+        self.assertEqual(BACKGROUND_TASK_COMPLETION_BATCH_LIMIT, 20)
+
     def test_reminder_contains_only_escaped_bounded_metadata(self) -> None:
         reminder = format_background_task_completion_reminder(
             (snapshot(BackgroundTaskStatus.FAILED),),

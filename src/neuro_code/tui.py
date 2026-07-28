@@ -9,6 +9,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, ClassVar, Protocol
+from urllib.parse import urlsplit
 
 from rich.console import RenderableType
 from rich.markdown import Markdown
@@ -27,22 +28,14 @@ from textual.theme import Theme
 from textual.widgets import Button, Header, Input, Label, Static
 from textual.worker import Worker
 
-from neuro_code.domain.background_tasks import BackgroundTaskSnapshot, BackgroundTaskStatus
-from neuro_code.domain.context_usage import estimate_context_tokens, estimate_text_tokens
-from neuro_code.domain.events import AgentEvent, AgentEventKind
-from neuro_code.domain.interaction_mode import InteractionMode
-from neuro_code.domain.messages import Message, Role, SessionItem
-from neuro_code.domain.provider_settings import ManagedProviderProfile, ManagedProviderSettings
-from neuro_code.domain.reasoning import ReasoningEffort
-from neuro_code.domain.sessions import SessionSummary
-from neuro_code.domain.ui_preferences import UiLanguage
-from neuro_code.permissions import PermissionApproval, PermissionRequest
-from neuro_code.ports.provider_settings import ProviderSettingsStore
-from neuro_code.ports.ui_preferences import UiPreferencesStore
-from neuro_code.redaction import redact_sensitive_text
-from neuro_code.runtime.agent import AgentRunResult, EventSink
-from neuro_code.runtime.approval import ApprovalHandler
-from neuro_code.runtime.profile_conversation import (
+from neuro_code.application.permissions.contracts import PermissionApproval, PermissionRequest
+from neuro_code.application.ports.http import HttpClientPolicy
+from neuro_code.application.ports.provider_catalog import ProviderCatalog
+from neuro_code.application.ports.provider_settings import ProviderSettingsStore
+from neuro_code.application.ports.ui_preferences import UiPreferencesStore
+from neuro_code.application.runtime.agent import AgentRunResult, EventSink
+from neuro_code.application.runtime.approval import ApprovalHandler
+from neuro_code.application.runtime.profile_conversation import (
     InteractionModeSelectionResult,
     ProviderOption,
     ProviderSelectionResult,
@@ -50,6 +43,22 @@ from neuro_code.runtime.profile_conversation import (
     SessionOption,
     SessionSelectionResult,
 )
+from neuro_code.config import resolve_http_client_policy
+from neuro_code.domain.background_tasks import BackgroundTaskSnapshot, BackgroundTaskStatus
+from neuro_code.domain.context_usage import estimate_context_tokens, estimate_text_tokens
+from neuro_code.domain.events import AgentEvent, AgentEventKind
+from neuro_code.domain.interaction_mode import InteractionMode
+from neuro_code.domain.messages import Message, Role, SessionItem
+from neuro_code.domain.provider_catalog import (
+    ProviderCatalogError,
+    ProviderCatalogResult,
+    ProviderConnectionSpec,
+)
+from neuro_code.domain.provider_settings import ManagedProviderProfile, ManagedProviderSettings
+from neuro_code.domain.reasoning import ReasoningEffort
+from neuro_code.domain.sessions import SessionSummary
+from neuro_code.domain.ui_preferences import UiLanguage
+from neuro_code.shared.redaction import redact_sensitive_text
 from neuro_code.tui_commands import SlashCompletion, slash_completions
 from neuro_code.tui_text import language_name, ui_text
 
@@ -180,6 +189,14 @@ _PROVIDER_PRESETS: tuple[ProviderPreset, ...] = (
     ),
     ProviderPreset("xai", "openai-responses", "xai", "https://api.x.ai/v1"),
 )
+
+
+def _is_deepseek_base_url(value: str) -> bool:
+    try:
+        return urlsplit(value.strip()).hostname == "api.deepseek.com"
+    except ValueError:
+        return False
+
 
 _MARKDOWN_THEME = RichTheme(
     {
@@ -354,7 +371,8 @@ class ToolFeedbackState:
 
 @dataclass(frozen=True, slots=True)
 class ProviderSettingsSubmission:
-    profile_name: str
+    profile_name: str | None
+    operation: str = "saved"
 
 
 class AssistantMarkdown(Markdown):
@@ -682,6 +700,9 @@ class ProviderSettingsScreen(ModalScreen[ProviderSettingsSubmission | None]):
 
     #provider-settings-description,
     #provider-settings-protocol-hint,
+    #provider-settings-proxy-title,
+    #provider-settings-proxy-hint,
+    #provider-settings-connection-status,
     #provider-settings-error,
     #provider-settings-empty {
         color: $text-muted;
@@ -690,6 +711,21 @@ class ProviderSettingsScreen(ModalScreen[ProviderSettingsSubmission | None]):
 
     #provider-settings-protocol-hint {
         color: #9cc4cc;
+    }
+
+    #provider-settings-proxy-title {
+        color: $text;
+        text-style: bold;
+        margin-top: 1;
+    }
+
+    #provider-settings-proxy-hint {
+        color: #9cc4cc;
+    }
+
+    #provider-settings-connection-status {
+        margin-top: 1;
+        margin-bottom: 1;
     }
 
     #provider-settings-error {
@@ -702,6 +738,18 @@ class ProviderSettingsScreen(ModalScreen[ProviderSettingsSubmission | None]):
         margin-bottom: 1;
     }
 
+    #provider-settings-models {
+        display: none;
+        height: auto;
+        max-height: 10;
+        margin-bottom: 1;
+    }
+
+    #provider-settings-models Button {
+        width: 100%;
+        margin-bottom: 1;
+    }
+
     #provider-settings-profiles Button {
         width: 100%;
         margin-bottom: 1;
@@ -710,6 +758,7 @@ class ProviderSettingsScreen(ModalScreen[ProviderSettingsSubmission | None]):
     #provider-settings-presets,
     #provider-settings-presets-row-one,
     #provider-settings-presets-row-two,
+    #provider-settings-proxy-modes,
     #provider-settings-form,
     #provider-settings-actions {
         height: auto;
@@ -730,6 +779,11 @@ class ProviderSettingsScreen(ModalScreen[ProviderSettingsSubmission | None]):
 
     #provider-settings-form Input {
         margin-bottom: 0;
+    }
+
+    #provider-settings-proxy-modes Button {
+        width: 1fr;
+        margin-right: 1;
     }
 
     #provider-settings-form {
@@ -755,15 +809,24 @@ class ProviderSettingsScreen(ModalScreen[ProviderSettingsSubmission | None]):
         language: UiLanguage,
         provider_settings: ManagedProviderSettings,
         provider_settings_store: ProviderSettingsStore,
+        provider_catalog: ProviderCatalog | None = None,
         first_run: bool = False,
+        initial_profile: str | None = None,
+        initial_error: str | None = None,
     ) -> None:
         super().__init__()
         self.language = language
         self.provider_settings = provider_settings
         self.provider_settings_store = provider_settings_store
+        self.provider_catalog = provider_catalog
         self.first_run = first_run
+        self.initial_profile = initial_profile
+        self.initial_error = initial_error
         self._editing_profile: str | None = None
         self._active_preset = "openai"
+        self._active_proxy_mode = "environment"
+        self._delete_confirmation_for: str | None = None
+        self._catalog_model_ids: dict[str, str] = {}
         self._profile_ids = {
             f"provider-settings-profile-{index}": profile.name
             for index, profile in enumerate(provider_settings.profiles)
@@ -798,14 +861,26 @@ class ProviderSettingsScreen(ModalScreen[ProviderSettingsSubmission | None]):
         ]
         actions: list[Any] = []
         if not self.first_run:
-            actions.append(
-                Button(ui_text(self.language, "settings.back"), id="provider-settings-back")
+            actions.extend(
+                (
+                    Button(ui_text(self.language, "settings.back"), id="provider-settings-back"),
+                    Button(
+                        ui_text(self.language, "provider_settings.delete"),
+                        id="provider-settings-delete",
+                        disabled=True,
+                    ),
+                )
             )
         actions.extend(
             (
                 Button(
                     ui_text(self.language, "provider_settings.new"),
                     id="provider-settings-new",
+                ),
+                Button(
+                    ui_text(self.language, "provider_settings.connection.test"),
+                    id="provider-settings-test",
+                    disabled=self.provider_catalog is None,
                 ),
                 Button(
                     ui_text(self.language, "provider_settings.save_use"),
@@ -858,6 +933,43 @@ class ProviderSettingsScreen(ModalScreen[ProviderSettingsSubmission | None]):
                         password=True,
                         id="provider-settings-api-key",
                     ),
+                    Static(
+                        ui_text(self.language, "provider_settings.proxy.title"),
+                        id="provider-settings-proxy-title",
+                    ),
+                    Horizontal(
+                        Button(
+                            ui_text(self.language, "provider_settings.proxy.environment"),
+                            id="provider-settings-proxy-environment",
+                            variant="primary",
+                        ),
+                        Button(
+                            ui_text(self.language, "provider_settings.proxy.direct"),
+                            id="provider-settings-proxy-direct",
+                        ),
+                        Button(
+                            ui_text(self.language, "provider_settings.proxy.explicit"),
+                            id="provider-settings-proxy-explicit",
+                        ),
+                        id="provider-settings-proxy-modes",
+                    ),
+                    Input(
+                        placeholder=ui_text(
+                            self.language,
+                            "provider_settings.proxy.environment_variable",
+                        ),
+                        id="provider-settings-proxy-env",
+                        disabled=True,
+                    ),
+                    Static(
+                        ui_text(
+                            self.language,
+                            "provider_settings.proxy.hint.environment",
+                        ),
+                        id="provider-settings-proxy-hint",
+                    ),
+                    Static("", id="provider-settings-connection-status"),
+                    VerticalScroll(id="provider-settings-models"),
                     id="provider-settings-form",
                 ),
                 Static("", id="provider-settings-error"),
@@ -876,7 +988,16 @@ class ProviderSettingsScreen(ModalScreen[ProviderSettingsSubmission | None]):
         return f"{profile.name} · {profile.model}{suffix}"
 
     def on_mount(self) -> None:
-        self.query_one("#provider-settings-name", Input).focus()
+        if self.initial_profile is not None:
+            self._edit_profile(self.initial_profile)
+        if self.initial_error:
+            self._show_provider_error(self.initial_error)
+        focus_target = (
+            "#provider-settings-model"
+            if self._editing_profile is not None
+            else "#provider-settings-name"
+        )
+        self.query_one(focus_target, Input).focus()
 
     async def on_button_pressed(self, event: Button.Pressed) -> None:
         button_id = event.button.id or ""
@@ -884,14 +1005,41 @@ class ProviderSettingsScreen(ModalScreen[ProviderSettingsSubmission | None]):
         if profile_name is not None:
             self._edit_profile(profile_name)
             return
+        catalog_model = self._catalog_model_ids.get(button_id)
+        if catalog_model is not None:
+            self.query_one("#provider-settings-model", Input).value = catalog_model
+            self._show_connection_status(
+                ui_text(
+                    self.language,
+                    "provider_settings.connection.selected",
+                    model=catalog_model,
+                ),
+                kind="success",
+            )
+            return
         if button_id.startswith("provider-settings-preset-"):
             self._select_preset(button_id.removeprefix("provider-settings-preset-"))
+            return
+        if button_id.startswith("provider-settings-proxy-"):
+            self._select_proxy_mode(button_id.removeprefix("provider-settings-proxy-"))
             return
         if button_id == "provider-settings-new":
             self._new_profile()
             return
         if button_id == "provider-settings-save":
             await self._save_provider()
+            return
+        if button_id == "provider-settings-test":
+            self.run_worker(
+                self._test_connection(),
+                name="provider-model-discovery",
+                group="provider-model-discovery",
+                exclusive=True,
+                exit_on_error=False,
+            )
+            return
+        if button_id == "provider-settings-delete":
+            await self._delete_provider()
             return
         if button_id == "provider-settings-back":
             self.dismiss(None)
@@ -901,6 +1049,7 @@ class ProviderSettingsScreen(ModalScreen[ProviderSettingsSubmission | None]):
         if profile is None:
             return
         self._editing_profile = name
+        self._clear_model_catalog()
         name_input = self.query_one("#provider-settings-name", Input)
         name_input.value = profile.name
         name_input.disabled = True
@@ -908,13 +1057,18 @@ class ProviderSettingsScreen(ModalScreen[ProviderSettingsSubmission | None]):
         self.query_one("#provider-settings-base-url", Input).value = profile.base_url
         self.query_one("#provider-settings-api-key", Input).value = ""
         self._select_preset(self._preset_for_profile(profile), update_endpoint=False)
+        self.query_one("#provider-settings-proxy-env", Input).value = profile.proxy_url_env or ""
+        self._select_proxy_mode(profile.proxy_mode)
+        self._reset_delete_confirmation()
+        if not self.first_run:
+            self.query_one("#provider-settings-delete", Button).disabled = False
         self._show_provider_error("")
         self.query_one("#provider-settings-model", Input).focus()
 
     @staticmethod
     def _preset_for_profile(profile: ManagedProviderProfile) -> str:
         base_url = profile.base_url.rstrip("/").casefold()
-        if base_url == "https://api.deepseek.com":
+        if _is_deepseek_base_url(profile.base_url):
             return "deepseek"
         exact = next(
             (
@@ -940,12 +1094,18 @@ class ProviderSettingsScreen(ModalScreen[ProviderSettingsSubmission | None]):
 
     def _new_profile(self) -> None:
         self._editing_profile = None
+        self._clear_model_catalog()
         name_input = self.query_one("#provider-settings-name", Input)
         name_input.disabled = False
         name_input.value = ""
         self.query_one("#provider-settings-model", Input).value = ""
         self.query_one("#provider-settings-api-key", Input).value = ""
+        self.query_one("#provider-settings-proxy-env", Input).value = ""
         self._select_preset("openai")
+        self._select_proxy_mode("environment")
+        self._reset_delete_confirmation()
+        if not self.first_run:
+            self.query_one("#provider-settings-delete", Button).disabled = True
         self._show_provider_error("")
         name_input.focus()
 
@@ -956,6 +1116,7 @@ class ProviderSettingsScreen(ModalScreen[ProviderSettingsSubmission | None]):
         )
         if preset is None:
             return
+        self._clear_model_catalog()
         self._active_preset = preset_name
         for candidate in _PROVIDER_PRESETS:
             button = self.query_one(f"#provider-settings-preset-{candidate.name}", Button)
@@ -970,16 +1131,204 @@ class ProviderSettingsScreen(ModalScreen[ProviderSettingsSubmission | None]):
         if update_endpoint:
             self.query_one("#provider-settings-base-url", Input).value = preset.base_url
 
+    def _select_proxy_mode(self, proxy_mode: str) -> None:
+        if proxy_mode not in {"environment", "direct", "explicit"}:
+            return
+        self._clear_model_catalog()
+        self._active_proxy_mode = proxy_mode
+        for candidate in ("environment", "direct", "explicit"):
+            button = self.query_one(f"#provider-settings-proxy-{candidate}", Button)
+            button.variant = "primary" if candidate == proxy_mode else "default"
+        proxy_env = self.query_one("#provider-settings-proxy-env", Input)
+        proxy_env.disabled = proxy_mode != "explicit"
+        self.query_one("#provider-settings-proxy-hint", Static).update(
+            ui_text(self.language, f"provider_settings.proxy.hint.{proxy_mode}")
+        )
+        self._reset_delete_confirmation()
+
+    def _connection_spec(self) -> tuple[ProviderConnectionSpec, HttpClientPolicy]:
+        preset = next(entry for entry in _PROVIDER_PRESETS if entry.name == self._active_preset)
+        base_url = self.query_one("#provider-settings-base-url", Input).value.strip()
+        if _is_deepseek_base_url(base_url) and preset.protocol != "openai-chat":
+            raise ValueError(ui_text(self.language, "provider_settings.deepseek_protocol_required"))
+        name = self.query_one("#provider-settings-name", Input).value.strip()
+        existing = self.provider_settings.profile(name)
+        entered_api_key = self.query_one("#provider-settings-api-key", Input).value.strip()
+        api_key = entered_api_key or (existing.api_key if existing is not None else None)
+        if api_key is None:
+            raise ValueError(ui_text(self.language, "provider_settings.api_key_required"))
+        proxy_url_env = (
+            self.query_one("#provider-settings-proxy-env", Input).value.strip() or None
+            if self._active_proxy_mode == "explicit"
+            else None
+        )
+        policy = resolve_http_client_policy(
+            proxy_mode=self._active_proxy_mode,
+            proxy_url_env=proxy_url_env,
+            environ=os.environ,
+        )
+        return (
+            ProviderConnectionSpec(
+                protocol=preset.protocol,
+                dialect=preset.dialect,
+                base_url=base_url,
+                api_key=api_key,
+            ),
+            policy,
+        )
+
+    async def _test_connection(self) -> None:
+        if self.provider_catalog is None:
+            return
+        button = self.query_one("#provider-settings-test", Button)
+        button.disabled = True
+        button.label = ui_text(self.language, "provider_settings.connection.testing")
+        self._clear_model_catalog()
+        self._show_provider_error("")
+        self._show_connection_status(
+            ui_text(self.language, "provider_settings.connection.testing"),
+            kind="normal",
+        )
+        signature: tuple[str, ...] | None = None
+        spec: ProviderConnectionSpec | None = None
+        try:
+            spec, policy = self._connection_spec()
+            signature = self._connection_signature()
+            result = await self.provider_catalog.discover_models(spec, http_policy=policy)
+            if signature != self._connection_signature():
+                self._show_connection_status(
+                    ui_text(self.language, "provider_settings.connection.stale"),
+                    kind="warning",
+                )
+                return
+            await self._show_model_catalog(result)
+        except Exception as error:
+            if signature is not None and signature != self._connection_signature():
+                self._show_connection_status(
+                    ui_text(self.language, "provider_settings.connection.stale"),
+                    kind="warning",
+                )
+            else:
+                self._show_connection_status(
+                    self._connection_error_message(
+                        error,
+                        api_key=spec.api_key if spec is not None else None,
+                    ),
+                    kind="error",
+                )
+        finally:
+            button.disabled = False
+            button.label = ui_text(self.language, "provider_settings.connection.test")
+
+    def _connection_signature(self) -> tuple[str, ...]:
+        return (
+            self._active_preset,
+            self._active_proxy_mode,
+            self.query_one("#provider-settings-name", Input).value,
+            self.query_one("#provider-settings-base-url", Input).value,
+            self.query_one("#provider-settings-api-key", Input).value,
+            self.query_one("#provider-settings-proxy-env", Input).value,
+        )
+
+    async def _show_model_catalog(self, result: ProviderCatalogResult) -> None:
+        container = self.query_one("#provider-settings-models", VerticalScroll)
+        await container.remove_children()
+        self._catalog_model_ids = {
+            f"provider-settings-catalog-model-{index}": model
+            for index, model in enumerate(result.models)
+        }
+        if result.models:
+            await container.mount(
+                *(
+                    Button(Text(model), id=button_id)
+                    for button_id, model in self._catalog_model_ids.items()
+                )
+            )
+            container.display = True
+        else:
+            container.display = False
+        selected_model = self.query_one("#provider-settings-model", Input).value.strip()
+        if not result.models:
+            message = ui_text(self.language, "provider_settings.connection.success_empty")
+            kind = "success"
+        elif selected_model and selected_model in result.models:
+            message = ui_text(
+                self.language,
+                "provider_settings.connection.success_selected",
+                count=len(result.models),
+                model=selected_model,
+            )
+            kind = "success"
+        elif selected_model:
+            message = ui_text(
+                self.language,
+                "provider_settings.connection.success_missing",
+                count=len(result.models),
+                model=selected_model,
+            )
+            kind = "warning"
+        else:
+            message = ui_text(
+                self.language,
+                "provider_settings.connection.success",
+                count=len(result.models),
+            )
+            kind = "success"
+        if result.truncated:
+            message += ui_text(self.language, "provider_settings.connection.truncated")
+        self._show_connection_status(message, kind=kind)
+
+    def _connection_error_message(self, error: Exception, *, api_key: str | None = None) -> str:
+        if isinstance(error, ProviderCatalogError):
+            key = {
+                "authentication": "authentication",
+                "endpoint": "endpoint",
+                "timeout": "timeout",
+                "rate_limit": "rate_limit",
+                "server": "server",
+                "http": "http",
+                "proxy": "proxy",
+                "network": "network",
+                "response_too_large": "response_too_large",
+                "invalid_response": "invalid_response",
+            }.get(error.kind, "unknown")
+            return ui_text(
+                self.language,
+                f"provider_settings.connection.error.{key}",
+                status=error.status_code if error.status_code is not None else "?",
+                detail=error.detail or ui_text(self.language, "value.unknown"),
+            )
+        entered_api_key = self.query_one("#provider-settings-api-key", Input).value.strip()
+        return redact_sensitive_text(str(error), explicit_values=(entered_api_key, api_key or ""))
+
+    def _clear_model_catalog(self) -> None:
+        self._catalog_model_ids = {}
+        if self.is_mounted:
+            self.query_one("#provider-settings-models", VerticalScroll).display = False
+            self.query_one("#provider-settings-connection-status", Static).update("")
+
+    def _show_connection_status(self, message: str, *, kind: str) -> None:
+        color = {
+            "success": "#78c2a4",
+            "warning": "#e59c74",
+            "error": "#c76d6d",
+        }.get(kind, "#9cc4cc")
+        self.query_one("#provider-settings-connection-status", Static).update(
+            Text(message, style=color)
+        )
+
     async def _save_provider(self) -> None:
         preset = next(entry for entry in _PROVIDER_PRESETS if entry.name == self._active_preset)
         api_key = self.query_one("#provider-settings-api-key", Input).value.strip() or None
         name = self.query_one("#provider-settings-name", Input).value.strip()
         base_url = self.query_one("#provider-settings-base-url", Input).value.strip()
+        proxy_url_env = (
+            self.query_one("#provider-settings-proxy-env", Input).value.strip() or None
+            if self._active_proxy_mode == "explicit"
+            else None
+        )
         try:
-            if (
-                base_url.rstrip("/").casefold() == "https://api.deepseek.com"
-                and preset.protocol != "openai-chat"
-            ):
+            if _is_deepseek_base_url(base_url) and preset.protocol != "openai-chat":
                 raise ValueError(
                     ui_text(self.language, "provider_settings.deepseek_protocol_required")
                 )
@@ -989,16 +1338,54 @@ class ProviderSettingsScreen(ModalScreen[ProviderSettingsSubmission | None]):
                 dialect=preset.dialect,
                 model=self.query_one("#provider-settings-model", Input).value.strip(),
                 base_url=base_url,
+                proxy_mode=self._active_proxy_mode,
+                proxy_url_env=proxy_url_env,
                 api_key=api_key,
             )
             existing = self.provider_settings.profile(name)
             if existing is None and api_key is None:
                 raise ValueError(ui_text(self.language, "provider_settings.api_key_required"))
+            resolve_http_client_policy(
+                proxy_mode=profile.proxy_mode,
+                proxy_url_env=profile.proxy_url_env,
+                environ=os.environ,
+            )
             await self.provider_settings_store.save_profile(profile, make_default=True)
         except Exception as error:
-            self._show_provider_error(f"{type(error).__name__}: {error}")
+            self._show_provider_error(str(error))
             return
         self.dismiss(ProviderSettingsSubmission(profile.name))
+
+    async def _delete_provider(self) -> None:
+        profile_name = self._editing_profile
+        if profile_name is None:
+            return
+        if self._delete_confirmation_for != profile_name:
+            self._delete_confirmation_for = profile_name
+            button = self.query_one("#provider-settings-delete", Button)
+            button.label = ui_text(self.language, "provider_settings.delete_confirm")
+            button.variant = "error"
+            self._show_provider_error(
+                ui_text(
+                    self.language,
+                    "provider_settings.delete_warning",
+                    profile=profile_name,
+                )
+            )
+            return
+        try:
+            await self.provider_settings_store.delete_profile(profile_name)
+        except Exception as error:
+            self._show_provider_error(str(error))
+            return
+        self.dismiss(ProviderSettingsSubmission(profile_name, operation="deleted"))
+
+    def _reset_delete_confirmation(self) -> None:
+        self._delete_confirmation_for = None
+        if not self.first_run and self.is_mounted:
+            button = self.query_one("#provider-settings-delete", Button)
+            button.label = ui_text(self.language, "provider_settings.delete")
+            button.variant = "default"
 
     def _show_provider_error(self, message: str) -> None:
         self.query_one("#provider-settings-error", Static).update(message)
@@ -1008,7 +1395,7 @@ class ProviderSettingsScreen(ModalScreen[ProviderSettingsSubmission | None]):
 
 
 class ProviderSetupApp(App[bool]):
-    """First-run TUI that creates the initial usable provider profile."""
+    """Focused provider setup used for first run and recoverable startup errors."""
 
     CSS = "Screen { background: $background; }"
 
@@ -1017,14 +1404,22 @@ class ProviderSetupApp(App[bool]):
         *,
         provider_settings: ManagedProviderSettings,
         provider_settings_store: ProviderSettingsStore,
+        provider_catalog: ProviderCatalog | None = None,
         language: UiLanguage = UiLanguage.ENGLISH,
+        first_run: bool = True,
+        initial_profile: str | None = None,
+        initial_error: str | None = None,
     ) -> None:
         super().__init__()
         self.register_theme(_NEURO_CODE_THEME)
         self.theme = _NEURO_CODE_THEME.name
         self._provider_settings = provider_settings
         self._provider_settings_store = provider_settings_store
+        self._provider_catalog = provider_catalog
         self._language = language
+        self._first_run = first_run
+        self._initial_profile = initial_profile
+        self._initial_error = initial_error
 
     def on_mount(self) -> None:
         self.push_screen(
@@ -1032,7 +1427,10 @@ class ProviderSetupApp(App[bool]):
                 language=self._language,
                 provider_settings=self._provider_settings,
                 provider_settings_store=self._provider_settings_store,
-                first_run=True,
+                provider_catalog=self._provider_catalog,
+                first_run=self._first_run,
+                initial_profile=self._initial_profile,
+                initial_error=self._initial_error,
             ),
             self._setup_finished,
         )
@@ -1767,6 +2165,7 @@ class NeuroCodeApp(App[None]):
         task_controller: TaskController | None = None,
         ui_preferences: UiPreferencesStore | None = None,
         provider_settings_store: ProviderSettingsStore | None = None,
+        provider_catalog: ProviderCatalog | None = None,
         managed_provider_settings: ManagedProviderSettings | None = None,
         language: UiLanguage = UiLanguage.ENGLISH,
         initial_items: Sequence[SessionItem] = (),
@@ -1823,6 +2222,7 @@ class NeuroCodeApp(App[None]):
         self._task_controller = task_controller
         self._ui_preferences = ui_preferences
         self._provider_settings_store = provider_settings_store
+        self._provider_catalog = provider_catalog
         self._managed_provider_settings = managed_provider_settings
         self._language = language
         self._initial_items = tuple(initial_items)
@@ -2948,6 +3348,7 @@ class NeuroCodeApp(App[None]):
                     language=self._language,
                     provider_settings=self._managed_provider_settings,
                     provider_settings_store=self._provider_settings_store,
+                    provider_catalog=self._provider_catalog,
                 ),
                 self._provider_settings_selected,
             )

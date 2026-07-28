@@ -1,3 +1,3 @@
-from neuro_code.cli import main
+from neuro_code.bootstrap.entrypoints import main
 
 raise SystemExit(main())

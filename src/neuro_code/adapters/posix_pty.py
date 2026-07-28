@@ -12,13 +12,13 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Self
 
-from neuro_code.domain.terminal import TerminalSignal, TerminalSize
-from neuro_code.ports.terminal import (
+from neuro_code.application.ports.terminal import (
     TerminalEofHandler,
     TerminalErrorHandler,
     TerminalOutputHandler,
     TerminalPlatformSession,
 )
+from neuro_code.domain.terminal import TerminalSignal, TerminalSize
 
 
 class PosixPtySession:

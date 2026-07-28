@@ -15,7 +15,9 @@
 
 ## 架构规则
 
-- 通过 `src/neuro_code/ports` 中的端口交付纵向用户能力。
+- 通过 `src/neuro_code/application/ports` 中的 canonical 端口交付纵向用户能力，
+  代码导入路径为 `neuro_code.application.ports.*`。新的生产代码必须使用 canonical
+  application ports 路径。
 - 领域层/应用层代码不得依赖 UI、供应商、数据库或平台实现。
 - 在外部边界保持 CLI、配置、会话和协议兼容，内部采用 Python 原生设计。
 - 所有副作用都必须经过权限系统以及工作区/平台适配器。

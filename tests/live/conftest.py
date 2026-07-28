@@ -4,8 +4,8 @@ import os
 
 import pytest
 
+from neuro_code.application.ports.model import ModelProvider
 from neuro_code.config import ProviderProfile
-from neuro_code.ports.model import ModelProvider
 from neuro_code.providers import create_provider
 
 
@@ -14,11 +14,11 @@ def _environment_value(name: str, default: str = "") -> str:
 
 
 @pytest.fixture(scope="session")
-def deepseek_provider() -> ModelProvider:
+def deepseek_profile() -> ProviderProfile:
     if not _environment_value("DEEPSEEK_API_KEY"):
         pytest.skip("DEEPSEEK_API_KEY is not configured")
     proxy_mode = _environment_value("NEURO_CODE_LIVE_PROXY_MODE", "environment")
-    profile = ProviderProfile(
+    return ProviderProfile(
         name="live-deepseek",
         protocol="openai-chat",
         model=_environment_value("NEURO_CODE_LIVE_DEEPSEEK_MODEL", "deepseek-chat"),
@@ -31,4 +31,8 @@ def deepseek_provider() -> ModelProvider:
         proxy_mode=proxy_mode,
         proxy_url_env="NEURO_CODE_LIVE_PROXY_URL" if proxy_mode == "explicit" else None,
     )
-    return create_provider(profile)
+
+
+@pytest.fixture(scope="session")
+def deepseek_provider(deepseek_profile: ProviderProfile) -> ModelProvider:
+    return create_provider(deepseek_profile)

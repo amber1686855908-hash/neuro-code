@@ -43,7 +43,14 @@ from neuro_code.acp import (
     convert_prompt_content,
     serve_acp,
 )
-from neuro_code.application import ApplicationComposition
+from neuro_code.application.acp.service import AcpApplicationService
+from neuro_code.application.permissions.contracts import PermissionApproval, PermissionRequest
+from neuro_code.application.ports.approval import PermissionApprover
+from neuro_code.application.ports.model import ModelProvider
+from neuro_code.application.runtime.agent import AgentRunResult, EventSink
+from neuro_code.application.runtime.profile_conversation import ConversationBinding
+from neuro_code.bootstrap.composition import ApplicationComposition
+from neuro_code.bootstrap.entrypoints import BootstrapCliServices
 from neuro_code.config import AppConfig, ProviderProfile
 from neuro_code.domain.events import AgentEvent, AgentEventKind
 from neuro_code.domain.interaction_mode import InteractionMode
@@ -61,12 +68,7 @@ from neuro_code.domain.reasoning import ReasoningEffort
 from neuro_code.domain.sandbox import SandboxProfile
 from neuro_code.domain.sessions import SessionSummary
 from neuro_code.domain.tools import ToolDefinition, ToolResult
-from neuro_code.errors import ConfigurationError, ProviderError, SessionError
-from neuro_code.permissions import PermissionApproval, PermissionRequest
-from neuro_code.ports.approval import PermissionApprover
-from neuro_code.ports.model import ModelProvider
-from neuro_code.runtime.agent import AgentRunResult, EventSink
-from neuro_code.runtime.profile_conversation import ConversationBinding
+from neuro_code.shared.errors import ConfigurationError, ProviderError, SessionError
 
 
 class AcpClientFixture:
@@ -114,11 +116,14 @@ class ProviderFixture:
 
 
 class BackgroundTasksFixture:
-    def __init__(self) -> None:
+    def __init__(self, cleanup_events: list[str] | None = None) -> None:
         self.shutdown_calls = 0
+        self._cleanup_events = cleanup_events
 
     async def shutdown(self) -> None:
         self.shutdown_calls += 1
+        if self._cleanup_events is not None:
+            self._cleanup_events.append("binding")
 
 
 class McpToolFixture:
@@ -135,12 +140,15 @@ class McpToolFixture:
 
 
 class McpCollectionFixture:
-    def __init__(self) -> None:
+    def __init__(self, cleanup_events: list[str] | None = None) -> None:
         self.tools = (McpToolFixture(),)
         self.close_calls = 0
+        self._cleanup_events = cleanup_events
 
     async def close(self) -> None:
         self.close_calls += 1
+        if self._cleanup_events is not None:
+            self._cleanup_events.append("mcp")
 
 
 class RunnerFixture:
@@ -294,6 +302,7 @@ class ApplicationFixture:
         self.resume_ids: list[str | None] = []
         self.additional_tool_names: list[tuple[str, ...]] = []
         self.resume_error: ConfigurationError | None = None
+        self.cleanup_events: list[str] | None = None
 
     async def config_for_session_resume(self, session_id: str) -> AppConfig:
         del session_id
@@ -313,7 +322,7 @@ class ApplicationFixture:
         self.additional_tool_names.append(tuple(tool.definition.name for tool in additional_tools))
         runner = self._runners.pop(0)
         runner.attach_approver(approver)
-        background = BackgroundTasksFixture()
+        background = BackgroundTasksFixture(self.cleanup_events)
         self.background_scopes.append(background)
         return ConversationBinding(
             runner,
@@ -399,7 +408,7 @@ async def initialized_agent(
     runners: Sequence[RunnerFixture],
 ) -> tuple[NeuroCodeAcpAgent, ApplicationFixture, AcpClientFixture]:
     application = ApplicationFixture(root, runners)
-    agent = NeuroCodeAcpAgent(cast(ApplicationComposition, application))
+    agent = NeuroCodeAcpAgent(_acp_service(application))
     client = AcpClientFixture()
     agent.on_connect(cast(Client, client))
     await agent.initialize(
@@ -408,6 +417,10 @@ async def initialized_agent(
         Implementation(name="fixture-client", version="1.0"),
     )
     return agent, application, client
+
+
+def _acp_service(application: ApplicationFixture) -> AcpApplicationService:
+    return BootstrapCliServices().create_acp_service(cast(ApplicationComposition, application))
 
 
 class PromptContentTests(unittest.TestCase):
@@ -757,7 +770,7 @@ class AcpAgentTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             application = ApplicationFixture(root, [])
-            agent = NeuroCodeAcpAgent(cast(ApplicationComposition, application))
+            agent = NeuroCodeAcpAgent(_acp_service(application))
             client = AcpClientFixture()
             agent.on_connect(cast(Client, client))
             capabilities = ClientCapabilities(terminal=True)
@@ -784,7 +797,7 @@ class AcpAgentTests(unittest.IsolatedAsyncioTestCase):
     async def test_initialize_negotiates_v1_and_rejects_duplicate_initialization(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             application = ApplicationFixture(Path(directory), [])
-            agent = NeuroCodeAcpAgent(cast(ApplicationComposition, application))
+            agent = NeuroCodeAcpAgent(_acp_service(application))
             response = await agent.initialize(99)
             with self.assertRaises(RequestError) as duplicate:
                 await agent.initialize(1)
@@ -796,7 +809,7 @@ class AcpAgentTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             application = ApplicationFixture(root, [])
-            agent = NeuroCodeAcpAgent(cast(ApplicationComposition, application))
+            agent = NeuroCodeAcpAgent(_acp_service(application))
             with self.assertRaises(RequestError) as not_initialized:
                 await agent.new_session(str(root))
             self.assertEqual(not_initialized.exception.data["reason"], "not_initialized")
@@ -888,7 +901,7 @@ class AcpAgentTests(unittest.IsolatedAsyncioTestCase):
                 side_effect=(first_collection, second_collection),
             )
             with patch(
-                "neuro_code.acp.McpStdioToolCollection.open",
+                "neuro_code.bootstrap.entrypoints.McpStdioToolCollection.open",
                 new=open_mcp,
             ):
                 created = await agent.new_session(str(root), mcp_servers=[server])
@@ -928,6 +941,81 @@ class AcpAgentTests(unittest.IsolatedAsyncioTestCase):
                 protected.exception.data["reason"],
                 "mcp_environment_protected",
             )
+
+    async def test_mcp_factory_is_lazy_until_a_session_requests_stdio_tools(self) -> None:
+        collection = McpCollectionFixture()
+        server = McpServerStdio(name="fixture", command="fixture-command", args=[], env=[])
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            agent, _, _ = await initialized_agent(root, [RunnerFixture(), RunnerFixture()])
+            open_mcp = AsyncMock(return_value=collection)
+            with patch(
+                "neuro_code.bootstrap.entrypoints.McpStdioToolCollection.open",
+                new=open_mcp,
+            ):
+                created_without_mcp = await agent.new_session(str(root))
+                open_mcp.assert_not_awaited()
+                await agent.close_session(created_without_mcp.session_id)
+
+                created_with_mcp = await agent.new_session(str(root), mcp_servers=[server])
+                open_mcp.assert_awaited_once()
+                await agent.close_session(created_with_mcp.session_id)
+
+        self.assertEqual(collection.close_calls, 1)
+
+    async def test_failed_session_creation_cleans_binding_then_mcp_in_reverse_order(self) -> None:
+        class NeverPublishAgent(NeuroCodeAcpAgent):
+            async def _publish_session(self, session: Any) -> bool:
+                del session
+                return False
+
+        cleanup_events: list[str] = []
+        collection = McpCollectionFixture(cleanup_events)
+        server = McpServerStdio(name="fixture", command="fixture-command", args=[], env=[])
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            application = ApplicationFixture(root, [RunnerFixture()])
+            application.cleanup_events = cleanup_events
+            agent = NeverPublishAgent(_acp_service(application))
+            await agent.initialize(1)
+            with (
+                patch(
+                    "neuro_code.bootstrap.entrypoints.McpStdioToolCollection.open",
+                    new=AsyncMock(return_value=collection),
+                ),
+                self.assertRaises(RequestError) as error,
+            ):
+                await agent.new_session(str(root), mcp_servers=[server])
+
+        self.assertEqual(error.exception.data["reason"], "connection_closing")
+        self.assertEqual(cleanup_events, ["binding", "mcp"])
+
+    async def test_cancel_keeps_session_mcp_context_until_explicit_close(self) -> None:
+        collection = McpCollectionFixture()
+        server = McpServerStdio(name="fixture", command="fixture-command", args=[], env=[])
+        runner = RunnerFixture(block=True)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            agent, _, _ = await initialized_agent(root, [runner])
+            with patch(
+                "neuro_code.bootstrap.entrypoints.McpStdioToolCollection.open",
+                new=AsyncMock(return_value=collection),
+            ):
+                created = await agent.new_session(str(root), mcp_servers=[server])
+                prompt = asyncio.create_task(
+                    agent.prompt(
+                        created.session_id,
+                        [TextContentBlock(type="text", text="wait")],
+                    )
+                )
+                await runner.wait_started()
+                await agent.cancel(created.session_id)
+                response = await prompt
+                self.assertEqual(collection.close_calls, 0)
+                await agent.close_session(created.session_id)
+
+        self.assertEqual(response.stop_reason, "cancelled")
+        self.assertEqual(collection.close_calls, 1)
 
     async def test_session_load_replays_bounded_visible_history_and_resumes(self) -> None:
         history = (
@@ -1542,7 +1630,7 @@ class AcpAgentTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as directory:
             application = ApplicationFixture(Path(directory), [])
             with patch("neuro_code.acp.run_agent", new_callable=AsyncMock) as run:
-                await serve_acp(cast(ApplicationComposition, application))
+                await serve_acp(_acp_service(application))
 
         self.assertTrue(run.await_args.kwargs["use_unstable_protocol"])
         self.assertEqual(

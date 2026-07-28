@@ -8,9 +8,9 @@ from collections.abc import Mapping
 from typing import Any
 
 from neuro_code.adapters.process_tree import ProcessTree
+from neuro_code.application.ports.tools import ToolContext
 from neuro_code.domain.tools import ToolDefinition, ToolResult
-from neuro_code.errors import ToolError
-from neuro_code.ports.tools import ToolContext
+from neuro_code.shared.errors import ToolError
 
 
 class BashTool:

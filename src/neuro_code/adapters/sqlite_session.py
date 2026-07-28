@@ -13,7 +13,6 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from neuro_code.async_utils import run_blocking
 from neuro_code.domain.events import AgentEvent
 from neuro_code.domain.messages import (
     ContentPart,
@@ -37,7 +36,8 @@ from neuro_code.domain.sessions import (
     SessionSummary,
     normalize_session_title,
 )
-from neuro_code.errors import SessionError
+from neuro_code.shared.async_utils import run_blocking
+from neuro_code.shared.errors import SessionError
 
 SCHEMA_VERSION = 5
 _SEARCH_SNIPPET_LIMIT = 500

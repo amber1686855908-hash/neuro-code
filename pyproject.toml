@@ -30,6 +30,7 @@ dependencies = [
 
 [project.optional-dependencies]
 tui = []
+socks = ["httpx[socks]>=0.28,<1"]
 dev = [
   "mypy>=1.14",
   "pytest>=8.3",
@@ -40,8 +41,8 @@ dev = [
 ]
 
 [project.scripts]
-neuro = "neuro_code.cli:main"
-neuro-code = "neuro_code.cli:main"
+neuro = "neuro_code.bootstrap.entrypoints:main"
+neuro-code = "neuro_code.bootstrap.entrypoints:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/neuro_code"]

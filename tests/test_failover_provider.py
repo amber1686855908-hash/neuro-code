@@ -13,8 +13,8 @@ from neuro_code.domain.model_events import (
     ModelTextDelta,
 )
 from neuro_code.domain.tools import ToolDefinition
-from neuro_code.errors import ConfigurationError, ProviderError
 from neuro_code.providers.failover import FailoverModelProvider, ProviderCandidate
+from neuro_code.shared.errors import ConfigurationError, ProviderError
 
 
 class ScriptedModelProvider:
