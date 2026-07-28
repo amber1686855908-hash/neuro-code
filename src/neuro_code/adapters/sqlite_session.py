@@ -224,6 +224,71 @@ class SqliteSessionStore:
             await run_blocking(import_snapshot)
         return summary.id
 
+    async def delete_session(self, session_id: str) -> None:
+        def delete() -> None:
+            with closing(self._connect()) as connection, connection:
+                cursor = connection.execute(
+                    "DELETE FROM sessions WHERE id = ?",
+                    (session_id,),
+                )
+                if cursor.rowcount != 1:
+                    raise SessionError(f"unknown session: {session_id}")
+
+        async with self._write_lock:
+            await run_blocking(delete)
+
+    async def fork_session(self, session_id: str) -> str:
+        forked_session_id = str(uuid.uuid4())
+
+        def fork() -> None:
+            with closing(self._connect()) as connection, connection:
+                row = connection.execute(
+                    """
+                    SELECT cwd, provider, model, messages_json, context_affinity,
+                           sandbox_profile, title
+                    FROM sessions
+                    WHERE id = ?
+                    """,
+                    (session_id,),
+                ).fetchone()
+                if row is None:
+                    raise SessionError(f"unknown session: {session_id}")
+                try:
+                    items = _session_items_from_json(row[3])
+                except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+                    raise SessionError(
+                        f"session {session_id} contains invalid session items"
+                    ) from error
+                title = str(row[6]) or fallback_session_title(items)
+                connection.execute(
+                    """
+                    INSERT INTO sessions(
+                        id, cwd, provider, model, messages_json,
+                        context_affinity, sandbox_profile, title
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        forked_session_id,
+                        row[0],
+                        row[1],
+                        row[2],
+                        row[3],
+                        row[4],
+                        row[5],
+                        title,
+                    ),
+                )
+                _upsert_search_document(
+                    connection,
+                    session_id=forked_session_id,
+                    title=title,
+                    content=searchable_session_text(items),
+                )
+
+        async with self._write_lock:
+            await run_blocking(fork)
+        return forked_session_id
+
     async def append_event(self, session_id: str, event: AgentEvent) -> None:
         payload = json.dumps(dict(event.data), ensure_ascii=False, separators=(",", ":"))
 

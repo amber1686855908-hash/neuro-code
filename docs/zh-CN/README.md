@@ -64,12 +64,12 @@ uv run neuro-code acp --cwd /absolute/workspace
 ```
 
 本切片实现 `initialize`、`session/new`、`session/list`、`session/load`、
-`session/prompt`、`session/cancel`（notification）和 `session/close`，发送
-`session/update` notification，并通过 `session/request_permission`
-请求交互授权。它声明 `loadSession: true` 和 `sessionCapabilities.list = {}` /
-`close = {}`。Text 与 ResourceLink 提示块会保持输入顺序并受数量/字节限制；
-ResourceLink 元数据采用字段白名单，`_meta` 不会进入模型，提示转换期间也绝不会下载或
-解引用链接。
+`session/delete`、`session/fork`、`session/resume`、`session/prompt`、
+`session/cancel`（notification）和 `session/close`，发送 `session/update`
+notification，并通过 `session/request_permission` 请求交互授权。它声明
+`loadSession: true` 和 list/delete/fork/resume/close session capability。Text 与
+ResourceLink 提示块会保持输入顺序并受数量/字节限制；ResourceLink 元数据采用字段
+白名单，`_meta` 不会进入模型，提示转换期间也绝不会下载或解引用链接。
 
 每条连接固定绑定到启动工作区。`session/new` 会拒绝不同或非绝对的 `cwd` 与非空
 `additionalDirectories`。它接受有界的 stdio `mcpServers`，在发布 session 前完成初始化
@@ -89,15 +89,17 @@ list 只返回连接工作区的安全元数据，为旧会话分配持久 ACP I
 frame、数量与分页都有上限，`_meta` 被忽略，显式环境变量值会被脱敏；取消必须在 prompt
 返回前终止完整 server 进程树。
 
-这明确不是完整 ACP v1 支持。会话 resume/delete/fork、额外目录、MCP HTTP/SSE/ACP
-传输、MCP resource/prompt/sampling/elicitation、图片/音频/embedded prompt 与多媒体
-历史回放、客户端 `fs/*` 与 `terminal/*`、WebSocket 传输和自定义扩展仍不支持，也不会
-被声明。详见
+ACP 会话 resume/delete/fork 已按工作区范围持久身份、事务 fork/delete，以及回放 load
+与静默 resume 的不同语义实现。这仍明确不是完整 ACP v1 支持：额外目录、MCP
+HTTP/SSE/ACP 传输、MCP resource/prompt/sampling/elicitation、图片/音频/embedded
+prompt 与多媒体历史回放、客户端 `fs/*` 与 `terminal/*`、WebSocket 传输和自定义扩展
+仍不支持，也不会被声明。详见
 [兼容矩阵](compatibility-matrix.md)和
 [ADR 0035](adr/0035-partial-acp-v1-stdio.md)及
 [ADR 0036](adr/0036-durable-acp-session-load.md)和
 [ADR 0037](adr/0037-workspace-scoped-acp-session-list.md)，以及
-[ADR 0038](adr/0038-session-owned-stdio-mcp-tools.md)。
+[ADR 0038](adr/0038-session-owned-stdio-mcp-tools.md)和
+[ADR 0050](adr/0050-acp-session-lifecycle.md)。
 
 ## 交互式 TUI
 

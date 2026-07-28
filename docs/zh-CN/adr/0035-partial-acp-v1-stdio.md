@@ -54,6 +54,8 @@ Neuro Code 需要标准编辑器/客户端协议界面，但不应重复实现 A
   MCP 能力、额外目录、
   resume/delete/fork、多媒体/embedded prompt 与历史，以及客户端文件系统/终端
   调用仍是后续切片。
+- ADR 0050 后续实现了 resume/delete/fork 生命周期切片，但不改变本 ADR 最初的
+  partial core 决策。
 - 原始 stdio 测试会记录官方 0.11 SDK 的 malformed frame 与 JSON-RPC 版本行为。不会
   用私有生产 parser 或 dispatcher 作为绕过方案；后续可在单独评审的依赖升级中吸收上游
   SDK 变化。

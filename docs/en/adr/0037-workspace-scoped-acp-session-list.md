@@ -63,3 +63,5 @@ additional roots and `_meta`.
   non-stdio MCP transports and non-tool MCP features, additional directories,
   multimedia prompt/history content, client filesystem/terminal calls,
   WebSocket transport, and custom extensions remain unsupported.
+- ADR 0050 later implements resume/delete/fork while preserving this ADR's
+  workspace scoping, durable aliases, and bounded list behavior.

@@ -1582,7 +1582,11 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
             await pilot.press("enter")
             await pilot.pause()
 
-            rendered = app.entries[-1].text
+            rendered = next(
+                entry.text
+                for entry in reversed(app.entries)
+                if "task-running · running" in entry.text
+            )
             self.assertIn("task-running · running", rendered)
             self.assertIn("task-failed · failed · exit 7", rendered)
             self.assertIn("19 output bytes", rendered)

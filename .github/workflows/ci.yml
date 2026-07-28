@@ -62,3 +62,33 @@ jobs:
       - run: uv run python scripts/check_docs_parity.py
       - run: uv run pytest --cov=neuro_code --cov-report=term-missing
       - run: uv build
+
+  package-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.0
+      - uses: astral-sh/setup-uv@v8.3.2
+        with:
+          version: "0.11.29"
+          python-version: "3.12"
+          enable-cache: true
+      - run: uv build
+      - run: uv venv --python 3.12 .wheel-smoke
+      - run: uv pip install --python .wheel-smoke/bin/python dist/neuro_code-*.whl
+      - run: .wheel-smoke/bin/python -m neuro_code --help
+      - run: .wheel-smoke/bin/neuro --help
+      - run: .wheel-smoke/bin/neuro-code --help
+      - name: Verify removed compatibility modules stay absent
+        run: >-
+          .wheel-smoke/bin/python -c
+          "import importlib.util;
+          removed = (
+          'neuro_code.runtime',
+          'neuro_code.ports',
+          'neuro_code.errors',
+          'neuro_code.async_utils',
+          'neuro_code.redaction',
+          'neuro_code.providers.xai_responses',
+          );
+          unexpected = [name for name in removed if importlib.util.find_spec(name) is not None];
+          assert not unexpected, f'unexpected compatibility modules: {unexpected}'"

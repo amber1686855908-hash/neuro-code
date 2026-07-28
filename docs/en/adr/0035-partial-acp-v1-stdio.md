@@ -72,6 +72,8 @@ incoming `jsonrpc` version before normalizing its response to 2.0.
   directories, resume/delete/fork,
   multimedia/embedded prompt content and history, and client
   filesystem/terminal calls remain future slices.
+- ADR 0050 later implements the resume/delete/fork lifecycle slice without
+  changing this ADR's original partial-core decision.
 - Raw stdio tests record the official 0.11 SDK's malformed-frame and JSON-RPC
   version behavior. Replacing it with a private production parser or dispatcher
   is not an accepted workaround; upstream SDK changes can be adopted within a
