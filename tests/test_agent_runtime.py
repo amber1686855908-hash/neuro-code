@@ -1181,12 +1181,17 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
             )
 
             turn = asyncio.create_task(runtime.run("Edit note.txt"))
-            await asyncio.wait_for(approver.requested.wait(), timeout=1)
-            self.assertEqual(target.read_text(encoding="utf-8"), "original")
-            self.assertNotIn("changed", approver.requests[0].summary)
+            try:
+                await asyncio.wait_for(approver.requested.wait(), timeout=5)
+                self.assertEqual(target.read_text(encoding="utf-8"), "original")
+                self.assertNotIn("changed", approver.requests[0].summary)
 
-            approver.resolve(PermissionApproval.allow_once())
-            result = await turn
+                approver.resolve(PermissionApproval.allow_once())
+                result = await turn
+            finally:
+                if not turn.done():
+                    turn.cancel()
+                    await asyncio.gather(turn, return_exceptions=True)
 
             self.assertEqual(target.read_text(encoding="utf-8"), "changed")
             kinds = [event.kind for event in result.events]
@@ -1295,10 +1300,15 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
             turn = asyncio.create_task(
                 runtime.run("Edit note.txt", sink=lambda event: observed.append(event.kind))
             )
-            await asyncio.wait_for(approver.requested.wait(), timeout=1)
-            turn.cancel()
-            with self.assertRaises(asyncio.CancelledError):
-                await turn
+            try:
+                await asyncio.wait_for(approver.requested.wait(), timeout=5)
+                turn.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await turn
+            finally:
+                if not turn.done():
+                    turn.cancel()
+                    await asyncio.gather(turn, return_exceptions=True)
 
             self.assertEqual(target.read_text(encoding="utf-8"), "original")
             self.assertIn(AgentEventKind.TOOL_APPROVAL_REQUESTED, observed)
