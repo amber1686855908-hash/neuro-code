@@ -657,9 +657,7 @@ def test_dynamic_import_scanner_reports_module_load_errors_with_operation_and_lo
     rendered = _render_dynamic_import_issues(scan.issues)
     for issue in scan.issues:
         assert (
-            f"src/neuro_code/application/dynamic_snippet.py:{issue.line} "
-            "(neuro_code.application.dynamic_snippet): "
-            f"{issue.detail}"
+            f"{issue.path}:{issue.line} (neuro_code.application.dynamic_snippet): {issue.detail}"
         ) in rendered
 
 

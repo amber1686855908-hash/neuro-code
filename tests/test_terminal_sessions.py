@@ -42,6 +42,10 @@ def _record_resolver_event(events: list[str]) -> Callable[[Path, str], None]:
     return record
 
 
+def _normalized_workspace(workspace: Path) -> Path:
+    return workspace.expanduser().resolve()
+
+
 class _FakePlatformSession:
     def __init__(self) -> None:
         self.process_id = 4242
@@ -477,6 +481,7 @@ class LocalInteractiveTerminalManagerTests(unittest.IsolatedAsyncioTestCase):
     async def test_injected_workspace_resolver_precedes_approval_sandbox_and_spawn(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)
+            expected_workspace = _normalized_workspace(root)
             child = root / "child"
             child.mkdir()
             events: list[str] = []
@@ -506,7 +511,10 @@ class LocalInteractiveTerminalManagerTests(unittest.IsolatedAsyncioTestCase):
                     size=TerminalSize(80, 24),
                     output_capacity=100,
                 )
-                self.assertEqual(resolver.calls, [(root, "requested-by-caller")])
+                self.assertEqual(
+                    resolver.calls,
+                    [(expected_workspace, "requested-by-caller")],
+                )
                 self.assertEqual(events, ["resolver", "approval", "sandbox", "spawn"])
                 await session.close()
             finally:
@@ -515,6 +523,7 @@ class LocalInteractiveTerminalManagerTests(unittest.IsolatedAsyncioTestCase):
     async def test_injected_workspace_resolver_keeps_directory_validation_in_runtime(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)
+            expected_workspace = _normalized_workspace(root)
             file_path = root / "file.txt"
             file_path.write_text("fixture", encoding="utf-8")
             platform = _FakeTerminalPlatform()
@@ -534,7 +543,10 @@ class LocalInteractiveTerminalManagerTests(unittest.IsolatedAsyncioTestCase):
                         size=TerminalSize(80, 24),
                         output_capacity=100,
                     )
-                self.assertEqual(resolver.calls, [(root, "file.txt")])
+                self.assertEqual(
+                    resolver.calls,
+                    [(expected_workspace, "file.txt")],
+                )
                 self.assertEqual(platform.spawn_calls, [])
                 self.assertEqual(manager._pending_creations, 0)
             finally:
@@ -543,6 +555,7 @@ class LocalInteractiveTerminalManagerTests(unittest.IsolatedAsyncioTestCase):
     async def test_workspace_resolver_failures_have_no_later_side_effects(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)
+            expected_workspace = _normalized_workspace(root)
             for error in (
                 ToolError("resolver tool failure"),
                 RuntimeError("resolver runtime failure"),
@@ -577,7 +590,10 @@ class LocalInteractiveTerminalManagerTests(unittest.IsolatedAsyncioTestCase):
                                 size=TerminalSize(80, 24),
                                 output_capacity=100,
                             )
-                        self.assertEqual(resolver.calls, [(root, "requested-by-caller")])
+                        self.assertEqual(
+                            resolver.calls,
+                            [(expected_workspace, "requested-by-caller")],
+                        )
                         self.assertEqual(events, ["resolver"])
                         self.assertEqual(approver.requests, [])
                         self.assertEqual(sandbox.calls, [])

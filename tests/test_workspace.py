@@ -105,7 +105,13 @@ class FilesystemWorkspaceIdentityTests(unittest.TestCase):
                 ) as normcase,
             ):
                 self.assertTrue(self.identity.matches(recorded, requested))
-            self.assertEqual(normcase.call_count, 2)
+            self.assertEqual(
+                normcase.call_args_list[-2:],
+                [
+                    ((os.fspath(recorded.resolve(strict=False)),), {}),
+                    ((os.fspath(requested.resolve(strict=False)),), {}),
+                ],
+            )
 
 
 class FilesystemWorkspacePathResolverTests(unittest.TestCase):
