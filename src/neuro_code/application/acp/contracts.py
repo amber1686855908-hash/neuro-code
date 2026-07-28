@@ -12,6 +12,8 @@ from neuro_code.application.ports.tools import Tool
 from neuro_code.application.runtime.profile_conversation import ConversationBinding
 
 MAX_MCP_SERVERS = 8
+MAX_ADDITIONAL_DIRECTORIES = 4
+MAX_ADDITIONAL_DIRECTORY_BYTES = 4 * 1024
 
 
 class AcpWorkspaceValidationError(ValueError):
@@ -77,6 +79,7 @@ class AcpPreparedSession(Protocol):
         *,
         approver: PermissionApprover | None,
         additional_tools: Sequence[Tool],
+        additional_workspace_roots: Sequence[Path],
     ) -> ConversationBinding: ...
 
 
@@ -88,6 +91,7 @@ class AcpBindingFactory(Protocol):
         *,
         approver: PermissionApprover | None,
         additional_tools: Sequence[Tool],
+        additional_workspace_roots: Sequence[Path],
     ) -> AcpBinding: ...
 
     async def prepare_session_resume(self, session_id: str) -> AcpPreparedSession: ...
@@ -117,6 +121,10 @@ class AcpMcpToolFactory(Protocol):
 class AcpWorkspaceValidator(Protocol):
     """Concrete workspace identity validation selected by bootstrap."""
 
-    async def validate(self, cwd: str) -> None: ...
+    async def validate(
+        self,
+        cwd: str,
+        additional_directories: Sequence[str],
+    ) -> tuple[Path, ...]: ...
 
     def matches(self, cwd: Path) -> bool: ...

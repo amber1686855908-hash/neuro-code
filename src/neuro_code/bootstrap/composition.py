@@ -40,7 +40,10 @@ from neuro_code.providers import create_routed_provider
 from neuro_code.shared.errors import ConfigurationError
 from neuro_code.tools import default_tool_registry
 from neuro_code.workspace import FilesystemWorkspaceIdentity, workspaces_match
-from neuro_code.workspace_changes import FilesystemWorkspaceChangeObserver
+from neuro_code.workspace_changes import (
+    FilesystemWorkspaceChangeObserver,
+    MultiRootWorkspaceChangeObserver,
+)
 
 if TYPE_CHECKING:
     from neuro_code.config import AppConfig
@@ -201,6 +204,7 @@ class ApplicationComposition:
         resume_id: str | None = None,
         reasoning_effort: ReasoningEffort | None = None,
         additional_tools: Sequence[Tool] = (),
+        additional_workspace_roots: Sequence[Path] = (),
     ) -> ConversationBinding:
         if self._closed:
             raise RuntimeError("application composition is closed")
@@ -265,6 +269,11 @@ class ApplicationComposition:
                 interactive=approver is not None,
             )
             workspace_change_observer = self._workspace_change_observer_factory()
+            if additional_workspace_roots:
+                workspace_change_observer = MultiRootWorkspaceChangeObserver(
+                    workspace_change_observer,
+                    additional_workspace_roots,
+                )
             runtime = AgentRuntime(
                 provider=provider,
                 tools=tools,
@@ -272,6 +281,7 @@ class ApplicationComposition:
                 permissions=permissions,
                 tool_context=ToolContext(
                     selected_config.cwd,
+                    additional_workspace_roots=tuple(additional_workspace_roots),
                     sandbox_profile=selected_config.sandbox_profile,
                     shell_sandbox=shell_sandbox,
                     protected_environment_variables=(

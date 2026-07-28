@@ -11,6 +11,7 @@ from collections import OrderedDict
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Literal, cast
 
 from acp.agent.router import build_agent_router
@@ -925,14 +926,16 @@ class NeuroCodeAcpAgent:
         cwd: str,
         additional_directories: list[str] | None,
         mcp_servers: list[McpServer] | None,
-    ) -> tuple[AcpMcpServerConfig, ...]:
-        if additional_directories:
-            raise _invalid_params("additional_directories_unsupported")
-        await self._validate_workspace(cwd)
-        return _mcp_server_configurations(
+    ) -> tuple[tuple[Path, ...], tuple[AcpMcpServerConfig, ...]]:
+        additional_workspace_roots = await self._validate_workspace(
+            cwd,
+            additional_directories or (),
+        )
+        configurations = _mcp_server_configurations(
             mcp_servers,
             protected_environment_variables=(self._service.protected_environment_variables),
         )
+        return additional_workspace_roots, configurations
 
     async def _open_mcp_tools(
         self,
@@ -942,9 +945,13 @@ class NeuroCodeAcpAgent:
             return None
         return await self._service.open_mcp_tools(configurations)
 
-    async def _validate_workspace(self, cwd: str) -> None:
+    async def _validate_workspace(
+        self,
+        cwd: str,
+        additional_directories: Sequence[str] = (),
+    ) -> tuple[Path, ...]:
         try:
-            await self._service.validate_workspace(cwd)
+            return await self._service.validate_workspace(cwd, additional_directories)
         except AcpWorkspaceValidationError as error:
             raise _invalid_params(error.reason, error.details) from None
 
@@ -984,7 +991,7 @@ class NeuroCodeAcpAgent:
         **_kwargs: Any,
     ) -> NewSessionResponse:
         self._require_initialized()
-        mcp_configurations = await self._validate_session_workspace(
+        additional_workspace_roots, mcp_configurations = await self._validate_session_workspace(
             cwd,
             additional_directories,
             mcp_servers,
@@ -1001,6 +1008,7 @@ class NeuroCodeAcpAgent:
             opened_binding = await self._service.create_binding(
                 approver=approvals,
                 additional_tools=mcp_tools.tools if mcp_tools is not None else (),
+                additional_workspace_roots=additional_workspace_roots,
             )
             binding = opened_binding.binding
         except asyncio.CancelledError:
@@ -1040,7 +1048,7 @@ class NeuroCodeAcpAgent:
         **_kwargs: Any,
     ) -> LoadSessionResponse:
         self._require_initialized()
-        mcp_configurations = await self._validate_session_workspace(
+        additional_workspace_roots, mcp_configurations = await self._validate_session_workspace(
             cwd,
             additional_directories,
             mcp_servers,
@@ -1049,6 +1057,7 @@ class NeuroCodeAcpAgent:
         await self._activate_persisted_session(
             external_session_id,
             mcp_configurations,
+            additional_workspace_roots,
             replay_history=True,
             failure_reason="session_load_failed",
         )
@@ -1063,7 +1072,7 @@ class NeuroCodeAcpAgent:
         **_kwargs: Any,
     ) -> ResumeSessionResponse:
         self._require_initialized()
-        mcp_configurations = await self._validate_session_workspace(
+        additional_workspace_roots, mcp_configurations = await self._validate_session_workspace(
             cwd,
             additional_directories,
             mcp_servers,
@@ -1072,6 +1081,7 @@ class NeuroCodeAcpAgent:
         await self._activate_persisted_session(
             external_session_id,
             mcp_configurations,
+            additional_workspace_roots,
             replay_history=False,
             failure_reason="session_resume_failed",
         )
@@ -1081,6 +1091,7 @@ class NeuroCodeAcpAgent:
         self,
         external_session_id: str,
         mcp_configurations: tuple[AcpMcpServerConfig, ...],
+        additional_workspace_roots: tuple[Path, ...],
         *,
         replay_history: bool,
         failure_reason: str,
@@ -1114,6 +1125,7 @@ class NeuroCodeAcpAgent:
                 binding = await prepared_session.create_binding(
                     approver=approvals,
                     additional_tools=mcp_tools.tools if mcp_tools is not None else (),
+                    additional_workspace_roots=additional_workspace_roots,
                 )
             except asyncio.CancelledError:
                 raise
@@ -1351,7 +1363,7 @@ class NeuroCodeAcpAgent:
         **_kwargs: Any,
     ) -> ForkSessionResponse:
         self._require_initialized()
-        mcp_configurations = await self._validate_session_workspace(
+        additional_workspace_roots, mcp_configurations = await self._validate_session_workspace(
             cwd,
             additional_directories,
             mcp_servers,
@@ -1391,6 +1403,7 @@ class NeuroCodeAcpAgent:
                 binding = await prepared_session.create_binding(
                     approver=approvals,
                     additional_tools=mcp_tools.tools if mcp_tools is not None else (),
+                    additional_workspace_roots=additional_workspace_roots,
                 )
             except asyncio.CancelledError:
                 raise

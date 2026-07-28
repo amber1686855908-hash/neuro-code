@@ -50,8 +50,12 @@ class AcpApplicationService:
     def context_window_tokens(self) -> int | None:
         return self._metadata.context_window_tokens
 
-    async def validate_workspace(self, cwd: str) -> None:
-        await self._workspace.validate(cwd)
+    async def validate_workspace(
+        self,
+        cwd: str,
+        additional_directories: Sequence[str] = (),
+    ) -> tuple[Path, ...]:
+        return await self._workspace.validate(cwd, additional_directories)
 
     def is_current_workspace(self, cwd: str) -> bool:
         try:
@@ -75,10 +79,12 @@ class AcpApplicationService:
         *,
         approver: PermissionApprover | None,
         additional_tools: Sequence[Tool],
+        additional_workspace_roots: Sequence[Path],
     ) -> AcpBinding:
         return await self._bindings.create_binding(
             approver=approver,
             additional_tools=additional_tools,
+            additional_workspace_roots=additional_workspace_roots,
         )
 
     async def prepare_session_resume(self, session_id: str) -> AcpPreparedSession:

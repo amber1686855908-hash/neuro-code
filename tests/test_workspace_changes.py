@@ -8,6 +8,7 @@ from neuro_code.application.ports.workspace_changes import (
 )
 from neuro_code.workspace_changes import (
     FilesystemWorkspaceChangeObserver,
+    MultiRootWorkspaceChangeObserver,
     capture_workspace_snapshot,
     compare_workspace_snapshots,
 )
@@ -104,3 +105,22 @@ def test_filesystem_observer_rejects_a_checkpoint_from_another_observer(tmp_path
 def test_workspace_change_report_ignores_omitted_files_without_visible_changes() -> None:
     assert not WorkspaceChangeReport(files=(), omitted_files=1, scan_limited=False).should_emit
     assert WorkspaceChangeReport(files=(), omitted_files=0, scan_limited=True).should_emit
+
+
+def test_multi_root_change_observer_labels_explicit_additional_directory(tmp_path: Path) -> None:
+    primary = tmp_path / "primary"
+    primary.mkdir()
+    additional = tmp_path / "additional"
+    additional.mkdir()
+    observer = MultiRootWorkspaceChangeObserver(
+        FilesystemWorkspaceChangeObserver(),
+        (additional,),
+    )
+
+    before = observer.capture(primary)
+    changed = additional / "shared.txt"
+    changed.write_text("new\n", encoding="utf-8")
+    after = observer.capture(primary)
+
+    report = observer.compare(before, after, explicit_redactions=())
+    assert [change.path for change in report.files] == [str(changed)]
