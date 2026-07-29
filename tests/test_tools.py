@@ -27,6 +27,10 @@ from neuro_code.tools.plans import UpdatePlanTool
 from neuro_code.workspace import resolve_workspace_path, workspaces_match
 
 
+def _canonical_path(path: str | Path) -> Path:
+    return Path(path).resolve()
+
+
 class ClientFileSystemFixture:
     def __init__(
         self,
@@ -214,7 +218,7 @@ class FilesystemToolTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_client_file_capability_delegates_read_and_exact_replace(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory).resolve()
+            root = _canonical_path(directory)
             target = root / "remote.txt"
             client_file_system = ClientFileSystemFixture(
                 contents={str(target): "alpha\nbeta\ngamma\n"}
@@ -276,7 +280,7 @@ class FilesystemToolTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_client_file_read_requires_capability_and_honors_output_limit(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory).resolve()
+            root = _canonical_path(directory)
             target = root / "remote.txt"
             unavailable = ClientFileSystemFixture(supports_read=False)
             with self.assertRaisesRegex(ToolError, "does not support text-file reads"):
