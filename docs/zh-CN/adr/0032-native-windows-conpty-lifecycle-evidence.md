@@ -74,7 +74,4 @@ Win32 生命周期遵循 Microsoft 的
 [伪控制台会话指南](https://learn.microsoft.com/zh-cn/windows/console/creating-a-pseudoconsole-session)
 与
 [ClosePseudoConsole 要求](https://learn.microsoft.com/zh-cn/windows/console/closepseudoconsole)。
-历史行为证据来自只读固定基线中的
-`crates/codegen/xai-grok-pager-pty-harness/src/pty.rs`、
-`crates/codegen/ptyctl/src/pty.rs` 和
-`crates/codegen/xai-grok-pager/tests/pty_e2e_minimal.rs`。
+Neuro Code 还以自身的 Windows 全量测试和原生 ConPTY 冒烟测试补充平台证据。

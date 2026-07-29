@@ -13,13 +13,6 @@
 限定工作区，并且不能把供应商私有推理、加密原生上下文、图片 URL 或系统指令变成可见
 摘要。
 
-固定 Rust 基线通过
-`crates/codegen/xai-grok-shell/src/extensions/session_search.rs` 暴露带排序和分页的会话
-搜索，在 `crates/codegen/xai-grok-shell/src/session/storage/search_fts.rs` 中实现 SQLite
-FTS5 标题/内容索引，并在
-`crates/codegen/xai-grok-shell/src/session/helpers/session_summary.rs` 中于模型标题生成失败时
-回退到用户消息的前十个词。
-
 ## 决策
 
 扩展带类型的 `SessionStore` 端口，增加 `search_sessions`，并返回由带类型

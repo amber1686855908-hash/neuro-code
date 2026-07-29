@@ -8,14 +8,12 @@ root are discovered in the next ``current_result()`` call.
 
 Sibling subtrees are isolated: if the model switches from ``src/foo/``
 to ``src/bar/``, the target moves and skills from ``src/foo/`` are no
-longer included.  Only the path from the *current* focus directory up to
-the workspace root contributes skills, matching the grok-build
-"walk-up-from-accessed-path" discovery model.
+longer included. Only the path from the *current* focus directory up to the
+workspace root contributes skills.
 
 The tracker is NOT a cache.  ``current_result()`` re-runs discovery on
 each call, so skill content changes take effect on the next model step
-without needing a session restart.  Unlike grok-build's
-``already_checked`` set, no cross-call deduplication cache is maintained
+without needing a session restart. No cross-call deduplication cache is maintained
 -- the upward walk is bounded by directory depth, which is typically
 small, and re-discovery ensures file changes are always picked up.
 

@@ -70,14 +70,6 @@ Textual 的无头测试 pilot 验证，应用控制器也可以在不导入 Text
 [ADR 0030](0030-bounded-interactive-tool-card-details.md) 加入。可恢复的运行中取消由
 [ADR 0016](0016-recoverable-turn-cancellation.md) 定义。
 
-## 历史源代码证据
+## 验证
 
-固定提交 `c68e39f60462f28d9be5e683d9cbe2c57b1a5027` 中的以下只读路径用于确定行为
-边界；本项目不会复制其 crate 布局：
-
-- `crates/codegen/xai-grok-pager-minimal/src/lib.rs`；
-- `crates/codegen/xai-grok-pager/src/views/prompt_widget/mod.rs`；
-- `crates/codegen/xai-grok-pager/src/app/event_loop.rs`；
-- `crates/codegen/xai-grok-pager/src/slash/command.rs`；
-- `crates/codegen/xai-grok-pager/tests/pty_e2e_minimal.rs`；其中的进程级 PTY 夹具证明终端
-  启动与退出恢复必须在可执行文件边界测试，不能仅从无头组件测试推断。
+Neuro Code 在可执行文件边界验证终端启动与退出恢复，而不只依赖无头组件推断。

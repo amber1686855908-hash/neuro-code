@@ -56,14 +56,7 @@ deliberately local and workspace-scoped. Session titles/content search, deletion
 cross-workspace switching, remote catalogs, and rich replay of tool cards remain
 future slices.
 
-## Historical source evidence
+## Validation
 
-The following read-only paths at pinned commit
-`c68e39f60462f28d9be5e683d9cbe2c57b1a5027` establish session-picker, load, and
-replay behavior. Neuro Code keeps its own SQLite/application contracts and does
-not copy the upstream widget or remote-session architecture:
-
-- `crates/codegen/xai-grok-pager/src/views/session_picker.rs`;
-- `crates/codegen/xai-grok-pager/src/app/dispatch/session/load.rs`;
-- `crates/codegen/xai-grok-pager/src/app/dispatch/tests/session/load.rs`;
-- `crates/codegen/xai-grok-pager/src/sessions_cmd.rs`.
+Neuro Code validates session selection, load, and replay behavior with its own
+SQLite and application contracts.

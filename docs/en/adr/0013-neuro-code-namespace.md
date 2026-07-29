@@ -30,9 +30,8 @@ identifier is supplied as an application default. CC Switch input is opt-in
 through `NEURO_CODE_CC_SWITCH_CONFIG` instead of coupling discovery to another
 tool's provider-specific directory layout.
 
-Historical provenance remains only where it is relevant to attribution: the
-root README and the legally required `NOTICE`. Runtime code and ordinary
-project documentation use neutral upstream terminology.
+The product, runtime code, and ordinary documentation use the project-owned
+namespace and describe Neuro Code as independently developed.
 
 ## Consequences
 

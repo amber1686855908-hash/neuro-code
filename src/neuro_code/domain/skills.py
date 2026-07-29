@@ -9,7 +9,7 @@ and fail-closed.
 Unlike instruction files, which are inherited along the directory chain from
 workspace root to the current target, skills are discovered in dedicated
 ``skills/`` subdirectories inside configuration directories (``.neuro``,
-``.agents``, ``.grok``, ``.claude``).  Each SKILL.md file has YAML
+``.agents``, ``.claude``).  Each SKILL.md file has YAML
 frontmatter with metadata (name, description, when-to-use) that is parsed
 without requiring a YAML library — a simple line-based parser handles the
 common case, and skills with malformed frontmatter still load using their
@@ -41,7 +41,7 @@ SKILL_FILENAME = "SKILL.md"
 
 # Configuration directories that may contain a ``skills/`` subdirectory.
 # Ordered by product-specific priority: .neuro first, then generic/compat.
-SKILL_CONFIG_DIRS: tuple[str, ...] = (".neuro", ".agents", ".grok", ".claude")
+SKILL_CONFIG_DIRS: tuple[str, ...] = (".neuro", ".agents", ".claude")
 
 # The subdirectory name inside a config dir that holds skill definitions.
 SKILL_SUBDIR = "skills"
@@ -291,8 +291,7 @@ def extract_skill_body(content: str) -> str:
     """Extract the body of a skill file (everything after YAML frontmatter).
 
     Returns the content (with leading whitespace stripped) if no frontmatter
-    delimiters are found.  Uses a simple string scan — the same approach as
-    the grok-build Rust baseline — to strip everything between the opening
+    delimiters are found. Uses a simple string scan to strip everything between the opening
     ``---`` and the closing ``\\n---``.
 
     This function does **not** parse the frontmatter; it only removes it.
@@ -320,8 +319,7 @@ _RE_SKILL_DIR = re.compile(r"\$\{SKILL_DIR\}")
 def _parse_supported_index(raw_index: str, upper_bound: int) -> int | None:
     """Return a safe positional index, leaving price-like tokens untouched.
 
-    The Rust baseline only probes indices through ``max(argv, 1) + 19``.
-    Mirroring that bounded window prevents a literal such as ``$100`` from
+    The bounded window prevents a literal such as ``$100`` from
     being interpreted as an argument when only a few arguments were passed,
     and avoids converting attacker-controlled, arbitrarily large integers.
     """
@@ -360,7 +358,7 @@ def apply_skill_substitutions(
     3. ``$ARGUMENTS`` — the full arguments string.
     4. ``${SKILL_DIR}`` — the directory containing the SKILL.md file.
 
-    **Suffix rule** (matching grok-build):
+    **Suffix rule**:
 
     - If the body contains any *argument* token (``$ARGUMENTS``,
       ``$ARGUMENTS[N]``, or ``$N``), arguments are expanded inline and **no**

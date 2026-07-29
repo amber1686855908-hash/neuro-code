@@ -15,13 +15,6 @@ remain workspace-safe in the TUI and must not turn provider-private reasoning,
 encrypted native context, image URLs, or system instructions into visible
 snippets.
 
-The pinned Rust baseline exposes ranked, paginated session search through
-`crates/codegen/xai-grok-shell/src/extensions/session_search.rs`, implements a
-SQLite FTS5 title/content index in
-`crates/codegen/xai-grok-shell/src/session/storage/search_fts.rs`, and falls
-back to the first ten user words when model title generation fails in
-`crates/codegen/xai-grok-shell/src/session/helpers/session_summary.rs`.
-
 ## Decision
 
 Extend the typed `SessionStore` port with `search_sessions` and return a

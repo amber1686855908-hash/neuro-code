@@ -15,7 +15,7 @@ Full bodies should not inflate every model prompt.
 
 Add a `SkillDiscovery` port, domain values, and a
 `FilesystemSkillDiscovery` adapter. The adapter scans `skills/` beneath
-`.neuro`, `.agents`, `.grok`, and `.claude`, in that priority order. It parses
+`.neuro`, `.agents`, and `.claude`, in that priority order. It parses
 bounded frontmatter for `name`, `description`, and `when-to-use`; absent or
 malformed metadata falls back to the directory name and first prose body line.
 Frontmatter delimiters must occupy complete lines.

@@ -2,116 +2,88 @@
 
 [简体中文](docs/zh-CN/README.md) · [English](docs/en/README.md)
 
-Neuro Code 最初基于开源 Grok Build 的行为边界进行 Python 重写，目前正作为独立、
-可扩展的终端编码智能体继续演进。
-当前项目处于 pre-alpha 阶段，已经具备可安装 CLI、无头代理循环、带失败关闭审批的
-最小交互 TUI（含可恢复取消和安全 profile 选择）、多模型流式适配、工作区工具、
-权限控制、工作区会话选择/历史回放与标题/内容全文搜索、Linux 失败关闭沙箱 profile、
-会话固定沙箱恢复和 SQLite 会话能力，以及受管后台 Shell 任务的启动/查询/单任务或
-多任务等待/终止生命周期。项目还提供基于官方 Python SDK、支持工作区范围会话发现、
-持久会话 load 与 session-owned stdio MCP 工具的 partial ACP v1 stdio 纵向切片；它
-没有宣称完整 ACP v1 兼容。TUI
-现已支持安全 Markdown 与语义配色、常驻模型/上下文占用/
-强度/模式/工作区状态栏、带参数的斜杠命令提示与 Tab 补全、模型步骤与整轮耗时、结构化
-且可通过单击/键盘收起详情的工具反馈，以及可持久化的五档应用层审查强度和四种安全交互
-模式。
+Neuro Code 是一个独立开发的 Python 终端编码智能体。它以清晰的工作区、权限、沙箱和会话边界为基础，提供可扩展的 CLI、TUI、MCP 与 ACP 能力。
 
-Neuro Code began as a Python reimplementation of the open-source Grok Build
-terminal coding agent and now evolves as an independent, extensible project. It
-is currently pre-alpha, with an installable CLI, a headless agent loop, a
-minimal interactive TUI with fail-closed approvals, recoverable in-flight
-cancellation, and safe profile selection, multi-provider streaming, workspace
-session selection/history replay and title/content search, tools, permissions, fail-closed Linux sandbox
-profiles, session-fixed sandbox resume, and SQLite sessions.
-It also supports conversation-scoped, process-owned background shell task
-start, snapshot/event-driven single-or-multi-wait, termination, read-only TUI
-visibility, and bounded
-model-boundary completion metadata within one application lifetime, plus a
-partial ACP v1 stdio slice with workspace-scoped session discovery, durable
-session load, and session-owned stdio MCP tools, built on the official Python
-SDKs. This is not a claim of complete ACP v1 compatibility. The TUI
-also provides safe Markdown with semantic colors, a persistent
-model/context-usage/effort/mode/workspace bar, parameter-aware slash-command
-hints with Tab completion, timed model steps and turns, structured tool
-feedback with click/keyboard detail toggling, five saved review-effort choices,
-and four safe interaction modes.
+Neuro Code is an independently developed Python terminal coding agent. It provides extensible CLI, TUI, MCP, and ACP capabilities with explicit workspace, permission, sandbox, and session boundaries.
 
-## 文档 / Documentation
+## 快速开始 / Quick start
 
-| 内容 | 中文 | English |
-|---|---|---|
-| 项目介绍 / Overview | [中文](docs/zh-CN/README.md) | [English](docs/en/README.md) |
-| 架构 / Architecture | [中文](docs/zh-CN/architecture.md) | [English](docs/en/architecture.md) |
-| 重写计划 / Rewrite plan | [中文](docs/zh-CN/rewrite-plan.md) | [English](docs/en/rewrite-plan.md) |
-| 兼容矩阵 / Compatibility | [中文](docs/zh-CN/compatibility-matrix.md) | [English](docs/en/compatibility-matrix.md) |
-| 贡献指南 / Contributing | [中文](docs/zh-CN/CONTRIBUTING.md) | [English](docs/en/CONTRIBUTING.md) |
-| 架构决策 / ADRs | [中文](docs/zh-CN/adr/) | [English](docs/en/adr/) |
+正式发布后，全局安装一次即可在任意目录使用，无需为每次启动激活虚拟环境：
 
-## 安装与启动 / Install and launch
-
-正式发行后可全局安装一次，无需为每次使用激活虚拟环境：
-
-Install the released package globally once; no per-use virtual-environment
-activation is required:
+Install the released package once to use it from any directory; no per-use virtual-environment activation is required:
 
 ```bash
 uv tool install neuro-code
 # or / 或：pipx install neuro-code
 ```
 
-在任意目录中使用 `neuro`、`neuro code` 或 `neuro-code` 都会以该目录为工作区启动
-TUI。首次启动可在 TUI 内配置模型供应商和 API 密钥；普通设置先显示一级分类，再进入
-语言或供应商详情。供应商页支持保存、编辑和切换多个 profile，并明确区分 OpenAI
-Responses、兼容 Chat 与 DeepSeek；还可按 profile 选择环境代理、直连或命名环境变量，
-按需测试连接并加载有界模型目录，以及经二次确认删除配置。认证、端点、限流、代理和网络
-错误会脱敏留在设置页；可修复的受管供应商启动错误也不会退出 TUI。
+以下命令都会以当前目录作为工作区启动 TUI：
 
-From any directory, `neuro`, `neuro code`, and `neuro-code` launch the TUI with
-that directory as the workspace. First-run setup and category-first Settings can
-save, edit, and switch multiple provider profiles and their API keys, with
-distinct OpenAI Responses, compatible Chat, and DeepSeek presets. Per-profile
-proxy modes, on-demand connection testing with a bounded model catalog,
-confirmed deletion, and in-TUI recovery from redacted managed-provider startup
-errors are included.
+Each command starts the TUI with the current directory as its workspace:
 
-## 快速验证 / Quick verification
+```bash
+neuro
+neuro code
+neuro-code
+```
 
-需要 Python 3.12 或更高版本，并推荐使用 `uv`：
+开发源码时使用：
 
-Python 3.12 or newer is required; `uv` is the recommended environment manager:
+For source development:
+
+```bash
+uv sync --extra dev
+uv run neuro
+```
+
+## 你可以做什么 / What it provides
+
+- **模型与设置 / Models and settings** — 在 TUI 中保存、编辑、测试和切换多个模型供应商 profile；API 密钥不会回显，网络与代理错误会脱敏展示。
+- **安全的工作区操作 / Safe workspace work** — 文件与终端操作经过权限、工作区和沙箱边界；显式拒绝始终优先。
+- **可恢复的会话 / Durable sessions** — SQLite 会话支持恢复、搜索、重命名、分叉、删除，以及受限的计划与任务快照查看。
+- **可读的终端体验 / Usable terminal experience** — TUI 提供流式对话、结构化工具反馈、Markdown、状态栏、斜杠命令和可持久化的交互偏好。
+- **协议集成 / Protocol integration** — 提供工作区绑定的 partial ACP v1 stdio、stdio/HTTP/SSE MCP 工具，以及按能力协商的客户端文件系统和终端操作。
+
+## 当前范围 / Current scope
+
+Neuro Code 仍处于 **pre-alpha** 阶段。CLI、无头 agent runtime、交互式 TUI、会话存储、权限与沙箱边界，以及 partial ACP v1 stdio 是当前已交付的纵向能力。
+
+ACP 实现明确不宣称完整兼容：WebSocket、完整 MCP transport、资源/提示/sampling/elicitation、音频与二进制多媒体历史回放、交互式客户端 PTY 输入/resize，以及自定义扩展尚未支持。具体支持范围与限制见兼容矩阵。
+
+Neuro Code is still **pre-alpha**. The CLI, headless agent runtime, interactive TUI, durable sessions, permission and sandbox boundaries, and partial ACP v1 stdio are implemented vertical capabilities.
+
+The ACP implementation deliberately does not claim complete compatibility. WebSocket, the full MCP transport surface, resources/prompts/sampling/elicitation, audio and binary-multimedia history replay, interactive client PTY input/resize, and custom extensions remain out of scope. See the compatibility matrix for the exact boundary.
+
+## 文档 / Documentation
+
+| 内容 / Topic | 中文 | English |
+|---|---|---|
+| 产品说明 / Product guide | [中文](docs/zh-CN/README.md) | [English](docs/en/README.md) |
+| 架构 / Architecture | [中文](docs/zh-CN/architecture.md) | [English](docs/en/architecture.md) |
+| 兼容矩阵 / Compatibility | [中文](docs/zh-CN/compatibility-matrix.md) | [English](docs/en/compatibility-matrix.md) |
+| 开发计划 / Development plan | [中文](docs/zh-CN/rewrite-plan.md) | [English](docs/en/rewrite-plan.md) |
+| 贡献 / Contributing | [中文](docs/zh-CN/CONTRIBUTING.md) | [English](docs/en/CONTRIBUTING.md) |
+| 架构决策 / ADRs | [中文](docs/zh-CN/adr/) | [English](docs/en/adr/) |
+
+## 开发与验证 / Development and verification
+
+需要 Python 3.12 或更高版本，推荐使用 `uv`：
+
+Python 3.12 or newer is required; `uv` is recommended:
 
 ```bash
 uv sync --extra dev
 uv run pytest
 uv run ruff check .
+uv run ruff format --check .
 uv run mypy
+uv build
 ```
 
-## 当前状态 / Status
+可通过 `PYTHONPATH=src python -m neuro_code inspect --json` 查看已生效的配置；输出会保护密钥。
 
-- 源基线 / Source baseline: [`xai-org/grok-build`](https://github.com/xai-org/grok-build) at `c68e39f60462f28d9be5e683d9cbe2c57b1a5027`
-- 目标平台 / Target platforms: Linux, macOS, Windows
-- 许可证 / License: Apache-2.0
-- 完整重写进度粗略为 56–60%；M2 退出测试已经满足，M3 最小 TUI、交互审批、可恢复
-  取消、安全 profile 选择、工作区会话恢复、Linux 沙箱、会话固定沙箱及受管后台命令
-  会话作用域、TUI 可见性、事件驱动多任务等待、模型完成提醒、会话全文搜索和手动重命名
-  切片、创建时原子加入的 Windows Job Object 进程树所有权，以及三平台原生终端生命周期
-  测试（Windows 使用 ConPTY）、受权限/工作区/沙箱门禁的有界交互式终端会话底座，以及
-  ACP v1 stdio 核心、工作区范围 session list、持久会话 load 与 session-owned stdio
-  MCP 工具 partial slice 已实现。
-- Overall public-surface parity is roughly 56–60%; the M2 exit test is satisfied
-  and the M3 minimal-TUI, interactive-approval, recoverable-cancellation, and
-  safe-profile-selection, workspace-session-resume, Linux-sandbox, and
-  session-fixed-sandbox and session-scoped managed-background-command/TUI-
-  visibility/event-driven-multi-wait/model-completion-reminder/session-search/manual-rename
-  slices, fail-closed Windows Job Object process-tree ownership with atomic
-  creation-time assignment, and native terminal-lifecycle tests across all
-  three platform families (ConPTY on Windows), plus a bounded interactive
-  terminal-session substrate gated by permission, workspace, and sandbox
-  boundaries, and a partial ACP v1 stdio core with workspace-scoped session
-  list, durable session load, and session-owned stdio MCP tools are implemented.
+Use `PYTHONPATH=src python -m neuro_code inspect --json` to inspect effective configuration without exposing credentials.
 
-本项目与 xAI 或 SpaceXAI 没有关联，也未获得其认可。“Grok”等名称可能是其各自所有者的商标。
+## 许可证 / License
 
-This project is not affiliated with or endorsed by xAI or SpaceXAI. “Grok” and
-related names may be trademarks of their respective owners.
+[Apache-2.0](LICENSE)
