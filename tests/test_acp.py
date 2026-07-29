@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import tempfile
 import unittest
 from collections.abc import AsyncIterator, Sequence
@@ -15,28 +16,42 @@ from acp.interfaces import Client
 from acp.schema import (
     AgentMessageChunk,
     AllowedOutcome,
+    AudioContentBlock,
+    BlobResourceContents,
     ClientCapabilities,
+    CreateTerminalResponse,
     DeniedOutcome,
+    EmbeddedResourceContentBlock,
     EnvVariable,
+    FileSystemCapabilities,
     HttpMcpServer,
     ImageContentBlock,
     Implementation,
     McpServerStdio,
     PermissionOption,
+    ReadTextFileResponse,
     RequestPermissionResponse,
     ResourceContentBlock,
     SseMcpServer,
+    TerminalExitStatus,
+    TerminalOutputResponse,
     TextContentBlock,
+    TextResourceContents,
     ToolCallProgress,
     ToolCallStart,
     ToolCallUpdate,
     UserMessageChunk,
+    WaitForTerminalExitResponse,
+    WriteTextFileResponse,
 )
 
 import neuro_code.acp as acp_module
 from neuro_code.acp import (
     ACP_STDIO_BUFFER_LIMIT_BYTES,
     MAX_ANNOTATION_AUDIENCE,
+    MAX_EMBEDDED_TEXT_RESOURCE_BYTES,
+    MAX_EMBEDDED_TEXT_RESOURCES,
+    MAX_IMAGE_BLOCKS,
     MAX_PROMPT_BLOCKS,
     MAX_PROMPT_BYTES,
     MAX_RESOURCE_LINKS,
@@ -55,9 +70,11 @@ from neuro_code.application.runtime.profile_conversation import ConversationBind
 from neuro_code.bootstrap.composition import ApplicationComposition
 from neuro_code.bootstrap.entrypoints import BootstrapCliServices
 from neuro_code.config import AppConfig, ProviderProfile
+from neuro_code.domain.background_tasks import BackgroundTaskStatus, BackgroundTaskWaitMode
 from neuro_code.domain.events import AgentEvent, AgentEventKind
 from neuro_code.domain.interaction_mode import InteractionMode
 from neuro_code.domain.messages import (
+    ContentPart,
     ContextItemKind,
     Message,
     PreservedContextItem,
@@ -67,11 +84,12 @@ from neuro_code.domain.messages import (
 )
 from neuro_code.domain.model_context import ModelContext
 from neuro_code.domain.model_events import ModelEvent
+from neuro_code.domain.plans import SessionPlan
 from neuro_code.domain.reasoning import ReasoningEffort
 from neuro_code.domain.sandbox import SandboxProfile
 from neuro_code.domain.sessions import SessionSummary
 from neuro_code.domain.tools import ToolDefinition, ToolResult
-from neuro_code.shared.errors import ConfigurationError, ProviderError, SessionError
+from neuro_code.shared.errors import ConfigurationError, ProviderError, SessionError, ToolError
 
 
 class AcpClientFixture:
@@ -82,6 +100,33 @@ class AcpClientFixture:
             outcome=AllowedOutcome(outcome="selected", option_id="allow_once")
         )
         self.permission_error: Exception | None = None
+        self.read_text_file_content = "client file contents"
+        self.read_text_file_requests: list[tuple[str, str, int | None, int | None]] = []
+        self.write_text_file_requests: list[tuple[str, str, str]] = []
+        self.read_text_file_error: Exception | None = None
+        self.write_text_file_error: Exception | None = None
+        self.terminal_id = "client-terminal"
+        self.create_terminal_requests: list[
+            tuple[str, str, list[str] | None, str | None, int | None]
+        ] = []
+        self.terminal_output_requests: list[tuple[str, str]] = []
+        self.terminal_wait_requests: list[tuple[str, str]] = []
+        self.terminal_kill_requests: list[tuple[str, str]] = []
+        self.terminal_release_requests: list[tuple[str, str]] = []
+        self.terminal_envs: list[list[EnvVariable] | None] = []
+        self.terminal_output_response = TerminalOutputResponse(
+            output="client terminal output",
+            truncated=False,
+            exit_status=TerminalExitStatus(exit_code=0),
+        )
+        self.terminal_wait = WaitForTerminalExitResponse(exit_code=0)
+        self.create_terminal_error: Exception | None = None
+        self.terminal_output_error: Exception | None = None
+        self.terminal_wait_error: Exception | None = None
+        self.terminal_wait_gate: asyncio.Event | None = None
+        self.terminal_wait_started = asyncio.Event()
+        self.terminal_kill_error: Exception | None = None
+        self.terminal_release_error: Exception | None = None
 
     async def session_update(
         self,
@@ -102,6 +147,92 @@ class AcpClientFixture:
         if self.permission_error is not None:
             raise self.permission_error
         return self.permission_response
+
+    async def read_text_file(
+        self,
+        session_id: str,
+        path: str,
+        line: int | None = None,
+        limit: int | None = None,
+        **_kwargs: Any,
+    ) -> ReadTextFileResponse:
+        self.read_text_file_requests.append((session_id, path, line, limit))
+        if self.read_text_file_error is not None:
+            raise self.read_text_file_error
+        return ReadTextFileResponse(content=self.read_text_file_content)
+
+    async def write_text_file(
+        self,
+        session_id: str,
+        path: str,
+        content: str,
+        **_kwargs: Any,
+    ) -> WriteTextFileResponse:
+        self.write_text_file_requests.append((session_id, path, content))
+        if self.write_text_file_error is not None:
+            raise self.write_text_file_error
+        return WriteTextFileResponse()
+
+    async def create_terminal(
+        self,
+        session_id: str,
+        command: str,
+        args: list[str] | None = None,
+        env: list[EnvVariable] | None = None,
+        cwd: str | None = None,
+        output_byte_limit: int | None = None,
+        **_kwargs: Any,
+    ) -> CreateTerminalResponse:
+        self.create_terminal_requests.append((session_id, command, args, cwd, output_byte_limit))
+        self.terminal_envs.append(env)
+        if self.create_terminal_error is not None:
+            raise self.create_terminal_error
+        return CreateTerminalResponse(terminal_id=self.terminal_id)
+
+    async def terminal_output(
+        self,
+        session_id: str,
+        terminal_id: str,
+        **_kwargs: Any,
+    ) -> TerminalOutputResponse:
+        self.terminal_output_requests.append((session_id, terminal_id))
+        if self.terminal_output_error is not None:
+            raise self.terminal_output_error
+        return self.terminal_output_response
+
+    async def wait_for_terminal_exit(
+        self,
+        session_id: str,
+        terminal_id: str,
+        **_kwargs: Any,
+    ) -> WaitForTerminalExitResponse:
+        self.terminal_wait_requests.append((session_id, terminal_id))
+        self.terminal_wait_started.set()
+        if self.terminal_wait_error is not None:
+            raise self.terminal_wait_error
+        if self.terminal_wait_gate is not None:
+            await self.terminal_wait_gate.wait()
+        return self.terminal_wait
+
+    async def kill_terminal(
+        self,
+        session_id: str,
+        terminal_id: str,
+        **_kwargs: Any,
+    ) -> None:
+        self.terminal_kill_requests.append((session_id, terminal_id))
+        if self.terminal_kill_error is not None:
+            raise self.terminal_kill_error
+
+    async def release_terminal(
+        self,
+        session_id: str,
+        terminal_id: str,
+        **_kwargs: Any,
+    ) -> None:
+        self.terminal_release_requests.append((session_id, terminal_id))
+        if self.terminal_release_error is not None:
+            raise self.terminal_release_error
 
 
 class ProviderFixture:
@@ -179,6 +310,7 @@ class RunnerFixture:
         self._started = asyncio.Event()
         self._release = asyncio.Event()
         self.approvals: list[PermissionApproval] = []
+        self.prompts: list[tuple[str, tuple[ContentPart, ...]]] = []
 
     @property
     def session_id(self) -> str | None:
@@ -187,6 +319,10 @@ class RunnerFixture:
     @property
     def items(self) -> tuple[SessionItem, ...]:
         return self._items
+
+    @property
+    def plan(self) -> SessionPlan | None:
+        return None
 
     @property
     def reasoning_effort(self) -> ReasoningEffort:
@@ -211,6 +347,7 @@ class RunnerFixture:
         prompt: str,
         *,
         sink: EventSink | None = None,
+        content_parts: Sequence[ContentPart] = (),
     ) -> AgentRunResult:
         if self._session_id is None:
             self._session_id = f"internal-session-{id(self)}"
@@ -262,11 +399,13 @@ class RunnerFixture:
                 raise
         if self._failure is not None:
             raise self._failure
+        prompt_parts = tuple(content_parts)
+        self.prompts.append((prompt, prompt_parts))
         return AgentRunResult(
             self._session_id,
             prompt,
-            (*self._items, Message(Role.USER, prompt)),
-            (*self._items, Message(Role.USER, prompt)),
+            (*self._items, Message(Role.USER, prompt, content_parts=prompt_parts)),
+            (*self._items, Message(Role.USER, prompt, content_parts=prompt_parts)),
             tuple(events),
             1,
         )
@@ -305,6 +444,8 @@ class ApplicationFixture:
         self.resume_ids: list[str | None] = []
         self.additional_tool_names: list[tuple[str, ...]] = []
         self.additional_workspace_roots: list[tuple[Path, ...]] = []
+        self.client_file_systems: list[Any | None] = []
+        self.client_terminals: list[Any | None] = []
         self.resume_error: ConfigurationError | None = None
         self.cleanup_events: list[str] | None = None
 
@@ -321,11 +462,15 @@ class ApplicationFixture:
         resume_id: str | None = None,
         additional_tools: Sequence[Any] = (),
         additional_workspace_roots: Sequence[Path] = (),
+        client_file_system: Any | None = None,
+        client_terminal: Any | None = None,
         **_kwargs: Any,
     ) -> ConversationBinding:
         self.resume_ids.append(resume_id)
         self.additional_tool_names.append(tuple(tool.definition.name for tool in additional_tools))
         self.additional_workspace_roots.append(tuple(additional_workspace_roots))
+        self.client_file_systems.append(client_file_system)
+        self.client_terminals.append(client_terminal)
         runner = self._runners.pop(0)
         runner.attach_approver(approver)
         background = BackgroundTasksFixture(self.cleanup_events)
@@ -491,11 +636,11 @@ class PromptContentTests(unittest.TestCase):
                 TextContentBlock(type="text", text="after"),
             ]
         )
-        self.assertLess(converted.index("before"), converted.index("resource_link"))
-        self.assertLess(converted.index("resource_link"), converted.index("after"))
-        self.assertNotIn("resource-secret", converted)
-        self.assertNotIn("annotation-secret", converted)
-        self.assertIn('"audience":["assistant"]', converted)
+        self.assertLess(converted.content.index("before"), converted.content.index("resource_link"))
+        self.assertLess(converted.content.index("resource_link"), converted.content.index("after"))
+        self.assertNotIn("resource-secret", converted.content)
+        self.assertNotIn("annotation-secret", converted.content)
+        self.assertIn('"audience":["assistant"]', converted.content)
 
     def test_resource_link_is_not_dereferenced(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -510,21 +655,131 @@ class PromptContentTests(unittest.TestCase):
                     )
                 ]
             )
-        self.assertIn(target.as_uri(), converted)
-        self.assertNotIn("CONTENT-MUST-NOT-BE-READ", converted)
+        self.assertIn(target.as_uri(), converted.content)
+        self.assertNotIn("CONTENT-MUST-NOT-BE-READ", converted.content)
+
+    def test_embedded_text_resource_preserves_order_and_does_not_dereference_uri(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "resource.txt"
+            target.write_text("CONTENT-MUST-NOT-BE-READ", encoding="utf-8")
+            resource = EmbeddedResourceContentBlock.model_validate(
+                {
+                    "type": "resource",
+                    "resource": {
+                        "uri": target.as_uri(),
+                        "mimeType": "text/plain",
+                        "text": "provided text",
+                        "_meta": {"resource-secret": "never-visible"},
+                    },
+                    "annotations": {
+                        "audience": ["assistant"],
+                        "_meta": {"annotation-secret": "never-visible"},
+                    },
+                    "_meta": {"block-secret": "never-visible"},
+                }
+            )
+            converted = convert_prompt_content(
+                [
+                    TextContentBlock(type="text", text="before"),
+                    resource,
+                    TextContentBlock(type="text", text="after"),
+                ]
+            )
+
+        header = (
+            f'<embedded_resource>{{"mimeType":"text/plain","uri":"{target.as_uri()}"}}'
+            "</embedded_resource>"
+        )
+        self.assertEqual(
+            [part.to_dict() for part in converted.content_parts],
+            [
+                {"type": "text", "text": "before"},
+                {"type": "text", "text": f"{header}\nprovided text"},
+                {"type": "text", "text": "after"},
+            ],
+        )
+        self.assertEqual(converted.content, f"before\n{header}\nprovided text\nafter")
+        self.assertNotIn("CONTENT-MUST-NOT-BE-READ", converted.content)
+        self.assertNotIn("resource-secret", converted.content)
+        self.assertNotIn("annotation-secret", converted.content)
+        self.assertNotIn("block-secret", converted.content)
+
+    def test_embedded_text_resource_validation_and_limits_fail_closed(self) -> None:
+        blob = EmbeddedResourceContentBlock(
+            type="resource",
+            resource=BlobResourceContents(
+                uri="memory://binary",
+                blob=base64.b64encode(b"binary").decode("ascii"),
+                mime_type="application/octet-stream",
+            ),
+        )
+        cases = (
+            (blob, "embedded_resource_blob_unsupported"),
+            (
+                EmbeddedResourceContentBlock(
+                    type="resource",
+                    resource=TextResourceContents(uri="", text="provided text"),
+                ),
+                "embedded_resource_uri_empty",
+            ),
+            (
+                EmbeddedResourceContentBlock(
+                    type="resource",
+                    resource=TextResourceContents(uri="memory://empty", text=" \t"),
+                ),
+                "embedded_resource_text_empty",
+            ),
+            (
+                EmbeddedResourceContentBlock(
+                    type="resource",
+                    resource=TextResourceContents(
+                        uri="memory://oversized",
+                        text="x" * (MAX_EMBEDDED_TEXT_RESOURCE_BYTES + 1),
+                    ),
+                ),
+                "embedded_resource_text_too_large",
+            ),
+        )
+        for resource, reason in cases:
+            with self.subTest(reason=reason), self.assertRaises(RequestError) as error:
+                convert_prompt_content([resource])
+            self.assertEqual(error.exception.data["reason"], reason)
+
+        valid = EmbeddedResourceContentBlock(
+            type="resource",
+            resource=TextResourceContents(uri="memory://provided", text="text"),
+        )
+        with self.assertRaises(RequestError) as count_error:
+            convert_prompt_content([valid] * (MAX_EMBEDDED_TEXT_RESOURCES + 1))
+        self.assertEqual(count_error.exception.data["reason"], "too_many_embedded_text_resources")
+
+        with (
+            patch.object(acp_module, "MAX_EMBEDDED_TEXT_RESOURCE_BYTES", 4),
+            patch.object(acp_module, "MAX_EMBEDDED_TEXT_TOTAL_BYTES", 3),
+            self.assertRaises(RequestError) as total_size_error,
+        ):
+            small = EmbeddedResourceContentBlock(
+                type="resource",
+                resource=TextResourceContents(uri="memory://small", text="ab"),
+            )
+            convert_prompt_content([small, small])
+        self.assertEqual(
+            total_size_error.exception.data["reason"],
+            "embedded_text_resources_too_large",
+        )
 
     def test_unsupported_and_oversized_content_is_rejected(self) -> None:
-        with self.assertRaises(RequestError) as image_error:
+        with self.assertRaises(RequestError) as audio_error:
             convert_prompt_content(
                 [
-                    ImageContentBlock(
-                        type="image",
+                    AudioContentBlock(
+                        type="audio",
                         data="AA==",
-                        mime_type="image/png",
+                        mime_type="audio/wav",
                     )
                 ]
             )
-        self.assertEqual(image_error.exception.data["reason"], "unsupported_prompt_content")
+        self.assertEqual(audio_error.exception.data["reason"], "unsupported_prompt_content")
 
         with self.assertRaises(RequestError) as text_error:
             convert_prompt_content(
@@ -653,11 +908,111 @@ class PromptContentTests(unittest.TestCase):
                 )
             ]
         )
-        self.assertNotIn("\u0001", converted)
-        self.assertIn("\ufffd", converted)
-        self.assertIn('"mimeType":"text/plain"', converted)
-        self.assertIn('"lastModified":"2026-01-01"', converted)
-        self.assertIn('"size":12', converted)
+        self.assertNotIn("\u0001", converted.content)
+        self.assertIn("\ufffd", converted.content)
+        self.assertIn('"mimeType":"text/plain"', converted.content)
+        self.assertIn('"lastModified":"2026-01-01"', converted.content)
+        self.assertIn('"size":12', converted.content)
+
+    def test_inline_images_preserve_block_order_without_dereferencing_uri(self) -> None:
+        encoded = base64.b64encode(b"image fixture").decode("ascii")
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "not-read.png"
+            target.write_bytes(b"CONTENT-MUST-NOT-BE-READ")
+            converted = convert_prompt_content(
+                [
+                    TextContentBlock(type="text", text="before"),
+                    ImageContentBlock(
+                        type="image",
+                        data=encoded,
+                        mime_type="image/jpg",
+                        uri=target.as_uri(),
+                    ),
+                    TextContentBlock(type="text", text="after"),
+                ]
+            )
+
+        self.assertEqual(converted.content, "before\nafter")
+        self.assertEqual(
+            [part.to_dict() for part in converted.content_parts],
+            [
+                {"type": "text", "text": "before"},
+                {"type": "image", "url": f"data:image/jpeg;base64,{encoded}"},
+                {"type": "text", "text": "after"},
+            ],
+        )
+        self.assertNotIn("CONTENT-MUST-NOT-BE-READ", repr(converted))
+
+    def test_image_prompt_validation_and_limits_fail_closed(self) -> None:
+        valid_image = ImageContentBlock(
+            type="image",
+            data=base64.b64encode(b"image").decode("ascii"),
+            mime_type="image/png",
+        )
+        cases = (
+            (
+                ImageContentBlock(type="image", data="not base64", mime_type="image/png"),
+                "image_data_invalid",
+            ),
+            (
+                ImageContentBlock(type="image", data="AA==", mime_type="application/octet-stream"),
+                "image_mime_type_unsupported",
+            ),
+        )
+        for image, reason in cases:
+            with self.subTest(reason=reason), self.assertRaises(RequestError) as error:
+                convert_prompt_content([image])
+            self.assertEqual(error.exception.data["reason"], reason)
+
+        with self.assertRaises(RequestError) as count_error:
+            convert_prompt_content([valid_image] * (MAX_IMAGE_BLOCKS + 1))
+        self.assertEqual(count_error.exception.data["reason"], "too_many_image_blocks")
+
+        with self.assertRaises(RequestError) as empty_data_error:
+            convert_prompt_content(
+                [ImageContentBlock(type="image", data="", mime_type="image/png")]
+            )
+        self.assertEqual(empty_data_error.exception.data["reason"], "image_block_too_large")
+
+        with patch.object(acp_module, "MAX_IMAGE_BLOCK_BYTES", 1):
+            oversized = ImageContentBlock(
+                type="image",
+                data=base64.b64encode(b"ab").decode("ascii"),
+                mime_type="image/png",
+            )
+            with self.assertRaises(RequestError) as size_error:
+                convert_prompt_content([oversized])
+        self.assertEqual(size_error.exception.data["reason"], "image_block_too_large")
+
+        with (
+            patch.object(acp_module, "MAX_IMAGE_BLOCK_BYTES", 4),
+            patch.object(acp_module, "MAX_IMAGE_TOTAL_BYTES", 3),
+            self.assertRaises(RequestError) as total_size_error,
+        ):
+            small_image = ImageContentBlock(
+                type="image",
+                data=base64.b64encode(b"ab").decode("ascii"),
+                mime_type="image/png",
+            )
+            convert_prompt_content([small_image, small_image])
+        self.assertEqual(total_size_error.exception.data["reason"], "images_too_large")
+
+        with self.assertRaises(RequestError) as blank_text_error:
+            convert_prompt_content([TextContentBlock(type="text", text=" \t")])
+        self.assertEqual(blank_text_error.exception.data["reason"], "prompt_empty")
+
+    def test_image_only_prompt_is_valid_structured_input(self) -> None:
+        converted = convert_prompt_content(
+            [
+                ImageContentBlock(
+                    type="image",
+                    data=base64.b64encode(b"image").decode("ascii"),
+                    mime_type="image/png",
+                )
+            ]
+        )
+        self.assertEqual(converted.content, "")
+        self.assertEqual(len(converted.content_parts), 1)
 
 
 class McpConfigurationTests(unittest.TestCase):
@@ -922,6 +1277,347 @@ class AcpAgentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.protocol_version, 1)
         self.assertEqual(duplicate.exception.data["reason"], "already_initialized")
 
+    async def test_client_filesystem_capabilities_are_bound_per_session(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            application = ApplicationFixture(root, [RunnerFixture()])
+            agent = NeuroCodeAcpAgent(_acp_service(application))
+            client = AcpClientFixture()
+            agent.on_connect(cast(Client, client))
+            await agent.initialize(
+                1,
+                ClientCapabilities(
+                    fs=FileSystemCapabilities(read_text_file=True, write_text_file=True)
+                ),
+            )
+
+            created = await agent.new_session(str(root))
+            client_file_system = application.client_file_systems[0]
+            self.assertIsNotNone(client_file_system)
+            assert client_file_system is not None
+            self.assertTrue(client_file_system.supports_read)
+            self.assertTrue(client_file_system.supports_write)
+
+            target = root / "remote.txt"
+            self.assertEqual(
+                await client_file_system.read_text_file(target, line=3, limit=4),
+                "client file contents",
+            )
+            await client_file_system.write_text_file(target, "updated")
+
+        self.assertEqual(
+            client.read_text_file_requests,
+            [(created.session_id, str(target), 3, 4)],
+        )
+        self.assertEqual(
+            client.write_text_file_requests,
+            [(created.session_id, str(target), "updated")],
+        )
+
+    async def test_client_filesystem_fails_closed_for_capabilities_and_client_failures(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            application = ApplicationFixture(
+                root, [RunnerFixture(), RunnerFixture(), RunnerFixture()]
+            )
+            agent = NeuroCodeAcpAgent(_acp_service(application))
+            client = AcpClientFixture()
+            agent.on_connect(cast(Client, client))
+            await agent.initialize(
+                1,
+                ClientCapabilities(
+                    fs=FileSystemCapabilities(read_text_file=True, write_text_file=True)
+                ),
+            )
+            created = await agent.new_session(str(root))
+            delegated = application.client_file_systems[0]
+            assert delegated is not None
+            target = root / "remote.txt"
+
+            client.read_text_file_error = RuntimeError("untrusted client detail")
+            with self.assertRaisesRegex(ToolError, "ACP client text-file read failed"):
+                await delegated.read_text_file(target)
+            client.read_text_file_error = None
+            client.read_text_file_content = "x" * (acp_module.MAX_CLIENT_FILE_BYTES + 1)
+            with self.assertRaisesRegex(ToolError, "response exceeds the size limit"):
+                await delegated.read_text_file(target)
+            client.read_text_file_content = "ok"
+
+            with self.assertRaisesRegex(ToolError, "write exceeds the size limit"):
+                await delegated.write_text_file(
+                    target,
+                    "x" * (acp_module.MAX_CLIENT_FILE_BYTES + 1),
+                )
+            client.write_text_file_error = RuntimeError("untrusted client detail")
+            with self.assertRaisesRegex(ToolError, "ACP client text-file write failed"):
+                await delegated.write_text_file(target, "ok")
+            client.write_text_file_error = None
+
+            await agent.close_session(created.session_id)
+
+            read_only_agent = NeuroCodeAcpAgent(_acp_service(application))
+            read_only_agent.on_connect(cast(Client, client))
+            await read_only_agent.initialize(
+                1,
+                ClientCapabilities(
+                    fs=FileSystemCapabilities(read_text_file=True, write_text_file=False)
+                ),
+            )
+            read_only_created = await read_only_agent.new_session(str(root))
+            read_only = application.client_file_systems[1]
+            assert read_only is not None
+            with self.assertRaisesRegex(ToolError, "does not support text-file writes"):
+                await read_only.write_text_file(target, "blocked")
+            await read_only_agent.close_session(read_only_created.session_id)
+
+            write_only_agent = NeuroCodeAcpAgent(_acp_service(application))
+            write_only_agent.on_connect(cast(Client, client))
+            await write_only_agent.initialize(
+                1,
+                ClientCapabilities(
+                    fs=FileSystemCapabilities(read_text_file=False, write_text_file=True)
+                ),
+            )
+            write_only_created = await write_only_agent.new_session(str(root))
+            write_only = application.client_file_systems[2]
+            assert write_only is not None
+            with self.assertRaisesRegex(ToolError, "does not support text-file reads"):
+                await write_only.read_text_file(target)
+            await write_only_agent.close_session(write_only_created.session_id)
+
+    async def test_client_terminal_capability_is_bound_and_releases_foreground_commands(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            application = ApplicationFixture(root, [RunnerFixture()])
+            agent = NeuroCodeAcpAgent(_acp_service(application))
+            client = AcpClientFixture()
+            agent.on_connect(cast(Client, client))
+            await agent.initialize(1, ClientCapabilities(terminal=True))
+
+            created = await agent.new_session(str(root))
+            terminal = application.client_terminals[0]
+            self.assertIsNotNone(terminal)
+            assert terminal is not None
+            result = await terminal.run(
+                "git",
+                ("status", "--short"),
+                cwd=root,
+                output_byte_limit=128,
+                timeout_seconds=1,
+            )
+
+        self.assertEqual(result.output, "client terminal output")
+        self.assertEqual(result.exit_code, 0)
+        self.assertIsNone(result.signal)
+        self.assertFalse(result.truncated)
+        self.assertEqual(
+            client.create_terminal_requests,
+            [(created.session_id, "git", ["status", "--short"], str(root), 128)],
+        )
+        self.assertEqual(client.terminal_envs, [None])
+        self.assertEqual(client.terminal_wait_requests, [(created.session_id, "client-terminal")])
+        self.assertEqual(client.terminal_output_requests, [(created.session_id, "client-terminal")])
+        self.assertEqual(client.terminal_kill_requests, [])
+        self.assertEqual(
+            client.terminal_release_requests, [(created.session_id, "client-terminal")]
+        )
+
+    async def test_client_terminal_fails_closed_for_capabilities_and_client_failures(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            application = ApplicationFixture(root, [RunnerFixture(), RunnerFixture()])
+            agent = NeuroCodeAcpAgent(_acp_service(application))
+            client = AcpClientFixture()
+            agent.on_connect(cast(Client, client))
+            await agent.initialize(1)
+            created = await agent.new_session(str(root))
+            self.assertIsNone(application.client_terminals[0])
+            await agent.close_session(created.session_id)
+
+            terminal_agent = NeuroCodeAcpAgent(_acp_service(application))
+            terminal_agent.on_connect(cast(Client, client))
+            await terminal_agent.initialize(1, ClientCapabilities(terminal=True))
+            terminal_created = await terminal_agent.new_session(str(root))
+            terminal = application.client_terminals[1]
+            assert terminal is not None
+
+            client.create_terminal_error = RuntimeError("untrusted client detail")
+            with self.assertRaisesRegex(ToolError, "terminal creation failed"):
+                await terminal.run("git", (), cwd=root, output_byte_limit=128, timeout_seconds=1)
+            client.create_terminal_error = None
+
+            client.terminal_output_error = RuntimeError("untrusted client detail")
+            with self.assertRaisesRegex(ToolError, "terminal output failed"):
+                await terminal.run("git", (), cwd=root, output_byte_limit=128, timeout_seconds=1)
+            client.terminal_output_error = None
+
+            client.terminal_output_response = TerminalOutputResponse(
+                output="x" * 129,
+                truncated=False,
+                exit_status=TerminalExitStatus(exit_code=0),
+            )
+            with self.assertRaisesRegex(ToolError, "response exceeds the output limit"):
+                await terminal.run("git", (), cwd=root, output_byte_limit=128, timeout_seconds=1)
+            client.terminal_output_response = TerminalOutputResponse(
+                output="ok",
+                truncated=False,
+                exit_status=TerminalExitStatus(exit_code=0),
+            )
+
+            client.terminal_wait = WaitForTerminalExitResponse()
+            with self.assertRaisesRegex(ToolError, "returned no exit status"):
+                await terminal.run("git", (), cwd=root, output_byte_limit=128, timeout_seconds=1)
+            client.terminal_wait = WaitForTerminalExitResponse(exit_code=0)
+
+            client.terminal_wait_error = RuntimeError("untrusted client detail")
+            with self.assertRaisesRegex(ToolError, "terminal wait failed"):
+                await terminal.run("git", (), cwd=root, output_byte_limit=128, timeout_seconds=1)
+            client.terminal_wait_error = None
+
+            client.terminal_wait_started = asyncio.Event()
+            client.terminal_wait_gate = asyncio.Event()
+            with self.assertRaisesRegex(ToolError, "timed out after"):
+                await terminal.run(
+                    "git", (), cwd=root, output_byte_limit=128, timeout_seconds=0.001
+                )
+
+            client.terminal_wait_started = asyncio.Event()
+            pending = asyncio.create_task(
+                terminal.run("git", (), cwd=root, output_byte_limit=128, timeout_seconds=1)
+            )
+            await client.terminal_wait_started.wait()
+            pending.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await pending
+            client.terminal_wait_gate = None
+            await terminal_agent.close_session(terminal_created.session_id)
+
+        self.assertGreaterEqual(len(client.terminal_kill_requests), 3)
+        self.assertGreaterEqual(len(client.terminal_release_requests), 6)
+
+    async def test_client_background_terminal_is_session_bound_and_releases_on_completion(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            application = ApplicationFixture(root, [RunnerFixture()])
+            agent = NeuroCodeAcpAgent(_acp_service(application))
+            client = AcpClientFixture()
+            client.terminal_wait_gate = asyncio.Event()
+            agent.on_connect(cast(Client, client))
+            await agent.initialize(1, ClientCapabilities(terminal=True))
+            created = await agent.new_session(str(root))
+            terminal = application.client_terminals[0]
+            assert terminal is not None
+
+            started = await terminal.start_exec(
+                "git",
+                ("status", "--short"),
+                cwd=root,
+                output_byte_limit=128,
+                timeout_seconds=10,
+            )
+            await client.terminal_wait_started.wait()
+            self.assertEqual(started.status, BackgroundTaskStatus.RUNNING)
+            self.assertTrue(started.task_id.startswith("terminal-task-"))
+            self.assertEqual(
+                client.create_terminal_requests,
+                [(created.session_id, "git", ["status", "--short"], str(root), 128)],
+            )
+
+            running = await terminal.get(started.task_id)
+            assert running is not None
+            self.assertEqual(running.status, BackgroundTaskStatus.RUNNING)
+            self.assertEqual(running.output, "client terminal output")
+            client.terminal_wait_gate.set()
+            completed = await terminal.wait(
+                (started.task_id,),
+                mode=BackgroundTaskWaitMode.WAIT_ALL,
+                timeout_seconds=1,
+            )
+            self.assertFalse(completed.timed_out)
+            self.assertEqual(completed.snapshots[0].status, BackgroundTaskStatus.COMPLETED)
+            self.assertEqual(completed.snapshots[0].output, "client terminal output")
+            await agent.close_session(created.session_id)
+
+        self.assertEqual(client.terminal_kill_requests, [])
+        self.assertEqual(
+            client.terminal_release_requests, [(created.session_id, "client-terminal")]
+        )
+
+    async def test_client_background_terminal_is_killed_and_released_when_session_closes(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            application = ApplicationFixture(root, [RunnerFixture()])
+            agent = NeuroCodeAcpAgent(_acp_service(application))
+            client = AcpClientFixture()
+            client.terminal_wait_gate = asyncio.Event()
+            agent.on_connect(cast(Client, client))
+            await agent.initialize(1, ClientCapabilities(terminal=True))
+            created = await agent.new_session(str(root))
+            terminal = application.client_terminals[0]
+            assert terminal is not None
+
+            started = await terminal.start_exec(
+                "git",
+                ("status",),
+                cwd=root,
+                output_byte_limit=128,
+            )
+            await client.terminal_wait_started.wait()
+            await agent.close_session(created.session_id)
+
+        self.assertTrue(started.task_id.startswith("terminal-task-"))
+        self.assertGreaterEqual(
+            client.terminal_kill_requests.count((created.session_id, "client-terminal")),
+            1,
+        )
+        self.assertEqual(
+            client.terminal_release_requests, [(created.session_id, "client-terminal")]
+        )
+
+    async def test_client_background_terminal_times_out_and_is_released(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            application = ApplicationFixture(root, [RunnerFixture()])
+            agent = NeuroCodeAcpAgent(_acp_service(application))
+            client = AcpClientFixture()
+            client.terminal_wait_gate = asyncio.Event()
+            agent.on_connect(cast(Client, client))
+            await agent.initialize(1, ClientCapabilities(terminal=True))
+            created = await agent.new_session(str(root))
+            terminal = application.client_terminals[0]
+            assert terminal is not None
+
+            started = await terminal.start_exec(
+                "git",
+                ("status",),
+                cwd=root,
+                output_byte_limit=128,
+                timeout_seconds=0.001,
+            )
+            await client.terminal_wait_started.wait()
+            completed = await terminal.wait(
+                (started.task_id,),
+                mode=BackgroundTaskWaitMode.WAIT_ALL,
+                timeout_seconds=1,
+            )
+            await agent.close_session(created.session_id)
+
+        self.assertEqual(completed.snapshots[0].status, BackgroundTaskStatus.TIMED_OUT)
+        self.assertIn((created.session_id, "client-terminal"), client.terminal_kill_requests)
+        self.assertEqual(
+            client.terminal_release_requests, [(created.session_id, "client-terminal")]
+        )
+
     async def test_requests_require_initialize_and_active_sessions(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -943,6 +1639,67 @@ class AcpAgentTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(RequestError) as creation:
                 await agent.new_session(str(root))
             self.assertEqual(creation.exception.data["reason"], "session_creation_failed")
+
+    async def test_image_prompt_reaches_the_binding_as_structured_history(self) -> None:
+        encoded = base64.b64encode(b"image fixture").decode("ascii")
+        runner = RunnerFixture()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            agent, _, _ = await initialized_agent(root, [runner])
+            session = await agent.new_session(str(root))
+            response = await agent.prompt(
+                session.session_id,
+                [
+                    TextContentBlock(type="text", text="inspect"),
+                    ImageContentBlock(type="image", data=encoded, mime_type="image/png"),
+                ],
+            )
+
+        self.assertEqual(response.stop_reason, "end_turn")
+        self.assertEqual(runner.prompts[0][0], "inspect")
+        self.assertEqual(
+            [part.to_dict() for part in runner.prompts[0][1]],
+            [
+                {"type": "text", "text": "inspect"},
+                {"type": "image", "url": f"data:image/png;base64,{encoded}"},
+            ],
+        )
+
+    async def test_embedded_text_resource_reaches_the_binding_as_labeled_text(self) -> None:
+        runner = RunnerFixture()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            agent, _, _ = await initialized_agent(root, [runner])
+            session = await agent.new_session(str(root))
+            response = await agent.prompt(
+                session.session_id,
+                [
+                    TextContentBlock(type="text", text="inspect"),
+                    EmbeddedResourceContentBlock(
+                        type="resource",
+                        resource=TextResourceContents(
+                            uri="memory://review-notes",
+                            mime_type="text/markdown",
+                            text="## Notes\nReview this change.",
+                        ),
+                    ),
+                ],
+            )
+
+        resource_text = (
+            '<embedded_resource>{"mimeType":"text/markdown",'
+            '"uri":"memory://review-notes"}</embedded_resource>\n'
+            "## Notes\nReview this change."
+        )
+        self.assertEqual(response.stop_reason, "end_turn")
+        self.assertEqual(runner.prompts[0][0], f"inspect\n{resource_text}")
+        self.assertEqual(
+            [part.to_dict() for part in runner.prompts[0][1]],
+            [
+                {"type": "text", "text": "inspect"},
+                {"type": "text", "text": resource_text},
+            ],
+        )
 
     async def test_session_new_validates_workspace_and_keeps_stable_acp_id(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1212,9 +1969,22 @@ class AcpAgentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(collection.close_calls, 1)
 
     async def test_session_load_replays_bounded_visible_history_and_resumes(self) -> None:
+        embedded_resource = (
+            '<embedded_resource>{"mimeType":"text/plain",'
+            '"uri":"memory://previous-notes"}</embedded_resource>\n'
+            "previous resource text"
+        )
         history = (
             Message(Role.SYSTEM, "hidden system instructions"),
-            Message(Role.USER, "previous question"),
+            Message(
+                Role.USER,
+                f"previous question\n{embedded_resource}",
+                content_parts=(
+                    ContentPart.from_text("previous question"),
+                    ContentPart.from_text(embedded_resource),
+                    ContentPart.from_image("data:image/png;base64,cHJpdmF0ZS1pbWFnZQ=="),
+                ),
+            ),
             PreservedContextItem(
                 ContextItemKind.REASONING,
                 {
@@ -1282,12 +2052,17 @@ class AcpAgentTests(unittest.IsolatedAsyncioTestCase):
                 ],
             )
             self.assertIsInstance(replay[0], UserMessageChunk)
-            self.assertEqual(replay[0].content.text, "previous question")
+            self.assertEqual(
+                replay[0].content.text,
+                f"previous question\n{embedded_resource}\n"
+                "[image content preserved in session; binary replay is unavailable]",
+            )
             self.assertEqual(replay[1].content.text, "previous answer")
             self.assertEqual([replay[2].status, replay[3].status], ["pending", "completed"])
             self.assertEqual([replay[4].status, replay[5].status], ["pending", "failed"])
             self.assertEqual(replay[2].locations[0].path, "safe.txt")
             self.assertNotIn("secretvalue", repr(replay))
+            self.assertNotIn("cHJpdmF0ZS1pbWFnZQ==", repr(replay))
             self.assertNotIn("hidden", repr(replay))
             self.assertIsNone(replay[2].raw_input)
             self.assertIsNone(replay[3].raw_output)
@@ -1308,7 +2083,8 @@ class AcpAgentTests(unittest.IsolatedAsyncioTestCase):
             )
             await agent.close_session("acp-durable")
 
-        self.assertEqual(application.resume_ids, ["persisted-id", "persisted-id"])
+            self.assertEqual(application.resume_ids, ["persisted-id", "persisted-id"])
+            self.assertTrue(all(terminal is not None for terminal in application.client_terminals))
         self.assertEqual(
             application.additional_workspace_roots,
             [(additional.resolve(),), (additional.resolve(),)],
@@ -1428,6 +2204,7 @@ class AcpAgentTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(client.updates, [])
             self.assertEqual(application.resume_ids, ["persisted-id"])
             self.assertEqual(application.additional_workspace_roots, [(additional.resolve(),)])
+            self.assertIsNotNone(application.client_terminals[0])
             prompted = await agent.prompt(
                 "acp-durable",
                 [TextContentBlock(type="text", text="continue")],
@@ -1641,6 +2418,7 @@ class AcpAgentTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(application.resume_ids, ["forked-1"])
             self.assertEqual(application.additional_workspace_roots, [(additional.resolve(),)])
+            self.assertIsNotNone(application.client_terminals[0])
             self.assertEqual(client.updates, [])
             prompted = await agent.prompt(
                 forked.session_id,

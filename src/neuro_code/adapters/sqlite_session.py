@@ -24,12 +24,19 @@ from neuro_code.domain.messages import (
     SessionItem,
     ToolCall,
 )
+from neuro_code.domain.plans import MAX_PLAN_COMMENTS, PlanComment, SessionPlan
 from neuro_code.domain.sandbox import SandboxProfile
 from neuro_code.domain.session_search import (
     SessionSearchHit,
     SessionSearchPage,
     fallback_session_title,
     searchable_session_text,
+)
+from neuro_code.domain.session_tasks import (
+    MAX_SESSION_TASK_ID_BYTES,
+    SessionTask,
+    SessionTaskKind,
+    SessionTaskStatus,
 )
 from neuro_code.domain.sessions import (
     SessionSnapshot,
@@ -39,7 +46,7 @@ from neuro_code.domain.sessions import (
 from neuro_code.shared.async_utils import run_blocking
 from neuro_code.shared.errors import SessionError
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 9
 _SEARCH_SNIPPET_LIMIT = 500
 _SQLITE_TIMEOUT_SECONDS = 30.0
 _SESSION_ALIAS_NAMESPACE_LIMIT = 64
@@ -131,6 +138,22 @@ class SqliteSessionStore:
                         _ensure_session_alias_schema(connection)
                         connection.execute("UPDATE schema_meta SET version = 5 WHERE singleton = 1")
                         version = (5,)
+                    if version is not None and version[0] == 5:
+                        _ensure_session_plan_schema(connection)
+                        connection.execute("UPDATE schema_meta SET version = 6 WHERE singleton = 1")
+                        version = (6,)
+                    if version is not None and version[0] == 6:
+                        _ensure_session_task_schema(connection)
+                        connection.execute("UPDATE schema_meta SET version = 7 WHERE singleton = 1")
+                        version = (7,)
+                    if version is not None and version[0] == 7:
+                        _ensure_session_plan_comment_schema(connection)
+                        connection.execute("UPDATE schema_meta SET version = 8 WHERE singleton = 1")
+                        version = (8,)
+                    if version is not None and version[0] == 8:
+                        _ensure_session_task_schema(connection)
+                        connection.execute("UPDATE schema_meta SET version = 9 WHERE singleton = 1")
+                        version = (9,)
                     if version is None or version[0] != SCHEMA_VERSION:
                         raise SessionError(
                             "unsupported session schema version: "
@@ -138,6 +161,9 @@ class SqliteSessionStore:
                         )
                     _ensure_search_schema(connection)
                     _ensure_session_alias_schema(connection)
+                    _ensure_session_plan_schema(connection)
+                    _ensure_session_task_schema(connection)
+                    _ensure_session_plan_comment_schema(connection)
                     _backfill_search_documents(connection, missing_only=True)
                     connection.commit()
                 except BaseException:
@@ -245,7 +271,7 @@ class SqliteSessionStore:
                 row = connection.execute(
                     """
                     SELECT cwd, provider, model, messages_json, context_affinity,
-                           sandbox_profile, title
+                           sandbox_profile, title, plan_json
                     FROM sessions
                     WHERE id = ?
                     """,
@@ -264,8 +290,8 @@ class SqliteSessionStore:
                     """
                     INSERT INTO sessions(
                         id, cwd, provider, model, messages_json,
-                        context_affinity, sandbox_profile, title
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        context_affinity, sandbox_profile, title, plan_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         forked_session_id,
@@ -276,6 +302,7 @@ class SqliteSessionStore:
                         row[4],
                         row[5],
                         title,
+                        row[7],
                     ),
                 )
                 _upsert_search_document(
@@ -284,6 +311,32 @@ class SqliteSessionStore:
                     title=title,
                     content=searchable_session_text(items),
                 )
+                comments = connection.execute(
+                    """
+                    SELECT plan_fingerprint, step_index, content, created_at
+                    FROM session_plan_comments
+                    WHERE session_id = ?
+                    ORDER BY created_at ASC, comment_id ASC
+                    """,
+                    (session_id,),
+                ).fetchall()
+                for plan_fingerprint, step_index, content, created_at in comments:
+                    connection.execute(
+                        """
+                        INSERT INTO session_plan_comments(
+                            comment_id, session_id, plan_fingerprint,
+                            step_index, content, created_at
+                        ) VALUES (?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            f"plan-comment-{uuid.uuid4().hex}",
+                            forked_session_id,
+                            plan_fingerprint,
+                            step_index,
+                            content,
+                            created_at,
+                        ),
+                    )
 
         async with self._write_lock:
             await run_blocking(fork)
@@ -503,6 +556,302 @@ class SqliteSessionStore:
     async def load_messages(self, session_id: str) -> list[Message]:
         items = await self.load_session_items(session_id)
         return [item for item in items if isinstance(item, Message)]
+
+    async def save_session_plan(self, session_id: str, plan: SessionPlan | None) -> None:
+        if plan is not None and not isinstance(plan, SessionPlan):
+            raise TypeError("plan must be a SessionPlan or None")
+        payload = (
+            json.dumps(plan.to_dict(), ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+            if plan is not None
+            else ""
+        )
+
+        def save() -> None:
+            with closing(self._connect()) as connection, connection:
+                cursor = connection.execute(
+                    """
+                    UPDATE sessions
+                    SET plan_json = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """,
+                    (payload, session_id),
+                )
+                if cursor.rowcount != 1:
+                    raise SessionError(f"unknown session: {session_id}")
+                if plan is None:
+                    connection.execute(
+                        "DELETE FROM session_plan_comments WHERE session_id = ?",
+                        (session_id,),
+                    )
+                else:
+                    connection.execute(
+                        """
+                        DELETE FROM session_plan_comments
+                        WHERE session_id = ? AND plan_fingerprint != ?
+                        """,
+                        (session_id, plan.fingerprint),
+                    )
+
+        async with self._write_lock:
+            await run_blocking(save)
+
+    async def load_session_plan(self, session_id: str) -> SessionPlan | None:
+        def load() -> SessionPlan | None:
+            with closing(self._connect()) as connection:
+                row = connection.execute(
+                    "SELECT plan_json FROM sessions WHERE id = ?", (session_id,)
+                ).fetchone()
+            if row is None:
+                raise SessionError(f"unknown session: {session_id}")
+            payload = row[0]
+            if not isinstance(payload, str) or not payload:
+                return None
+            try:
+                return SessionPlan.from_dict(json.loads(payload))
+            except (TypeError, ValueError, json.JSONDecodeError) as error:
+                raise SessionError(f"session {session_id} contains an invalid plan") from error
+
+        return await run_blocking(load)
+
+    async def add_plan_comment(
+        self,
+        session_id: str,
+        plan: SessionPlan,
+        comment: PlanComment,
+    ) -> None:
+        if not isinstance(plan, SessionPlan):
+            raise TypeError("plan must be a SessionPlan")
+        if not isinstance(comment, PlanComment):
+            raise TypeError("comment must be a PlanComment")
+        if comment.step_index > len(plan.steps):
+            raise SessionError("plan comment refers to an unknown step")
+
+        def add() -> None:
+            try:
+                with closing(self._connect()) as connection, connection:
+                    row = connection.execute(
+                        "SELECT plan_json FROM sessions WHERE id = ?",
+                        (session_id,),
+                    ).fetchone()
+                    if row is None:
+                        raise SessionError(f"unknown session: {session_id}")
+                    payload = row[0]
+                    if not isinstance(payload, str) or not payload:
+                        raise SessionError("session has no saved plan")
+                    try:
+                        current_plan = SessionPlan.from_dict(json.loads(payload))
+                    except (TypeError, ValueError, json.JSONDecodeError) as error:
+                        raise SessionError(
+                            f"session {session_id} contains an invalid plan"
+                        ) from error
+                    if current_plan.fingerprint != plan.fingerprint:
+                        raise SessionError("session plan changed before the comment was saved")
+                    comment_count = connection.execute(
+                        """
+                        SELECT COUNT(*) FROM session_plan_comments
+                        WHERE session_id = ? AND plan_fingerprint = ?
+                        """,
+                        (session_id, plan.fingerprint),
+                    ).fetchone()
+                    if comment_count is None or int(comment_count[0]) >= MAX_PLAN_COMMENTS:
+                        raise SessionError("plan comment limit reached")
+                    connection.execute(
+                        """
+                        INSERT INTO session_plan_comments(
+                            comment_id, session_id, plan_fingerprint,
+                            step_index, content, created_at
+                        ) VALUES (?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            comment.comment_id,
+                            session_id,
+                            plan.fingerprint,
+                            comment.step_index,
+                            comment.content,
+                            comment.created_at.isoformat(),
+                        ),
+                    )
+                    connection.execute(
+                        "UPDATE sessions SET updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                        (session_id,),
+                    )
+            except sqlite3.IntegrityError as error:
+                raise SessionError(f"cannot save plan comment: {comment.comment_id}") from error
+
+        async with self._write_lock:
+            await run_blocking(add)
+
+    async def list_plan_comments(
+        self,
+        session_id: str,
+        plan: SessionPlan,
+    ) -> list[PlanComment]:
+        if not isinstance(plan, SessionPlan):
+            raise TypeError("plan must be a SessionPlan")
+
+        def load() -> list[PlanComment]:
+            with closing(self._connect()) as connection:
+                session = connection.execute(
+                    "SELECT 1 FROM sessions WHERE id = ?", (session_id,)
+                ).fetchone()
+                if session is None:
+                    raise SessionError(f"unknown session: {session_id}")
+                rows = connection.execute(
+                    """
+                    SELECT comment_id, step_index, content, created_at
+                    FROM session_plan_comments
+                    WHERE session_id = ? AND plan_fingerprint = ?
+                    ORDER BY created_at ASC, comment_id ASC
+                    """,
+                    (session_id, plan.fingerprint),
+                ).fetchall()
+            return [_plan_comment_from_row(row, session_id=session_id) for row in rows]
+
+        return await run_blocking(load)
+
+    async def create_session_task(self, session_id: str, task: SessionTask) -> None:
+        if not isinstance(task, SessionTask):
+            raise TypeError("task must be a SessionTask")
+        plan_snapshot_json = (
+            json.dumps(
+                task.plan_snapshot.to_dict(),
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            if task.plan_snapshot is not None
+            else ""
+        )
+
+        def create() -> None:
+            try:
+                with closing(self._connect()) as connection, connection:
+                    connection.execute(
+                        """
+                        INSERT INTO session_tasks(
+                            task_id, session_id, kind, status, started_at, finished_at,
+                            plan_snapshot_json
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            task.task_id,
+                            session_id,
+                            task.kind.value,
+                            task.status.value,
+                            task.started_at.isoformat(),
+                            task.finished_at.isoformat() if task.finished_at else None,
+                            plan_snapshot_json,
+                        ),
+                    )
+                    connection.execute(
+                        "UPDATE sessions SET updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                        (session_id,),
+                    )
+            except sqlite3.IntegrityError as error:
+                raise SessionError(f"cannot create session task: {task.task_id}") from error
+
+        async with self._write_lock:
+            await run_blocking(create)
+
+    async def update_session_task(self, session_id: str, task: SessionTask) -> None:
+        if not isinstance(task, SessionTask):
+            raise TypeError("task must be a SessionTask")
+
+        def update() -> None:
+            with closing(self._connect()) as connection, connection:
+                row = connection.execute(
+                    """
+                    SELECT task_id, kind, status, started_at, finished_at, plan_snapshot_json
+                    FROM session_tasks
+                    WHERE session_id = ? AND task_id = ?
+                    """,
+                    (session_id, task.task_id),
+                ).fetchone()
+                if row is None:
+                    raise SessionError(f"unknown session task: {task.task_id}")
+                current = _session_task_from_row(row, session_id=session_id)
+                try:
+                    if task.finished_at is None:
+                        raise ValueError("session task finish time is missing")
+                    expected = current.finish(task.status, finished_at=task.finished_at)
+                except ValueError as error:
+                    raise SessionError(
+                        f"invalid session task transition: {task.task_id}"
+                    ) from error
+                if task != expected:
+                    raise SessionError(f"invalid session task transition: {task.task_id}")
+                connection.execute(
+                    """
+                    UPDATE session_tasks
+                    SET status = ?, finished_at = ?
+                    WHERE session_id = ? AND task_id = ?
+                    """,
+                    (
+                        task.status.value,
+                        task.finished_at.isoformat() if task.finished_at else None,
+                        session_id,
+                        task.task_id,
+                    ),
+                )
+                connection.execute(
+                    "UPDATE sessions SET updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                    (session_id,),
+                )
+
+        async with self._write_lock:
+            await run_blocking(update)
+
+    async def list_session_tasks(
+        self,
+        session_id: str,
+        *,
+        limit: int = 50,
+    ) -> list[SessionTask]:
+        if limit <= 0:
+            raise SessionError("session task limit must be positive")
+
+        def load() -> list[SessionTask]:
+            with closing(self._connect()) as connection:
+                session = connection.execute(
+                    "SELECT 1 FROM sessions WHERE id = ?", (session_id,)
+                ).fetchone()
+                if session is None:
+                    raise SessionError(f"unknown session: {session_id}")
+                rows = connection.execute(
+                    """
+                    SELECT task_id, kind, status, started_at, finished_at, plan_snapshot_json
+                    FROM session_tasks
+                    WHERE session_id = ?
+                    ORDER BY started_at DESC, task_id DESC
+                    LIMIT ?
+                    """,
+                    (session_id, limit),
+                ).fetchall()
+            return [_session_task_from_row(row, session_id=session_id) for row in rows]
+
+        return await run_blocking(load)
+
+    async def get_session_task(self, session_id: str, task_id: str) -> SessionTask | None:
+        _validated_session_task_id(task_id)
+
+        def load() -> SessionTask | None:
+            with closing(self._connect()) as connection:
+                session = connection.execute(
+                    "SELECT 1 FROM sessions WHERE id = ?", (session_id,)
+                ).fetchone()
+                if session is None:
+                    raise SessionError(f"unknown session: {session_id}")
+                row = connection.execute(
+                    """
+                    SELECT task_id, kind, status, started_at, finished_at, plan_snapshot_json
+                    FROM session_tasks
+                    WHERE session_id = ? AND task_id = ?
+                    """,
+                    (session_id, task_id),
+                ).fetchone()
+            return _session_task_from_row(row, session_id=session_id) if row is not None else None
+
+        return await run_blocking(load)
 
     async def load_session_items(self, session_id: str) -> list[SessionItem]:
         def load() -> list[SessionItem]:
@@ -1015,6 +1364,103 @@ def _ensure_session_alias_schema(connection: sqlite3.Connection) -> None:
     )
 
 
+def _ensure_session_plan_schema(connection: sqlite3.Connection) -> None:
+    columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(sessions)").fetchall()}
+    if "plan_json" not in columns:
+        connection.execute("ALTER TABLE sessions ADD COLUMN plan_json TEXT NOT NULL DEFAULT ''")
+
+
+def _ensure_session_task_schema(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS session_tasks (
+            task_id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            status TEXT NOT NULL,
+            started_at TEXT NOT NULL,
+            finished_at TEXT,
+            plan_snapshot_json TEXT NOT NULL DEFAULT '',
+            FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+        )
+        """
+    )
+    columns = {
+        str(row[1]) for row in connection.execute("PRAGMA table_info(session_tasks)").fetchall()
+    }
+    if "plan_snapshot_json" not in columns:
+        connection.execute(
+            "ALTER TABLE session_tasks ADD COLUMN plan_snapshot_json TEXT NOT NULL DEFAULT ''"
+        )
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS session_tasks_by_session_started
+        ON session_tasks(session_id, started_at DESC, task_id DESC)
+        """
+    )
+
+
+def _ensure_session_plan_comment_schema(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS session_plan_comments (
+            comment_id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            plan_fingerprint TEXT NOT NULL,
+            step_index INTEGER NOT NULL,
+            content TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS session_plan_comments_by_current_plan
+        ON session_plan_comments(session_id, plan_fingerprint, created_at, comment_id)
+        """
+    )
+
+
+def _plan_comment_from_row(row: Sequence[object], *, session_id: str) -> PlanComment:
+    try:
+        comment_id, raw_step_index, content, raw_created_at = row
+        if not isinstance(raw_step_index, int) or isinstance(raw_step_index, bool):
+            raise ValueError("plan comment step index is invalid")
+        return PlanComment(
+            str(comment_id),
+            raw_step_index,
+            str(content),
+            datetime.fromisoformat(str(raw_created_at)),
+        )
+    except (TypeError, ValueError) as error:
+        raise SessionError(f"session {session_id} contains an invalid plan comment") from error
+
+
+def _session_task_from_row(row: Sequence[object], *, session_id: str) -> SessionTask:
+    try:
+        task_id, raw_kind, raw_status, raw_started_at, raw_finished_at, raw_plan_snapshot = row
+        started_at = datetime.fromisoformat(str(raw_started_at))
+        finished_at = (
+            datetime.fromisoformat(str(raw_finished_at)) if raw_finished_at is not None else None
+        )
+        if not isinstance(raw_plan_snapshot, str):
+            raise ValueError("session task plan snapshot is invalid")
+        plan_snapshot = (
+            SessionPlan.from_dict(json.loads(raw_plan_snapshot)) if raw_plan_snapshot else None
+        )
+        return SessionTask(
+            str(task_id),
+            SessionTaskKind(str(raw_kind)),
+            SessionTaskStatus(str(raw_status)),
+            started_at,
+            finished_at,
+            plan_snapshot,
+        )
+    except (TypeError, ValueError, json.JSONDecodeError) as error:
+        raise SessionError(f"session {session_id} contains an invalid task") from error
+
+
 def _session_alias_value(value: str, *, field_name: str, limit: int) -> str:
     if not value or "\x00" in value:
         raise SessionError(f"session alias {field_name} must not be empty")
@@ -1023,6 +1469,16 @@ def _session_alias_value(value: str, *, field_name: str, limit: int) -> str:
     if any(ord(character) < 32 or ord(character) == 127 for character in value):
         raise SessionError(f"session alias {field_name} contains control characters")
     return value
+
+
+def _validated_session_task_id(task_id: str) -> str:
+    if not isinstance(task_id, str) or not task_id or "\x00" in task_id:
+        raise SessionError("session task id is invalid")
+    if len(task_id.encode("utf-8")) > MAX_SESSION_TASK_ID_BYTES:
+        raise SessionError("session task id is invalid")
+    if any(ord(character) < 32 or ord(character) == 127 for character in task_id):
+        raise SessionError("session task id is invalid")
+    return task_id
 
 
 def _backfill_search_documents(

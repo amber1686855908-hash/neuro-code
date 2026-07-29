@@ -5,7 +5,7 @@ import difflib
 import os
 import re
 import sys
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, ClassVar, Protocol
@@ -49,6 +49,7 @@ from neuro_code.domain.context_usage import estimate_context_tokens, estimate_te
 from neuro_code.domain.events import AgentEvent, AgentEventKind
 from neuro_code.domain.interaction_mode import InteractionMode
 from neuro_code.domain.messages import Message, Role, SessionItem
+from neuro_code.domain.plans import PlanComment, SessionPlan
 from neuro_code.domain.provider_catalog import (
     ProviderCatalogError,
     ProviderCatalogResult,
@@ -56,6 +57,7 @@ from neuro_code.domain.provider_catalog import (
 )
 from neuro_code.domain.provider_settings import ManagedProviderProfile, ManagedProviderSettings
 from neuro_code.domain.reasoning import ReasoningEffort
+from neuro_code.domain.session_tasks import SessionTask
 from neuro_code.domain.sessions import SessionSummary
 from neuro_code.domain.ui_preferences import UiLanguage
 from neuro_code.shared.redaction import redact_sensitive_text
@@ -338,6 +340,23 @@ class SessionController(Protocol):
 
 class TaskController(Protocol):
     async def list_background_tasks(self) -> tuple[BackgroundTaskSnapshot, ...]: ...
+
+
+class SessionTaskController(Protocol):
+    async def list_session_tasks(self) -> tuple[SessionTask, ...]: ...
+
+    async def get_session_task(self, task_id: str) -> SessionTask | None: ...
+
+
+class PlanController(Protocol):
+    @property
+    def plan(self) -> SessionPlan | None: ...
+
+    async def add_plan_comment(self, step_index: int, content: str) -> PlanComment: ...
+
+    async def list_plan_comments(self) -> tuple[PlanComment, ...]: ...
+
+    async def execute_plan(self, *, sink: EventSink | None = None) -> AgentRunResult: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -2163,6 +2182,8 @@ class NeuroCodeApp(App[None]):
         interaction_mode_controller: InteractionModeController | None = None,
         session_controller: SessionController | None = None,
         task_controller: TaskController | None = None,
+        session_task_controller: SessionTaskController | None = None,
+        plan_controller: PlanController | None = None,
         ui_preferences: UiPreferencesStore | None = None,
         provider_settings_store: ProviderSettingsStore | None = None,
         provider_catalog: ProviderCatalog | None = None,
@@ -2220,6 +2241,8 @@ class NeuroCodeApp(App[None]):
         self._interaction_mode_controller = interaction_mode_controller
         self._session_controller = session_controller
         self._task_controller = task_controller
+        self._session_task_controller = session_task_controller
+        self._plan_controller = plan_controller
         self._ui_preferences = ui_preferences
         self._provider_settings_store = provider_settings_store
         self._provider_catalog = provider_catalog
@@ -2252,6 +2275,7 @@ class NeuroCodeApp(App[None]):
         self._context_window_tokens = context_window_tokens
         self._context_used_tokens = estimate_context_tokens(self._initial_items)
         self._context_usage_estimated = True
+        self._plan = plan_controller.plan if plan_controller is not None else None
         self._entries: list[TranscriptEntry] = []
         self._entry_widgets: list[ConversationMessage] = []
         self._tool_feedback_by_call: dict[tuple[bool, str], ToolFeedbackState] = {}
@@ -2355,6 +2379,12 @@ class NeuroCodeApp(App[None]):
             self._write_ui_entry("error", "turn.running")
             return
 
+        self._submit_prompt(prompt)
+
+    def _submit_prompt(self, prompt: str) -> None:
+        if self._turn_worker is not None and self._turn_worker.is_running:
+            self._write_ui_entry("error", "turn.running")
+            return
         self._write_entry("user", prompt)
         self._context_used_tokens += 4 + estimate_text_tokens(prompt)
         self._context_usage_estimated = True
@@ -2411,9 +2441,22 @@ class NeuroCodeApp(App[None]):
         prompt.cursor_position = len(completed)
 
     async def _run_prompt(self, prompt: str) -> None:
+        await self._run_agent_turn(lambda: self._runner.run(prompt, sink=self._handle_event))
+
+    async def _run_plan_execution(self) -> None:
+        controller = self._plan_controller
+        if controller is None:
+            self._write_ui_entry("error", "plan.execution_unavailable")
+            return
+        await self._run_agent_turn(lambda: controller.execute_plan(sink=self._handle_event))
+
+    async def _run_agent_turn(
+        self,
+        run: Callable[[], Awaitable[AgentRunResult]],
+    ) -> None:
         prompt_input = self.query_one("#prompt", Input)
         try:
-            result = await self._runner.run(prompt, sink=self._handle_event)
+            result = await run()
             response = result.response or ui_text(self._language, "turn.no_response")
             if not self._turn_usage_reported:
                 self._context_used_tokens = (
@@ -2508,6 +2551,13 @@ class NeuroCodeApp(App[None]):
             AgentEventKind.TOOL_FAILED,
         }:
             self._handle_tool_feedback_event(event)
+        elif event.kind is AgentEventKind.PLAN_UPDATED:
+            try:
+                self._plan = SessionPlan.from_dict(data)
+            except ValueError:
+                return
+        elif event.kind is AgentEventKind.PLAN_EXECUTION_REQUESTED:
+            self._write_ui_entry("status", "plan.execution_requested")
         elif event.kind is AgentEventKind.TURN_COMPLETED:
             self._turn_completion = (
                 self._event_duration(data),
@@ -3165,6 +3215,27 @@ class NeuroCodeApp(App[None]):
     async def _dispatch_slash_command(self, raw: str) -> None:
         command, _, arguments = raw[1:].partition(" ")
         command = command.casefold()
+        if command == "plan":
+            description = arguments.strip()
+            await self._apply_interaction_mode(InteractionMode.PLAN)
+            if description and self._interaction_mode is InteractionMode.PLAN:
+                self._submit_prompt(description)
+            return
+        if command in {"view-plan", "show-plan"}:
+            if arguments.strip():
+                self._write_ui_entry("error", "command.arguments", command=command)
+                return
+            await self._show_plan()
+            return
+        if command in {"comment-plan", "plan-comment"}:
+            await self._add_plan_comment(arguments)
+            return
+        if command in {"execute-plan", "run-plan"}:
+            if arguments.strip():
+                self._write_ui_entry("error", "command.arguments", command=command)
+                return
+            await self._execute_plan()
+            return
         if command == "mode":
             mode_value = arguments.strip()
             if not mode_value:
@@ -3221,7 +3292,10 @@ class NeuroCodeApp(App[None]):
             if arguments.strip():
                 self._write_ui_entry("error", "command.tasks_arguments")
                 return
-            await self._show_background_tasks()
+            await self._show_tasks()
+            return
+        if command == "view-task":
+            await self._show_session_task(arguments.strip())
             return
         if command in {"setting", "settings"}:
             if arguments.strip():
@@ -3474,6 +3548,36 @@ class NeuroCodeApp(App[None]):
                     error=f"{type(error).__name__}: {error}",
                 )
 
+    async def _execute_plan(self) -> None:
+        controller = self._plan_controller
+        if controller is None:
+            self._write_ui_entry("error", "plan.execution_unavailable")
+            return
+        plan = controller.plan
+        self._plan = plan
+        if plan is None:
+            self._write_ui_entry("status", "plan.none")
+            return
+        if self._turn_worker is not None and self._turn_worker.is_running:
+            self._write_ui_entry("error", "turn.running")
+            return
+        await self._apply_interaction_mode(InteractionMode.ACCEPT_EDITS)
+        if self._interaction_mode is not InteractionMode.ACCEPT_EDITS:
+            return
+        self._write_ui_entry("user", "plan.execution_user")
+        self._assistant_parts.clear()
+        self._reasoning_announced = False
+        self._turn_completion = None
+        self._turn_usage_reported = False
+        self._begin_pending_assistant()
+        self._turn_worker = self.run_worker(
+            self._run_plan_execution(),
+            name="agent-plan-execution",
+            group="agent",
+            exclusive=True,
+            exit_on_error=False,
+        )
+
     async def _language_settings_selected(
         self,
         result: UiLanguage | None,
@@ -3551,6 +3655,8 @@ class NeuroCodeApp(App[None]):
 
         self._provider_name = result.provider_name
         self._model_name = result.model_name
+        if self._plan_controller is not None:
+            self._plan = self._plan_controller.plan
         self._context_window_tokens = result.context_window_tokens
         if result.changed:
             self._context_used_tokens = 0
@@ -3652,6 +3758,8 @@ class NeuroCodeApp(App[None]):
 
         self._provider_name = result.provider_name
         self._model_name = result.model_name
+        if self._plan_controller is not None:
+            self._plan = self._plan_controller.plan
         self._context_window_tokens = result.context_window_tokens
         if result.changed:
             self._context_used_tokens = estimate_context_tokens(result.items)
@@ -3701,22 +3809,99 @@ class NeuroCodeApp(App[None]):
             stopped=self._stopped_task_note(result.stopped_background_tasks),
         )
 
-    async def _show_background_tasks(self) -> None:
-        if self._task_controller is None:
-            self._write_ui_entry("error", "tasks.unavailable")
+    async def _add_plan_comment(self, arguments: str) -> None:
+        controller = self._plan_controller
+        if controller is None:
+            self._write_ui_entry("error", "plan.comment_unavailable")
+            return
+        plan = controller.plan
+        self._plan = plan
+        if plan is None:
+            self._write_ui_entry("status", "plan.none")
+            return
+        if self._turn_worker is not None and self._turn_worker.is_running:
+            self._write_ui_entry("error", "turn.running")
+            return
+        raw_index, separator, content = arguments.strip().partition(" ")
+        if not separator or not raw_index or not content.strip():
+            self._write_ui_entry("error", "plan.comment_usage")
             return
         try:
-            snapshots = await self._task_controller.list_background_tasks()
+            step_index = int(raw_index)
+        except ValueError:
+            self._write_ui_entry("error", "plan.comment_step_invalid", index=raw_index)
+            return
+        if not 1 <= step_index <= len(plan.steps):
+            self._write_ui_entry("error", "plan.comment_step_invalid", index=raw_index)
+            return
+        try:
+            await controller.add_plan_comment(step_index, content)
         except Exception as error:
             self._write_entry("error", f"{type(error).__name__}: {error}")
             return
-        if not snapshots:
+        self._write_ui_entry("status", "plan.comment_added", index=step_index)
+        await self._show_plan()
+
+    async def _show_plan(self) -> None:
+        controller = self._plan_controller
+        plan = controller.plan if controller is not None else self._plan
+        self._plan = plan
+        if plan is None:
+            self._write_ui_entry("status", "plan.none")
+            return
+        comments: tuple[PlanComment, ...] = ()
+        if controller is not None:
+            try:
+                comments = await controller.list_plan_comments()
+            except Exception as error:
+                self._write_entry("error", f"{type(error).__name__}: {error}")
+                return
+        lines = [ui_text(self._language, "plan.heading")]
+        if plan.explanation is not None:
+            lines.append(ui_text(self._language, "plan.purpose", explanation=plan.explanation))
+        for index, step in enumerate(plan.steps, start=1):
+            lines.append(
+                ui_text(
+                    self._language,
+                    "plan.step",
+                    index=index,
+                    status=ui_text(self._language, f"plan.status.{step.status.value}"),
+                    step=step.step,
+                )
+            )
+            lines.extend(
+                ui_text(self._language, "plan.comment", content=comment.content)
+                for comment in comments
+                if comment.step_index == index
+            )
+        self._write_entry("system", "\n".join(lines))
+
+    async def _show_tasks(self) -> None:
+        if self._task_controller is None and self._session_task_controller is None:
+            self._write_ui_entry("error", "tasks.unavailable")
+            return
+        try:
+            snapshots = (
+                await self._task_controller.list_background_tasks()
+                if self._task_controller is not None
+                else ()
+            )
+            session_tasks = (
+                await self._session_task_controller.list_session_tasks()
+                if self._session_task_controller is not None
+                else ()
+            )
+        except Exception as error:
+            self._write_entry("error", f"{type(error).__name__}: {error}")
+            return
+        if not snapshots and not session_tasks:
             self._write_ui_entry("status", "tasks.none")
             return
 
         visible = snapshots[-_TASK_LIST_LIMIT:]
         omitted = len(snapshots) - len(visible)
         lines = [self._task_summary(snapshot) for snapshot in visible]
+        lines.extend(self._session_task_summary(task) for task in session_tasks[:_TASK_LIST_LIMIT])
         if omitted:
             lines.insert(0, ui_text(self._language, "tasks.omitted", count=omitted))
         self._write_ui_entry(
@@ -3724,6 +3909,70 @@ class NeuroCodeApp(App[None]):
             "tasks.heading",
             lines="\n".join(lines),
         )
+
+    async def _show_session_task(self, task_id: str) -> None:
+        if not task_id:
+            self._write_ui_entry("error", "tasks.view.usage")
+            return
+        controller = self._session_task_controller
+        if controller is None:
+            self._write_ui_entry("error", "tasks.unavailable")
+            return
+        try:
+            task = await controller.get_session_task(task_id)
+        except Exception as error:
+            self._write_entry("error", f"{type(error).__name__}: {error}")
+            return
+        if task is None:
+            self._write_ui_entry("status", "tasks.view.not_found", task_id=task_id)
+            return
+        if task.plan_snapshot is None:
+            self._write_ui_entry("status", "tasks.view.no_plan", task_id=task.task_id)
+            return
+
+        plan = task.plan_snapshot
+        finished = (
+            ui_text(
+                self._language,
+                "tasks.session.finished",
+                finished=task.finished_at.astimezone().strftime("%H:%M:%S"),
+            )
+            if task.finished_at is not None
+            else ""
+        )
+        lines = [
+            ui_text(self._language, "tasks.view.heading", task_id=task.task_id),
+            ui_text(
+                self._language,
+                "tasks.view.lifecycle",
+                kind=ui_text(self._language, f"tasks.kind.{task.kind.value}"),
+                status=ui_text(self._language, f"tasks.status.{task.status.value}"),
+                started=task.started_at.astimezone().strftime("%H:%M:%S"),
+                finished=finished,
+            ),
+            ui_text(
+                self._language,
+                "tasks.view.revision",
+                fingerprint=plan.fingerprint,
+            ),
+            ui_text(self._language, "tasks.view.snapshot"),
+        ]
+        if plan.explanation is not None:
+            lines.append(
+                ui_text(self._language, "tasks.view.purpose", explanation=plan.explanation)
+            )
+        lines.extend(
+            ui_text(
+                self._language,
+                "tasks.view.step",
+                index=index,
+                status=ui_text(self._language, f"plan.status.{step.status.value}"),
+                step=step.step,
+            )
+            for index, step in enumerate(plan.steps, start=1)
+        )
+        lines.append(ui_text(self._language, "tasks.view.reference"))
+        self._write_entry("system", "\n".join(lines))
 
     async def _poll_background_tasks(self) -> None:
         if self._task_controller is None or self._task_polling:
@@ -3783,6 +4032,38 @@ class NeuroCodeApp(App[None]):
             f"tasks.completion.{snapshot.status.value}",
             task_id=snapshot.task_id,
             exit_note=exit_note,
+        )
+
+    def _session_task_summary(self, task: SessionTask) -> str:
+        started = task.started_at.astimezone().strftime("%H:%M:%S")
+        finished = (
+            ui_text(
+                self._language,
+                "tasks.session.finished",
+                finished=task.finished_at.astimezone().strftime("%H:%M:%S"),
+            )
+            if task.finished_at is not None
+            else ""
+        )
+        plan_note = ""
+        if task.plan_snapshot is not None:
+            completed = sum(step.status.value == "completed" for step in task.plan_snapshot.steps)
+            plan_note = ui_text(
+                self._language,
+                "tasks.session.plan_revision",
+                fingerprint=task.plan_snapshot.fingerprint[:12],
+                completed=completed,
+                total=len(task.plan_snapshot.steps),
+            )
+        return ui_text(
+            self._language,
+            "tasks.session.summary",
+            task_id=task.task_id,
+            kind=ui_text(self._language, f"tasks.kind.{task.kind.value}"),
+            status=ui_text(self._language, f"tasks.status.{task.status.value}"),
+            started=started,
+            finished=finished,
+            plan=plan_note,
         )
 
     def _stopped_task_note(self, count: int) -> str:
@@ -4310,6 +4591,7 @@ __all__ = [
     "ReasoningEffortScreen",
     "SessionController",
     "SessionSelectionScreen",
+    "SessionTaskController",
     "SettingsScreen",
     "TaskController",
     "ToolFeedbackMessage",

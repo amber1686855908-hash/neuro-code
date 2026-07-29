@@ -8,6 +8,8 @@ from pathlib import Path
 from typing import Literal, Protocol
 
 from neuro_code.application.ports.approval import PermissionApprover
+from neuro_code.application.ports.client_filesystem import ClientFileSystem
+from neuro_code.application.ports.client_terminal import ClientTerminal
 from neuro_code.application.ports.tools import Tool
 from neuro_code.application.runtime.profile_conversation import ConversationBinding
 
@@ -93,6 +95,8 @@ class AcpPreparedSession(Protocol):
         approver: PermissionApprover | None,
         additional_tools: Sequence[Tool],
         additional_workspace_roots: Sequence[Path],
+        client_file_system: ClientFileSystem | None,
+        client_terminal: ClientTerminal | None,
     ) -> ConversationBinding: ...
 
 
@@ -105,6 +109,8 @@ class AcpBindingFactory(Protocol):
         approver: PermissionApprover | None,
         additional_tools: Sequence[Tool],
         additional_workspace_roots: Sequence[Path],
+        client_file_system: ClientFileSystem | None,
+        client_terminal: ClientTerminal | None,
     ) -> AcpBinding: ...
 
     async def prepare_session_resume(self, session_id: str) -> AcpPreparedSession: ...

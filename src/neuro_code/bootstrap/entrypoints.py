@@ -41,6 +41,8 @@ from neuro_code.application.acp.contracts import (
 )
 from neuro_code.application.acp.service import AcpApplicationService
 from neuro_code.application.ports.approval import PermissionApprover
+from neuro_code.application.ports.client_filesystem import ClientFileSystem
+from neuro_code.application.ports.client_terminal import ClientTerminal
 from neuro_code.application.ports.storage import SessionStore
 from neuro_code.application.ports.tools import Tool
 from neuro_code.application.runtime.approval import SessionApprovalBroker
@@ -238,6 +240,8 @@ class _PreparedCompositionAcpSession:
         approver: PermissionApprover | None,
         additional_tools: Sequence[Tool],
         additional_workspace_roots: Sequence[Path],
+        client_file_system: ClientFileSystem | None,
+        client_terminal: ClientTerminal | None,
     ) -> ConversationBinding:
         return await self.application.create_binding(
             config=self.config,
@@ -245,6 +249,8 @@ class _PreparedCompositionAcpSession:
             resume_id=self.session_id,
             additional_tools=additional_tools,
             additional_workspace_roots=additional_workspace_roots,
+            client_file_system=client_file_system,
+            client_terminal=client_terminal,
         )
 
 
@@ -260,11 +266,15 @@ class _CompositionAcpBindingFactory:
         approver: PermissionApprover | None,
         additional_tools: Sequence[Tool],
         additional_workspace_roots: Sequence[Path],
+        client_file_system: ClientFileSystem | None,
+        client_terminal: ClientTerminal | None,
     ) -> AcpBinding:
         binding = await self._application.create_binding(
             approver=approver,
             additional_tools=additional_tools,
             additional_workspace_roots=additional_workspace_roots,
+            client_file_system=client_file_system,
+            client_terminal=client_terminal,
         )
         return AcpBinding(
             binding=binding,
@@ -552,6 +562,8 @@ class BootstrapCliServices:
                     provider_controller=controller,
                     session_controller=controller,
                     task_controller=controller,
+                    session_task_controller=controller,
+                    plan_controller=controller,
                     ui_preferences=ui_preferences,
                     provider_settings_store=provider_settings_store,
                     provider_catalog=provider_catalog,

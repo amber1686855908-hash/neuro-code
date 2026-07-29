@@ -895,6 +895,8 @@ def test_canonical_ports_are_the_only_port_modules() -> None:
         "neuro_code.application.ports",
         "neuro_code.application.ports.approval",
         "neuro_code.application.ports.background_tasks",
+        "neuro_code.application.ports.client_filesystem",
+        "neuro_code.application.ports.client_terminal",
         "neuro_code.application.ports.http",
         "neuro_code.application.ports.instructions",
         "neuro_code.application.ports.model",

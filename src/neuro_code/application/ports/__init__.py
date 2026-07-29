@@ -5,6 +5,8 @@ from neuro_code.application.ports.background_tasks import (
     BackgroundTaskManager,
     BackgroundTaskSupervisor,
 )
+from neuro_code.application.ports.client_filesystem import ClientFileSystem
+from neuro_code.application.ports.client_terminal import ClientTerminal, ClientTerminalResult
 from neuro_code.application.ports.http import HttpClientPolicy
 from neuro_code.application.ports.model import ModelProvider
 from neuro_code.application.ports.provider_catalog import ProviderCatalog
@@ -33,6 +35,9 @@ from neuro_code.application.ports.workspace_changes import (
 __all__ = [
     "BackgroundTaskManager",
     "BackgroundTaskSupervisor",
+    "ClientFileSystem",
+    "ClientTerminal",
+    "ClientTerminalResult",
     "HttpClientPolicy",
     "InteractiveTerminalManager",
     "InteractiveTerminalSession",

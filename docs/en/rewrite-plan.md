@@ -90,22 +90,38 @@ terminal state or child processes.
   initialize/new/list/load/delete/fork/resume/prompt/cancel/close, durable
   external-to-internal session aliases, transactional durable fork/delete,
   replaying load versus silent resume, workspace-scoped bounded cursor discovery,
-  bounded/redacted visible-history replay, bounded Text/ResourceLink input,
+  bounded/redacted visible-history replay, bounded Text/inline-Image/ResourceLink/
+  embedded-TextResource input,
   fail-closed permission requests, standard event updates, per-session
   concurrency, disconnect cleanup, bounded additional directories, and
-  bounded session-owned stdio/Streamable HTTP/legacy SSE MCP tool servers are
-  implemented.
+  bounded session-owned stdio/Streamable HTTP/legacy SSE MCP tool servers,
+  plus capability-gated client text-file reads and exact replacements through
+  `fs/read_text_file` and `fs/write_text_file`, direct foreground
+  `terminal_exec` plus bounded standard client background terminal lifecycle
+  (`terminal_start`/`terminal_output`/`terminal_wait`/`terminal_kill`), durable
+  native image context with safe ACP-history placeholders, and labeled bounded
+  embedded text resources, are implemented.
 - Complete ACP conformance remains open: ACP MCP transport and non-tool MCP
-  features, client
-  filesystem/terminal methods, multimedia
-  prompt/history content, embedded prompt content, WebSocket, and any
-  advertised `x.ai/*` extensions.
+  features, interactive client terminal input/resize/PTY framing, audio prompt,
+  embedded binary-resource prompt content, binary multimedia-history replay,
+  WebSocket, and any advertised `x.ai/*` extensions.
 - Bounded exact-name `AGENTS.md` inheritance and read-only LOCAL/REPO/USER
   skill discovery/body loading are implemented, including dynamic session
   targets, content-change checks, and bounded variable substitution.
   Remote/server/bundled skills, agent profiles, hooks, and executable plugins
   remain open alongside the remaining MCP features.
-- Subagents, plan mode, and their integration with the common task lifecycle.
+- A bounded provider-neutral plan mode is implemented: model-managed
+  `update_plan` replacements persist per session, restore on resume, inherit on
+  fork, and are shown through TUI `/plan DESCRIPTION` and `/view-plan`. A
+  user-confirmed `/execute-plan`/`/run-plan` handoff persists an execution
+  event, creates one bounded durable session-task record, and moves only to
+  `accept-edits`. The task has opaque identity and explicit terminal states but
+  neither schedules nor wakes work. The local `/comment-plan STEP COMMENT`
+  command adds bounded feedback to the current plan revision and shows it with
+  `/view-plan`. Each execution task also preserves the handed-off immutable
+  plan revision: `/tasks` shows a compact audit summary, while explicit
+  current-session `/view-task TASK_ID` renders the stored snapshot only as
+  read-only reference. Task scheduling and subagents remain open.
 
 Exit: standard ACP clients pass the complete conformance scenarios and
 extension failures do not corrupt the primary session. The current partial

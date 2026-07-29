@@ -14,6 +14,8 @@ from neuro_code.adapters.skill_discovery import FilesystemSkillDiscovery
 from neuro_code.adapters.sqlite_session import SqliteSessionStore
 from neuro_code.application.ports.approval import PermissionApprover
 from neuro_code.application.ports.background_tasks import BackgroundTaskSupervisor
+from neuro_code.application.ports.client_filesystem import ClientFileSystem
+from neuro_code.application.ports.client_terminal import ClientTerminal
 from neuro_code.application.ports.instructions import InstructionDiscovery
 from neuro_code.application.ports.model import ModelProvider
 from neuro_code.application.ports.sandbox import ShellSandbox
@@ -205,6 +207,8 @@ class ApplicationComposition:
         reasoning_effort: ReasoningEffort | None = None,
         additional_tools: Sequence[Tool] = (),
         additional_workspace_roots: Sequence[Path] = (),
+        client_file_system: ClientFileSystem | None = None,
+        client_terminal: ClientTerminal | None = None,
     ) -> ConversationBinding:
         if self._closed:
             raise RuntimeError("application composition is closed")
@@ -212,6 +216,8 @@ class ApplicationComposition:
         tools = default_tool_registry(
             selected_config.sandbox_profile,
             enable_background_tasks=True,
+            client_file_system=client_file_system,
+            client_terminal=client_terminal,
         )
         for tool in additional_tools:
             tools.register(tool)
@@ -291,6 +297,8 @@ class ApplicationComposition:
                     background_tasks=task_scope,
                     instruction_tracker=tracker,
                     skill_tracker=skill_tracker,
+                    client_file_system=client_file_system,
+                    client_terminal=client_terminal,
                 ),
                 approver=approver,
                 session_store=self.store,

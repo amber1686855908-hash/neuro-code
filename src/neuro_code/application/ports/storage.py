@@ -8,8 +8,10 @@ from typing import Any, Protocol
 
 from neuro_code.domain.events import AgentEvent
 from neuro_code.domain.messages import Message, SessionItem
+from neuro_code.domain.plans import PlanComment, SessionPlan
 from neuro_code.domain.sandbox import SandboxProfile
 from neuro_code.domain.session_search import SessionSearchPage
+from neuro_code.domain.session_tasks import SessionTask
 from neuro_code.domain.sessions import SessionSnapshot, SessionSummary
 
 
@@ -56,9 +58,39 @@ class SessionStore(Protocol):
 
     async def save_session_items(self, session_id: str, items: Sequence[SessionItem]) -> None: ...
 
+    async def save_session_plan(self, session_id: str, plan: SessionPlan | None) -> None: ...
+
     async def load_messages(self, session_id: str) -> list[Message]: ...
 
     async def load_session_items(self, session_id: str) -> list[SessionItem]: ...
+
+    async def load_session_plan(self, session_id: str) -> SessionPlan | None: ...
+
+    async def add_plan_comment(
+        self,
+        session_id: str,
+        plan: SessionPlan,
+        comment: PlanComment,
+    ) -> None: ...
+
+    async def list_plan_comments(
+        self,
+        session_id: str,
+        plan: SessionPlan,
+    ) -> list[PlanComment]: ...
+
+    async def create_session_task(self, session_id: str, task: SessionTask) -> None: ...
+
+    async def update_session_task(self, session_id: str, task: SessionTask) -> None: ...
+
+    async def list_session_tasks(
+        self,
+        session_id: str,
+        *,
+        limit: int = 50,
+    ) -> list[SessionTask]: ...
+
+    async def get_session_task(self, session_id: str, task_id: str) -> SessionTask | None: ...
 
     async def load_events(self, session_id: str) -> list[dict[str, Any]]: ...
 
