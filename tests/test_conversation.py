@@ -5,6 +5,7 @@ import sys
 import tempfile
 import unittest
 from collections.abc import AsyncIterator, Sequence
+from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import patch
 
@@ -12,11 +13,17 @@ from neuro_code.adapters.background_tasks import LocalBackgroundTaskManager
 from neuro_code.adapters.sqlite_session import SqliteSessionStore
 from neuro_code.application.ports.tools import ToolContext
 from neuro_code.application.runtime.agent import AgentRuntime
-from neuro_code.application.runtime.conversation import AgentConversation
+from neuro_code.application.runtime.conversation import (
+    PLAN_EXECUTION_PROMPT,
+    AgentConversation,
+)
+from neuro_code.domain.events import AgentEventKind
 from neuro_code.domain.messages import Message, Role
 from neuro_code.domain.model_context import ModelContext
 from neuro_code.domain.model_events import ModelCompleted, ModelEvent, ModelTextDelta
+from neuro_code.domain.plans import PlanComment, PlanStep, PlanStepStatus, SessionPlan
 from neuro_code.domain.sandbox import SandboxProfile
+from neuro_code.domain.session_tasks import SessionTaskStatus
 from neuro_code.domain.tools import ToolDefinition
 from neuro_code.permissions import PermissionManager
 from neuro_code.shared.errors import ConfigurationError, ProviderError
@@ -85,6 +92,172 @@ class CancelOnceConversationProvider(ConversationProvider):
 
 
 class AgentConversationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_resumed_conversation_loads_the_durable_plan_into_model_context(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = SqliteSessionStore(root / "sessions.db")
+            await store.initialize()
+            session_id = await store.create_session(
+                str(root),
+                "conversation-fixture",
+                "fixture-model",
+            )
+            plan = SessionPlan(
+                (PlanStep("Inspect the existing implementation", PlanStepStatus.IN_PROGRESS),),
+                "Resume work without losing the agreed plan",
+            )
+            await store.save_session_plan(session_id, plan)
+            comment = PlanComment(
+                "plan-comment-resume",
+                1,
+                "Show the exact verification command in the revised plan.",
+                datetime(2026, 7, 29, 13, tzinfo=UTC),
+            )
+            await store.add_plan_comment(session_id, plan, comment)
+            provider = ConversationProvider(("resumed response",))
+            runtime = AgentRuntime(
+                provider=provider,
+                tools=default_tool_registry(),
+                workspace_change_observer=EmptyWorkspaceChangeObserver(),
+                permissions=PermissionManager(),
+                tool_context=ToolContext(root),
+                session_store=store,
+            )
+
+            conversation = await AgentConversation.open(
+                runtime=runtime,
+                store=store,
+                cwd=root,
+                workspace_identity=FakeWorkspaceIdentity(),
+                resume_id=session_id,
+            )
+            result = await conversation.run("Continue the plan")
+
+            self.assertEqual(conversation.plan, plan)
+            self.assertEqual(conversation.plan_comments, (comment,))
+            self.assertEqual(result.plan, plan)
+            system = next(
+                message for message in provider.contexts[0].messages if message.role is Role.SYSTEM
+            )
+            self.assertIn("Resume work without losing the agreed plan", system.content)
+            self.assertIn("Inspect the existing implementation", system.content)
+            self.assertIn("User comments on the current structured plan", system.content)
+            self.assertIn("Show the exact verification command", system.content)
+
+    async def test_adding_a_plan_comment_persists_without_starting_a_turn(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = SqliteSessionStore(root / "sessions.db")
+            await store.initialize()
+            session_id = await store.create_session(
+                str(root),
+                "conversation-fixture",
+                "fixture-model",
+            )
+            plan = SessionPlan(
+                (PlanStep("Inspect the persisted feedback", PlanStepStatus.IN_PROGRESS),),
+            )
+            await store.save_session_plan(session_id, plan)
+            provider = ConversationProvider(("not needed",))
+            runtime = AgentRuntime(
+                provider=provider,
+                tools=default_tool_registry(),
+                workspace_change_observer=EmptyWorkspaceChangeObserver(),
+                permissions=PermissionManager(),
+                tool_context=ToolContext(root),
+                session_store=store,
+            )
+            conversation = await AgentConversation.open(
+                runtime=runtime,
+                store=store,
+                cwd=root,
+                workspace_identity=FakeWorkspaceIdentity(),
+                resume_id=session_id,
+            )
+
+            comment = await conversation.add_plan_comment(
+                1,
+                "Keep this plan reviewable before execution.",
+            )
+
+            self.assertEqual(conversation.plan_comments, (comment,))
+            self.assertEqual(await conversation.list_plan_comments(), (comment,))
+            self.assertEqual(provider.contexts, [])
+
+    async def test_saved_plan_requires_an_explicit_execution_handoff(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = SqliteSessionStore(root / "sessions.db")
+            await store.initialize()
+            session_id = await store.create_session(
+                str(root),
+                "conversation-fixture",
+                "fixture-model",
+            )
+            plan = SessionPlan(
+                (PlanStep("Execute the approved change", PlanStepStatus.IN_PROGRESS),),
+                "Make the saved plan actionable only after confirmation",
+            )
+            await store.save_session_plan(session_id, plan)
+            provider = ConversationProvider(("executed response",))
+            runtime = AgentRuntime(
+                provider=provider,
+                tools=default_tool_registry(),
+                workspace_change_observer=EmptyWorkspaceChangeObserver(),
+                permissions=PermissionManager(),
+                tool_context=ToolContext(root),
+                session_store=store,
+            )
+            conversation = await AgentConversation.open(
+                runtime=runtime,
+                store=store,
+                cwd=root,
+                workspace_identity=FakeWorkspaceIdentity(),
+                resume_id=session_id,
+            )
+
+            result = await conversation.execute_plan()
+
+            self.assertEqual(result.response, "executed response")
+            self.assertEqual(conversation.plan, plan)
+            tasks = await conversation.list_session_tasks()
+            self.assertEqual(len(tasks), 1)
+            self.assertIs(tasks[0].status, SessionTaskStatus.COMPLETED)
+            self.assertEqual(await conversation.get_session_task(tasks[0].task_id), tasks[0])
+            user = next(
+                message for message in provider.contexts[0].messages if message.role is Role.USER
+            )
+            self.assertEqual(user.content, PLAN_EXECUTION_PROMPT)
+            event_kinds = [event["kind"] for event in await store.load_events(session_id)]
+            self.assertLess(
+                event_kinds.index(AgentEventKind.PLAN_EXECUTION_REQUESTED.value),
+                event_kinds.index(AgentEventKind.USER_MESSAGE.value),
+            )
+
+    async def test_plan_execution_without_a_saved_plan_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = SqliteSessionStore(root / "sessions.db")
+            await store.initialize()
+            runtime = AgentRuntime(
+                provider=ConversationProvider(("unused",)),
+                tools=default_tool_registry(),
+                workspace_change_observer=EmptyWorkspaceChangeObserver(),
+                permissions=PermissionManager(),
+                tool_context=ToolContext(root),
+                session_store=store,
+            )
+            conversation = await AgentConversation.open(
+                runtime=runtime,
+                store=store,
+                cwd=root,
+                workspace_identity=FakeWorkspaceIdentity(),
+            )
+
+            self.assertIsNone(await conversation.get_session_task("task-not-created"))
+            with self.assertRaisesRegex(ConfigurationError, "has not been saved"):
+                await conversation.execute_plan()
+
     async def test_failed_provider_attempt_does_not_consume_completion_reminder(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -5,9 +5,11 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import Literal, Protocol
 
 from neuro_code.application.ports.approval import PermissionApprover
+from neuro_code.application.ports.client_filesystem import ClientFileSystem
+from neuro_code.application.ports.client_terminal import ClientTerminal
 from neuro_code.application.ports.tools import Tool
 from neuro_code.application.runtime.profile_conversation import ConversationBinding
 
@@ -42,13 +44,26 @@ class AcpResumeUnavailableError(RuntimeError):
 
 
 @dataclass(frozen=True, slots=True)
-class AcpMcpServerConfig:
+class AcpMcpStdioServerConfig:
     """Validated stdio MCP server input independent of its concrete adapter."""
 
     name: str
     command: str
     args: tuple[str, ...] = ()
     env: tuple[tuple[str, str], ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class AcpMcpHttpServerConfig:
+    """Validated remote MCP server input for Streamable HTTP or legacy SSE."""
+
+    name: str
+    url: str
+    headers: tuple[tuple[str, str], ...] = ()
+    transport: Literal["http", "sse"] = "http"
+
+
+type AcpMcpServerConfig = AcpMcpStdioServerConfig | AcpMcpHttpServerConfig
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,6 +95,8 @@ class AcpPreparedSession(Protocol):
         approver: PermissionApprover | None,
         additional_tools: Sequence[Tool],
         additional_workspace_roots: Sequence[Path],
+        client_file_system: ClientFileSystem | None,
+        client_terminal: ClientTerminal | None,
     ) -> ConversationBinding: ...
 
 
@@ -92,6 +109,8 @@ class AcpBindingFactory(Protocol):
         approver: PermissionApprover | None,
         additional_tools: Sequence[Tool],
         additional_workspace_roots: Sequence[Path],
+        client_file_system: ClientFileSystem | None,
+        client_terminal: ClientTerminal | None,
     ) -> AcpBinding: ...
 
     async def prepare_session_resume(self, session_id: str) -> AcpPreparedSession: ...

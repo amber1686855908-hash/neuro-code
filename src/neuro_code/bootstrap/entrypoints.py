@@ -9,7 +9,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from neuro_code.adapters.mcp_http import (
+    McpHttpError,
+    McpHttpServerConfig,
+    McpHttpToolCollection,
+)
 from neuro_code.adapters.mcp_stdio import (
+    MAX_MCP_TOTAL_TOOLS,
     McpStdioError,
     McpStdioServerConfig,
     McpStdioToolCollection,
@@ -23,7 +29,9 @@ from neuro_code.application.acp.contracts import (
     MAX_ADDITIONAL_DIRECTORIES,
     MAX_ADDITIONAL_DIRECTORY_BYTES,
     AcpBinding,
+    AcpMcpHttpServerConfig,
     AcpMcpServerConfig,
+    AcpMcpStdioServerConfig,
     AcpMcpToolError,
     AcpMcpTools,
     AcpPreparedSession,
@@ -33,6 +41,8 @@ from neuro_code.application.acp.contracts import (
 )
 from neuro_code.application.acp.service import AcpApplicationService
 from neuro_code.application.ports.approval import PermissionApprover
+from neuro_code.application.ports.client_filesystem import ClientFileSystem
+from neuro_code.application.ports.client_terminal import ClientTerminal
 from neuro_code.application.ports.storage import SessionStore
 from neuro_code.application.ports.tools import Tool
 from neuro_code.application.runtime.approval import SessionApprovalBroker
@@ -144,23 +154,74 @@ class _BootstrapMcpToolFactory:
         cwd: Path,
         explicit_redactions: Sequence[str],
     ) -> AcpMcpTools:
-        concrete_configurations = tuple(
-            McpStdioServerConfig(
-                name=configuration.name,
-                command=configuration.command,
-                args=configuration.args,
-                env=configuration.env,
-            )
-            for configuration in configurations
-        )
+        collections: list[AcpMcpTools] = []
+        tools: list[Tool] = []
+        names: set[str] = set()
         try:
-            return await McpStdioToolCollection.open(
-                concrete_configurations,
-                cwd=cwd,
-                explicit_redactions=explicit_redactions,
+            for configuration in configurations:
+                collection: AcpMcpTools
+                if isinstance(configuration, AcpMcpStdioServerConfig):
+                    collection = await McpStdioToolCollection.open(
+                        (
+                            McpStdioServerConfig(
+                                name=configuration.name,
+                                command=configuration.command,
+                                args=configuration.args,
+                                env=configuration.env,
+                            ),
+                        ),
+                        cwd=cwd,
+                        explicit_redactions=explicit_redactions,
+                    )
+                elif isinstance(configuration, AcpMcpHttpServerConfig):
+                    collection = await McpHttpToolCollection.open(
+                        (
+                            McpHttpServerConfig(
+                                name=configuration.name,
+                                url=configuration.url,
+                                headers=configuration.headers,
+                                transport=configuration.transport,
+                            ),
+                        ),
+                        explicit_redactions=explicit_redactions,
+                    )
+                else:  # pragma: no cover - the validated union is exhaustive.
+                    raise AcpMcpToolError("mcp_transport_unsupported")
+                collections.append(collection)
+                for tool in collection.tools:
+                    if tool.definition.name in names:
+                        raise AcpMcpToolError("mcp_tool_name_collision")
+                    names.add(tool.definition.name)
+                    tools.append(tool)
+                    if len(tools) > MAX_MCP_TOTAL_TOOLS:
+                        raise AcpMcpToolError("too_many_mcp_tools")
+            return _CompositeMcpTools(tuple(collections), tuple(tools))
+        except (McpHttpError, McpStdioError, AcpMcpToolError) as error:
+            await asyncio.gather(
+                *(collection.close() for collection in reversed(collections)),
+                return_exceptions=True,
             )
-        except McpStdioError as error:
             raise AcpMcpToolError(error.reason) from None
+
+
+class _CompositeMcpTools:
+    """Close heterogeneous session-owned MCP adapters as one resource."""
+
+    def __init__(self, collections: tuple[AcpMcpTools, ...], tools: tuple[Tool, ...]) -> None:
+        self._collections = collections
+        self.tools = tools
+        self._closed = False
+        self._close_lock = asyncio.Lock()
+
+    async def close(self) -> None:
+        async with self._close_lock:
+            if self._closed:
+                return
+            self._closed = True
+            await asyncio.gather(
+                *(collection.close() for collection in reversed(self._collections)),
+                return_exceptions=True,
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -179,6 +240,8 @@ class _PreparedCompositionAcpSession:
         approver: PermissionApprover | None,
         additional_tools: Sequence[Tool],
         additional_workspace_roots: Sequence[Path],
+        client_file_system: ClientFileSystem | None,
+        client_terminal: ClientTerminal | None,
     ) -> ConversationBinding:
         return await self.application.create_binding(
             config=self.config,
@@ -186,6 +249,8 @@ class _PreparedCompositionAcpSession:
             resume_id=self.session_id,
             additional_tools=additional_tools,
             additional_workspace_roots=additional_workspace_roots,
+            client_file_system=client_file_system,
+            client_terminal=client_terminal,
         )
 
 
@@ -201,11 +266,15 @@ class _CompositionAcpBindingFactory:
         approver: PermissionApprover | None,
         additional_tools: Sequence[Tool],
         additional_workspace_roots: Sequence[Path],
+        client_file_system: ClientFileSystem | None,
+        client_terminal: ClientTerminal | None,
     ) -> AcpBinding:
         binding = await self._application.create_binding(
             approver=approver,
             additional_tools=additional_tools,
             additional_workspace_roots=additional_workspace_roots,
+            client_file_system=client_file_system,
+            client_terminal=client_terminal,
         )
         return AcpBinding(
             binding=binding,
@@ -493,6 +562,8 @@ class BootstrapCliServices:
                     provider_controller=controller,
                     session_controller=controller,
                     task_controller=controller,
+                    session_task_controller=controller,
+                    plan_controller=controller,
                     ui_preferences=ui_preferences,
                     provider_settings_store=provider_settings_store,
                     provider_catalog=provider_catalog,

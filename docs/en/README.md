@@ -72,21 +72,31 @@ The slice implements `initialize`, `session/new`, `session/list`,
 `session/prompt`, `session/cancel` (notification), and `session/close`, sends
 `session/update` notifications, and requests interactive authority through
 `session/request_permission`. It advertises `loadSession: true` and
-list/delete/fork/resume/close session capabilities. Text and ResourceLink
-prompt blocks preserve their order and are bounded; ResourceLink metadata is
-allowlisted, `_meta` is not sent to the model, and links are never downloaded
-or dereferenced during prompt conversion.
+list/delete/fork/resume/close session capabilities. Text, inline Image,
+ResourceLink, and embedded text-resource prompt blocks preserve their order
+and are bounded. An Image block accepts raw base64 only for a small raster MIME
+allowlist, with at most eight 5 MiB images and 10 MiB in total; its associated
+URI is never read or dereferenced. An embedded `TextResourceContents` block
+accepts only client-provided text, at most eight 64 KiB resources and 128 KiB
+in aggregate; its URI is an origin label and is never resolved. ResourceLink
+metadata is allowlisted, `_meta` is not sent to the model, and links are never
+downloaded or dereferenced during prompt conversion.
 
 Each connection remains bound to its launch workspace. `session/new` rejects a
-different or relative `cwd` and non-empty `additionalDirectories`. It accepts
-bounded stdio `mcpServers`, fully initializes and lists their tools before
-publishing the session, and rejects HTTP, SSE, and ACP MCP transports. ACP
-session IDs are stable and separate from the internal SQLite
+different or relative `cwd`; an `off`-profile binding may additionally declare
+up to four existing, absolute, non-overlapping `additionalDirectories`, while
+every enabled sandbox rejects them before binding creation. It accepts bounded
+stdio, Streamable HTTP, and legacy SSE `mcpServers`, fully initializes and
+lists their tools before publishing the session, and rejects only ACP-transport
+MCP servers. ACP session IDs are stable and separate from the internal SQLite
 ID that is created lazily on the first prompt; their durable mapping allows a
 later process to load the same ID. Load revalidates workspace, fixed sandbox,
 and provider affinity, then replays only bounded/redacted visible user,
-assistant, and tool history. System prompts, private reasoning, provider-native
-context, arbitrary arguments, and raw tool data are not replayed. List returns
+assistant, and tool history. Images remain in the durable model context, while
+their ACP history projection is a safe textual placeholder; image bytes and
+URLs are not replayed. Embedded text resources remain bounded, labeled user
+text in history. System prompts, private reasoning, provider-native context,
+arbitrary arguments, and raw tool data are not replayed. List returns
 only safe metadata for the connection workspace, assigns durable ACP IDs to
 legacy sessions, and uses bounded opaque cursor pagination. Concurrent prompts
 are allowed across sessions but not within one session. Cancel, close, stdin
@@ -95,28 +105,44 @@ tasks; close never deletes persisted history.
 
 Each accepted MCP server and its tools are owned by that ACP session. The
 official MCP Python SDK owns schemas, `ClientSession`, negotiation, and
-JSON-RPC dispatch; a bounded transport bridge uses Neuro Code's `ProcessTree`
-so POSIX process groups and atomic Windows Job ownership remain fail-closed.
-Only MCP tools are projected. Every invocation is treated as side-effecting and
-requires ACP client approval even under local bypass mode; explicit local deny
-still wins. Arguments, schemas, results, stderr, environment, frame sizes,
-counts, and pagination are bounded, `_meta` is ignored, configured environment
-values are redacted, and cancellation terminates the complete server tree
-before the prompt returns.
+JSON-RPC dispatch. Stdio uses Neuro Code's bounded `ProcessTree` bridge, while
+remote transports use the SDK's Streamable HTTP or legacy SSE clients with
+HTTPS/HTTP URL and header validation, no environment proxy inheritance, no
+redirect following, and bounded response bodies. Only MCP tools are projected.
+Every invocation is treated as side-effecting and requires ACP client approval
+even under local bypass mode; explicit local deny still wins. `_meta` is
+ignored and configured environment/header values are redacted. Cancelling a
+remote request closes it locally and makes its connection unavailable; the
+remote server is not a locally owned process, so its in-flight side effect is
+never represented as successfully cancelled.
 
 ACP session resume/delete/fork are implemented with workspace-scoped durable
-identity, transactional fork/delete behavior, and distinct replaying load
-versus silent resume semantics. This is still explicitly not complete ACP v1
-support: additional directories, MCP HTTP/SSE/ACP transports, MCP
-resources/prompts/sampling/elicitation, image/audio/embedded prompt content and
-multimedia history replay, client `fs/*` and `terminal/*`, WebSocket transport,
-and custom extensions remain unsupported and are not advertised. See the
+identity, transactional fork/delete behavior, distinct replaying load versus
+silent resume semantics, bounded additional directories, MCP HTTP/SSE tools,
+and capability-gated client `fs/read_text_file` plus exact
+`fs/write_text_file` replacement. A client that advertises `terminal: true`
+also receives direct foreground `terminal_exec` in an `off` sandbox binding;
+it takes an executable and argument vector, never a shell command, and does
+not receive configured Neuro Code environment values. It also exposes the bounded standard
+background lifecycle (`terminal_start`, `terminal_output`, `terminal_wait`, and `terminal_kill`)
+with opaque task IDs; terminal input, resize, and PTY framing remain unavailable. This is still
+explicitly not complete ACP v1
+support: ACP MCP transport, MCP resources/prompts/sampling/elicitation, audio
+prompt content, embedded binary-resource prompt content, binary multimedia
+history replay, client interactive terminal input/resize/PTY methods, WebSocket
+transport, and custom extensions remain unsupported and are not advertised. See the
 [compatibility matrix](compatibility-matrix.md) and
 [ADR 0035](adr/0035-partial-acp-v1-stdio.md) plus
 [ADR 0036](adr/0036-durable-acp-session-load.md) and
 [ADR 0037](adr/0037-workspace-scoped-acp-session-list.md), plus
-[ADR 0038](adr/0038-session-owned-stdio-mcp-tools.md) and
-[ADR 0050](adr/0050-acp-session-lifecycle.md).
+[ADR 0038](adr/0038-session-owned-stdio-mcp-tools.md),
+[ADR 0050](adr/0050-acp-session-lifecycle.md),
+[ADR 0051](adr/0051-bounded-remote-mcp-transports.md), and
+[ADR 0052](adr/0052-capability-gated-acp-client-filesystem.md), and
+[ADR 0053](adr/0053-capability-gated-acp-client-terminal.md), and
+[ADR 0054](adr/0054-bounded-acp-inline-image-prompts.md), and
+[ADR 0055](adr/0055-bounded-acp-embedded-text-resources.md), and
+[ADR 0056](adr/0056-bounded-acp-client-background-terminals.md).
 
 ## Interactive TUI
 
@@ -169,8 +195,8 @@ raw input, resize, signals, wait and close, and refuses to spawn until
 permission, workspace and any configured sandbox checks pass. POSIX owns the
 complete PTY process group; Windows creates the ConPTY leader atomically inside
 a kill-on-close Job. The partial ACP core does not expose this interactive
-terminal substrate through client `terminal/*`; that protocol slice remains
-pending. See
+terminal substrate through client terminal APIs; interactive framing and
+backpressure remain pending. See
 [ADR 0034](adr/0034-bounded-owned-interactive-terminal-sessions.md).
 
 User prompts render as full-width muted blocks, while assistant output uses a
@@ -286,8 +312,35 @@ permission defaults as `accept-edits`, so commands and network effects still
 ask. Only an explicit startup `--always-approve` retains the existing bypass
 default; explicit rules and the process sandbox still win. Mode changes are
 rejected during a turn, persist as a UI preference, and are reapplied after
-profile/session switches. See
-[ADR 0028](adr/0028-timed-tool-feedback-and-interaction-modes.md).
+profile/session switches.
+
+Plan mode also gives the model a provider-neutral `update_plan` tool. It
+replaces one bounded structured plan (purpose plus pending, in-progress, or
+completed steps), persists it with the SQLite session, restores it on resume,
+and copies it when a session is forked. Use `/plan DESCRIPTION` to enter plan
+mode and immediately ask for a plan, or `/view-plan` (alias `/show-plan`) to
+show the current saved plan. Once the user has reviewed it, `/execute-plan`
+(alias `/run-plan`) explicitly records a plan-to-turn handoff and switches only
+to `accept-edits`. Each such turn has one durable, metadata-only session task
+record with an opaque ID and a `running`, `completed`, `failed`, or `cancelled`
+state; it is restored for inspection but is not copied to a fork. Command,
+network, workspace, and sandbox boundaries remain in force. `/comment-plan STEP
+COMMENT` (alias `/plan-comment`) stores bounded user feedback for one current
+plan step and `/view-plan` renders that feedback under its step. Comments are
+shown to the model only with the next prompt; they do not approve, execute, or
+schedule work. They follow the current plan when a session is forked, but a
+replacement plan discards its old comments. A task scheduler and a subagent
+system remain unavailable. `/tasks` keeps task lists compact. To inspect the
+complete immutable plan snapshot for one durable plan-execution task, explicitly
+run `/view-task TASK_ID`; it resolves only that ID in the currently open session
+and presents the snapshot as read-only reference. It neither changes the current
+plan nor starts a model turn or any work. See
+[ADR 0028](adr/0028-timed-tool-feedback-and-interaction-modes.md) and
+[ADR 0057](adr/0057-durable-structured-session-plans.md), plus
+[ADR 0058](adr/0058-durable-session-task-lifecycle.md) and
+[ADR 0059](adr/0059-bounded-current-plan-comments.md), plus
+[ADR 0060](adr/0060-plan-execution-revision-snapshots.md) and
+[ADR 0061](adr/0061-read-only-plan-execution-inspection.md).
 
 Use `Ctrl+P`, bare `/provider` or bare `/model` to open the configured-profile
 picker. `/provider PROFILE` and `/model PROFILE` select directly. The picker
@@ -387,12 +440,20 @@ switch, in-process session resume, restart, or startup resume. Switching a
 binding terminates its live tasks and reports the count; a one-shot headless run
 terminates any remaining tasks before returning, and TUI exit does the same.
 
-Use `/tasks` in the TUI for a read-only list of the current binding's task IDs,
-status, exit code, bounded-output size, and start time. The TUI emits one local
-terminal-state notice per task but does not print command text or raw output.
-`/tasks` cannot terminate work: ask the model to use `kill_task` so the action
-continues through permission/approval policy. Prefer `is_background=true` to an
-inner shell `&`. On Windows, each `ProcessTree` owns a kill-on-close Job Object,
+Use `/tasks` in the TUI for a read-only list of the current binding's live
+background-task metadata and its durable plan-execution task records. A
+background task shows its task ID, status, exit code, bounded-output size, and
+start time; a plan-execution record shows its opaque ID, kind, state, start and
+terminal time, plus the first 12 characters of its immutable plan-revision
+fingerprint and its completed-step count. It never prints a prompt, command,
+tool output, or credential. The TUI emits one local terminal-state notice per
+background task but does not print command text or raw output. `/tasks` cannot
+terminate work: ask the model to use `kill_task` so the action continues through
+permission/approval policy. Prefer `is_background=true` to an inner shell `&`.
+For one durable plan-execution record, `/view-task TASK_ID` is the separate
+explicit read-only inspection surface for its stored plan snapshot; it is limited
+to the open session and cannot execute, retry, or modify anything.
+On Windows, each `ProcessTree` owns a kill-on-close Job Object,
 assigns the leader atomically during `CreateProcessW`, waits for descendants
 after the leader exits, and fails command launch if extended creation cannot
 preserve that boundary. Only the null-input and output-pipe handles in the

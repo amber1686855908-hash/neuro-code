@@ -67,39 +67,57 @@ uv run neuro-code acp --cwd /absolute/workspace
 `session/delete`、`session/fork`、`session/resume`、`session/prompt`、
 `session/cancel`（notification）和 `session/close`，发送 `session/update`
 notification，并通过 `session/request_permission` 请求交互授权。它声明
-`loadSession: true` 和 list/delete/fork/resume/close session capability。Text 与
-ResourceLink 提示块会保持输入顺序并受数量/字节限制；ResourceLink 元数据采用字段
-白名单，`_meta` 不会进入模型，提示转换期间也绝不会下载或解引用链接。
+`loadSession: true` 和 list/delete/fork/resume/close session capability。Text、内嵌
+Image、ResourceLink 与内嵌文本资源提示块会保持输入顺序并受数量/字节限制。Image 只接受一小组
+光栅 MIME 类型的原始 base64，最多八张、单张 5 MiB、总计 10 MiB；关联 URI 绝不会被读取或
+解引用。内嵌 `TextResourceContents` 只接受客户端已提供的文本，最多八个、单个 64 KiB、合计
+128 KiB；URI 只是来源标签，绝不会被解析。ResourceLink 元数据采用字段白名单，`_meta` 不会
+进入模型，提示转换期间也绝不会下载或解引用链接。
 
-每条连接固定绑定到启动工作区。`session/new` 会拒绝不同或非绝对的 `cwd` 与非空
-`additionalDirectories`。它接受有界的 stdio `mcpServers`，在发布 session 前完成初始化
-与工具枚举，并拒绝 HTTP、SSE 和 ACP MCP 传输。ACP session ID 稳定且独立于首次
+每条连接固定绑定到启动工作区。`session/new` 会拒绝不同或非绝对的 `cwd`；`off` profile
+的 binding 最多还可声明四个已存在、绝对且互不重叠的 `additionalDirectories`，所有已启用
+sandbox 都会在建立 binding 前拒绝它们。它接受有界的 stdio、Streamable HTTP 与 legacy SSE
+`mcpServers`，在发布 session 前完成初始化与工具枚举，只拒绝 ACP 传输 MCP server。ACP session ID 稳定且独立于首次
 prompt 时才按需创建的内部 SQLite ID；持久映射允许后续进程加载同一个 ID。load 会重新
 校验工作区、固定 sandbox 和 provider 亲和，然后只回放有界/脱敏的可见用户、助手和工具
-历史。系统提示、私有 reasoning、供应商原生上下文、任意参数与 raw 工具数据不会回放。
-list 只返回连接工作区的安全元数据，为旧会话分配持久 ACP ID，并使用有界 opaque cursor
+历史。图片会保留在持久化模型上下文中，但其 ACP 历史仅显示安全的文本占位符；图片字节与
+URL 不会回放。内嵌文本资源会作为有界、带标签的用户文本留在历史中。系统提示、私有
+reasoning、供应商原生上下文、任意参数与 raw 工具数据不会回放。list 只返回连接工作区的
+安全元数据，为旧会话分配持久 ACP ID，并使用有界 opaque cursor
 分页。不同 session 可以并行，同一 session 不能并发 prompt。取消、关闭、stdin EOF 和
 连接故障都会取消受控工作与 session 作用域后台任务；close 不会删除持久化历史。
 
 每个接受的 MCP server 及其工具都由对应 ACP session 独立持有。官方 MCP Python SDK
-负责 Schema、`ClientSession`、协商与 JSON-RPC 调度；有界传输桥接复用 Neuro Code 的
-`ProcessTree`，从而继续失败关闭地持有 POSIX 进程组和创建时原子加入的 Windows Job。
-本切片只投影 MCP 工具。每次调用都按有副作用操作处理，即使本地处于 bypass 模式也必须
-请求 ACP client 审批；本地显式 deny 仍优先。参数、Schema、结果、stderr、环境变量、
-frame、数量与分页都有上限，`_meta` 被忽略，显式环境变量值会被脱敏；取消必须在 prompt
-返回前终止完整 server 进程树。
+负责 Schema、`ClientSession`、协商与 JSON-RPC 调度。stdio 使用 Neuro Code 有界的
+`ProcessTree` 桥接；远程传输使用 SDK 的 Streamable HTTP 或 legacy SSE client，并校验
+HTTP/HTTPS URL 与 header、不继承环境代理、不跟随重定向且限制响应体。本切片只投影 MCP
+工具。每次调用都按有副作用操作处理，即使本地处于 bypass 模式也必须请求 ACP client 审批；
+本地显式 deny 仍优先。`_meta` 被忽略，显式环境变量/header 值会被脱敏。取消远程请求会
+在本地关闭并令该连接不可再用；远程 server 不是本地持有的进程，因此不会把可能仍在执行的
+远程副作用表示成已成功取消。
 
 ACP 会话 resume/delete/fork 已按工作区范围持久身份、事务 fork/delete，以及回放 load
-与静默 resume 的不同语义实现。这仍明确不是完整 ACP v1 支持：额外目录、MCP
-HTTP/SSE/ACP 传输、MCP resource/prompt/sampling/elicitation、图片/音频/embedded
-prompt 与多媒体历史回放、客户端 `fs/*` 与 `terminal/*`、WebSocket 传输和自定义扩展
+与静默 resume 的不同语义、额外目录、MCP HTTP/SSE 工具，以及由能力协商控制的客户端
+`fs/read_text_file` 和精确替换式 `fs/write_text_file` 实现。声明 `terminal: true` 的客户端在
+`off` 沙箱 binding 中还会获得直接前台 `terminal_exec`；它接收可执行文件和参数向量，而不是
+Shell 命令，也不会收到已配置的 Neuro Code 环境值。它也暴露有界的标准后台生命周期
+（`terminal_start`、`terminal_output`、`terminal_wait` 和 `terminal_kill`），并使用不透明 task ID；
+终端输入、resize 和 PTY framing 仍不可用。这仍明确不是完整 ACP v1
+支持：ACP MCP 传输、MCP resource/prompt/sampling/elicitation、音频 prompt、内嵌二进制
+资源 prompt、二进制多媒体历史回放、客户端交互式终端输入/resize/PTY 方法、WebSocket 传输和自定义扩展
 仍不支持，也不会被声明。详见
 [兼容矩阵](compatibility-matrix.md)和
 [ADR 0035](adr/0035-partial-acp-v1-stdio.md)及
 [ADR 0036](adr/0036-durable-acp-session-load.md)和
 [ADR 0037](adr/0037-workspace-scoped-acp-session-list.md)，以及
-[ADR 0038](adr/0038-session-owned-stdio-mcp-tools.md)和
-[ADR 0050](adr/0050-acp-session-lifecycle.md)。
+[ADR 0038](adr/0038-session-owned-stdio-mcp-tools.md)、
+[ADR 0050](adr/0050-acp-session-lifecycle.md)、
+[ADR 0051](adr/0051-bounded-remote-mcp-transports.md)和
+[ADR 0052](adr/0052-capability-gated-acp-client-filesystem.md)及
+[ADR 0053](adr/0053-capability-gated-acp-client-terminal.md)，以及
+[ADR 0054](adr/0054-bounded-acp-inline-image-prompts.md)及
+[ADR 0055](adr/0055-bounded-acp-embedded-text-resources.md)，以及
+[ADR 0056](adr/0056-bounded-acp-client-background-terminals.md)。
 
 ## 交互式 TUI
 
@@ -140,7 +158,7 @@ Linux/macOS 使用标准库 PTY，Windows 使用标准库 `ctypes` ConPTY 适配
 可复用的交互式终端底座现在位于这些原生适配器之上，提供带显式丢弃计数的有界游标输出、
 原始输入、resize、信号、等待和关闭；权限、工作区和任何已配置沙箱检查通过前不会启动。
 POSIX 持有完整 PTY 进程组，Windows 则把 ConPTY 入口原子创建到关闭即终止的 Job 中。
-partial ACP 核心不会通过客户端 `terminal/*` 暴露该交互式终端底座；这部分协议切片
+partial ACP 核心不会通过客户端终端 API 暴露该交互式终端底座；交互式 framing 与背压
 仍待实现。详见
 [ADR 0034](adr/0034-bounded-owned-interactive-terminal-sessions.md)。
 
@@ -224,7 +242,27 @@ TUI 管理的供应商元数据会原子写入 `~/.neuro-code/providers.json`；
 会明确标为安全预览，并采用与 `accept-edits` 相同的默认权限，因此命令和网络操作仍需
 授权。只有启动时显式使用 `--always-approve` 才保留现有绕过默认值；显式规则和进程沙箱
 仍然优先。活动轮次中不能切换模式；模式会保存为 UI 偏好，并在 profile/会话切换后重新
-应用。详见 [ADR 0028](adr/0028-timed-tool-feedback-and-interaction-modes.md)。
+应用。
+
+计划模式还向模型提供供应商中立的 `update_plan` 工具。它会整体替换一份有界结构化计划
+（目的，以及 pending、in-progress 或 completed 步骤），把它与 SQLite 会话一同保存，在恢复时
+载入，并在分叉会话时复制。可用 `/plan DESCRIPTION` 进入计划模式并立即发起规划请求，或用
+`/view-plan`（别名 `/show-plan`）查看当前已保存的计划。用户审阅后可用 `/execute-plan`
+（别名 `/run-plan`）显式记录从计划到轮次的交接，并且只切换到 `accept-edits`。每次这样的
+轮次都会获得一个仅含元数据的持久会话任务记录：它具有不透明 ID，状态为 `running`、
+`completed`、`failed` 或 `cancelled`；可在恢复后查看，但不会复制到分叉会话。命令、网络、
+工作区和沙箱边界仍然有效。`/comment-plan STEP COMMENT`（别名 `/plan-comment`）会为当前计划的
+一个步骤保存有界用户反馈，`/view-plan` 会在相应步骤下显示它。评论只会随下一条提示提供给模型；
+它不会批准、执行或调度工作。评论会随当前计划一起分叉，但整体替换计划会丢弃旧评论。任务调度器和
+子代理系统仍不可用。`/tasks` 始终保持紧凑的任务列表。如需查看某一持久计划执行任务的完整不可变计划
+快照，用户必须显式运行 `/view-task TASK_ID`；它只会在当前打开的会话中解析该 ID，并把快照作为只读
+参考展示。它既不会更改当前计划，也不会启动模型轮次或任何工作。详见
+[ADR 0028](adr/0028-timed-tool-feedback-and-interaction-modes.md)
+、[ADR 0057](adr/0057-durable-structured-session-plans.md) 与
+[ADR 0058](adr/0058-durable-session-task-lifecycle.md)、
+[ADR 0059](adr/0059-bounded-current-plan-comments.md) 与
+[ADR 0060](adr/0060-plan-execution-revision-snapshots.md) 与
+[ADR 0061](adr/0061-read-only-plan-execution-inspection.md)。
 
 使用 `Ctrl+P`、不带参数的 `/provider` 或 `/model` 可以打开已配置 profile 选择器；
 `/provider PROFILE` 与 `/model PROFILE` 可以直接选择。选择器只展示 profile 名称、模型、
@@ -297,10 +335,13 @@ ID，并在有界的 30 秒事件等待中选择任意一个或全部已知任�
 profile 切换、进程内会话恢复、重启或启动恢复。切换绑定会终止其中的活动任务并显示数量；
 单次无头运行会在返回前终止剩余任务，TUI 退出时也一样。
 
-在 TUI 中使用 `/tasks` 可以只读查看当前绑定的任务 ID、状态、退出码、有界输出大小和开始
-时间。每个任务进入终态时，TUI 会发出一次本地通知，但不会打印命令文本或原始输出。
-`/tasks` 不能终止任务；应让模型使用 `kill_task`，使该操作继续经过权限/审批策略。应优先
-使用 `is_background=true`，而不是在 Shell 内部追加 `&`。Windows 上每个 `ProcessTree`
+在 TUI 中使用 `/tasks` 可以只读查看当前绑定的存活后台任务元数据，以及持久的计划执行任务
+记录。后台任务会显示任务 ID、状态、退出码、有界输出大小和开始时间；计划执行记录会显示不透明 ID、
+类别、状态、开始/终态时间、不可变计划修订指纹的前 12 个字符以及已完成步骤数。它绝不会显示提示词、
+命令、工具输出或凭据。每个后台任务进入终态时，TUI 会发出一次本地通知，但不会打印命令文本或原始输出。
+`/tasks` 不能终止任务；应让模型使用 `kill_task`，使该操作继续经过权限/审批策略。应优先使用
+`is_background=true`，而不是在 Shell 内部追加 `&`。对于单条持久计划执行记录，`/view-task TASK_ID`
+是独立、需显式调用的只读计划快照查看入口；它只限当前打开的会话，不能执行、重试或修改任何内容。Windows 上每个 `ProcessTree`
 都会掌控一个关闭即终止的 Job Object，通过 `CreateProcessW` 在创建时原子加入入口进程，
 并在入口退出后继续等待后代；如果扩展创建无法维持该边界，命令启动会显式失败。子进程只
 继承显式句柄列表中的空输入和输出管道句柄。详见

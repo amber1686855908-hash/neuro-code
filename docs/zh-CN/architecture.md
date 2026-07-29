@@ -351,27 +351,50 @@ scope，释放运行时绑定，同时保留持久历史与 alias。EOF 或连�
 附加目录，因为它们的挂载命名空间在 ACP 请求前已经固定；这也避免将平台中可写的临时或
 状态挂载误当作事后声明的目录根。这样不会通过事后挂载主机目录来削弱显式沙箱边界。
 
-非空 `mcpServers` 只接受 ACP 基线 stdio 结构；HTTP、SSE 和 ACP 传输会被确定性拒绝。
-每个 server 都必须在 session 发布前完成初始化，并通过有界分页枚举和校验工具目录；
-server 重名、非法工具名、远端工具之间或与内建工具冲突、覆盖受保护环境变量、配置超限
-都会使整个 session 创建失败。加载持久 ACP session 时可以重新提供相同的临时 MCP
-配置，但它不会作为历史或授权被持久化。
+当 ACP 客户端明确声明 `fs.readTextFile` 时，session 会获得一个绑定到该 ACP session 的窄
+`ClientFileSystem` 应用端口。既有 `read_file` 工具仍会先通过选定的主工作区或额外工作区
+根解析每个路径，再将绝对路径及有界行范围委托给 `fs/read_text_file`；它绝不会回退调用未声明
+的客户端操作。当客户端同时声明文本读写能力时，`search_replace` 会使用同一端口读取、保留现有
+精确匹配/歧义检查和指令预检规则，再通过 `fs/write_text_file` 写回结果。只读客户端不会暴露该
+工具。客户端响应与写入均限制为 1 MiB；客户端失败会成为不含原始详情的稳定失败关闭工具错误，
+最终写入的文件系统语义仍由客户端负责。
+
+当 ACP 客户端明确声明 `terminal: true` 时，`off` profile 的 binding 还会获得绑定到 session 的
+`ClientTerminal` 端口。独立的 `terminal_exec` 工具接收一个可执行文件与有界参数向量；它不会把
+既有本地 `bash` 工具重新解释为远程 Shell。每次调用都会创建、等待、读取并释放一个客户端终端，
+输出限制为 1 MiB，超时或取消时请求 kill，也不会转发任何已配置的 Neuro Code 环境值。同一按 session
+绑定的端口也暴露标准 ACP 后台直接可执行文件工具：`terminal_start`、`terminal_output`、
+`terminal_wait` 与 `terminal_kill`。它们使用不透明 task ID，最多允许八个运行中任务和 32 个保留任务，
+并会在超时或 session 清理时 kill/release 工作。普通有副作用权限仍会门禁启动和终止操作。所有启用的
+sandbox 都不会暴露这些工具，直接调用也会失败关闭，因此客户端终端不能弱化显式本地沙箱。交互式
+输入/resize、游标流式读取和 PTY framing/背压仍未支持。
+
+非空 `mcpServers` 接受 ACP stdio、Streamable HTTP（`http`）和 legacy SSE（`sse`）
+结构；ACP 传输 server 会被确定性拒绝。每个 server 都必须在 session 发布前完成初始化，
+并通过有界分页枚举和校验工具目录；server 重名、非法工具名、远端工具之间或与内建工具
+冲突、覆盖受保护环境变量、不安全的 URL/header 输入或配置超限都会使整个 session 创建
+失败。远程 URL 必须是绝对 HTTP/HTTPS endpoint，不能包含内嵌凭据或 fragment。header
+名称、数量、值与总字节均有上限，且不能覆盖 framing 或 routing header。加载持久 ACP
+session 时可以重新提供相同的临时 MCP 配置，但它不会作为历史或授权被持久化。
 
 官方 `mcp>=1.28.1,<2` SDK 持有 MCP Schema、`ClientSession`、版本协商、JSON-RPC 调度
-和工具结果类型。有界的项目自有换行分隔传输桥接会复用 `ProcessTree`：官方 SDK 在
-Windows 上采用 spawn 后再附加 Job 的方式，无法满足 Neuro Code 创建时原子加入 Job
-列表的要求。frame、Schema、工具数、JSON 深度/节点、参数、输出和超时均有上限；MCP
-stderr 会被排空但不会进入 ACP stdout；`_meta`、图片/音频/embedded body 与无界 raw
-值不会被投影。ResourceLink 结果只保留引用元数据，不会被解引用。显式 server 环境变量
-值与应用凭据会从模型可见文本中脱敏。
+和工具结果类型。stdio 使用项目自有的换行分隔 `ProcessTree` 桥接：官方 SDK 在 Windows
+上采用 spawn 后再附加 Job 的方式，无法满足 Neuro Code 创建时原子加入 Job 列表的要求。
+Streamable HTTP 与 SSE 使用 SDK client，并由应用 HTTP client 禁用环境代理和重定向、
+保持 TLS 校验且将每个响应体限制为 1 MiB。frame、Schema、工具数、JSON 深度/节点、参数、
+输出和超时均有上限；MCP stderr 会被排空但不会进入 ACP stdout；`_meta`、图片/音频/
+embedded body 与无界 raw 值不会被投影。ResourceLink 结果只保留引用元数据，不会被
+解引用。显式 server 环境变量/header 值与应用凭据会从模型可见文本中脱敏。
 
 MCP annotations 只是不可被信任的提示，因此所有投影后的 MCP 工具均标记为有副作用。
 `ApplicationComposition` 会在 bypass/always-approve 行为之上安装精确 ASK 规则，同时
 保留本地显式 DENY 的优先级。普通运行时因此先发送 pending、请求 ACP 审批，随后才发送
-in-progress 并调用 server；拒绝审批绝不会执行。prompt 取消会中止 SDK request 并终止
-整个 server 进程树，然后才完成工具失败 update 与 `cancelled` prompt 响应。close、load
-失败、创建失败、EOF 与断连都幂等关闭同一 session-owned collection。MCP resources、
-prompts、sampling、elicitation 与传输特定能力均未公开。
+in-progress 并调用 server；拒绝审批绝不会执行。stdio prompt 取消会在工具失败 update 与
+`cancelled` prompt 响应完成前终止整个受控 server 进程树。远程 server 的取消会关闭 SDK
+连接并让其无法再被调用；项目不声称持有远程进程，因此不会把终态不确定的远程副作用表示成
+已成功取消。close、load 失败、创建失败、EOF 与断连都幂等关闭同一 session-owned
+collection。MCP resources、prompts、sampling、elicitation、动态工具目录刷新与 ACP
+传输仍未支持。
 
 list 只用于发现；即使省略 `cwd`，也始终限制在连接工作区。它只返回持久 ACP ID、记录的
 绝对 cwd、有界标题和 ISO 更新时间。尚无 alias 的 session 通过 schema v5 原子
@@ -380,17 +403,24 @@ get-or-create 获得一个。SQLite keyset page 经过文件系统身份工作�
 位置，最多 256 个，不暴露内部 ID。list 不会打开 conversation/background scope，也不
 返回内容、provider 元数据、`_meta` 或额外目录。
 
-提示转换只接受 ACP 基线 Text 与 ResourceLink。block 数量、单字段大小、annotations
-序列化、ResourceLink 汇总字节和整轮提示字节都有上限。只有 `uri`、`name`、`title`、
-`description`、`mimeType`、`size` 和标准 annotations 字段会进入模型可见的引用描述；
-`_meta` 会被忽略。本地 `file:` 与远程链接都不会被读取、下载或解引用；模型随后主动
-读取文件时仍必须经过普通工作区/工具边界。
+提示转换按照输入顺序接受 ACP 基线 Text、内嵌 Image、ResourceLink 与内嵌
+`TextResourceContents`。Text/resource 数量、单字段大小、annotations 序列化、ResourceLink
+汇总字节和文本总字节都有上限。Image 只接受固定光栅 MIME 白名单中通过校验的 base64：最多
+八张、解码后单张 5 MiB、总计 10 MiB。其可选 URI、本地文件与远程链接绝不会被读取、下载或
+解引用。内嵌文本资源只接受已提供的文本：最多八个、单个 64 KiB、合计 128 KiB。它会成为带
+有界 URI 和可选 MIME 类型来源标签的文本 `ContentPart`；URI 绝不会被解析，block、resource
+及 annotation 的 `_meta` 都会被省略。规范的有序 `ContentPart` 会随用户消息持久化，因此
+供应商适配器可以在当前轮和恢复会话中应用自己的角色、MIME 和请求大小校验。只有 `uri`、
+`name`、`title`、`description`、`mimeType`、`size` 和标准 annotations 字段会进入模型可见的
+ResourceLink 描述；`_meta` 会被忽略。音频和内嵌 `BlobResourceContents` 提示块仍会被拒绝。
 
 load 历史使用另一组显式投影。可见用户与助手文本使用新的 UUID message ID 映射为标准
-message chunk。工具调用只暴露有界/脱敏的名称、类型、白名单路径和结果内容，并确保
-pending 到终态 update 配对。system message、reasoning、供应商保留上下文、图片、任意
-参数、`_meta` 和 raw input/output 全部省略。发送第一条 update 前先校验完整回放，并
-限制持久项数、update 数、单字段和序列化总字节。
+message chunk。有序图片 part 会变成现有的安全图片占位符，绝不会变成 raw data URI、图片
+字节载荷或远程 URL。内嵌文本资源会保留为有界、带标签的用户文本。工具调用只暴露有界/脱敏
+的名称、类型、白名单路径和结果内容，并确保 pending 到终态 update 配对。system message、
+reasoning、供应商保留上下文、任意参数、
+`_meta` 和 raw input/output 全部省略。发送第一条 update 前先校验完整回放，并限制持久项数、
+update 数、单字段和序列化总字节。
 
 事件投影采用显式白名单：
 
@@ -406,12 +436,17 @@ pending 到终态 update 配对。system message、reasoning、供应商保留�
 
 原始 prompt 响应承载 `end_turn`、`max_tokens`、`max_turn_requests`、`refusal` 或
 `cancelled`。审批沿用现有失败关闭权限管理器：本地 deny、工作区和沙箱结论始终拥有最终
-优先级，pending 工具更新先于客户端请求，批准返回前不能开始执行。本切片会保存协商到的
-客户端文件系统与终端能力，但绝不调用这些方法。详见
+优先级，pending 工具更新先于客户端请求，批准返回前不能开始执行。协商到的客户端文件系统和
+终端能力只会经绑定到 session 的应用端口调用；应用代码不会接触 ACP SDK 类型。详见
 [ADR 0035](adr/0035-partial-acp-v1-stdio.md)与
 [ADR 0036](adr/0036-durable-acp-session-load.md)及
 [ADR 0037](adr/0037-workspace-scoped-acp-session-list.md)，以及
-[ADR 0038](adr/0038-session-owned-stdio-mcp-tools.md)。
+[ADR 0038](adr/0038-session-owned-stdio-mcp-tools.md)、
+[ADR 0052](adr/0052-capability-gated-acp-client-filesystem.md)与
+[ADR 0053](adr/0053-capability-gated-acp-client-terminal.md)，以及
+[ADR 0054](adr/0054-bounded-acp-inline-image-prompts.md)及
+[ADR 0055](adr/0055-bounded-acp-embedded-text-resources.md)，以及
+[ADR 0056](adr/0056-bounded-acp-client-background-terminals.md)。
 
 最小 TUI 是 `AgentEvent` 之上的表现适配器，负责提示输入、滚动记录、实时文本表面和
 本地斜杠命令。它绝不渲染原始推理或不受限制的参数/结果映射；只有路径、命令、模式、
@@ -488,10 +523,14 @@ ConPTY 创建会原子组合伪控制台与 Job 列表属性，终止/关闭作�
 [ADR 0028](adr/0028-timed-tool-feedback-and-interaction-modes.md) 与
 [ADR 0029](adr/0029-auditable-in-place-tool-cards.md)。
 
-对于当前会话作用域，本地 `/tasks` 只渲染有界任务元数据，不显示命令文本或输出；周期
-只读轮询会为每个终态转换发出一次通知。它不能修改任务状态；`kill_task` 仍走普通模型
-工具与权限路径。详见
-[ADR 0022](adr/0022-session-scoped-background-task-visibility.md)。
+对于当前会话作用域，本地 `/tasks` 会同时渲染有界的存活后台任务元数据和持久计划执行任务
+记录，两者都不显示命令文本或输出。周期只读轮询仍只会为每个后台任务终态转换发出一次通知。
+`/tasks` 不能修改任何一种任务状态；`kill_task` 仍走普通模型工具与权限路径。`/view-task TASK_ID`
+则是用户主动发起的当前会话持久任务精确读取：对于带快照的计划执行记录，它会仅供参考地渲染完整已保存
+计划，不会启动轮次或改变任务状态。详见
+[ADR 0022](adr/0022-session-scoped-background-task-visibility.md) 与
+[ADR 0058](adr/0058-durable-session-task-lifecycle.md) 与
+[ADR 0061](adr/0061-read-only-plan-execution-inspection.md)。
 
 TUI 在 Worker 管理的轮次运行时保持提示框可用。`Ctrl+C` 与本地 `/cancel` 会取消该
 Worker；审批模态框则把 `Ctrl+C` 限定为拒绝待处理请求。运行时拥有的恢复与工具结果
@@ -501,7 +540,29 @@ Worker；审批模态框则把 `Ctrl+C` 限定为拒绝待处理请求。运行�
 把选择重新应用到替换后的绑定。`normal`、`accept-edits` 与 `plan` 映射为确定性的权限管理
 模式；安全分类器实现前，`auto` 默认采用安全的 `accept-edits` 预览，只有显式授权的
 `--always-approve` 启动会保留绕过默认值。提示词指引只描述模式，真正权限只来自权限、
-工作区和沙箱适配器。详见 ADR 0028。
+工作区和沙箱适配器。
+
+`SessionPlan` 是活跃对话拥有的有界领域值，而不是供应商或 UI 所有的状态。普通、无副作用的
+`update_plan` 工具会校验完整替换值。`AgentRuntime` 通过 `SessionStore` 保存已接受的计划，
+发出 `PLAN_UPDATED`，并把供应商中立的渲染内容加入后续模型请求。`AgentConversation.open`
+会在恢复轮次前载入它，分叉也会复制已保存的值。Textual 界面只读取这一状态：
+`/plan DESCRIPTION` 会先安全切换到计划模式再提交说明，`/view-plan`/`/show-plan` 则本地化地
+显示已保存状态。用户显式调用 `/execute-plan`/`/run-plan` 后，界面只切换到 `accept-edits`，
+再请求应用执行已保存的计划。运行时会创建一条仅含元数据、不透明的 `SessionTask`，并在规范用户消息
+之前持久化 `PLAN_EXECUTION_REQUESTED`。它会在对应轮次终态事件之前恰好一次转换为 completed、failed
+或 cancelled。该记录可持久化查看，但不会随着会话分叉复制，也不会调度或唤醒后续工作。因此交接
+可恢复、可审计，却不授予命令、网络、工作区或沙箱权限。`/tasks` 会保持持久记录摘要有界。只有显式的
+`/view-task TASK_ID` 才会调用活动对话精确、限当前会话的 `SessionStore.get_session_task` 读取，并把
+保存的不可变快照作为参考渲染。该读取既不会进入模型上下文，也不会更改当前计划、创建轮次、执行工作、
+请求审批或具有调度语义；任务不存在或旧记录没有快照时不会显示细节。本切片刻意不写计划文件，也不提供
+任务调度器或子代理生命周期。当前计划评论是刻意独立且有界的反馈通道：`/comment-plan STEP COMMENT` 会把用户
+文本保存到编号计划步骤下，`/view-plan` 会渲染它，下一次模型请求才把它作为临时计划指引提供。评论
+不是规范消息、批准、任务或执行请求。计划指纹阻止它泄露到替换后的计划；整体替换或清除计划会删除
+过期评论。详见 ADR 0028、[ADR 0057](adr/0057-durable-structured-session-plans.md)、
+[ADR 0058](adr/0058-durable-session-task-lifecycle.md) 与
+[ADR 0059](adr/0059-bounded-current-plan-comments.md)、
+[ADR 0060](adr/0060-plan-execution-revision-snapshots.md) 与
+[ADR 0061](adr/0061-read-only-plan-execution-inspection.md)。
 
 交互组合使用 `ProfileConversationController` 包装当前 `AgentConversation`。它让 profile
 选择与轮次串行执行，并且只向 TUI 暴露脱敏的 `ProviderOption` 数据。选择另一个已配置
@@ -573,8 +634,8 @@ TUI 通过 `Ctrl+E`、`/effort` 和 `/reasoning` 暴露选择，CLI 则使用 `-
   输入、输出、resize、信号、等待和关闭行为。
 - `PermissionManager`：在任何副作用之前返回 allow、deny 或 ask。
 - `PermissionApprover`：可选地异步解决 `ask`，但不能覆盖策略拒绝。
-- `SessionStore`：追加带版本事件、保留有序 `SessionItem`，提供规范序列与普通消息
-  投影，并返回带类型、可分页的会话标题/内容搜索页。
+- `SessionStore`：追加带版本事件、保留有序 `SessionItem`，拥有有界的持久会话任务元数据，
+  提供规范序列与普通消息投影，并返回带类型、可分页的会话标题/内容搜索页。
 - `InstructionDiscovery`：在工作区边界内确定性地、有界地、失败关闭地发现 AGENTS.md
   指令文件，返回有序的 `InstructionFile` 列表、`InstructionRejection` 列表和稳定指纹。
   适配器不得从网络读取、不得执行发现的文件、不得跟随逃逸工作区的符号链接。
@@ -717,8 +778,16 @@ SQLite 是会话及其有序事件的规范事务存储。JSON 和 Markdown 用�
 没有导入标题时从第一条可见用户消息生成十词标题，并回填包含转义字符的对话内容，但
 不索引供应商私有项。启动时可通过 immutable 只读连接检查沙箱字段，且发生在创建/迁移数据库或
 激活进程沙箱之前。schema v5 新增带 namespace、外键和一对一约束的外部 session
-alias，供协议适配器使用；JSON export schema version 4 不变。Rust 会话由独立的只读
-适配器解析。该适配器校验格式版本 0 和 1，以明确上限
+alias，供协议适配器使用；JSON export schema version 4 不变。schema v6 增加有界 JSON
+计划列：该值由领域值校验，不进入可见内容搜索或会话导出，在恢复轮次前载入，并且只会作为持久
+会话分叉的一部分复制。schema v7 新增带外键的会话任务表，用于保存不透明的计划执行生命周期
+元数据。一个任务拥有一个开始时间和可选的终态时间；其中不含提示词、命令、模型输出或凭据，不会
+进入 FTS、导出或导入，也刻意不会随分叉复制。schema v8 新增带外键的 `session_plan_comments`
+表，用于保存最多 48 条、按当前计划规范指纹作用域划分的有界评论。它不进入索引、导出或导入；
+带计划的分叉会以新的不透明 ID 复制它，而替换或清除计划会删除它。schema v9 会为每个计划执行任务增加可选的不可变计划快照。该快照标识被交接的准确
+结构化修订，仍不进入 FTS 或导出/导入，也刻意不会随分叉复制；`/tasks` 只显示其短指纹和已完成步骤
+数量。显式的当前会话精确任务查询可以在 TUI 中把同一已保存快照作为只读参考渲染，但它绝不会成为模型
+输入或任务控制操作。Rust 会话由独立的只读适配器解析。该适配器校验格式版本 0 和 1，以明确上限
 读取 JSONL 记录，把受支持的新旧记录转换为有序 `SessionSnapshot`，并报告损坏或
 不支持的记录，而不是静默编造内容。SQLite 适配器在单个事务中插入快照，并保留其
 ID、工作区、模型和时间戳；ID 已存在时不做任何修改并返回失败。源会话文件永远不会

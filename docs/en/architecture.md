@@ -457,36 +457,72 @@ was fixed before the ACP request; this also avoids treating a platform's
 writable temporary or state mounts as a late-declared directory root. This
 preserves the explicit sandbox boundary rather than adding late host mounts.
 
-Non-empty `mcpServers` are accepted only for the ACP baseline stdio shape.
-HTTP, SSE, and ACP transports are rejected deterministically. Each server is
-initialized and its bounded, paginated tool catalog is validated before the
-session is published; duplicate server names, invalid tool names, collisions
-between remote tools or with built-ins, protected environment overrides, and
-oversized configuration fail the complete session creation. The same ephemeral
-MCP configuration may be supplied when loading a durable ACP session, but it is
-not persisted as session history or authority.
+When an ACP client explicitly advertises `fs.readTextFile`, a session receives
+a narrow `ClientFileSystem` application port bound to that ACP session. The
+existing `read_file` tool still resolves every path through the selected primary
+or additional workspace roots, then delegates the absolute path and its bounded
+line range to `fs/read_text_file`; it never falls back to an unadvertised client
+operation. When the client advertises both text read and write, `search_replace`
+uses the same port to read, preserve the existing exact-match/ambiguity and
+instruction preflight rules, then write the result through `fs/write_text_file`.
+The tool is not exposed for a read-only client. Client responses and writes are
+each limited to 1 MiB, client failures are rendered as stable fail-closed tool
+errors without raw details, and the client remains responsible for the final
+write's filesystem semantics.
+
+When an ACP client explicitly advertises `terminal: true`, an `off`-profile
+binding also receives a session-bound `ClientTerminal` port. The separate
+`terminal_exec` tool accepts one executable and a bounded argument vector; it
+does not reinterpret the existing local `bash` tool as a remote shell. Each
+call creates, waits for, reads, and releases one client terminal, limits output
+to 1 MiB, requests kill on timeout or cancellation, and forwards no configured
+Neuro Code environment values. The same session-bound port also exposes
+standard ACP background direct-executable tools: `terminal_start`,
+`terminal_output`, `terminal_wait`, and `terminal_kill`. They expose opaque task
+IDs, allow at most eight running and 32 retained tasks, and kill/release work on
+timeout or session cleanup. Ordinary side-effect permissions still gate starts
+and kills. Every enabled sandbox omits the tools and direct use fails closed, so
+a client terminal cannot weaken an explicit local sandbox. Interactive
+input/resize, cursor streaming, and PTY framing/backpressure remain unsupported.
+
+Non-empty `mcpServers` accept ACP stdio, Streamable HTTP (`http`), and legacy
+SSE (`sse`) shapes; ACP-transport servers are rejected deterministically.
+Every server is initialized and its bounded, paginated tool catalog is
+validated before the session is published; duplicate server names, invalid tool
+names, collisions between remote tools or with built-ins, protected environment
+overrides, unsafe URL/header input, and oversized configuration fail the
+complete session creation. Remote URLs must be absolute HTTP/HTTPS endpoints
+without embedded credentials or fragments. Header names, counts, values, and
+total bytes are bounded; framing and routing headers cannot be overridden. The
+same ephemeral MCP configuration may be supplied when loading a durable ACP
+session, but it is not persisted as session history or authority.
 
 The official `mcp>=1.28.1,<2` SDK owns MCP schemas, `ClientSession`, version
-negotiation, JSON-RPC dispatch, and tool result types. A project-owned
-newline-delimited transport bridge deliberately reuses `ProcessTree`: the
-official SDK's post-spawn Windows Job attachment cannot meet Neuro Code's
-atomic Job-list requirement. Frames, schemas, tool counts, JSON depth/nodes,
-arguments, output, and timeouts are bounded; MCP stderr is drained without
-entering ACP stdout; `_meta`, image/audio/embedded bodies, and unbounded raw
-values are never projected. ResourceLink results remain metadata and are not
-dereferenced. Explicit server environment values and application credentials
-are redacted from model-visible text.
+negotiation, JSON-RPC dispatch, and tool result types. Stdio uses a
+project-owned newline-delimited `ProcessTree` bridge because the official SDK's
+post-spawn Windows Job attachment cannot meet Neuro Code's atomic Job-list
+requirement. Streamable HTTP and SSE use the SDK clients with an application
+HTTP client that disables environment proxies and redirects, retains TLS
+verification, and caps every response body at 1 MiB. Frames, schemas, tool
+counts, JSON depth/nodes, arguments, output, and timeouts are bounded; MCP
+stderr is drained without entering ACP stdout; `_meta`, image/audio/embedded
+bodies, and unbounded raw values are never projected. ResourceLink results
+remain metadata and are not dereferenced. Explicit server environment/header
+values and application credentials are redacted from model-visible text.
 
 MCP annotations are untrusted hints, so every projected MCP tool is marked
 side-effecting. `ApplicationComposition` installs an exact ASK rule above
 bypass/always-approve behavior while retaining explicit local DENY precedence.
 The ordinary runtime therefore emits pending, requests ACP permission, and
 only then emits in-progress and calls the server. A declined request never
-executes. Prompt cancellation aborts the SDK request and terminates the whole
-server process tree before the tool failure update and `cancelled` prompt
-response complete. Close, load failure, creation failure, EOF, and disconnect
-close the same session-owned collection idempotently. MCP resources, prompts,
-sampling, elicitation, and transport-specific capabilities are not exposed.
+executes. Stdio cancellation terminates the whole owned process tree before the
+tool failure update and `cancelled` prompt response complete. For a remote
+server, cancellation closes the SDK connection and makes it unavailable for
+later calls; no local process ownership is claimed, so an indeterminate remote
+side effect is never reported as successfully cancelled. Close, load failure,
+creation failure, EOF, and disconnect close the same session-owned collection
+idempotently. MCP resources, prompts, sampling, elicitation, dynamic tool-list
+refresh, and ACP transport remain unsupported.
 
 List is discovery-only and remains scoped to the connection workspace even
 when `cwd` is omitted. It returns only durable ACP ID, absolute recorded cwd,
@@ -498,22 +534,34 @@ cursor tokens retain only the keyset position in memory, are capped at 256,
 and reveal no internal ID. List never opens a conversation/background scope or
 returns content, provider metadata, `_meta`, or additional directories.
 
-Prompt conversion accepts only ACP baseline Text and ResourceLink blocks.
-Counts, per-field sizes, annotation serialization, ResourceLink aggregate
-bytes, and total prompt bytes are bounded. Only `uri`, `name`, `title`,
-`description`, `mimeType`, `size`, and standard annotation fields reach the
-model-visible reference description. `_meta` is ignored. Neither local
-`file:` links nor remote links are read, downloaded, or dereferenced; later
-model-selected file access still crosses the ordinary workspace/tool boundary.
+Prompt conversion accepts ACP baseline Text, inline Image, ResourceLink, and
+embedded `TextResourceContents` blocks in their supplied order. Text/resource
+counts, per-field sizes, annotation serialization, ResourceLink aggregate
+bytes, and total text bytes are bounded. An Image block accepts only validated
+base64 for a fixed raster MIME allowlist: at most eight images, 5 MiB decoded
+per image, and 10 MiB decoded in aggregate. Its optional URI, local files, and
+remote links are never read, downloaded, or dereferenced. An embedded text
+resource accepts only the supplied text: at most eight values, 64 KiB per
+value, and 128 KiB in aggregate. It becomes a labeled text `ContentPart` with
+a bounded URI and optional MIME type; its URI is never resolved, and block,
+resource, and annotation `_meta` values are omitted. The canonical ordered
+`ContentPart` values are persisted with the user message so provider adapters
+can apply their own role, MIME, and request-size validation on the current turn
+and a resumed session. Only `uri`, `name`, `title`, `description`, `mimeType`,
+`size`, and standard annotation fields reach a model-visible ResourceLink
+description; `_meta` is ignored. Audio and embedded `BlobResourceContents`
+prompt blocks remain rejected.
 
 Load history uses a second explicit projection. Visible user and assistant text
-become standard message chunks with fresh UUID message IDs. Tool calls expose
-only bounded/redacted name, kind, allowlisted path, and result content, with
-balanced pending-to-terminal updates. System messages, reasoning, preserved
-provider context, images, arbitrary arguments, `_meta`, and raw input/output
-are omitted. The complete replay is validated before its first update and is
-bounded by stored-item, update-count, per-field, and aggregate serialized-byte
-limits.
+become standard message chunks with fresh UUID message IDs. Ordered image parts
+become the existing safe image placeholder, never a raw data URI, image byte
+payload, or remote URL. Embedded text resources remain their bounded, labeled
+user text. Tool calls expose only bounded/redacted name, kind, allowlisted
+path, and result content, with balanced pending-to-terminal
+updates. System messages, reasoning, preserved provider context, arbitrary
+arguments, `_meta`, and raw input/output are omitted. The complete replay is
+validated before its first update and is bounded by stored-item, update-count,
+per-field, and aggregate serialized-byte limits.
 
 The event projection is an explicit allowlist:
 
@@ -531,12 +579,18 @@ The original prompt response carries `end_turn`, `max_tokens`,
 `max_turn_requests`, `refusal`, or `cancelled`. Approval follows the existing
 fail-closed permission manager: local deny/workspace/sandbox decisions remain
 authoritative, a pending tool update precedes the client request, and execution
-cannot start until approval returns. Client filesystem and terminal methods are
-remembered as negotiated capabilities but are never invoked in this slice. See
+cannot start until approval returns. The negotiated client filesystem and
+terminal capabilities are invoked only through their session-bound
+application ports; no ACP SDK type reaches application code. See
 [ADR 0035](adr/0035-partial-acp-v1-stdio.md) and
 [ADR 0036](adr/0036-durable-acp-session-load.md) plus
 [ADR 0037](adr/0037-workspace-scoped-acp-session-list.md), plus
-[ADR 0038](adr/0038-session-owned-stdio-mcp-tools.md).
+[ADR 0038](adr/0038-session-owned-stdio-mcp-tools.md), plus
+[ADR 0052](adr/0052-capability-gated-acp-client-filesystem.md) and
+[ADR 0053](adr/0053-capability-gated-acp-client-terminal.md), and
+[ADR 0054](adr/0054-bounded-acp-inline-image-prompts.md), and
+[ADR 0055](adr/0055-bounded-acp-embedded-text-resources.md), and
+[ADR 0056](adr/0056-bounded-acp-client-background-terminals.md).
 
 The minimal TUI is a presentation adapter over `AgentEvent`. It owns prompt
 input, scrollback, a live text surface, and local slash commands. It never
@@ -656,11 +710,18 @@ external Python API.
 See [ADR 0028](adr/0028-timed-tool-feedback-and-interaction-modes.md) and
 [ADR 0029](adr/0029-auditable-in-place-tool-cards.md).
 
-For the active conversation scope, local `/tasks` renders bounded task metadata
-without command text or output and a periodic read-only poll emits one notice
-per terminal transition. It cannot mutate task state; `kill_task` remains on the
-ordinary model tool and permission path. See
-[ADR 0022](adr/0022-session-scoped-background-task-visibility.md).
+For the active conversation scope, local `/tasks` renders bounded live
+background-task metadata alongside durable plan-execution task records. Neither
+view includes command text or output. The periodic read-only poll emits one
+notice per background-task terminal transition. `/tasks` cannot mutate either
+kind of task; `kill_task` remains on the ordinary model tool and permission
+path. `/view-task TASK_ID` is a separate, user-initiated exact read of the
+current session's durable task; for a snapshot-bearing plan-execution record it
+renders the full stored plan as reference only, without initiating a turn or
+changing task state. See
+[ADR 0022](adr/0022-session-scoped-background-task-visibility.md),
+[ADR 0058](adr/0058-durable-session-task-lifecycle.md), and
+[ADR 0061](adr/0061-read-only-plan-execution-inspection.md).
 
 The TUI keeps its prompt available while a worker-owned turn runs. `Ctrl+C` and
 local `/cancel` cancel that worker; an approval modal gives `Ctrl+C` the narrower
@@ -674,7 +735,43 @@ bindings. `normal`, `accept-edits`, and `plan` map to deterministic permission
 manager modes. `auto` defaults to the safe `accept-edits` preview until a safety
 classifier exists; only an explicitly authorized `--always-approve` launch
 retains bypass defaults. Prompt guidance describes the mode, but actual authority
-comes exclusively from permission/workspace/sandbox adapters. See ADR 0028.
+comes exclusively from permission/workspace/sandbox adapters.
+
+`SessionPlan` is a bounded domain value owned by the active conversation rather
+than by a provider or UI. The ordinary non-side-effecting `update_plan` tool
+validates a complete replacement. `AgentRuntime` saves an accepted plan through
+`SessionStore`, emits `PLAN_UPDATED`, and adds its provider-neutral rendering to
+subsequent model requests. `AgentConversation.open` restores it before a resumed
+turn, and a fork copies the stored value. The Textual interface only reads this
+state: `/plan DESCRIPTION` switches safely to plan mode before submitting the
+description, while `/view-plan`/`/show-plan` render the localized saved state.
+After an explicit user command, `/execute-plan`/`/run-plan` changes only to
+`accept-edits` and asks the application to execute the saved plan. The runtime
+creates one opaque, metadata-only `SessionTask` and persists
+`PLAN_EXECUTION_REQUESTED` before the canonical user message. It transitions the
+task exactly once to completed, failed, or cancelled before the corresponding
+turn terminal event. These records are durable for inspection but do not copy
+when a session is forked and do not schedule or wake further work. The handoff
+remains auditable without granting command, network, workspace, or sandbox
+authority. `/tasks` keeps durable-record summaries bounded. Only an explicit
+`/view-task TASK_ID` calls the active conversation's exact, current-session
+`SessionStore.get_session_task` read and renders the stored immutable snapshot
+as reference. That read neither enters the model context nor changes the current
+plan, creates a turn, executes work, requests approval, or has scheduler
+semantics; a missing or legacy no-snapshot task reports no detail. There is
+deliberately no plan-file write, task scheduler, or subagent lifecycle in this
+slice. Current-plan comments are an intentionally
+separate, bounded feedback channel: `/comment-plan STEP COMMENT` stores user
+text under a numbered plan step, `/view-plan` renders it, and the next model
+request receives it as transient plan guidance. The comment is not a canonical
+message, approval, task, or execution request. Its plan fingerprint prevents it
+leaking to a replacement plan; replacement and clearing of a plan remove
+obsolete comments. See ADR 0028,
+[ADR 0057](adr/0057-durable-structured-session-plans.md),
+[ADR 0058](adr/0058-durable-session-task-lifecycle.md), and
+[ADR 0059](adr/0059-bounded-current-plan-comments.md), plus
+[ADR 0060](adr/0060-plan-execution-revision-snapshots.md) and
+[ADR 0061](adr/0061-read-only-plan-execution-inspection.md).
 
 `ProfileConversationController` wraps the active `AgentConversation` for the
 interactive composition. It serializes selection with turns and exposes only
@@ -773,8 +870,9 @@ continues to fail closed. See
 - `PermissionApprover`: optionally resolves an `ask` asynchronously without
   overriding policy denial.
 - `SessionStore`: appends versioned events, preserves ordered `SessionItem`
-  values, exposes canonical and ordinary-message projections, and returns
-  typed, paginated session-title/content search pages.
+  values, owns bounded durable session-task metadata, exposes canonical and
+  ordinary-message projections, and returns typed, paginated session-title/
+  content search pages.
 - `InstructionDiscovery`: deterministically, bounded, fail-closed discovers
   AGENTS.md instruction files within the workspace boundary, returning an
   ordered list of `InstructionFile`s, `InstructionRejection`s, and a stable
@@ -975,8 +1073,25 @@ provider items. Startup can inspect the sandbox field through an immutable
 read-only connection before any database creation, migration, or process
 sandbox activation. Schema v5 adds namespaced, foreign-keyed, one-to-one
 external session aliases used by protocol adapters; it does not change JSON
-export schema version 4. Rust sessions are parsed by
-a separate read-only adapter. It validates format versions 0 and 1, reads
+export schema version 4. Schema v6 adds a bounded JSON plan column: it is
+validated by the domain value, remains outside visible-content search and
+session export, is restored before a resumed turn, and is copied only as part
+of a durable session fork. Schema v7 adds a foreign-keyed session-task table
+for opaque plan-execution lifecycle metadata. A task has one start time and an
+optional terminal time; it contains no prompt, command, model output, or
+credential, is not included in FTS or export/import, and is deliberately not
+copied by a fork. Schema v8 adds a foreign-keyed `session_plan_comments` table
+for at most 48 bounded comments scoped to the canonical fingerprint of the
+current plan. It is neither indexed nor exported/imported; it is copied on a
+plan-bearing fork with fresh opaque IDs and deleted when its plan is replaced
+or cleared. Schema v9 adds an optional immutable plan snapshot to each
+plan-execution task. The snapshot identifies the exact structured revision
+handed off, remains outside FTS and export/import, and is deliberately not
+copied by a fork; `/tasks` shows only its short fingerprint and completed-step
+count. An explicit exact current-session task lookup may render that same stored
+snapshot in the TUI as read-only reference, but it never becomes a model input
+or task-control operation. Rust sessions are parsed by a separate read-only
+adapter. It validates format versions 0 and 1, reads
 bounded JSONL records, converts supported legacy/current records into an
 ordered `SessionSnapshot`, and reports corrupt or unsupported records instead
 of silently inventing content. The SQLite adapter inserts that snapshot in one

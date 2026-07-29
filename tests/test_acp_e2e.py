@@ -327,6 +327,7 @@ context_window_tokens = 32000
                     capabilities,
                     {
                         "loadSession": True,
+                        "mcpCapabilities": {"http": True, "sse": True},
                         "sessionCapabilities": {
                             "list": {},
                             "delete": {},
@@ -609,7 +610,7 @@ context_window_tokens = 32000
                     exclude_none=True,
                     exclude_unset=True,
                 )
-                self.assertNotIn("mcpCapabilities", declared)
+                self.assertEqual(declared["mcpCapabilities"], {"http": True, "sse": True})
                 created = await connection.new_session(
                     str(root),
                     mcp_servers=[

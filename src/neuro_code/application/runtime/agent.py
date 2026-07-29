@@ -3,8 +3,10 @@ from __future__ import annotations
 import asyncio
 import inspect
 import os
+import uuid
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from time import monotonic
 
 from neuro_code.application.permissions.contracts import (
@@ -29,6 +31,7 @@ from neuro_code.domain.events import AgentEvent, AgentEventKind
 from neuro_code.domain.instructions import InstructionDiscoveryResult
 from neuro_code.domain.interaction_mode import InteractionMode, interaction_mode_guidance
 from neuro_code.domain.messages import (
+    ContentPart,
     Message,
     PreservedContextItem,
     Role,
@@ -47,8 +50,10 @@ from neuro_code.domain.model_events import (
     ModelTextDelta,
     ModelToolCall,
 )
+from neuro_code.domain.plans import PlanComment, SessionPlan
 from neuro_code.domain.reasoning import ReasoningEffort, reasoning_guidance
 from neuro_code.domain.sandbox import SandboxProfile
+from neuro_code.domain.session_tasks import SessionTask, SessionTaskKind, SessionTaskStatus
 from neuro_code.domain.skills import SkillDiscoveryResult
 from neuro_code.domain.tools import ToolResult
 from neuro_code.permissions import (
@@ -58,7 +63,7 @@ from neuro_code.permissions import (
     PermissionMode,
 )
 from neuro_code.shared.async_utils import run_blocking
-from neuro_code.shared.errors import ProviderError, ToolError
+from neuro_code.shared.errors import ConfigurationError, ProviderError, ToolError
 from neuro_code.shared.redaction import redact_sensitive_text
 
 EventSink = Callable[[AgentEvent], Awaitable[None] | None]
@@ -79,6 +84,7 @@ class AgentRunResult:
     items: tuple[SessionItem, ...]
     events: tuple[AgentEvent, ...]
     steps: int
+    plan: SessionPlan | None = None
 
 
 class AgentRuntime:
@@ -98,6 +104,8 @@ class AgentRuntime:
         interaction_mode: InteractionMode | None = None,
         instruction_provider: Callable[[], InstructionDiscoveryResult | None] | None = None,
         skill_provider: Callable[[], SkillDiscoveryResult | None] | None = None,
+        plan: SessionPlan | None = None,
+        plan_comments: Sequence[PlanComment] = (),
     ) -> None:
         if max_steps < 1:
             raise ValueError("max_steps must be positive")
@@ -115,6 +123,9 @@ class AgentRuntime:
         self._skill_provider = skill_provider
         self._last_instruction_result: InstructionDiscoveryResult | None = None
         self._last_skill_result: SkillDiscoveryResult | None = None
+        self._plan = plan
+        self._plan_comments: tuple[PlanComment, ...] = ()
+        self.set_plan_comments(plan_comments)
         self._auto_permission_mode = (
             PermissionMode.BYPASS
             if permissions.mode is PermissionMode.BYPASS
@@ -149,6 +160,32 @@ class AgentRuntime:
     @property
     def auto_mode_unrestricted(self) -> bool:
         return self._auto_permission_mode is PermissionMode.BYPASS
+
+    @property
+    def plan(self) -> SessionPlan | None:
+        return self._plan
+
+    @property
+    def plan_comments(self) -> tuple[PlanComment, ...]:
+        return self._plan_comments
+
+    def set_plan(self, plan: SessionPlan | None) -> None:
+        if plan is not None and not isinstance(plan, SessionPlan):
+            raise TypeError("plan must be a SessionPlan or None")
+        self._plan = plan
+        self._plan_comments = ()
+
+    def set_plan_comments(self, comments: Sequence[PlanComment]) -> None:
+        normalized = tuple(comments)
+        if not all(isinstance(comment, PlanComment) for comment in normalized):
+            raise TypeError("plan comments must be PlanComment values")
+        if normalized and self._plan is None:
+            raise ValueError("plan comments require a saved plan")
+        if self._plan is not None and any(
+            comment.step_index > len(self._plan.steps) for comment in normalized
+        ):
+            raise ValueError("plan comments must refer to saved steps")
+        self._plan_comments = normalized
 
     def set_interaction_mode(self, mode: InteractionMode) -> None:
         if not isinstance(mode, InteractionMode):
@@ -185,6 +222,11 @@ class AgentRuntime:
             reasoning_guidance(self._reasoning_effort),
             interaction_mode_guidance(self._interaction_mode),
         ]
+        if self._plan is not None:
+            guidance_parts.append(self._plan.model_guidance())
+            comments = self._plan.comment_guidance(self._plan_comments)
+            if comments:
+                guidance_parts.append(comments)
         guidance = "\n\n".join(guidance_parts)
         rendered = list(items)
 
@@ -271,14 +313,19 @@ class AgentRuntime:
         prompt: str,
         *,
         sink: EventSink | None = None,
+        content_parts: Sequence[ContentPart] = (),
+        plan_execution_requested: bool = False,
         initial_items: Sequence[SessionItem] = (),
         source_provider: str | None = None,
         source_model: str | None = None,
         source_context_affinity: str | None = None,
         session_id: str | None = None,
     ) -> AgentRunResult:
-        if not prompt.strip():
+        prompt_parts = tuple(content_parts)
+        if not prompt.strip() and not prompt_parts:
             raise ValueError("prompt must not be empty")
+        if plan_execution_requested and self._plan is None:
+            raise ConfigurationError("cannot execute a plan that has not been saved")
         turn_started_at = monotonic()
         context_items = list(initial_items)
         messages = [item for item in context_items if isinstance(item, Message)]
@@ -305,6 +352,22 @@ class AgentRuntime:
             )
         elif self._session_store is not None and session_id is not None:
             sequence = await self._session_store.next_event_sequence(session_id) - 1
+        if plan_execution_requested and (self._session_store is None or session_id is None):
+            raise ConfigurationError("session-backed task storage is unavailable")
+        if plan_execution_requested and self._plan is None:
+            raise ConfigurationError("cannot execute a plan that has not been saved")
+        session_task: SessionTask | None = None
+        if plan_execution_requested:
+            assert self._session_store is not None
+            assert session_id is not None
+            session_task = SessionTask(
+                f"task-{uuid.uuid4().hex}",
+                SessionTaskKind.PLAN_EXECUTION,
+                SessionTaskStatus.RUNNING,
+                datetime.now(UTC),
+                plan_snapshot=self._plan,
+            )
+            await self._session_store.create_session_task(session_id, session_task)
 
         async def emit(kind: AgentEventKind, data: dict[str, object]) -> AgentEvent:
             nonlocal sequence
@@ -319,8 +382,30 @@ class AgentRuntime:
                     await outcome
             return event
 
+        async def finish_session_task(status: SessionTaskStatus) -> None:
+            nonlocal session_task
+            if session_task is None:
+                return
+            assert self._session_store is not None
+            assert session_id is not None
+            task = session_task.finish(status, finished_at=datetime.now(UTC))
+            await self._session_store.update_session_task(session_id, task)
+            session_task = task
+            if status is SessionTaskStatus.COMPLETED:
+                event_kind = AgentEventKind.SESSION_TASK_COMPLETED
+            elif status is SessionTaskStatus.FAILED:
+                event_kind = AgentEventKind.SESSION_TASK_FAILED
+            elif status is SessionTaskStatus.CANCELLED:
+                event_kind = AgentEventKind.SESSION_TASK_CANCELLED
+            else:
+                raise AssertionError("a session task must finish in a terminal state")
+            await emit(event_kind, {"task": task.to_dict()})
+
         async def record_turn_failure(error: BaseException) -> None:
             cancelled = isinstance(error, asyncio.CancelledError)
+            await finish_session_task(
+                SessionTaskStatus.CANCELLED if cancelled else SessionTaskStatus.FAILED
+            )
             await emit(
                 AgentEventKind.TURN_FAILED,
                 {
@@ -344,10 +429,18 @@ class AgentRuntime:
                     "model": self._provider.model_name,
                 },
             )
-            user_message = Message(Role.USER, prompt)
+            if session_task is not None:
+                await emit(AgentEventKind.SESSION_TASK_STARTED, {"task": session_task.to_dict()})
+            if plan_execution_requested:
+                assert self._plan is not None
+                await emit(
+                    AgentEventKind.PLAN_EXECUTION_REQUESTED,
+                    {"plan": self._plan.to_dict()},
+                )
+            user_message = Message(Role.USER, prompt, content_parts=prompt_parts)
             context_items.append(user_message)
             messages.append(user_message)
-            await emit(AgentEventKind.USER_MESSAGE, {"content": prompt})
+            await emit(AgentEventKind.USER_MESSAGE, {"content": user_message.model_content()})
 
             for step in range(1, self._max_steps + 1):
                 step_started_at = monotonic()
@@ -533,6 +626,7 @@ class AgentRuntime:
                 messages.append(assistant_message)
 
                 if not tool_calls:
+                    await finish_session_task(SessionTaskStatus.COMPLETED)
                     await emit(
                         AgentEventKind.TURN_COMPLETED,
                         {
@@ -552,11 +646,12 @@ class AgentRuntime:
                         tuple(context_items),
                         tuple(events),
                         step,
+                        self._plan,
                     )
 
                 for index, call in enumerate(tool_calls):
                     try:
-                        await self._execute_tool(call, messages, context_items, emit)
+                        await self._execute_tool(call, messages, context_items, emit, session_id)
                     except BaseException as error:
                         await self._record_unstarted_tool_calls(
                             tool_calls[index + 1 :],
@@ -581,6 +676,7 @@ class AgentRuntime:
         messages: list[Message],
         context_items: list[SessionItem],
         emit: Callable[[AgentEventKind, dict[str, object]], Awaitable[AgentEvent]],
+        session_id: str | None,
     ) -> None:
         resolved = False
         tool_requested_at = monotonic()
@@ -693,12 +789,21 @@ class AgentRuntime:
                     metadata=result.metadata,
                 )
             kind = AgentEventKind.TOOL_FAILED if result.is_error else AgentEventKind.TOOL_COMPLETED
+            plan = self._plan_from_tool_result(call.name, result)
+            if plan is not None:
+                if self._session_store is None or session_id is None:
+                    raise ToolError("session-backed plan storage is unavailable")
+                await self._session_store.save_session_plan(session_id, plan)
+                self._plan = plan
+                self._plan_comments = ()
             record_result(result)
             terminal_data = terminal_event_data(result)
             change_report = await self._workspace_change_report(workspace_before)
             if change_report is not None:
                 terminal_data["workspace_changes"] = change_report.to_event_payload()
             await emit(kind, terminal_data)
+            if plan is not None:
+                await emit(AgentEventKind.PLAN_UPDATED, plan.to_dict())
         except BaseException as error:
             if not resolved:
                 cancelled = isinstance(error, asyncio.CancelledError)
@@ -720,6 +825,16 @@ class AgentRuntime:
                     terminal_data,
                 )
             raise
+
+    @staticmethod
+    def _plan_from_tool_result(name: str, result: ToolResult) -> SessionPlan | None:
+        if name != "update_plan" or result.is_error or result.metadata is None:
+            return None
+        raw_plan = result.metadata.get("plan")
+        try:
+            return SessionPlan.from_dict(raw_plan)
+        except ValueError as error:
+            raise ToolError("update_plan returned an invalid plan") from error
 
     async def _capture_workspace_snapshot(self) -> WorkspaceChangeCheckpoint | None:
         try:

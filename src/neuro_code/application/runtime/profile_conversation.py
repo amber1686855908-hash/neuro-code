@@ -11,10 +11,12 @@ from neuro_code.application.ports.model import ModelProvider
 from neuro_code.application.runtime.agent import AgentRunResult, EventSink
 from neuro_code.domain.background_tasks import BackgroundTaskSnapshot, BackgroundTaskStatus
 from neuro_code.domain.interaction_mode import InteractionMode
-from neuro_code.domain.messages import SessionItem
+from neuro_code.domain.messages import ContentPart, SessionItem
+from neuro_code.domain.plans import PlanComment, SessionPlan
 from neuro_code.domain.reasoning import ReasoningEffort
 from neuro_code.domain.sandbox import SandboxProfile
 from neuro_code.domain.session_search import SessionSearchHit
+from neuro_code.domain.session_tasks import SessionTask
 from neuro_code.domain.sessions import SessionSummary
 from neuro_code.shared.errors import ConfigurationError
 
@@ -25,6 +27,20 @@ class ConversationRunner(Protocol):
 
     @property
     def items(self) -> tuple[SessionItem, ...]: ...
+
+    @property
+    def plan(self) -> SessionPlan | None: ...
+
+    @property
+    def plan_comments(self) -> tuple[PlanComment, ...]: ...
+
+    async def add_plan_comment(self, step_index: int, content: str) -> PlanComment: ...
+
+    async def list_plan_comments(self) -> tuple[PlanComment, ...]: ...
+
+    async def list_session_tasks(self) -> tuple[SessionTask, ...]: ...
+
+    async def get_session_task(self, task_id: str) -> SessionTask | None: ...
 
     @property
     def reasoning_effort(self) -> ReasoningEffort: ...
@@ -39,7 +55,15 @@ class ConversationRunner(Protocol):
 
     def set_interaction_mode(self, mode: InteractionMode) -> None: ...
 
-    async def run(self, prompt: str, *, sink: EventSink | None = None) -> AgentRunResult: ...
+    async def run(
+        self,
+        prompt: str,
+        *,
+        sink: EventSink | None = None,
+        content_parts: Sequence[ContentPart] = (),
+    ) -> AgentRunResult: ...
+
+    async def execute_plan(self, *, sink: EventSink | None = None) -> AgentRunResult: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -223,9 +247,36 @@ class ProfileConversationController:
     def items(self) -> tuple[SessionItem, ...]:
         return self._binding.runner.items
 
+    @property
+    def plan(self) -> SessionPlan | None:
+        return self._binding.runner.plan
+
+    @property
+    def plan_comments(self) -> tuple[PlanComment, ...]:
+        return self._binding.runner.plan_comments
+
     async def run(self, prompt: str, *, sink: EventSink | None = None) -> AgentRunResult:
         async with self._turn_lock:
             return await self._binding.runner.run(prompt, sink=sink)
+
+    async def execute_plan(self, *, sink: EventSink | None = None) -> AgentRunResult:
+        async with self._turn_lock:
+            return await self._binding.runner.execute_plan(sink=sink)
+
+    async def add_plan_comment(self, step_index: int, content: str) -> PlanComment:
+        if self._turn_lock.locked():
+            raise ConfigurationError("cannot comment on a plan while a turn is running")
+        async with self._turn_lock:
+            return await self._binding.runner.add_plan_comment(step_index, content)
+
+    async def list_plan_comments(self) -> tuple[PlanComment, ...]:
+        return await self._binding.runner.list_plan_comments()
+
+    async def list_session_tasks(self) -> tuple[SessionTask, ...]:
+        return await self._binding.runner.list_session_tasks()
+
+    async def get_session_task(self, task_id: str) -> SessionTask | None:
+        return await self._binding.runner.get_session_task(task_id)
 
     async def list_background_tasks(self) -> tuple[BackgroundTaskSnapshot, ...]:
         manager = self._binding.background_tasks

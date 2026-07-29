@@ -40,7 +40,8 @@ def interaction_mode_guidance(mode: InteractionMode) -> str:
         ),
         InteractionMode.PLAN: (
             "Operating mode: Plan. Explore with read-only tools and produce a concrete plan. "
-            "Do not request edits, shell commands, network access, or other side effects."
+            "Use update_plan to save a concise structured plan before presenting it. Do not "
+            "request edits, shell commands, network access, or other side effects."
         ),
         InteractionMode.AUTO: (
             "Operating mode: Auto. Continue autonomously through safe work, but obey every "

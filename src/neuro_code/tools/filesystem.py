@@ -7,6 +7,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
+from neuro_code.application.ports.client_filesystem import ClientFileSystem
 from neuro_code.application.ports.tools import ToolContext
 from neuro_code.domain.sandbox import SandboxProfile
 from neuro_code.domain.tools import ToolDefinition, ToolResult
@@ -86,18 +87,46 @@ class ReadFileTool:
     side_effecting = False
 
     async def execute(self, arguments: Mapping[str, Any], context: ToolContext) -> ToolResult:
-        path = _resolve_path(context, _require_string(arguments, "path"), must_exist=True)
-        if not path.is_file():
-            raise ToolError(f"not a file: {path}")
-        # Notify the instruction tracker so AGENTS.md files from root to this
-        # directory are discovered for the next model step.
-        _track_primary_workspace_path(context, path)
         start_line = arguments.get("start_line", 1)
         max_lines = arguments.get("max_lines", 500)
         if not isinstance(start_line, int) or start_line < 1:
             raise ToolError("start_line must be a positive integer")
         if not isinstance(max_lines, int) or not 1 <= max_lines <= 5000:
             raise ToolError("max_lines must be between 1 and 5000")
+
+        requested = _require_string(arguments, "path")
+        client_file_system = context.client_file_system
+        path = _resolve_path(
+            context,
+            requested,
+            must_exist=client_file_system is None,
+        )
+        if client_file_system is not None:
+            if not client_file_system.supports_read:
+                raise ToolError("ACP client does not support text-file reads")
+            content = await client_file_system.read_text_file(
+                path,
+                line=start_line,
+                limit=max_lines,
+            )
+            numbered = "\n".join(
+                f"{number:>6}\t{line}"
+                for number, line in enumerate(content.splitlines(), start=start_line)
+            )
+            if len(numbered.encode()) > context.output_byte_limit:
+                numbered = numbered.encode()[: context.output_byte_limit].decode("utf-8", "ignore")
+                numbered += "\n[output truncated]"
+            _track_primary_workspace_path(context, path)
+            return ToolResult(
+                numbered,
+                metadata={"path": str(path), "client_delegated": True},
+            )
+
+        if not path.is_file():
+            raise ToolError(f"not a file: {path}")
+        # Notify the instruction tracker so AGENTS.md files from root to this
+        # directory are discovered for the next model step.
+        _track_primary_workspace_path(context, path)
 
         def read() -> tuple[str, int]:
             text = path.read_text(encoding="utf-8")
@@ -233,7 +262,12 @@ class SearchReplaceTool:
             raise ToolError(
                 f"sandbox profile {context.sandbox_profile.value!r} prohibits workspace edits"
             )
-        path = _resolve_path(context, _require_string(arguments, "path"), must_exist=True)
+        client_file_system = context.client_file_system
+        path = _resolve_path(
+            context,
+            _require_string(arguments, "path"),
+            must_exist=client_file_system is None,
+        )
         old = _require_string(arguments, "old")
         new = arguments.get("new")
         replace_all = arguments.get("replace_all", False)
@@ -241,7 +275,7 @@ class SearchReplaceTool:
             raise ToolError("new must be a string")
         if not isinstance(replace_all, bool):
             raise ToolError("replace_all must be a boolean")
-        if not path.is_file():
+        if client_file_system is None and not path.is_file():
             raise ToolError(f"not a file: {path}")
         if (
             _is_primary_workspace_path(context, path) is False
@@ -267,6 +301,19 @@ class SearchReplaceTool:
                     is_error=True,
                     metadata={"path": str(path), "preflight": "new_instructions"},
                 )
+
+        async def replace_client_text(file_system: ClientFileSystem) -> int:
+            if not (file_system.supports_read and file_system.supports_write):
+                raise ToolError("ACP client does not support text-file replacement")
+            original = await file_system.read_text_file(path)
+            count = original.count(old)
+            if count == 0:
+                raise ToolError("old text was not found")
+            if count > 1 and not replace_all:
+                raise ToolError(f"old text is ambiguous: found {count} occurrences")
+            updated = original.replace(old, new) if replace_all else original.replace(old, new, 1)
+            await file_system.write_text_file(path, updated)
+            return count if replace_all else 1
 
         def replace_text() -> int:
             original = path.read_text(encoding="utf-8")
@@ -298,8 +345,15 @@ class SearchReplaceTool:
                     os.unlink(temporary_name)
             return count if replace_all else 1
 
-        replaced = await run_blocking(replace_text)
+        if client_file_system is None:
+            replaced = await run_blocking(replace_text)
+        else:
+            replaced = await replace_client_text(client_file_system)
         return ToolResult(
             f"replaced {replaced} occurrence(s) in {_display_path(context, path)}",
-            metadata={"path": str(path), "replacements": replaced},
+            metadata={
+                "path": str(path),
+                "replacements": replaced,
+                "client_delegated": client_file_system is not None,
+            },
         )

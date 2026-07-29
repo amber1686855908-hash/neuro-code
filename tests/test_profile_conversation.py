@@ -19,9 +19,11 @@ from neuro_code.domain.interaction_mode import InteractionMode
 from neuro_code.domain.messages import Message, Role, SessionItem
 from neuro_code.domain.model_context import ModelContext
 from neuro_code.domain.model_events import ModelEvent
+from neuro_code.domain.plans import PlanComment, PlanStep, SessionPlan
 from neuro_code.domain.reasoning import ReasoningEffort
 from neuro_code.domain.sandbox import SandboxProfile
 from neuro_code.domain.session_search import SessionSearchHit
+from neuro_code.domain.session_tasks import SessionTask, SessionTaskKind, SessionTaskStatus
 from neuro_code.domain.sessions import SessionSummary
 from neuro_code.domain.tools import ToolDefinition
 from neuro_code.shared.errors import ConfigurationError
@@ -51,10 +53,17 @@ class FixtureConversation:
         *,
         blocked: bool = False,
         items: Sequence[SessionItem] = (),
+        plan: SessionPlan | None = None,
+        plan_comments: Sequence[PlanComment] = (),
+        session_tasks: Sequence[SessionTask] = (),
     ) -> None:
         self._session_id = session_id
         self._items = tuple(items)
+        self._plan = plan
+        self._plan_comments = tuple(plan_comments)
+        self._session_tasks = tuple(session_tasks)
         self.prompts: list[str] = []
+        self.plan_execution_calls = 0
         self.blocked = blocked
         self.started = asyncio.Event()
         self.release = asyncio.Event()
@@ -70,6 +79,29 @@ class FixtureConversation:
     def items(self) -> tuple[SessionItem, ...]:
         return self._items
 
+    @property
+    def plan(self) -> SessionPlan | None:
+        return self._plan
+
+    @property
+    def plan_comments(self) -> tuple[PlanComment, ...]:
+        return self._plan_comments
+
+    async def add_plan_comment(self, step_index: int, content: str) -> PlanComment:
+        if self._plan is None:
+            raise ConfigurationError("cannot comment on a plan that has not been saved")
+        comment = PlanComment(
+            f"plan-comment-{len(self._plan_comments) + 1}",
+            step_index,
+            content,
+            datetime.now(UTC),
+        )
+        self._plan_comments = (*self._plan_comments, comment)
+        return comment
+
+    async def list_plan_comments(self) -> tuple[PlanComment, ...]:
+        return self._plan_comments
+
     def set_reasoning_effort(self, effort: ReasoningEffort) -> None:
         self.reasoning_effort = effort
 
@@ -84,6 +116,20 @@ class FixtureConversation:
             await self.release.wait()
         self._session_id = self._session_id or "new-session"
         return AgentRunResult(self._session_id, "ok", self._items, (), (), 1)
+
+    async def execute_plan(self, *, sink: EventSink | None = None) -> AgentRunResult:
+        del sink
+        if self._plan is None:
+            raise ConfigurationError("cannot execute a plan that has not been saved")
+        self.plan_execution_calls += 1
+        self._session_id = self._session_id or "new-session"
+        return AgentRunResult(self._session_id, "executed", self._items, (), (), 1, self._plan)
+
+    async def list_session_tasks(self) -> tuple[SessionTask, ...]:
+        return self._session_tasks
+
+    async def get_session_task(self, task_id: str) -> SessionTask | None:
+        return next((task for task in self._session_tasks if task.task_id == task_id), None)
 
 
 class FixtureTaskScope:
@@ -155,6 +201,68 @@ def summary(
 
 
 class ProfileConversationControllerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_execute_plan_delegates_through_the_turn_lock(self) -> None:
+        plan = SessionPlan((PlanStep("Execute the change"),), "Use the saved plan")
+        runner = FixtureConversation(plan=plan)
+
+        async def bind(name: str) -> ConversationBinding:
+            return ConversationBinding(FixtureConversation(), FixtureProvider(name, "model"))
+
+        controller = ProfileConversationController(
+            options=(option("first"),),
+            selected_profile="first",
+            binding=ConversationBinding(runner, FixtureProvider("first", "first-model")),
+            binding_factory=bind,
+        )
+
+        result = await controller.execute_plan()
+
+        self.assertEqual(result.response, "executed")
+        self.assertEqual(runner.plan_execution_calls, 1)
+        self.assertEqual(controller.plan, plan)
+
+    async def test_session_task_listing_delegates_to_the_current_binding(self) -> None:
+        task = SessionTask(
+            "task-current",
+            SessionTaskKind.PLAN_EXECUTION,
+            SessionTaskStatus.COMPLETED,
+            datetime(2026, 7, 28, tzinfo=UTC),
+            datetime(2026, 7, 28, 0, 1, tzinfo=UTC),
+        )
+        runner = FixtureConversation(session_tasks=(task,))
+
+        async def bind(name: str) -> ConversationBinding:
+            return ConversationBinding(FixtureConversation(), FixtureProvider(name, "model"))
+
+        controller = ProfileConversationController(
+            options=(option("first"),),
+            selected_profile="first",
+            binding=ConversationBinding(runner, FixtureProvider("first", "first-model")),
+            binding_factory=bind,
+        )
+
+        self.assertEqual(await controller.list_session_tasks(), (task,))
+        self.assertEqual(await controller.get_session_task(task.task_id), task)
+        self.assertIsNone(await controller.get_session_task("missing-task"))
+
+    async def test_plan_comment_methods_delegate_to_the_current_binding(self) -> None:
+        plan = SessionPlan((PlanStep("Review the plan"),))
+        runner = FixtureConversation(plan=plan)
+
+        async def bind(name: str) -> ConversationBinding:
+            return ConversationBinding(FixtureConversation(), FixtureProvider(name, "model"))
+
+        controller = ProfileConversationController(
+            options=(option("first"),),
+            selected_profile="first",
+            binding=ConversationBinding(runner, FixtureProvider("first", "first-model")),
+            binding_factory=bind,
+        )
+
+        comment = await controller.add_plan_comment(1, "Keep the scope narrow.")
+
+        self.assertEqual(await controller.list_plan_comments(), (comment,))
+
     async def test_interaction_mode_updates_runner_and_survives_profile_switch(self) -> None:
         first = FixtureConversation("old-session")
         second = FixtureConversation()

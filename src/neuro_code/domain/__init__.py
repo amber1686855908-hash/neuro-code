@@ -34,8 +34,23 @@ from neuro_code.domain.model_events import (
     ModelTextDelta,
     ModelToolCall,
 )
+from neuro_code.domain.plans import (
+    MAX_PLAN_COMMENT_BYTES,
+    MAX_PLAN_COMMENT_ID_BYTES,
+    MAX_PLAN_COMMENTS,
+    PlanComment,
+    PlanStep,
+    PlanStepStatus,
+    SessionPlan,
+)
 from neuro_code.domain.reasoning import ReasoningEffort, reasoning_guidance
 from neuro_code.domain.session_search import SessionSearchHit, SessionSearchPage
+from neuro_code.domain.session_tasks import (
+    MAX_SESSION_TASK_ID_BYTES,
+    SessionTask,
+    SessionTaskKind,
+    SessionTaskStatus,
+)
 from neuro_code.domain.sessions import SessionSnapshot, SessionSummary
 from neuro_code.domain.terminal import (
     MAX_TERMINAL_DIMENSION,
@@ -51,6 +66,10 @@ from neuro_code.domain.ui_preferences import UiLanguage
 
 __all__ = [
     "MAX_BACKGROUND_TASK_WAIT_IDS",
+    "MAX_PLAN_COMMENTS",
+    "MAX_PLAN_COMMENT_BYTES",
+    "MAX_PLAN_COMMENT_ID_BYTES",
+    "MAX_SESSION_TASK_ID_BYTES",
     "MAX_TERMINAL_DIMENSION",
     "MAX_TERMINAL_OUTPUT_BYTES",
     "MAX_TERMINAL_READ_BYTES",
@@ -78,14 +97,21 @@ __all__ = [
     "ModelReasoningDelta",
     "ModelTextDelta",
     "ModelToolCall",
+    "PlanComment",
+    "PlanStep",
+    "PlanStepStatus",
     "PreservedContextItem",
     "ReasoningEffort",
     "Role",
     "SessionItem",
+    "SessionPlan",
     "SessionSearchHit",
     "SessionSearchPage",
     "SessionSnapshot",
     "SessionSummary",
+    "SessionTask",
+    "SessionTaskKind",
+    "SessionTaskStatus",
     "TerminalOutputChunk",
     "TerminalSignal",
     "TerminalSize",

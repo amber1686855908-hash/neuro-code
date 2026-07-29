@@ -42,6 +42,7 @@ from neuro_code.domain.messages import (
     SessionItem,
     ToolCall,
 )
+from neuro_code.domain.plans import PlanComment, PlanStep, PlanStepStatus, SessionPlan
 from neuro_code.domain.provider_catalog import (
     ProviderCatalogError,
     ProviderCatalogResult,
@@ -50,6 +51,7 @@ from neuro_code.domain.provider_catalog import (
 from neuro_code.domain.provider_settings import ManagedProviderProfile, ManagedProviderSettings
 from neuro_code.domain.reasoning import ReasoningEffort
 from neuro_code.domain.sandbox import SandboxProfile
+from neuro_code.domain.session_tasks import SessionTask, SessionTaskKind, SessionTaskStatus
 from neuro_code.domain.sessions import SessionSummary
 from neuro_code.domain.ui_preferences import UiLanguage
 from neuro_code.tui import (
@@ -323,13 +325,23 @@ class ApprovalControllerFixture:
 
 
 class ProfileTuiController:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        plan: SessionPlan | None = None,
+        *,
+        plan_comments: tuple[PlanComment, ...] = (),
+        session_tasks: tuple[SessionTask, ...] = (),
+    ) -> None:
         self._selected_profile = "first"
         self.selections: list[str] = []
         self.effort_selections: list[ReasoningEffort] = []
         self.mode_selections: list[InteractionMode] = []
+        self.plan_execution_calls = 0
         self._reasoning_effort = ReasoningEffort.HIGH
         self._interaction_mode = InteractionMode.NORMAL
+        self._plan = plan
+        self._plan_comments = plan_comments
+        self._session_tasks = session_tasks
         self._options = (
             ProviderOption(
                 "first",
@@ -378,6 +390,25 @@ class ProfileTuiController:
     def auto_mode_unrestricted(self) -> bool:
         return False
 
+    @property
+    def plan(self) -> SessionPlan | None:
+        return self._plan
+
+    async def add_plan_comment(self, step_index: int, content: str) -> PlanComment:
+        if self._plan is None:
+            raise ValueError("cannot comment on a plan that has not been saved")
+        comment = PlanComment(
+            f"plan-comment-{len(self._plan_comments) + 1}",
+            step_index,
+            content,
+            datetime.now(UTC),
+        )
+        self._plan_comments = (*self._plan_comments, comment)
+        return comment
+
+    async def list_plan_comments(self) -> tuple[PlanComment, ...]:
+        return self._plan_comments
+
     async def set_reasoning_effort(
         self,
         effort: ReasoningEffort,
@@ -404,6 +435,43 @@ class ProfileTuiController:
             auto_unrestricted=False,
         )
 
+    async def execute_plan(self, *, sink: EventSink | None = None) -> AgentRunResult:
+        if self._plan is None:
+            raise ValueError("cannot execute a plan that has not been saved")
+        self.plan_execution_calls += 1
+        events = (
+            AgentEvent.create(
+                1,
+                AgentEventKind.PLAN_EXECUTION_REQUESTED,
+                {"plan": self._plan.to_dict()},
+            ),
+            AgentEvent.create(
+                2,
+                AgentEventKind.TURN_COMPLETED,
+                {"step": 1, "duration_seconds": 0.25},
+            ),
+        )
+        if sink is not None:
+            for event in events:
+                outcome = sink(event)
+                if inspect.isawaitable(outcome):
+                    await outcome
+        return AgentRunResult(
+            "plan-session",
+            "plan execution response",
+            (),
+            (),
+            events,
+            1,
+            self._plan,
+        )
+
+    async def list_session_tasks(self) -> tuple[SessionTask, ...]:
+        return self._session_tasks
+
+    async def get_session_task(self, task_id: str) -> SessionTask | None:
+        return next((task for task in self._session_tasks if task.task_id == task_id), None)
+
     async def select_profile(self, name: str) -> ProviderSelectionResult:
         self.selections.append(name)
         changed = name != self._selected_profile
@@ -420,6 +488,12 @@ class ProfileTuiController:
             changed,
             context_window_tokens=context_window_tokens,
         )
+
+
+class FailingSessionTaskController:
+    async def get_session_task(self, task_id: str) -> SessionTask | None:
+        del task_id
+        raise RuntimeError("task read failed")
 
 
 def restored_history() -> tuple[SessionItem, ...]:
@@ -546,6 +620,11 @@ class TaskTuiController:
     async def list_background_tasks(self) -> tuple[BackgroundTaskSnapshot, ...]:
         self.list_calls += 1
         return self.snapshots
+
+
+class FailingTaskTuiController:
+    async def list_background_tasks(self) -> tuple[BackgroundTaskSnapshot, ...]:
+        raise RuntimeError("task list failed")
 
 
 def background_snapshot(
@@ -1594,6 +1673,230 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("private task output", rendered)
             self.assertEqual(runner.prompts, [])
 
+    async def test_tasks_command_includes_durable_plan_execution_records(self) -> None:
+        plan = SessionPlan(
+            (
+                PlanStep("Inspect the current state", PlanStepStatus.COMPLETED),
+                PlanStep("Apply the reviewed change", PlanStepStatus.IN_PROGRESS),
+            ),
+            "Retain the execution revision for audit",
+        )
+        task = SessionTask(
+            "task-plan",
+            SessionTaskKind.PLAN_EXECUTION,
+            SessionTaskStatus.COMPLETED,
+            datetime(2026, 7, 28, 9, 30, tzinfo=UTC),
+            datetime(2026, 7, 28, 9, 31, tzinfo=UTC),
+            plan_snapshot=plan,
+        )
+        profiles = ProfileTuiController(session_tasks=(task,))
+        app = NeuroCodeApp(
+            TuiConversation(),
+            session_task_controller=profiles,
+            provider_name="fixture",
+            model_name="fixture-model",
+            cwd=Path("/workspace"),
+        )
+
+        async with app.run_test(size=(110, 35)) as pilot:
+            prompt = app.query_one("#prompt", Input)
+            prompt.value = "/tasks"
+            await pilot.press("enter")
+            await pilot.pause()
+
+            rendered = app.entries[-1].text
+            self.assertIn("task-plan · plan execution · completed", rendered)
+            self.assertIn("started", rendered)
+            self.assertIn("finished", rendered)
+            self.assertIn(f"plan revision {plan.fingerprint[:12]}", rendered)
+            self.assertIn("1/2 completed", rendered)
+
+    async def test_tasks_command_handles_empty_unavailable_failing_and_truncated_views(
+        self,
+    ) -> None:
+        unavailable = NeuroCodeApp(
+            TuiConversation(),
+            provider_name="fixture",
+            model_name="fixture-model",
+            cwd=Path("/workspace"),
+        )
+        async with unavailable.run_test(size=(110, 35)) as pilot:
+            prompt = unavailable.query_one("#prompt", Input)
+            prompt.value = "/tasks"
+            await pilot.press("enter")
+            await pilot.pause()
+            self.assertIn("Task visibility is unavailable", unavailable.entries[-1].text)
+
+            prompt.value = "/tasks unexpected"
+            await pilot.press("enter")
+            await pilot.pause()
+            self.assertIn("does not accept arguments", unavailable.entries[-1].text)
+
+        empty = NeuroCodeApp(
+            TuiConversation(),
+            task_controller=TaskTuiController(),
+            provider_name="fixture",
+            model_name="fixture-model",
+            cwd=Path("/workspace"),
+        )
+        async with empty.run_test(size=(110, 35)) as pilot:
+            prompt = empty.query_one("#prompt", Input)
+            prompt.value = "/tasks"
+            await pilot.press("enter")
+            await pilot.pause()
+            self.assertIn("No tasks for the current session", empty.entries[-1].text)
+
+        failing = NeuroCodeApp(
+            TuiConversation(),
+            task_controller=FailingTaskTuiController(),
+            provider_name="fixture",
+            model_name="fixture-model",
+            cwd=Path("/workspace"),
+        )
+        async with failing.run_test(size=(110, 35)) as pilot:
+            prompt = failing.query_one("#prompt", Input)
+            prompt.value = "/tasks"
+            await pilot.press("enter")
+            await pilot.pause()
+            self.assertIn("RuntimeError: task list failed", failing.entries[-1].text)
+
+        snapshots = tuple(
+            background_snapshot(f"task-{index}", BackgroundTaskStatus.RUNNING)
+            for index in range(21)
+        )
+        truncated = NeuroCodeApp(
+            TuiConversation(),
+            task_controller=TaskTuiController(snapshots),
+            provider_name="fixture",
+            model_name="fixture-model",
+            cwd=Path("/workspace"),
+        )
+        async with truncated.run_test(size=(110, 35)) as pilot:
+            prompt = truncated.query_one("#prompt", Input)
+            prompt.value = "/tasks"
+            await pilot.press("enter")
+            await pilot.pause()
+            self.assertIn("1 older task(s) omitted", truncated.entries[-1].text)
+            self.assertNotIn("task-0 ·", truncated.entries[-1].text)
+            self.assertIn("task-20 ·", truncated.entries[-1].text)
+
+    async def test_view_task_renders_a_historical_plan_snapshot_without_starting_a_turn(
+        self,
+    ) -> None:
+        plan = SessionPlan(
+            (
+                PlanStep("Inspect the current state", PlanStepStatus.COMPLETED),
+                PlanStep("Apply the reviewed change", PlanStepStatus.IN_PROGRESS),
+            ),
+            "Retain the execution revision for audit",
+        )
+        task = SessionTask(
+            "task-history",
+            SessionTaskKind.PLAN_EXECUTION,
+            SessionTaskStatus.COMPLETED,
+            datetime(2026, 7, 28, 9, 30, tzinfo=UTC),
+            datetime(2026, 7, 28, 9, 31, tzinfo=UTC),
+            plan_snapshot=plan,
+        )
+        runner = TuiConversation()
+        app = NeuroCodeApp(
+            runner,
+            session_task_controller=ProfileTuiController(session_tasks=(task,)),
+            provider_name="fixture",
+            model_name="fixture-model",
+            cwd=Path("/workspace"),
+        )
+
+        async with app.run_test(size=(110, 35)) as pilot:
+            prompt = app.query_one("#prompt", Input)
+            prompt.value = "/view-task task-history"
+            await pilot.press("enter")
+            await pilot.pause()
+
+            rendered = app.entries[-1].text
+            self.assertIn("Plan execution task task-history", rendered)
+            self.assertIn(plan.fingerprint, rendered)
+            self.assertIn("Retain the execution revision for audit", rendered)
+            self.assertIn("[completed] Inspect the current state", rendered)
+            self.assertIn("[in progress] Apply the reviewed change", rendered)
+            self.assertIn("read-only", rendered)
+            self.assertEqual(runner.prompts, [])
+
+    async def test_view_task_reports_missing_or_legacy_plan_snapshots(self) -> None:
+        legacy = SessionTask(
+            "task-legacy",
+            SessionTaskKind.PLAN_EXECUTION,
+            SessionTaskStatus.COMPLETED,
+            datetime(2026, 7, 28, 9, 30, tzinfo=UTC),
+            datetime(2026, 7, 28, 9, 31, tzinfo=UTC),
+        )
+        app = NeuroCodeApp(
+            TuiConversation(),
+            session_task_controller=ProfileTuiController(session_tasks=(legacy,)),
+            provider_name="fixture",
+            model_name="fixture-model",
+            cwd=Path("/workspace"),
+        )
+
+        async with app.run_test(size=(110, 35)) as pilot:
+            prompt = app.query_one("#prompt", Input)
+            prompt.value = "/view-task missing-task"
+            await pilot.press("enter")
+            await pilot.pause()
+            self.assertIn("No durable task 'missing-task'", app.entries[-1].text)
+
+            prompt.value = "/view-task task-legacy"
+            await pilot.press("enter")
+            await pilot.pause()
+            self.assertIn("has no saved plan snapshot", app.entries[-1].text)
+
+    async def test_view_task_requires_an_id_and_a_session_task_reader(self) -> None:
+        app = NeuroCodeApp(
+            TuiConversation(),
+            session_task_controller=ProfileTuiController(),
+            provider_name="fixture",
+            model_name="fixture-model",
+            cwd=Path("/workspace"),
+        )
+
+        async with app.run_test(size=(110, 35)) as pilot:
+            prompt = app.query_one("#prompt", Input)
+            prompt.value = "/view-task"
+            await pilot.press("enter")
+            await pilot.pause()
+            self.assertIn("Usage: /view-task TASK_ID", app.entries[-1].text)
+
+        unavailable = NeuroCodeApp(
+            TuiConversation(),
+            provider_name="fixture",
+            model_name="fixture-model",
+            cwd=Path("/workspace"),
+        )
+        async with unavailable.run_test(size=(110, 35)) as pilot:
+            prompt = unavailable.query_one("#prompt", Input)
+            prompt.value = "/view-task task-history"
+            await pilot.press("enter")
+            await pilot.pause()
+            self.assertIn("Task visibility is unavailable", unavailable.entries[-1].text)
+
+    async def test_view_task_reports_a_reader_failure_without_starting_a_turn(self) -> None:
+        runner = TuiConversation()
+        app = NeuroCodeApp(
+            runner,
+            session_task_controller=FailingSessionTaskController(),
+            provider_name="fixture",
+            model_name="fixture-model",
+            cwd=Path("/workspace"),
+        )
+
+        async with app.run_test(size=(110, 35)) as pilot:
+            prompt = app.query_one("#prompt", Input)
+            prompt.value = "/view-task task-history"
+            await pilot.press("enter")
+            await pilot.pause()
+            self.assertIn("RuntimeError: task read failed", app.entries[-1].text)
+            self.assertEqual(runner.prompts, [])
+
     async def test_terminal_task_notification_is_emitted_once_without_raw_output(
         self,
     ) -> None:
@@ -1828,6 +2131,7 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("/sessions", app.entries[-1].text)
             self.assertIn("/rename", app.entries[-1].text)
             self.assertIn("/tasks", app.entries[-1].text)
+            self.assertIn("/view-task TASK_ID", app.entries[-1].text)
 
             prompt.value = "/status"
             await pilot.press("enter")
@@ -1839,6 +2143,132 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             self.assertEqual([entry.text for entry in app.entries], ["Transcript cleared."])
             self.assertEqual(runner.prompts, [])
+
+    async def test_plan_commands_show_the_saved_plan_and_start_a_plan_turn(self) -> None:
+        plan = SessionPlan(
+            (
+                PlanStep("Inspect the current behavior", PlanStepStatus.COMPLETED),
+                PlanStep("Implement the safe follow-up", PlanStepStatus.IN_PROGRESS),
+            ),
+            "Keep the agreed work visible in this session",
+        )
+        runner = TuiConversation()
+        profiles = ProfileTuiController(plan)
+        app = NeuroCodeApp(
+            runner,
+            provider_controller=profiles,
+            interaction_mode_controller=profiles,
+            plan_controller=profiles,
+            provider_name="first",
+            model_name="first-model",
+            cwd=Path("/workspace"),
+        )
+
+        async with app.run_test(size=(100, 30)) as pilot:
+            prompt = app.query_one("#prompt", Input)
+            prompt.value = "/view-plan"
+            await pilot.press("enter")
+            await pilot.pause()
+            displayed = app.entries[-1].text
+            self.assertIn("Current plan:", displayed)
+            self.assertIn("Keep the agreed work visible", displayed)
+            self.assertIn("[in progress] Implement the safe follow-up", displayed)
+
+            prompt.value = "/plan Verify the implementation before editing"
+            await pilot.press("enter")
+            for _ in range(20):
+                await pilot.pause(0.01)
+                if runner.prompts:
+                    break
+            self.assertEqual(profiles.mode_selections, [InteractionMode.PLAN])
+            self.assertEqual(runner.prompts, ["Verify the implementation before editing"])
+
+    async def test_plan_comment_command_persists_and_renders_user_feedback(self) -> None:
+        plan = SessionPlan(
+            (
+                PlanStep("Inspect the current behavior", PlanStepStatus.COMPLETED),
+                PlanStep("Implement the safe follow-up", PlanStepStatus.IN_PROGRESS),
+            ),
+        )
+        runner = TuiConversation()
+        profiles = ProfileTuiController(plan)
+        app = NeuroCodeApp(
+            runner,
+            plan_controller=profiles,
+            provider_name="first",
+            model_name="first-model",
+            cwd=Path("/workspace"),
+        )
+
+        async with app.run_test(size=(100, 30)) as pilot:
+            prompt = app.query_one("#prompt", Input)
+            prompt.value = "/comment-plan 2 Keep the verification check explicit"
+            await pilot.press("enter")
+            await pilot.pause()
+
+            self.assertEqual(len(await profiles.list_plan_comments()), 1)
+            self.assertIn("Saved comment for plan step 2.", app.entries[-2].text)
+            self.assertIn("Comment: Keep the verification check explicit", app.entries[-1].text)
+
+    async def test_execute_plan_switches_only_to_accept_edits_and_records_the_handoff(self) -> None:
+        plan = SessionPlan(
+            (PlanStep("Implement the reviewed change", PlanStepStatus.IN_PROGRESS),),
+            "Execute only after the user confirms",
+        )
+        runner = TuiConversation()
+        profiles = ProfileTuiController(plan)
+        profiles._interaction_mode = InteractionMode.PLAN
+        app = NeuroCodeApp(
+            runner,
+            provider_controller=profiles,
+            interaction_mode_controller=profiles,
+            plan_controller=profiles,
+            provider_name="first",
+            model_name="first-model",
+            cwd=Path("/workspace"),
+        )
+
+        async with app.run_test(size=(100, 30)) as pilot:
+            prompt = app.query_one("#prompt", Input)
+            prompt.value = "/execute-plan"
+            await pilot.press("enter")
+            for _ in range(20):
+                await pilot.pause(0.01)
+                if profiles.plan_execution_calls:
+                    break
+
+            self.assertEqual(profiles.mode_selections, [InteractionMode.ACCEPT_EDITS])
+            self.assertEqual(profiles.plan_execution_calls, 1)
+            self.assertIn(
+                "Execution started from the current structured plan in accept-edits mode.",
+                [entry.text for entry in app.entries],
+            )
+            self.assertIn(
+                "Execute the current structured plan.", [entry.text for entry in app.entries]
+            )
+
+    async def test_execute_plan_requires_a_saved_plan(self) -> None:
+        runner = TuiConversation()
+        profiles = ProfileTuiController()
+        app = NeuroCodeApp(
+            runner,
+            provider_controller=profiles,
+            interaction_mode_controller=profiles,
+            plan_controller=profiles,
+            provider_name="first",
+            model_name="first-model",
+            cwd=Path("/workspace"),
+        )
+
+        async with app.run_test(size=(100, 30)) as pilot:
+            prompt = app.query_one("#prompt", Input)
+            prompt.value = "/execute-plan"
+            await pilot.press("enter")
+            await pilot.pause()
+
+            self.assertEqual(profiles.mode_selections, [])
+            self.assertEqual(profiles.plan_execution_calls, 0)
+            self.assertIn("No structured plan has been saved", app.entries[-1].text)
 
     async def test_permission_modal_blocks_until_allow_once_is_selected(self) -> None:
         broker = SessionApprovalBroker()

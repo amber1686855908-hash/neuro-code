@@ -18,6 +18,8 @@ from neuro_code.application.acp.contracts import (
     AcpWorkspaceValidator,
 )
 from neuro_code.application.ports.approval import PermissionApprover
+from neuro_code.application.ports.client_filesystem import ClientFileSystem
+from neuro_code.application.ports.client_terminal import ClientTerminal
 from neuro_code.application.ports.storage import SessionStore
 from neuro_code.application.ports.tools import Tool
 from neuro_code.domain.sessions import SessionSummary
@@ -80,11 +82,15 @@ class AcpApplicationService:
         approver: PermissionApprover | None,
         additional_tools: Sequence[Tool],
         additional_workspace_roots: Sequence[Path],
+        client_file_system: ClientFileSystem | None,
+        client_terminal: ClientTerminal | None,
     ) -> AcpBinding:
         return await self._bindings.create_binding(
             approver=approver,
             additional_tools=additional_tools,
             additional_workspace_roots=additional_workspace_roots,
+            client_file_system=client_file_system,
+            client_terminal=client_terminal,
         )
 
     async def prepare_session_resume(self, session_id: str) -> AcpPreparedSession:

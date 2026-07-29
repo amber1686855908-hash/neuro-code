@@ -21,7 +21,15 @@ from neuro_code.domain.messages import (
     Role,
     ToolCall,
 )
+from neuro_code.domain.plans import (
+    MAX_PLAN_COMMENTS,
+    PlanComment,
+    PlanStep,
+    PlanStepStatus,
+    SessionPlan,
+)
 from neuro_code.domain.sandbox import SandboxProfile
+from neuro_code.domain.session_tasks import SessionTask, SessionTaskKind, SessionTaskStatus
 from neuro_code.domain.sessions import SessionSnapshot, SessionSummary
 from neuro_code.shared.errors import SessionError
 
@@ -198,6 +206,70 @@ class SessionStoreTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(summary.cwd, "/workspace")
             self.assertEqual(summary.context_affinity, "profile-v1:fixture")
             self.assertIs(summary.sandbox_profile, SandboxProfile.READ_ONLY)
+            plan = SessionPlan(
+                (
+                    PlanStep("Inspect the persisted session", PlanStepStatus.COMPLETED),
+                    PlanStep("Implement the follow-up", PlanStepStatus.IN_PROGRESS),
+                ),
+                "Finish the durable plan workflow",
+            )
+            await store.save_session_plan(session_id, plan)
+            self.assertEqual(await store.load_session_plan(session_id), plan)
+            comment = PlanComment(
+                "plan-comment-round-trip",
+                2,
+                "Keep the verification command visible.",
+                datetime(2026, 7, 3, 9, 59, tzinfo=UTC),
+            )
+            await store.add_plan_comment(session_id, plan, comment)
+            self.assertEqual(await store.list_plan_comments(session_id, plan), [comment])
+            replacement = SessionPlan((PlanStep("Use a revised approach"),))
+            await store.save_session_plan(session_id, replacement)
+            self.assertEqual(await store.list_plan_comments(session_id, replacement), [])
+            await store.save_session_plan(session_id, plan)
+            self.assertEqual(await store.list_plan_comments(session_id, plan), [])
+            await store.save_session_plan(session_id, None)
+            self.assertIsNone(await store.load_session_plan(session_id))
+            task = SessionTask(
+                "task-plan-execution",
+                SessionTaskKind.PLAN_EXECUTION,
+                SessionTaskStatus.RUNNING,
+                datetime(2026, 7, 3, 10, tzinfo=UTC),
+                plan_snapshot=plan,
+            )
+            await store.create_session_task(session_id, task)
+            self.assertEqual(await store.list_session_tasks(session_id), [task])
+            self.assertEqual(await store.get_session_task(session_id, task.task_id), task)
+            self.assertIsNone(await store.get_session_task(session_id, "task-not-found"))
+            with self.assertRaisesRegex(SessionError, "unknown session"):
+                await store.get_session_task("missing-session", "task-not-found")
+            other_session_id = await store.create_session(
+                "/other-workspace",
+                "fake",
+                "test-model",
+            )
+            self.assertIsNone(await store.get_session_task(other_session_id, task.task_id))
+            with self.assertRaisesRegex(SessionError, "task id is invalid"):
+                await store.get_session_task(session_id, "task\x00invalid")
+            completed = task.finish(
+                SessionTaskStatus.COMPLETED,
+                finished_at=datetime(2026, 7, 3, 10, 1, tzinfo=UTC),
+            )
+            await store.update_session_task(session_id, completed)
+            self.assertEqual(await store.list_session_tasks(session_id), [completed])
+            self.assertEqual(await store.get_session_task(session_id, completed.task_id), completed)
+            with self.assertRaisesRegex(SessionError, "invalid session task transition"):
+                await store.update_session_task(session_id, completed)
+            with self.assertRaisesRegex(SessionError, "unknown session task"):
+                await store.update_session_task(
+                    session_id,
+                    SessionTask(
+                        "task-missing",
+                        SessionTaskKind.PLAN_EXECUTION,
+                        SessionTaskStatus.RUNNING,
+                        datetime(2026, 7, 3, 10, tzinfo=UTC),
+                    ),
+                )
             self.assertIs(
                 await store.peek_session_sandbox_profile(session_id),
                 SandboxProfile.READ_ONLY,
@@ -213,7 +285,98 @@ class SessionStoreTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(summary.model, "fallback-model")
             self.assertEqual(summary.context_affinity, "profile-v1:fallback")
             self.assertIs(summary.sandbox_profile, SandboxProfile.READ_ONLY)
-            self.assertEqual((await store.list_sessions())[0], summary)
+            self.assertIn(summary, await store.list_sessions())
+
+    async def test_schema_v8_migration_preserves_tasks_without_plan_snapshots(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "sessions.db"
+            store = SqliteSessionStore(database)
+            await store.initialize()
+            session_id = await store.create_session("/workspace", "fixture", "model")
+            task = SessionTask(
+                "task-v8-plan",
+                SessionTaskKind.PLAN_EXECUTION,
+                SessionTaskStatus.RUNNING,
+                datetime(2026, 7, 29, 10, tzinfo=UTC),
+            )
+            await store.create_session_task(session_id, task)
+
+            connection = sqlite3.connect(database)
+            connection.executescript(
+                """
+                ALTER TABLE session_tasks RENAME TO legacy_session_tasks;
+                CREATE TABLE session_tasks (
+                    task_id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    started_at TEXT NOT NULL,
+                    finished_at TEXT,
+                    FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+                );
+                INSERT INTO session_tasks(task_id, session_id, kind, status, started_at, finished_at)
+                SELECT task_id, session_id, kind, status, started_at, finished_at
+                FROM legacy_session_tasks;
+                DROP TABLE legacy_session_tasks;
+                UPDATE schema_meta SET version = 8 WHERE singleton = 1;
+                """
+            )
+            connection.commit()
+            connection.close()
+
+            migrated = SqliteSessionStore(database)
+            await migrated.initialize()
+            self.assertEqual(await migrated.list_session_tasks(session_id), [task])
+
+            connection = sqlite3.connect(database)
+            self.assertEqual(
+                connection.execute(
+                    "SELECT version FROM schema_meta WHERE singleton = 1"
+                ).fetchone(),
+                (9,),
+            )
+            columns = {row[1] for row in connection.execute("PRAGMA table_info(session_tasks)")}
+            self.assertIn("plan_snapshot_json", columns)
+            self.assertEqual(
+                connection.execute(
+                    "SELECT plan_snapshot_json FROM session_tasks WHERE task_id = ?",
+                    (task.task_id,),
+                ).fetchone(),
+                ("",),
+            )
+            connection.close()
+
+    async def test_current_plan_comment_count_is_bounded(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = SqliteSessionStore(Path(directory) / "sessions.db")
+            await store.initialize()
+            session_id = await store.create_session("/workspace", "fixture", "model")
+            plan = SessionPlan((PlanStep("Review the bounded feedback"),))
+            await store.save_session_plan(session_id, plan)
+            timestamp = datetime(2026, 7, 29, 14, tzinfo=UTC)
+            for index in range(MAX_PLAN_COMMENTS):
+                await store.add_plan_comment(
+                    session_id,
+                    plan,
+                    PlanComment(
+                        f"plan-comment-{index}",
+                        1,
+                        f"Comment {index}",
+                        timestamp,
+                    ),
+                )
+
+            with self.assertRaisesRegex(SessionError, "comment limit"):
+                await store.add_plan_comment(
+                    session_id,
+                    plan,
+                    PlanComment(
+                        "plan-comment-overflow",
+                        1,
+                        "One comment too many",
+                        timestamp,
+                    ),
+                )
 
     async def test_fork_copies_context_without_events_and_delete_cascades_indexes(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -240,6 +403,34 @@ class SessionStoreTests(unittest.IsolatedAsyncioTestCase):
             ]
             await store.save_session_items(source_id, items)
             await store.update_session_title(source_id, "Shared fork title")
+            plan = SessionPlan(
+                (
+                    PlanStep("Keep source context", PlanStepStatus.COMPLETED),
+                    PlanStep("Continue from the fork", PlanStepStatus.IN_PROGRESS),
+                ),
+                "Verify that the fork keeps its work plan",
+            )
+            await store.save_session_plan(source_id, plan)
+            await store.add_plan_comment(
+                source_id,
+                plan,
+                PlanComment(
+                    "plan-comment-source",
+                    2,
+                    "Do not drop the regression tests from this fork.",
+                    datetime(2026, 7, 4, 0, 0, 30, tzinfo=UTC),
+                ),
+            )
+            await store.create_session_task(
+                source_id,
+                SessionTask(
+                    "task-source",
+                    SessionTaskKind.PLAN_EXECUTION,
+                    SessionTaskStatus.COMPLETED,
+                    datetime(2026, 7, 4, tzinfo=UTC),
+                    datetime(2026, 7, 4, 0, 1, tzinfo=UTC),
+                ),
+            )
             await store.append_event(
                 source_id,
                 AgentEvent.create(1, AgentEventKind.TURN_COMPLETED, {"step": 1}),
@@ -258,6 +449,16 @@ class SessionStoreTests(unittest.IsolatedAsyncioTestCase):
             self.assertIs(forked.sandbox_profile, source.sandbox_profile)
             self.assertEqual(forked.title, "Shared fork title")
             self.assertEqual(await store.load_session_items(forked_id), items)
+            self.assertEqual(await store.load_session_plan(forked_id), plan)
+            forked_comments = await store.list_plan_comments(forked_id, plan)
+            self.assertEqual(len(forked_comments), 1)
+            self.assertNotEqual(forked_comments[0].comment_id, "plan-comment-source")
+            self.assertEqual(forked_comments[0].step_index, 2)
+            self.assertEqual(
+                forked_comments[0].content,
+                "Do not drop the regression tests from this fork.",
+            )
+            self.assertEqual(await store.list_session_tasks(forked_id), [])
             self.assertEqual(await store.load_events(forked_id), [])
             search = await store.search_sessions("fork searchable")
             self.assertEqual(
@@ -488,10 +689,18 @@ class SessionStoreTests(unittest.IsolatedAsyncioTestCase):
                 "SELECT version FROM schema_meta WHERE singleton = 1"
             ).fetchone()
             columns = {row[1] for row in migrated.execute("PRAGMA table_info(sessions)").fetchall()}
+            tables = {row[0] for row in migrated.execute("SELECT name FROM sqlite_master")}
+            task_columns = {
+                row[1] for row in migrated.execute("PRAGMA table_info(session_tasks)").fetchall()
+            }
             migrated.close()
-            self.assertEqual(version, (5,))
+            self.assertEqual(version, (9,))
             self.assertIn("context_affinity", columns)
             self.assertIn("sandbox_profile", columns)
+            self.assertIn("plan_json", columns)
+            self.assertIn("session_tasks", tables)
+            self.assertIn("session_plan_comments", tables)
+            self.assertIn("plan_snapshot_json", task_columns)
 
     async def test_schema_v2_peek_is_read_only_then_migrates_as_legacy(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -549,7 +758,7 @@ class SessionStoreTests(unittest.IsolatedAsyncioTestCase):
             migrated = sqlite3.connect(database)
             self.assertEqual(
                 migrated.execute("SELECT version FROM schema_meta WHERE singleton = 1").fetchone(),
-                (5,),
+                (9,),
             )
             migrated.close()
 
@@ -629,7 +838,7 @@ class SessionStoreTests(unittest.IsolatedAsyncioTestCase):
             migrated = sqlite3.connect(database)
             self.assertEqual(
                 migrated.execute("SELECT version FROM schema_meta WHERE singleton = 1").fetchone(),
-                (5,),
+                (9,),
             )
             tables = {
                 row[0]
@@ -672,7 +881,7 @@ class SessionStoreTests(unittest.IsolatedAsyncioTestCase):
                 connection.execute(
                     "SELECT version FROM schema_meta WHERE singleton = 1"
                 ).fetchone(),
-                (5,),
+                (9,),
             )
             connection.close()
 
@@ -741,7 +950,7 @@ class SessionStoreTests(unittest.IsolatedAsyncioTestCase):
             recovered = sqlite3.connect(database)
             self.assertEqual(
                 recovered.execute("SELECT version FROM schema_meta WHERE singleton = 1").fetchone(),
-                (5,),
+                (9,),
             )
             recovered.close()
 
@@ -765,7 +974,7 @@ class SessionStoreTests(unittest.IsolatedAsyncioTestCase):
                 connection.execute(
                     "SELECT version FROM schema_meta WHERE singleton = 1"
                 ).fetchone(),
-                (5,),
+                (9,),
             )
             self.assertEqual(
                 connection.execute("SELECT COUNT(*) FROM session_search_documents").fetchone(),
@@ -1026,6 +1235,7 @@ class SessionStoreTests(unittest.IsolatedAsyncioTestCase):
                 store.get_session("missing"),
                 store.load_messages("missing"),
                 store.load_session_items("missing"),
+                store.load_session_plan("missing"),
                 store.next_event_sequence("missing"),
                 store.update_session_provider("missing", "provider", "model", None),
                 store.list_sessions(limit=0),

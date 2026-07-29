@@ -25,6 +25,7 @@ from neuro_code.domain.background_tasks import BackgroundTaskSnapshot, Backgroun
 from neuro_code.domain.events import AgentEventKind
 from neuro_code.domain.interaction_mode import InteractionMode
 from neuro_code.domain.messages import (
+    ContentPart,
     ContextItemKind,
     Message,
     PreservedContextItem,
@@ -41,7 +42,9 @@ from neuro_code.domain.model_events import (
     ModelTextDelta,
     ModelToolCall,
 )
+from neuro_code.domain.plans import PlanComment, PlanStep, PlanStepStatus, SessionPlan
 from neuro_code.domain.reasoning import ReasoningEffort
+from neuro_code.domain.session_tasks import SessionTaskKind, SessionTaskStatus
 from neuro_code.domain.tools import ToolDefinition, ToolResult
 from neuro_code.permissions import (
     PermissionEffect,
@@ -50,7 +53,7 @@ from neuro_code.permissions import (
     PermissionRule,
 )
 from neuro_code.providers.failover import FailoverModelProvider, ProviderCandidate
-from neuro_code.shared.errors import ProviderError
+from neuro_code.shared.errors import ConfigurationError, ProviderError
 from neuro_code.tools import ToolRegistry, default_tool_registry
 from neuro_code.tools.background_tasks import TaskOutputTool
 from neuro_code.workspace_changes import FilesystemWorkspaceChangeObserver
@@ -92,6 +95,26 @@ class FailingProvider:
     ) -> AsyncIterator[ModelEvent]:
         del context, tools
         raise ProviderError(f"{self.provider_name} unavailable")
+        if False:
+            yield ModelCompleted("stop")
+
+
+class BlockingProvider:
+    provider_name = "blocking"
+    model_name = "blocking-model"
+    context_affinity = "profile-v1:blocking"
+
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+
+    async def stream(
+        self,
+        context: ModelContext,
+        tools: Sequence[ToolDefinition],
+    ) -> AsyncIterator[ModelEvent]:
+        del context, tools
+        self.started.set()
+        await asyncio.Event().wait()
         if False:
             yield ModelCompleted("stop")
 
@@ -374,6 +397,254 @@ def completion_snapshot(task_id: str) -> BackgroundTaskSnapshot:
 
 
 class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_update_plan_is_persisted_emitted_and_added_to_follow_up_context(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = SqliteSessionStore(root / ".state" / "sessions.db")
+            await store.initialize()
+            provider = ScriptedProvider(
+                (
+                    (
+                        ModelToolCall(
+                            ToolCall(
+                                "plan-1",
+                                "update_plan",
+                                {
+                                    "explanation": "Complete the requested feature safely",
+                                    "plan": [
+                                        {
+                                            "step": "Inspect the current behavior",
+                                            "status": "completed",
+                                        },
+                                        {
+                                            "step": "Implement the next vertical slice",
+                                            "status": "in_progress",
+                                        },
+                                    ],
+                                },
+                            )
+                        ),
+                        ModelCompleted("tool_calls"),
+                    ),
+                    (ModelTextDelta("Plan saved."), ModelCompleted("stop")),
+                )
+            )
+            runtime = AgentRuntime(
+                provider=provider,
+                tools=default_tool_registry(),
+                workspace_change_observer=EmptyWorkspaceChangeObserver(),
+                permissions=PermissionManager(),
+                tool_context=ToolContext(root),
+                session_store=store,
+                plan=SessionPlan((PlanStep("Review the initial plan"),)),
+                plan_comments=(
+                    PlanComment(
+                        "plan-comment-revision",
+                        1,
+                        "Replace this draft with a more concrete plan.",
+                        datetime(2026, 7, 29, 14, tzinfo=UTC),
+                    ),
+                ),
+            )
+
+            result = await runtime.run("Make a plan for the feature")
+
+            plan = SessionPlan(
+                (
+                    PlanStep("Inspect the current behavior", PlanStepStatus.COMPLETED),
+                    PlanStep("Implement the next vertical slice", PlanStepStatus.IN_PROGRESS),
+                ),
+                "Complete the requested feature safely",
+            )
+            self.assertEqual(result.plan, plan)
+            assert result.session_id is not None
+            self.assertEqual(await store.load_session_plan(result.session_id), plan)
+            plan_event = next(
+                event for event in result.events if event.kind is AgentEventKind.PLAN_UPDATED
+            )
+            self.assertEqual(plan_event.data, plan.to_dict())
+            second_system = next(
+                message
+                for message in provider.calls[1].messages
+                if isinstance(message, Message) and message.role is Role.SYSTEM
+            )
+            self.assertIn("Current structured plan:", second_system.content)
+            self.assertIn("Implement the next vertical slice", second_system.content)
+            self.assertNotIn("Replace this draft with a more concrete plan", second_system.content)
+
+    async def test_explicit_plan_execution_is_recorded_before_the_user_message(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = SqliteSessionStore(root / "sessions.db")
+            await store.initialize()
+            plan = SessionPlan(
+                (PlanStep("Implement the approved slice", PlanStepStatus.IN_PROGRESS),),
+                "Complete the work after explicit confirmation",
+            )
+            provider = ScriptedProvider(((ModelTextDelta("executed"), ModelCompleted("stop")),))
+            runtime = AgentRuntime(
+                provider=provider,
+                tools=ToolRegistry(),
+                workspace_change_observer=EmptyWorkspaceChangeObserver(),
+                permissions=PermissionManager(),
+                tool_context=ToolContext(root),
+                session_store=store,
+                plan=plan,
+            )
+
+            result = await runtime.run("Execute the approved plan", plan_execution_requested=True)
+
+            requested_index = next(
+                index
+                for index, event in enumerate(result.events)
+                if event.kind is AgentEventKind.PLAN_EXECUTION_REQUESTED
+            )
+            user_index = next(
+                index
+                for index, event in enumerate(result.events)
+                if event.kind is AgentEventKind.USER_MESSAGE
+            )
+            self.assertLess(requested_index, user_index)
+            self.assertEqual(result.events[requested_index].data, {"plan": plan.to_dict()})
+            self.assertIsNotNone(result.session_id)
+            assert result.session_id is not None
+            session_tasks = await store.list_session_tasks(result.session_id)
+            self.assertEqual(len(session_tasks), 1)
+            self.assertIs(session_tasks[0].kind, SessionTaskKind.PLAN_EXECUTION)
+            self.assertIs(session_tasks[0].status, SessionTaskStatus.COMPLETED)
+            self.assertEqual(session_tasks[0].plan_snapshot, plan)
+            persisted_kinds = [
+                event["kind"] for event in await store.load_events(result.session_id)
+            ]
+            self.assertIn(AgentEventKind.PLAN_EXECUTION_REQUESTED.value, persisted_kinds)
+            self.assertLess(
+                persisted_kinds.index(AgentEventKind.SESSION_TASK_STARTED.value),
+                persisted_kinds.index(AgentEventKind.PLAN_EXECUTION_REQUESTED.value),
+            )
+            self.assertLess(
+                persisted_kinds.index(AgentEventKind.SESSION_TASK_COMPLETED.value),
+                persisted_kinds.index(AgentEventKind.TURN_COMPLETED.value),
+            )
+
+            system = next(
+                message for message in provider.calls[0].messages if message.role is Role.SYSTEM
+            )
+            self.assertIn("Implement the approved slice", system.content)
+
+    async def test_failed_plan_execution_marks_its_durable_task_failed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = SqliteSessionStore(root / "sessions.db")
+            await store.initialize()
+            runtime = AgentRuntime(
+                provider=FailingProvider("failing"),
+                tools=ToolRegistry(),
+                workspace_change_observer=EmptyWorkspaceChangeObserver(),
+                permissions=PermissionManager(),
+                tool_context=ToolContext(root),
+                session_store=store,
+                plan=SessionPlan((PlanStep("Try the execution"),)),
+            )
+
+            with self.assertRaisesRegex(ProviderError, "failing unavailable"):
+                await runtime.run("Execute the approved plan", plan_execution_requested=True)
+
+            session_id = (await store.list_sessions())[0].id
+            tasks = await store.list_session_tasks(session_id)
+            self.assertEqual(len(tasks), 1)
+            self.assertIs(tasks[0].status, SessionTaskStatus.FAILED)
+            event_kinds = [event["kind"] for event in await store.load_events(session_id)]
+            self.assertIn(AgentEventKind.SESSION_TASK_FAILED.value, event_kinds)
+
+    async def test_cancelled_plan_execution_marks_its_durable_task_cancelled(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = SqliteSessionStore(root / "sessions.db")
+            await store.initialize()
+            provider = BlockingProvider()
+            runtime = AgentRuntime(
+                provider=provider,
+                tools=ToolRegistry(),
+                workspace_change_observer=EmptyWorkspaceChangeObserver(),
+                permissions=PermissionManager(),
+                tool_context=ToolContext(root),
+                session_store=store,
+                plan=SessionPlan((PlanStep("Try the execution"),)),
+            )
+
+            turn = asyncio.create_task(
+                runtime.run("Execute the approved plan", plan_execution_requested=True)
+            )
+            try:
+                await asyncio.wait_for(provider.started.wait(), timeout=5)
+                turn.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await turn
+            finally:
+                if not turn.done():
+                    turn.cancel()
+                    await asyncio.gather(turn, return_exceptions=True)
+
+            session_id = (await store.list_sessions())[0].id
+            tasks = await store.list_session_tasks(session_id)
+            self.assertEqual(len(tasks), 1)
+            self.assertIs(tasks[0].status, SessionTaskStatus.CANCELLED)
+            event_kinds = [event["kind"] for event in await store.load_events(session_id)]
+            self.assertLess(
+                event_kinds.index(AgentEventKind.SESSION_TASK_CANCELLED.value),
+                event_kinds.index(AgentEventKind.TURN_FAILED.value),
+            )
+
+    async def test_plan_execution_without_a_saved_plan_fails_before_creating_a_session(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = SqliteSessionStore(root / "sessions.db")
+            await store.initialize()
+            runtime = AgentRuntime(
+                provider=ScriptedProvider(()),
+                tools=ToolRegistry(),
+                workspace_change_observer=EmptyWorkspaceChangeObserver(),
+                permissions=PermissionManager(),
+                tool_context=ToolContext(root),
+                session_store=store,
+            )
+
+            with self.assertRaisesRegex(ConfigurationError, "has not been saved"):
+                await runtime.run("Execute the plan", plan_execution_requested=True)
+            self.assertEqual(await store.list_sessions(), [])
+
+    async def test_structured_user_images_reach_provider_and_events_stay_safe(self) -> None:
+        provider = ScriptedProvider(((ModelTextDelta("done"), ModelCompleted("stop")),))
+        runtime = AgentRuntime(
+            provider=provider,
+            tools=ToolRegistry(),
+            workspace_change_observer=EmptyWorkspaceChangeObserver(),
+            permissions=PermissionManager(),
+            tool_context=ToolContext(Path("/workspace")),
+        )
+        image_url = "data:image/png;base64,cHJpdmF0ZS1pbWFnZQ=="
+
+        result = await runtime.run(
+            "inspect",
+            content_parts=(
+                ContentPart.from_text("inspect"),
+                ContentPart.from_image(image_url),
+            ),
+        )
+
+        user = next(message for message in provider.calls[0].messages if message.role is Role.USER)
+        self.assertEqual(user.content, "inspect")
+        self.assertEqual(user.content_parts[1].url, image_url)
+        persisted = next(message for message in result.messages if message.role is Role.USER)
+        self.assertEqual(persisted.content_parts[1].url, image_url)
+        user_event = next(
+            event for event in result.events if event.kind is AgentEventKind.USER_MESSAGE
+        )
+        self.assertIn("image content preserved", str(user_event.data["content"]))
+        self.assertNotIn("cHJpdmF0ZS1pbWFnZQ==", str(user_event.data))
+
     async def test_structural_tool_collection_preserves_order_and_known_tool_dispatch(self) -> None:
         first = CollectionFixtureTool("first", "first completed")
         second = CollectionFixtureTool("second", "second completed")

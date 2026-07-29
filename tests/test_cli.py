@@ -566,6 +566,8 @@ api_key_env = "FIXTURE_KEY"
                     provider_controller: object,
                     session_controller: object,
                     task_controller: object,
+                    session_task_controller: object,
+                    plan_controller: object,
                     ui_preferences: object,
                     provider_settings_store: object,
                     provider_catalog: object,
@@ -582,6 +584,8 @@ api_key_env = "FIXTURE_KEY"
                         provider_controller=provider_controller,
                         session_controller=session_controller,
                         task_controller=task_controller,
+                        session_task_controller=session_task_controller,
+                        plan_controller=plan_controller,
                         ui_preferences=ui_preferences,
                         provider_settings_store=provider_settings_store,
                         provider_catalog=provider_catalog,
@@ -621,6 +625,8 @@ api_key_env = "FIXTURE_KEY"
             self.assertIs(captured["runner"], captured["provider_controller"])
             self.assertIs(captured["runner"], captured["session_controller"])
             self.assertIs(captured["runner"], captured["task_controller"])
+            self.assertIs(captured["runner"], captured["session_task_controller"])
+            self.assertIs(captured["runner"], captured["plan_controller"])
             self.assertEqual(captured["initial_items"], ())
             self.assertEqual(captured["language"], UiLanguage.SIMPLIFIED_CHINESE)
             self.assertIsInstance(captured["provider_catalog"], HttpProviderCatalog)
@@ -756,6 +762,8 @@ api_key_env = "FIXTURE_KEY"
                     provider_controller: object,
                     session_controller: object,
                     task_controller: object,
+                    session_task_controller: object,
+                    plan_controller: object,
                     ui_preferences: object,
                     provider_settings_store: object,
                     provider_catalog: object,
@@ -771,6 +779,8 @@ api_key_env = "FIXTURE_KEY"
                         approval_controller,
                         provider_controller,
                         task_controller,
+                        session_task_controller,
+                        plan_controller,
                         ui_preferences,
                         provider_settings_store,
                         provider_catalog,
@@ -854,6 +864,8 @@ api_key_env = "SECOND_KEY"
                     provider_controller: object,
                     session_controller: object,
                     task_controller: object,
+                    session_task_controller: object,
+                    plan_controller: object,
                     ui_preferences: object,
                     provider_settings_store: object,
                     provider_catalog: object,
@@ -866,6 +878,7 @@ api_key_env = "SECOND_KEY"
                 ) -> None:
                     del (
                         approval_controller,
+                        plan_controller,
                         ui_preferences,
                         provider_settings_store,
                         provider_catalog,
@@ -880,6 +893,7 @@ api_key_env = "SECOND_KEY"
                     self.provider_controller = provider_controller
                     self.session_controller = session_controller
                     self.task_controller = task_controller
+                    self.session_task_controller = session_task_controller
 
                 async def run_async(self) -> None:
                     selection = await self.provider_controller.select_profile("second")
@@ -887,6 +901,9 @@ api_key_env = "SECOND_KEY"
                     captured["same_controller"] = self.runner is self.provider_controller
                     captured["same_session_controller"] = self.runner is self.session_controller
                     captured["same_task_controller"] = self.runner is self.task_controller
+                    captured["same_session_task_controller"] = (
+                        self.runner is self.session_task_controller
+                    )
 
             with (
                 patch.dict(
@@ -911,6 +928,7 @@ api_key_env = "SECOND_KEY"
             self.assertTrue(captured["same_controller"])
             self.assertTrue(captured["same_session_controller"])
             self.assertTrue(captured["same_task_controller"])
+            self.assertTrue(captured["same_session_task_controller"])
             selection = captured["selection"]
             self.assertTrue(selection.changed)
             self.assertIsNone(selection.previous_session_id)
@@ -989,6 +1007,8 @@ api_key_env = "SECOND_KEY"
                     provider_controller: object,
                     session_controller: object,
                     task_controller: object,
+                    session_task_controller: object,
+                    plan_controller: object,
                     ui_preferences: object,
                     provider_settings_store: object,
                     provider_catalog: object,
@@ -1005,6 +1025,8 @@ api_key_env = "SECOND_KEY"
                         provider_settings_store,
                         provider_catalog,
                         managed_provider_settings,
+                        plan_controller,
+                        session_task_controller,
                         language,
                         provider_name,
                         model_name,

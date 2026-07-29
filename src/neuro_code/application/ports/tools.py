@@ -8,6 +8,8 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from neuro_code.application.ports.background_tasks import BackgroundTaskManager
+from neuro_code.application.ports.client_filesystem import ClientFileSystem
+from neuro_code.application.ports.client_terminal import ClientTerminal
 from neuro_code.application.ports.instructions import InstructionContextTracker
 from neuro_code.application.ports.sandbox import ShellSandbox
 from neuro_code.application.ports.skills import SkillContextTracker
@@ -29,6 +31,8 @@ class ToolContext:
     background_tasks: BackgroundTaskManager | None = None
     instruction_tracker: InstructionContextTracker | None = None
     skill_tracker: SkillContextTracker | None = None
+    client_file_system: ClientFileSystem | None = None
+    client_terminal: ClientTerminal | None = None
 
 
 class Tool(Protocol):

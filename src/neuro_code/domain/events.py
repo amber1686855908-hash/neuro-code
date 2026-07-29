@@ -28,6 +28,12 @@ class AgentEventKind(StrEnum):
     TOOL_STARTED = "tool_started"
     TOOL_COMPLETED = "tool_completed"
     TOOL_FAILED = "tool_failed"
+    PLAN_UPDATED = "plan_updated"
+    PLAN_EXECUTION_REQUESTED = "plan_execution_requested"
+    SESSION_TASK_STARTED = "session_task_started"
+    SESSION_TASK_COMPLETED = "session_task_completed"
+    SESSION_TASK_FAILED = "session_task_failed"
+    SESSION_TASK_CANCELLED = "session_task_cancelled"
     TURN_COMPLETED = "turn_completed"
     TURN_FAILED = "turn_failed"
 
