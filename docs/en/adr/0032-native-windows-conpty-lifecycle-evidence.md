@@ -95,7 +95,5 @@ The Win32 lifecycle follows Microsoft's
 [pseudoconsole session guidance](https://learn.microsoft.com/en-us/windows/console/creating-a-pseudoconsole-session)
 and
 [ClosePseudoConsole requirements](https://learn.microsoft.com/en-us/windows/console/closepseudoconsole).
-Historical behavior evidence comes from the read-only pinned baseline at
-`crates/codegen/xai-grok-pager-pty-harness/src/pty.rs`,
-`crates/codegen/ptyctl/src/pty.rs`, and
-`crates/codegen/xai-grok-pager/tests/pty_e2e_minimal.rs`.
+Neuro Code supplements the platform documentation with its own Windows full-suite
+and native ConPTY smoke evidence.

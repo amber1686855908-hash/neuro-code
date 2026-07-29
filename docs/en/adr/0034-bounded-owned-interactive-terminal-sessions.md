@@ -14,14 +14,8 @@ endpoint or another interface could safely consume. Exposing the test helper
 directly would bypass permission, workspace, sandbox, output-memory, process-tree,
 and shutdown boundaries.
 
-The pinned Rust baseline demonstrates a terminal configuration with command,
-working directory, environment and dimensions, followed by explicit read,
-write, resize, wait and kill operations in
-`crates/codegen/ptyctl/src/pty.rs`. Its pager harness also distinguishes timed
-reads from closed output, handles raw key input and resize, and kills the owned
-child on drop in
-`crates/codegen/xai-grok-pager-pty-harness/src/pty.rs`. These are behavior
-evidence, not a crate graph to translate.
+The terminal contract explicitly covers command, working directory, environment,
+dimensions, bounded reads, input, resize, wait, and owned-process shutdown.
 
 ## Decision
 

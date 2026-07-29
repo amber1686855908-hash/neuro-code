@@ -191,9 +191,9 @@ system 或 user 消息。所有发现过程都是确定性的、有界的、失�
 
 发现服务由 `SkillDiscovery` 端口定义，默认适配器是
 `FilesystemSkillDiscovery`。适配器扫描配置目录
-（`.neuro/skills/`、`.agents/skills/`、`.grok/skills/`、`.claude/skills/`），
+（`.neuro/skills/`、`.agents/skills/`、`.claude/skills/`），
 递归遍历每个 `skills/` 目录树（最大深度 5）查找 `SKILL.md` 文件。配置目录
-按产品特定优先级扫描（`.neuro` 先于 `.agents` 先于 `.grok` 先于 `.claude`），
+按产品特定优先级扫描（`.neuro` 先于 `.agents` 先于 `.claude`），
 子目录按字典序遍历。技能按名称去重（先见为准，按各范围内的配置目录优先级），
 再按范围优先级（Local > Repo > User）和名称排序。
 
@@ -271,8 +271,7 @@ LOCAL 技能（根 = 工作区）和 USER 技能（根 = 用户主目录）的�
 
 跨范围优先级以范围为先：LOCAL 候选先于 REPO 候选收集和处理，REPO 候选先于
 USER 候选。按名称先见为准的去重确保 LOCAL 技能遮蔽同名 REPO 技能遮蔽同名 USER
-技能。在每个范围内，配置目录优先级（`.neuro` → `.agents` → `.grok` →
-`.claude`）仍然适用。详见
+技能。在每个范围内，配置目录优先级（`.neuro` → `.agents` → `.claude`）仍然适用。详见
 [ADR 0042](adr/0042-user-level-skill-discovery.md) 和
 [ADR 0044](adr/0044-repository-level-skill-discovery.md)。
 
@@ -287,7 +286,7 @@ USER 候选。按名称先见为准的去重确保 LOCAL 技能遮蔽同名 REPO
 
 适配器从 `target` **向上**遍历到 `workspace_root`（含），检查每个祖先目录
 的配置目录。更深的祖先先被扫描，因此先见为准的名称去重使更具体（更深）的
-技能优先于一般（根）的技能，匹配 grok-build 的"最深优先"模型。当 `target`
+技能优先于一般（根）的技能。当 `target`
 为 `None` 或等于工作区根时（如 CLI inspect、`rediscover_skills`），遍历退化
 为仅扫描根层级。
 
@@ -500,9 +499,8 @@ CLI 冒烟测试会在 Linux/macOS 标准库 PTY 与 Windows ConPTY 中发送真
 `termios`，Windows 则覆盖 resize、空闲 `Ctrl+C`、非零退出码保持，以及任何可用父控制台
 mode 的比较。私有标准库 `windows_conpty` 适配器掌控同步管道、扩展进程创建、有界捕获和
 一个在 `ClosePseudoConsole` 期间继续工作的专用输出排空线程。详见
-[ADR 0032](adr/0032-native-windows-conpty-lifecycle-evidence.md)。该进程边界沿用固定历史
-基线中只读 `crates/codegen/xai-grok-pager/tests/pty_e2e_minimal.rs` 的行为证据，但不复制其
-Rust 实现。
+[ADR 0032](adr/0032-native-windows-conpty-lifecycle-evidence.md)。Neuro Code 通过自身的
+原生终端测试验证此进程边界。
 
 原生适配器之上，`LocalInteractiveTerminalManager` 实现共享
 `InteractiveTerminalManager` 端口。创建必须在启动前依次经过权限、工作区和匹配沙箱

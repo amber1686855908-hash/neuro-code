@@ -56,13 +56,7 @@ persistent allow/deny rules. Rich argument diffs, queued approvals from multiple
 concurrent agents, user-provided rejection feedback, and ACP permission mapping
 remain future vertical slices.
 
-## Historical source evidence
+## Validation
 
-The following read-only paths at pinned commit
-`c68e39f60462f28d9be5e683d9cbe2c57b1a5027` establish the behavioral boundary;
-their queue, ACP, and widget implementations are not copied:
-
-- `crates/codegen/xai-grok-pager/src/views/permission_view.rs`;
-- `crates/codegen/xai-grok-pager/src/app/dispatch/permissions.rs`;
-- `crates/codegen/xai-grok-pager/src/app/dispatch/tests/permissions.rs`;
-- `crates/codegen/xai-grok-pager/src/headless.rs`.
+The approval queue, ACP boundary, and interactive interface are validated by
+Neuro Code's own contracts and behavior tests.

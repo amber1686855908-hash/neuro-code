@@ -13,7 +13,7 @@
 ## 决策
 
 增加 `SkillDiscovery` 端口、领域值和 `FilesystemSkillDiscovery` 适配器。适配器按
-`.neuro`、`.agents`、`.grok`、`.claude` 的优先级扫描其下的 `skills/`。它以有界
+`.neuro`、`.agents`、`.claude` 的优先级扫描其下的 `skills/`。它以有界
 frontmatter 解析 `name`、`description` 和 `when-to-use`；元数据缺失或格式错误时，
 回退到目录名和正文首个散文行。frontmatter 分隔符必须独占整行。
 

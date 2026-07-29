@@ -260,8 +260,8 @@ adapter imports the filesystem safety helpers (`_toctou_safe_read`,
 instruction discovery adapter, so both share the same bounded, best-effort
 symlink-resistant read pattern.
 
-The adapter scans `.neuro/skills/`, `.agents/skills/`, `.grok/skills/`, and
-`.claude/skills/` for `SKILL.md` files, walking up to
+The adapter scans `.neuro/skills/`, `.agents/skills/`, and `.claude/skills/`
+for `SKILL.md` files, walking up to
 `MAX_SKILL_WALK_DEPTH = 5` directory levels. Skills are deduplicated by name
 (first-seen wins, ordered by config-directory priority within each scope) and
 ordered by scope priority (`LOCAL` > `REPO` > `USER`). All three scopes
@@ -353,8 +353,8 @@ Cross-scope priority is scope-first: LOCAL candidates are collected and
 processed before REPO candidates, which are collected before USER
 candidates. The same first-seen-wins dedup by name ensures a LOCAL skill
 shadows a REPO skill shadows a USER skill with the same name. Within each
-scope, the config-directory priority (`.neuro` → `.agents` → `.grok` →
-`.claude`) still applies. See
+scope, the config-directory priority (`.neuro` → `.agents` → `.claude`) still
+applies. See
 [ADR 0042](adr/0042-user-level-skill-discovery.md) and
 [ADR 0044](adr/0044-repository-level-skill-discovery.md).
 
@@ -373,8 +373,7 @@ reads a file in `src/foo/`.
 The adapter walks **upward** from `target` to `workspace_root`
 (inclusive), checking each ancestor directory for config dirs. Deeper
 ancestors are scanned first so first-seen-wins name deduplication gives
-precedence to more specific (deeper) skills over general (root) skills,
-matching the grok-build "deepest-first" model. When `target` is `None`
+precedence to more specific (deeper) skills over general (root) skills. When `target` is `None`
 or equals the workspace root (e.g. CLI inspect, `rediscover_skills`),
 the walk degenerates to scanning just the root level.
 
@@ -677,10 +676,8 @@ exit codes, and compare any available parent console modes. The private
 standard-library `windows_conpty` adapter owns synchronous pipes, extended
 process creation, bounded capture, and a dedicated output-drain thread that
 remains active across `ClosePseudoConsole`. See
-[ADR 0032](adr/0032-native-windows-conpty-lifecycle-evidence.md). The
-process-boundary shape follows the read-only pinned baseline evidence in
-`crates/codegen/xai-grok-pager/tests/pty_e2e_minimal.rs` without copying its Rust
-implementation.
+[ADR 0032](adr/0032-native-windows-conpty-lifecycle-evidence.md). Neuro Code
+validates this process-boundary shape with its own native terminal tests.
 
 Above the native adapters, `LocalInteractiveTerminalManager` implements the
 shared `InteractiveTerminalManager` port. Creation crosses permission,

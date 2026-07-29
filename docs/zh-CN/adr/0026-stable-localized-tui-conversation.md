@@ -45,11 +45,6 @@
 卡片，[ADR 0030](0030-bounded-interactive-tool-card-details.md) 再加入有界的展开/收起
 控件；Mermaid 和媒体仍是独立切片。
 
-## 历史源代码证据
+## 验证
 
-固定提交 `c68e39f60462f28d9be5e683d9cbe2c57b1a5027` 中的以下只读路径用于确定上游交互
-边界，但不规定本项目的 Textual 组件设计：
-
-- `crates/codegen/xai-grok-pager/src/views/prompt_widget/mod.rs`；
-- `crates/codegen/xai-grok-pager/src/app/event_loop.rs`；
-- `crates/codegen/xai-grok-pager/tests/pty_e2e_minimal.rs`。
+交互边界与本地化 Textual 设计由 Neuro Code 自身的界面和终端行为测试验证。

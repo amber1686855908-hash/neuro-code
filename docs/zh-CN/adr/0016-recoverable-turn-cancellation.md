@@ -42,13 +42,6 @@
 这仍是 M3 的部分行为。首 token 前无痕回退、草稿恢复、缓冲插话处理、供应商托管远程
 取消保证，以及跨平台 PTY 冒烟覆盖仍属于后续切片。
 
-## 历史源代码证据
+## 验证
 
-固定提交 `c68e39f60462f28d9be5e683d9cbe2c57b1a5027` 中的以下只读路径用于确定恢复边界；
-本项目不会复制其传输和组件实现：
-
-- `crates/codegen/xai-grok-pager/src/app/agent_view/interactions.rs`；
-- `crates/codegen/xai-grok-pager/src/app/event_loop.rs`；
-- `crates/codegen/xai-grok-pager/tests/pty_e2e/ctrl_c_cancel_during_stream_recovers_cleanly.rs`；
-- `crates/codegen/xai-grok-pager/tests/pty_e2e/cancel_then_resend_prompt_appears_once.rs`；
-- `crates/codegen/xai-grok-pager/tests/pty_e2e/cancel_discards_buffered_interjection.rs`。
+Neuro Code 通过自身的运行时、会话和交互界面测试验证取消与恢复行为。

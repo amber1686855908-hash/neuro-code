@@ -58,14 +58,7 @@ This is still partial M3 behavior. Pristine pre-token rewind, draft restoration,
 buffered interjection handling, provider-hosted remote cancellation guarantees,
 and cross-platform PTY smoke coverage remain future slices.
 
-## Historical source evidence
+## Validation
 
-The following read-only paths at pinned commit
-`c68e39f60462f28d9be5e683d9cbe2c57b1a5027` establish the recovery boundary;
-their transport and widget implementations are not copied:
-
-- `crates/codegen/xai-grok-pager/src/app/agent_view/interactions.rs`;
-- `crates/codegen/xai-grok-pager/src/app/event_loop.rs`;
-- `crates/codegen/xai-grok-pager/tests/pty_e2e/ctrl_c_cancel_during_stream_recovers_cleanly.rs`;
-- `crates/codegen/xai-grok-pager/tests/pty_e2e/cancel_then_resend_prompt_appears_once.rs`;
-- `crates/codegen/xai-grok-pager/tests/pty_e2e/cancel_discards_buffered_interjection.rs`.
+Neuro Code validates cancellation and recovery behavior through its own runtime,
+conversation, and interactive-interface tests.

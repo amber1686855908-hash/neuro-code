@@ -97,16 +97,7 @@ complete the broader remaining M3 work. Bounded interactive tool-card details we
 Recoverable in-flight cancellation is defined by
 [ADR 0016](0016-recoverable-turn-cancellation.md).
 
-## Historical source evidence
+## Validation
 
-The following read-only paths at pinned commit
-`c68e39f60462f28d9be5e683d9cbe2c57b1a5027` establish the behavioral boundary;
-their crate layout is not copied:
-
-- `crates/codegen/xai-grok-pager-minimal/src/lib.rs`;
-- `crates/codegen/xai-grok-pager/src/views/prompt_widget/mod.rs`;
-- `crates/codegen/xai-grok-pager/src/app/event_loop.rs`;
-- `crates/codegen/xai-grok-pager/src/slash/command.rs`;
-- `crates/codegen/xai-grok-pager/tests/pty_e2e_minimal.rs`, whose process-level
-  PTY harness establishes that terminal startup and exit restoration must be
-  tested at the executable boundary rather than inferred from headless widgets.
+Neuro Code verifies terminal startup and exit restoration at the executable
+boundary rather than inferring those properties from headless widgets.

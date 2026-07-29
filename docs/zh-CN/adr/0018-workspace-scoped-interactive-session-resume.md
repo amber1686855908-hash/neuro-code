@@ -42,12 +42,6 @@ Neuro Code 已能通过 CLI 列出和恢复 SQLite 会话，但第一版 TUI 只
 可恢复。该能力刻意只服务本地且限定当前工作区。会话标题/内容搜索、删除、跨工作区切换、
 远程目录和工具卡片富回放仍属于后续切片。
 
-## 历史源代码证据
+## 验证
 
-固定提交 `c68e39f60462f28d9be5e683d9cbe2c57b1a5027` 中的以下只读路径用于确定会话选择、
-加载与回放行为。Neuro Code 保留自己的 SQLite/应用契约，不复制上游控件或远程会话架构：
-
-- `crates/codegen/xai-grok-pager/src/views/session_picker.rs`；
-- `crates/codegen/xai-grok-pager/src/app/dispatch/session/load.rs`；
-- `crates/codegen/xai-grok-pager/src/app/dispatch/tests/session/load.rs`；
-- `crates/codegen/xai-grok-pager/src/sessions_cmd.rs`。
+Neuro Code 通过自身的 SQLite 和应用契约验证会话选择、加载与回放行为。

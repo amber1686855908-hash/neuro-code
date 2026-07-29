@@ -4,15 +4,9 @@
 
 ## Source of truth
 
-- The historical Rust source oracle is pinned to commit
-  `c68e39f60462f28d9be5e683d9cbe2c57b1a5027`; attribution is documented in the
-  root README.
-- Treat a local source checkout and its `.ua` directory as read-only.
-- Source code, tests, and executable behavior override generated `.ua` text.
-- Do not mechanically translate crates or synchronize files by path.
-
-For the optional baseline check, set `NEURO_CODE_SOURCE_REPOSITORY` to the local
-checkout or pass `--source` to `scripts/check_source_baseline.py`.
+- Neuro Code source code, tests, and executable behavior are the source of truth.
+- Do not mechanically port external modules or synchronize files by path.
+- Deliver independently designed, testable vertical user capabilities.
 
 ## Architecture
 

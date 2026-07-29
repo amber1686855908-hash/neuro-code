@@ -60,15 +60,7 @@ editing remain future vertical slices. The application-owned effort selection
 is independent of profile inventory and is reapplied to a new binding; native
 provider effort mapping remains unimplemented.
 
-## Historical source evidence
+## Validation
 
-The following read-only paths at pinned commit
-`c68e39f60462f28d9be5e683d9cbe2c57b1a5027` establish the interaction and
-new-session boundaries; their catalog, transport, and widget implementations
-are not copied:
-
-- `crates/codegen/xai-grok-pager/src/slash/commands/model.rs`;
-- `crates/codegen/xai-grok-pager/src/views/picker.rs`;
-- `crates/codegen/xai-grok-pager/tests/pty_e2e/zero_turn_model_switch_no_modal.rs`;
-- `crates/codegen/xai-grok-pager/tests/pty_e2e/agent_type_mismatch_modal_on_model_switch.rs`;
-- `crates/codegen/xai-grok-pager/tests/pty_e2e/agent_type_mismatch_yes_starts_new_session.rs`.
+Neuro Code validates profile selection and new-session boundaries through its
+own catalog, transport, and TUI behavior tests.

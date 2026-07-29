@@ -444,7 +444,7 @@ class TestFilesystemSkillDiscovery:
         workspace = _make_workspace(tmp_path)
         _make_skill(workspace, ".neuro", "commit")
         _make_skill(workspace, ".agents", "review")
-        _make_skill(workspace, ".grok", "deploy")
+        _make_skill(workspace, ".claude", "deploy")
         discovery = FilesystemSkillDiscovery()
         result = discovery.discover(workspace)
         names = {f.name for f in result.files}
@@ -817,7 +817,7 @@ class TestSkillSymlinkRejection:
 
 class TestConfigDirPriority:
     def test_config_dirs_order(self) -> None:
-        assert SKILL_CONFIG_DIRS == (".neuro", ".agents", ".grok", ".claude")
+        assert SKILL_CONFIG_DIRS == (".neuro", ".agents", ".claude")
 
     def test_neuro_priority_over_agents(self, tmp_path: Path) -> None:
         workspace = _make_workspace(tmp_path)

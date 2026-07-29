@@ -60,12 +60,7 @@ cards. [ADR 0030](0030-bounded-interactive-tool-card-details.md) subsequently
 adds bounded expansion/collapse controls; Mermaid and media remain separate
 slices.
 
-## Historical source evidence
+## Validation
 
-The following read-only paths at pinned commit
-`c68e39f60462f28d9be5e683d9cbe2c57b1a5027` establish the upstream interactive
-boundary without prescribing this Textual widget design:
-
-- `crates/codegen/xai-grok-pager/src/views/prompt_widget/mod.rs`;
-- `crates/codegen/xai-grok-pager/src/app/event_loop.rs`;
-- `crates/codegen/xai-grok-pager/tests/pty_e2e_minimal.rs`.
+The interactive boundary and localized Textual design are validated by Neuro
+Code's own interface and terminal behavior tests.

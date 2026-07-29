@@ -44,12 +44,6 @@ deny 优先。第一版 TUI 没有安全暂停工具调用并等待用户响应�
 差异、多个并发智能体的审批队列、用户自定义拒绝反馈，以及 ACP 权限映射仍属于后续
 纵向切片。
 
-## 历史源代码证据
+## 验证
 
-固定提交 `c68e39f60462f28d9be5e683d9cbe2c57b1a5027` 中的以下只读路径用于确定行为
-边界；本项目不会复制其队列、ACP 和组件实现：
-
-- `crates/codegen/xai-grok-pager/src/views/permission_view.rs`；
-- `crates/codegen/xai-grok-pager/src/app/dispatch/permissions.rs`；
-- `crates/codegen/xai-grok-pager/src/app/dispatch/tests/permissions.rs`；
-- `crates/codegen/xai-grok-pager/src/headless.rs`。
+审批队列、ACP 边界和交互界面由 Neuro Code 自身的契约与行为测试验证。

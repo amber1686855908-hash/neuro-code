@@ -44,13 +44,6 @@ profile 清单是启动时快照。配置热重载、远程模型目录、兼容
 仍属于后续纵向切片。应用自有强度选择独立于 profile 清单，并会重新应用到新绑定；
 供应商原生强度映射仍未实现。
 
-## 历史源代码证据
+## 验证
 
-固定提交 `c68e39f60462f28d9be5e683d9cbe2c57b1a5027` 中的以下只读路径用于确定交互和新
-会话边界；本项目不会复制其目录、传输和组件实现：
-
-- `crates/codegen/xai-grok-pager/src/slash/commands/model.rs`；
-- `crates/codegen/xai-grok-pager/src/views/picker.rs`；
-- `crates/codegen/xai-grok-pager/tests/pty_e2e/zero_turn_model_switch_no_modal.rs`；
-- `crates/codegen/xai-grok-pager/tests/pty_e2e/agent_type_mismatch_modal_on_model_switch.rs`；
-- `crates/codegen/xai-grok-pager/tests/pty_e2e/agent_type_mismatch_yes_starts_new_session.rs`。
+Neuro Code 通过自身的目录、传输和 TUI 行为测试验证 profile 选择与新会话边界。
