@@ -72,14 +72,14 @@
   initialize/new/list/load/delete/fork/resume/prompt/cancel/close、持久化外部到内部
   session alias、事务持久 fork/delete、回放 load 与静默 resume、工作区范围有界 cursor
   发现、有界/脱敏可见历史回放、有界 Text/ResourceLink 输入、失败关闭权限请求、标准
-  事件 update、session 级并发、断连清理，以及有界且由 session 持有的 stdio MCP 工具
-  server。
-- 完整 ACP 一致性仍待完成：额外目录、MCP HTTP/SSE/ACP 传输与非工具 MCP 能力、客户端
+  事件 update、session 级并发、断连清理、有界额外目录，以及有界且由 session 持有的
+  stdio/Streamable HTTP/legacy SSE MCP 工具 server。
+- 完整 ACP 一致性仍待完成：ACP MCP 传输与非工具 MCP 能力、客户端
   文件系统/终端方法、多媒体 prompt/历史、embedded prompt、WebSocket，以及任何明确
   声明的 `x.ai/*` 扩展。
 - 已实现有界精确名称 `AGENTS.md` 继承，以及只读 LOCAL/REPO/USER 技能发现与正文加载，
   包括动态会话目标、内容变化检查和有界变量替换。远程/服务器/捆绑技能、代理配置、
-  钩子和可执行插件仍待完成，其他 MCP 传输/能力也仍待完成。
+  钩子和可执行插件仍待完成，其他 MCP 能力也仍待完成。
 - 子代理、计划模式，以及它们与公共任务生命周期的整合。
 
 退出条件：标准 ACP 客户端通过完整一致性场景；扩展失败不会破坏主会话。当前 partial

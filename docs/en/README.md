@@ -78,10 +78,12 @@ allowlisted, `_meta` is not sent to the model, and links are never downloaded
 or dereferenced during prompt conversion.
 
 Each connection remains bound to its launch workspace. `session/new` rejects a
-different or relative `cwd` and non-empty `additionalDirectories`. It accepts
-bounded stdio `mcpServers`, fully initializes and lists their tools before
-publishing the session, and rejects HTTP, SSE, and ACP MCP transports. ACP
-session IDs are stable and separate from the internal SQLite
+different or relative `cwd`; an `off`-profile binding may additionally declare
+up to four existing, absolute, non-overlapping `additionalDirectories`, while
+every enabled sandbox rejects them before binding creation. It accepts bounded
+stdio, Streamable HTTP, and legacy SSE `mcpServers`, fully initializes and
+lists their tools before publishing the session, and rejects only ACP-transport
+MCP servers. ACP session IDs are stable and separate from the internal SQLite
 ID that is created lazily on the first prompt; their durable mapping allows a
 later process to load the same ID. Load revalidates workspace, fixed sandbox,
 and provider affinity, then replays only bounded/redacted visible user,
@@ -95,28 +97,31 @@ tasks; close never deletes persisted history.
 
 Each accepted MCP server and its tools are owned by that ACP session. The
 official MCP Python SDK owns schemas, `ClientSession`, negotiation, and
-JSON-RPC dispatch; a bounded transport bridge uses Neuro Code's `ProcessTree`
-so POSIX process groups and atomic Windows Job ownership remain fail-closed.
-Only MCP tools are projected. Every invocation is treated as side-effecting and
-requires ACP client approval even under local bypass mode; explicit local deny
-still wins. Arguments, schemas, results, stderr, environment, frame sizes,
-counts, and pagination are bounded, `_meta` is ignored, configured environment
-values are redacted, and cancellation terminates the complete server tree
-before the prompt returns.
+JSON-RPC dispatch. Stdio uses Neuro Code's bounded `ProcessTree` bridge, while
+remote transports use the SDK's Streamable HTTP or legacy SSE clients with
+HTTPS/HTTP URL and header validation, no environment proxy inheritance, no
+redirect following, and bounded response bodies. Only MCP tools are projected.
+Every invocation is treated as side-effecting and requires ACP client approval
+even under local bypass mode; explicit local deny still wins. `_meta` is
+ignored and configured environment/header values are redacted. Cancelling a
+remote request closes it locally and makes its connection unavailable; the
+remote server is not a locally owned process, so its in-flight side effect is
+never represented as successfully cancelled.
 
 ACP session resume/delete/fork are implemented with workspace-scoped durable
-identity, transactional fork/delete behavior, and distinct replaying load
-versus silent resume semantics. This is still explicitly not complete ACP v1
-support: additional directories, MCP HTTP/SSE/ACP transports, MCP
-resources/prompts/sampling/elicitation, image/audio/embedded prompt content and
+identity, transactional fork/delete behavior, distinct replaying load versus
+silent resume semantics, bounded additional directories, and MCP HTTP/SSE
+tools. This is still explicitly not complete ACP v1 support: ACP MCP
+transport, MCP resources/prompts/sampling/elicitation, image/audio/embedded prompt content and
 multimedia history replay, client `fs/*` and `terminal/*`, WebSocket transport,
 and custom extensions remain unsupported and are not advertised. See the
 [compatibility matrix](compatibility-matrix.md) and
 [ADR 0035](adr/0035-partial-acp-v1-stdio.md) plus
 [ADR 0036](adr/0036-durable-acp-session-load.md) and
 [ADR 0037](adr/0037-workspace-scoped-acp-session-list.md), plus
-[ADR 0038](adr/0038-session-owned-stdio-mcp-tools.md) and
-[ADR 0050](adr/0050-acp-session-lifecycle.md).
+[ADR 0038](adr/0038-session-owned-stdio-mcp-tools.md),
+[ADR 0050](adr/0050-acp-session-lifecycle.md), and
+[ADR 0051](adr/0051-bounded-remote-mcp-transports.md).
 
 ## Interactive TUI
 

@@ -92,10 +92,11 @@ terminal state or child processes.
   replaying load versus silent resume, workspace-scoped bounded cursor discovery,
   bounded/redacted visible-history replay, bounded Text/ResourceLink input,
   fail-closed permission requests, standard event updates, per-session
-  concurrency, disconnect cleanup, and bounded session-owned stdio MCP tool
-  servers are implemented.
-- Complete ACP conformance remains open: additional directories, MCP
-  HTTP/SSE/ACP transports and non-tool MCP features, client
+  concurrency, disconnect cleanup, bounded additional directories, and
+  bounded session-owned stdio/Streamable HTTP/legacy SSE MCP tool servers are
+  implemented.
+- Complete ACP conformance remains open: ACP MCP transport and non-tool MCP
+  features, client
   filesystem/terminal methods, multimedia
   prompt/history content, embedded prompt content, WebSocket, and any
   advertised `x.ai/*` extensions.
@@ -103,7 +104,7 @@ terminal state or child processes.
   skill discovery/body loading are implemented, including dynamic session
   targets, content-change checks, and bounded variable substitution.
   Remote/server/bundled skills, agent profiles, hooks, and executable plugins
-  remain open alongside the remaining MCP transports/features.
+  remain open alongside the remaining MCP features.
 - Subagents, plan mode, and their integration with the common task lifecycle.
 
 Exit: standard ACP clients pass the complete conformance scenarios and

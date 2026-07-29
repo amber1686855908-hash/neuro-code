@@ -71,9 +71,10 @@ notification，并通过 `session/request_permission` 请求交互授权。它�
 ResourceLink 提示块会保持输入顺序并受数量/字节限制；ResourceLink 元数据采用字段
 白名单，`_meta` 不会进入模型，提示转换期间也绝不会下载或解引用链接。
 
-每条连接固定绑定到启动工作区。`session/new` 会拒绝不同或非绝对的 `cwd` 与非空
-`additionalDirectories`。它接受有界的 stdio `mcpServers`，在发布 session 前完成初始化
-与工具枚举，并拒绝 HTTP、SSE 和 ACP MCP 传输。ACP session ID 稳定且独立于首次
+每条连接固定绑定到启动工作区。`session/new` 会拒绝不同或非绝对的 `cwd`；`off` profile
+的 binding 最多还可声明四个已存在、绝对且互不重叠的 `additionalDirectories`，所有已启用
+sandbox 都会在建立 binding 前拒绝它们。它接受有界的 stdio、Streamable HTTP 与 legacy SSE
+`mcpServers`，在发布 session 前完成初始化与工具枚举，只拒绝 ACP 传输 MCP server。ACP session ID 稳定且独立于首次
 prompt 时才按需创建的内部 SQLite ID；持久映射允许后续进程加载同一个 ID。load 会重新
 校验工作区、固定 sandbox 和 provider 亲和，然后只回放有界/脱敏的可见用户、助手和工具
 历史。系统提示、私有 reasoning、供应商原生上下文、任意参数与 raw 工具数据不会回放。
@@ -82,24 +83,26 @@ list 只返回连接工作区的安全元数据，为旧会话分配持久 ACP I
 连接故障都会取消受控工作与 session 作用域后台任务；close 不会删除持久化历史。
 
 每个接受的 MCP server 及其工具都由对应 ACP session 独立持有。官方 MCP Python SDK
-负责 Schema、`ClientSession`、协商与 JSON-RPC 调度；有界传输桥接复用 Neuro Code 的
-`ProcessTree`，从而继续失败关闭地持有 POSIX 进程组和创建时原子加入的 Windows Job。
-本切片只投影 MCP 工具。每次调用都按有副作用操作处理，即使本地处于 bypass 模式也必须
-请求 ACP client 审批；本地显式 deny 仍优先。参数、Schema、结果、stderr、环境变量、
-frame、数量与分页都有上限，`_meta` 被忽略，显式环境变量值会被脱敏；取消必须在 prompt
-返回前终止完整 server 进程树。
+负责 Schema、`ClientSession`、协商与 JSON-RPC 调度。stdio 使用 Neuro Code 有界的
+`ProcessTree` 桥接；远程传输使用 SDK 的 Streamable HTTP 或 legacy SSE client，并校验
+HTTP/HTTPS URL 与 header、不继承环境代理、不跟随重定向且限制响应体。本切片只投影 MCP
+工具。每次调用都按有副作用操作处理，即使本地处于 bypass 模式也必须请求 ACP client 审批；
+本地显式 deny 仍优先。`_meta` 被忽略，显式环境变量/header 值会被脱敏。取消远程请求会
+在本地关闭并令该连接不可再用；远程 server 不是本地持有的进程，因此不会把可能仍在执行的
+远程副作用表示成已成功取消。
 
 ACP 会话 resume/delete/fork 已按工作区范围持久身份、事务 fork/delete，以及回放 load
-与静默 resume 的不同语义实现。这仍明确不是完整 ACP v1 支持：额外目录、MCP
-HTTP/SSE/ACP 传输、MCP resource/prompt/sampling/elicitation、图片/音频/embedded
+与静默 resume 的不同语义、额外目录以及 MCP HTTP/SSE 工具实现。这仍明确不是完整 ACP v1
+支持：ACP MCP 传输、MCP resource/prompt/sampling/elicitation、图片/音频/embedded
 prompt 与多媒体历史回放、客户端 `fs/*` 与 `terminal/*`、WebSocket 传输和自定义扩展
 仍不支持，也不会被声明。详见
 [兼容矩阵](compatibility-matrix.md)和
 [ADR 0035](adr/0035-partial-acp-v1-stdio.md)及
 [ADR 0036](adr/0036-durable-acp-session-load.md)和
 [ADR 0037](adr/0037-workspace-scoped-acp-session-list.md)，以及
-[ADR 0038](adr/0038-session-owned-stdio-mcp-tools.md)和
-[ADR 0050](adr/0050-acp-session-lifecycle.md)。
+[ADR 0038](adr/0038-session-owned-stdio-mcp-tools.md)、
+[ADR 0050](adr/0050-acp-session-lifecycle.md)和
+[ADR 0051](adr/0051-bounded-remote-mcp-transports.md)。
 
 ## 交互式 TUI
 

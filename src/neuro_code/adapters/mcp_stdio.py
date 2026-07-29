@@ -12,7 +12,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 import anyio
 import mcp.types as mcp_types
@@ -74,7 +74,21 @@ class _CallRequest:
     cancelled: asyncio.Event
 
 
-class McpStdioTool:
+class _McpToolConnection(Protocol):
+    """The narrow connection behavior shared by MCP transport adapters."""
+
+    explicit_redactions: tuple[str, ...]
+
+    async def call(
+        self,
+        name: str,
+        arguments: dict[str, Any],
+        *,
+        timeout_seconds: float,
+    ) -> mcp_types.CallToolResult: ...
+
+
+class McpTool:
     """Model tool projection of one official-SDK MCP tool."""
 
     side_effecting = True
@@ -82,7 +96,7 @@ class McpStdioTool:
     def __init__(
         self,
         *,
-        connection: _McpServerConnection,
+        connection: _McpToolConnection,
         definition: ToolDefinition,
         remote_name: str,
     ) -> None:
@@ -119,13 +133,17 @@ class McpStdioTool:
         )
 
 
+# Kept as a compatibility spelling for the pre-HTTP adapter API.
+McpStdioTool = McpTool
+
+
 class McpStdioToolCollection:
     """Own all stdio MCP servers and model tools for one ACP session."""
 
     def __init__(
         self,
         connections: tuple[_McpServerConnection, ...],
-        tools: tuple[McpStdioTool, ...],
+        tools: tuple[McpTool, ...],
     ) -> None:
         self._connections = connections
         self.tools = tools
@@ -143,7 +161,7 @@ class McpStdioToolCollection:
         if len(configurations) > MAX_MCP_SERVERS:
             raise McpStdioError("too_many_mcp_servers")
         connections: list[_McpServerConnection] = []
-        tools: list[McpStdioTool] = []
+        tools: list[McpTool] = []
         names: set[str] = set()
         try:
             for configuration in configurations:
@@ -164,7 +182,7 @@ class McpStdioToolCollection:
                         raise McpStdioError("mcp_tool_name_collision")
                     names.add(definition.name)
                     tools.append(
-                        McpStdioTool(
+                        McpTool(
                             connection=connection,
                             definition=definition,
                             remote_name=remote_tool.name,

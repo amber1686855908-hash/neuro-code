@@ -351,27 +351,32 @@ scope，释放运行时绑定，同时保留持久历史与 alias。EOF 或连�
 附加目录，因为它们的挂载命名空间在 ACP 请求前已经固定；这也避免将平台中可写的临时或
 状态挂载误当作事后声明的目录根。这样不会通过事后挂载主机目录来削弱显式沙箱边界。
 
-非空 `mcpServers` 只接受 ACP 基线 stdio 结构；HTTP、SSE 和 ACP 传输会被确定性拒绝。
-每个 server 都必须在 session 发布前完成初始化，并通过有界分页枚举和校验工具目录；
-server 重名、非法工具名、远端工具之间或与内建工具冲突、覆盖受保护环境变量、配置超限
-都会使整个 session 创建失败。加载持久 ACP session 时可以重新提供相同的临时 MCP
-配置，但它不会作为历史或授权被持久化。
+非空 `mcpServers` 接受 ACP stdio、Streamable HTTP（`http`）和 legacy SSE（`sse`）
+结构；ACP 传输 server 会被确定性拒绝。每个 server 都必须在 session 发布前完成初始化，
+并通过有界分页枚举和校验工具目录；server 重名、非法工具名、远端工具之间或与内建工具
+冲突、覆盖受保护环境变量、不安全的 URL/header 输入或配置超限都会使整个 session 创建
+失败。远程 URL 必须是绝对 HTTP/HTTPS endpoint，不能包含内嵌凭据或 fragment。header
+名称、数量、值与总字节均有上限，且不能覆盖 framing 或 routing header。加载持久 ACP
+session 时可以重新提供相同的临时 MCP 配置，但它不会作为历史或授权被持久化。
 
 官方 `mcp>=1.28.1,<2` SDK 持有 MCP Schema、`ClientSession`、版本协商、JSON-RPC 调度
-和工具结果类型。有界的项目自有换行分隔传输桥接会复用 `ProcessTree`：官方 SDK 在
-Windows 上采用 spawn 后再附加 Job 的方式，无法满足 Neuro Code 创建时原子加入 Job
-列表的要求。frame、Schema、工具数、JSON 深度/节点、参数、输出和超时均有上限；MCP
-stderr 会被排空但不会进入 ACP stdout；`_meta`、图片/音频/embedded body 与无界 raw
-值不会被投影。ResourceLink 结果只保留引用元数据，不会被解引用。显式 server 环境变量
-值与应用凭据会从模型可见文本中脱敏。
+和工具结果类型。stdio 使用项目自有的换行分隔 `ProcessTree` 桥接：官方 SDK 在 Windows
+上采用 spawn 后再附加 Job 的方式，无法满足 Neuro Code 创建时原子加入 Job 列表的要求。
+Streamable HTTP 与 SSE 使用 SDK client，并由应用 HTTP client 禁用环境代理和重定向、
+保持 TLS 校验且将每个响应体限制为 1 MiB。frame、Schema、工具数、JSON 深度/节点、参数、
+输出和超时均有上限；MCP stderr 会被排空但不会进入 ACP stdout；`_meta`、图片/音频/
+embedded body 与无界 raw 值不会被投影。ResourceLink 结果只保留引用元数据，不会被
+解引用。显式 server 环境变量/header 值与应用凭据会从模型可见文本中脱敏。
 
 MCP annotations 只是不可被信任的提示，因此所有投影后的 MCP 工具均标记为有副作用。
 `ApplicationComposition` 会在 bypass/always-approve 行为之上安装精确 ASK 规则，同时
 保留本地显式 DENY 的优先级。普通运行时因此先发送 pending、请求 ACP 审批，随后才发送
-in-progress 并调用 server；拒绝审批绝不会执行。prompt 取消会中止 SDK request 并终止
-整个 server 进程树，然后才完成工具失败 update 与 `cancelled` prompt 响应。close、load
-失败、创建失败、EOF 与断连都幂等关闭同一 session-owned collection。MCP resources、
-prompts、sampling、elicitation 与传输特定能力均未公开。
+in-progress 并调用 server；拒绝审批绝不会执行。stdio prompt 取消会在工具失败 update 与
+`cancelled` prompt 响应完成前终止整个受控 server 进程树。远程 server 的取消会关闭 SDK
+连接并让其无法再被调用；项目不声称持有远程进程，因此不会把终态不确定的远程副作用表示成
+已成功取消。close、load 失败、创建失败、EOF 与断连都幂等关闭同一 session-owned
+collection。MCP resources、prompts、sampling、elicitation、动态工具目录刷新与 ACP
+传输仍未支持。
 
 list 只用于发现；即使省略 `cwd`，也始终限制在连接工作区。它只返回持久 ACP ID、记录的
 绝对 cwd、有界标题和 ISO 更新时间。尚无 alias 的 session 通过 schema v5 原子

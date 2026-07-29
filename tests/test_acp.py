@@ -18,12 +18,14 @@ from acp.schema import (
     ClientCapabilities,
     DeniedOutcome,
     EnvVariable,
+    HttpMcpServer,
     ImageContentBlock,
     Implementation,
     McpServerStdio,
     PermissionOption,
     RequestPermissionResponse,
     ResourceContentBlock,
+    SseMcpServer,
     TextContentBlock,
     ToolCallProgress,
     ToolCallStart,
@@ -688,6 +690,70 @@ class McpConfigurationTests(unittest.TestCase):
             )
         self.assertEqual(error.exception.data["reason"], reason)
 
+    def test_http_and_sse_configurations_are_validated_without_forwarding_meta(self) -> None:
+        servers = [
+            HttpMcpServer.model_validate(
+                {
+                    "name": "http",
+                    "type": "http",
+                    "url": "https://mcp.example.test/v1?tenant=one",
+                    "headers": [
+                        {"name": "Authorization", "value": "Bearer fixture-secret"},
+                    ],
+                    "_meta": {"must": "not-forward"},
+                }
+            ),
+            SseMcpServer(
+                name="sse",
+                type="sse",
+                url="http://127.0.0.1:8123/events",
+                headers=[],
+            ),
+        ]
+
+        configurations = acp_module._mcp_server_configurations(
+            servers,
+            protected_environment_variables=frozenset(),
+        )
+
+        self.assertEqual(configurations[0].transport, "http")
+        self.assertEqual(configurations[0].url, "https://mcp.example.test/v1?tenant=one")
+        self.assertEqual(
+            configurations[0].headers,
+            (("Authorization", "Bearer fixture-secret"),),
+        )
+        self.assertEqual(configurations[1].transport, "sse")
+        self.assertNotIn("must", repr(configurations))
+
+    def test_http_and_sse_reject_unsafe_urls_and_headers(self) -> None:
+        def server(url: str, headers: list[dict[str, str]]) -> HttpMcpServer:
+            return HttpMcpServer.model_validate(
+                {"name": "http", "type": "http", "url": url, "headers": headers}
+            )
+
+        cases = (
+            (server("ftp://mcp.example.test", []), "mcp_http_url_invalid"),
+            (server("https://token@example.test/mcp", []), "mcp_http_url_invalid"),
+            (server("https://mcp.example.test/mcp#fragment", []), "mcp_http_url_invalid"),
+            (
+                server("https://mcp.example.test", [{"name": "Host", "value": "override"}]),
+                "mcp_http_header_reserved",
+            ),
+            (
+                server(
+                    "https://mcp.example.test",
+                    [
+                        {"name": "Authorization", "value": "one"},
+                        {"name": "authorization", "value": "two"},
+                    ],
+                ),
+                "mcp_http_header_name_invalid",
+            ),
+        )
+        for configured, reason in cases:
+            with self.subTest(reason=reason):
+                self._assert_reason([configured], reason)
+
     def test_server_name_command_and_argument_limits(self) -> None:
         valid = self._server(args=["", "--stdio"])
         self.assertEqual(
@@ -834,6 +900,7 @@ class AcpAgentTests(unittest.IsolatedAsyncioTestCase):
             ),
             {
                 "loadSession": True,
+                "mcpCapabilities": {"http": True, "sse": True},
                 "sessionCapabilities": {
                     "list": {},
                     "delete": {},
@@ -1058,6 +1125,36 @@ class AcpAgentTests(unittest.IsolatedAsyncioTestCase):
                 open_mcp.assert_awaited_once()
                 await agent.close_session(created_with_mcp.session_id)
 
+        self.assertEqual(collection.close_calls, 1)
+
+    async def test_http_mcp_is_session_owned_and_opened_by_the_remote_adapter(self) -> None:
+        collection = McpCollectionFixture()
+        server = HttpMcpServer(
+            name="remote",
+            type="http",
+            url="https://mcp.example.test/mcp",
+            headers=[{"name": "Authorization", "value": "Bearer fixture-secret"}],
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            agent, application, _ = await initialized_agent(root, [RunnerFixture()])
+            open_mcp = AsyncMock(return_value=collection)
+            with patch(
+                "neuro_code.bootstrap.entrypoints.McpHttpToolCollection.open",
+                new=open_mcp,
+            ):
+                created = await agent.new_session(str(root), mcp_servers=[server])
+                await agent.close_session(created.session_id)
+
+        configuration = open_mcp.await_args.args[0][0]
+        self.assertEqual(configuration.name, "remote")
+        self.assertEqual(configuration.url, "https://mcp.example.test/mcp")
+        self.assertEqual(
+            configuration.headers,
+            (("Authorization", "Bearer fixture-secret"),),
+        )
+        self.assertEqual(configuration.transport, "http")
+        self.assertEqual(application.additional_tool_names, [("remote_echo",)])
         self.assertEqual(collection.close_calls, 1)
 
     async def test_failed_session_creation_cleans_binding_then_mcp_in_reverse_order(self) -> None:

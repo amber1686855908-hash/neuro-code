@@ -457,36 +457,44 @@ was fixed before the ACP request; this also avoids treating a platform's
 writable temporary or state mounts as a late-declared directory root. This
 preserves the explicit sandbox boundary rather than adding late host mounts.
 
-Non-empty `mcpServers` are accepted only for the ACP baseline stdio shape.
-HTTP, SSE, and ACP transports are rejected deterministically. Each server is
-initialized and its bounded, paginated tool catalog is validated before the
-session is published; duplicate server names, invalid tool names, collisions
-between remote tools or with built-ins, protected environment overrides, and
-oversized configuration fail the complete session creation. The same ephemeral
-MCP configuration may be supplied when loading a durable ACP session, but it is
-not persisted as session history or authority.
+Non-empty `mcpServers` accept ACP stdio, Streamable HTTP (`http`), and legacy
+SSE (`sse`) shapes; ACP-transport servers are rejected deterministically.
+Every server is initialized and its bounded, paginated tool catalog is
+validated before the session is published; duplicate server names, invalid tool
+names, collisions between remote tools or with built-ins, protected environment
+overrides, unsafe URL/header input, and oversized configuration fail the
+complete session creation. Remote URLs must be absolute HTTP/HTTPS endpoints
+without embedded credentials or fragments. Header names, counts, values, and
+total bytes are bounded; framing and routing headers cannot be overridden. The
+same ephemeral MCP configuration may be supplied when loading a durable ACP
+session, but it is not persisted as session history or authority.
 
 The official `mcp>=1.28.1,<2` SDK owns MCP schemas, `ClientSession`, version
-negotiation, JSON-RPC dispatch, and tool result types. A project-owned
-newline-delimited transport bridge deliberately reuses `ProcessTree`: the
-official SDK's post-spawn Windows Job attachment cannot meet Neuro Code's
-atomic Job-list requirement. Frames, schemas, tool counts, JSON depth/nodes,
-arguments, output, and timeouts are bounded; MCP stderr is drained without
-entering ACP stdout; `_meta`, image/audio/embedded bodies, and unbounded raw
-values are never projected. ResourceLink results remain metadata and are not
-dereferenced. Explicit server environment values and application credentials
-are redacted from model-visible text.
+negotiation, JSON-RPC dispatch, and tool result types. Stdio uses a
+project-owned newline-delimited `ProcessTree` bridge because the official SDK's
+post-spawn Windows Job attachment cannot meet Neuro Code's atomic Job-list
+requirement. Streamable HTTP and SSE use the SDK clients with an application
+HTTP client that disables environment proxies and redirects, retains TLS
+verification, and caps every response body at 1 MiB. Frames, schemas, tool
+counts, JSON depth/nodes, arguments, output, and timeouts are bounded; MCP
+stderr is drained without entering ACP stdout; `_meta`, image/audio/embedded
+bodies, and unbounded raw values are never projected. ResourceLink results
+remain metadata and are not dereferenced. Explicit server environment/header
+values and application credentials are redacted from model-visible text.
 
 MCP annotations are untrusted hints, so every projected MCP tool is marked
 side-effecting. `ApplicationComposition` installs an exact ASK rule above
 bypass/always-approve behavior while retaining explicit local DENY precedence.
 The ordinary runtime therefore emits pending, requests ACP permission, and
 only then emits in-progress and calls the server. A declined request never
-executes. Prompt cancellation aborts the SDK request and terminates the whole
-server process tree before the tool failure update and `cancelled` prompt
-response complete. Close, load failure, creation failure, EOF, and disconnect
-close the same session-owned collection idempotently. MCP resources, prompts,
-sampling, elicitation, and transport-specific capabilities are not exposed.
+executes. Stdio cancellation terminates the whole owned process tree before the
+tool failure update and `cancelled` prompt response complete. For a remote
+server, cancellation closes the SDK connection and makes it unavailable for
+later calls; no local process ownership is claimed, so an indeterminate remote
+side effect is never reported as successfully cancelled. Close, load failure,
+creation failure, EOF, and disconnect close the same session-owned collection
+idempotently. MCP resources, prompts, sampling, elicitation, dynamic tool-list
+refresh, and ACP transport remain unsupported.
 
 List is discovery-only and remains scoped to the connection workspace even
 when `cwd` is omitted. It returns only durable ACP ID, absolute recorded cwd,

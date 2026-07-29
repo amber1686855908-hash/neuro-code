@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal, cast
+from urllib.parse import urlsplit
 
 from acp.agent.router import build_agent_router
 from acp.core import Connection
@@ -40,6 +41,7 @@ from acp.schema import (
     InitializeResponse,
     ListSessionsResponse,
     LoadSessionResponse,
+    McpCapabilities,
     McpServerStdio,
     NewSessionResponse,
     PermissionOption,
@@ -72,7 +74,9 @@ from acp.utils import normalize_result, notify_model, request_model
 from neuro_code import __version__
 from neuro_code.application.acp.contracts import (
     MAX_MCP_SERVERS,
+    AcpMcpHttpServerConfig,
     AcpMcpServerConfig,
+    AcpMcpStdioServerConfig,
     AcpMcpToolError,
     AcpMcpTools,
     AcpResumeUnavailableError,
@@ -127,6 +131,11 @@ MAX_MCP_ENVIRONMENT_VARIABLES = 64
 MAX_MCP_ENVIRONMENT_NAME_BYTES = 256
 MAX_MCP_ENVIRONMENT_VALUE_BYTES = 16 * 1024
 MAX_MCP_ENVIRONMENT_TOTAL_BYTES = 64 * 1024
+MAX_MCP_URL_BYTES = 8 * 1024
+MAX_MCP_HTTP_HEADERS = 64
+MAX_MCP_HTTP_HEADER_NAME_BYTES = 256
+MAX_MCP_HTTP_HEADER_VALUE_BYTES = 16 * 1024
+MAX_MCP_HTTP_HEADER_TOTAL_BYTES = 64 * 1024
 MAX_MCP_CONFIGURATION_BYTES = 256 * 1024
 
 _SESSION_NOT_ACTIVE = -32001
@@ -134,6 +143,23 @@ _SESSION_NOT_FOUND = -32002
 _SESSION_BUSY = -32003
 _ACP_SESSION_ALIAS_NAMESPACE = "acp-v1"
 _ENVIRONMENT_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
+_HTTP_HEADER_NAME = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+\Z")
+_RESERVED_MCP_HTTP_HEADERS = frozenset(
+    {
+        "accept",
+        "connection",
+        "content-length",
+        "content-type",
+        "host",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+    }
+)
 _ALLOWED_STOP_REASONS = frozenset(
     {"end_turn", "max_tokens", "max_turn_requests", "refusal", "cancelled"}
 )
@@ -299,7 +325,7 @@ def _mcp_server_configurations(
     server_names: set[str] = set()
     serialized: list[dict[str, object]] = []
     for server in servers:
-        if not isinstance(server, McpServerStdio):
+        if not isinstance(server, HttpMcpServer | SseMcpServer | AcpMcpServer | McpServerStdio):
             raise _invalid_params("mcp_transport_unsupported")
         name = _mcp_string(
             server.name,
@@ -310,6 +336,28 @@ def _mcp_server_configurations(
         if folded_name in server_names:
             raise _invalid_params("mcp_server_name_duplicate")
         server_names.add(folded_name)
+        if isinstance(server, HttpMcpServer | SseMcpServer):
+            url = _mcp_http_url(server.url)
+            headers = _mcp_http_headers(server.headers)
+            serialized.append(
+                {
+                    "name": name,
+                    "transport": server.type,
+                    "url": url,
+                    "headers": dict(headers),
+                }
+            )
+            configurations.append(
+                AcpMcpHttpServerConfig(
+                    name=name,
+                    url=url,
+                    headers=tuple(headers),
+                    transport=server.type,
+                )
+            )
+            continue
+        if not isinstance(server, McpServerStdio):
+            raise _invalid_params("mcp_transport_unsupported")
         command = _mcp_string(
             server.command,
             limit=MAX_MCP_COMMAND_BYTES,
@@ -373,7 +421,7 @@ def _mcp_server_configurations(
             }
         )
         configurations.append(
-            AcpMcpServerConfig(
+            AcpMcpStdioServerConfig(
                 name=name,
                 command=command,
                 args=tuple(arguments),
@@ -383,6 +431,61 @@ def _mcp_server_configurations(
     if _serialized_size(serialized) > MAX_MCP_CONFIGURATION_BYTES:
         raise _invalid_params("mcp_configuration_too_large")
     return tuple(configurations)
+
+
+def _mcp_http_url(value: object) -> str:
+    url = _mcp_string(
+        value,
+        limit=MAX_MCP_URL_BYTES,
+        reason="mcp_http_url_invalid",
+    )
+    try:
+        parsed = urlsplit(url)
+        port = parsed.port
+    except ValueError:
+        raise _invalid_params("mcp_http_url_invalid") from None
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.netloc
+        or parsed.hostname is None
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.fragment
+        or (port is not None and not 0 < port <= 65_535)
+    ):
+        raise _invalid_params("mcp_http_url_invalid")
+    return url
+
+
+def _mcp_http_headers(headers: Sequence[Any]) -> list[tuple[str, str]]:
+    if len(headers) > MAX_MCP_HTTP_HEADERS:
+        raise _invalid_params("too_many_mcp_http_headers")
+    values: list[tuple[str, str]] = []
+    names: set[str] = set()
+    total_bytes = 0
+    for header in headers:
+        name = _mcp_string(
+            header.name,
+            limit=MAX_MCP_HTTP_HEADER_NAME_BYTES,
+            reason="mcp_http_header_name_invalid",
+        )
+        folded_name = name.casefold()
+        if not _HTTP_HEADER_NAME.fullmatch(name) or folded_name in names:
+            raise _invalid_params("mcp_http_header_name_invalid")
+        if folded_name in _RESERVED_MCP_HTTP_HEADERS:
+            raise _invalid_params("mcp_http_header_reserved")
+        value = _mcp_string(
+            header.value,
+            limit=MAX_MCP_HTTP_HEADER_VALUE_BYTES,
+            reason="mcp_http_header_value_invalid",
+            allow_empty=True,
+        )
+        total_bytes += len(name.encode("utf-8")) + len(value.encode("utf-8"))
+        if total_bytes > MAX_MCP_HTTP_HEADER_TOTAL_BYTES:
+            raise _invalid_params("mcp_http_headers_too_large")
+        names.add(folded_name)
+        values.append((name, value))
+    return values
 
 
 def _annotations_payload(annotations: Annotations | None) -> dict[str, object] | None:
@@ -899,7 +1002,7 @@ class NeuroCodeAcpAgent:
             agent_capabilities=AgentCapabilities(
                 load_session=True,
                 prompt_capabilities=None,
-                mcp_capabilities=None,
+                mcp_capabilities=McpCapabilities(http=True, sse=True),
                 auth=None,
                 session_capabilities=SessionCapabilities(
                     list=SessionListCapabilities(),
