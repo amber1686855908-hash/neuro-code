@@ -5,6 +5,7 @@ import unittest
 
 import httpx
 
+from neuro_code.application.ports.model import ModelToolPolicy
 from neuro_code.domain.messages import (
     ContentPart,
     ContextItemKind,
@@ -189,6 +190,33 @@ class XaiDialectResponsesProviderTests(unittest.IsolatedAsyncioTestCase):
                 "code_interpreter_call.outputs",
             ],
         )
+
+    def test_disabled_tool_policy_omits_builtin_and_local_tools_without_sticky_state(self) -> None:
+        provider = _xai_provider(
+            model="xai-test-model",
+            base_url="https://api.x.ai/v1",
+            api_key="fixture",
+            builtin_tools=("web_search", "code_interpreter"),
+        )
+        context = ModelContext((Message(Role.USER, "research"),))
+        tools = (ToolDefinition("read_file", "Read", {"type": "object"}),)
+
+        allowed = provider._request_body(context, tools)
+        disabled = provider._request_body(
+            context,
+            tools,
+            tool_policy=ModelToolPolicy.DISABLED,
+        )
+        allowed_again = provider._request_body(context, tools)
+
+        self.assertEqual(allowed["tools"], allowed_again["tools"])
+        self.assertNotIn("tools", disabled)
+        self.assertNotIn("tool_choice", disabled)
+        self.assertNotIn("parallel_tool_calls", disabled)
+        self.assertEqual(disabled["include"], ["reasoning.encrypted_content"])
+        self.assertEqual(disabled["reasoning"], {"summary": "concise"})
+        self.assertEqual(provider._builtin_tools, ("web_search", "code_interpreter"))
+        self.assertEqual(tools[0].name, "read_file")
 
     def test_builtin_tool_constructor_validation_is_defensive(self) -> None:
         invalid = (

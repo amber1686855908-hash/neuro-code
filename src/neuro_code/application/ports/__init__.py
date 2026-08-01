@@ -8,7 +8,7 @@ from neuro_code.application.ports.background_tasks import (
 from neuro_code.application.ports.client_filesystem import ClientFileSystem
 from neuro_code.application.ports.client_terminal import ClientTerminal, ClientTerminalResult
 from neuro_code.application.ports.http import HttpClientPolicy
-from neuro_code.application.ports.model import ModelProvider
+from neuro_code.application.ports.model import ModelProvider, ModelToolPolicy
 from neuro_code.application.ports.provider_catalog import ProviderCatalog
 from neuro_code.application.ports.sandbox import ShellLaunch, ShellSandbox
 from neuro_code.application.ports.storage import SessionStore
@@ -42,6 +42,7 @@ __all__ = [
     "InteractiveTerminalManager",
     "InteractiveTerminalSession",
     "ModelProvider",
+    "ModelToolPolicy",
     "PermissionApprover",
     "ProviderCatalog",
     "SessionStore",

@@ -5,6 +5,7 @@ import unittest
 
 import httpx
 
+from neuro_code.application.ports.model import ModelToolPolicy
 from neuro_code.domain.messages import (
     IMAGE_MODEL_PLACEHOLDER,
     ContentPart,
@@ -244,6 +245,33 @@ class AnthropicProviderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(body["messages"][2]["content"][0]["tool_use_id"], "old-1")
         self.assertEqual(body["messages"][2]["content"][1]["text"], "Continue.")
         self.assertEqual(body["tools"][0]["input_schema"]["type"], "object")
+
+    def test_disabled_tool_policy_omits_tools_without_sticky_state(self) -> None:
+        provider = AnthropicProvider(
+            model="claude-fixture",
+            base_url="https://api.anthropic.invalid",
+            api_key="fixture",
+            max_output_tokens=4096,
+        )
+        messages = (Message(Role.SYSTEM, "Be precise."), Message(Role.USER, "Inspect it."))
+        tools = (ToolDefinition("read_file", "Read", {"type": "object"}),)
+
+        allowed = provider._request_body(messages, tools)
+        disabled = provider._request_body(
+            messages,
+            tools,
+            tool_policy=ModelToolPolicy.DISABLED,
+        )
+        allowed_again = provider._request_body(messages, tools)
+
+        self.assertEqual(allowed["tools"], allowed_again["tools"])
+        self.assertNotIn("tools", disabled)
+        self.assertNotIn("tool_choice", disabled)
+        self.assertNotIn("beta", disabled)
+        self.assertEqual(disabled["model"], "claude-fixture")
+        self.assertEqual(disabled["max_tokens"], 4096)
+        self.assertEqual(disabled["system"], "Be precise.")
+        self.assertEqual(tools[0].name, "read_file")
 
     async def test_stream_rejects_http_json_stream_and_transport_failures(self) -> None:
         cases = (

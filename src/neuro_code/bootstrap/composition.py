@@ -304,6 +304,7 @@ class ApplicationComposition:
                 session_store=self.store,
                 max_steps=self.settings.max_steps,
                 reasoning_effort=reasoning_effort or self.settings.reasoning_effort,
+                execution_control_mode=self.settings.execution_control_mode,
                 instruction_provider=instruction_provider,
                 skill_provider=skill_provider,
             )

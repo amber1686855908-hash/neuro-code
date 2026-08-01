@@ -6,7 +6,11 @@ import json
 from collections.abc import Mapping
 from pathlib import Path
 
-from neuro_code.domain.provider_settings import ManagedProviderProfile, ManagedProviderSettings
+from neuro_code.domain.provider_settings import (
+    ManagedProviderProfile,
+    ManagedProviderSettings,
+    ManagedProxyPolicy,
+)
 from neuro_code.shared.errors import ConfigurationError
 
 _SCHEMA_VERSION = 1
@@ -81,10 +85,24 @@ def load_managed_provider_settings(state_dir: Path) -> ManagedProviderSettings:
         }
         if not all(isinstance(values[field], str) for field in values):
             raise ConfigurationError(f"managed provider settings {metadata_path} are invalid")
-        proxy_mode = raw_profile.get("proxy_mode", "environment")
+        # Version-one files always implied the environment policy when this
+        # field was absent. Treat that legacy default as inheritance so the new
+        # user-wide setting has the same behavior until the user changes it.
+        proxy_mode = raw_profile.get("proxy_mode")
+        if proxy_mode == "environment":
+            proxy_mode = None
         proxy_url_env = raw_profile.get("proxy_url_env")
-        if not isinstance(proxy_mode, str) or (
-            proxy_url_env is not None and not isinstance(proxy_url_env, str)
+        context_window_tokens = raw_profile.get("context_window_tokens")
+        if (
+            (proxy_mode is not None and not isinstance(proxy_mode, str))
+            or (proxy_url_env is not None and not isinstance(proxy_url_env, str))
+            or (
+                context_window_tokens is not None
+                and (
+                    not isinstance(context_window_tokens, int)
+                    or isinstance(context_window_tokens, bool)
+                )
+            )
         ):
             raise ConfigurationError(f"managed provider settings {metadata_path} are invalid")
         name = str(values["name"])
@@ -99,6 +117,7 @@ def load_managed_provider_settings(state_dir: Path) -> ManagedProviderSettings:
                 model=str(values["model"]),
                 base_url=str(values["base_url"]),
                 dialect=dialect,
+                context_window_tokens=context_window_tokens,
                 proxy_mode=proxy_mode,
                 proxy_url_env=proxy_url_env,
                 api_key=api_keys.get(name),
@@ -107,7 +126,20 @@ def load_managed_provider_settings(state_dir: Path) -> ManagedProviderSettings:
     raw_default = metadata.get("default_provider")
     if raw_default is not None and not isinstance(raw_default, str):
         raise ConfigurationError(f"managed provider settings {metadata_path} are invalid")
-    return ManagedProviderSettings(tuple(profiles), raw_default)
+    raw_proxy_defaults = metadata.get("proxy_defaults", {})
+    if not isinstance(raw_proxy_defaults, Mapping):
+        raise ConfigurationError(f"managed provider settings {metadata_path} are invalid")
+    proxy_mode = raw_proxy_defaults.get("mode", "environment")
+    proxy_url_env = raw_proxy_defaults.get("proxy_url_env")
+    if not isinstance(proxy_mode, str) or (
+        proxy_url_env is not None and not isinstance(proxy_url_env, str)
+    ):
+        raise ConfigurationError(f"managed provider settings {metadata_path} are invalid")
+    return ManagedProviderSettings(
+        tuple(profiles),
+        raw_default,
+        ManagedProxyPolicy(proxy_mode, proxy_url_env),
+    )
 
 
 __all__ = ["load_managed_provider_settings"]

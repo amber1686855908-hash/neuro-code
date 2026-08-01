@@ -5,6 +5,7 @@ import unittest
 
 import httpx
 
+from neuro_code.application.ports.model import ModelToolPolicy
 from neuro_code.domain.messages import (
     IMAGE_MODEL_PLACEHOLDER,
     ContentPart,
@@ -206,6 +207,31 @@ class GeminiProviderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response["response"], {"content": "old contents"})
         self.assertEqual(body["contents"][2]["parts"][1]["text"], "Continue.")
         self.assertEqual(body["tools"][0]["functionDeclarations"][0]["name"], "read_file")
+
+    def test_disabled_tool_policy_omits_function_declarations_without_sticky_state(self) -> None:
+        provider = GeminiProvider(
+            model="models/gemini-fixture",
+            base_url="https://generativelanguage.invalid",
+            api_key="fixture",
+            max_output_tokens=2048,
+        )
+        messages = (Message(Role.SYSTEM, "Be precise."), Message(Role.USER, "Inspect it."))
+        tools = (ToolDefinition("read_file", "Read", {"type": "object"}),)
+
+        allowed = provider._request_body(messages, tools)
+        disabled = provider._request_body(
+            messages,
+            tools,
+            tool_policy=ModelToolPolicy.DISABLED,
+        )
+        allowed_again = provider._request_body(messages, tools)
+
+        self.assertEqual(allowed["tools"], allowed_again["tools"])
+        self.assertNotIn("tools", disabled)
+        self.assertNotIn("toolConfig", disabled)
+        self.assertEqual(disabled["generationConfig"], {"maxOutputTokens": 2048})
+        self.assertEqual(disabled["systemInstruction"]["parts"][0]["text"], "Be precise.")
+        self.assertEqual(tools[0].name, "read_file")
 
     async def test_stream_rejects_http_json_provider_and_transport_failures(self) -> None:
         cases = (

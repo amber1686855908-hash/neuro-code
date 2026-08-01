@@ -56,6 +56,7 @@ _EXACT_LAYERS = {
     "neuro_code.tui": _INTERFACES,
     "neuro_code.tui_commands": _INTERFACES,
     "neuro_code.tui_text": _INTERFACES,
+    "neuro_code.tui_theme": _INTERFACES,
     "neuro_code.workspace": _INFRASTRUCTURE,
     "neuro_code.workspace_changes": _INFRASTRUCTURE,
 }
@@ -987,9 +988,11 @@ def test_canonical_runtime_modules_are_the_only_runtime_implementations() -> Non
         "neuro_code.application.runtime.agent",
         "neuro_code.application.runtime.approval",
         "neuro_code.application.runtime.conversation",
+        "neuro_code.application.runtime.finalization",
         "neuro_code.application.runtime.instruction_tracker",
         "neuro_code.application.runtime.profile_conversation",
         "neuro_code.application.runtime.skill_tracker",
+        "neuro_code.application.runtime.supervision",
         "neuro_code.application.runtime.terminal_sessions",
     }
     assert {

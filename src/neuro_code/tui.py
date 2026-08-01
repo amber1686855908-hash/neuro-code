@@ -7,15 +7,15 @@ import re
 import sys
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, ClassVar, Protocol
+from typing import Any, ClassVar, Protocol, cast
 from urllib.parse import urlsplit
 
 from rich.console import RenderableType
 from rich.markdown import Markdown
 from rich.table import Table
 from rich.text import Text
-from rich.theme import Theme as RichTheme
 from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding, BindingType
@@ -24,8 +24,7 @@ from textual.geometry import Size
 from textual.message import Message as TextualMessage
 from textual.screen import ModalScreen
 from textual.suggester import Suggester
-from textual.theme import Theme
-from textual.widgets import Button, Header, Input, Label, Static
+from textual.widgets import Button, Input, Label, Static
 from textual.worker import Worker
 
 from neuro_code.application.permissions.contracts import PermissionApproval, PermissionRequest
@@ -55,7 +54,11 @@ from neuro_code.domain.provider_catalog import (
     ProviderCatalogResult,
     ProviderConnectionSpec,
 )
-from neuro_code.domain.provider_settings import ManagedProviderProfile, ManagedProviderSettings
+from neuro_code.domain.provider_settings import (
+    ManagedProviderProfile,
+    ManagedProviderSettings,
+    ManagedProxyPolicy,
+)
 from neuro_code.domain.reasoning import ReasoningEffort
 from neuro_code.domain.session_tasks import SessionTask
 from neuro_code.domain.sessions import SessionSummary
@@ -63,6 +66,53 @@ from neuro_code.domain.ui_preferences import UiLanguage
 from neuro_code.shared.redaction import redact_sensitive_text
 from neuro_code.tui_commands import SlashCompletion, slash_completions
 from neuro_code.tui_text import language_name, ui_text
+from neuro_code.tui_theme import (
+    ACCENT_CODE,
+    ACCENT_SUCCESS,
+    ACCENT_WARNING,
+    ASSISTANT_TEXT_STYLE,
+    BRAND_TEXT,
+    CONNECTION_STATUS_STYLES,
+    DIFF_ADDITION_STYLE,
+    DIFF_CONTEXT_STYLE,
+    DIFF_DELETION_STYLE,
+    DIFF_FILE_STYLE,
+    DIFF_HUNK_STYLE,
+    DIFF_SUMMARY_ADDITION_STYLE,
+    DIFF_SUMMARY_DELETION_STYLE,
+    EFFORT_STYLES,
+    ERROR_DETAIL_STYLE,
+    ERROR_LABEL_STYLE,
+    ERROR_TEXT_STYLE,
+    MARKDOWN_THEME,
+    MODE_STYLES,
+    MONO_SYNTAX_THEME,
+    RECOVERABLE_LABEL_STYLE,
+    RECOVERABLE_TEXT_STYLE,
+    STATUS_LABEL_STYLE,
+    STATUS_TEXT_STYLE,
+    SYSTEM_LABEL_STYLE,
+    SYSTEM_TEXT_STYLE,
+    TEXT_BODY,
+    TEXT_DIM,
+    TEXT_DISABLED,
+    TEXT_EMPHASIS,
+    TEXT_MUTED,
+    TEXT_PRIMARY,
+    TEXT_SECONDARY,
+    TEXTUAL_THEME,
+    TOOL_ACTIVE_STYLE,
+    TOOL_COMPLETE_STYLE,
+    TOOL_DETAIL_STYLE,
+    TOOL_GUIDE_STYLE,
+    TOOL_LABEL_STYLE,
+    TOOL_META_STYLE,
+    TOOL_TEXT_STYLE,
+    TOOL_TITLE_STYLE,
+    USER_TEXT_STYLE,
+    WAITING_STYLE,
+    loading_style,
+)
 
 _RESTORED_MESSAGE_LIMIT = 20_000
 _TASK_LIST_LIMIT = 20
@@ -75,22 +125,22 @@ _TOOL_OUTPUT_MAX_CHARACTERS = 6_000
 _TOOL_DIFF_MAX_FILES = 8
 _COMPACT_READ_TOOLS = frozenset({"grep", "list_dir", "read_file", "skill", "view_image"})
 TUI_RELOAD_PROVIDER_SETTINGS = 75
+_PROMPT_MARK = "\N{SINGLE RIGHT-POINTING ANGLE QUOTATION MARK}"
+_ERROR_MARK = "\N{MULTIPLICATION SIGN}"
+_SUCCESS_MARK = "\N{CHECK MARK}"
+_WARNING_MARK = "!"
 _ANSI_ESCAPE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
 
-_EFFORT_COLORS = {
-    ReasoningEffort.LOW: "#8e939a",
-    ReasoningEffort.MEDIUM: "#6fb7d6",
-    ReasoningEffort.HIGH: "#78c2a4",
-    ReasoningEffort.XHIGH: "#a9a1e8",
-    ReasoningEffort.ULTRACODE: "#d58cc8",
-}
 
-_MODE_COLORS = {
-    InteractionMode.NORMAL: "#9aa3b2",
-    InteractionMode.ACCEPT_EDITS: "#78c2a4",
-    InteractionMode.PLAN: "#8b9cff",
-    InteractionMode.AUTO: "#d58cc8",
-}
+def _markdown_code_theme() -> str:
+    """Contain Rich Markdown's narrow annotation without changing the runtime theme.
+
+    ``Markdown`` forwards the value to ``Syntax``, whose runtime API accepts a
+    ``PygmentsSyntaxTheme``. Its public annotation is limited to a named string
+    theme, so this local cast preserves the custom theme object.
+    """
+
+    return cast(str, MONO_SYNTAX_THEME)
 
 
 @dataclass(frozen=True, slots=True)
@@ -198,74 +248,6 @@ def _is_deepseek_base_url(value: str) -> bool:
         return urlsplit(value.strip()).hostname == "api.deepseek.com"
     except ValueError:
         return False
-
-
-_MARKDOWN_THEME = RichTheme(
-    {
-        "markdown.paragraph": "#d8dadd",
-        "markdown.text": "#d8dadd",
-        "markdown.em": "italic #b8bcc2",
-        "markdown.strong": "bold #aebcff",
-        "markdown.code": "bold #9cc4cc on #1a1c1f",
-        "markdown.code_block": "#d8dadd on #16181b",
-        "markdown.block_quote": "italic #9aa2ad",
-        "markdown.list": "#d8dadd",
-        "markdown.item": "#d8dadd",
-        "markdown.item.bullet": "bold #6fc3df",
-        "markdown.item.number": "bold #6fc3df",
-        "markdown.hr": "#3b3f44",
-        "markdown.h1": "bold #b6c2ff",
-        "markdown.h2": "bold #9eafff",
-        "markdown.h3": "bold #8b9cff",
-        "markdown.h4": "bold #8ed1e6",
-        "markdown.h5": "bold #9db4c8",
-        "markdown.h6": "bold #989da4",
-        "markdown.link": "underline #7da7d9",
-        "markdown.link_url": "underline #7da7d9",
-        "markdown.table.border": "#50555b",
-        "markdown.table.header": "bold #9eafff",
-        "markdown.kbd": "bold #aebcff on #292c30",
-    }
-)
-
-_NEURO_CODE_THEME = Theme(
-    name="neuro-code-dark",
-    primary="#8b9cff",
-    secondary="#777c83",
-    accent="#6fc3df",
-    warning="#e59c74",
-    error="#c76d6d",
-    success="#78c2a4",
-    foreground="#d8dadd",
-    background="#101214",
-    surface="#1a1c1f",
-    panel="#16181b",
-    boost="#2a2d31",
-    luminosity_spread=0.08,
-    text_alpha=0.96,
-    variables={
-        "border": "#5866a3",
-        "border-blurred": "#3b3f44",
-        "block-cursor-background": "#8b9cff",
-        "block-cursor-foreground": "#101214",
-        "block-hover-background": "#2a2d31",
-        "button-color-foreground": "#101214",
-        "button-focus-text-style": "bold",
-        "footer-background": "#141619",
-        "footer-description-background": "#141619",
-        "footer-description-foreground": "#a9adb3",
-        "footer-item-background": "#141619",
-        "footer-key-background": "#141619",
-        "footer-key-foreground": "#8b9cff",
-        "input-cursor-background": "#d8dadd",
-        "input-cursor-foreground": "#101214",
-        "input-selection-background": "#5866a3 55%",
-        "scrollbar": "#50555b",
-        "scrollbar-active": "#6878ba",
-        "scrollbar-background": "#101214",
-        "scrollbar-hover": "#666b72",
-    },
-)
 
 
 def _read_terminal_size() -> Size | None:
@@ -472,7 +454,7 @@ class SettingsScreen(ModalScreen[str | None]):
     CSS = """
     SettingsScreen {
         align: center middle;
-        background: $background 70%;
+        background: $background 85%;
     }
 
     #settings-dialog {
@@ -481,13 +463,13 @@ class SettingsScreen(ModalScreen[str | None]):
         height: auto;
         max-height: 85%;
         padding: 1 2;
-        border: heavy $primary;
+        border: solid $border;
         background: $surface;
     }
 
     #settings-title {
         text-style: bold;
-        color: $primary;
+        color: $text-primary;
         margin-bottom: 1;
     }
 
@@ -547,6 +529,11 @@ class SettingsScreen(ModalScreen[str | None]):
                     id="settings-category-providers",
                     disabled=not self.provider_settings_available,
                 ),
+                Button(
+                    ui_text(self.language, "settings.category.network"),
+                    id="settings-category-network",
+                    disabled=not self.provider_settings_available,
+                ),
                 id="settings-categories",
             ),
             Static(ui_text(self.language, "settings.help"), id="settings-help"),
@@ -560,6 +547,7 @@ class SettingsScreen(ModalScreen[str | None]):
         categories = {
             "settings-category-language": "language",
             "settings-category-providers": "providers",
+            "settings-category-network": "network",
         }
         category = categories.get(event.button.id or "")
         if category is not None:
@@ -575,7 +563,7 @@ class LanguageSettingsScreen(ModalScreen[UiLanguage | None]):
     CSS = """
     LanguageSettingsScreen {
         align: center middle;
-        background: $background 70%;
+        background: $background 85%;
     }
 
     #language-settings-dialog {
@@ -583,13 +571,13 @@ class LanguageSettingsScreen(ModalScreen[UiLanguage | None]):
         max-width: 78;
         height: auto;
         padding: 1 2;
-        border: heavy $primary;
+        border: solid $border;
         background: $surface;
     }
 
     #language-settings-title {
         text-style: bold;
-        color: $primary;
+        color: $text-primary;
         margin-bottom: 1;
     }
 
@@ -688,13 +676,184 @@ class LanguageSettingsScreen(ModalScreen[UiLanguage | None]):
         self.dismiss(None)
 
 
+class NetworkProxySettingsScreen(ModalScreen[ManagedProviderSettings | None]):
+    """Edit the user-wide proxy default independently of provider credentials."""
+
+    CSS = """
+    NetworkProxySettingsScreen {
+        align: center middle;
+        background: $background 85%;
+    }
+
+    #network-settings-dialog {
+        width: 82%;
+        max-width: 88;
+        height: auto;
+        padding: 1 2;
+        border: solid $border;
+        background: $surface;
+    }
+
+    #network-settings-title {
+        text-style: bold;
+        color: $text-primary;
+        margin-bottom: 1;
+    }
+
+    #network-settings-description,
+    #network-settings-hint,
+    #network-settings-error {
+        color: $text-muted;
+        margin-bottom: 1;
+    }
+
+    #network-settings-error {
+        padding-left: 1;
+        border-left: tall $border-focus;
+        color: $text-primary;
+        text-style: bold;
+    }
+
+    #network-settings-modes,
+    #network-settings-actions {
+        height: auto;
+    }
+
+    #network-settings-modes Button {
+        width: 1fr;
+        margin-right: 1;
+    }
+
+    #network-settings-actions {
+        align-horizontal: right;
+    }
+
+    #network-settings-actions Button {
+        margin-left: 1;
+    }
+    """
+    BINDINGS: ClassVar[list[BindingType]] = [
+        Binding("escape", "cancel", "Back", show=False),
+        Binding("ctrl+c", "cancel", "Back", show=False),
+    ]
+
+    def __init__(
+        self,
+        *,
+        language: UiLanguage,
+        provider_settings: ManagedProviderSettings,
+        provider_settings_store: ProviderSettingsStore,
+    ) -> None:
+        super().__init__()
+        self.language = language
+        self.provider_settings = provider_settings
+        self.provider_settings_store = provider_settings_store
+        self._active_proxy_mode = provider_settings.proxy_defaults.mode
+
+    def compose(self) -> ComposeResult:
+        yield Vertical(
+            Label(ui_text(self.language, "network_settings.title"), id="network-settings-title"),
+            Static(
+                ui_text(self.language, "network_settings.description"),
+                id="network-settings-description",
+            ),
+            Label(ui_text(self.language, "network_settings.default_policy")),
+            Horizontal(
+                Button(
+                    ui_text(self.language, "network_settings.environment"),
+                    id="network-settings-environment",
+                    variant="primary",
+                ),
+                Button(
+                    ui_text(self.language, "network_settings.direct"),
+                    id="network-settings-direct",
+                ),
+                Button(
+                    ui_text(self.language, "network_settings.explicit"),
+                    id="network-settings-explicit",
+                ),
+                id="network-settings-modes",
+            ),
+            Input(
+                value=self.provider_settings.proxy_defaults.proxy_url_env or "",
+                placeholder=ui_text(self.language, "network_settings.environment_variable"),
+                id="network-settings-proxy-env",
+                disabled=self.provider_settings.proxy_defaults.mode != "explicit",
+            ),
+            Static("", id="network-settings-hint"),
+            Static("", id="network-settings-error"),
+            Horizontal(
+                Button(ui_text(self.language, "settings.back"), id="network-settings-back"),
+                Button(
+                    ui_text(self.language, "network_settings.save"),
+                    id="network-settings-save",
+                    variant="success",
+                ),
+                id="network-settings-actions",
+            ),
+            id="network-settings-dialog",
+        )
+
+    def on_mount(self) -> None:
+        self._select_proxy_mode(self._active_proxy_mode)
+        self.query_one(f"#network-settings-{self._active_proxy_mode}", Button).focus()
+
+    async def on_button_pressed(self, event: Button.Pressed) -> None:
+        button_id = event.button.id or ""
+        if button_id.startswith("network-settings-"):
+            mode = button_id.removeprefix("network-settings-")
+            if mode in {"environment", "direct", "explicit"}:
+                self._select_proxy_mode(mode)
+                return
+        if button_id == "network-settings-save":
+            await self._save()
+        elif button_id == "network-settings-back":
+            self.dismiss(None)
+
+    def _select_proxy_mode(self, proxy_mode: str) -> None:
+        if proxy_mode not in {"environment", "direct", "explicit"}:
+            return
+        self._active_proxy_mode = proxy_mode
+        for candidate in ("environment", "direct", "explicit"):
+            button = self.query_one(f"#network-settings-{candidate}", Button)
+            button.variant = "primary" if candidate == proxy_mode else "default"
+        self.query_one("#network-settings-proxy-env", Input).disabled = proxy_mode != "explicit"
+        self.query_one("#network-settings-hint", Static).update(
+            ui_text(self.language, f"network_settings.hint.{proxy_mode}")
+        )
+
+    async def _save(self) -> None:
+        proxy_url_env = (
+            self.query_one("#network-settings-proxy-env", Input).value.strip() or None
+            if self._active_proxy_mode == "explicit"
+            else None
+        )
+        try:
+            proxy_defaults = ManagedProxyPolicy(self._active_proxy_mode, proxy_url_env)
+            resolve_http_client_policy(
+                proxy_mode=proxy_defaults.mode,
+                proxy_url_env=proxy_defaults.proxy_url_env,
+                environ=os.environ,
+            )
+            settings = await self.provider_settings_store.save_proxy_defaults(proxy_defaults)
+        except Exception as error:
+            self.query_one("#network-settings-error", Static).update(
+                Text(f"{_ERROR_MARK} {error}", style=ERROR_TEXT_STYLE)
+            )
+            return
+        self.dismiss(settings)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
 class ProviderSettingsScreen(ModalScreen[ProviderSettingsSubmission | None]):
     """Create and edit user-owned provider profiles on a focused detail screen."""
 
     CSS = """
     ProviderSettingsScreen {
         align: center middle;
-        background: $background 70%;
+        background: $background 85%;
     }
 
     #provider-settings-dialog {
@@ -703,7 +862,7 @@ class ProviderSettingsScreen(ModalScreen[ProviderSettingsSubmission | None]):
         height: 95%;
         max-height: 95%;
         padding: 1 2;
-        border: heavy $primary;
+        border: solid $border;
         background: $surface;
     }
 
@@ -713,7 +872,7 @@ class ProviderSettingsScreen(ModalScreen[ProviderSettingsSubmission | None]):
 
     #provider-settings-title {
         text-style: bold;
-        color: $accent;
+        color: $text-primary;
         margin-bottom: 1;
     }
 
@@ -721,6 +880,7 @@ class ProviderSettingsScreen(ModalScreen[ProviderSettingsSubmission | None]):
     #provider-settings-protocol-hint,
     #provider-settings-proxy-title,
     #provider-settings-proxy-hint,
+    #provider-settings-context-hint,
     #provider-settings-connection-status,
     #provider-settings-error,
     #provider-settings-empty {
@@ -729,7 +889,7 @@ class ProviderSettingsScreen(ModalScreen[ProviderSettingsSubmission | None]):
     }
 
     #provider-settings-protocol-hint {
-        color: #9cc4cc;
+        color: $text-secondary;
     }
 
     #provider-settings-proxy-title {
@@ -739,7 +899,7 @@ class ProviderSettingsScreen(ModalScreen[ProviderSettingsSubmission | None]):
     }
 
     #provider-settings-proxy-hint {
-        color: #9cc4cc;
+        color: $text-secondary;
     }
 
     #provider-settings-connection-status {
@@ -748,7 +908,10 @@ class ProviderSettingsScreen(ModalScreen[ProviderSettingsSubmission | None]):
     }
 
     #provider-settings-error {
-        color: $error;
+        padding-left: 1;
+        border-left: tall $border-focus;
+        color: $text-primary;
+        text-style: bold;
     }
 
     #provider-settings-profiles {
@@ -800,6 +963,11 @@ class ProviderSettingsScreen(ModalScreen[ProviderSettingsSubmission | None]):
         margin-bottom: 0;
     }
 
+    #provider-settings-form Label {
+        color: $text-primary;
+        margin-top: 1;
+    }
+
     #provider-settings-proxy-modes Button {
         width: 1fr;
         margin-right: 1;
@@ -843,7 +1011,7 @@ class ProviderSettingsScreen(ModalScreen[ProviderSettingsSubmission | None]):
         self.initial_error = initial_error
         self._editing_profile: str | None = None
         self._active_preset = "openai"
-        self._active_proxy_mode = "environment"
+        self._active_proxy_mode: str | None = None
         self._delete_confirmation_for: str | None = None
         self._catalog_model_ids: dict[str, str] = {}
         self._profile_ids = {
@@ -934,23 +1102,36 @@ class ProviderSettingsScreen(ModalScreen[ProviderSettingsSubmission | None]):
                     id="provider-settings-protocol-hint",
                 ),
                 Vertical(
+                    Label(ui_text(self.language, "provider_settings.field.name")),
                     Input(
                         placeholder=ui_text(self.language, "provider_settings.name"),
                         id="provider-settings-name",
                     ),
+                    Label(ui_text(self.language, "provider_settings.field.model")),
                     Input(
                         placeholder=ui_text(self.language, "provider_settings.model.openai"),
                         id="provider-settings-model",
                     ),
+                    Label(ui_text(self.language, "provider_settings.field.base_url")),
                     Input(
                         value="https://api.openai.com/v1",
                         placeholder=ui_text(self.language, "provider_settings.base_url"),
                         id="provider-settings-base-url",
                     ),
+                    Label(ui_text(self.language, "provider_settings.field.api_key")),
                     Input(
                         placeholder=ui_text(self.language, "provider_settings.api_key"),
                         password=True,
                         id="provider-settings-api-key",
+                    ),
+                    Label(ui_text(self.language, "provider_settings.field.context_window")),
+                    Input(
+                        placeholder=ui_text(self.language, "provider_settings.context_window"),
+                        id="provider-settings-context-window",
+                    ),
+                    Static(
+                        ui_text(self.language, "provider_settings.context_window_hint"),
+                        id="provider-settings-context-hint",
                     ),
                     Static(
                         ui_text(self.language, "provider_settings.proxy.title"),
@@ -958,9 +1139,13 @@ class ProviderSettingsScreen(ModalScreen[ProviderSettingsSubmission | None]):
                     ),
                     Horizontal(
                         Button(
+                            ui_text(self.language, "provider_settings.proxy.inherit"),
+                            id="provider-settings-proxy-inherit",
+                            variant="primary",
+                        ),
+                        Button(
                             ui_text(self.language, "provider_settings.proxy.environment"),
                             id="provider-settings-proxy-environment",
-                            variant="primary",
                         ),
                         Button(
                             ui_text(self.language, "provider_settings.proxy.direct"),
@@ -1040,7 +1225,8 @@ class ProviderSettingsScreen(ModalScreen[ProviderSettingsSubmission | None]):
             self._select_preset(button_id.removeprefix("provider-settings-preset-"))
             return
         if button_id.startswith("provider-settings-proxy-"):
-            self._select_proxy_mode(button_id.removeprefix("provider-settings-proxy-"))
+            selection = button_id.removeprefix("provider-settings-proxy-")
+            self._select_proxy_mode(None if selection == "inherit" else selection)
             return
         if button_id == "provider-settings-new":
             self._new_profile()
@@ -1075,6 +1261,9 @@ class ProviderSettingsScreen(ModalScreen[ProviderSettingsSubmission | None]):
         self.query_one("#provider-settings-model", Input).value = profile.model
         self.query_one("#provider-settings-base-url", Input).value = profile.base_url
         self.query_one("#provider-settings-api-key", Input).value = ""
+        self.query_one("#provider-settings-context-window", Input).value = (
+            str(profile.context_window_tokens) if profile.context_window_tokens is not None else ""
+        )
         self._select_preset(self._preset_for_profile(profile), update_endpoint=False)
         self.query_one("#provider-settings-proxy-env", Input).value = profile.proxy_url_env or ""
         self._select_proxy_mode(profile.proxy_mode)
@@ -1088,7 +1277,10 @@ class ProviderSettingsScreen(ModalScreen[ProviderSettingsSubmission | None]):
     def _preset_for_profile(profile: ManagedProviderProfile) -> str:
         base_url = profile.base_url.rstrip("/").casefold()
         if _is_deepseek_base_url(profile.base_url):
-            return "deepseek"
+            if profile.protocol == "openai-chat" and profile.dialect == "standard":
+                return "deepseek"
+            if profile.protocol == "openai-responses" and profile.dialect == "standard":
+                return "openai"
         exact = next(
             (
                 preset.name
@@ -1119,9 +1311,10 @@ class ProviderSettingsScreen(ModalScreen[ProviderSettingsSubmission | None]):
         name_input.value = ""
         self.query_one("#provider-settings-model", Input).value = ""
         self.query_one("#provider-settings-api-key", Input).value = ""
+        self.query_one("#provider-settings-context-window", Input).value = ""
         self.query_one("#provider-settings-proxy-env", Input).value = ""
         self._select_preset("openai")
-        self._select_proxy_mode("environment")
+        self._select_proxy_mode(None)
         self._reset_delete_confirmation()
         if not self.first_run:
             self.query_one("#provider-settings-delete", Button).disabled = True
@@ -1150,40 +1343,73 @@ class ProviderSettingsScreen(ModalScreen[ProviderSettingsSubmission | None]):
         if update_endpoint:
             self.query_one("#provider-settings-base-url", Input).value = preset.base_url
 
-    def _select_proxy_mode(self, proxy_mode: str) -> None:
-        if proxy_mode not in {"environment", "direct", "explicit"}:
+    def _select_proxy_mode(self, proxy_mode: str | None) -> None:
+        if proxy_mode not in {None, "environment", "direct", "explicit"}:
             return
         self._clear_model_catalog()
         self._active_proxy_mode = proxy_mode
-        for candidate in ("environment", "direct", "explicit"):
-            button = self.query_one(f"#provider-settings-proxy-{candidate}", Button)
+        for candidate in (None, "environment", "direct", "explicit"):
+            name = "inherit" if candidate is None else candidate
+            button = self.query_one(f"#provider-settings-proxy-{name}", Button)
             button.variant = "primary" if candidate == proxy_mode else "default"
         proxy_env = self.query_one("#provider-settings-proxy-env", Input)
         proxy_env.disabled = proxy_mode != "explicit"
         self.query_one("#provider-settings-proxy-hint", Static).update(
-            ui_text(self.language, f"provider_settings.proxy.hint.{proxy_mode}")
+            ui_text(
+                self.language,
+                (
+                    "provider_settings.proxy.hint.inherit"
+                    if proxy_mode is None
+                    else f"provider_settings.proxy.hint.{proxy_mode}"
+                ),
+                policy=self._global_proxy_policy_label(),
+            )
         )
         self._reset_delete_confirmation()
+
+    def _global_proxy_policy_label(self) -> str:
+        return ui_text(
+            self.language,
+            f"network_settings.policy.{self.provider_settings.proxy_defaults.mode}",
+        )
+
+    def _draft_proxy_policy(self) -> ManagedProxyPolicy:
+        if self._active_proxy_mode is None:
+            return self.provider_settings.proxy_defaults
+        proxy_url_env = (
+            self.query_one("#provider-settings-proxy-env", Input).value.strip() or None
+            if self._active_proxy_mode == "explicit"
+            else None
+        )
+        return ManagedProxyPolicy(self._active_proxy_mode, proxy_url_env)
+
+    def _context_window_tokens(self) -> int | None:
+        value = self.query_one("#provider-settings-context-window", Input).value.strip()
+        if not value:
+            return None
+        try:
+            context_window_tokens = int(value)
+        except ValueError as error:
+            raise ValueError(
+                ui_text(self.language, "provider_settings.context_window_invalid")
+            ) from error
+        if context_window_tokens <= 0:
+            raise ValueError(ui_text(self.language, "provider_settings.context_window_invalid"))
+        return context_window_tokens
 
     def _connection_spec(self) -> tuple[ProviderConnectionSpec, HttpClientPolicy]:
         preset = next(entry for entry in _PROVIDER_PRESETS if entry.name == self._active_preset)
         base_url = self.query_one("#provider-settings-base-url", Input).value.strip()
-        if _is_deepseek_base_url(base_url) and preset.protocol != "openai-chat":
-            raise ValueError(ui_text(self.language, "provider_settings.deepseek_protocol_required"))
         name = self.query_one("#provider-settings-name", Input).value.strip()
         existing = self.provider_settings.profile(name)
         entered_api_key = self.query_one("#provider-settings-api-key", Input).value.strip()
         api_key = entered_api_key or (existing.api_key if existing is not None else None)
         if api_key is None:
             raise ValueError(ui_text(self.language, "provider_settings.api_key_required"))
-        proxy_url_env = (
-            self.query_one("#provider-settings-proxy-env", Input).value.strip() or None
-            if self._active_proxy_mode == "explicit"
-            else None
-        )
+        proxy_policy = self._draft_proxy_policy()
         policy = resolve_http_client_policy(
-            proxy_mode=self._active_proxy_mode,
-            proxy_url_env=proxy_url_env,
+            proxy_mode=proxy_policy.mode,
+            proxy_url_env=proxy_policy.proxy_url_env,
             environ=os.environ,
         )
         return (
@@ -1242,7 +1468,9 @@ class ProviderSettingsScreen(ModalScreen[ProviderSettingsSubmission | None]):
     def _connection_signature(self) -> tuple[str, ...]:
         return (
             self._active_preset,
-            self._active_proxy_mode,
+            self._active_proxy_mode or "inherit",
+            self.provider_settings.proxy_defaults.mode,
+            self.provider_settings.proxy_defaults.proxy_url_env or "",
             self.query_one("#provider-settings-name", Input).value,
             self.query_one("#provider-settings-base-url", Input).value,
             self.query_one("#provider-settings-api-key", Input).value,
@@ -1327,13 +1555,14 @@ class ProviderSettingsScreen(ModalScreen[ProviderSettingsSubmission | None]):
             self.query_one("#provider-settings-connection-status", Static).update("")
 
     def _show_connection_status(self, message: str, *, kind: str) -> None:
-        color = {
-            "success": "#78c2a4",
-            "warning": "#e59c74",
-            "error": "#c76d6d",
-        }.get(kind, "#9cc4cc")
+        color = CONNECTION_STATUS_STYLES.get(kind, TEXT_SECONDARY)
+        marker = {
+            "success": _SUCCESS_MARK,
+            "warning": _WARNING_MARK,
+            "error": _ERROR_MARK,
+        }.get(kind, "…")
         self.query_one("#provider-settings-connection-status", Static).update(
-            Text(message, style=color)
+            Text(f"{marker} {message}", style=color)
         )
 
     async def _save_provider(self) -> None:
@@ -1341,32 +1570,27 @@ class ProviderSettingsScreen(ModalScreen[ProviderSettingsSubmission | None]):
         api_key = self.query_one("#provider-settings-api-key", Input).value.strip() or None
         name = self.query_one("#provider-settings-name", Input).value.strip()
         base_url = self.query_one("#provider-settings-base-url", Input).value.strip()
-        proxy_url_env = (
-            self.query_one("#provider-settings-proxy-env", Input).value.strip() or None
-            if self._active_proxy_mode == "explicit"
-            else None
-        )
         try:
-            if _is_deepseek_base_url(base_url) and preset.protocol != "openai-chat":
-                raise ValueError(
-                    ui_text(self.language, "provider_settings.deepseek_protocol_required")
-                )
+            proxy_policy = self._draft_proxy_policy()
             profile = ManagedProviderProfile(
                 name=name,
                 protocol=preset.protocol,
                 dialect=preset.dialect,
                 model=self.query_one("#provider-settings-model", Input).value.strip(),
                 base_url=base_url,
+                context_window_tokens=self._context_window_tokens(),
                 proxy_mode=self._active_proxy_mode,
-                proxy_url_env=proxy_url_env,
+                proxy_url_env=(
+                    proxy_policy.proxy_url_env if self._active_proxy_mode is not None else None
+                ),
                 api_key=api_key,
             )
             existing = self.provider_settings.profile(name)
             if existing is None and api_key is None:
                 raise ValueError(ui_text(self.language, "provider_settings.api_key_required"))
             resolve_http_client_policy(
-                proxy_mode=profile.proxy_mode,
-                proxy_url_env=profile.proxy_url_env,
+                proxy_mode=proxy_policy.mode,
+                proxy_url_env=proxy_policy.proxy_url_env,
                 environ=os.environ,
             )
             await self.provider_settings_store.save_profile(profile, make_default=True)
@@ -1407,7 +1631,9 @@ class ProviderSettingsScreen(ModalScreen[ProviderSettingsSubmission | None]):
             button.variant = "default"
 
     def _show_provider_error(self, message: str) -> None:
-        self.query_one("#provider-settings-error", Static).update(message)
+        self.query_one("#provider-settings-error", Static).update(
+            Text(f"{_ERROR_MARK} {message}", style=ERROR_TEXT_STYLE)
+        )
 
     def action_cancel(self) -> None:
         self.dismiss(None)
@@ -1416,7 +1642,44 @@ class ProviderSettingsScreen(ModalScreen[ProviderSettingsSubmission | None]):
 class ProviderSetupApp(App[bool]):
     """Focused provider setup used for first run and recoverable startup errors."""
 
-    CSS = "Screen { background: $background; }"
+    CSS = """
+    Screen {
+        background: $background;
+        color: $text-primary;
+    }
+
+    Button {
+        background: $surface;
+        color: $text-primary;
+        border: none;
+    }
+
+    Button:hover {
+        background: $surface-hover;
+    }
+
+    Button:focus {
+        background: $surface-selected;
+        border-left: tall $border-focus;
+        text-style: bold;
+    }
+
+    Button:disabled {
+        background: $background;
+        color: $text-disabled;
+        border: none;
+    }
+
+    Input {
+        background: $surface;
+        color: $text-primary;
+        border: tall $border;
+    }
+
+    Input:focus {
+        border: tall $border-focus;
+    }
+    """
 
     def __init__(
         self,
@@ -1430,8 +1693,8 @@ class ProviderSetupApp(App[bool]):
         initial_error: str | None = None,
     ) -> None:
         super().__init__()
-        self.register_theme(_NEURO_CODE_THEME)
-        self.theme = _NEURO_CODE_THEME.name
+        self.register_theme(TEXTUAL_THEME)
+        self.theme = TEXTUAL_THEME.name
         self._provider_settings = provider_settings
         self._provider_settings_store = provider_settings_store
         self._provider_catalog = provider_catalog
@@ -1467,7 +1730,7 @@ class ReasoningEffortScreen(ModalScreen[ReasoningEffort | None]):
     CSS = """
     ReasoningEffortScreen {
         align: center middle;
-        background: $background 70%;
+        background: $background 85%;
     }
 
     #effort-dialog {
@@ -1476,13 +1739,13 @@ class ReasoningEffortScreen(ModalScreen[ReasoningEffort | None]):
         height: auto;
         max-height: 90%;
         padding: 1 2;
-        border: heavy $primary;
+        border: solid $border;
         background: $surface;
     }
 
     #effort-title {
         text-style: bold;
-        color: $primary;
+        color: $text-primary;
         margin-bottom: 1;
     }
 
@@ -1521,21 +1784,21 @@ class ReasoningEffortScreen(ModalScreen[ReasoningEffort | None]):
         }
 
     def _label(self, effort: ReasoningEffort) -> Text:
-        color = _EFFORT_COLORS[effort]
+        color = EFFORT_STYLES[effort.value]
         rendered = Text(f"{effort.glyph}  {effort.value}", style=f"bold {color}")
         rendered.append(
             f"  ·  {ui_text(self.language, f'effort.description.{effort.value}')}",
-            style="#b0b4ba",
+            style=TEXT_SECONDARY,
         )
         if effort is self.selected:
             rendered.append(
                 f"  ({ui_text(self.language, 'marker.current')})",
-                style="bold #8b9cff",
+                style=f"bold {TEXT_PRIMARY}",
             )
         if effort is ReasoningEffort.ULTRACODE:
             rendered.append(
                 f"  ({ui_text(self.language, 'effort.workflow_planned')})",
-                style="#d58cc8",
+                style=TEXT_MUTED,
             )
         return rendered
 
@@ -1574,7 +1837,7 @@ class PermissionApprovalScreen(ModalScreen[PermissionApproval]):
     CSS = """
     PermissionApprovalScreen {
         align: center middle;
-        background: $background 70%;
+        background: $background 85%;
     }
 
     #approval-dialog {
@@ -1583,13 +1846,13 @@ class PermissionApprovalScreen(ModalScreen[PermissionApproval]):
         height: auto;
         max-height: 90%;
         padding: 1 2;
-        border: heavy $warning;
+        border: solid $border-focus;
         background: $surface;
     }
 
     #approval-title {
         text-style: bold;
-        color: $warning;
+        color: $text-primary;
         margin-bottom: 1;
     }
 
@@ -1599,7 +1862,7 @@ class PermissionApprovalScreen(ModalScreen[PermissionApproval]):
         overflow-y: auto;
         margin: 1 0;
         padding: 1;
-        border: round $primary-darken-2;
+        border: round $border;
     }
 
     #approval-reason {
@@ -1714,7 +1977,7 @@ class ProviderSelectionScreen(ModalScreen[str | None]):
     CSS = """
     ProviderSelectionScreen {
         align: center middle;
-        background: $background 70%;
+        background: $background 85%;
     }
 
     #provider-dialog {
@@ -1722,13 +1985,13 @@ class ProviderSelectionScreen(ModalScreen[str | None]):
         max-width: 110;
         height: 80%;
         padding: 1 2;
-        border: heavy $primary;
+        border: solid $border;
         background: $surface;
     }
 
     #provider-title {
         text-style: bold;
-        color: $primary;
+        color: $text-primary;
         margin-bottom: 1;
     }
 
@@ -1828,7 +2091,7 @@ class SessionSelectionScreen(ModalScreen[str | None]):
     CSS = """
     SessionSelectionScreen {
         align: center middle;
-        background: $background 70%;
+        background: $background 85%;
     }
 
     #session-dialog {
@@ -1836,13 +2099,13 @@ class SessionSelectionScreen(ModalScreen[str | None]):
         max-width: 115;
         height: 80%;
         padding: 1 2;
-        border: heavy $primary;
+        border: solid $border;
         background: $surface;
     }
 
     #session-title {
         text-style: bold;
-        color: $primary;
+        color: $text-primary;
         margin-bottom: 1;
     }
 
@@ -1982,36 +2245,71 @@ class NeuroCodeApp(App[None]):
         layout: vertical;
         width: 100%;
         height: 100%;
-        background: #101214;
-        color: #d8dadd;
+        background: $background;
+        color: $text-primary;
     }
 
-    Header {
-        background: #16181b;
-        color: #d8dadd;
+    Button {
+        background: $surface;
+        color: $text-primary;
+        border: none;
     }
 
-    HeaderIcon {
-        display: none;
+    Button:hover {
+        background: $surface-hover;
     }
 
-    HeaderTitle {
-        padding-left: 2;
-        content-align: left middle;
+    Button:focus {
+        background: $surface-selected;
+        color: $text-primary;
+        border-left: tall $border-focus;
+        text-style: bold;
     }
 
-    HeaderClock {
-        background: #1a1c1f;
-        color: #989da4;
+    Button:disabled {
+        background: $background;
+        color: $text-disabled;
+        border: none;
+    }
+
+    Input {
+        background: $surface;
+        color: $text-primary;
+        border: tall $border;
+    }
+
+    Input:focus {
+        border: tall $border-focus;
+    }
+
+    #header {
+        height: 3;
+        padding: 1 2 0 2;
+        background: $background;
+    }
+
+    #brand {
+        width: auto;
+        height: 1;
+    }
+
+    #header-space {
+        width: 1fr;
+    }
+
+    #clock {
+        width: auto;
+        height: 1;
+        color: $text-muted;
+        text-align: right;
     }
 
     #transcript {
         width: 100%;
         height: 1fr;
         padding: 1 2;
-        background: #101214;
-        color: #d8dadd;
-        border-bottom: solid #303338;
+        background: $background;
+        color: $text-body;
     }
 
     .conversation-message {
@@ -2020,59 +2318,78 @@ class NeuroCodeApp(App[None]):
         min-height: 1;
         margin-bottom: 1;
         padding: 0;
-        color: #d8dadd;
+        color: $text-body;
     }
 
     .message-user {
-        padding: 1 2;
-        background: #292c30;
-        color: #e3e5e8;
-        border-left: solid #5866a3;
+        margin-left: 2;
+        padding: 0 1;
+        background: $surface;
+        color: $text-primary;
+        border-left: solid $border;
+        text-style: bold;
     }
 
     .message-assistant {
-        padding: 0 2;
-        background: #101214;
-        color: #e1e3e6;
+        margin-right: 2;
+        padding: 0 1;
+        background: $background;
+        color: $text-body;
     }
 
     .message-pending {
-        color: #8e939a;
+        color: $text-secondary;
         text-style: italic;
     }
 
     .message-system {
         padding: 0 1;
-        color: #aebcff;
+        color: $text-emphasis;
     }
 
     .message-tool {
         padding: 0 1;
-        color: #78c2a4;
+        color: $text-body;
     }
 
     .message-tool.tool-interactive:hover,
     .message-tool.tool-interactive:focus {
-        background: #161a1c;
-        border-left: solid #5866a3;
+        background: $surface-hover;
+        border-left: solid $border-focus;
     }
 
     .message-status {
         padding: 0 1;
-        color: #8e939a;
+        color: $text-secondary;
+    }
+
+    .message-recoverable {
+        padding: 0 1;
+        color: $text-emphasis;
+        border-left: solid $border;
     }
 
     .message-error {
         padding: 0 1;
-        color: #c76d6d;
+        color: $text-primary;
+        border-left: tall $border-focus;
+        text-style: bold;
+    }
+
+    #composer {
+        height: auto;
+        padding: 0 2 1 2;
+        background: $background;
     }
 
     #runtime-bar {
         width: 100%;
-        height: 1;
-        padding: 0 2;
-        background: #16181b;
-        color: #a9adb3;
+        height: 2;
+        padding: 0 1;
+        background: $background;
+        border-top: solid $border-dim;
+        color: $text-secondary;
+        align-vertical: middle;
     }
 
     #runtime-model {
@@ -2113,18 +2430,38 @@ class NeuroCodeApp(App[None]):
         overflow: hidden hidden;
     }
 
-    #prompt {
+    #prompt-row {
         height: 3;
-        margin: 0 1;
-        background: #1a1c1f;
-        color: #d8dadd;
-        border: tall #3b3f44;
+        padding: 0 1;
+        background: $surface;
+        border-left: tall $border;
+        align-vertical: middle;
     }
 
-    #prompt:focus {
-        background: #1d1f22;
-        background-tint: #ffffff 2%;
-        border: tall #5866a3;
+    #prompt-mark {
+        width: 3;
+        height: 1;
+        color: $text-primary;
+        text-style: bold;
+        content-align: center middle;
+    }
+
+    #prompt {
+        width: 1fr;
+        height: 1;
+        padding: 0;
+        margin: 0;
+        border: none;
+        background: $surface;
+        color: $text-primary;
+    }
+
+    #prompt > .input--placeholder {
+        color: $text-disabled;
+    }
+
+    #prompt-row:focus-within {
+        border-left: tall $border-focus;
     }
 
     #command-hints {
@@ -2132,26 +2469,17 @@ class NeuroCodeApp(App[None]):
         width: 100%;
         height: auto;
         max-height: 3;
-        padding: 0 2;
-        background: #141619;
-        color: #a9adb3;
+        padding: 0 1;
+        background: $background;
+        color: $text-secondary;
         overflow: hidden hidden;
     }
 
     #shortcut-bar {
-        height: 1;
+        height: 2;
         padding: 0 1;
-        background: #141619;
-        color: #a9adb3;
-    }
-
-    #provider-options Button:focus,
-    #session-options Button:focus,
-    #effort-options Button:focus,
-    #settings-languages Button:focus {
-        background: #292c30;
-        color: #e1e3e6;
-        border-left: solid #5866a3;
+        background: $background;
+        color: $text-muted;
     }
     """
     BINDINGS: ClassVar[list[BindingType]] = [
@@ -2200,8 +2528,8 @@ class NeuroCodeApp(App[None]):
         if context_window_tokens is not None and context_window_tokens <= 0:
             raise ValueError("context window tokens must be positive")
         super().__init__()
-        self.register_theme(_NEURO_CODE_THEME)
-        self.theme = _NEURO_CODE_THEME.name
+        self.register_theme(TEXTUAL_THEME)
+        self.theme = TEXTUAL_THEME.name
         self._runner = runner
         self._approval_controller = approval_controller
         self._provider_controller = provider_controller
@@ -2284,6 +2612,9 @@ class NeuroCodeApp(App[None]):
         self._pending_assistant: ConversationMessage | None = None
         self._reasoning_announced = False
         self._turn_completion: tuple[str, int] | None = None
+        self._terminal_execution_status: str | None = None
+        self._terminal_execution_recoverable = False
+        self._finalizing = False
         self._turn_usage_reported = False
         self._turn_worker: Worker[None] | None = None
         self._model_loading = False
@@ -2297,26 +2628,34 @@ class NeuroCodeApp(App[None]):
         return tuple(self._entries)
 
     def compose(self) -> ComposeResult:
-        yield Header(show_clock=True, icon="")
+        with Horizontal(id="header"):
+            yield Static(id="brand")
+            yield Static(id="header-space")
+            yield Static(id="clock")
         yield VerticalScroll(id="transcript")
-        yield Horizontal(
-            Static(id="runtime-model"),
-            Static(id="runtime-workspace"),
-            Static(id="runtime-context"),
-            Static(id="runtime-effort"),
-            Static(id="runtime-mode"),
-            id="runtime-bar",
-        )
-        yield Input(
-            placeholder=ui_text(self._language, "prompt.placeholder"),
-            suggester=SlashCommandSuggester(self._slash_completions),
-            id="prompt",
-        )
-        yield Static(id="command-hints")
-        yield Static(ui_text(self._language, "shortcuts"), id="shortcut-bar")
+        with Vertical(id="composer"):
+            yield Horizontal(
+                Static(id="runtime-model"),
+                Static(id="runtime-workspace"),
+                Static(id="runtime-context"),
+                Static(id="runtime-effort"),
+                Static(id="runtime-mode"),
+                id="runtime-bar",
+            )
+            with Horizontal(id="prompt-row"):
+                yield Static(_PROMPT_MARK, id="prompt-mark")
+                yield Input(
+                    placeholder=ui_text(self._language, "prompt.placeholder"),
+                    suggester=SlashCommandSuggester(self._slash_completions),
+                    id="prompt",
+                )
+            yield Static(id="command-hints")
+            yield Static(ui_text(self._language, "shortcuts"), id="shortcut-bar")
 
     def on_mount(self) -> None:
-        self.console.push_theme(_MARKDOWN_THEME)
+        self.console.push_theme(MARKDOWN_THEME)
+        self._refresh_header()
+        self.set_interval(1.0, self._update_clock)
         self._apply_language_to_chrome()
         if self._approval_controller is not None:
             self._approval_controller.set_handler(self._request_approval)
@@ -2362,6 +2701,19 @@ class NeuroCodeApp(App[None]):
             self._approval_controller.set_handler(None)
         self.console.pop_theme()
 
+    def _refresh_header(self) -> None:
+        brand = Text()
+        brand.append("NEURO", style=f"bold {BRAND_TEXT}")
+        brand.append(" / CODE", style=TEXT_MUTED)
+        self.query_one("#brand", Static).update(brand)
+        self._update_clock()
+
+    def _update_clock(self) -> None:
+        current_time = datetime.now(tz=UTC).astimezone()
+        clock = next(iter(self.query("#clock")), None)
+        if isinstance(clock, Static):
+            clock.update(current_time.strftime("%H:%M"))
+
     async def _request_approval(self, request: PermissionRequest) -> PermissionApproval:
         return await self.push_screen_wait(
             PermissionApprovalScreen(request, language=self._language)
@@ -2392,6 +2744,9 @@ class NeuroCodeApp(App[None]):
         self._assistant_parts.clear()
         self._reasoning_announced = False
         self._turn_completion = None
+        self._terminal_execution_status = None
+        self._terminal_execution_recoverable = False
+        self._finalizing = False
         self._turn_usage_reported = False
         self._begin_pending_assistant()
         self._turn_worker = self.run_worker(
@@ -2467,7 +2822,12 @@ class NeuroCodeApp(App[None]):
                 self._context_usage_estimated = True
                 self._refresh_runtime_bar()
             self._finish_pending_assistant(response)
-            if self._turn_completion is not None:
+            if self._terminal_execution_recoverable and self._terminal_execution_status is not None:
+                self._write_ui_entry(
+                    "recoverable",
+                    f"turn.{self._terminal_execution_status}_recoverable",
+                )
+            elif self._turn_completion is not None:
                 duration, steps = self._turn_completion
                 self._write_ui_entry(
                     "status",
@@ -2491,8 +2851,14 @@ class NeuroCodeApp(App[None]):
         if event.kind is AgentEventKind.TEXT_DELTA:
             text = data.get("text")
             if isinstance(text, str):
+                self._finalizing = False
                 self._assistant_parts.append(text)
                 self._update_pending_assistant("".join(self._assistant_parts))
+        elif event.kind is AgentEventKind.FINALIZING_STARTED:
+            self._finalizing = True
+            pending = self._pending_assistant
+            if pending is not None and not self._assistant_parts:
+                pending.update(self._render_model_loading())
         elif event.kind is AgentEventKind.REASONING_DELTA and not self._reasoning_announced:
             self._reasoning_announced = True
             self._write_ui_entry("status", "turn.reasoning")
@@ -2559,10 +2925,18 @@ class NeuroCodeApp(App[None]):
         elif event.kind is AgentEventKind.PLAN_EXECUTION_REQUESTED:
             self._write_ui_entry("status", "plan.execution_requested")
         elif event.kind is AgentEventKind.TURN_COMPLETED:
+            self._finalizing = False
             self._turn_completion = (
                 self._event_duration(data),
                 self._positive_int(data.get("step"), fallback=1),
             )
+            execution_status = data.get("execution_status")
+            if execution_status in {"stuck", "budget_limited"} and data.get("recoverable") is True:
+                self._terminal_execution_status = execution_status
+                self._terminal_execution_recoverable = True
+            else:
+                self._terminal_execution_status = None
+                self._terminal_execution_recoverable = False
 
     def _handle_tool_feedback_event(self, event: AgentEvent) -> None:
         hosted = event.kind in {
@@ -2760,23 +3134,28 @@ class NeuroCodeApp(App[None]):
         return f"{name}({', '.join(values)})" if values else name
 
     def _tool_feedback_body(self, state: ToolFeedbackState) -> Text:
+        if state.phase == "completed":
+            marker, marker_style = _SUCCESS_MARK, TOOL_COMPLETE_STYLE
+        elif state.phase in {"failed", "permission_denied", "approval_denied"}:
+            marker, marker_style = _ERROR_MARK, ERROR_TEXT_STYLE
+        else:
+            marker, marker_style = "…", TOOL_ACTIVE_STYLE
         compact_summary = self._compact_read_summary(state)
         if compact_summary is not None and not state.expanded:
             body = Text(overflow="fold")
-            marker_style = "bold #78c2a4" if state.phase == "completed" else "bold #8b9cff"
-            body.append("● ", style=marker_style)
-            body.append(compact_summary, style="#c5c9ce")
+            body.append(f"{marker} ", style=marker_style)
+            body.append(compact_summary, style=TOOL_DETAIL_STYLE)
             if state.phase == "completed" and state.duration is not None:
-                body.append(f" · {state.duration}", style="#7f8790")
+                body.append(f" · {state.duration}", style=TOOL_META_STYLE)
             return body
 
         body = Text(overflow="fold")
-        body.append("● ", style="bold #78c2a4")
+        body.append(f"{marker} ", style=marker_style)
         if state.hosted:
-            body.append(ui_text(self._language, "tool.card.hosted"), style="#9aa3b2")
+            body.append(ui_text(self._language, "tool.card.hosted"), style=TOOL_META_STYLE)
             body.append(" ")
         invocation = self._tool_invocation(state.name, state.arguments)
-        body.append(invocation, style="bold #8ed1e6")
+        body.append(invocation, style=TOOL_TITLE_STYLE)
 
         if state.permission_effect == "allow":
             self._append_tool_line(
@@ -2787,7 +3166,7 @@ class NeuroCodeApp(App[None]):
                     "tool.card.allowed",
                     reason=self._bounded_inline(state.permission_reason),
                 ),
-                style="#9fb8af",
+                style=TOOL_COMPLETE_STYLE,
             )
         elif state.permission_effect == "ask":
             if state.approval_outcome is not None:
@@ -2799,14 +3178,18 @@ class NeuroCodeApp(App[None]):
                     body,
                     "├",
                     ui_text(self._language, "tool.card.approval", outcome=outcome),
-                    style="#9fb8af" if state.approval_effect == "allow" else "#d58b8b",
+                    style=(
+                        TOOL_COMPLETE_STYLE
+                        if state.approval_effect == "allow"
+                        else ERROR_TEXT_STYLE
+                    ),
                 )
             elif state.phase == "awaiting_approval":
                 self._append_tool_line(
                     body,
                     "├",
                     ui_text(self._language, "tool.card.awaiting_approval"),
-                    style="#a9adb3",
+                    style=WAITING_STYLE,
                 )
             else:
                 self._append_tool_line(
@@ -2817,7 +3200,7 @@ class NeuroCodeApp(App[None]):
                         "tool.card.approval_required",
                         reason=self._bounded_inline(state.permission_reason),
                     ),
-                    style="#a9adb3",
+                    style=WAITING_STYLE,
                 )
 
         change_report = self._tool_change_report(state)
@@ -2838,7 +3221,7 @@ class NeuroCodeApp(App[None]):
                         else "tool.card.details_collapsed"
                     ),
                 ),
-                style="#8b9cff",
+                style=TOOL_ACTIVE_STYLE,
             )
 
         if state.phase == "running":
@@ -2846,30 +3229,34 @@ class NeuroCodeApp(App[None]):
                 body,
                 "├",
                 ui_text(self._language, "tool.card.running"),
-                style="#a9adb3",
+                style=WAITING_STYLE,
             )
         if state.phase == "completed":
+            duration = state.duration or "—"
             self._append_tool_line(
                 body,
                 "└",
                 ui_text(
                     self._language,
                     "tool.card.completed",
-                    duration=state.duration or "—",
+                    duration=duration,
                 ),
-                style="#78c2a4",
+                style=TOOL_COMPLETE_STYLE,
             )
+            body.stylize(TOOL_META_STYLE, len(body.plain) - len(duration), len(body.plain))
         elif state.phase == "failed":
+            duration = state.duration or "—"
             self._append_tool_line(
                 body,
                 "└",
                 ui_text(
                     self._language,
                     "tool.card.failed",
-                    duration=state.duration or "—",
+                    duration=duration,
                 ),
-                style="#d58b8b",
+                style=ERROR_TEXT_STYLE,
             )
+            body.stylize(TOOL_META_STYLE, len(body.plain) - len(duration), len(body.plain))
         elif state.phase in {"permission_denied", "approval_denied"}:
             reason = state.approval_reason or state.permission_reason
             self._append_tool_line(
@@ -2880,7 +3267,7 @@ class NeuroCodeApp(App[None]):
                     "tool.card.denied",
                     reason=self._bounded_inline(reason),
                 ),
-                style="#d58b8b",
+                style=ERROR_TEXT_STYLE,
             )
         return body
 
@@ -2914,7 +3301,7 @@ class NeuroCodeApp(App[None]):
     @staticmethod
     def _append_tool_line(body: Text, connector: str, content: str, *, style: str) -> None:
         body.append("\n")
-        body.append(f"{connector} ", style="#626a73")
+        body.append(f"{connector} ", style=TOOL_GUIDE_STYLE)
         body.append(content, style=style)
 
     @staticmethod
@@ -2983,24 +3370,24 @@ class NeuroCodeApp(App[None]):
             body,
             "├",
             heading,
-            style="#d58b8b" if state.is_error else "#9aa3b2",
+            style=ERROR_TEXT_STYLE if state.is_error else TOOL_META_STYLE,
         )
         if not expanded:
             return
         for line in lines:
-            body.append("\n│   ", style="#505860")
-            body.append(line, style="#c5c9ce")
+            body.append("\n│   ", style=TOOL_GUIDE_STYLE)
+            body.append(line, style=TOOL_DETAIL_STYLE)
         if omitted_lines:
-            body.append("\n│   ", style="#505860")
+            body.append("\n│   ", style=TOOL_GUIDE_STYLE)
             body.append(
                 ui_text(self._language, "tool.card.lines_omitted", count=omitted_lines),
-                style="italic #7f8790",
+                style=f"italic {TOOL_META_STYLE}",
             )
         if truncated:
-            body.append("\n│   ", style="#505860")
+            body.append("\n│   ", style=TOOL_GUIDE_STYLE)
             body.append(
                 ui_text(self._language, "tool.card.preview_truncated"),
-                style="italic #7f8790",
+                style=f"italic {TOOL_META_STYLE}",
             )
 
     @classmethod
@@ -3134,13 +3521,13 @@ class NeuroCodeApp(App[None]):
                 deletions=deletions,
             )
             content_start = len(body) + 3
-            self._append_tool_line(body, "├", summary, style="#8ed1e6")
-            body.highlight_words((path,), style="bold #8ed1e6", case_sensitive=True)
+            self._append_tool_line(body, "├", summary, style=TOOL_TITLE_STYLE)
+            body.highlight_words((path,), style=TOOL_TITLE_STYLE, case_sensitive=True)
             addition_text = f"+{additions}"
             addition_offset = summary.find(addition_text)
             if addition_offset >= 0:
                 body.stylize(
-                    "bold #9ce7b5 on #213a2b",
+                    DIFF_SUMMARY_ADDITION_STYLE,
                     content_start + addition_offset,
                     content_start + addition_offset + len(addition_text),
                 )
@@ -3148,7 +3535,7 @@ class NeuroCodeApp(App[None]):
             deletion_offset = summary.find(deletion_text)
             if deletion_offset >= 0:
                 body.stylize(
-                    "bold #ffb4ab on #4a221d",
+                    DIFF_SUMMARY_DELETION_STYLE,
                     content_start + deletion_offset,
                     content_start + deletion_offset + len(deletion_text),
                 )
@@ -3157,13 +3544,13 @@ class NeuroCodeApp(App[None]):
             if expanded and isinstance(raw_diff, str) and raw_diff:
                 diff_lines, _, omitted, truncated = self._bounded_tool_preview(raw_diff)
                 for line in diff_lines:
-                    body.append("\n│   ", style="#505860")
+                    body.append("\n│   ", style=TOOL_GUIDE_STYLE)
                     body.append(line, style=self._diff_line_style(line))
                 if omitted or truncated or change.get("diff_truncated") is True:
-                    body.append("\n│   ", style="#505860")
+                    body.append("\n│   ", style=TOOL_GUIDE_STYLE)
                     body.append(
                         ui_text(self._language, "tool.card.diff_truncated"),
-                        style="italic #7f8790",
+                        style=f"italic {TOOL_META_STYLE}",
                     )
             hidden_reason = change.get("hidden_reason")
             if isinstance(hidden_reason, str):
@@ -3172,10 +3559,10 @@ class NeuroCodeApp(App[None]):
                     if hidden_reason in {"sensitive", "large", "budget", "binary", "redacted"}
                     else "unavailable"
                 )
-                body.append("\n│   ", style="#505860")
+                body.append("\n│   ", style=TOOL_GUIDE_STYLE)
                 body.append(
                     ui_text(self._language, f"tool.card.hidden.{known_reason}"),
-                    style="italic #7f8790",
+                    style=f"italic {TOOL_META_STYLE}",
                 )
 
         omitted_files = self._non_negative_int(report.get("omitted_files")) + max(
@@ -3186,14 +3573,14 @@ class NeuroCodeApp(App[None]):
                 body,
                 "├",
                 ui_text(self._language, "tool.card.files_omitted", count=omitted_files),
-                style="italic #7f8790",
+                style=f"italic {TOOL_META_STYLE}",
             )
         if report.get("scan_limited") is True:
             self._append_tool_line(
                 body,
                 "├",
                 ui_text(self._language, "tool.card.scan_limited"),
-                style="italic #7f8790",
+                style=f"italic {TOOL_META_STYLE}",
             )
 
     @staticmethod
@@ -3203,14 +3590,14 @@ class NeuroCodeApp(App[None]):
     @staticmethod
     def _diff_line_style(line: str) -> str:
         if line.startswith("@@"):
-            return "bold #b6c2ff on #232637"
+            return DIFF_HUNK_STYLE
         if line.startswith(("+++", "---")):
-            return "bold #7da7d9"
+            return DIFF_FILE_STYLE
         if line.startswith("+"):
-            return "#b7f7ca on #213a2b"
+            return DIFF_ADDITION_STYLE
         if line.startswith("-"):
-            return "#ffb4ab on #4a221d"
-        return "#b8bcc2"
+            return DIFF_DELETION_STYLE
+        return DIFF_CONTEXT_STYLE
 
     async def _dispatch_slash_command(self, raw: str) -> None:
         command, _, arguments = raw[1:].partition(" ")
@@ -3364,7 +3751,12 @@ class NeuroCodeApp(App[None]):
             return
         if isinstance(
             self.screen,
-            (SettingsScreen, LanguageSettingsScreen, ProviderSettingsScreen),
+            (
+                SettingsScreen,
+                LanguageSettingsScreen,
+                NetworkProxySettingsScreen,
+                ProviderSettingsScreen,
+            ),
         ):
             self.screen.action_cancel()
             return
@@ -3426,12 +3818,33 @@ class NeuroCodeApp(App[None]):
                 ),
                 self._provider_settings_selected,
             )
+            return
+        if category == "network":
+            if self._managed_provider_settings is None or self._provider_settings_store is None:
+                return
+            self.push_screen(
+                NetworkProxySettingsScreen(
+                    language=self._language,
+                    provider_settings=self._managed_provider_settings,
+                    provider_settings_store=self._provider_settings_store,
+                ),
+                self._network_proxy_settings_selected,
+            )
 
     async def _provider_settings_selected(
         self,
         result: ProviderSettingsSubmission | None,
     ) -> None:
         if result is not None:
+            self.exit(return_code=TUI_RELOAD_PROVIDER_SETTINGS)
+            return
+        await self.action_open_settings()
+
+    async def _network_proxy_settings_selected(
+        self,
+        settings: ManagedProviderSettings | None,
+    ) -> None:
+        if settings is not None:
             self.exit(return_code=TUI_RELOAD_PROVIDER_SETTINGS)
             return
         await self.action_open_settings()
@@ -3568,6 +3981,9 @@ class NeuroCodeApp(App[None]):
         self._assistant_parts.clear()
         self._reasoning_announced = False
         self._turn_completion = None
+        self._terminal_execution_status = None
+        self._terminal_execution_recoverable = False
+        self._finalizing = False
         self._turn_usage_reported = False
         self._begin_pending_assistant()
         self._turn_worker = self.run_worker(
@@ -4110,33 +4526,35 @@ class NeuroCodeApp(App[None]):
     @staticmethod
     def _semantic_value_style(name: str, value: object) -> str | None:
         if name in {"provider", "model", "profile", "source"}:
-            return "bold #7da7d9"
+            return f"bold {ACCENT_CODE}"
         if name in {"name", "task_id", "session_id", "title"}:
-            return "bold #8ed1e6"
-        if name in {"cwd", "path"}:
-            return "#8ab3ad"
+            return f"bold {ACCENT_CODE}"
+        if name == "path":
+            return ACCENT_CODE
+        if name == "cwd":
+            return TEXT_SECONDARY
         if name in {"effect", "outcome", "status"}:
-            return "bold #78c2a4"
+            return f"bold {ACCENT_SUCCESS}"
         if name in {"duration", "steps", "step"}:
-            return "bold #78c2a4"
+            return f"bold {TEXT_SECONDARY}"
         if name == "context":
-            return "bold #8ab3ad"
+            return f"bold {TEXT_SECONDARY}"
         if name in {"effort", "requested", "effective"}:
             try:
                 effort = ReasoningEffort(str(value))
             except ValueError:
-                return "bold #a9a1e8"
-            return f"bold {_EFFORT_COLORS[effort]}"
+                return f"bold {TEXT_EMPHASIS}"
+            return f"bold {EFFORT_STYLES[effort.value]}"
         if name == "mode":
             try:
                 mode = InteractionMode(str(value))
             except ValueError:
-                return "bold #8b9cff"
-            return f"bold {_MODE_COLORS[mode]}"
+                return f"bold {TEXT_EMPHASIS}"
+            return f"bold {MODE_STYLES[mode.value]}"
         if name == "policy":
-            return "#9aa3b2"
+            return TEXT_SECONDARY
         if name in {"message", "reason", "error"}:
-            return "#d88a8a"
+            return ERROR_TEXT_STYLE
         return None
 
     def _render_entry(
@@ -4148,29 +4566,34 @@ class NeuroCodeApp(App[None]):
         ui_values: tuple[tuple[str, object], ...] = (),
     ) -> RenderableType:
         if category == "user":
-            return Text(content, style="#e3e5e8", overflow="fold")
+            return Text(content, style=USER_TEXT_STYLE, overflow="fold")
         if category == "assistant":
             return AssistantMarkdown(
                 content,
-                code_theme="github-dark",
-                style="#e1e3e6",
+                code_theme=_markdown_code_theme(),
+                style=ASSISTANT_TEXT_STYLE,
                 hyperlinks=False,
             )
 
         labels = {
-            "error": (ui_text(self._language, "label.error"), "bold #c76d6d"),
-            "status": (ui_text(self._language, "label.status"), "bold #8e939a"),
-            "system": ("Neuro Code", "bold #8b9cff"),
-            "tool": (ui_text(self._language, "label.tool"), "bold #78c2a4"),
+            "error": (f"{_ERROR_MARK} {ui_text(self._language, 'label.error')}", ERROR_LABEL_STYLE),
+            "recoverable": (
+                f"! {ui_text(self._language, 'label.status')}",
+                RECOVERABLE_LABEL_STYLE,
+            ),
+            "status": (f"… {ui_text(self._language, 'label.status')}", STATUS_LABEL_STYLE),
+            "system": ("NEURO", SYSTEM_LABEL_STYLE),
+            "tool": (f"• {ui_text(self._language, 'label.tool')}", TOOL_LABEL_STYLE),
         }
         body_styles = {
-            "error": "#d58b8b",
-            "status": "#a9adb3",
-            "system": "#c8cbd0",
-            "tool": "#b8c7c1",
+            "error": ERROR_DETAIL_STYLE,
+            "recoverable": RECOVERABLE_TEXT_STYLE,
+            "status": STATUS_TEXT_STYLE,
+            "system": SYSTEM_TEXT_STYLE,
+            "tool": TOOL_TEXT_STYLE,
         }
-        label, label_style = labels.get(category, (category.title(), "bold"))
-        body = Text(content, style=body_styles.get(category, "#d8dadd"), overflow="fold")
+        label, label_style = labels.get(category, (category.title(), f"bold {TEXT_PRIMARY}"))
+        body = Text(content, style=body_styles.get(category, TEXT_BODY), overflow="fold")
         for name, value in ui_values:
             style = self._semantic_value_style(name, value)
             rendered_value = str(value)
@@ -4192,7 +4615,7 @@ class NeuroCodeApp(App[None]):
         table = Table.grid(expand=True, padding=(0, 1))
         table.add_column(width=10, justify="right", no_wrap=True)
         table.add_column(ratio=1, overflow="fold")
-        label_style = "bold #d07878" if state.is_error else "bold #78c2a4"
+        label_style = ERROR_LABEL_STYLE if state.is_error else TOOL_LABEL_STYLE
         table.add_row(
             Text(ui_text(self._language, "label.tool"), style=label_style),
             body if body is not None else self._tool_feedback_body(state),
@@ -4325,8 +4748,8 @@ class NeuroCodeApp(App[None]):
             self._language,
             "prompt.placeholder",
         )
-        shortcuts = Text(ui_text(self._language, "shortcuts"), style="#a9adb3")
-        shortcuts.highlight_regex(r"\^(?:[A-Z]|,)|Shift\+Tab", style="bold #8b9cff")
+        shortcuts = Text(ui_text(self._language, "shortcuts"), style=TEXT_MUTED)
+        shortcuts.highlight_regex(r"\^(?:[A-Z]|,)|Shift\+Tab", style=f"bold {TEXT_EMPHASIS}")
         self.query_one("#shortcut-bar", Static).update(shortcuts)
         prompt = self.query_one("#prompt", Input)
         self._refresh_command_hints(prompt.value)
@@ -4349,21 +4772,21 @@ class NeuroCodeApp(App[None]):
             return
 
         hints = Text()
-        hints.append(ui_text(self._language, "command_hint.tab"), style="bold #8b9cff")
-        hints.append("  ", style="#555b62")
+        hints.append(ui_text(self._language, "command_hint.tab"), style=f"bold {TEXT_EMPHASIS}")
+        hints.append("  ", style=TEXT_DISABLED)
         for index, completion in enumerate(completions[:_COMMAND_HINT_LIMIT]):
             if index:
-                hints.append("  ·  ", style="#555b62")
-            hints.append(completion.display, style="#7da7d9")
+                hints.append("  ·  ", style=TEXT_DISABLED)
+            hints.append(completion.display, style=TEXT_SECONDARY)
         if len(completions) > _COMMAND_HINT_LIMIT:
-            hints.append("  ·  …", style="#777c83")
+            hints.append("  ·  …", style=TEXT_MUTED)
         widget.update(hints)
         widget.display = True
 
     def _context_percentage(self) -> str:
         window = self._context_window_tokens
         if window is None:
-            return ui_text(self._language, "runtime.context_unknown")
+            return self._context_token_usage()
         percentage = self._context_used_tokens / window * 100
         rendered = "<0.1%" if 0 < percentage < 0.1 else f"{percentage:.1f}%"
         return f"~{rendered}" if self._context_usage_estimated else rendered
@@ -4371,76 +4794,68 @@ class NeuroCodeApp(App[None]):
     def _context_color(self) -> str:
         window = self._context_window_tokens
         if window is None:
-            return "#8e939a"
+            return TEXT_SECONDARY
         ratio = self._context_used_tokens / window
         if ratio >= 0.8:
-            return "#c76d6d"
-        if ratio >= 0.5:
-            return "#e59c74"
-        return "#78c2a4"
+            return ACCENT_WARNING
+        return TEXT_SECONDARY
+
+    def _context_token_usage(self) -> str:
+        tokens = self._context_used_tokens
+        if tokens >= 1_000_000:
+            rendered = f"{tokens / 1_000_000:.1f}M"
+        elif tokens >= 1_000:
+            rendered = f"{tokens / 1_000:.1f}k"
+        else:
+            rendered = f"{tokens:,}"
+        approximation = "≈" if self._context_usage_estimated else ""
+        return f"{approximation}{rendered} tok"
 
     def _context_usage_summary(self) -> str:
         window = self._context_window_tokens
         if window is None:
-            return ui_text(self._language, "runtime.context_unknown")
+            return self._context_token_usage()
         approximation = "≈" if self._context_usage_estimated else ""
         return (
             f"{self._context_percentage()} "
             f"({approximation}{self._context_used_tokens:,}/{window:,})"
         )
 
-    @staticmethod
-    def _loading_color(level: int) -> str:
-        inactive = (72, 72, 72)
-        active = (230, 230, 230)
-        peak = (255, 255, 255)
-        intensity = max(0.0, min(1.0, level / 7))
-        color = tuple(
-            round(background + (foreground - background) * intensity)
-            for foreground, background in zip(active, inactive, strict=True)
-        )
-        if level >= 6:
-            peak_amount = min(1.0, (level - 5) / 2)
-            color = tuple(
-                round(background + (foreground - background) * peak_amount)
-                for foreground, background in zip(peak, color, strict=True)
-            )
-        return f"#{color[0]:02x}{color[1]:02x}{color[2]:02x}"
-
     def _loading_wave(self) -> Text:
         symbols = ("▁", "▂", "▃", "▄", "▅", "▆", "▇", "█")
         wave = Text()
         for level in self._loading_animation.levels():
             safe_level = max(0, min(7, level))
-            style = self._loading_color(safe_level)
-            if safe_level == 7:
-                style = f"bold {style}"
-            wave.append(symbols[safe_level], style=style)
+            wave.append(symbols[safe_level], style=loading_style(safe_level))
         return wave
 
     def _render_model_loading(self) -> Text:
         loading = self._loading_wave()
         loading.append("  ")
-        loading.append(ui_text(self._language, "turn.waiting"), style="#a9adb3")
+        key = "turn.finalizing" if self._finalizing else "turn.waiting"
+        loading.append(ui_text(self._language, key), style=WAITING_STYLE)
+        loading.append("  ·  ↓", style=TEXT_DIM)
+        loading.append(self._context_token_usage(), style=self._context_color())
         return loading
 
     def _refresh_runtime_bar(self) -> None:
         model = Text()
         model.append(
             f"{ui_text(self._language, 'runtime.model')}  ",
-            style="bold #777c83",
+            style=f"bold {TEXT_DIM}",
         )
-        model.append(self._provider_name, style="bold #8ab3ad")
-        model.append(" / ", style="#555b62")
-        model.append(self._model_name, style="bold #7da7d9")
+        model.append(self._provider_name, style=f"bold {ACCENT_CODE}")
+        if self._model_name != self._provider_name:
+            model.append(" · ", style=TEXT_DIM)
+            model.append(self._model_name, style=f"bold {ACCENT_CODE}")
         self.query_one("#runtime-model", Static).update(model)
 
         workspace = Text(justify="right", overflow="ellipsis", no_wrap=True)
         workspace.append(
             f"{ui_text(self._language, 'runtime.workspace')}  ",
-            style="bold #777c83",
+            style=f"bold {TEXT_DIM}",
         )
-        workspace.append(self._display_cwd(), style="#6fb7d6")
+        workspace.append(self._display_cwd(), style=TEXT_DIM)
         workspace_widget = self.query_one("#runtime-workspace", Static)
         workspace_widget.update(workspace)
         workspace_widget.tooltip = str(self._cwd)
@@ -4448,7 +4863,7 @@ class NeuroCodeApp(App[None]):
         context = Text()
         context.append(
             f"{ui_text(self._language, 'runtime.context')}  ",
-            style="bold #777c83",
+            style=f"bold {TEXT_DIM}",
         )
         context.append(
             self._context_percentage(),
@@ -4457,10 +4872,7 @@ class NeuroCodeApp(App[None]):
         context_widget = self.query_one("#runtime-context", Static)
         context_widget.update(context)
         if self._context_window_tokens is None:
-            context_widget.tooltip = ui_text(
-                self._language,
-                "runtime.context_help_unknown",
-            )
+            context_widget.tooltip = self._context_token_usage()
         else:
             context_widget.tooltip = ui_text(
                 self._language,
@@ -4478,17 +4890,17 @@ class NeuroCodeApp(App[None]):
         effort = Text()
         effort.append(
             f"{ui_text(self._language, 'runtime.effort')}  ",
-            style="bold #777c83",
+            style=f"bold {TEXT_DIM}",
         )
         effort.append(
             f"{requested.glyph} {requested.value}",
-            style=f"bold {_EFFORT_COLORS[requested]}",
+            style=f"bold {EFFORT_STYLES[requested.value]}",
         )
         if effective is not requested:
-            effort.append(" → ", style="#777c83")
+            effort.append(" → ", style=TEXT_DIM)
             effort.append(
                 f"{effective.glyph} {effective.value}",
-                style=f"bold {_EFFORT_COLORS[effective]}",
+                style=f"bold {EFFORT_STYLES[effective.value]}",
             )
         effort_widget = self.query_one("#runtime-effort", Static)
         effort_widget.update(effort)
@@ -4497,11 +4909,11 @@ class NeuroCodeApp(App[None]):
         mode = Text()
         mode.append(
             f"{ui_text(self._language, 'runtime.mode')}  ",
-            style="bold #777c83",
+            style=f"bold {TEXT_DIM}",
         )
         mode.append(
             f"{self._interaction_mode.glyph} {self._interaction_mode.value}",
-            style=f"bold {_MODE_COLORS[self._interaction_mode]}",
+            style=f"bold {MODE_STYLES[self._interaction_mode.value]}",
         )
         mode_widget = self.query_one("#runtime-mode", Static)
         mode_widget.update(mode)
@@ -4580,6 +4992,7 @@ __all__ = [
     "ConversationMessage",
     "ConversationRunner",
     "LanguageSettingsScreen",
+    "NetworkProxySettingsScreen",
     "NeuroCodeApp",
     "PermissionApprovalScreen",
     "ProviderController",

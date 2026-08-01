@@ -5,7 +5,7 @@ import os
 import sys
 import tempfile
 import unittest
-from collections.abc import AsyncIterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
@@ -14,6 +14,7 @@ from neuro_code.adapters.background_tasks import LocalBackgroundTaskManager
 from neuro_code.adapters.sqlite_session import SqliteSessionStore
 from neuro_code.application.permissions.contracts import PermissionApproval, PermissionRequest
 from neuro_code.application.ports.background_tasks import BackgroundTaskManager
+from neuro_code.application.ports.model import ModelProvider, ModelToolPolicy
 from neuro_code.application.ports.tools import Tool, ToolContext
 from neuro_code.application.ports.workspace_changes import (
     WorkspaceChangeCheckpoint,
@@ -21,8 +22,24 @@ from neuro_code.application.ports.workspace_changes import (
     WorkspaceFileChange,
 )
 from neuro_code.application.runtime.agent import AgentRuntime
+from neuro_code.application.runtime.finalization import AgentFinalizer
+from neuro_code.application.runtime.supervision import (
+    AgentExecutionSupervisor,
+    ExecutionControlMode,
+    SupervisionCheckpoint,
+    SupervisionMode,
+    SupervisionTraceRecord,
+)
 from neuro_code.domain.background_tasks import BackgroundTaskSnapshot, BackgroundTaskStatus
-from neuro_code.domain.events import AgentEventKind
+from neuro_code.domain.events import AgentEvent, AgentEventKind
+from neuro_code.domain.execution import (
+    AgentExecutionStatus,
+    ExecutionBudget,
+    ProgressKind,
+    SupervisorDecision,
+    SupervisorDecisionKind,
+    SupervisorReasonCode,
+)
 from neuro_code.domain.interaction_mode import InteractionMode
 from neuro_code.domain.messages import (
     ContentPart,
@@ -65,20 +82,26 @@ class ScriptedProvider:
     model_name = "fixture-model"
     context_affinity = "profile-v1:scripted"
 
-    def __init__(self, scripts: Sequence[Sequence[ModelEvent]]) -> None:
+    def __init__(self, scripts: Sequence[Sequence[ModelEvent | BaseException]]) -> None:
         self._scripts = list(scripts)
         self.calls: list[ModelContext] = []
         self.tool_definitions: list[tuple[ToolDefinition, ...]] = []
+        self.tool_policies: list[ModelToolPolicy] = []
 
     async def stream(
         self,
         context: ModelContext,
         tools: Sequence[ToolDefinition],
+        *,
+        tool_policy: ModelToolPolicy = ModelToolPolicy.ALLOWED,
     ) -> AsyncIterator[ModelEvent]:
         self.calls.append(context)
         self.tool_definitions.append(tuple(tools))
+        self.tool_policies.append(tool_policy)
         script = self._scripts.pop(0)
         for event in script:
+            if isinstance(event, BaseException):
+                raise event
             yield event
 
 
@@ -87,13 +110,17 @@ class FailingProvider:
         self.provider_name = name
         self.model_name = f"{name}-model"
         self.context_affinity = f"profile-v1:{name}"
+        self.tool_policies: list[ModelToolPolicy] = []
 
     async def stream(
         self,
         context: ModelContext,
         tools: Sequence[ToolDefinition],
+        *,
+        tool_policy: ModelToolPolicy = ModelToolPolicy.ALLOWED,
     ) -> AsyncIterator[ModelEvent]:
         del context, tools
+        self.tool_policies.append(tool_policy)
         raise ProviderError(f"{self.provider_name} unavailable")
         if False:
             yield ModelCompleted("stop")
@@ -106,13 +133,17 @@ class BlockingProvider:
 
     def __init__(self) -> None:
         self.started = asyncio.Event()
+        self.tool_policies: list[ModelToolPolicy] = []
 
     async def stream(
         self,
         context: ModelContext,
         tools: Sequence[ToolDefinition],
+        *,
+        tool_policy: ModelToolPolicy = ModelToolPolicy.ALLOWED,
     ) -> AsyncIterator[ModelEvent]:
         del context, tools
+        self.tool_policies.append(tool_policy)
         self.started.set()
         await asyncio.Event().wait()
         if False:
@@ -231,6 +262,27 @@ class CollectionFixtureTool:
         del context
         self.calls.append(dict(arguments))
         return ToolResult(self._content)
+
+
+class MetadataFixtureTool:
+    def __init__(self, name: str, result: ToolResult, *, side_effecting: bool = False) -> None:
+        self.definition = ToolDefinition(
+            name=name,
+            description=f"Return fixture metadata for {name}.",
+            input_schema={"type": "object", "additionalProperties": False},
+        )
+        self.side_effecting = side_effecting
+        self.calls: list[dict[str, object]] = []
+        self._result = result
+
+    async def execute(
+        self,
+        arguments: Mapping[str, object],
+        context: ToolContext,
+    ) -> ToolResult:
+        del context
+        self.calls.append(dict(arguments))
+        return self._result
 
 
 class MinimalToolCollection:
@@ -394,6 +446,47 @@ def completion_snapshot(task_id: str) -> BackgroundTaskSnapshot:
         started_at=timestamp,
         finished_at=timestamp,
     )
+
+
+def observation_budget(**overrides: object) -> ExecutionBudget:
+    values: dict[str, object] = {
+        "max_model_calls": 24,
+        "max_tool_rounds": 24,
+        "max_tool_calls": 96,
+        "max_calls_per_tool": 24,
+        "max_wall_seconds": None,
+        "max_input_tokens": None,
+        "max_output_tokens": None,
+        "max_total_tokens": None,
+        "finalizer_model_calls": 2,
+    }
+    values.update(overrides)
+    return ExecutionBudget(**values)  # type: ignore[arg-type]
+
+
+def observing_supervisor_factory(
+    budget: ExecutionBudget,
+    created: list[AgentExecutionSupervisor] | None = None,
+) -> Callable[[], AgentExecutionSupervisor]:
+    def factory() -> AgentExecutionSupervisor:
+        supervisor = AgentExecutionSupervisor(budget, mode=SupervisionMode.OBSERVE)
+        if created is not None:
+            created.append(supervisor)
+        return supervisor
+
+    return factory
+
+
+class DecisionInjectingSupervisor(AgentExecutionSupervisor):
+    """Return one explicit decision while preserving normal observation counters."""
+
+    def __init__(self, budget: ExecutionBudget, decision: SupervisorDecision) -> None:
+        super().__init__(budget, mode=SupervisionMode.OBSERVE)
+        self._decision = decision
+
+    def authorize_model_request(self) -> SupervisorDecision:
+        super().authorize_model_request()
+        return self._decision
 
 
 class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
@@ -1920,6 +2013,961 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
                     for event in result.events
                 )
             )
+
+    async def test_supervision_observes_a_no_tool_turn_without_changing_events(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            traces: list[SupervisionTraceRecord] = []
+            provider = ScriptedProvider(((ModelTextDelta("done"), ModelCompleted("stop", 3, 2)),))
+            runtime = AgentRuntime(
+                provider=provider,
+                tools=default_tool_registry(),
+                workspace_change_observer=EmptyWorkspaceChangeObserver(),
+                permissions=PermissionManager(),
+                tool_context=ToolContext(Path(directory)),
+                supervision_observer=traces.append,
+            )
+
+            result = await runtime.run("answer")
+
+            self.assertEqual(result.response, "done")
+            self.assertEqual(
+                [record.checkpoint for record in traces],
+                [SupervisionCheckpoint.BEFORE_MODEL, SupervisionCheckpoint.AFTER_MODEL],
+            )
+            self.assertEqual(traces[-1].snapshot.counters.model_requests, 1)
+            self.assertEqual(traces[-1].snapshot.counters.model_completions, 1)
+            self.assertEqual(traces[-1].snapshot.counters.tool_rounds, 0)
+            self.assertNotIn("supervision", " ".join(event.kind.value for event in result.events))
+
+    async def test_supervision_observes_one_tool_and_preserves_event_order(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            traces: list[SupervisionTraceRecord] = []
+            tool = CollectionFixtureTool("inspect", "evidence")
+            provider = ScriptedProvider(
+                (
+                    (
+                        ModelToolCall(ToolCall("inspect-1", "inspect", {"path": "note.txt"})),
+                        ModelCompleted("tool_calls"),
+                    ),
+                    (ModelTextDelta("finished"), ModelCompleted("stop")),
+                )
+            )
+            runtime = AgentRuntime(
+                provider=provider,
+                tools=MinimalToolCollection((tool,)),
+                workspace_change_observer=EmptyWorkspaceChangeObserver(),
+                permissions=PermissionManager(),
+                tool_context=ToolContext(Path(directory)),
+                supervision_observer=traces.append,
+            )
+
+            result = await runtime.run("inspect")
+
+            self.assertEqual(tool.calls, [{"path": "note.txt"}])
+            self.assertEqual(
+                [record.checkpoint for record in traces],
+                [
+                    SupervisionCheckpoint.BEFORE_MODEL,
+                    SupervisionCheckpoint.AFTER_MODEL,
+                    SupervisionCheckpoint.AFTER_TOOL_BATCH,
+                    SupervisionCheckpoint.AFTER_TOOL,
+                    SupervisionCheckpoint.BEFORE_MODEL,
+                    SupervisionCheckpoint.AFTER_MODEL,
+                ],
+            )
+            after_tool = next(
+                record for record in traces if record.checkpoint is SupervisionCheckpoint.AFTER_TOOL
+            )
+            self.assertEqual(after_tool.snapshot.counters.tool_calls_executed, 1)
+            kinds = [event.kind for event in result.events]
+            self.assertLess(
+                kinds.index(AgentEventKind.MODEL_STEP_STARTED),
+                kinds.index(AgentEventKind.TOOL_REQUESTED),
+            )
+            self.assertLess(
+                kinds.index(AgentEventKind.TOOL_REQUESTED),
+                kinds.index(AgentEventKind.TOOL_COMPLETED),
+            )
+            second_step = [
+                index
+                for index, kind in enumerate(kinds)
+                if kind is AgentEventKind.MODEL_STEP_STARTED
+            ][1]
+            self.assertLess(kinds.index(AgentEventKind.TOOL_COMPLETED), second_step)
+            self.assertLess(second_step, kinds.index(AgentEventKind.TURN_COMPLETED))
+
+    async def test_supervision_counts_one_round_for_multiple_tool_calls(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            traces: list[SupervisionTraceRecord] = []
+            first = CollectionFixtureTool("first", "one")
+            second = CollectionFixtureTool("second", "two")
+            provider = ScriptedProvider(
+                (
+                    (
+                        ModelToolCall(ToolCall("first-1", "first", {})),
+                        ModelToolCall(ToolCall("second-1", "second", {})),
+                        ModelCompleted("tool_calls"),
+                    ),
+                    (ModelTextDelta("finished"), ModelCompleted("stop")),
+                )
+            )
+            runtime = AgentRuntime(
+                provider=provider,
+                tools=MinimalToolCollection((first, second)),
+                workspace_change_observer=EmptyWorkspaceChangeObserver(),
+                permissions=PermissionManager(),
+                tool_context=ToolContext(Path(directory)),
+                supervision_observer=traces.append,
+            )
+
+            await runtime.run("run both")
+
+            batch = next(
+                record
+                for record in traces
+                if record.checkpoint is SupervisionCheckpoint.AFTER_TOOL_BATCH
+            )
+            after_tools = [
+                record for record in traces if record.checkpoint is SupervisionCheckpoint.AFTER_TOOL
+            ]
+            self.assertEqual(batch.snapshot.counters.tool_rounds, 1)
+            self.assertEqual(batch.snapshot.counters.tool_calls_requested, 2)
+            self.assertEqual([record.tool_name for record in after_tools], ["first", "second"])
+            self.assertEqual([first.calls, second.calls], [[{}], [{}]])
+
+    async def test_supervision_loop_decision_does_not_stop_the_existing_runtime(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            traces: list[SupervisionTraceRecord] = []
+            tool = CollectionFixtureTool("repeat", "same result")
+            scripts = tuple(
+                (
+                    ModelToolCall(ToolCall(f"repeat-{index}", "repeat", {})),
+                    ModelCompleted("tool_calls"),
+                )
+                for index in range(4)
+            )
+            provider = ScriptedProvider(scripts)
+            runtime = AgentRuntime(
+                provider=provider,
+                tools=MinimalToolCollection((tool,)),
+                workspace_change_observer=EmptyWorkspaceChangeObserver(),
+                permissions=PermissionManager(),
+                tool_context=ToolContext(Path(directory)),
+                max_steps=4,
+                supervision_observer=traces.append,
+            )
+
+            with self.assertRaisesRegex(
+                ProviderError, "agent exceeded the maximum of 4 model steps"
+            ):
+                await runtime.run("repeat")
+
+            self.assertEqual(len(tool.calls), 4)
+            self.assertIn(
+                SupervisorDecisionKind.MARK_STUCK,
+                [record.decision.kind for record in traces],
+            )
+            self.assertNotIn(
+                SupervisionCheckpoint.AFTER_MODEL,
+                [record.checkpoint for record in traces if record.model_step == 5],
+            )
+
+    async def test_supervision_budget_decision_does_not_prevent_the_next_model_request(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            traces: list[SupervisionTraceRecord] = []
+            tool = CollectionFixtureTool("inspect", "evidence")
+            provider = ScriptedProvider(
+                (
+                    (
+                        ModelToolCall(ToolCall("inspect-1", "inspect", {})),
+                        ModelCompleted("tool_calls"),
+                    ),
+                    (ModelTextDelta("finished"), ModelCompleted("stop")),
+                )
+            )
+            runtime = AgentRuntime(
+                provider=provider,
+                tools=MinimalToolCollection((tool,)),
+                workspace_change_observer=EmptyWorkspaceChangeObserver(),
+                permissions=PermissionManager(),
+                tool_context=ToolContext(Path(directory)),
+                supervisor_factory=observing_supervisor_factory(
+                    observation_budget(max_model_calls=2, finalizer_model_calls=1)
+                ),
+                supervision_observer=traces.append,
+            )
+
+            result = await runtime.run("inspect")
+
+            self.assertEqual(result.response, "finished")
+            self.assertEqual(len(provider.calls), 2)
+            self.assertIn(
+                SupervisorDecisionKind.FINALIZE, [record.decision.kind for record in traces]
+            )
+            self.assertEqual(provider.tool_definitions[0], provider.tool_definitions[1])
+
+    async def test_supervision_observes_tool_error_unknown_tool_and_permission_denial(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            traces: list[SupervisionTraceRecord] = []
+            failed_tool = OSErrorSideEffectTool([], ToolResult("unused"))
+            denied_tool = NeverStartedTool()
+            provider = ScriptedProvider(
+                (
+                    (
+                        ModelToolCall(ToolCall("error", failed_tool.definition.name, {})),
+                        ModelCompleted("tool_calls"),
+                    ),
+                    (
+                        ModelToolCall(ToolCall("missing", "missing", {})),
+                        ModelCompleted("tool_calls"),
+                    ),
+                    (
+                        ModelToolCall(ToolCall("denied", denied_tool.definition.name, {})),
+                        ModelCompleted("tool_calls"),
+                    ),
+                    (ModelTextDelta("recovered"), ModelCompleted("stop")),
+                )
+            )
+            runtime = AgentRuntime(
+                provider=provider,
+                tools=MinimalToolCollection((failed_tool, denied_tool)),
+                workspace_change_observer=EmptyWorkspaceChangeObserver(),
+                permissions=PermissionManager(
+                    mode=PermissionMode.BYPASS,
+                    rules=(PermissionRule(PermissionEffect.DENY, denied_tool.definition.name),),
+                ),
+                tool_context=ToolContext(root),
+                supervision_observer=traces.append,
+            )
+
+            result = await runtime.run("recover")
+
+            tool_records = [
+                record for record in traces if record.checkpoint is SupervisionCheckpoint.AFTER_TOOL
+            ]
+            self.assertEqual(len(tool_records), 3)
+            self.assertTrue(
+                all(record.snapshot.recent_interactions[-1].is_error for record in tool_records)
+            )
+            self.assertEqual(result.response, "recovered")
+            self.assertEqual(
+                [event.kind for event in result.events].count(AgentEventKind.TOOL_FAILED),
+                3,
+            )
+            self.assertFalse(denied_tool.executed)
+
+    async def test_supervision_failures_do_not_change_provider_errors_or_cancellation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+
+            def failing_factory() -> AgentExecutionSupervisor:
+                raise RuntimeError("supervision setup failed")
+
+            failing_runtime = AgentRuntime(
+                provider=FailingProvider("failing"),
+                tools=default_tool_registry(),
+                workspace_change_observer=EmptyWorkspaceChangeObserver(),
+                permissions=PermissionManager(),
+                tool_context=ToolContext(root),
+                supervisor_factory=failing_factory,
+            )
+            with self.assertRaisesRegex(ProviderError, "failing unavailable"):
+                await failing_runtime.run("fail")
+
+            completed_with_failed_supervisor = AgentRuntime(
+                provider=ScriptedProvider(((ModelTextDelta("done"), ModelCompleted("stop")),)),
+                tools=default_tool_registry(),
+                workspace_change_observer=EmptyWorkspaceChangeObserver(),
+                permissions=PermissionManager(),
+                tool_context=ToolContext(root),
+                supervisor_factory=failing_factory,
+            )
+
+            completed = await completed_with_failed_supervisor.run("complete")
+
+            self.assertEqual(completed.response, "done")
+            self.assertEqual(
+                [event.kind for event in completed.events],
+                [
+                    AgentEventKind.SESSION_STARTED,
+                    AgentEventKind.USER_MESSAGE,
+                    AgentEventKind.MODEL_STEP_STARTED,
+                    AgentEventKind.MODEL_THINKING_COMPLETED,
+                    AgentEventKind.TEXT_DELTA,
+                    AgentEventKind.TURN_COMPLETED,
+                ],
+            )
+
+            provider = BlockingProvider()
+            cancellation_runtime = AgentRuntime(
+                provider=provider,
+                tools=default_tool_registry(),
+                workspace_change_observer=EmptyWorkspaceChangeObserver(),
+                permissions=PermissionManager(),
+                tool_context=ToolContext(root),
+                supervision_observer=lambda record: (_ for _ in ()).throw(
+                    RuntimeError("observer failed")
+                ),
+            )
+            turn = asyncio.create_task(cancellation_runtime.run("cancel"))
+            await asyncio.wait_for(provider.started.wait(), timeout=1)
+            turn.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await turn
+
+    async def test_supervision_isolated_for_each_runtime_turn(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            created: list[AgentExecutionSupervisor] = []
+            provider = ScriptedProvider(
+                (
+                    (ModelTextDelta("first"), ModelCompleted("stop")),
+                    (ModelTextDelta("second"), ModelCompleted("stop")),
+                )
+            )
+            runtime = AgentRuntime(
+                provider=provider,
+                tools=default_tool_registry(),
+                workspace_change_observer=EmptyWorkspaceChangeObserver(),
+                permissions=PermissionManager(),
+                tool_context=ToolContext(Path(directory)),
+                supervisor_factory=observing_supervisor_factory(observation_budget(), created),
+            )
+
+            first = await runtime.run("first")
+            second = await runtime.run("second")
+
+            self.assertEqual((first.response, second.response), ("first", "second"))
+            self.assertEqual(len(created), 2)
+            self.assertIsNot(created[0], created[1])
+            self.assertEqual(
+                [supervisor.snapshot.counters.model_requests for supervisor in created], [1, 1]
+            )
+
+    async def test_default_execution_control_remains_observe_only(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            emitted: list[AgentEvent] = []
+            tool = CollectionFixtureTool("repeat", "same")
+            provider = ScriptedProvider(
+                ((ModelToolCall(ToolCall("repeat-1", "repeat", {})), ModelCompleted("tool_calls")),)
+            )
+            runtime = AgentRuntime(
+                provider=provider,
+                tools=MinimalToolCollection((tool,)),
+                workspace_change_observer=EmptyWorkspaceChangeObserver(),
+                permissions=PermissionManager(),
+                tool_context=ToolContext(Path(directory)),
+                max_steps=1,
+            )
+
+            with self.assertRaisesRegex(
+                ProviderError, "agent exceeded the maximum of 1 model steps"
+            ):
+                await runtime.run("repeat", sink=emitted.append)
+
+            self.assertEqual(tool.calls, [{}])
+            self.assertEqual(provider.tool_policies, [ModelToolPolicy.ALLOWED])
+            self.assertNotIn(
+                AgentEventKind.FINALIZING_STARTED,
+                [event.kind for event in emitted],
+            )
+
+    async def test_controlled_mode_finalizes_after_budget_limited_tool_batch(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            tool = CollectionFixtureTool("inspect", "evidence")
+            provider = ScriptedProvider(
+                (
+                    (
+                        ModelToolCall(ToolCall("inspect-1", "inspect", {})),
+                        ModelCompleted("tool_calls"),
+                    ),
+                    (ModelTextDelta("bounded final response"), ModelCompleted("stop")),
+                )
+            )
+            runtime = AgentRuntime(
+                provider=provider,
+                tools=MinimalToolCollection((tool,)),
+                workspace_change_observer=EmptyWorkspaceChangeObserver(),
+                permissions=PermissionManager(),
+                tool_context=ToolContext(Path(directory)),
+                supervisor_factory=observing_supervisor_factory(
+                    observation_budget(max_model_calls=2, finalizer_model_calls=1)
+                ),
+                execution_control_mode=ExecutionControlMode.FINALIZE_TERMINAL,
+            )
+
+            result = await runtime.run("inspect")
+
+            assert result.outcome is not None
+            self.assertEqual(result.response, "bounded final response")
+            self.assertIs(result.outcome.status, AgentExecutionStatus.BUDGET_LIMITED)
+            self.assertTrue(result.outcome.finalized)
+            self.assertTrue(result.outcome.recoverable)
+            self.assertEqual(result.steps, 1)
+            self.assertEqual(
+                provider.tool_policies, [ModelToolPolicy.ALLOWED, ModelToolPolicy.DISABLED]
+            )
+            completed = result.events[-1]
+            self.assertIs(completed.kind, AgentEventKind.TURN_COMPLETED)
+            self.assertEqual(completed.data["execution_status"], "budget_limited")
+            self.assertEqual(completed.data["finalization_attempts"], 1)
+            finalizing = [
+                event for event in result.events if event.kind is AgentEventKind.FINALIZING_STARTED
+            ]
+            self.assertEqual(len(finalizing), 1)
+            self.assertEqual(
+                finalizing[0].data,
+                {
+                    "execution_status": "budget_limited",
+                    "execution_reason": "model_call_reserve",
+                    "recoverable": True,
+                },
+            )
+            kinds = [event.kind for event in result.events]
+            self.assertLess(
+                kinds.index(AgentEventKind.TOOL_COMPLETED),
+                kinds.index(AgentEventKind.FINALIZING_STARTED),
+            )
+            self.assertLess(
+                kinds.index(AgentEventKind.FINALIZING_STARTED),
+                kinds.index(AgentEventKind.TEXT_DELTA),
+            )
+            self.assertLess(
+                kinds.index(AgentEventKind.TEXT_DELTA),
+                kinds.index(AgentEventKind.TURN_COMPLETED),
+            )
+
+    async def test_controlled_mode_finalizes_at_hard_max_steps(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            tool = CollectionFixtureTool("inspect", "evidence")
+            provider = ScriptedProvider(
+                (
+                    (
+                        ModelToolCall(ToolCall("inspect-1", "inspect", {})),
+                        ModelCompleted("tool_calls"),
+                    ),
+                    (ModelTextDelta("hard limit summary"), ModelCompleted("stop")),
+                )
+            )
+            runtime = AgentRuntime(
+                provider=provider,
+                tools=MinimalToolCollection((tool,)),
+                workspace_change_observer=EmptyWorkspaceChangeObserver(),
+                permissions=PermissionManager(),
+                tool_context=ToolContext(Path(directory)),
+                max_steps=1,
+                execution_control_mode=ExecutionControlMode.FINALIZE_TERMINAL,
+            )
+
+            result = await runtime.run("inspect")
+
+            assert result.outcome is not None
+            self.assertEqual(result.response, "hard limit summary")
+            self.assertIs(result.outcome.status, AgentExecutionStatus.BUDGET_LIMITED)
+            self.assertIs(result.outcome.reason_code, SupervisorReasonCode.MODEL_STEP_LIMIT)
+            self.assertEqual(result.steps, 1)
+            self.assertEqual(
+                provider.tool_policies, [ModelToolPolicy.ALLOWED, ModelToolPolicy.DISABLED]
+            )
+
+    async def test_controlled_mode_finalizes_after_stuck_batch_without_stopping_mid_batch(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            tool = CollectionFixtureTool("repeat", "same result")
+            scripts = [
+                (
+                    ModelToolCall(ToolCall(f"repeat-{index}", "repeat", {})),
+                    ModelCompleted("tool_calls"),
+                )
+                for index in range(1, 5)
+            ]
+            provider = ScriptedProvider(
+                (*scripts, (ModelTextDelta("stuck summary"), ModelCompleted("stop")))
+            )
+            runtime = AgentRuntime(
+                provider=provider,
+                tools=MinimalToolCollection((tool,)),
+                workspace_change_observer=EmptyWorkspaceChangeObserver(),
+                permissions=PermissionManager(),
+                tool_context=ToolContext(Path(directory)),
+                max_steps=4,
+                execution_control_mode=ExecutionControlMode.FINALIZE_TERMINAL,
+            )
+
+            result = await runtime.run("repeat")
+
+            assert result.outcome is not None
+            self.assertIs(result.outcome.status, AgentExecutionStatus.STUCK)
+            self.assertEqual(tool.calls, [{}, {}, {}, {}])
+            self.assertEqual(result.response, "stuck summary")
+            self.assertEqual(len(provider.calls), 5)
+            self.assertIs(provider.tool_policies[-1], ModelToolPolicy.DISABLED)
+
+    async def test_normal_no_tool_answer_wins_over_terminal_budget_decision(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            provider = ScriptedProvider(
+                ((ModelTextDelta("ordinary answer"), ModelCompleted("stop", 0, 1)),)
+            )
+            runtime = AgentRuntime(
+                provider=provider,
+                tools=default_tool_registry(),
+                workspace_change_observer=EmptyWorkspaceChangeObserver(),
+                permissions=PermissionManager(),
+                tool_context=ToolContext(Path(directory)),
+                supervisor_factory=observing_supervisor_factory(
+                    observation_budget(max_output_tokens=1)
+                ),
+                execution_control_mode=ExecutionControlMode.FINALIZE_TERMINAL,
+            )
+
+            result = await runtime.run("answer")
+
+            self.assertEqual(result.response, "ordinary answer")
+            self.assertIsNone(result.outcome)
+            self.assertEqual(provider.tool_policies, [ModelToolPolicy.ALLOWED])
+            self.assertNotIn(
+                AgentEventKind.FINALIZING_STARTED,
+                [event.kind for event in result.events],
+            )
+
+    async def test_terminal_decision_never_stops_a_multi_tool_batch_and_finalizes_once(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            first = CollectionFixtureTool("first", "one")
+            second = CollectionFixtureTool("second", "two")
+            provider = ScriptedProvider(
+                (
+                    (
+                        ModelToolCall(ToolCall("first-1", "first", {})),
+                        ModelToolCall(ToolCall("second-1", "second", {})),
+                        ModelCompleted("tool_calls"),
+                    ),
+                    (ModelTextDelta("batch final"), ModelCompleted("stop")),
+                )
+            )
+            runtime = AgentRuntime(
+                provider=provider,
+                tools=MinimalToolCollection((first, second)),
+                workspace_change_observer=EmptyWorkspaceChangeObserver(),
+                permissions=PermissionManager(),
+                tool_context=ToolContext(Path(directory)),
+                supervisor_factory=observing_supervisor_factory(
+                    observation_budget(max_model_calls=3, finalizer_model_calls=1, max_tool_calls=1)
+                ),
+                execution_control_mode=ExecutionControlMode.FINALIZE_TERMINAL,
+            )
+
+            result = await runtime.run("run both")
+
+            self.assertEqual([first.calls, second.calls], [[{}], [{}]])
+            self.assertEqual(result.response, "batch final")
+            tool_messages = [message for message in result.messages if message.role is Role.TOOL]
+            assistant_calls = [
+                call
+                for message in result.messages
+                if message.role is Role.ASSISTANT
+                for call in message.tool_calls
+            ]
+            self.assertEqual(
+                {message.tool_call_id for message in tool_messages},
+                {call.id for call in assistant_calls},
+            )
+            text_events = [
+                event for event in result.events if event.kind is AgentEventKind.TEXT_DELTA
+            ]
+            self.assertEqual([event.data["text"] for event in text_events], ["batch final"])
+
+    async def test_finalizer_tool_calls_are_not_executed_or_persisted(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            tool = CollectionFixtureTool("inspect", "evidence")
+            provider = ScriptedProvider(
+                (
+                    (
+                        ModelToolCall(ToolCall("inspect-1", "inspect", {})),
+                        ModelCompleted("tool_calls"),
+                    ),
+                    (
+                        ModelToolCall(
+                            ToolCall("finalizer-call", "unexpected", {"secret": "hidden"})
+                        ),
+                        ModelCompleted("tool_calls"),
+                    ),
+                    (ModelTextDelta("safe final"), ModelCompleted("stop")),
+                )
+            )
+            runtime = AgentRuntime(
+                provider=provider,
+                tools=MinimalToolCollection((tool,)),
+                workspace_change_observer=EmptyWorkspaceChangeObserver(),
+                permissions=PermissionManager(),
+                tool_context=ToolContext(Path(directory), redaction_values=("hidden",)),
+                supervisor_factory=observing_supervisor_factory(
+                    observation_budget(max_model_calls=2, finalizer_model_calls=1)
+                ),
+                execution_control_mode=ExecutionControlMode.FINALIZE_TERMINAL,
+            )
+
+            result = await runtime.run("inspect")
+
+            self.assertEqual(tool.calls, [{}])
+            self.assertEqual(
+                [event.kind for event in result.events].count(AgentEventKind.TOOL_REQUESTED),
+                1,
+            )
+            self.assertEqual(result.response, "safe final")
+            self.assertNotIn("finalizer-rejected-", repr(result.items))
+            self.assertNotIn("hidden", repr(result.items))
+
+    async def test_finalizer_factory_failure_does_not_fall_back_to_normal_agent(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            tool = CollectionFixtureTool("inspect", "evidence")
+            provider = ScriptedProvider(
+                (
+                    (
+                        ModelToolCall(ToolCall("inspect-1", "inspect", {})),
+                        ModelCompleted("tool_calls"),
+                    ),
+                )
+            )
+
+            def failing_factory(
+                model: ModelProvider,
+                attempts: int,
+                redactions: tuple[str, ...],
+            ) -> AgentFinalizer:
+                del model, attempts, redactions
+                raise RuntimeError("finalizer unavailable")
+
+            runtime = AgentRuntime(
+                provider=provider,
+                tools=MinimalToolCollection((tool,)),
+                workspace_change_observer=EmptyWorkspaceChangeObserver(),
+                permissions=PermissionManager(),
+                tool_context=ToolContext(Path(directory)),
+                supervisor_factory=observing_supervisor_factory(
+                    observation_budget(max_model_calls=2, finalizer_model_calls=1)
+                ),
+                execution_control_mode=ExecutionControlMode.FINALIZE_TERMINAL,
+                finalizer_factory=failing_factory,
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "finalizer unavailable"):
+                await runtime.run("inspect")
+
+            self.assertEqual(len(provider.calls), 1)
+
+    async def test_finalizer_provider_error_records_turn_failure_and_propagates(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            emitted: list[AgentEvent] = []
+            tool = CollectionFixtureTool("inspect", "evidence")
+            provider = ScriptedProvider(
+                (
+                    (
+                        ModelToolCall(ToolCall("inspect-1", "inspect", {})),
+                        ModelCompleted("tool_calls"),
+                    ),
+                    (ProviderError("finalizer provider failed"),),
+                )
+            )
+            runtime = AgentRuntime(
+                provider=provider,
+                tools=MinimalToolCollection((tool,)),
+                workspace_change_observer=EmptyWorkspaceChangeObserver(),
+                permissions=PermissionManager(),
+                tool_context=ToolContext(Path(directory)),
+                supervisor_factory=observing_supervisor_factory(
+                    observation_budget(max_model_calls=2, finalizer_model_calls=1)
+                ),
+                execution_control_mode=ExecutionControlMode.FINALIZE_TERMINAL,
+            )
+
+            with self.assertRaisesRegex(ProviderError, "finalizer provider failed"):
+                await runtime.run("inspect", sink=emitted.append)
+
+            self.assertIs(emitted[-1].kind, AgentEventKind.TURN_FAILED)
+            self.assertEqual(emitted[-1].data["error_type"], "ProviderError")
+
+    async def test_finalizer_cancellation_preserves_turn_failure_semantics(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            emitted: list[AgentEvent] = []
+            tool = CollectionFixtureTool("inspect", "evidence")
+            provider = ScriptedProvider(
+                (
+                    (
+                        ModelToolCall(ToolCall("inspect-1", "inspect", {})),
+                        ModelCompleted("tool_calls"),
+                    ),
+                    (asyncio.CancelledError(),),
+                )
+            )
+            runtime = AgentRuntime(
+                provider=provider,
+                tools=MinimalToolCollection((tool,)),
+                workspace_change_observer=EmptyWorkspaceChangeObserver(),
+                permissions=PermissionManager(),
+                tool_context=ToolContext(Path(directory)),
+                supervisor_factory=observing_supervisor_factory(
+                    observation_budget(max_model_calls=2, finalizer_model_calls=1)
+                ),
+                execution_control_mode=ExecutionControlMode.FINALIZE_TERMINAL,
+            )
+
+            with self.assertRaises(asyncio.CancelledError):
+                await runtime.run("inspect", sink=emitted.append)
+
+            self.assertIs(emitted[-1].kind, AgentEventKind.TURN_FAILED)
+            self.assertTrue(emitted[-1].data["cancelled"])
+
+    async def test_runtime_finalization_evidence_is_conservative(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            secret = "runtime-evidence-secret"
+            tool = CollectionFixtureTool("inspect", f"evidence {secret}")
+            provider = ScriptedProvider(
+                (
+                    (
+                        ModelToolCall(ToolCall("inspect-1", "inspect", {})),
+                        ModelCompleted("tool_calls"),
+                    ),
+                    (ModelTextDelta("safe"), ModelCompleted("stop")),
+                )
+            )
+            runtime = AgentRuntime(
+                provider=provider,
+                tools=MinimalToolCollection((tool,)),
+                workspace_change_observer=EmptyWorkspaceChangeObserver(),
+                permissions=PermissionManager(),
+                tool_context=ToolContext(Path(directory), redaction_values=(secret,)),
+                supervisor_factory=observing_supervisor_factory(
+                    observation_budget(max_model_calls=2, finalizer_model_calls=1)
+                ),
+                execution_control_mode=ExecutionControlMode.FINALIZE_TERMINAL,
+            )
+
+            await runtime.run("inspect")
+
+            finalizer_instruction = next(
+                message.content
+                for message in provider.calls[-1].messages
+                if message.role is Role.SYSTEM and message.content.startswith("You are producing")
+            )
+            self.assertIn("No additional verification should be claimed", finalizer_instruction)
+            self.assertNotIn(secret, finalizer_instruction)
+            self.assertNotIn("digest", finalizer_instruction)
+            self.assertNotIn("tool result", finalizer_instruction.lower())
+
+    async def test_finalization_workspace_evidence_is_redacted_and_excludes_diffs_and_tool_output(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            secret = "workspace-evidence-secret"
+            report = WorkspaceChangeReport(
+                (
+                    WorkspaceFileChange(
+                        f"src/{secret}.py",
+                        "modified",
+                        3,
+                        1,
+                        diff=f"-{secret}\n+private diff content",
+                        diff_truncated=False,
+                    ),
+                ),
+                omitted_files=0,
+                scan_limited=False,
+            )
+            observer = RecordingWorkspaceChangeObserver(report)
+            tool = OrderedSideEffectTool([], ToolResult(f"tool output {secret}"))
+            provider = ScriptedProvider(
+                (
+                    (
+                        ModelToolCall(ToolCall("change", tool.definition.name, {})),
+                        ModelCompleted("tool_calls"),
+                    ),
+                    (ModelTextDelta("safe final response"), ModelCompleted("stop")),
+                )
+            )
+            runtime = AgentRuntime(
+                provider=provider,
+                tools=MinimalToolCollection((tool,)),
+                workspace_change_observer=observer,
+                permissions=PermissionManager(mode=PermissionMode.BYPASS),
+                tool_context=ToolContext(Path(directory), redaction_values=(secret,)),
+                supervisor_factory=observing_supervisor_factory(
+                    observation_budget(max_model_calls=2, finalizer_model_calls=1)
+                ),
+                execution_control_mode=ExecutionControlMode.FINALIZE_TERMINAL,
+            )
+
+            await runtime.run("apply the change")
+
+            finalizer_instruction = next(
+                message.content
+                for message in provider.calls[-1].messages
+                if message.role is Role.SYSTEM and message.content.startswith("You are producing")
+            )
+            self.assertIn("modified src/[REDACTED].py (+3/-1)", finalizer_instruction)
+            self.assertIn("Confirmed validation: none provided", finalizer_instruction)
+            self.assertNotIn(secret, finalizer_instruction)
+            self.assertNotIn("private diff content", finalizer_instruction)
+            self.assertNotIn("tool output", finalizer_instruction)
+            self.assertNotIn("digest", finalizer_instruction)
+            self.assertNotIn(secret, repr(provider.calls[-1]))
+            self.assertNotIn("private diff content", repr(provider.calls[-1]))
+            self.assertNotIn("ToolResult(", repr(provider.calls[-1]))
+
+    async def test_supervision_background_metadata_uses_only_stable_allowlisted_progress(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            secret = "background-metadata-secret"
+            traces: list[SupervisionTraceRecord] = []
+            tool = MetadataFixtureTool(
+                "task_output",
+                ToolResult(
+                    "background output",
+                    metadata={
+                        "status": "running",
+                        "total_output_bytes": 30,
+                        "exit_code": 0,
+                        "secret": secret,
+                        "nested": {"secret": secret},
+                    },
+                ),
+            )
+            provider = ScriptedProvider(
+                (
+                    (
+                        ModelToolCall(ToolCall("task", "task_output", {"task_id": "one"})),
+                        ModelCompleted("tool_calls"),
+                    ),
+                    (ModelTextDelta("done"), ModelCompleted("stop")),
+                )
+            )
+            runtime = AgentRuntime(
+                provider=provider,
+                tools=MinimalToolCollection((tool,)),
+                workspace_change_observer=EmptyWorkspaceChangeObserver(),
+                permissions=PermissionManager(),
+                tool_context=ToolContext(Path(directory), redaction_values=(secret,)),
+                supervision_observer=traces.append,
+            )
+
+            result = await runtime.run("poll the task")
+
+            tool_trace = next(
+                record for record in traces if record.checkpoint is SupervisionCheckpoint.AFTER_TOOL
+            )
+            interaction = tool_trace.snapshot.recent_interactions[-1]
+            self.assertIs(interaction.progress_kind, ProgressKind.EXTERNAL_STATE)
+            self.assertNotIn(secret, repr(tool_trace))
+            self.assertNotIn("nested", repr(tool_trace))
+            self.assertEqual(result.response, "done")
+            self.assertEqual(tool.calls, [{"task_id": "one"}])
+
+    async def test_runtime_rejects_invalid_control_and_finalizer_attempt_configuration(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            common = {
+                "provider": ScriptedProvider(((ModelTextDelta("done"), ModelCompleted("stop")),)),
+                "tools": default_tool_registry(),
+                "workspace_change_observer": EmptyWorkspaceChangeObserver(),
+                "permissions": PermissionManager(),
+                "tool_context": ToolContext(Path(directory)),
+            }
+            with self.assertRaisesRegex(TypeError, "execution_control_mode"):
+                AgentRuntime(
+                    **common,
+                    execution_control_mode="finalize_terminal",  # type: ignore[arg-type]
+                )
+            with self.assertRaisesRegex(ValueError, "finalizer_max_attempts"):
+                AgentRuntime(**common, finalizer_max_attempts=True)
+
+    async def test_controlled_finalizer_state_is_isolated_between_turns(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            tool = CollectionFixtureTool("inspect", "evidence")
+            provider = ScriptedProvider(
+                (
+                    (
+                        ModelToolCall(ToolCall("inspect-1", "inspect", {})),
+                        ModelCompleted("tool_calls"),
+                    ),
+                    (ModelTextDelta("first final"), ModelCompleted("stop")),
+                    (ModelTextDelta("second ordinary"), ModelCompleted("stop")),
+                )
+            )
+            runtime = AgentRuntime(
+                provider=provider,
+                tools=MinimalToolCollection((tool,)),
+                workspace_change_observer=EmptyWorkspaceChangeObserver(),
+                permissions=PermissionManager(),
+                tool_context=ToolContext(Path(directory)),
+                supervisor_factory=observing_supervisor_factory(
+                    observation_budget(max_model_calls=2, finalizer_model_calls=1)
+                ),
+                execution_control_mode=ExecutionControlMode.FINALIZE_TERMINAL,
+            )
+
+            first = await runtime.run("inspect")
+            second = await runtime.run("ordinary")
+
+            self.assertEqual((first.response, second.response), ("first final", "second ordinary"))
+            self.assertIsNotNone(first.outcome)
+            self.assertIsNone(second.outcome)
+
+    async def test_unimplemented_decisions_remain_observation_only(self) -> None:
+        decisions = (
+            SupervisorDecision(
+                SupervisorDecisionKind.REPLAN,
+                "a different approach is required",
+                AgentExecutionStatus.RUNNING,
+                False,
+                SupervisorReasonCode.NO_PROGRESS,
+            ),
+            SupervisorDecision(
+                SupervisorDecisionKind.BLOCK,
+                "user intervention is required",
+                AgentExecutionStatus.BLOCKED,
+                False,
+                SupervisorReasonCode.EXTERNAL_BLOCKED,
+            ),
+            SupervisorDecision(
+                SupervisorDecisionKind.FAIL,
+                "an internal failure was observed",
+                AgentExecutionStatus.FAILED,
+                False,
+                SupervisorReasonCode.INTERNAL_FAILURE,
+            ),
+        )
+        for decision in decisions:
+            with self.subTest(decision=decision.kind), tempfile.TemporaryDirectory() as directory:
+                provider = ScriptedProvider(
+                    ((ModelTextDelta("ordinary answer"), ModelCompleted("stop")),)
+                )
+                runtime = AgentRuntime(
+                    provider=provider,
+                    tools=default_tool_registry(),
+                    workspace_change_observer=EmptyWorkspaceChangeObserver(),
+                    permissions=PermissionManager(),
+                    tool_context=ToolContext(Path(directory)),
+                    supervisor_factory=lambda decision=decision: DecisionInjectingSupervisor(
+                        observation_budget(),
+                        decision,
+                    ),
+                    execution_control_mode=ExecutionControlMode.FINALIZE_TERMINAL,
+                    finalizer_factory=lambda model, attempts, redactions: self.fail(
+                        "unimplemented decisions must not invoke the finalizer"
+                    ),
+                )
+
+                result = await runtime.run("answer")
+
+                self.assertEqual(result.response, "ordinary answer")
+                self.assertIsNone(result.outcome)
+                self.assertEqual(provider.tool_policies, [ModelToolPolicy.ALLOWED])
 
     async def test_timing_events_cover_thinking_tools_and_the_complete_turn(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -766,16 +766,19 @@ def load_config(
         for managed_profile in managed.profiles:
             # Replace the complete same-name table. In particular, do not inherit a
             # workspace-controlled endpoint, proxy, or tool flag for a stored key.
-            managed_provider = {
+            proxy_policy = managed_profile.effective_proxy_policy(managed.proxy_defaults)
+            managed_provider: dict[str, object] = {
                 "protocol": managed_profile.protocol,
                 "dialect": managed_profile.dialect,
                 "model": managed_profile.model,
                 "base_url": managed_profile.base_url,
                 "auth": "stored",
-                "proxy_mode": managed_profile.proxy_mode,
+                "proxy_mode": proxy_policy.mode,
             }
-            if managed_profile.proxy_url_env is not None:
-                managed_provider["proxy_url_env"] = managed_profile.proxy_url_env
+            if managed_profile.context_window_tokens is not None:
+                managed_provider["context_window_tokens"] = managed_profile.context_window_tokens
+            if proxy_policy.proxy_url_env is not None:
+                managed_provider["proxy_url_env"] = proxy_policy.proxy_url_env
             managed_provider_table[managed_profile.name] = managed_provider
         data = dict(data)
         data["providers"] = managed_provider_table

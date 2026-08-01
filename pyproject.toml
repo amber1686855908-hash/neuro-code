@@ -38,6 +38,7 @@ dev = [
   "pytest-cov>=6.0",
   "ruff>=0.9",
   "textual>=1.0,<2",
+  "types-Pygments>=2.19",
 ]
 
 [project.scripts]

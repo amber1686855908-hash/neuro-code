@@ -109,6 +109,11 @@ from neuro_code.domain.background_tasks import (
     BackgroundTaskWaitResult,
 )
 from neuro_code.domain.events import AgentEvent, AgentEventKind
+from neuro_code.domain.execution import (
+    AgentExecutionOutcome,
+    AgentExecutionStatus,
+    SupervisorReasonCode,
+)
 from neuro_code.domain.messages import ContentPart, Message, Role, SessionItem, ToolCall
 from neuro_code.domain.sessions import SessionSummary
 from neuro_code.shared.errors import ConfigurationError, ProviderError, SessionError, ToolError
@@ -758,6 +763,37 @@ def _map_stop_reason(value: object) -> StopReason:
     if value in {"length", "max_output_tokens"}:
         return "max_tokens"
     return "end_turn"
+
+
+def _execution_outcome_stop_reason(outcome: AgentExecutionOutcome | None) -> StopReason | None:
+    if outcome is None:
+        return None
+    if outcome.status is AgentExecutionStatus.STUCK:
+        return "end_turn"
+    if outcome.status is not AgentExecutionStatus.BUDGET_LIMITED:
+        return None
+    if outcome.reason_code in {
+        SupervisorReasonCode.INPUT_TOKEN_BUDGET,
+        SupervisorReasonCode.OUTPUT_TOKEN_BUDGET,
+        SupervisorReasonCode.TOTAL_TOKEN_BUDGET,
+    }:
+        return "max_tokens"
+    return "max_turn_requests"
+
+
+def _execution_outcome_metadata(
+    outcome: AgentExecutionOutcome | None,
+) -> dict[str, str | bool] | None:
+    if outcome is None:
+        return None
+    return {
+        "neuro_code.execution_status": outcome.status.value,
+        "neuro_code.execution_reason": (
+            outcome.reason_code.value if outcome.reason_code is not None else "none"
+        ),
+        "neuro_code.finalized": outcome.finalized,
+        "neuro_code.recoverable": outcome.recoverable,
+    }
 
 
 def _safe_output_text(
@@ -2482,7 +2518,10 @@ class NeuroCodeAcpAgent:
             await self._bind_internal_session(session, result.session_id)
             if session.cancel_requested or session.closing:
                 return PromptResponse(stop_reason="cancelled")
-            return PromptResponse(stop_reason=mapper.stop_reason)
+            return PromptResponse(
+                stop_reason=_execution_outcome_stop_reason(result.outcome) or mapper.stop_reason,
+                field_meta=_execution_outcome_metadata(result.outcome),
+            )
         except asyncio.CancelledError:
             await self._capture_runner_session(session, binding, suppress_errors=True)
             return PromptResponse(stop_reason="cancelled")

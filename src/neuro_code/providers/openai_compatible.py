@@ -7,6 +7,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from neuro_code.application.ports.http import HttpClientPolicy
+from neuro_code.application.ports.model import ModelToolPolicy
 from neuro_code.domain.messages import (
     IMAGE_MODEL_PLACEHOLDER,
     ContentPartKind,
@@ -254,6 +255,8 @@ class OpenAICompatibleProvider:
         self,
         context: ModelContext,
         tools: Sequence[ToolDefinition],
+        *,
+        tool_policy: ModelToolPolicy = ModelToolPolicy.ALLOWED,
     ) -> dict[str, Any]:
         body: dict[str, Any] = {
             "model": self._model,
@@ -262,7 +265,7 @@ class OpenAICompatibleProvider:
             "stream": True,
             "stream_options": {"include_usage": True},
         }
-        if tools:
+        if tool_policy is ModelToolPolicy.ALLOWED and tools:
             body["tools"] = [
                 {
                     "type": "function",
@@ -280,6 +283,8 @@ class OpenAICompatibleProvider:
         self,
         context: ModelContext,
         tools: Sequence[ToolDefinition],
+        *,
+        tool_policy: ModelToolPolicy = ModelToolPolicy.ALLOWED,
     ) -> AsyncIterator[ModelEvent]:
         try:
             import httpx
@@ -288,7 +293,7 @@ class OpenAICompatibleProvider:
                 "httpx is required for live model requests; install the project"
             ) from error
 
-        body = self._request_body(context, tools)
+        body = self._request_body(context, tools, tool_policy=tool_policy)
 
         headers = {"Authorization": f"Bearer {self._api_key}"}
         buffers: dict[int, _ToolCallBuffer] = {}

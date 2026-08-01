@@ -6,6 +6,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from neuro_code.application.ports.http import HttpClientPolicy
+from neuro_code.application.ports.model import ModelToolPolicy
 from neuro_code.domain.messages import (
     IMAGE_MODEL_PLACEHOLDER,
     ContentPartKind,
@@ -307,15 +308,18 @@ class OpenAIResponsesProvider:
         self,
         context: ModelContext,
         tools: Sequence[ToolDefinition],
+        *,
+        tool_policy: ModelToolPolicy = ModelToolPolicy.ALLOWED,
     ) -> dict[str, Any]:
         includes: list[str] = []
         if self._dialect == "xai" or self._context_affinity is not None:
             includes.append("reasoning.encrypted_content")
-        includes.extend(
-            _BUILTIN_TOOL_INCLUDES[name]
-            for name in self._builtin_tools
-            if name in _BUILTIN_TOOL_INCLUDES
-        )
+        if tool_policy is ModelToolPolicy.ALLOWED:
+            includes.extend(
+                _BUILTIN_TOOL_INCLUDES[name]
+                for name in self._builtin_tools
+                if name in _BUILTIN_TOOL_INCLUDES
+            )
         body: dict[str, Any] = {
             "model": self._model,
             "input": self._input_items(context),
@@ -327,22 +331,23 @@ class OpenAIResponsesProvider:
             body["reasoning"] = {"summary": "concise"}
         if includes:
             body["include"] = includes
-        request_tools: list[dict[str, Any]] = [{"type": name} for name in self._builtin_tools]
-        builtin_names = set(self._builtin_tools)
-        request_tools.extend(
-            [
-                {
-                    "type": "function",
-                    "name": tool.name,
-                    "description": tool.description,
-                    "parameters": dict(tool.input_schema),
-                }
-                for tool in tools
-                if tool.name not in builtin_names
-            ]
-        )
-        if request_tools:
-            body["tools"] = request_tools
+        if tool_policy is ModelToolPolicy.ALLOWED:
+            request_tools: list[dict[str, Any]] = [{"type": name} for name in self._builtin_tools]
+            builtin_names = set(self._builtin_tools)
+            request_tools.extend(
+                [
+                    {
+                        "type": "function",
+                        "name": tool.name,
+                        "description": tool.description,
+                        "parameters": dict(tool.input_schema),
+                    }
+                    for tool in tools
+                    if tool.name not in builtin_names
+                ]
+            )
+            if request_tools:
+                body["tools"] = request_tools
         return body
 
     @staticmethod
@@ -612,6 +617,8 @@ class OpenAIResponsesProvider:
         self,
         context: ModelContext,
         tools: Sequence[ToolDefinition],
+        *,
+        tool_policy: ModelToolPolicy = ModelToolPolicy.ALLOWED,
     ) -> AsyncIterator[ModelEvent]:
         try:
             import httpx
@@ -620,7 +627,7 @@ class OpenAIResponsesProvider:
                 "httpx is required for live model requests; install the project"
             ) from error
 
-        body = self._request_body(context, tools)
+        body = self._request_body(context, tools, tool_policy=tool_policy)
         headers = {"Authorization": f"Bearer {self._api_key}"}
         terminal: Mapping[str, Any] | None = None
         streamed_text = False

@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from typing import Any, cast
 
 from neuro_code.application.ports.http import HttpClientPolicy
+from neuro_code.application.ports.model import ModelToolPolicy
 from neuro_code.domain.messages import (
     IMAGE_MODEL_PLACEHOLDER,
     ContentPartKind,
@@ -188,7 +189,11 @@ class AnthropicProvider:
         return ("\n\n".join(system_parts) or None), converted
 
     def _request_body(
-        self, messages: Sequence[Message], tools: Sequence[ToolDefinition]
+        self,
+        messages: Sequence[Message],
+        tools: Sequence[ToolDefinition],
+        *,
+        tool_policy: ModelToolPolicy = ModelToolPolicy.ALLOWED,
     ) -> dict[str, Any]:
         system, converted = self._convert_messages(messages)
         body: dict[str, Any] = {
@@ -199,7 +204,7 @@ class AnthropicProvider:
         }
         if system is not None:
             body["system"] = system
-        if tools:
+        if tool_policy is ModelToolPolicy.ALLOWED and tools:
             body["tools"] = [tool.to_dict() for tool in tools]
         return body
 
@@ -227,6 +232,8 @@ class AnthropicProvider:
         self,
         context: ModelContext,
         tools: Sequence[ToolDefinition],
+        *,
+        tool_policy: ModelToolPolicy = ModelToolPolicy.ALLOWED,
     ) -> AsyncIterator[ModelEvent]:
         try:
             import httpx
@@ -235,7 +242,7 @@ class AnthropicProvider:
                 "httpx is required for live model requests; install the project"
             ) from error
 
-        body = self._request_body(context.messages, tools)
+        body = self._request_body(context.messages, tools, tool_policy=tool_policy)
         headers = {
             "x-api-key": self._api_key,
             "anthropic-version": "2023-06-01",

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import inspect
 import tempfile
 import unittest
@@ -9,6 +10,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import patch
 
+from pygments.token import Keyword, Name, Number, String
 from textual.containers import VerticalScroll
 from textual.geometry import Size
 from textual.widgets import Button, Input, Label, Static
@@ -48,7 +50,11 @@ from neuro_code.domain.provider_catalog import (
     ProviderCatalogResult,
     ProviderConnectionSpec,
 )
-from neuro_code.domain.provider_settings import ManagedProviderProfile, ManagedProviderSettings
+from neuro_code.domain.provider_settings import (
+    ManagedProviderProfile,
+    ManagedProviderSettings,
+    ManagedProxyPolicy,
+)
 from neuro_code.domain.reasoning import ReasoningEffort
 from neuro_code.domain.sandbox import SandboxProfile
 from neuro_code.domain.session_tasks import SessionTask, SessionTaskKind, SessionTaskStatus
@@ -59,6 +65,7 @@ from neuro_code.tui import (
     AssistantMarkdown,
     ConversationMessage,
     LanguageSettingsScreen,
+    NetworkProxySettingsScreen,
     NeuroCodeApp,
     PermissionApprovalScreen,
     ProviderSelectionScreen,
@@ -68,6 +75,23 @@ from neuro_code.tui import (
     SessionSelectionScreen,
     SettingsScreen,
     ToolFeedbackMessage,
+)
+from neuro_code.tui_theme import (
+    ACCENT_CODE,
+    ACCENT_ERROR,
+    ACCENT_LINK,
+    ACCENT_NUMBER,
+    ACCENT_SUCCESS,
+    ACCENT_WARNING,
+    BORDER_FOCUS,
+    MONO_COLORS,
+    MONO_SYNTAX_THEME,
+    SURFACE_HOVER,
+    SURFACE_SELECTED,
+    TEXT_BODY,
+    TEXT_EMPHASIS,
+    TEXT_PRIMARY,
+    TEXT_SECONDARY,
 )
 
 
@@ -249,6 +273,89 @@ class StreamingTuiConversation:
             (first, second),
             1,
         )
+
+
+class FinalizingTuiConversation:
+    def __init__(self, execution_status: str) -> None:
+        self._execution_status = execution_status
+        self._session_id: str | None = None
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    @property
+    def session_id(self) -> str | None:
+        return self._session_id
+
+    async def run(self, prompt: str, *, sink: EventSink | None = None) -> AgentRunResult:
+        del prompt
+        self._session_id = "finalizing-session"
+        finalizing = AgentEvent.create(
+            1,
+            AgentEventKind.FINALIZING_STARTED,
+            {
+                "execution_status": self._execution_status,
+                "execution_reason": "model_step_limit",
+                "recoverable": True,
+            },
+        )
+        if sink is not None:
+            outcome = sink(finalizing)
+            if inspect.isawaitable(outcome):
+                await outcome
+        self.started.set()
+        await self.release.wait()
+        text = AgentEvent.create(2, AgentEventKind.TEXT_DELTA, {"text": "safe final text"})
+        completed = AgentEvent.create(
+            3,
+            AgentEventKind.TURN_COMPLETED,
+            {
+                "step": 1,
+                "duration_seconds": 0.25,
+                "execution_status": self._execution_status,
+                "recoverable": True,
+            },
+        )
+        if sink is not None:
+            for event in (text, completed):
+                outcome = sink(event)
+                if inspect.isawaitable(outcome):
+                    await outcome
+        return AgentRunResult(
+            self._session_id,
+            "safe final text",
+            (),
+            (),
+            (finalizing, text, completed),
+            1,
+        )
+
+
+class UnknownTerminalMetadataTuiConversation:
+    @property
+    def session_id(self) -> str | None:
+        return "unknown-terminal-session"
+
+    async def run(self, prompt: str, *, sink: EventSink | None = None) -> AgentRunResult:
+        del prompt
+        events = (
+            AgentEvent.create(1, AgentEventKind.TEXT_DELTA, {"text": "ordinary text"}),
+            AgentEvent.create(
+                2,
+                AgentEventKind.TURN_COMPLETED,
+                {
+                    "step": 1,
+                    "duration_seconds": 0.25,
+                    "execution_status": "unknown_terminal",
+                    "recoverable": True,
+                },
+            ),
+        )
+        if sink is not None:
+            for event in events:
+                outcome = sink(event)
+                if inspect.isawaitable(outcome):
+                    await outcome
+        return AgentRunResult("unknown-terminal-session", "ordinary text", (), (), events, 1)
 
 
 class UiPreferencesFixture:
@@ -671,7 +778,7 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(app.return_code, 0)
         self.assertIsNone(approvals.handlers[-1])
 
-    async def test_neutral_theme_disables_the_builtin_emoji_command_palette(self) -> None:
+    async def test_monochrome_theme_uses_the_compact_custom_chrome(self) -> None:
         app = NeuroCodeApp(
             TuiConversation(),
             provider_name="fixture",
@@ -682,10 +789,23 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
         async with app.run_test(size=(80, 24)) as pilot:
             await pilot.pause()
 
-            self.assertEqual(app.theme, "neuro-code-dark")
-            self.assertEqual(app.screen.styles.background.hex, "#101214")
+            self.assertEqual(app.theme, "neuro-code-mono")
+            self.assertEqual(app.screen.styles.background.hex.lower(), "#0c0c0c")
+            self.assertEqual(BORDER_FOCUS, "#BDBDBD")
+            self.assertNotIn("#F0F0F0", NeuroCodeApp.CSS)
             self.assertFalse(app.ENABLE_COMMAND_PALETTE)
-            self.assertEqual(app.query_one("HeaderIcon").styles.display, "none")
+            self.assertIn("NEURO / CODE", str(app.query_one("#brand", Static).renderable))
+            self.assertEqual(str(app.query_one("#clock", Static).renderable).count(":"), 1)
+            self.assertEqual(len(list(app.query("#header"))), 1)
+            self.assertEqual(len(list(app.query("#prompt-row"))), 1)
+            self.assertEqual(len(list(app.query("#prompt-mark"))), 1)
+            self.assertEqual(
+                app.query_one("#prompt-mark", Static).renderable,
+                "\N{SINGLE RIGHT-POINTING ANGLE QUOTATION MARK}",
+            )
+            for color in MONO_COLORS:
+                red, green, blue = (int(color[index : index + 2], 16) for index in (1, 3, 5))
+                self.assertEqual((red, green, blue), (red, red, red))
             entry_styles = {
                 str(app._render_entry(category, "content").style)
                 for category in ("assistant", "system", "tool", "user")
@@ -697,6 +817,30 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
                     for color in ("cyan", "green", "magenta", "yellow")
                 )
             )
+            self.assertFalse(
+                any(
+                    accent in NeuroCodeApp.CSS
+                    for accent in (
+                        ACCENT_CODE,
+                        ACCENT_LINK,
+                        ACCENT_NUMBER,
+                        ACCENT_SUCCESS,
+                        ACCENT_WARNING,
+                        ACCENT_ERROR,
+                    )
+                )
+            )
+
+    async def test_monochrome_reference_module_loads_without_launching_the_app(self) -> None:
+        reference = Path(__file__).parents[1] / "docs" / "ui-reference" / "neuro_code_mono_demo.py"
+        spec = importlib.util.spec_from_file_location("neuro_code_mono_demo_reference", reference)
+        assert spec is not None
+        assert spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        self.assertEqual(module.NeuroCodeMonoDemo.TITLE, "Neuro Code")
+        self.assertEqual(len(module.NeuroCodeMonoDemo.BINDINGS), 5)
 
     async def test_user_and_assistant_messages_use_distinct_unlabelled_blocks(self) -> None:
         app = NeuroCodeApp(
@@ -756,9 +900,86 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("code", plain)
             self.assertIn("[red]literal[/red]", plain)
             self.assertNotIn("**bold**", plain)
-            self.assertIn("#9eafff", styled["Important"])
-            self.assertIn("#aebcff", styled["bold"])
-            self.assertIn("#9cc4cc", styled["code"])
+            self.assertIn(TEXT_EMPHASIS.lower(), styled["Important"].lower())
+            self.assertIn(TEXT_PRIMARY.lower(), styled["bold"].lower())
+            self.assertIn(ACCENT_CODE.lower(), styled["code"].lower())
+
+    async def test_fenced_code_blocks_keep_the_custom_semantic_syntax_theme(self) -> None:
+        app = NeuroCodeApp(
+            TuiConversation(),
+            provider_name="fixture",
+            model_name="fixture-model",
+            cwd=Path("/workspace"),
+        )
+
+        async with app.run_test(size=(100, 30)):
+            rendered = app._render_entry(
+                "assistant",
+                '```python\nclass Sample:\n    return "ok", 42\n```',
+            )
+            self.assertIsInstance(rendered, AssistantMarkdown)
+            self.assertIs(rendered.code_theme, MONO_SYNTAX_THEME)
+            plain = "".join(
+                segment.text
+                for segment in app.console.render(rendered, app.console.options.update(width=80))
+            )
+            self.assertIn("Sample", plain)
+            self.assertIn(
+                ACCENT_LINK.lower(),
+                str(MONO_SYNTAX_THEME.get_style_for_token(Keyword)).lower(),
+            )
+            self.assertIn(
+                ACCENT_CODE.lower(),
+                str(MONO_SYNTAX_THEME.get_style_for_token(Name.Function)).lower(),
+            )
+            self.assertIn(
+                ACCENT_SUCCESS.lower(),
+                str(MONO_SYNTAX_THEME.get_style_for_token(String)).lower(),
+            )
+            self.assertIn(
+                TEXT_EMPHASIS.lower(),
+                str(MONO_SYNTAX_THEME.get_style_for_token(Number)).lower(),
+            )
+
+    async def test_markdown_prose_remains_neutral_gray(self) -> None:
+        app = NeuroCodeApp(
+            TuiConversation(),
+            provider_name="fixture",
+            model_name="fixture-model",
+            cwd=Path("/workspace"),
+        )
+
+        async with app.run_test(size=(100, 30)):
+            rendered = app._render_entry("assistant", "Ordinary prose stays neutral.")
+            segments = list(app.console.render(rendered, app.console.options.update(width=80)))
+            prose = next(segment for segment in segments if "Ordinary prose" in segment.text)
+            self.assertIn(TEXT_BODY.lower(), str(prose.style).lower())
+            self.assertNotIn(ACCENT_CODE.lower(), str(prose.style).lower())
+
+    async def test_success_warning_and_error_statuses_use_distinct_semantic_accents(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            app = ProviderSetupApp(
+                provider_settings=ManagedProviderSettings(),
+                provider_settings_store=JsonProviderSettingsStore(Path(directory)),
+            )
+
+            async with app.run_test(size=(100, 30)) as pilot:
+                for _ in range(20):
+                    await pilot.pause(0.01)
+                    if isinstance(app.screen, ProviderSettingsScreen):
+                        break
+                screen = app.screen
+                self.assertIsInstance(screen, ProviderSettingsScreen)
+                status = screen.query_one("#provider-settings-connection-status", Static)
+                for kind, marker, accent in (
+                    ("success", "✓", ACCENT_SUCCESS),
+                    ("warning", "!", ACCENT_WARNING),
+                    ("error", "\N{MULTIPLICATION SIGN}", ACCENT_ERROR),
+                ):
+                    screen._show_connection_status("fixture status", kind=kind)
+                    rendered = status.renderable
+                    self.assertIn(marker, str(rendered))
+                    self.assertIn(accent.lower(), str(rendered.style).lower())
 
     async def test_tool_notice_highlights_the_tool_name_in_an_aligned_gutter(self) -> None:
         app = NeuroCodeApp(
@@ -779,7 +1000,7 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
             tool_segments = [segment for segment in segments if "read_file" in segment.text]
 
             self.assertTrue(tool_segments)
-            self.assertIn("#8ed1e6", str(tool_segments[0].style))
+            self.assertIn(ACCENT_CODE.lower(), str(tool_segments[0].style).lower())
 
     async def test_streaming_response_updates_one_stable_transcript_node(self) -> None:
         runner = StreamingTuiConversation()
@@ -817,6 +1038,78 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertIs(pending.parent, transcript)
             self.assertIn("partial response", str(pending.renderable))
 
+    async def test_finalizing_and_recoverable_terminal_states_preserve_the_final_response(
+        self,
+    ) -> None:
+        messages = {
+            "stuck": "The task entered a repeated loop and was stopped safely.",
+            "budget_limited": "This turn reached its execution budget and was stopped safely.",
+        }
+        for execution_status, expected in messages.items():
+            with self.subTest(execution_status=execution_status):
+                runner = FinalizingTuiConversation(execution_status)
+                app = NeuroCodeApp(
+                    runner,
+                    provider_name="fixture",
+                    model_name="fixture-model",
+                    cwd=Path("/workspace"),
+                )
+
+                async with app.run_test(size=(100, 30)) as pilot:
+                    prompt = app.query_one("#prompt", Input)
+                    prompt.value = "finish safely"
+                    await pilot.press("enter")
+                    await asyncio.wait_for(runner.started.wait(), timeout=1)
+                    await pilot.pause()
+
+                    pending = app._pending_assistant
+                    assert pending is not None
+                    self.assertIn("Safely finalizing", str(pending.renderable))
+                    self.assertTrue(pending.has_class("message-pending"))
+
+                    runner.release.set()
+                    for _ in range(20):
+                        await pilot.pause(0.01)
+                        if any(entry.category == "recoverable" for entry in app.entries):
+                            break
+
+                    self.assertIn(
+                        "safe final text",
+                        [entry.text for entry in app.entries if entry.category == "assistant"],
+                    )
+                    recoverable = app.entries[-1]
+                    self.assertEqual(recoverable.category, "recoverable")
+                    self.assertIn(expected, recoverable.text)
+                    self.assertFalse(any(entry.category == "error" for entry in app.entries))
+                    widget = app._entry_widgets[-1]
+                    self.assertTrue(widget.has_class("message-recoverable"))
+                    self.assertFalse(prompt.disabled)
+                    prompt.value = "continue with new instructions"
+                    self.assertEqual(prompt.value, "continue with new instructions")
+
+    async def test_unknown_terminal_metadata_falls_back_to_normal_completion(self) -> None:
+        app = NeuroCodeApp(
+            UnknownTerminalMetadataTuiConversation(),
+            provider_name="fixture",
+            model_name="fixture-model",
+            cwd=Path("/workspace"),
+        )
+
+        async with app.run_test(size=(100, 30)) as pilot:
+            prompt = app.query_one("#prompt", Input)
+            prompt.value = "complete normally"
+            await pilot.press("enter")
+            for _ in range(20):
+                await pilot.pause(0.01)
+                if any(entry.ui_key == "turn.completed" for entry in app.entries):
+                    break
+
+            self.assertIn("ordinary text", [entry.text for entry in app.entries])
+            self.assertTrue(any(entry.ui_key == "turn.completed" for entry in app.entries))
+            self.assertFalse(any(entry.category == "recoverable" for entry in app.entries))
+            self.assertFalse(any(entry.category == "error" for entry in app.entries))
+            self.assertFalse(prompt.disabled)
+
     async def test_waiting_model_uses_the_supplied_collapsing_pulse(self) -> None:
         app = NeuroCodeApp(
             TuiConversation(),
@@ -832,6 +1125,24 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
             first_frame = str(pending.renderable)
             self.assertIn("█", first_frame)
             self.assertIn("Thinking", first_frame)
+            self.assertIn("↓≈0 tok", first_frame)
+            loading_segments = list(
+                app.console.render(pending.renderable, app.console.options.update(width=80))
+            )
+            self.assertIn(
+                TEXT_SECONDARY.lower(),
+                str(
+                    next(
+                        segment.style for segment in loading_segments if "Thinking" in segment.text
+                    )
+                ).lower(),
+            )
+            self.assertIn(
+                TEXT_SECONDARY.lower(),
+                str(
+                    next(segment.style for segment in loading_segments if "≈0 tok" in segment.text)
+                ).lower(),
+            )
 
             app._advance_model_loading_animation()
             app._advance_model_loading_animation()
@@ -907,7 +1218,7 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
                     base_url="https://api.deepseek.com/v1",
                 )
             ),
-            "deepseek",
+            "openai",
         )
         with tempfile.TemporaryDirectory() as directory, patch.dict("os.environ", {}, clear=True):
             store = JsonProviderSettingsStore(Path(directory))
@@ -954,6 +1265,41 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(saved.default_provider, "personal")
             self.assertEqual(saved.profiles[0].protocol, "openai-chat")
             self.assertEqual(saved.profiles[0].model, "deepseek-v4-pro")
+            self.assertNotIn("never-echo-this-key", repr(saved))
+
+    async def test_deepseek_responses_profile_is_allowed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, patch.dict("os.environ", {}, clear=True):
+            store = JsonProviderSettingsStore(Path(directory))
+            app = ProviderSetupApp(
+                provider_settings=ManagedProviderSettings(),
+                provider_settings_store=store,
+            )
+
+            async with app.run_test(size=(110, 40)) as pilot:
+                for _ in range(20):
+                    await pilot.pause(0.01)
+                    if isinstance(app.screen, ProviderSettingsScreen):
+                        break
+                self.assertIsInstance(app.screen, ProviderSettingsScreen)
+                screen = app.screen
+                screen._select_preset("openai")
+                screen.query_one("#provider-settings-name", Input).value = "deepseek-responses"
+                screen.query_one("#provider-settings-model", Input).value = "deepseek-v4-flash"
+                screen.query_one(
+                    "#provider-settings-base-url", Input
+                ).value = "https://api.deepseek.com"
+                screen.query_one("#provider-settings-api-key", Input).value = "never-echo-this-key"
+
+                await pilot.click("#provider-settings-save")
+                for _ in range(20):
+                    await pilot.pause(0.01)
+                    if (await store.load()).profiles:
+                        break
+
+            saved = await store.load()
+            self.assertEqual(saved.default_provider, "deepseek-responses")
+            self.assertEqual(saved.profiles[0].protocol, "openai-responses")
+            self.assertEqual(saved.profiles[0].base_url, "https://api.deepseek.com")
             self.assertNotIn("never-echo-this-key", repr(saved))
 
     async def test_invalid_environment_proxy_stays_in_settings_and_direct_mode_recovers(
@@ -1221,9 +1567,83 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
                     str(screen.query_one("#provider-settings-error", Static).renderable),
                 )
                 self.assertEqual(
-                    screen.query_one("#provider-settings-proxy-environment", Button).variant,
+                    screen.query_one("#provider-settings-proxy-inherit", Button).variant,
                     "primary",
                 )
+
+    async def test_network_defaults_and_provider_context_capacity_are_persisted(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = JsonProviderSettingsStore(Path(directory))
+            settings = await store.save_profile(
+                ManagedProviderProfile(
+                    name="personal",
+                    protocol="openai-chat",
+                    model="old-model",
+                    base_url="https://provider.invalid/v1",
+                    api_key="saved-secret",
+                )
+            )
+            app = NeuroCodeApp(
+                TuiConversation(),
+                provider_settings_store=store,
+                managed_provider_settings=settings,
+                provider_name="fixture",
+                model_name="fixture-model",
+                cwd=Path("/workspace"),
+            )
+
+            async with app.run_test(size=(110, 44)) as pilot:
+                await app.action_open_settings()
+                await pilot.pause()
+                self.assertIsInstance(app.screen, SettingsScreen)
+                self.assertTrue(await pilot.click("#settings-category-network"))
+                for _ in range(20):
+                    await pilot.pause(0.01)
+                    if isinstance(app.screen, NetworkProxySettingsScreen):
+                        break
+                self.assertIsInstance(app.screen, NetworkProxySettingsScreen)
+                self.assertTrue(await pilot.click("#network-settings-direct"))
+                self.assertTrue(await pilot.click("#network-settings-save"))
+                for _ in range(20):
+                    await pilot.pause(0.01)
+                    if app.return_code is not None:
+                        break
+
+            updated = await store.load()
+            self.assertEqual(updated.proxy_defaults, ManagedProxyPolicy("direct"))
+            self.assertIsNone(updated.profiles[0].proxy_mode)
+            self.assertEqual(app.return_code, TUI_RELOAD_PROVIDER_SETTINGS)
+
+        with tempfile.TemporaryDirectory() as directory, patch.dict("os.environ", {}, clear=True):
+            store = JsonProviderSettingsStore(Path(directory))
+            app = ProviderSetupApp(
+                provider_settings=ManagedProviderSettings(),
+                provider_settings_store=store,
+            )
+
+            async with app.run_test(size=(110, 44)) as pilot:
+                for _ in range(20):
+                    await pilot.pause(0.01)
+                    if isinstance(app.screen, ProviderSettingsScreen):
+                        break
+                screen = app.screen
+                self.assertIsInstance(screen, ProviderSettingsScreen)
+                screen._select_preset("deepseek")
+                screen.query_one("#provider-settings-name", Input).value = "deepseek"
+                screen.query_one("#provider-settings-model", Input).value = "deepseek-v4-flash"
+                screen.query_one("#provider-settings-api-key", Input).value = "saved-secret"
+                screen.query_one("#provider-settings-context-window", Input).value = "128000"
+                await screen._save_provider()
+                for _ in range(20):
+                    await pilot.pause(0.01)
+                    if (await store.load()).profiles:
+                        break
+
+            saved = await store.load()
+            self.assertEqual(saved.profiles[0].context_window_tokens, 128_000)
+            self.assertIsNone(saved.profiles[0].proxy_mode)
 
     async def test_settings_edit_managed_provider_and_request_safe_reload(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1355,7 +1775,7 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
             workspace = app.query_one("#runtime-workspace", Static)
             mode = app.query_one("#runtime-mode", Static)
             self.assertIn("MODEL", str(model.renderable))
-            self.assertIn("first / first-model", str(model.renderable))
+            self.assertIn("first · first-model", str(model.renderable))
             self.assertIn("EFFORT", str(effort.renderable))
             self.assertIn("● high", str(effort.renderable))
             self.assertIn("CTX", str(context.renderable))
@@ -1364,6 +1784,29 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn(str(Path("/workspace")), str(workspace.renderable))
             self.assertIn("MODE", str(mode.renderable))
             self.assertIn("normal", str(mode.renderable))
+            model_segments = list(app.console.render(model.renderable))
+            effort_segments = list(app.console.render(effort.renderable))
+            mode_segments = list(app.console.render(mode.renderable))
+            self.assertIn(
+                ACCENT_CODE.lower(),
+                str(
+                    next(
+                        segment.style for segment in model_segments if "first-model" in segment.text
+                    )
+                ).lower(),
+            )
+            self.assertIn(
+                TEXT_EMPHASIS.lower(),
+                str(
+                    next(segment.style for segment in effort_segments if "high" in segment.text)
+                ).lower(),
+            )
+            self.assertIn(
+                TEXT_EMPHASIS.lower(),
+                str(
+                    next(segment.style for segment in mode_segments if "normal" in segment.text)
+                ).lower(),
+            )
 
             await app._language_settings_selected(UiLanguage.SIMPLIFIED_CHINESE)
             await pilot.pause()
@@ -1372,7 +1815,13 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("强度", str(effort.renderable))
             self.assertIn("工作区", str(workspace.renderable))
             self.assertIn("模式", str(mode.renderable))
-            self.assertIn("first / first-model", str(model.renderable))
+            self.assertIn("first · first-model", str(model.renderable))
+
+            app._provider_name = "same-name"
+            app._model_name = "same-name"
+            app._refresh_runtime_bar()
+            self.assertEqual(str(model.renderable).count("same-name"), 1)
+            self.assertNotIn(" · same-name", str(model.renderable))
 
     async def test_shift_tab_cycles_modes_and_persists_safe_auto_preview(self) -> None:
         profiles = ProfileTuiController()
@@ -1419,21 +1868,61 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
                 AgentEvent.create(
                     1,
                     AgentEventKind.CONTEXT_USAGE_UPDATED,
-                    {"used_tokens": 500_000, "estimated": False},
+                    {"used_tokens": 850_000, "estimated": False},
                 )
             )
             await pilot.pause()
 
             context = app.query_one("#runtime-context", Static)
-            self.assertIn("50.0%", str(context.renderable))
+            self.assertIn("85.0%", str(context.renderable))
             self.assertNotIn("~", str(context.renderable))
-            self.assertIn("500,000 / 1,000,000", str(context.tooltip))
+            self.assertIn("850,000 / 1,000,000", str(context.tooltip))
+            context_segments = list(app.console.render(context.renderable))
+            self.assertIn(
+                ACCENT_WARNING.lower(),
+                str(
+                    next(segment.style for segment in context_segments if "85.0%" in segment.text)
+                ).lower(),
+            )
 
             prompt = app.query_one("#prompt", Input)
             prompt.value = "/status"
             await pilot.press("enter")
             await pilot.pause()
-            self.assertIn("Context: 50.0% (500,000/1,000,000)", app.entries[-1].text)
+            self.assertIn("Context: 85.0% (850,000/1,000,000)", app.entries[-1].text)
+
+    async def test_context_without_a_provider_window_shows_token_usage(self) -> None:
+        app = NeuroCodeApp(
+            TuiConversation(),
+            provider_name="fixture",
+            model_name="fixture-model",
+            cwd=Path("/workspace"),
+        )
+
+        async with app.run_test(size=(90, 24)) as pilot:
+            await app._handle_event(
+                AgentEvent.create(
+                    1,
+                    AgentEventKind.CONTEXT_USAGE_UPDATED,
+                    {"used_tokens": 1_536, "estimated": False},
+                )
+            )
+            await pilot.pause()
+
+            context = app.query_one("#runtime-context", Static)
+            self.assertIn("1.5k tok", str(context.renderable))
+            self.assertNotIn("?", str(context.renderable))
+            self.assertNotIn("Unknown", str(context.renderable))
+            self.assertEqual(context.tooltip, "1.5k tok")
+            context_segments = list(app.console.render(context.renderable))
+            self.assertIn(
+                TEXT_SECONDARY.lower(),
+                str(
+                    next(
+                        segment.style for segment in context_segments if "1.5k tok" in segment.text
+                    )
+                ).lower(),
+            )
 
     async def test_slash_commands_show_parameter_hints_and_tab_completes_first_option(
         self,
@@ -1605,7 +2094,7 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertGreater(effort.region.width, 0)
             self.assertGreater(context.region.width, 0)
             self.assertGreater(mode.region.width, 0)
-            self.assertIn("?", str(context.renderable))
+            self.assertIn("≈0 tok", str(context.renderable))
             self.assertIn("● high", str(effort.renderable))
             self.assertIn("normal", str(mode.renderable))
 
@@ -1630,8 +2119,12 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
                 132,
             )
             prompt = app.query_one("#prompt", Input)
-            self.assertEqual(prompt.region.right, 131)
-            self.assertEqual(prompt.region.bottom, 40)
+            self.assertGreater(prompt.region.width, 0)
+            self.assertLessEqual(prompt.region.right, app.screen.size.width)
+            shortcut_bar = app.query_one("#shortcut-bar", Static)
+            self.assertLess(prompt.region.bottom, shortcut_bar.region.y)
+            self.assertGreater(shortcut_bar.region.height, 0)
+            self.assertLessEqual(shortcut_bar.region.bottom, app.screen.size.height)
 
     async def test_tasks_command_lists_current_scope_without_rendering_command_or_output(
         self,
@@ -1968,7 +2461,7 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn(("status", "Thought for 1.2s · model step 1"), entries)
             tool_entries = [text for category, text in entries if category == "tool"]
             self.assertEqual(len(tool_entries), 1)
-            self.assertEqual(tool_entries[0], "● Read README.md · 420ms")
+            self.assertEqual(tool_entries[0], "✓ Read README.md · 420ms")
             self.assertIn(("assistant", "fixture response"), entries)
             self.assertEqual(entries[-1], ("status", "Turn completed in 2.8s · 1 model step(s)"))
             self.assertNotIn("private", "\n".join(text for _, text in entries))
@@ -2053,7 +2546,7 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
             tool_entries = [entry for entry in app.entries if entry.category == "tool"]
             self.assertEqual(len(tool_entries), 1)
             card = tool_entries[0].text
-            self.assertIn("● bash(", card)
+            self.assertIn("✓ bash(", card)
             self.assertIn("├ Allowed · fixture policy", card)
             self.assertIn("├ Created src/new.py (+2)", card)
             self.assertIn("+++ b/src/new.py", card)
@@ -2074,12 +2567,24 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
             removed_or_header_segments = [
                 segment for segment in rendered_segments if "--- /dev/null" in segment.text
             ]
+            command_segments = [segment for segment in rendered_segments if "bash(" in segment.text]
+            success_segments = [segment for segment in rendered_segments if "✓" in segment.text]
+            duration_segments = [
+                segment for segment in rendered_segments if "125ms" in segment.text
+            ]
+            details_segments = [
+                segment for segment in rendered_segments if "Details shown" in segment.text
+            ]
             self.assertTrue(added_segments)
-            self.assertIn("#b7f7ca", str(added_segments[0].style))
-            self.assertIn("#213a2b", str(added_segments[0].style))
+            self.assertIn(ACCENT_SUCCESS.lower(), str(added_segments[0].style).lower())
+            self.assertIn(SURFACE_SELECTED.lower(), str(added_segments[0].style).lower())
             self.assertTrue(removed_or_header_segments)
-            self.assertIn("#ffb4ab", app._diff_line_style("-removed line"))
-            self.assertIn("#4a221d", app._diff_line_style("-removed line"))
+            self.assertIn(ACCENT_ERROR.lower(), app._diff_line_style("-removed line").lower())
+            self.assertIn(SURFACE_HOVER.lower(), app._diff_line_style("-removed line").lower())
+            self.assertIn(ACCENT_CODE.lower(), str(command_segments[0].style).lower())
+            self.assertIn(ACCENT_SUCCESS.lower(), str(success_segments[0].style).lower())
+            self.assertIn(TEXT_SECONDARY.lower(), str(duration_segments[0].style).lower())
+            self.assertIn(TEXT_SECONDARY.lower(), str(details_segments[0].style).lower())
 
             card_widget = app.query_one(ToolFeedbackMessage)
             self.assertTrue(card_widget.can_focus)
@@ -2426,7 +2931,7 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(profiles.selections, ["second"])
             self.assertIn("previous session old-session remains saved", app.entries[-1].text)
             self.assertIn(
-                "second / second-model",
+                "second · second-model",
                 str(app.query_one("#runtime-model", Static).renderable),
             )
 

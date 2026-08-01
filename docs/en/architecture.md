@@ -651,7 +651,9 @@ starts with a provider-neutral estimate over canonical
 session items. Each model completion with token metadata emits
 `CONTEXT_USAGE_UPDATED`, replacing that estimate with the provider-reported
 input plus output count. The denominator is explicit profile metadata named
-`context_window_tokens`; an absent value stays unknown.
+`context_window_tokens`; an absent value leaves only the known token-use count
+visible rather than inventing a percentage. Managed-provider metadata exposes
+the same positive field per profile.
 
 Slash completion is a deterministic presentation catalog, separate from
 command execution. It projects effort/mode choices and selectable redacted profile
@@ -902,7 +904,7 @@ Credentials are environment references or a validated loopback-proxy
 placeholder for manual TOML profiles. The TUI additionally uses a
 `ProviderSettingsStore` port for user-managed profiles. Its JSON adapter writes
 non-secret metadata and credentials to separate atomic owner-private files;
-proxy mode and an optional environment-variable name are non-secret metadata,
+one global proxy default plus optional per-profile overrides are non-secret metadata,
 while the resolved proxy URL remains environment-only;
 `ProviderProfile.stored_api_key` is excluded from representations and redacted
 inspection, and explicit configured values are scrubbed at the runtime

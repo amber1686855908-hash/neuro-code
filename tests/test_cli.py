@@ -17,8 +17,15 @@ from unittest.mock import AsyncMock, patch
 from neuro_code.adapters.provider_catalog import HttpProviderCatalog
 from neuro_code.adapters.provider_settings import JsonProviderSettingsStore
 from neuro_code.adapters.sqlite_session import SqliteSessionStore
+from neuro_code.application.ports.model import ModelToolPolicy
+from neuro_code.application.runtime.supervision import ExecutionControlMode
 from neuro_code.bootstrap.entrypoints import main
-from neuro_code.cli import _normalize_rule
+from neuro_code.cli import (
+    _application_settings,
+    _execution_control_mode,
+    _normalize_rule,
+    build_parser,
+)
 from neuro_code.config import AppConfig
 from neuro_code.domain.messages import Message, Role, ToolCall
 from neuro_code.domain.model_context import ModelContext
@@ -33,6 +40,7 @@ from neuro_code.domain.reasoning import ReasoningEffort
 from neuro_code.domain.sandbox import SandboxProfile
 from neuro_code.domain.tools import ToolDefinition
 from neuro_code.domain.ui_preferences import UiLanguage
+from neuro_code.shared.errors import ConfigurationError, ProviderError
 
 
 class CliProvider:
@@ -46,10 +54,51 @@ class CliProvider:
         self,
         context: ModelContext,
         tools: Sequence[ToolDefinition],
+        *,
+        tool_policy: ModelToolPolicy = ModelToolPolicy.ALLOWED,
     ) -> AsyncIterator[ModelEvent]:
+        del tools, tool_policy
         self.contexts.append(context)
         yield ModelTextDelta("fixture response")
         yield ModelCompleted("stop", 2, 3)
+
+
+class FinalizingCliProvider:
+    provider_name = "cli-finalizer-fixture"
+    model_name = "fixture-model"
+
+    def __init__(self, *, normal_tool_calls: int, fail_finalizer: bool = False) -> None:
+        self._normal_tool_calls = normal_tool_calls
+        self._fail_finalizer = fail_finalizer
+        self._normal_calls = 0
+        self.tool_policies: list[ModelToolPolicy] = []
+
+    async def stream(
+        self,
+        context: ModelContext,
+        tools: Sequence[ToolDefinition],
+        *,
+        tool_policy: ModelToolPolicy = ModelToolPolicy.ALLOWED,
+    ) -> AsyncIterator[ModelEvent]:
+        del context, tools
+        self.tool_policies.append(tool_policy)
+        if tool_policy is ModelToolPolicy.ALLOWED:
+            self._normal_calls += 1
+            if self._normal_calls > self._normal_tool_calls:
+                raise AssertionError("unexpected ordinary model request")
+            yield ModelToolCall(
+                ToolCall(
+                    f"list-{self._normal_calls}",
+                    "list_dir",
+                    {"path": "."},
+                )
+            )
+            yield ModelCompleted("tool_calls")
+            return
+        if self._fail_finalizer:
+            raise ProviderError("finalizer provider failed")
+        yield ModelTextDelta("finalized fixture response")
+        yield ModelCompleted("stop")
 
 
 class BackgroundTaskSupervisorFixture:
@@ -80,6 +129,199 @@ api_key_env = "FIXTURE_KEY"
 """,
             encoding="utf-8",
         )
+
+    @classmethod
+    def _run_finalizing_agent(
+        cls,
+        root: Path,
+        provider: FinalizingCliProvider,
+        *arguments: str,
+    ) -> tuple[int, str, str]:
+        state = root / "state"
+        cls._write_provider_config(state)
+        output = io.StringIO()
+        errors = io.StringIO()
+        with (
+            patch.dict(
+                "os.environ",
+                {
+                    "HOME": str(root),
+                    "NEURO_CODE_HOME": str(state),
+                    "FIXTURE_KEY": "fixture-key",
+                },
+                clear=True,
+            ),
+            patch(
+                "neuro_code.bootstrap.composition.create_routed_provider",
+                return_value=provider,
+            ),
+            redirect_stdout(output),
+            redirect_stderr(errors),
+        ):
+            exit_code = main(arguments)
+        return exit_code, output.getvalue(), errors.getvalue()
+
+    def test_cli_execution_control_defaults_to_finalize_terminal(self) -> None:
+        settings = _application_settings(build_parser().parse_args(("-p", "answer")))
+
+        self.assertIs(settings.execution_control_mode, ExecutionControlMode.FINALIZE_TERMINAL)
+
+    def test_cli_accepts_observe_only_execution_control_for_agent_acp_and_tui(self) -> None:
+        parser = build_parser()
+        agent_settings = _application_settings(
+            parser.parse_args(("agent", "-p", "answer", "--execution-control", "observe-only"))
+        )
+        acp_settings = _application_settings(
+            parser.parse_args(("acp", "--execution-control", "observe-only"))
+        )
+        tui_settings = _application_settings(
+            parser.parse_args(("code", "--execution-control", "observe-only"))
+        )
+
+        self.assertIs(agent_settings.execution_control_mode, ExecutionControlMode.OBSERVE_ONLY)
+        self.assertIs(acp_settings.execution_control_mode, ExecutionControlMode.OBSERVE_ONLY)
+        self.assertIs(tui_settings.execution_control_mode, ExecutionControlMode.OBSERVE_ONLY)
+
+    def test_cli_rejects_unknown_execution_control(self) -> None:
+        with self.assertRaises(SystemExit) as error:
+            build_parser().parse_args(("agent", "-p", "answer", "--execution-control", "unsafe"))
+
+        self.assertEqual(error.exception.code, 2)
+
+    def test_execution_control_conversion_fails_closed_outside_argparse(self) -> None:
+        for value in ("unsafe", object()):
+            with (
+                self.subTest(value_type=type(value).__name__),
+                self.assertRaisesRegex(
+                    ConfigurationError,
+                    "execution control selection",
+                ),
+            ):
+                _execution_control_mode(value)
+
+    def test_tui_launch_receives_execution_control_setting(self) -> None:
+        launch = AsyncMock(return_value=0)
+        with patch("neuro_code.bootstrap.entrypoints.BootstrapCliServices.run_tui", launch):
+            exit_code = main(("code", "--execution-control", "observe-only"))
+
+        self.assertEqual(exit_code, 0)
+        settings = launch.await_args.args[1]
+        self.assertIs(settings.execution_control_mode, ExecutionControlMode.OBSERVE_ONLY)
+
+    def test_plain_output_prints_a_finalized_response_once(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            exit_code, output, errors = self._run_finalizing_agent(
+                Path(directory),
+                FinalizingCliProvider(normal_tool_calls=1),
+                "-p",
+                "summarize",
+                "--max-steps",
+                "1",
+            )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(errors, "")
+        self.assertEqual(output.count("finalized fixture response"), 1)
+
+    def test_json_output_contains_budget_limited_outcome_without_internal_state(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            exit_code, output, errors = self._run_finalizing_agent(
+                Path(directory),
+                FinalizingCliProvider(normal_tool_calls=1),
+                "-p",
+                "summarize",
+                "--max-steps",
+                "1",
+                "--output-format",
+                "json",
+            )
+
+        payload = json.loads(output)
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(errors, "")
+        self.assertEqual(
+            payload["outcome"],
+            {
+                "status": "budget_limited",
+                "reason": "model_step_limit",
+                "finalized": True,
+                "recoverable": True,
+            },
+        )
+        self.assertNotIn("snapshot", repr(payload))
+        self.assertNotIn("digest", repr(payload))
+
+    def test_json_output_contains_stuck_outcome(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            exit_code, output, errors = self._run_finalizing_agent(
+                Path(directory),
+                FinalizingCliProvider(normal_tool_calls=4),
+                "-p",
+                "repeat",
+                "--max-steps",
+                "4",
+                "--output-format",
+                "json",
+            )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(errors, "")
+        self.assertEqual(json.loads(output)["outcome"]["status"], "stuck")
+
+    def test_jsonl_preserves_event_protocol_and_terminal_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            exit_code, output, errors = self._run_finalizing_agent(
+                Path(directory),
+                FinalizingCliProvider(normal_tool_calls=1),
+                "-p",
+                "summarize",
+                "--max-steps",
+                "1",
+                "--output-format",
+                "jsonl",
+            )
+
+        records = [json.loads(line) for line in output.splitlines()]
+        text_records = [record for record in records if record["kind"] == "text_delta"]
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(errors, "")
+        self.assertEqual(records[-1]["kind"], "turn_completed")
+        self.assertEqual(records[-1]["data"]["execution_status"], "budget_limited")
+        self.assertEqual(
+            [record["data"]["text"] for record in text_records], ["finalized fixture response"]
+        )
+
+    def test_observe_only_preserves_the_legacy_max_step_provider_error(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            exit_code, output, errors = self._run_finalizing_agent(
+                Path(directory),
+                FinalizingCliProvider(normal_tool_calls=1),
+                "-p",
+                "summarize",
+                "--max-steps",
+                "1",
+                "--execution-control",
+                "observe-only",
+            )
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(output, "")
+        self.assertIn("agent exceeded the maximum of 1 model steps", errors)
+
+    def test_finalizer_provider_error_keeps_a_failure_exit_code(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            exit_code, output, errors = self._run_finalizing_agent(
+                Path(directory),
+                FinalizingCliProvider(normal_tool_calls=1, fail_finalizer=True),
+                "-p",
+                "summarize",
+                "--max-steps",
+                "1",
+            )
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(output, "")
+        self.assertIn("finalizer provider failed", errors)
 
     def test_native_bash_permission_patterns_are_normalized(self) -> None:
         self.assertEqual(_normalize_rule("Bash"), "bash:*")
@@ -351,7 +593,9 @@ api_key_env = "FIXTURE_KEY"
                 self.assertEqual(exit_code, 0)
                 self.assertIn("fixture response", output.getvalue())
                 if output_format == "json":
-                    self.assertEqual(json.loads(output.getvalue())["steps"], 1)
+                    payload = json.loads(output.getvalue())
+                    self.assertEqual(payload["steps"], 1)
+                    self.assertIsNone(payload["outcome"])
                 if output_format == "jsonl":
                     records = [json.loads(line) for line in output.getvalue().splitlines()]
                     self.assertEqual(records[-1]["kind"], "turn_completed")

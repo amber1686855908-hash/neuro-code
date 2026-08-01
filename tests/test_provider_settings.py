@@ -10,7 +10,7 @@ from neuro_code.adapters.provider_settings import JsonProviderSettingsStore
 from neuro_code.configuration.managed_provider_settings import (
     load_managed_provider_settings as canonical_load_managed_provider_settings,
 )
-from neuro_code.domain.provider_settings import ManagedProviderProfile
+from neuro_code.domain.provider_settings import ManagedProviderProfile, ManagedProxyPolicy
 from neuro_code.shared.errors import ConfigurationError
 
 
@@ -34,7 +34,7 @@ class JsonProviderSettingsStoreTests(unittest.IsolatedAsyncioTestCase):
         *,
         api_key: str | None = "secret-value",
         model: str = "fixture-model",
-        proxy_mode: str = "environment",
+        proxy_mode: str | None = None,
         proxy_url_env: str | None = None,
     ) -> ManagedProviderProfile:
         return ManagedProviderProfile(
@@ -104,7 +104,7 @@ class JsonProviderSettingsStoreTests(unittest.IsolatedAsyncioTestCase):
                 "NEURO_PROVIDER_PROXY_URL",
             )
 
-    async def test_legacy_managed_profile_defaults_to_environment_proxy_mode(self) -> None:
+    async def test_legacy_managed_profile_inherits_the_environment_proxy_default(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             state_dir = Path(directory)
             store = JsonProviderSettingsStore(state_dir)
@@ -133,8 +133,46 @@ class JsonProviderSettingsStoreTests(unittest.IsolatedAsyncioTestCase):
 
             loaded = await store.load()
 
-            self.assertEqual(loaded.profiles[0].proxy_mode, "environment")
+            self.assertIsNone(loaded.profiles[0].proxy_mode)
             self.assertIsNone(loaded.profiles[0].proxy_url_env)
+            self.assertEqual(loaded.proxy_defaults, ManagedProxyPolicy())
+
+    async def test_global_proxy_default_and_provider_override_round_trip(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = JsonProviderSettingsStore(Path(directory))
+            await store.save_proxy_defaults(ManagedProxyPolicy("explicit", "NEURO_CODE_PROXY_URL"))
+            settings = await store.save_profile(self._profile(proxy_mode="direct"))
+
+            self.assertEqual(
+                settings.proxy_defaults,
+                ManagedProxyPolicy("explicit", "NEURO_CODE_PROXY_URL"),
+            )
+            self.assertEqual(settings.profiles[0].proxy_mode, "direct")
+            metadata = json.loads(store.metadata_path.read_text(encoding="utf-8"))
+            self.assertEqual(metadata["proxy_defaults"]["mode"], "explicit")
+            self.assertEqual(
+                metadata["proxy_defaults"]["proxy_url_env"],
+                "NEURO_CODE_PROXY_URL",
+            )
+
+    async def test_context_window_capacity_round_trips_as_non_secret_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = JsonProviderSettingsStore(Path(directory))
+            saved = await store.save_profile(
+                ManagedProviderProfile(
+                    name="context-aware",
+                    protocol="openai-chat",
+                    model="fixture-model",
+                    base_url="https://provider.invalid/v1",
+                    context_window_tokens=128_000,
+                    api_key="secret-value",
+                )
+            )
+
+            self.assertEqual(saved.profiles[0].context_window_tokens, 128_000)
+            metadata = json.loads(store.metadata_path.read_text(encoding="utf-8"))
+            self.assertEqual(metadata["providers"][0]["context_window_tokens"], 128_000)
+            self.assertNotIn("secret-value", store.metadata_path.read_text(encoding="utf-8"))
 
     async def test_new_profile_requires_key_and_invalid_files_fail_closed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

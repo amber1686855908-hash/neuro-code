@@ -14,6 +14,7 @@ class AgentEventKind(StrEnum):
     MODEL_STEP_STARTED = "model_step_started"
     MODEL_THINKING_COMPLETED = "model_thinking_completed"
     CONTEXT_USAGE_UPDATED = "context_usage_updated"
+    FINALIZING_STARTED = "finalizing_started"
     BACKGROUND_TASK_COMPLETION_REMINDER = "background_task_completion_reminder"
     PROVIDER_ATTEMPT_FAILED = "provider_attempt_failed"
     PROVIDER_SELECTED = "provider_selected"

@@ -72,6 +72,11 @@ from neuro_code.bootstrap.entrypoints import BootstrapCliServices
 from neuro_code.config import AppConfig, ProviderProfile
 from neuro_code.domain.background_tasks import BackgroundTaskStatus, BackgroundTaskWaitMode
 from neuro_code.domain.events import AgentEvent, AgentEventKind
+from neuro_code.domain.execution import (
+    AgentExecutionOutcome,
+    AgentExecutionStatus,
+    SupervisorReasonCode,
+)
 from neuro_code.domain.interaction_mode import InteractionMode
 from neuro_code.domain.messages import (
     ContentPart,
@@ -297,6 +302,7 @@ class RunnerFixture:
         wrap_cancellation: bool = False,
         session_id: str | None = None,
         items: Sequence[SessionItem] = (),
+        outcome: AgentExecutionOutcome | None = None,
     ) -> None:
         self._session_id = session_id
         self._items = tuple(items)
@@ -306,6 +312,7 @@ class RunnerFixture:
         self._approval_scope = approval_scope
         self._failure = failure
         self._wrap_cancellation = wrap_cancellation
+        self._outcome = outcome
         self._approver: PermissionApprover | None = None
         self._started = asyncio.Event()
         self._release = asyncio.Event()
@@ -408,6 +415,7 @@ class RunnerFixture:
             (*self._items, Message(Role.USER, prompt, content_parts=prompt_parts)),
             tuple(events),
             1,
+            outcome=self._outcome,
         )
 
     def attach_approver(self, approver: PermissionApprover | None) -> None:
@@ -2620,6 +2628,84 @@ class AcpAgentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(provider.exception.data["reason"], "provider_failure")
         self.assertEqual(generic.exception.data["reason"], "prompt_failure")
         self.assertIs(direct.exception, forwarded)
+
+    async def test_typed_execution_outcomes_take_priority_over_legacy_error_mapping(self) -> None:
+        model_step_limited = RunnerFixture(
+            outcome=AgentExecutionOutcome(
+                AgentExecutionStatus.BUDGET_LIMITED,
+                SupervisorReasonCode.MODEL_STEP_LIMIT,
+                finalized=True,
+                recoverable=True,
+            )
+        )
+        stuck = RunnerFixture(
+            outcome=AgentExecutionOutcome(
+                AgentExecutionStatus.STUCK,
+                SupervisorReasonCode.PERIODIC_CYCLE,
+                finalized=True,
+                recoverable=True,
+            )
+        )
+        token_limited = RunnerFixture(
+            outcome=AgentExecutionOutcome(
+                AgentExecutionStatus.BUDGET_LIMITED,
+                SupervisorReasonCode.OUTPUT_TOKEN_BUDGET,
+                finalized=True,
+                recoverable=True,
+            )
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            agent, _, _ = await initialized_agent(
+                root,
+                [model_step_limited, stuck, token_limited],
+            )
+            sessions = [await agent.new_session(str(root)) for _ in range(3)]
+            limited = await agent.prompt(
+                sessions[0].session_id,
+                [TextContentBlock(type="text", text="limit")],
+            )
+            stuck_response = await agent.prompt(
+                sessions[1].session_id,
+                [TextContentBlock(type="text", text="stuck")],
+            )
+            token_response = await agent.prompt(
+                sessions[2].session_id,
+                [TextContentBlock(type="text", text="tokens")],
+            )
+
+        self.assertEqual(limited.stop_reason, "max_turn_requests")
+        self.assertEqual(stuck_response.stop_reason, "end_turn")
+        self.assertEqual(token_response.stop_reason, "max_tokens")
+        self.assertEqual(limited.field_meta["neuro_code.execution_status"], "budget_limited")
+        self.assertEqual(limited.field_meta["neuro_code.execution_reason"], "model_step_limit")
+        self.assertTrue(limited.field_meta["neuro_code.finalized"])
+        self.assertTrue(limited.field_meta["neuro_code.recoverable"])
+        self.assertEqual(stuck_response.field_meta["neuro_code.execution_status"], "stuck")
+        self.assertNotIn("snapshot", repr(limited.field_meta))
+        self.assertNotIn("digest", repr(limited.field_meta))
+
+    async def test_non_budget_execution_outcome_keeps_the_existing_stop_reason(self) -> None:
+        completed = RunnerFixture(
+            outcome=AgentExecutionOutcome(
+                AgentExecutionStatus.COMPLETED,
+                None,
+                finalized=False,
+                recoverable=False,
+            )
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            agent, _, _ = await initialized_agent(root, [completed])
+            session = await agent.new_session(str(root))
+            response = await agent.prompt(
+                session.session_id,
+                [TextContentBlock(type="text", text="complete")],
+            )
+
+        self.assertEqual(response.stop_reason, "end_turn")
+        self.assertEqual(response.field_meta["neuro_code.execution_status"], "completed")
+        self.assertEqual(response.field_meta["neuro_code.execution_reason"], "none")
 
     async def test_permission_approval_and_denial_are_fail_closed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
