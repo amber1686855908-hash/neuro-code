@@ -24,6 +24,32 @@ _SUPPORTED_PROXY_MODES = frozenset({"environment", "direct", "explicit"})
 
 
 @dataclass(frozen=True, slots=True)
+class ManagedProxyPolicy:
+    """One non-secret proxy policy for managed provider configuration."""
+
+    mode: str = "environment"
+    proxy_url_env: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.mode not in _SUPPORTED_PROXY_MODES:
+            raise ConfigurationError(
+                "provider proxy_mode must be 'environment', 'direct', or 'explicit'"
+            )
+        if self.mode == "explicit":
+            if (
+                self.proxy_url_env is None
+                or _ENVIRONMENT_VARIABLE.fullmatch(self.proxy_url_env) is None
+            ):
+                raise ConfigurationError(
+                    "provider explicit proxy mode requires a valid proxy environment variable"
+                )
+        elif self.proxy_url_env is not None:
+            raise ConfigurationError(
+                "provider proxy environment variable requires proxy_mode 'explicit'"
+            )
+
+
+@dataclass(frozen=True, slots=True)
 class ManagedProviderProfile:
     """One user-managed provider profile; its credential is never represented."""
 
@@ -32,7 +58,8 @@ class ManagedProviderProfile:
     model: str
     base_url: str
     dialect: str = "standard"
-    proxy_mode: str = "environment"
+    context_window_tokens: int | None = None
+    proxy_mode: str | None = None
     proxy_url_env: str | None = None
     api_key: str | None = field(default=None, repr=False, compare=False)
 
@@ -70,32 +97,35 @@ class ManagedProviderProfile:
             raise ConfigurationError("provider base URL must not contain user information")
         if parsed.query or parsed.fragment:
             raise ConfigurationError("provider base URL must not contain a query or fragment")
-        if self.proxy_mode not in _SUPPORTED_PROXY_MODES:
-            raise ConfigurationError(
-                "provider proxy_mode must be 'environment', 'direct', or 'explicit'"
-            )
-        if self.proxy_mode == "explicit":
-            if (
-                self.proxy_url_env is None
-                or _ENVIRONMENT_VARIABLE.fullmatch(self.proxy_url_env) is None
-            ):
+        if self.context_window_tokens is not None and (
+            isinstance(self.context_window_tokens, bool) or self.context_window_tokens <= 0
+        ):
+            raise ConfigurationError("provider context_window_tokens must be positive")
+        if self.proxy_mode is None:
+            if self.proxy_url_env is not None:
                 raise ConfigurationError(
-                    "provider explicit proxy mode requires a valid proxy environment variable"
+                    "provider proxy environment variable requires a proxy override"
                 )
-        elif self.proxy_url_env is not None:
-            raise ConfigurationError(
-                "provider proxy environment variable requires proxy_mode 'explicit'"
-            )
+        else:
+            ManagedProxyPolicy(self.proxy_mode, self.proxy_url_env)
         if self.api_key is not None and not self.api_key.strip():
             object.__setattr__(self, "api_key", None)
         if self.api_key is not None and len(self.api_key) > _MAX_API_KEY_CHARACTERS:
             raise ConfigurationError("provider API key is too long")
+
+    def effective_proxy_policy(self, defaults: ManagedProxyPolicy) -> ManagedProxyPolicy:
+        """Return this profile's explicit policy or the user-wide default."""
+
+        if self.proxy_mode is None:
+            return defaults
+        return ManagedProxyPolicy(self.proxy_mode, self.proxy_url_env)
 
 
 @dataclass(frozen=True, slots=True)
 class ManagedProviderSettings:
     profiles: tuple[ManagedProviderProfile, ...] = ()
     default_provider: str | None = None
+    proxy_defaults: ManagedProxyPolicy = field(default_factory=ManagedProxyPolicy)
 
     def __post_init__(self) -> None:
         if len(self.profiles) > _MAX_PROFILES:
@@ -110,4 +140,4 @@ class ManagedProviderSettings:
         return next((profile for profile in self.profiles if profile.name == name), None)
 
 
-__all__ = ["ManagedProviderProfile", "ManagedProviderSettings"]
+__all__ = ["ManagedProviderProfile", "ManagedProviderSettings", "ManagedProxyPolicy"]

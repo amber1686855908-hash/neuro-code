@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import AsyncIterator, Callable, Sequence
 from dataclasses import dataclass
 
-from neuro_code.application.ports.model import ModelProvider
+from neuro_code.application.ports.model import ModelProvider, ModelToolPolicy
 from neuro_code.domain.model_context import ModelContext
 from neuro_code.domain.model_events import (
     ModelEvent,
@@ -84,6 +84,8 @@ class FailoverModelProvider:
         self,
         context: ModelContext,
         tools: Sequence[ToolDefinition],
+        *,
+        tool_policy: ModelToolPolicy = ModelToolPolicy.ALLOWED,
     ) -> AsyncIterator[ModelEvent]:
         start_index = self._active_index if self._active_index is not None else 0
         failures: list[tuple[str, str]] = []
@@ -91,7 +93,7 @@ class FailoverModelProvider:
             candidate = self._candidates[index]
             try:
                 provider = self._provider(index)
-                iterator = provider.stream(context, tools)
+                iterator = provider.stream(context, tools, tool_policy=tool_policy)
                 first_event = await anext(iterator)
             except (ConfigurationError, ProviderError) as error:
                 message = self._failure_message(error)

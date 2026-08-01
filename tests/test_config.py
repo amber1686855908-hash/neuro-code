@@ -14,7 +14,7 @@ from neuro_code.config import (
     override_sandbox,
     pin_resumed_sandbox,
 )
-from neuro_code.domain.provider_settings import ManagedProviderProfile
+from neuro_code.domain.provider_settings import ManagedProviderProfile, ManagedProxyPolicy
 from neuro_code.domain.sandbox import SandboxProfile
 from neuro_code.shared.errors import ConfigurationError
 
@@ -342,6 +342,31 @@ api_key_env = "FIXTURE_KEY"
             self.assertTrue(config.provider.redacted_dict({})["credential_configured"])
             self.assertNotIn(secret, repr(config))
             self.assertNotIn(secret, repr(config.redacted_dict()))
+
+    def test_managed_profile_inherits_global_proxy_and_context_capacity(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / ".neuro-code"
+            store = JsonProviderSettingsStore(state)
+            asyncio.run(store.save_proxy_defaults(ManagedProxyPolicy("direct")))
+            asyncio.run(
+                store.save_profile(
+                    ManagedProviderProfile(
+                        name="managed",
+                        protocol="openai-chat",
+                        model="managed-model",
+                        base_url="https://managed.invalid/v1",
+                        context_window_tokens=128_000,
+                        api_key="managed-secret",
+                    )
+                )
+            )
+
+            profile = load_config(root, home=root, environ={}).provider
+
+            self.assertEqual(profile.proxy_mode, "direct")
+            self.assertIsNone(profile.proxy_url_env)
+            self.assertEqual(profile.context_window_tokens, 128_000)
 
     def test_workspace_cannot_redirect_a_managed_profile_credential(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

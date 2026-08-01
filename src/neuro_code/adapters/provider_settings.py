@@ -16,7 +16,11 @@ from neuro_code.configuration.managed_provider_settings import (
 from neuro_code.configuration.managed_provider_settings import (
     load_managed_provider_settings as _load_managed_provider_settings,
 )
-from neuro_code.domain.provider_settings import ManagedProviderProfile, ManagedProviderSettings
+from neuro_code.domain.provider_settings import (
+    ManagedProviderProfile,
+    ManagedProviderSettings,
+    ManagedProxyPolicy,
+)
 from neuro_code.shared.async_utils import run_blocking
 from neuro_code.shared.errors import ConfigurationError
 
@@ -73,6 +77,7 @@ class JsonProviderSettingsStore:
             model=profile.model.strip(),
             base_url=profile.base_url.strip().rstrip("/"),
             dialect=profile.dialect,
+            context_window_tokens=profile.context_window_tokens,
             proxy_mode=profile.proxy_mode,
             proxy_url_env=profile.proxy_url_env,
             api_key=api_key,
@@ -85,7 +90,7 @@ class JsonProviderSettingsStore:
             if make_default or current.default_provider is None
             else current.default_provider
         )
-        updated = ManagedProviderSettings(tuple(profiles), default)
+        updated = ManagedProviderSettings(tuple(profiles), default, current.proxy_defaults)
         self._save(updated)
         return updated
 
@@ -97,7 +102,27 @@ class JsonProviderSettingsStore:
         current = _load_managed_provider_settings(self._state_dir)
         if current.profile(name) is None:
             raise ConfigurationError(f"managed provider profile does not exist: {name}")
-        updated = ManagedProviderSettings(current.profiles, name)
+        updated = ManagedProviderSettings(current.profiles, name, current.proxy_defaults)
+        self._save(updated)
+        return updated
+
+    async def save_proxy_defaults(
+        self,
+        proxy_defaults: ManagedProxyPolicy,
+    ) -> ManagedProviderSettings:
+        async with self._write_lock:
+            return await run_blocking(self._save_proxy_defaults, proxy_defaults)
+
+    def _save_proxy_defaults(
+        self,
+        proxy_defaults: ManagedProxyPolicy,
+    ) -> ManagedProviderSettings:
+        current = _load_managed_provider_settings(self._state_dir)
+        updated = ManagedProviderSettings(
+            current.profiles,
+            current.default_provider,
+            proxy_defaults,
+        )
         self._save(updated)
         return updated
 
@@ -113,7 +138,7 @@ class JsonProviderSettingsStore:
         default = current.default_provider
         if default == name:
             default = profiles[0].name if profiles else None
-        updated = ManagedProviderSettings(profiles, default)
+        updated = ManagedProviderSettings(profiles, default, current.proxy_defaults)
         self._save(updated)
         return updated
 
@@ -121,6 +146,10 @@ class JsonProviderSettingsStore:
         metadata = {
             "version": _SCHEMA_VERSION,
             "default_provider": settings.default_provider,
+            "proxy_defaults": {
+                "mode": settings.proxy_defaults.mode,
+                "proxy_url_env": settings.proxy_defaults.proxy_url_env,
+            },
             "providers": [
                 {
                     "name": profile.name,
@@ -128,6 +157,7 @@ class JsonProviderSettingsStore:
                     "dialect": profile.dialect,
                     "model": profile.model,
                     "base_url": profile.base_url,
+                    "context_window_tokens": profile.context_window_tokens,
                     "proxy_mode": profile.proxy_mode,
                     "proxy_url_env": profile.proxy_url_env,
                 }

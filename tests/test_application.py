@@ -14,6 +14,7 @@ from neuro_code.application.ports.background_tasks import (
     BackgroundTaskSupervisor,
 )
 from neuro_code.application.ports.model import ModelProvider
+from neuro_code.application.runtime.supervision import ExecutionControlMode
 from neuro_code.application.settings import ApplicationSettings
 from neuro_code.bootstrap.composition import ApplicationComposition
 from neuro_code.config import AppConfig
@@ -128,6 +129,54 @@ api_key_env = "FIXTURE_KEY"
 """,
             encoding="utf-8",
         )
+
+    def test_application_settings_default_to_finalize_terminal(self) -> None:
+        settings = ApplicationSettings()
+
+        self.assertIs(settings.execution_control_mode, ExecutionControlMode.FINALIZE_TERMINAL)
+        self.assertEqual(settings.max_steps, 24)
+        self.assertIs(settings.reasoning_effort, ReasoningEffort.HIGH)
+
+    def test_application_settings_can_select_observe_only(self) -> None:
+        settings = ApplicationSettings(execution_control_mode=ExecutionControlMode.OBSERVE_ONLY)
+
+        self.assertIs(settings.execution_control_mode, ExecutionControlMode.OBSERVE_ONLY)
+
+    async def test_composition_passes_execution_control_mode_to_runtime(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / "state"
+            self._write_config(state)
+            environment = {
+                "HOME": str(root),
+                "NEURO_CODE_HOME": str(state),
+                "FIXTURE_KEY": "fixture-key",
+            }
+            with patch.dict("os.environ", environment, clear=True):
+                default_application = await ApplicationComposition.open(
+                    ApplicationSettings(cwd=root),
+                    provider_factory=lambda config, failover: ApplicationProviderFixture(),
+                )
+                default_binding = await default_application.create_binding()
+                self.assertIs(
+                    default_binding.runner._runtime._execution_control_mode,
+                    ExecutionControlMode.FINALIZE_TERMINAL,
+                )
+                await default_application.close()
+
+                observe_application = await ApplicationComposition.open(
+                    ApplicationSettings(
+                        cwd=root,
+                        execution_control_mode=ExecutionControlMode.OBSERVE_ONLY,
+                    ),
+                    provider_factory=lambda config, failover: ApplicationProviderFixture(),
+                )
+                observe_binding = await observe_application.create_binding()
+                self.assertIs(
+                    observe_binding.runner._runtime._execution_control_mode,
+                    ExecutionControlMode.OBSERVE_ONLY,
+                )
+                await observe_application.close()
 
     async def test_open_create_and_close_own_shared_resources(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

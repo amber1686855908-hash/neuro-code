@@ -5,9 +5,11 @@ import unittest
 
 import httpx
 
+from neuro_code.application.ports.model import ModelToolPolicy
 from neuro_code.domain.messages import ContextItemKind, Message, PreservedContextItem, Role
 from neuro_code.domain.model_context import ModelContext
 from neuro_code.domain.model_events import ModelCompleted
+from neuro_code.domain.tools import ToolDefinition
 from neuro_code.providers.openai_responses import OpenAIResponsesProvider
 
 
@@ -128,6 +130,65 @@ class OpenAIResponsesProviderTests(unittest.IsolatedAsyncioTestCase):
             completed.context_items[0].to_dict()["encrypted_content"],
             "encrypted",
         )
+
+    async def test_disabled_tool_policy_omits_local_functions_without_sticky_state(self) -> None:
+        captured: list[dict[str, object]] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured.append(json.loads(request.content))
+            body = "\n\n".join(
+                (
+                    "data: "
+                    + json.dumps(
+                        {
+                            "type": "response.completed",
+                            "response": {
+                                "status": "completed",
+                                "output": [
+                                    {
+                                        "type": "message",
+                                        "role": "assistant",
+                                        "content": [{"type": "output_text", "text": "done"}],
+                                    }
+                                ],
+                                "usage": {"input_tokens": 2, "output_tokens": 1},
+                            },
+                        }
+                    ),
+                    "data: [DONE]",
+                    "",
+                )
+            )
+            return httpx.Response(200, text=body)
+
+        provider = OpenAIResponsesProvider(
+            model="response-model",
+            base_url="https://gateway.invalid/v1",
+            api_key="fixture",
+            transport=httpx.MockTransport(handler),
+        )
+        context = ModelContext((Message(Role.USER, "hello"),))
+        tools = (ToolDefinition("read_file", "Read", {"type": "object"}),)
+
+        first = [event async for event in provider.stream(context, tools)]
+        disabled = [
+            event
+            async for event in provider.stream(
+                context,
+                tools,
+                tool_policy=ModelToolPolicy.DISABLED,
+            )
+        ]
+        second = [event async for event in provider.stream(context, tools)]
+
+        self.assertIsInstance(first[-1], ModelCompleted)
+        self.assertIsInstance(disabled[-1], ModelCompleted)
+        self.assertIsInstance(second[-1], ModelCompleted)
+        self.assertEqual(captured[0]["tools"], captured[2]["tools"])
+        self.assertNotIn("tools", captured[1])
+        self.assertNotIn("tool_choice", captured[1])
+        self.assertNotIn("parallel_tool_calls", captured[1])
+        self.assertEqual(tools[0].name, "read_file")
 
 
 if __name__ == "__main__":

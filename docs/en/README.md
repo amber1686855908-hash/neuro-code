@@ -232,8 +232,10 @@ reasoning effort, and interaction mode. While waiting for model output, the
 supplied seven-cell collapsing pulse animates before the pending-assistant text. The
 context percentage starts as a visibly approximate local estimate and switches
 to provider-reported input/output token usage after a model step. A configured
-`context_window_tokens` value supplies the denominator; unknown windows display
-`?` instead of inventing a percentage. When a requested effort has a different
+`context_window_tokens` value supplies the denominator. When no capacity is
+configured, the bar shows the known token use without inventing a percentage.
+Managed provider details expose this local capability field so every configured
+model can supply its own real denominator. When a requested effort has a different
 implemented policy, the bar shows both values, for example
 `⚡ ultracode → ⬤ xhigh`. The labels update with the selected UI language and
 remain visible in narrow layouts.
@@ -245,11 +247,13 @@ text commands display placeholders such as `SESSION_ID`, `QUERY`, and `TITLE`.
 focus traversal retain their normal behavior.
 
 Use `Ctrl+,`, `/settings`, or `/setting` to open a first-level category page,
-then choose interface language or model providers. Provider details distinguish
+then choose interface language, model providers, or network and proxy defaults. Provider details distinguish
 OpenAI Responses (`/responses`) from OpenAI-compatible Chat Completions
 (`/chat/completions`); the DeepSeek preset selects the latter and fills
 `https://api.deepseek.com`.
-Provider details run the same local proxy-policy resolver used by the runtime
+Network settings own the global proxy default. Provider details inherit it by
+default and expose an explicit override only when a provider needs another
+route. Both screens run the same local proxy-policy resolver used by the runtime
 before writing settings; this does not send a network request. An explicit
 **Test and load models** action performs a read-only catalog request with the
 draft endpoint, credential, and proxy policy. It sends no conversation and

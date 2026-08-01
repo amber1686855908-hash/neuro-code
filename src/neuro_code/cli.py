@@ -10,8 +10,10 @@ from typing import TYPE_CHECKING, Any, Protocol
 
 from neuro_code import __version__
 from neuro_code.application.ports.storage import SessionStore
+from neuro_code.application.runtime.supervision import ExecutionControlMode
 from neuro_code.application.settings import ApplicationSettings
 from neuro_code.domain.events import AgentEvent, AgentEventKind
+from neuro_code.domain.execution import AgentExecutionOutcome
 from neuro_code.domain.instructions import InstructionDiscoveryResult
 from neuro_code.domain.messages import (
     ContextItemKind,
@@ -33,6 +35,12 @@ from neuro_code.shared.errors import ConfigurationError, NeuroCodeError
 
 if TYPE_CHECKING:
     from neuro_code.config import AppConfig
+
+
+_EXECUTION_CONTROL_CHOICES = {
+    "finalize-terminal": ExecutionControlMode.FINALIZE_TERMINAL,
+    "observe-only": ExecutionControlMode.OBSERVE_ONLY,
+}
 
 
 class ImportedRustSession(Protocol):
@@ -125,6 +133,12 @@ def _add_run_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--deny", action="append", default=[], metavar="PATTERN")
     parser.add_argument("--max-steps", type=int, default=24)
     parser.add_argument(
+        "--execution-control",
+        choices=tuple(_EXECUTION_CONTROL_CHOICES),
+        default="finalize-terminal",
+        help="supervision behavior after a terminal execution decision",
+    )
+    parser.add_argument(
         "--effort",
         choices=tuple(effort.value for effort in ReasoningEffort),
         help="agent review depth (default: high, or the saved TUI preference)",
@@ -150,6 +164,12 @@ def _add_acp_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--allow", action="append", default=[], metavar="PATTERN")
     parser.add_argument("--deny", action="append", default=[], metavar="PATTERN")
     parser.add_argument("--max-steps", type=int, default=24)
+    parser.add_argument(
+        "--execution-control",
+        choices=tuple(_EXECUTION_CONTROL_CHOICES),
+        default="finalize-terminal",
+        help="supervision behavior after a terminal execution decision",
+    )
     parser.add_argument(
         "--effort",
         choices=tuple(effort.value for effort in ReasoningEffort),
@@ -413,6 +433,7 @@ async def _run_agent(args: argparse.Namespace, services: CliServices) -> int:
                         "response": result.response,
                         "steps": result.steps,
                         "events": [event.to_dict() for event in result.events],
+                        "outcome": _serialized_execution_outcome(result.outcome),
                     },
                     ensure_ascii=False,
                 )
@@ -446,6 +467,9 @@ def _application_settings(
         ),
         permission_rules=_rules(args),
         max_steps=args.max_steps,
+        execution_control_mode=_execution_control_mode(
+            getattr(args, "execution_control", "finalize-terminal")
+        ),
         reasoning_effort=(
             ReasoningEffort(args.effort)
             if getattr(args, "effort", None) is not None
@@ -454,6 +478,28 @@ def _application_settings(
         resume_id=getattr(args, "resume", None),
         launch_command=(sys.executable, "-m", "neuro_code", *raw_arguments),
     )
+
+
+def _execution_control_mode(value: object) -> ExecutionControlMode:
+    if not isinstance(value, str):
+        raise ConfigurationError("execution control selection is invalid")
+    try:
+        return _EXECUTION_CONTROL_CHOICES[value]
+    except KeyError:
+        raise ConfigurationError("execution control selection is invalid") from None
+
+
+def _serialized_execution_outcome(
+    outcome: AgentExecutionOutcome | None,
+) -> dict[str, object] | None:
+    if outcome is None:
+        return None
+    return {
+        "status": outcome.status.value,
+        "reason": outcome.reason_code.value if outcome.reason_code is not None else None,
+        "finalized": outcome.finalized,
+        "recoverable": outcome.recoverable,
+    }
 
 
 def _provider_rows(config: AppConfig) -> list[dict[str, object]]:

@@ -7,6 +7,7 @@ from unittest import mock
 
 import httpx
 
+from neuro_code.application.ports.model import ModelToolPolicy
 from neuro_code.config import AppConfig, ProviderProfile
 from neuro_code.domain.messages import (
     IMAGE_MODEL_PLACEHOLDER,
@@ -500,6 +501,108 @@ class OpenAICompatibleProviderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(body["messages"][1]["reasoning_content"], "prior tool reasoning")
         self.assertEqual(body["messages"][2]["tool_call_id"], "old")
         self.assertEqual(body["tools"][0]["function"]["name"], "read_file")
+
+    async def test_tool_policy_disabled_omits_tools_without_sticky_state(self) -> None:
+        captured: list[dict[str, object]] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured.append(json.loads(request.content))
+            return httpx.Response(
+                200,
+                text=_sse({"choices": [{"delta": {"content": "done"}, "finish_reason": "stop"}]}),
+                headers={"content-type": "text/event-stream"},
+            )
+
+        provider = OpenAICompatibleProvider(
+            model="fixture-model",
+            base_url="https://provider.invalid/v1",
+            api_key="fixture",
+            transport=httpx.MockTransport(handler),
+        )
+        context = ModelContext((Message(Role.USER, "hello"),))
+        tools = (
+            ToolDefinition(
+                "read_file",
+                "Read a file",
+                {"type": "object", "properties": {"path": {"type": "string"}}},
+            ),
+        )
+
+        first = [event async for event in provider.stream(context, tools)]
+        disabled = [
+            event
+            async for event in provider.stream(
+                context,
+                tools,
+                tool_policy=ModelToolPolicy.DISABLED,
+            )
+        ]
+        second = [event async for event in provider.stream(context, tools)]
+
+        self.assertEqual(ModelToolPolicy.ALLOWED.value, "allowed")
+        self.assertEqual(ModelToolPolicy.DISABLED.value, "disabled")
+        self.assertIsInstance(first[-1], ModelCompleted)
+        self.assertIsInstance(disabled[-1], ModelCompleted)
+        self.assertIsInstance(second[-1], ModelCompleted)
+        self.assertEqual(captured[0]["tools"], captured[2]["tools"])
+        self.assertNotIn("tools", captured[1])
+        self.assertNotIn("tool_choice", captured[1])
+        self.assertNotIn("parallel_tool_calls", captured[1])
+        self.assertEqual(tools[0].name, "read_file")
+
+    async def test_disabled_tool_policy_preserves_illegal_remote_tool_call_events(self) -> None:
+        captured: dict[str, object] = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured["body"] = json.loads(request.content)
+            return httpx.Response(
+                200,
+                text=_sse(
+                    {
+                        "choices": [
+                            {
+                                "delta": {
+                                    "tool_calls": [
+                                        {
+                                            "index": 0,
+                                            "id": "remote-call",
+                                            "function": {
+                                                "name": "read_file",
+                                                "arguments": '{"path":"a.py"}',
+                                            },
+                                        }
+                                    ]
+                                },
+                                "finish_reason": "tool_calls",
+                            }
+                        ]
+                    }
+                ),
+                headers={"content-type": "text/event-stream"},
+            )
+
+        provider = OpenAICompatibleProvider(
+            model="fixture-model",
+            base_url="https://provider.invalid/v1",
+            api_key="fixture",
+            transport=httpx.MockTransport(handler),
+        )
+        tools = (ToolDefinition("read_file", "Read", {"type": "object"}),)
+
+        events = [
+            event
+            async for event in provider.stream(
+                ModelContext((Message(Role.USER, "hello"),)),
+                tools,
+                tool_policy=ModelToolPolicy.DISABLED,
+            )
+        ]
+
+        body = captured["body"]
+        assert isinstance(body, dict)
+        self.assertNotIn("tools", body)
+        self.assertIsInstance(events[0], ModelToolCall)
+        self.assertEqual(events[0].call.name, "read_file")
 
     async def test_http_error_is_bounded_and_does_not_echo_api_key(self) -> None:
         def handler(request: httpx.Request) -> httpx.Response:

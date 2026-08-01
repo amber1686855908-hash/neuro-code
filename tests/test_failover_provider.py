@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import unittest
 from collections.abc import AsyncIterator, Sequence
 
+from neuro_code.application.ports.model import ModelToolPolicy
 from neuro_code.domain.messages import Message, Role
 from neuro_code.domain.model_context import ModelContext
 from neuro_code.domain.model_events import (
@@ -21,24 +23,28 @@ class ScriptedModelProvider:
     def __init__(
         self,
         name: str,
-        scripts: Sequence[Sequence[ModelEvent | Exception]],
+        scripts: Sequence[Sequence[ModelEvent | BaseException]],
     ) -> None:
         self.provider_name = name
         self.model_name = f"{name}-model"
         self.context_affinity = f"profile-v1:{name}"
         self._scripts = [tuple(script) for script in scripts]
         self.calls = 0
+        self.tool_policies: list[ModelToolPolicy] = []
 
     async def stream(
         self,
         context: ModelContext,
         tools: Sequence[ToolDefinition],
+        *,
+        tool_policy: ModelToolPolicy = ModelToolPolicy.ALLOWED,
     ) -> AsyncIterator[ModelEvent]:
         del context, tools
+        self.tool_policies.append(tool_policy)
         script = self._scripts[self.calls]
         self.calls += 1
         for item in script:
-            if isinstance(item, Exception):
+            if isinstance(item, BaseException):
                 raise item
             yield item
 
@@ -88,6 +94,59 @@ class FailoverModelProviderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(selected.context_window_tokens, 128_000)
         self.assertEqual(router.provider_name, "fallback")
         self.assertEqual(router.context_affinity, "profile-v1:fallback")
+        self.assertEqual(primary.tool_policies, [ModelToolPolicy.ALLOWED])
+        self.assertEqual(fallback.tool_policies, [ModelToolPolicy.ALLOWED])
+
+    async def test_disabled_policy_is_forwarded_to_every_failover_candidate(self) -> None:
+        primary = ScriptedModelProvider(
+            "primary",
+            ((ProviderError("temporary upstream failure"),),),
+        )
+        fallback = ScriptedModelProvider(
+            "fallback",
+            ((ModelTextDelta("ok"), ModelCompleted("stop")),),
+        )
+        router = FailoverModelProvider((_candidate(primary), _candidate(fallback)))
+
+        events = [
+            event
+            async for event in router.stream(
+                ModelContext((Message(Role.USER, "hello"),)),
+                (),
+                tool_policy=ModelToolPolicy.DISABLED,
+            )
+        ]
+
+        self.assertEqual(
+            [type(event) for event in events],
+            [
+                ModelProviderAttemptFailed,
+                ModelProviderSelected,
+                ModelTextDelta,
+                ModelCompleted,
+            ],
+        )
+        self.assertEqual(primary.tool_policies, [ModelToolPolicy.DISABLED])
+        self.assertEqual(fallback.tool_policies, [ModelToolPolicy.DISABLED])
+
+    async def test_cancellation_keeps_the_requested_policy_and_does_not_fail_over(self) -> None:
+        primary = ScriptedModelProvider("primary", ((asyncio.CancelledError(),),))
+        fallback = ScriptedModelProvider(
+            "fallback",
+            ((ModelTextDelta("unexpected"), ModelCompleted("stop")),),
+        )
+        router = FailoverModelProvider((_candidate(primary), _candidate(fallback)))
+
+        with self.assertRaises(asyncio.CancelledError):
+            async for _ in router.stream(
+                ModelContext((Message(Role.USER, "hello"),)),
+                (),
+                tool_policy=ModelToolPolicy.DISABLED,
+            ):
+                pass
+
+        self.assertEqual(primary.tool_policies, [ModelToolPolicy.DISABLED])
+        self.assertEqual(fallback.calls, 0)
 
     async def test_failure_after_first_model_event_never_fails_over(self) -> None:
         primary = ScriptedModelProvider(
@@ -154,8 +213,10 @@ class FailoverModelProviderTests(unittest.IsolatedAsyncioTestCase):
         async def empty_stream(
             context: ModelContext,
             tools: Sequence[ToolDefinition],
+            *,
+            tool_policy: ModelToolPolicy = ModelToolPolicy.ALLOWED,
         ) -> AsyncIterator[ModelEvent]:
-            del context, tools
+            del context, tools, tool_policy
             if False:
                 yield ModelCompleted("stop")
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
+from neuro_code.application.runtime.supervision import ExecutionControlMode
 from neuro_code.domain.reasoning import ReasoningEffort
 from neuro_code.permissions import PermissionMode, PermissionRule
 
@@ -23,5 +24,6 @@ class ApplicationSettings:
     permission_rules: tuple[PermissionRule, ...] = ()
     max_steps: int = 24
     reasoning_effort: ReasoningEffort = ReasoningEffort.HIGH
+    execution_control_mode: ExecutionControlMode = ExecutionControlMode.FINALIZE_TERMINAL
     resume_id: str | None = None
     launch_command: tuple[str, ...] = ()

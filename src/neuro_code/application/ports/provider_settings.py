@@ -4,7 +4,11 @@ from __future__ import annotations
 
 from typing import Protocol
 
-from neuro_code.domain.provider_settings import ManagedProviderProfile, ManagedProviderSettings
+from neuro_code.domain.provider_settings import (
+    ManagedProviderProfile,
+    ManagedProviderSettings,
+    ManagedProxyPolicy,
+)
 
 
 class ProviderSettingsStore(Protocol):
@@ -20,6 +24,11 @@ class ProviderSettingsStore(Protocol):
     ) -> ManagedProviderSettings: ...
 
     async def set_default(self, name: str) -> ManagedProviderSettings: ...
+
+    async def save_proxy_defaults(
+        self,
+        proxy_defaults: ManagedProxyPolicy,
+    ) -> ManagedProviderSettings: ...
 
     async def delete_profile(self, name: str) -> ManagedProviderSettings: ...
 

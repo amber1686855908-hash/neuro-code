@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
+import logging
 import os
 import uuid
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from time import monotonic
@@ -16,7 +18,7 @@ from neuro_code.application.permissions.contracts import (
 from neuro_code.application.ports.approval import PermissionApprover
 from neuro_code.application.ports.model import ModelProvider
 from neuro_code.application.ports.storage import SessionStore
-from neuro_code.application.ports.tools import ToolCollection, ToolContext
+from neuro_code.application.ports.tools import Tool, ToolCollection, ToolContext
 from neuro_code.application.ports.workspace_changes import (
     WorkspaceChangeCheckpoint,
     WorkspaceChangeObserver,
@@ -26,8 +28,33 @@ from neuro_code.application.runtime.background_task_reminders import (
     BACKGROUND_TASK_COMPLETION_BATCH_LIMIT,
     format_background_task_completion_reminder,
 )
+from neuro_code.application.runtime.finalization import (
+    AgentFinalizer,
+    FinalizationEvidence,
+    FinalizationResult,
+    Finalizer,
+)
+from neuro_code.application.runtime.supervision import (
+    AgentExecutionSupervisor,
+    ExecutionControlMode,
+    StableMetadataFact,
+    SupervisionCheckpoint,
+    SupervisionObserver,
+    SupervisionTraceRecord,
+    ToolExecutionObservation,
+    create_observing_supervisor,
+    stable_metadata_fact,
+)
 from neuro_code.domain.background_tasks import BackgroundTaskSnapshot
 from neuro_code.domain.events import AgentEvent, AgentEventKind
+from neuro_code.domain.execution import (
+    AgentExecutionOutcome,
+    AgentExecutionStatus,
+    ProgressKind,
+    SupervisorDecision,
+    SupervisorDecisionKind,
+    SupervisorReasonCode,
+)
 from neuro_code.domain.instructions import InstructionDiscoveryResult
 from neuro_code.domain.interaction_mode import InteractionMode, interaction_mode_guidance
 from neuro_code.domain.messages import (
@@ -69,6 +96,40 @@ from neuro_code.shared.redaction import redact_sensitive_text
 EventSink = Callable[[AgentEvent], Awaitable[None] | None]
 
 
+FinalizerFactory = Callable[[ModelProvider, int, tuple[str, ...]], Finalizer]
+
+LOGGER = logging.getLogger(__name__)
+
+_SUPERVISION_METADATA_KEYS = frozenset(
+    {
+        "client_delegated",
+        "count",
+        "exit_code",
+        "is_background",
+        "requested_count",
+        "status",
+        "terminal_count",
+        "timed_out",
+        "total_lines",
+        "total_output_bytes",
+        "truncated",
+    }
+)
+_BACKGROUND_STATE_TOOL_NAMES = frozenset({"kill_task", "task_output"})
+
+
+def _create_finalizer(
+    provider: ModelProvider,
+    max_attempts: int,
+    redaction_values: tuple[str, ...],
+) -> AgentFinalizer:
+    return AgentFinalizer(
+        provider,
+        max_attempts=max_attempts,
+        redaction_values=redaction_values,
+    )
+
+
 DEFAULT_SYSTEM_PROMPT = """You are Neuro Code, a terminal coding agent.
 Use tools when repository evidence is needed. Read before editing. Never claim a
 tool action succeeded unless its result confirms success. Keep the final answer
@@ -85,6 +146,7 @@ class AgentRunResult:
     events: tuple[AgentEvent, ...]
     steps: int
     plan: SessionPlan | None = None
+    outcome: AgentExecutionOutcome | None = None
 
 
 class AgentRuntime:
@@ -106,9 +168,22 @@ class AgentRuntime:
         skill_provider: Callable[[], SkillDiscoveryResult | None] | None = None,
         plan: SessionPlan | None = None,
         plan_comments: Sequence[PlanComment] = (),
+        supervisor_factory: Callable[[], AgentExecutionSupervisor] | None = None,
+        supervision_observer: SupervisionObserver | None = None,
+        execution_control_mode: ExecutionControlMode = ExecutionControlMode.OBSERVE_ONLY,
+        finalizer_factory: FinalizerFactory | None = None,
+        finalizer_max_attempts: int = 2,
     ) -> None:
         if max_steps < 1:
             raise ValueError("max_steps must be positive")
+        if not isinstance(execution_control_mode, ExecutionControlMode):
+            raise TypeError("execution_control_mode must be an ExecutionControlMode")
+        if (
+            not isinstance(finalizer_max_attempts, int)
+            or isinstance(finalizer_max_attempts, bool)
+            or finalizer_max_attempts < 1
+        ):
+            raise ValueError("finalizer_max_attempts must be a positive integer")
         self._provider = provider
         self._tools = tools
         self._workspace_change_observer = workspace_change_observer
@@ -123,6 +198,11 @@ class AgentRuntime:
         self._skill_provider = skill_provider
         self._last_instruction_result: InstructionDiscoveryResult | None = None
         self._last_skill_result: SkillDiscoveryResult | None = None
+        self._supervisor_factory = supervisor_factory or create_observing_supervisor
+        self._supervision_observer = supervision_observer
+        self._execution_control_mode = execution_control_mode
+        self._finalizer_factory = finalizer_factory or _create_finalizer
+        self._finalizer_max_attempts = finalizer_max_attempts
         self._plan = plan
         self._plan_comments: tuple[PlanComment, ...] = ()
         self.set_plan_comments(plan_comments)
@@ -418,9 +498,220 @@ class AgentRuntime:
             if self._session_store is not None and session_id is not None:
                 await self._session_store.save_session_items(session_id, context_items)
 
+        supervisor: AgentExecutionSupervisor | None = None
+
+        def disable_supervision(failure: str, error: Exception | None = None) -> None:
+            nonlocal supervisor
+            LOGGER.debug(
+                "supervision disabled failure=%s error_type=%s",
+                failure,
+                type(error).__name__ if error is not None else "none",
+            )
+            supervisor = None
+
+        def record_supervision(
+            checkpoint: SupervisionCheckpoint,
+            model_step: int,
+            operation: Callable[[AgentExecutionSupervisor], SupervisorDecision],
+            *,
+            tool_name: str | None = None,
+        ) -> SupervisorDecision | None:
+            current = supervisor
+            if current is None:
+                return None
+            try:
+                decision = operation(current)
+                record = SupervisionTraceRecord(
+                    checkpoint,
+                    model_step,
+                    tool_name,
+                    current.snapshot,
+                    decision,
+                )
+                LOGGER.debug(
+                    "supervision checkpoint=%s step=%s tool=%s decision=%s reason_code=%s "
+                    "counters=%s status=%s",
+                    record.checkpoint.value,
+                    record.model_step,
+                    record.tool_name,
+                    record.decision.kind.value,
+                    record.decision.reason_code.value,
+                    record.snapshot.counters,
+                    record.snapshot.status.value,
+                )
+                if self._supervision_observer is not None:
+                    self._supervision_observer(record)
+                return decision
+            except Exception as error:
+                disable_supervision("checkpoint", error)
+                return None
+
+        def controlled_terminal_decision(
+            decision: SupervisorDecision | None,
+        ) -> SupervisorDecision | None:
+            if self._execution_control_mode is not ExecutionControlMode.FINALIZE_TERMINAL:
+                return None
+            if decision is None:
+                return None
+            if decision.kind not in {
+                SupervisorDecisionKind.FINALIZE,
+                SupervisorDecisionKind.MARK_STUCK,
+                SupervisorDecisionKind.MARK_BUDGET_LIMITED,
+            }:
+                return None
+            return decision
+
+        def select_terminal_decision(
+            current: SupervisorDecision | None,
+            candidate: SupervisorDecision | None,
+        ) -> SupervisorDecision | None:
+            candidate = controlled_terminal_decision(candidate)
+            if candidate is None:
+                return current
+            if current is None:
+                return candidate
+            priority = {
+                SupervisorDecisionKind.FINALIZE: 1,
+                SupervisorDecisionKind.MARK_BUDGET_LIMITED: 2,
+                SupervisorDecisionKind.MARK_STUCK: 3,
+            }
+            return candidate if priority[candidate.kind] > priority[current.kind] else current
+
+        def outcome_for_terminal_decision(
+            decision: SupervisorDecision,
+        ) -> AgentExecutionOutcome:
+            status = (
+                AgentExecutionStatus.STUCK
+                if decision.kind is SupervisorDecisionKind.MARK_STUCK
+                else AgentExecutionStatus.BUDGET_LIMITED
+            )
+            return AgentExecutionOutcome(
+                status,
+                decision.reason_code,
+                finalized=True,
+                recoverable=True,
+            )
+
+        workspace_evidence: list[str] = []
+        verification_evidence: list[str] = []
+
+        def record_workspace_evidence(report: WorkspaceChangeReport) -> None:
+            for change in report.files:
+                path = redact_sensitive_text(
+                    change.path,
+                    explicit_values=self._tool_context.redaction_values,
+                )
+                workspace_evidence.append(
+                    f"{change.status} {path} (+{change.additions}/-{change.deletions})"
+                )
+
+        def record_verification_evidence(observation: ToolExecutionObservation) -> None:
+            if observation.progress_kind is ProgressKind.VERIFICATION:
+                verification_evidence.append(
+                    "A verification result was recorded before finalization."
+                )
+
+        async def complete_finalized_turn(
+            decision: SupervisorDecision,
+            *,
+            step: int,
+        ) -> AgentRunResult:
+            outcome = outcome_for_terminal_decision(decision)
+            await emit(
+                AgentEventKind.FINALIZING_STARTED,
+                {
+                    "execution_status": outcome.status.value,
+                    "execution_reason": outcome.reason_code.value
+                    if outcome.reason_code is not None
+                    else None,
+                    "recoverable": outcome.recoverable,
+                },
+            )
+            finalizer = self._finalizer_factory(
+                self._provider,
+                self._finalizer_max_attempts,
+                self._tool_context.redaction_values,
+            )
+            finalization = await finalizer.finalize(
+                ModelContext(
+                    tuple(context_items),
+                    context_source_provider,
+                    context_source_model,
+                    context_source_affinity,
+                    self._reasoning_effort,
+                ),
+                FinalizationEvidence(
+                    decision.reason_code,
+                    workspace_changes=tuple(workspace_evidence),
+                    verification=tuple(verification_evidence),
+                    unverified_items=(
+                        "No additional verification should be claimed without recorded evidence.",
+                    ),
+                    blocker=(
+                        f"Execution stopped because {decision.reason_code.value.replace('_', ' ')}."
+                    ),
+                    uncertainty=(
+                        "The final response is limited to evidence already recorded in the conversation.",
+                    ),
+                ),
+            )
+            return await complete_finalization_result(finalization, decision, step=step)
+
+        async def complete_finalization_result(
+            finalization: FinalizationResult,
+            decision: SupervisorDecision,
+            *,
+            step: int,
+        ) -> AgentRunResult:
+            outcome = outcome_for_terminal_decision(decision)
+            final_message = Message(Role.ASSISTANT, finalization.response)
+            messages.append(final_message)
+            context_items.append(final_message)
+            await emit(AgentEventKind.TEXT_DELTA, {"text": finalization.response})
+            await finish_session_task(SessionTaskStatus.COMPLETED)
+            await emit(
+                AgentEventKind.TURN_COMPLETED,
+                {
+                    "step": step,
+                    "stop_reason": finalization.stop_reason,
+                    "input_tokens": finalization.total_input_tokens,
+                    "output_tokens": finalization.total_output_tokens,
+                    "duration_seconds": monotonic() - turn_started_at,
+                    "execution_status": outcome.status.value,
+                    "execution_reason": outcome.reason_code.value
+                    if outcome.reason_code is not None
+                    else None,
+                    "finalized": outcome.finalized,
+                    "recoverable": outcome.recoverable,
+                    "finalization_status": finalization.status.value,
+                    "finalization_attempts": len(finalization.attempts),
+                    "illegal_tool_calls": finalization.illegal_tool_calls,
+                },
+            )
+            if self._session_store is not None and session_id is not None:
+                await self._session_store.save_session_items(session_id, context_items)
+            return AgentRunResult(
+                session_id,
+                finalization.response,
+                tuple(messages),
+                tuple(context_items),
+                tuple(events),
+                step,
+                self._plan,
+                outcome,
+            )
+
         response_parts: list[str] = []
         completion_reminders: list[Message] = []
+        pending_terminal_decision: SupervisorDecision | None = None
         try:
+            try:
+                supervisor = self._supervisor_factory()
+                if not isinstance(supervisor, AgentExecutionSupervisor):
+                    raise TypeError("supervisor_factory must return an AgentExecutionSupervisor")
+                supervisor.start_turn()
+            except Exception as error:
+                disable_supervision("start_turn", error)
             await emit(
                 AgentEventKind.SESSION_STARTED,
                 {
@@ -443,6 +734,8 @@ class AgentRuntime:
             await emit(AgentEventKind.USER_MESSAGE, {"content": user_message.model_content()})
 
             for step in range(1, self._max_steps + 1):
+                if pending_terminal_decision is not None:
+                    return await complete_finalized_turn(pending_terminal_decision, step=step - 1)
                 step_started_at = monotonic()
                 thinking_completed = False
 
@@ -513,6 +806,14 @@ class AgentRuntime:
                     context_source_affinity,
                     self._reasoning_effort,
                 )
+                before_model_decision = record_supervision(
+                    SupervisionCheckpoint.BEFORE_MODEL,
+                    step,
+                    lambda current: current.authorize_model_request(),
+                )
+                terminal_before_model = controlled_terminal_decision(before_model_decision)
+                if terminal_before_model is not None:
+                    return await complete_finalized_turn(terminal_before_model, step=step - 1)
                 async for model_event in self._provider.stream(context, self._tools.definitions()):
                     if isinstance(model_event, ModelProviderAttemptFailed):
                         await emit(
@@ -599,6 +900,22 @@ class AgentRuntime:
                             "estimated": completion.output_tokens is None,
                         },
                     )
+
+                def observe_model_completion(
+                    current: AgentExecutionSupervisor,
+                    input_tokens: int | None = completion.input_tokens,
+                    output_tokens: int | None = completion.output_tokens,
+                ) -> SupervisorDecision:
+                    return current.observe_model_completion(
+                        input_tokens=input_tokens,
+                        output_tokens=output_tokens,
+                    )
+
+                after_model_decision = record_supervision(
+                    SupervisionCheckpoint.AFTER_MODEL,
+                    step,
+                    observe_model_completion,
+                )
                 if completion_batch and background_tasks is not None:
                     await background_tasks.mark_completions_reported(
                         tuple(snapshot.task_id for snapshot in completion_batch)
@@ -649,9 +966,74 @@ class AgentRuntime:
                         self._plan,
                     )
 
+                tool_batch = tuple(call.name for call in tool_calls)
+                pending_terminal_decision = select_terminal_decision(
+                    pending_terminal_decision,
+                    after_model_decision,
+                )
+
+                def assess_tool_batch(
+                    current: AgentExecutionSupervisor,
+                    tool_batch: tuple[str, ...] = tool_batch,
+                ) -> SupervisorDecision:
+                    return current.assess_tool_batch(tool_batch)
+
+                after_tool_batch_decision = record_supervision(
+                    SupervisionCheckpoint.AFTER_TOOL_BATCH,
+                    step,
+                    assess_tool_batch,
+                )
+                pending_terminal_decision = select_terminal_decision(
+                    pending_terminal_decision,
+                    after_tool_batch_decision,
+                )
+
+                def record_tool_outcome(
+                    observation: ToolExecutionObservation,
+                    *,
+                    model_step: int = step,
+                ) -> SupervisorDecision | None:
+                    def observe_tool(
+                        current: AgentExecutionSupervisor,
+                    ) -> SupervisorDecision:
+                        return current.observe_tool_outcome(observation)
+
+                    return record_supervision(
+                        SupervisionCheckpoint.AFTER_TOOL,
+                        model_step,
+                        observe_tool,
+                        tool_name=observation.tool_name,
+                    )
+
+                def record_interrupted_tool_outcome(
+                    observation: ToolExecutionObservation,
+                ) -> None:
+                    record_tool_outcome(observation)
+
                 for index, call in enumerate(tool_calls):
                     try:
-                        await self._execute_tool(call, messages, context_items, emit, session_id)
+                        observation = await self._execute_tool(
+                            call,
+                            messages,
+                            context_items,
+                            emit,
+                            session_id,
+                            interrupted_observation_sink=record_interrupted_tool_outcome,
+                            workspace_change_sink=(
+                                record_workspace_evidence
+                                if self._execution_control_mode
+                                is ExecutionControlMode.FINALIZE_TERMINAL
+                                else None
+                            ),
+                        )
+                        if observation is None:
+                            disable_supervision("tool_observation_unavailable")
+                        else:
+                            record_verification_evidence(observation)
+                            pending_terminal_decision = select_terminal_decision(
+                                pending_terminal_decision,
+                                record_tool_outcome(observation),
+                            )
                     except BaseException as error:
                         await self._record_unstarted_tool_calls(
                             tool_calls[index + 1 :],
@@ -661,9 +1043,22 @@ class AgentRuntime:
                             cancelled=isinstance(error, asyncio.CancelledError),
                         )
                         raise
+                if pending_terminal_decision is not None:
+                    return await complete_finalized_turn(pending_terminal_decision, step=step)
                 if self._session_store is not None and session_id is not None:
                     await self._session_store.save_session_items(session_id, context_items)
 
+            if self._execution_control_mode is ExecutionControlMode.FINALIZE_TERMINAL:
+                return await complete_finalized_turn(
+                    SupervisorDecision(
+                        SupervisorDecisionKind.MARK_BUDGET_LIMITED,
+                        "agent reached its hard model-step limit",
+                        AgentExecutionStatus.BUDGET_LIMITED,
+                        False,
+                        SupervisorReasonCode.MODEL_STEP_LIMIT,
+                    ),
+                    step=self._max_steps,
+                )
             raise ProviderError(f"agent exceeded the maximum of {self._max_steps} model steps")
         except BaseException as error:
             # Preserve cancellation semantics while still making the session auditable.
@@ -677,10 +1072,17 @@ class AgentRuntime:
         context_items: list[SessionItem],
         emit: Callable[[AgentEventKind, dict[str, object]], Awaitable[AgentEvent]],
         session_id: str | None,
-    ) -> None:
+        *,
+        interrupted_observation_sink: Callable[[ToolExecutionObservation], None] | None = None,
+        workspace_change_sink: Callable[[WorkspaceChangeReport], None] | None = None,
+    ) -> ToolExecutionObservation | None:
         resolved = False
         tool_requested_at = monotonic()
         workspace_before: WorkspaceChangeCheckpoint | None = None
+        change_report: WorkspaceChangeReport | None = None
+        tool: Tool | None = None
+        result: ToolResult | None = None
+        plan_fingerprint_before = self._plan.fingerprint if self._plan is not None else None
 
         def terminal_event_data(result: ToolResult, **extra: object) -> dict[str, object]:
             return {
@@ -713,7 +1115,13 @@ class AgentRuntime:
                     AgentEventKind.TOOL_FAILED,
                     terminal_event_data(result),
                 )
-                return
+                return self._tool_execution_observation(
+                    call,
+                    result,
+                    tool=None,
+                    change_report=None,
+                    plan_fingerprint_before=plan_fingerprint_before,
+                )
 
             decision = self._permissions.decide(
                 call.name,
@@ -769,7 +1177,13 @@ class AgentRuntime:
                     AgentEventKind.TOOL_FAILED,
                     terminal_event_data(result),
                 )
-                return
+                return self._tool_execution_observation(
+                    call,
+                    result,
+                    tool=tool,
+                    change_report=None,
+                    plan_fingerprint_before=plan_fingerprint_before,
+                )
 
             await emit(AgentEventKind.TOOL_STARTED, {"id": call.id, "name": call.name})
             if tool.side_effecting:
@@ -804,6 +1218,15 @@ class AgentRuntime:
             await emit(kind, terminal_data)
             if plan is not None:
                 await emit(AgentEventKind.PLAN_UPDATED, plan.to_dict())
+            if change_report is not None and workspace_change_sink is not None:
+                workspace_change_sink(change_report)
+            return self._tool_execution_observation(
+                call,
+                result,
+                tool=tool,
+                change_report=change_report,
+                plan_fingerprint_before=plan_fingerprint_before,
+            )
         except BaseException as error:
             if not resolved:
                 cancelled = isinstance(error, asyncio.CancelledError)
@@ -824,7 +1247,136 @@ class AgentRuntime:
                     AgentEventKind.TOOL_FAILED,
                     terminal_data,
                 )
+            if result is not None and interrupted_observation_sink is not None:
+                observation = self._tool_execution_observation(
+                    call,
+                    result,
+                    tool=tool,
+                    change_report=change_report,
+                    plan_fingerprint_before=plan_fingerprint_before,
+                )
+                if observation is not None:
+                    interrupted_observation_sink(observation)
             raise
+
+    def _tool_execution_observation(
+        self,
+        call: ToolCall,
+        result: ToolResult,
+        *,
+        tool: Tool | None,
+        change_report: WorkspaceChangeReport | None,
+        plan_fingerprint_before: str | None,
+    ) -> ToolExecutionObservation | None:
+        """Build a fail-open, redacted supervision record after a tool terminal path."""
+
+        try:
+            workspace_changed = change_report is not None and bool(change_report.files)
+            workspace_progress_token = self._workspace_progress_token(change_report)
+            current_plan_fingerprint = self._plan.fingerprint if self._plan is not None else None
+            plan_fingerprint = (
+                current_plan_fingerprint
+                if current_plan_fingerprint != plan_fingerprint_before
+                else None
+            )
+            external_state_token = self._background_state_token(call.name, result.metadata)
+            if workspace_changed:
+                progress_kind = ProgressKind.WORKSPACE
+            elif plan_fingerprint is not None:
+                progress_kind = ProgressKind.PLAN
+            elif external_state_token is not None:
+                progress_kind = ProgressKind.EXTERNAL_STATE
+            elif not result.is_error and tool is not None and not tool.side_effecting:
+                progress_kind = ProgressKind.EVIDENCE
+            else:
+                progress_kind = ProgressKind.NONE
+            return ToolExecutionObservation.from_result(
+                tool_name=call.name,
+                arguments=call.arguments,
+                result_content=result.content,
+                is_error=result.is_error,
+                metadata_facts=self._supervision_metadata_facts(result.metadata),
+                workspace_changed=workspace_changed,
+                workspace_progress_token=workspace_progress_token,
+                plan_fingerprint=plan_fingerprint,
+                external_state_token=external_state_token,
+                progress_kind=progress_kind,
+                path_context=None,
+                redaction_values=self._tool_context.redaction_values,
+                tool_call_id=call.id,
+            )
+        except Exception as error:
+            LOGGER.debug(
+                "supervision tool observation unavailable error_type=%s",
+                type(error).__name__,
+            )
+            return None
+
+    def _supervision_metadata_facts(
+        self,
+        metadata: Mapping[str, object] | None,
+    ) -> tuple[StableMetadataFact, ...]:
+        if metadata is None:
+            return ()
+        facts: list[StableMetadataFact] = []
+        for name in sorted(_SUPERVISION_METADATA_KEYS.intersection(metadata)):
+            value = metadata[name]
+            if isinstance(value, bool):
+                rendered = "true" if value else "false"
+            elif isinstance(value, int):
+                rendered = str(value)
+            elif isinstance(value, str):
+                rendered = value
+            else:
+                continue
+            facts.append(
+                stable_metadata_fact(
+                    name,
+                    rendered,
+                    redaction_values=self._tool_context.redaction_values,
+                )
+            )
+        return tuple(facts)
+
+    @staticmethod
+    def _workspace_progress_token(change_report: WorkspaceChangeReport | None) -> str | None:
+        if change_report is None or not change_report.files:
+            return None
+        payload = {
+            "files": [
+                {
+                    "additions": change.additions,
+                    "deletions": change.deletions,
+                    "path": change.path,
+                    "status": change.status,
+                }
+                for change in change_report.files
+            ],
+            "omitted_files": change_report.omitted_files,
+            "scan_limited": change_report.scan_limited,
+        }
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+
+    @staticmethod
+    def _background_state_token(
+        tool_name: str,
+        metadata: Mapping[str, object] | None,
+    ) -> str | None:
+        if tool_name not in _BACKGROUND_STATE_TOOL_NAMES or metadata is None:
+            return None
+        values: list[str] = []
+        for name in ("status", "total_output_bytes", "exit_code"):
+            value = metadata.get(name)
+            if isinstance(value, bool):
+                rendered = "true" if value else "false"
+            elif isinstance(value, int):
+                rendered = str(value)
+            elif isinstance(value, str):
+                rendered = value
+            else:
+                continue
+            values.append(f"{name}={rendered}")
+        return "|".join(values) if values else None
 
     @staticmethod
     def _plan_from_tool_result(name: str, result: ToolResult) -> SessionPlan | None:

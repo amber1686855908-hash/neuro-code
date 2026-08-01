@@ -16,9 +16,12 @@ deletion, but no TUI action exposed it.
 
 ## Decision
 
-- Persist `environment`, `direct`, or `explicit` proxy mode with every managed
-  profile. Explicit mode persists only an environment-variable name, never the
-  resolved proxy URL or credentials.
+- Persist one user-wide default of `environment`, `direct`, or `explicit` for
+  managed providers. A profile inherits that default unless it explicitly
+  overrides it. Explicit policies persist only an environment-variable name,
+  never the resolved proxy URL or credentials. Legacy environment-default
+  profiles migrate to inheritance, while `direct` and explicit policies remain
+  profile-specific overrides.
 - Use the runtime's shared `HttpClientPolicy` resolver before saving. This is
   local structural/dependency validation and does not contact a model endpoint.
 - During TUI startup preflight, validate the selected managed profile before
@@ -34,9 +37,10 @@ deletion, but no TUI action exposed it.
 ## Consequences
 
 Users can repair inherited proxy failures without leaving the TUI, choose a
-per-provider direct route, or name a dedicated proxy variable without placing a
-proxy secret in managed JSON. Saving remains atomic after validation. The
-pre-save check does not prove endpoint reachability or API-key validity; those
-remain request-time provider outcomes. ADR 0048 adds a separate, explicit
-read-only connection test without changing offline save semantics. PAC
-processing, proxy mounts, and platform keychain storage remain future work.
+global direct route, or override one provider with a dedicated proxy variable
+without placing a proxy secret in managed JSON. Saving remains atomic after
+validation. The pre-save check does not prove endpoint reachability or API-key
+validity; those remain request-time provider outcomes. ADR 0048 adds a
+separate, explicit read-only connection test without changing offline save
+semantics. PAC processing, proxy mounts, and platform keychain storage remain
+future work.

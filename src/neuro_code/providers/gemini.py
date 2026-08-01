@@ -6,6 +6,7 @@ from typing import Any, cast
 from urllib.parse import quote
 
 from neuro_code.application.ports.http import HttpClientPolicy
+from neuro_code.application.ports.model import ModelToolPolicy
 from neuro_code.domain.messages import (
     IMAGE_MODEL_PLACEHOLDER,
     ContentPartKind,
@@ -184,7 +185,11 @@ class GeminiProvider:
         return ("\n\n".join(system_parts) or None), contents
 
     def _request_body(
-        self, messages: Sequence[Message], tools: Sequence[ToolDefinition]
+        self,
+        messages: Sequence[Message],
+        tools: Sequence[ToolDefinition],
+        *,
+        tool_policy: ModelToolPolicy = ModelToolPolicy.ALLOWED,
     ) -> dict[str, Any]:
         system, contents = self._convert_messages(messages)
         body: dict[str, Any] = {
@@ -193,7 +198,7 @@ class GeminiProvider:
         }
         if system is not None:
             body["systemInstruction"] = {"parts": [{"text": system}]}
-        if tools:
+        if tool_policy is ModelToolPolicy.ALLOWED and tools:
             body["tools"] = [
                 {
                     "functionDeclarations": [
@@ -215,6 +220,8 @@ class GeminiProvider:
         self,
         context: ModelContext,
         tools: Sequence[ToolDefinition],
+        *,
+        tool_policy: ModelToolPolicy = ModelToolPolicy.ALLOWED,
     ) -> AsyncIterator[ModelEvent]:
         try:
             import httpx
@@ -223,7 +230,7 @@ class GeminiProvider:
                 "httpx is required for live model requests; install the project"
             ) from error
 
-        body = self._request_body(context.messages, tools)
+        body = self._request_body(context.messages, tools, tool_policy=tool_policy)
         headers = {"x-goog-api-key": self._api_key, "accept": "text/event-stream"}
         stop_reason = "stop"
         input_tokens: int | None = None
