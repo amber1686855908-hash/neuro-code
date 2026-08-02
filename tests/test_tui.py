@@ -4243,6 +4243,7 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
                 if (
                     controller.queries[-1:] == ["quoted"]
                     and "Current workspace session" not in labels
+                    and "Escaped quoted session" in labels
                 ):
                     break
 

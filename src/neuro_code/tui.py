@@ -5773,7 +5773,7 @@ class NeuroCodeApp(App[None]):
     def _display_cwd(self) -> str:
         try:
             relative = self._cwd.resolve().relative_to(Path.home().resolve())
-        except (OSError, ValueError):
+        except (OSError, RuntimeError, ValueError):
             return str(self._cwd)
         return "~" if str(relative) == "." else f"~/{relative}"
 

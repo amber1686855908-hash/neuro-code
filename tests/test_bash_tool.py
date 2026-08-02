@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import os
 import shlex
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -17,6 +18,13 @@ from neuro_code.domain.sandbox import SandboxProfile
 from neuro_code.shared.errors import ToolError
 from neuro_code.tools.background_tasks import TaskOutputTool
 from neuro_code.tools.bash import BashTool
+
+
+def _python_shell_command(code: str) -> str:
+    """Build a Python command using quoting for the host shell."""
+
+    argv = [sys.executable, "-c", code]
+    return subprocess.list2cmdline(argv) if os.name == "nt" else shlex.join(argv)
 
 
 class BashToolTests(unittest.IsolatedAsyncioTestCase):
@@ -83,7 +91,7 @@ class BashToolTests(unittest.IsolatedAsyncioTestCase):
                 f"import pathlib,time;pathlib.Path({str(marker)!r}).open('a').write('run\\n');"
                 "print('started',flush=True);time.sleep(0.3);print('finished',flush=True)"
             )
-            command = f"{shlex.quote(sys.executable)} -c {shlex.quote(code)}"
+            command = _python_shell_command(code)
             manager = LocalBackgroundTaskManager()
             context = ToolContext(
                 root,
@@ -120,7 +128,7 @@ class BashToolTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             code = "print('short');import sys;sys.exit(7)"
-            command = f"{shlex.quote(sys.executable)} -c {shlex.quote(code)}"
+            command = _python_shell_command(code)
             manager = LocalBackgroundTaskManager()
             context = ToolContext(
                 root,
@@ -158,7 +166,7 @@ class BashToolTests(unittest.IsolatedAsyncioTestCase):
             try:
                 background = await BashTool(background_enabled=True).execute(
                     {
-                        "command": f"{shlex.quote(sys.executable)} -c 'import time;time.sleep(60)'",
+                        "command": _python_shell_command("import time;time.sleep(60)"),
                         "is_background": True,
                     },
                     context,
@@ -168,9 +176,7 @@ class BashToolTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIsInstance(task_id, str)
 
                 result = await BashTool(background_enabled=True).execute(
-                    {
-                        "command": f"{shlex.quote(sys.executable)} -c 'print(\"foreground fallback\")'"
-                    },
+                    {"command": _python_shell_command('print("foreground fallback")')},
                     context,
                 )
 
@@ -185,7 +191,7 @@ class BashToolTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             code = "print('capture failure trigger',flush=True)"
-            command = f"{shlex.quote(sys.executable)} -c {shlex.quote(code)}"
+            command = _python_shell_command(code)
             manager = LocalBackgroundTaskManager()
             context = ToolContext(root, command_timeout_seconds=2, background_tasks=manager)
             try:
@@ -224,7 +230,7 @@ class BashToolTests(unittest.IsolatedAsyncioTestCase):
                 f"import pathlib,os,time;pathlib.Path({str(pid_file)!r}).write_text(str(os.getpid()));"
                 "time.sleep(60)"
             )
-            command = f"{shlex.quote(sys.executable)} -c {shlex.quote(code)}"
+            command = _python_shell_command(code)
             with self.assertRaisesRegex(ToolError, "timed out"):
                 await BashTool(background_enabled=True).execute(
                     {"command": command, "timeout_seconds": 0.05},
@@ -261,7 +267,7 @@ class BashToolTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             code = "print('x'*100)"
-            command = f"{shlex.quote(sys.executable)} -c {shlex.quote(code)}"
+            command = _python_shell_command(code)
             manager = LocalBackgroundTaskManager()
             context = ToolContext(
                 root,
