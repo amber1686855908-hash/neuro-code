@@ -8,9 +8,12 @@ from collections.abc import Mapping
 from typing import Any
 
 from neuro_code.adapters.process_tree import ProcessTree
+from neuro_code.application.ports.background_tasks import BackgroundTaskManager
+from neuro_code.application.ports.sandbox import ShellLaunch
 from neuro_code.application.ports.tools import ToolContext
+from neuro_code.domain.background_tasks import BackgroundTaskSnapshot, BackgroundTaskStatus
 from neuro_code.domain.tools import ToolDefinition, ToolResult
-from neuro_code.shared.errors import ToolError
+from neuro_code.shared.errors import BackgroundTaskCapacityError, ToolError
 
 
 class BashTool:
@@ -30,7 +33,8 @@ class BashTool:
             }
             description += (
                 " Set is_background=true for a managed task that can be inspected with "
-                "task_output and stopped with kill_task."
+                "task_output or wait_tasks and stopped with kill_task. A foreground command "
+                "that exceeds its wait budget continues as the same managed task."
             )
         self.definition = ToolDefinition(
             name="bash",
@@ -102,6 +106,9 @@ class BashTool:
         env["GIT_PAGER"] = "cat"
         env["GIT_TERMINAL_PROMPT"] = "0"
         background_timeout = float(timeout) if has_explicit_timeout else None
+        auto_promote = (
+            self._background_enabled and not is_background and context.background_tasks is not None
+        )
         if context.sandbox_profile.enabled:
             if context.shell_sandbox is None:
                 raise ToolError(
@@ -124,6 +131,16 @@ class BashTool:
                     timeout_seconds=background_timeout,
                 )
                 return self._background_result(snapshot.task_id)
+            if auto_promote:
+                managed_result = await self._managed_foreground_result(
+                    command=command,
+                    wait_budget=float(timeout),
+                    context=context,
+                    env=env,
+                    launch=launch,
+                )
+                if managed_result is not None:
+                    return managed_result
             tree = await ProcessTree.spawn_exec(
                 launch.executable,
                 launch.arguments,
@@ -143,6 +160,16 @@ class BashTool:
                     timeout_seconds=background_timeout,
                 )
                 return self._background_result(snapshot.task_id)
+            if auto_promote:
+                managed_result = await self._managed_foreground_result(
+                    command=command,
+                    wait_budget=float(timeout),
+                    context=context,
+                    env=env,
+                    launch=None,
+                )
+                if managed_result is not None:
+                    return managed_result
             tree = await ProcessTree.spawn_shell(
                 command,
                 cwd=context.cwd,
@@ -191,6 +218,118 @@ class BashTool:
             content,
             is_error=process.returncode != 0,
             metadata={"exit_code": process.returncode, "truncated": truncated},
+        )
+
+    async def _managed_foreground_result(
+        self,
+        *,
+        command: str,
+        wait_budget: float,
+        context: ToolContext,
+        env: Mapping[str, str],
+        launch: ShellLaunch | None,
+    ) -> ToolResult | None:
+        """Wait on one manager-owned launch, promoting it without a respawn."""
+
+        manager = context.background_tasks
+        assert manager is not None
+        loop = asyncio.get_running_loop()
+        start_time = loop.time()
+        try:
+            if launch is None:
+                started = await manager.start_shell(
+                    command,
+                    cwd=context.cwd,
+                    env=env,
+                    output_byte_limit=context.output_byte_limit,
+                    termination_grace_seconds=context.termination_grace_seconds,
+                    timeout_seconds=None,
+                )
+            else:
+                started = await manager.start_exec(
+                    launch.executable,
+                    launch.arguments,
+                    display_command=command,
+                    cwd=context.cwd,
+                    env=env,
+                    output_byte_limit=context.output_byte_limit,
+                    termination_grace_seconds=context.termination_grace_seconds,
+                    timeout_seconds=None,
+                )
+        except BackgroundTaskCapacityError:
+            # A full managed registry must not turn an ordinary short command
+            # into a new failure. Fall back to the established foreground
+            # behavior, which remains bounded and kills on timeout.
+            return None
+
+        task_id = started.task_id
+        discarded = False
+        try:
+            remaining = max(0.0, wait_budget - (loop.time() - start_time))
+            observed = await manager.get(task_id, wait_seconds=remaining)
+            if observed is None:
+                raise ToolError("managed foreground task disappeared while waiting")
+            if observed.status is BackgroundTaskStatus.RUNNING:
+                return self._promoted_result(observed)
+
+            result = self._foreground_result(observed)
+            if not await manager.discard_completed(task_id):
+                raise ToolError("completed foreground task could not be discarded")
+            discarded = True
+            return result
+        except asyncio.CancelledError as cancellation:
+            try:
+                await self._cleanup_managed_task(manager, task_id)
+            except BaseException as cleanup_error:
+                raise cleanup_error from cancellation
+            raise
+        except Exception as error:
+            if not discarded:
+                try:
+                    await self._cleanup_managed_task(manager, task_id)
+                except BaseException as cleanup_error:
+                    raise cleanup_error from error
+            raise
+
+    @staticmethod
+    async def _cleanup_managed_task(manager: BackgroundTaskManager, task_id: str) -> None:
+        killed = await manager.kill(task_id)
+        if killed is None:
+            raise ToolError("managed foreground task could not be cleaned up")
+        if not await manager.discard_completed(task_id):
+            raise ToolError("managed foreground task record could not be discarded")
+
+    @staticmethod
+    def _foreground_result(snapshot: BackgroundTaskSnapshot) -> ToolResult:
+        content = snapshot.output
+        if snapshot.truncated:
+            content += "\n[output truncated]"
+        return ToolResult(
+            content,
+            is_error=(
+                snapshot.status is not BackgroundTaskStatus.COMPLETED or snapshot.exit_code != 0
+            ),
+            metadata={
+                "exit_code": snapshot.exit_code,
+                "truncated": snapshot.truncated,
+            },
+        )
+
+    @staticmethod
+    def _promoted_result(snapshot: BackgroundTaskSnapshot) -> ToolResult:
+        task_id = snapshot.task_id
+        return ToolResult(
+            (
+                "Foreground wait budget expired; the command continues as a managed "
+                f"background task: {task_id}\n"
+                f"Use task_output, wait_tasks, or kill_task with task_id={task_id!r}."
+            ),
+            metadata={
+                "task_id": task_id,
+                "status": "running",
+                "is_background": True,
+                "promoted_from_foreground": True,
+            },
         )
 
     @staticmethod

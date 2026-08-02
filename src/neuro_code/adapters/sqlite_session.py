@@ -13,7 +13,14 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from neuro_code.domain.events import AgentEvent
+from neuro_code.domain.background_tasks import BackgroundWakeState
+from neuro_code.domain.events import AgentEvent, AgentEventKind
+from neuro_code.domain.execution import (
+    AgentExecutionOutcome,
+    AgentExecutionStatus,
+    SessionExecutionRecord,
+    SupervisorReasonCode,
+)
 from neuro_code.domain.messages import (
     ContentPart,
     ContentPartKind,
@@ -33,6 +40,7 @@ from neuro_code.domain.session_search import (
     searchable_session_text,
 )
 from neuro_code.domain.session_tasks import (
+    MAX_QUEUED_SESSION_TASKS,
     MAX_SESSION_TASK_ID_BYTES,
     SessionTask,
     SessionTaskKind,
@@ -46,7 +54,7 @@ from neuro_code.domain.sessions import (
 from neuro_code.shared.async_utils import run_blocking
 from neuro_code.shared.errors import SessionError
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 11
 _SEARCH_SNIPPET_LIMIT = 500
 _SQLITE_TIMEOUT_SECONDS = 30.0
 _SESSION_ALIAS_NAMESPACE_LIMIT = 64
@@ -154,6 +162,18 @@ class SqliteSessionStore:
                         _ensure_session_task_schema(connection)
                         connection.execute("UPDATE schema_meta SET version = 9 WHERE singleton = 1")
                         version = (9,)
+                    if version is not None and version[0] == 9:
+                        _ensure_session_execution_record_schema(connection)
+                        connection.execute(
+                            "UPDATE schema_meta SET version = 10 WHERE singleton = 1"
+                        )
+                        version = (10,)
+                    if version is not None and version[0] == 10:
+                        _ensure_session_background_wake_schema(connection)
+                        connection.execute(
+                            "UPDATE schema_meta SET version = 11 WHERE singleton = 1"
+                        )
+                        version = (11,)
                     if version is None or version[0] != SCHEMA_VERSION:
                         raise SessionError(
                             "unsupported session schema version: "
@@ -164,6 +184,8 @@ class SqliteSessionStore:
                     _ensure_session_plan_schema(connection)
                     _ensure_session_task_schema(connection)
                     _ensure_session_plan_comment_schema(connection)
+                    _ensure_session_execution_record_schema(connection)
+                    _ensure_session_background_wake_schema(connection)
                     _backfill_search_documents(connection, missing_only=True)
                     connection.commit()
                 except BaseException:
@@ -553,6 +575,138 @@ class SqliteSessionStore:
         async with self._write_lock:
             await run_blocking(save)
 
+    async def finalize_turn(
+        self,
+        session_id: str,
+        event: AgentEvent,
+        items: Sequence[SessionItem],
+        record: SessionExecutionRecord | None,
+    ) -> None:
+        if not isinstance(event, AgentEvent):
+            raise TypeError("event must be an AgentEvent")
+        if event.kind is not AgentEventKind.TURN_COMPLETED:
+            raise SessionError("finalize_turn requires a TURN_COMPLETED event")
+        if (
+            not isinstance(event.sequence, int)
+            or isinstance(event.sequence, bool)
+            or event.sequence <= 0
+        ):
+            raise SessionError("finalize_turn event sequence must be positive")
+        if record is not None:
+            if not isinstance(record, SessionExecutionRecord):
+                raise TypeError("record must be a SessionExecutionRecord or None")
+            if record.event_sequence != event.sequence:
+                raise SessionError("execution record sequence does not match completion event")
+        new_items = list(items)
+        payload = json.dumps(dict(event.data), ensure_ascii=False, separators=(",", ":"))
+
+        def finalize() -> None:
+            connection = self._connect()
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                row = connection.execute(
+                    "SELECT messages_json, title FROM sessions WHERE id = ?", (session_id,)
+                ).fetchone()
+                if row is None:
+                    raise SessionError(f"unknown session: {session_id}")
+                try:
+                    current_items = _session_items_from_json(row[0])
+                except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+                    raise SessionError(
+                        f"session {session_id} contains invalid session items"
+                    ) from error
+                if (
+                    len(new_items) < len(current_items)
+                    or new_items[: len(current_items)] != current_items
+                ):
+                    raise SessionError("cannot rewrite the persisted session item prefix")
+                if record is not None:
+                    _validate_execution_record_order(
+                        connection,
+                        session_id=session_id,
+                        incoming=record,
+                    )
+                duplicate = connection.execute(
+                    "SELECT 1 FROM events WHERE session_id = ? AND sequence = ?",
+                    (session_id, event.sequence),
+                ).fetchone()
+                if duplicate is not None:
+                    raise SessionError(f"completion event sequence {event.sequence} already exists")
+                items_payload = _serialize_session_items(new_items)
+                title = str(row[1]) or fallback_session_title(new_items)
+                connection.execute(
+                    """
+                    INSERT INTO events(session_id, sequence, kind, created_at, data_json)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        session_id,
+                        event.sequence,
+                        event.kind.value,
+                        event.created_at.isoformat(),
+                        payload,
+                    ),
+                )
+                cursor = connection.execute(
+                    """
+                    UPDATE sessions
+                    SET messages_json = ?, title = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """,
+                    (items_payload, title, session_id),
+                )
+                if cursor.rowcount != 1:
+                    raise SessionError(f"unknown session: {session_id}")
+                _upsert_search_document(
+                    connection,
+                    session_id=session_id,
+                    title=title,
+                    content=searchable_session_text(new_items),
+                )
+                if record is not None:
+                    connection.execute(
+                        """
+                        INSERT INTO session_execution_records(
+                            session_id, event_sequence, status, reason_code,
+                            finalized, recoverable, completed_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(session_id) DO UPDATE SET
+                            event_sequence = excluded.event_sequence,
+                            status = excluded.status,
+                            reason_code = excluded.reason_code,
+                            finalized = excluded.finalized,
+                            recoverable = excluded.recoverable,
+                            completed_at = excluded.completed_at
+                        """,
+                        (
+                            session_id,
+                            record.event_sequence,
+                            record.outcome.status.value,
+                            (
+                                record.outcome.reason_code.value
+                                if record.outcome.reason_code is not None
+                                else None
+                            ),
+                            int(record.outcome.finalized),
+                            int(record.outcome.recoverable),
+                            record.completed_at.isoformat(),
+                        ),
+                    )
+                connection.commit()
+            except sqlite3.IntegrityError as error:
+                connection.rollback()
+                raise SessionError(
+                    f"cannot finalize turn event {event.sequence} for session {session_id}"
+                ) from error
+            except BaseException:
+                connection.rollback()
+                raise
+            finally:
+                connection.close()
+
+        async with self._write_lock:
+            await run_blocking(finalize)
+
     async def load_messages(self, session_id: str) -> list[Message]:
         items = await self.load_session_items(session_id)
         return [item for item in items if isinstance(item, Message)]
@@ -610,6 +764,180 @@ class SqliteSessionStore:
                 return SessionPlan.from_dict(json.loads(payload))
             except (TypeError, ValueError, json.JSONDecodeError) as error:
                 raise SessionError(f"session {session_id} contains an invalid plan") from error
+
+        return await run_blocking(load)
+
+    async def save_execution_record(
+        self,
+        session_id: str,
+        record: SessionExecutionRecord,
+    ) -> None:
+        if not isinstance(record, SessionExecutionRecord):
+            raise TypeError("record must be a SessionExecutionRecord")
+
+        def save() -> None:
+            with closing(self._connect()) as connection, connection:
+                connection.execute("BEGIN IMMEDIATE")
+                exists = connection.execute(
+                    "SELECT 1 FROM sessions WHERE id = ?",
+                    (session_id,),
+                ).fetchone()
+                if exists is None:
+                    raise SessionError(f"unknown session: {session_id}")
+                event = connection.execute(
+                    """
+                    SELECT kind FROM events
+                    WHERE session_id = ? AND sequence = ?
+                    """,
+                    (session_id, record.event_sequence),
+                ).fetchone()
+                if event is None or event[0] != "turn_completed":
+                    raise SessionError(
+                        "execution record must reference a persisted turn-completed event"
+                    )
+                _validate_execution_record_order(
+                    connection,
+                    session_id=session_id,
+                    incoming=record,
+                )
+                connection.execute(
+                    """
+                    INSERT INTO session_execution_records(
+                        session_id, event_sequence, status, reason_code,
+                        finalized, recoverable, completed_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(session_id) DO UPDATE SET
+                        event_sequence = excluded.event_sequence,
+                        status = excluded.status,
+                        reason_code = excluded.reason_code,
+                        finalized = excluded.finalized,
+                        recoverable = excluded.recoverable,
+                        completed_at = excluded.completed_at
+                    """,
+                    (
+                        session_id,
+                        record.event_sequence,
+                        record.outcome.status.value,
+                        (
+                            record.outcome.reason_code.value
+                            if record.outcome.reason_code is not None
+                            else None
+                        ),
+                        int(record.outcome.finalized),
+                        int(record.outcome.recoverable),
+                        record.completed_at.isoformat(),
+                    ),
+                )
+                connection.execute(
+                    "UPDATE sessions SET updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                    (session_id,),
+                )
+
+        async with self._write_lock:
+            await run_blocking(save)
+
+    async def load_execution_record(self, session_id: str) -> SessionExecutionRecord | None:
+        def load() -> SessionExecutionRecord | None:
+            with closing(self._connect()) as connection:
+                exists = connection.execute(
+                    "SELECT 1 FROM sessions WHERE id = ?",
+                    (session_id,),
+                ).fetchone()
+                if exists is None:
+                    raise SessionError(f"unknown session: {session_id}")
+                row = connection.execute(
+                    """
+                    SELECT event_sequence, status, reason_code, finalized, recoverable, completed_at
+                    FROM session_execution_records
+                    WHERE session_id = ?
+                    """,
+                    (session_id,),
+                ).fetchone()
+                if row is None:
+                    return None
+                event = connection.execute(
+                    """
+                    SELECT kind
+                    FROM events
+                    WHERE session_id = ? AND sequence = ?
+                    """,
+                    (session_id, row[0]),
+                ).fetchone()
+                if event is None or event[0] != AgentEventKind.TURN_COMPLETED.value:
+                    raise SessionError(
+                        f"session {session_id} execution record references an invalid completion event"
+                    )
+            return _session_execution_record_from_row(row, session_id=session_id)
+
+        return await run_blocking(load)
+
+    async def save_background_wake_state(
+        self,
+        session_id: str,
+        state: BackgroundWakeState,
+    ) -> None:
+        if not isinstance(state, BackgroundWakeState):
+            raise TypeError("state must be a BackgroundWakeState")
+
+        def save() -> None:
+            with closing(self._connect()) as connection, connection:
+                exists = connection.execute(
+                    "SELECT 1 FROM sessions WHERE id = ?",
+                    (session_id,),
+                ).fetchone()
+                if exists is None:
+                    raise SessionError(f"unknown session: {session_id}")
+                connection.execute(
+                    """
+                    INSERT INTO session_background_wake_state(
+                        session_id, announced_task_ids_json, pending_task_ids_json,
+                        wake_count, last_wake_at, wake_in_flight
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(session_id) DO UPDATE SET
+                        announced_task_ids_json = excluded.announced_task_ids_json,
+                        pending_task_ids_json = excluded.pending_task_ids_json,
+                        wake_count = excluded.wake_count,
+                        last_wake_at = excluded.last_wake_at,
+                        wake_in_flight = excluded.wake_in_flight
+                    """,
+                    (
+                        session_id,
+                        json.dumps(state.announced_task_ids, separators=(",", ":")),
+                        json.dumps(state.pending_task_ids, separators=(",", ":")),
+                        state.wake_count,
+                        state.last_wake_at.isoformat() if state.last_wake_at else None,
+                        int(state.wake_in_flight),
+                    ),
+                )
+                connection.execute(
+                    "UPDATE sessions SET updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                    (session_id,),
+                )
+
+        async with self._write_lock:
+            await run_blocking(save)
+
+    async def load_background_wake_state(self, session_id: str) -> BackgroundWakeState:
+        def load() -> BackgroundWakeState:
+            with closing(self._connect()) as connection:
+                exists = connection.execute(
+                    "SELECT 1 FROM sessions WHERE id = ?",
+                    (session_id,),
+                ).fetchone()
+                if exists is None:
+                    raise SessionError(f"unknown session: {session_id}")
+                row = connection.execute(
+                    """
+                    SELECT announced_task_ids_json, pending_task_ids_json,
+                           wake_count, last_wake_at, wake_in_flight
+                    FROM session_background_wake_state
+                    WHERE session_id = ?
+                    """,
+                    (session_id,),
+                ).fetchone()
+            if row is None:
+                return BackgroundWakeState()
+            return _background_wake_state_from_row(row, session_id=session_id)
 
         return await run_blocking(load)
 
@@ -726,6 +1054,26 @@ class SqliteSessionStore:
         def create() -> None:
             try:
                 with closing(self._connect()) as connection, connection:
+                    if (
+                        task.kind is SessionTaskKind.PLAN_EXECUTION
+                        and task.status is SessionTaskStatus.QUEUED
+                    ):
+                        queued = connection.execute(
+                            """
+                            SELECT COUNT(*)
+                            FROM session_tasks
+                            WHERE session_id = ? AND kind = ? AND status = ?
+                            """,
+                            (
+                                session_id,
+                                SessionTaskKind.PLAN_EXECUTION.value,
+                                SessionTaskStatus.QUEUED.value,
+                            ),
+                        ).fetchone()
+                        if queued is not None and int(queued[0]) >= MAX_QUEUED_SESSION_TASKS:
+                            raise SessionError(
+                                f"at most {MAX_QUEUED_SESSION_TASKS} plan tasks may be queued"
+                            )
                     connection.execute(
                         """
                         INSERT INTO session_tasks(
@@ -752,6 +1100,63 @@ class SqliteSessionStore:
 
         async with self._write_lock:
             await run_blocking(create)
+
+    async def start_session_task(
+        self,
+        session_id: str,
+        task_id: str,
+        started_at: datetime,
+    ) -> SessionTask:
+        """Atomically claim one queued task for explicit execution."""
+
+        _validated_session_task_id(task_id)
+
+        def start() -> SessionTask:
+            connection = self._connect()
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                row = connection.execute(
+                    """
+                    SELECT task_id, kind, status, started_at, finished_at, plan_snapshot_json
+                    FROM session_tasks
+                    WHERE session_id = ? AND task_id = ?
+                    """,
+                    (session_id, task_id),
+                ).fetchone()
+                if row is None:
+                    raise SessionError(f"unknown session task: {task_id}")
+                current = _session_task_from_row(row, session_id=session_id)
+                try:
+                    claimed = current.start(started_at=started_at)
+                except ValueError as error:
+                    raise SessionError(f"invalid session task transition: {task_id}") from error
+                connection.execute(
+                    """
+                    UPDATE session_tasks
+                    SET status = ?, started_at = ?, finished_at = NULL
+                    WHERE session_id = ? AND task_id = ?
+                    """,
+                    (
+                        claimed.status.value,
+                        claimed.started_at.isoformat(),
+                        session_id,
+                        task_id,
+                    ),
+                )
+                connection.execute(
+                    "UPDATE sessions SET updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                    (session_id,),
+                )
+                connection.commit()
+                return claimed
+            except BaseException:
+                connection.rollback()
+                raise
+            finally:
+                connection.close()
+
+        async with self._write_lock:
+            return await run_blocking(start)
 
     async def update_session_task(self, session_id: str, task: SessionTask) -> None:
         if not isinstance(task, SessionTask):
@@ -1422,6 +1827,39 @@ def _ensure_session_plan_comment_schema(connection: sqlite3.Connection) -> None:
     )
 
 
+def _ensure_session_execution_record_schema(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS session_execution_records (
+            session_id TEXT PRIMARY KEY,
+            event_sequence INTEGER NOT NULL CHECK (event_sequence > 0),
+            status TEXT NOT NULL,
+            reason_code TEXT,
+            finalized INTEGER NOT NULL CHECK (finalized IN (0, 1)),
+            recoverable INTEGER NOT NULL CHECK (recoverable IN (0, 1)),
+            completed_at TEXT NOT NULL,
+            FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+        )
+        """
+    )
+
+
+def _ensure_session_background_wake_schema(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS session_background_wake_state (
+            session_id TEXT PRIMARY KEY,
+            announced_task_ids_json TEXT NOT NULL,
+            pending_task_ids_json TEXT NOT NULL,
+            wake_count INTEGER NOT NULL CHECK (wake_count >= 0),
+            last_wake_at TEXT,
+            wake_in_flight INTEGER NOT NULL CHECK (wake_in_flight IN (0, 1)),
+            FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+        )
+        """
+    )
+
+
 def _plan_comment_from_row(row: Sequence[object], *, session_id: str) -> PlanComment:
     try:
         comment_id, raw_step_index, content, raw_created_at = row
@@ -1435,6 +1873,109 @@ def _plan_comment_from_row(row: Sequence[object], *, session_id: str) -> PlanCom
         )
     except (TypeError, ValueError) as error:
         raise SessionError(f"session {session_id} contains an invalid plan comment") from error
+
+
+def _session_execution_record_from_row(
+    row: Sequence[object],
+    *,
+    session_id: str,
+) -> SessionExecutionRecord:
+    try:
+        (
+            raw_event_sequence,
+            raw_status,
+            raw_reason_code,
+            raw_finalized,
+            raw_recoverable,
+            raw_completed_at,
+        ) = row
+        if not isinstance(raw_event_sequence, int) or isinstance(raw_event_sequence, bool):
+            raise ValueError("event sequence is invalid")
+        if raw_finalized not in (0, 1) or isinstance(raw_finalized, bool):
+            raise ValueError("finalized flag is invalid")
+        if raw_recoverable not in (0, 1) or isinstance(raw_recoverable, bool):
+            raise ValueError("recoverable flag is invalid")
+        reason_code = (
+            SupervisorReasonCode(str(raw_reason_code)) if raw_reason_code is not None else None
+        )
+        return SessionExecutionRecord(
+            AgentExecutionOutcome(
+                AgentExecutionStatus(str(raw_status)),
+                reason_code,
+                bool(raw_finalized),
+                bool(raw_recoverable),
+            ),
+            raw_event_sequence,
+            datetime.fromisoformat(str(raw_completed_at)),
+        )
+    except (TypeError, ValueError) as error:
+        raise SessionError(f"session {session_id} contains an invalid execution record") from error
+
+
+def _validate_execution_record_order(
+    connection: sqlite3.Connection,
+    *,
+    session_id: str,
+    incoming: SessionExecutionRecord,
+) -> None:
+    row = connection.execute(
+        """
+        SELECT event_sequence, status, reason_code, finalized, recoverable, completed_at
+        FROM session_execution_records
+        WHERE session_id = ?
+        """,
+        (session_id,),
+    ).fetchone()
+    if row is None:
+        return
+    current = _session_execution_record_from_row(row, session_id=session_id)
+    if incoming.event_sequence < current.event_sequence:
+        raise SessionError("cannot replace a newer execution record with an older event sequence")
+    if incoming.event_sequence == current.event_sequence and incoming != current:
+        raise SessionError("conflicting execution records use the same event sequence")
+
+
+def _background_wake_state_from_row(
+    row: Sequence[object],
+    *,
+    session_id: str,
+) -> BackgroundWakeState:
+    try:
+        (
+            raw_announced,
+            raw_pending,
+            raw_wake_count,
+            raw_last_wake_at,
+            raw_in_flight,
+        ) = row
+        announced = json.loads(str(raw_announced))
+        pending = json.loads(str(raw_pending))
+        if not isinstance(announced, list) or not all(
+            isinstance(task_id, str) for task_id in announced
+        ):
+            raise ValueError("announced task IDs are invalid")
+        if not isinstance(pending, list) or not all(
+            isinstance(task_id, str) for task_id in pending
+        ):
+            raise ValueError("pending task IDs are invalid")
+        if not isinstance(raw_wake_count, int) or isinstance(raw_wake_count, bool):
+            raise ValueError("wake count is invalid")
+        if raw_in_flight not in (0, 1) or isinstance(raw_in_flight, bool):
+            raise ValueError("wake in-flight flag is invalid")
+        last_wake_at = (
+            datetime.fromisoformat(str(raw_last_wake_at)) if raw_last_wake_at is not None else None
+        )
+        return BackgroundWakeState(
+            announced_task_ids=tuple(announced),
+            pending_task_ids=tuple(pending),
+            wake_count=raw_wake_count,
+            last_wake_at=last_wake_at,
+            wake_in_flight=bool(raw_in_flight),
+        )
+    except (TypeError, ValueError, json.JSONDecodeError) as error:
+        raise SessionError(
+            f"session {session_id} contains an invalid background wake state"
+        ) from error
 
 
 def _session_task_from_row(row: Sequence[object], *, session_id: str) -> SessionTask:

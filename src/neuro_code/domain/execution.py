@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from datetime import datetime
 from enum import StrEnum
 
 
@@ -25,6 +26,20 @@ class AgentExecutionStatus(StrEnum):
     @property
     def terminal(self) -> bool:
         return self not in {self.RUNNING, self.FINALIZING}
+
+
+class TurnCancellationPolicy(StrEnum):
+    """Controls whether an unstarted turn may be removed after cancellation."""
+
+    RETAIN = "retain"
+    REWIND_PRISTINE = "rewind_pristine"
+
+
+class TurnSource(StrEnum):
+    """Identifies whether a model turn came from a user or a background wake."""
+
+    USER = "user"
+    BACKGROUND_TASK_AUTO_WAKE = "background_task_auto_wake"
 
 
 class SupervisorDecisionKind(StrEnum):
@@ -102,6 +117,27 @@ class AgentExecutionOutcome:
             raise ValueError("stuck and budget-limited outcomes must be recoverable")
         if self.status is AgentExecutionStatus.COMPLETED and self.reason_code is not None:
             raise ValueError("completed outcomes must not have a reason_code")
+
+
+@dataclass(frozen=True, slots=True)
+class SessionExecutionRecord:
+    """The last durable terminal execution result for one session.
+
+    This intentionally retains only stable outcome metadata and the matching
+    ``TURN_COMPLETED`` event identity. It is safe to load during resume without
+    retaining prompts, tool arguments, output, evidence, or supervisor state.
+    """
+
+    outcome: AgentExecutionOutcome
+    event_sequence: int
+    completed_at: datetime
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.outcome, AgentExecutionOutcome):
+            raise ValueError("session execution record outcome must be canonical")
+        _require_positive_int(self.event_sequence, field_name="event_sequence")
+        if not isinstance(self.completed_at, datetime) or self.completed_at.tzinfo is None:
+            raise ValueError("session execution record timestamp must be timezone-aware")
 
 
 def _require_positive_int(value: object, *, field_name: str) -> int:
@@ -474,6 +510,7 @@ __all__ = [
     "ExecutionCounters",
     "ExecutionSnapshot",
     "ProgressKind",
+    "SessionExecutionRecord",
     "SupervisionThresholds",
     "SupervisorDecision",
     "SupervisorDecisionKind",
@@ -481,4 +518,6 @@ __all__ = [
     "ToolCallBudget",
     "ToolCallCount",
     "ToolInteractionFingerprint",
+    "TurnCancellationPolicy",
+    "TurnSource",
 ]

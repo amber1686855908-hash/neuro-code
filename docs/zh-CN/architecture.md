@@ -131,8 +131,12 @@ canonical reader，不再 re-export 它。`neuro_code.config` 同样通过私有
 组合相同的控制器，因此恢复和供应商回放规则不会因界面不同而分叉。
 
 发生失败或取消时，`AgentConversation` 会在释放轮次锁之前，从 `SessionStore` 重新加载
-规范有序项和供应商来源。所以下一条提示会复用持久状态，而不是过期的内存前缀。取消的
-用户消息仍保留在历史中；首 token 前回退是另一项尚未实现的交互策略。
+规范有序项和供应商来源。所以下一条提示会复用持久状态，而不是过期的内存前缀。TUI 会为
+提示请求显式的首 token 前回退策略：在任何非空模型输出、完成事件或工具活动之前取消时，
+运行时保存本轮前的项前缀，并在 `TURN_FAILED` 中报告回退；追加式审计事件仍记录用户曾提交
+该提示。产生输出或工具活动后，用户消息仍保留。TUI 会把安全回退的提示恢复到草稿，并可在
+首个非空模型 token 前缓冲最多四条显式后续提示；该队列只是界面状态，不属于持久 Runtime
+上下文。
 
 ## 仓库级 AGENTS.md 指令发现
 
@@ -553,15 +557,18 @@ Worker；审批模态框则把 `Ctrl+C` 限定为拒绝待处理请求。运行�
 可恢复、可审计，却不授予命令、网络、工作区或沙箱权限。`/tasks` 会保持持久记录摘要有界。只有显式的
 `/view-task TASK_ID` 才会调用活动对话精确、限当前会话的 `SessionStore.get_session_task` 读取，并把
 保存的不可变快照作为参考渲染。该读取既不会进入模型上下文，也不会更改当前计划、创建轮次、执行工作、
-请求审批或具有调度语义；任务不存在或旧记录没有快照时不会显示细节。本切片刻意不写计划文件，也不提供
-任务调度器或子代理生命周期。当前计划评论是刻意独立且有界的反馈通道：`/comment-plan STEP COMMENT` 会把用户
+请求审批或具有调度语义；任务不存在或旧记录没有快照时不会显示细节。显式 `/schedule-plan`/`/queue-plan`
+命令会在不联系模型的情况下为每个会话保存最多四个排队计划快照。`/run-task TASK_ID` 通过
+`SessionStore.start_session_task` 原子认领一个排队快照，然后复用 `/execute-plan` 的计划执行生命周期；
+排队任务不会自动启动、重试、唤醒或创建子代理。本切片刻意不写计划文件，也不提供子代理生命周期。当前计划评论是刻意独立且有界的反馈通道：`/comment-plan STEP COMMENT` 会把用户
 文本保存到编号计划步骤下，`/view-plan` 会渲染它，下一次模型请求才把它作为临时计划指引提供。评论
 不是规范消息、批准、任务或执行请求。计划指纹阻止它泄露到替换后的计划；整体替换或清除计划会删除
 过期评论。详见 ADR 0028、[ADR 0057](adr/0057-durable-structured-session-plans.md)、
 [ADR 0058](adr/0058-durable-session-task-lifecycle.md) 与
 [ADR 0059](adr/0059-bounded-current-plan-comments.md)、
 [ADR 0060](adr/0060-plan-execution-revision-snapshots.md) 与
-[ADR 0061](adr/0061-read-only-plan-execution-inspection.md)。
+[ADR 0061](adr/0061-read-only-plan-execution-inspection.md) 以及
+[ADR 0063](adr/0063-bounded-explicit-plan-task-scheduling.md)。
 
 交互组合使用 `ProfileConversationController` 包装当前 `AgentConversation`。它让 profile
 选择与轮次串行执行，并且只向 TUI 暴露脱敏的 `ProviderOption` 数据。选择另一个已配置
@@ -787,7 +794,16 @@ alias，供协议适配器使用；JSON export schema version 4 不变。schema 
 带计划的分叉会以新的不透明 ID 复制它，而替换或清除计划会删除它。schema v9 会为每个计划执行任务增加可选的不可变计划快照。该快照标识被交接的准确
 结构化修订，仍不进入 FTS 或导出/导入，也刻意不会随分叉复制；`/tasks` 只显示其短指纹和已完成步骤
 数量。显式的当前会话精确任务查询可以在 TUI 中把同一已保存快照作为只读参考渲染，但它绝不会成为模型
-输入或任务控制操作。Rust 会话由独立的只读适配器解析。该适配器校验格式版本 0 和 1，以明确上限
+输入或任务控制操作。schema v10 会为每个源会话增加一条带外键的最后安全终态执行记录。它必须引用已经
+持久化的 `TURN_COMPLETED` 事件，只保存有类型的状态、reason code、finalized/recoverable 标志、事件序号和
+时间戳。它刻意排除 prompt、工具参数/结果、证据、工作区 diff、supervisor snapshot、FTS、导出/导入和
+分叉复制。后续成功的普通完成会覆盖此前可恢复的终态结果，因此恢复时可安全地区分最近完成的轮次和已暂停的
+轮次，而不会把该记录当作可重放的模型上下文。运行时的终态成功路径使用有类型的
+`SessionStore.finalize_turn` 边界：`TURN_COMPLETED` 事件、最终只追加的有序会话项、同步的标题/FTS
+投影以及可选的用户轮次执行记录，在存储写锁下的一个短 SQLite 事务中一起提交。后台自动唤醒不传入记录，
+因此不会覆盖此前的用户执行记录。这个边界不会让此前的轮次事件、供应商/工具工作或跨进程运行时操作变成原子操作。
+在执行记录边界内，SQLite 会串行化写入，并拒绝更旧的事件序号或同一序号的冲突数据，因此过期进程不能覆盖更新的终态结果。
+Rust 会话由独立的只读适配器解析。该适配器校验格式版本 0 和 1，以明确上限
 读取 JSONL 记录，把受支持的新旧记录转换为有序 `SessionSnapshot`，并报告损坏或
 不支持的记录，而不是静默编造内容。SQLite 适配器在单个事务中插入快照，并保留其
 ID、工作区、模型和时间戳；ID 已存在时不做任何修改并返回失败。源会话文件永远不会

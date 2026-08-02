@@ -9,6 +9,7 @@ from enum import StrEnum
 from neuro_code.domain.plans import SessionPlan
 
 MAX_SESSION_TASK_ID_BYTES = 80
+MAX_QUEUED_SESSION_TASKS = 4
 
 
 class SessionTaskKind(StrEnum):
@@ -21,6 +22,7 @@ class SessionTaskKind(StrEnum):
 class SessionTaskStatus(StrEnum):
     """Lifecycle states with no implicit retry or automatic follow-up."""
 
+    QUEUED = "queued"
     RUNNING = "running"
     COMPLETED = "completed"
     FAILED = "failed"
@@ -28,7 +30,17 @@ class SessionTaskStatus(StrEnum):
 
     @property
     def terminal(self) -> bool:
-        return self is not self.RUNNING
+        return self in {
+            SessionTaskStatus.COMPLETED,
+            SessionTaskStatus.FAILED,
+            SessionTaskStatus.CANCELLED,
+        }
+
+    @property
+    def active(self) -> bool:
+        """Whether the task is waiting for or currently receiving execution."""
+
+        return self in {SessionTaskStatus.QUEUED, SessionTaskStatus.RUNNING}
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,6 +79,19 @@ class SessionTask:
         if self.plan_snapshot is not None and self.kind is not SessionTaskKind.PLAN_EXECUTION:
             raise ValueError("only a plan execution task may contain a plan snapshot")
 
+    def start(self, *, started_at: datetime) -> SessionTask:
+        """Return the one allowed queued-to-running transition."""
+
+        if self.status is not SessionTaskStatus.QUEUED:
+            raise ValueError("session task is not queued")
+        return SessionTask(
+            self.task_id,
+            self.kind,
+            SessionTaskStatus.RUNNING,
+            started_at,
+            plan_snapshot=self.plan_snapshot,
+        )
+
     def finish(self, status: SessionTaskStatus, *, finished_at: datetime) -> SessionTask:
         """Return the one allowed terminal transition for this task."""
 
@@ -95,6 +120,7 @@ class SessionTask:
 
 
 __all__ = [
+    "MAX_QUEUED_SESSION_TASKS",
     "MAX_SESSION_TASK_ID_BYTES",
     "SessionTask",
     "SessionTaskKind",

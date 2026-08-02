@@ -51,9 +51,12 @@ from neuro_code.domain.execution import (
     AgentExecutionOutcome,
     AgentExecutionStatus,
     ProgressKind,
+    SessionExecutionRecord,
     SupervisorDecision,
     SupervisorDecisionKind,
     SupervisorReasonCode,
+    TurnCancellationPolicy,
+    TurnSource,
 )
 from neuro_code.domain.instructions import InstructionDiscoveryResult
 from neuro_code.domain.interaction_mode import InteractionMode, interaction_mode_guidance
@@ -395,23 +398,35 @@ class AgentRuntime:
         sink: EventSink | None = None,
         content_parts: Sequence[ContentPart] = (),
         plan_execution_requested: bool = False,
+        plan_execution_task_id: str | None = None,
         initial_items: Sequence[SessionItem] = (),
         source_provider: str | None = None,
         source_model: str | None = None,
         source_context_affinity: str | None = None,
         session_id: str | None = None,
+        cancellation_policy: TurnCancellationPolicy = TurnCancellationPolicy.RETAIN,
+        turn_source: TurnSource = TurnSource.USER,
     ) -> AgentRunResult:
         prompt_parts = tuple(content_parts)
-        if not prompt.strip() and not prompt_parts:
+        if not isinstance(turn_source, TurnSource):
+            raise TypeError("turn_source must be a TurnSource")
+        if turn_source is TurnSource.USER and not prompt.strip() and not prompt_parts:
             raise ValueError("prompt must not be empty")
+        if turn_source is TurnSource.BACKGROUND_TASK_AUTO_WAKE and (prompt.strip() or prompt_parts):
+            raise ValueError("background task auto-wake must not include a user prompt")
         if plan_execution_requested and self._plan is None:
             raise ConfigurationError("cannot execute a plan that has not been saved")
+        if plan_execution_task_id is not None and not plan_execution_requested:
+            raise ConfigurationError("a session task requires plan execution")
+        if not isinstance(cancellation_policy, TurnCancellationPolicy):
+            raise TypeError("cancellation_policy must be a TurnCancellationPolicy")
         turn_started_at = monotonic()
         context_items = list(initial_items)
         messages = [item for item in context_items if isinstance(item, Message)]
         context_source_provider = source_provider
         context_source_model = source_model
         context_source_affinity = source_context_affinity
+        persist_turn_context = turn_source is TurnSource.USER
         can_adopt_provider_origin = not any(
             isinstance(item, PreservedContextItem) for item in context_items
         )
@@ -419,8 +434,18 @@ class AgentRuntime:
             system_message = Message(Role.SYSTEM, self._system_prompt)
             context_items.append(system_message)
             messages.append(system_message)
+        turn_context_prefix = tuple(context_items)
+        pristine_cancel_eligible = cancellation_policy is TurnCancellationPolicy.REWIND_PRISTINE
         events: list[AgentEvent] = []
         sequence = 0
+
+        background_tasks = self._tool_context.background_tasks
+        if turn_source is TurnSource.BACKGROUND_TASK_AUTO_WAKE:
+            if background_tasks is None:
+                raise ConfigurationError("background task auto-wake is unavailable")
+            pending_completions = await background_tasks.pending_completions()
+            if not pending_completions:
+                raise ConfigurationError("no pending background task completion is available")
 
         if self._session_store is not None and session_id is None:
             session_id = await self._session_store.create_session(
@@ -440,26 +465,57 @@ class AgentRuntime:
         if plan_execution_requested:
             assert self._session_store is not None
             assert session_id is not None
-            session_task = SessionTask(
-                f"task-{uuid.uuid4().hex}",
-                SessionTaskKind.PLAN_EXECUTION,
-                SessionTaskStatus.RUNNING,
-                datetime.now(UTC),
-                plan_snapshot=self._plan,
-            )
-            await self._session_store.create_session_task(session_id, session_task)
+            if plan_execution_task_id is None:
+                session_task = SessionTask(
+                    f"task-{uuid.uuid4().hex}",
+                    SessionTaskKind.PLAN_EXECUTION,
+                    SessionTaskStatus.RUNNING,
+                    datetime.now(UTC),
+                    plan_snapshot=self._plan,
+                )
+                await self._session_store.create_session_task(session_id, session_task)
+            else:
+                queued_task = await self._session_store.get_session_task(
+                    session_id,
+                    plan_execution_task_id,
+                )
+                if queued_task is None:
+                    raise ConfigurationError(f"unknown queued plan task: {plan_execution_task_id}")
+                if queued_task.kind is not SessionTaskKind.PLAN_EXECUTION:
+                    raise ConfigurationError("only plan execution tasks can be started")
+                if queued_task.status is not SessionTaskStatus.QUEUED:
+                    raise ConfigurationError(f"plan task {plan_execution_task_id} is not queued")
+                if queued_task.plan_snapshot != self._plan:
+                    raise ConfigurationError(
+                        f"plan task {plan_execution_task_id} does not match the saved plan"
+                    )
+                session_task = await self._session_store.start_session_task(
+                    session_id,
+                    plan_execution_task_id,
+                    datetime.now(UTC),
+                )
 
-        async def emit(kind: AgentEventKind, data: dict[str, object]) -> AgentEvent:
-            nonlocal sequence
-            sequence += 1
-            event = AgentEvent.create(sequence, kind, data)
-            events.append(event)
-            if self._session_store is not None and session_id is not None:
-                await self._session_store.append_event(session_id, event)
+        async def deliver(event: AgentEvent) -> None:
             if sink is not None:
                 outcome = sink(event)
                 if inspect.isawaitable(outcome):
                     await outcome
+
+        async def emit(
+            kind: AgentEventKind,
+            data: dict[str, object],
+            *,
+            persist: bool = True,
+            deliver_event: bool = True,
+        ) -> AgentEvent:
+            nonlocal sequence
+            sequence += 1
+            event = AgentEvent.create(sequence, kind, data)
+            events.append(event)
+            if persist and self._session_store is not None and session_id is not None:
+                await self._session_store.append_event(session_id, event)
+            if deliver_event:
+                await deliver(event)
             return event
 
         async def finish_session_task(status: SessionTaskStatus) -> None:
@@ -483,6 +539,7 @@ class AgentRuntime:
 
         async def record_turn_failure(error: BaseException) -> None:
             cancelled = isinstance(error, asyncio.CancelledError)
+            pristine_rewound = cancelled and pristine_cancel_eligible
             await finish_session_task(
                 SessionTaskStatus.CANCELLED if cancelled else SessionTaskStatus.FAILED
             )
@@ -492,11 +549,48 @@ class AgentRuntime:
                     "error_type": type(error).__name__,
                     "message": "turn cancelled" if cancelled else str(error),
                     "cancelled": cancelled,
+                    "pristine_rewound": pristine_rewound,
                     "duration_seconds": monotonic() - turn_started_at,
                 },
             )
             if self._session_store is not None and session_id is not None:
-                await self._session_store.save_session_items(session_id, context_items)
+                await self._session_store.save_session_items(
+                    session_id,
+                    (
+                        turn_context_prefix
+                        if pristine_rewound or not persist_turn_context
+                        else context_items
+                    ),
+                )
+
+        async def finalize_turn_completion(
+            outcome: AgentExecutionOutcome,
+            data: dict[str, object],
+            result_items: Sequence[SessionItem],
+        ) -> None:
+            completed_event = await emit(
+                AgentEventKind.TURN_COMPLETED,
+                data,
+                persist=False,
+                deliver_event=False,
+            )
+            record = (
+                None
+                if turn_source is TurnSource.BACKGROUND_TASK_AUTO_WAKE
+                else SessionExecutionRecord(
+                    outcome,
+                    completed_event.sequence,
+                    completed_event.created_at,
+                )
+            )
+            if self._session_store is not None and session_id is not None:
+                await self._session_store.finalize_turn(
+                    session_id,
+                    completed_event,
+                    result_items,
+                    record,
+                )
+            await deliver(completed_event)
 
         supervisor: AgentExecutionSupervisor | None = None
 
@@ -666,11 +760,13 @@ class AgentRuntime:
             outcome = outcome_for_terminal_decision(decision)
             final_message = Message(Role.ASSISTANT, finalization.response)
             messages.append(final_message)
-            context_items.append(final_message)
+            if persist_turn_context:
+                context_items.append(final_message)
             await emit(AgentEventKind.TEXT_DELTA, {"text": finalization.response})
             await finish_session_task(SessionTaskStatus.COMPLETED)
-            await emit(
-                AgentEventKind.TURN_COMPLETED,
+            result_items = tuple(context_items) if persist_turn_context else turn_context_prefix
+            await finalize_turn_completion(
+                outcome,
                 {
                     "step": step,
                     "stop_reason": finalization.stop_reason,
@@ -687,14 +783,13 @@ class AgentRuntime:
                     "finalization_attempts": len(finalization.attempts),
                     "illegal_tool_calls": finalization.illegal_tool_calls,
                 },
+                result_items,
             )
-            if self._session_store is not None and session_id is not None:
-                await self._session_store.save_session_items(session_id, context_items)
             return AgentRunResult(
                 session_id,
                 finalization.response,
                 tuple(messages),
-                tuple(context_items),
+                result_items,
                 tuple(events),
                 step,
                 self._plan,
@@ -720,6 +815,23 @@ class AgentRuntime:
                     "model": self._provider.model_name,
                 },
             )
+            if turn_source is TurnSource.BACKGROUND_TASK_AUTO_WAKE:
+                assert background_tasks is not None
+                pending_completions = await background_tasks.pending_completions()
+                await emit(
+                    AgentEventKind.BACKGROUND_TASK_AUTO_WAKE_STARTED,
+                    {
+                        "count": min(
+                            len(pending_completions),
+                            BACKGROUND_TASK_COMPLETION_BATCH_LIMIT,
+                        ),
+                        "remaining_count": max(
+                            0,
+                            len(pending_completions) - BACKGROUND_TASK_COMPLETION_BATCH_LIMIT,
+                        ),
+                        "model_context_only": True,
+                    },
+                )
             if session_task is not None:
                 await emit(AgentEventKind.SESSION_TASK_STARTED, {"task": session_task.to_dict()})
             if plan_execution_requested:
@@ -728,10 +840,11 @@ class AgentRuntime:
                     AgentEventKind.PLAN_EXECUTION_REQUESTED,
                     {"plan": self._plan.to_dict()},
                 )
-            user_message = Message(Role.USER, prompt, content_parts=prompt_parts)
-            context_items.append(user_message)
-            messages.append(user_message)
-            await emit(AgentEventKind.USER_MESSAGE, {"content": user_message.model_content()})
+            if turn_source is TurnSource.USER:
+                user_message = Message(Role.USER, prompt, content_parts=prompt_parts)
+                context_items.append(user_message)
+                messages.append(user_message)
+                await emit(AgentEventKind.USER_MESSAGE, {"content": user_message.model_content()})
 
             for step in range(1, self._max_steps + 1):
                 if pending_terminal_decision is not None:
@@ -757,7 +870,6 @@ class AgentRuntime:
 
                 await emit(AgentEventKind.MODEL_STEP_STARTED, {"step": step})
                 completion_batch: tuple[BackgroundTaskSnapshot, ...] = ()
-                background_tasks = self._tool_context.background_tasks
                 if background_tasks is not None:
                     pending_completions = await background_tasks.pending_completions()
                     completion_batch = pending_completions[:BACKGROUND_TASK_COMPLETION_BATCH_LIMIT]
@@ -773,6 +885,14 @@ class AgentRuntime:
                                         "task_output"
                                         if self._tools.get("task_output") is not None
                                         else None
+                                    ),
+                                    include_output=(
+                                        turn_source is TurnSource.BACKGROUND_TASK_AUTO_WAKE
+                                    ),
+                                    redaction_values=(
+                                        self._tool_context.redaction_values
+                                        if turn_source is TurnSource.BACKGROUND_TASK_AUTO_WAKE
+                                        else ()
                                     ),
                                 ),
                             )
@@ -851,9 +971,13 @@ class AgentRuntime:
                         )
                     elif isinstance(model_event, ModelTextDelta):
                         await complete_thinking()
+                        if model_event.text:
+                            pristine_cancel_eligible = False
                         step_text.append(model_event.text)
                         await emit(AgentEventKind.TEXT_DELTA, {"text": model_event.text})
                     elif isinstance(model_event, ModelReasoningDelta):
+                        if model_event.text:
+                            pristine_cancel_eligible = False
                         step_reasoning.append(model_event.text)
                         await emit(
                             AgentEventKind.REASONING_DELTA,
@@ -861,6 +985,7 @@ class AgentRuntime:
                         )
                     elif isinstance(model_event, ModelBackendToolStarted):
                         await complete_thinking()
+                        pristine_cancel_eligible = False
                         backend_tool_started_at[model_event.call_id] = monotonic()
                         await emit(
                             AgentEventKind.BACKEND_TOOL_STARTED,
@@ -868,6 +993,7 @@ class AgentRuntime:
                         )
                     elif isinstance(model_event, ModelBackendToolCompleted):
                         await complete_thinking()
+                        pristine_cancel_eligible = False
                         started_at = backend_tool_started_at.pop(
                             model_event.call_id,
                             step_started_at,
@@ -882,9 +1008,11 @@ class AgentRuntime:
                         )
                     elif isinstance(model_event, ModelToolCall):
                         await complete_thinking()
+                        pristine_cancel_eligible = False
                         tool_calls.append(model_event.call)
                     elif isinstance(model_event, ModelCompleted):
                         await complete_thinking()
+                        pristine_cancel_eligible = False
                         completion = model_event
 
                 if completion is None:
@@ -920,6 +1048,9 @@ class AgentRuntime:
                     await background_tasks.mark_completions_reported(
                         tuple(snapshot.task_id for snapshot in completion_batch)
                     )
+                    # The manager has now acknowledged this batch. Never
+                    # include it in a later model step of the same turn.
+                    completion_reminders.clear()
                 if completion.context_items:
                     context_items.extend(completion.context_items)
                     if can_adopt_provider_origin:
@@ -939,13 +1070,22 @@ class AgentRuntime:
                     tool_calls=tuple(tool_calls),
                     reasoning_content="".join(step_reasoning) or None,
                 )
-                context_items.append(assistant_message)
                 messages.append(assistant_message)
+                if persist_turn_context:
+                    context_items.append(assistant_message)
 
                 if not tool_calls:
                     await finish_session_task(SessionTaskStatus.COMPLETED)
-                    await emit(
-                        AgentEventKind.TURN_COMPLETED,
+                    result_items = (
+                        tuple(context_items) if persist_turn_context else turn_context_prefix
+                    )
+                    await finalize_turn_completion(
+                        AgentExecutionOutcome(
+                            AgentExecutionStatus.COMPLETED,
+                            None,
+                            finalized=False,
+                            recoverable=False,
+                        ),
                         {
                             "step": step,
                             "stop_reason": completion.stop_reason,
@@ -953,14 +1093,13 @@ class AgentRuntime:
                             "output_tokens": completion.output_tokens,
                             "duration_seconds": monotonic() - turn_started_at,
                         },
+                        result_items,
                     )
-                    if self._session_store is not None and session_id is not None:
-                        await self._session_store.save_session_items(session_id, context_items)
                     return AgentRunResult(
                         session_id,
                         "".join(response_parts),
                         tuple(messages),
-                        tuple(context_items),
+                        result_items,
                         tuple(events),
                         step,
                         self._plan,
@@ -1045,9 +1184,6 @@ class AgentRuntime:
                         raise
                 if pending_terminal_decision is not None:
                     return await complete_finalized_turn(pending_terminal_decision, step=step)
-                if self._session_store is not None and session_id is not None:
-                    await self._session_store.save_session_items(session_id, context_items)
-
             if self._execution_control_mode is ExecutionControlMode.FINALIZE_TERMINAL:
                 return await complete_finalized_turn(
                     SupervisorDecision(
@@ -1058,6 +1194,11 @@ class AgentRuntime:
                         SupervisorReasonCode.MODEL_STEP_LIMIT,
                     ),
                     step=self._max_steps,
+                )
+            if self._session_store is not None and session_id is not None:
+                await self._session_store.save_session_items(
+                    session_id,
+                    context_items if persist_turn_context else turn_context_prefix,
                 )
             raise ProviderError(f"agent exceeded the maximum of {self._max_steps} model steps")
         except BaseException as error:

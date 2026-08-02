@@ -11,6 +11,7 @@ import time
 import unittest
 from collections.abc import AsyncIterator, Sequence
 from contextlib import redirect_stderr, redirect_stdout
+from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -27,6 +28,13 @@ from neuro_code.cli import (
     build_parser,
 )
 from neuro_code.config import AppConfig
+from neuro_code.domain.events import AgentEvent, AgentEventKind
+from neuro_code.domain.execution import (
+    AgentExecutionOutcome,
+    AgentExecutionStatus,
+    SessionExecutionRecord,
+    SupervisorReasonCode,
+)
 from neuro_code.domain.messages import Message, Role, ToolCall
 from neuro_code.domain.model_context import ModelContext
 from neuro_code.domain.model_events import (
@@ -1368,11 +1376,40 @@ api_key_env = "SECOND_KEY"
             self.assertEqual(resumed["session_id"], session_id)
             self.assertGreater(resumed["events"][0]["sequence"], 1)
 
+            async def save_recoverable_record() -> None:
+                store = SqliteSessionStore(root / "state" / "sessions.db")
+                await store.initialize()
+                completed = AgentEvent.create(
+                    await store.next_event_sequence(session_id),
+                    AgentEventKind.TURN_COMPLETED,
+                    {"step": 3},
+                )
+                await store.append_event(session_id, completed)
+                await store.save_execution_record(
+                    session_id,
+                    SessionExecutionRecord(
+                        outcome=AgentExecutionOutcome(
+                            status=AgentExecutionStatus.BUDGET_LIMITED,
+                            reason_code=SupervisorReasonCode.MODEL_STEP_LIMIT,
+                            finalized=True,
+                            recoverable=True,
+                        ),
+                        event_sequence=completed.sequence,
+                        completed_at=datetime.now(UTC),
+                    ),
+                )
+
+            asyncio.run(save_recoverable_record())
+
             exit_code, list_output = run(("sessions", "--json", "--cwd", str(root)))
             self.assertEqual(exit_code, 0)
-            self.assertEqual(json.loads(list_output)[0]["id"], session_id)
-            self.assertEqual(json.loads(list_output)[0]["sandbox_profile"], "off")
-            self.assertEqual(json.loads(list_output)[0]["title"], "first")
+            listed = json.loads(list_output)[0]
+            self.assertEqual(listed["id"], session_id)
+            self.assertEqual(listed["sandbox_profile"], "off")
+            self.assertEqual(listed["title"], "first")
+            self.assertEqual(listed["last_execution"]["status"], "budget_limited")
+            self.assertEqual(listed["last_execution"]["reason"], "model_step_limit")
+            self.assertTrue(listed["last_execution"]["recoverable"])
 
             exit_code, search_output = run(
                 (
@@ -1391,6 +1428,15 @@ api_key_env = "SECOND_KEY"
             self.assertEqual(search_page["results"][0]["id"], session_id)
             self.assertIn("content", search_page["results"][0]["matched_fields"])
             self.assertIsNotNone(search_page["results"][0]["snippet"])
+            self.assertEqual(
+                search_page["results"][0]["last_execution"]["status"],
+                "budget_limited",
+            )
+            self.assertEqual(
+                search_page["results"][0]["last_execution"]["reason"],
+                "model_step_limit",
+            )
+            self.assertTrue(search_page["results"][0]["last_execution"]["recoverable"])
 
             exit_code, rename_output = run(
                 (

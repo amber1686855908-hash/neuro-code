@@ -17,9 +17,10 @@ conversation controller can retain stale in-memory items after the runtime has
 saved its terminal state.
 
 The historical terminal behavior proves that a pane must accept another prompt
-after cancellation. Pristine rewind before the first token, restored drafts,
-and queued interjections are broader interaction policies and are not required
-for this vertical slice.
+after cancellation. Pristine rewind before the first token and full draft
+restoration are broader interaction policies. The TUI now provides a bounded
+presentation-only queue for explicit follow-up prompts submitted before the
+first non-empty model token.
 
 ## Decision
 
@@ -41,10 +42,24 @@ for this vertical slice.
   a terminal completion. The cancelled user message remains durable. This
   slice does not claim transaction rollback for side effects completed before
   cancellation.
+- TUI prompts opt into a pristine-rewind policy. If cancellation occurs before
+  any non-empty model text/reasoning, completion, or tool activity, the runtime
+  saves the pre-turn item prefix instead of the cancelled user message and marks
+  `pristine_rewound: true` on `TURN_FAILED`. The submitted user event remains in
+  the append-only audit stream; no model context or tool result is replayed.
+  Once output or tool activity exists, the message is retained and normal
+  cancellation recovery applies.
+- Before the first non-empty model token, the TUI accepts at most four explicit
+  follow-up prompts into a local queue. A successful turn starts them in order;
+  cancellation or failure restores the first queued prompt to the input. The
+  queued prompts are not sent to the runtime or persisted until their turn
+  starts, and the queue never accepts input after the first token.
 - Local adapters retain responsibility for bounded cleanup. In particular,
-  Bash cancellation terminates its owned process tree. Cancelling a client
-  stream cannot guarantee cancellation of work already executing inside a
-  provider-hosted tool.
+  Bash cancellation terminates its owned process tree. When background
+  management is enabled, cancellation during the foreground wait also kills
+  the same manager-owned task and discards its terminal record. Cancelling a
+  client stream cannot guarantee cancellation of work already executing inside
+  a provider-hosted tool.
 
 ## Consequences
 
@@ -54,9 +69,15 @@ distinguish cancellation through `cancelled: true` on `tool_failed` and
 `turn_failed` data. Headless runtime callers receive the original
 `CancelledError`; cancellation is never reported as success.
 
-This is still partial M3 behavior. Pristine pre-token rewind, draft restoration,
-buffered interjection handling, provider-hosted remote cancellation guarantees,
-and cross-platform PTY smoke coverage remain future slices.
+This is still partial M3 behavior. The TUI now restores a safely rewound prompt
+to its draft and keeps the existing bounded pre-token interjection queue.
+Provider-hosted remote cancellation guarantees and cross-platform PTY smoke
+coverage remain future slices. Model-completion auto-wake is available as an
+explicitly enabled, session-scoped, bounded TUI policy with persisted global
+defaults, per-provider overrides, cooldown, budget, duplicate suppression, and
+restart-aware wake-ledger recovery. Enabled Bash calls automatically promote a
+still-running foreground command after its wait budget without restarting it;
+the task remains owned by the conversation scope.
 
 ## Validation
 

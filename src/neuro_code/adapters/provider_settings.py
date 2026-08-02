@@ -16,6 +16,7 @@ from neuro_code.configuration.managed_provider_settings import (
 from neuro_code.configuration.managed_provider_settings import (
     load_managed_provider_settings as _load_managed_provider_settings,
 )
+from neuro_code.domain.background_tasks import BackgroundTaskWakePolicy
 from neuro_code.domain.provider_settings import (
     ManagedProviderProfile,
     ManagedProviderSettings,
@@ -81,6 +82,7 @@ class JsonProviderSettingsStore:
             proxy_mode=profile.proxy_mode,
             proxy_url_env=profile.proxy_url_env,
             api_key=api_key,
+            background_task_wake_policy=profile.background_task_wake_policy,
         )
         profiles = [entry for entry in current.profiles if entry.name != saved.name]
         profiles.append(saved)
@@ -90,7 +92,12 @@ class JsonProviderSettingsStore:
             if make_default or current.default_provider is None
             else current.default_provider
         )
-        updated = ManagedProviderSettings(tuple(profiles), default, current.proxy_defaults)
+        updated = ManagedProviderSettings(
+            tuple(profiles),
+            default,
+            current.proxy_defaults,
+            current.background_task_wake_policy,
+        )
         self._save(updated)
         return updated
 
@@ -102,7 +109,12 @@ class JsonProviderSettingsStore:
         current = _load_managed_provider_settings(self._state_dir)
         if current.profile(name) is None:
             raise ConfigurationError(f"managed provider profile does not exist: {name}")
-        updated = ManagedProviderSettings(current.profiles, name, current.proxy_defaults)
+        updated = ManagedProviderSettings(
+            current.profiles,
+            name,
+            current.proxy_defaults,
+            current.background_task_wake_policy,
+        )
         self._save(updated)
         return updated
 
@@ -122,6 +134,28 @@ class JsonProviderSettingsStore:
             current.profiles,
             current.default_provider,
             proxy_defaults,
+            current.background_task_wake_policy,
+        )
+        self._save(updated)
+        return updated
+
+    async def save_background_task_wake_policy(
+        self,
+        policy: BackgroundTaskWakePolicy,
+    ) -> ManagedProviderSettings:
+        async with self._write_lock:
+            return await run_blocking(self._save_background_task_wake_policy, policy)
+
+    def _save_background_task_wake_policy(
+        self,
+        policy: BackgroundTaskWakePolicy,
+    ) -> ManagedProviderSettings:
+        current = _load_managed_provider_settings(self._state_dir)
+        updated = ManagedProviderSettings(
+            current.profiles,
+            current.default_provider,
+            current.proxy_defaults,
+            policy,
         )
         self._save(updated)
         return updated
@@ -138,7 +172,12 @@ class JsonProviderSettingsStore:
         default = current.default_provider
         if default == name:
             default = profiles[0].name if profiles else None
-        updated = ManagedProviderSettings(profiles, default, current.proxy_defaults)
+        updated = ManagedProviderSettings(
+            profiles,
+            default,
+            current.proxy_defaults,
+            current.background_task_wake_policy,
+        )
         self._save(updated)
         return updated
 
@@ -150,6 +189,7 @@ class JsonProviderSettingsStore:
                 "mode": settings.proxy_defaults.mode,
                 "proxy_url_env": settings.proxy_defaults.proxy_url_env,
             },
+            "background_task_wake_policy": settings.background_task_wake_policy.value,
             "providers": [
                 {
                     "name": profile.name,
@@ -160,6 +200,11 @@ class JsonProviderSettingsStore:
                     "context_window_tokens": profile.context_window_tokens,
                     "proxy_mode": profile.proxy_mode,
                     "proxy_url_env": profile.proxy_url_env,
+                    "background_task_wake_policy": (
+                        profile.background_task_wake_policy.value
+                        if profile.background_task_wake_policy is not None
+                        else None
+                    ),
                 }
                 for profile in settings.profiles
             ],

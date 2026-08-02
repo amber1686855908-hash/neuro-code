@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import unittest
 from collections.abc import Sequence
+from datetime import UTC, datetime
 from pathlib import Path
 
 from neuro_code.application.runtime.supervision import (
@@ -21,6 +22,7 @@ from neuro_code.domain.execution import (
     ExecutionCounters,
     ExecutionSnapshot,
     ProgressKind,
+    SessionExecutionRecord,
     SupervisionThresholds,
     SupervisorDecision,
     SupervisorDecisionKind,
@@ -149,6 +151,30 @@ class ExecutionSupervisionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "reason_code"):
             AgentExecutionOutcome(
                 AgentExecutionStatus.COMPLETED, SupervisorReasonCode.NONE, False, False
+            )
+
+    def test_session_execution_record_accepts_only_a_terminal_outcome_and_a_safe_event_identity(
+        self,
+    ) -> None:
+        record = SessionExecutionRecord(
+            AgentExecutionOutcome(
+                AgentExecutionStatus.STUCK,
+                SupervisorReasonCode.NO_PROGRESS,
+                finalized=True,
+                recoverable=True,
+            ),
+            12,
+            datetime(2026, 8, 1, 9, tzinfo=UTC),
+        )
+        self.assertIs(record.outcome.status, AgentExecutionStatus.STUCK)
+        self.assertEqual(record.event_sequence, 12)
+        with self.assertRaisesRegex(ValueError, "event_sequence"):
+            SessionExecutionRecord(record.outcome, 0, record.completed_at)
+        with self.assertRaisesRegex(ValueError, "timezone-aware"):
+            SessionExecutionRecord(
+                record.outcome,
+                record.event_sequence,
+                datetime(2026, 8, 1, 9, tzinfo=UTC).replace(tzinfo=None),
             )
 
     def supervisor(

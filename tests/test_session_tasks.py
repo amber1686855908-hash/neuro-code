@@ -8,6 +8,26 @@ from neuro_code.domain.session_tasks import SessionTask, SessionTaskKind, Sessio
 
 
 class SessionTaskTests(unittest.TestCase):
+    def test_queued_task_can_be_started_once_before_finishing(self) -> None:
+        queued_at = datetime(2026, 7, 29, 12, tzinfo=UTC)
+        started_at = queued_at + timedelta(seconds=5)
+        task = SessionTask(
+            "task-queued-plan",
+            SessionTaskKind.PLAN_EXECUTION,
+            SessionTaskStatus.QUEUED,
+            queued_at,
+        )
+
+        self.assertFalse(task.status.terminal)
+        self.assertTrue(task.status.active)
+        running = task.start(started_at=started_at)
+
+        self.assertIs(running.status, SessionTaskStatus.RUNNING)
+        self.assertTrue(running.status.active)
+        self.assertEqual(running.started_at, started_at)
+        with self.assertRaisesRegex(ValueError, "not queued"):
+            running.start(started_at=started_at + timedelta(seconds=1))
+
     def test_running_task_transitions_once_to_a_terminal_state(self) -> None:
         started_at = datetime(2026, 7, 29, 12, tzinfo=UTC)
         plan = SessionPlan(

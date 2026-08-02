@@ -9,7 +9,12 @@ from typing import Protocol
 from neuro_code.application.ports.background_tasks import BackgroundTaskManager
 from neuro_code.application.ports.model import ModelProvider
 from neuro_code.application.runtime.agent import AgentRunResult, EventSink
-from neuro_code.domain.background_tasks import BackgroundTaskSnapshot, BackgroundTaskStatus
+from neuro_code.domain.background_tasks import (
+    BackgroundTaskSnapshot,
+    BackgroundTaskStatus,
+    BackgroundWakeState,
+)
+from neuro_code.domain.execution import SessionExecutionRecord, TurnCancellationPolicy, TurnSource
 from neuro_code.domain.interaction_mode import InteractionMode
 from neuro_code.domain.messages import ContentPart, SessionItem
 from neuro_code.domain.plans import PlanComment, SessionPlan
@@ -61,9 +66,31 @@ class ConversationRunner(Protocol):
         *,
         sink: EventSink | None = None,
         content_parts: Sequence[ContentPart] = (),
+        cancellation_policy: TurnCancellationPolicy = TurnCancellationPolicy.RETAIN,
+        turn_source: TurnSource = TurnSource.USER,
     ) -> AgentRunResult: ...
 
-    async def execute_plan(self, *, sink: EventSink | None = None) -> AgentRunResult: ...
+    async def run_background_wake(self, *, sink: EventSink | None = None) -> AgentRunResult: ...
+
+    async def load_background_wake_state(self) -> BackgroundWakeState: ...
+
+    async def save_background_wake_state(self, state: BackgroundWakeState) -> None: ...
+
+    async def schedule_plan(self) -> SessionTask: ...
+
+    async def execute_plan(
+        self,
+        *,
+        sink: EventSink | None = None,
+        task_id: str | None = None,
+    ) -> AgentRunResult: ...
+
+    async def run_session_task(
+        self,
+        task_id: str,
+        *,
+        sink: EventSink | None = None,
+    ) -> AgentRunResult: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -244,6 +271,11 @@ class ProfileConversationController:
         return self._binding.runner.session_id
 
     @property
+    def execution_record(self) -> SessionExecutionRecord | None:
+        record = getattr(self._binding.runner, "execution_record", None)
+        return record if isinstance(record, SessionExecutionRecord) else None
+
+    @property
     def items(self) -> tuple[SessionItem, ...]:
         return self._binding.runner.items
 
@@ -255,13 +287,60 @@ class ProfileConversationController:
     def plan_comments(self) -> tuple[PlanComment, ...]:
         return self._binding.runner.plan_comments
 
-    async def run(self, prompt: str, *, sink: EventSink | None = None) -> AgentRunResult:
+    async def run(
+        self,
+        prompt: str,
+        *,
+        sink: EventSink | None = None,
+        cancellation_policy: TurnCancellationPolicy = TurnCancellationPolicy.RETAIN,
+        turn_source: TurnSource = TurnSource.USER,
+    ) -> AgentRunResult:
         async with self._turn_lock:
-            return await self._binding.runner.run(prompt, sink=sink)
+            if (
+                cancellation_policy is TurnCancellationPolicy.RETAIN
+                and turn_source is TurnSource.USER
+            ):
+                return await self._binding.runner.run(prompt, sink=sink)
+            return await self._binding.runner.run(
+                prompt,
+                sink=sink,
+                cancellation_policy=cancellation_policy,
+                turn_source=turn_source,
+            )
 
-    async def execute_plan(self, *, sink: EventSink | None = None) -> AgentRunResult:
+    async def run_background_wake(self, *, sink: EventSink | None = None) -> AgentRunResult:
         async with self._turn_lock:
-            return await self._binding.runner.execute_plan(sink=sink)
+            return await self._binding.runner.run_background_wake(sink=sink)
+
+    async def load_background_wake_state(self) -> BackgroundWakeState:
+        async with self._turn_lock:
+            return await self._binding.runner.load_background_wake_state()
+
+    async def save_background_wake_state(self, state: BackgroundWakeState) -> None:
+        async with self._turn_lock:
+            await self._binding.runner.save_background_wake_state(state)
+
+    async def schedule_plan(self) -> SessionTask:
+        async with self._turn_lock:
+            return await self._binding.runner.schedule_plan()
+
+    async def execute_plan(
+        self,
+        *,
+        sink: EventSink | None = None,
+        task_id: str | None = None,
+    ) -> AgentRunResult:
+        async with self._turn_lock:
+            return await self._binding.runner.execute_plan(sink=sink, task_id=task_id)
+
+    async def run_session_task(
+        self,
+        task_id: str,
+        *,
+        sink: EventSink | None = None,
+    ) -> AgentRunResult:
+        async with self._turn_lock:
+            return await self._binding.runner.run_session_task(task_id, sink=sink)
 
     async def add_plan_comment(self, step_index: int, content: str) -> PlanComment:
         if self._turn_lock.locked():

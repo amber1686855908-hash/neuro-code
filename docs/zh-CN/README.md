@@ -252,12 +252,14 @@ TUI 管理的供应商元数据会原子写入 `~/.neuro-code/providers.json`；
 载入，并在分叉会话时复制。可用 `/plan DESCRIPTION` 进入计划模式并立即发起规划请求，或用
 `/view-plan`（别名 `/show-plan`）查看当前已保存的计划。用户审阅后可用 `/execute-plan`
 （别名 `/run-plan`）显式记录从计划到轮次的交接，并且只切换到 `accept-edits`。每次这样的
-轮次都会获得一个仅含元数据的持久会话任务记录：它具有不透明 ID，状态为 `running`、
+轮次都会获得一个仅含元数据的持久会话任务记录：它具有不透明 ID，状态为 `queued`、`running`、
 `completed`、`failed` 或 `cancelled`；可在恢复后查看，但不会复制到分叉会话。命令、网络、
 工作区和沙箱边界仍然有效。`/comment-plan STEP COMMENT`（别名 `/plan-comment`）会为当前计划的
 一个步骤保存有界用户反馈，`/view-plan` 会在相应步骤下显示它。评论只会随下一条提示提供给模型；
-它不会批准、执行或调度工作。评论会随当前计划一起分叉，但整体替换计划会丢弃旧评论。任务调度器和
-子代理系统仍不可用。`/tasks` 始终保持紧凑的任务列表。如需查看某一持久计划执行任务的完整不可变计划
+它不会批准、执行或调度工作。评论会随当前计划一起分叉，但整体替换计划会丢弃旧评论。可使用
+`/schedule-plan`（别名 `/queue-plan`）在不联系模型的情况下持久化当前计划的有界排队副本，再使用
+`/run-task TASK_ID` 显式启动这一快照。每个会话最多排队四个计划任务；排队任务不会自动启动、重试、
+唤醒或创建子代理。`/tasks` 始终保持紧凑的任务列表。如需查看某一持久计划执行任务的完整不可变计划
 快照，用户必须显式运行 `/view-task TASK_ID`；它只会在当前打开的会话中解析该 ID，并把快照作为只读
 参考展示。它既不会更改当前计划，也不会启动模型轮次或任何工作。详见
 [ADR 0028](adr/0028-timed-tool-feedback-and-interaction-modes.md)
@@ -265,7 +267,8 @@ TUI 管理的供应商元数据会原子写入 `~/.neuro-code/providers.json`；
 [ADR 0058](adr/0058-durable-session-task-lifecycle.md)、
 [ADR 0059](adr/0059-bounded-current-plan-comments.md) 与
 [ADR 0060](adr/0060-plan-execution-revision-snapshots.md) 与
-[ADR 0061](adr/0061-read-only-plan-execution-inspection.md)。
+[ADR 0061](adr/0061-read-only-plan-execution-inspection.md) 以及
+[ADR 0063](adr/0063-bounded-explicit-plan-task-scheduling.md)。
 
 使用 `Ctrl+P`、不带参数的 `/provider` 或 `/model` 可以打开已配置 profile 选择器；
 `/provider PROFILE` 与 `/model PROFILE` 可以直接选择。选择器只展示 profile 名称、模型、
@@ -300,8 +303,12 @@ SQLite 会话仍可恢复，下一条提示使用全新会话，从而避免把�
 
 轮次运行期间可使用 `Ctrl+C` 或 `/cancel` 请求取消。运行时会记录取消，把当前以及同批
 尚未启动的本地工具调用补齐为错误结果，重载持久会话，并让同一个会话继续接受下一条
-提示。当前切片会在会话历史中保留被取消的用户消息；尚未实现首个 token 之前的无痕
-回退与草稿恢复。
+提示。TUI 会显式请求首 token 前回退策略：如果取消发生在任何非空模型文字/推理、完成事件或
+工具活动之前，运行时只保存本轮之前的会话项，把刚提交的用户提示从模型上下文中移除，并将
+它恢复到输入草稿。`USER_MESSAGE` 与 `TURN_FAILED` 仍保留在追加式审计事件流中。只要已经产生
+输出或工具活动，就保留该提示并使用普通取消恢复路径。在首个非空模型 token 到达前，最多四条
+显式后续提示会在界面内缓冲，并在当前轮次完成后按顺序执行；只有真正启动时才会进入会话历史。
+如果无法安全回退，轮次取消或失败时第一条排队提示会恢复到输入框。
 
 具有副作用的工具判定为 `ask` 时，TUI 会打开失败关闭的审批模态框，默认焦点是拒绝。
 可以选择仅允许本次、在本进程会话中允许完全相同的工具/参数操作，或者拒绝；`Esc` 也会
@@ -358,7 +365,11 @@ profile 切换、进程内会话恢复、重启或启动恢复。切换绑定会
 用户提示触发的轮次。仅供模型使用的每批通知最多包含 20 个任务，只携带经过转义的状态
 元数据，不包含命令文本、cwd 或输出。终态 `task_output`、`wait_tasks` 或 `kill_task` 结果
 会消费对应通知，防止重复。只有供应商返回有效完成后才确认通知；通知不会作为会话消息
-持久化，也绝不会自主启动付费模型轮次。详见
+持久化；当有效唤醒策略关闭时，也绝不会自主启动付费模型轮次。Settings 中可以编辑持久的
+用户级默认策略，每个受管供应商配置可以继承默认值，也可以显式覆盖。空闲 TUI 会话还可以
+使用 `/auto-wake on|off` 临时切换；会话选择优先，并且每个待处理完成批次最多启动一次仅供
+模型使用的唤醒轮次，只有供应商返回有效完成后才消费待处理通知，唤醒回答与合成提醒不会
+进入持久会话项。新旧配置默认均为关闭。详见
 [ADR 0023](adr/0023-model-visible-background-task-completion-reminders.md)。
 
 ## 操作系统沙箱 profile
@@ -578,6 +589,10 @@ neuro-code sessions rename SESSION_ID "手动会话标题" --json
 neuro-code export SESSION_ID --format markdown --output transcript.md
 neuro-code import-session /path/to/upstream/session --json
 ```
+
+`sessions` 和 `sessions search` 的 JSON 形式会在存在持久终态记录时增加有界的
+`last_execution` 投影。它只包含状态、原因、是否收尾、是否可恢复和完成时间；纯文本会话
+列表保持不变。
 
 `import-session` 既可以接收受支持的上游 Rust 会话目录，也可以直接接收其中的
 `summary.json`。它只读解析 JSONL 文件，不会修改源文件；随后在单个事务中创建

@@ -1,19 +1,30 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import shlex
+import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
+from neuro_code.adapters.background_tasks import LocalBackgroundTaskManager
 from neuro_code.application.ports.sandbox import ShellLaunch
 from neuro_code.application.ports.tools import ToolContext
 from neuro_code.domain.sandbox import SandboxProfile
 from neuro_code.shared.errors import ToolError
+from neuro_code.tools.background_tasks import TaskOutputTool
 from neuro_code.tools.bash import BashTool
+
+
+def _python_shell_command(code: str) -> str:
+    """Build a Python command using quoting for the host shell."""
+
+    argv = [sys.executable, "-c", code]
+    return subprocess.list2cmdline(argv) if os.name == "nt" else shlex.join(argv)
 
 
 class BashToolTests(unittest.IsolatedAsyncioTestCase):
@@ -72,6 +83,135 @@ class BashToolTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(result.metadata["exit_code"], 7)
             self.assertTrue(result.metadata["truncated"])
 
+    async def test_enabled_manager_promotes_once_and_preserves_task_ownership(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            marker = root / "runs.txt"
+            code = (
+                f"import pathlib,time;pathlib.Path({str(marker)!r}).open('a').write('run\\n');"
+                "print('started',flush=True);time.sleep(0.3);print('finished',flush=True)"
+            )
+            command = _python_shell_command(code)
+            manager = LocalBackgroundTaskManager()
+            context = ToolContext(
+                root,
+                command_timeout_seconds=0.05,
+                termination_grace_seconds=0.05,
+                background_tasks=manager,
+            )
+            try:
+                result = await BashTool(background_enabled=True).execute(
+                    {"command": command},
+                    context,
+                )
+                assert result.metadata is not None
+                task_id = result.metadata["task_id"]
+                self.assertIsInstance(task_id, str)
+                self.assertEqual(result.metadata["status"], "running")
+                self.assertTrue(result.metadata["is_background"])
+                self.assertTrue(result.metadata["promoted_from_foreground"])
+                self.assertNotIn(command, result.content)
+
+                output = await TaskOutputTool().execute(
+                    {"task_id": task_id, "wait_seconds": 2},
+                    context,
+                )
+                self.assertIn("finished", output.content)
+                self.assertEqual(marker.read_text(encoding="utf-8").splitlines(), ["run"])
+                snapshot = await manager.get(task_id)
+                assert snapshot is not None
+                self.assertEqual(snapshot.status.value, "completed")
+            finally:
+                await manager.shutdown()
+
+    async def test_enabled_manager_short_foreground_result_is_discarded(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            code = "print('short');import sys;sys.exit(7)"
+            command = _python_shell_command(code)
+            manager = LocalBackgroundTaskManager()
+            context = ToolContext(
+                root,
+                command_timeout_seconds=2,
+                output_byte_limit=100,
+                background_tasks=manager,
+            )
+            try:
+                result = await BashTool(background_enabled=True).execute(
+                    {"command": command},
+                    context,
+                )
+                self.assertTrue(result.is_error)
+                self.assertIn("short", result.content)
+                assert result.metadata is not None
+                self.assertEqual(result.metadata["exit_code"], 7)
+                self.assertNotIn("task_id", result.metadata)
+                self.assertNotIn("promoted_from_foreground", result.metadata)
+                self.assertEqual(await manager.list(), ())
+                self.assertEqual(await manager.pending_completions(), ())
+            finally:
+                await manager.shutdown()
+
+    async def test_full_background_registry_falls_back_to_bounded_foreground_execution(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manager = LocalBackgroundTaskManager(max_running_tasks=1)
+            context = ToolContext(
+                root,
+                command_timeout_seconds=2,
+                background_tasks=manager,
+            )
+            try:
+                background = await BashTool(background_enabled=True).execute(
+                    {
+                        "command": _python_shell_command("import time;time.sleep(60)"),
+                        "is_background": True,
+                    },
+                    context,
+                )
+                assert background.metadata is not None
+                task_id = background.metadata["task_id"]
+                self.assertIsInstance(task_id, str)
+
+                result = await BashTool(background_enabled=True).execute(
+                    {"command": _python_shell_command('print("foreground fallback")')},
+                    context,
+                )
+
+                self.assertFalse(result.is_error)
+                self.assertEqual(result.content.strip(), "foreground fallback")
+                self.assertNotIn("task_id", result.metadata or {})
+                await manager.kill(task_id)
+            finally:
+                await manager.shutdown()
+
+    async def test_manager_capture_failure_with_zero_exit_is_an_error(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            code = "print('capture failure trigger',flush=True)"
+            command = _python_shell_command(code)
+            manager = LocalBackgroundTaskManager()
+            context = ToolContext(root, command_timeout_seconds=2, background_tasks=manager)
+            try:
+                with mock.patch(
+                    "neuro_code.adapters.background_tasks._BoundedOutput.append",
+                    side_effect=RuntimeError("controlled capture failure"),
+                ):
+                    result = await BashTool(background_enabled=True).execute(
+                        {"command": command},
+                        context,
+                    )
+                self.assertTrue(result.is_error)
+                assert result.metadata is not None
+                self.assertEqual(result.metadata["exit_code"], 0)
+                self.assertNotIn("task_id", result.metadata)
+                self.assertEqual(await manager.list(), ())
+                self.assertEqual(await manager.pending_completions(), ())
+            finally:
+                await manager.shutdown()
+
     async def test_timeout_terminates_process(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             command = f'"{sys.executable}" -c "import time; time.sleep(10)"'
@@ -80,6 +220,77 @@ class BashToolTests(unittest.IsolatedAsyncioTestCase):
                     {"command": command, "timeout_seconds": 0.05},
                     ToolContext(Path(directory), termination_grace_seconds=0.05),
                 )
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "Linux process-group assertion")
+    async def test_enabled_without_manager_keeps_foreground_timeout_cleanup(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pid_file = root / "foreground-timeout.pid"
+            code = (
+                f"import pathlib,os,time;pathlib.Path({str(pid_file)!r}).write_text(str(os.getpid()));"
+                "time.sleep(60)"
+            )
+            command = _python_shell_command(code)
+            with self.assertRaisesRegex(ToolError, "timed out"):
+                await BashTool(background_enabled=True).execute(
+                    {"command": command, "timeout_seconds": 0.05},
+                    ToolContext(root, termination_grace_seconds=0.05),
+                )
+            self.assertTrue(pid_file.exists())
+            await self._assert_process_stopped(int(pid_file.read_text(encoding="utf-8")))
+
+    async def test_explicit_background_timeout_remains_task_deadline(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manager = LocalBackgroundTaskManager()
+            context = ToolContext(root, background_tasks=manager)
+            command = f'"{sys.executable}" -c "import time; time.sleep(60)"'
+            try:
+                result = await BashTool(background_enabled=True).execute(
+                    {
+                        "command": command,
+                        "is_background": True,
+                        "timeout_seconds": 0.05,
+                    },
+                    context,
+                )
+                assert result.metadata is not None
+                task_id = result.metadata["task_id"]
+                self.assertNotIn("promoted_from_foreground", result.metadata)
+                snapshot = await manager.get(task_id, wait_seconds=2)
+                assert snapshot is not None
+                self.assertEqual(snapshot.status.value, "timed_out")
+            finally:
+                await manager.shutdown()
+
+    async def test_enabled_manager_short_foreground_output_truncation_is_preserved(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            code = "print('x'*100)"
+            command = _python_shell_command(code)
+            manager = LocalBackgroundTaskManager()
+            context = ToolContext(
+                root,
+                command_timeout_seconds=2,
+                output_byte_limit=20,
+                background_tasks=manager,
+            )
+            try:
+                result = await BashTool(background_enabled=True).execute(
+                    {"command": command},
+                    context,
+                )
+                self.assertFalse(result.is_error)
+                self.assertIn("[output truncated]", result.content)
+                assert result.metadata is not None
+                self.assertEqual(result.metadata["exit_code"], 0)
+                self.assertTrue(result.metadata["truncated"])
+                self.assertNotIn("task_id", result.metadata)
+                self.assertNotIn("promoted_from_foreground", result.metadata)
+                self.assertEqual(await manager.list(), ())
+                self.assertEqual(await manager.pending_completions(), ())
+            finally:
+                await manager.shutdown()
 
     @unittest.skipUnless(os.name == "posix", "POSIX exec syntax")
     async def test_timeout_also_covers_processes_that_close_output_pipes(self) -> None:
@@ -137,6 +348,43 @@ class BashToolTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(result.content.splitlines(), ["missing", "missing"])
             self.assertNotIn("provider-secret", result.content)
             self.assertNotIn("proxy-secret", result.content)
+
+    async def test_auto_promotion_reuses_sandbox_launch_and_protected_environment(self) -> None:
+        class FixtureSandbox:
+            profile = SandboxProfile.WORKSPACE
+
+            def shell_launch(self, command: str) -> ShellLaunch:
+                self.command = command
+                code = "import os;print(os.environ.get('FIXTURE_API_KEY','missing'))"
+                return ShellLaunch(sys.executable, ("-c", code))
+
+        with tempfile.TemporaryDirectory() as directory:
+            manager = LocalBackgroundTaskManager()
+            sandbox = FixtureSandbox()
+            context = ToolContext(
+                Path(directory),
+                command_timeout_seconds=2,
+                sandbox_profile=SandboxProfile.WORKSPACE,
+                shell_sandbox=sandbox,
+                protected_environment_variables=frozenset({"fixture_api_key"}),
+                background_tasks=manager,
+            )
+            try:
+                with mock.patch.dict(
+                    os.environ,
+                    {"FIXTURE_API_KEY": "provider-secret"},
+                    clear=False,
+                ):
+                    result = await BashTool(background_enabled=True).execute(
+                        {"command": "sandboxed foreground"},
+                        context,
+                    )
+                self.assertEqual(result.content.strip(), "missing")
+                self.assertEqual(sandbox.command, "sandboxed foreground")
+                self.assertEqual(await manager.list(), ())
+                self.assertNotIn("provider-secret", result.content)
+            finally:
+                await manager.shutdown()
 
     async def test_argument_validation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -219,6 +467,48 @@ class BashToolTests(unittest.IsolatedAsyncioTestCase):
                 await task
 
             await self._assert_process_stopped(int(pid_file.read_text(encoding="utf-8")))
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "Linux process-group assertion")
+    async def test_auto_promotion_cancellation_kills_tree_and_discards_record(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            child_code = "import time;time.sleep(60)"
+            parent_code = (
+                "import pathlib,subprocess,sys,time;"
+                f"child=subprocess.Popen([sys.executable,'-c',{child_code!r}]);"
+                "pathlib.Path('auto-cancel-child.pid').write_text(str(child.pid));"
+                "time.sleep(60)"
+            )
+            command = f"{shlex.quote(sys.executable)} -c {shlex.quote(parent_code)}"
+            manager = LocalBackgroundTaskManager()
+            context = ToolContext(
+                root,
+                command_timeout_seconds=10,
+                termination_grace_seconds=0.05,
+                background_tasks=manager,
+            )
+            task = asyncio.create_task(
+                BashTool(background_enabled=True).execute({"command": command}, context)
+            )
+            pid_file = root / "auto-cancel-child.pid"
+            try:
+                for _ in range(100):
+                    if pid_file.exists():
+                        break
+                    await asyncio.sleep(0.01)
+                self.assertTrue(pid_file.exists())
+                task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+                self.assertEqual(await manager.list(), ())
+                self.assertEqual(await manager.pending_completions(), ())
+                await self._assert_process_stopped(int(pid_file.read_text(encoding="utf-8")))
+            finally:
+                if not task.done():
+                    task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await task
+                await manager.shutdown()
 
     async def _assert_process_stopped(self, pid: int) -> None:
         def running() -> bool:

@@ -176,8 +176,13 @@ rules cannot diverge by interface.
 On failure or cancellation, `AgentConversation` reloads the canonical ordered
 items and provider origin from `SessionStore` before releasing its turn lock.
 The next prompt therefore reuses durable state instead of a stale in-memory
-prefix. A cancelled user message remains part of that history; pre-token rewind
-is a separate, unimplemented interaction policy.
+prefix. TUI prompts use an explicit pristine-rewind cancellation policy: before
+any non-empty model output, completion, or tool activity, the runtime persists
+the pre-turn item prefix and reports the rewind on `TURN_FAILED`; the audit event
+still records that the user message was submitted. After output or tool activity,
+the message remains durable. The TUI restores a safely rewound prompt to the
+draft and may buffer up to four explicit follow-ups before the first non-empty
+model token; that buffer is presentation state and is not durable context.
 
 ## Repository-level AGENTS.md instruction discovery
 
@@ -757,9 +762,13 @@ authority. `/tasks` keeps durable-record summaries bounded. Only an explicit
 `SessionStore.get_session_task` read and renders the stored immutable snapshot
 as reference. That read neither enters the model context nor changes the current
 plan, creates a turn, executes work, requests approval, or has scheduler
-semantics; a missing or legacy no-snapshot task reports no detail. There is
-deliberately no plan-file write, task scheduler, or subagent lifecycle in this
-slice. Current-plan comments are an intentionally
+semantics; a missing or legacy no-snapshot task reports no detail. The explicit
+`/schedule-plan`/`/queue-plan` command stores at most four queued plan snapshots
+per session without contacting the model. `/run-task TASK_ID` claims one queued
+snapshot atomically through `SessionStore.start_session_task`, then reuses the
+same plan-execution lifecycle as `/execute-plan`; queued tasks never auto-start,
+retry, wake, or spawn subagents. There is deliberately no plan-file write or
+subagent lifecycle in this slice. Current-plan comments are an intentionally
 separate, bounded feedback channel: `/comment-plan STEP COMMENT` stores user
 text under a numbered plan step, `/view-plan` renders it, and the next model
 request receives it as transient plan guidance. The comment is not a canonical
@@ -770,7 +779,8 @@ obsolete comments. See ADR 0028,
 [ADR 0058](adr/0058-durable-session-task-lifecycle.md), and
 [ADR 0059](adr/0059-bounded-current-plan-comments.md), plus
 [ADR 0060](adr/0060-plan-execution-revision-snapshots.md) and
-[ADR 0061](adr/0061-read-only-plan-execution-inspection.md).
+[ADR 0061](adr/0061-read-only-plan-execution-inspection.md), plus
+[ADR 0063](adr/0063-bounded-explicit-plan-task-scheduling.md).
 
 `ProfileConversationController` wraps the active `AgentConversation` for the
 interactive composition. It serializes selection with turns and exposes only
@@ -1089,8 +1099,25 @@ handed off, remains outside FTS and export/import, and is deliberately not
 copied by a fork; `/tasks` shows only its short fingerprint and completed-step
 count. An explicit exact current-session task lookup may render that same stored
 snapshot in the TUI as read-only reference, but it never becomes a model input
-or task-control operation. Rust sessions are parsed by a separate read-only
-adapter. It validates format versions 0 and 1, reads
+or task-control operation. Schema v10 adds one foreign-keyed last-safe-terminal execution record
+per source session. It must reference an already-persisted `TURN_COMPLETED`
+event and retains only the typed status, reason code, finalized/recoverable
+flags, event sequence, and timestamp. It deliberately excludes prompts, tool
+arguments/results, evidence, workspace diffs, supervisor snapshots, FTS,
+export/import, and fork copying. A later successful ordinary completion
+replaces a prior recoverable terminal result, so resume can safely distinguish
+the latest completed turn from a paused one without treating it as replayable
+model context. Runtime terminal success paths use the typed
+`SessionStore.finalize_turn` boundary: the `TURN_COMPLETED` event, final
+append-only ordered session items, synchronized title/FTS projection, and an
+optional user-turn execution record are committed together in one short SQLite
+transaction under the store write lock. Background auto-wake passes no record,
+so it cannot replace a prior user execution record. This boundary does not
+make earlier turn events, provider/tool work, or cross-process runtime actions
+atomic. Within the execution-record boundary, SQLite serializes writes and
+rejects older event sequences or conflicting data for the same sequence, so a
+stale process cannot overwrite a newer terminal result. Rust sessions are parsed by a separate read-only adapter. It validates format
+versions 0 and 1, reads
 bounded JSONL records, converts supported legacy/current records into an
 ordered `SessionSnapshot`, and reports corrupt or unsupported records instead
 of silently inventing content. The SQLite adapter inserts that snapshot in one

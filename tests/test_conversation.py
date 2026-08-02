@@ -17,13 +17,26 @@ from neuro_code.application.runtime.conversation import (
     PLAN_EXECUTION_PROMPT,
     AgentConversation,
 )
-from neuro_code.domain.events import AgentEventKind
+from neuro_code.domain.background_tasks import BackgroundWakeState
+from neuro_code.domain.events import AgentEvent, AgentEventKind
+from neuro_code.domain.execution import (
+    AgentExecutionOutcome,
+    AgentExecutionStatus,
+    SessionExecutionRecord,
+    SupervisorReasonCode,
+    TurnCancellationPolicy,
+)
 from neuro_code.domain.messages import Message, Role
 from neuro_code.domain.model_context import ModelContext
 from neuro_code.domain.model_events import ModelCompleted, ModelEvent, ModelTextDelta
 from neuro_code.domain.plans import PlanComment, PlanStep, PlanStepStatus, SessionPlan
 from neuro_code.domain.sandbox import SandboxProfile
-from neuro_code.domain.session_tasks import SessionTaskStatus
+from neuro_code.domain.session_tasks import (
+    MAX_QUEUED_SESSION_TASKS,
+    SessionTask,
+    SessionTaskKind,
+    SessionTaskStatus,
+)
 from neuro_code.domain.tools import ToolDefinition
 from neuro_code.permissions import PermissionManager
 from neuro_code.shared.errors import ConfigurationError, ProviderError
@@ -91,7 +104,91 @@ class CancelOnceConversationProvider(ConversationProvider):
             yield event
 
 
+class CancelAfterTextConversationProvider(ConversationProvider):
+    def __init__(self) -> None:
+        super().__init__(("recovered response",))
+        self.started = asyncio.Event()
+
+    async def stream(
+        self,
+        context: ModelContext,
+        tools: Sequence[ToolDefinition],
+    ) -> AsyncIterator[ModelEvent]:
+        del tools
+        self.contexts.append(context)
+        yield ModelTextDelta("partial output")
+        self.started.set()
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+
 class AgentConversationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_resume_loads_and_next_completion_replaces_the_durable_execution_record(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = SqliteSessionStore(root / "sessions.db")
+            await store.initialize()
+            session_id = await store.create_session(
+                str(root),
+                "conversation-fixture",
+                "fixture-model",
+            )
+            paused_event = AgentEvent.create(
+                1,
+                AgentEventKind.TURN_COMPLETED,
+                {"step": 1, "execution_status": "budget_limited"},
+            )
+            await store.append_event(session_id, paused_event)
+            paused = SessionExecutionRecord(
+                AgentExecutionOutcome(
+                    AgentExecutionStatus.BUDGET_LIMITED,
+                    SupervisorReasonCode.MODEL_STEP_LIMIT,
+                    finalized=True,
+                    recoverable=True,
+                ),
+                paused_event.sequence,
+                paused_event.created_at,
+            )
+            await store.save_execution_record(session_id, paused)
+            provider = ConversationProvider(("continued safely",))
+            runtime = AgentRuntime(
+                provider=provider,
+                tools=default_tool_registry(),
+                workspace_change_observer=EmptyWorkspaceChangeObserver(),
+                permissions=PermissionManager(),
+                tool_context=ToolContext(root),
+                session_store=store,
+            )
+
+            conversation = await AgentConversation.open(
+                runtime=runtime,
+                store=store,
+                cwd=root,
+                workspace_identity=FakeWorkspaceIdentity(),
+                resume_id=session_id,
+            )
+
+            self.assertEqual(conversation.execution_record, paused)
+            result = await conversation.run("continue with a new instruction")
+            completed = next(
+                event for event in result.events if event.kind is AgentEventKind.TURN_COMPLETED
+            )
+            self.assertEqual(
+                conversation.execution_record,
+                SessionExecutionRecord(
+                    AgentExecutionOutcome(
+                        AgentExecutionStatus.COMPLETED,
+                        None,
+                        finalized=False,
+                        recoverable=False,
+                    ),
+                    completed.sequence,
+                    completed.created_at,
+                ),
+            )
+
     async def test_resumed_conversation_loads_the_durable_plan_into_model_context(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -233,6 +330,198 @@ class AgentConversationTests(unittest.IsolatedAsyncioTestCase):
                 event_kinds.index(AgentEventKind.PLAN_EXECUTION_REQUESTED.value),
                 event_kinds.index(AgentEventKind.USER_MESSAGE.value),
             )
+
+    async def test_schedule_plan_persists_without_model_execution_until_explicit_run(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = SqliteSessionStore(root / "sessions.db")
+            await store.initialize()
+            session_id = await store.create_session(
+                str(root),
+                "conversation-fixture",
+                "fixture-model",
+            )
+            plan = SessionPlan(
+                (PlanStep("Run the approved plan", PlanStepStatus.IN_PROGRESS),),
+                "Keep this queued plan immutable until the user starts it.",
+            )
+            await store.save_session_plan(session_id, plan)
+            provider = ConversationProvider(("queued response",))
+            runtime = AgentRuntime(
+                provider=provider,
+                tools=default_tool_registry(),
+                workspace_change_observer=EmptyWorkspaceChangeObserver(),
+                permissions=PermissionManager(),
+                tool_context=ToolContext(root),
+                session_store=store,
+            )
+            conversation = await AgentConversation.open(
+                runtime=runtime,
+                store=store,
+                cwd=root,
+                workspace_identity=FakeWorkspaceIdentity(),
+                resume_id=session_id,
+            )
+
+            queued = await conversation.schedule_plan()
+
+            self.assertIs(queued.status, SessionTaskStatus.QUEUED)
+            self.assertEqual(queued.plan_snapshot, plan)
+            self.assertEqual(provider.contexts, [])
+            self.assertEqual(await conversation.list_session_tasks(), (queued,))
+
+            result = await conversation.run_session_task(queued.task_id)
+
+            self.assertEqual(result.response, "queued response")
+            completed = await conversation.get_session_task(queued.task_id)
+            self.assertIsNotNone(completed)
+            assert completed is not None
+            self.assertIs(completed.status, SessionTaskStatus.COMPLETED)
+            self.assertEqual(len(provider.contexts), 1)
+
+    async def test_schedule_plan_rejects_more_than_the_bounded_queue(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = SqliteSessionStore(root / "sessions.db")
+            await store.initialize()
+            session_id = await store.create_session(str(root), "fixture", "model")
+            plan = SessionPlan((PlanStep("Keep queued"),))
+            await store.save_session_plan(session_id, plan)
+            conversation = await AgentConversation.open(
+                runtime=AgentRuntime(
+                    provider=ConversationProvider(()),
+                    tools=default_tool_registry(),
+                    workspace_change_observer=EmptyWorkspaceChangeObserver(),
+                    permissions=PermissionManager(),
+                    tool_context=ToolContext(root),
+                    session_store=store,
+                ),
+                store=store,
+                cwd=root,
+                workspace_identity=FakeWorkspaceIdentity(),
+                resume_id=session_id,
+            )
+
+            for _ in range(MAX_QUEUED_SESSION_TASKS):
+                await conversation.schedule_plan()
+            with self.assertRaisesRegex(ConfigurationError, "at most 4 plan tasks"):
+                await conversation.schedule_plan()
+
+    async def test_schedule_plan_requires_saved_plan_and_session(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = SqliteSessionStore(root / "sessions.db")
+            await store.initialize()
+            conversation = await AgentConversation.open(
+                runtime=AgentRuntime(
+                    provider=ConversationProvider(()),
+                    tools=default_tool_registry(),
+                    workspace_change_observer=EmptyWorkspaceChangeObserver(),
+                    permissions=PermissionManager(),
+                    tool_context=ToolContext(root),
+                    session_store=store,
+                ),
+                store=store,
+                cwd=root,
+                workspace_identity=FakeWorkspaceIdentity(),
+            )
+
+            with self.assertRaisesRegex(ConfigurationError, "has not been saved"):
+                await conversation.schedule_plan()
+            conversation._runtime.set_plan(SessionPlan((PlanStep("queued"),)))
+            with self.assertRaisesRegex(ConfigurationError, "session is required"):
+                await conversation.schedule_plan()
+
+    async def test_plan_task_execution_requires_a_session_and_wake_state_is_empty_without_one(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = SqliteSessionStore(root / "sessions.db")
+            await store.initialize()
+            conversation = await AgentConversation.open(
+                runtime=AgentRuntime(
+                    provider=ConversationProvider(("unused",)),
+                    tools=default_tool_registry(),
+                    workspace_change_observer=EmptyWorkspaceChangeObserver(),
+                    permissions=PermissionManager(),
+                    tool_context=ToolContext(root),
+                    session_store=store,
+                ),
+                store=store,
+                cwd=root,
+                workspace_identity=FakeWorkspaceIdentity(),
+            )
+            conversation._runtime.set_plan(SessionPlan((PlanStep("queued"),)))
+
+            with self.assertRaisesRegex(ConfigurationError, "session is required"):
+                await conversation.execute_plan(task_id="task-without-session")
+            self.assertEqual(await conversation.load_background_wake_state(), BackgroundWakeState())
+            state = BackgroundWakeState()
+            await conversation.save_background_wake_state(state)
+
+    async def test_run_session_task_rejects_unknown_kind_terminal_and_missing_snapshot(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = SqliteSessionStore(root / "sessions.db")
+            await store.initialize()
+            session_id = await store.create_session(str(root), "fixture", "model")
+            plan = SessionPlan((PlanStep("Run the plan"),))
+            await store.save_session_plan(session_id, plan)
+            now = datetime(2026, 7, 29, 12, tzinfo=UTC)
+            await store.create_session_task(
+                session_id,
+                SessionTask(
+                    "task-subagent",
+                    SessionTaskKind.SUBAGENT,
+                    SessionTaskStatus.QUEUED,
+                    now,
+                ),
+            )
+            running = SessionTask(
+                "task-completed",
+                SessionTaskKind.PLAN_EXECUTION,
+                SessionTaskStatus.RUNNING,
+                now,
+            )
+            await store.create_session_task(
+                session_id,
+                running.finish(SessionTaskStatus.COMPLETED, finished_at=now),
+            )
+            await store.create_session_task(
+                session_id,
+                SessionTask(
+                    "task-no-snapshot",
+                    SessionTaskKind.PLAN_EXECUTION,
+                    SessionTaskStatus.QUEUED,
+                    now,
+                ),
+            )
+            conversation = await AgentConversation.open(
+                runtime=AgentRuntime(
+                    provider=ConversationProvider(()),
+                    tools=default_tool_registry(),
+                    workspace_change_observer=EmptyWorkspaceChangeObserver(),
+                    permissions=PermissionManager(),
+                    tool_context=ToolContext(root),
+                    session_store=store,
+                ),
+                store=store,
+                cwd=root,
+                workspace_identity=FakeWorkspaceIdentity(),
+                resume_id=session_id,
+            )
+
+            with self.assertRaisesRegex(ConfigurationError, "unknown queued plan task"):
+                await conversation.run_session_task("missing")
+            with self.assertRaisesRegex(ConfigurationError, "only plan execution"):
+                await conversation.run_session_task("task-subagent")
+            with self.assertRaisesRegex(ConfigurationError, "not queued"):
+                await conversation.run_session_task("task-completed")
+            with self.assertRaisesRegex(ConfigurationError, "no saved plan snapshot"):
+                await conversation.run_session_task("task-no-snapshot")
 
     async def test_plan_execution_without_a_saved_plan_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -379,6 +668,97 @@ class AgentConversationTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 await manager.shutdown()
 
+    async def test_explicit_background_wake_consumes_completion_without_user_message(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = SqliteSessionStore(root / "sessions.db")
+            await store.initialize()
+            manager = LocalBackgroundTaskManager()
+            task = await manager.start_exec(
+                sys.executable,
+                ("-c", "print('wake completion output')"),
+                display_command="fixture wake completion",
+                cwd=root,
+                env={},
+                output_byte_limit=2_000,
+                termination_grace_seconds=0.05,
+            )
+            await manager.get(task.task_id, wait_seconds=2)
+            provider = ConversationProvider(("wake response", "next response"))
+            runtime = AgentRuntime(
+                provider=provider,
+                tools=default_tool_registry(enable_background_tasks=True),
+                workspace_change_observer=EmptyWorkspaceChangeObserver(),
+                permissions=PermissionManager(),
+                tool_context=ToolContext(root, background_tasks=manager),
+                session_store=store,
+            )
+            conversation = await AgentConversation.open(
+                runtime=runtime,
+                store=store,
+                cwd=root,
+                workspace_identity=FakeWorkspaceIdentity(),
+            )
+            try:
+                result = await conversation.run_background_wake()
+
+                self.assertEqual(result.response, "wake response")
+                self.assertNotIn(
+                    AgentEventKind.USER_MESSAGE, [event.kind for event in result.events]
+                )
+                self.assertIn(
+                    AgentEventKind.BACKGROUND_TASK_AUTO_WAKE_STARTED,
+                    [event.kind for event in result.events],
+                )
+                reminder = next(
+                    message
+                    for message in provider.contexts[0].messages
+                    if "<background-task-completions>" in message.content
+                )
+                self.assertIn(task.task_id, reminder.content)
+                self.assertIn("wake completion output", reminder.content)
+                self.assertEqual(await manager.pending_completions(), ())
+                self.assertNotIn(
+                    "wake response",
+                    "\n".join(
+                        item.content for item in conversation.items if isinstance(item, Message)
+                    ),
+                )
+                persisted = await store.load_messages(conversation.session_id or "")
+                self.assertNotIn(
+                    "wake response", "\n".join(message.content for message in persisted)
+                )
+
+                await conversation.run("next prompt")
+                self.assertIn(
+                    "next prompt",
+                    [
+                        message.content
+                        for message in provider.contexts[-1].messages
+                        if message.role is Role.USER
+                    ],
+                )
+            finally:
+                await manager.shutdown()
+
+    async def test_background_wake_requires_a_pending_completion(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manager = LocalBackgroundTaskManager()
+            runtime = AgentRuntime(
+                provider=ConversationProvider(("unused",)),
+                tools=default_tool_registry(enable_background_tasks=True),
+                workspace_change_observer=EmptyWorkspaceChangeObserver(),
+                permissions=PermissionManager(),
+                tool_context=ToolContext(root, background_tasks=manager),
+            )
+            conversation = AgentConversation(
+                runtime=runtime, store=SqliteSessionStore(root / "sessions.db")
+            )
+            with self.assertRaisesRegex(ConfigurationError, "no pending background task"):
+                await conversation.run_background_wake()
+            await manager.shutdown()
+
     async def test_multiple_turns_reuse_session_and_provider_origin(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -505,6 +885,115 @@ class AgentConversationTests(unittest.IsolatedAsyncioTestCase):
                 if event["kind"] == "turn_failed" and event["data"].get("cancelled")
             )
             self.assertEqual(cancelled_failure["data"]["message"], "turn cancelled")
+
+    async def test_pristine_cancel_rewinds_user_message_before_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = SqliteSessionStore(root / "sessions.db")
+            await store.initialize()
+            provider = CancelOnceConversationProvider()
+            runtime = AgentRuntime(
+                provider=provider,
+                tools=default_tool_registry(),
+                workspace_change_observer=EmptyWorkspaceChangeObserver(),
+                permissions=PermissionManager(),
+                tool_context=ToolContext(root),
+                session_store=store,
+            )
+            conversation = await AgentConversation.open(
+                runtime=runtime,
+                store=store,
+                cwd=root,
+                workspace_identity=FakeWorkspaceIdentity(),
+            )
+
+            turn = asyncio.create_task(
+                conversation.run(
+                    "pristine prompt",
+                    cancellation_policy=TurnCancellationPolicy.REWIND_PRISTINE,
+                )
+            )
+            await asyncio.wait_for(provider.started.wait(), timeout=1)
+            turn.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await turn
+
+            session_id = conversation.session_id
+            self.assertIsNotNone(session_id)
+            assert session_id is not None
+            visible_after_cancel = [
+                message.content
+                for message in await store.load_messages(session_id)
+                if message.role is not Role.SYSTEM
+            ]
+            self.assertEqual(visible_after_cancel, [])
+            events = await store.load_events(session_id)
+            cancelled_failure = next(
+                event
+                for event in events
+                if event["kind"] == "turn_failed" and event["data"].get("cancelled")
+            )
+            self.assertTrue(cancelled_failure["data"]["pristine_rewound"])
+
+            recovered = await conversation.run("retry prompt")
+            self.assertEqual(
+                [
+                    message.content
+                    for message in provider.contexts[1].messages
+                    if message.role is not Role.SYSTEM
+                ],
+                ["retry prompt"],
+            )
+            self.assertEqual(recovered.response, "recovered response")
+
+    async def test_pristine_cancel_retains_prompt_after_model_output(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = SqliteSessionStore(root / "sessions.db")
+            await store.initialize()
+            provider = CancelAfterTextConversationProvider()
+            runtime = AgentRuntime(
+                provider=provider,
+                tools=default_tool_registry(),
+                workspace_change_observer=EmptyWorkspaceChangeObserver(),
+                permissions=PermissionManager(),
+                tool_context=ToolContext(root),
+                session_store=store,
+            )
+            conversation = await AgentConversation.open(
+                runtime=runtime,
+                store=store,
+                cwd=root,
+                workspace_identity=FakeWorkspaceIdentity(),
+            )
+
+            turn = asyncio.create_task(
+                conversation.run(
+                    "output already started",
+                    cancellation_policy=TurnCancellationPolicy.REWIND_PRISTINE,
+                )
+            )
+            await asyncio.wait_for(provider.started.wait(), timeout=1)
+            turn.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await turn
+
+            session_id = conversation.session_id
+            self.assertIsNotNone(session_id)
+            assert session_id is not None
+            visible = [
+                message.content
+                for message in await store.load_messages(session_id)
+                if message.role is not Role.SYSTEM
+            ]
+            self.assertEqual(visible, ["output already started"])
+            events = await store.load_events(session_id)
+            cancelled_failure = next(
+                event
+                for event in events
+                if event["kind"] == "turn_failed" and event["data"].get("cancelled")
+            )
+            self.assertFalse(cancelled_failure["data"]["pristine_rewound"])
 
     async def test_resume_rejects_a_different_workspace(self) -> None:
         with (

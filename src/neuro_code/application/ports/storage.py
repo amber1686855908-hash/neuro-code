@@ -6,7 +6,9 @@ from collections.abc import Sequence
 from datetime import datetime
 from typing import Any, Protocol
 
+from neuro_code.domain.background_tasks import BackgroundWakeState
 from neuro_code.domain.events import AgentEvent
+from neuro_code.domain.execution import SessionExecutionRecord
 from neuro_code.domain.messages import Message, SessionItem
 from neuro_code.domain.plans import PlanComment, SessionPlan
 from neuro_code.domain.sandbox import SandboxProfile
@@ -58,13 +60,37 @@ class SessionStore(Protocol):
 
     async def save_session_items(self, session_id: str, items: Sequence[SessionItem]) -> None: ...
 
+    async def finalize_turn(
+        self,
+        session_id: str,
+        event: AgentEvent,
+        items: Sequence[SessionItem],
+        record: SessionExecutionRecord | None,
+    ) -> None: ...
+
     async def save_session_plan(self, session_id: str, plan: SessionPlan | None) -> None: ...
+
+    async def save_execution_record(
+        self,
+        session_id: str,
+        record: SessionExecutionRecord,
+    ) -> None: ...
 
     async def load_messages(self, session_id: str) -> list[Message]: ...
 
     async def load_session_items(self, session_id: str) -> list[SessionItem]: ...
 
     async def load_session_plan(self, session_id: str) -> SessionPlan | None: ...
+
+    async def load_execution_record(self, session_id: str) -> SessionExecutionRecord | None: ...
+
+    async def save_background_wake_state(
+        self,
+        session_id: str,
+        state: BackgroundWakeState,
+    ) -> None: ...
+
+    async def load_background_wake_state(self, session_id: str) -> BackgroundWakeState: ...
 
     async def add_plan_comment(
         self,
@@ -80,6 +106,13 @@ class SessionStore(Protocol):
     ) -> list[PlanComment]: ...
 
     async def create_session_task(self, session_id: str, task: SessionTask) -> None: ...
+
+    async def start_session_task(
+        self,
+        session_id: str,
+        task_id: str,
+        started_at: datetime,
+    ) -> SessionTask: ...
 
     async def update_session_task(self, session_id: str, task: SessionTask) -> None: ...
 

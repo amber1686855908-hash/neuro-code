@@ -326,15 +326,20 @@ mode and immediately ask for a plan, or `/view-plan` (alias `/show-plan`) to
 show the current saved plan. Once the user has reviewed it, `/execute-plan`
 (alias `/run-plan`) explicitly records a plan-to-turn handoff and switches only
 to `accept-edits`. Each such turn has one durable, metadata-only session task
-record with an opaque ID and a `running`, `completed`, `failed`, or `cancelled`
-state; it is restored for inspection but is not copied to a fork. Command,
+record with an opaque ID and a `queued`, `running`, `completed`, `failed`, or
+`cancelled` state; it is restored for inspection but is not copied to a fork.
+Command,
 network, workspace, and sandbox boundaries remain in force. `/comment-plan STEP
 COMMENT` (alias `/plan-comment`) stores bounded user feedback for one current
 plan step and `/view-plan` renders that feedback under its step. Comments are
 shown to the model only with the next prompt; they do not approve, execute, or
 schedule work. They follow the current plan when a session is forked, but a
-replacement plan discards its old comments. A task scheduler and a subagent
-system remain unavailable. `/tasks` keeps task lists compact. To inspect the
+replacement plan discards its old comments. Use `/schedule-plan` (alias
+`/queue-plan`) to persist a bounded queued copy of the current plan without
+contacting the model, then `/run-task TASK_ID` to start exactly that snapshot
+explicitly. At most four plan tasks can be queued per session; queued tasks
+never auto-start, retry, wake, or spawn subagents. `/tasks` keeps task lists
+compact. To inspect the
 complete immutable plan snapshot for one durable plan-execution task, explicitly
 run `/view-task TASK_ID`; it resolves only that ID in the currently open session
 and presents the snapshot as read-only reference. It neither changes the current
@@ -344,7 +349,8 @@ plan nor starts a model turn or any work. See
 [ADR 0058](adr/0058-durable-session-task-lifecycle.md) and
 [ADR 0059](adr/0059-bounded-current-plan-comments.md), plus
 [ADR 0060](adr/0060-plan-execution-revision-snapshots.md) and
-[ADR 0061](adr/0061-read-only-plan-execution-inspection.md).
+[ADR 0061](adr/0061-read-only-plan-execution-inspection.md), plus
+[ADR 0063](adr/0063-bounded-explicit-plan-task-scheduling.md).
 
 Use `Ctrl+P`, bare `/provider` or bare `/model` to open the configured-profile
 picker. `/provider PROFILE` and `/model PROFILE` select directly. The picker
@@ -393,9 +399,16 @@ UI bound. See
 While a turn is running, use `Ctrl+C` or `/cancel` to request cancellation. The
 runtime records cancellation, balances any active and not-yet-started local tool
 calls with error results, reloads the durable conversation, and leaves the same
-session ready for another prompt. The current slice retains the cancelled user
-message in session history; pristine pre-token rewind and draft restoration are
-not implemented yet.
+session ready for another prompt. TUI prompts request a pristine rewind policy:
+when cancellation arrives before any non-empty model text/reasoning, completion,
+or tool activity, the just-submitted user message is removed from durable model
+context and restored to the input draft. The `USER_MESSAGE` and `TURN_FAILED`
+events remain as an audit trail. Once output or tool activity exists, the prompt
+is retained and the normal cancellation recovery path applies. Before the first
+non-empty model token, up to four explicit follow-up prompts are buffered locally
+and run in order after the current turn completes; they are not added to session
+history until started. A cancelled or failed turn restores the first buffered
+prompt to the input when a pristine rewind is not safe.
 
 When a side-effecting tool resolves to `ask`, the TUI opens a fail-closed
 approval modal. Deny is focused by default. Choose allow once, allow the
@@ -477,7 +490,14 @@ or `wait_tasks`/`kill_task` result consumes the corresponding notice to prevent
 duplication.
 Notices are acknowledged only after a provider returns a valid completion, are
 not persisted as conversation messages, and never start an autonomous paid
-model turn. See
+model turn when the effective wake policy is disabled. The persisted user-wide
+default is edited in Settings; each managed provider profile may inherit that
+default or explicitly override it. An idle TUI session may still opt in or out
+temporarily with `/auto-wake on|off`; that session choice takes precedence and
+starts at most one model-only wake for each pending completion batch, consumes
+the pending notice only after a valid completion, and keeps the wake response
+and synthetic reminder out of durable conversation items. Legacy and new
+profiles default to off. See
 [ADR 0023](adr/0023-model-visible-background-task-completion-reminders.md).
 
 ## Operating-system sandbox profiles
@@ -722,6 +742,11 @@ neuro-code sessions rename SESSION_ID "Manual session title" --json
 neuro-code export SESSION_ID --format markdown --output transcript.md
 neuro-code import-session /path/to/upstream/session --json
 ```
+
+The JSON forms of `sessions` and `sessions search` add a bounded
+`last_execution` projection when a durable terminal result exists. It contains
+only the status, reason, finalized/recoverable flags, and completion timestamp;
+plain-text session listings remain unchanged.
 
 `import-session` accepts either a supported upstream Rust session directory or
 its `summary.json`. It reads the JSONL files without modifying them and

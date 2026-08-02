@@ -4,6 +4,7 @@ import re
 from dataclasses import dataclass, field
 from urllib.parse import urlsplit
 
+from neuro_code.domain.background_tasks import BackgroundTaskWakePolicy
 from neuro_code.shared.errors import ConfigurationError
 
 _PROFILE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
@@ -62,6 +63,7 @@ class ManagedProviderProfile:
     proxy_mode: str | None = None
     proxy_url_env: str | None = None
     api_key: str | None = field(default=None, repr=False, compare=False)
+    background_task_wake_policy: BackgroundTaskWakePolicy | None = None
 
     def __post_init__(self) -> None:
         if _PROFILE_NAME.fullmatch(self.name) is None:
@@ -112,6 +114,10 @@ class ManagedProviderProfile:
             object.__setattr__(self, "api_key", None)
         if self.api_key is not None and len(self.api_key) > _MAX_API_KEY_CHARACTERS:
             raise ConfigurationError("provider API key is too long")
+        if self.background_task_wake_policy is not None and not isinstance(
+            self.background_task_wake_policy, BackgroundTaskWakePolicy
+        ):
+            raise ConfigurationError("provider background task wake policy must be canonical")
 
     def effective_proxy_policy(self, defaults: ManagedProxyPolicy) -> ManagedProxyPolicy:
         """Return this profile's explicit policy or the user-wide default."""
@@ -120,12 +126,21 @@ class ManagedProviderProfile:
             return defaults
         return ManagedProxyPolicy(self.proxy_mode, self.proxy_url_env)
 
+    def effective_background_task_wake_policy(
+        self,
+        default: BackgroundTaskWakePolicy,
+    ) -> BackgroundTaskWakePolicy:
+        """Return the profile override or the user-wide default."""
+
+        return self.background_task_wake_policy or default
+
 
 @dataclass(frozen=True, slots=True)
 class ManagedProviderSettings:
     profiles: tuple[ManagedProviderProfile, ...] = ()
     default_provider: str | None = None
     proxy_defaults: ManagedProxyPolicy = field(default_factory=ManagedProxyPolicy)
+    background_task_wake_policy: BackgroundTaskWakePolicy = BackgroundTaskWakePolicy.DISABLED
 
     def __post_init__(self) -> None:
         if len(self.profiles) > _MAX_PROFILES:
@@ -135,9 +150,26 @@ class ManagedProviderSettings:
             raise ConfigurationError("managed provider profile names must be unique")
         if self.default_provider is not None and self.default_provider not in names:
             raise ConfigurationError("managed default provider does not exist")
+        if not isinstance(self.background_task_wake_policy, BackgroundTaskWakePolicy):
+            raise ConfigurationError("background task wake policy must be canonical")
 
     def profile(self, name: str) -> ManagedProviderProfile | None:
         return next((profile for profile in self.profiles if profile.name == name), None)
 
+    def effective_background_task_wake_policy(
+        self,
+        provider_name: str | None,
+    ) -> BackgroundTaskWakePolicy:
+        """Resolve one profile against the persisted user-wide default."""
 
-__all__ = ["ManagedProviderProfile", "ManagedProviderSettings", "ManagedProxyPolicy"]
+        profile = self.profile(provider_name) if provider_name is not None else None
+        if profile is None:
+            return self.background_task_wake_policy
+        return profile.effective_background_task_wake_policy(self.background_task_wake_policy)
+
+
+__all__ = [
+    "ManagedProviderProfile",
+    "ManagedProviderSettings",
+    "ManagedProxyPolicy",
+]

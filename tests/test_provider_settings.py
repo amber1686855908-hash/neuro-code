@@ -10,6 +10,7 @@ from neuro_code.adapters.provider_settings import JsonProviderSettingsStore
 from neuro_code.configuration.managed_provider_settings import (
     load_managed_provider_settings as canonical_load_managed_provider_settings,
 )
+from neuro_code.domain.background_tasks import BackgroundTaskWakePolicy
 from neuro_code.domain.provider_settings import ManagedProviderProfile, ManagedProxyPolicy
 from neuro_code.shared.errors import ConfigurationError
 
@@ -36,6 +37,7 @@ class JsonProviderSettingsStoreTests(unittest.IsolatedAsyncioTestCase):
         model: str = "fixture-model",
         proxy_mode: str | None = None,
         proxy_url_env: str | None = None,
+        background_task_wake_policy: BackgroundTaskWakePolicy | None = None,
     ) -> ManagedProviderProfile:
         return ManagedProviderProfile(
             name=name,
@@ -46,6 +48,7 @@ class JsonProviderSettingsStoreTests(unittest.IsolatedAsyncioTestCase):
             proxy_mode=proxy_mode,
             proxy_url_env=proxy_url_env,
             api_key=api_key,
+            background_task_wake_policy=background_task_wake_policy,
         )
 
     async def test_profiles_and_credentials_are_separate_private_atomic_files(self) -> None:
@@ -154,6 +157,68 @@ class JsonProviderSettingsStoreTests(unittest.IsolatedAsyncioTestCase):
                 metadata["proxy_defaults"]["proxy_url_env"],
                 "NEURO_CODE_PROXY_URL",
             )
+
+    async def test_global_background_wake_default_and_provider_override_round_trip(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = JsonProviderSettingsStore(Path(directory))
+            await store.save_background_task_wake_policy(BackgroundTaskWakePolicy.ENABLED)
+            settings = await store.save_profile(
+                self._profile(
+                    name="quiet",
+                    background_task_wake_policy=BackgroundTaskWakePolicy.DISABLED,
+                )
+            )
+
+            self.assertEqual(settings.background_task_wake_policy, BackgroundTaskWakePolicy.ENABLED)
+            self.assertEqual(
+                settings.effective_background_task_wake_policy("quiet"),
+                BackgroundTaskWakePolicy.DISABLED,
+            )
+            self.assertEqual(
+                settings.effective_background_task_wake_policy("inherited"),
+                BackgroundTaskWakePolicy.ENABLED,
+            )
+            metadata = json.loads(store.metadata_path.read_text(encoding="utf-8"))
+            self.assertEqual(metadata["background_task_wake_policy"], "enabled")
+            self.assertEqual(
+                metadata["providers"][0]["background_task_wake_policy"],
+                "disabled",
+            )
+
+    async def test_legacy_background_wake_settings_default_to_disabled(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state_dir = Path(directory)
+            store = JsonProviderSettingsStore(state_dir)
+            store.metadata_path.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "default_provider": "legacy",
+                        "providers": [
+                            {
+                                "name": "legacy",
+                                "protocol": "openai-chat",
+                                "dialect": "standard",
+                                "model": "legacy-model",
+                                "base_url": "https://provider.invalid/v1",
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            store.credentials_path.write_text(
+                json.dumps({"version": 1, "api_keys": {"legacy": "secret"}}),
+                encoding="utf-8",
+            )
+
+            loaded = await store.load()
+
+            self.assertEqual(
+                loaded.background_task_wake_policy,
+                BackgroundTaskWakePolicy.DISABLED,
+            )
+            self.assertIsNone(loaded.profiles[0].background_task_wake_policy)
 
     async def test_context_window_capacity_round_trips_as_non_secret_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
