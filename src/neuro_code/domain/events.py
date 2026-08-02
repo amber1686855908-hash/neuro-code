@@ -16,6 +16,7 @@ class AgentEventKind(StrEnum):
     CONTEXT_USAGE_UPDATED = "context_usage_updated"
     FINALIZING_STARTED = "finalizing_started"
     BACKGROUND_TASK_COMPLETION_REMINDER = "background_task_completion_reminder"
+    BACKGROUND_TASK_AUTO_WAKE_STARTED = "background_task_auto_wake_started"
     PROVIDER_ATTEMPT_FAILED = "provider_attempt_failed"
     PROVIDER_SELECTED = "provider_selected"
     TEXT_DELTA = "text_delta"

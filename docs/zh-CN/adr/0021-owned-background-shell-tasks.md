@@ -27,7 +27,9 @@ Shell 入口进程，CLI 退出后还可能留下后代进程。
 
 面向模型的契约如下：
 
-- `bash` 接受可选 `is_background`。`false` 保留前台超时行为，`true` 立即返回任务 ID。
+- `bash` 接受可选 `is_background`。`true` 立即返回任务 ID；启用后台管理时，省略或设为
+  `false` 会等待前台预算，并把仍在运行的命令提升为同一个任务且不重启。若命令在预算内
+  完成，则丢弃其终态记录，结果保留普通前台元数据。
 - 后台任务省略 `timeout_seconds` 表示没有工具级截止时间；显式正数会在对应时间后终止任务。
 - `task_output` 默认返回非阻塞快照，也可以等待最多 30 秒。状态包括 `running`、
   `completed`、`failed`、`timed_out` 和 `cancelled`。
@@ -57,8 +59,8 @@ Shell 入口进程，CLI 退出后还可能留下后代进程。
 - TUI 元数据可见性和本地完成通知由
   [ADR 0022](0022-session-scoped-background-task-visibility.md) 进一步规定，明确模型边界的
   完成元数据则由
-  [ADR 0023](0023-model-visible-background-task-completion-reminders.md) 定义。完整输出文件、
-  模型自动唤醒、前台自动转后台，以及与子代理共享任务命名空间仍是后续切片。
+  [ADR 0023](0023-model-visible-background-task-completion-reminders.md) 定义。完整输出文件和
+  与子代理共享任务命名空间仍是后续切片；前台自动转后台由 ADR 0062 定义。
 - ACP PTY 的创建/输入/尺寸调整/环形缓冲/关闭仍是独立能力；后续会复用进程所有权边界，
   而不是改变当前工具契约。
 - Windows Job Object 的所有权与失败行为由

@@ -20,7 +20,7 @@ from neuro_code.domain.background_tasks import (
     BackgroundTaskWaitMode,
     BackgroundTaskWaitResult,
 )
-from neuro_code.shared.errors import ToolError
+from neuro_code.shared.errors import BackgroundTaskCapacityError, ToolError
 
 
 class _BoundedOutput:
@@ -197,7 +197,7 @@ class LocalBackgroundTaskManager:
                 record.status is BackgroundTaskStatus.RUNNING for record in self._records.values()
             )
             if running >= self._max_running_tasks:
-                raise ToolError(
+                raise BackgroundTaskCapacityError(
                     f"background task limit reached ({self._max_running_tasks} running tasks)"
                 )
             self._prune_completed(scope_id)
@@ -242,7 +242,7 @@ class LocalBackgroundTaskManager:
             del self._records[task_id]
         retained = sum(record.scope_id == scope_id for record in self._records.values())
         if retained >= self._max_retained_tasks:
-            raise ToolError(
+            raise BackgroundTaskCapacityError(
                 f"background task retention limit reached ({self._max_retained_tasks} tasks)"
             )
 
@@ -260,7 +260,17 @@ class LocalBackgroundTaskManager:
                 except TimeoutError:
                     record.timed_out = True
                     await self._terminate(record)
-            await capture
+            try:
+                await asyncio.wait_for(capture, timeout=record.termination_grace_seconds)
+            except TimeoutError:
+                # A child that escaped the owned process group can keep its
+                # inherited pipe open after the direct command has exited.
+                # Never let that prevent kill(), shutdown, or cancellation
+                # from reaching a terminal record.
+                record.internal_failure = True
+                capture.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await capture
         except asyncio.CancelledError:
             record.kill_requested = True
             with contextlib.suppress(Exception):
@@ -458,6 +468,25 @@ class LocalBackgroundTaskManager:
             and not record.completion_reported
         )
 
+    async def discard_completed(self, task_id: str) -> bool:
+        return await self._discard_completed(self._root_scope_id, task_id)
+
+    async def _discard_completed(self, scope_id: str, task_id: str) -> bool:
+        """Remove one terminal record owned by ``scope_id``.
+
+        This is intentionally narrower than ``kill`` or a general delete: a
+        running record, an unknown ID, and an ID belonging to another scope are
+        all left untouched and report ``False``.  The registry lock makes the
+        terminal check and removal one operation for concurrent task polling.
+        """
+
+        async with self._registry_lock:
+            record = self._records.get(task_id)
+            if record is None or record.scope_id != scope_id or not record.status.terminal:
+                return False
+            del self._records[task_id]
+            return True
+
     async def mark_completions_reported(self, task_ids: tuple[str, ...]) -> None:
         self._mark_completions_reported(self._root_scope_id, task_ids)
 
@@ -528,6 +557,7 @@ class LocalBackgroundTaskManager:
             exit_code=record.exit_code,
             started_at=record.started_at,
             finished_at=record.finished_at,
+            completion_reported=record.completion_reported,
         )
 
 
@@ -625,6 +655,9 @@ class _LocalBackgroundTaskScope:
 
     async def pending_completions(self) -> tuple[BackgroundTaskSnapshot, ...]:
         return self._supervisor._pending_completions(self._scope_id)
+
+    async def discard_completed(self, task_id: str) -> bool:
+        return await self._supervisor._discard_completed(self._scope_id, task_id)
 
     async def mark_completions_reported(self, task_ids: tuple[str, ...]) -> None:
         self._supervisor._mark_completions_reported(self._scope_id, task_ids)

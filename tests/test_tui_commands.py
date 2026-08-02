@@ -17,6 +17,9 @@ class SlashCompletionTests(unittest.TestCase):
         self.assertEqual(slash_completions("/comment-")[0].value, "/comment-plan")
         self.assertEqual(slash_completions("/comment-plan")[0].value, "/comment-plan ")
         self.assertEqual(slash_completions("/execute-")[0].value, "/execute-plan")
+        self.assertEqual(slash_completions("/schedule-")[0].value, "/schedule-plan")
+        self.assertEqual(slash_completions("/run-t")[0].value, "/run-task")
+        self.assertEqual(slash_completions("/run-task")[0].value, "/run-task ")
         self.assertEqual(slash_completions("/view-t")[0].value, "/view-task")
         self.assertEqual(slash_completions("/view-task")[0].value, "/view-task ")
 

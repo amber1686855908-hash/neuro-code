@@ -88,9 +88,11 @@ permission behavior. The UI can be exercised with Textual's headless test pilot,
 and the application controller can be tested without importing Textual.
 
 This is partial M3 support. Remote model catalogs, provider-native effort
-mapping and workflow orchestration, pristine pre-token rewind, interjection
-queues, Mermaid/media rendering, and the public cross-platform interactive ACP
-PTY integration remain separate vertical slices. Three-platform production
+mapping and workflow orchestration, Mermaid/media rendering, and the public
+cross-platform interactive ACP PTY integration remain separate vertical slices.
+The TUI now uses an explicit pristine-rewind policy before model output and
+restores the cancelled prompt to its draft; it retains the prompt once output or
+tool activity has begun. Three-platform production
 terminal smoke coverage does not implement that user-facing PTY capability or
 complete the broader remaining M3 work. Bounded interactive tool-card details were subsequently added by
 [ADR 0030](0030-bounded-interactive-tool-card-details.md).

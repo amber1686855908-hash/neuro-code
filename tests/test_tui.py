@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import importlib.util
 import inspect
 import tempfile
 import unittest
@@ -32,8 +31,21 @@ from neuro_code.application.runtime.profile_conversation import (
     SessionOption,
     SessionSelectionResult,
 )
-from neuro_code.domain.background_tasks import BackgroundTaskSnapshot, BackgroundTaskStatus
+from neuro_code.domain.background_tasks import (
+    BackgroundTaskSnapshot,
+    BackgroundTaskStatus,
+    BackgroundTaskWakePolicy,
+    BackgroundWakeLimits,
+    BackgroundWakeState,
+)
 from neuro_code.domain.events import AgentEvent, AgentEventKind
+from neuro_code.domain.execution import (
+    AgentExecutionOutcome,
+    AgentExecutionStatus,
+    SessionExecutionRecord,
+    SupervisorReasonCode,
+    TurnCancellationPolicy,
+)
 from neuro_code.domain.interaction_mode import InteractionMode
 from neuro_code.domain.messages import (
     ContentPart,
@@ -63,6 +75,7 @@ from neuro_code.domain.ui_preferences import UiLanguage
 from neuro_code.tui import (
     TUI_RELOAD_PROVIDER_SETTINGS,
     AssistantMarkdown,
+    BackgroundWakeSettingsScreen,
     ConversationMessage,
     LanguageSettingsScreen,
     NetworkProxySettingsScreen,
@@ -104,7 +117,14 @@ class TuiConversation:
     def session_id(self) -> str | None:
         return self._session_id
 
-    async def run(self, prompt: str, *, sink: EventSink | None = None) -> AgentRunResult:
+    async def run(
+        self,
+        prompt: str,
+        *,
+        sink: EventSink | None = None,
+        cancellation_policy: TurnCancellationPolicy = TurnCancellationPolicy.RETAIN,
+    ) -> AgentRunResult:
+        del cancellation_policy
         self.prompts.append(prompt)
         self._session_id = "session-fixture"
         events = (
@@ -188,6 +208,78 @@ class TuiConversation:
             1,
         )
 
+    async def run_background_wake(self, *, sink: EventSink | None = None) -> AgentRunResult:
+        return await self.run("background wake", sink=sink)
+
+
+class AutoWakeTuiConversation:
+    def __init__(self) -> None:
+        self._session_id = "auto-wake-session"
+        self.wake_count = 0
+
+    @property
+    def session_id(self) -> str | None:
+        return self._session_id
+
+    async def run(
+        self,
+        prompt: str,
+        *,
+        sink: EventSink | None = None,
+        cancellation_policy: TurnCancellationPolicy = TurnCancellationPolicy.RETAIN,
+    ) -> AgentRunResult:
+        del prompt, sink, cancellation_policy
+        raise AssertionError("auto-wake fixture must not start a user turn")
+
+    async def run_background_wake(self, *, sink: EventSink | None = None) -> AgentRunResult:
+        self.wake_count += 1
+        events = (
+            AgentEvent.create(
+                1,
+                AgentEventKind.BACKGROUND_TASK_AUTO_WAKE_STARTED,
+                {"count": 1, "remaining_count": 0, "model_context_only": True},
+            ),
+            AgentEvent.create(
+                2,
+                AgentEventKind.BACKGROUND_TASK_COMPLETION_REMINDER,
+                {"task_ids": ["task-fast"], "count": 1, "remaining_count": 0},
+            ),
+            AgentEvent.create(3, AgentEventKind.TEXT_DELTA, {"text": "wake response"}),
+            AgentEvent.create(
+                4,
+                AgentEventKind.TURN_COMPLETED,
+                {"step": 1, "duration_seconds": 0.1},
+            ),
+        )
+        if sink is not None:
+            for event in events:
+                outcome = sink(event)
+                if inspect.isawaitable(outcome):
+                    await outcome
+        return AgentRunResult(
+            self._session_id,
+            "wake response",
+            (),
+            (),
+            events,
+            1,
+        )
+
+
+class FailingAutoWakeTuiConversation(AutoWakeTuiConversation):
+    async def run_background_wake(self, *, sink: EventSink | None = None) -> AgentRunResult:
+        self.wake_count += 1
+        reminder = AgentEvent.create(
+            1,
+            AgentEventKind.BACKGROUND_TASK_COMPLETION_REMINDER,
+            {"task_ids": ["task-fast"], "count": 1, "remaining_count": 0},
+        )
+        if sink is not None:
+            outcome = sink(reminder)
+            if inspect.isawaitable(outcome):
+                await outcome
+        raise RuntimeError("wake provider failed")
+
 
 class ApprovalTuiConversation:
     def __init__(self, broker: SessionApprovalBroker) -> None:
@@ -200,8 +292,14 @@ class ApprovalTuiConversation:
     def session_id(self) -> str | None:
         return self._session_id
 
-    async def run(self, prompt: str, *, sink: EventSink | None = None) -> AgentRunResult:
-        del prompt, sink
+    async def run(
+        self,
+        prompt: str,
+        *,
+        sink: EventSink | None = None,
+        cancellation_policy: TurnCancellationPolicy = TurnCancellationPolicy.RETAIN,
+    ) -> AgentRunResult:
+        del prompt, sink, cancellation_policy
         request = build_permission_request(
             "edit",
             "search_replace",
@@ -227,8 +325,14 @@ class CancellableTuiConversation:
     def session_id(self) -> str | None:
         return self._session_id
 
-    async def run(self, prompt: str, *, sink: EventSink | None = None) -> AgentRunResult:
-        del sink
+    async def run(
+        self,
+        prompt: str,
+        *,
+        sink: EventSink | None = None,
+        cancellation_policy: TurnCancellationPolicy = TurnCancellationPolicy.RETAIN,
+    ) -> AgentRunResult:
+        del sink, cancellation_policy
         self.prompts.append(prompt)
         self._session_id = "cancel-session"
         self.started.set()
@@ -238,6 +342,97 @@ class CancellableTuiConversation:
             self.cancelled = True
             raise
         raise AssertionError("unreachable")
+
+
+class PristineRewindTuiConversation:
+    def __init__(self) -> None:
+        self._session_id: str | None = None
+        self.started = asyncio.Event()
+        self.cancelled = False
+        self.policies: list[TurnCancellationPolicy] = []
+
+    @property
+    def session_id(self) -> str | None:
+        return self._session_id
+
+    async def run(
+        self,
+        prompt: str,
+        *,
+        sink: EventSink | None = None,
+        cancellation_policy: TurnCancellationPolicy = TurnCancellationPolicy.RETAIN,
+    ) -> AgentRunResult:
+        del prompt
+        self.policies.append(cancellation_policy)
+        self._session_id = "pristine-rewind-session"
+        self.started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            self.cancelled = True
+            if sink is not None:
+                event = AgentEvent.create(
+                    1,
+                    AgentEventKind.TURN_FAILED,
+                    {
+                        "cancelled": True,
+                        "pristine_rewound": cancellation_policy
+                        is TurnCancellationPolicy.REWIND_PRISTINE,
+                    },
+                )
+                outcome = sink(event)
+                if inspect.isawaitable(outcome):
+                    await outcome
+            raise
+        raise AssertionError("unreachable")
+
+
+class PreTokenInterjectionConversation:
+    def __init__(self) -> None:
+        self._session_id: str | None = None
+        self.prompts: list[str] = []
+        self.started: asyncio.Queue[str] = asyncio.Queue()
+        self.release: asyncio.Queue[None] = asyncio.Queue()
+
+    @property
+    def session_id(self) -> str | None:
+        return self._session_id
+
+    async def run(
+        self,
+        prompt: str,
+        *,
+        sink: EventSink | None = None,
+        cancellation_policy: TurnCancellationPolicy = TurnCancellationPolicy.RETAIN,
+    ) -> AgentRunResult:
+        del cancellation_policy
+        self.prompts.append(prompt)
+        self._session_id = "interjection-session"
+        await self.started.put(prompt)
+        await self.release.get()
+        text = AgentEvent.create(
+            len(self.prompts) * 2 - 1,
+            AgentEventKind.TEXT_DELTA,
+            {"text": f"response to {prompt}"},
+        )
+        completed = AgentEvent.create(
+            len(self.prompts) * 2,
+            AgentEventKind.TURN_COMPLETED,
+            {"step": 1, "duration_seconds": 0.1},
+        )
+        if sink is not None:
+            for event in (text, completed):
+                outcome = sink(event)
+                if inspect.isawaitable(outcome):
+                    await outcome
+        return AgentRunResult(
+            self._session_id,
+            f"response to {prompt}",
+            (),
+            (),
+            (text, completed),
+            1,
+        )
 
 
 class StreamingTuiConversation:
@@ -250,8 +445,14 @@ class StreamingTuiConversation:
     def session_id(self) -> str | None:
         return self._session_id
 
-    async def run(self, prompt: str, *, sink: EventSink | None = None) -> AgentRunResult:
-        del prompt
+    async def run(
+        self,
+        prompt: str,
+        *,
+        sink: EventSink | None = None,
+        cancellation_policy: TurnCancellationPolicy = TurnCancellationPolicy.RETAIN,
+    ) -> AgentRunResult:
+        del prompt, cancellation_policy
         self._session_id = "streaming-session"
         first = AgentEvent.create(1, AgentEventKind.TEXT_DELTA, {"text": "partial"})
         if sink is not None:
@@ -286,8 +487,14 @@ class FinalizingTuiConversation:
     def session_id(self) -> str | None:
         return self._session_id
 
-    async def run(self, prompt: str, *, sink: EventSink | None = None) -> AgentRunResult:
-        del prompt
+    async def run(
+        self,
+        prompt: str,
+        *,
+        sink: EventSink | None = None,
+        cancellation_policy: TurnCancellationPolicy = TurnCancellationPolicy.RETAIN,
+    ) -> AgentRunResult:
+        del prompt, cancellation_policy
         self._session_id = "finalizing-session"
         finalizing = AgentEvent.create(
             1,
@@ -335,8 +542,14 @@ class UnknownTerminalMetadataTuiConversation:
     def session_id(self) -> str | None:
         return "unknown-terminal-session"
 
-    async def run(self, prompt: str, *, sink: EventSink | None = None) -> AgentRunResult:
-        del prompt
+    async def run(
+        self,
+        prompt: str,
+        *,
+        sink: EventSink | None = None,
+        cancellation_policy: TurnCancellationPolicy = TurnCancellationPolicy.RETAIN,
+    ) -> AgentRunResult:
+        del prompt, cancellation_policy
         events = (
             AgentEvent.create(1, AgentEventKind.TEXT_DELTA, {"text": "ordinary text"}),
             AgentEvent.create(
@@ -542,9 +755,28 @@ class ProfileTuiController:
             auto_unrestricted=False,
         )
 
-    async def execute_plan(self, *, sink: EventSink | None = None) -> AgentRunResult:
+    async def schedule_plan(self) -> SessionTask:
+        if self._plan is None:
+            raise ValueError("cannot schedule a plan that has not been saved")
+        task = SessionTask(
+            f"task-queued-{len(self._session_tasks) + 1}",
+            SessionTaskKind.PLAN_EXECUTION,
+            SessionTaskStatus.QUEUED,
+            datetime.now(UTC),
+            plan_snapshot=self._plan,
+        )
+        self._session_tasks = (*self._session_tasks, task)
+        return task
+
+    async def execute_plan(
+        self,
+        *,
+        sink: EventSink | None = None,
+        task_id: str | None = None,
+    ) -> AgentRunResult:
         if self._plan is None:
             raise ValueError("cannot execute a plan that has not been saved")
+        del task_id
         self.plan_execution_calls += 1
         events = (
             AgentEvent.create(
@@ -572,6 +804,28 @@ class ProfileTuiController:
             1,
             self._plan,
         )
+
+    async def run_session_task(
+        self,
+        task_id: str,
+        *,
+        sink: EventSink | None = None,
+    ) -> AgentRunResult:
+        task = await self.get_session_task(task_id)
+        if task is None or task.status is not SessionTaskStatus.QUEUED:
+            raise ValueError("queued task is unavailable")
+        started_at = datetime.now(UTC)
+        running = task.start(started_at=started_at)
+        self._session_tasks = tuple(
+            running if item.task_id == task_id else item for item in self._session_tasks
+        )
+        result = await self.execute_plan(sink=sink, task_id=task_id)
+        finished_at = datetime.now(UTC)
+        completed = running.finish(SessionTaskStatus.COMPLETED, finished_at=finished_at)
+        self._session_tasks = tuple(
+            completed if item.task_id == task_id else item for item in self._session_tasks
+        )
+        return result
 
     async def list_session_tasks(self) -> tuple[SessionTask, ...]:
         return self._session_tasks
@@ -673,8 +927,14 @@ class SessionTuiController:
     def session_id(self) -> str | None:
         return self._session_id
 
-    async def run(self, prompt: str, *, sink: EventSink | None = None) -> AgentRunResult:
-        del prompt, sink
+    async def run(
+        self,
+        prompt: str,
+        *,
+        sink: EventSink | None = None,
+        cancellation_policy: TurnCancellationPolicy = TurnCancellationPolicy.RETAIN,
+    ) -> AgentRunResult:
+        del prompt, sink, cancellation_policy
         return AgentRunResult(self._session_id, "ok", (), (), (), 1)
 
     async def list_sessions(self, query: str | None = None) -> tuple[SessionOption, ...]:
@@ -723,15 +983,28 @@ class TaskTuiController:
     def __init__(self, snapshots: tuple[BackgroundTaskSnapshot, ...] = ()) -> None:
         self.snapshots = snapshots
         self.list_calls = 0
+        self.wake_state = BackgroundWakeState()
 
     async def list_background_tasks(self) -> tuple[BackgroundTaskSnapshot, ...]:
         self.list_calls += 1
         return self.snapshots
 
+    async def load_background_wake_state(self) -> BackgroundWakeState:
+        return self.wake_state
+
+    async def save_background_wake_state(self, state: BackgroundWakeState) -> None:
+        self.wake_state = state
+
 
 class FailingTaskTuiController:
     async def list_background_tasks(self) -> tuple[BackgroundTaskSnapshot, ...]:
         raise RuntimeError("task list failed")
+
+    async def load_background_wake_state(self) -> BackgroundWakeState:
+        raise RuntimeError("wake state failed")
+
+    async def save_background_wake_state(self, state: BackgroundWakeState) -> None:
+        del state
 
 
 def background_snapshot(
@@ -739,6 +1012,7 @@ def background_snapshot(
     status: BackgroundTaskStatus,
     *,
     exit_code: int | None = None,
+    completion_reported: bool = False,
 ) -> BackgroundTaskSnapshot:
     started_at = datetime(2026, 7, 18, 9, 30, tzinfo=UTC)
     return BackgroundTaskSnapshot(
@@ -752,10 +1026,91 @@ def background_snapshot(
         exit_code=exit_code,
         started_at=started_at,
         finished_at=started_at if status.terminal else None,
+        completion_reported=completion_reported,
     )
 
 
 class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
+    async def test_plan_queue_commands_report_unavailable_and_failed_paths(self) -> None:
+        """The explicit queue surface fails closed when its collaborators are absent."""
+
+        unavailable = NeuroCodeApp(
+            TuiConversation(),
+            provider_name="fixture",
+            model_name="fixture-model",
+            cwd=Path("/workspace"),
+        )
+        async with unavailable.run_test(size=(80, 24)):
+            await unavailable._schedule_plan()
+            await unavailable._run_queued_task("missing")
+            self.assertIn("unavailable", unavailable.entries[-1].text.lower())
+
+        no_plan = ProfileTuiController()
+        no_plan_app = NeuroCodeApp(
+            TuiConversation(),
+            plan_controller=no_plan,
+            provider_name="fixture",
+            model_name="fixture-model",
+            cwd=Path("/workspace"),
+        )
+        async with no_plan_app.run_test(size=(80, 24)):
+            await no_plan_app._schedule_plan()
+            self.assertIn("No structured plan", no_plan_app.entries[-1].text)
+
+        class FailingScheduler(ProfileTuiController):
+            async def schedule_plan(self) -> SessionTask:
+                raise RuntimeError("schedule failed")
+
+        failing = FailingScheduler(SessionPlan((PlanStep("queued"),)))
+        failing_app = NeuroCodeApp(
+            TuiConversation(),
+            plan_controller=failing,
+            provider_name="fixture",
+            model_name="fixture-model",
+            cwd=Path("/workspace"),
+        )
+        async with failing_app.run_test(size=(80, 24)):
+            await failing_app._schedule_plan()
+            self.assertIn("RuntimeError: schedule failed", failing_app.entries[-1].text)
+
+        no_task_controller = ProfileTuiController(SessionPlan((PlanStep("queued"),)))
+        no_task_app = NeuroCodeApp(
+            TuiConversation(),
+            plan_controller=no_task_controller,
+            provider_name="fixture",
+            model_name="fixture-model",
+            cwd=Path("/workspace"),
+        )
+        async with no_task_app.run_test(size=(80, 24)):
+            await no_task_app._run_queued_task("missing")
+            self.assertIn("unavailable", no_task_app.entries[-1].text.lower())
+
+        failing_task_app = NeuroCodeApp(
+            TuiConversation(),
+            plan_controller=ProfileTuiController(SessionPlan((PlanStep("queued"),))),
+            session_task_controller=FailingSessionTaskController(),
+            provider_name="fixture",
+            model_name="fixture-model",
+            cwd=Path("/workspace"),
+        )
+        async with failing_task_app.run_test(size=(80, 24)):
+            await failing_task_app._run_queued_task("task-failing")
+            self.assertIn("RuntimeError: task read failed", failing_task_app.entries[-1].text)
+
+        queued_controller = ProfileTuiController(SessionPlan((PlanStep("queued"),)))
+        queued = await queued_controller.schedule_plan()
+        no_mode_app = NeuroCodeApp(
+            TuiConversation(),
+            plan_controller=queued_controller,
+            session_task_controller=queued_controller,
+            provider_name="fixture",
+            model_name="fixture-model",
+            cwd=Path("/workspace"),
+        )
+        async with no_mode_app.run_test(size=(80, 24)):
+            await no_mode_app._run_queued_task(queued.task_id)
+            self.assertIn("unavailable", no_mode_app.entries[-1].text.lower())
+
     async def test_local_quit_skips_the_model_and_detaches_approval_handler(self) -> None:
         runner = TuiConversation()
         approvals = ApprovalControllerFixture()
@@ -830,17 +1185,6 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
                     )
                 )
             )
-
-    async def test_monochrome_reference_module_loads_without_launching_the_app(self) -> None:
-        reference = Path(__file__).parents[1] / "docs" / "ui-reference" / "neuro_code_mono_demo.py"
-        spec = importlib.util.spec_from_file_location("neuro_code_mono_demo_reference", reference)
-        assert spec is not None
-        assert spec.loader is not None
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-
-        self.assertEqual(module.NeuroCodeMonoDemo.TITLE, "Neuro Code")
-        self.assertEqual(len(module.NeuroCodeMonoDemo.BINDINGS), 5)
 
     async def test_user_and_assistant_messages_use_distinct_unlabelled_blocks(self) -> None:
         app = NeuroCodeApp(
@@ -957,7 +1301,7 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn(ACCENT_CODE.lower(), str(prose.style).lower())
 
     async def test_success_warning_and_error_statuses_use_distinct_semantic_accents(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory() as directory, patch.dict("os.environ", {}, clear=True):
             app = ProviderSetupApp(
                 provider_settings=ManagedProviderSettings(),
                 provider_settings_store=JsonProviderSettingsStore(Path(directory)),
@@ -1109,6 +1453,79 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(any(entry.category == "recoverable" for entry in app.entries))
             self.assertFalse(any(entry.category == "error" for entry in app.entries))
             self.assertFalse(prompt.disabled)
+
+    async def test_resumed_recoverable_execution_record_shows_one_safe_notice(self) -> None:
+        for status, reason_code, key in (
+            (
+                AgentExecutionStatus.STUCK,
+                SupervisorReasonCode.REPEATED_ACTION_OBSERVATION,
+                "session.stuck_recoverable",
+            ),
+            (
+                AgentExecutionStatus.BUDGET_LIMITED,
+                SupervisorReasonCode.MODEL_STEP_LIMIT,
+                "session.budget_limited_recoverable",
+            ),
+        ):
+            with self.subTest(status=status):
+                runner = TuiConversation()
+                runner._session_id = "session-resumed"
+                record = SessionExecutionRecord(
+                    outcome=AgentExecutionOutcome(
+                        status=status,
+                        reason_code=reason_code,
+                        finalized=True,
+                        recoverable=True,
+                    ),
+                    event_sequence=4,
+                    completed_at=datetime.now(UTC),
+                )
+                app = NeuroCodeApp(
+                    runner,
+                    execution_record=record,
+                    provider_name="fixture",
+                    model_name="fixture-model",
+                    cwd=Path("/workspace"),
+                )
+
+                async with app.run_test(size=(100, 30)):
+                    notices = [entry for entry in app.entries if entry.ui_key == key]
+                    self.assertEqual(len(notices), 1)
+                    self.assertEqual(notices[0].category, "recoverable")
+                    self.assertFalse(any(entry.category == "error" for entry in app.entries))
+
+    async def test_resumed_completed_execution_record_has_no_recoverable_notice(self) -> None:
+        runner = TuiConversation()
+        runner._session_id = "session-resumed"
+        record = SessionExecutionRecord(
+            outcome=AgentExecutionOutcome(
+                status=AgentExecutionStatus.COMPLETED,
+                reason_code=None,
+                finalized=False,
+                recoverable=False,
+            ),
+            event_sequence=4,
+            completed_at=datetime.now(UTC),
+        )
+        app = NeuroCodeApp(
+            runner,
+            execution_record=record,
+            provider_name="fixture",
+            model_name="fixture-model",
+            cwd=Path("/workspace"),
+        )
+
+        async with app.run_test(size=(100, 30)):
+            self.assertFalse(
+                any(
+                    entry.ui_key
+                    in {
+                        "session.stuck_recoverable",
+                        "session.budget_limited_recoverable",
+                    }
+                    for entry in app.entries
+                )
+            )
 
     async def test_waiting_model_uses_the_supplied_collapsing_pulse(self) -> None:
         app = NeuroCodeApp(
@@ -1644,6 +2061,79 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
             saved = await store.load()
             self.assertEqual(saved.profiles[0].context_window_tokens, 128_000)
             self.assertIsNone(saved.profiles[0].proxy_mode)
+
+    async def test_background_wake_global_default_and_provider_override_are_persisted(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, patch.dict("os.environ", {}, clear=True):
+            store = JsonProviderSettingsStore(Path(directory))
+            settings = await store.save_profile(
+                ManagedProviderProfile(
+                    name="personal",
+                    protocol="openai-chat",
+                    model="fixture-model",
+                    base_url="https://provider.invalid/v1",
+                    api_key="saved-secret",
+                )
+            )
+            app = NeuroCodeApp(
+                TuiConversation(),
+                provider_settings_store=store,
+                managed_provider_settings=settings,
+                provider_name="personal",
+                model_name="fixture-model",
+                cwd=Path("/workspace"),
+            )
+
+            async with app.run_test(size=(110, 44)) as pilot:
+                await app.action_open_settings()
+                await pilot.pause()
+                self.assertIsInstance(app.screen, SettingsScreen)
+                self.assertTrue(await pilot.click("#settings-category-background-wake"))
+                for _ in range(20):
+                    await pilot.pause(0.01)
+                    if isinstance(app.screen, BackgroundWakeSettingsScreen):
+                        break
+                self.assertIsInstance(app.screen, BackgroundWakeSettingsScreen)
+                self.assertTrue(await pilot.click("#background-wake-settings-enabled"))
+                self.assertTrue(await pilot.click("#background-wake-settings-save"))
+                for _ in range(20):
+                    await pilot.pause(0.01)
+                    if app.return_code is not None:
+                        break
+
+            saved = await store.load()
+            self.assertEqual(saved.background_task_wake_policy, BackgroundTaskWakePolicy.ENABLED)
+            self.assertEqual(app.return_code, TUI_RELOAD_PROVIDER_SETTINGS)
+
+            app = ProviderSetupApp(
+                provider_settings=saved,
+                provider_settings_store=store,
+                first_run=False,
+                initial_profile="personal",
+            )
+            async with app.run_test(size=(110, 48)) as pilot:
+                for _ in range(20):
+                    await pilot.pause(0.01)
+                    if isinstance(app.screen, ProviderSettingsScreen):
+                        break
+                screen = app.screen
+                self.assertIsInstance(screen, ProviderSettingsScreen)
+                self.assertEqual(
+                    screen.query_one("#provider-settings-wake-inherit", Button).variant,
+                    "primary",
+                )
+                screen._select_background_wake_policy(BackgroundTaskWakePolicy.DISABLED)
+                await screen._save_provider()
+                for _ in range(20):
+                    await pilot.pause(0.01)
+                    if (await store.load()).profiles[0].background_task_wake_policy is not None:
+                        break
+
+            updated = await store.load()
+            self.assertEqual(
+                updated.effective_background_task_wake_policy("personal"),
+                BackgroundTaskWakePolicy.DISABLED,
+            )
+            self.assertEqual(updated.background_task_wake_policy, BackgroundTaskWakePolicy.ENABLED)
 
     async def test_settings_edit_managed_provider_and_request_safe_reload(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -2421,6 +2911,268 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(notifications, ["Background task task-fast completed (exit 0)."])
             self.assertNotIn("private task output", "\n".join(notifications))
 
+    async def test_background_task_auto_wake_is_disabled_by_default(self) -> None:
+        runner = AutoWakeTuiConversation()
+        tasks = TaskTuiController(
+            (
+                background_snapshot(
+                    "task-fast",
+                    BackgroundTaskStatus.COMPLETED,
+                    exit_code=0,
+                ),
+            )
+        )
+        app = NeuroCodeApp(
+            runner,
+            task_controller=tasks,
+            provider_name="fixture",
+            model_name="fixture-model",
+            cwd=Path("/workspace"),
+        )
+
+        async with app.run_test(size=(110, 35)):
+            await app._poll_background_tasks()
+            await app._poll_background_tasks()
+
+        self.assertEqual(runner.wake_count, 0)
+
+    async def test_background_task_auto_wake_is_opt_in_bounded_and_deduplicated(self) -> None:
+        runner = AutoWakeTuiConversation()
+        tasks = TaskTuiController(
+            (
+                background_snapshot(
+                    "task-fast",
+                    BackgroundTaskStatus.COMPLETED,
+                    exit_code=0,
+                ),
+            )
+        )
+        app = NeuroCodeApp(
+            runner,
+            task_controller=tasks,
+            background_task_wake_policy=BackgroundTaskWakePolicy.ENABLED,
+            provider_name="fixture",
+            model_name="fixture-model",
+            cwd=Path("/workspace"),
+        )
+
+        async with app.run_test(size=(110, 35)) as pilot:
+            await app._poll_background_tasks()
+            for _ in range(20):
+                await pilot.pause(0.01)
+                if any(entry.category == "assistant" for entry in app.entries):
+                    break
+            await app._poll_background_tasks()
+
+            self.assertEqual(runner.wake_count, 1)
+            self.assertIn(
+                ("status", "Background task completed; waking the model once."),
+                [(entry.category, entry.text) for entry in app.entries],
+            )
+            self.assertIn(
+                ("assistant", "wake response"),
+                [(entry.category, entry.text) for entry in app.entries],
+            )
+
+    async def test_failed_background_wake_retains_pending_completion_for_retry(self) -> None:
+        runner = FailingAutoWakeTuiConversation()
+        tasks = TaskTuiController(
+            (
+                background_snapshot(
+                    "task-fast",
+                    BackgroundTaskStatus.COMPLETED,
+                    exit_code=0,
+                ),
+            )
+        )
+        app = NeuroCodeApp(
+            runner,
+            task_controller=tasks,
+            background_task_wake_policy=BackgroundTaskWakePolicy.ENABLED,
+            background_wake_limits=BackgroundWakeLimits(cooldown_seconds=0.001),
+            provider_name="fixture",
+            model_name="fixture-model",
+            cwd=Path("/workspace"),
+        )
+
+        async with app.run_test(size=(110, 35)) as pilot:
+            await app._poll_background_tasks()
+            for _ in range(30):
+                await pilot.pause(0.01)
+                if any("wake provider failed" in entry.text for entry in app.entries):
+                    break
+            self.assertEqual(runner.wake_count, 1)
+            self.assertEqual(tasks.wake_state.pending_task_ids, ("task-fast",))
+            self.assertEqual(tasks.wake_state.wake_count, 0)
+            self.assertFalse(tasks.wake_state.wake_in_flight)
+
+            await app._poll_background_tasks()
+            for _ in range(30):
+                await pilot.pause(0.01)
+                if runner.wake_count == 2:
+                    break
+
+        self.assertEqual(runner.wake_count, 2)
+        self.assertEqual(tasks.wake_state.pending_task_ids, ("task-fast",))
+        self.assertEqual(tasks.wake_state.wake_count, 0)
+
+    async def test_reported_background_completion_does_not_start_an_empty_wake(self) -> None:
+        runner = AutoWakeTuiConversation()
+        tasks = TaskTuiController(
+            (
+                background_snapshot(
+                    "task-reported",
+                    BackgroundTaskStatus.COMPLETED,
+                    exit_code=0,
+                    completion_reported=True,
+                ),
+            )
+        )
+        app = NeuroCodeApp(
+            runner,
+            task_controller=tasks,
+            background_task_wake_policy=BackgroundTaskWakePolicy.ENABLED,
+            provider_name="fixture",
+            model_name="fixture-model",
+            cwd=Path("/workspace"),
+        )
+
+        async with app.run_test(size=(110, 35)) as pilot:
+            await app._poll_background_tasks()
+            await pilot.pause(0.05)
+
+        self.assertEqual(runner.wake_count, 0)
+        self.assertEqual(tasks.wake_state.pending_task_ids, ())
+
+    async def test_background_task_auto_wake_can_be_enabled_from_slash_command(self) -> None:
+        runner = AutoWakeTuiConversation()
+        tasks = TaskTuiController(
+            (
+                background_snapshot(
+                    "task-fast",
+                    BackgroundTaskStatus.COMPLETED,
+                    exit_code=0,
+                ),
+            )
+        )
+        app = NeuroCodeApp(
+            runner,
+            task_controller=tasks,
+            provider_name="fixture",
+            model_name="fixture-model",
+            cwd=Path("/workspace"),
+        )
+
+        async with app.run_test(size=(110, 35)) as pilot:
+            prompt = app.query_one("#prompt", Input)
+            prompt.value = "/auto-wake on"
+            await pilot.press("enter")
+            for _ in range(20):
+                await pilot.pause(0.01)
+                if runner.wake_count:
+                    break
+
+            self.assertEqual(runner.wake_count, 1)
+            self.assertIn(
+                "Background-task auto-wake is now enabled",
+                "\n".join(entry.text for entry in app.entries),
+            )
+
+    async def test_auto_wake_on_creates_a_session_override_when_it_matches_the_global_default(
+        self,
+    ) -> None:
+        app = NeuroCodeApp(
+            TuiConversation(),
+            managed_provider_settings=ManagedProviderSettings(
+                background_task_wake_policy=BackgroundTaskWakePolicy.ENABLED
+            ),
+            provider_name="fixture",
+            model_name="fixture-model",
+            cwd=Path("/workspace"),
+        )
+
+        async with app.run_test(size=(110, 35)):
+            self.assertIsNone(app._background_task_wake_policy_override)
+            await app._apply_background_task_wake_policy("on")
+            self.assertIs(
+                app._background_task_wake_policy_override,
+                BackgroundTaskWakePolicy.ENABLED,
+            )
+
+    async def test_background_task_wake_state_survives_restart_without_duplicate_wake(self) -> None:
+        tasks = TaskTuiController(
+            (
+                background_snapshot(
+                    "task-fast",
+                    BackgroundTaskStatus.COMPLETED,
+                    exit_code=0,
+                ),
+            )
+        )
+        first_runner = AutoWakeTuiConversation()
+        first_app = NeuroCodeApp(
+            first_runner,
+            task_controller=tasks,
+            background_task_wake_policy=BackgroundTaskWakePolicy.ENABLED,
+            provider_name="fixture",
+            model_name="fixture-model",
+            cwd=Path("/workspace"),
+        )
+
+        async with first_app.run_test(size=(110, 35)) as pilot:
+            await first_app._poll_background_tasks()
+            for _ in range(20):
+                await pilot.pause(0.01)
+                if first_runner.wake_count:
+                    break
+        self.assertEqual(first_runner.wake_count, 1)
+        self.assertEqual(tasks.wake_state.pending_task_ids, ())
+        self.assertEqual(tasks.wake_state.wake_count, 1)
+
+        second_runner = AutoWakeTuiConversation()
+        second_app = NeuroCodeApp(
+            second_runner,
+            task_controller=tasks,
+            background_task_wake_policy=BackgroundTaskWakePolicy.ENABLED,
+            provider_name="fixture",
+            model_name="fixture-model",
+            cwd=Path("/workspace"),
+        )
+        async with second_app.run_test(size=(110, 35)):
+            await second_app._poll_background_tasks()
+            await second_app._poll_background_tasks()
+        self.assertEqual(second_runner.wake_count, 0)
+
+    async def test_background_task_wake_budget_blocks_repeated_batches(self) -> None:
+        runner = AutoWakeTuiConversation()
+        tasks = TaskTuiController(
+            (background_snapshot("task-fast", BackgroundTaskStatus.COMPLETED, exit_code=0),)
+        )
+        app = NeuroCodeApp(
+            runner,
+            task_controller=tasks,
+            background_task_wake_policy=BackgroundTaskWakePolicy.ENABLED,
+            background_wake_limits=BackgroundWakeLimits(max_wakes_per_session=1),
+            provider_name="fixture",
+            model_name="fixture-model",
+            cwd=Path("/workspace"),
+        )
+
+        async with app.run_test(size=(110, 35)) as pilot:
+            await app._poll_background_tasks()
+            for _ in range(20):
+                await pilot.pause(0.01)
+                if runner.wake_count:
+                    break
+            tasks.snapshots = (
+                background_snapshot("task-next", BackgroundTaskStatus.COMPLETED, exit_code=0),
+            )
+            await app._poll_background_tasks()
+            await pilot.pause(0.05)
+
+        self.assertEqual(runner.wake_count, 1)
+        self.assertIn("task-next", tasks.wake_state.pending_task_ids)
+
     def test_session_picker_labels_saved_and_mismatched_sandbox_profiles(self) -> None:
         option = replace(
             SessionTuiController().options[1],
@@ -2775,6 +3527,84 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(profiles.plan_execution_calls, 0)
             self.assertIn("No structured plan has been saved", app.entries[-1].text)
 
+    async def test_schedule_plan_queues_without_running_and_run_task_starts_it(self) -> None:
+        plan = SessionPlan(
+            (PlanStep("Run the queued plan", PlanStepStatus.IN_PROGRESS),),
+            "Require an explicit start command",
+        )
+        runner = TuiConversation()
+        profiles = ProfileTuiController(plan)
+        app = NeuroCodeApp(
+            runner,
+            provider_controller=profiles,
+            interaction_mode_controller=profiles,
+            plan_controller=profiles,
+            session_task_controller=profiles,
+            provider_name="first",
+            model_name="first-model",
+            cwd=Path("/workspace"),
+        )
+
+        async with app.run_test(size=(100, 30)) as pilot:
+            prompt = app.query_one("#prompt", Input)
+            prompt.value = "/schedule-plan"
+            await pilot.press("enter")
+            await pilot.pause()
+
+            self.assertEqual(profiles.plan_execution_calls, 0)
+            queued = profiles._session_tasks[0]
+            self.assertIs(queued.status, SessionTaskStatus.QUEUED)
+            self.assertIn(queued.task_id, app.entries[-1].text)
+
+            prompt.value = f"/run-task {queued.task_id}"
+            await pilot.press("enter")
+            for _ in range(20):
+                await pilot.pause(0.01)
+                if profiles.plan_execution_calls:
+                    break
+
+            self.assertEqual(profiles.plan_execution_calls, 1)
+            self.assertIs(profiles._session_tasks[0].status, SessionTaskStatus.COMPLETED)
+            self.assertIn("Run queued plan task", " ".join(entry.text for entry in app.entries))
+
+    async def test_run_task_reports_missing_non_plan_and_non_queued_tasks(self) -> None:
+        plan = SessionPlan((PlanStep("Run a plan"),))
+        timestamp = datetime(2026, 7, 29, 12, tzinfo=UTC)
+        running = SessionTask(
+            "task-running",
+            SessionTaskKind.PLAN_EXECUTION,
+            SessionTaskStatus.RUNNING,
+            timestamp,
+            plan_snapshot=plan,
+        )
+        subagent = SessionTask(
+            "task-subagent",
+            SessionTaskKind.SUBAGENT,
+            SessionTaskStatus.QUEUED,
+            timestamp,
+        )
+        profiles = ProfileTuiController(plan, session_tasks=(running, subagent))
+        app = NeuroCodeApp(
+            TuiConversation(),
+            plan_controller=profiles,
+            session_task_controller=profiles,
+            provider_name="first",
+            model_name="first-model",
+            cwd=Path("/workspace"),
+        )
+
+        async with app.run_test(size=(100, 30)) as pilot:
+            prompt = app.query_one("#prompt", Input)
+            for task_id, expected in (
+                ("missing", "No durable task 'missing' exists"),
+                ("task-subagent", "is not a plan execution task"),
+                ("task-running", "is not queued"),
+            ):
+                prompt.value = f"/run-task {task_id}"
+                await pilot.press("enter")
+                await pilot.pause()
+                self.assertIn(expected, app.entries[-1].text)
+
     async def test_permission_modal_blocks_until_allow_once_is_selected(self) -> None:
         broker = SessionApprovalBroker()
         runner = ApprovalTuiConversation(broker)
@@ -2870,6 +3700,286 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("Cancellation requested.", [entry.text for entry in app.entries])
             self.assertIn("Turn cancelled.", [entry.text for entry in app.entries])
             self.assertEqual(runner.prompts, ["long turn"])
+
+    async def test_pristine_cancel_restores_draft_and_removes_transcript_prompt(self) -> None:
+        runner = PristineRewindTuiConversation()
+        app = NeuroCodeApp(
+            runner,
+            provider_name="fixture",
+            model_name="fixture-model",
+            cwd=Path("/workspace"),
+        )
+
+        async with app.run_test(size=(100, 30)) as pilot:
+            prompt = app.query_one("#prompt", Input)
+            prompt.value = "restore this prompt"
+            await pilot.press("enter")
+            await asyncio.wait_for(runner.started.wait(), timeout=1)
+
+            await pilot.press("ctrl+c")
+            for _ in range(30):
+                await pilot.pause(0.02)
+                if prompt.value == "restore this prompt" and runner.cancelled:
+                    break
+
+            self.assertTrue(runner.cancelled)
+            self.assertEqual(
+                runner.policies,
+                [TurnCancellationPolicy.REWIND_PRISTINE],
+            )
+            self.assertEqual(prompt.value, "restore this prompt")
+            self.assertNotIn(
+                "restore this prompt",
+                [entry.text for entry in app.entries if entry.category == "user"],
+            )
+            self.assertIn(
+                "The cancelled prompt was restored to the draft.",
+                [entry.text for entry in app.entries],
+            )
+
+    async def test_pristine_cancel_preserves_original_prompt_when_a_newer_draft_exists(
+        self,
+    ) -> None:
+        runner = PristineRewindTuiConversation()
+        app = NeuroCodeApp(
+            runner,
+            provider_name="fixture",
+            model_name="fixture-model",
+            cwd=Path("/workspace"),
+        )
+
+        async with app.run_test(size=(100, 30)) as pilot:
+            prompt = app.query_one("#prompt", Input)
+            prompt.value = "original prompt"
+            await pilot.press("enter")
+            await asyncio.wait_for(runner.started.wait(), timeout=1)
+            prompt.value = "newer draft"
+
+            await pilot.press("ctrl+c")
+            for _ in range(30):
+                await pilot.pause(0.02)
+                if runner.cancelled:
+                    break
+
+            self.assertEqual(prompt.value, "newer draft")
+            self.assertIn(
+                "original prompt",
+                [entry.text for entry in app.entries if entry.category == "user"],
+            )
+            self.assertIn(
+                "The cancelled prompt remains above because a newer draft is already in the input.",
+                [entry.text for entry in app.entries],
+            )
+
+    async def test_pre_token_prompt_is_buffered_and_runs_after_current_turn(self) -> None:
+        runner = PreTokenInterjectionConversation()
+        app = NeuroCodeApp(
+            runner,
+            provider_name="fixture",
+            model_name="fixture-model",
+            cwd=Path("/workspace"),
+        )
+
+        async with app.run_test(size=(100, 30)) as pilot:
+            prompt = app.query_one("#prompt", Input)
+            prompt.value = "first prompt"
+            await pilot.press("enter")
+            self.assertEqual(
+                await asyncio.wait_for(runner.started.get(), timeout=1), "first prompt"
+            )
+
+            prompt.value = "follow-up before first token"
+            await pilot.press("enter")
+            await pilot.pause()
+            self.assertEqual(runner.prompts, ["first prompt"])
+            self.assertIn(
+                "Queued until the current response completes.",
+                [entry.text for entry in app.entries],
+            )
+
+            await runner.release.put(None)
+            for _ in range(30):
+                await pilot.pause(0.02)
+                if runner.prompts == ["first prompt", "follow-up before first token"]:
+                    break
+            self.assertEqual(runner.prompts, ["first prompt", "follow-up before first token"])
+
+            await runner.release.put(None)
+            for _ in range(30):
+                await pilot.pause(0.02)
+                if any(
+                    "response to follow-up before first token" in entry.text
+                    for entry in app.entries
+                ):
+                    break
+            self.assertTrue(
+                any(
+                    "response to follow-up before first token" in entry.text
+                    for entry in app.entries
+                )
+            )
+
+    async def test_prompt_after_first_token_keeps_running_turn_guard(self) -> None:
+        runner = StreamingTuiConversation()
+        app = NeuroCodeApp(
+            runner,
+            provider_name="fixture",
+            model_name="fixture-model",
+            cwd=Path("/workspace"),
+        )
+
+        async with app.run_test(size=(100, 30)) as pilot:
+            prompt = app.query_one("#prompt", Input)
+            prompt.value = "first prompt"
+            await pilot.press("enter")
+            await asyncio.wait_for(runner.started.wait(), timeout=1)
+
+            prompt.value = "late follow-up"
+            await pilot.press("enter")
+            await pilot.pause()
+            self.assertEqual(
+                app.entries[-1].text,
+                "A turn is already running.",
+            )
+            self.assertEqual(runner._session_id, "streaming-session")
+            runner.release.set()
+
+    async def test_cancelled_pre_token_turn_restores_buffered_prompt(self) -> None:
+        runner = PreTokenInterjectionConversation()
+        app = NeuroCodeApp(
+            runner,
+            provider_name="fixture",
+            model_name="fixture-model",
+            cwd=Path("/workspace"),
+        )
+
+        async with app.run_test(size=(100, 30)) as pilot:
+            prompt = app.query_one("#prompt", Input)
+            prompt.value = "first prompt"
+            await pilot.press("enter")
+            await asyncio.wait_for(runner.started.get(), timeout=1)
+            prompt.value = "restore this follow-up"
+            await pilot.press("enter")
+            await pilot.press("ctrl+c")
+            for _ in range(30):
+                await pilot.pause(0.02)
+                if prompt.value == "restore this follow-up":
+                    break
+            self.assertEqual(prompt.value, "restore this follow-up")
+            self.assertEqual(runner.prompts, ["first prompt"])
+
+    async def test_cancelled_pre_token_turn_restores_every_queued_prompt_without_autorun(
+        self,
+    ) -> None:
+        runner = CancellableTuiConversation()
+        app = NeuroCodeApp(
+            runner,
+            provider_name="fixture",
+            model_name="fixture-model",
+            cwd=Path("/workspace"),
+        )
+
+        async with app.run_test(size=(100, 30)) as pilot:
+            prompt = app.query_one("#prompt", Input)
+            prompt.value = "first prompt"
+            await pilot.press("enter")
+            await asyncio.wait_for(runner.started.wait(), timeout=1)
+            for follow_up in ("queued one", "queued two"):
+                prompt.value = follow_up
+                await pilot.press("enter")
+
+            await pilot.press("ctrl+c")
+            for _ in range(30):
+                await pilot.pause(0.02)
+                if runner.cancelled:
+                    break
+
+            self.assertEqual(prompt.value, "queued one\n\nqueued two")
+            self.assertEqual(runner.prompts, ["first prompt"])
+            self.assertFalse(app._queued_interjections)
+            await pilot.pause(0.05)
+            self.assertEqual(runner.prompts, ["first prompt"])
+
+    async def test_pre_token_interjection_limit_keeps_the_unsent_prompt_in_the_input(self) -> None:
+        runner = CancellableTuiConversation()
+        app = NeuroCodeApp(
+            runner,
+            provider_name="fixture",
+            model_name="fixture-model",
+            cwd=Path("/workspace"),
+        )
+
+        async with app.run_test(size=(100, 30)) as pilot:
+            prompt = app.query_one("#prompt", Input)
+            prompt.value = "first prompt"
+            await pilot.press("enter")
+            await asyncio.wait_for(runner.started.wait(), timeout=1)
+            for index in range(4):
+                prompt.value = f"queued {index}"
+                await pilot.press("enter")
+            prompt.value = "fifth prompt"
+            await pilot.press("enter")
+
+            self.assertEqual(prompt.value, "fifth prompt")
+            self.assertEqual(len(app._queued_interjections), 4)
+            self.assertIn(
+                "Too many queued prompts; wait for the current turn to finish.",
+                [entry.text for entry in app.entries],
+            )
+            await pilot.press("ctrl+c")
+
+    async def test_clearing_the_transcript_discards_queued_interjections(self) -> None:
+        runner = CancellableTuiConversation()
+        app = NeuroCodeApp(
+            runner,
+            provider_name="fixture",
+            model_name="fixture-model",
+            cwd=Path("/workspace"),
+        )
+
+        async with app.run_test(size=(100, 30)) as pilot:
+            prompt = app.query_one("#prompt", Input)
+            prompt.value = "first prompt"
+            await pilot.press("enter")
+            await asyncio.wait_for(runner.started.wait(), timeout=1)
+            prompt.value = "stale queued prompt"
+            await pilot.press("enter")
+            self.assertTrue(app._queued_interjections)
+
+            app.action_clear_transcript()
+            self.assertFalse(app._queued_interjections)
+            await pilot.press("ctrl+c")
+            for _ in range(30):
+                await pilot.pause(0.02)
+                if runner.cancelled:
+                    break
+
+            self.assertEqual(runner.prompts, ["first prompt"])
+            self.assertEqual(prompt.value, "")
+
+    async def test_reasoning_delta_closes_the_pre_token_interjection_window(self) -> None:
+        runner = CancellableTuiConversation()
+        app = NeuroCodeApp(
+            runner,
+            provider_name="fixture",
+            model_name="fixture-model",
+            cwd=Path("/workspace"),
+        )
+
+        async with app.run_test(size=(100, 30)) as pilot:
+            prompt = app.query_one("#prompt", Input)
+            prompt.value = "first prompt"
+            await pilot.press("enter")
+            await asyncio.wait_for(runner.started.wait(), timeout=1)
+            await app._handle_event(
+                AgentEvent.create(1, AgentEventKind.REASONING_DELTA, {"text": "thinking"})
+            )
+            prompt.value = "late prompt"
+            await pilot.press("enter")
+
+            self.assertFalse(app._queued_interjections)
+            self.assertEqual(app.entries[-1].text, "A turn is already running.")
+            await pilot.press("ctrl+c")
 
     async def test_cancel_command_cancels_without_starting_another_turn(self) -> None:
         runner = CancellableTuiConversation()
@@ -3103,6 +4213,45 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
             labels = "\n".join(str(button.label) for button in app.screen.query(Button))
             self.assertIn("Escaped quoted session", labels)
             self.assertIn("[quoted] content", labels)
+            await pilot.press("escape")
+
+    async def test_session_picker_debounces_live_search_and_replaces_options(self) -> None:
+        controller = SessionTuiController()
+        app = NeuroCodeApp(
+            controller,
+            session_controller=controller,
+            provider_name="first",
+            model_name="first-model",
+            cwd=Path("/workspace"),
+        )
+
+        async with app.run_test(size=(120, 35)) as pilot:
+            await pilot.press("ctrl+r")
+            for _ in range(20):
+                await pilot.pause(0.01)
+                if isinstance(app.screen, SessionSelectionScreen):
+                    break
+
+            self.assertIsInstance(app.screen, SessionSelectionScreen)
+            search = app.screen.query_one("#session-search", Input)
+            search.value = "quoted"
+            await pilot.pause(0.05)
+            self.assertEqual(controller.queries, [None])
+            for _ in range(30):
+                await pilot.pause(0.02)
+                labels = "\n".join(str(button.label) for button in app.screen.query(Button))
+                if (
+                    controller.queries[-1:] == ["quoted"]
+                    and "Current workspace session" not in labels
+                ):
+                    break
+
+            self.assertEqual(controller.queries, [None, "quoted"])
+            labels = "\n".join(str(button.label) for button in app.screen.query(Button))
+            self.assertIn("Escaped quoted session", labels)
+            self.assertNotIn("Current workspace session", labels)
+            title = app.screen.query_one("#session-title", Label)
+            self.assertEqual(str(title.renderable), "Session search: quoted")
             await pilot.press("escape")
 
     async def test_rename_and_title_commands_update_the_current_session(self) -> None:

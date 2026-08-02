@@ -6,6 +6,7 @@ import json
 from collections.abc import Mapping
 from pathlib import Path
 
+from neuro_code.domain.background_tasks import BackgroundTaskWakePolicy
 from neuro_code.domain.provider_settings import (
     ManagedProviderProfile,
     ManagedProviderSettings,
@@ -93,6 +94,7 @@ def load_managed_provider_settings(state_dir: Path) -> ManagedProviderSettings:
             proxy_mode = None
         proxy_url_env = raw_profile.get("proxy_url_env")
         context_window_tokens = raw_profile.get("context_window_tokens")
+        raw_wake_policy = raw_profile.get("background_task_wake_policy")
         if (
             (proxy_mode is not None and not isinstance(proxy_mode, str))
             or (proxy_url_env is not None and not isinstance(proxy_url_env, str))
@@ -103,8 +105,17 @@ def load_managed_provider_settings(state_dir: Path) -> ManagedProviderSettings:
                     or isinstance(context_window_tokens, bool)
                 )
             )
+            or (raw_wake_policy is not None and not isinstance(raw_wake_policy, str))
         ):
             raise ConfigurationError(f"managed provider settings {metadata_path} are invalid")
+        try:
+            wake_policy = (
+                BackgroundTaskWakePolicy(raw_wake_policy) if raw_wake_policy is not None else None
+            )
+        except ValueError as error:
+            raise ConfigurationError(
+                f"managed provider settings {metadata_path} are invalid"
+            ) from error
         name = str(values["name"])
         protocol = str(values["protocol"])
         dialect = str(values["dialect"])
@@ -121,6 +132,7 @@ def load_managed_provider_settings(state_dir: Path) -> ManagedProviderSettings:
                 proxy_mode=proxy_mode,
                 proxy_url_env=proxy_url_env,
                 api_key=api_keys.get(name),
+                background_task_wake_policy=wake_policy,
             )
         )
     raw_default = metadata.get("default_provider")
@@ -135,10 +147,23 @@ def load_managed_provider_settings(state_dir: Path) -> ManagedProviderSettings:
         proxy_url_env is not None and not isinstance(proxy_url_env, str)
     ):
         raise ConfigurationError(f"managed provider settings {metadata_path} are invalid")
+    raw_wake_policy = metadata.get(
+        "background_task_wake_policy",
+        BackgroundTaskWakePolicy.DISABLED.value,
+    )
+    if not isinstance(raw_wake_policy, str):
+        raise ConfigurationError(f"managed provider settings {metadata_path} are invalid")
+    try:
+        wake_policy = BackgroundTaskWakePolicy(raw_wake_policy)
+    except ValueError as error:
+        raise ConfigurationError(
+            f"managed provider settings {metadata_path} are invalid"
+        ) from error
     return ManagedProviderSettings(
         tuple(profiles),
         raw_default,
         ManagedProxyPolicy(proxy_mode, proxy_url_env),
+        wake_policy,
     )
 
 

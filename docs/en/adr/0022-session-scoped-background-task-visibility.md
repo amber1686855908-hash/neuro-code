@@ -58,9 +58,13 @@ slice does not wake the model automatically or inject completion output.
   repeated polls do not duplicate it.
 - The task list is useful for status and ID discovery without copying raw tool
   results or command text into scrollback.
-- Task persistence across restart/resume, model auto-wake, completion-output
-  injection, a rich task pane, multi-task wait, and direct user cancellation
-  with a separately designed approval flow remain future work.
+- Cross-process task restoration, full-output files, a rich task pane, and
+  direct user cancellation with a separately designed approval flow remain
+  future work. Model auto-wake now has an explicit bounded session policy with
+  persisted global/provider configuration and a restart-aware wake ledger; it
+  does not pretend process-owned task results survive an application restart.
+  Automatic foreground promotion uses this same scope and process ownership;
+  it does not add cross-process restoration.
 
 Source evidence is the per-session `BackgroundTaskRegistry`, task-completion
 notifications, and task output/kill behavior at the pinned historical commit.

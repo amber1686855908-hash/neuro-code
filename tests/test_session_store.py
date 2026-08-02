@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import multiprocessing
 import os
 import sqlite3
 import tempfile
@@ -12,7 +13,14 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from neuro_code.adapters.sqlite_session import SqliteSessionStore
+from neuro_code.domain.background_tasks import BackgroundWakeState
 from neuro_code.domain.events import AgentEvent, AgentEventKind
+from neuro_code.domain.execution import (
+    AgentExecutionOutcome,
+    AgentExecutionStatus,
+    SessionExecutionRecord,
+    SupervisorReasonCode,
+)
 from neuro_code.domain.messages import (
     ContentPart,
     ContextItemKind,
@@ -29,12 +37,133 @@ from neuro_code.domain.plans import (
     SessionPlan,
 )
 from neuro_code.domain.sandbox import SandboxProfile
-from neuro_code.domain.session_tasks import SessionTask, SessionTaskKind, SessionTaskStatus
+from neuro_code.domain.session_tasks import (
+    MAX_QUEUED_SESSION_TASKS,
+    SessionTask,
+    SessionTaskKind,
+    SessionTaskStatus,
+)
 from neuro_code.domain.sessions import SessionSnapshot, SessionSummary
 from neuro_code.shared.errors import SessionError
 
 
+def _save_execution_record_in_process(
+    database: str,
+    session_id: str,
+    record: SessionExecutionRecord,
+    ready_queue,
+    start_event,
+    result_queue,
+) -> None:
+    """Attempt one execution-record write from a real OS process."""
+
+    ready_queue.put("ready")
+    if not start_event.wait(timeout=10):
+        result_queue.put("start-timeout")
+        return
+
+    async def save() -> None:
+        store = SqliteSessionStore(Path(database))
+        try:
+            await store.save_execution_record(session_id, record)
+        except Exception as error:
+            result_queue.put(f"error:{type(error).__name__}:{error}")
+        else:
+            result_queue.put("ok")
+
+    asyncio.run(save())
+
+
 class SessionStoreTests(unittest.IsolatedAsyncioTestCase):
+    async def test_queued_plan_tasks_are_capped_and_claimed_once(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = SqliteSessionStore(Path(directory) / "sessions.db")
+            await store.initialize()
+            session_id = await store.create_session("/workspace", "fixture", "model")
+            queued_at = datetime(2026, 7, 29, 12, tzinfo=UTC)
+            for index in range(MAX_QUEUED_SESSION_TASKS):
+                await store.create_session_task(
+                    session_id,
+                    SessionTask(
+                        f"task-queued-{index}",
+                        SessionTaskKind.PLAN_EXECUTION,
+                        SessionTaskStatus.QUEUED,
+                        queued_at,
+                    ),
+                )
+
+            with self.assertRaisesRegex(SessionError, "at most 4 plan tasks"):
+                await store.create_session_task(
+                    session_id,
+                    SessionTask(
+                        "task-queued-overflow",
+                        SessionTaskKind.PLAN_EXECUTION,
+                        SessionTaskStatus.QUEUED,
+                        queued_at,
+                    ),
+                )
+            with self.assertRaisesRegex(SessionError, "unknown session task"):
+                await store.start_session_task(session_id, "task-not-found", queued_at)
+
+            started = await store.start_session_task(
+                session_id,
+                "task-queued-0",
+                queued_at.replace(second=5),
+            )
+            self.assertIs(started.status, SessionTaskStatus.RUNNING)
+            with self.assertRaisesRegex(SessionError, "cannot create session task"):
+                await store.create_session_task(
+                    session_id,
+                    SessionTask(
+                        "task-queued-1",
+                        SessionTaskKind.PLAN_EXECUTION,
+                        SessionTaskStatus.QUEUED,
+                        queued_at,
+                    ),
+                )
+            with self.assertRaisesRegex(SessionError, "invalid session task transition"):
+                await store.start_session_task(
+                    session_id,
+                    "task-queued-0",
+                    queued_at.replace(second=6),
+                )
+
+            await store.create_session_task(
+                session_id,
+                SessionTask(
+                    "task-naive-start",
+                    SessionTaskKind.PLAN_EXECUTION,
+                    SessionTaskStatus.QUEUED,
+                    queued_at,
+                ),
+            )
+            with self.assertRaisesRegex(SessionError, "invalid session task transition"):
+                await store.start_session_task(
+                    session_id,
+                    "task-naive-start",
+                    datetime.fromisoformat("2026-07-29T12:00:06"),
+                )
+            await store.start_session_task(
+                session_id,
+                "task-naive-start",
+                queued_at.replace(second=7),
+            )
+
+            await store.create_session_task(
+                session_id,
+                SessionTask(
+                    "task-queued-replacement",
+                    SessionTaskKind.PLAN_EXECUTION,
+                    SessionTaskStatus.QUEUED,
+                    queued_at,
+                ),
+            )
+            tasks = await store.list_session_tasks(session_id)
+            self.assertEqual(
+                sum(task.status is SessionTaskStatus.QUEUED for task in tasks),
+                MAX_QUEUED_SESSION_TASKS,
+            )
+
     def test_connect_retries_only_transient_wal_locks_and_closes_on_failure(self) -> None:
         store = SqliteSessionStore(Path("/unused/sessions.db"))
         retry_connection = Mock(spec=sqlite3.Connection)
@@ -195,12 +324,24 @@ class SessionStoreTests(unittest.IsolatedAsyncioTestCase):
                 session_id,
                 AgentEvent.create(2, AgentEventKind.TURN_COMPLETED, {"step": 1}),
             )
+            execution_record = SessionExecutionRecord(
+                AgentExecutionOutcome(
+                    AgentExecutionStatus.BUDGET_LIMITED,
+                    SupervisorReasonCode.MODEL_STEP_LIMIT,
+                    finalized=True,
+                    recoverable=True,
+                ),
+                2,
+                datetime(2026, 7, 3, 9, 58, tzinfo=UTC),
+            )
+            await store.save_execution_record(session_id, execution_record)
 
             loaded = await store.load_messages(session_id)
             events = await store.load_events(session_id)
             self.assertEqual(loaded, messages)
             self.assertEqual([event["sequence"] for event in events], [1, 2])
             self.assertEqual(await store.next_event_sequence(session_id), 3)
+            self.assertEqual(await store.load_execution_record(session_id), execution_record)
             summary = await store.get_session(session_id)
             self.assertEqual(summary.id, session_id)
             self.assertEqual(summary.cwd, "/workspace")
@@ -287,6 +428,165 @@ class SessionStoreTests(unittest.IsolatedAsyncioTestCase):
             self.assertIs(summary.sandbox_profile, SandboxProfile.READ_ONLY)
             self.assertIn(summary, await store.list_sessions())
 
+    async def test_finalize_turn_commits_event_items_and_execution_record(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = SqliteSessionStore(Path(directory) / "sessions.db")
+            await store.initialize()
+            session_id = await store.create_session("/workspace", "fixture", "model")
+            initial_items = [Message(Role.USER, "persist this turn")]
+            await store.save_session_items(session_id, initial_items)
+            event = AgentEvent.create(1, AgentEventKind.TURN_COMPLETED, {"step": 1})
+            final_items = [*initial_items, Message(Role.ASSISTANT, "done")]
+            record = SessionExecutionRecord(
+                AgentExecutionOutcome(
+                    AgentExecutionStatus.COMPLETED,
+                    None,
+                    finalized=False,
+                    recoverable=False,
+                ),
+                event.sequence,
+                event.created_at,
+            )
+
+            await store.finalize_turn(session_id, event, final_items, record)
+
+            self.assertEqual(await store.load_session_items(session_id), final_items)
+            self.assertEqual(await store.load_execution_record(session_id), record)
+            persisted_events = await store.load_events(session_id)
+            self.assertEqual(
+                [(item["sequence"], item["kind"], item["data"]) for item in persisted_events],
+                [(1, AgentEventKind.TURN_COMPLETED.value, {"step": 1})],
+            )
+
+    async def test_finalize_turn_without_record_preserves_previous_execution_record(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = SqliteSessionStore(Path(directory) / "sessions.db")
+            await store.initialize()
+            session_id = await store.create_session("/workspace", "fixture", "model")
+            initial_items = [Message(Role.USER, "user turn")]
+            await store.save_session_items(session_id, initial_items)
+            first_event = AgentEvent.create(1, AgentEventKind.TURN_COMPLETED, {"step": 1})
+            first_items = [*initial_items, Message(Role.ASSISTANT, "user result")]
+            previous_record = SessionExecutionRecord(
+                AgentExecutionOutcome(
+                    AgentExecutionStatus.COMPLETED,
+                    None,
+                    finalized=False,
+                    recoverable=False,
+                ),
+                first_event.sequence,
+                first_event.created_at,
+            )
+            await store.finalize_turn(session_id, first_event, first_items, previous_record)
+
+            second_event = AgentEvent.create(2, AgentEventKind.TURN_COMPLETED, {"step": 2})
+            second_items = [*first_items, Message(Role.ASSISTANT, "background result")]
+            await store.finalize_turn(session_id, second_event, second_items, None)
+
+            self.assertEqual(await store.load_session_items(session_id), second_items)
+            self.assertEqual(await store.load_execution_record(session_id), previous_record)
+            self.assertEqual(
+                [event["sequence"] for event in await store.load_events(session_id)],
+                [1, 2],
+            )
+
+    async def test_finalize_turn_rejects_invalid_completion_and_duplicate_sequences(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = SqliteSessionStore(Path(directory) / "sessions.db")
+            await store.initialize()
+            session_id = await store.create_session("/workspace", "fixture", "model")
+            initial_items = [Message(Role.USER, "prefix")]
+            await store.save_session_items(session_id, initial_items)
+
+            with self.assertRaisesRegex(SessionError, "TURN_COMPLETED"):
+                await store.finalize_turn(
+                    session_id,
+                    AgentEvent.create(1, AgentEventKind.USER_MESSAGE, {}),
+                    initial_items,
+                    None,
+                )
+            mismatch_event = AgentEvent.create(1, AgentEventKind.TURN_COMPLETED, {})
+            mismatch_record = SessionExecutionRecord(
+                AgentExecutionOutcome(
+                    AgentExecutionStatus.COMPLETED,
+                    None,
+                    finalized=False,
+                    recoverable=False,
+                ),
+                2,
+                mismatch_event.created_at,
+            )
+            with self.assertRaisesRegex(SessionError, "does not match"):
+                await store.finalize_turn(
+                    session_id,
+                    mismatch_event,
+                    initial_items,
+                    mismatch_record,
+                )
+            with self.assertRaisesRegex(SessionError, "prefix"):
+                await store.finalize_turn(
+                    session_id,
+                    mismatch_event,
+                    [Message(Role.ASSISTANT, "rewritten")],
+                    None,
+                )
+
+            await store.finalize_turn(session_id, mismatch_event, initial_items, None)
+            with self.assertRaisesRegex(SessionError, "already exists"):
+                await store.finalize_turn(session_id, mismatch_event, initial_items, None)
+            self.assertEqual(
+                [event["sequence"] for event in await store.load_events(session_id)],
+                [1],
+            )
+
+    async def test_finalize_turn_rolls_back_event_items_and_record_on_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = SqliteSessionStore(Path(directory) / "sessions.db")
+            await store.initialize()
+            session_id = await store.create_session("/workspace", "fixture", "model")
+            initial_items = [Message(Role.USER, "existing")]
+            await store.save_session_items(session_id, initial_items)
+            previous_event = AgentEvent.create(1, AgentEventKind.TURN_COMPLETED, {"step": 1})
+            previous_record = SessionExecutionRecord(
+                AgentExecutionOutcome(
+                    AgentExecutionStatus.COMPLETED,
+                    None,
+                    finalized=False,
+                    recoverable=False,
+                ),
+                previous_event.sequence,
+                previous_event.created_at,
+            )
+            await store.finalize_turn(session_id, previous_event, initial_items, previous_record)
+            next_event = AgentEvent.create(2, AgentEventKind.TURN_COMPLETED, {"step": 2})
+            next_items = [*initial_items, Message(Role.ASSISTANT, "new result")]
+            next_record = SessionExecutionRecord(
+                AgentExecutionOutcome(
+                    AgentExecutionStatus.BUDGET_LIMITED,
+                    SupervisorReasonCode.MODEL_STEP_LIMIT,
+                    finalized=True,
+                    recoverable=True,
+                ),
+                next_event.sequence,
+                next_event.created_at,
+            )
+
+            with (
+                patch(
+                    "neuro_code.adapters.sqlite_session._upsert_search_document",
+                    side_effect=RuntimeError("index failure"),
+                ),
+                self.assertRaisesRegex(RuntimeError, "index failure"),
+            ):
+                await store.finalize_turn(session_id, next_event, next_items, next_record)
+
+            self.assertEqual(await store.load_session_items(session_id), initial_items)
+            self.assertEqual(await store.load_execution_record(session_id), previous_record)
+            self.assertEqual(
+                [event["sequence"] for event in await store.load_events(session_id)],
+                [1],
+            )
+
     async def test_schema_v8_migration_preserves_tasks_without_plan_snapshots(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             database = Path(directory) / "sessions.db"
@@ -333,10 +633,18 @@ class SessionStoreTests(unittest.IsolatedAsyncioTestCase):
                 connection.execute(
                     "SELECT version FROM schema_meta WHERE singleton = 1"
                 ).fetchone(),
-                (9,),
+                (11,),
             )
             columns = {row[1] for row in connection.execute("PRAGMA table_info(session_tasks)")}
+            tables = {
+                row[0]
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                ).fetchall()
+            }
             self.assertIn("plan_snapshot_json", columns)
+            self.assertIn("session_execution_records", tables)
+            self.assertIn("session_background_wake_state", tables)
             self.assertEqual(
                 connection.execute(
                     "SELECT plan_snapshot_json FROM session_tasks WHERE task_id = ?",
@@ -345,6 +653,328 @@ class SessionStoreTests(unittest.IsolatedAsyncioTestCase):
                 ("",),
             )
             connection.close()
+
+    async def test_execution_records_are_auditable_overwritable_and_not_forked(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = SqliteSessionStore(Path(directory) / "sessions.db")
+            await store.initialize()
+            source_id = await store.create_session("/workspace", "fixture", "model")
+            await store.append_event(
+                source_id,
+                AgentEvent.create(1, AgentEventKind.TURN_COMPLETED, {"step": 1}),
+            )
+            paused = SessionExecutionRecord(
+                AgentExecutionOutcome(
+                    AgentExecutionStatus.STUCK,
+                    SupervisorReasonCode.PERIODIC_CYCLE,
+                    finalized=True,
+                    recoverable=True,
+                ),
+                1,
+                datetime(2026, 7, 31, 12, tzinfo=UTC),
+            )
+            await store.save_execution_record(source_id, paused)
+            self.assertEqual(await store.load_execution_record(source_id), paused)
+
+            forked_id = await store.fork_session(source_id)
+            self.assertIsNone(await store.load_execution_record(forked_id))
+
+            await store.append_event(
+                source_id,
+                AgentEvent.create(2, AgentEventKind.TURN_COMPLETED, {"step": 2}),
+            )
+            completed = SessionExecutionRecord(
+                AgentExecutionOutcome(
+                    AgentExecutionStatus.COMPLETED,
+                    None,
+                    finalized=False,
+                    recoverable=False,
+                ),
+                2,
+                datetime(2026, 7, 31, 12, 1, tzinfo=UTC),
+            )
+            await store.save_execution_record(source_id, completed)
+            self.assertEqual(await store.load_execution_record(source_id), completed)
+
+            with self.assertRaisesRegex(SessionError, "turn-completed event"):
+                await store.save_execution_record(
+                    source_id,
+                    SessionExecutionRecord(
+                        completed.outcome,
+                        3,
+                        datetime(2026, 7, 31, 12, 2, tzinfo=UTC),
+                    ),
+                )
+
+    async def test_loading_execution_record_rejects_missing_or_non_terminal_event(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "sessions.db"
+            store = SqliteSessionStore(database)
+            await store.initialize()
+            session_id = await store.create_session("/workspace", "fixture", "model")
+            record = SessionExecutionRecord(
+                AgentExecutionOutcome(
+                    AgentExecutionStatus.STUCK,
+                    SupervisorReasonCode.PERIODIC_CYCLE,
+                    finalized=True,
+                    recoverable=True,
+                ),
+                1,
+                datetime(2026, 7, 31, 12, tzinfo=UTC),
+            )
+            await store.append_event(
+                session_id,
+                AgentEvent.create(1, AgentEventKind.TURN_COMPLETED, {"step": 1}),
+            )
+            await store.save_execution_record(session_id, record)
+
+            connection = sqlite3.connect(database)
+            connection.execute(
+                "DELETE FROM events WHERE session_id = ? AND sequence = ?",
+                (session_id, record.event_sequence),
+            )
+            connection.commit()
+            connection.close()
+            with self.assertRaisesRegex(SessionError, "invalid completion event"):
+                await store.load_execution_record(session_id)
+
+            connection = sqlite3.connect(database)
+            connection.execute(
+                "INSERT INTO events(session_id, sequence, kind, created_at, data_json) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (
+                    session_id,
+                    record.event_sequence,
+                    AgentEventKind.USER_MESSAGE.value,
+                    datetime(2026, 7, 31, 12, tzinfo=UTC).isoformat(),
+                    "{}",
+                ),
+            )
+            connection.commit()
+            connection.close()
+            with self.assertRaisesRegex(SessionError, "invalid completion event"):
+                await store.load_execution_record(session_id)
+
+    async def test_execution_record_writes_are_monotonic_across_turn_sequences(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = SqliteSessionStore(Path(directory) / "sessions.db")
+            await store.initialize()
+            session_id = await store.create_session("/workspace", "fixture", "model")
+            await store.append_event(
+                session_id,
+                AgentEvent.create(2, AgentEventKind.TURN_COMPLETED, {"step": 2}),
+            )
+            newer = SessionExecutionRecord(
+                AgentExecutionOutcome(
+                    AgentExecutionStatus.BUDGET_LIMITED,
+                    SupervisorReasonCode.MODEL_STEP_LIMIT,
+                    finalized=True,
+                    recoverable=True,
+                ),
+                2,
+                datetime(2026, 7, 31, 12, 1, tzinfo=UTC),
+            )
+            older = SessionExecutionRecord(
+                AgentExecutionOutcome(
+                    AgentExecutionStatus.STUCK,
+                    SupervisorReasonCode.PERIODIC_CYCLE,
+                    finalized=True,
+                    recoverable=True,
+                ),
+                1,
+                datetime(2026, 7, 31, 12, tzinfo=UTC),
+            )
+            await store.save_execution_record(session_id, newer)
+            stale_event = AgentEvent.create(1, AgentEventKind.TURN_COMPLETED, {"step": 1})
+            await store.append_event(session_id, stale_event)
+            with self.assertRaisesRegex(SessionError, "older event sequence"):
+                await store.save_execution_record(session_id, older)
+            self.assertEqual(await store.load_execution_record(session_id), newer)
+
+            same_sequence_conflict = SessionExecutionRecord(
+                AgentExecutionOutcome(
+                    AgentExecutionStatus.STUCK,
+                    SupervisorReasonCode.PERIODIC_CYCLE,
+                    finalized=True,
+                    recoverable=True,
+                ),
+                2,
+                datetime(2026, 7, 31, 12, 2, tzinfo=UTC),
+            )
+            with self.assertRaisesRegex(SessionError, "same event sequence"):
+                await store.save_execution_record(session_id, same_sequence_conflict)
+            self.assertEqual(await store.load_execution_record(session_id), newer)
+
+            with self.assertRaisesRegex(SessionError, "older event sequence"):
+                await store.finalize_turn(session_id, stale_event, (), older)
+            self.assertEqual(await store.load_execution_record(session_id), newer)
+
+    async def test_concurrent_store_connections_keep_the_newest_execution_record(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "sessions.db"
+            setup_store = SqliteSessionStore(database)
+            await setup_store.initialize()
+            session_id = await setup_store.create_session("/workspace", "fixture", "model")
+            for sequence in (1, 2):
+                await setup_store.append_event(
+                    session_id,
+                    AgentEvent.create(sequence, AgentEventKind.TURN_COMPLETED, {"step": sequence}),
+                )
+
+            older = SessionExecutionRecord(
+                AgentExecutionOutcome(
+                    AgentExecutionStatus.STUCK,
+                    SupervisorReasonCode.PERIODIC_CYCLE,
+                    finalized=True,
+                    recoverable=True,
+                ),
+                1,
+                datetime(2026, 7, 31, 12, tzinfo=UTC),
+            )
+            newer = SessionExecutionRecord(
+                AgentExecutionOutcome(
+                    AgentExecutionStatus.BUDGET_LIMITED,
+                    SupervisorReasonCode.MODEL_STEP_LIMIT,
+                    finalized=True,
+                    recoverable=True,
+                ),
+                2,
+                datetime(2026, 7, 31, 12, 1, tzinfo=UTC),
+            )
+            older_store = SqliteSessionStore(database)
+            newer_store = SqliteSessionStore(database)
+            results = await asyncio.gather(
+                older_store.save_execution_record(session_id, older),
+                newer_store.save_execution_record(session_id, newer),
+                return_exceptions=True,
+            )
+
+            errors = [result for result in results if isinstance(result, BaseException)]
+            self.assertLessEqual(len(errors), 1)
+            if errors:
+                self.assertIsInstance(errors[0], SessionError)
+                self.assertIn("older event sequence", str(errors[0]))
+            self.assertEqual(await setup_store.load_execution_record(session_id), newer)
+
+    async def test_cross_process_writes_keep_the_newest_execution_record(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "sessions.db"
+            setup_store = SqliteSessionStore(database)
+            await setup_store.initialize()
+            session_id = await setup_store.create_session("/workspace", "fixture", "model")
+            for sequence in (1, 2):
+                await setup_store.append_event(
+                    session_id,
+                    AgentEvent.create(sequence, AgentEventKind.TURN_COMPLETED, {"step": sequence}),
+                )
+
+            older = SessionExecutionRecord(
+                AgentExecutionOutcome(
+                    AgentExecutionStatus.STUCK,
+                    SupervisorReasonCode.PERIODIC_CYCLE,
+                    finalized=True,
+                    recoverable=True,
+                ),
+                1,
+                datetime(2026, 7, 31, 12, tzinfo=UTC),
+            )
+            newer = SessionExecutionRecord(
+                AgentExecutionOutcome(
+                    AgentExecutionStatus.BUDGET_LIMITED,
+                    SupervisorReasonCode.MODEL_STEP_LIMIT,
+                    finalized=True,
+                    recoverable=True,
+                ),
+                2,
+                datetime(2026, 7, 31, 12, 1, tzinfo=UTC),
+            )
+            context = multiprocessing.get_context("spawn")
+            ready_queue = context.Queue()
+            result_queue = context.Queue()
+            start_event = context.Event()
+            processes = [
+                context.Process(
+                    target=_save_execution_record_in_process,
+                    args=(
+                        str(database),
+                        session_id,
+                        older,
+                        ready_queue,
+                        start_event,
+                        result_queue,
+                    ),
+                ),
+                context.Process(
+                    target=_save_execution_record_in_process,
+                    args=(
+                        str(database),
+                        session_id,
+                        newer,
+                        ready_queue,
+                        start_event,
+                        result_queue,
+                    ),
+                ),
+            ]
+            lock_connection = sqlite3.connect(database, timeout=30)
+            results: list[str] = []
+            try:
+                lock_connection.execute("BEGIN IMMEDIATE")
+                for process in processes:
+                    process.start()
+                for _ in processes:
+                    self.assertEqual(ready_queue.get(timeout=10), "ready")
+                start_event.set()
+                lock_connection.commit()
+
+                for _ in processes:
+                    results.append(result_queue.get(timeout=30))
+                for process in processes:
+                    process.join(timeout=30)
+                    self.assertFalse(process.is_alive())
+                    self.assertEqual(process.exitcode, 0)
+            finally:
+                if lock_connection.in_transaction:
+                    lock_connection.rollback()
+                lock_connection.close()
+                for process in processes:
+                    if process.is_alive():
+                        process.terminate()
+                    process.join(timeout=5)
+                ready_queue.close()
+                result_queue.close()
+                ready_queue.join_thread()
+                result_queue.join_thread()
+
+            self.assertEqual(len(results), len(processes))
+            self.assertTrue(
+                all(result == "ok" or result.startswith("error:") for result in results)
+            )
+            errors = [result for result in results if result != "ok"]
+            self.assertLessEqual(len(errors), 1)
+            if errors:
+                self.assertIn("SessionError", errors[0])
+                self.assertIn("older event sequence", errors[0])
+            self.assertEqual(await setup_store.load_execution_record(session_id), newer)
+
+    async def test_background_wake_state_round_trips_and_is_not_forked(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = SqliteSessionStore(Path(directory) / "sessions.db")
+            await store.initialize()
+            source_id = await store.create_session("/workspace", "fixture", "model")
+            state = BackgroundWakeState().record_terminal_task("task-1", enqueue=True)
+            await store.save_background_wake_state(source_id, state)
+            self.assertEqual(await store.load_background_wake_state(source_id), state)
+
+            forked_id = await store.fork_session(source_id)
+            self.assertEqual(
+                await store.load_background_wake_state(forked_id),
+                BackgroundWakeState(),
+            )
+
+            reopened = SqliteSessionStore(store.database_path)
+            await reopened.initialize()
+            self.assertEqual(await reopened.load_background_wake_state(source_id), state)
 
     async def test_current_plan_comment_count_is_bounded(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -694,7 +1324,7 @@ class SessionStoreTests(unittest.IsolatedAsyncioTestCase):
                 row[1] for row in migrated.execute("PRAGMA table_info(session_tasks)").fetchall()
             }
             migrated.close()
-            self.assertEqual(version, (9,))
+            self.assertEqual(version, (11,))
             self.assertIn("context_affinity", columns)
             self.assertIn("sandbox_profile", columns)
             self.assertIn("plan_json", columns)
@@ -758,7 +1388,7 @@ class SessionStoreTests(unittest.IsolatedAsyncioTestCase):
             migrated = sqlite3.connect(database)
             self.assertEqual(
                 migrated.execute("SELECT version FROM schema_meta WHERE singleton = 1").fetchone(),
-                (9,),
+                (11,),
             )
             migrated.close()
 
@@ -838,7 +1468,7 @@ class SessionStoreTests(unittest.IsolatedAsyncioTestCase):
             migrated = sqlite3.connect(database)
             self.assertEqual(
                 migrated.execute("SELECT version FROM schema_meta WHERE singleton = 1").fetchone(),
-                (9,),
+                (11,),
             )
             tables = {
                 row[0]
@@ -881,7 +1511,7 @@ class SessionStoreTests(unittest.IsolatedAsyncioTestCase):
                 connection.execute(
                     "SELECT version FROM schema_meta WHERE singleton = 1"
                 ).fetchone(),
-                (9,),
+                (11,),
             )
             connection.close()
 
@@ -950,7 +1580,7 @@ class SessionStoreTests(unittest.IsolatedAsyncioTestCase):
             recovered = sqlite3.connect(database)
             self.assertEqual(
                 recovered.execute("SELECT version FROM schema_meta WHERE singleton = 1").fetchone(),
-                (9,),
+                (11,),
             )
             recovered.close()
 
@@ -974,7 +1604,7 @@ class SessionStoreTests(unittest.IsolatedAsyncioTestCase):
                 connection.execute(
                     "SELECT version FROM schema_meta WHERE singleton = 1"
                 ).fetchone(),
-                (9,),
+                (11,),
             )
             self.assertEqual(
                 connection.execute("SELECT COUNT(*) FROM session_search_documents").fetchone(),

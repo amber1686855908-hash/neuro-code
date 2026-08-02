@@ -21,6 +21,10 @@ class ToolError(NeuroCodeError):
     """A tool request is invalid or could not be completed."""
 
 
+class BackgroundTaskCapacityError(ToolError):
+    """A managed task supervisor cannot accept another task right now."""
+
+
 class PermissionDenied(ToolError):
     """A tool call was rejected by the permission policy."""
 
@@ -38,6 +42,7 @@ class SessionError(NeuroCodeError):
 
 
 __all__ = [
+    "BackgroundTaskCapacityError",
     "ConfigurationError",
     "NeuroCodeError",
     "PermissionDenied",

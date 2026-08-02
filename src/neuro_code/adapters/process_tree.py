@@ -181,7 +181,7 @@ class ProcessTree:
 
         stdin_error: BaseException | None = None
         try:
-            returncode = await self.process.wait()
+            returncode = await self._wait_for_direct_returncode()
         except BaseException:
             with contextlib.suppress(BaseException):
                 await self.close_stdin()
@@ -212,6 +212,28 @@ class ProcessTree:
         if stdin_error is not None:
             raise stdin_error
         return returncode
+
+    async def _wait_for_direct_returncode(self) -> int:
+        """Observe direct-child exit even when a detached child retains a pipe.
+
+        asyncio's ``Process.wait()`` can remain pending until inherited stdout
+        and stderr pipes close. A detached descendant is outside this
+        ``ProcessTree``'s ownership boundary, so its pipe must not hold the
+        owned task's lifecycle open indefinitely.
+        """
+
+        waiter = asyncio.create_task(self.process.wait())
+        try:
+            while not waiter.done():
+                if self.process.returncode is not None:
+                    return self.process.returncode
+                await asyncio.sleep(0.02)
+            return waiter.result()
+        finally:
+            if not waiter.done():
+                waiter.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await waiter
 
     @staticmethod
     def _validated_unix_group(pid: int) -> int:

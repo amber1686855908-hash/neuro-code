@@ -10,12 +10,19 @@ from pathlib import Path
 from neuro_code.application.ports.storage import SessionStore
 from neuro_code.application.ports.workspace import WorkspaceIdentity
 from neuro_code.application.runtime.agent import AgentRunResult, AgentRuntime, EventSink
+from neuro_code.domain.background_tasks import BackgroundWakeState
 from neuro_code.domain.events import AgentEvent, AgentEventKind
+from neuro_code.domain.execution import SessionExecutionRecord, TurnCancellationPolicy, TurnSource
 from neuro_code.domain.interaction_mode import InteractionMode
 from neuro_code.domain.messages import ContentPart, SessionItem
 from neuro_code.domain.plans import PlanComment, SessionPlan
 from neuro_code.domain.reasoning import ReasoningEffort
-from neuro_code.domain.session_tasks import SessionTask
+from neuro_code.domain.session_tasks import (
+    MAX_QUEUED_SESSION_TASKS,
+    SessionTask,
+    SessionTaskKind,
+    SessionTaskStatus,
+)
 from neuro_code.shared.errors import ConfigurationError
 
 PLAN_EXECUTION_PROMPT = (
@@ -39,6 +46,7 @@ class AgentConversation:
         source_provider: str | None = None,
         source_model: str | None = None,
         source_context_affinity: str | None = None,
+        execution_record: SessionExecutionRecord | None = None,
     ) -> None:
         self._runtime = runtime
         self._store = store
@@ -47,6 +55,7 @@ class AgentConversation:
         self._source_provider = source_provider
         self._source_model = source_model
         self._source_context_affinity = source_context_affinity
+        self._execution_record = execution_record
         self._turn_lock = asyncio.Lock()
 
     @classmethod
@@ -87,6 +96,7 @@ class AgentConversation:
             source_provider=summary.provider,
             source_model=summary.model,
             source_context_affinity=summary.context_affinity,
+            execution_record=await store.load_execution_record(resume_id),
         )
 
     @property
@@ -104,6 +114,12 @@ class AgentConversation:
     @property
     def plan_comments(self) -> tuple[PlanComment, ...]:
         return self._runtime.plan_comments
+
+    @property
+    def execution_record(self) -> SessionExecutionRecord | None:
+        """Return the latest safe terminal execution state restored for this session."""
+
+        return self._execution_record
 
     async def add_plan_comment(self, step_index: int, content: str) -> PlanComment:
         """Persist user feedback for one current-plan step without starting a turn."""
@@ -143,6 +159,37 @@ class AgentConversation:
             return None
         return await self._store.get_session_task(self._session_id, task_id)
 
+    async def schedule_plan(self) -> SessionTask:
+        """Persist a bounded plan task without starting a model turn."""
+
+        if self.plan is None:
+            raise ConfigurationError("cannot schedule a plan that has not been saved")
+        if self._session_id is None:
+            raise ConfigurationError("a session is required before scheduling a plan")
+        async with self._turn_lock:
+            plan = self.plan
+            if plan is None or self._session_id is None:
+                raise ConfigurationError("cannot schedule a plan that has not been saved")
+            tasks = await self._store.list_session_tasks(self._session_id)
+            queued_count = sum(
+                task.status is SessionTaskStatus.QUEUED
+                for task in tasks
+                if task.kind is SessionTaskKind.PLAN_EXECUTION
+            )
+            if queued_count >= MAX_QUEUED_SESSION_TASKS:
+                raise ConfigurationError(
+                    f"at most {MAX_QUEUED_SESSION_TASKS} plan tasks may be queued"
+                )
+            task = SessionTask(
+                f"task-{uuid.uuid4().hex}",
+                SessionTaskKind.PLAN_EXECUTION,
+                SessionTaskStatus.QUEUED,
+                datetime.now(UTC),
+                plan_snapshot=plan,
+            )
+            await self._store.create_session_task(self._session_id, task)
+            return task
+
     @property
     def reasoning_effort(self) -> ReasoningEffort:
         return self._runtime.reasoning_effort
@@ -167,6 +214,8 @@ class AgentConversation:
         *,
         sink: EventSink | None = None,
         content_parts: Sequence[ContentPart] = (),
+        cancellation_policy: TurnCancellationPolicy = TurnCancellationPolicy.RETAIN,
+        turn_source: TurnSource = TurnSource.USER,
     ) -> AgentRunResult:
         async with self._turn_lock:
 
@@ -190,6 +239,8 @@ class AgentConversation:
                     source_model=self._source_model,
                     source_context_affinity=self._source_context_affinity,
                     session_id=self._session_id,
+                    cancellation_policy=cancellation_policy,
+                    turn_source=turn_source,
                 )
             except asyncio.CancelledError:
                 await self._reload_persisted_state()
@@ -201,14 +252,56 @@ class AgentConversation:
             self._session_id = result.session_id
             await self._reload_plan_state()
             await self._reload_provider_origin()
+            await self._reload_execution_record()
             return result
 
-    async def execute_plan(self, *, sink: EventSink | None = None) -> AgentRunResult:
+    async def run_background_wake(self, *, sink: EventSink | None = None) -> AgentRunResult:
+        """Run one model turn for pending background completions without a user prompt."""
+
+        return await self.run(
+            "",
+            sink=sink,
+            turn_source=TurnSource.BACKGROUND_TASK_AUTO_WAKE,
+        )
+
+    async def load_background_wake_state(self) -> BackgroundWakeState:
+        """Load the bounded wake ledger for the current durable session."""
+
+        if self._session_id is None:
+            return BackgroundWakeState()
+        return await self._store.load_background_wake_state(self._session_id)
+
+    async def save_background_wake_state(self, state: BackgroundWakeState) -> None:
+        """Persist the bounded wake ledger without retaining task output."""
+
+        if self._session_id is None:
+            return
+        await self._store.save_background_wake_state(self._session_id, state)
+
+    async def execute_plan(
+        self,
+        *,
+        sink: EventSink | None = None,
+        task_id: str | None = None,
+    ) -> AgentRunResult:
         """Record an explicit user handoff from a saved plan to one agent turn."""
 
         if self.plan is None:
             raise ConfigurationError("cannot execute a plan that has not been saved")
         async with self._turn_lock:
+            if task_id is not None:
+                if self._session_id is None:
+                    raise ConfigurationError("a session is required before running a plan task")
+                task = await self._store.get_session_task(self._session_id, task_id)
+                if task is None:
+                    raise ConfigurationError(f"unknown queued plan task: {task_id}")
+                if task.kind is not SessionTaskKind.PLAN_EXECUTION:
+                    raise ConfigurationError("only plan execution tasks can be started")
+                if task.status is not SessionTaskStatus.QUEUED:
+                    raise ConfigurationError(f"plan task {task_id} is not queued")
+                if task.plan_snapshot is None:
+                    raise ConfigurationError(f"plan task {task_id} has no saved plan snapshot")
+                self._runtime.set_plan(task.plan_snapshot)
 
             async def capture_session(event: AgentEvent) -> None:
                 if event.kind is AgentEventKind.SESSION_STARTED:
@@ -225,6 +318,7 @@ class AgentConversation:
                     PLAN_EXECUTION_PROMPT,
                     sink=capture_session,
                     plan_execution_requested=True,
+                    plan_execution_task_id=task_id,
                     initial_items=self._items,
                     source_provider=self._source_provider,
                     source_model=self._source_model,
@@ -241,7 +335,18 @@ class AgentConversation:
             self._session_id = result.session_id
             await self._reload_plan_state()
             await self._reload_provider_origin()
+            await self._reload_execution_record()
             return result
+
+    async def run_session_task(
+        self,
+        task_id: str,
+        *,
+        sink: EventSink | None = None,
+    ) -> AgentRunResult:
+        """Start one queued plan task after explicit user selection."""
+
+        return await self.execute_plan(sink=sink, task_id=task_id)
 
     async def _reload_persisted_state(self) -> None:
         if self._session_id is None:
@@ -249,6 +354,7 @@ class AgentConversation:
         self._items = tuple(await self._store.load_session_items(self._session_id))
         await self._reload_plan_state()
         await self._reload_provider_origin()
+        await self._reload_execution_record()
 
     async def _reload_plan_state(self) -> None:
         if self._session_id is None:
@@ -268,6 +374,12 @@ class AgentConversation:
         self._source_provider = summary.provider
         self._source_model = summary.model
         self._source_context_affinity = summary.context_affinity
+
+    async def _reload_execution_record(self) -> None:
+        if self._session_id is None:
+            self._execution_record = None
+            return
+        self._execution_record = await self._store.load_execution_record(self._session_id)
 
 
 __all__ = ["PLAN_EXECUTION_PROMPT", "AgentConversation"]

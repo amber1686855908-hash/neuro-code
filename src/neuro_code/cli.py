@@ -13,7 +13,7 @@ from neuro_code.application.ports.storage import SessionStore
 from neuro_code.application.runtime.supervision import ExecutionControlMode
 from neuro_code.application.settings import ApplicationSettings
 from neuro_code.domain.events import AgentEvent, AgentEventKind
-from neuro_code.domain.execution import AgentExecutionOutcome
+from neuro_code.domain.execution import AgentExecutionOutcome, SessionExecutionRecord
 from neuro_code.domain.instructions import InstructionDiscoveryResult
 from neuro_code.domain.messages import (
     ContextItemKind,
@@ -24,6 +24,7 @@ from neuro_code.domain.messages import (
 )
 from neuro_code.domain.reasoning import ReasoningEffort
 from neuro_code.domain.sandbox import SandboxProfile
+from neuro_code.domain.session_search import SessionSearchPage
 from neuro_code.domain.sessions import SessionSnapshot
 from neuro_code.domain.skills import SkillDiscoveryResult
 from neuro_code.permissions import (
@@ -502,6 +503,38 @@ def _serialized_execution_outcome(
     }
 
 
+def _serialized_execution_record(
+    record: SessionExecutionRecord | None,
+) -> dict[str, object] | None:
+    if record is None:
+        return None
+    outcome = _serialized_execution_outcome(record.outcome)
+    if outcome is None:
+        return None
+    outcome["completed_at"] = record.completed_at.isoformat()
+    return outcome
+
+
+async def _serialized_session_search_page(
+    page: SessionSearchPage,
+    store: SessionStore,
+) -> dict[str, object]:
+    """Serialize search results with the same safe execution projection as list."""
+
+    results: list[dict[str, object]] = []
+    for hit in page.results:
+        row = hit.to_dict()
+        row["last_execution"] = _serialized_execution_record(
+            await store.load_execution_record(hit.summary.id)
+        )
+        results.append(row)
+    return {
+        "results": results,
+        "next_offset": page.next_offset,
+        "total_estimate": page.total_estimate,
+    }
+
+
 def _provider_rows(config: AppConfig) -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
     for name, profile in config.providers.items():
@@ -573,7 +606,12 @@ async def _sessions_command(args: argparse.Namespace, services: CliServices) -> 
             include_content=args.include_content,
         )
         if args.json:
-            print(json.dumps(page.to_dict(), ensure_ascii=False))
+            print(
+                json.dumps(
+                    await _serialized_session_search_page(page, store),
+                    ensure_ascii=False,
+                )
+            )
         elif not page.results:
             print("No matching sessions found.")
         else:
@@ -613,7 +651,14 @@ async def _sessions_command(args: argparse.Namespace, services: CliServices) -> 
         )
     sessions = await store.list_sessions(limit=args.limit)
     if args.json:
-        print(json.dumps([session.to_dict() for session in sessions], ensure_ascii=False))
+        rows: list[dict[str, object]] = []
+        for session in sessions:
+            row: dict[str, object] = dict(session.to_dict())
+            row["last_execution"] = _serialized_execution_record(
+                await store.load_execution_record(session.id)
+            )
+            rows.append(row)
+        print(json.dumps(rows, ensure_ascii=False))
     elif not sessions:
         print("No sessions found.")
     else:

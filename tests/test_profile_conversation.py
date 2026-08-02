@@ -117,13 +117,55 @@ class FixtureConversation:
         self._session_id = self._session_id or "new-session"
         return AgentRunResult(self._session_id, "ok", self._items, (), (), 1)
 
-    async def execute_plan(self, *, sink: EventSink | None = None) -> AgentRunResult:
+    async def execute_plan(
+        self,
+        *,
+        sink: EventSink | None = None,
+        task_id: str | None = None,
+    ) -> AgentRunResult:
         del sink
+        del task_id
         if self._plan is None:
             raise ConfigurationError("cannot execute a plan that has not been saved")
         self.plan_execution_calls += 1
         self._session_id = self._session_id or "new-session"
         return AgentRunResult(self._session_id, "executed", self._items, (), (), 1, self._plan)
+
+    async def schedule_plan(self) -> SessionTask:
+        if self._plan is None:
+            raise ConfigurationError("cannot schedule a plan that has not been saved")
+        task = SessionTask(
+            f"task-queued-{len(self._session_tasks) + 1}",
+            SessionTaskKind.PLAN_EXECUTION,
+            SessionTaskStatus.QUEUED,
+            datetime.now(UTC),
+            plan_snapshot=self._plan,
+        )
+        self._session_tasks = (*self._session_tasks, task)
+        return task
+
+    async def run_session_task(
+        self,
+        task_id: str,
+        *,
+        sink: EventSink | None = None,
+    ) -> AgentRunResult:
+        task = await self.get_session_task(task_id)
+        if task is None or task.status is not SessionTaskStatus.QUEUED:
+            raise ConfigurationError("queued task is unavailable")
+        started = task.start(started_at=datetime.now(UTC))
+        self._session_tasks = tuple(
+            started if item.task_id == task_id else item for item in self._session_tasks
+        )
+        result = await self.execute_plan(sink=sink, task_id=task_id)
+        completed = started.finish(
+            SessionTaskStatus.COMPLETED,
+            finished_at=datetime.now(UTC),
+        )
+        self._session_tasks = tuple(
+            completed if item.task_id == task_id else item for item in self._session_tasks
+        )
+        return result
 
     async def list_session_tasks(self) -> tuple[SessionTask, ...]:
         return self._session_tasks
@@ -220,6 +262,27 @@ class ProfileConversationControllerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.response, "executed")
         self.assertEqual(runner.plan_execution_calls, 1)
         self.assertEqual(controller.plan, plan)
+
+    async def test_schedule_and_run_task_delegate_through_the_turn_lock(self) -> None:
+        plan = SessionPlan((PlanStep("Execute the queued change"),))
+        runner = FixtureConversation(session_id="profile-session", plan=plan)
+
+        async def bind(name: str) -> ConversationBinding:
+            return ConversationBinding(FixtureConversation(), FixtureProvider(name, "model"))
+
+        controller = ProfileConversationController(
+            options=(option("first"),),
+            selected_profile="first",
+            binding=ConversationBinding(runner, FixtureProvider("first", "first-model")),
+            binding_factory=bind,
+        )
+
+        queued = await controller.schedule_plan()
+        result = await controller.run_session_task(queued.task_id)
+
+        self.assertIs(queued.status, SessionTaskStatus.QUEUED)
+        self.assertEqual(runner.plan_execution_calls, 1)
+        self.assertEqual(result.response, "executed")
 
     async def test_session_task_listing_delegates_to_the_current_binding(self) -> None:
         task = SessionTask(

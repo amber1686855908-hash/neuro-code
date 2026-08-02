@@ -1,13 +1,21 @@
 """Provider-independent domain contracts."""
 
 from neuro_code.domain.background_tasks import (
+    DEFAULT_BACKGROUND_WAKE_COOLDOWN_SECONDS,
+    DEFAULT_BACKGROUND_WAKE_MAX_PER_SESSION,
     MAX_BACKGROUND_TASK_WAIT_IDS,
+    MAX_BACKGROUND_WAKE_COUNT,
+    MAX_BACKGROUND_WAKE_TASK_IDS,
     BackgroundTaskKillOutcome,
     BackgroundTaskKillResult,
     BackgroundTaskSnapshot,
     BackgroundTaskStatus,
     BackgroundTaskWaitMode,
     BackgroundTaskWaitResult,
+    BackgroundTaskWakePolicy,
+    BackgroundWakeDecision,
+    BackgroundWakeLimits,
+    BackgroundWakeState,
 )
 from neuro_code.domain.context_usage import estimate_context_tokens, estimate_text_tokens
 from neuro_code.domain.events import AgentEvent, AgentEventKind
@@ -46,6 +54,7 @@ from neuro_code.domain.plans import (
 from neuro_code.domain.reasoning import ReasoningEffort, reasoning_guidance
 from neuro_code.domain.session_search import SessionSearchHit, SessionSearchPage
 from neuro_code.domain.session_tasks import (
+    MAX_QUEUED_SESSION_TASKS,
     MAX_SESSION_TASK_ID_BYTES,
     SessionTask,
     SessionTaskKind,
@@ -65,10 +74,15 @@ from neuro_code.domain.tools import ToolDefinition, ToolResult
 from neuro_code.domain.ui_preferences import UiLanguage
 
 __all__ = [
+    "DEFAULT_BACKGROUND_WAKE_COOLDOWN_SECONDS",
+    "DEFAULT_BACKGROUND_WAKE_MAX_PER_SESSION",
     "MAX_BACKGROUND_TASK_WAIT_IDS",
+    "MAX_BACKGROUND_WAKE_COUNT",
+    "MAX_BACKGROUND_WAKE_TASK_IDS",
     "MAX_PLAN_COMMENTS",
     "MAX_PLAN_COMMENT_BYTES",
     "MAX_PLAN_COMMENT_ID_BYTES",
+    "MAX_QUEUED_SESSION_TASKS",
     "MAX_SESSION_TASK_ID_BYTES",
     "MAX_TERMINAL_DIMENSION",
     "MAX_TERMINAL_OUTPUT_BYTES",
@@ -82,6 +96,10 @@ __all__ = [
     "BackgroundTaskStatus",
     "BackgroundTaskWaitMode",
     "BackgroundTaskWaitResult",
+    "BackgroundTaskWakePolicy",
+    "BackgroundWakeDecision",
+    "BackgroundWakeLimits",
+    "BackgroundWakeState",
     "ContentPart",
     "ContentPartKind",
     "ContextItemKind",

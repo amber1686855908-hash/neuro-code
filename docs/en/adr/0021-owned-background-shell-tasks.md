@@ -34,8 +34,11 @@ starts.
 
 The model-facing contract is:
 
-- `bash` accepts optional `is_background`. `false` retains the foreground
-  timeout behavior; `true` returns a task ID immediately.
+- `bash` accepts optional `is_background`. `true` returns a task ID immediately;
+  when background management is enabled, an omitted or `false` value waits for
+  the foreground budget and promotes a still-running command to that same task
+  without restarting it. If the command finishes within the budget, its
+  terminal record is discarded and the result has normal foreground metadata.
 - An omitted background `timeout_seconds` means no tool-level deadline. A
   positive explicit value terminates the task after that interval.
 - `task_output` returns a non-blocking snapshot by default or waits for at most
@@ -78,8 +81,8 @@ application.
   [ADR 0022](0022-session-scoped-background-task-visibility.md), while explicit
   model-boundary completion metadata is defined by
   [ADR 0023](0023-model-visible-background-task-completion-reminders.md). Full
-  output files, model auto-wake, automatic foreground-to-background promotion,
-  and a shared subagent task namespace remain future slices.
+  output files and a shared subagent task namespace remain future slices;
+  automatic foreground-to-background promotion is defined by ADR 0062.
 - ACP PTY create/input/resize/ring-buffer/close behavior remains separate. It
   will build on the process-ownership boundary rather than changing this tool
   contract.

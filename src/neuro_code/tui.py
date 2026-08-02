@@ -5,6 +5,7 @@ import difflib
 import os
 import re
 import sys
+from collections import deque
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
@@ -43,9 +44,21 @@ from neuro_code.application.runtime.profile_conversation import (
     SessionSelectionResult,
 )
 from neuro_code.config import resolve_http_client_policy
-from neuro_code.domain.background_tasks import BackgroundTaskSnapshot, BackgroundTaskStatus
+from neuro_code.domain.background_tasks import (
+    BackgroundTaskSnapshot,
+    BackgroundTaskStatus,
+    BackgroundTaskWakePolicy,
+    BackgroundWakeDecision,
+    BackgroundWakeLimits,
+    BackgroundWakeState,
+)
 from neuro_code.domain.context_usage import estimate_context_tokens, estimate_text_tokens
 from neuro_code.domain.events import AgentEvent, AgentEventKind
+from neuro_code.domain.execution import (
+    AgentExecutionStatus,
+    SessionExecutionRecord,
+    TurnCancellationPolicy,
+)
 from neuro_code.domain.interaction_mode import InteractionMode
 from neuro_code.domain.messages import Message, Role, SessionItem
 from neuro_code.domain.plans import PlanComment, SessionPlan
@@ -60,7 +73,7 @@ from neuro_code.domain.provider_settings import (
     ManagedProxyPolicy,
 )
 from neuro_code.domain.reasoning import ReasoningEffort
-from neuro_code.domain.session_tasks import SessionTask
+from neuro_code.domain.session_tasks import SessionTask, SessionTaskKind, SessionTaskStatus
 from neuro_code.domain.sessions import SessionSummary
 from neuro_code.domain.ui_preferences import UiLanguage
 from neuro_code.shared.redaction import redact_sensitive_text
@@ -117,6 +130,8 @@ from neuro_code.tui_theme import (
 _RESTORED_MESSAGE_LIMIT = 20_000
 _TASK_LIST_LIMIT = 20
 _TASK_POLL_SECONDS = 0.5
+_MAX_QUEUED_INTERJECTIONS = 4
+_DEFAULT_BACKGROUND_WAKE_LIMITS = BackgroundWakeLimits()
 _TERMINAL_SIZE_POLL_SECONDS = 0.25
 _LOADING_ANIMATION_TICK_SECONDS = 0.05
 _COMMAND_HINT_LIMIT = 5
@@ -269,7 +284,19 @@ class ConversationRunner(Protocol):
     @property
     def session_id(self) -> str | None: ...
 
-    async def run(self, prompt: str, *, sink: EventSink | None = None) -> AgentRunResult: ...
+    async def run(
+        self,
+        prompt: str,
+        *,
+        sink: EventSink | None = None,
+        cancellation_policy: TurnCancellationPolicy = TurnCancellationPolicy.RETAIN,
+    ) -> AgentRunResult: ...
+
+    async def run_background_wake(self, *, sink: EventSink | None = None) -> AgentRunResult: ...
+
+    async def load_background_wake_state(self) -> BackgroundWakeState: ...
+
+    async def save_background_wake_state(self, state: BackgroundWakeState) -> None: ...
 
 
 class ApprovalController(Protocol):
@@ -320,8 +347,15 @@ class SessionController(Protocol):
     async def rename_session(self, title: str) -> SessionSummary: ...
 
 
+SessionSearchCallback = Callable[[str | None], Awaitable[tuple[SessionOption, ...]]]
+
+
 class TaskController(Protocol):
     async def list_background_tasks(self) -> tuple[BackgroundTaskSnapshot, ...]: ...
+
+    async def load_background_wake_state(self) -> BackgroundWakeState: ...
+
+    async def save_background_wake_state(self, state: BackgroundWakeState) -> None: ...
 
 
 class SessionTaskController(Protocol):
@@ -338,7 +372,21 @@ class PlanController(Protocol):
 
     async def list_plan_comments(self) -> tuple[PlanComment, ...]: ...
 
-    async def execute_plan(self, *, sink: EventSink | None = None) -> AgentRunResult: ...
+    async def schedule_plan(self) -> SessionTask: ...
+
+    async def execute_plan(
+        self,
+        *,
+        sink: EventSink | None = None,
+        task_id: str | None = None,
+    ) -> AgentRunResult: ...
+
+    async def run_session_task(
+        self,
+        task_id: str,
+        *,
+        sink: EventSink | None = None,
+    ) -> AgentRunResult: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -534,6 +582,11 @@ class SettingsScreen(ModalScreen[str | None]):
                     id="settings-category-network",
                     disabled=not self.provider_settings_available,
                 ),
+                Button(
+                    ui_text(self.language, "settings.category.background_wake"),
+                    id="settings-category-background-wake",
+                    disabled=not self.provider_settings_available,
+                ),
                 id="settings-categories",
             ),
             Static(ui_text(self.language, "settings.help"), id="settings-help"),
@@ -548,6 +601,7 @@ class SettingsScreen(ModalScreen[str | None]):
             "settings-category-language": "language",
             "settings-category-providers": "providers",
             "settings-category-network": "network",
+            "settings-category-background-wake": "background-wake",
         }
         category = categories.get(event.button.id or "")
         if category is not None:
@@ -847,6 +901,157 @@ class NetworkProxySettingsScreen(ModalScreen[ManagedProviderSettings | None]):
         self.dismiss(None)
 
 
+class BackgroundWakeSettingsScreen(ModalScreen[ManagedProviderSettings | None]):
+    """Edit the user-wide background-task wake default."""
+
+    CSS = """
+    BackgroundWakeSettingsScreen {
+        align: center middle;
+        background: $background 85%;
+    }
+
+    #background-wake-settings-dialog {
+        width: 82%;
+        max-width: 88;
+        height: auto;
+        padding: 1 2;
+        border: solid $border;
+        background: $surface;
+    }
+
+    #background-wake-settings-title {
+        text-style: bold;
+        color: $text-primary;
+        margin-bottom: 1;
+    }
+
+    #background-wake-settings-description,
+    #background-wake-settings-hint,
+    #background-wake-settings-error {
+        color: $text-muted;
+        margin-bottom: 1;
+    }
+
+    #background-wake-settings-error {
+        padding-left: 1;
+        border-left: tall $border-focus;
+        color: $text-primary;
+        text-style: bold;
+    }
+
+    #background-wake-settings-modes,
+    #background-wake-settings-actions {
+        height: auto;
+    }
+
+    #background-wake-settings-modes Button {
+        width: 1fr;
+        margin-right: 1;
+    }
+
+    #background-wake-settings-actions {
+        align-horizontal: right;
+    }
+
+    #background-wake-settings-actions Button {
+        margin-left: 1;
+    }
+    """
+    BINDINGS: ClassVar[list[BindingType]] = [
+        Binding("escape", "cancel", "Back", show=False),
+        Binding("ctrl+c", "cancel", "Back", show=False),
+    ]
+
+    def __init__(
+        self,
+        *,
+        language: UiLanguage,
+        provider_settings: ManagedProviderSettings,
+        provider_settings_store: ProviderSettingsStore,
+    ) -> None:
+        super().__init__()
+        self.language = language
+        self.provider_settings = provider_settings
+        self.provider_settings_store = provider_settings_store
+        self._active_policy = provider_settings.background_task_wake_policy
+
+    def compose(self) -> ComposeResult:
+        yield Vertical(
+            Label(
+                ui_text(self.language, "background_wake_settings.title"),
+                id="background-wake-settings-title",
+            ),
+            Static(
+                ui_text(self.language, "background_wake_settings.description"),
+                id="background-wake-settings-description",
+            ),
+            Label(ui_text(self.language, "background_wake_settings.default_policy")),
+            Horizontal(
+                Button(
+                    ui_text(self.language, "background_wake_settings.disabled"),
+                    id="background-wake-settings-disabled",
+                ),
+                Button(
+                    ui_text(self.language, "background_wake_settings.enabled"),
+                    id="background-wake-settings-enabled",
+                ),
+                id="background-wake-settings-modes",
+            ),
+            Static("", id="background-wake-settings-hint"),
+            Static("", id="background-wake-settings-error"),
+            Horizontal(
+                Button(ui_text(self.language, "settings.back"), id="background-wake-settings-back"),
+                Button(
+                    ui_text(self.language, "background_wake_settings.save"),
+                    id="background-wake-settings-save",
+                    variant="success",
+                ),
+                id="background-wake-settings-actions",
+            ),
+            id="background-wake-settings-dialog",
+        )
+
+    def on_mount(self) -> None:
+        self._select_policy(self._active_policy)
+        self.query_one(f"#background-wake-settings-{self._active_policy.value}", Button).focus()
+
+    async def on_button_pressed(self, event: Button.Pressed) -> None:
+        button_id = event.button.id or ""
+        if button_id in {"background-wake-settings-disabled", "background-wake-settings-enabled"}:
+            self._select_policy(
+                BackgroundTaskWakePolicy(button_id.removeprefix("background-wake-settings-"))
+            )
+        elif button_id == "background-wake-settings-save":
+            try:
+                settings = await self.provider_settings_store.save_background_task_wake_policy(
+                    self._active_policy
+                )
+            except Exception as error:
+                self.query_one("#background-wake-settings-error", Static).update(
+                    Text(f"{_ERROR_MARK} {error}", style=ERROR_TEXT_STYLE)
+                )
+                return
+            self.dismiss(settings)
+        elif button_id == "background-wake-settings-back":
+            self.dismiss(None)
+
+    def _select_policy(self, policy: BackgroundTaskWakePolicy) -> None:
+        self._active_policy = policy
+        for candidate in BackgroundTaskWakePolicy:
+            self.query_one(f"#background-wake-settings-{candidate.value}", Button).variant = (
+                "primary" if candidate is policy else "default"
+            )
+        self.query_one("#background-wake-settings-hint", Static).update(
+            ui_text(
+                self.language,
+                f"background_wake_settings.hint.{policy.value}",
+            )
+        )
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
 class ProviderSettingsScreen(ModalScreen[ProviderSettingsSubmission | None]):
     """Create and edit user-owned provider profiles on a focused detail screen."""
 
@@ -941,6 +1146,7 @@ class ProviderSettingsScreen(ModalScreen[ProviderSettingsSubmission | None]):
     #provider-settings-presets-row-one,
     #provider-settings-presets-row-two,
     #provider-settings-proxy-modes,
+    #provider-settings-wake-modes,
     #provider-settings-form,
     #provider-settings-actions {
         height: auto;
@@ -969,6 +1175,11 @@ class ProviderSettingsScreen(ModalScreen[ProviderSettingsSubmission | None]):
     }
 
     #provider-settings-proxy-modes Button {
+        width: 1fr;
+        margin-right: 1;
+    }
+
+    #provider-settings-wake-modes Button {
         width: 1fr;
         margin-right: 1;
     }
@@ -1012,6 +1223,7 @@ class ProviderSettingsScreen(ModalScreen[ProviderSettingsSubmission | None]):
         self._editing_profile: str | None = None
         self._active_preset = "openai"
         self._active_proxy_mode: str | None = None
+        self._active_background_wake_policy: BackgroundTaskWakePolicy | None = None
         self._delete_confirmation_for: str | None = None
         self._catalog_model_ids: dict[str, str] = {}
         self._profile_ids = {
@@ -1172,6 +1384,45 @@ class ProviderSettingsScreen(ModalScreen[ProviderSettingsSubmission | None]):
                         ),
                         id="provider-settings-proxy-hint",
                     ),
+                    Static(
+                        ui_text(
+                            self.language,
+                            "provider_settings.background_wake.title",
+                        ),
+                        id="provider-settings-background-wake-title",
+                    ),
+                    Horizontal(
+                        Button(
+                            ui_text(
+                                self.language,
+                                "provider_settings.background_wake.inherit",
+                            ),
+                            id="provider-settings-wake-inherit",
+                            variant="primary",
+                        ),
+                        Button(
+                            ui_text(
+                                self.language,
+                                "provider_settings.background_wake.disabled",
+                            ),
+                            id="provider-settings-wake-disabled",
+                        ),
+                        Button(
+                            ui_text(
+                                self.language,
+                                "provider_settings.background_wake.enabled",
+                            ),
+                            id="provider-settings-wake-enabled",
+                        ),
+                        id="provider-settings-wake-modes",
+                    ),
+                    Static(
+                        ui_text(
+                            self.language,
+                            "provider_settings.background_wake.hint",
+                        ),
+                        id="provider-settings-background-wake-hint",
+                    ),
                     Static("", id="provider-settings-connection-status"),
                     VerticalScroll(id="provider-settings-models"),
                     id="provider-settings-form",
@@ -1228,6 +1479,12 @@ class ProviderSettingsScreen(ModalScreen[ProviderSettingsSubmission | None]):
             selection = button_id.removeprefix("provider-settings-proxy-")
             self._select_proxy_mode(None if selection == "inherit" else selection)
             return
+        if button_id.startswith("provider-settings-wake-"):
+            selection = button_id.removeprefix("provider-settings-wake-")
+            self._select_background_wake_policy(
+                None if selection == "inherit" else BackgroundTaskWakePolicy(selection)
+            )
+            return
         if button_id == "provider-settings-new":
             self._new_profile()
             return
@@ -1267,6 +1524,7 @@ class ProviderSettingsScreen(ModalScreen[ProviderSettingsSubmission | None]):
         self._select_preset(self._preset_for_profile(profile), update_endpoint=False)
         self.query_one("#provider-settings-proxy-env", Input).value = profile.proxy_url_env or ""
         self._select_proxy_mode(profile.proxy_mode)
+        self._select_background_wake_policy(profile.background_task_wake_policy)
         self._reset_delete_confirmation()
         if not self.first_run:
             self.query_one("#provider-settings-delete", Button).disabled = False
@@ -1315,6 +1573,7 @@ class ProviderSettingsScreen(ModalScreen[ProviderSettingsSubmission | None]):
         self.query_one("#provider-settings-proxy-env", Input).value = ""
         self._select_preset("openai")
         self._select_proxy_mode(None)
+        self._select_background_wake_policy(None)
         self._reset_delete_confirmation()
         if not self.first_run:
             self.query_one("#provider-settings-delete", Button).disabled = True
@@ -1371,6 +1630,23 @@ class ProviderSettingsScreen(ModalScreen[ProviderSettingsSubmission | None]):
         return ui_text(
             self.language,
             f"network_settings.policy.{self.provider_settings.proxy_defaults.mode}",
+        )
+
+    def _select_background_wake_policy(
+        self,
+        policy: BackgroundTaskWakePolicy | None,
+    ) -> None:
+        self._active_background_wake_policy = policy
+        for candidate in (None, *BackgroundTaskWakePolicy):
+            name = "inherit" if candidate is None else candidate.value
+            self.query_one(f"#provider-settings-wake-{name}", Button).variant = (
+                "primary" if candidate is policy else "default"
+            )
+        self.query_one("#provider-settings-background-wake-hint", Static).update(
+            ui_text(
+                self.language,
+                "provider_settings.background_wake.hint",
+            )
         )
 
     def _draft_proxy_policy(self) -> ManagedProxyPolicy:
@@ -1584,6 +1860,7 @@ class ProviderSettingsScreen(ModalScreen[ProviderSettingsSubmission | None]):
                     proxy_policy.proxy_url_env if self._active_proxy_mode is not None else None
                 ),
                 api_key=api_key,
+                background_task_wake_policy=self._active_background_wake_policy,
             )
             existing = self.provider_settings.profile(name)
             if existing is None and api_key is None:
@@ -2109,6 +2386,10 @@ class SessionSelectionScreen(ModalScreen[str | None]):
         margin-bottom: 1;
     }
 
+    #session-search {
+        margin-bottom: 1;
+    }
+
     #session-options {
         height: 1fr;
     }
@@ -2134,14 +2415,30 @@ class SessionSelectionScreen(ModalScreen[str | None]):
         *,
         query: str | None = None,
         language: UiLanguage = UiLanguage.ENGLISH,
+        search_callback: SessionSearchCallback | None = None,
     ) -> None:
         super().__init__()
         self.options = options
         self.search_query = query
         self.language = language
+        self._search_callback = search_callback
+        self._search_generation = 0
+        self._search_ready = False
         self._choice_ids = {
             f"session-choice-{index}": option.session_id for index, option in enumerate(options)
         }
+
+    def _option_buttons(self) -> list[Button]:
+        return [
+            Button(
+                Text(self._label(option, self.language)),
+                id=f"session-choice-{index}",
+                variant="primary" if option.current else "default",
+                disabled=not option.selectable,
+                tooltip=option.session_id,
+            )
+            for index, option in enumerate(self.options)
+        ]
 
     @staticmethod
     def _label(
@@ -2182,16 +2479,6 @@ class SessionSelectionScreen(ModalScreen[str | None]):
         )
 
     def compose(self) -> ComposeResult:
-        buttons = [
-            Button(
-                Text(self._label(option, self.language)),
-                id=f"session-choice-{index}",
-                variant="primary" if option.current else "default",
-                disabled=not option.selectable,
-                tooltip=option.session_id,
-            )
-            for index, option in enumerate(self.options)
-        ]
         yield Vertical(
             Label(
                 Text(
@@ -2205,7 +2492,12 @@ class SessionSelectionScreen(ModalScreen[str | None]):
                 ),
                 id="session-title",
             ),
-            VerticalScroll(*buttons, id="session-options"),
+            Input(
+                value=self.search_query or "",
+                placeholder=ui_text(self.language, "session.search_placeholder"),
+                id="session-search",
+            ),
+            VerticalScroll(*self._option_buttons(), id="session-options"),
             Static(
                 ui_text(self.language, "session.help"),
                 id="session-help",
@@ -2214,6 +2506,10 @@ class SessionSelectionScreen(ModalScreen[str | None]):
         )
 
     def on_mount(self) -> None:
+        if self._search_callback is not None:
+            self._search_ready = True
+            self.query_one("#session-search", Input).focus()
+            return
         target: Button | None = None
         for index, option in enumerate(self.options):
             button = self.query_one(f"#session-choice-{index}", Button)
@@ -2222,6 +2518,65 @@ class SessionSelectionScreen(ModalScreen[str | None]):
                 break
             if target is None and not button.disabled:
                 target = button
+        if target is not None:
+            target.focus()
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        if (
+            event.input.id != "session-search"
+            or self._search_callback is None
+            or not self._search_ready
+        ):
+            return
+        self._search_generation += 1
+        generation = self._search_generation
+        self.run_worker(
+            self._refresh_search_results(event.value, generation),
+            name="session-search",
+            group="session-search",
+            exclusive=True,
+            exit_on_error=False,
+        )
+
+    async def _refresh_search_results(self, value: str, generation: int) -> None:
+        await asyncio.sleep(0.2)
+        callback = self._search_callback
+        if callback is None:
+            return
+        try:
+            options = await callback(value.strip() or None)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return
+        if generation != self._search_generation:
+            return
+        self.options = options
+        self._choice_ids = {
+            f"session-choice-{index}": option.session_id for index, option in enumerate(options)
+        }
+        title = self.query_one("#session-title", Label)
+        title.update(
+            Text(
+                ui_text(
+                    self.language,
+                    "session.search",
+                    query=value.strip(),
+                )
+                if value.strip()
+                else ui_text(self.language, "session.title")
+            )
+        )
+        options_widget = self.query_one("#session-options", VerticalScroll)
+        await options_widget.remove_children()
+        await options_widget.mount(*self._option_buttons())
+        target: Button | None = None
+        for index in range(len(options)):
+            button = self.query_one(f"#session-choice-{index}", Button)
+            if not button.disabled:
+                target = button
+                if options[index].current:
+                    break
         if target is not None:
             target.focus()
 
@@ -2518,12 +2873,15 @@ class NeuroCodeApp(App[None]):
         managed_provider_settings: ManagedProviderSettings | None = None,
         language: UiLanguage = UiLanguage.ENGLISH,
         initial_items: Sequence[SessionItem] = (),
+        execution_record: SessionExecutionRecord | None = None,
         provider_name: str,
         model_name: str,
         cwd: Path,
         reasoning_effort: ReasoningEffort = ReasoningEffort.HIGH,
         interaction_mode: InteractionMode = InteractionMode.NORMAL,
         context_window_tokens: int | None = None,
+        background_task_wake_policy: BackgroundTaskWakePolicy | None = None,
+        background_wake_limits: BackgroundWakeLimits = _DEFAULT_BACKGROUND_WAKE_LIMITS,
     ) -> None:
         if context_window_tokens is not None and context_window_tokens <= 0:
             raise ValueError("context window tokens must be positive")
@@ -2575,8 +2933,36 @@ class NeuroCodeApp(App[None]):
         self._provider_settings_store = provider_settings_store
         self._provider_catalog = provider_catalog
         self._managed_provider_settings = managed_provider_settings
+        if background_task_wake_policy is not None and not isinstance(
+            background_task_wake_policy, BackgroundTaskWakePolicy
+        ):
+            raise TypeError("background_task_wake_policy must be a BackgroundTaskWakePolicy")
+        if not isinstance(background_wake_limits, BackgroundWakeLimits):
+            raise TypeError("background_wake_limits must be a BackgroundWakeLimits")
+        selected_provider = (
+            provider_controller.selected_profile
+            if provider_controller is not None
+            else provider_name
+        )
+        self._background_task_wake_policy_override = background_task_wake_policy
+        self._background_task_wake_policy = (
+            background_task_wake_policy
+            if background_task_wake_policy is not None
+            else managed_provider_settings.effective_background_task_wake_policy(selected_provider)
+            if managed_provider_settings is not None
+            else BackgroundTaskWakePolicy.DISABLED
+        )
+        self._background_wake_limits = background_wake_limits
         self._language = language
         self._initial_items = tuple(initial_items)
+        runner_record = getattr(runner, "execution_record", None)
+        self._execution_record = (
+            execution_record
+            if execution_record is not None
+            else runner_record
+            if isinstance(runner_record, SessionExecutionRecord)
+            else None
+        )
         self._provider_name = provider_name
         self._model_name = model_name
         self._reasoning_effort = (
@@ -2609,6 +2995,11 @@ class NeuroCodeApp(App[None]):
         self._tool_feedback_by_call: dict[tuple[bool, str], ToolFeedbackState] = {}
         self._tool_feedback_by_entry: dict[int, ToolFeedbackState] = {}
         self._assistant_parts: list[str] = []
+        self._first_token_seen = False
+        self._queued_interjections: deque[str] = deque()
+        self._active_prompt: str | None = None
+        self._active_prompt_entry_index: int | None = None
+        self._turn_pristine_rewound = False
         self._pending_assistant: ConversationMessage | None = None
         self._reasoning_announced = False
         self._turn_completion: tuple[str, int] | None = None
@@ -2621,6 +3012,11 @@ class NeuroCodeApp(App[None]):
         self._loading_animation = CollapsingPulseAnimation()
         self._loading_animation_elapsed = 0.0
         self._announced_terminal_tasks: set[str] = set()
+        self._pending_auto_wake_tasks: set[str] = set()
+        self._background_wake_state = BackgroundWakeState()
+        self._background_wake_state_loaded = self._task_controller is None
+        self._background_wake_active = False
+        self._background_wake_task_ids: tuple[str, ...] = ()
         self._task_polling = False
 
     @property
@@ -2669,6 +3065,7 @@ class NeuroCodeApp(App[None]):
                 model=self._model_name,
                 cwd=self._cwd,
             )
+            self._write_recoverable_resume_notice(self._execution_record)
         else:
             self._write_ui_entry(
                 "system",
@@ -2728,7 +3125,12 @@ class NeuroCodeApp(App[None]):
             await self._dispatch_slash_command(prompt)
             return
         if self._turn_worker is not None and self._turn_worker.is_running:
-            self._write_ui_entry("error", "turn.running")
+            if not self._first_token_seen and self._pending_assistant is not None:
+                if not self._queue_interjection(prompt):
+                    event.input.value = prompt
+                    event.input.cursor_position = len(prompt)
+            else:
+                self._write_ui_entry("error", "turn.running")
             return
 
         self._submit_prompt(prompt)
@@ -2737,11 +3139,15 @@ class NeuroCodeApp(App[None]):
         if self._turn_worker is not None and self._turn_worker.is_running:
             self._write_ui_entry("error", "turn.running")
             return
+        self._active_prompt = prompt
+        self._active_prompt_entry_index = len(self._entries)
+        self._turn_pristine_rewound = False
         self._write_entry("user", prompt)
         self._context_used_tokens += 4 + estimate_text_tokens(prompt)
         self._context_usage_estimated = True
         self._refresh_runtime_bar()
         self._assistant_parts.clear()
+        self._first_token_seen = False
         self._reasoning_announced = False
         self._turn_completion = None
         self._terminal_execution_status = None
@@ -2756,6 +3162,72 @@ class NeuroCodeApp(App[None]):
             exclusive=True,
             exit_on_error=False,
         )
+
+    def _queue_interjection(self, prompt: str) -> bool:
+        if len(self._queued_interjections) >= _MAX_QUEUED_INTERJECTIONS:
+            self._write_ui_entry("error", "turn.interjection_limit")
+            return False
+        self._queued_interjections.append(prompt)
+        self._write_ui_entry("status", "turn.interjection_queued")
+        return True
+
+    def _start_next_interjection(self) -> None:
+        if (
+            self._turn_worker is not None and self._turn_worker.is_running
+        ) or not self._queued_interjections:
+            return
+        self._submit_prompt(self._queued_interjections.popleft())
+
+    def _restore_queued_interjections(self) -> None:
+        """Return every unsent interjection to the draft without auto-submitting it."""
+
+        if not self._queued_interjections:
+            return
+        queued = tuple(self._queued_interjections)
+        self._queued_interjections.clear()
+        prompt = self.query_one("#prompt", Input)
+        prompt.value = "\n\n".join((*queued, prompt.value)) if prompt.value else "\n\n".join(queued)
+        prompt.cursor_position = len(prompt.value)
+        self._write_ui_entry("status", "turn.interjections_restored", count=len(queued))
+
+    async def _restore_pristine_prompt(self) -> None:
+        prompt_text = self._active_prompt
+        if not prompt_text:
+            return
+        entry_index = self._active_prompt_entry_index
+        prompt = self.query_one("#prompt", Input)
+        if not prompt.value:
+            if entry_index is not None and 0 <= entry_index < len(self._entries):
+                entry = self._entries[entry_index]
+                if entry.category == "user" and entry.text == prompt_text:
+                    await self._remove_transcript_entry(entry_index)
+            prompt.value = prompt_text
+            prompt.cursor_position = len(prompt_text)
+            self._write_ui_entry("status", "turn.draft_restored")
+            return
+        self._write_ui_entry("status", "turn.draft_preserved")
+
+    async def _remove_transcript_entry(self, index: int) -> None:
+        if index < 0 or index >= len(self._entries):
+            return
+        widget = self._entry_widgets.pop(index)
+        self._entries.pop(index)
+        removed_state = self._tool_feedback_by_entry.pop(index, None)
+        if removed_state is not None:
+            self._tool_feedback_by_call.pop(
+                (removed_state.hosted, removed_state.call_id),
+                None,
+            )
+        shifted: dict[int, ToolFeedbackState] = {}
+        for entry_index, state in self._tool_feedback_by_entry.items():
+            if entry_index > index:
+                state.entry_index -= 1
+                shifted[entry_index - 1] = state
+            else:
+                shifted[entry_index] = state
+        self._tool_feedback_by_entry = shifted
+        if widget.parent is not None:
+            await widget.remove()
 
     def on_input_changed(self, event: Input.Changed) -> None:
         if event.input.id == "prompt" and event.input.screen is self.screen:
@@ -2796,7 +3268,18 @@ class NeuroCodeApp(App[None]):
         prompt.cursor_position = len(completed)
 
     async def _run_prompt(self, prompt: str) -> None:
-        await self._run_agent_turn(lambda: self._runner.run(prompt, sink=self._handle_event))
+        await self._run_agent_turn(
+            lambda: self._runner.run(
+                prompt,
+                sink=self._handle_event,
+                cancellation_policy=TurnCancellationPolicy.REWIND_PRISTINE,
+            )
+        )
+
+    async def _run_background_wake(self) -> None:
+        await self._run_agent_turn(
+            lambda: self._runner.run_background_wake(sink=self._handle_event)
+        )
 
     async def _run_plan_execution(self) -> None:
         controller = self._plan_controller
@@ -2805,13 +3288,26 @@ class NeuroCodeApp(App[None]):
             return
         await self._run_agent_turn(lambda: controller.execute_plan(sink=self._handle_event))
 
+    async def _run_queued_plan(self, task_id: str) -> None:
+        controller = self._plan_controller
+        if controller is None:
+            self._write_ui_entry("error", "plan.execution_unavailable")
+            return
+        await self._run_agent_turn(
+            lambda: controller.run_session_task(task_id, sink=self._handle_event)
+        )
+
     async def _run_agent_turn(
         self,
         run: Callable[[], Awaitable[AgentRunResult]],
     ) -> None:
         prompt_input = self.query_one("#prompt", Input)
+        completed = False
         try:
             result = await run()
+            if self._background_wake_active:
+                await self._complete_background_wake()
+            completed = True
             response = result.response or ui_text(self._language, "turn.no_response")
             if not self._turn_usage_reported:
                 self._context_used_tokens = (
@@ -2837,14 +3333,30 @@ class NeuroCodeApp(App[None]):
                 )
         except asyncio.CancelledError:
             await self._discard_pending_assistant()
+            if self._turn_pristine_rewound:
+                await self._restore_pristine_prompt()
+            self._restore_queued_interjections()
             self._write_ui_entry("status", "turn.cancelled")
             raise
         except Exception as error:
             await self._discard_pending_assistant()
+            self._restore_queued_interjections()
             self._write_entry("error", f"{type(error).__name__}: {error}")
         finally:
+            if self._background_wake_active:
+                self._background_wake_state = self._background_wake_state.abandon_wake(
+                    failed_at=datetime.now(UTC)
+                )
+                self._background_wake_active = False
+                self._background_wake_task_ids = ()
+                await self._persist_background_wake_state()
             self._stop_model_loading()
             prompt_input.focus()
+            if completed and self._queued_interjections:
+                self.call_after_refresh(self._start_next_interjection)
+            if completed or self._turn_pristine_rewound or self._active_prompt is not None:
+                self._active_prompt = None
+                self._active_prompt_entry_index = None
 
     async def _handle_event(self, event: AgentEvent) -> None:
         data = event.data
@@ -2852,6 +3364,8 @@ class NeuroCodeApp(App[None]):
             text = data.get("text")
             if isinstance(text, str):
                 self._finalizing = False
+                if text:
+                    self._first_token_seen = True
                 self._assistant_parts.append(text)
                 self._update_pending_assistant("".join(self._assistant_parts))
         elif event.kind is AgentEventKind.FINALIZING_STARTED:
@@ -2859,9 +3373,13 @@ class NeuroCodeApp(App[None]):
             pending = self._pending_assistant
             if pending is not None and not self._assistant_parts:
                 pending.update(self._render_model_loading())
-        elif event.kind is AgentEventKind.REASONING_DELTA and not self._reasoning_announced:
-            self._reasoning_announced = True
-            self._write_ui_entry("status", "turn.reasoning")
+        elif event.kind is AgentEventKind.REASONING_DELTA:
+            text = data.get("text")
+            if isinstance(text, str) and text:
+                self._first_token_seen = True
+            if not self._reasoning_announced:
+                self._reasoning_announced = True
+                self._write_ui_entry("status", "turn.reasoning")
         elif event.kind is AgentEventKind.MODEL_THINKING_COMPLETED:
             self._write_ui_entry(
                 "status",
@@ -2876,6 +3394,15 @@ class NeuroCodeApp(App[None]):
                 self._context_usage_estimated = data.get("estimated") is not False
                 self._turn_usage_reported = not self._context_usage_estimated
                 self._refresh_runtime_bar()
+        elif event.kind is AgentEventKind.BACKGROUND_TASK_COMPLETION_REMINDER:
+            raw_task_ids = data.get("task_ids")
+            if (
+                self._background_wake_active
+                and isinstance(raw_task_ids, Sequence)
+                and not isinstance(raw_task_ids, str | bytes)
+            ):
+                task_ids = tuple(task_id for task_id in raw_task_ids if isinstance(task_id, str))
+                self._background_wake_task_ids = task_ids
         elif event.kind is AgentEventKind.PROVIDER_ATTEMPT_FAILED:
             provider = self._field(data, "provider")
             message = self._field(data, "message")
@@ -2937,6 +3464,8 @@ class NeuroCodeApp(App[None]):
             else:
                 self._terminal_execution_status = None
                 self._terminal_execution_recoverable = False
+        elif event.kind is AgentEventKind.TURN_FAILED:
+            self._turn_pristine_rewound = data.get("pristine_rewound") is True
 
     def _handle_tool_feedback_event(self, event: AgentEvent) -> None:
         hosted = event.kind in {
@@ -3623,6 +4152,12 @@ class NeuroCodeApp(App[None]):
                 return
             await self._execute_plan()
             return
+        if command in {"schedule-plan", "queue-plan"}:
+            if arguments.strip():
+                self._write_ui_entry("error", "command.arguments", command=command)
+                return
+            await self._schedule_plan()
+            return
         if command == "mode":
             mode_value = arguments.strip()
             if not mode_value:
@@ -3681,8 +4216,18 @@ class NeuroCodeApp(App[None]):
                 return
             await self._show_tasks()
             return
+        if command in {"auto-wake", "autowake"}:
+            await self._apply_background_task_wake_policy(arguments)
+            return
         if command == "view-task":
             await self._show_session_task(arguments.strip())
+            return
+        if command == "run-task":
+            task_id = arguments.strip()
+            if not task_id or " " in task_id:
+                self._write_ui_entry("error", "tasks.run.usage")
+                return
+            await self._run_queued_task(task_id)
             return
         if command in {"setting", "settings"}:
             if arguments.strip():
@@ -3727,6 +4272,55 @@ class NeuroCodeApp(App[None]):
         else:
             self._write_ui_entry("error", "command.unknown", command=command)
 
+    async def _apply_background_task_wake_policy(self, arguments: str) -> None:
+        value = arguments.strip().casefold()
+        if not value:
+            self._write_ui_entry(
+                "system",
+                "background_wake.current",
+                policy=self._background_task_wake_policy_label(),
+            )
+            return
+        policy_values = {
+            "on": BackgroundTaskWakePolicy.ENABLED,
+            "enabled": BackgroundTaskWakePolicy.ENABLED,
+            "off": BackgroundTaskWakePolicy.DISABLED,
+            "disabled": BackgroundTaskWakePolicy.DISABLED,
+        }
+        policy = policy_values.get(value)
+        if policy is None:
+            self._write_ui_entry(
+                "error",
+                "background_wake.invalid",
+                value=value,
+            )
+            return
+        if (
+            policy is self._background_task_wake_policy
+            and policy is self._background_task_wake_policy_override
+        ):
+            self._write_ui_entry(
+                "status",
+                "background_wake.already_selected",
+                policy=self._background_task_wake_policy_label(),
+            )
+            return
+        self._background_task_wake_policy_override = policy
+        self._background_task_wake_policy = policy
+        self._write_ui_entry(
+            "status",
+            "background_wake.changed",
+            policy=self._background_task_wake_policy_label(),
+        )
+        if policy is BackgroundTaskWakePolicy.ENABLED:
+            await self._poll_background_tasks()
+
+    def _background_task_wake_policy_label(self) -> str:
+        return ui_text(
+            self._language,
+            f"background_wake.policy.{self._background_task_wake_policy.value}",
+        )
+
     def action_clear_transcript(self) -> None:
         transcript = self.query_one("#transcript", VerticalScroll)
         transcript.remove_children(tuple(self._entry_widgets))
@@ -3734,6 +4328,7 @@ class NeuroCodeApp(App[None]):
         self._entry_widgets.clear()
         self._tool_feedback_by_call.clear()
         self._tool_feedback_by_entry.clear()
+        self._queued_interjections.clear()
         self._write_ui_entry("system", "transcript.cleared")
 
     def action_cancel_turn(self) -> None:
@@ -3755,6 +4350,7 @@ class NeuroCodeApp(App[None]):
                 SettingsScreen,
                 LanguageSettingsScreen,
                 NetworkProxySettingsScreen,
+                BackgroundWakeSettingsScreen,
                 ProviderSettingsScreen,
             ),
         ):
@@ -3830,6 +4426,18 @@ class NeuroCodeApp(App[None]):
                 ),
                 self._network_proxy_settings_selected,
             )
+            return
+        if category == "background-wake":
+            if self._managed_provider_settings is None or self._provider_settings_store is None:
+                return
+            self.push_screen(
+                BackgroundWakeSettingsScreen(
+                    language=self._language,
+                    provider_settings=self._managed_provider_settings,
+                    provider_settings_store=self._provider_settings_store,
+                ),
+                self._background_wake_settings_selected,
+            )
 
     async def _provider_settings_selected(
         self,
@@ -3841,6 +4449,15 @@ class NeuroCodeApp(App[None]):
         await self.action_open_settings()
 
     async def _network_proxy_settings_selected(
+        self,
+        settings: ManagedProviderSettings | None,
+    ) -> None:
+        if settings is not None:
+            self.exit(return_code=TUI_RELOAD_PROVIDER_SETTINGS)
+            return
+        await self.action_open_settings()
+
+    async def _background_wake_settings_selected(
         self,
         settings: ManagedProviderSettings | None,
     ) -> None:
@@ -3979,6 +4596,7 @@ class NeuroCodeApp(App[None]):
             return
         self._write_ui_entry("user", "plan.execution_user")
         self._assistant_parts.clear()
+        self._first_token_seen = False
         self._reasoning_announced = False
         self._turn_completion = None
         self._terminal_execution_status = None
@@ -3989,6 +4607,68 @@ class NeuroCodeApp(App[None]):
         self._turn_worker = self.run_worker(
             self._run_plan_execution(),
             name="agent-plan-execution",
+            group="agent",
+            exclusive=True,
+            exit_on_error=False,
+        )
+
+    async def _schedule_plan(self) -> None:
+        controller = self._plan_controller
+        if controller is None:
+            self._write_ui_entry("error", "plan.execution_unavailable")
+            return
+        if controller.plan is None:
+            self._write_ui_entry("status", "plan.none")
+            return
+        if self._turn_worker is not None and self._turn_worker.is_running:
+            self._write_ui_entry("error", "turn.running")
+            return
+        try:
+            task = await controller.schedule_plan()
+        except Exception as error:
+            self._write_entry("error", f"{type(error).__name__}: {error}")
+            return
+        self._write_ui_entry("status", "plan.scheduled", task_id=task.task_id)
+
+    async def _run_queued_task(self, task_id: str) -> None:
+        controller = self._plan_controller
+        task_controller = self._session_task_controller
+        if controller is None or task_controller is None:
+            self._write_ui_entry("error", "plan.execution_unavailable")
+            return
+        if self._turn_worker is not None and self._turn_worker.is_running:
+            self._write_ui_entry("error", "turn.running")
+            return
+        try:
+            task = await task_controller.get_session_task(task_id)
+        except Exception as error:
+            self._write_entry("error", f"{type(error).__name__}: {error}")
+            return
+        if task is None:
+            self._write_ui_entry("error", "tasks.run.not_found", task_id=task_id)
+            return
+        if task.kind is not SessionTaskKind.PLAN_EXECUTION:
+            self._write_ui_entry("error", "tasks.run.not_plan", task_id=task_id)
+            return
+        if task.status is not SessionTaskStatus.QUEUED:
+            self._write_ui_entry("error", "tasks.run.not_queued", task_id=task_id)
+            return
+        await self._apply_interaction_mode(InteractionMode.ACCEPT_EDITS)
+        if self._interaction_mode is not InteractionMode.ACCEPT_EDITS:
+            return
+        self._write_ui_entry("user", "plan.task_execution_user", task_id=task_id)
+        self._assistant_parts.clear()
+        self._first_token_seen = False
+        self._reasoning_announced = False
+        self._turn_completion = None
+        self._terminal_execution_status = None
+        self._terminal_execution_recoverable = False
+        self._finalizing = False
+        self._turn_usage_reported = False
+        self._begin_pending_assistant()
+        self._turn_worker = self.run_worker(
+            self._run_queued_plan(task_id),
+            name="agent-queued-plan-execution",
             group="agent",
             exclusive=True,
             exit_on_error=False,
@@ -4071,6 +4751,14 @@ class NeuroCodeApp(App[None]):
 
         self._provider_name = result.provider_name
         self._model_name = result.model_name
+        if self._background_task_wake_policy_override is None:
+            self._background_task_wake_policy = (
+                self._managed_provider_settings.effective_background_task_wake_policy(
+                    result.profile_name
+                )
+                if self._managed_provider_settings is not None
+                else BackgroundTaskWakePolicy.DISABLED
+            )
         if self._plan_controller is not None:
             self._plan = self._plan_controller.plan
         self._context_window_tokens = result.context_window_tokens
@@ -4079,7 +4767,9 @@ class NeuroCodeApp(App[None]):
             self._context_usage_estimated = True
         self._refresh_runtime_bar()
         if result.changed:
+            self._queued_interjections.clear()
             self._reset_background_task_tracking()
+            await self._ensure_background_wake_state()
         if not result.changed:
             self._write_ui_entry(
                 "status",
@@ -4137,7 +4827,12 @@ class NeuroCodeApp(App[None]):
                 )
             return
         self.push_screen(
-            SessionSelectionScreen(options, query=query, language=self._language),
+            SessionSelectionScreen(
+                options,
+                query=query,
+                language=self._language,
+                search_callback=self._session_controller.list_sessions,
+            ),
             self._session_selected,
         )
 
@@ -4189,8 +4884,11 @@ class NeuroCodeApp(App[None]):
             )
             return
 
+        self._queued_interjections.clear()
         self._reset_background_task_tracking()
+        await self._ensure_background_wake_state()
         self._replace_transcript(result.items)
+        self._execution_record = self._session_execution_record()
         profile_note = (
             ui_text(
                 self._language,
@@ -4224,6 +4922,7 @@ class NeuroCodeApp(App[None]):
             previous=previous_note,
             stopped=self._stopped_task_note(result.stopped_background_tasks),
         )
+        self._write_recoverable_resume_notice(self._execution_record)
 
     async def _add_plan_comment(self, arguments: str) -> None:
         controller = self._plan_controller
@@ -4395,28 +5094,152 @@ class NeuroCodeApp(App[None]):
             return
         self._task_polling = True
         try:
+            await self._ensure_background_wake_state()
+            if not self._background_wake_state_loaded:
+                return
             snapshots = await self._task_controller.list_background_tasks()
         except Exception:
             return
         finally:
             self._task_polling = False
 
+        pending_completion_ids = {
+            snapshot.task_id
+            for snapshot in snapshots
+            if snapshot.status.terminal and not snapshot.completion_reported
+        }
+        reconciled = self._background_wake_state.reconcile_visible_tasks(pending_completion_ids)
+        if reconciled != self._background_wake_state:
+            self._background_wake_state = reconciled
+            self._pending_auto_wake_tasks.intersection_update(
+                self._background_wake_state.pending_task_ids
+            )
+
         for snapshot in snapshots:
             if not snapshot.status.terminal:
                 continue
-            if snapshot.task_id in self._announced_terminal_tasks:
-                continue
-            self._announced_terminal_tasks.add(snapshot.task_id)
-            category = (
-                "status"
-                if snapshot.status
-                in {BackgroundTaskStatus.COMPLETED, BackgroundTaskStatus.CANCELLED}
-                else "error"
-            )
-            self._write_entry(category, self._task_completion_message(snapshot))
+            if snapshot.task_id not in self._announced_terminal_tasks:
+                self._announced_terminal_tasks.add(snapshot.task_id)
+                category = (
+                    "status"
+                    if snapshot.status
+                    in {BackgroundTaskStatus.COMPLETED, BackgroundTaskStatus.CANCELLED}
+                    else "error"
+                )
+                self._write_entry(category, self._task_completion_message(snapshot))
+                self._background_wake_state = self._background_wake_state.record_terminal_task(
+                    snapshot.task_id,
+                    enqueue=(
+                        self._background_task_wake_policy is BackgroundTaskWakePolicy.ENABLED
+                        and not snapshot.completion_reported
+                    ),
+                )
+            if snapshot.task_id in self._background_wake_state.pending_task_ids:
+                self._pending_auto_wake_tasks.add(snapshot.task_id)
+
+        await self._persist_background_wake_state()
+
+        if (
+            self._background_task_wake_policy is BackgroundTaskWakePolicy.ENABLED
+            and self._pending_auto_wake_tasks
+            and not (self._turn_worker is not None and self._turn_worker.is_running)
+        ):
+            await self._start_background_wake()
+
+    async def _ensure_background_wake_state(self) -> None:
+        if self._background_wake_state_loaded:
+            return
+        controller = self._task_controller
+        if controller is None:
+            self._background_wake_state_loaded = True
+            return
+        try:
+            state = await controller.load_background_wake_state()
+        except Exception:
+            self._background_wake_state = BackgroundWakeState()
+            self._background_wake_state_loaded = True
+            return
+        recovered = state.recover_after_restart()
+        self._background_wake_state = recovered
+        self._announced_terminal_tasks = set(recovered.announced_task_ids)
+        self._pending_auto_wake_tasks.clear()
+        self._background_wake_state_loaded = True
+        if recovered != state:
+            await self._persist_background_wake_state()
+
+    async def _persist_background_wake_state(self) -> None:
+        controller = self._task_controller
+        if controller is None or not self._background_wake_state_loaded:
+            return
+        try:
+            await controller.save_background_wake_state(self._background_wake_state)
+        except Exception:
+            # Wake bookkeeping must never make a task poll or user turn fail.
+            return
 
     def _reset_background_task_tracking(self) -> None:
         self._announced_terminal_tasks.clear()
+        self._pending_auto_wake_tasks.clear()
+        self._background_wake_state = BackgroundWakeState()
+        self._background_wake_state_loaded = self._task_controller is None
+        self._background_wake_active = False
+        self._background_wake_task_ids = ()
+
+    async def _start_background_wake(self) -> None:
+        if self._turn_worker is not None and self._turn_worker.is_running:
+            return
+        if not self._pending_auto_wake_tasks:
+            return
+        now = datetime.now(UTC)
+        decision = self._background_wake_state.decision(
+            now,
+            limits=self._background_wake_limits,
+        )
+        if decision is not BackgroundWakeDecision.ALLOW:
+            return
+        self._background_wake_state = self._background_wake_state.begin_wake(
+            now,
+            limits=self._background_wake_limits,
+        )
+        await self._persist_background_wake_state()
+        self._pending_auto_wake_tasks.clear()
+        self._background_wake_active = True
+        self._background_wake_task_ids = ()
+        self._assistant_parts.clear()
+        self._first_token_seen = False
+        self._reasoning_announced = False
+        self._turn_completion = None
+        self._terminal_execution_status = None
+        self._terminal_execution_recoverable = False
+        self._finalizing = False
+        self._turn_usage_reported = False
+        self._begin_pending_assistant()
+        self._write_ui_entry("status", "background_wake.started")
+        self._turn_worker = self.run_worker(
+            self._run_background_wake(),
+            name="background-auto-wake",
+            group="agent",
+            exclusive=True,
+            exit_on_error=False,
+        )
+
+    async def _complete_background_wake(self) -> None:
+        """Commit wake consumption only after the model turn completed successfully."""
+
+        task_ids = self._background_wake_task_ids
+        if not task_ids:
+            self._background_wake_state = self._background_wake_state.abandon_wake(
+                failed_at=datetime.now(UTC)
+            )
+        else:
+            self._background_wake_state = self._background_wake_state.complete_wake(
+                task_ids,
+                completed_at=datetime.now(UTC),
+            )
+            self._pending_auto_wake_tasks.difference_update(task_ids)
+        self._background_wake_active = False
+        self._background_wake_task_ids = ()
+        await self._persist_background_wake_state()
 
     def _task_summary(self, snapshot: BackgroundTaskSnapshot) -> str:
         exit_note = (
@@ -4488,6 +5311,27 @@ class NeuroCodeApp(App[None]):
         if count == 1:
             return ui_text(self._language, "tasks.stopped_one")
         return ui_text(self._language, "tasks.stopped_many", count=count)
+
+    def _session_execution_record(self) -> SessionExecutionRecord | None:
+        controller = self._session_controller
+        if controller is None:
+            return None
+        record = getattr(controller, "execution_record", None)
+        return record if isinstance(record, SessionExecutionRecord) else None
+
+    def _write_recoverable_resume_notice(
+        self,
+        record: SessionExecutionRecord | None,
+    ) -> None:
+        if record is None or not record.outcome.recoverable:
+            return
+        key_by_status = {
+            AgentExecutionStatus.STUCK: "session.stuck_recoverable",
+            AgentExecutionStatus.BUDGET_LIMITED: "session.budget_limited_recoverable",
+        }
+        key = key_by_status.get(record.outcome.status)
+        if key is not None:
+            self._write_ui_entry("recoverable", key)
 
     def _replace_transcript(self, items: Sequence[SessionItem]) -> None:
         transcript = self.query_one("#transcript", VerticalScroll)
@@ -4989,6 +5833,7 @@ __all__ = [
     "TUI_RELOAD_PROVIDER_SETTINGS",
     "ApprovalController",
     "AssistantMarkdown",
+    "BackgroundWakeSettingsScreen",
     "ConversationMessage",
     "ConversationRunner",
     "LanguageSettingsScreen",

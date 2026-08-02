@@ -5,6 +5,8 @@ from datetime import UTC, datetime
 
 from neuro_code.application.runtime.background_task_reminders import (
     BACKGROUND_TASK_COMPLETION_BATCH_LIMIT,
+    BACKGROUND_TASK_COMPLETION_OUTPUT_PREVIEW_LIMIT,
+    BACKGROUND_TASK_COMPLETION_OUTPUT_TOTAL_LIMIT,
     format_background_task_completion_reminder,
 )
 from neuro_code.domain.background_tasks import BackgroundTaskSnapshot, BackgroundTaskStatus
@@ -47,6 +49,72 @@ class BackgroundTaskReminderTests(unittest.TestCase):
         self.assertNotIn("private command", reminder)
         self.assertNotIn("private output", reminder)
         self.assertNotIn("/private/workspace", reminder)
+
+    def test_output_preview_is_opt_in_bounded_and_redacted(self) -> None:
+        output = "safe output " + ("x" * (BACKGROUND_TASK_COMPLETION_OUTPUT_PREVIEW_LIMIT + 100))
+        completion = BackgroundTaskSnapshot(
+            task_id="task-preview",
+            command="private command",
+            cwd="/private/workspace",
+            status=BackgroundTaskStatus.COMPLETED,
+            output=output + " super-secret",
+            total_output_bytes=len(output) + len(" super-secret"),
+            truncated=False,
+            exit_code=0,
+            started_at=datetime(2026, 7, 18, 12, 0, tzinfo=UTC),
+            finished_at=datetime(2026, 7, 18, 12, 0, tzinfo=UTC),
+        )
+
+        reminder = format_background_task_completion_reminder(
+            (completion,),
+            include_output=True,
+            redaction_values=("super-secret",),
+            task_output_tool=None,
+        )
+
+        self.assertIn("untrusted task evidence", reminder)
+        self.assertIn('"output_preview":', reminder)
+        self.assertIn('"output_preview_truncated":true', reminder)
+        self.assertNotIn("super-secret", reminder)
+        self.assertNotIn("private command", reminder)
+        self.assertNotIn("/private/workspace", reminder)
+        payload = next(line for line in reminder.splitlines() if '"task_id":"task-preview"' in line)
+        encoded_preview = payload.split('"output_preview":"', 1)[1].split('"', 1)[0]
+        self.assertLessEqual(len(encoded_preview.encode("utf-8")), 2_048)
+
+    def test_output_preview_has_a_bounded_batch_total(self) -> None:
+        timestamp = datetime(2026, 7, 18, 12, 0, tzinfo=UTC)
+        completions = tuple(
+            BackgroundTaskSnapshot(
+                task_id=f"task-{index}",
+                command="private command",
+                cwd="/private/workspace",
+                status=BackgroundTaskStatus.COMPLETED,
+                output="o" * 2_048,
+                total_output_bytes=2_048,
+                truncated=False,
+                exit_code=0,
+                started_at=timestamp,
+                finished_at=timestamp,
+            )
+            for index in range(6)
+        )
+
+        reminder = format_background_task_completion_reminder(
+            completions,
+            include_output=True,
+            task_output_tool=None,
+        )
+        previews = [
+            line.split('"output_preview":"', 1)[1].split('"', 1)[0]
+            for line in reminder.splitlines()
+            if '"output_preview":"' in line
+        ]
+        self.assertEqual(len(previews), len(completions))
+        self.assertLessEqual(
+            sum(len(preview.encode("utf-8")) for preview in previews),
+            BACKGROUND_TASK_COMPLETION_OUTPUT_TOTAL_LIMIT,
+        )
 
     def test_invalid_batches_fail_before_rendering(self) -> None:
         with self.assertRaisesRegex(ValueError, "at least one"):

@@ -33,12 +33,15 @@ from neuro_code.application.runtime.supervision import (
 from neuro_code.domain.background_tasks import BackgroundTaskSnapshot, BackgroundTaskStatus
 from neuro_code.domain.events import AgentEvent, AgentEventKind
 from neuro_code.domain.execution import (
+    AgentExecutionOutcome,
     AgentExecutionStatus,
     ExecutionBudget,
     ProgressKind,
+    SessionExecutionRecord,
     SupervisorDecision,
     SupervisorDecisionKind,
     SupervisorReasonCode,
+    TurnSource,
 )
 from neuro_code.domain.interaction_mode import InteractionMode
 from neuro_code.domain.messages import (
@@ -47,6 +50,7 @@ from neuro_code.domain.messages import (
     Message,
     PreservedContextItem,
     Role,
+    SessionItem,
     ToolCall,
 )
 from neuro_code.domain.model_context import UPSTREAM_IMPORT_PROVIDER, ModelContext
@@ -1113,6 +1117,123 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
             [item.task_id for item in await manager.pending_completions()],
             ["task-20"],
         )
+
+    async def test_background_auto_wake_injects_redacted_bounded_output_once(self) -> None:
+        timestamp = datetime(2026, 7, 18, 12, 0, tzinfo=UTC)
+        snapshot = BackgroundTaskSnapshot(
+            task_id="task-auto-wake",
+            command="private command",
+            cwd="/private/workspace",
+            status=BackgroundTaskStatus.COMPLETED,
+            output="safe completion output with private output",
+            total_output_bytes=43,
+            truncated=False,
+            exit_code=0,
+            started_at=timestamp,
+            finished_at=timestamp,
+        )
+        manager = FixtureCompletionManager((snapshot,))
+        provider = ScriptedProvider(
+            ((ModelTextDelta("Reported the completion."), ModelCompleted("stop")),)
+        )
+        runtime = AgentRuntime(
+            provider=provider,
+            tools=ToolRegistry(),
+            workspace_change_observer=EmptyWorkspaceChangeObserver(),
+            permissions=PermissionManager(),
+            tool_context=ToolContext(
+                Path("/workspace"),
+                background_tasks=manager.as_manager(),
+                redaction_values=("private output",),
+            ),
+        )
+
+        result = await runtime.run("", turn_source=TurnSource.BACKGROUND_TASK_AUTO_WAKE)
+
+        reminders = [
+            message.content
+            for message in provider.calls[0].messages
+            if "<background-task-completions>" in message.content
+        ]
+        self.assertEqual(len(reminders), 1)
+        self.assertIn('"output_preview":', reminders[0])
+        self.assertIn("safe completion output", reminders[0])
+        self.assertIn("untrusted task evidence", reminders[0])
+        self.assertNotIn("private output", reminders[0])
+        self.assertNotIn("private command", reminders[0])
+        self.assertNotIn("/private/workspace", reminders[0])
+        self.assertEqual(await manager.pending_completions(), ())
+        self.assertNotIn(
+            "<background-task-completions>",
+            "\n".join(item.content for item in result.items if isinstance(item, Message)),
+        )
+
+    async def test_auto_wake_does_not_replace_a_previous_recoverable_execution_record(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = SqliteSessionStore(root / "sessions.db")
+            await store.initialize()
+            session_id = await store.create_session(str(root), "fixture", "fixture-model")
+            previous_event = AgentEvent.create(1, AgentEventKind.TURN_COMPLETED, {"step": 1})
+            await store.append_event(session_id, previous_event)
+            previous = SessionExecutionRecord(
+                AgentExecutionOutcome(
+                    AgentExecutionStatus.STUCK,
+                    SupervisorReasonCode.PERIODIC_CYCLE,
+                    finalized=True,
+                    recoverable=True,
+                ),
+                previous_event.sequence,
+                previous_event.created_at,
+            )
+            await store.save_execution_record(session_id, previous)
+            manager = FixtureCompletionManager((completion_snapshot("task-wake"),))
+            runtime = AgentRuntime(
+                provider=ScriptedProvider(
+                    ((ModelTextDelta("reported completion"), ModelCompleted("stop")),)
+                ),
+                tools=ToolRegistry(),
+                workspace_change_observer=EmptyWorkspaceChangeObserver(),
+                permissions=PermissionManager(),
+                tool_context=ToolContext(root, background_tasks=manager.as_manager()),
+                session_store=store,
+            )
+
+            await runtime.run(
+                "", session_id=session_id, turn_source=TurnSource.BACKGROUND_TASK_AUTO_WAKE
+            )
+
+            self.assertEqual(await store.load_execution_record(session_id), previous)
+
+    async def test_completion_reminder_is_not_reinjected_after_the_manager_acknowledges_it(
+        self,
+    ) -> None:
+        manager = FixtureCompletionManager((completion_snapshot("task-once"),))
+        provider = ScriptedProvider(
+            (
+                (
+                    ModelToolCall(ToolCall("inspect", "inspect", {})),
+                    ModelCompleted("tool_calls"),
+                ),
+                (ModelTextDelta("done"), ModelCompleted("stop")),
+            )
+        )
+        runtime = AgentRuntime(
+            provider=provider,
+            tools=MinimalToolCollection((CollectionFixtureTool("inspect", "evidence"),)),
+            workspace_change_observer=EmptyWorkspaceChangeObserver(),
+            permissions=PermissionManager(),
+            tool_context=ToolContext(Path("/workspace"), background_tasks=manager.as_manager()),
+        )
+
+        await runtime.run("inspect completion")
+
+        first_context = "\n".join(message.content for message in provider.calls[0].messages)
+        second_context = "\n".join(message.content for message in provider.calls[1].messages)
+        self.assertIn("<background-task-completions>", first_context)
+        self.assertNotIn("<background-task-completions>", second_context)
 
     async def test_completion_during_tool_step_is_reported_at_next_model_boundary(
         self,
@@ -2439,6 +2560,134 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 kinds.index(AgentEventKind.TURN_COMPLETED),
             )
 
+    async def test_controlled_terminal_outcome_is_persisted_with_its_completion_event(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = SqliteSessionStore(root / "sessions.db")
+            await store.initialize()
+            tool = CollectionFixtureTool("inspect", "evidence")
+            provider = ScriptedProvider(
+                (
+                    (
+                        ModelToolCall(ToolCall("inspect-1", "inspect", {})),
+                        ModelCompleted("tool_calls"),
+                    ),
+                    (ModelTextDelta("durable summary"), ModelCompleted("stop")),
+                )
+            )
+            runtime = AgentRuntime(
+                provider=provider,
+                tools=MinimalToolCollection((tool,)),
+                workspace_change_observer=EmptyWorkspaceChangeObserver(),
+                permissions=PermissionManager(),
+                tool_context=ToolContext(root),
+                session_store=store,
+                supervisor_factory=observing_supervisor_factory(
+                    observation_budget(max_model_calls=2, finalizer_model_calls=1)
+                ),
+                execution_control_mode=ExecutionControlMode.FINALIZE_TERMINAL,
+            )
+
+            result = await runtime.run("inspect")
+
+            assert result.session_id is not None
+            assert result.outcome is not None
+            completed = next(
+                event for event in result.events if event.kind is AgentEventKind.TURN_COMPLETED
+            )
+            self.assertEqual(
+                await store.load_execution_record(result.session_id),
+                SessionExecutionRecord(result.outcome, completed.sequence, completed.created_at),
+            )
+
+    async def test_terminal_event_is_delivered_after_finalize_turn_commits(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = SqliteSessionStore(root / "sessions.db")
+            await store.initialize()
+            session_id = await store.create_session(str(root), "fixture", "fixture-model")
+            observations: list[tuple[bool, bool, int]] = []
+
+            async def observe(event: AgentEvent) -> None:
+                if event.kind is not AgentEventKind.TURN_COMPLETED:
+                    return
+                persisted_events = await store.load_events(session_id)
+                persisted_record = await store.load_execution_record(session_id)
+                observations.append(
+                    (
+                        any(item["sequence"] == event.sequence for item in persisted_events),
+                        persisted_record is not None
+                        and persisted_record.event_sequence == event.sequence,
+                        len(await store.load_session_items(session_id)),
+                    )
+                )
+
+            runtime = AgentRuntime(
+                provider=ScriptedProvider(((ModelTextDelta("committed"), ModelCompleted("stop")),)),
+                tools=ToolRegistry(),
+                workspace_change_observer=EmptyWorkspaceChangeObserver(),
+                permissions=PermissionManager(),
+                tool_context=ToolContext(root),
+                session_store=store,
+            )
+
+            result = await runtime.run("inspect", session_id=session_id, sink=observe)
+
+            self.assertEqual(observations, [(True, True, len(result.items))])
+
+    async def test_normal_completion_replaces_a_previous_recoverable_execution_record(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = SqliteSessionStore(root / "sessions.db")
+            await store.initialize()
+            session_id = await store.create_session(str(root), "fixture", "fixture-model")
+            previous_event = AgentEvent.create(1, AgentEventKind.TURN_COMPLETED, {"step": 1})
+            await store.append_event(session_id, previous_event)
+            await store.save_execution_record(
+                session_id,
+                SessionExecutionRecord(
+                    AgentExecutionOutcome(
+                        AgentExecutionStatus.STUCK,
+                        SupervisorReasonCode.PERIODIC_CYCLE,
+                        finalized=True,
+                        recoverable=True,
+                    ),
+                    previous_event.sequence,
+                    previous_event.created_at,
+                ),
+            )
+            runtime = AgentRuntime(
+                provider=ScriptedProvider(((ModelTextDelta("continued"), ModelCompleted("stop")),)),
+                tools=ToolRegistry(),
+                workspace_change_observer=EmptyWorkspaceChangeObserver(),
+                permissions=PermissionManager(),
+                tool_context=ToolContext(root),
+                session_store=store,
+            )
+
+            result = await runtime.run("continue", session_id=session_id)
+
+            completed = next(
+                event for event in result.events if event.kind is AgentEventKind.TURN_COMPLETED
+            )
+            self.assertEqual(
+                await store.load_execution_record(session_id),
+                SessionExecutionRecord(
+                    AgentExecutionOutcome(
+                        AgentExecutionStatus.COMPLETED,
+                        None,
+                        finalized=False,
+                        recoverable=False,
+                    ),
+                    completed.sequence,
+                    completed.created_at,
+                ),
+            )
+
     async def test_controlled_mode_finalizes_at_hard_max_steps(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             tool = CollectionFixtureTool("inspect", "evidence")
@@ -2471,6 +2720,44 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(
                 provider.tool_policies, [ModelToolPolicy.ALLOWED, ModelToolPolicy.DISABLED]
             )
+
+    async def test_hard_max_finalization_does_not_prewrite_intermediate_items(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = SqliteSessionStore(root / "sessions.db")
+            await store.initialize()
+            session_id = await store.create_session(str(root), "fixture", "fixture-model")
+            tool = CollectionFixtureTool("inspect", "evidence")
+            provider = ScriptedProvider(
+                (
+                    (
+                        ModelToolCall(ToolCall("inspect-1", "inspect", {})),
+                        ModelCompleted("tool_calls"),
+                    ),
+                    (ModelTextDelta("hard limit summary"), ModelCompleted("stop")),
+                )
+            )
+            observed_items: list[list[SessionItem]] = []
+
+            async def observe(event: AgentEvent) -> None:
+                if event.kind is AgentEventKind.FINALIZING_STARTED:
+                    observed_items.append(await store.load_session_items(session_id))
+
+            runtime = AgentRuntime(
+                provider=provider,
+                tools=MinimalToolCollection((tool,)),
+                workspace_change_observer=EmptyWorkspaceChangeObserver(),
+                permissions=PermissionManager(),
+                tool_context=ToolContext(root),
+                session_store=store,
+                max_steps=1,
+                execution_control_mode=ExecutionControlMode.FINALIZE_TERMINAL,
+            )
+
+            result = await runtime.run("inspect", session_id=session_id, sink=observe)
+
+            self.assertEqual(observed_items, [[]])
+            self.assertEqual(await store.load_session_items(session_id), list(result.items))
 
     async def test_controlled_mode_finalizes_after_stuck_batch_without_stopping_mid_batch(
         self,
