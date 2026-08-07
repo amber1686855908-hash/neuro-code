@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from neuro_code.bash_commands import analyze_bash_command
+from neuro_code.domain.permissions.bash_commands import analyze_bash_command
 
 
 class BashCommandAnalysisTests(unittest.TestCase):

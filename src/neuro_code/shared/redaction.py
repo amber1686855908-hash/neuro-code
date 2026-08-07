@@ -25,6 +25,8 @@ def redact_sensitive_text(text: str, *, explicit_values: Iterable[str] = ()) -> 
     Explicit configured values are replaced first. Conservative shape and assignment
     matching then covers common credentials that originated in workspace files or tool
     output rather than the active provider configuration.
+
+    对准备写入日志或本地 UI 的文本中的可能凭据进行脱敏. 先替换显式配置值,再匹配常见凭据形状.
     """
 
     redacted = text

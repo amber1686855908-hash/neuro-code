@@ -1,4 +1,6 @@
-"""Neuro Code public package metadata."""
+"""Neuro Code public package metadata.
+
+Neuro Code 的公开包元数据."""
 
 from typing import Final
 

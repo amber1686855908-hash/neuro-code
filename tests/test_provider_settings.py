@@ -6,12 +6,12 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from neuro_code.adapters.provider_settings import JsonProviderSettingsStore
 from neuro_code.configuration.managed_provider_settings import (
     load_managed_provider_settings as canonical_load_managed_provider_settings,
 )
 from neuro_code.domain.background_tasks import BackgroundTaskWakePolicy
 from neuro_code.domain.provider_settings import ManagedProviderProfile, ManagedProxyPolicy
+from neuro_code.infrastructure.providers.provider_settings import JsonProviderSettingsStore
 from neuro_code.shared.errors import ConfigurationError
 
 

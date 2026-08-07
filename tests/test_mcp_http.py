@@ -9,10 +9,14 @@ from unittest.mock import patch
 
 import httpx
 
-import neuro_code.adapters.mcp_http as mcp_http
-from neuro_code.adapters.mcp_http import McpHttpError, McpHttpServerConfig, McpHttpToolCollection
+import neuro_code.infrastructure.mcp.http as mcp_http
 from neuro_code.application.ports.tools import ToolContext
 from neuro_code.domain.sandbox import SandboxProfile
+from neuro_code.infrastructure.mcp.http import (
+    McpHttpError,
+    McpHttpServerConfig,
+    McpHttpToolCollection,
+)
 from neuro_code.shared.errors import ToolError
 
 
@@ -137,7 +141,7 @@ class McpHttpToolCollectionTests(unittest.IsolatedAsyncioTestCase):
         for transport in ("http", "sse"):
             with self.subTest(transport=transport):
                 fixture = _RemoteMcpTransportFixture(transport)
-                with patch("neuro_code.adapters.mcp_http._mcp_http_client", fixture.client):
+                with patch("neuro_code.infrastructure.mcp.http._mcp_http_client", fixture.client):
                     collection = await McpHttpToolCollection.open(
                         (
                             McpHttpServerConfig(
@@ -170,7 +174,7 @@ class McpHttpToolCollectionTests(unittest.IsolatedAsyncioTestCase):
     async def test_cancelling_remote_call_closes_connection_and_fails_closed(self) -> None:
         fixture = _RemoteMcpTransportFixture("http")
         fixture.block_tool_calls = True
-        with patch("neuro_code.adapters.mcp_http._mcp_http_client", fixture.client):
+        with patch("neuro_code.infrastructure.mcp.http._mcp_http_client", fixture.client):
             collection = await McpHttpToolCollection.open(
                 (
                     McpHttpServerConfig(

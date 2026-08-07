@@ -1,45 +1,7 @@
-from __future__ import annotations
+"""Compatibility facade for :mod:`neuro_code.domain.conversation.context`.
 
-from collections.abc import Sequence
-from dataclasses import dataclass
+提供模型上下文类型的兼容门面,并重新导出会话领域中的规范定义."""
 
-from neuro_code.domain.messages import Message, PreservedContextItem, SessionItem
-from neuro_code.domain.reasoning import ReasoningEffort
+from neuro_code.domain.conversation.context import UPSTREAM_IMPORT_PROVIDER, ModelContext
 
-UPSTREAM_IMPORT_PROVIDER = "upstream-rust-import"
-
-
-@dataclass(frozen=True, slots=True)
-class ModelContext:
-    """Ordered model input plus the session origin used for replay decisions."""
-
-    items: tuple[SessionItem, ...]
-    source_provider: str | None = None
-    source_model: str | None = None
-    source_context_affinity: str | None = None
-    reasoning_effort: ReasoningEffort = ReasoningEffort.HIGH
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "items", tuple(self.items))
-        if not isinstance(self.reasoning_effort, ReasoningEffort):
-            raise TypeError("model context reasoning effort must be a ReasoningEffort")
-        if (self.source_provider is None) != (self.source_model is None):
-            raise ValueError("model context source provider and model must be set together")
-        if self.source_provider == "" or self.source_model == "":
-            raise ValueError("model context source fields must not be empty")
-        if self.source_context_affinity == "":
-            raise ValueError("model context source affinity must not be empty")
-        if self.source_context_affinity is not None and self.source_provider is None:
-            raise ValueError("model context source affinity requires provider/model origin")
-
-    @classmethod
-    def from_messages(cls, messages: Sequence[Message]) -> ModelContext:
-        return cls(tuple(messages))
-
-    @property
-    def messages(self) -> tuple[Message, ...]:
-        return tuple(item for item in self.items if isinstance(item, Message))
-
-    @property
-    def preserved_items(self) -> tuple[PreservedContextItem, ...]:
-        return tuple(item for item in self.items if isinstance(item, PreservedContextItem))
+__all__ = ["UPSTREAM_IMPORT_PROVIDER", "ModelContext"]

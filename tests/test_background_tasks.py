@@ -13,7 +13,6 @@ from datetime import UTC, datetime, timedelta
 from math import inf, nan
 from pathlib import Path
 
-from neuro_code.adapters.background_tasks import LocalBackgroundTaskManager
 from neuro_code.domain.background_tasks import (
     MAX_BACKGROUND_TASK_WAIT_IDS,
     BackgroundTaskKillOutcome,
@@ -23,6 +22,7 @@ from neuro_code.domain.background_tasks import (
     BackgroundWakeLimits,
     BackgroundWakeState,
 )
+from neuro_code.infrastructure.background_tasks import LocalBackgroundTaskManager
 from neuro_code.shared.errors import ToolError
 
 

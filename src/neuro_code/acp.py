@@ -84,9 +84,12 @@ from neuro_code.application.acp.contracts import (
     AcpMcpToolError,
     AcpMcpTools,
     AcpResumeUnavailableError,
+    AcpToolOutputArtifactQuery,
+    AcpToolOutputArtifactQueryError,
     AcpWorkspaceValidationError,
 )
 from neuro_code.application.acp.service import AcpApplicationService
+from neuro_code.application.permissions.broker import SessionApprovalBroker
 from neuro_code.application.permissions.contracts import (
     PermissionApproval,
     PermissionRequest,
@@ -97,9 +100,13 @@ from neuro_code.application.ports.client_terminal import (
     ClientTerminal,
     ClientTerminalResult,
 )
-from neuro_code.application.runtime.approval import SessionApprovalBroker
-from neuro_code.application.runtime.profile_conversation import ConversationBinding
-from neuro_code.domain.background_tasks import (
+from neuro_code.application.ports.tools import (
+    MAX_TOOL_OUTPUT_ARTIFACT_READ_BYTES,
+)
+from neuro_code.application.sessions.binding import ConversationBinding
+from neuro_code.application.sessions.turns import RunTurnRequest
+from neuro_code.application.tools.service import SessionToolOutputArtifact
+from neuro_code.domain.background_tasks.models import (
     MAX_BACKGROUND_TASK_WAIT_IDS,
     BackgroundTaskKillOutcome,
     BackgroundTaskKillResult,
@@ -108,16 +115,26 @@ from neuro_code.domain.background_tasks import (
     BackgroundTaskWaitMode,
     BackgroundTaskWaitResult,
 )
-from neuro_code.domain.events import AgentEvent, AgentEventKind
-from neuro_code.domain.execution import (
-    AgentExecutionOutcome,
-    AgentExecutionStatus,
-    SupervisorReasonCode,
+from neuro_code.domain.conversation.events import AgentEvent, AgentEventKind
+from neuro_code.domain.conversation.messages import (
+    ContentPart,
+    Message,
+    Role,
+    SessionItem,
+    ToolCall,
 )
-from neuro_code.domain.messages import ContentPart, Message, Role, SessionItem, ToolCall
 from neuro_code.domain.sessions import SessionSummary
+from neuro_code.interfaces.acp.serialization import (
+    AcpStopReason,
+    execution_outcome_metadata,
+    execution_outcome_stop_reason,
+    map_stop_reason,
+    safe_output_text,
+    sanitize_controls,
+    serialized_size_bytes,
+    truncate_utf8,
+)
 from neuro_code.shared.errors import ConfigurationError, ProviderError, SessionError, ToolError
-from neuro_code.shared.redaction import redact_sensitive_text
 
 ACP_PROTOCOL_VERSION = 1
 ACP_STDIO_BUFFER_LIMIT_BYTES = 1024 * 1024
@@ -176,6 +193,7 @@ MAX_CLIENT_TERMINAL_ID_BYTES = 512
 MAX_CLIENT_TERMINAL_SIGNAL_BYTES = 128
 MAX_CLIENT_TERMINAL_TASKS = 8
 MAX_CLIENT_TERMINAL_RETAINED_TASKS = 32
+ACP_TOOL_OUTPUT_ARTIFACT_EXTENSION = "neuro-code/session/artifacts"
 
 _SESSION_NOT_ACTIVE = -32001
 _SESSION_NOT_FOUND = -32002
@@ -211,9 +229,6 @@ _RESERVED_MCP_HTTP_HEADERS = frozenset(
         "upgrade",
     }
 )
-_ALLOWED_STOP_REASONS = frozenset(
-    {"end_turn", "max_tokens", "max_turn_requests", "refusal", "cancelled"}
-)
 _TOOL_KINDS: dict[str, Literal["read", "edit", "search", "execute", "other"]] = {
     "read_file": "read",
     "list_dir": "read",
@@ -234,19 +249,14 @@ PromptBlock = (
     | EmbeddedResourceContentBlock
 )
 McpServer = HttpMcpServer | SseMcpServer | AcpMcpServer | McpServerStdio
-StopReason = Literal[
-    "end_turn",
-    "max_tokens",
-    "max_turn_requests",
-    "refusal",
-    "cancelled",
-]
 HistoryUpdate = UserMessageChunk | AgentMessageChunk | ToolCallStart | ToolCallProgress
 
 
 @dataclass(frozen=True, slots=True)
 class ConvertedPrompt:
-    """Bounded model input preserving ACP text, image, and link ordering."""
+    """Bounded model input preserving ACP text, image, and link ordering.
+
+    保持 ACP 文本,图像和链接顺序的有界模型输入."""
 
     content: str
     content_parts: tuple[ContentPart, ...]
@@ -304,48 +314,11 @@ def _validated_session_id(value: object) -> str:
     return value
 
 
-def _sanitize_controls(text: str) -> str:
-    return "".join(
-        character
-        if character in {"\n", "\r", "\t"} or ord(character) >= 32
-        else "\N{REPLACEMENT CHARACTER}"
-        for character in text
-    ).replace("\x7f", "\N{REPLACEMENT CHARACTER}")
-
-
-def _truncate_utf8(text: str, limit: int, *, marker: str = "\n… [truncated]") -> str:
-    payload = text.encode("utf-8")
-    if len(payload) <= limit:
-        return text
-    marker_bytes = marker.encode("utf-8")
-    retained = payload[: max(0, limit - len(marker_bytes))]
-    while retained:
-        try:
-            prefix = retained.decode("utf-8")
-        except UnicodeDecodeError:
-            retained = retained[:-1]
-            continue
-        return prefix + marker
-    return marker[:limit]
-
-
 def _bounded_input_text(value: str, *, limit: int, field_name: str) -> str:
-    sanitized = _sanitize_controls(value)
+    sanitized = sanitize_controls(value)
     if len(sanitized.encode("utf-8")) > limit:
         raise _invalid_params(f"{field_name}_too_large")
     return sanitized
-
-
-def _serialized_size(value: object) -> int:
-    return len(
-        json.dumps(
-            value,
-            allow_nan=False,
-            ensure_ascii=False,
-            separators=(",", ":"),
-            sort_keys=True,
-        ).encode("utf-8")
-    )
 
 
 def _mcp_string(
@@ -488,7 +461,7 @@ def _mcp_server_configurations(
                 env=tuple(environment),
             )
         )
-    if _serialized_size(serialized) > MAX_MCP_CONFIGURATION_BYTES:
+    if serialized_size_bytes(serialized) > MAX_MCP_CONFIGURATION_BYTES:
         raise _invalid_params("mcp_configuration_too_large")
     return tuple(configurations)
 
@@ -573,7 +546,7 @@ def _annotations_payload(annotations: Annotations | None) -> dict[str, object] |
         if not math.isfinite(annotations.priority):
             raise _invalid_params("resource_annotation_priority_invalid")
         payload["priority"] = annotations.priority
-    if _serialized_size(payload) > MAX_ANNOTATIONS_BYTES:
+    if serialized_size_bytes(payload) > MAX_ANNOTATIONS_BYTES:
         raise _invalid_params("resource_annotations_too_large")
     return payload or None
 
@@ -614,7 +587,9 @@ def _resource_payload(resource: ResourceContentBlock) -> dict[str, object]:
 
 
 def _image_content_part(block: ImageContentBlock) -> tuple[ContentPart, int]:
-    """Validate one inline ACP image without reading or dereferencing its URI."""
+    """Validate one inline ACP image without reading or dereferencing its URI.
+
+    验证一个 ACP 内联图像,但不读取或解引用其 URI."""
 
     media_type = _ACP_IMAGE_MEDIA_TYPE_ALIASES.get(
         block.mime_type.casefold(), block.mime_type.casefold()
@@ -636,7 +611,9 @@ def _image_content_part(block: ImageContentBlock) -> tuple[ContentPart, int]:
 def _embedded_text_resource_part(
     block: EmbeddedResourceContentBlock,
 ) -> tuple[ContentPart, int]:
-    """Render an already-provided ACP text resource without resource I/O."""
+    """Render an already-provided ACP text resource without resource I/O.
+
+    渲染已提供的 ACP 文本资源,不进行资源 I/O."""
 
     resource = block.resource
     if isinstance(resource, BlobResourceContents):
@@ -678,7 +655,9 @@ def _embedded_text_resource_part(
 
 
 def convert_prompt_content(prompt: list[PromptBlock]) -> ConvertedPrompt:
-    """Convert supported ACP blocks to bounded, ordered structured model input."""
+    """Convert supported ACP blocks to bounded, ordered structured model input.
+
+    将支持的 ACP 块转换为有界,有序的结构化模型输入."""
 
     if not prompt:
         raise _invalid_params("prompt_empty")
@@ -757,55 +736,57 @@ def convert_prompt_content(prompt: list[PromptBlock]) -> ConvertedPrompt:
     return ConvertedPrompt(converted, tuple(content_parts))
 
 
-def _map_stop_reason(value: object) -> StopReason:
-    if value in _ALLOWED_STOP_REASONS:
-        return cast(StopReason, value)
-    if value in {"length", "max_output_tokens"}:
-        return "max_tokens"
-    return "end_turn"
-
-
-def _execution_outcome_stop_reason(outcome: AgentExecutionOutcome | None) -> StopReason | None:
-    if outcome is None:
-        return None
-    if outcome.status is AgentExecutionStatus.STUCK:
-        return "end_turn"
-    if outcome.status is not AgentExecutionStatus.BUDGET_LIMITED:
-        return None
-    if outcome.reason_code in {
-        SupervisorReasonCode.INPUT_TOKEN_BUDGET,
-        SupervisorReasonCode.OUTPUT_TOKEN_BUDGET,
-        SupervisorReasonCode.TOTAL_TOKEN_BUDGET,
-    }:
-        return "max_tokens"
-    return "max_turn_requests"
-
-
-def _execution_outcome_metadata(
-    outcome: AgentExecutionOutcome | None,
-) -> dict[str, str | bool] | None:
-    if outcome is None:
-        return None
-    return {
-        "neuro_code.execution_status": outcome.status.value,
-        "neuro_code.execution_reason": (
-            outcome.reason_code.value if outcome.reason_code is not None else "none"
-        ),
-        "neuro_code.finalized": outcome.finalized,
-        "neuro_code.recoverable": outcome.recoverable,
-    }
-
-
 def _safe_output_text(
     value: object,
     limit: int,
     *,
     explicit_redactions: tuple[str, ...],
 ) -> str:
-    text = value if isinstance(value, str) else ""
-    text = _sanitize_controls(text)
-    text = redact_sensitive_text(text, explicit_values=explicit_redactions)
-    return _truncate_utf8(text, limit)
+    return safe_output_text(value, limit, explicit_redactions=explicit_redactions)
+
+
+def _artifact_list_payload(
+    artifacts: Sequence[SessionToolOutputArtifact],
+) -> dict[str, list[dict[str, int | str | bool]]]:
+    """Serialize only canonical, non-sensitive artifact facts for ACP.
+
+    仅为 ACP 序列化规范且不含敏感信息的 artifact 事实.
+    """
+
+    payload: list[dict[str, int | str | bool]] = []
+    for reference in artifacts:
+        artifact = reference.artifact
+        if not re.fullmatch(r"[0-9a-f]{32}", artifact.artifact_id):
+            continue
+        payload.append(
+            {
+                "artifactId": artifact.artifact_id,
+                "byteCount": artifact.byte_count,
+                "truncated": artifact.truncated,
+                "eventSequence": reference.event_sequence,
+            }
+        )
+    return {"artifacts": payload}
+
+
+def _artifact_read_payload(
+    artifact_id: str,
+    content: str,
+    read_truncated: bool,
+    *,
+    explicit_redactions: tuple[str, ...],
+) -> dict[str, str | bool]:
+    """Serialize one bounded redacted artifact without its storage path."""
+
+    return {
+        "artifactId": artifact_id,
+        "content": _safe_output_text(
+            content,
+            MAX_TOOL_OUTPUT_ARTIFACT_READ_BYTES,
+            explicit_redactions=explicit_redactions,
+        ),
+        "readTruncated": read_truncated,
+    }
 
 
 def _tool_location_from_call(
@@ -954,7 +935,8 @@ def _history_updates(
     if len(updates) > MAX_LOAD_SESSION_UPDATES:
         raise _invalid_params("session_history_too_large")
     total_bytes = sum(
-        _serialized_size(update.model_dump(by_alias=True, exclude_none=True)) for update in updates
+        serialized_size_bytes(update.model_dump(by_alias=True, exclude_none=True))
+        for update in updates
     )
     if total_bytes > MAX_LOAD_SESSION_BYTES:
         raise _invalid_params("session_history_too_large")
@@ -980,7 +962,7 @@ class _AcpEventMapper:
         self._tool_names: dict[str, str] = {}
         self._started_tools: set[str] = set()
         self._sent_text_bytes = 0
-        self.stop_reason: StopReason = "end_turn"
+        self.stop_reason: AcpStopReason = "end_turn"
 
     def tool_call_id(self, value: object) -> str:
         return _bounded_identifier(value)
@@ -1043,7 +1025,7 @@ class _AcpEventMapper:
             remaining = MAX_TURN_UPDATE_BYTES - self._sent_text_bytes
             if remaining <= 0 or not text:
                 return
-            text = _truncate_utf8(text, remaining)
+            text = truncate_utf8(text, remaining)
             self._sent_text_bytes += len(text.encode("utf-8"))
             await self._client.session_update(
                 self._session_id,
@@ -1109,7 +1091,7 @@ class _AcpEventMapper:
                 )
             return
         if event.kind is AgentEventKind.TURN_COMPLETED:
-            self.stop_reason = _map_stop_reason(event.data.get("stop_reason"))
+            self.stop_reason = map_stop_reason(event.data.get("stop_reason"))
 
 
 @dataclass(slots=True)
@@ -1156,7 +1138,9 @@ class _AcpClientTerminalTask:
 
 
 class _AcpClientTerminal:
-    """Bounded standard-ACP terminal adapter for one active ACP session."""
+    """Bounded standard-ACP terminal adapter for one active ACP session.
+
+    为一个活动 ACP 会话提供的有界标准 ACP 终端适配器."""
 
     def __init__(self, client: Client, session_id: str) -> None:
         self._client = client
@@ -1244,7 +1228,9 @@ class _AcpClientTerminal:
         output_byte_limit: int,
         timeout_seconds: float | None = None,
     ) -> BackgroundTaskSnapshot:
-        """Start one direct executable and retain its standard ACP lifecycle."""
+        """Start one direct executable and retain its standard ACP lifecycle.
+
+        启动一个直接可执行文件,并保留其标准 ACP 生命周期."""
 
         self._ensure_open()
         validated_command, validated_arguments = _client_terminal_command(command, arguments)
@@ -1687,7 +1673,9 @@ def _client_terminal_exit_status(
 
 
 class _AcpClientFileSystem:
-    """Bounded ACP client filesystem adapter for one active session."""
+    """Bounded ACP client filesystem adapter for one active session.
+
+    为一个活动会话提供有界的 ACP 客户端文件系统适配器."""
 
     def __init__(
         self,
@@ -1759,7 +1747,9 @@ class _SessionListCursor:
 
 
 class NeuroCodeAcpAgent:
-    """Official-SDK ACP v1 adapter for one workspace-bound process."""
+    """Official-SDK ACP v1 adapter for one workspace-bound process.
+
+    为一个工作区绑定进程提供官方 SDK ACP v1 适配器."""
 
     def __init__(self, service: AcpApplicationService) -> None:
         self._service = service
@@ -2435,6 +2425,78 @@ class NeuroCodeAcpAgent:
     def _explicit_redactions(self) -> tuple[str, ...]:
         return self._service.explicit_redactions()
 
+    async def _artifact_internal_session_id(self, external_session_id: str) -> str:
+        """Resolve an ACP ID without exposing the internal session identity."""
+
+        async with self._registry_lock:
+            if external_session_id in self._pending_session_tasks:
+                raise _session_busy(external_session_id, "session_creation_in_progress")
+            active = self._sessions.get(external_session_id)
+        if active is not None:
+            async with active.state_lock:
+                if active.closed or active.closing:
+                    raise _session_not_active(external_session_id)
+                internal_session_id = active.internal_session_id
+            if internal_session_id is None:
+                raise _session_not_found(external_session_id)
+            return internal_session_id
+        try:
+            return await self._service.resolve_session_alias(
+                _ACP_SESSION_ALIAS_NAMESPACE,
+                external_session_id,
+            )
+        except SessionError:
+            raise _session_not_found(external_session_id) from None
+
+    async def ext_method(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+        """Serve the private, session-scoped tool-output artifact extension.
+
+        提供私有的会话作用域工具输出 artifact 扩展.
+
+        The extension is intentionally not advertised as a standard ACP
+        capability.  It accepts an external ACP session ID and never exposes
+        internal IDs, paths, raw metadata, or unbounded content.
+
+        该扩展有意不作为标准 ACP 能力宣告.它接收 ACP 外部会话 ID,且绝不暴露内部 ID、
+        路径、原始 metadata 或无界内容.
+        """
+
+        self._require_initialized()
+        if method != ACP_TOOL_OUTPUT_ARTIFACT_EXTENSION:
+            raise RequestError.method_not_found(f"_{method}")
+        try:
+            query = AcpToolOutputArtifactQuery.from_payload(params)
+        except AcpToolOutputArtifactQueryError as error:
+            raise _invalid_params(error.reason) from None
+        external_session_id = _validated_session_id(query.session_id)
+        if not self._service.tool_output_artifacts_available:
+            raise RequestError.internal_error({"reason": "artifact_query_unavailable"})
+        internal_session_id = await self._artifact_internal_session_id(external_session_id)
+        if query.artifact_id is None:
+            try:
+                artifacts = await self._service.list_tool_output_artifacts(
+                    internal_session_id,
+                    limit=query.limit,
+                )
+            except SessionError:
+                raise _session_not_found(external_session_id) from None
+            return _artifact_list_payload(artifacts)
+
+        try:
+            artifact = await self._service.read_tool_output_artifact(
+                internal_session_id,
+                query.artifact_id,
+                max_bytes=query.max_bytes,
+            )
+        except SessionError:
+            raise _invalid_params("artifact_not_found") from None
+        return _artifact_read_payload(
+            artifact.artifact.artifact_id,
+            artifact.content,
+            artifact.read_truncated,
+            explicit_redactions=self._explicit_redactions(),
+        )
+
     async def _bind_internal_session(
         self,
         session: _AcpSession,
@@ -2508,10 +2570,14 @@ class NeuroCodeAcpAgent:
             binding = session.binding
 
         try:
-            result = await binding.runner.run(
-                converted.content,
+            turn_service = self._service.bind_runner(binding.runner)
+            result = await turn_service.run_turn(
+                RunTurnRequest(
+                    converted.content,
+                    content_parts=converted.content_parts,
+                    expected_session_id=session.internal_session_id,
+                ),
                 sink=mapper,
-                content_parts=converted.content_parts,
             )
             if result.session_id is None:
                 raise RequestError.internal_error({"reason": "session_identity_unavailable"})
@@ -2519,8 +2585,8 @@ class NeuroCodeAcpAgent:
             if session.cancel_requested or session.closing:
                 return PromptResponse(stop_reason="cancelled")
             return PromptResponse(
-                stop_reason=_execution_outcome_stop_reason(result.outcome) or mapper.stop_reason,
-                field_meta=_execution_outcome_metadata(result.outcome),
+                stop_reason=execution_outcome_stop_reason(result.outcome) or mapper.stop_reason,
+                field_meta=execution_outcome_metadata(result.outcome),
             )
         except asyncio.CancelledError:
             await self._capture_runner_session(session, binding, suppress_errors=True)
@@ -2695,7 +2761,9 @@ class NeuroCodeAcpAgent:
 
 
 def _build_acp_router(agent: NeuroCodeAcpAgent) -> MessageRouter:
-    """Extend the SDK 0.11 router with its generated stable delete route."""
+    """Extend the SDK 0.11 router with its generated stable delete route.
+
+    使用生成的稳定删除路由扩展 SDK 0.11 路由器."""
 
     router = build_agent_router(cast(Agent, agent), use_unstable_protocol=True)
     router.route_request(
@@ -2709,7 +2777,9 @@ def _build_acp_router(agent: NeuroCodeAcpAgent) -> MessageRouter:
 
 
 class _AcpSdkConnection:
-    """Small SDK connection adapter until its agent router registers delete."""
+    """Small SDK connection adapter until its agent router registers delete.
+
+    在 Agent 路由器注册删除操作前使用的小型 SDK 连接适配器."""
 
     def __init__(
         self,
@@ -2768,7 +2838,9 @@ class _AcpSdkConnection:
 
 
 async def serve_acp(service: AcpApplicationService) -> None:
-    """Serve ACP on stdio through the official SDK framing and router."""
+    """Serve ACP on stdio through the official SDK framing and router.
+
+    通过官方 SDK 帧协议和路由器在 stdio 上提供 ACP 服务."""
 
     agent = NeuroCodeAcpAgent(service)
     connection: _AcpSdkConnection | None = None

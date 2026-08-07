@@ -32,7 +32,7 @@ from acp.schema import (
 from acp.stdio import spawn_agent_process
 
 from neuro_code.adapters.sqlite_session import SqliteSessionStore
-from neuro_code.workspace import workspaces_match
+from neuro_code.infrastructure.workspace.paths import workspaces_match
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 MCP_FIXTURE = REPOSITORY_ROOT / "tests" / "fixtures" / "mcp_stdio_server.py"

@@ -9,22 +9,22 @@ from typing import cast
 
 from neuro_code.application.ports.background_tasks import BackgroundTaskManager
 from neuro_code.application.runtime.agent import AgentRunResult, EventSink
-from neuro_code.application.runtime.profile_conversation import (
+from neuro_code.application.sessions.profile_conversation import (
     ConversationBinding,
     ProfileConversationController,
     ProviderOption,
 )
 from neuro_code.domain.background_tasks import BackgroundTaskSnapshot, BackgroundTaskStatus
-from neuro_code.domain.interaction_mode import InteractionMode
+from neuro_code.domain.conversation.interaction_mode import InteractionMode
+from neuro_code.domain.conversation.reasoning import ReasoningEffort
 from neuro_code.domain.messages import Message, Role, SessionItem
 from neuro_code.domain.model_context import ModelContext
 from neuro_code.domain.model_events import ModelEvent
 from neuro_code.domain.plans import PlanComment, PlanStep, SessionPlan
-from neuro_code.domain.reasoning import ReasoningEffort
 from neuro_code.domain.sandbox import SandboxProfile
-from neuro_code.domain.session_search import SessionSearchHit
 from neuro_code.domain.session_tasks import SessionTask, SessionTaskKind, SessionTaskStatus
 from neuro_code.domain.sessions import SessionSummary
+from neuro_code.domain.sessions.search import SessionSearchHit
 from neuro_code.domain.tools import ToolDefinition
 from neuro_code.shared.errors import ConfigurationError
 

@@ -16,7 +16,7 @@ from neuro_code.application.ports.terminal import (
     TerminalOutputHandler,
 )
 from neuro_code.application.ports.workspace import WorkspacePathResolver
-from neuro_code.application.runtime.terminal_sessions import LocalInteractiveTerminalManager
+from neuro_code.application.sessions.terminal_sessions import LocalInteractiveTerminalManager
 from neuro_code.domain.sandbox import SandboxProfile
 from neuro_code.domain.terminal import (
     MAX_TERMINAL_OUTPUT_BYTES,
@@ -25,12 +25,12 @@ from neuro_code.domain.terminal import (
     TerminalSignal,
     TerminalSize,
 )
+from neuro_code.infrastructure.workspace.paths import FilesystemWorkspacePathResolver
 from neuro_code.permissions import (
     PermissionManager,
     PermissionMode,
 )
 from neuro_code.shared.errors import PermissionDenied, TerminalError, ToolError
-from neuro_code.workspace import FilesystemWorkspacePathResolver
 from tests.fakes import FakeWorkspacePathResolver
 
 

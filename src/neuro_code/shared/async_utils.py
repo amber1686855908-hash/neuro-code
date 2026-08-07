@@ -12,6 +12,8 @@ async def run_blocking[**P, R](function: Callable[P, R], *args: P.args, **kwargs
     process sandboxes where the executor's cross-thread wakeup descriptor may
     be delayed. On a normal event loop the task completes immediately and the
     tick does not affect the result or cancellation semantics.
+
+    在不占用事件循环线程的情况下运行阻塞工作. 协作 tick 保持受限沙箱中的完成和取消语义可靠.
     """
 
     completed = threading.Event()

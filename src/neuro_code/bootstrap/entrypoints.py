@@ -1,4 +1,6 @@
-"""Canonical CLI and TUI process entry points and their concrete wiring."""
+"""Canonical CLI and TUI process entry points and their concrete wiring.
+
+定义规范的 CLI 和 TUI 进程入口及其具体依赖连接."""
 
 from __future__ import annotations
 
@@ -9,22 +11,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from neuro_code.adapters.mcp_http import (
-    McpHttpError,
-    McpHttpServerConfig,
-    McpHttpToolCollection,
-)
-from neuro_code.adapters.mcp_stdio import (
-    MAX_MCP_TOTAL_TOOLS,
-    McpStdioError,
-    McpStdioServerConfig,
-    McpStdioToolCollection,
-)
-from neuro_code.adapters.provider_catalog import HttpProviderCatalog
-from neuro_code.adapters.provider_settings import JsonProviderSettingsStore
-from neuro_code.adapters.rust_session import load_rust_session
-from neuro_code.adapters.sqlite_session import SqliteSessionStore
-from neuro_code.adapters.ui_preferences import JsonUiPreferencesStore
 from neuro_code.application.acp.contracts import (
     MAX_ADDITIONAL_DIRECTORIES,
     MAX_ADDITIONAL_DIRECTORY_BYTES,
@@ -40,37 +26,62 @@ from neuro_code.application.acp.contracts import (
     AcpWorkspaceValidationError,
 )
 from neuro_code.application.acp.service import AcpApplicationService
+from neuro_code.application.permissions.broker import SessionApprovalBroker
 from neuro_code.application.ports.approval import PermissionApprover
 from neuro_code.application.ports.client_filesystem import ClientFileSystem
 from neuro_code.application.ports.client_terminal import ClientTerminal
 from neuro_code.application.ports.storage import SessionStore
 from neuro_code.application.ports.tools import Tool
-from neuro_code.application.runtime.approval import SessionApprovalBroker
-from neuro_code.application.runtime.profile_conversation import (
-    ConversationBinding,
+from neuro_code.application.providers.contracts import ProviderOption
+from neuro_code.application.sessions.binding import ConversationBinding
+from neuro_code.application.sessions.lifecycle import RenameSessionRequest
+from neuro_code.application.sessions.profile_conversation import (
     ProfileConversationController,
-    ProviderOption,
+)
+from neuro_code.application.sessions.service import (
+    ResumeSessionRequest,
+    SessionApplicationService,
 )
 from neuro_code.application.settings import ApplicationSettings
+from neuro_code.application.tools.service import SessionToolOutputArtifactApplicationService
 from neuro_code.bootstrap.composition import ApplicationComposition
-from neuro_code.config import AppConfig, load_config, override_provider
-from neuro_code.domain.interaction_mode import InteractionMode
-from neuro_code.domain.reasoning import ReasoningEffort
-from neuro_code.domain.sandbox import SandboxProfile
-from neuro_code.domain.session_search import SessionSearchHit
+from neuro_code.configuration.app import AppConfig, load_config, override_provider
+from neuro_code.domain.conversation.interaction_mode import InteractionMode
+from neuro_code.domain.conversation.reasoning import ReasoningEffort
+from neuro_code.domain.sandbox.models import SandboxProfile
 from neuro_code.domain.sessions import SessionSummary
+from neuro_code.domain.sessions.search import SessionSearchHit
+from neuro_code.infrastructure.mcp.http import (
+    McpHttpError,
+    McpHttpServerConfig,
+    McpHttpToolCollection,
+)
+from neuro_code.infrastructure.mcp.stdio import (
+    MAX_MCP_TOTAL_TOOLS,
+    McpStdioError,
+    McpStdioServerConfig,
+    McpStdioToolCollection,
+)
+from neuro_code.infrastructure.persistence.output_artifacts import FileToolOutputArtifactStore
+from neuro_code.infrastructure.persistence.rust_session import load_rust_session
+from neuro_code.infrastructure.persistence.sqlite_session import SqliteSessionStore
+from neuro_code.infrastructure.persistence.ui_preferences import JsonUiPreferencesStore
+from neuro_code.infrastructure.providers.provider_catalog import HttpProviderCatalog
+from neuro_code.infrastructure.providers.provider_settings import JsonProviderSettingsStore
+from neuro_code.infrastructure.workspace.paths import workspaces_match
 from neuro_code.shared.async_utils import run_blocking
 from neuro_code.shared.errors import ConfigurationError
-from neuro_code.workspace import workspaces_match
 
 if TYPE_CHECKING:
-    from neuro_code.adapters.rust_session import RustSessionImport
-    from neuro_code.domain.instructions import InstructionDiscoveryResult
-    from neuro_code.domain.skills import SkillDiscoveryResult
+    from neuro_code.domain.workspace.instructions import InstructionDiscoveryResult
+    from neuro_code.domain.workspace.skills import SkillDiscoveryResult
+    from neuro_code.infrastructure.persistence.rust_session import RustSessionImport
 
 
 class _BootstrapWorkspaceValidator:
-    """Concrete workspace identity behavior selected only by bootstrap."""
+    """Concrete workspace identity behavior selected only by bootstrap.
+
+    表示仅由 bootstrap 选择的具体工作区身份行为."""
 
     def __init__(self, workspace: Path, sandbox_profile: SandboxProfile) -> None:
         self._workspace = workspace
@@ -145,7 +156,9 @@ class _BootstrapWorkspaceValidator:
 
 
 class _BootstrapMcpToolFactory:
-    """Adapter-backed MCP factory; opening remains session-lazy."""
+    """Adapter-backed MCP factory; opening remains session-lazy.
+
+    提供由适配器支持的 MCP 工厂,打开操作仍延迟到会话创建之后."""
 
     async def open(
         self,
@@ -205,7 +218,9 @@ class _BootstrapMcpToolFactory:
 
 
 class _CompositeMcpTools:
-    """Close heterogeneous session-owned MCP adapters as one resource."""
+    """Close heterogeneous session-owned MCP adapters as one resource.
+
+    将多个类型不同的会话拥有 MCP 适配器作为一个资源关闭."""
 
     def __init__(self, collections: tuple[AcpMcpTools, ...], tools: tuple[Tool, ...]) -> None:
         self._collections = collections
@@ -255,7 +270,9 @@ class _PreparedCompositionAcpSession:
 
 
 class _CompositionAcpBindingFactory:
-    """Composition-root adapter for ACP's narrow binding contract."""
+    """Composition-root adapter for ACP's narrow binding contract.
+
+    提供组合根适配器,实现 ACP 的精简绑定契约."""
 
     def __init__(self, application: ApplicationComposition) -> None:
         self._application = application
@@ -297,7 +314,9 @@ class _CompositionAcpBindingFactory:
 
 
 class BootstrapCliServices:
-    """Concrete infrastructure choices used by the CLI command dispatcher."""
+    """Concrete infrastructure choices used by the CLI command dispatcher.
+
+    表示 CLI 命令分发器使用的具体基础设施选择."""
 
     async def open_application(self, settings: ApplicationSettings) -> ApplicationComposition:
         return await ApplicationComposition.open(settings)
@@ -316,6 +335,31 @@ class BootstrapCliServices:
         await store.initialize()
         return store
 
+    def create_tool_output_artifact_service(
+        self,
+        config: AppConfig,
+        store: SessionStore,
+    ) -> SessionToolOutputArtifactApplicationService:
+        """Build the CLI's session-scoped bounded artifact read boundary.
+
+        构建 CLI 使用的会话作用域有界 artifact 读取边界.
+
+        The CLI receives only the application service; the state directory and
+        filesystem reader remain bootstrap-owned infrastructure details.
+
+        CLI 只接收应用服务;状态目录和文件读取器仍属于 bootstrap 基础设施细节.
+        """
+
+        reader = FileToolOutputArtifactStore(
+            config.state_dir / "tool-output",
+            redaction_values=config.redaction_values(),
+        )
+        return SessionToolOutputArtifactApplicationService(
+            store,
+            reader,
+            garbage_collector=reader,
+        )
+
     async def load_rust_session(self, source: Path) -> RustSessionImport:
         return await run_blocking(load_rust_session, source)
 
@@ -323,7 +367,9 @@ class BootstrapCliServices:
         return workspaces_match(left, right)
 
     def create_acp_service(self, application: ApplicationComposition) -> AcpApplicationService:
-        """Assemble ACP's narrow application service for one open process."""
+        """Assemble ACP's narrow application service for one open process.
+
+        为一个已打开的进程组装 ACP 精简应用服务."""
         config = application.config
         return AcpApplicationService(
             metadata=AcpSessionMetadata(
@@ -335,6 +381,9 @@ class BootstrapCliServices:
             bindings=_CompositionAcpBindingFactory(application),
             mcp_tools=_BootstrapMcpToolFactory(),
             workspace=_BootstrapWorkspaceValidator(config.cwd, config.sandbox_profile),
+            sessions=application.session_service,
+            summary_queries=application.session_summary_queries,
+            artifacts=application.create_tool_output_artifact_service(config=config),
         )
 
     async def run_acp(
@@ -342,7 +391,9 @@ class BootstrapCliServices:
         args: argparse.Namespace,
         settings: ApplicationSettings,
     ) -> int:
-        """Open the process composition and serve ACP with injected dependencies."""
+        """Open the process composition and serve ACP with injected dependencies.
+
+        打开进程组合,使用注入的依赖提供 ACP 服务."""
         del args
         from neuro_code.acp import serve_acp
 
@@ -435,9 +486,13 @@ class BootstrapCliServices:
 
             application = await self.open_application(settings)
             try:
+                if args.resume is not None:
+                    await application.session_service.prepare_resume(
+                        ResumeSessionRequest(args.resume)
+                    )
                 approvals = SessionApprovalBroker()
                 config = application.config
-                store = application.store
+                session_service = application.session_service
                 managed_provider_settings = await provider_settings_store.load()
                 language = await ui_preferences.load_language()
                 saved_reasoning_effort = await ui_preferences.load_reasoning_effort()
@@ -487,32 +542,27 @@ class BootstrapCliServices:
 
                 async def list_workspace_sessions(
                     *,
-                    store_: SessionStore = store,
+                    session_service_: SessionApplicationService = session_service,
                     config_: AppConfig = config,
                 ) -> tuple[SessionSummary, ...]:
-                    sessions = await store_.list_sessions(limit=1000)
-                    return tuple(
-                        session
-                        for session in sessions
-                        if workspaces_match(session.cwd, config_.cwd)
-                    )[:50]
+                    return await session_service_.list_sessions_in_workspace(
+                        config_.cwd.as_posix(),
+                        limit=1000,
+                        result_limit=50,
+                    )
 
                 async def search_workspace_sessions(
                     query: str,
                     *,
-                    store_: SessionStore = store,
+                    session_service_: SessionApplicationService = session_service,
                     config_: AppConfig = config,
                 ) -> tuple[SessionSearchHit, ...]:
-                    page = await store_.search_sessions(
+                    return await session_service_.search_sessions_in_workspace(
                         query,
+                        config_.cwd.as_posix(),
                         limit=1000,
-                        include_content=True,
+                        result_limit=50,
                     )
-                    return tuple(
-                        hit
-                        for hit in page.results
-                        if workspaces_match(hit.summary.cwd, config_.cwd)
-                    )[:50]
 
                 async def bind_session(
                     profile_name: str,
@@ -522,7 +572,11 @@ class BootstrapCliServices:
                     compose_scoped_: Callable[
                         [AppConfig, str | None], Awaitable[ConversationBinding]
                     ] = compose_scoped,
+                    application_: ApplicationComposition = application,
                 ) -> ConversationBinding:
+                    await application_.session_service.prepare_resume(
+                        ResumeSessionRequest(session_id)
+                    )
                     selected_config = override_provider(config_, provider=profile_name)
                     return await compose_scoped_(
                         selected_config,
@@ -533,15 +587,17 @@ class BootstrapCliServices:
                     session_id: str,
                     title: str,
                     *,
-                    store_: SessionStore = store,
+                    session_service_: SessionApplicationService = session_service,
                     config_: AppConfig = config,
                 ) -> SessionSummary:
-                    summary = await store_.get_session(session_id)
-                    if not workspaces_match(summary.cwd, config_.cwd):
+                    inspection = await session_service_.inspect_session(session_id)
+                    if not workspaces_match(inspection.summary.cwd, config_.cwd):
                         raise ConfigurationError(
                             f"session does not exist in the current workspace: {session_id}"
                         )
-                    return await store_.update_session_title(session_id, title)
+                    return await session_service_.rename_session(
+                        RenameSessionRequest(session_id, title)
+                    )
 
                 controller = ProfileConversationController(
                     options=_provider_options(config),
@@ -556,14 +612,35 @@ class BootstrapCliServices:
                     reasoning_effort=reasoning_effort,
                     interaction_mode=interaction_mode,
                 )
+                provider_service = application.bind_provider_controller(controller)
+                session_selection_service = application.bind_session_selection_controller(
+                    controller
+                )
+                plan_execution_service = application.bind_plan_execution_controller(controller)
+                plan_scheduling_service = application.bind_plan_scheduling_controller(controller)
+                queued_plan_execution_service = application.bind_queued_plan_execution_controller(
+                    controller
+                )
+                turn_service = application.session_service.bind_runner(controller)
+                tool_output_artifact_service = application.create_tool_output_artifact_service(
+                    config=config
+                )
                 app = NeuroCodeApp(
                     controller,
+                    turn_service=turn_service,
                     approval_controller=approvals,
-                    provider_controller=controller,
+                    provider_controller=provider_service,
+                    reasoning_controller=controller,
+                    interaction_mode_controller=controller,
                     session_controller=controller,
+                    session_selection_service=session_selection_service,
                     task_controller=controller,
                     session_task_controller=controller,
                     plan_controller=controller,
+                    plan_execution_service=plan_execution_service,
+                    plan_scheduling_service=plan_scheduling_service,
+                    queued_plan_execution_service=queued_plan_execution_service,
+                    tool_output_artifact_service=tool_output_artifact_service,
                     ui_preferences=ui_preferences,
                     provider_settings_store=provider_settings_store,
                     provider_catalog=provider_catalog,
@@ -602,7 +679,9 @@ def _provider_options(config: AppConfig) -> tuple[ProviderOption, ...]:
 
 
 def main(argv: list[str] | tuple[str, ...] | None = None) -> int:
-    """Run the canonical command-line entry point."""
+    """Run the canonical command-line entry point.
+
+    运行规范的命令行入口."""
     from neuro_code.cli import run
 
     return run(argv, services=BootstrapCliServices())

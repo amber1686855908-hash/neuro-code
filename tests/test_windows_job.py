@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 from unittest import mock
 
-from neuro_code.adapters.windows_job import (
+from neuro_code.infrastructure.sandbox.windows_job import (
     WindowsJobObject,
     _BasicAccountingInformation,
     _ExtendedLimitInformation,
@@ -61,7 +61,7 @@ class _FakeWindowsJobApi:
 class WindowsJobObjectTests(unittest.TestCase):
     def test_non_windows_default_creation_fails_cleanly(self) -> None:
         with (
-            mock.patch("neuro_code.adapters.windows_job.os.name", "posix"),
+            mock.patch("neuro_code.infrastructure.sandbox.windows_job.os.name", "posix"),
             self.assertRaisesRegex(OSError, "only available on Windows"),
         ):
             WindowsJobObject.create()

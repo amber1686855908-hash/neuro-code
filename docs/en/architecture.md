@@ -46,6 +46,10 @@ Stage 1 established `neuro_code.shared.{errors,async_utils,redaction}` and
 breaking cleanup removed the root shared compatibility modules
 `neuro_code.{errors,async_utils,redaction}` and `neuro_code.ports`; shared
 primitives and port contracts are available only from their canonical paths.
+`neuro_code.shared.ui_language` now owns the cross-layer `UiLanguage` primitive;
+the former `neuro_code.domain.ui_preferences` import is compatibility-only.
+UI preference ports, persistence, TUI, and localized text use the shared owner
+without changing language values or persistence behavior.
 Stage 2A establishes
 `neuro_code.application.settings.ApplicationSettings` and
 `neuro_code.bootstrap.composition.ApplicationComposition` as canonical paths.
@@ -81,10 +85,96 @@ adapts an `ApplicationComposition` caller. ACP no longer imports MCP or workspac
 configuration or storage directly; importing ACP does not load bootstrap, the
 MCP adapter, SQLite storage, or providers.
 
-Application runtime behavior currently lives in the explicit canonical
-submodules of `neuro_code.application.runtime`:
-`background_task_reminders`, `agent`, `conversation`, `profile_conversation`,
-`terminal_sessions`, `approval`, `instruction_tracker`, and `skill_tracker`.
+Agent harness behavior currently lives in the explicit canonical submodules of
+`neuro_code.application.runtime`: `background_task_reminders`, `agent`,
+`conversation`, and the loop/context/tool/finalization modules. Interactive
+approval coordination is owned by `neuro_code.application.permissions.broker`;
+the former `neuro_code.application.runtime.approval` path is a one-way
+compatibility facade.
+Profile and interactive-terminal session coordination live in the canonical
+`neuro_code.application.sessions` package. Binding-scoped instruction and
+skill trackers live in the canonical `neuro_code.application.memory` package.
+Read-only session catalog and inspection queries live in
+`neuro_code.application.sessions.catalog`; the lifecycle service delegates
+those projections without moving session writes or conversation ownership.
+The typed single-turn boundary lives in
+`neuro_code.application.sessions.turns`; `SessionApplicationService` retains
+only the compatibility binding helper, while the turn runner continues to own
+locking, persisted context, event delivery, and cancellation.
+Shared provider-selection projections live in
+`neuro_code.application.providers.contracts`. The profile conversation
+controller still owns binding replacement and session selection, while provider
+application services and interface/bootstrap consumers use the provider
+contract seam. Historical profile and runtime imports remain
+identity-preserving compatibility re-exports.
+The typed session-binding contract lives in
+`neuro_code.application.sessions.binding`. ACP, bootstrap, session application,
+and runtime-facing consumers use its `ConversationBinding` and
+`ConversationRunner` types; `ProfileConversationController` retains
+profile-specific session selection and binding replacement. Historical profile
+and runtime imports remain identity-preserving compatibility re-exports.
+Immutable session-selection and interaction-policy projections live in
+`neuro_code.application.sessions.contracts`. The TUI consumes
+`SessionOption`, `SessionSelectionResult`, `ReasoningEffortSelectionResult`,
+and `InteractionModeSelectionResult` from this seam, while
+`ProfileConversationController` retains selection, policy application, locking,
+and binding replacement. Historical profile and runtime imports remain
+identity-preserving compatibility re-exports.
+Interactive session listing, selection, and rename use the non-owning
+`neuro_code.application.sessions.selection.SessionSelectionService` seam. The
+profile controller remains the lifecycle owner; the TUI uses the facade for
+these operations and retains only a compatibility controller reference for the
+existing execution-record projection.
+Typed durable session lifecycle commands use the canonical
+`neuro_code.application.sessions.lifecycle.SessionLifecycleService` seam.
+Runtime session creation, CLI import/rename, and ACP fork/delete consume its
+validated request types; the legacy session application service preserves
+identity-compatible delegation. Workspace visibility, binding replacement,
+turn locking, protocol cleanup, and execution-record projection remain with
+their existing owners.
+Read-only session-task queries use the canonical
+`neuro_code.application.sessions.task_queries.SessionTaskQueryService` seam.
+The Runtime and `AgentConversation` consume its validated list/get requests,
+while the broad session service keeps identity-compatible delegation for older
+callers. Task creation, queueing, state transitions, permissions, execution,
+locking, cancellation, and all SessionStore/SQLite writes remain with the
+existing conversation/runtime owners.
+Read-only session-summary queries use the canonical
+`neuro_code.application.sessions.summary.SessionSummaryQueryService` seam.
+Session resume, bootstrap configuration, ACP workspace validation, and
+session-scoped tool-output artifact reads consume its validated request; the
+broad session service keeps identity-compatible delegation for older callers.
+Lifecycle writes, event/item reads, schema, transactions, Runtime, Provider,
+Finalizer, and wire behavior remain with their existing owners.
+Read-only execution-record projections use the canonical
+`neuro_code.application.sessions.execution_queries.SessionExecutionQueryService`
+seam. The session catalog and conversation resume/reload paths share its
+single and bounded bulk requests, while the broad session service keeps
+identity-compatible compatibility exports. Execution-record writes, schema,
+transactions, Runtime, Provider, Finalizer, TUI, ACP, and wire behavior remain
+with their existing owners.
+Copied session-event projections use the canonical
+`neuro_code.application.sessions.event_queries.SessionEventQueryService` seam.
+Session export and session-scoped tool-output artifact reads share its typed
+request and immutable outer mapping projection. Event rows remain untrusted
+storage data rather than a second domain-event model; event writes, decoding,
+transactions, Runtime, Provider, Finalizer, TUI, ACP, and wire behavior remain
+with their existing owners.
+Existing application consumers also import concrete canonical owners directly:
+bootstrap composition and the TUI use `application.providers.service` and the
+three `application.workflows.*` modules, while CLI/bootstrap/ACP and CLI
+serialization use the concrete session lifecycle, service, and catalog modules.
+Aggregate package exports remain compatibility paths; this import convergence
+does not create a second implementation or change workflow, locking,
+persistence, Runtime, Provider, Finalizer, TUI layout, ACP wire, or session
+behavior. Plan/comment/export reads remain with their current owner because no
+second production consumer or stable cross-interface contract exists.
+The bounded tool-output artifact application boundary is likewise consumed
+through `neuro_code.application.tools.service` by CLI, TUI, ACP, bootstrap, and
+CLI serialization. The package aggregate is compatibility-only; artifact
+handles, session visibility, redaction, byte limits, pruning, permissions,
+storage, Runtime, and protocol behavior remain owned by the service and its
+ports/adapters.
 The development-stage breaking cleanup removed `neuro_code.runtime`; runtime
 application behavior is available only from these explicit canonical
 submodules. `neuro_code.application.runtime.__init__` currently remains minimal
@@ -98,6 +188,11 @@ synchronous managed JSON reader in
 `neuro_code.configuration.managed_provider_settings` owns schema, protocol,
 and dialect checks, the file-size limit, metadata/credentials merging,
 structural validation, and `ManagedProviderSettings` construction.
+The provider-settings value objects and persistence contract are owned by
+`neuro_code.application.ports.provider_settings`; the former
+`neuro_code.domain.provider_settings` path remains only as a one-way
+compatibility facade. This keeps configuration and infrastructure consumers on
+the application port boundary without changing validation or persistence.
 `neuro_code.adapters.provider_settings` owns `JsonProviderSettingsStore`,
 asynchronous persistence, atomic writes, and POSIX private permissions. It uses
 the canonical reader through a private binding and no longer re-exports it.
@@ -166,12 +261,15 @@ and never starts a model turn itself. See
 ## Conversation and interactive interface
 
 `AgentConversation` is the reusable application boundary above one-turn
-`AgentRuntime`. It serializes turns and carries the ordered session items,
-session identifier, and provider-origin metadata forward after each durable
-commit. Opening an existing conversation validates that its recorded workspace
-is the same filesystem location as the requested workspace. The headless CLI
-and Textual interface compose the same controller, so resume and provider replay
-rules cannot diverge by interface.
+`AgentRuntime`. Its canonical implementation is
+`neuro_code.application.sessions.conversation`; the former
+`neuro_code.application.runtime.conversation` path remains only as a one-way
+compatibility facade. It serializes turns and carries the ordered session
+items, session identifier, and provider-origin metadata forward after each
+durable commit. Opening an existing conversation validates that its recorded
+workspace is the same filesystem location as the requested workspace. The
+headless CLI and Textual interface compose the same controller, so resume and
+provider replay rules cannot diverge by interface.
 
 On failure or cancellation, `AgentConversation` reloads the canonical ordered
 items and provider origin from `SessionStore` before releasing its turn lock.
@@ -185,6 +283,14 @@ draft and may buffer up to four explicit follow-ups before the first non-empty
 model token; that buffer is presentation state and is not durable context.
 
 ## Repository-level AGENTS.md instruction discovery
+
+The pure instruction value objects are owned by
+`neuro_code.domain.workspace.instructions`. The former
+`neuro_code.domain.instructions` path remains a one-way compatibility facade;
+the filesystem discovery adapter remains in
+`neuro_code.infrastructure.workspace.instructions`. This separates domain
+projection values from filesystem side effects without changing the discovery
+port or its security limits.
 
 Repository-level AGENTS.md files are project-owned, non-system instructions that
 guide agent behaviour within the workspace boundary. They are never loaded from
@@ -254,6 +360,14 @@ inspect does not use the same runtime instance as a live session. See
 
 ## Read-only skill file discovery
 
+The pure skill metadata owner is
+`neuro_code.domain.workspace.skills`. The former
+`neuro_code.domain.skills` path remains a one-way compatibility facade;
+filesystem discovery remains in `neuro_code.infrastructure.workspace.skills`,
+and the `SkillTool` remains an infrastructure-side read-only body loader.
+This keeps parsing, bounded metadata projections, substitutions, fingerprints,
+and synthetic-message construction independent from filesystem side effects.
+
 Project, repository, and user `SKILL.md` files are read-only metadata that
 inform the model of available skills. Skill discovery follows the same
 ports-and-adapters pattern as instruction discovery: a `SkillDiscovery` port,
@@ -286,7 +400,7 @@ synthetic `User` message tagged with
 preserves the "repository content does not share system prompt trust level"
 safety invariant. The `Message.synthetic_reason` field is an in-memory
 marker only; skill listings do not enter `SessionItem` persistence and are
-re-discovered on each model step. The runtime `SkillTracker` is
+re-discovered on each model step. The application-memory `SkillTracker` is
 session-scoped and maintains a moving target (mirroring the
 `InstructionTracker` design): when file-access tools touch a path,
 `check_path()` updates the target so that `SKILL.md` files from the
@@ -324,7 +438,7 @@ next tool invocation without a session restart. Variable substitution is
 performed at load time: the `SkillTool` accepts an optional `args`
 parameter and expands `$ARGUMENTS`, `$ARGUMENTS[N]`, `$N`, and
 `${SKILL_DIR}` tokens in the body via `apply_skill_substitutions()` in
-`domain/skills.py`. When the body contains no argument tokens but args are
+`domain/workspace/skills.py`. When the body contains no argument tokens but args are
 non-empty, the args are appended as a `**ARGUMENTS:**` suffix for backward
 compatibility. Arguments, substitution count, and rendered output are byte or
 count bounded; unsupported positional tokens such as `$100` remain literal.
@@ -686,8 +800,9 @@ remains active across `ClosePseudoConsole`. See
 [ADR 0032](adr/0032-native-windows-conpty-lifecycle-evidence.md). Neuro Code
 validates this process-boundary shape with its own native terminal tests.
 
-Above the native adapters, `LocalInteractiveTerminalManager` implements the
-shared `InteractiveTerminalManager` port. Creation crosses permission,
+Above the native adapters, the application session owner
+`neuro_code.application.sessions.terminal_sessions` implements the shared
+`InteractiveTerminalManager` port. Creation crosses permission,
 workspace and matching-sandbox checks before spawn. A thread-safe bounded tail
 ring exposes monotonic output cursors and exact dropped-byte counts; input,
 resize, signals, wait and close share one owned lifecycle. POSIX targets the
@@ -726,6 +841,13 @@ changing task state. See
 [ADR 0022](adr/0022-session-scoped-background-task-visibility.md),
 [ADR 0058](adr/0058-durable-session-task-lifecycle.md), and
 [ADR 0061](adr/0061-read-only-plan-execution-inspection.md).
+
+Ordered persisted conversation items have a dedicated application read owner,
+`neuro_code.application.sessions.item_queries`. Session resume/reload and
+explicit session export share its typed request and tuple projection; the
+legacy session facade keeps identity-preserving compatibility exports. The
+owner does not absorb plan, comment, lifecycle, event, or storage transaction
+responsibilities.
 
 The TUI keeps its prompt available while a worker-owned turn runs. `Ctrl+C` and
 local `/cancel` cancel that worker; an approval modal gives `Ctrl+C` the narrower
@@ -782,8 +904,21 @@ obsolete comments. See ADR 0028,
 [ADR 0061](adr/0061-read-only-plan-execution-inspection.md), plus
 [ADR 0063](adr/0063-bounded-explicit-plan-task-scheduling.md).
 
-`ProfileConversationController` wraps the active `AgentConversation` for the
-interactive composition. It serializes selection with turns and exposes only
+Stage5CQ adds an explicit, bounded `SubagentExecutionService` application
+workflow. It creates a metadata-only `SUBAGENT` session task before invoking an
+injected `SubagentExecutor`, records exactly one terminal state, and preserves
+the executor's result, failure, or cancellation. The request is bounded and
+does not contain parent messages, tools, credentials, or output. The executor
+must build a fresh child runtime/context; this service never reuses the parent
+conversation. There is no queue, retry, automatic scheduler, ACP method, CLI
+command, or TUI command in this slice. See
+[ADR 0071](adr/0071-explicit-bounded-subagent-lifecycle.md).
+
+`ProfileConversationController` in
+`neuro_code.application.sessions.profile_conversation` wraps the active
+`AgentConversation` for the interactive composition. The former
+`neuro_code.application.runtime.profile_conversation` path is a compatibility
+facade. It serializes selection with turns and exposes only
 redacted `ProviderOption` data to the TUI. Selecting a different configured
 profile composes a new provider/runtime/conversation binding with no resumed
 session; the old SQLite session remains untouched. This strict boundary avoids
@@ -946,10 +1081,21 @@ renders an error response body, and classifies failures for localized recovery.
 Catalog values live only in the current screen; neither credentials nor remote
 responses are added to provider metadata. Manual model input remains available
 for compatible services without a catalog endpoint.
+The request, bounded-result, classified-error, and port types are owned by
+`neuro_code.application.ports.provider_catalog`; the former
+`neuro_code.domain.provider_catalog` import remains only as a compatibility
+facade and is not a second implementation.
 See [ADR 0046](adr/0046-global-cli-and-managed-provider-settings.md) and
 [ADR 0047](adr/0047-recoverable-managed-provider-proxy-settings.md). Read-only
 connection discovery is defined by
 [ADR 0048](adr/0048-bounded-provider-connection-discovery.md).
+
+The managed provider value objects (`ManagedProviderProfile`,
+`ManagedProviderSettings`, and `ManagedProxyPolicy`) and the
+`ProviderSettingsStore` contract are canonical at
+`neuro_code.application.ports.provider_settings`. The historical
+`neuro_code.domain.provider_settings` import is compatibility-only; it does not
+contain a second implementation. See ADR 0049, item 82.
 
 An optional positive `context_window_tokens` field records provider/model
 capability metadata. It is propagated through redacted profile selection and

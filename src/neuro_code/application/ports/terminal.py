@@ -1,4 +1,6 @@
-"""Canonical interactive-terminal ports."""
+"""Canonical interactive-terminal ports.
+
+定义规范的交互式终端端口."""
 
 from __future__ import annotations
 
@@ -6,7 +8,7 @@ from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Protocol
 
-from neuro_code.domain.terminal import TerminalOutputChunk, TerminalSignal, TerminalSize
+from neuro_code.domain.terminal.models import TerminalOutputChunk, TerminalSignal, TerminalSize
 
 
 class InteractiveTerminalSession(Protocol):

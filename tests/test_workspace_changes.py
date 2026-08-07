@@ -6,7 +6,7 @@ from neuro_code.application.ports.workspace_changes import (
     WorkspaceChangeCheckpoint,
     WorkspaceChangeReport,
 )
-from neuro_code.workspace_changes import (
+from neuro_code.infrastructure.workspace.changes import (
     FilesystemWorkspaceChangeObserver,
     MultiRootWorkspaceChangeObserver,
     capture_workspace_snapshot,

@@ -8,8 +8,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from neuro_code.adapters.sandbox import LinuxBubblewrapSandbox
 from neuro_code.domain.sandbox import SandboxProfile
+from neuro_code.infrastructure.sandbox.sandbox import LinuxBubblewrapSandbox
 from neuro_code.shared.errors import SandboxError
 
 
@@ -32,7 +32,7 @@ class LinuxBubblewrapSandboxTests(unittest.TestCase):
     ) -> LinuxBubblewrapSandbox:
         executable = Path("/usr/bin/true")
         with mock.patch(
-            "neuro_code.adapters.sandbox._trusted_system_executable",
+            "neuro_code.infrastructure.sandbox.sandbox._trusted_system_executable",
             return_value=executable,
         ):
             return LinuxBubblewrapSandbox(profile, workspace, state_dir)
@@ -134,7 +134,7 @@ class LinuxBubblewrapSandboxTests(unittest.TestCase):
 
             with (
                 mock.patch(
-                    "neuro_code.adapters.sandbox._trusted_system_executable",
+                    "neuro_code.infrastructure.sandbox.sandbox._trusted_system_executable",
                     return_value=Path("/usr/bin/true"),
                 ),
                 self.assertRaisesRegex(SandboxError, "state_dir cannot contain"),
@@ -153,7 +153,10 @@ class LinuxBubblewrapSandboxTests(unittest.TestCase):
                 mock.patch.dict(os.environ, {}, clear=True),
                 mock.patch.object(sandbox, "_preflight_bubblewrap"),
                 mock.patch.object(sandbox, "_preflight_child_network"),
-                mock.patch("neuro_code.adapters.sandbox.os.execv", side_effect=OSError("denied")),
+                mock.patch(
+                    "neuro_code.infrastructure.sandbox.sandbox.os.execv",
+                    side_effect=OSError("denied"),
+                ),
                 self.assertRaisesRegex(SandboxError, "could not enter"),
             ):
                 sandbox.enforce_current_process((sys.executable, "-m", "neuro_code"))

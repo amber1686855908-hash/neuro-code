@@ -1,4 +1,6 @@
-"""Tests for repository AGENTS.md instruction discovery."""
+"""Tests for repository AGENTS.md instruction discovery.
+
+测试仓库 AGENTS.md 指令发现."""
 
 from __future__ import annotations
 
@@ -8,8 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from neuro_code.adapters.instruction_discovery import FilesystemInstructionDiscovery
-from neuro_code.domain.instructions import (
+from neuro_code.domain.workspace.instructions import (
     INSTRUCTION_FILENAME,
     MAX_DIRECTORY_DEPTH,
     MAX_INSTRUCTION_FILES,
@@ -20,6 +21,7 @@ from neuro_code.domain.instructions import (
     InstructionRejectionReason,
     compute_instruction_fingerprint,
 )
+from neuro_code.infrastructure.workspace.instructions import FilesystemInstructionDiscovery
 from tests.fakes import EmptyWorkspaceChangeObserver
 
 # ---------------------------------------------------------------------------
@@ -276,6 +278,8 @@ class TestFilesystemInstructionDiscovery:
         The TOCTOU-safe read uses O_NOFOLLOW and does not follow any
         symlinks, so even a safe symlink is rejected with
         SYMLINK_NOT_SUPPORTED rather than being followed.
+
+        验证即使符号链接目标位于工作区内也会被拒绝,因为安全读取不跟随符号链接.
         """
         real = tmp_path / "real_agents.md"
         real.write_text("internal", encoding="utf-8")
@@ -298,7 +302,9 @@ class TestFilesystemInstructionDiscovery:
         )
 
     def test_target_outside_workspace_rejected(self, tmp_path: Path) -> None:
-        """Target outside workspace must be rejected, not silently clamped."""
+        """Target outside workspace must be rejected, not silently clamped.
+
+        验证工作区外目标会被拒绝,而不是被静默限制到边界内."""
         (tmp_path / INSTRUCTION_FILENAME).write_text("root", encoding="utf-8")
         outside = tmp_path.parent / "elsewhere_dir"
         result = self.discovery.discover(tmp_path, target=outside)
@@ -329,7 +335,9 @@ class TestFilesystemInstructionDiscovery:
         assert result.files[0].content == ""
 
     def test_toctou_safe_read(self, tmp_path: Path) -> None:
-        """Verify that the adapter reads bytes first then checks size (TOCTOU-safe)."""
+        """Verify that the adapter reads bytes first then checks size (TOCTOU-safe).
+
+        验证适配器先读取字节再检查大小,以保持 TOCTOU 安全."""
         # Write a file exactly at the size limit.
         (tmp_path / INSTRUCTION_FILENAME).write_text("x" * MAX_SINGLE_FILE_BYTES, encoding="utf-8")
         result = self.discovery.discover(tmp_path)
@@ -348,6 +356,8 @@ def _can_create_junction(tmp_path: Path) -> bool:
     fail in some sandboxes or when the user lacks the relevant filesystem
     permissions.  Returns True on non-Windows platforms so that the gating
     logic in callers reduces to ``os.name == "nt"``.
+
+    探测当前环境是否可以创建目录联接.
     """
     if os.name != "nt":
         return False
@@ -375,13 +385,17 @@ class TestWindowsReparsePoints:
     reports as False (they use ``IO_REPARSE_TAG_MOUNT_POINT`` rather than
     ``IO_REPARSE_TAG_SYMLINK``).  The adapter must still reject them when
     they would let repository instructions escape the workspace.
+
+    测试 Windows 目录联接和 NTFS 符号链接的处理.
     """
 
     def setup_method(self) -> None:
         self.discovery = FilesystemInstructionDiscovery()
 
     def test_directory_junction_named_agents_md_rejected(self, tmp_path: Path) -> None:
-        """A directory junction named AGENTS.md is a reparse point, rejected."""
+        """A directory junction named AGENTS.md is a reparse point, rejected.
+
+        验证名为 AGENTS.md 的目录联接会被识别为重解析点并拒绝."""
         if not _can_create_junction(tmp_path):
             pytest.skip("cannot create directory junctions in this environment")
         import subprocess
@@ -400,7 +414,9 @@ class TestWindowsReparsePoints:
         assert result.rejections[0].reason is InstructionRejectionReason.SYMLINK_NOT_SUPPORTED
 
     def test_directory_junction_escape_rejected(self, tmp_path: Path) -> None:
-        """A subdirectory junction that points outside must reject the escaped AGENTS.md."""
+        """A subdirectory junction that points outside must reject the escaped AGENTS.md.
+
+        验证指向工作区外的子目录联接会拒绝越界的 AGENTS.md."""
         if not _can_create_junction(tmp_path):
             pytest.skip("cannot create directory junctions in this environment")
         import subprocess
@@ -446,6 +462,8 @@ class TestWindowsReparsePoints:
 
         This test requires ``SeCreateSymbolicLinkPrivilege`` (admin or Developer
         Mode).  It is skipped gracefully when the privilege is unavailable.
+
+        验证越界的 NTFS 文件符号链接会被拒绝.
         """
         outside = tmp_path.parent / "neuro_code_symlink_outside.md"
         outside.write_text("escaped", encoding="utf-8")
@@ -474,18 +492,20 @@ class TestWindowsReparsePoints:
 
 class TestRuntimeInstructionInjection:
     async def test_instruction_injected_as_synthetic_user(self, tmp_path: Path) -> None:
-        """Verify instructions are injected as a synthetic User message, not System."""
+        """Verify instructions are injected as a synthetic User message, not System.
+
+        验证指令以合成 User 消息注入,而不是 System 消息."""
         from collections.abc import AsyncIterator, Sequence
 
         from neuro_code.application.ports.tools import ToolContext
         from neuro_code.application.runtime.agent import AgentRuntime
+        from neuro_code.domain.conversation.reasoning import ReasoningEffort
         from neuro_code.domain.messages import Message, Role, SyntheticReason
         from neuro_code.domain.model_context import ModelContext
         from neuro_code.domain.model_events import ModelCompleted, ModelEvent, ModelTextDelta
-        from neuro_code.domain.reasoning import ReasoningEffort
         from neuro_code.domain.tools import ToolDefinition
+        from neuro_code.infrastructure.tools.registry import ToolRegistry
         from neuro_code.permissions import PermissionManager, PermissionMode
-        from neuro_code.tools.registry import ToolRegistry
 
         (tmp_path / INSTRUCTION_FILENAME).write_text("Use tabs.", encoding="utf-8")
         discovery = FilesystemInstructionDiscovery()
@@ -548,18 +568,20 @@ class TestRuntimeInstructionInjection:
         assert "Use tabs." not in sys_msg.model_content()
 
     async def test_no_instruction_provider_no_injection(self, tmp_path: Path) -> None:
-        """Without an instruction provider, no synthetic User message is injected."""
+        """Without an instruction provider, no synthetic User message is injected.
+
+        验证没有指令 Provider 时不会注入合成 User 消息."""
         from collections.abc import AsyncIterator, Sequence
 
         from neuro_code.application.ports.tools import ToolContext
         from neuro_code.application.runtime.agent import AgentRuntime
+        from neuro_code.domain.conversation.reasoning import ReasoningEffort
         from neuro_code.domain.messages import Message, SyntheticReason
         from neuro_code.domain.model_context import ModelContext
         from neuro_code.domain.model_events import ModelCompleted, ModelEvent, ModelTextDelta
-        from neuro_code.domain.reasoning import ReasoningEffort
         from neuro_code.domain.tools import ToolDefinition
+        from neuro_code.infrastructure.tools.registry import ToolRegistry
         from neuro_code.permissions import PermissionManager, PermissionMode
-        from neuro_code.tools.registry import ToolRegistry
 
         captured_contexts: list[ModelContext] = []
 
@@ -600,18 +622,20 @@ class TestRuntimeInstructionInjection:
         assert len(synthetic_msgs) == 0
 
     async def test_instruction_refreshed_between_calls(self, tmp_path: Path) -> None:
-        """Verify that instruction content changes are picked up on the next call."""
+        """Verify that instruction content changes are picked up on the next call.
+
+        验证指令内容变化会在下一次调用中被发现."""
         from collections.abc import AsyncIterator, Sequence
 
         from neuro_code.application.ports.tools import ToolContext
         from neuro_code.application.runtime.agent import AgentRuntime
+        from neuro_code.domain.conversation.reasoning import ReasoningEffort
         from neuro_code.domain.messages import Message, SyntheticReason
         from neuro_code.domain.model_context import ModelContext
         from neuro_code.domain.model_events import ModelCompleted, ModelEvent, ModelTextDelta
-        from neuro_code.domain.reasoning import ReasoningEffort
         from neuro_code.domain.tools import ToolDefinition
+        from neuro_code.infrastructure.tools.registry import ToolRegistry
         from neuro_code.permissions import PermissionManager, PermissionMode
-        from neuro_code.tools.registry import ToolRegistry
 
         agents_file = tmp_path / INSTRUCTION_FILENAME
         agents_file.write_text("version 1", encoding="utf-8")
@@ -686,6 +710,8 @@ class TestInstructionTracker:
     target deeper when file-access tools touch a path.  These tests verify
     target movement, subtree isolation, and workspace-boundary clamping
     without spinning up a full AgentRuntime.
+
+    提供 InstructionTracker 的单元测试,覆盖目标移动、子树隔离和工作区边界限制.
     """
 
     def test_initial_target_is_workspace_root(self, tmp_path: Path) -> None:
@@ -748,7 +774,9 @@ class TestInstructionTracker:
                 outside.rmdir()
 
     def test_subtree_isolation_sibling_excluded(self, tmp_path: Path) -> None:
-        """Moving from src/foo/ to src/bar/ must exclude src/foo/AGENTS.md."""
+        """Moving from src/foo/ to src/bar/ must exclude src/foo/AGENTS.md.
+
+        验证从 src/foo/ 移动到 src/bar/ 后会排除 src/foo/AGENTS.md."""
         from neuro_code.application.runtime.instruction_tracker import InstructionTracker
 
         foo_dir = tmp_path / "src" / "foo"
@@ -779,7 +807,9 @@ class TestInstructionTracker:
         assert "foo rules" not in contents_bar
 
     def test_current_result_includes_root_and_deep(self, tmp_path: Path) -> None:
-        """When target is deep, result includes AGENTS.md from root to target."""
+        """When target is deep, result includes AGENTS.md from root to target.
+
+        验证目标位于深层目录时,结果包含从根目录到目标目录的 AGENTS.md."""
         from neuro_code.application.runtime.instruction_tracker import InstructionTracker
 
         deep_dir = tmp_path / "packages" / "api"
@@ -799,7 +829,9 @@ class TestInstructionTracker:
         assert "deep rules" in contents
 
     def test_current_result_not_cached(self, tmp_path: Path) -> None:
-        """current_result() re-runs discovery on each call (no caching)."""
+        """current_result() re-runs discovery on each call (no caching).
+
+        验证 current_result() 每次调用都会重新发现,不使用缓存."""
         from neuro_code.application.runtime.instruction_tracker import InstructionTracker
 
         agents = tmp_path / INSTRUCTION_FILENAME
@@ -828,16 +860,21 @@ class TestAgentRuntimeDeepScope:
     """End-to-end tests that the InstructionTracker is wired into ToolContext
     and that file-access tools update the discovery target, so the next model
     step's instruction context includes deeper AGENTS.md files.
+
+    提供端到端测试,验证 InstructionTracker 接入 ToolContext 并更新后续模型上下文.
     """
 
     async def test_read_file_tool_moves_tracker_target_deeper(self, tmp_path: Path) -> None:
         """read_file on a deep path updates the tracker, so the second model
-        step sees both root and deep AGENTS.md instructions."""
+        step sees both root and deep AGENTS.md instructions.
+
+        验证深层 read_file 会更新跟踪目标,使第二个模型步骤看到根目录和深层指令."""
         from collections.abc import AsyncIterator, Sequence
 
         from neuro_code.application.ports.tools import ToolContext
         from neuro_code.application.runtime.agent import AgentRuntime
         from neuro_code.application.runtime.instruction_tracker import InstructionTracker
+        from neuro_code.domain.conversation.reasoning import ReasoningEffort
         from neuro_code.domain.messages import Message, SyntheticReason, ToolCall
         from neuro_code.domain.model_context import ModelContext
         from neuro_code.domain.model_events import (
@@ -846,7 +883,6 @@ class TestAgentRuntimeDeepScope:
             ModelTextDelta,
             ModelToolCall,
         )
-        from neuro_code.domain.reasoning import ReasoningEffort
         from neuro_code.domain.tools import ToolDefinition
         from neuro_code.permissions import PermissionManager, PermissionMode
         from neuro_code.tools import default_tool_registry
@@ -942,12 +978,15 @@ class TestAgentRuntimeDeepScope:
 
     async def test_subtree_isolation_in_runtime(self, tmp_path: Path) -> None:
         """When read_file moves from src/foo/ to src/bar/, the deep AGENTS.md
-        from src/foo/ is excluded on the next step (subtree isolation)."""
+        from src/foo/ is excluded on the next step (subtree isolation).
+
+        验证 read_file 从 src/foo/ 移动到 src/bar/ 后会排除 src/foo/ 的深层 AGENTS.md."""
         from collections.abc import AsyncIterator, Sequence
 
         from neuro_code.application.ports.tools import ToolContext
         from neuro_code.application.runtime.agent import AgentRuntime
         from neuro_code.application.runtime.instruction_tracker import InstructionTracker
+        from neuro_code.domain.conversation.reasoning import ReasoningEffort
         from neuro_code.domain.messages import Message, SyntheticReason, ToolCall
         from neuro_code.domain.model_context import ModelContext
         from neuro_code.domain.model_events import (
@@ -956,7 +995,6 @@ class TestAgentRuntimeDeepScope:
             ModelTextDelta,
             ModelToolCall,
         )
-        from neuro_code.domain.reasoning import ReasoningEffort
         from neuro_code.domain.tools import ToolDefinition
         from neuro_code.permissions import PermissionManager, PermissionMode
         from neuro_code.tools import default_tool_registry
@@ -1066,6 +1104,8 @@ class TestAgentRuntimeDeepScope:
 class TestPathSubstitutionDetection:
     """Tests that the lstat-with-fstat identity comparison detects path
     substitution between lstat and open.
+
+    测试 lstat 与 fstat 身份比较能够检测路径替换.
     """
 
     def setup_method(self) -> None:
@@ -1078,6 +1118,8 @@ class TestPathSubstitutionDetection:
         with a different file between the lstat() and os.open() calls.  The
         lstat-with-fstat identity comparison (st_dev/st_ino) should detect
         the mismatch and reject the read.
+
+        验证文件在 lstat 和 open 之间被替换时会拒绝读取,从而检测 TOCTOU 攻击.
         """
         import unittest.mock
 
@@ -1100,7 +1142,9 @@ class TestPathSubstitutionDetection:
         assert any(r.reason is InstructionRejectionReason.READ_ERROR for r in result.rejections)
 
     def test_no_substitution_no_false_positive(self, tmp_path: Path) -> None:
-        """A normal file (no substitution) should not trigger a false positive."""
+        """A normal file (no substitution) should not trigger a false positive.
+
+        验证普通文件未发生替换时不会产生误报."""
         (tmp_path / INSTRUCTION_FILENAME).write_text("normal content", encoding="utf-8")
         result = self.discovery.discover(tmp_path)
         assert result.loaded_count == 1
@@ -1115,11 +1159,15 @@ class TestPathSubstitutionDetection:
 class TestSearchReplacePreFlight:
     """Tests that search_replace aborts when new AGENTS.md files are found
     in the target directory that the model has not yet seen.
+
+    测试发现模型未读取的新 AGENTS.md 时 search_replace 会中止.
     """
 
     async def test_direct_deep_search_replace_triggers_preflight(self, tmp_path: Path) -> None:
         """search_replace on a deep file with unseen AGENTS.md must NOT
         modify the file -- it should return the instructions instead.
+
+        验证深层文件存在未发现 AGENTS.md 时 search_replace 绝不修改文件,而是返回指令.
         """
         from neuro_code.application.ports.tools import ToolContext
         from neuro_code.application.runtime.instruction_tracker import InstructionTracker
@@ -1163,10 +1211,13 @@ class TestSearchReplacePreFlight:
         """If the model has already read a file in the deep directory (moving
         the tracker there), a subsequent search_replace should proceed because
         the deep AGENTS.md was already in the model instruction context.
+
+        验证模型已经读取深层目录文件并移动跟踪器后,后续 search_replace 可以继续.
         """
         from neuro_code.application.ports.tools import ToolContext
         from neuro_code.application.runtime.instruction_tracker import InstructionTracker
-        from neuro_code.tools.filesystem import ReadFileTool, SearchReplaceTool
+        from neuro_code.infrastructure.tools.filesystem import ReadFileTool
+        from neuro_code.tools.filesystem import SearchReplaceTool
 
         (tmp_path / INSTRUCTION_FILENAME).write_text("root rules", encoding="utf-8")
         deep_dir = tmp_path / "src" / "deep"
@@ -1236,12 +1287,14 @@ class TestSearchReplacePreFlight:
 class TestGrepRecursiveTracker:
     """Tests that grep recursive search calls check_path for each matched
     file, moving the tracker to the deepest matched file directory.
+
+    测试递归 grep 会为每个匹配结果调用 check_path.
     """
 
     async def test_grep_recursive_moves_tracker_for_deep_matches(self, tmp_path: Path) -> None:
         from neuro_code.application.ports.tools import ToolContext
         from neuro_code.application.runtime.instruction_tracker import InstructionTracker
-        from neuro_code.tools.filesystem import GrepTool
+        from neuro_code.infrastructure.tools.filesystem import GrepTool
 
         # Workspace layout:
         #   tmp_path/AGENTS.md           -> "root rules"

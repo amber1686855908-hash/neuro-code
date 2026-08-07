@@ -19,12 +19,13 @@ from neuro_code.domain.background_tasks import (
     BackgroundTaskWaitResult,
 )
 from neuro_code.domain.sandbox import SandboxProfile
+from neuro_code.infrastructure.tools.filesystem import GrepTool, ReadFileTool
+from neuro_code.infrastructure.tools.plans import UpdatePlanTool
+from neuro_code.infrastructure.workspace.paths import resolve_workspace_path, workspaces_match
 from neuro_code.shared.errors import ToolError
 from neuro_code.tools import default_tool_registry
 from neuro_code.tools.client_terminal import ClientTerminalTool
-from neuro_code.tools.filesystem import GrepTool, ReadFileTool, SearchReplaceTool
-from neuro_code.tools.plans import UpdatePlanTool
-from neuro_code.workspace import resolve_workspace_path, workspaces_match
+from neuro_code.tools.filesystem import SearchReplaceTool
 
 
 def _canonical_path(path: str | Path) -> Path:

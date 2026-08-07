@@ -1,4 +1,6 @@
-"""Contracts shared by application permission flow and interactive adapters."""
+"""Contracts shared by application permission flow and interactive adapters.
+
+定义应用权限流程与交互适配器共享的契约."""
 
 from __future__ import annotations
 
@@ -9,7 +11,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
 
-from neuro_code.bash_commands import analyze_bash_command
+from neuro_code.domain.permissions.bash_commands import analyze_bash_command
 
 
 class PermissionApprovalKind(StrEnum):
@@ -76,7 +78,9 @@ def build_permission_request(
     arguments: Mapping[str, Any],
     reason: str,
 ) -> PermissionRequest:
-    """Build a bounded UI description and opaque exact-action session scope."""
+    """Build a bounded UI description and opaque exact-action session scope.
+
+    构建有界的 UI 描述和不透明的精确动作会话范围."""
 
     cacheable = True
     if tool_name == "bash":

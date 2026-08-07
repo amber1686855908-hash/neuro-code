@@ -1,4 +1,6 @@
-"""Session-scoped foreground command execution delegated to an ACP client."""
+"""Session-scoped foreground command execution delegated to an ACP client.
+
+定义委托给 ACP 客户端的会话范围前台命令执行."""
 
 from __future__ import annotations
 
@@ -7,7 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
-from neuro_code.domain.background_tasks import (
+from neuro_code.domain.background_tasks.models import (
     BackgroundTaskKillResult,
     BackgroundTaskSnapshot,
     BackgroundTaskWaitMode,
@@ -19,7 +21,9 @@ MAX_CLIENT_TERMINAL_OUTPUT_BYTES = 1024 * 1024
 
 @dataclass(frozen=True, slots=True)
 class ClientTerminalResult:
-    """A bounded terminal result returned by a capability-negotiated client."""
+    """A bounded terminal result returned by a capability-negotiated client.
+
+    表示能力协商客户端返回的有界终端结果."""
 
     output: str
     exit_code: int | None
@@ -35,6 +39,8 @@ class ClientTerminal(Protocol):
     configured Neuro Code credentials, and fail closed when terminal capability
     was not advertised.  The output limit cannot exceed
     ``MAX_CLIENT_TERMINAL_OUTPUT_BYTES``.
+
+    通过 ACP 运行直接前台可执行文件和受管理的后台可执行文件.
     """
 
     async def run(

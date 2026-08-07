@@ -20,11 +20,11 @@ from neuro_code.domain.model_events import (
     ModelTextDelta,
 )
 from neuro_code.domain.provider_catalog import ProviderConnectionSpec
+from neuro_code.infrastructure.tools.filesystem import ReadFileTool
+from neuro_code.infrastructure.tools.registry import ToolRegistry
 from neuro_code.permissions import PermissionManager
 from neuro_code.providers.failover import FailoverModelProvider, ProviderCandidate
 from neuro_code.shared.errors import ConfigurationError
-from neuro_code.tools.filesystem import ReadFileTool
-from neuro_code.tools.registry import ToolRegistry
 
 pytestmark = pytest.mark.live
 

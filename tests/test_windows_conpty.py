@@ -8,7 +8,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from unittest import mock
 
-from neuro_code.adapters.windows_conpty import (
+from neuro_code.infrastructure.sandbox.windows_conpty import (
     WindowsPseudoConsoleSession,
     _Coord,
     _CreatedProcess,
@@ -172,7 +172,7 @@ class WindowsPseudoConsoleSessionTests(unittest.TestCase):
     def test_non_windows_default_creation_fails_cleanly(self) -> None:
         cwd = Path(".")
         with (
-            mock.patch("neuro_code.adapters.windows_conpty.os.name", "posix"),
+            mock.patch("neuro_code.infrastructure.sandbox.windows_conpty.os.name", "posix"),
             self.assertRaisesRegex(OSError, "only available on Windows"),
         ):
             WindowsPseudoConsoleSession.spawn(
@@ -333,11 +333,11 @@ class WindowsPseudoConsoleSessionTests(unittest.TestCase):
         api.process_done = True
         with (
             mock.patch(
-                "neuro_code.adapters.windows_conpty._NativeWindowsConPtyApi",
+                "neuro_code.infrastructure.sandbox.windows_conpty._NativeWindowsConPtyApi",
                 return_value=api,
             ),
             mock.patch(
-                "neuro_code.adapters.windows_conpty.WindowsJobObject.create",
+                "neuro_code.infrastructure.sandbox.windows_conpty.WindowsJobObject.create",
                 return_value=job,
             ) as create_job,
         ):

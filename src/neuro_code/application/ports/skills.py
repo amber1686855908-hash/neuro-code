@@ -1,11 +1,13 @@
-"""Canonical port for workspace skill file discovery."""
+"""Canonical port for workspace skill file discovery.
+
+定义工作区技能文件发现的规范端口."""
 
 from __future__ import annotations
 
 from pathlib import Path
 from typing import Protocol
 
-from neuro_code.domain.skills import SkillDiscoveryResult
+from neuro_code.domain.workspace.skills import SkillDiscoveryResult
 
 
 class SkillDiscovery(Protocol):
@@ -17,6 +19,8 @@ class SkillDiscovery(Protocol):
     only a compact listing (name + description + when-to-use) enters model
     context. A selected body is loaded separately through the read-only skill
     tool.
+
+    在工作区边界内发现 SKILL.md 技能文件. 发现过程确定性、有界且失败关闭,模型上下文只接收精简元数据列表.
     """
 
     def discover(
@@ -39,12 +43,16 @@ class SkillDiscovery(Protocol):
         scanning just the root level.  Deeper skills (closer to *target*)
         are collected first and win name-collision deduplication over
         shallower skills.
+
+        在 *workspace_root* 中发现技能文件,并按作用域优先级去重.
         """
         ...
 
 
 class SkillContextTracker(Protocol):
-    """Tool-facing skill tracker contract owned by one binding."""
+    """Tool-facing skill tracker contract owned by one binding.
+
+    定义由单个绑定拥有的、面向工具的技能跟踪器契约."""
 
     def check_path(self, target_path: Path) -> None: ...
 

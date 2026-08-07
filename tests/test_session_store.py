@@ -55,7 +55,9 @@ def _save_execution_record_in_process(
     start_event,
     result_queue,
 ) -> None:
-    """Attempt one execution-record write from a real OS process."""
+    """Attempt one execution-record write from a real OS process.
+
+    从真实 OS 进程尝试写入一条执行记录."""
 
     ready_queue.put("ready")
     if not start_event.wait(timeout=10):
@@ -180,10 +182,10 @@ class SessionStoreTests(unittest.IsolatedAsyncioTestCase):
         retry_connection.execute.side_effect = execute_with_transient_lock
         with (
             patch(
-                "neuro_code.adapters.sqlite_session.sqlite3.connect",
+                "neuro_code.infrastructure.persistence.sqlite_session.sqlite3.connect",
                 return_value=retry_connection,
             ),
-            patch("neuro_code.adapters.sqlite_session.time.sleep") as sleep,
+            patch("neuro_code.infrastructure.persistence.sqlite_session.time.sleep") as sleep,
         ):
             self.assertIs(store._connect(), retry_connection)
 
@@ -201,7 +203,7 @@ class SessionStoreTests(unittest.IsolatedAsyncioTestCase):
         failed_connection.execute.side_effect = execute_with_permanent_failure
         with (
             patch(
-                "neuro_code.adapters.sqlite_session.sqlite3.connect",
+                "neuro_code.infrastructure.persistence.sqlite_session.sqlite3.connect",
                 return_value=failed_connection,
             ),
             self.assertRaisesRegex(sqlite3.OperationalError, "disk I/O error"),
@@ -573,7 +575,7 @@ class SessionStoreTests(unittest.IsolatedAsyncioTestCase):
 
             with (
                 patch(
-                    "neuro_code.adapters.sqlite_session._upsert_search_document",
+                    "neuro_code.infrastructure.persistence.sqlite_session._upsert_search_document",
                     side_effect=RuntimeError("index failure"),
                 ),
                 self.assertRaisesRegex(RuntimeError, "index failure"),
@@ -754,6 +756,46 @@ class SessionStoreTests(unittest.IsolatedAsyncioTestCase):
             connection.close()
             with self.assertRaisesRegex(SessionError, "invalid completion event"):
                 await store.load_execution_record(session_id)
+
+    async def test_loading_execution_records_preserves_order_and_missing_records(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = SqliteSessionStore(Path(directory) / "sessions.db")
+            await store.initialize()
+            recorded_id = await store.create_session("/recorded", "fixture", "model")
+            empty_id = await store.create_session("/empty", "fixture", "model")
+            record = SessionExecutionRecord(
+                AgentExecutionOutcome(
+                    AgentExecutionStatus.STUCK,
+                    SupervisorReasonCode.NO_PROGRESS,
+                    finalized=True,
+                    recoverable=True,
+                ),
+                1,
+                datetime(2026, 7, 31, 12, tzinfo=UTC),
+            )
+            await store.append_event(
+                recorded_id,
+                AgentEvent.create(1, AgentEventKind.TURN_COMPLETED, {"step": 1}),
+            )
+            await store.save_execution_record(recorded_id, record)
+
+            self.assertEqual(
+                await store.load_execution_records((empty_id, recorded_id, recorded_id)),
+                (None, record, record),
+            )
+            self.assertEqual(await store.load_execution_records(()), ())
+            with self.assertRaisesRegex(SessionError, "unknown session: missing"):
+                await store.load_execution_records((recorded_id, "missing"))
+
+            connection = sqlite3.connect(Path(directory) / "sessions.db")
+            connection.execute(
+                "UPDATE events SET kind = ? WHERE session_id = ? AND sequence = ?",
+                (AgentEventKind.USER_MESSAGE.value, recorded_id, record.event_sequence),
+            )
+            connection.commit()
+            connection.close()
+            with self.assertRaisesRegex(SessionError, "invalid completion event"):
+                await store.load_execution_records((recorded_id,))
 
     async def test_execution_record_writes_are_monotonic_across_turn_sequences(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1253,7 +1295,7 @@ class SessionStoreTests(unittest.IsolatedAsyncioTestCase):
 
             with (
                 patch(
-                    "neuro_code.adapters.sqlite_session._upsert_search_document",
+                    "neuro_code.infrastructure.persistence.sqlite_session._upsert_search_document",
                     side_effect=RuntimeError("injected index failure"),
                 ),
                 self.assertRaisesRegex(RuntimeError, "injected index failure"),
@@ -1552,7 +1594,7 @@ class SessionStoreTests(unittest.IsolatedAsyncioTestCase):
             store = SqliteSessionStore(database)
             with (
                 patch(
-                    "neuro_code.adapters.sqlite_session._backfill_search_documents",
+                    "neuro_code.infrastructure.persistence.sqlite_session._backfill_search_documents",
                     side_effect=RuntimeError("injected backfill failure"),
                 ),
                 self.assertRaisesRegex(RuntimeError, "injected backfill failure"),

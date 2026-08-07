@@ -6,10 +6,10 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from neuro_code.adapters.ui_preferences import JsonUiPreferencesStore
-from neuro_code.domain.interaction_mode import InteractionMode
-from neuro_code.domain.reasoning import ReasoningEffort
+from neuro_code.domain.conversation.interaction_mode import InteractionMode
+from neuro_code.domain.conversation.reasoning import ReasoningEffort
 from neuro_code.domain.ui_preferences import UiLanguage
+from neuro_code.infrastructure.persistence.ui_preferences import JsonUiPreferencesStore
 
 
 class JsonUiPreferencesStoreTests(unittest.IsolatedAsyncioTestCase):

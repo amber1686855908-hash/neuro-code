@@ -65,7 +65,9 @@ def slash_completions(
     *,
     provider_names: tuple[str, ...] = (),
 ) -> tuple[SlashCompletion, ...]:
-    """Return deterministic slash-command completions for the current draft."""
+    """Return deterministic slash-command completions for the current draft.
+
+    返回当前草稿的确定性斜杠命令补全结果."""
 
     if not value.startswith("/") or "\n" in value or "\r" in value:
         return ()

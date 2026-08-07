@@ -1,4 +1,6 @@
-"""Bounded, provider-neutral structured plans for one durable session."""
+"""Bounded, provider-neutral structured plans for one durable session.
+
+定义一个持久化会话使用的有界且与 Provider 无关的结构化计划."""
 
 from __future__ import annotations
 
@@ -19,7 +21,9 @@ MAX_PLAN_STEPS = 12
 
 
 class PlanStepStatus(StrEnum):
-    """Visible lifecycle states for one user-facing plan step."""
+    """Visible lifecycle states for one user-facing plan step.
+
+    定义一个面向用户的计划步骤可见生命周期状态."""
 
     PENDING = "pending"
     IN_PROGRESS = "in_progress"
@@ -59,7 +63,9 @@ class PlanStep:
 
 @dataclass(frozen=True, slots=True)
 class PlanComment:
-    """Bounded user feedback anchored to one visible plan step."""
+    """Bounded user feedback anchored to one visible plan step.
+
+    表示绑定到一个可见计划步骤的有界用户反馈."""
 
     comment_id: str
     step_index: int
@@ -97,7 +103,9 @@ class PlanComment:
 
 @dataclass(frozen=True, slots=True)
 class SessionPlan:
-    """The bounded current plan associated with one session."""
+    """The bounded current plan associated with one session.
+
+    表示一个会话关联的有界当前计划."""
 
     steps: tuple[PlanStep, ...]
     explanation: str | None = None
@@ -129,7 +137,9 @@ class SessionPlan:
 
     @property
     def fingerprint(self) -> str:
-        """Return the stable identity used to attach user feedback to this revision."""
+        """Return the stable identity used to attach user feedback to this revision.
+
+        返回用于将用户反馈附加到此版本的稳定身份."""
 
         payload = json.dumps(
             self.to_dict(),
@@ -173,7 +183,9 @@ class SessionPlan:
         return cls(tuple(steps), raw_explanation)
 
     def model_guidance(self) -> str:
-        """Render stable control text without adding a provider-specific protocol."""
+        """Render stable control text without adding a provider-specific protocol.
+
+        渲染稳定的控制文本,不增加 Provider 特定协议."""
 
         lines = ["Current structured plan:"]
         if self.explanation is not None:
@@ -184,7 +196,9 @@ class SessionPlan:
         return "\n".join(lines)
 
     def comment_guidance(self, comments: Sequence[PlanComment]) -> str:
-        """Render current-revision user feedback for the next provider request."""
+        """Render current-revision user feedback for the next provider request.
+
+        为下一次 Provider 请求渲染当前版本的用户反馈."""
 
         normalized = tuple(comments)
         if not normalized:
@@ -200,7 +214,9 @@ class SessionPlan:
 
 
 def plan_from_update_arguments(arguments: Mapping[str, Any]) -> SessionPlan:
-    """Validate the public update-plan schema independently of a UI/provider."""
+    """Validate the public update-plan schema independently of a UI/provider.
+
+    独立于 UI 和 Provider 验证公开的 update-plan 数据结构."""
 
     return SessionPlan.from_dict(arguments)
 

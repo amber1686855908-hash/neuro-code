@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import difflib
+import logging
 import os
 import re
 import sys
@@ -28,23 +29,56 @@ from textual.suggester import Suggester
 from textual.widgets import Button, Input, Label, Static
 from textual.worker import Worker
 
+from neuro_code.application.permissions.broker import ApprovalHandler
 from neuro_code.application.permissions.contracts import PermissionApproval, PermissionRequest
 from neuro_code.application.ports.http import HttpClientPolicy
-from neuro_code.application.ports.provider_catalog import ProviderCatalog
-from neuro_code.application.ports.provider_settings import ProviderSettingsStore
+from neuro_code.application.ports.provider_catalog import (
+    ProviderCatalog,
+    ProviderCatalogError,
+    ProviderCatalogResult,
+    ProviderConnectionSpec,
+)
+from neuro_code.application.ports.provider_settings import (
+    ManagedProviderProfile,
+    ManagedProviderSettings,
+    ManagedProxyPolicy,
+    ProviderSettingsStore,
+)
 from neuro_code.application.ports.ui_preferences import UiPreferencesStore
-from neuro_code.application.runtime.agent import AgentRunResult, EventSink
-from neuro_code.application.runtime.approval import ApprovalHandler
-from neuro_code.application.runtime.profile_conversation import (
-    InteractionModeSelectionResult,
+from neuro_code.application.providers.contracts import (
     ProviderOption,
     ProviderSelectionResult,
+)
+from neuro_code.application.providers.service import ChangeProviderRequest
+from neuro_code.application.runtime.agent import AgentRunResult, EventSink
+from neuro_code.application.sessions.contracts import (
+    InteractionModeSelectionResult,
     ReasoningEffortSelectionResult,
     SessionOption,
-    SessionSelectionResult,
 )
-from neuro_code.config import resolve_http_client_policy
-from neuro_code.domain.background_tasks import (
+from neuro_code.application.sessions.selection import (
+    SessionSelectionController,
+    SessionSelectionService,
+)
+from neuro_code.application.sessions.turns import RunTurnRequest, SessionTurnService
+from neuro_code.application.tools.service import (
+    ReadSessionToolOutputArtifactRequest,
+    SessionToolOutputArtifactApplicationService,
+)
+from neuro_code.application.workflows.plan_execution import (
+    ExecutePlanRequest,
+    PlanExecutionService,
+)
+from neuro_code.application.workflows.plan_scheduling import (
+    PlanSchedulingService,
+    SchedulePlanRequest,
+)
+from neuro_code.application.workflows.session_task_execution import (
+    QueuedPlanExecutionService,
+    RunSessionTaskRequest,
+)
+from neuro_code.configuration.app import resolve_http_client_policy
+from neuro_code.domain.background_tasks.models import (
     BackgroundTaskSnapshot,
     BackgroundTaskStatus,
     BackgroundTaskWakePolicy,
@@ -52,31 +86,21 @@ from neuro_code.domain.background_tasks import (
     BackgroundWakeLimits,
     BackgroundWakeState,
 )
-from neuro_code.domain.context_usage import estimate_context_tokens, estimate_text_tokens
-from neuro_code.domain.events import AgentEvent, AgentEventKind
+from neuro_code.domain.conversation.context import estimate_context_tokens, estimate_text_tokens
+from neuro_code.domain.conversation.events import AgentEvent, AgentEventKind
+from neuro_code.domain.conversation.interaction_mode import InteractionMode
+from neuro_code.domain.conversation.messages import Message, Role, SessionItem
+from neuro_code.domain.conversation.reasoning import ReasoningEffort
 from neuro_code.domain.execution import (
     AgentExecutionStatus,
     SessionExecutionRecord,
     TurnCancellationPolicy,
 )
-from neuro_code.domain.interaction_mode import InteractionMode
-from neuro_code.domain.messages import Message, Role, SessionItem
 from neuro_code.domain.plans import PlanComment, SessionPlan
-from neuro_code.domain.provider_catalog import (
-    ProviderCatalogError,
-    ProviderCatalogResult,
-    ProviderConnectionSpec,
-)
-from neuro_code.domain.provider_settings import (
-    ManagedProviderProfile,
-    ManagedProviderSettings,
-    ManagedProxyPolicy,
-)
-from neuro_code.domain.reasoning import ReasoningEffort
 from neuro_code.domain.session_tasks import SessionTask, SessionTaskKind, SessionTaskStatus
-from neuro_code.domain.sessions import SessionSummary
-from neuro_code.domain.ui_preferences import UiLanguage
+from neuro_code.interfaces.tui import recoverable_terminal_status
 from neuro_code.shared.redaction import redact_sensitive_text
+from neuro_code.shared.ui_language import UiLanguage
 from neuro_code.tui_commands import SlashCompletion, slash_completions
 from neuro_code.tui_text import language_name, ui_text
 from neuro_code.tui_theme import (
@@ -145,6 +169,7 @@ _ERROR_MARK = "\N{MULTIPLICATION SIGN}"
 _SUCCESS_MARK = "\N{CHECK MARK}"
 _WARNING_MARK = "!"
 _ANSI_ESCAPE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
+_LOGGER = logging.getLogger(__name__)
 
 
 def _markdown_code_theme() -> str:
@@ -153,6 +178,8 @@ def _markdown_code_theme() -> str:
     ``Markdown`` forwards the value to ``Syntax``, whose runtime API accepts a
     ``PygmentsSyntaxTheme``. Its public annotation is limited to a named string
     theme, so this local cast preserves the custom theme object.
+
+    通过局部类型辅助函数容纳 Rich Markdown 的窄类型注解,不改变运行时主题.
     """
 
     return cast(str, MONO_SYNTAX_THEME)
@@ -168,7 +195,9 @@ class ProviderPreset:
 
 @dataclass(slots=True)
 class CollapsingPulseAnimation:
-    """Textual-friendly port of the user-supplied collapsing pulse demo."""
+    """Textual-friendly port of the user-supplied collapsing pulse demo.
+
+    提供适配 Textual 的用户折叠脉冲动画示例."""
 
     width: int = 7
     level_by_distance: tuple[int, ...] = (7, 5, 3, 1)
@@ -266,7 +295,9 @@ def _is_deepseek_base_url(value: str) -> bool:
 
 
 def _read_terminal_size() -> Size | None:
-    """Read the real TTY viewport without trusting possibly stale shell variables."""
+    """Read the real TTY viewport without trusting possibly stale shell variables.
+
+    读取真实 TTY 视口,不依赖可能过期的 shell 变量."""
 
     for stream in (sys.__stdin__, sys.__stderr__, sys.__stdout__):
         if stream is None:
@@ -310,7 +341,7 @@ class ProviderController(Protocol):
     @property
     def selected_profile(self) -> str: ...
 
-    async def select_profile(self, name: str) -> ProviderSelectionResult: ...
+    async def change_provider(self, request: ChangeProviderRequest) -> ProviderSelectionResult: ...
 
 
 class ReasoningController(Protocol):
@@ -339,12 +370,7 @@ class InteractionModeController(Protocol):
     ) -> InteractionModeSelectionResult: ...
 
 
-class SessionController(Protocol):
-    async def list_sessions(self, query: str | None = None) -> tuple[SessionOption, ...]: ...
-
-    async def select_session(self, session_id: str) -> SessionSelectionResult: ...
-
-    async def rename_session(self, title: str) -> SessionSummary: ...
+SessionController = SessionSelectionController
 
 
 SessionSearchCallback = Callable[[str | None], Awaitable[tuple[SessionOption, ...]]]
@@ -415,6 +441,11 @@ class ToolFeedbackState:
     is_error: bool = False
     metadata: dict[str, Any] | None = None
     workspace_changes: dict[str, Any] | None = None
+    artifact_id: str | None = None
+    artifact_content: str | None = None
+    artifact_read_truncated: bool = False
+    artifact_loading: bool = False
+    artifact_unavailable: bool = False
     expanded: bool = False
 
 
@@ -425,14 +456,18 @@ class ProviderSettingsSubmission:
 
 
 class AssistantMarkdown(Markdown):
-    """Safe model Markdown whose string form remains useful in diagnostics."""
+    """Safe model Markdown whose string form remains useful in diagnostics.
+
+    安全的模型 Markdown,其字符串形式仍适合诊断."""
 
     def __str__(self) -> str:
         return self.markup
 
 
 class SlashCommandSuggester(Suggester):
-    """Show the same first completion that Tab will apply."""
+    """Show the same first completion that Tab will apply.
+
+    显示 Tab 键将应用的第一条补全结果."""
 
     def __init__(
         self,
@@ -449,7 +484,9 @@ class SlashCommandSuggester(Suggester):
 
 
 class ConversationMessage(Static):
-    """One stable message node in the scrollable conversation."""
+    """One stable message node in the scrollable conversation.
+
+    可滚动会话中的一个稳定消息节点."""
 
     def __init__(
         self,
@@ -469,7 +506,9 @@ class ConversationMessage(Static):
 
 
 class ToolFeedbackMessage(ConversationMessage, can_focus=True):
-    """A stable tool card whose already-bounded details can be toggled."""
+    """A stable tool card whose already-bounded details can be toggled.
+
+    可切换已限制详情显示的稳定工具卡片."""
 
     BINDINGS: ClassVar[list[BindingType]] = [
         Binding("enter", "toggle_details", "Toggle details", show=False),
@@ -477,7 +516,9 @@ class ToolFeedbackMessage(ConversationMessage, can_focus=True):
     ]
 
     class ToggleRequested(TextualMessage):
-        """Request that the owning app toggle one tool card."""
+        """Request that the owning app toggle one tool card.
+
+        请求所属应用切换一个工具卡片."""
 
         def __init__(self, card: ToolFeedbackMessage) -> None:
             self.card = card
@@ -497,7 +538,9 @@ class ToolFeedbackMessage(ConversationMessage, can_focus=True):
 
 
 class SettingsScreen(ModalScreen[str | None]):
-    """First-level settings navigation; detailed forms live on child screens."""
+    """First-level settings navigation; detailed forms live on child screens.
+
+    一级设置导航;详细表单位于子界面."""
 
     CSS = """
     SettingsScreen {
@@ -612,7 +655,9 @@ class SettingsScreen(ModalScreen[str | None]):
 
 
 class LanguageSettingsScreen(ModalScreen[UiLanguage | None]):
-    """Edit one interface preference without rendering unrelated provider fields."""
+    """Edit one interface preference without rendering unrelated provider fields.
+
+    编辑一项界面偏好,不渲染无关的 Provider 字段."""
 
     CSS = """
     LanguageSettingsScreen {
@@ -731,7 +776,9 @@ class LanguageSettingsScreen(ModalScreen[UiLanguage | None]):
 
 
 class NetworkProxySettingsScreen(ModalScreen[ManagedProviderSettings | None]):
-    """Edit the user-wide proxy default independently of provider credentials."""
+    """Edit the user-wide proxy default independently of provider credentials.
+
+    独立编辑用户级代理默认值,不涉及 Provider 凭据."""
 
     CSS = """
     NetworkProxySettingsScreen {
@@ -902,7 +949,9 @@ class NetworkProxySettingsScreen(ModalScreen[ManagedProviderSettings | None]):
 
 
 class BackgroundWakeSettingsScreen(ModalScreen[ManagedProviderSettings | None]):
-    """Edit the user-wide background-task wake default."""
+    """Edit the user-wide background-task wake default.
+
+    编辑用户级后台任务唤醒默认值."""
 
     CSS = """
     BackgroundWakeSettingsScreen {
@@ -1053,7 +1102,9 @@ class BackgroundWakeSettingsScreen(ModalScreen[ManagedProviderSettings | None]):
 
 
 class ProviderSettingsScreen(ModalScreen[ProviderSettingsSubmission | None]):
-    """Create and edit user-owned provider profiles on a focused detail screen."""
+    """Create and edit user-owned provider profiles on a focused detail screen.
+
+    在聚焦的详情界面创建和编辑用户拥有的 Provider 配置."""
 
     CSS = """
     ProviderSettingsScreen {
@@ -1917,7 +1968,9 @@ class ProviderSettingsScreen(ModalScreen[ProviderSettingsSubmission | None]):
 
 
 class ProviderSetupApp(App[bool]):
-    """Focused provider setup used for first run and recoverable startup errors."""
+    """Focused provider setup used for first run and recoverable startup errors.
+
+    用于首次运行和可恢复启动错误的聚焦 Provider 配置界面."""
 
     CSS = """
     Screen {
@@ -2002,7 +2055,9 @@ class ProviderSetupApp(App[bool]):
 
 
 class ReasoningEffortScreen(ModalScreen[ReasoningEffort | None]):
-    """Select application-owned review depth without implying native API support."""
+    """Select application-owned review depth without implying native API support.
+
+    选择应用层拥有的审查深度,不暗示底层 API 原生支持."""
 
     CSS = """
     ReasoningEffortScreen {
@@ -2109,7 +2164,9 @@ class ReasoningEffortScreen(ModalScreen[ReasoningEffort | None]):
 
 
 class PermissionApprovalScreen(ModalScreen[PermissionApproval]):
-    """Fail-closed modal for one bounded permission request."""
+    """Fail-closed modal for one bounded permission request.
+
+    用于单个有界权限请求的故障关闭模态框."""
 
     CSS = """
     PermissionApprovalScreen {
@@ -2249,7 +2306,9 @@ class PermissionApprovalScreen(ModalScreen[PermissionApproval]):
 
 
 class ProviderSelectionScreen(ModalScreen[str | None]):
-    """Select one configured profile without exposing credentials or endpoints."""
+    """Select one configured profile without exposing credentials or endpoints.
+
+    选择一个已配置的配置档,不暴露凭据或端点."""
 
     CSS = """
     ProviderSelectionScreen {
@@ -2363,7 +2422,9 @@ class ProviderSelectionScreen(ModalScreen[str | None]):
 
 
 class SessionSelectionScreen(ModalScreen[str | None]):
-    """Select one recent session already constrained to the active workspace."""
+    """Select one recent session already constrained to the active workspace.
+
+    选择一个已限制在当前工作区内的最近会话."""
 
     CSS = """
     SessionSelectionScreen {
@@ -2590,7 +2651,9 @@ class SessionSelectionScreen(ModalScreen[str | None]):
 
 
 class NeuroCodeApp(App[None]):
-    """Minimal Textual interface over the normalized agent event stream."""
+    """Minimal Textual interface over the normalized agent event stream.
+
+    建立在规范化 Agent 事件流之上的最小 Textual 界面."""
 
     TITLE = "Neuro Code"
     SUB_TITLE = "Terminal coding agent"
@@ -2859,14 +2922,19 @@ class NeuroCodeApp(App[None]):
         self,
         runner: ConversationRunner,
         *,
+        turn_service: SessionTurnService | None = None,
         approval_controller: ApprovalController | None = None,
         provider_controller: ProviderController | None = None,
         reasoning_controller: ReasoningController | None = None,
         interaction_mode_controller: InteractionModeController | None = None,
         session_controller: SessionController | None = None,
+        session_selection_service: SessionSelectionService | None = None,
         task_controller: TaskController | None = None,
         session_task_controller: SessionTaskController | None = None,
         plan_controller: PlanController | None = None,
+        plan_execution_service: PlanExecutionService | None = None,
+        plan_scheduling_service: PlanSchedulingService | None = None,
+        queued_plan_execution_service: QueuedPlanExecutionService | None = None,
         ui_preferences: UiPreferencesStore | None = None,
         provider_settings_store: ProviderSettingsStore | None = None,
         provider_catalog: ProviderCatalog | None = None,
@@ -2874,6 +2942,7 @@ class NeuroCodeApp(App[None]):
         language: UiLanguage = UiLanguage.ENGLISH,
         initial_items: Sequence[SessionItem] = (),
         execution_record: SessionExecutionRecord | None = None,
+        tool_output_artifact_service: SessionToolOutputArtifactApplicationService | None = None,
         provider_name: str,
         model_name: str,
         cwd: Path,
@@ -2889,6 +2958,7 @@ class NeuroCodeApp(App[None]):
         self.register_theme(TEXTUAL_THEME)
         self.theme = TEXTUAL_THEME.name
         self._runner = runner
+        self._turn_service = turn_service
         self._approval_controller = approval_controller
         self._provider_controller = provider_controller
         if context_window_tokens is None and provider_controller is not None:
@@ -2926,9 +2996,13 @@ class NeuroCodeApp(App[None]):
             interaction_mode_controller = provider_controller  # type: ignore[assignment]
         self._interaction_mode_controller = interaction_mode_controller
         self._session_controller = session_controller
+        self._session_selection_service = session_selection_service
         self._task_controller = task_controller
         self._session_task_controller = session_task_controller
         self._plan_controller = plan_controller
+        self._plan_execution_service = plan_execution_service
+        self._plan_scheduling_service = plan_scheduling_service
+        self._queued_plan_execution_service = queued_plan_execution_service
         self._ui_preferences = ui_preferences
         self._provider_settings_store = provider_settings_store
         self._provider_catalog = provider_catalog
@@ -2955,6 +3029,7 @@ class NeuroCodeApp(App[None]):
         self._background_wake_limits = background_wake_limits
         self._language = language
         self._initial_items = tuple(initial_items)
+        self._tool_output_artifact_service = tool_output_artifact_service
         runner_record = getattr(runner, "execution_record", None)
         self._execution_record = (
             execution_record
@@ -3085,7 +3160,9 @@ class NeuroCodeApp(App[None]):
         self.query_one("#prompt", Input).focus()
 
     def _synchronize_terminal_size(self) -> None:
-        """Recover when a terminal drops its normal resize notification."""
+        """Recover when a terminal drops its normal resize notification.
+
+        在终端丢失常规尺寸变化通知时恢复."""
 
         terminal_size = _read_terminal_size()
         if terminal_size is None or terminal_size == self.screen.size:
@@ -3179,7 +3256,9 @@ class NeuroCodeApp(App[None]):
         self._submit_prompt(self._queued_interjections.popleft())
 
     def _restore_queued_interjections(self) -> None:
-        """Return every unsent interjection to the draft without auto-submitting it."""
+        """Return every unsent interjection to the draft without auto-submitting it.
+
+        将所有未发送的插话放回草稿,不自动提交."""
 
         if not self._queued_interjections:
             return
@@ -3245,7 +3324,61 @@ class NeuroCodeApp(App[None]):
             return
         state.expanded = not state.expanded
         self._refresh_tool_feedback(state)
+        if state.expanded:
+            self._request_tool_artifact(state)
         event.card.focus()
+
+    def _request_tool_artifact(self, state: ToolFeedbackState) -> None:
+        if (
+            state.artifact_id is None
+            or self._tool_output_artifact_service is None
+            or self._runner.session_id is None
+            or state.artifact_loading
+            or state.artifact_content is not None
+        ):
+            return
+        state.artifact_loading = True
+        self._refresh_tool_feedback(state)
+        self.run_worker(
+            self._load_tool_artifact(state),
+            name=f"tool-output-artifact-{state.entry_index}",
+            group="tool-output-artifact",
+            exclusive=False,
+            exit_on_error=False,
+        )
+
+    async def _load_tool_artifact(self, state: ToolFeedbackState) -> None:
+        service = self._tool_output_artifact_service
+        session_id = self._runner.session_id
+        artifact_id = state.artifact_id
+        if service is None or session_id is None or artifact_id is None:
+            state.artifact_loading = False
+            return
+        try:
+            result = await service.read(
+                ReadSessionToolOutputArtifactRequest(
+                    session_id=session_id,
+                    artifact_id=artifact_id,
+                )
+            )
+            if (
+                self._runner.session_id != session_id
+                or self._tool_feedback_by_entry.get(state.entry_index) is not state
+            ):
+                return
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            _LOGGER.debug("tool output artifact is unavailable", exc_info=True)
+            state.artifact_unavailable = True
+        else:
+            state.artifact_content = result.content
+            state.artifact_read_truncated = result.read_truncated
+            state.artifact_unavailable = False
+        finally:
+            state.artifact_loading = False
+            if self._tool_feedback_by_entry.get(state.entry_index) is state:
+                self._refresh_tool_feedback(state)
 
     def action_complete_slash_command(self) -> None:
         if isinstance(self.screen, ModalScreen):
@@ -3268,6 +3401,17 @@ class NeuroCodeApp(App[None]):
         prompt.cursor_position = len(completed)
 
     async def _run_prompt(self, prompt: str) -> None:
+        turn_service = self._turn_service
+        if turn_service is not None:
+            request = RunTurnRequest(
+                prompt,
+                cancellation_policy=TurnCancellationPolicy.REWIND_PRISTINE,
+                expected_session_id=self._runner.session_id,
+            )
+            await self._run_agent_turn(
+                lambda: turn_service.run_turn(request, sink=self._handle_event)
+            )
+            return
         await self._run_agent_turn(
             lambda: self._runner.run(
                 prompt,
@@ -3286,12 +3430,30 @@ class NeuroCodeApp(App[None]):
         if controller is None:
             self._write_ui_entry("error", "plan.execution_unavailable")
             return
+        service = self._plan_execution_service
+        if service is not None:
+            await self._run_agent_turn(
+                lambda: service.execute_plan(
+                    ExecutePlanRequest(),
+                    sink=self._handle_event,
+                )
+            )
+            return
         await self._run_agent_turn(lambda: controller.execute_plan(sink=self._handle_event))
 
     async def _run_queued_plan(self, task_id: str) -> None:
         controller = self._plan_controller
         if controller is None:
             self._write_ui_entry("error", "plan.execution_unavailable")
+            return
+        service = self._queued_plan_execution_service
+        if service is not None:
+            await self._run_agent_turn(
+                lambda: service.run_session_task(
+                    RunSessionTaskRequest(task_id),
+                    sink=self._handle_event,
+                )
+            )
             return
         await self._run_agent_turn(
             lambda: controller.run_session_task(task_id, sink=self._handle_event)
@@ -3457,9 +3619,9 @@ class NeuroCodeApp(App[None]):
                 self._event_duration(data),
                 self._positive_int(data.get("step"), fallback=1),
             )
-            execution_status = data.get("execution_status")
-            if execution_status in {"stuck", "budget_limited"} and data.get("recoverable") is True:
-                self._terminal_execution_status = execution_status
+            execution_status = recoverable_terminal_status(data)
+            if execution_status is not None:
+                self._terminal_execution_status = execution_status.value
                 self._terminal_execution_recoverable = True
             else:
                 self._terminal_execution_status = None
@@ -3516,6 +3678,11 @@ class NeuroCodeApp(App[None]):
             )
             raw_metadata = data.get("metadata")
             state.metadata = dict(raw_metadata) if isinstance(raw_metadata, Mapping) else None
+            state.artifact_id = self._artifact_id_from_metadata(raw_metadata)
+            state.artifact_content = None
+            state.artifact_read_truncated = False
+            state.artifact_loading = False
+            state.artifact_unavailable = False
             raw_changes = data.get("workspace_changes")
             state.workspace_changes = (
                 dict(raw_changes) if isinstance(raw_changes, Mapping) else None
@@ -3584,6 +3751,15 @@ class NeuroCodeApp(App[None]):
         if value or allow_empty:
             return value
         return None
+
+    @staticmethod
+    def _artifact_id_from_metadata(metadata: object) -> str | None:
+        if not isinstance(metadata, Mapping):
+            return None
+        value = metadata.get("output_artifact_id")
+        if not isinstance(value, str) or not value.strip() or "\x00" in value or len(value) > 128:
+            return None
+        return value
 
     def _refresh_tool_feedback(self, state: ToolFeedbackState) -> None:
         if state.entry_index >= len(self._entries):
@@ -3837,13 +4013,18 @@ class NeuroCodeApp(App[None]):
     def _known_approval_outcome(outcome: str) -> str:
         return outcome if outcome in {"allow_once", "allow_session", "deny"} else "unknown"
 
-    @classmethod
     def _tool_details_available(
-        cls,
+        self,
         state: ToolFeedbackState,
         change_report: Mapping[str, Any] | None,
     ) -> bool:
-        if state.content is not None and cls._safe_tool_text(state.content).strip():
+        if state.content is not None and self._safe_tool_text(state.content).strip():
+            return True
+        if (
+            state.artifact_id is not None
+            and self._tool_output_artifact_service is not None
+            and self._runner.session_id is not None
+        ):
             return True
         if change_report is None:
             return False
@@ -3853,7 +4034,7 @@ class NeuroCodeApp(App[None]):
         return any(
             isinstance(change, Mapping)
             and isinstance(change.get("diff"), str)
-            and bool(cls._safe_tool_text(change["diff"]).strip())
+            and bool(self._safe_tool_text(change["diff"]).strip())
             for change in raw_files
         )
 
@@ -3882,7 +4063,11 @@ class NeuroCodeApp(App[None]):
         *,
         expanded: bool,
     ) -> None:
-        content = state.content or ""
+        content = (
+            state.artifact_content
+            if expanded and state.artifact_content is not None
+            else state.content or ""
+        )
         lines, total_lines, omitted_lines, truncated = self._bounded_tool_preview(content)
         if not lines:
             heading = ui_text(
@@ -3918,6 +4103,28 @@ class NeuroCodeApp(App[None]):
                 ui_text(self._language, "tool.card.preview_truncated"),
                 style=f"italic {TOOL_META_STYLE}",
             )
+        if expanded and state.artifact_id is not None:
+            if state.artifact_loading:
+                self._append_tool_line(
+                    body,
+                    "├",
+                    ui_text(self._language, "tool.card.artifact_loading"),
+                    style=TOOL_META_STYLE,
+                )
+            elif state.artifact_unavailable:
+                self._append_tool_line(
+                    body,
+                    "├",
+                    ui_text(self._language, "tool.card.artifact_unavailable"),
+                    style=TOOL_META_STYLE,
+                )
+            elif state.artifact_read_truncated:
+                self._append_tool_line(
+                    body,
+                    "├",
+                    ui_text(self._language, "tool.card.artifact_read_truncated"),
+                    style=f"italic {TOOL_META_STYLE}",
+                )
 
     @classmethod
     def _bounded_tool_preview(cls, content: str) -> tuple[tuple[str, ...], int, int, bool]:
@@ -4624,7 +4831,11 @@ class NeuroCodeApp(App[None]):
             self._write_ui_entry("error", "turn.running")
             return
         try:
-            task = await controller.schedule_plan()
+            service = self._plan_scheduling_service
+            if service is not None:
+                task = await service.schedule_plan(SchedulePlanRequest())
+            else:
+                task = await controller.schedule_plan()
         except Exception as error:
             self._write_entry("error", f"{type(error).__name__}: {error}")
             return
@@ -4728,7 +4939,9 @@ class NeuroCodeApp(App[None]):
     async def _apply_provider_selection(self, profile_name: str) -> None:
         assert self._provider_controller is not None
         try:
-            result = await self._provider_controller.select_profile(profile_name)
+            result = await self._provider_controller.change_provider(
+                ChangeProviderRequest(profile_name)
+            )
         except Exception as error:
             self._write_entry("error", f"{type(error).__name__}: {error}")
             return
@@ -4802,7 +5015,8 @@ class NeuroCodeApp(App[None]):
         *,
         query: str | None = None,
     ) -> None:
-        if self._session_controller is None:
+        controller = self._session_selection_owner()
+        if controller is None:
             self._write_ui_entry("error", "session.resume_unavailable")
             return
         if self._turn_worker is not None and self._turn_worker.is_running:
@@ -4812,7 +5026,7 @@ class NeuroCodeApp(App[None]):
             await self._apply_session_selection(requested)
             return
         try:
-            options = await self._session_controller.list_sessions(query)
+            options = await controller.list_sessions(query)
         except Exception as error:
             self._write_entry("error", f"{type(error).__name__}: {error}")
             return
@@ -4831,20 +5045,21 @@ class NeuroCodeApp(App[None]):
                 options,
                 query=query,
                 language=self._language,
-                search_callback=self._session_controller.list_sessions,
+                search_callback=controller.list_sessions,
             ),
             self._session_selected,
         )
 
     async def _rename_session(self, title: str) -> None:
-        if self._session_controller is None:
+        controller = self._session_selection_owner()
+        if controller is None:
             self._write_ui_entry("error", "session.rename_unavailable")
             return
         if self._turn_worker is not None and self._turn_worker.is_running:
             self._write_ui_entry("error", "session.rename_running")
             return
         try:
-            summary = await self._session_controller.rename_session(title)
+            summary = await controller.rename_session(title)
         except Exception as error:
             self._write_entry("error", f"{type(error).__name__}: {error}")
             return
@@ -4860,9 +5075,10 @@ class NeuroCodeApp(App[None]):
             await self._apply_session_selection(session_id)
 
     async def _apply_session_selection(self, session_id: str) -> None:
-        assert self._session_controller is not None
+        controller = self._session_selection_owner()
+        assert controller is not None
         try:
-            result = await self._session_controller.select_session(session_id)
+            result = await controller.select_session(session_id)
         except Exception as error:
             self._write_entry("error", f"{type(error).__name__}: {error}")
             return
@@ -5224,7 +5440,9 @@ class NeuroCodeApp(App[None]):
         )
 
     async def _complete_background_wake(self) -> None:
-        """Commit wake consumption only after the model turn completed successfully."""
+        """Commit wake consumption only after the model turn completed successfully.
+
+        仅在模型回合成功完成后提交唤醒消费."""
 
         task_ids = self._background_wake_task_ids
         if not task_ids:
@@ -5318,6 +5536,22 @@ class NeuroCodeApp(App[None]):
             return None
         record = getattr(controller, "execution_record", None)
         return record if isinstance(record, SessionExecutionRecord) else None
+
+    def _session_selection_owner(self) -> SessionController | None:
+        """Return the narrow session-selection boundary used by the TUI.
+
+        返回 TUI 使用的窄会话选择边界.
+
+        ``session_controller`` remains an optional compatibility input because
+        it also supplies the current execution-record projection to the TUI.
+        Production bootstrap injects the narrower application service for
+        selection operations while retaining that projection compatibility.
+
+        ``session_controller`` 仍是可选兼容输入,因为它还向 TUI 提供当前执行记录投影.
+        生产 bootstrap 为选择操作注入更窄的应用服务,同时保留该投影兼容性.
+        """
+
+        return self._session_selection_service or self._session_controller
 
     def _write_recoverable_resume_notice(
         self,

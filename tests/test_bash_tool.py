@@ -11,17 +11,20 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from neuro_code.adapters.background_tasks import LocalBackgroundTaskManager
 from neuro_code.application.ports.sandbox import ShellLaunch
 from neuro_code.application.ports.tools import ToolContext
 from neuro_code.domain.sandbox import SandboxProfile
+from neuro_code.infrastructure.background_tasks import LocalBackgroundTaskManager
+from neuro_code.infrastructure.persistence.output_artifacts import FileToolOutputArtifactStore
+from neuro_code.infrastructure.tools.background_tasks import TaskOutputTool
 from neuro_code.shared.errors import ToolError
-from neuro_code.tools.background_tasks import TaskOutputTool
 from neuro_code.tools.bash import BashTool
 
 
 def _python_shell_command(code: str) -> str:
-    """Build a Python command using quoting for the host shell."""
+    """Build a Python command using quoting for the host shell.
+
+    使用适合宿主 Shell 的引号构建 Python 命令."""
 
     argv = [sys.executable, "-c", code]
     return subprocess.list2cmdline(argv) if os.name == "nt" else shlex.join(argv)
@@ -82,6 +85,60 @@ class BashToolTests(unittest.IsolatedAsyncioTestCase):
             assert result.metadata is not None
             self.assertEqual(result.metadata["exit_code"], 7)
             self.assertTrue(result.metadata["truncated"])
+
+    async def test_truncated_foreground_output_has_redacted_artifact_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            secret = "provider-secret"
+            command = _python_shell_command(
+                f"print('token={secret}');print('x'*200)",
+            )
+            store = FileToolOutputArtifactStore(
+                root / "tool-output",
+                redaction_values=(secret,),
+                max_bytes=64,
+            )
+            result = await BashTool().execute(
+                {"command": command},
+                ToolContext(root, output_byte_limit=20, output_artifact_store=store),
+            )
+
+            assert result.metadata is not None
+            artifact_id = result.metadata["output_artifact_id"]
+            artifact_path = result.metadata["output_artifact_path"]
+            self.assertIsInstance(artifact_id, str)
+            self.assertEqual(artifact_path, f"tool-output/{artifact_id}.log")
+            content = (root / artifact_path).read_text(encoding="utf-8")
+            self.assertNotIn(secret, content)
+            self.assertTrue(result.metadata["output_artifact_truncated"])
+
+    async def test_managed_background_truncation_persists_artifact_after_completion(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manager = LocalBackgroundTaskManager()
+            store = FileToolOutputArtifactStore(root / "tool-output", max_bytes=256)
+            context = ToolContext(
+                root,
+                output_byte_limit=20,
+                background_tasks=manager,
+                output_artifact_store=store,
+            )
+            try:
+                result = await BashTool(background_enabled=True).execute(
+                    {"command": _python_shell_command("print('x'*200)"), "is_background": True},
+                    context,
+                )
+                assert result.metadata is not None
+                task_id = result.metadata["task_id"]
+                self.assertIsInstance(task_id, str)
+                snapshot = await manager.get(task_id, wait_seconds=2)
+                assert snapshot is not None
+                self.assertTrue(snapshot.truncated)
+                self.assertIsNotNone(snapshot.output_artifact_id)
+                assert snapshot.output_artifact_path is not None
+                self.assertTrue((root / snapshot.output_artifact_path).is_file())
+            finally:
+                await manager.shutdown()
 
     async def test_enabled_manager_promotes_once_and_preserves_task_ownership(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -196,7 +253,7 @@ class BashToolTests(unittest.IsolatedAsyncioTestCase):
             context = ToolContext(root, command_timeout_seconds=2, background_tasks=manager)
             try:
                 with mock.patch(
-                    "neuro_code.adapters.background_tasks._BoundedOutput.append",
+                    "neuro_code.infrastructure.background_tasks._BoundedOutput.append",
                     side_effect=RuntimeError("controlled capture failure"),
                 ):
                     result = await BashTool(background_enabled=True).execute(

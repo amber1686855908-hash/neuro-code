@@ -1,4 +1,6 @@
-"""Session-scoped text-file capability delegated to an ACP client."""
+"""Session-scoped text-file capability delegated to an ACP client.
+
+定义委托给 ACP 客户端的会话范围文本文件能力."""
 
 from __future__ import annotations
 
@@ -12,6 +14,8 @@ class ClientFileSystem(Protocol):
     Implementations must keep a request bound to its ACP session, preserve the
     workspace boundary chosen for that session, and fail closed when the client
     did not advertise the corresponding operation.
+
+    定义由已连接客户端拥有且经过能力协商的文本文件访问.
     """
 
     @property

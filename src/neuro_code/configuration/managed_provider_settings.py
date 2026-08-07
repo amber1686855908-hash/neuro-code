@@ -1,4 +1,6 @@
-"""Synchronous readers for managed provider settings."""
+"""Synchronous readers for managed provider settings.
+
+提供读取受管理 Provider 设置的同步读取器."""
 
 from __future__ import annotations
 
@@ -6,12 +8,12 @@ import json
 from collections.abc import Mapping
 from pathlib import Path
 
-from neuro_code.domain.background_tasks import BackgroundTaskWakePolicy
-from neuro_code.domain.provider_settings import (
+from neuro_code.application.ports.provider_settings import (
     ManagedProviderProfile,
     ManagedProviderSettings,
     ManagedProxyPolicy,
 )
+from neuro_code.domain.background_tasks.models import BackgroundTaskWakePolicy
 from neuro_code.shared.errors import ConfigurationError
 
 _SCHEMA_VERSION = 1
@@ -49,7 +51,9 @@ def _mapping(payload: object, *, path: Path) -> Mapping[str, object]:
 
 
 def load_managed_provider_settings(state_dir: Path) -> ManagedProviderSettings:
-    """Load bounded metadata and credentials from the user state directory."""
+    """Load bounded metadata and credentials from the user state directory.
+
+    从用户状态目录加载有界元数据和凭据."""
 
     metadata_path = state_dir / _METADATA_NAME
     credentials_path = state_dir / _CREDENTIALS_NAME

@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import unittest
 
+from neuro_code.application.permissions.broker import SessionApprovalBroker
 from neuro_code.application.permissions.contracts import (
     PermissionApproval,
     PermissionRequest,
     build_permission_request,
 )
-from neuro_code.application.runtime.approval import SessionApprovalBroker
 
 
 class SessionApprovalBrokerTests(unittest.IsolatedAsyncioTestCase):

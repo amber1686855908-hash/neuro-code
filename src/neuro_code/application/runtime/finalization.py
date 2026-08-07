@@ -4,6 +4,8 @@ This module intentionally has no connection to :mod:`agent`, persistence, or
 user-interface event sinks.  A later runtime slice decides when it is safe to
 invoke the finalizer; this component only makes a bounded, strictly no-tool
 model request from already available context and evidence.
+
+提供监督 Agent 执行使用的缓冲式无工具最终响应. 本模块不连接 Agent、持久化或 UI 事件接收器.
 """
 
 from __future__ import annotations
@@ -14,10 +16,10 @@ from enum import StrEnum
 from typing import Protocol
 
 from neuro_code.application.ports.model import ModelProvider, ModelToolPolicy
+from neuro_code.domain.conversation.context import ModelContext
+from neuro_code.domain.conversation.events import ModelCompleted, ModelTextDelta, ModelToolCall
+from neuro_code.domain.conversation.messages import Message, Role, ToolCall
 from neuro_code.domain.execution import SupervisorReasonCode
-from neuro_code.domain.messages import Message, Role, ToolCall
-from neuro_code.domain.model_context import ModelContext
-from neuro_code.domain.model_events import ModelCompleted, ModelTextDelta, ModelToolCall
 from neuro_code.domain.tools import ToolResult
 from neuro_code.shared.errors import ProviderError
 from neuro_code.shared.redaction import redact_sensitive_text
@@ -44,7 +46,9 @@ _EMPTY_RESPONSE_FALLBACK = (
 
 
 class FinalizationStatus(StrEnum):
-    """The accepted outcome of one bounded finalization request."""
+    """The accepted outcome of one bounded finalization request.
+
+    表示一次有界最终化请求被接受后的结果."""
 
     COMPLETED = "completed"
     TOOL_CALL_REJECTED = "tool_call_rejected"
@@ -52,7 +56,9 @@ class FinalizationStatus(StrEnum):
 
 
 class Finalizer(Protocol):
-    """The narrow runtime dependency needed to produce one final response."""
+    """The narrow runtime dependency needed to produce one final response.
+
+    表示生成一个最终响应所需的精简运行时依赖."""
 
     async def finalize(
         self,
@@ -96,7 +102,9 @@ def _bounded_evidence_items(value: Sequence[str], *, field_name: str) -> tuple[s
 
 @dataclass(frozen=True, slots=True)
 class FinalizationAttempt:
-    """A safe summary of one provider attempt, without its raw output."""
+    """A safe summary of one provider attempt, without its raw output.
+
+    表示一次 Provider 尝试的安全摘要,不包含原始输出."""
 
     attempt_number: int
     received_completion: bool
@@ -125,7 +133,9 @@ class FinalizationAttempt:
 
 @dataclass(frozen=True, slots=True)
 class FinalizationEvidence:
-    """Bounded factual evidence made available to a final no-tool request."""
+    """Bounded factual evidence made available to a final no-tool request.
+
+    表示提供给最终无工具请求的有界事实证据."""
 
     trigger: SupervisorReasonCode
     completed_items: tuple[str, ...] = field(default_factory=tuple)
@@ -175,7 +185,9 @@ class FinalizationEvidence:
 
 @dataclass(frozen=True, slots=True)
 class FinalizationResult:
-    """The only data a runtime needs from one isolated finalization attempt."""
+    """The only data a runtime needs from one isolated finalization attempt.
+
+    表示运行时从一次隔离最终化尝试中需要的唯一数据."""
 
     status: FinalizationStatus
     response: str
@@ -221,7 +233,9 @@ class FinalizationResult:
 
 
 class AgentFinalizer:
-    """Make a bounded, buffered final no-tool request from existing evidence."""
+    """Make a bounded, buffered final no-tool request from existing evidence.
+
+    根据已有证据发起有界且缓冲的最终无工具请求."""
 
     __slots__ = ("_max_attempts", "_provider", "_redaction_values")
 
@@ -242,7 +256,9 @@ class AgentFinalizer:
 
     @property
     def max_attempts(self) -> int:
-        """Return the finite number of allowed model attempts."""
+        """Return the finite number of allowed model attempts.
+
+        返回允许的有限模型尝试次数."""
 
         return self._max_attempts
 
@@ -351,7 +367,9 @@ class AgentFinalizer:
         context: ModelContext,
         evidence: FinalizationEvidence,
     ) -> FinalizationResult:
-        """Return a bounded final response without executing or exposing any tool."""
+        """Return a bounded final response without executing or exposing any tool.
+
+        返回有界最终响应,不执行也不暴露任何工具."""
 
         if not isinstance(context, ModelContext):
             raise TypeError("context must be a ModelContext")

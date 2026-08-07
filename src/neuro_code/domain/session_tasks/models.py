@@ -1,4 +1,6 @@
-"""Durable task lifecycle values shared by plan execution and future subagents."""
+"""Canonical durable session-task value objects.
+
+定义规范的持久化会话任务值对象."""
 
 from __future__ import annotations
 
@@ -13,14 +15,18 @@ MAX_QUEUED_SESSION_TASKS = 4
 
 
 class SessionTaskKind(StrEnum):
-    """The owned work category, independent of its eventual implementation."""
+    """The owned work category, independent of its eventual implementation.
+
+    表示任务所属的工作类别,与最终实现方式无关."""
 
     PLAN_EXECUTION = "plan_execution"
     SUBAGENT = "subagent"
 
 
 class SessionTaskStatus(StrEnum):
-    """Lifecycle states with no implicit retry or automatic follow-up."""
+    """Lifecycle states with no implicit retry or automatic follow-up.
+
+    定义没有隐式重试或自动后续动作的生命周期状态."""
 
     QUEUED = "queued"
     RUNNING = "running"
@@ -38,14 +44,18 @@ class SessionTaskStatus(StrEnum):
 
     @property
     def active(self) -> bool:
-        """Whether the task is waiting for or currently receiving execution."""
+        """Whether the task is waiting for or currently receiving execution.
+
+        表示任务正在等待执行还是正在接收执行."""
 
         return self in {SessionTaskStatus.QUEUED, SessionTaskStatus.RUNNING}
 
 
 @dataclass(frozen=True, slots=True)
 class SessionTask:
-    """A bounded durable record for one execution owned by a session."""
+    """A bounded durable record for one execution owned by a session.
+
+    表示会话拥有的一次执行的有界持久化记录."""
 
     task_id: str
     kind: SessionTaskKind
@@ -80,7 +90,9 @@ class SessionTask:
             raise ValueError("only a plan execution task may contain a plan snapshot")
 
     def start(self, *, started_at: datetime) -> SessionTask:
-        """Return the one allowed queued-to-running transition."""
+        """Return the one allowed queued-to-running transition.
+
+        返回唯一允许的 queued 到 running 转换."""
 
         if self.status is not SessionTaskStatus.QUEUED:
             raise ValueError("session task is not queued")
@@ -93,7 +105,9 @@ class SessionTask:
         )
 
     def finish(self, status: SessionTaskStatus, *, finished_at: datetime) -> SessionTask:
-        """Return the one allowed terminal transition for this task."""
+        """Return the one allowed terminal transition for this task.
+
+        返回当前任务唯一允许的终态转换."""
 
         if self.status is not SessionTaskStatus.RUNNING:
             raise ValueError("session task is already terminal")

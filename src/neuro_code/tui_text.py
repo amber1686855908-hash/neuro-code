@@ -4,7 +4,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Final
 
-from neuro_code.domain.ui_preferences import UiLanguage
+from neuro_code.shared.ui_language import UiLanguage
 
 # Natural Chinese interface copy deliberately uses full-width punctuation.
 
@@ -215,6 +215,9 @@ _ENGLISH: Final[dict[str, str]] = {
     "tool.card.error_empty": "Error output · no details",
     "tool.card.lines_omitted": "... {count} middle line(s) omitted",
     "tool.card.preview_truncated": "... preview truncated at the display limit",
+    "tool.card.artifact_loading": "Loading the bounded full output…",
+    "tool.card.artifact_unavailable": "Full output is unavailable for this session",
+    "tool.card.artifact_read_truncated": "... full output is bounded at the read limit",
     "tool.card.diff_truncated": "... diff truncated at the display limit",
     "tool.card.details_expanded": "▾ Details shown · click or press Enter to collapse",
     "tool.card.details_collapsed": "▸ Details hidden · click or press Enter to expand",
@@ -567,6 +570,9 @@ _CHINESE: Final[dict[str, str]] = {
     "tool.card.error_empty": "错误输出 · 无详细信息",
     "tool.card.lines_omitted": "……省略中间 {count} 行",
     "tool.card.preview_truncated": "……预览已达到显示上限",
+    "tool.card.artifact_loading": "正在加载有界完整输出……",
+    "tool.card.artifact_unavailable": "当前会话无法读取完整输出",
+    "tool.card.artifact_read_truncated": "……完整输出已达到读取上限",
     "tool.card.diff_truncated": "……差异已达到显示上限",
     "tool.card.details_expanded": "▾ 已展开详细信息 · 单击或按 Enter 收起",
     "tool.card.details_collapsed": "▸ 已收起详细信息 · 单击或按 Enter 展开",
@@ -722,7 +728,9 @@ _CATALOGS: Final[Mapping[UiLanguage, Mapping[str, str]]] = {
 
 
 def ui_text(locale: UiLanguage, key: str, **values: object) -> str:
-    """Render one owned UI string while leaving conversation content untouched."""
+    """Render one owned UI string while leaving conversation content untouched.
+
+    渲染一个由本模块管理的 UI 字符串,同时保持会话内容不变."""
 
     template = _CATALOGS[locale][key]
     return template.format_map(values)
