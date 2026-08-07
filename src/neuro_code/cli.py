@@ -9,33 +9,54 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 
 from neuro_code import __version__
-from neuro_code.application.ports.storage import SessionStore
-from neuro_code.application.runtime.supervision import ExecutionControlMode
-from neuro_code.application.settings import ApplicationSettings
-from neuro_code.domain.events import AgentEvent, AgentEventKind
-from neuro_code.domain.execution import AgentExecutionOutcome, SessionExecutionRecord
-from neuro_code.domain.instructions import InstructionDiscoveryResult
-from neuro_code.domain.messages import (
-    ContextItemKind,
-    Message,
-    PreservedContextItem,
-    Role,
-    SessionItem,
-)
-from neuro_code.domain.reasoning import ReasoningEffort
-from neuro_code.domain.sandbox import SandboxProfile
-from neuro_code.domain.session_search import SessionSearchPage
-from neuro_code.domain.sessions import SessionSnapshot
-from neuro_code.domain.skills import SkillDiscoveryResult
-from neuro_code.permissions import (
+from neuro_code.application.permissions.policy import (
     PermissionEffect,
     PermissionMode,
     PermissionRule,
 )
+from neuro_code.application.ports.storage import SessionStore
+from neuro_code.application.ports.tools import MAX_TOOL_OUTPUT_ARTIFACT_READ_BYTES
+from neuro_code.application.runtime.supervision import ExecutionControlMode
+from neuro_code.application.sessions.catalog import (
+    ListSessionsRequest,
+    SearchSessionsRequest,
+    SessionCatalogApplicationService,
+)
+from neuro_code.application.sessions.lifecycle import (
+    ImportSessionRequest,
+    RenameSessionRequest,
+    SessionLifecycleService,
+)
+from neuro_code.application.sessions.service import (
+    ExportSessionRequest,
+    ResumeSessionRequest,
+    SessionApplicationService,
+)
+from neuro_code.application.sessions.turns import RunTurnRequest
+from neuro_code.application.settings import ApplicationSettings
+from neuro_code.application.tools.service import (
+    ListSessionToolOutputArtifactsRequest,
+    ReadSessionToolOutputArtifactRequest,
+    SessionToolOutputArtifactApplicationService,
+)
+from neuro_code.domain.conversation.events import AgentEvent, AgentEventKind
+from neuro_code.domain.conversation.reasoning import ReasoningEffort
+from neuro_code.domain.sandbox.models import SandboxProfile
+from neuro_code.domain.sessions import SessionSnapshot
+from neuro_code.domain.workspace.instructions import InstructionDiscoveryResult
+from neuro_code.domain.workspace.skills import SkillDiscoveryResult
+from neuro_code.interfaces.cli.serialization import (
+    render_session_markdown,
+    serialize_execution_outcome,
+    serialize_execution_record,
+    serialize_session_search_page,
+    serialize_tool_output_artifact,
+    serialize_tool_output_artifact_read,
+)
 from neuro_code.shared.errors import ConfigurationError, NeuroCodeError
 
 if TYPE_CHECKING:
-    from neuro_code.config import AppConfig
+    from neuro_code.configuration.app import AppConfig
 
 
 _EXECUTION_CONTROL_CHOICES = {
@@ -45,7 +66,9 @@ _EXECUTION_CONTROL_CHOICES = {
 
 
 class ImportedRustSession(Protocol):
-    """CLI-facing view of an imported historical session."""
+    """CLI-facing view of an imported historical session.
+
+    表示 CLI 使用的已导入历史会话视图."""
 
     @property
     def snapshot(self) -> SessionSnapshot: ...
@@ -81,7 +104,9 @@ class ImportedRustSession(Protocol):
 
 
 class CliServices(Protocol):
-    """Capabilities selected by bootstrap for CLI command handling."""
+    """Capabilities selected by bootstrap for CLI command handling.
+
+    表示 bootstrap 为 CLI 命令处理选择的能力集合."""
 
     async def open_application(self, settings: ApplicationSettings) -> Any: ...
 
@@ -92,6 +117,12 @@ class CliServices(Protocol):
     def discover_skills(self, cwd: Path) -> SkillDiscoveryResult: ...
 
     async def create_session_store(self, config: AppConfig) -> SessionStore: ...
+
+    def create_tool_output_artifact_service(
+        self,
+        config: AppConfig,
+        store: SessionStore,
+    ) -> SessionToolOutputArtifactApplicationService: ...
 
     async def load_rust_session(self, source: Path) -> ImportedRustSession: ...
 
@@ -212,7 +243,7 @@ def build_parser() -> argparse.ArgumentParser:
     sessions_parser.add_argument(
         "session_action",
         nargs="?",
-        choices=("list", "search", "rename"),
+        choices=("list", "search", "rename", "artifacts"),
         default="list",
         help="session operation (default: list)",
     )
@@ -220,18 +251,29 @@ def build_parser() -> argparse.ArgumentParser:
         "query",
         nargs="?",
         metavar="QUERY_OR_SESSION_ID",
-        help="search query or session ID to rename",
+        help="search query, session ID, or artifact session ID",
     )
     sessions_parser.add_argument(
         "title",
         nargs="?",
-        metavar="TITLE",
-        help="new title for the rename operation",
+        metavar="TITLE_OR_ARTIFACT_ID",
+        help="new title or artifact ID",
     )
     sessions_parser.add_argument("--json", action="store_true")
     sessions_parser.add_argument("--limit", type=int, default=50)
     sessions_parser.add_argument("--offset", type=int, default=0)
     sessions_parser.add_argument("--include-content", action="store_true")
+    sessions_parser.add_argument(
+        "--max-bytes",
+        type=int,
+        default=MAX_TOOL_OUTPUT_ARTIFACT_READ_BYTES,
+        help="bounded artifact read size (only valid for sessions artifacts)",
+    )
+    sessions_parser.add_argument(
+        "--prune",
+        action="store_true",
+        help="prune old artifacts not referenced by any persisted session",
+    )
     sessions_parser.add_argument("--cwd", type=Path, help="configuration working directory")
 
     export_parser = subparsers.add_parser("export", help="export a persisted session")
@@ -341,7 +383,9 @@ def _plain_config(config: AppConfig) -> str:
 
 
 def _instruction_lines(cwd: Path, services: CliServices) -> list[str]:
-    """Discover instruction files and format them for inspect output."""
+    """Discover instruction files and format them for inspect output.
+
+    发现指令文件并将其格式化为 inspect 输出."""
     result = services.discover_instructions(cwd)
     lines: list[str] = ["instruction_files:"]
     if result.files:
@@ -362,7 +406,9 @@ def _instruction_lines(cwd: Path, services: CliServices) -> list[str]:
 
 
 def _skill_lines(cwd: Path, services: CliServices) -> list[str]:
-    """Discover skill files and format them for inspect output."""
+    """Discover skill files and format them for inspect output.
+
+    发现技能文件并将其格式化为 inspect 输出."""
     result = services.discover_skills(cwd)
     lines: list[str] = ["skill_files:"]
     if result.files:
@@ -413,6 +459,8 @@ async def _run_agent(args: argparse.Namespace, services: CliServices) -> int:
         )
     application = await services.open_application(_application_settings(args))
     try:
+        if args.resume is not None:
+            await application.session_service.prepare_resume(ResumeSessionRequest(args.resume))
         binding = await application.create_binding(resume_id=args.resume)
 
         async def stream_event(event: AgentEvent) -> None:
@@ -423,7 +471,14 @@ async def _run_agent(args: argparse.Namespace, services: CliServices) -> int:
             elif args.output_format == "jsonl":
                 print(json.dumps(event.to_dict(), ensure_ascii=False), flush=True)
 
-        result = await binding.runner.run(args.prompt, sink=stream_event)
+        turn_service = application.session_service.bind_runner(binding.runner)
+        result = await turn_service.run_turn(
+            RunTurnRequest(
+                args.prompt,
+                expected_session_id=args.resume,
+            ),
+            sink=stream_event,
+        )
         if args.output_format == "plain":
             print()
         elif args.output_format == "json":
@@ -434,7 +489,7 @@ async def _run_agent(args: argparse.Namespace, services: CliServices) -> int:
                         "response": result.response,
                         "steps": result.steps,
                         "events": [event.to_dict() for event in result.events],
-                        "outcome": _serialized_execution_outcome(result.outcome),
+                        "outcome": serialize_execution_outcome(result.outcome),
                     },
                     ensure_ascii=False,
                 )
@@ -488,51 +543,6 @@ def _execution_control_mode(value: object) -> ExecutionControlMode:
         return _EXECUTION_CONTROL_CHOICES[value]
     except KeyError:
         raise ConfigurationError("execution control selection is invalid") from None
-
-
-def _serialized_execution_outcome(
-    outcome: AgentExecutionOutcome | None,
-) -> dict[str, object] | None:
-    if outcome is None:
-        return None
-    return {
-        "status": outcome.status.value,
-        "reason": outcome.reason_code.value if outcome.reason_code is not None else None,
-        "finalized": outcome.finalized,
-        "recoverable": outcome.recoverable,
-    }
-
-
-def _serialized_execution_record(
-    record: SessionExecutionRecord | None,
-) -> dict[str, object] | None:
-    if record is None:
-        return None
-    outcome = _serialized_execution_outcome(record.outcome)
-    if outcome is None:
-        return None
-    outcome["completed_at"] = record.completed_at.isoformat()
-    return outcome
-
-
-async def _serialized_session_search_page(
-    page: SessionSearchPage,
-    store: SessionStore,
-) -> dict[str, object]:
-    """Serialize search results with the same safe execution projection as list."""
-
-    results: list[dict[str, object]] = []
-    for hit in page.results:
-        row = hit.to_dict()
-        row["last_execution"] = _serialized_execution_record(
-            await store.load_execution_record(hit.summary.id)
-        )
-        results.append(row)
-    return {
-        "results": results,
-        "next_offset": page.next_offset,
-        "total_estimate": page.total_estimate,
-    }
 
 
 def _provider_rows(config: AppConfig) -> list[dict[str, object]]:
@@ -594,28 +604,120 @@ def _providers_command(args: argparse.Namespace, services: CliServices) -> int:
 async def _sessions_command(args: argparse.Namespace, services: CliServices) -> int:
     config = services.load_config(args.cwd)
     store = await services.create_session_store(config)
+    session_lifecycle = SessionLifecycleService(store)
+    session_catalog = SessionCatalogApplicationService(store)
+    if args.session_action == "artifacts":
+        artifact_service = services.create_tool_output_artifact_service(config, store)
+        if args.prune:
+            if args.query is not None or args.title is not None:
+                raise ConfigurationError("--prune cannot be combined with a session or artifact ID")
+            if (
+                args.limit != 50
+                or args.offset != 0
+                or args.include_content
+                or args.max_bytes != MAX_TOOL_OUTPUT_ARTIFACT_READ_BYTES
+            ):
+                raise ConfigurationError(
+                    "--limit, --offset, --include-content and --max-bytes are not valid with --prune"
+                )
+            prune_result = await artifact_service.prune_unreferenced()
+            payload = {
+                "deleted": prune_result.deleted_count,
+                "preserved": prune_result.preserved_count,
+            }
+            if args.json:
+                print(json.dumps(payload, ensure_ascii=False))
+            else:
+                print(
+                    f"Pruned {prune_result.deleted_count} artifact(s); "
+                    f"preserved {prune_result.preserved_count}."
+                )
+            return 0
+        if args.query is None or not args.query.strip():
+            raise ConfigurationError("sessions artifacts requires a session ID")
+        if args.offset != 0 or args.include_content:
+            raise ConfigurationError(
+                "--offset and --include-content are not valid for sessions artifacts"
+            )
+        if args.title is None:
+            references = await artifact_service.list(
+                ListSessionToolOutputArtifactsRequest(args.query, limit=args.limit)
+            )
+            if args.max_bytes != MAX_TOOL_OUTPUT_ARTIFACT_READ_BYTES:
+                raise ConfigurationError(
+                    "--max-bytes requires an artifact ID for sessions artifacts"
+                )
+            if args.json:
+                print(
+                    json.dumps(
+                        [serialize_tool_output_artifact(reference) for reference in references],
+                        ensure_ascii=False,
+                    )
+                )
+            elif not references:
+                print("No tool output artifacts found.")
+            else:
+                for reference in references:
+                    artifact = reference.artifact
+                    print(
+                        f"{artifact.artifact_id}\t{artifact.byte_count} bytes\t"
+                        f"truncated={str(artifact.truncated).lower()}\t"
+                        f"event={reference.event_sequence}"
+                    )
+            return 0
+
+        if args.limit != 50:
+            raise ConfigurationError("--limit is not valid when an artifact ID is provided")
+        result = await artifact_service.read(
+            ReadSessionToolOutputArtifactRequest(
+                args.query,
+                args.title,
+                max_bytes=args.max_bytes,
+            )
+        )
+        if args.json:
+            print(
+                json.dumps(
+                    serialize_tool_output_artifact_read(
+                        result.artifact.artifact_id,
+                        result.content,
+                        result.read_truncated,
+                    ),
+                    ensure_ascii=False,
+                )
+            )
+        else:
+            print(result.content, end="" if result.content.endswith("\n") else "\n")
+            if result.read_truncated:
+                print("[output truncated at the requested read limit]")
+        return 0
+    if args.prune:
+        raise ConfigurationError("--prune is only valid for sessions artifacts")
     if args.session_action == "search":
         if args.title is not None:
             raise ConfigurationError("sessions search accepts exactly one query")
         if args.query is None or not args.query.strip():
             raise ConfigurationError("sessions search requires a non-empty query")
-        page = await store.search_sessions(
-            args.query,
-            limit=args.limit,
-            offset=args.offset,
-            include_content=args.include_content,
+        page = await session_catalog.search_sessions(
+            SearchSessionsRequest(
+                args.query,
+                limit=args.limit,
+                offset=args.offset,
+                include_content=args.include_content,
+            )
         )
         if args.json:
             print(
                 json.dumps(
-                    await _serialized_session_search_page(page, store),
+                    await serialize_session_search_page(page),
                     ensure_ascii=False,
                 )
             )
         elif not page.results:
             print("No matching sessions found.")
         else:
-            for hit in page.results:
+            for inspection in page.results:
+                hit = inspection.hit
                 session = hit.summary
                 title = session.title or "New session"
                 fields = ",".join(hit.matched_fields)
@@ -635,7 +737,9 @@ async def _sessions_command(args: argparse.Namespace, services: CliServices) -> 
             raise ConfigurationError(
                 "--limit, --offset and --include-content are not valid for sessions rename"
             )
-        summary = await store.update_session_title(args.query, args.title)
+        summary = await session_lifecycle.rename_session(
+            RenameSessionRequest(args.query, args.title)
+        )
         if args.json:
             print(json.dumps(summary.to_dict(), ensure_ascii=False))
         else:
@@ -649,20 +753,19 @@ async def _sessions_command(args: argparse.Namespace, services: CliServices) -> 
         raise ConfigurationError(
             "--offset and --include-content are only valid for sessions search"
         )
-    sessions = await store.list_sessions(limit=args.limit)
+    inspections = await session_catalog.list_sessions(ListSessionsRequest(args.limit))
     if args.json:
         rows: list[dict[str, object]] = []
-        for session in sessions:
-            row: dict[str, object] = dict(session.to_dict())
-            row["last_execution"] = _serialized_execution_record(
-                await store.load_execution_record(session.id)
-            )
+        for session_inspection in inspections:
+            row: dict[str, object] = dict(session_inspection.summary.to_dict())
+            row["last_execution"] = serialize_execution_record(session_inspection.execution_record)
             rows.append(row)
         print(json.dumps(rows, ensure_ascii=False))
-    elif not sessions:
+    elif not inspections:
         print("No sessions found.")
     else:
-        for session in sessions:
+        for session_inspection in inspections:
+            session = session_inspection.summary
             print(
                 f"{session.id}\t{session.updated_at.isoformat()}\t"
                 f"{session.provider}/{session.model}\t"
@@ -672,85 +775,16 @@ async def _sessions_command(args: argparse.Namespace, services: CliServices) -> 
     return 0
 
 
-def _reasoning_markdown(item: PreservedContextItem) -> str:
-    payload = item.to_dict()
-    text_parts: list[str] = []
-    for field in ("content", "summary"):
-        blocks = payload.get(field)
-        if not isinstance(blocks, list):
-            continue
-        for block in blocks:
-            if isinstance(block, dict) and isinstance(block.get("text"), str):
-                text_parts.append(block["text"])
-    if text_parts:
-        return "\n\n".join(text_parts)
-    if payload.get("encrypted_content") is not None:
-        return "_(encrypted reasoning preserved in JSON export)_"
-    return "_(reasoning metadata preserved in JSON export)_"
-
-
-def _backend_tool_markdown(item: PreservedContextItem) -> str:
-    payload = item.to_dict()
-    kind = payload.get("kind")
-    if not isinstance(kind, dict):
-        return "_(backend tool metadata preserved in JSON export)_"
-    tool_type = kind.get("tool_type", "unknown")
-    identifier = kind.get("id")
-    lines = [f"Type: `{tool_type}`"]
-    if isinstance(identifier, str) and identifier:
-        lines.append(f"ID: `{identifier}`")
-    action = kind.get("action")
-    if isinstance(action, dict):
-        action_type = action.get("type")
-        if isinstance(action_type, str):
-            lines.append(f"Action: `{action_type}`")
-        for field in ("query", "url", "pattern"):
-            value = action.get(field)
-            if isinstance(value, str) and value:
-                lines.append(f"{field.replace('_', ' ').title()}: {value}")
-    return "\n\n".join(lines)
-
-
-def _session_markdown(items: Sequence[SessionItem]) -> str:
-    sections = ["# Neuro Code session export", ""]
-    for item in items:
-        if isinstance(item, PreservedContextItem):
-            if item.kind is ContextItemKind.REASONING:
-                sections.extend(("## Reasoning", "", _reasoning_markdown(item), ""))
-            else:
-                sections.extend(("## Backend tool call", "", _backend_tool_markdown(item), ""))
-            continue
-        message = item
-        if message.role is Role.SYSTEM:
-            continue
-        title = {
-            Role.USER: "User",
-            Role.ASSISTANT: "Assistant",
-            Role.TOOL: f"Tool: {message.name or 'unknown'}",
-        }[message.role]
-        sections.extend((f"## {title}", "", message.model_content() or "_(no text)_", ""))
-        for call in message.tool_calls:
-            sections.extend(
-                (
-                    f"### Tool call: `{call.name}`",
-                    "",
-                    "```json",
-                    json.dumps(dict(call.arguments), ensure_ascii=False, indent=2),
-                    "```",
-                    "",
-                )
-            )
-    return "\n".join(sections).rstrip() + "\n"
-
-
 async def _export_session(args: argparse.Namespace, services: CliServices) -> int:
     config = services.load_config(args.cwd)
     store = await services.create_session_store(config)
-    summary = await store.get_session(args.session_id)
-    items = await store.load_session_items(args.session_id)
-    messages = [item for item in items if isinstance(item, Message)]
+    exported = await SessionApplicationService(store).export_session(
+        ExportSessionRequest(args.session_id, include_events=args.format == "json")
+    )
+    summary = exported.snapshot.summary
+    items = exported.snapshot.items
+    messages = exported.snapshot.messages
     if args.format == "json":
-        events = await store.load_events(args.session_id)
         content = (
             json.dumps(
                 {
@@ -758,7 +792,7 @@ async def _export_session(args: argparse.Namespace, services: CliServices) -> in
                     "session": summary.to_dict(),
                     "messages": [message.to_dict() for message in messages],
                     "conversation_items": [item.to_dict() for item in items],
-                    "events": events,
+                    "events": [dict(event) for event in exported.events],
                 },
                 ensure_ascii=False,
                 indent=2,
@@ -766,7 +800,7 @@ async def _export_session(args: argparse.Namespace, services: CliServices) -> in
             + "\n"
         )
     else:
-        content = _session_markdown(items)
+        content = render_session_markdown(items)
     if args.output is None:
         print(content, end="")
     else:
@@ -781,7 +815,7 @@ async def _import_session(args: argparse.Namespace, services: CliServices) -> in
     config = services.load_config(args.cwd)
     imported = await services.load_rust_session(args.source)
     store = await services.create_session_store(config)
-    await store.import_session(imported.snapshot)
+    await SessionLifecycleService(store).import_session(ImportSessionRequest(imported.snapshot))
     if args.json:
         print(json.dumps(imported.to_dict(), ensure_ascii=False, indent=2))
     else:
@@ -800,7 +834,9 @@ async def _import_session(args: argparse.Namespace, services: CliServices) -> in
 
 
 def run(argv: Sequence[str] | None, *, services: CliServices) -> int:
-    """Parse arguments and render CLI responses with bootstrap-provided services."""
+    """Parse arguments and render CLI responses with bootstrap-provided services.
+
+    解析参数,并使用 bootstrap 提供的服务渲染 CLI 响应."""
     parser = build_parser()
     launch_arguments = tuple(sys.argv[1:] if argv is None else argv)
     args = parser.parse_args(launch_arguments)

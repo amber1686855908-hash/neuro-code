@@ -40,6 +40,9 @@ canonical 进程入口位于 bootstrap。少数从入站层到 bootstrap 的兼�
 `neuro_code.application.ports.*` 建立为 canonical 路径。开发阶段的 breaking cleanup 已移除
 根级 shared compatibility 模块 `neuro_code.{errors,async_utils,redaction}` 和
 `neuro_code.ports`；shared 原语和端口契约仅可通过各自的 canonical 路径获得。
+`neuro_code.shared.ui_language` 现在拥有跨层 `UiLanguage` 原语；原
+`neuro_code.domain.ui_preferences` 导入仅用于兼容。UI 偏好端口、持久化、TUI 和本地化文案均使用
+shared owner，同时不改变语言值或持久化行为。
 阶段 2A 将 `neuro_code.application.settings.ApplicationSettings` 和
 `neuro_code.bootstrap.composition.ApplicationComposition` 建立为 canonical 路径。
 `neuro_code.application` 仅保留惰性的 `ApplicationSettings` 包级导出；组合必须从
@@ -63,9 +66,55 @@ CLI 不会加载 bootstrap、adapters 或 providers，也不会创建资源。
 `ApplicationComposition` 调用方。ACP 不再导入 MCP 或工作区实现，也不再直接读取组合根配置或存储；导入 ACP 不会
 加载 bootstrap、MCP adapter、SQLite 存储或 providers。
 
-应用运行时行为现阶段位于 `neuro_code.application.runtime` 的明确 canonical 子模块：
-`background_task_reminders`、`agent`、`conversation`、`profile_conversation`、
-`terminal_sessions`、`approval`、`instruction_tracker` 和 `skill_tracker`。
+Agent harness 行为现阶段位于 `neuro_code.application.runtime` 的明确 canonical 子模块：
+`background_task_reminders`、`agent`、`conversation` 以及循环、上下文、工具和终结模块。
+交互式审批协调由 `neuro_code.application.permissions.broker` 拥有；原
+`neuro_code.application.runtime.approval` 路径只保留单向兼容 facade。Profile 与交互式终端会话协调位于
+`neuro_code.application.sessions` 的 canonical owner。绑定级 `InstructionTracker` 与
+`SkillTracker` 位于 `neuro_code.application.memory` 的 canonical owner。
+只读会话目录与检查查询位于 `neuro_code.application.sessions.catalog`；生命周期服务委托这些投影，
+但不迁移会话写入或会话对话控制权。
+单个会话回合的类型化边界位于 `neuro_code.application.sessions.turns`；
+`SessionApplicationService` 仅保留兼容性的绑定辅助方法，回合运行器继续拥有锁、持久化上下文、事件发送和取消。
+共享的 Provider 选择投影位于 `neuro_code.application.providers.contracts`。profile 会话控制器仍拥有绑定替换
+与会话选择，Provider 应用服务以及接口/bootstrap 消费者则使用 Provider 契约接缝。历史 profile 与 runtime 导入
+继续作为保持 identity 的兼容 re-export。
+类型化会话绑定契约位于 `neuro_code.application.sessions.binding`。ACP、bootstrap、会话应用服务以及面向
+Runtime 的消费者使用其中的 `ConversationBinding` 与 `ConversationRunner` 类型；`ProfileConversationController`
+继续拥有 profile 专属的会话选择与绑定替换。历史 profile 与 runtime 导入继续作为保持 identity 的兼容
+re-export。
+不可变的会话选择与交互策略投影位于 `neuro_code.application.sessions.contracts`。TUI 从该接缝直接消费
+`SessionOption`、`SessionSelectionResult`、`ReasoningEffortSelectionResult` 和 `InteractionModeSelectionResult`；
+`ProfileConversationController` 继续拥有选择、策略应用、锁和绑定替换。历史 profile 与 runtime 导入继续作为
+保持 identity 的兼容 re-export。
+交互式会话列表、选择和重命名现在使用非拥有型的
+`neuro_code.application.sessions.selection.SessionSelectionService` 接缝。profile 控制器仍是生命周期 owner；
+TUI 通过该门面执行这些操作，同时仅保留兼容性控制器引用以取得现有执行记录投影。
+类型化的持久会话生命周期命令使用规范的
+`neuro_code.application.sessions.lifecycle.SessionLifecycleService` 接缝。
+Runtime 会话创建、CLI 导入/重命名以及 ACP 分叉/删除都消费其已校验的请求类型；旧的
+session application service 保持 identity 兼容委托。工作区可见性、binding 替换、回合锁、协议清理
+以及执行记录投影仍由现有 owner 负责。
+只读会话任务查询使用规范的
+`neuro_code.application.sessions.task_queries.SessionTaskQueryService` 接缝。
+Runtime 与 `AgentConversation` 消费其经过校验的列表/单任务请求，宽泛的 session service
+仍为旧调用方保留保持 identity 的委托。任务创建、排队、状态转换、权限、执行、锁、取消以及所有
+SessionStore/SQLite 写入仍由现有会话/Runtime owner 负责。
+只读会话摘要查询使用规范的
+`neuro_code.application.sessions.summary.SessionSummaryQueryService` 接缝。
+会话恢复、bootstrap 配置、ACP 工作区校验和会话作用域工具输出 artifact 读取使用其经过验证的请求；
+宽泛的 session service 为旧调用方保留保持 identity 的兼容委托。生命周期写入、事件/会话项读取、schema、
+事务、Runtime、Provider、Finalizer 与 wire 行为仍由原有 owner 负责。
+只读执行记录投影使用规范的
+`neuro_code.application.sessions.execution_queries.SessionExecutionQueryService` 接缝。
+会话目录和会话恢复/重载路径共享其单条及有界批量请求，宽泛的 session service 为旧调用方保留保持
+identity 的兼容导出。执行记录写入、schema、事务、Runtime、Provider、Finalizer、TUI、ACP 与 wire 行为仍由
+原有 owner 负责。
+复制后的会话事件投影使用规范的
+`neuro_code.application.sessions.event_queries.SessionEventQueryService` 接缝。
+会话导出和会话作用域工具输出 artifact 读取共享其类型化请求与外层不可变 mapping 投影。事件行仍是不可信
+存储数据，而不是第二套领域事件模型；事件写入、解码、事务、Runtime、Provider、Finalizer、TUI、ACP 与 wire
+行为仍由原有 owner 负责。
 开发阶段的 breaking cleanup 已移除 `neuro_code.runtime`；运行时应用行为仅可通过这些
 明确的 canonical 子模块获得。`neuro_code.application.runtime.__init__` 现阶段保持最小，
 不提供 aggregate API；内部生产代码直接导入 canonical 子模块。
@@ -74,7 +123,11 @@ CLI 不会加载 bootstrap、adapters 或 providers，也不会创建资源。
 配置、环境覆盖、路由、managed overlay、sandbox 策略、stored credential 注入以及 HTTP
 proxy policy。`neuro_code.configuration.managed_provider_settings` 中的同步 managed JSON
 reader 负责 schema、protocol 和 dialect 检查、文件大小限制、metadata/credentials 合并、
-结构校验以及 `ManagedProviderSettings` 构造。`neuro_code.adapters.provider_settings` 负责
+结构校验以及 `ManagedProviderSettings` 构造。managed provider 值对象和持久化契约的
+canonical owner 是
+`neuro_code.application.ports.provider_settings`；原
+`neuro_code.domain.provider_settings` 路径仅作为单向兼容 facade 保留。这样配置和基础设施消费者
+都通过 application port 边界工作，同时不改变校验或持久化行为。`neuro_code.adapters.provider_settings` 负责
 `JsonProviderSettingsStore`、异步持久化、原子写入和 POSIX 私有权限。它通过私有绑定使用
 canonical reader，不再 re-export 它。`neuro_code.config` 同样通过私有绑定使用 reader，且不再
 导入 provider-settings adapter；该边界中的 `ProviderProfile` 和 `AppConfig` 取代已移除的
@@ -125,7 +178,9 @@ canonical reader，不再 re-export 它。`neuro_code.config` 同样通过私有
 
 ## 会话与交互界面
 
-`AgentConversation` 是位于单轮 `AgentRuntime` 之上的可复用应用边界。它串行执行轮次，
+`AgentConversation` 是位于单轮 `AgentRuntime` 之上的可复用应用边界。其 canonical 实现位于
+`neuro_code.application.sessions.conversation`；原
+`neuro_code.application.runtime.conversation` 路径只保留单向兼容 facade。它串行执行轮次，
 并在每次持久提交后继续携带有序会话项、会话 ID 和供应商来源元数据。打开已有会话时，
 它会校验记录的工作区与请求工作区是否指向同一文件系统位置。无头 CLI 和 Textual 界面
 组合相同的控制器，因此恢复和供应商回放规则不会因界面不同而分叉。
@@ -139,6 +194,12 @@ canonical reader，不再 re-export 它。`neuro_code.config` 同样通过私有
 上下文。
 
 ## 仓库级 AGENTS.md 指令发现
+
+纯指令值对象的 canonical owner 是
+`neuro_code.domain.workspace.instructions`。旧的
+`neuro_code.domain.instructions` 路径只保留单向兼容 facade；文件系统发现适配器仍位于
+`neuro_code.infrastructure.workspace.instructions`。这样可以把领域投影值与文件系统副作用分开，
+同时不改变发现端口和既有安全限制。
 
 仓库级 AGENTS.md 文件是项目自有的非系统指令，在工作区边界内指导代理行为。它们
 不会从网络加载，不会被执行，也不会被允许冒充 system 或 user 消息。所有发现过程都是
@@ -187,6 +248,12 @@ inspect 不使用与活动会话相同的运行时实例。详见
 [ADR 0039](adr/0039-repository-instruction-discovery.md)。
 
 ## 只读技能文件发现
+
+纯技能元数据的 canonical owner 是
+`neuro_code.domain.workspace.skills`。旧的
+`neuro_code.domain.skills` 路径只保留单向兼容 facade；文件系统发现仍位于
+`neuro_code.infrastructure.workspace.skills`，`SkillTool` 仍是基础设施层的只读正文读取工具。
+这样可以让解析、有界元数据投影、替换、fingerprint 和合成消息构造与文件系统副作用分离。
 
 只读技能文件发现遵循与指令发现相同的端口与适配器架构模式。技能文件
 （`SKILL.md`）是仓库提供的最佳实践参考文档，描述如何处理特定任务。与
@@ -250,7 +317,7 @@ system 或 user 消息。所有发现过程都是确定性的、有界的、失�
 `ApplicationComposition.create_binding()` 接线。`SkillTracker` 在每次
 `current_result()` 调用时重新发现，因此技能文件变更在下次工具调用时生效，
 无需重启会话。变量替换在加载时执行：`SkillTool` 接受可选的 `args` 参数，
-通过 `domain/skills.py` 中的 `apply_skill_substitutions()` 展开正文中的
+通过 `domain/workspace/skills.py` 中的 `apply_skill_substitutions()` 展开正文中的
 `$ARGUMENTS`、`$ARGUMENTS[N]`、`$N` 和 `${SKILL_DIR}` 令牌。当正文不包含
 参数令牌但 args 非空时，args 作为 `**ARGUMENTS:**` 后缀追加以保持向后兼容。
 参数字节数、替换次数和渲染输出都有上限；不支持的位置令牌（如 `$100`）保持原样。
@@ -507,7 +574,8 @@ mode 的比较。私有标准库 `windows_conpty` 适配器掌控同步管道、
 [ADR 0032](adr/0032-native-windows-conpty-lifecycle-evidence.md)。Neuro Code 通过自身的
 原生终端测试验证此进程边界。
 
-原生适配器之上，`LocalInteractiveTerminalManager` 实现共享
+原生适配器之上，应用会话 owner
+`neuro_code.application.sessions.terminal_sessions` 实现共享的
 `InteractiveTerminalManager` 端口。创建必须在启动前依次经过权限、工作区和匹配沙箱
 检查；线程安全的有界尾部环形缓冲通过单调输出游标暴露准确丢弃字节数，输入、resize、
 信号、等待和关闭共享同一条受控生命周期。POSIX 作用于完整 PTY 进程组；生产 Windows
@@ -570,7 +638,16 @@ Worker；审批模态框则把 `Ctrl+C` 限定为拒绝待处理请求。运行�
 [ADR 0061](adr/0061-read-only-plan-execution-inspection.md) 以及
 [ADR 0063](adr/0063-bounded-explicit-plan-task-scheduling.md)。
 
-交互组合使用 `ProfileConversationController` 包装当前 `AgentConversation`。它让 profile
+Stage5CQ 新增显式且有界的 `SubagentExecutionService` 应用工作流. 它在调用注入的
+`SubagentExecutor` 前创建只含元数据的 `SUBAGENT` 会话任务, 恰好记录一个终态, 并保留
+执行器的结果、失败或取消语义. 请求有界, 不包含父消息、工具、凭据或输出. 执行器必须
+构建新的子运行时/上下文, 本服务不会复用父会话. 本切片没有队列、重试、自动调度、ACP
+方法、CLI 命令或 TUI 命令. 详见
+[ADR 0071](adr/0071-explicit-bounded-subagent-lifecycle.md)。
+
+交互组合使用 `neuro_code.application.sessions.profile_conversation` 中的
+`ProfileConversationController` 包装当前 `AgentConversation`。旧的
+`neuro_code.application.runtime.profile_conversation` 路径只保留兼容 facade。它让 profile
 选择与轮次串行执行，并且只向 TUI 暴露脱敏的 `ProviderOption` 数据。选择另一个已配置
 profile 时，组合根创建不恢复任何会话的新供应商/运行时/会话绑定，旧 SQLite 会话保持
 不变。这条严格边界避免跨供应商回放加密推理、托管工具状态、方言元数据和 profile 亲和
@@ -689,6 +766,15 @@ Responses、Anthropic 与 Gemini profile 映射到各自模型列表端点。适
 服务仍可手动输入模型。只读连接发现详见
 [ADR 0048](adr/0048-bounded-provider-connection-discovery.md)。
 
+受管 provider 值对象（`ManagedProviderProfile`、`ManagedProviderSettings`、
+`ManagedProxyPolicy`）以及 `ProviderSettingsStore` 契约的 canonical owner 是
+`neuro_code.application.ports.provider_settings`。历史
+`neuro_code.domain.provider_settings` 导入仅用于兼容，不包含第二份实现。详见 ADR 0049 第 82 项。
+
+请求、有限结果、分类错误和端口类型的 canonical owner 是
+`neuro_code.application.ports.provider_catalog`；原
+`neuro_code.domain.provider_catalog` 仅作为兼容 facade 保留，不再存在第二份实现。
+
 可选的正整数 `context_window_tokens` 记录供应商/模型能力元数据。它通过脱敏 profile 选择
 和故障转移事件传播，用于本地预算，但绝不会序列化为 API 请求参数；真实上限仍由模型
 端点执行。
@@ -731,6 +817,21 @@ CC Switch 是可选配置源和 HTTP 网关，不是应用依赖。其导出的�
 后端输出补出一对开始/完成事件。
 
 ## 安全不变量
+
+有序持久化会话项有独立的应用读取 owner：
+`neuro_code.application.sessions.item_queries`。会话恢复/重载和显式会话导出共享其类型化请求与 tuple 投影；旧 session facade 保留保持 identity 的兼容导出。该 owner 不接管计划、评论、生命周期、事件或存储事务职责。
+
+现有 application 消费者也直接导入具体规范 owner：bootstrap composition 与 TUI 使用
+`application.providers.service` 和三个 `application.workflows.*` 模块；CLI/bootstrap/ACP
+以及 CLI 序列化器使用具体的 session lifecycle、service 和 catalog 模块。聚合 package export
+仍是兼容路径；这次导入收敛不创建第二套实现，也不改变工作流、锁、持久化、Runtime、Provider、
+Finalizer、TUI 布局、ACP wire 或会话行为。由于 plan/comment/export 读取没有第二个生产消费者或
+稳定的跨接口契约，仍由当前 owner 负责，不再重复拆分。
+
+有界工具输出 artifact 应用边界也通过
+`neuro_code.application.tools.service` 被 CLI、TUI、ACP、bootstrap 和 CLI 序列化器消费。
+package 聚合入口只用于兼容；artifact 句柄、会话可见性、脱敏、字节上限、清理、权限、存储、
+Runtime 与协议行为仍由 service 及其端口/适配器负责。
 
 - deny 规则优先于 allow 规则和绕过模式。
 - 无头执行把未解决的 `ask` 转换为拒绝。

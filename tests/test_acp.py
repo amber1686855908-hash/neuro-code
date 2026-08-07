@@ -48,6 +48,7 @@ from acp.schema import (
 import neuro_code.acp as acp_module
 from neuro_code.acp import (
     ACP_STDIO_BUFFER_LIMIT_BYTES,
+    ACP_TOOL_OUTPUT_ARTIFACT_EXTENSION,
     MAX_ANNOTATION_AUDIENCE,
     MAX_EMBEDDED_TEXT_RESOURCE_BYTES,
     MAX_EMBEDDED_TEXT_RESOURCES,
@@ -65,19 +66,42 @@ from neuro_code.application.acp.service import AcpApplicationService
 from neuro_code.application.permissions.contracts import PermissionApproval, PermissionRequest
 from neuro_code.application.ports.approval import PermissionApprover
 from neuro_code.application.ports.model import ModelProvider
+from neuro_code.application.ports.storage import SessionStore
+from neuro_code.application.ports.tools import ToolOutputArtifact, ToolOutputArtifactRead
 from neuro_code.application.runtime.agent import AgentRunResult, EventSink
-from neuro_code.application.runtime.profile_conversation import ConversationBinding
+from neuro_code.application.sessions import (
+    BindSessionAliasRequest,
+    DeleteSessionRequest,
+    ForkSessionRequest,
+    GetOrCreateSessionAliasRequest,
+    GetSessionSummaryRequest,
+    ListSessionsPageRequest,
+    ResolveSessionAliasRequest,
+    SessionApplicationService,
+    SessionTurnRunner,
+    SessionTurnService,
+)
+from neuro_code.application.sessions.profile_conversation import ConversationBinding
+from neuro_code.application.tools import (
+    ListSessionToolOutputArtifactsRequest,
+    ReadSessionToolOutputArtifactRequest,
+    SessionToolOutputArtifact,
+    SessionToolOutputArtifactApplicationService,
+)
 from neuro_code.bootstrap.composition import ApplicationComposition
 from neuro_code.bootstrap.entrypoints import BootstrapCliServices
 from neuro_code.config import AppConfig, ProviderProfile
 from neuro_code.domain.background_tasks import BackgroundTaskStatus, BackgroundTaskWaitMode
+from neuro_code.domain.conversation.interaction_mode import InteractionMode
+from neuro_code.domain.conversation.reasoning import ReasoningEffort
 from neuro_code.domain.events import AgentEvent, AgentEventKind
 from neuro_code.domain.execution import (
     AgentExecutionOutcome,
     AgentExecutionStatus,
     SupervisorReasonCode,
+    TurnCancellationPolicy,
+    TurnSource,
 )
-from neuro_code.domain.interaction_mode import InteractionMode
 from neuro_code.domain.messages import (
     ContentPart,
     ContextItemKind,
@@ -90,10 +114,18 @@ from neuro_code.domain.messages import (
 from neuro_code.domain.model_context import ModelContext
 from neuro_code.domain.model_events import ModelEvent
 from neuro_code.domain.plans import SessionPlan
-from neuro_code.domain.reasoning import ReasoningEffort
 from neuro_code.domain.sandbox import SandboxProfile
 from neuro_code.domain.sessions import SessionSummary
 from neuro_code.domain.tools import ToolDefinition, ToolResult
+from neuro_code.interfaces.acp.serialization import (
+    execution_outcome_metadata,
+    execution_outcome_stop_reason,
+    map_stop_reason,
+    safe_output_text,
+    sanitize_controls,
+    serialized_size_bytes,
+    truncate_utf8,
+)
 from neuro_code.shared.errors import ConfigurationError, ProviderError, SessionError, ToolError
 
 
@@ -355,7 +387,10 @@ class RunnerFixture:
         *,
         sink: EventSink | None = None,
         content_parts: Sequence[ContentPart] = (),
+        cancellation_policy: TurnCancellationPolicy = TurnCancellationPolicy.RETAIN,
+        turn_source: TurnSource = TurnSource.USER,
     ) -> AgentRunResult:
+        del cancellation_policy, turn_source
         if self._session_id is None:
             self._session_id = f"internal-session-{id(self)}"
         self._started.set()
@@ -428,6 +463,43 @@ class RunnerFixture:
         self._release.set()
 
 
+class ArtifactServiceFixture:
+    def __init__(
+        self,
+        reference: SessionToolOutputArtifact,
+        content: str,
+        session_id: str = "artifact-internal",
+    ) -> None:
+        self.reference = reference
+        self.content = content
+        self.session_id = session_id
+        self.list_requests: list[ListSessionToolOutputArtifactsRequest] = []
+        self.read_requests: list[ReadSessionToolOutputArtifactRequest] = []
+
+    async def list(
+        self,
+        request: ListSessionToolOutputArtifactsRequest,
+    ) -> tuple[SessionToolOutputArtifact, ...]:
+        self.list_requests.append(request)
+        return (self.reference,)
+
+    async def read(
+        self,
+        request: ReadSessionToolOutputArtifactRequest,
+    ) -> ToolOutputArtifactRead:
+        self.read_requests.append(request)
+        if (
+            request.session_id != self.session_id
+            or request.artifact_id != self.reference.artifact.artifact_id
+        ):
+            raise SessionError("tool output artifact is not associated with this session")
+        return ToolOutputArtifactRead(
+            self.reference.artifact,
+            self.content,
+            read_truncated=True,
+        )
+
+
 class ApplicationFixture:
     def __init__(self, root: Path, runners: Sequence[RunnerFixture]) -> None:
         profile = ProviderProfile(
@@ -449,6 +521,8 @@ class ApplicationFixture:
         self._runners = list(runners)
         self.background_scopes: list[BackgroundTasksFixture] = []
         self.store = SessionAliasStoreFixture()
+        self.session_service = SessionApplicationServiceFixture(self.store)
+        self.session_summary_queries = self.session_service
         self.resume_ids: list[str | None] = []
         self.additional_tool_names: list[tuple[str, ...]] = []
         self.additional_workspace_roots: list[tuple[Path, ...]] = []
@@ -456,12 +530,23 @@ class ApplicationFixture:
         self.client_terminals: list[Any | None] = []
         self.resume_error: ConfigurationError | None = None
         self.cleanup_events: list[str] | None = None
+        self.artifact_service: SessionToolOutputArtifactApplicationService | None = None
 
     async def config_for_session_resume(self, session_id: str) -> AppConfig:
         del session_id
         if self.resume_error is not None:
             raise self.resume_error
         return self.config
+
+    def create_tool_output_artifact_service(
+        self,
+        *,
+        config: AppConfig | None = None,
+    ) -> SessionToolOutputArtifactApplicationService | None:
+        """Keep the ACP fixture explicit about its optional artifact seam."""
+
+        del config
+        return self.artifact_service
 
     async def create_binding(
         self,
@@ -602,6 +687,52 @@ class SessionAliasStoreFixture:
         return summaries[:limit]
 
 
+class SessionApplicationServiceFixture:
+    def __init__(self, store: object) -> None:
+        self._service = SessionApplicationService(cast(SessionStore, store))
+        self.bound_runners: list[SessionTurnRunner] = []
+        self.delete_requests: list[DeleteSessionRequest] = []
+        self.fork_requests: list[ForkSessionRequest] = []
+        self.summary_requests: list[GetSessionSummaryRequest] = []
+
+    def bind_runner(self, runner: SessionTurnRunner) -> SessionTurnService:
+        self.bound_runners.append(runner)
+        return self._service.bind_runner(runner)
+
+    async def fork_session(self, request: ForkSessionRequest) -> str:
+        self.fork_requests.append(request)
+        return await self._service.fork_session(request)
+
+    async def delete_session(self, request: DeleteSessionRequest) -> None:
+        self.delete_requests.append(request)
+        await self._service.delete_session(request)
+
+    async def get_session_summary(
+        self,
+        request: GetSessionSummaryRequest,
+    ) -> SessionSummary:
+        self.summary_requests.append(request)
+        return await self._service.get_session_summary(request)
+
+    async def bind_session_alias(self, request: BindSessionAliasRequest) -> None:
+        await self._service.bind_session_alias(request)
+
+    async def resolve_session_alias(self, request: ResolveSessionAliasRequest) -> str:
+        return await self._service.resolve_session_alias(request)
+
+    async def get_or_create_session_alias(
+        self,
+        request: GetOrCreateSessionAliasRequest,
+    ) -> str:
+        return await self._service.get_or_create_session_alias(request)
+
+    async def list_sessions_page(
+        self,
+        request: ListSessionsPageRequest,
+    ) -> tuple[SessionSummary, ...]:
+        return await self._service.list_sessions_page(request)
+
+
 async def initialized_agent(
     root: Path,
     runners: Sequence[RunnerFixture],
@@ -618,11 +749,90 @@ async def initialized_agent(
     return agent, application, client
 
 
+async def initialized_artifact_agent(
+    root: Path,
+) -> tuple[NeuroCodeAcpAgent, ApplicationFixture, ArtifactServiceFixture]:
+    artifact_id = "a" * 32
+    reference = SessionToolOutputArtifact(
+        event_sequence=7,
+        artifact=ToolOutputArtifact(
+            artifact_id=artifact_id,
+            relative_path=f"tool-output/{artifact_id}.log",
+            byte_count=64,
+            truncated=True,
+        ),
+    )
+    artifact_service = ArtifactServiceFixture(reference, "redacted output\n")
+    application = ApplicationFixture(root, [])
+    application.artifact_service = cast(
+        SessionToolOutputArtifactApplicationService,
+        artifact_service,
+    )
+    summary = SessionSummary(
+        id="artifact-internal",
+        cwd=str(root),
+        provider="fixture",
+        model="fixture-model",
+        created_at=datetime(2026, 7, 1, tzinfo=UTC),
+        updated_at=datetime(2026, 7, 1, tzinfo=UTC),
+        title="Artifact session",
+    )
+    application.store.summaries.append(summary)
+    application.store.session_ids.add(summary.id)
+    await application.store.bind_session_alias("acp-v1", "acp-artifacts", summary.id)
+    agent = NeuroCodeAcpAgent(_acp_service(application))
+    client = AcpClientFixture()
+    agent.on_connect(cast(Client, client))
+    await agent.initialize(1, ClientCapabilities(terminal=True))
+    return agent, application, artifact_service
+
+
 def _acp_service(application: ApplicationFixture) -> AcpApplicationService:
     return BootstrapCliServices().create_acp_service(cast(ApplicationComposition, application))
 
 
 class PromptContentTests(unittest.TestCase):
+    def test_acp_outcome_projection_is_bounded_and_protocol_safe(self) -> None:
+        budget_limited = AgentExecutionOutcome(
+            AgentExecutionStatus.BUDGET_LIMITED,
+            SupervisorReasonCode.OUTPUT_TOKEN_BUDGET,
+            finalized=True,
+            recoverable=True,
+        )
+        self.assertEqual(map_stop_reason("length"), "max_tokens")
+        self.assertEqual(map_stop_reason("unexpected"), "end_turn")
+        self.assertEqual(execution_outcome_stop_reason(budget_limited), "max_tokens")
+        metadata = execution_outcome_metadata(budget_limited)
+        self.assertEqual(
+            metadata,
+            {
+                "neuro_code.execution_status": "budget_limited",
+                "neuro_code.execution_reason": "output_token_budget",
+                "neuro_code.finalized": True,
+                "neuro_code.recoverable": True,
+            },
+        )
+        self.assertNotIn("snapshot", repr(metadata))
+        self.assertNotIn("digest", repr(metadata))
+
+    def test_acp_bounded_serialization_helpers_preserve_safety_order(self) -> None:
+        self.assertEqual(sanitize_controls("before\x00after\x7f"), "before�after�")
+        self.assertEqual(
+            truncate_utf8("前缀-abcdefghijklmnop", 20),
+            "前\n… [truncated]",
+        )
+        rendered = safe_output_text(
+            "secret-token\n" + ("x" * 200),
+            80,
+            explicit_redactions=("secret-token",),
+        )
+        self.assertNotIn("secret-token", rendered)
+        self.assertLessEqual(len(rendered.encode("utf-8")), 80)
+        self.assertEqual(
+            serialized_size_bytes({"b": "中文", "a": 1}),
+            len('{"a":1,"b":"中文"}'.encode()),
+        )
+
     def test_text_and_resource_links_preserve_order_and_drop_meta(self) -> None:
         resource = ResourceContentBlock.model_validate(
             {
@@ -1237,6 +1447,95 @@ class McpConfigurationTests(unittest.TestCase):
 
 
 class AcpAgentTests(unittest.IsolatedAsyncioTestCase):
+    async def test_private_artifact_extension_lists_and_reads_bounded_output(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            agent, _, artifact_service = await initialized_artifact_agent(Path(directory))
+
+            listed = await agent.ext_method(
+                ACP_TOOL_OUTPUT_ARTIFACT_EXTENSION,
+                {"sessionId": "acp-artifacts", "limit": 1},
+            )
+            read = await agent.ext_method(
+                ACP_TOOL_OUTPUT_ARTIFACT_EXTENSION,
+                {
+                    "sessionId": "acp-artifacts",
+                    "artifactId": "a" * 32,
+                    "maxBytes": 128,
+                },
+            )
+
+        self.assertEqual(
+            listed,
+            {
+                "artifacts": [
+                    {
+                        "artifactId": "a" * 32,
+                        "byteCount": 64,
+                        "truncated": True,
+                        "eventSequence": 7,
+                    }
+                ]
+            },
+        )
+        self.assertEqual(
+            read,
+            {
+                "artifactId": "a" * 32,
+                "content": "redacted output\n",
+                "readTruncated": True,
+            },
+        )
+        self.assertEqual(artifact_service.list_requests[0].limit, 1)
+        self.assertEqual(artifact_service.read_requests[0].max_bytes, 128)
+
+    async def test_private_artifact_extension_is_session_scoped_and_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            agent, application, _ = await initialized_artifact_agent(Path(directory))
+            other = SessionSummary(
+                id="other-internal",
+                cwd=str(Path(directory)),
+                provider="fixture",
+                model="fixture-model",
+                created_at=datetime(2026, 7, 2, tzinfo=UTC),
+                updated_at=datetime(2026, 7, 2, tzinfo=UTC),
+                title="Other session",
+            )
+            application.store.summaries.append(other)
+            application.store.session_ids.add(other.id)
+            await application.store.bind_session_alias("acp-v1", "acp-other", other.id)
+
+            with self.assertRaises(RequestError) as cross_session:
+                await agent.ext_method(
+                    ACP_TOOL_OUTPUT_ARTIFACT_EXTENSION,
+                    {"sessionId": "acp-other", "artifactId": "a" * 32},
+                )
+            with self.assertRaises(RequestError) as invalid:
+                await agent.ext_method(
+                    ACP_TOOL_OUTPUT_ARTIFACT_EXTENSION,
+                    {"sessionId": "acp-artifacts", "artifactId": "not-an-id"},
+                )
+            with self.assertRaises(RequestError) as unknown:
+                await agent.ext_method("other/private/method", {})
+
+        self.assertEqual(cross_session.exception.code, -32602)
+        self.assertEqual(cross_session.exception.data, {"reason": "artifact_not_found"})
+        self.assertEqual(invalid.exception.data, {"reason": "artifact_id_invalid"})
+        self.assertEqual(unknown.exception.code, -32601)
+
+    async def test_prompt_uses_application_turn_service(self) -> None:
+        runner = RunnerFixture()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            agent, application, _ = await initialized_agent(root, [runner])
+            session = await agent.new_session(str(root))
+            response = await agent.prompt(
+                session.session_id,
+                [TextContentBlock(type="text", text="answer")],
+            )
+
+        self.assertEqual(response.stop_reason, "end_turn")
+        self.assertEqual(application.session_service.bound_runners, [runner])
+
     async def test_initialize_declares_session_lifecycle_and_saves_client_details(
         self,
     ) -> None:
@@ -2342,6 +2641,14 @@ class AcpAgentTests(unittest.IsolatedAsyncioTestCase):
             deleted = await agent.delete_session("acp-durable")
 
             self.assertEqual(deleted.model_dump(exclude_none=True), {})
+            self.assertEqual(
+                application.session_service.delete_requests,
+                [DeleteSessionRequest("persisted-id")],
+            )
+            self.assertEqual(
+                application.session_service.summary_requests,
+                [GetSessionSummaryRequest("persisted-id")],
+            )
             self.assertEqual(application.store.deleted_session_ids, ["persisted-id"])
             with self.assertRaises(RequestError) as missing:
                 await agent.delete_session("acp-durable")
@@ -2416,6 +2723,10 @@ class AcpAgentTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(
                 application.store.forked_session_ids,
                 [("source-id", "forked-1")],
+            )
+            self.assertEqual(
+                application.session_service.fork_requests,
+                [ForkSessionRequest("source-id")],
             )
             self.assertEqual(
                 await application.store.resolve_session_alias(
@@ -2908,6 +3219,18 @@ class AcpAgentTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result, {})
         self.assertEqual(application.store.deleted_session_ids, ["persisted-id"])
+
+    async def test_sdk_router_dispatches_private_artifact_extension(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            agent, _, _ = await initialized_artifact_agent(Path(directory))
+
+            result = await acp_module._build_acp_router(agent)(
+                "_" + ACP_TOOL_OUTPUT_ARTIFACT_EXTENSION,
+                {"sessionId": "acp-artifacts", "limit": 1},
+                False,
+            )
+
+        self.assertEqual(result["artifacts"][0]["artifactId"], "a" * 32)
 
     async def test_serve_uses_official_sdk_streams_and_always_closes_connection(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

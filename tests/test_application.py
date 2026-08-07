@@ -7,7 +7,8 @@ from pathlib import Path
 from typing import Any, cast
 from unittest.mock import patch
 
-import neuro_code.config as config_module
+import neuro_code.configuration.app as config_module
+from neuro_code.application.permissions.service import ToolApprovalService
 from neuro_code.application.ports.approval import PermissionApprover
 from neuro_code.application.ports.background_tasks import (
     BackgroundTaskManager,
@@ -15,21 +16,24 @@ from neuro_code.application.ports.background_tasks import (
 )
 from neuro_code.application.ports.model import ModelProvider
 from neuro_code.application.runtime.supervision import ExecutionControlMode
+from neuro_code.application.sessions import GetSessionSummaryRequest, SessionApplicationService
+from neuro_code.application.sessions.summary import SessionSummaryQueryService
 from neuro_code.application.settings import ApplicationSettings
 from neuro_code.bootstrap.composition import ApplicationComposition
-from neuro_code.config import AppConfig
+from neuro_code.configuration.app import AppConfig
+from neuro_code.domain.conversation.reasoning import ReasoningEffort
 from neuro_code.domain.model_context import ModelContext
 from neuro_code.domain.model_events import ModelEvent
-from neuro_code.domain.reasoning import ReasoningEffort
 from neuro_code.domain.sandbox import SandboxProfile
+from neuro_code.domain.sessions import SessionSummary
 from neuro_code.domain.tools import ToolDefinition, ToolResult
+from neuro_code.infrastructure.workspace.paths import workspaces_match
 from neuro_code.permissions import (
     PermissionEffect,
     PermissionMode,
     PermissionRule,
 )
 from neuro_code.shared.errors import ConfigurationError, ToolError
-from neuro_code.workspace import workspaces_match
 from tests.fakes import EmptyWorkspaceChangeObserver
 
 
@@ -156,6 +160,10 @@ api_key_env = "FIXTURE_KEY"
                 default_application = await ApplicationComposition.open(
                     ApplicationSettings(cwd=root),
                     provider_factory=lambda config, failover: ApplicationProviderFixture(),
+                )
+                self.assertIsInstance(
+                    default_application.session_service,
+                    SessionApplicationService,
                 )
                 default_binding = await default_application.create_binding()
                 self.assertIs(
@@ -301,17 +309,17 @@ api_key_env = "FIXTURE_KEY"
                 clear=True,
             ):
                 with (
-                    patch("neuro_code.config.load_config", side_effect=load_config),
+                    patch("neuro_code.configuration.app.load_config", side_effect=load_config),
                     patch(
-                        "neuro_code.config.override_sandbox",
+                        "neuro_code.configuration.app.override_sandbox",
                         side_effect=override_sandbox,
                     ),
                     patch(
-                        "neuro_code.config.override_provider",
+                        "neuro_code.configuration.app.override_provider",
                         side_effect=override_provider,
                     ),
                     patch(
-                        "neuro_code.config.pin_resumed_sandbox",
+                        "neuro_code.configuration.app.pin_resumed_sandbox",
                         side_effect=pin_resumed_sandbox,
                     ),
                 ):
@@ -499,6 +507,7 @@ api_key_env = "FIXTURE_KEY"
                     ),
                 )
                 runtime = cast(Any, cast(Any, binding.runner)._runtime)
+                self.assertIsInstance(runtime._approver, ToolApprovalService)
                 ask = runtime._permissions.decide(
                     "remote_ask",
                     {},
@@ -586,6 +595,49 @@ api_key_env = "FIXTURE_KEY"
                 )
                 with self.assertRaisesRegex(ConfigurationError, "provider"):
                     await application.config_for_session_resume(missing_affinity)
+                await application.close()
+
+    async def test_resume_configuration_uses_session_application_summary_seam(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / "state"
+            self._write_config(state)
+            with patch.dict(
+                "os.environ",
+                {
+                    "HOME": str(root),
+                    "NEURO_CODE_HOME": str(state),
+                    "FIXTURE_KEY": "fixture-key",
+                },
+                clear=True,
+            ):
+                application = await ApplicationComposition.open(
+                    ApplicationSettings(cwd=root),
+                    provider_factory=lambda config, failover: cast(
+                        ModelProvider,
+                        ApplicationProviderFixture(),
+                    ),
+                    process_sandbox_enforcer=lambda *args: None,
+                )
+                session_id = await application.store.create_session(
+                    str(root),
+                    "fixture",
+                    "fixture-model",
+                )
+                requests: list[GetSessionSummaryRequest] = []
+                original = SessionSummaryQueryService.get_session_summary
+
+                async def capture(
+                    service: SessionSummaryQueryService,
+                    request: GetSessionSummaryRequest,
+                ) -> SessionSummary:
+                    requests.append(request)
+                    return await original(service, request)
+
+                with patch.object(SessionSummaryQueryService, "get_session_summary", new=capture):
+                    await application.config_for_session_resume(session_id)
+
+                self.assertEqual(requests, [GetSessionSummaryRequest(session_id)])
                 await application.close()
 
     async def test_failed_open_closes_the_process_supervisor(self) -> None:

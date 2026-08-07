@@ -13,21 +13,38 @@ from collections.abc import AsyncIterator, Sequence
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from neuro_code.adapters.provider_catalog import HttpProviderCatalog
 from neuro_code.adapters.provider_settings import JsonProviderSettingsStore
 from neuro_code.adapters.sqlite_session import SqliteSessionStore
 from neuro_code.application.ports.model import ModelToolPolicy
+from neuro_code.application.providers import ChangeProviderRequest, ProviderChangeService
+from neuro_code.application.runtime.agent import AgentRunResult
 from neuro_code.application.runtime.supervision import ExecutionControlMode
+from neuro_code.application.sessions import (
+    ResumeSessionRequest,
+    SessionSelectionService,
+    SessionTurnService,
+)
+from neuro_code.application.settings import ApplicationSettings
+from neuro_code.application.tools import SessionToolOutputArtifactApplicationService
+from neuro_code.application.workflows import (
+    PlanExecutionService,
+    PlanSchedulingService,
+    QueuedPlanExecutionService,
+)
 from neuro_code.bootstrap.entrypoints import main
 from neuro_code.cli import (
     _application_settings,
     _execution_control_mode,
     _normalize_rule,
+    _run_agent,
     build_parser,
 )
 from neuro_code.config import AppConfig
+from neuro_code.domain.conversation.reasoning import ReasoningEffort
 from neuro_code.domain.events import AgentEvent, AgentEventKind
 from neuro_code.domain.execution import (
     AgentExecutionOutcome,
@@ -44,10 +61,14 @@ from neuro_code.domain.model_events import (
     ModelToolCall,
 )
 from neuro_code.domain.provider_settings import ManagedProviderProfile
-from neuro_code.domain.reasoning import ReasoningEffort
 from neuro_code.domain.sandbox import SandboxProfile
 from neuro_code.domain.tools import ToolDefinition
 from neuro_code.domain.ui_preferences import UiLanguage
+from neuro_code.infrastructure.persistence.output_artifacts import FileToolOutputArtifactStore
+from neuro_code.interfaces.cli.serialization import (
+    serialize_execution_outcome,
+    serialize_execution_record,
+)
 from neuro_code.shared.errors import ConfigurationError, ProviderError
 
 
@@ -120,6 +141,79 @@ class BackgroundTaskSupervisorFixture:
         self.shutdown_calls += 1
 
 
+class CliApplicationRunnerFixture:
+    session_id = "session-fixture"
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[object, ...]] = []
+
+    async def run(
+        self,
+        prompt: str,
+        *,
+        sink=None,
+        content_parts=(),
+        cancellation_policy=None,
+        turn_source=None,
+    ) -> AgentRunResult:
+        self.calls.append(
+            (
+                prompt,
+                sink,
+                tuple(content_parts),
+                cancellation_policy,
+                turn_source,
+            )
+        )
+        event = AgentEvent.create(1, AgentEventKind.TEXT_DELTA, {"text": "fixture response"})
+        if sink is not None:
+            await sink(event)
+        return AgentRunResult("session-fixture", "fixture response", (), (), (event,), 1)
+
+
+class CliApplicationSessionFixture:
+    def __init__(self, runner: CliApplicationRunnerFixture, operations: list[str]) -> None:
+        self.runner = runner
+        self.operations = operations
+        self.resume_requests: list[ResumeSessionRequest] = []
+        self.bound_runners: list[object] = []
+
+    async def prepare_resume(self, request: ResumeSessionRequest) -> None:
+        self.operations.append("prepare_resume")
+        self.resume_requests.append(request)
+
+    def bind_runner(self, runner: CliApplicationRunnerFixture) -> SessionTurnService:
+        self.operations.append("bind_runner")
+        self.bound_runners.append(runner)
+        return SessionTurnService(runner)
+
+
+class CliApplicationFixture:
+    def __init__(self) -> None:
+        self.runner = CliApplicationRunnerFixture()
+        self.operations: list[str] = []
+        self.session_service = CliApplicationSessionFixture(self.runner, self.operations)
+        self.created_resume_ids: list[str | None] = []
+        self.close_calls = 0
+
+    async def create_binding(self, *, resume_id: str | None = None) -> SimpleNamespace:
+        self.operations.append("create_binding")
+        self.created_resume_ids.append(resume_id)
+        return SimpleNamespace(runner=self.runner)
+
+    async def close(self) -> None:
+        self.close_calls += 1
+
+
+class CliServicesFixture:
+    def __init__(self, application: CliApplicationFixture) -> None:
+        self.application = application
+
+    async def open_application(self, settings: ApplicationSettings) -> CliApplicationFixture:
+        del settings
+        return self.application
+
+
 class CliTests(unittest.TestCase):
     @staticmethod
     def _write_provider_config(state_dir: Path) -> None:
@@ -174,6 +268,35 @@ api_key_env = "FIXTURE_KEY"
 
         self.assertIs(settings.execution_control_mode, ExecutionControlMode.FINALIZE_TERMINAL)
 
+    def test_cli_serialization_helpers_keep_bounded_execution_projection(self) -> None:
+        outcome = AgentExecutionOutcome(
+            status=AgentExecutionStatus.BUDGET_LIMITED,
+            reason_code=SupervisorReasonCode.MODEL_STEP_LIMIT,
+            finalized=True,
+            recoverable=True,
+        )
+        self.assertEqual(
+            serialize_execution_outcome(outcome),
+            {
+                "status": "budget_limited",
+                "reason": "model_step_limit",
+                "finalized": True,
+                "recoverable": True,
+            },
+        )
+        self.assertIsNone(serialize_execution_outcome(None))
+
+        record = SessionExecutionRecord(
+            outcome=outcome,
+            event_sequence=3,
+            completed_at=datetime(2026, 1, 1, tzinfo=UTC),
+        )
+        serialized_record = serialize_execution_record(record)
+        self.assertIsNotNone(serialized_record)
+        assert serialized_record is not None
+        self.assertEqual(serialized_record["completed_at"], "2026-01-01T00:00:00+00:00")
+        self.assertNotIn("event_sequence", serialized_record)
+
     def test_cli_accepts_observe_only_execution_control_for_agent_acp_and_tui(self) -> None:
         parser = build_parser()
         agent_settings = _application_settings(
@@ -195,6 +318,48 @@ api_key_env = "FIXTURE_KEY"
             build_parser().parse_args(("agent", "-p", "answer", "--execution-control", "unsafe"))
 
         self.assertEqual(error.exception.code, 2)
+
+    def test_headless_agent_uses_application_turn_service_for_new_session(self) -> None:
+        application = CliApplicationFixture()
+        services = CliServicesFixture(application)
+        args = build_parser().parse_args(("-p", "answer"))
+        output = io.StringIO()
+
+        with redirect_stdout(output):
+            exit_code = asyncio.run(_run_agent(args, services))
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(application.operations, ["create_binding", "bind_runner"])
+        self.assertEqual(application.created_resume_ids, [None])
+        self.assertEqual(application.session_service.bound_runners, [application.runner])
+        self.assertEqual(application.runner.calls[0][0], "answer")
+        self.assertEqual(output.getvalue(), "fixture response\n")
+        self.assertEqual(application.close_calls, 1)
+
+    def test_headless_agent_preflights_resume_before_binding_runner(self) -> None:
+        application = CliApplicationFixture()
+        application.runner.session_id = "session-resume"
+        services = CliServicesFixture(application)
+        args = build_parser().parse_args(("-p", "continue", "--resume", "session-resume"))
+        output = io.StringIO()
+
+        with redirect_stdout(output):
+            exit_code = asyncio.run(_run_agent(args, services))
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(
+            application.operations,
+            ["prepare_resume", "create_binding", "bind_runner"],
+        )
+        self.assertEqual(
+            application.session_service.resume_requests,
+            [ResumeSessionRequest("session-resume")],
+        )
+        self.assertEqual(application.created_resume_ids, ["session-resume"])
+        self.assertEqual(application.session_service.bound_runners, [application.runner])
+        self.assertEqual(application.runner.calls[0][0], "continue")
+        self.assertEqual(output.getvalue(), "fixture response\n")
+        self.assertEqual(application.close_calls, 1)
 
     def test_execution_control_conversion_fails_closed_outside_argparse(self) -> None:
         for value in ("unsafe", object()):
@@ -471,7 +636,7 @@ api_key_env = "FIXTURE_KEY"
             asyncio.run(store.initialize())
             session_id = asyncio.run(
                 store.create_session(
-                    str(root.resolve()),
+                    str(root),
                     "cli-fixture",
                     "fixture-model",
                     sandbox_profile=SandboxProfile.WORKSPACE,
@@ -814,16 +979,24 @@ api_key_env = "FIXTURE_KEY"
                     self,
                     runner: object,
                     *,
+                    turn_service: object,
                     approval_controller: object,
                     provider_controller: object,
+                    reasoning_controller: object,
+                    interaction_mode_controller: object,
                     session_controller: object,
+                    session_selection_service: object,
                     task_controller: object,
                     session_task_controller: object,
                     plan_controller: object,
+                    plan_execution_service: object,
+                    plan_scheduling_service: object,
+                    queued_plan_execution_service: object,
                     ui_preferences: object,
                     provider_settings_store: object,
                     provider_catalog: object,
                     managed_provider_settings: object,
+                    tool_output_artifact_service: object,
                     language: UiLanguage,
                     initial_items: object,
                     provider_name: str,
@@ -832,16 +1005,24 @@ api_key_env = "FIXTURE_KEY"
                 ) -> None:
                     captured.update(
                         runner=runner,
+                        turn_service=turn_service,
                         approval_controller=approval_controller,
                         provider_controller=provider_controller,
+                        reasoning_controller=reasoning_controller,
+                        interaction_mode_controller=interaction_mode_controller,
                         session_controller=session_controller,
+                        session_selection_service=session_selection_service,
                         task_controller=task_controller,
                         session_task_controller=session_task_controller,
                         plan_controller=plan_controller,
+                        plan_execution_service=plan_execution_service,
+                        plan_scheduling_service=plan_scheduling_service,
+                        queued_plan_execution_service=queued_plan_execution_service,
                         ui_preferences=ui_preferences,
                         provider_settings_store=provider_settings_store,
                         provider_catalog=provider_catalog,
                         managed_provider_settings=managed_provider_settings,
+                        tool_output_artifact_service=tool_output_artifact_service,
                         language=language,
                         initial_items=initial_items,
                         provider_name=provider_name,
@@ -874,14 +1055,27 @@ api_key_env = "FIXTURE_KEY"
             self.assertEqual(captured["provider_name"], "cli-fixture")
             self.assertEqual(captured["model_name"], "fixture-model")
             self.assertEqual(captured["cwd"], root.resolve())
-            self.assertIs(captured["runner"], captured["provider_controller"])
+            self.assertIsInstance(captured["provider_controller"], ProviderChangeService)
+            self.assertIsInstance(captured["session_selection_service"], SessionSelectionService)
+            self.assertIsInstance(captured["plan_execution_service"], PlanExecutionService)
+            self.assertIsInstance(captured["plan_scheduling_service"], PlanSchedulingService)
+            self.assertIsInstance(
+                captured["queued_plan_execution_service"], QueuedPlanExecutionService
+            )
             self.assertIs(captured["runner"], captured["session_controller"])
             self.assertIs(captured["runner"], captured["task_controller"])
             self.assertIs(captured["runner"], captured["session_task_controller"])
             self.assertIs(captured["runner"], captured["plan_controller"])
+            self.assertIs(captured["runner"], captured["reasoning_controller"])
+            self.assertIs(captured["runner"], captured["interaction_mode_controller"])
+            self.assertIsInstance(captured["turn_service"], SessionTurnService)
             self.assertEqual(captured["initial_items"], ())
             self.assertEqual(captured["language"], UiLanguage.SIMPLIFIED_CHINESE)
             self.assertIsInstance(captured["provider_catalog"], HttpProviderCatalog)
+            self.assertIsInstance(
+                captured["tool_output_artifact_service"],
+                SessionToolOutputArtifactApplicationService,
+            )
             self.assertTrue(captured["ran"])
 
     def test_tui_propagates_textual_return_code_and_shuts_down_tasks(self) -> None:
@@ -1010,16 +1204,24 @@ api_key_env = "FIXTURE_KEY"
                     self,
                     runner: object,
                     *,
+                    turn_service: object,
                     approval_controller: object,
                     provider_controller: object,
+                    reasoning_controller: object,
+                    interaction_mode_controller: object,
                     session_controller: object,
+                    session_selection_service: object,
                     task_controller: object,
                     session_task_controller: object,
                     plan_controller: object,
+                    plan_execution_service: object,
+                    plan_scheduling_service: object,
+                    queued_plan_execution_service: object,
                     ui_preferences: object,
                     provider_settings_store: object,
                     provider_catalog: object,
                     managed_provider_settings: object,
+                    tool_output_artifact_service: object,
                     language: UiLanguage,
                     initial_items: object,
                     provider_name: str,
@@ -1028,15 +1230,23 @@ api_key_env = "FIXTURE_KEY"
                 ) -> None:
                     del (
                         runner,
+                        turn_service,
                         approval_controller,
                         provider_controller,
+                        reasoning_controller,
+                        interaction_mode_controller,
+                        session_selection_service,
                         task_controller,
                         session_task_controller,
                         plan_controller,
+                        plan_execution_service,
+                        plan_scheduling_service,
+                        queued_plan_execution_service,
                         ui_preferences,
                         provider_settings_store,
                         provider_catalog,
                         managed_provider_settings,
+                        tool_output_artifact_service,
                         language,
                         initial_items,
                         provider_name,
@@ -1112,16 +1322,24 @@ api_key_env = "SECOND_KEY"
                     self,
                     runner: object,
                     *,
+                    turn_service: object,
                     approval_controller: object,
                     provider_controller: object,
+                    reasoning_controller: object,
+                    interaction_mode_controller: object,
                     session_controller: object,
+                    session_selection_service: object,
                     task_controller: object,
                     session_task_controller: object,
                     plan_controller: object,
+                    plan_execution_service: object,
+                    plan_scheduling_service: object,
+                    queued_plan_execution_service: object,
                     ui_preferences: object,
                     provider_settings_store: object,
                     provider_catalog: object,
                     managed_provider_settings: object,
+                    tool_output_artifact_service: object,
                     language: UiLanguage,
                     initial_items: object,
                     provider_name: str,
@@ -1130,11 +1348,19 @@ api_key_env = "SECOND_KEY"
                 ) -> None:
                     del (
                         approval_controller,
+                        turn_service,
+                        reasoning_controller,
+                        interaction_mode_controller,
+                        session_selection_service,
                         plan_controller,
+                        plan_execution_service,
+                        plan_scheduling_service,
+                        queued_plan_execution_service,
                         ui_preferences,
                         provider_settings_store,
                         provider_catalog,
                         managed_provider_settings,
+                        tool_output_artifact_service,
                         language,
                         initial_items,
                         provider_name,
@@ -1148,7 +1374,9 @@ api_key_env = "SECOND_KEY"
                     self.session_task_controller = session_task_controller
 
                 async def run_async(self) -> None:
-                    selection = await self.provider_controller.select_profile("second")
+                    selection = await self.provider_controller.change_provider(
+                        ChangeProviderRequest("second")
+                    )
                     captured["selection"] = selection
                     captured["same_controller"] = self.runner is self.provider_controller
                     captured["same_session_controller"] = self.runner is self.session_controller
@@ -1177,7 +1405,7 @@ api_key_env = "SECOND_KEY"
 
             self.assertEqual(exit_code, 0)
             self.assertEqual(selected, ["first", "second"])
-            self.assertTrue(captured["same_controller"])
+            self.assertFalse(captured["same_controller"])
             self.assertTrue(captured["same_session_controller"])
             self.assertTrue(captured["same_task_controller"])
             self.assertTrue(captured["same_session_task_controller"])
@@ -1255,16 +1483,24 @@ api_key_env = "SECOND_KEY"
                     self,
                     runner: object,
                     *,
+                    turn_service: object,
                     approval_controller: object,
                     provider_controller: object,
+                    reasoning_controller: object,
+                    interaction_mode_controller: object,
                     session_controller: object,
+                    session_selection_service: object,
                     task_controller: object,
                     session_task_controller: object,
                     plan_controller: object,
+                    plan_execution_service: object,
+                    plan_scheduling_service: object,
+                    queued_plan_execution_service: object,
                     ui_preferences: object,
                     provider_settings_store: object,
                     provider_catalog: object,
                     managed_provider_settings: object,
+                    tool_output_artifact_service: object,
                     language: UiLanguage,
                     initial_items: object,
                     provider_name: str,
@@ -1273,11 +1509,19 @@ api_key_env = "SECOND_KEY"
                 ) -> None:
                     del (
                         approval_controller,
+                        turn_service,
+                        reasoning_controller,
+                        interaction_mode_controller,
+                        session_selection_service,
                         ui_preferences,
                         provider_settings_store,
                         provider_catalog,
                         managed_provider_settings,
+                        tool_output_artifact_service,
                         plan_controller,
+                        plan_execution_service,
+                        plan_scheduling_service,
+                        queued_plan_execution_service,
                         session_task_controller,
                         language,
                         provider_name,
@@ -1300,10 +1544,10 @@ api_key_env = "SECOND_KEY"
                         "Renamed from TUI"
                     )
                     captured["same_controller"] = (
-                        self.runner
-                        is self.provider_controller
-                        is self.session_controller
-                        is self.task_controller
+                        self.runner is self.session_controller is self.task_controller
+                    )
+                    captured["provider_service_is_distinct"] = (
+                        self.runner is not self.provider_controller
                     )
 
             with (
@@ -1322,6 +1566,7 @@ api_key_env = "SECOND_KEY"
             self.assertEqual(captured["session_ids"], [root_session])
             self.assertNotIn(other_session, captured["session_ids"])
             self.assertTrue(captured["same_controller"])
+            self.assertTrue(captured["provider_service_is_distinct"])
             self.assertEqual(captured["initial_items"], ())
             selection = captured["selection"]
             self.assertEqual(selection.session_id, root_session)
@@ -1495,6 +1740,125 @@ api_key_env = "SECOND_KEY"
             self.assertEqual(exported["session"]["sandbox_profile"], "off")
             self.assertEqual(exported["session"]["title"], "Manual CLI title")
             self.assertEqual(exported["conversation_items"], exported["messages"])
+
+    def test_sessions_artifacts_list_and_read_through_session_boundary(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / "state"
+            self._write_provider_config(state)
+
+            async def seed() -> tuple[str, str, Path]:
+                store = SqliteSessionStore(state / "sessions.db")
+                await store.initialize()
+                session_id = await store.create_session(
+                    str(root),
+                    "cli-fixture",
+                    "fixture-model",
+                )
+                artifact_store = FileToolOutputArtifactStore(state / "tool-output")
+                artifact = await artifact_store.save(
+                    tool_name="bash",
+                    content=b"bounded output\n",
+                    content_truncated=True,
+                )
+                orphan = await artifact_store.save(tool_name="bash", content=b"orphan")
+                orphan_path = state / "tool-output" / Path(orphan.relative_path).name
+                old_timestamp = os.stat(orphan_path).st_mtime - 7200
+                os.utime(orphan_path, (old_timestamp, old_timestamp))
+                event = AgentEvent.create(
+                    await store.next_event_sequence(session_id),
+                    AgentEventKind.TOOL_COMPLETED,
+                    {
+                        "metadata": {
+                            "output_artifact_id": artifact.artifact_id,
+                            "output_artifact_path": artifact.relative_path,
+                            "output_artifact_bytes": artifact.byte_count,
+                            "output_artifact_truncated": artifact.truncated,
+                        }
+                    },
+                )
+                await store.append_event(session_id, event)
+                return session_id, artifact.artifact_id, orphan_path
+
+            session_id, artifact_id, orphan_path = asyncio.run(seed())
+            environment = {
+                "HOME": str(root),
+                "NEURO_CODE_HOME": str(state),
+                "FIXTURE_KEY": "fixture-key",
+            }
+            output = io.StringIO()
+            with patch.dict("os.environ", environment, clear=True), redirect_stdout(output):
+                exit_code = main(
+                    (
+                        "sessions",
+                        "artifacts",
+                        session_id,
+                        "--json",
+                        "--cwd",
+                        str(root),
+                    )
+                )
+            self.assertEqual(exit_code, 0)
+            listed = json.loads(output.getvalue())
+            self.assertEqual(listed[0]["id"], artifact_id)
+            self.assertEqual(listed[0]["bytes"], len(b"bounded output\n"))
+            self.assertTrue(listed[0]["truncated"])
+            self.assertNotIn("path", listed[0])
+
+            output = io.StringIO()
+            with patch.dict("os.environ", environment, clear=True), redirect_stdout(output):
+                exit_code = main(
+                    (
+                        "sessions",
+                        "artifacts",
+                        session_id,
+                        artifact_id,
+                        "--json",
+                        "--max-bytes",
+                        "7",
+                        "--cwd",
+                        str(root),
+                    )
+                )
+            self.assertEqual(exit_code, 0)
+            read = json.loads(output.getvalue())
+            self.assertEqual(read["id"], artifact_id)
+            self.assertEqual(read["content"], "bounded")
+            self.assertTrue(read["read_truncated"])
+
+            output = io.StringIO()
+            with patch.dict("os.environ", environment, clear=True), redirect_stdout(output):
+                exit_code = main(
+                    (
+                        "sessions",
+                        "artifacts",
+                        "--prune",
+                        "--json",
+                        "--cwd",
+                        str(root),
+                    )
+                )
+            self.assertEqual(exit_code, 0)
+            pruned = json.loads(output.getvalue())
+            self.assertEqual(pruned["deleted"], 1)
+            self.assertFalse(orphan_path.exists())
+
+    def test_sessions_prune_is_restricted_to_artifact_action(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / "state"
+            self._write_provider_config(state)
+            environment = {
+                "HOME": str(root),
+                "NEURO_CODE_HOME": str(state),
+                "FIXTURE_KEY": "fixture-key",
+            }
+            with patch.dict("os.environ", environment, clear=True):
+                output = io.StringIO()
+                with redirect_stderr(output):
+                    exit_code = main(("sessions", "--prune", "--cwd", str(root)))
+            self.assertEqual(exit_code, 2)
+            self.assertIn("--prune is only valid for sessions artifacts", output.getvalue())
 
     def test_import_rust_session_is_available_to_list_and_export(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

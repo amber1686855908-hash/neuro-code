@@ -1,13 +1,7 @@
-from __future__ import annotations
+"""Compatibility export for the shared UI-language primitive.
 
-from enum import StrEnum
+提供共享 UI 语言值类型的兼容导出."""
 
-
-class UiLanguage(StrEnum):
-    """Languages supported by the application-owned terminal interface."""
-
-    ENGLISH = "en"
-    SIMPLIFIED_CHINESE = "zh-CN"
-
+from neuro_code.shared.ui_language import UiLanguage
 
 __all__ = ["UiLanguage"]

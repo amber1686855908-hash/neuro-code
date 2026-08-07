@@ -1,16 +1,27 @@
+"""Canonical session value objects.
+
+This module owns the immutable summaries and snapshots used by the session
+ports.  The package aggregate re-exports the public names so existing
+``neuro_code.domain.sessions`` imports remain stable.
+
+定义规范的会话值对象. 模块拥有会话端口使用的不可变摘要和快照,并重新导出公共名称以保持导入兼容.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
 
-from neuro_code.domain.messages import Message, SessionItem
-from neuro_code.domain.sandbox import SandboxProfile
+from neuro_code.domain.conversation.messages import Message, SessionItem
+from neuro_code.domain.sandbox.models import SandboxProfile
 
 MAX_SESSION_TITLE_CHARS = 200
 
 
 def normalize_session_title(title: str) -> str:
-    """Normalize a persisted display title and enforce the domain invariant."""
+    """Normalize a persisted display title and enforce the domain invariant.
+
+    规范化持久化的显示标题,并强制执行领域不变量."""
 
     normalized = " ".join(title.split())
     if not normalized:
@@ -71,3 +82,11 @@ class SessionSnapshot:
     @property
     def messages(self) -> tuple[Message, ...]:
         return tuple(item for item in self.items if isinstance(item, Message))
+
+
+__all__ = [
+    "MAX_SESSION_TITLE_CHARS",
+    "SessionSnapshot",
+    "SessionSummary",
+    "normalize_session_title",
+]

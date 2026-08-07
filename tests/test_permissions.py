@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 
 from neuro_code.application.permissions.contracts import build_permission_request
-from neuro_code.permissions import (
+from neuro_code.application.permissions.policy import (
     PermissionEffect,
     PermissionManager,
     PermissionMode,

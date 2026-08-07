@@ -1,12 +1,17 @@
-"""Canonical background-task ports."""
+"""Canonical background-task ports.
+
+定义规范的后台任务端口."""
 
 from __future__ import annotations
 
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 
-from neuro_code.domain.background_tasks import (
+if TYPE_CHECKING:
+    from neuro_code.application.ports.tools import ToolOutputArtifactStore
+
+from neuro_code.domain.background_tasks.models import (
     BackgroundTaskKillResult,
     BackgroundTaskSnapshot,
     BackgroundTaskWaitMode,
@@ -15,7 +20,9 @@ from neuro_code.domain.background_tasks import (
 
 
 class BackgroundTaskManager(Protocol):
-    """Own background process trees visible to one conversation binding."""
+    """Own background process trees visible to one conversation binding.
+
+    管理一个会话绑定可见的后台进程树."""
 
     async def start_shell(
         self,
@@ -26,6 +33,7 @@ class BackgroundTaskManager(Protocol):
         output_byte_limit: int,
         termination_grace_seconds: float,
         timeout_seconds: float | None = None,
+        output_artifact_store: ToolOutputArtifactStore | None = None,
     ) -> BackgroundTaskSnapshot: ...
 
     async def start_exec(
@@ -39,6 +47,7 @@ class BackgroundTaskManager(Protocol):
         output_byte_limit: int,
         termination_grace_seconds: float,
         timeout_seconds: float | None = None,
+        output_artifact_store: ToolOutputArtifactStore | None = None,
     ) -> BackgroundTaskSnapshot: ...
 
     async def get(
@@ -70,7 +79,9 @@ class BackgroundTaskManager(Protocol):
 
 
 class BackgroundTaskSupervisor(Protocol):
-    """Create isolated task scopes and clean up every scope at application exit."""
+    """Create isolated task scopes and clean up every scope at application exit.
+
+    创建隔离的任务范围,并在应用退出时清理每个范围."""
 
     def open_scope(self) -> BackgroundTaskManager: ...
 

@@ -4,6 +4,8 @@ Covers the domain model (SkillInfo, frontmatter parsing, fingerprint),
 the filesystem adapter (discovery, symlink rejection, size/depth/count
 limits, deduplication, scope ordering), the session tracker, and the
 AgentRuntime injection of skill listings as synthetic messages.
+
+提供只读技能文件发现的测试,覆盖领域模型、frontmatter、文件系统适配器、跟踪器和 AgentRuntime 注入.
 """
 
 from __future__ import annotations
@@ -15,9 +17,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from neuro_code.adapters.skill_discovery import FilesystemSkillDiscovery
 from neuro_code.domain.messages import Message, Role, SyntheticReason
-from neuro_code.domain.skills import (
+from neuro_code.domain.workspace.skills import (
     MAX_NAME_LEN,
     MAX_SINGLE_SKILL_BYTES,
     MAX_SKILL_ANCESTOR_DEPTH,
@@ -34,6 +35,7 @@ from neuro_code.domain.skills import (
     normalize_skill_name,
     parse_frontmatter,
 )
+from neuro_code.infrastructure.workspace.skills import FilesystemSkillDiscovery
 from tests.fakes import EmptyWorkspaceChangeObserver
 
 # ---------------------------------------------------------------------------
@@ -46,14 +48,18 @@ def _isolate_default_user_home(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Keep default USER-scope discovery independent of the developer machine."""
+    """Keep default USER-scope discovery independent of the developer machine.
+
+    验证默认 USER 范围发现不依赖开发者机器环境."""
     user_home = tmp_path / "isolated-home"
     user_home.mkdir()
     monkeypatch.setattr(Path, "home", lambda: user_home)
 
 
 def _make_workspace(tmp_path: Path) -> Path:
-    """Create a workspace root directory and return it."""
+    """Create a workspace root directory and return it.
+
+    创建并返回一个工作区根目录."""
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     return workspace
@@ -68,6 +74,8 @@ def _make_skill(
     """Create a SKILL.md file inside a skills directory.
 
     Returns the path to the SKILL.md file.
+
+    在 skills 目录中创建一个 SKILL.md 文件,并返回该文件路径.
     """
     skill_dir = workspace / config_dir / SKILL_SUBDIR / skill_dir_name
     skill_dir.mkdir(parents=True, exist_ok=True)
@@ -572,7 +580,7 @@ class TestSkillDiscoveryLimits:
         assert result.rejections[0].reason is SkillRejectionReason.FILE_TOO_LARGE
 
     def test_total_too_large(self, tmp_path: Path) -> None:
-        from neuro_code.domain.skills import MAX_SKILL_FILES, MAX_TOTAL_SKILL_BYTES
+        from neuro_code.domain.workspace.skills import MAX_SKILL_FILES, MAX_TOTAL_SKILL_BYTES
 
         workspace = _make_workspace(tmp_path)
         # Create skills that collectively exceed MAX_TOTAL_SKILL_BYTES.
@@ -621,7 +629,7 @@ class TestSkillDiscoveryLimits:
         assert any(r.reason is SkillRejectionReason.CONTROL_CHARACTERS for r in result.rejections)
 
     def test_too_many_files(self, tmp_path: Path) -> None:
-        from neuro_code.domain.skills import MAX_SKILL_FILES
+        from neuro_code.domain.workspace.skills import MAX_SKILL_FILES
 
         workspace = _make_workspace(tmp_path)
         for i in range(MAX_SKILL_FILES + 5):
@@ -647,7 +655,7 @@ class TestSkillDiscoveryLimits:
         assert result.loaded_count == 0
 
     def test_walk_depth_limit(self, tmp_path: Path) -> None:
-        from neuro_code.domain.skills import MAX_SKILL_WALK_DEPTH
+        from neuro_code.domain.workspace.skills import MAX_SKILL_WALK_DEPTH
 
         workspace = _make_workspace(tmp_path)
         # Create a deeply nested skill beyond the walk depth
@@ -681,7 +689,7 @@ class TestSkillDiscoveryLimits:
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        import neuro_code.adapters.skill_discovery as adapter
+        import neuro_code.infrastructure.workspace.skills as adapter
 
         workspace = _make_workspace(tmp_path)
         for name in ("alpha", "beta", "gamma"):
@@ -701,7 +709,7 @@ class TestSkillDiscoveryLimits:
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        import neuro_code.adapters.skill_discovery as adapter
+        import neuro_code.infrastructure.workspace.skills as adapter
 
         workspace = _make_workspace(tmp_path)
         _make_skill(workspace, ".neuro", "alpha")
@@ -877,8 +885,10 @@ class TestSkillTracker:
 
 class TestAgentRuntimeSkillInjection:
     def test_skill_listing_injected_as_synthetic_message(self) -> None:
-        """Verify that skill_provider results are injected as synthetic messages."""
-        from neuro_code.domain.skills import SkillDiscoveryResult
+        """Verify that skill_provider results are injected as synthetic messages.
+
+        验证 skill_provider 结果会作为合成消息注入."""
+        from neuro_code.domain.workspace.skills import SkillDiscoveryResult
 
         skill_result = SkillDiscoveryResult(
             files=(
@@ -903,8 +913,8 @@ class TestAgentRuntimeSkillInjection:
         from neuro_code.application.ports.model import ModelProvider
         from neuro_code.application.runtime.agent import AgentRuntime
         from neuro_code.domain.messages import Role
+        from neuro_code.infrastructure.tools.registry import ToolRegistry
         from neuro_code.permissions import PermissionManager, PermissionMode
-        from neuro_code.tools.registry import ToolRegistry
 
         provider = MagicMock(spec=ModelProvider)
         permissions = PermissionManager(mode=PermissionMode.BYPASS)
@@ -934,9 +944,9 @@ class TestAgentRuntimeSkillInjection:
         from neuro_code.application.ports.model import ModelProvider
         from neuro_code.application.runtime.agent import AgentRuntime
         from neuro_code.domain.messages import Role
-        from neuro_code.domain.skills import SkillDiscoveryResult
+        from neuro_code.domain.workspace.skills import SkillDiscoveryResult
+        from neuro_code.infrastructure.tools.registry import ToolRegistry
         from neuro_code.permissions import PermissionManager, PermissionMode
-        from neuro_code.tools.registry import ToolRegistry
 
         def skill_provider() -> SkillDiscoveryResult | None:
             return SkillDiscoveryResult(files=(), rejections=(), fingerprint="empty")
@@ -965,8 +975,8 @@ class TestAgentRuntimeSkillInjection:
         from neuro_code.application.ports.model import ModelProvider
         from neuro_code.application.runtime.agent import AgentRuntime
         from neuro_code.domain.messages import Role
+        from neuro_code.infrastructure.tools.registry import ToolRegistry
         from neuro_code.permissions import PermissionManager, PermissionMode
-        from neuro_code.tools.registry import ToolRegistry
 
         provider = MagicMock(spec=ModelProvider)
         permissions = PermissionManager(mode=PermissionMode.BYPASS)
@@ -1084,7 +1094,9 @@ def _make_user_skill(
     skill_dir_name: str,
     content: str | None = None,
 ) -> Path:
-    """Create a SKILL.md file inside the user home skills directory."""
+    """Create a SKILL.md file inside the user home skills directory.
+
+    在用户主目录的 skills 目录中创建一个 SKILL.md 文件."""
     skill_dir = user_home / config_dir / SKILL_SUBDIR / skill_dir_name
     skill_dir.mkdir(parents=True, exist_ok=True)
     skill_path = skill_dir / SKILL_FILENAME
@@ -1226,7 +1238,9 @@ class TestUserScopeDiscovery:
         assert skill.root == workspace.resolve()
 
     def test_user_skill_dedup_across_config_dirs(self, tmp_path: Path) -> None:
-        """User-level skills dedup by name, first config dir wins."""
+        """User-level skills dedup by name, first config dir wins.
+
+        验证用户级技能按名称去重,第一个配置目录优先."""
         workspace = _make_workspace(tmp_path)
         user_home = tmp_path / "home"
         user_home.mkdir()
@@ -1258,7 +1272,9 @@ class TestUserScopeDiscovery:
         assert result1.fingerprint != result2.fingerprint
 
     def test_no_user_home_param_uses_path_home(self, tmp_path: Path) -> None:
-        """Default constructor uses Path.home() — verify it doesn't crash."""
+        """Default constructor uses Path.home() — verify it doesn't crash.
+
+        验证默认构造函数使用 Path.home() 时不会崩溃."""
         workspace = _make_workspace(tmp_path)
         _make_skill(workspace, ".neuro", "commit")
         discovery = FilesystemSkillDiscovery()
@@ -1271,7 +1287,9 @@ class TestUserScopeDiscovery:
     def test_path_home_runtime_error_skips_user_scan(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """When Path.home() raises RuntimeError, USER scan is skipped gracefully."""
+        """When Path.home() raises RuntimeError, USER scan is skipped gracefully.
+
+        验证 Path.home() 抛出 RuntimeError 时会优雅跳过 USER 范围扫描."""
 
         def _raise_runtime_error() -> Path:
             raise RuntimeError("Could not determine home directory.")
@@ -1285,7 +1303,9 @@ class TestUserScopeDiscovery:
         assert result.files[0].scope is SkillScope.LOCAL
 
     def test_local_and_user_different_config_dirs_priority(self, tmp_path: Path) -> None:
-        """Verify cross-scope config dir priority: LOCAL .agents > USER .neuro."""
+        """Verify cross-scope config dir priority: LOCAL .agents > USER .neuro.
+
+        验证跨范围配置目录优先级为 LOCAL .agents 高于 USER .neuro."""
         workspace = _make_workspace(tmp_path)
         user_home = tmp_path / "home"
         user_home.mkdir()
@@ -1326,6 +1346,8 @@ def _make_nested_skill(
 
     *subpath* is a relative path like ``"src/foo"`` — the skill will be
     created at ``base/subpath/config_dir/skills/skill_dir_name/SKILL.md``.
+
+    在 *base* 内的嵌套路径创建一个 SKILL.md 文件.
     """
     skill_dir = base / subpath / config_dir / SKILL_SUBDIR / skill_dir_name
     skill_dir.mkdir(parents=True, exist_ok=True)
@@ -1343,10 +1365,14 @@ def _make_nested_skill(
 
 
 class TestDynamicDiscovery:
-    """Tests for target-based upward walk discovery (ADR 0043)."""
+    """Tests for target-based upward walk discovery (ADR 0043).
+
+    测试基于目标路径向上遍历的发现逻辑 (ADR 0043)."""
 
     def test_nested_skill_discovered_with_target(self, tmp_path: Path) -> None:
-        """A skill in a subdirectory is discovered when target is set."""
+        """A skill in a subdirectory is discovered when target is set.
+
+        验证设置 target 后可以发现子目录中的技能."""
         workspace = _make_workspace(tmp_path)
         _make_nested_skill(workspace, "src/foo", ".neuro", "nested-commit")
         discovery = FilesystemSkillDiscovery()
@@ -1357,7 +1383,9 @@ class TestDynamicDiscovery:
         assert result.files[0].scope is SkillScope.LOCAL
 
     def test_nested_skill_not_discovered_without_target(self, tmp_path: Path) -> None:
-        """Without a target, only workspace-root config dirs are scanned."""
+        """Without a target, only workspace-root config dirs are scanned.
+
+        验证没有 target 时只扫描工作区根目录的配置目录."""
         workspace = _make_workspace(tmp_path)
         _make_nested_skill(workspace, "src/foo", ".neuro", "nested-commit")
         discovery = FilesystemSkillDiscovery()
@@ -1365,7 +1393,9 @@ class TestDynamicDiscovery:
         assert result.loaded_count == 0
 
     def test_root_skill_still_discovered_with_target(self, tmp_path: Path) -> None:
-        """Root-level skills are still found when target is a subdirectory."""
+        """Root-level skills are still found when target is a subdirectory.
+
+        验证 target 位于子目录时仍能发现根目录技能."""
         workspace = _make_workspace(tmp_path)
         _make_skill(workspace, ".neuro", "root-commit")
         _make_nested_skill(workspace, "src/foo", ".neuro", "nested-commit")
@@ -1379,7 +1409,9 @@ class TestDynamicDiscovery:
 
     def test_deeper_skill_shadows_shallower_same_name(self, tmp_path: Path) -> None:
         """When a skill name exists at both a nested and root level, the
-        deeper (closer to target) one wins due to first-seen-wins."""
+        deeper (closer to target) one wins due to first-seen-wins.
+
+        验证技能名称同时存在于嵌套目录和根目录时,更接近目标的技能优先."""
         workspace = _make_workspace(tmp_path)
         _make_skill(
             workspace,
@@ -1401,7 +1433,9 @@ class TestDynamicDiscovery:
         assert result.files[0].description == "Nested level"
 
     def test_target_equal_to_workspace_root(self, tmp_path: Path) -> None:
-        """When target equals workspace root, only root level is scanned."""
+        """When target equals workspace root, only root level is scanned.
+
+        验证 target 等于工作区根目录时只扫描根目录层级."""
         workspace = _make_workspace(tmp_path)
         _make_skill(workspace, ".neuro", "commit")
         discovery = FilesystemSkillDiscovery()
@@ -1410,7 +1444,9 @@ class TestDynamicDiscovery:
         assert result.files[0].name == "commit"
 
     def test_target_outside_workspace_falls_back_to_root(self, tmp_path: Path) -> None:
-        """Target outside workspace falls back to root-only scan."""
+        """Target outside workspace falls back to root-only scan.
+
+        验证 target 位于工作区外时回退为只扫描根目录."""
         workspace = _make_workspace(tmp_path)
         _make_skill(workspace, ".neuro", "commit")
         outside = tmp_path / "outside"
@@ -1423,7 +1459,9 @@ class TestDynamicDiscovery:
         assert result.files[0].name == "commit"
 
     def test_file_target_uses_parent_directory(self, tmp_path: Path) -> None:
-        """When target is a file path, its parent directory is used."""
+        """When target is a file path, its parent directory is used.
+
+        验证 target 是文件路径时使用其父目录."""
         workspace = _make_workspace(tmp_path)
         _make_nested_skill(workspace, "src/foo", ".neuro", "nested")
         # Create a dummy file to use as target
@@ -1436,7 +1474,9 @@ class TestDynamicDiscovery:
         assert result.files[0].name == "nested"
 
     def test_skills_at_multiple_levels_discovered(self, tmp_path: Path) -> None:
-        """Skills at multiple nesting levels are all discovered."""
+        """Skills at multiple nesting levels are all discovered.
+
+        验证可以发现多个嵌套层级的技能."""
         workspace = _make_workspace(tmp_path)
         _make_skill(workspace, ".neuro", "root-skill")
         _make_nested_skill(workspace, "src", ".neuro", "mid-skill")
@@ -1449,7 +1489,9 @@ class TestDynamicDiscovery:
         assert names == {"root-skill", "mid-skill", "deep-skill"}
 
     def test_nested_skill_root_is_workspace(self, tmp_path: Path) -> None:
-        """LOCAL skills share one unambiguous workspace-relative root."""
+        """LOCAL skills share one unambiguous workspace-relative root.
+
+        验证 LOCAL 技能共享唯一明确的工作区相对根目录."""
         workspace = _make_workspace(tmp_path)
         _make_nested_skill(workspace, "src/foo", ".neuro", "nested")
         discovery = FilesystemSkillDiscovery()
@@ -1460,7 +1502,9 @@ class TestDynamicDiscovery:
         assert skill.root == workspace.resolve()
 
     def test_nested_skill_relative_path(self, tmp_path: Path) -> None:
-        """Nested LOCAL paths retain their workspace-relative location."""
+        """Nested LOCAL paths retain their workspace-relative location.
+
+        验证嵌套 LOCAL 路径保留相对于工作区的路径."""
         workspace = _make_workspace(tmp_path)
         _make_nested_skill(workspace, "src/foo", ".neuro", "nested")
         discovery = FilesystemSkillDiscovery()
@@ -1471,7 +1515,9 @@ class TestDynamicDiscovery:
         assert skill.relative_path == "src/foo/.neuro/skills/nested/SKILL.md"
 
     def test_intermediate_level_skill_shadows_root(self, tmp_path: Path) -> None:
-        """A skill at an intermediate level shadows one at the root."""
+        """A skill at an intermediate level shadows one at the root.
+
+        验证中间层级的技能会覆盖根目录同名技能."""
         workspace = _make_workspace(tmp_path)
         _make_skill(
             workspace,
@@ -1494,7 +1540,9 @@ class TestDynamicDiscovery:
         assert result.files[0].description == "Mid"
 
     def test_config_dir_priority_at_nested_level(self, tmp_path: Path) -> None:
-        """Config dir priority (.neuro > .agents) applies at nested levels."""
+        """Config dir priority (.neuro > .agents) applies at nested levels.
+
+        验证配置目录优先级 (.neuro > .agents) 在嵌套层级同样生效."""
         workspace = _make_workspace(tmp_path)
         _make_nested_skill(
             workspace,
@@ -1517,7 +1565,9 @@ class TestDynamicDiscovery:
         assert result.files[0].description == "Neuro nested"
 
     def test_target_none_scans_root_only(self, tmp_path: Path) -> None:
-        """target=None scans only the workspace root level."""
+        """target=None scans only the workspace root level.
+
+        验证 target=None 时只扫描工作区根目录层级."""
         workspace = _make_workspace(tmp_path)
         _make_skill(workspace, ".neuro", "root-skill")
         _make_nested_skill(workspace, "src", ".neuro", "nested-skill")
@@ -1528,7 +1578,9 @@ class TestDynamicDiscovery:
 
 
 class TestSkillTrackerDynamicTarget:
-    """Tests for SkillTracker's moving target (check_path / current_result)."""
+    """Tests for SkillTracker's moving target (check_path / current_result).
+
+    测试 SkillTracker 的移动目标行为 (check_path / current_result)."""
 
     def test_initial_target_defaults_to_workspace_root(self, tmp_path: Path) -> None:
         from neuro_code.application.runtime.skill_tracker import SkillTracker
@@ -1670,7 +1722,9 @@ def _make_repo_skill(
     skill_dir_name: str,
     content: str | None = None,
 ) -> Path:
-    """Create a SKILL.md file inside a repo root skills directory."""
+    """Create a SKILL.md file inside a repo root skills directory.
+
+    在仓库根目录的 skills 目录中创建一个 SKILL.md 文件."""
     skill_dir = repo_root / config_dir / SKILL_SUBDIR / skill_dir_name
     skill_dir.mkdir(parents=True, exist_ok=True)
     skill_path = skill_dir / SKILL_FILENAME
@@ -1687,10 +1741,14 @@ def _make_repo_skill(
 
 
 class TestRepoScopeDiscovery:
-    """Tests for REPO scope (git root) skill discovery (ADR 0044)."""
+    """Tests for REPO scope (git root) skill discovery (ADR 0044).
+
+    测试 REPO 范围 (git 根目录) 的技能发现 (ADR 0044)."""
 
     def test_repo_skill_discovered(self, tmp_path: Path) -> None:
-        """A skill at the git root is discovered with REPO scope."""
+        """A skill at the git root is discovered with REPO scope.
+
+        验证 git 根目录的技能会以 REPO 范围发现."""
         repo_root = tmp_path / "myrepo"
         repo_root.mkdir()
         workspace = repo_root / "frontend"
@@ -1741,7 +1799,9 @@ class TestRepoScopeDiscovery:
         assert result.files[0].description == "Package"
 
     def test_repo_skill_not_discovered_when_git_root_equals_workspace(self, tmp_path: Path) -> None:
-        """When git root equals workspace root, REPO scan is skipped."""
+        """When git root equals workspace root, REPO scan is skipped.
+
+        验证 git 根目录等于工作区根目录时跳过 REPO 扫描."""
         workspace = _make_workspace(tmp_path)
         _make_skill(workspace, ".neuro", "commit")
         discovery = FilesystemSkillDiscovery(git_root=workspace)
@@ -1750,7 +1810,9 @@ class TestRepoScopeDiscovery:
         assert result.files[0].scope is SkillScope.LOCAL
 
     def test_repo_skill_not_discovered_when_git_root_not_ancestor(self, tmp_path: Path) -> None:
-        """When git root is not an ancestor of workspace, REPO scan is skipped."""
+        """When git root is not an ancestor of workspace, REPO scan is skipped.
+
+        验证 git 根目录不是工作区祖先时跳过 REPO 扫描."""
         workspace = _make_workspace(tmp_path)
         other_root = tmp_path / "other"
         other_root.mkdir()
@@ -1760,7 +1822,9 @@ class TestRepoScopeDiscovery:
         assert result.loaded_count == 0
 
     def test_local_shadows_repo_same_name(self, tmp_path: Path) -> None:
-        """LOCAL scope shadows REPO scope for same-named skills."""
+        """LOCAL scope shadows REPO scope for same-named skills.
+
+        验证同名技能中 LOCAL 范围覆盖 REPO 范围."""
         repo_root = tmp_path / "myrepo"
         repo_root.mkdir()
         workspace = repo_root / "frontend"
@@ -1778,7 +1842,9 @@ class TestRepoScopeDiscovery:
         assert result.files[0].scope is SkillScope.LOCAL
 
     def test_repo_shadows_user_same_name(self, tmp_path: Path) -> None:
-        """REPO scope shadows USER scope for same-named skills."""
+        """REPO scope shadows USER scope for same-named skills.
+
+        验证同名技能中 REPO 范围覆盖 USER 范围."""
         repo_root = tmp_path / "myrepo"
         repo_root.mkdir()
         workspace = repo_root / "frontend"
@@ -1798,7 +1864,9 @@ class TestRepoScopeDiscovery:
         assert result.files[0].scope is SkillScope.REPO
 
     def test_local_repo_user_all_discovered(self, tmp_path: Path) -> None:
-        """Skills at all three scopes are discovered with correct priority."""
+        """Skills at all three scopes are discovered with correct priority.
+
+        验证三个范围的技能都能以正确优先级被发现."""
         repo_root = tmp_path / "myrepo"
         repo_root.mkdir()
         workspace = repo_root / "frontend"
@@ -1817,7 +1885,9 @@ class TestRepoScopeDiscovery:
         assert scopes["user-skill"] is SkillScope.USER
 
     def test_repo_skill_root_set_to_git_root(self, tmp_path: Path) -> None:
-        """SkillInfo.root is set to the git root for REPO scope skills."""
+        """SkillInfo.root is set to the git root for REPO scope skills.
+
+        验证 REPO 范围技能的 SkillInfo.root 设置为 git 根目录."""
         repo_root = tmp_path / "myrepo"
         repo_root.mkdir()
         workspace = repo_root / "frontend"
@@ -1829,7 +1899,9 @@ class TestRepoScopeDiscovery:
         assert result.files[0].root == repo_root.resolve()
 
     def test_repo_skill_relative_path(self, tmp_path: Path) -> None:
-        """relative_path is relative to the git root, not workspace."""
+        """relative_path is relative to the git root, not workspace.
+
+        验证 relative_path 相对于 git 根目录,而不是工作区."""
         repo_root = tmp_path / "myrepo"
         repo_root.mkdir()
         workspace = repo_root / "frontend"
@@ -1841,7 +1913,9 @@ class TestRepoScopeDiscovery:
         assert result.files[0].relative_path == ".neuro/skills/repo-commit/SKILL.md"
 
     def test_repo_skill_from_agents_dir(self, tmp_path: Path) -> None:
-        """REPO scope skills from .agents/ directory are discovered."""
+        """REPO scope skills from .agents/ directory are discovered.
+
+        验证可以发现 .agents/ 目录中的 REPO 范围技能."""
         repo_root = tmp_path / "myrepo"
         repo_root.mkdir()
         workspace = repo_root / "frontend"
@@ -1854,7 +1928,9 @@ class TestRepoScopeDiscovery:
         assert result.files[0].scope is SkillScope.REPO
 
     def test_repo_scope_with_dynamic_target(self, tmp_path: Path) -> None:
-        """REPO scope skills are discovered alongside LOCAL dynamic skills."""
+        """REPO scope skills are discovered alongside LOCAL dynamic skills.
+
+        验证 REPO 范围技能可以与 LOCAL 动态技能同时被发现."""
         repo_root = tmp_path / "myrepo"
         repo_root.mkdir()
         workspace = repo_root / "frontend"
@@ -1870,7 +1946,9 @@ class TestRepoScopeDiscovery:
         assert names == {"root-skill", "nested-skill", "repo-skill"}
 
     def test_no_git_root_param_auto_detects(self, tmp_path: Path) -> None:
-        """Default constructor auto-detects git root — verify no crash."""
+        """Default constructor auto-detects git root — verify no crash.
+
+        验证默认构造函数自动检测 git 根目录时不会崩溃."""
         workspace = _make_workspace(tmp_path)
         _make_skill(workspace, ".neuro", "commit")
         discovery = FilesystemSkillDiscovery()
@@ -1881,7 +1959,9 @@ class TestRepoScopeDiscovery:
         assert any(s.name == "commit" for s in local_skills)
 
     def test_git_root_none_when_not_a_repo(self, tmp_path: Path) -> None:
-        """When the workspace is not in a git repo, REPO scan is skipped."""
+        """When the workspace is not in a git repo, REPO scan is skipped.
+
+        验证工作区不在 git 仓库内时跳过 REPO 扫描."""
         workspace = _make_workspace(tmp_path)
         _make_skill(workspace, ".neuro", "commit")
         # No git_root param → auto-detect → not a git repo → no REPO skills

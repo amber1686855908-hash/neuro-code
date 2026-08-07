@@ -1,4 +1,6 @@
-"""Application contract for bounded workspace-change observation."""
+"""Application contract for bounded workspace-change observation.
+
+定义有界工作区变更观察的应用契约."""
 
 from __future__ import annotations
 
@@ -17,13 +19,17 @@ WorkspaceChangeHiddenReason = Literal[
 
 
 class WorkspaceChangeCheckpoint:
-    """Opaque checkpoint produced and consumed by a workspace observer."""
+    """Opaque checkpoint produced and consumed by a workspace observer.
+
+    表示由工作区观察器生成并消费的不透明检查点."""
 
     __slots__ = ()
 
 
 class WorkspaceChangeVisibleFileEventPayload(TypedDict):
-    """Serialized change for a file whose contents can be shown safely."""
+    """Serialized change for a file whose contents can be shown safely.
+
+    表示可以安全展示文件内容的序列化变更."""
 
     path: str
     status: WorkspaceChangeStatus
@@ -35,7 +41,9 @@ class WorkspaceChangeVisibleFileEventPayload(TypedDict):
 
 
 class WorkspaceChangeHiddenFileEventPayload(TypedDict):
-    """Serialized change for a file whose contents must remain hidden."""
+    """Serialized change for a file whose contents must remain hidden.
+
+    表示必须隐藏文件内容的序列化变更."""
 
     path: str
     status: WorkspaceChangeStatus
@@ -50,7 +58,9 @@ WorkspaceChangeFileEventPayload = (
 
 
 class WorkspaceChangeEventPayload(TypedDict):
-    """The stable workspace-change payload embedded in terminal tool events."""
+    """The stable workspace-change payload embedded in terminal tool events.
+
+    表示嵌入终端工具事件的稳定工作区变更载荷."""
 
     files: list[WorkspaceChangeFileEventPayload]
     omitted_files: int
@@ -101,7 +111,9 @@ class WorkspaceChangeReport:
 
     @property
     def should_emit(self) -> bool:
-        """Match the existing runtime policy for adding a change report to an event."""
+        """Match the existing runtime policy for adding a change report to an event.
+
+        遵循现有运行时策略,判断是否将变更报告加入事件."""
 
         return bool(self.files) or self.scan_limited
 
@@ -114,7 +126,9 @@ class WorkspaceChangeReport:
 
 
 class WorkspaceChangeObserver(Protocol):
-    """Capture and compare bounded workspace state around one tool invocation."""
+    """Capture and compare bounded workspace state around one tool invocation.
+
+    在一次工具调用前后捕获并比较有界的工作区状态."""
 
     def capture(
         self,

@@ -15,21 +15,31 @@ from textual.geometry import Size
 from textual.widgets import Button, Input, Label, Static
 
 from neuro_code.adapters.provider_settings import JsonProviderSettingsStore
+from neuro_code.application.permissions.broker import SessionApprovalBroker
 from neuro_code.application.permissions.contracts import (
     PermissionApproval,
     PermissionApprovalKind,
     build_permission_request,
 )
 from neuro_code.application.ports.http import HttpClientPolicy
+from neuro_code.application.ports.tools import ToolOutputArtifact, ToolOutputArtifactRead
+from neuro_code.application.providers import ChangeProviderRequest, ProviderChangeService
 from neuro_code.application.runtime.agent import AgentRunResult, EventSink
-from neuro_code.application.runtime.approval import SessionApprovalBroker
-from neuro_code.application.runtime.profile_conversation import (
+from neuro_code.application.sessions import SessionTurnService
+from neuro_code.application.sessions.profile_conversation import (
     InteractionModeSelectionResult,
     ProviderOption,
     ProviderSelectionResult,
     ReasoningEffortSelectionResult,
     SessionOption,
     SessionSelectionResult,
+)
+from neuro_code.application.sessions.selection import SessionSelectionService
+from neuro_code.application.tools import ReadSessionToolOutputArtifactRequest
+from neuro_code.application.workflows import (
+    PlanExecutionService,
+    PlanSchedulingService,
+    QueuedPlanExecutionService,
 )
 from neuro_code.domain.background_tasks import (
     BackgroundTaskSnapshot,
@@ -38,6 +48,8 @@ from neuro_code.domain.background_tasks import (
     BackgroundWakeLimits,
     BackgroundWakeState,
 )
+from neuro_code.domain.conversation.interaction_mode import InteractionMode
+from neuro_code.domain.conversation.reasoning import ReasoningEffort
 from neuro_code.domain.events import AgentEvent, AgentEventKind
 from neuro_code.domain.execution import (
     AgentExecutionOutcome,
@@ -45,8 +57,8 @@ from neuro_code.domain.execution import (
     SessionExecutionRecord,
     SupervisorReasonCode,
     TurnCancellationPolicy,
+    TurnSource,
 )
-from neuro_code.domain.interaction_mode import InteractionMode
 from neuro_code.domain.messages import (
     ContentPart,
     ContextItemKind,
@@ -67,11 +79,11 @@ from neuro_code.domain.provider_settings import (
     ManagedProviderSettings,
     ManagedProxyPolicy,
 )
-from neuro_code.domain.reasoning import ReasoningEffort
 from neuro_code.domain.sandbox import SandboxProfile
 from neuro_code.domain.session_tasks import SessionTask, SessionTaskKind, SessionTaskStatus
 from neuro_code.domain.sessions import SessionSummary
 from neuro_code.domain.ui_preferences import UiLanguage
+from neuro_code.interfaces.tui import recoverable_terminal_status
 from neuro_code.tui import (
     TUI_RELOAD_PROVIDER_SETTINGS,
     AssistantMarkdown,
@@ -210,6 +222,29 @@ class TuiConversation:
 
     async def run_background_wake(self, *, sink: EventSink | None = None) -> AgentRunResult:
         return await self.run("background wake", sink=sink)
+
+
+class TypedTuiConversation(TuiConversation):
+    def __init__(self) -> None:
+        super().__init__()
+        self.turn_sources: list[TurnSource] = []
+
+    async def run(
+        self,
+        prompt: str,
+        *,
+        sink: EventSink | None = None,
+        content_parts: tuple[ContentPart, ...] = (),
+        cancellation_policy: TurnCancellationPolicy = TurnCancellationPolicy.RETAIN,
+        turn_source: TurnSource = TurnSource.USER,
+    ) -> AgentRunResult:
+        del content_parts
+        self.turn_sources.append(turn_source)
+        return await super().run(
+            prompt,
+            sink=sink,
+            cancellation_policy=cancellation_policy,
+        )
 
 
 class AutoWakeTuiConversation:
@@ -850,6 +885,9 @@ class ProfileTuiController:
             context_window_tokens=context_window_tokens,
         )
 
+    async def change_provider(self, request: ChangeProviderRequest) -> ProviderSelectionResult:
+        return await self.select_profile(request.profile_name)
+
 
 class FailingSessionTaskController:
     async def get_session_task(self, task_id: str) -> SessionTask | None:
@@ -1031,8 +1069,30 @@ def background_snapshot(
 
 
 class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
+    def test_recoverable_terminal_status_projection_is_fail_closed(self) -> None:
+        self.assertEqual(
+            recoverable_terminal_status({"execution_status": "stuck", "recoverable": True}),
+            AgentExecutionStatus.STUCK,
+        )
+        self.assertEqual(
+            recoverable_terminal_status(
+                {"execution_status": "budget_limited", "recoverable": True}
+            ),
+            AgentExecutionStatus.BUDGET_LIMITED,
+        )
+        for data in (
+            {"execution_status": "stuck", "recoverable": False},
+            {"execution_status": "completed", "recoverable": True},
+            {"execution_status": "unknown", "recoverable": True},
+            {"execution_status": 1, "recoverable": True},
+        ):
+            with self.subTest(data=data):
+                self.assertIsNone(recoverable_terminal_status(data))
+
     async def test_plan_queue_commands_report_unavailable_and_failed_paths(self) -> None:
-        """The explicit queue surface fails closed when its collaborators are absent."""
+        """The explicit queue surface fails closed when its collaborators are absent.
+
+        验证显式队列接口在协作者缺失时会失败关闭."""
 
         unavailable = NeuroCodeApp(
             TuiConversation(),
@@ -1381,6 +1441,28 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertIs(app._entry_widgets[-1], pending)
             self.assertIs(pending.parent, transcript)
             self.assertIn("partial response", str(pending.renderable))
+
+    async def test_user_turn_uses_typed_application_turn_service_when_bound(self) -> None:
+        runner = TypedTuiConversation()
+        app = NeuroCodeApp(
+            runner,
+            turn_service=SessionTurnService(runner),
+            provider_name="fixture",
+            model_name="fixture-model",
+            cwd=Path("/workspace"),
+        )
+
+        async with app.run_test(size=(100, 30)) as pilot:
+            prompt = app.query_one("#prompt", Input)
+            prompt.value = "run through the application seam"
+            await pilot.press("enter")
+            for _ in range(20):
+                await pilot.pause(0.01)
+                if any(entry.category == "assistant" for entry in app.entries):
+                    break
+
+        self.assertEqual(runner.prompts, ["run through the application seam"])
+        self.assertEqual(runner.turn_sources, [TurnSource.USER])
 
     async def test_finalizing_and_recoverable_terminal_states_preserve_the_final_response(
         self,
@@ -3218,6 +3300,87 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(entries[-1], ("status", "Turn completed in 2.8s · 1 model step(s)"))
             self.assertNotIn("private", "\n".join(text for _, text in entries))
 
+    async def test_expanding_truncated_tool_output_reads_bounded_session_artifact(self) -> None:
+        artifact_id = "a" * 32
+
+        class ArtifactService:
+            def __init__(self) -> None:
+                self.requests: list[ReadSessionToolOutputArtifactRequest] = []
+
+            async def read(
+                self, request: ReadSessionToolOutputArtifactRequest
+            ) -> ToolOutputArtifactRead:
+                self.requests.append(request)
+                return ToolOutputArtifactRead(
+                    ToolOutputArtifact(
+                        artifact_id,
+                        f"tool-output/{artifact_id}.log",
+                        byte_count=64,
+                        truncated=True,
+                    ),
+                    "full output line 1\nfull output line 2",
+                    read_truncated=True,
+                )
+
+        runner = TuiConversation()
+        runner._session_id = "artifact-session"
+        artifact_service = ArtifactService()
+        app = NeuroCodeApp(
+            runner,
+            tool_output_artifact_service=artifact_service,
+            provider_name="fixture",
+            model_name="fixture-model",
+            cwd=Path("/workspace"),
+        )
+
+        async with app.run_test(size=(110, 32)) as pilot:
+            await app._handle_event(
+                AgentEvent.create(
+                    1,
+                    AgentEventKind.TOOL_REQUESTED,
+                    {
+                        "id": "bash-call",
+                        "name": "bash",
+                        "arguments": {"command": "printf output"},
+                    },
+                )
+            )
+            await app._handle_event(
+                AgentEvent.create(
+                    2,
+                    AgentEventKind.TOOL_COMPLETED,
+                    {
+                        "id": "bash-call",
+                        "name": "bash",
+                        "content": "preview output",
+                        "metadata": {
+                            "output_artifact_id": artifact_id,
+                            "output_artifact_path": f"tool-output/{artifact_id}.log",
+                            "output_artifact_bytes": 64,
+                            "output_artifact_truncated": True,
+                        },
+                    },
+                )
+            )
+            card = app.query_one(ToolFeedbackMessage)
+            self.assertTrue(card.can_focus)
+            card.focus()
+            await pilot.press("enter")
+            for _ in range(40):
+                await pilot.pause(0.02)
+                if any("full output line 2" in entry.text for entry in app.entries):
+                    break
+
+            self.assertEqual(len(artifact_service.requests), 1)
+            request = artifact_service.requests[0]
+            self.assertEqual(request.session_id, "artifact-session")
+            self.assertEqual(request.artifact_id, artifact_id)
+            card_text = next(entry.text for entry in app.entries if entry.category == "tool")
+            self.assertIn("full output line 1", card_text)
+            self.assertIn("full output line 2", card_text)
+            self.assertIn("bounded at the read limit", card_text)
+            self.assertNotIn(artifact_id, card_text)
+
     async def test_tool_card_updates_in_place_and_renders_a_redacted_file_diff(self) -> None:
         app = NeuroCodeApp(
             TuiConversation(),
@@ -3504,6 +3667,32 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
                 "Execute the current structured plan.", [entry.text for entry in app.entries]
             )
 
+    async def test_execute_plan_uses_the_application_workflow_service(self) -> None:
+        plan = SessionPlan((PlanStep("Execute through the application seam"),))
+        runner = TuiConversation()
+        profiles = ProfileTuiController(plan)
+        app = NeuroCodeApp(
+            runner,
+            provider_controller=profiles,
+            interaction_mode_controller=profiles,
+            plan_controller=profiles,
+            plan_execution_service=PlanExecutionService(profiles),
+            provider_name="first",
+            model_name="first-model",
+            cwd=Path("/workspace"),
+        )
+
+        async with app.run_test(size=(100, 30)) as pilot:
+            prompt = app.query_one("#prompt", Input)
+            prompt.value = "/execute-plan"
+            await pilot.press("enter")
+            for _ in range(20):
+                await pilot.pause(0.01)
+                if profiles.plan_execution_calls:
+                    break
+
+            self.assertEqual(profiles.plan_execution_calls, 1)
+
     async def test_execute_plan_requires_a_saved_plan(self) -> None:
         runner = TuiConversation()
         profiles = ProfileTuiController()
@@ -3534,12 +3723,25 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
         )
         runner = TuiConversation()
         profiles = ProfileTuiController(plan)
+
+        class SchedulingSpy:
+            def __init__(self, delegate: ProfileTuiController) -> None:
+                self.delegate = delegate
+                self.calls = 0
+
+            async def schedule_plan(self) -> SessionTask:
+                self.calls += 1
+                return await self.delegate.schedule_plan()
+
+        scheduling_spy = SchedulingSpy(profiles)
         app = NeuroCodeApp(
             runner,
             provider_controller=profiles,
             interaction_mode_controller=profiles,
             plan_controller=profiles,
+            plan_scheduling_service=PlanSchedulingService(scheduling_spy),
             session_task_controller=profiles,
+            queued_plan_execution_service=QueuedPlanExecutionService(profiles),
             provider_name="first",
             model_name="first-model",
             cwd=Path("/workspace"),
@@ -3555,6 +3757,7 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
             queued = profiles._session_tasks[0]
             self.assertIs(queued.status, SessionTaskStatus.QUEUED)
             self.assertIn(queued.task_id, app.entries[-1].text)
+            self.assertEqual(scheduling_spy.calls, 1)
 
             prompt.value = f"/run-task {queued.task_id}"
             await pilot.press("enter")
@@ -4011,7 +4214,7 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
         profiles = ProfileTuiController()
         app = NeuroCodeApp(
             runner,
-            provider_controller=profiles,
+            provider_controller=ProviderChangeService(profiles),
             provider_name="first",
             model_name="first-model",
             cwd=Path("/workspace"),
@@ -4140,6 +4343,7 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
         app = NeuroCodeApp(
             controller,
             session_controller=controller,
+            session_selection_service=SessionSelectionService(controller),
             provider_name="first",
             model_name="first-model",
             cwd=Path("/workspace"),

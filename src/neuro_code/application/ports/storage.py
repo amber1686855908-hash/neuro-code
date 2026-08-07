@@ -1,4 +1,6 @@
-"""Canonical session-storage port."""
+"""Canonical session-storage port.
+
+定义规范的会话存储端口."""
 
 from __future__ import annotations
 
@@ -6,15 +8,15 @@ from collections.abc import Sequence
 from datetime import datetime
 from typing import Any, Protocol
 
-from neuro_code.domain.background_tasks import BackgroundWakeState
-from neuro_code.domain.events import AgentEvent
+from neuro_code.domain.background_tasks.models import BackgroundWakeState
+from neuro_code.domain.conversation.events import AgentEvent
+from neuro_code.domain.conversation.messages import Message, SessionItem
 from neuro_code.domain.execution import SessionExecutionRecord
-from neuro_code.domain.messages import Message, SessionItem
 from neuro_code.domain.plans import PlanComment, SessionPlan
-from neuro_code.domain.sandbox import SandboxProfile
-from neuro_code.domain.session_search import SessionSearchPage
+from neuro_code.domain.sandbox.models import SandboxProfile
 from neuro_code.domain.session_tasks import SessionTask
 from neuro_code.domain.sessions import SessionSnapshot, SessionSummary
+from neuro_code.domain.sessions.search import SessionSearchPage
 
 
 class SessionStore(Protocol):
@@ -83,6 +85,11 @@ class SessionStore(Protocol):
     async def load_session_plan(self, session_id: str) -> SessionPlan | None: ...
 
     async def load_execution_record(self, session_id: str) -> SessionExecutionRecord | None: ...
+
+    async def load_execution_records(
+        self,
+        session_ids: Sequence[str],
+    ) -> tuple[SessionExecutionRecord | None, ...]: ...
 
     async def save_background_wake_state(
         self,

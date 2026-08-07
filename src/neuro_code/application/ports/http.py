@@ -1,4 +1,6 @@
-"""Canonical HTTP client policy port."""
+"""Canonical HTTP client policy port.
+
+定义规范的 HTTP 客户端策略端口."""
 
 from __future__ import annotations
 
@@ -8,7 +10,9 @@ from typing import Any
 
 @dataclass(frozen=True, slots=True)
 class HttpClientPolicy:
-    """Resolved HTTPX client policy without secret-bearing representation."""
+    """Resolved HTTPX client policy without secret-bearing representation.
+
+    表示已解析的 HTTPX 客户端策略,不包含秘密信息表示."""
 
     trust_env: bool = True
     proxy_url: str | None = field(default=None, repr=False)

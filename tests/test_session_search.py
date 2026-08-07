@@ -10,13 +10,13 @@ from neuro_code.domain.messages import (
     Role,
     ToolCall,
 )
-from neuro_code.domain.session_search import (
+from neuro_code.domain.sessions import SessionSummary
+from neuro_code.domain.sessions.search import (
     SessionSearchHit,
     SessionSearchPage,
     fallback_session_title,
     searchable_session_text,
 )
-from neuro_code.domain.sessions import SessionSummary
 
 
 class SessionSearchDomainTests(unittest.TestCase):

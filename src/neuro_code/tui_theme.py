@@ -2,6 +2,8 @@
 
 This module deliberately contains presentation-only values.  It must not own
 application state, controller decisions, or terminal interaction behavior.
+
+Textual 终端界面使用的单色视觉令牌.
 """
 
 from __future__ import annotations
@@ -151,7 +153,9 @@ MARKDOWN_THEME = RichTheme(
 
 
 class _MonochromePygmentsStyle(PygmentsStyle):
-    """Pygments token styles for fenced Markdown code blocks."""
+    """Pygments token styles for fenced Markdown code blocks.
+
+    用于 Markdown 围栏代码块的 Pygments 令牌样式."""
 
     background_color: ClassVar[str] = SURFACE
     styles: ClassVar[Mapping[_TokenType, str]] = {
@@ -242,7 +246,9 @@ CONNECTION_STATUS_STYLES = {
 
 
 def loading_style(level: int) -> str:
-    """Return a bounded monochrome style for one loading-wave column."""
+    """Return a bounded monochrome style for one loading-wave column.
+
+    返回一个用于加载波列的有界单色样式."""
 
     safe_level = max(0, min(len(LOADING_LEVEL_STYLES) - 1, level))
     style = LOADING_LEVEL_STYLES[safe_level]

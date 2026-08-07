@@ -3,6 +3,8 @@
 This module intentionally does not import :mod:`agent`.  A later integration
 phase can adapt ``AgentRuntime`` tool results into ``ToolExecutionObservation``
 without making the runtime depend on untyped event payloads.
+
+提供纯函数式的逐回合执行监督和稳定工具指纹. 模块不依赖 Agent,避免运行时依赖无类型事件载荷.
 """
 
 from __future__ import annotations
@@ -36,21 +38,27 @@ MAX_OBSERVATION_SUMMARY_BYTES = 512
 
 
 class SupervisionMode(StrEnum):
-    """Whether decisions enforce budgets or only describe observed execution."""
+    """Whether decisions enforce budgets or only describe observed execution.
+
+    表示决策是执行预算约束,还是仅描述已观察到的执行."""
 
     ENFORCE = "enforce"
     OBSERVE = "observe"
 
 
 class ExecutionControlMode(StrEnum):
-    """Whether AgentRuntime only observes decisions or finalizes terminal ones."""
+    """Whether AgentRuntime only observes decisions or finalizes terminal ones.
+
+    表示 AgentRuntime 仅观察决策,还是执行终态最终化."""
 
     OBSERVE_ONLY = "observe_only"
     FINALIZE_TERMINAL = "finalize_terminal"
 
 
 class SupervisionCheckpoint(StrEnum):
-    """A stable boundary at which one supervision trace is captured."""
+    """A stable boundary at which one supervision trace is captured.
+
+    表示捕获一条监督轨迹的稳定检查点."""
 
     BEFORE_MODEL = "before_model"
     AFTER_MODEL = "after_model"
@@ -210,6 +218,8 @@ class PathNormalizationContext:
     Only paths explicitly supplied as ``Path`` values receive this treatment.
     Strings are retained as strings, preventing a broad ``/tmp`` rule from
     accidentally merging meaningful literal values.
+
+    表示对 Path 参数值进行哈希时使用的显式路径根.
     """
 
     workspace_root: Path | None = None
@@ -228,7 +238,9 @@ class PathNormalizationContext:
 
 @dataclass(frozen=True, slots=True)
 class StableMetadataFact:
-    """An allowlisted metadata value represented only by its safe digest."""
+    """An allowlisted metadata value represented only by its safe digest.
+
+    表示列入允许列表的元数据值,只保存其安全摘要."""
 
     name: str
     value_digest: str
@@ -244,7 +256,9 @@ def stable_metadata_fact(
     *,
     redaction_values: Sequence[str] = (),
 ) -> StableMetadataFact:
-    """Create a metadata fact without retaining its original value."""
+    """Create a metadata fact without retaining its original value.
+
+    创建一个元数据事实,不保留其原始值."""
 
     _validate_token_name(name, field_name="stable metadata fact name")
     if not isinstance(value, str):
@@ -259,7 +273,9 @@ def stable_action_digest(
     path_context: PathNormalizationContext | None = None,
     redaction_values: Sequence[str] = (),
 ) -> str:
-    """Hash typed, ordered canonical arguments without retaining their source text."""
+    """Hash typed, ordered canonical arguments without retaining their source text.
+
+    对类型化且有序的规范参数进行哈希,不保留参数原文."""
 
     _validate_tool_name(tool_name)
     canonical = {
@@ -292,7 +308,9 @@ def stable_observation_digest(
     external_state_token: str | None = None,
     redaction_values: Sequence[str] = (),
 ) -> str:
-    """Hash a redacted, bounded observation without serializing arbitrary metadata."""
+    """Hash a redacted, bounded observation without serializing arbitrary metadata.
+
+    对脱敏且有界的观察结果进行哈希,不序列化任意元数据."""
 
     if not isinstance(is_error, bool):
         raise ValueError("is_error must be a bool")
@@ -360,7 +378,9 @@ def _safe_digest_token(value: str | None, *, redaction_values: Sequence[str]) ->
 
 @dataclass(frozen=True, slots=True)
 class ToolExecutionObservation:
-    """Typed, redacted input to the future runtime supervision boundary."""
+    """Typed, redacted input to the future runtime supervision boundary.
+
+    表示传递给运行时监督边界的类型化脱敏输入."""
 
     tool_name: str
     action_digest: str
@@ -442,6 +462,8 @@ class ToolExecutionObservation:
         Transport identifiers and volatile usage metrics are accepted only to make
         their exclusion explicit at the future runtime boundary.  They are never
         retained or included in either digest.
+
+        构建观察结果并丢弃原始参数和完整输出. 传输标识和易变用量只用于明确排除,不会进入摘要.
         """
 
         if not isinstance(result_content, str):
@@ -492,7 +514,9 @@ class ToolExecutionObservation:
 
 @dataclass(frozen=True, slots=True)
 class SupervisionTraceRecord:
-    """One safe, in-memory observation of a supervised runtime boundary."""
+    """One safe, in-memory observation of a supervised runtime boundary.
+
+    表示监督运行时边界的一条安全内存观察记录."""
 
     checkpoint: SupervisionCheckpoint
     model_step: int
@@ -518,7 +542,9 @@ class SupervisionTraceRecord:
 
 
 class SupervisionObserver(Protocol):
-    """Receives a redacted, typed trace without affecting agent events."""
+    """Receives a redacted, typed trace without affecting agent events.
+
+    接收脱敏的类型化轨迹,且不影响 Agent 事件."""
 
     def __call__(self, record: SupervisionTraceRecord) -> None: ...
 
@@ -537,13 +563,17 @@ DEFAULT_OBSERVATION_BUDGET = ExecutionBudget(
 
 
 def create_observing_supervisor() -> AgentExecutionSupervisor:
-    """Create the default non-enforcing supervisor for one runtime turn."""
+    """Create the default non-enforcing supervisor for one runtime turn.
+
+    为一个运行时回合创建默认的非强制监督器."""
 
     return AgentExecutionSupervisor(DEFAULT_OBSERVATION_BUDGET, mode=SupervisionMode.OBSERVE)
 
 
 class AgentExecutionSupervisor:
-    """Stateful, deterministic supervision for exactly one future agent turn."""
+    """Stateful, deterministic supervision for exactly one future agent turn.
+
+    为一个 Agent 回合提供有状态且确定性的监督,每个实例只服务一个回合."""
 
     def __init__(
         self,
@@ -582,7 +612,9 @@ class AgentExecutionSupervisor:
         return self._mode
 
     def start_turn(self) -> ExecutionSnapshot:
-        """Initialize the isolated state used for one execution."""
+        """Initialize the isolated state used for one execution.
+
+        初始化一次执行所需的隔离状态."""
 
         if self._snapshot is not None:
             raise RuntimeError("supervisor turn has already started")
@@ -602,7 +634,9 @@ class AgentExecutionSupervisor:
         return self._snapshot
 
     def authorize_model_request(self) -> SupervisorDecision:
-        """Reserve one ordinary model request while retaining Finalizer capacity."""
+        """Reserve one ordinary model request while retaining Finalizer capacity.
+
+        预留一次普通模型请求,同时保留 Finalizer 容量."""
 
         snapshot = self._require_started()
         if self._reserved_tool_names:
@@ -622,7 +656,9 @@ class AgentExecutionSupervisor:
         input_tokens: int | None,
         output_tokens: int | None,
     ) -> SupervisorDecision:
-        """Record one logical model completion and its optional usage values."""
+        """Record one logical model completion and its optional usage values.
+
+        记录一次逻辑模型完成及其可选用量值."""
 
         snapshot = self._require_started()
         counters = snapshot.counters
@@ -648,7 +684,9 @@ class AgentExecutionSupervisor:
         return self._evaluate(include_model_reserve=False)
 
     def assess_tool_batch(self, tool_names: Sequence[str]) -> SupervisorDecision:
-        """Atomically reserve one tool round and all calls returned by one model step."""
+        """Atomically reserve one tool round and all calls returned by one model step.
+
+        原子预留一个工具轮次及一次模型步骤返回的全部调用."""
 
         snapshot = self._require_started()
         if not self._model_completion_pending:
@@ -689,7 +727,9 @@ class AgentExecutionSupervisor:
         return budget_decision or decision
 
     def observe_tool_outcome(self, observation: ToolExecutionObservation) -> SupervisorDecision:
-        """Record one reserved tool result and evaluate deterministic detectors."""
+        """Record one reserved tool result and evaluate deterministic detectors.
+
+        记录一个已预留的工具结果,并评估确定性检测器."""
 
         snapshot = self._require_started()
         if not isinstance(observation, ToolExecutionObservation):
@@ -726,7 +766,9 @@ class AgentExecutionSupervisor:
         return self._evaluate(include_model_reserve=not self._reserved_tool_names)
 
     def evaluate(self) -> SupervisorDecision:
-        """Evaluate all current detectors without mutating a normal running state."""
+        """Evaluate all current detectors without mutating a normal running state.
+
+        评估当前所有检测器,不改变正常运行状态."""
 
         self._require_started()
         return self._evaluate(include_model_reserve=not self._reserved_tool_names)
@@ -1135,7 +1177,9 @@ def _changed_token(value: str | None, previous: str | None) -> bool:
 
 
 def _decision_allows_continuation(decision: SupervisorDecision) -> bool:
-    """Keep advisory REPLAN decisions observable without blocking Phase 1 telemetry."""
+    """Keep advisory REPLAN decisions observable without blocking Phase 1 telemetry.
+
+    保持建议性的 REPLAN 决策可观察,但不阻塞阶段 1 遥测."""
 
     return decision.kind in {SupervisorDecisionKind.CONTINUE, SupervisorDecisionKind.REPLAN}
 

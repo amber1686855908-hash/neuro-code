@@ -5,10 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from neuro_code.adapters.rust_session import (
-    UPSTREAM_IMPORT_PROVIDER,
-    load_rust_session,
-)
+from neuro_code.domain.conversation.context import UPSTREAM_IMPORT_PROVIDER
 from neuro_code.domain.messages import (
     IMAGE_MODEL_PLACEHOLDER,
     ContentPartKind,
@@ -18,6 +15,7 @@ from neuro_code.domain.messages import (
     Role,
 )
 from neuro_code.domain.sandbox import SandboxProfile
+from neuro_code.infrastructure.persistence.rust_session import load_rust_session
 from neuro_code.providers.anthropic import AnthropicProvider
 from neuro_code.shared.errors import SessionError
 

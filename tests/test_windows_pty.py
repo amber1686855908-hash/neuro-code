@@ -4,8 +4,11 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from neuro_code.adapters.windows_pty import WindowsConPtyPlatform, WindowsConPtySession
 from neuro_code.domain.terminal import TerminalSignal, TerminalSize
+from neuro_code.infrastructure.sandbox.windows_pty import (
+    WindowsConPtyPlatform,
+    WindowsConPtySession,
+)
 
 
 class _FakeNativeSession:
@@ -67,7 +70,7 @@ class WindowsConPtyPortAdapterTests(unittest.TestCase):
             del failure
 
         with mock.patch(
-            "neuro_code.adapters.windows_pty.WindowsPseudoConsoleSession.spawn",
+            "neuro_code.infrastructure.sandbox.windows_pty.WindowsPseudoConsoleSession.spawn",
             return_value=native,
         ) as spawn:
             platform = WindowsConPtyPlatform(diagnostic_capture_bytes=1234)

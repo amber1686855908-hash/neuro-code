@@ -1,6 +1,8 @@
-"""Provider-independent domain contracts."""
+"""Provider-independent domain contracts.
 
-from neuro_code.domain.background_tasks import (
+与 Provider 无关的领域契约."""
+
+from neuro_code.domain.background_tasks.models import (
     DEFAULT_BACKGROUND_WAKE_COOLDOWN_SECONDS,
     DEFAULT_BACKGROUND_WAKE_MAX_PER_SESSION,
     MAX_BACKGROUND_TASK_WAIT_IDS,
@@ -17,21 +19,14 @@ from neuro_code.domain.background_tasks import (
     BackgroundWakeLimits,
     BackgroundWakeState,
 )
-from neuro_code.domain.context_usage import estimate_context_tokens, estimate_text_tokens
-from neuro_code.domain.events import AgentEvent, AgentEventKind
-from neuro_code.domain.interaction_mode import InteractionMode, interaction_mode_guidance
-from neuro_code.domain.messages import (
-    ContentPart,
-    ContentPartKind,
-    ContextItemKind,
-    Message,
-    PreservedContextItem,
-    Role,
-    SessionItem,
-    ToolCall,
+from neuro_code.domain.conversation.context import (
+    ModelContext,
+    estimate_context_tokens,
+    estimate_text_tokens,
 )
-from neuro_code.domain.model_context import ModelContext
-from neuro_code.domain.model_events import (
+from neuro_code.domain.conversation.events import (
+    AgentEvent,
+    AgentEventKind,
     ModelBackendToolCompleted,
     ModelBackendToolStarted,
     ModelCompleted,
@@ -42,6 +37,21 @@ from neuro_code.domain.model_events import (
     ModelTextDelta,
     ModelToolCall,
 )
+from neuro_code.domain.conversation.interaction_mode import (
+    InteractionMode,
+    interaction_mode_guidance,
+)
+from neuro_code.domain.conversation.messages import (
+    ContentPart,
+    ContentPartKind,
+    ContextItemKind,
+    Message,
+    PreservedContextItem,
+    Role,
+    SessionItem,
+    ToolCall,
+)
+from neuro_code.domain.conversation.reasoning import ReasoningEffort, reasoning_guidance
 from neuro_code.domain.plans import (
     MAX_PLAN_COMMENT_BYTES,
     MAX_PLAN_COMMENT_ID_BYTES,
@@ -51,8 +61,6 @@ from neuro_code.domain.plans import (
     PlanStepStatus,
     SessionPlan,
 )
-from neuro_code.domain.reasoning import ReasoningEffort, reasoning_guidance
-from neuro_code.domain.session_search import SessionSearchHit, SessionSearchPage
 from neuro_code.domain.session_tasks import (
     MAX_QUEUED_SESSION_TASKS,
     MAX_SESSION_TASK_ID_BYTES,
@@ -61,7 +69,8 @@ from neuro_code.domain.session_tasks import (
     SessionTaskStatus,
 )
 from neuro_code.domain.sessions import SessionSnapshot, SessionSummary
-from neuro_code.domain.terminal import (
+from neuro_code.domain.sessions.search import SessionSearchHit, SessionSearchPage
+from neuro_code.domain.terminal.models import (
     MAX_TERMINAL_DIMENSION,
     MAX_TERMINAL_OUTPUT_BYTES,
     MAX_TERMINAL_READ_BYTES,
@@ -71,7 +80,7 @@ from neuro_code.domain.terminal import (
     TerminalSize,
 )
 from neuro_code.domain.tools import ToolDefinition, ToolResult
-from neuro_code.domain.ui_preferences import UiLanguage
+from neuro_code.shared.ui_language import UiLanguage
 
 __all__ = [
     "DEFAULT_BACKGROUND_WAKE_COOLDOWN_SECONDS",

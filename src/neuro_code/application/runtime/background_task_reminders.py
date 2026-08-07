@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from collections.abc import Sequence
 
-from neuro_code.domain.background_tasks import BackgroundTaskSnapshot
+from neuro_code.domain.background_tasks.models import BackgroundTaskSnapshot
 from neuro_code.shared.redaction import redact_sensitive_text
 
 BACKGROUND_TASK_COMPLETION_BATCH_LIMIT = 20
@@ -33,6 +33,8 @@ def format_background_task_completion_reminder(
     evidence to summarize a completed task without immediately polling again.
     The preview is untrusted evidence, is redacted, and is bounded both per
     task and across the whole reminder.
+
+    渲染有界的仅模型状态,并可选地渲染安全输出预览. 预览仅在明确请求的后台唤醒中使用,且经过脱敏和总量限制.
     """
     if not snapshots:
         raise ValueError("completion reminder requires at least one task")

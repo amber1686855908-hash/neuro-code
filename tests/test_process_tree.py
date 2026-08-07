@@ -10,8 +10,8 @@ from pathlib import Path
 from typing import cast
 from unittest import mock
 
-from neuro_code.adapters.process_tree import ProcessTree
-from neuro_code.adapters.windows_job import WindowsJobObject
+from neuro_code.infrastructure.sandbox.process_tree import ProcessTree
+from neuro_code.infrastructure.sandbox.windows_job import WindowsJobObject
 
 
 class _FastExitProcess:
@@ -65,7 +65,7 @@ class ProcessTreeTests(unittest.IsolatedAsyncioTestCase):
         tree = ProcessTree(cast(asyncio.subprocess.Process, process), process.pid)
         transient = PermissionError(1, "transient group state")
         with mock.patch(
-            "neuro_code.adapters.process_tree.os.killpg",
+            "neuro_code.infrastructure.sandbox.process_tree.os.killpg",
             side_effect=(transient, ProcessLookupError()),
         ) as killpg:
             await tree._terminate_posix(0.1, 0.1)
@@ -84,7 +84,7 @@ class ProcessTreeTests(unittest.IsolatedAsyncioTestCase):
         tree = ProcessTree(cast(asyncio.subprocess.Process, process), process.pid)
         with (
             mock.patch(
-                "neuro_code.adapters.process_tree.os.killpg",
+                "neuro_code.infrastructure.sandbox.process_tree.os.killpg",
                 side_effect=(
                     PermissionError(1, "transient group state"),
                     PermissionError(1, "persistent denial"),
@@ -99,13 +99,13 @@ class WindowsProcessTreeLifecycleTests(unittest.IsolatedAsyncioTestCase):
     async def test_atomic_spawn_failure_closes_the_preconfigured_job(self) -> None:
         job = _WindowsJobFixture()
         with (
-            mock.patch("neuro_code.adapters.process_tree.os.name", "nt"),
+            mock.patch("neuro_code.infrastructure.sandbox.process_tree.os.name", "nt"),
             mock.patch(
-                "neuro_code.adapters.process_tree.WindowsJobObject.create",
+                "neuro_code.infrastructure.sandbox.process_tree.WindowsJobObject.create",
                 return_value=job,
             ),
             mock.patch(
-                "neuro_code.adapters.process_tree.WindowsJobProcess.spawn_exec",
+                "neuro_code.infrastructure.sandbox.process_tree.WindowsJobProcess.spawn_exec",
                 side_effect=OSError("fixture atomic creation failure"),
             ),
             self.assertRaisesRegex(OSError, "fixture atomic creation failure"),
@@ -124,13 +124,13 @@ class WindowsProcessTreeLifecycleTests(unittest.IsolatedAsyncioTestCase):
         job = _WindowsJobFixture()
         cwd = Path("/workspace")
         with (
-            mock.patch("neuro_code.adapters.process_tree.os.name", "nt"),
+            mock.patch("neuro_code.infrastructure.sandbox.process_tree.os.name", "nt"),
             mock.patch(
-                "neuro_code.adapters.process_tree.WindowsJobObject.create",
+                "neuro_code.infrastructure.sandbox.process_tree.WindowsJobObject.create",
                 return_value=job,
             ),
             mock.patch(
-                "neuro_code.adapters.process_tree.WindowsJobProcess.spawn_exec",
+                "neuro_code.infrastructure.sandbox.process_tree.WindowsJobProcess.spawn_exec",
                 return_value=process,
             ) as spawn,
         ):
@@ -167,7 +167,7 @@ class WindowsProcessTreeLifecycleTests(unittest.IsolatedAsyncioTestCase):
             job.active_process_count = 0
 
         release = asyncio.create_task(release_descendant())
-        with mock.patch("neuro_code.adapters.process_tree.os.name", "nt"):
+        with mock.patch("neuro_code.infrastructure.sandbox.process_tree.os.name", "nt"):
             self.assertEqual(await tree.wait(), 0)
         await release
 
@@ -182,7 +182,7 @@ class WindowsProcessTreeLifecycleTests(unittest.IsolatedAsyncioTestCase):
             _windows_job=cast(WindowsJobObject, job),
         )
 
-        with mock.patch("neuro_code.adapters.process_tree.os.name", "nt"):
+        with mock.patch("neuro_code.infrastructure.sandbox.process_tree.os.name", "nt"):
             await tree.terminate(grace_seconds=0, force_wait_seconds=0.1)
             await tree.terminate(grace_seconds=0, force_wait_seconds=0.1)
 

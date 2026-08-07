@@ -1,3 +1,11 @@
+"""Canonical tool value objects.
+
+Tool registration and execution remain outside the domain package.  This
+module only owns the immutable request/result shapes shared by those ports.
+
+定义规范的工具值对象. 工具注册和执行位于领域包之外,此处只拥有端口共享的不可变请求和结果形状.
+"""
+
 from __future__ import annotations
 
 from collections.abc import Mapping
@@ -34,3 +42,6 @@ class ToolResult:
         if self.metadata is not None:
             result["metadata"] = dict(self.metadata)
         return result
+
+
+__all__ = ["ToolDefinition", "ToolResult"]

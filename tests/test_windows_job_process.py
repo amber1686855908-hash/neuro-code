@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 from unittest import mock
 
-from neuro_code.adapters.windows_job_process import (
+from neuro_code.infrastructure.sandbox.windows_job_process import (
     WindowsJobProcess,
     _CreatedProcess,
     _NativeWindowsJobProcessApi,
@@ -394,7 +394,7 @@ class WindowsJobProcessTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_non_windows_default_api_fails_cleanly(self) -> None:
         with (
-            mock.patch("neuro_code.adapters.windows_job_process.os.name", "posix"),
+            mock.patch("neuro_code.infrastructure.sandbox.windows_job_process.os.name", "posix"),
             self.assertRaisesRegex(OSError, "only available on Windows"),
         ):
             WindowsJobProcess.spawn_exec(

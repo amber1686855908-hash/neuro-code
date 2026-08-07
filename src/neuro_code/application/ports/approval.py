@@ -1,4 +1,6 @@
-"""Canonical approval interaction port."""
+"""Canonical approval interaction port.
+
+定义规范的审批交互端口."""
 
 from __future__ import annotations
 

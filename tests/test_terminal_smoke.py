@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from neuro_code.adapters.windows_conpty import WindowsPseudoConsoleSession
+from neuro_code.infrastructure.sandbox.windows_conpty import WindowsPseudoConsoleSession
 
 pytestmark = pytest.mark.terminal
 

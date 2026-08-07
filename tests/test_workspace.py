@@ -7,12 +7,12 @@ from pathlib import Path
 from unittest.mock import patch
 
 from neuro_code.application.ports.workspace import WorkspaceIdentity, WorkspacePathResolver
-from neuro_code.shared.errors import ToolError
-from neuro_code.workspace import (
+from neuro_code.infrastructure.workspace.paths import (
     FilesystemWorkspaceIdentity,
     FilesystemWorkspacePathResolver,
     workspaces_match,
 )
+from neuro_code.shared.errors import ToolError
 
 
 def _as_workspace_identity(identity: WorkspaceIdentity) -> WorkspaceIdentity:
@@ -100,7 +100,7 @@ class FilesystemWorkspaceIdentityTests(unittest.TestCase):
             with (
                 patch.object(Path, "samefile", side_effect=OSError("unavailable")),
                 patch(
-                    "neuro_code.workspace.os.path.normcase",
+                    "neuro_code.infrastructure.workspace.paths.os.path.normcase",
                     side_effect=lambda value: value.casefold(),
                 ) as normcase,
             ):

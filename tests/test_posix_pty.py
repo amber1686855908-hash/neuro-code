@@ -9,8 +9,8 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import mock
 
-from neuro_code.adapters.posix_pty import PosixPtySession
 from neuro_code.domain.terminal import TerminalSignal, TerminalSize
+from neuro_code.infrastructure.sandbox.posix_pty import PosixPtySession
 
 
 @unittest.skipUnless(os.name == "posix", "POSIX PTY integration contract")
@@ -129,7 +129,7 @@ while True:
 
     def test_non_posix_default_fails_before_opening_a_pty(self) -> None:
         with (
-            mock.patch("neuro_code.adapters.posix_pty.os.name", "nt"),
+            mock.patch("neuro_code.infrastructure.sandbox.posix_pty.os.name", "nt"),
             self.assertRaisesRegex(OSError, "only available on POSIX"),
         ):
             PosixPtySession.spawn(

@@ -8,7 +8,9 @@ LIVE_TEST_ENV = "NEURO_CODE_RUN_LIVE_TESTS"
 
 
 def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
-    """Keep live tests inert unless the caller supplies the explicit cost gate."""
+    """Keep live tests inert unless the caller supplies the explicit cost gate.
+
+    除非调用方提供明确的费用开关,否则保持在线测试不执行."""
 
     if os.environ.get(LIVE_TEST_ENV) == "1":
         return

@@ -297,7 +297,7 @@ api_key_env = "FIXTURE_KEY"
                 profile.http_client_policy({"HTTPS_PROXY": value})
 
         with (
-            patch("neuro_code.config.find_spec", return_value=None),
+            patch("neuro_code.configuration.app.find_spec", return_value=None),
             self.assertRaisesRegex(ConfigurationError, "optional SOCKS support"),
         ):
             profile.http_client_policy({"ALL_PROXY": "socks5://127.0.0.1:7890"})

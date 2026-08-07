@@ -8,15 +8,15 @@ from unittest.mock import AsyncMock, patch
 
 import mcp.types as mcp_types
 
-import neuro_code.adapters.mcp_stdio as mcp_stdio
-from neuro_code.adapters.mcp_stdio import (
+import neuro_code.infrastructure.mcp.stdio as mcp_stdio
+from neuro_code.application.ports.tools import ToolContext
+from neuro_code.domain.sandbox import SandboxProfile
+from neuro_code.infrastructure.mcp.stdio import (
     MAX_MCP_SERVERS,
     McpStdioError,
     McpStdioServerConfig,
     McpStdioToolCollection,
 )
-from neuro_code.application.ports.tools import ToolContext
-from neuro_code.domain.sandbox import SandboxProfile
 from neuro_code.shared.errors import ToolError
 
 _FIXTURE = Path(__file__).parent / "fixtures" / "mcp_stdio_server.py"

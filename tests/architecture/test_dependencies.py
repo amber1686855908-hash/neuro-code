@@ -48,7 +48,14 @@ _EXACT_LAYERS = {
     "neuro_code": _SHARED,
     "neuro_code.__main__": _INTERFACES,
     "neuro_code.acp": _INTERFACES,
-    # The parser is a pure, fail-closed permission rule; its file move is deferred.
+    "neuro_code.application.permissions.broker": _APPLICATION,
+    "neuro_code.application.permissions.service": _APPLICATION,
+    "neuro_code.application.permissions.policy": _APPLICATION,
+    "neuro_code.configuration.app": _CONFIGURATION,
+    "neuro_code.domain.permissions.bash_commands": _DOMAIN,
+    "neuro_code.domain.provider_catalog": _PORTS,
+    "neuro_code.domain.provider_settings": _PORTS,
+    "neuro_code.domain.sessions.search": _DOMAIN,
     "neuro_code.bash_commands": _DOMAIN,
     "neuro_code.cli": _INTERFACES,
     "neuro_code.config": _CONFIGURATION,
@@ -721,7 +728,7 @@ def test_current_production_tree_has_no_dynamic_import_violations() -> None:
     modules = _source_modules()
     known_modules = frozenset(modules)
     issues: list[DynamicImportIssue] = []
-    config_scan: DynamicImportScan | None = None
+    config_scans: dict[str, DynamicImportScan] = {}
 
     for source, path in modules.items():
         package = source if path.name == "__init__.py" else source.rpartition(".")[0]
@@ -733,12 +740,13 @@ def test_current_production_tree_has_no_dynamic_import_violations() -> None:
             known_modules=known_modules,
         )
         issues.extend(scan.issues)
-        if source == "neuro_code.config":
-            config_scan = scan
+        if source in {"neuro_code.config", "neuro_code.configuration.app"}:
+            config_scans[source] = scan
 
-    assert config_scan is not None
-    assert not config_scan.targets
-    assert not config_scan.issues
+    assert set(config_scans) == {"neuro_code.config", "neuro_code.configuration.app"}
+    for config_scan in config_scans.values():
+        assert not config_scan.targets
+        assert not config_scan.issues
     assert not issues, "dynamic import architecture violations:\n" + _render_dynamic_import_issues(
         tuple(issues)
     )
@@ -748,9 +756,11 @@ def test_managed_provider_settings_reader_is_canonical_and_consumed_privately() 
     modules = _source_modules()
     known_modules = frozenset(modules)
     canonical = "neuro_code.configuration.managed_provider_settings"
+    implementation = "neuro_code.infrastructure.providers.provider_settings"
     adapter = "neuro_code.adapters.provider_settings"
-    config = "neuro_code.config"
+    config = "neuro_code.configuration.app"
     canonical_tree = ast.parse(modules[canonical].read_text(encoding="utf-8"))
+    implementation_tree = ast.parse(modules[implementation].read_text(encoding="utf-8"))
     adapter_tree = ast.parse(modules[adapter].read_text(encoding="utf-8"))
     config_tree = ast.parse(modules[config].read_text(encoding="utf-8"))
     canonical_imports = _internal_imports(
@@ -761,6 +771,11 @@ def test_managed_provider_settings_reader_is_canonical_and_consumed_privately() 
     adapter_imports = _internal_imports(
         modules[adapter],
         source=adapter,
+        known_modules=known_modules,
+    )
+    implementation_imports = _internal_imports(
+        modules[implementation],
+        source=implementation,
         known_modules=known_modules,
     )
     config_imports = _internal_imports(
@@ -806,14 +821,15 @@ def test_managed_provider_settings_reader_is_canonical_and_consumed_privately() 
 
     assert reader_bindings <= canonical_bindings
     assert not reader_bindings & adapter_bindings
-    assert canonical in adapter_imports
+    assert canonical in implementation_imports
     assert canonical in config_imports
+    assert implementation in adapter_imports
     assert not {
         module
         for module in config_imports
         if module == "neuro_code.adapters" or module.startswith("neuro_code.adapters.")
     }
-    for consumer_tree in (adapter_tree, config_tree):
+    for consumer_tree in (implementation_tree, config_tree):
         loader_imports = [
             alias
             for node in consumer_tree.body
@@ -823,6 +839,12 @@ def test_managed_provider_settings_reader_is_canonical_and_consumed_privately() 
         ]
         assert len(loader_imports) == 1
         assert loader_imports[0].asname == "_load_managed_provider_settings"
+    assert not any(
+        isinstance(node, ast.ImportFrom)
+        and node.module == canonical
+        and any(alias.name == "load_managed_provider_settings" for alias in node.names)
+        for node in adapter_tree.body
+    )
     assert not {
         module
         for module in canonical_imports
@@ -879,6 +901,7 @@ def test_canonical_shared_modules_are_the_only_shared_implementations() -> None:
         "neuro_code.shared.async_utils",
         "neuro_code.shared.errors",
         "neuro_code.shared.redaction",
+        "neuro_code.shared.ui_language",
     }
     assert {
         module for module in modules if module.startswith("neuro_code.shared")
@@ -920,6 +943,88 @@ def test_canonical_ports_are_the_only_port_modules() -> None:
         for module in modules
         if module == "neuro_code.ports" or module.startswith("neuro_code.ports.")
     }
+
+
+def test_canonical_persistence_modules_are_the_only_persistence_implementations() -> None:
+    modules = _source_modules()
+    canonical_modules = {
+        "neuro_code.infrastructure.persistence",
+        "neuro_code.infrastructure.persistence.output_artifacts",
+        "neuro_code.infrastructure.persistence.rust_session",
+        "neuro_code.infrastructure.persistence.sqlite_session",
+        "neuro_code.infrastructure.persistence.ui_preferences",
+    }
+    assert {
+        module for module in modules if module.startswith("neuro_code.infrastructure.persistence")
+    } == canonical_modules
+
+
+def test_canonical_background_manager_is_the_only_manager_implementation() -> None:
+    modules = _source_modules()
+    assert {
+        module for module in modules if module == "neuro_code.infrastructure.background_tasks"
+    } == {"neuro_code.infrastructure.background_tasks"}
+
+
+def test_canonical_mcp_modules_are_the_only_mcp_implementations() -> None:
+    modules = _source_modules()
+    canonical_modules = {
+        "neuro_code.infrastructure.mcp",
+        "neuro_code.infrastructure.mcp.http",
+        "neuro_code.infrastructure.mcp.stdio",
+    }
+    assert {
+        module for module in modules if module.startswith("neuro_code.infrastructure.mcp")
+    } == canonical_modules
+
+
+def test_canonical_workspace_modules_are_the_only_workspace_implementations() -> None:
+    modules = _source_modules()
+    canonical_modules = {
+        "neuro_code.infrastructure.workspace",
+        "neuro_code.infrastructure.workspace.changes",
+        "neuro_code.infrastructure.workspace.instructions",
+        "neuro_code.infrastructure.workspace.paths",
+        "neuro_code.infrastructure.workspace.skills",
+    }
+    assert {
+        module for module in modules if module.startswith("neuro_code.infrastructure.workspace")
+    } == canonical_modules
+
+
+def test_canonical_provider_modules_are_the_only_provider_implementations() -> None:
+    modules = _source_modules()
+    canonical_modules = {
+        "neuro_code.infrastructure.providers",
+        "neuro_code.infrastructure.providers.anthropic",
+        "neuro_code.infrastructure.providers.failover",
+        "neuro_code.infrastructure.providers.gemini",
+        "neuro_code.infrastructure.providers.image_references",
+        "neuro_code.infrastructure.providers.openai_compatible",
+        "neuro_code.infrastructure.providers.openai_responses",
+        "neuro_code.infrastructure.providers.provider_catalog",
+        "neuro_code.infrastructure.providers.provider_settings",
+    }
+    assert {
+        module for module in modules if module.startswith("neuro_code.infrastructure.providers")
+    } == canonical_modules
+
+
+def test_canonical_tool_modules_are_the_only_tool_implementations() -> None:
+    modules = _source_modules()
+    canonical_modules = {
+        "neuro_code.infrastructure.tools",
+        "neuro_code.infrastructure.tools.background_tasks",
+        "neuro_code.infrastructure.tools.bash",
+        "neuro_code.infrastructure.tools.client_terminal",
+        "neuro_code.infrastructure.tools.filesystem",
+        "neuro_code.infrastructure.tools.plans",
+        "neuro_code.infrastructure.tools.registry",
+        "neuro_code.infrastructure.tools.skills",
+    }
+    assert {
+        module for module in modules if module.startswith("neuro_code.infrastructure.tools")
+    } == canonical_modules
 
 
 def test_production_modules_do_not_import_the_removed_ports_package() -> None:
@@ -983,21 +1088,28 @@ def test_production_modules_do_not_import_the_removed_shared_modules() -> None:
 
 def test_canonical_runtime_modules_are_the_only_runtime_implementations() -> None:
     modules = _source_modules()
-    canonical_modules = {
-        "neuro_code.application.runtime.background_task_reminders",
-        "neuro_code.application.runtime.agent",
+    compatibility_facades = {
         "neuro_code.application.runtime.approval",
         "neuro_code.application.runtime.conversation",
-        "neuro_code.application.runtime.finalization",
         "neuro_code.application.runtime.instruction_tracker",
         "neuro_code.application.runtime.profile_conversation",
         "neuro_code.application.runtime.skill_tracker",
-        "neuro_code.application.runtime.supervision",
         "neuro_code.application.runtime.terminal_sessions",
+    }
+    canonical_modules = {
+        "neuro_code.application.runtime.background_task_reminders",
+        "neuro_code.application.runtime.agent",
+        "neuro_code.application.runtime.agent_loop",
+        "neuro_code.application.runtime.context_builder",
+        "neuro_code.application.runtime.event_recorder",
+        "neuro_code.application.runtime.finalization",
+        "neuro_code.application.runtime.model_step",
+        "neuro_code.application.runtime.supervision",
+        "neuro_code.application.runtime.tool_pipeline",
     }
     assert {
         module for module in modules if module.startswith("neuro_code.application.runtime.")
-    } == canonical_modules
+    } - compatibility_facades == canonical_modules
     assert not {
         module
         for module in modules
@@ -1005,27 +1117,158 @@ def test_canonical_runtime_modules_are_the_only_runtime_implementations() -> Non
     }
 
     expected_classes = {
-        "neuro_code.application.runtime.agent": {"AgentRunResult", "AgentRuntime"},
-        "neuro_code.application.runtime.approval": {"SessionApprovalBroker"},
-        "neuro_code.application.runtime.conversation": {"AgentConversation"},
-        "neuro_code.application.runtime.instruction_tracker": {"InstructionTracker"},
-        "neuro_code.application.runtime.profile_conversation": {
-            "ConversationBinding",
-            "ConversationRunner",
-            "InteractionModeSelectionResult",
-            "ProfileConversationController",
-            "ProviderOption",
-            "ProviderSelectionResult",
-            "ReasoningEffortSelectionResult",
-            "SessionOption",
-            "SessionSelectionResult",
+        "neuro_code.application.runtime.agent": {"AgentRuntime"},
+        "neuro_code.application.runtime.agent_loop": {"AgentLoopRunner", "AgentRunResult"},
+        "neuro_code.application.runtime.context_builder": {"ContextBuilder"},
+        "neuro_code.application.runtime.event_recorder": {"TurnEventRecorder"},
+        "neuro_code.application.runtime.model_step": {
+            "ModelStepProcessor",
+            "ModelStepResult",
         },
-        "neuro_code.application.runtime.skill_tracker": {"SkillTracker"},
-        "neuro_code.application.runtime.terminal_sessions": {
+        "neuro_code.application.sessions.terminal_sessions": {
             "LocalInteractiveTerminalManager",
             "LocalInteractiveTerminalSession",
             "_TerminalOutputRing",
         },
+        "neuro_code.application.sessions.conversation": {"AgentConversation"},
+        "neuro_code.application.runtime.tool_pipeline": {
+            "ToolExecutor",
+            "ToolObservationBuilder",
+        },
+    }
+    for module, class_names in expected_classes.items():
+        tree = ast.parse(modules[module].read_text(encoding="utf-8"))
+        assert {node.name for node in tree.body if isinstance(node, ast.ClassDef)} == class_names
+
+
+def test_canonical_memory_modules_are_the_only_memory_implementations() -> None:
+    modules = _source_modules()
+    canonical_modules = {
+        "neuro_code.application.memory.instruction_tracker",
+        "neuro_code.application.memory.skill_tracker",
+    }
+    assert {
+        module for module in modules if module.startswith("neuro_code.application.memory.")
+    } == canonical_modules
+
+    expected_classes = {
+        "neuro_code.application.memory.instruction_tracker": {"InstructionTracker"},
+        "neuro_code.application.memory.skill_tracker": {"SkillTracker"},
+    }
+    for module, class_names in expected_classes.items():
+        tree = ast.parse(modules[module].read_text(encoding="utf-8"))
+        assert {node.name for node in tree.body if isinstance(node, ast.ClassDef)} == class_names
+
+
+def test_canonical_session_modules_are_the_only_session_implementations() -> None:
+    modules = _source_modules()
+    canonical_modules = {
+        "neuro_code.application.sessions",
+        "neuro_code.application.sessions.binding",
+        "neuro_code.application.sessions.catalog",
+        "neuro_code.application.sessions.contracts",
+        "neuro_code.application.sessions.event_queries",
+        "neuro_code.application.sessions.execution_queries",
+        "neuro_code.application.sessions.lifecycle",
+        "neuro_code.application.sessions.item_queries",
+        "neuro_code.application.sessions.profile_conversation",
+        "neuro_code.application.sessions.selection",
+        "neuro_code.application.sessions.service",
+        "neuro_code.application.sessions.summary",
+        "neuro_code.application.sessions.task_queries",
+        "neuro_code.application.sessions.turns",
+        "neuro_code.application.sessions.conversation",
+        "neuro_code.application.sessions.terminal_sessions",
+    }
+    assert {
+        module for module in modules if module.startswith("neuro_code.application.sessions")
+    } == canonical_modules
+
+    expected_classes = {
+        "neuro_code.application.sessions.contracts": {
+            "InteractionModeSelectionResult",
+            "ReasoningEffortSelectionResult",
+            "SessionOption",
+            "SessionSelectionResult",
+        },
+        "neuro_code.application.sessions.selection": {
+            "SessionSelectionController",
+            "SessionSelectionService",
+        },
+        "neuro_code.application.sessions.profile_conversation": {
+            "ProfileConversationController",
+        },
+        "neuro_code.application.sessions.binding": {
+            "ConversationRunner",
+            "ConversationBinding",
+        },
+        "neuro_code.application.sessions.catalog": {
+            "ListSessionsPageRequest",
+            "ListSessionsRequest",
+            "SearchSessionsRequest",
+            "SessionCatalogApplicationService",
+            "SessionInspection",
+            "SessionSearchInspection",
+            "SessionSearchInspectionPage",
+        },
+        "neuro_code.application.sessions.lifecycle": {
+            "DeleteSessionRequest",
+            "ForkSessionRequest",
+            "ImportSessionRequest",
+            "RenameSessionRequest",
+            "SessionLifecycleController",
+            "SessionLifecycleService",
+            "StartSessionRequest",
+        },
+        "neuro_code.application.sessions.task_queries": {
+            "GetSessionTaskRequest",
+            "ListSessionTasksRequest",
+            "SessionTaskQueryController",
+            "SessionTaskQueryService",
+        },
+        "neuro_code.application.sessions.summary": {
+            "GetSessionSummaryRequest",
+            "SessionSummaryQueryController",
+            "SessionSummaryQueryService",
+        },
+        "neuro_code.application.sessions.execution_queries": {
+            "LoadExecutionRecordRequest",
+            "LoadExecutionRecordsRequest",
+            "SessionExecutionQueryController",
+            "SessionExecutionQueryService",
+        },
+        "neuro_code.application.sessions.item_queries": {
+            "LoadSessionItemsRequest",
+            "SessionItemQueryController",
+            "SessionItemQueryService",
+        },
+        "neuro_code.application.sessions.event_queries": {
+            "LoadSessionEventsRequest",
+            "SessionEventQueryController",
+            "SessionEventQueryService",
+        },
+        "neuro_code.application.sessions.service": {
+            "BindSessionAliasRequest",
+            "ExportSessionRequest",
+            "GetOrCreateSessionAliasRequest",
+            "LoadSessionPlanRequest",
+            "ListPlanCommentsRequest",
+            "ResolveSessionAliasRequest",
+            "ResumeSessionRequest",
+            "SessionApplicationService",
+            "SessionExport",
+        },
+        "neuro_code.application.sessions.turns": {
+            "RunTurnRequest",
+            "SessionTurnRunner",
+            "SessionTurnService",
+        },
+        "neuro_code.application.sessions.terminal_sessions": {
+            "LocalInteractiveTerminalManager",
+            "LocalInteractiveTerminalSession",
+            "_TerminalOutputRing",
+        },
+        "neuro_code.application.sessions.conversation": {"AgentConversation"},
     }
     for module, class_names in expected_classes.items():
         tree = ast.parse(modules[module].read_text(encoding="utf-8"))
@@ -1061,33 +1304,92 @@ def test_canonical_runtime_consumers_use_explicit_submodules() -> None:
     known_modules = frozenset(modules)
     expected_imports = {
         "neuro_code.application.runtime.agent": {
-            "neuro_code.application.runtime.background_task_reminders",
+            "neuro_code.application.runtime.agent_loop",
+            "neuro_code.application.runtime.context_builder",
+            "neuro_code.application.runtime.tool_pipeline",
         },
-        "neuro_code.application.runtime.conversation": {
+        "neuro_code.application.sessions.conversation": {
             "neuro_code.application.runtime.agent",
+            "neuro_code.application.sessions.execution_queries",
+            "neuro_code.application.sessions.item_queries",
+            "neuro_code.application.sessions.summary",
+            "neuro_code.application.sessions.task_queries",
         },
-        "neuro_code.application.runtime.profile_conversation": {
+        "neuro_code.application.sessions.catalog": {
+            "neuro_code.application.sessions.execution_queries",
+        },
+        "neuro_code.application.tools.service": {
+            "neuro_code.application.sessions.event_queries",
+        },
+        "neuro_code.application.sessions.profile_conversation": {
             "neuro_code.application.runtime.agent",
+            "neuro_code.application.sessions.binding",
+            "neuro_code.application.sessions.contracts",
+        },
+        "neuro_code.application.runtime.agent_loop": {
+            "neuro_code.application.sessions.lifecycle",
+            "neuro_code.application.sessions.task_queries",
+        },
+        "neuro_code.application.acp.service": {
+            "neuro_code.application.sessions.catalog",
+            "neuro_code.application.sessions.lifecycle",
+            "neuro_code.application.sessions.service",
+            "neuro_code.application.sessions.summary",
+            "neuro_code.application.tools.service",
+        },
+        "neuro_code.application.providers.service": {
+            "neuro_code.application.providers.contracts",
         },
         "neuro_code.bootstrap.composition": {
+            "neuro_code.infrastructure.background_tasks",
             "neuro_code.application.runtime.agent",
-            "neuro_code.application.runtime.conversation",
-            "neuro_code.application.runtime.instruction_tracker",
-            "neuro_code.application.runtime.profile_conversation",
-            "neuro_code.application.runtime.skill_tracker",
+            "neuro_code.application.providers.service",
+            "neuro_code.application.sessions.summary",
+            "neuro_code.application.sessions.conversation",
+            "neuro_code.application.sessions.binding",
+            "neuro_code.application.sessions.selection",
+            "neuro_code.application.memory.instruction_tracker",
+            "neuro_code.application.memory.skill_tracker",
+            "neuro_code.application.tools.service",
+            "neuro_code.application.workflows.plan_execution",
+            "neuro_code.application.workflows.plan_scheduling",
+            "neuro_code.application.workflows.session_task_execution",
+            "neuro_code.application.workflows.subagent",
         },
         "neuro_code.bootstrap.entrypoints": {
-            "neuro_code.application.runtime.approval",
-            "neuro_code.application.runtime.profile_conversation",
+            "neuro_code.application.permissions.broker",
+            "neuro_code.application.providers.contracts",
+            "neuro_code.application.sessions.binding",
+            "neuro_code.application.sessions.lifecycle",
+            "neuro_code.application.sessions.profile_conversation",
+            "neuro_code.application.sessions.service",
+            "neuro_code.application.tools.service",
         },
         "neuro_code.acp": {
-            "neuro_code.application.runtime.approval",
-            "neuro_code.application.runtime.profile_conversation",
+            "neuro_code.application.permissions.broker",
+            "neuro_code.application.sessions.binding",
+            "neuro_code.application.tools.service",
         },
         "neuro_code.tui": {
             "neuro_code.application.runtime.agent",
-            "neuro_code.application.runtime.approval",
-            "neuro_code.application.runtime.profile_conversation",
+            "neuro_code.application.permissions.broker",
+            "neuro_code.application.providers.contracts",
+            "neuro_code.application.providers.service",
+            "neuro_code.application.sessions.contracts",
+            "neuro_code.application.sessions.selection",
+            "neuro_code.application.tools.service",
+            "neuro_code.application.workflows.plan_execution",
+            "neuro_code.application.workflows.plan_scheduling",
+            "neuro_code.application.workflows.session_task_execution",
+        },
+        "neuro_code.cli": {
+            "neuro_code.application.sessions.lifecycle",
+            "neuro_code.application.sessions.service",
+            "neuro_code.application.tools.service",
+        },
+        "neuro_code.interfaces.cli.serialization": {
+            "neuro_code.application.sessions.catalog",
+            "neuro_code.application.tools.service",
         },
     }
 
@@ -1100,7 +1402,7 @@ def test_canonical_runtime_consumers_use_explicit_submodules() -> None:
         assert canonical_imports <= imports
 
     dependency = Dependency(
-        "neuro_code.application.runtime.terminal_sessions", "neuro_code.workspace"
+        "neuro_code.application.sessions.terminal_sessions", "neuro_code.workspace"
     )
     assert dependency not in _forbidden_dependencies()
     assert dependency not in {entry.dependency for entry in _TEMPORARY_ALLOWLIST}
@@ -1109,11 +1411,11 @@ def test_canonical_runtime_consumers_use_explicit_submodules() -> None:
 def test_terminal_manager_no_longer_depends_on_concrete_platform_adapters() -> None:
     dependencies = {
         Dependency(
-            "neuro_code.application.runtime.terminal_sessions",
+            "neuro_code.application.sessions.terminal_sessions",
             "neuro_code.adapters.posix_pty",
         ),
         Dependency(
-            "neuro_code.application.runtime.terminal_sessions",
+            "neuro_code.application.sessions.terminal_sessions",
             "neuro_code.adapters.windows_pty",
         ),
     }

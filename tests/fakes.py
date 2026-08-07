@@ -1,4 +1,6 @@
-"""Explicit test doubles for application ports."""
+"""Explicit test doubles for application ports.
+
+提供应用端口使用的显式测试替身."""
 
 from __future__ import annotations
 
@@ -12,7 +14,9 @@ from neuro_code.application.ports.workspace_changes import (
 
 
 class FakeWorkspaceIdentity:
-    """Explicit workspace identity fake without filesystem dependencies."""
+    """Explicit workspace identity fake without filesystem dependencies.
+
+    提供不依赖文件系统的显式工作区身份测试替身."""
 
     def __init__(
         self,
@@ -37,7 +41,9 @@ class FakeWorkspaceIdentity:
 
 
 class FakeWorkspacePathResolver:
-    """Explicit path resolver fake without filesystem dependencies."""
+    """Explicit path resolver fake without filesystem dependencies.
+
+    提供不依赖文件系统的显式路径解析器测试替身."""
 
     def __init__(
         self,
@@ -66,13 +72,17 @@ class FakeWorkspacePathResolver:
 
 
 class EmptyWorkspaceChangeCheckpoint(WorkspaceChangeCheckpoint):
-    """Opaque checkpoint used by tests unrelated to filesystem observation."""
+    """Opaque checkpoint used by tests unrelated to filesystem observation.
+
+    提供与文件系统观察无关测试使用的不透明检查点."""
 
     __slots__ = ()
 
 
 class EmptyWorkspaceChangeObserver:
-    """Explicit observer fake that reports no workspace changes."""
+    """Explicit observer fake that reports no workspace changes.
+
+    提供明确报告无工作区变更的观察器测试替身."""
 
     def capture(self, root: Path, /) -> WorkspaceChangeCheckpoint:
         del root

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from neuro_code.domain.reasoning import ReasoningEffort, reasoning_guidance
+from neuro_code.domain.conversation.reasoning import ReasoningEffort, reasoning_guidance
 
 
 class ReasoningEffortTests(unittest.TestCase):

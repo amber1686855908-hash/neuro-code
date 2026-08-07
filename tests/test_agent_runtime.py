@@ -9,8 +9,8 @@ from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
+from unittest.mock import patch
 
-from neuro_code.adapters.background_tasks import LocalBackgroundTaskManager
 from neuro_code.adapters.sqlite_session import SqliteSessionStore
 from neuro_code.application.permissions.contracts import PermissionApproval, PermissionRequest
 from neuro_code.application.ports.background_tasks import BackgroundTaskManager
@@ -30,7 +30,15 @@ from neuro_code.application.runtime.supervision import (
     SupervisionMode,
     SupervisionTraceRecord,
 )
+from neuro_code.application.sessions import (
+    GetSessionTaskRequest,
+    StartSessionRequest,
+)
+from neuro_code.application.sessions.lifecycle import SessionLifecycleService
+from neuro_code.application.sessions.task_queries import SessionTaskQueryService
 from neuro_code.domain.background_tasks import BackgroundTaskSnapshot, BackgroundTaskStatus
+from neuro_code.domain.conversation.interaction_mode import InteractionMode
+from neuro_code.domain.conversation.reasoning import ReasoningEffort
 from neuro_code.domain.events import AgentEvent, AgentEventKind
 from neuro_code.domain.execution import (
     AgentExecutionOutcome,
@@ -43,7 +51,6 @@ from neuro_code.domain.execution import (
     SupervisorReasonCode,
     TurnSource,
 )
-from neuro_code.domain.interaction_mode import InteractionMode
 from neuro_code.domain.messages import (
     ContentPart,
     ContextItemKind,
@@ -64,9 +71,11 @@ from neuro_code.domain.model_events import (
     ModelToolCall,
 )
 from neuro_code.domain.plans import PlanComment, PlanStep, PlanStepStatus, SessionPlan
-from neuro_code.domain.reasoning import ReasoningEffort
-from neuro_code.domain.session_tasks import SessionTaskKind, SessionTaskStatus
+from neuro_code.domain.session_tasks import SessionTask, SessionTaskKind, SessionTaskStatus
 from neuro_code.domain.tools import ToolDefinition, ToolResult
+from neuro_code.infrastructure.background_tasks import LocalBackgroundTaskManager
+from neuro_code.infrastructure.tools.background_tasks import TaskOutputTool
+from neuro_code.infrastructure.workspace.changes import FilesystemWorkspaceChangeObserver
 from neuro_code.permissions import (
     PermissionEffect,
     PermissionManager,
@@ -76,8 +85,6 @@ from neuro_code.permissions import (
 from neuro_code.providers.failover import FailoverModelProvider, ProviderCandidate
 from neuro_code.shared.errors import ConfigurationError, ProviderError
 from neuro_code.tools import ToolRegistry, default_tool_registry
-from neuro_code.tools.background_tasks import TaskOutputTool
-from neuro_code.workspace_changes import FilesystemWorkspaceChangeObserver
 from tests.fakes import EmptyWorkspaceChangeObserver
 
 
@@ -290,7 +297,9 @@ class MetadataFixtureTool:
 
 
 class MinimalToolCollection:
-    """A structural ToolCollection fixture with no registry-specific API."""
+    """A structural ToolCollection fixture with no registry-specific API.
+
+    提供只满足结构接口的 ToolCollection 测试夹具,不包含注册表专用 API."""
 
     def __init__(self, tools: Sequence[Tool]) -> None:
         self._tools = {tool.definition.name: tool for tool in tools}
@@ -303,7 +312,9 @@ class MinimalToolCollection:
 
 
 class FixtureWorkspaceChangeCheckpoint(WorkspaceChangeCheckpoint):
-    """Opaque checkpoint used to prove the runtime does not need snapshots."""
+    """Opaque checkpoint used to prove the runtime does not need snapshots.
+
+    提供不透明检查点,用于证明运行时不依赖快照."""
 
     __slots__ = ("sequence",)
 
@@ -482,7 +493,9 @@ def observing_supervisor_factory(
 
 
 class DecisionInjectingSupervisor(AgentExecutionSupervisor):
-    """Return one explicit decision while preserving normal observation counters."""
+    """Return one explicit decision while preserving normal observation counters.
+
+    返回一个明确决策,同时保留正常观察计数."""
 
     def __init__(self, budget: ExecutionBudget, decision: SupervisorDecision) -> None:
         super().__init__(budget, mode=SupervisionMode.OBSERVE)
@@ -627,6 +640,104 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 message for message in provider.calls[0].messages if message.role is Role.SYSTEM
             )
             self.assertIn("Implement the approved slice", system.content)
+
+    async def test_queued_plan_execution_reads_task_through_application_session_seam(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = SqliteSessionStore(root / "sessions.db")
+            await store.initialize()
+            session_id = await store.create_session(
+                str(root),
+                "runtime-fixture",
+                "fixture-model",
+            )
+            plan = SessionPlan(
+                (PlanStep("Run the queued plan", PlanStepStatus.IN_PROGRESS),),
+                "Execute only the explicitly selected task.",
+            )
+            await store.save_session_plan(session_id, plan)
+            task = SessionTask(
+                "queued-plan-task",
+                SessionTaskKind.PLAN_EXECUTION,
+                SessionTaskStatus.QUEUED,
+                datetime(2026, 8, 6, 12, tzinfo=UTC),
+                plan_snapshot=plan,
+            )
+            await store.create_session_task(session_id, task)
+            runtime = AgentRuntime(
+                provider=ScriptedProvider(((ModelTextDelta("queued"), ModelCompleted("stop")),)),
+                tools=ToolRegistry(),
+                workspace_change_observer=EmptyWorkspaceChangeObserver(),
+                permissions=PermissionManager(),
+                tool_context=ToolContext(root),
+                session_store=store,
+                plan=plan,
+            )
+            captured: list[GetSessionTaskRequest] = []
+            original = SessionTaskQueryService.get_session_task
+
+            async def capture(
+                service: SessionTaskQueryService,
+                request: GetSessionTaskRequest,
+            ) -> SessionTask | None:
+                captured.append(request)
+                return await original(service, request)
+
+            with patch.object(SessionTaskQueryService, "get_session_task", new=capture):
+                result = await runtime.run(
+                    "Execute the queued plan",
+                    session_id=session_id,
+                    plan_execution_requested=True,
+                    plan_execution_task_id=task.task_id,
+                )
+
+            self.assertEqual(result.response, "queued")
+            self.assertEqual(captured, [GetSessionTaskRequest(session_id, task.task_id)])
+            persisted = await store.get_session_task(session_id, task.task_id)
+            self.assertIsNotNone(persisted)
+            assert persisted is not None
+            self.assertIs(persisted.status, SessionTaskStatus.COMPLETED)
+
+    async def test_new_runtime_session_uses_application_start_session_seam(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = SqliteSessionStore(root / "sessions.db")
+            await store.initialize()
+            provider = ScriptedProvider(((ModelTextDelta("started"), ModelCompleted("stop")),))
+            runtime = AgentRuntime(
+                provider=provider,
+                tools=ToolRegistry(),
+                workspace_change_observer=EmptyWorkspaceChangeObserver(),
+                permissions=PermissionManager(),
+                tool_context=ToolContext(root),
+                session_store=store,
+            )
+            captured: list[StartSessionRequest] = []
+            original = SessionLifecycleService.start_session
+
+            async def capture(
+                service: SessionLifecycleService,
+                request: StartSessionRequest,
+            ) -> object:
+                captured.append(request)
+                return await original(service, request)
+
+            with patch.object(SessionLifecycleService, "start_session", new=capture):
+                result = await runtime.run("Create a session")
+
+            self.assertEqual(result.response, "started")
+            self.assertEqual(
+                captured,
+                [
+                    StartSessionRequest(
+                        str(root),
+                        provider.provider_name,
+                        provider.model_name,
+                        provider.context_affinity,
+                    )
+                ],
+            )
+            self.assertIsNotNone(result.session_id)
 
     async def test_failed_plan_execution_marks_its_durable_task_failed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

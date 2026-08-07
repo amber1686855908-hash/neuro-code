@@ -1,16 +1,20 @@
-"""Canonical UI-preferences port."""
+"""Canonical UI-preferences port.
+
+定义规范的 UI 偏好端口."""
 
 from __future__ import annotations
 
 from typing import Protocol
 
-from neuro_code.domain.interaction_mode import InteractionMode
-from neuro_code.domain.reasoning import ReasoningEffort
-from neuro_code.domain.ui_preferences import UiLanguage
+from neuro_code.domain.conversation.interaction_mode import InteractionMode
+from neuro_code.domain.conversation.reasoning import ReasoningEffort
+from neuro_code.shared.ui_language import UiLanguage
 
 
 class UiPreferencesStore(Protocol):
-    """Persist interactive user preferences outside provider and project config."""
+    """Persist interactive user preferences outside provider and project config.
+
+    在 Provider 配置和项目配置之外持久化交互式用户偏好."""
 
     async def load_language(self) -> UiLanguage: ...
 
