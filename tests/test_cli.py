@@ -16,10 +16,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
-from neuro_code.adapters.provider_catalog import HttpProviderCatalog
-from neuro_code.adapters.provider_settings import JsonProviderSettingsStore
-from neuro_code.adapters.sqlite_session import SqliteSessionStore
 from neuro_code.application.ports.model import ModelToolPolicy
+from neuro_code.application.ports.provider_settings import ManagedProviderProfile
 from neuro_code.application.providers import ChangeProviderRequest, ProviderChangeService
 from neuro_code.application.runtime.agent import AgentRunResult
 from neuro_code.application.runtime.supervision import ExecutionControlMode
@@ -43,33 +41,36 @@ from neuro_code.cli import (
     _run_agent,
     build_parser,
 )
-from neuro_code.config import AppConfig
+from neuro_code.configuration.app import AppConfig
+from neuro_code.domain.conversation.context import ModelContext
+from neuro_code.domain.conversation.events import (
+    AgentEvent,
+    AgentEventKind,
+    ModelCompleted,
+    ModelEvent,
+    ModelTextDelta,
+    ModelToolCall,
+)
+from neuro_code.domain.conversation.messages import Message, Role, ToolCall
 from neuro_code.domain.conversation.reasoning import ReasoningEffort
-from neuro_code.domain.events import AgentEvent, AgentEventKind
 from neuro_code.domain.execution import (
     AgentExecutionOutcome,
     AgentExecutionStatus,
     SessionExecutionRecord,
     SupervisorReasonCode,
 )
-from neuro_code.domain.messages import Message, Role, ToolCall
-from neuro_code.domain.model_context import ModelContext
-from neuro_code.domain.model_events import (
-    ModelCompleted,
-    ModelEvent,
-    ModelTextDelta,
-    ModelToolCall,
-)
-from neuro_code.domain.provider_settings import ManagedProviderProfile
 from neuro_code.domain.sandbox import SandboxProfile
 from neuro_code.domain.tools import ToolDefinition
-from neuro_code.domain.ui_preferences import UiLanguage
 from neuro_code.infrastructure.persistence.output_artifacts import FileToolOutputArtifactStore
+from neuro_code.infrastructure.persistence.sqlite_session import SqliteSessionStore
+from neuro_code.infrastructure.providers.provider_catalog import HttpProviderCatalog
+from neuro_code.infrastructure.providers.provider_settings import JsonProviderSettingsStore
 from neuro_code.interfaces.cli.serialization import (
     serialize_execution_outcome,
     serialize_execution_record,
 )
 from neuro_code.shared.errors import ConfigurationError, ProviderError
+from neuro_code.shared.ui_language import UiLanguage
 
 
 class CliProvider:

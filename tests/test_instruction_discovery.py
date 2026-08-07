@@ -85,7 +85,7 @@ class TestInstructionDiscoveryResult:
         assert "[Repository instruction: AGENTS.md]" in text
 
     def test_instruction_message_is_synthetic_user(self) -> None:
-        from neuro_code.domain.messages import Role, SyntheticReason
+        from neuro_code.domain.conversation.messages import Role, SyntheticReason
 
         f = InstructionFile(relative_path="AGENTS.md", content="Use tabs.", depth=0)
         result = InstructionDiscoveryResult(files=(f,), rejections=(), fingerprint="abc")
@@ -497,15 +497,15 @@ class TestRuntimeInstructionInjection:
         验证指令以合成 User 消息注入,而不是 System 消息."""
         from collections.abc import AsyncIterator, Sequence
 
+        from neuro_code.application.permissions.policy import PermissionManager, PermissionMode
         from neuro_code.application.ports.tools import ToolContext
         from neuro_code.application.runtime.agent import AgentRuntime
+        from neuro_code.domain.conversation.context import ModelContext
+        from neuro_code.domain.conversation.events import ModelCompleted, ModelEvent, ModelTextDelta
+        from neuro_code.domain.conversation.messages import Message, Role, SyntheticReason
         from neuro_code.domain.conversation.reasoning import ReasoningEffort
-        from neuro_code.domain.messages import Message, Role, SyntheticReason
-        from neuro_code.domain.model_context import ModelContext
-        from neuro_code.domain.model_events import ModelCompleted, ModelEvent, ModelTextDelta
         from neuro_code.domain.tools import ToolDefinition
         from neuro_code.infrastructure.tools.registry import ToolRegistry
-        from neuro_code.permissions import PermissionManager, PermissionMode
 
         (tmp_path / INSTRUCTION_FILENAME).write_text("Use tabs.", encoding="utf-8")
         discovery = FilesystemInstructionDiscovery()
@@ -573,15 +573,15 @@ class TestRuntimeInstructionInjection:
         验证没有指令 Provider 时不会注入合成 User 消息."""
         from collections.abc import AsyncIterator, Sequence
 
+        from neuro_code.application.permissions.policy import PermissionManager, PermissionMode
         from neuro_code.application.ports.tools import ToolContext
         from neuro_code.application.runtime.agent import AgentRuntime
+        from neuro_code.domain.conversation.context import ModelContext
+        from neuro_code.domain.conversation.events import ModelCompleted, ModelEvent, ModelTextDelta
+        from neuro_code.domain.conversation.messages import Message, SyntheticReason
         from neuro_code.domain.conversation.reasoning import ReasoningEffort
-        from neuro_code.domain.messages import Message, SyntheticReason
-        from neuro_code.domain.model_context import ModelContext
-        from neuro_code.domain.model_events import ModelCompleted, ModelEvent, ModelTextDelta
         from neuro_code.domain.tools import ToolDefinition
         from neuro_code.infrastructure.tools.registry import ToolRegistry
-        from neuro_code.permissions import PermissionManager, PermissionMode
 
         captured_contexts: list[ModelContext] = []
 
@@ -627,15 +627,15 @@ class TestRuntimeInstructionInjection:
         验证指令内容变化会在下一次调用中被发现."""
         from collections.abc import AsyncIterator, Sequence
 
+        from neuro_code.application.permissions.policy import PermissionManager, PermissionMode
         from neuro_code.application.ports.tools import ToolContext
         from neuro_code.application.runtime.agent import AgentRuntime
+        from neuro_code.domain.conversation.context import ModelContext
+        from neuro_code.domain.conversation.events import ModelCompleted, ModelEvent, ModelTextDelta
+        from neuro_code.domain.conversation.messages import Message, SyntheticReason
         from neuro_code.domain.conversation.reasoning import ReasoningEffort
-        from neuro_code.domain.messages import Message, SyntheticReason
-        from neuro_code.domain.model_context import ModelContext
-        from neuro_code.domain.model_events import ModelCompleted, ModelEvent, ModelTextDelta
         from neuro_code.domain.tools import ToolDefinition
         from neuro_code.infrastructure.tools.registry import ToolRegistry
-        from neuro_code.permissions import PermissionManager, PermissionMode
 
         agents_file = tmp_path / INSTRUCTION_FILENAME
         agents_file.write_text("version 1", encoding="utf-8")
@@ -871,21 +871,21 @@ class TestAgentRuntimeDeepScope:
         验证深层 read_file 会更新跟踪目标,使第二个模型步骤看到根目录和深层指令."""
         from collections.abc import AsyncIterator, Sequence
 
+        from neuro_code.application.permissions.policy import PermissionManager, PermissionMode
         from neuro_code.application.ports.tools import ToolContext
         from neuro_code.application.runtime.agent import AgentRuntime
         from neuro_code.application.runtime.instruction_tracker import InstructionTracker
-        from neuro_code.domain.conversation.reasoning import ReasoningEffort
-        from neuro_code.domain.messages import Message, SyntheticReason, ToolCall
-        from neuro_code.domain.model_context import ModelContext
-        from neuro_code.domain.model_events import (
+        from neuro_code.domain.conversation.context import ModelContext
+        from neuro_code.domain.conversation.events import (
             ModelCompleted,
             ModelEvent,
             ModelTextDelta,
             ModelToolCall,
         )
+        from neuro_code.domain.conversation.messages import Message, SyntheticReason, ToolCall
+        from neuro_code.domain.conversation.reasoning import ReasoningEffort
         from neuro_code.domain.tools import ToolDefinition
-        from neuro_code.permissions import PermissionManager, PermissionMode
-        from neuro_code.tools import default_tool_registry
+        from neuro_code.infrastructure.tools.registry import default_tool_registry
 
         # Workspace layout:
         #   tmp_path/AGENTS.md            -> "root: use 2-space indent"
@@ -983,21 +983,21 @@ class TestAgentRuntimeDeepScope:
         验证 read_file 从 src/foo/ 移动到 src/bar/ 后会排除 src/foo/ 的深层 AGENTS.md."""
         from collections.abc import AsyncIterator, Sequence
 
+        from neuro_code.application.permissions.policy import PermissionManager, PermissionMode
         from neuro_code.application.ports.tools import ToolContext
         from neuro_code.application.runtime.agent import AgentRuntime
         from neuro_code.application.runtime.instruction_tracker import InstructionTracker
-        from neuro_code.domain.conversation.reasoning import ReasoningEffort
-        from neuro_code.domain.messages import Message, SyntheticReason, ToolCall
-        from neuro_code.domain.model_context import ModelContext
-        from neuro_code.domain.model_events import (
+        from neuro_code.domain.conversation.context import ModelContext
+        from neuro_code.domain.conversation.events import (
             ModelCompleted,
             ModelEvent,
             ModelTextDelta,
             ModelToolCall,
         )
+        from neuro_code.domain.conversation.messages import Message, SyntheticReason, ToolCall
+        from neuro_code.domain.conversation.reasoning import ReasoningEffort
         from neuro_code.domain.tools import ToolDefinition
-        from neuro_code.permissions import PermissionManager, PermissionMode
-        from neuro_code.tools import default_tool_registry
+        from neuro_code.infrastructure.tools.registry import default_tool_registry
 
         foo_dir = tmp_path / "src" / "foo"
         bar_dir = tmp_path / "src" / "bar"
@@ -1171,7 +1171,7 @@ class TestSearchReplacePreFlight:
         """
         from neuro_code.application.ports.tools import ToolContext
         from neuro_code.application.runtime.instruction_tracker import InstructionTracker
-        from neuro_code.tools.filesystem import SearchReplaceTool
+        from neuro_code.infrastructure.tools.filesystem import SearchReplaceTool
 
         # Workspace layout:
         #   tmp_path/AGENTS.md           -> "root rules"
@@ -1216,8 +1216,7 @@ class TestSearchReplacePreFlight:
         """
         from neuro_code.application.ports.tools import ToolContext
         from neuro_code.application.runtime.instruction_tracker import InstructionTracker
-        from neuro_code.infrastructure.tools.filesystem import ReadFileTool
-        from neuro_code.tools.filesystem import SearchReplaceTool
+        from neuro_code.infrastructure.tools.filesystem import ReadFileTool, SearchReplaceTool
 
         (tmp_path / INSTRUCTION_FILENAME).write_text("root rules", encoding="utf-8")
         deep_dir = tmp_path / "src" / "deep"
@@ -1258,7 +1257,7 @@ class TestSearchReplacePreFlight:
     ) -> None:
         from neuro_code.application.ports.tools import ToolContext
         from neuro_code.application.runtime.instruction_tracker import InstructionTracker
-        from neuro_code.tools.filesystem import SearchReplaceTool
+        from neuro_code.infrastructure.tools.filesystem import SearchReplaceTool
 
         instructions = tmp_path / INSTRUCTION_FILENAME
         instructions.write_text("version one", encoding="utf-8")

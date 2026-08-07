@@ -8,6 +8,11 @@ from typing import Any, cast
 from unittest.mock import patch
 
 import neuro_code.configuration.app as config_module
+from neuro_code.application.permissions.policy import (
+    PermissionEffect,
+    PermissionMode,
+    PermissionRule,
+)
 from neuro_code.application.permissions.service import ToolApprovalService
 from neuro_code.application.ports.approval import PermissionApprover
 from neuro_code.application.ports.background_tasks import (
@@ -21,18 +26,13 @@ from neuro_code.application.sessions.summary import SessionSummaryQueryService
 from neuro_code.application.settings import ApplicationSettings
 from neuro_code.bootstrap.composition import ApplicationComposition
 from neuro_code.configuration.app import AppConfig
+from neuro_code.domain.conversation.context import ModelContext
+from neuro_code.domain.conversation.events import ModelEvent
 from neuro_code.domain.conversation.reasoning import ReasoningEffort
-from neuro_code.domain.model_context import ModelContext
-from neuro_code.domain.model_events import ModelEvent
 from neuro_code.domain.sandbox import SandboxProfile
 from neuro_code.domain.sessions import SessionSummary
 from neuro_code.domain.tools import ToolDefinition, ToolResult
 from neuro_code.infrastructure.workspace.paths import workspaces_match
-from neuro_code.permissions import (
-    PermissionEffect,
-    PermissionMode,
-    PermissionRule,
-)
 from neuro_code.shared.errors import ConfigurationError, ToolError
 from tests.fakes import EmptyWorkspaceChangeObserver
 

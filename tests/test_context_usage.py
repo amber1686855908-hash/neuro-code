@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import unittest
 
-from neuro_code.domain.context_usage import estimate_context_tokens, estimate_text_tokens
-from neuro_code.domain.messages import Message, Role, ToolCall
+from neuro_code.domain.conversation.context import estimate_context_tokens, estimate_text_tokens
+from neuro_code.domain.conversation.messages import Message, Role, ToolCall
 
 
 class ContextUsageTests(unittest.TestCase):

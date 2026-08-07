@@ -8,8 +8,15 @@ from unittest import mock
 import httpx
 
 from neuro_code.application.ports.model import ModelToolPolicy
-from neuro_code.config import AppConfig, ProviderProfile
-from neuro_code.domain.messages import (
+from neuro_code.configuration.app import AppConfig, ProviderProfile
+from neuro_code.domain.conversation.context import UPSTREAM_IMPORT_PROVIDER, ModelContext
+from neuro_code.domain.conversation.events import (
+    ModelCompleted,
+    ModelReasoningDelta,
+    ModelTextDelta,
+    ModelToolCall,
+)
+from neuro_code.domain.conversation.messages import (
     IMAGE_MODEL_PLACEHOLDER,
     ContentPart,
     ContextItemKind,
@@ -18,20 +25,16 @@ from neuro_code.domain.messages import (
     Role,
     ToolCall,
 )
-from neuro_code.domain.model_context import UPSTREAM_IMPORT_PROVIDER, ModelContext
-from neuro_code.domain.model_events import (
-    ModelCompleted,
-    ModelReasoningDelta,
-    ModelTextDelta,
-    ModelToolCall,
-)
 from neuro_code.domain.tools import ToolDefinition
-from neuro_code.providers import create_provider, create_routed_provider
-from neuro_code.providers.anthropic import AnthropicProvider
-from neuro_code.providers.failover import FailoverModelProvider
-from neuro_code.providers.gemini import GeminiProvider
-from neuro_code.providers.openai_compatible import OpenAICompatibleProvider, _ToolCallBuffer
-from neuro_code.providers.openai_responses import OpenAIResponsesProvider
+from neuro_code.infrastructure.providers import create_provider, create_routed_provider
+from neuro_code.infrastructure.providers.anthropic import AnthropicProvider
+from neuro_code.infrastructure.providers.failover import FailoverModelProvider
+from neuro_code.infrastructure.providers.gemini import GeminiProvider
+from neuro_code.infrastructure.providers.openai_compatible import (
+    OpenAICompatibleProvider,
+    _ToolCallBuffer,
+)
+from neuro_code.infrastructure.providers.openai_responses import OpenAIResponsesProvider
 from neuro_code.shared.errors import ConfigurationError, ProviderError
 
 

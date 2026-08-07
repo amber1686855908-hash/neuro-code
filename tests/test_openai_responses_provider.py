@@ -6,11 +6,16 @@ import unittest
 import httpx
 
 from neuro_code.application.ports.model import ModelToolPolicy
-from neuro_code.domain.messages import ContextItemKind, Message, PreservedContextItem, Role
-from neuro_code.domain.model_context import ModelContext
-from neuro_code.domain.model_events import ModelCompleted
+from neuro_code.domain.conversation.context import ModelContext
+from neuro_code.domain.conversation.events import ModelCompleted
+from neuro_code.domain.conversation.messages import (
+    ContextItemKind,
+    Message,
+    PreservedContextItem,
+    Role,
+)
 from neuro_code.domain.tools import ToolDefinition
-from neuro_code.providers.openai_responses import OpenAIResponsesProvider
+from neuro_code.infrastructure.providers.openai_responses import OpenAIResponsesProvider
 
 
 def _reasoning() -> PreservedContextItem:

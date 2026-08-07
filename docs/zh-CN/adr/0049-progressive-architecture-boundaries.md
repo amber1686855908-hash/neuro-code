@@ -5,6 +5,8 @@
 - 状态：已接受
 - 日期：2026-07-22
 - 源代码基线：`c68e39f60462f28d9be5e683d9cbe2c57b1a5027`
+- 其中关于保留 Provider facade 的部分已由 Architecture Freeze v1 后的 ADR 0072 取代。
+- 其中关于保留 Adapter、Tool 和 Domain 平面 facade 的部分已由兼容性清理审计后的 ADR 0074 取代。
 
 ## 背景
 

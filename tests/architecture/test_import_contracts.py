@@ -11,16 +11,13 @@ import tomllib
 from pathlib import Path
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
+_PACKAGE_ROOT = _PROJECT_ROOT / "src" / "neuro_code"
 
 _EXPECTED_IMPORTS = (
     ("neuro_code", "__version__"),
     ("neuro_code.acp", "NeuroCodeAcpAgent"),
     ("neuro_code.acp", "serve_acp"),
-    ("neuro_code.adapters.sqlite_session", "SqliteSessionStore"),
     ("neuro_code.infrastructure.persistence.sqlite_session", "SqliteSessionStore"),
-    ("neuro_code.adapters.rust_session", "RustSessionImport"),
-    ("neuro_code.adapters.rust_session", "load_rust_session"),
-    ("neuro_code.adapters.rust_session", "UPSTREAM_IMPORT_PROVIDER"),
     ("neuro_code.infrastructure.persistence", "RustSessionImport"),
     ("neuro_code.infrastructure.persistence", "load_rust_session"),
     ("neuro_code.infrastructure.persistence", "UPSTREAM_IMPORT_PROVIDER"),
@@ -32,7 +29,6 @@ _EXPECTED_IMPORTS = (
         "neuro_code.infrastructure.persistence.rust_session",
         "load_rust_session",
     ),
-    ("neuro_code.adapters.ui_preferences", "JsonUiPreferencesStore"),
     ("neuro_code.infrastructure.persistence", "JsonUiPreferencesStore"),
     (
         "neuro_code.infrastructure.persistence.ui_preferences",
@@ -40,16 +36,8 @@ _EXPECTED_IMPORTS = (
     ),
     ("neuro_code.infrastructure.background_tasks", "LocalBackgroundTaskManager"),
     (
-        "neuro_code.adapters.instruction_discovery",
-        "FilesystemInstructionDiscovery",
-    ),
-    (
         "neuro_code.infrastructure.workspace.instructions",
         "FilesystemInstructionDiscovery",
-    ),
-    (
-        "neuro_code.adapters.skill_discovery",
-        "FilesystemSkillDiscovery",
     ),
     (
         "neuro_code.infrastructure.workspace.skills",
@@ -299,22 +287,15 @@ _EXPECTED_IMPORTS = (
     ("neuro_code.domain.sessions.search", "SessionSearchPage"),
     ("neuro_code.domain.sessions.search", "fallback_session_title"),
     ("neuro_code.domain.sessions.search", "searchable_session_text"),
-    ("neuro_code.domain.session_search", "SessionSearchHit"),
-    ("neuro_code.domain.session_search", "SessionSearchPage"),
     ("neuro_code.domain.conversation.interaction_mode", "InteractionMode"),
     (
         "neuro_code.domain.conversation.interaction_mode",
         "interaction_mode_guidance",
     ),
-    ("neuro_code.domain.interaction_mode", "InteractionMode"),
-    ("neuro_code.domain.interaction_mode", "interaction_mode_guidance"),
     ("neuro_code.domain.conversation.reasoning", "ReasoningEffort"),
     ("neuro_code.domain.conversation.reasoning", "reasoning_guidance"),
-    ("neuro_code.domain.reasoning", "ReasoningEffort"),
-    ("neuro_code.domain.reasoning", "reasoning_guidance"),
     ("neuro_code.domain.workspace", "InstructionDiscoveryResult"),
     ("neuro_code.domain.workspace.instructions", "InstructionDiscoveryResult"),
-    ("neuro_code.domain.instructions", "InstructionDiscoveryResult"),
     (
         "neuro_code.domain.background_tasks.models",
         "DEFAULT_BACKGROUND_WAKE_COOLDOWN_SECONDS",
@@ -346,7 +327,6 @@ _EXPECTED_IMPORTS = (
     ("neuro_code.domain.terminal.models", "TerminalSize"),
     ("neuro_code.domain.workspace", "SkillInfo"),
     ("neuro_code.domain.workspace.skills", "SkillInfo"),
-    ("neuro_code.domain.skills", "SkillInfo"),
     ("neuro_code.configuration.app", "AppConfig"),
     ("neuro_code.configuration.app", "ProviderProfile"),
     ("neuro_code.configuration.app", "load_config"),
@@ -358,7 +338,6 @@ _EXPECTED_IMPORTS = (
     ("neuro_code.shared.errors", "ConfigurationError"),
     ("neuro_code.shared.redaction", "redact_sensitive_text"),
     ("neuro_code.shared.ui_language", "UiLanguage"),
-    ("neuro_code.domain.ui_preferences", "UiLanguage"),
     ("neuro_code.application.ports", "ToolCollection"),
     ("neuro_code.application.ports", "ProviderCatalogError"),
     ("neuro_code.application.ports", "ProviderCatalogResult"),
@@ -371,16 +350,10 @@ _EXPECTED_IMPORTS = (
     ("neuro_code.application.ports.provider_catalog", "ProviderCatalogError"),
     ("neuro_code.application.ports.provider_catalog", "ProviderCatalogResult"),
     ("neuro_code.application.ports.provider_catalog", "ProviderConnectionSpec"),
-    ("neuro_code.domain.provider_catalog", "ProviderCatalogError"),
-    ("neuro_code.domain.provider_catalog", "ProviderCatalogResult"),
-    ("neuro_code.domain.provider_catalog", "ProviderConnectionSpec"),
     ("neuro_code.application.ports.provider_settings", "ManagedProviderProfile"),
     ("neuro_code.application.ports.provider_settings", "ManagedProviderSettings"),
     ("neuro_code.application.ports.provider_settings", "ManagedProxyPolicy"),
     ("neuro_code.application.ports.provider_settings", "ProviderSettingsStore"),
-    ("neuro_code.domain.provider_settings", "ManagedProviderProfile"),
-    ("neuro_code.domain.provider_settings", "ManagedProviderSettings"),
-    ("neuro_code.domain.provider_settings", "ManagedProxyPolicy"),
     ("neuro_code.application.ports", "WorkspaceChangeObserver"),
     ("neuro_code.application.ports", "WorkspaceIdentity"),
     ("neuro_code.application.ports", "WorkspacePathResolver"),
@@ -394,20 +367,12 @@ _EXPECTED_IMPORTS = (
     ("neuro_code.bootstrap.composition", "WorkspaceChangeObserverFactory"),
     ("neuro_code.bootstrap.entrypoints", "main"),
     ("neuro_code.cli", "build_parser"),
-    ("neuro_code.config", "AppConfig"),
-    ("neuro_code.config", "ProviderProfile"),
-    ("neuro_code.config", "load_config"),
-    ("neuro_code.providers", "create_provider"),
-    ("neuro_code.providers", "create_routed_provider"),
     ("neuro_code.infrastructure.providers", "create_provider"),
     ("neuro_code.infrastructure.providers", "create_routed_provider"),
-    ("neuro_code.providers.openai_responses", "OpenAIResponsesProvider"),
     (
         "neuro_code.infrastructure.providers.openai_responses",
         "OpenAIResponsesProvider",
     ),
-    ("neuro_code.tools", "ToolRegistry"),
-    ("neuro_code.tools", "default_tool_registry"),
     ("neuro_code.tui", "NeuroCodeApp"),
 )
 
@@ -423,21 +388,6 @@ _COMPATIBILITY_IDENTITY_EXPORTS = (
         ("ToolCollection",),
     ),
     (
-        "neuro_code.domain.provider_catalog",
-        "neuro_code.application.ports.provider_catalog",
-        ("ProviderCatalogError", "ProviderCatalogResult", "ProviderConnectionSpec"),
-    ),
-    (
-        "neuro_code.domain.ui_preferences",
-        "neuro_code.shared.ui_language",
-        ("UiLanguage",),
-    ),
-    (
-        "neuro_code.domain.provider_settings",
-        "neuro_code.application.ports.provider_settings",
-        ("ManagedProviderProfile", "ManagedProviderSettings", "ManagedProxyPolicy"),
-    ),
-    (
         "neuro_code.application.ports",
         "neuro_code.application.ports.provider_settings",
         (
@@ -445,70 +395,6 @@ _COMPATIBILITY_IDENTITY_EXPORTS = (
             "ManagedProviderSettings",
             "ManagedProxyPolicy",
             "ProviderSettingsStore",
-        ),
-    ),
-    (
-        "neuro_code.config",
-        "neuro_code.configuration.app",
-        (
-            "AppConfig",
-            "ProviderProfile",
-            "load_config",
-            "override_provider",
-            "override_sandbox",
-            "pin_resumed_sandbox",
-            "resolve_http_client_policy",
-        ),
-    ),
-    (
-        "neuro_code.domain.session_search",
-        "neuro_code.domain.sessions.search",
-        (
-            "SessionSearchHit",
-            "SessionSearchPage",
-            "fallback_session_title",
-            "searchable_session_text",
-        ),
-    ),
-    (
-        "neuro_code.domain.interaction_mode",
-        "neuro_code.domain.conversation.interaction_mode",
-        ("InteractionMode", "interaction_mode_guidance"),
-    ),
-    (
-        "neuro_code.domain.reasoning",
-        "neuro_code.domain.conversation.reasoning",
-        ("ReasoningEffort", "reasoning_guidance"),
-    ),
-    (
-        "neuro_code.domain.instructions",
-        "neuro_code.domain.workspace.instructions",
-        (
-            "InstructionDiscoveryResult",
-            "InstructionFile",
-            "InstructionRejection",
-            "InstructionRejectionReason",
-            "compute_instruction_fingerprint",
-            "normalize_relative_path",
-        ),
-    ),
-    (
-        "neuro_code.domain.skills",
-        "neuro_code.domain.workspace.skills",
-        (
-            "ParsedFrontmatter",
-            "SkillDiscoveryResult",
-            "SkillInfo",
-            "SkillRejection",
-            "SkillRejectionReason",
-            "SkillScope",
-            "apply_skill_substitutions",
-            "compute_skill_fingerprint",
-            "extract_skill_body",
-            "is_valid_skill_name",
-            "normalize_relative_path",
-            "normalize_skill_name",
-            "parse_frontmatter",
         ),
     ),
     (
@@ -561,70 +447,17 @@ _COMPATIBILITY_IDENTITY_EXPORTS = (
     ),
 )
 
-# These paths are intentionally kept as one-way compatibility facades until a
-# versioned removal decision is made.  The quarantine is explicit so a future
-# production import cannot silently make a facade an implementation dependency.
+# These are the remaining runtime compatibility facades. The quarantine is
+# explicit so a future production import cannot silently make a facade an
+# implementation dependency.
 _LEGACY_FACADE_MODULES = frozenset(
     {
-        "neuro_code.config",
-        "neuro_code.permissions",
-        "neuro_code.bash_commands",
-        "neuro_code.workspace",
-        "neuro_code.workspace_changes",
-        "neuro_code.domain.background_tasks",
-        "neuro_code.domain.context_usage",
-        "neuro_code.domain.events",
-        "neuro_code.domain.instructions",
-        "neuro_code.domain.interaction_mode",
-        "neuro_code.domain.messages",
-        "neuro_code.domain.model_context",
-        "neuro_code.domain.model_events",
-        "neuro_code.domain.provider_catalog",
-        "neuro_code.domain.provider_settings",
-        "neuro_code.domain.reasoning",
-        "neuro_code.domain.sandbox",
-        "neuro_code.domain.session_search",
-        "neuro_code.domain.skills",
-        "neuro_code.domain.terminal",
-        "neuro_code.domain.ui_preferences",
         "neuro_code.application.runtime.approval",
         "neuro_code.application.runtime.conversation",
         "neuro_code.application.runtime.instruction_tracker",
         "neuro_code.application.runtime.profile_conversation",
         "neuro_code.application.runtime.skill_tracker",
         "neuro_code.application.runtime.terminal_sessions",
-        "neuro_code.adapters.background_tasks",
-        "neuro_code.adapters.instruction_discovery",
-        "neuro_code.adapters.mcp_http",
-        "neuro_code.adapters.mcp_stdio",
-        "neuro_code.adapters.posix_pty",
-        "neuro_code.adapters.process_tree",
-        "neuro_code.adapters.provider_catalog",
-        "neuro_code.adapters.provider_settings",
-        "neuro_code.adapters.rust_session",
-        "neuro_code.adapters.sandbox",
-        "neuro_code.adapters.skill_discovery",
-        "neuro_code.adapters.sqlite_session",
-        "neuro_code.adapters.ui_preferences",
-        "neuro_code.adapters.windows_conpty",
-        "neuro_code.adapters.windows_job",
-        "neuro_code.adapters.windows_job_process",
-        "neuro_code.adapters.windows_process",
-        "neuro_code.adapters.windows_pty",
-        "neuro_code.providers",
-        "neuro_code.providers.anthropic",
-        "neuro_code.providers.failover",
-        "neuro_code.providers.gemini",
-        "neuro_code.providers.openai_compatible",
-        "neuro_code.providers.openai_responses",
-        "neuro_code.tools",
-        "neuro_code.tools.background_tasks",
-        "neuro_code.tools.bash",
-        "neuro_code.tools.client_terminal",
-        "neuro_code.tools.filesystem",
-        "neuro_code.tools.plans",
-        "neuro_code.tools.registry",
-        "neuro_code.tools.skills",
     }
 )
 
@@ -640,6 +473,72 @@ def test_key_compatibility_imports_remain_available() -> None:
     )
 
 
+def test_removed_root_compatibility_modules_are_absent() -> None:
+    removed = (
+        "neuro_code.bash_commands",
+        "neuro_code.config",
+        "neuro_code.permissions",
+        "neuro_code.workspace",
+        "neuro_code.workspace_changes",
+    )
+    for module_name in removed:
+        assert importlib.util.find_spec(module_name) is None, module_name
+
+
+def test_removed_adapter_tool_and_flat_domain_facades_are_absent() -> None:
+    for package_name in ("adapters", "tools"):
+        package_root = _PACKAGE_ROOT / package_name
+        assert not any(package_root.glob("*.py")), package_name
+
+    domain_root = _PACKAGE_ROOT / "domain"
+    removed_flat_files = (
+        "background_tasks.py",
+        "context_usage.py",
+        "events.py",
+        "instructions.py",
+        "interaction_mode.py",
+        "messages.py",
+        "model_context.py",
+        "model_events.py",
+        "provider_catalog.py",
+        "provider_settings.py",
+        "reasoning.py",
+        "sandbox.py",
+        "session_search.py",
+        "skills.py",
+        "terminal.py",
+        "ui_preferences.py",
+    )
+    for filename in removed_flat_files:
+        assert not (domain_root / filename).exists(), filename
+
+    for module_name in (
+        "neuro_code.domain.context_usage",
+        "neuro_code.domain.events",
+        "neuro_code.domain.instructions",
+        "neuro_code.domain.interaction_mode",
+        "neuro_code.domain.messages",
+        "neuro_code.domain.model_context",
+        "neuro_code.domain.model_events",
+        "neuro_code.domain.provider_catalog",
+        "neuro_code.domain.provider_settings",
+        "neuro_code.domain.reasoning",
+        "neuro_code.domain.session_search",
+        "neuro_code.domain.skills",
+        "neuro_code.domain.ui_preferences",
+    ):
+        assert importlib.util.find_spec(module_name) is None, module_name
+
+    # These names remain importable as canonical package aggregates; only their
+    # conflicting flat .py facades were removed.
+    for module_name in (
+        "neuro_code.domain.background_tasks",
+        "neuro_code.domain.sandbox",
+        "neuro_code.domain.terminal",
+    ):
+        assert importlib.util.find_spec(module_name) is not None, module_name
+
+
 def test_compatibility_exports_preserve_object_identity() -> None:
     mismatches: list[str] = []
     for old_module_name, canonical_module_name, export_names in _COMPATIBILITY_IDENTITY_EXPORTS:
@@ -651,69 +550,6 @@ def test_compatibility_exports_preserve_object_identity() -> None:
     assert not mismatches, "compatibility exports changed object identity:\n" + "\n".join(
         f"  - {entry}" for entry in mismatches
     )
-
-
-def test_conversation_canonical_modules_preserve_legacy_identity() -> None:
-    canonical = {
-        "messages": importlib.import_module("neuro_code.domain.conversation.messages"),
-        "events": importlib.import_module("neuro_code.domain.conversation.events"),
-        "context": importlib.import_module("neuro_code.domain.conversation.context"),
-        "interaction_mode": importlib.import_module(
-            "neuro_code.domain.conversation.interaction_mode"
-        ),
-        "reasoning": importlib.import_module("neuro_code.domain.conversation.reasoning"),
-    }
-    legacy = {
-        "messages": importlib.import_module("neuro_code.domain.messages"),
-        "events": importlib.import_module("neuro_code.domain.events"),
-        "model_events": importlib.import_module("neuro_code.domain.model_events"),
-        "model_context": importlib.import_module("neuro_code.domain.model_context"),
-        "context_usage": importlib.import_module("neuro_code.domain.context_usage"),
-    }
-
-    for name in (
-        "ContentPart",
-        "ContentPartKind",
-        "ContextItemKind",
-        "Message",
-        "PreservedContextItem",
-        "Role",
-        "SessionItem",
-        "SyntheticReason",
-        "ToolCall",
-    ):
-        assert getattr(legacy["messages"], name) is getattr(canonical["messages"], name)
-    for name in ("AgentEvent", "AgentEventKind"):
-        assert getattr(legacy["events"], name) is getattr(canonical["events"], name)
-    for name in (
-        "ModelBackendToolCompleted",
-        "ModelBackendToolStarted",
-        "ModelCompleted",
-        "ModelProviderAttemptFailed",
-        "ModelProviderSelected",
-        "ModelReasoningDelta",
-        "ModelTextDelta",
-        "ModelToolCall",
-    ):
-        assert getattr(legacy["model_events"], name) is getattr(canonical["events"], name)
-    assert legacy["model_events"].ModelEvent is canonical["events"].ModelEvent
-    assert legacy["model_context"].ModelContext is canonical["context"].ModelContext
-    assert (
-        legacy["model_context"].UPSTREAM_IMPORT_PROVIDER
-        == canonical["context"].UPSTREAM_IMPORT_PROVIDER
-    )
-    for name in ("estimate_context_tokens", "estimate_text_tokens"):
-        assert getattr(legacy["context_usage"], name) is getattr(canonical["context"], name)
-
-    assert (
-        canonical["interaction_mode"].InteractionMode.__module__
-        == canonical["interaction_mode"].__name__
-    )
-    assert canonical["reasoning"].ReasoningEffort.__module__ == canonical["reasoning"].__name__
-
-    assert canonical["messages"].Message.__module__ == canonical["messages"].__name__
-    assert canonical["events"].AgentEvent.__module__ == canonical["events"].__name__
-    assert canonical["context"].ModelContext.__module__ == canonical["context"].__name__
 
 
 def test_production_sources_use_canonical_conversation_imports() -> None:
@@ -740,113 +576,6 @@ def test_production_sources_use_canonical_conversation_imports() -> None:
             else:
                 continue
             assert not legacy_modules.intersection(imported_modules), path
-
-
-def test_importing_canonical_interaction_mode_does_not_load_legacy_facade() -> None:
-    script = """
-import importlib
-import sys
-
-importlib.import_module("neuro_code.domain.conversation.interaction_mode")
-assert "neuro_code.domain.interaction_mode" not in sys.modules
-"""
-    result = subprocess.run(
-        [sys.executable, "-c", script],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    assert result.returncode == 0, result.stderr or result.stdout
-
-
-def test_importing_canonical_reasoning_does_not_load_legacy_facade() -> None:
-    script = """
-import importlib
-import sys
-
-importlib.import_module("neuro_code.domain.conversation.reasoning")
-assert "neuro_code.domain.reasoning" not in sys.modules
-"""
-    result = subprocess.run(
-        [sys.executable, "-c", script],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    assert result.returncode == 0, result.stderr or result.stdout
-
-
-def test_workspace_instruction_package_preserves_legacy_identity() -> None:
-    aggregate = importlib.import_module("neuro_code.domain.workspace")
-    canonical = importlib.import_module("neuro_code.domain.workspace.instructions")
-    legacy = importlib.import_module("neuro_code.domain.instructions")
-
-    for name in (
-        "InstructionDiscoveryResult",
-        "InstructionFile",
-        "InstructionRejection",
-        "InstructionRejectionReason",
-    ):
-        assert getattr(aggregate, name) is getattr(canonical, name)
-        assert getattr(legacy, name) is getattr(canonical, name)
-        assert getattr(canonical, name).__module__ == canonical.__name__
-    for name in (
-        "INSTRUCTION_FILENAME",
-        "MAX_DIRECTORY_DEPTH",
-        "MAX_INSTRUCTION_FILES",
-        "MAX_SINGLE_FILE_BYTES",
-        "MAX_TOTAL_BYTES",
-    ):
-        assert getattr(aggregate, name) == getattr(canonical, name)
-
-
-def test_workspace_skill_package_preserves_legacy_identity() -> None:
-    aggregate = importlib.import_module("neuro_code.domain.workspace")
-    canonical = importlib.import_module("neuro_code.domain.workspace.skills")
-    legacy = importlib.import_module("neuro_code.domain.skills")
-
-    for name in (
-        "ParsedFrontmatter",
-        "SkillDiscoveryResult",
-        "SkillInfo",
-        "SkillRejection",
-        "SkillRejectionReason",
-        "SkillScope",
-    ):
-        assert getattr(aggregate, name) is getattr(canonical, name)
-        assert getattr(legacy, name) is getattr(canonical, name)
-        assert getattr(canonical, name).__module__ == canonical.__name__
-    for name in (
-        "MAX_DESCRIPTION_LEN",
-        "MAX_FRONTMATTER_BYTES",
-        "MAX_NAME_LEN",
-        "MAX_SINGLE_SKILL_BYTES",
-        "MAX_SKILL_FILES",
-        "MAX_SKILL_SUBSTITUTIONS",
-        "MAX_TOTAL_SKILL_BYTES",
-        "SKILL_CONFIG_DIRS",
-        "SKILL_FILENAME",
-        "SKILL_SUBDIR",
-    ):
-        assert getattr(aggregate, name) == getattr(canonical, name)
-        assert getattr(legacy, name) == getattr(canonical, name)
-
-
-def test_importing_canonical_workspace_skills_does_not_load_legacy_facade() -> None:
-    script = """
-import importlib
-import sys
-
-importlib.import_module("neuro_code.domain.workspace.skills")
-assert "neuro_code.domain.skills" not in sys.modules
-"""
-    result = subprocess.run(
-        [sys.executable, "-c", script],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    assert result.returncode == 0, result.stderr or result.stdout
 
 
 def test_importing_canonical_session_profile_does_not_load_runtime_facade() -> None:
@@ -898,59 +627,6 @@ assert "neuro_code.application.runtime.conversation" not in sys.modules
         text=True,
     )
     assert result.returncode == 0, result.stderr or result.stdout
-
-
-def test_importing_canonical_workspace_instructions_does_not_load_legacy_facade() -> None:
-    script = """
-import importlib
-import sys
-
-importlib.import_module("neuro_code.domain.workspace.instructions")
-assert "neuro_code.domain.instructions" not in sys.modules
-"""
-    result = subprocess.run(
-        [sys.executable, "-c", script],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    assert result.returncode == 0, result.stderr or result.stdout
-
-
-def test_production_sources_use_canonical_workspace_instruction_imports() -> None:
-    legacy_module = "neuro_code.domain.instructions"
-    source_root = _PROJECT_ROOT / "src" / "neuro_code"
-    for path in source_root.rglob("*.py"):
-        if path == source_root / "domain" / "instructions.py":
-            continue
-        tree = ast.parse(path.read_text(encoding="utf-8"))
-        for node in ast.walk(tree):
-            imported_module = node.module if isinstance(node, ast.ImportFrom) else None
-            if isinstance(node, ast.Import):
-                imported_modules = tuple(alias.name for alias in node.names)
-            elif imported_module is not None:
-                imported_modules = (imported_module,)
-            else:
-                continue
-            assert legacy_module not in imported_modules, path
-
-
-def test_production_sources_use_canonical_workspace_skill_imports() -> None:
-    legacy_module = "neuro_code.domain.skills"
-    source_root = _PROJECT_ROOT / "src" / "neuro_code"
-    for path in source_root.rglob("*.py"):
-        if path == source_root / "domain" / "skills.py":
-            continue
-        tree = ast.parse(path.read_text(encoding="utf-8"))
-        for node in ast.walk(tree):
-            imported_module = node.module if isinstance(node, ast.ImportFrom) else None
-            if isinstance(node, ast.Import):
-                imported_modules = tuple(alias.name for alias in node.names)
-            elif imported_module is not None:
-                imported_modules = (imported_module,)
-            else:
-                continue
-            assert legacy_module not in imported_modules, path
 
 
 def test_production_sources_use_canonical_session_profile_imports() -> None:
@@ -1117,41 +793,6 @@ def test_sessions_package_preserves_public_identity_from_models_module() -> None
     ):
         assert getattr(aggregate, name) is getattr(search, name)
     assert aggregate.SessionSearchHit.__module__ == search.__name__
-
-
-def test_importing_canonical_session_search_does_not_load_legacy_facade() -> None:
-    script = """
-import importlib
-import sys
-
-importlib.import_module("neuro_code.domain.sessions.search")
-assert "neuro_code.domain.session_search" not in sys.modules
-"""
-    result = subprocess.run(
-        [sys.executable, "-c", script],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    assert result.returncode == 0, result.stderr or result.stdout
-
-
-def test_production_sources_use_canonical_session_search_imports() -> None:
-    legacy_modules = frozenset({"neuro_code.domain.session_search"})
-    source_root = _PROJECT_ROOT / "src" / "neuro_code"
-    for path in source_root.rglob("*.py"):
-        tree = ast.parse(path.read_text(encoding="utf-8"))
-        for node in ast.walk(tree):
-            imported_module = node.module if isinstance(node, ast.ImportFrom) else None
-            if isinstance(node, ast.Import):
-                imported_modules = tuple(alias.name for alias in node.names)
-            elif imported_module is not None:
-                imported_modules = (imported_module,)
-            else:
-                continue
-            if path == source_root / "domain" / "session_search.py":
-                continue
-            assert not legacy_modules.intersection(imported_modules), path
 
 
 def test_tools_package_preserves_public_identity_from_models_module() -> None:
@@ -1326,154 +967,6 @@ def test_production_code_does_not_import_legacy_compatibility_facades() -> None:
             assert not _LEGACY_FACADE_MODULES.intersection(imported_modules), path
 
 
-def test_process_tree_compatibility_facade_preserves_canonical_identity() -> None:
-    canonical = importlib.import_module("neuro_code.infrastructure.sandbox.process_tree")
-    facade = importlib.import_module("neuro_code.adapters.process_tree")
-
-    assert facade.ProcessTree is canonical.ProcessTree
-    assert canonical.ProcessTree.__module__ == canonical.__name__
-
-
-def test_pty_compatibility_facades_preserve_canonical_identity() -> None:
-    canonical_posix = importlib.import_module("neuro_code.infrastructure.sandbox.posix_pty")
-    facade_posix = importlib.import_module("neuro_code.adapters.posix_pty")
-    canonical_windows = importlib.import_module("neuro_code.infrastructure.sandbox.windows_pty")
-    facade_windows = importlib.import_module("neuro_code.adapters.windows_pty")
-
-    assert facade_posix.PosixPtyPlatform is canonical_posix.PosixPtyPlatform
-    assert facade_posix.PosixPtySession is canonical_posix.PosixPtySession
-    assert facade_windows.WindowsConPtyPlatform is canonical_windows.WindowsConPtyPlatform
-    assert facade_windows.WindowsConPtySession is canonical_windows.WindowsConPtySession
-    assert canonical_posix.PosixPtySession.__module__ == canonical_posix.__name__
-    assert canonical_windows.WindowsConPtySession.__module__ == canonical_windows.__name__
-
-
-def test_bubblewrap_sandbox_compatibility_facade_preserves_canonical_identity() -> None:
-    canonical = importlib.import_module("neuro_code.infrastructure.sandbox.sandbox")
-    facade = importlib.import_module("neuro_code.adapters.sandbox")
-
-    for name in (
-        "LinuxBubblewrapSandbox",
-        "create_shell_sandbox",
-        "enforce_configured_sandbox",
-    ):
-        assert getattr(facade, name) is getattr(canonical, name)
-    assert canonical.LinuxBubblewrapSandbox.__module__ == canonical.__name__
-
-
-def test_windows_process_compatibility_facade_preserves_canonical_identity() -> None:
-    canonical = importlib.import_module("neuro_code.infrastructure.sandbox.windows_process")
-    facade = importlib.import_module("neuro_code.adapters.windows_process")
-
-    assert facade.windows_environment_block is canonical.windows_environment_block
-    assert canonical.windows_environment_block.__module__ == canonical.__name__
-
-
-def test_windows_job_compatibility_facade_preserves_canonical_identity() -> None:
-    canonical = importlib.import_module("neuro_code.infrastructure.sandbox.windows_job")
-    facade = importlib.import_module("neuro_code.adapters.windows_job")
-
-    assert facade.WindowsJobObject is canonical.WindowsJobObject
-    assert canonical.WindowsJobObject.__module__ == canonical.__name__
-
-
-def test_windows_job_process_compatibility_facade_preserves_canonical_identity() -> None:
-    canonical = importlib.import_module("neuro_code.infrastructure.sandbox.windows_job_process")
-    facade = importlib.import_module("neuro_code.adapters.windows_job_process")
-
-    assert facade.WindowsJobProcess is canonical.WindowsJobProcess
-    assert canonical.WindowsJobProcess.__module__ == canonical.__name__
-
-
-def test_windows_conpty_compatibility_facade_preserves_canonical_identity() -> None:
-    canonical = importlib.import_module("neuro_code.infrastructure.sandbox.windows_conpty")
-    facade = importlib.import_module("neuro_code.adapters.windows_conpty")
-
-    assert facade.WindowsPseudoConsoleSession is canonical.WindowsPseudoConsoleSession
-    assert canonical.WindowsPseudoConsoleSession.__module__ == canonical.__name__
-
-
-def test_provider_catalog_compatibility_facade_preserves_canonical_identity() -> None:
-    canonical = importlib.import_module("neuro_code.infrastructure.providers.provider_catalog")
-    facade = importlib.import_module("neuro_code.adapters.provider_catalog")
-
-    assert facade.HttpProviderCatalog is canonical.HttpProviderCatalog
-    assert canonical.HttpProviderCatalog.__module__ == canonical.__name__
-
-
-def test_provider_settings_compatibility_facade_preserves_canonical_identity() -> None:
-    canonical = importlib.import_module("neuro_code.infrastructure.providers.provider_settings")
-    facade = importlib.import_module("neuro_code.adapters.provider_settings")
-
-    assert facade.JsonProviderSettingsStore is canonical.JsonProviderSettingsStore
-    assert canonical.JsonProviderSettingsStore.__module__ == canonical.__name__
-
-
-def test_provider_compatibility_facades_preserve_canonical_identity() -> None:
-    canonical = importlib.import_module("neuro_code.infrastructure.providers")
-    facade = importlib.import_module("neuro_code.providers")
-    names = (
-        "AnthropicProvider",
-        "FailoverModelProvider",
-        "GeminiProvider",
-        "OpenAICompatibleProvider",
-        "OpenAIResponsesProvider",
-        "ProviderCandidate",
-        "create_provider",
-        "create_routed_provider",
-    )
-    for name in names:
-        assert getattr(facade, name) is getattr(canonical, name)
-
-
-def test_provider_submodule_facades_preserve_canonical_identity() -> None:
-    pairs = (
-        (
-            "neuro_code.providers.anthropic",
-            "neuro_code.infrastructure.providers.anthropic",
-            ("AnthropicProvider",),
-        ),
-        (
-            "neuro_code.providers.gemini",
-            "neuro_code.infrastructure.providers.gemini",
-            ("GeminiProvider",),
-        ),
-        (
-            "neuro_code.providers.failover",
-            "neuro_code.infrastructure.providers.failover",
-            ("FailoverModelProvider", "ProviderCandidate"),
-        ),
-        (
-            "neuro_code.providers.openai_compatible",
-            "neuro_code.infrastructure.providers.openai_compatible",
-            ("OpenAICompatibleProvider", "_ToolCallBuffer"),
-        ),
-        (
-            "neuro_code.providers.openai_responses",
-            "neuro_code.infrastructure.providers.openai_responses",
-            ("OpenAIResponsesProvider",),
-        ),
-    )
-    for facade_name, canonical_name, names in pairs:
-        facade = importlib.import_module(facade_name)
-        canonical = importlib.import_module(canonical_name)
-        for name in names:
-            assert getattr(facade, name) is getattr(canonical, name)
-
-
-def test_provider_image_reference_facade_preserves_canonical_identity() -> None:
-    canonical = importlib.import_module("neuro_code.infrastructure.providers.image_references")
-    facade = importlib.import_module("neuro_code.providers.image_references")
-    names = (
-        "InlineImageReference",
-        "RemoteImageReference",
-        "parse_image_reference",
-        "is_gemini_file_uri",
-    )
-    for name in names:
-        assert getattr(facade, name) is getattr(canonical, name)
-
-
 def test_importing_canonical_provider_modules_does_not_load_legacy_facades() -> None:
     script = """
 import importlib
@@ -1496,144 +989,6 @@ assert not any(name.startswith("neuro_code.providers.") for name in sys.modules)
         text=True,
     )
     assert result.returncode == 0, result.stderr or result.stdout
-
-
-def test_sqlite_session_compatibility_facade_preserves_canonical_identity() -> None:
-    canonical = importlib.import_module("neuro_code.infrastructure.persistence.sqlite_session")
-    facade = importlib.import_module("neuro_code.adapters.sqlite_session")
-
-    assert facade.SqliteSessionStore is canonical.SqliteSessionStore
-    assert canonical.SqliteSessionStore.__module__ == canonical.__name__
-
-
-def test_rust_session_compatibility_facade_preserves_canonical_identity() -> None:
-    canonical = importlib.import_module("neuro_code.infrastructure.persistence.rust_session")
-    facade = importlib.import_module("neuro_code.adapters.rust_session")
-    aggregate = importlib.import_module("neuro_code.infrastructure.persistence")
-
-    for name in (
-        "RustSessionImport",
-        "load_rust_session",
-        "UPSTREAM_IMPORT_PROVIDER",
-    ):
-        assert getattr(facade, name) is getattr(canonical, name)
-        assert getattr(aggregate, name) is getattr(canonical, name)
-    assert canonical.RustSessionImport.__module__ == canonical.__name__
-    assert canonical.load_rust_session.__module__ == canonical.__name__
-
-
-def test_importing_canonical_rust_session_does_not_load_legacy_facade() -> None:
-    script = """
-import importlib
-import sys
-
-importlib.import_module("neuro_code.infrastructure.persistence.rust_session")
-assert "neuro_code.adapters.rust_session" not in sys.modules
-"""
-    result = subprocess.run(
-        [sys.executable, "-c", script],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    assert result.returncode == 0, result.stderr or result.stdout
-
-
-def test_ui_preferences_compatibility_facade_preserves_canonical_identity() -> None:
-    canonical = importlib.import_module("neuro_code.infrastructure.persistence.ui_preferences")
-    facade = importlib.import_module("neuro_code.adapters.ui_preferences")
-    aggregate = importlib.import_module("neuro_code.infrastructure.persistence")
-
-    assert facade.JsonUiPreferencesStore is canonical.JsonUiPreferencesStore
-    assert aggregate.JsonUiPreferencesStore is canonical.JsonUiPreferencesStore
-    assert canonical.JsonUiPreferencesStore.__module__ == canonical.__name__
-
-
-def test_importing_canonical_ui_preferences_does_not_load_legacy_facade() -> None:
-    script = """
-import importlib
-import sys
-
-importlib.import_module("neuro_code.infrastructure.persistence.ui_preferences")
-assert "neuro_code.adapters.ui_preferences" not in sys.modules
-"""
-    result = subprocess.run(
-        [sys.executable, "-c", script],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    assert result.returncode == 0, result.stderr or result.stdout
-
-
-def test_mcp_stdio_compatibility_facade_preserves_canonical_identity() -> None:
-    canonical = importlib.import_module("neuro_code.infrastructure.mcp.stdio")
-    facade = importlib.import_module("neuro_code.adapters.mcp_stdio")
-
-    for name in ("McpStdioTool", "McpStdioToolCollection"):
-        canonical_type = getattr(canonical, name)
-        assert getattr(facade, name) is canonical_type
-        assert canonical_type.__module__ == canonical.__name__
-
-
-def test_mcp_http_compatibility_facade_preserves_canonical_identity() -> None:
-    canonical = importlib.import_module("neuro_code.infrastructure.mcp.http")
-    facade = importlib.import_module("neuro_code.adapters.mcp_http")
-
-    for name in ("McpHttpError", "McpHttpServerConfig", "McpHttpToolCollection"):
-        canonical_type = getattr(canonical, name)
-        assert getattr(facade, name) is canonical_type
-        assert canonical_type.__module__ == canonical.__name__
-
-
-def test_workspace_path_compatibility_facade_preserves_canonical_identity() -> None:
-    canonical = importlib.import_module("neuro_code.infrastructure.workspace.paths")
-    facade = importlib.import_module("neuro_code.workspace")
-    names = (
-        "FilesystemWorkspaceIdentity",
-        "FilesystemWorkspacePathResolver",
-        "is_additional_workspace_path",
-        "resolve_workspace_path",
-        "workspace_display_path",
-        "workspaces_match",
-    )
-    for name in names:
-        canonical_value = getattr(canonical, name)
-        assert getattr(facade, name) is canonical_value
-        assert canonical_value.__module__ == canonical.__name__
-
-
-def test_workspace_change_compatibility_facade_preserves_canonical_identity() -> None:
-    canonical = importlib.import_module("neuro_code.infrastructure.workspace.changes")
-    facade = importlib.import_module("neuro_code.workspace_changes")
-    names = (
-        "FilesystemWorkspaceChangeObserver",
-        "MultiRootWorkspaceChangeObserver",
-        "WorkspaceFileSnapshot",
-        "WorkspaceSnapshot",
-        "capture_workspace_snapshot",
-        "compare_workspace_snapshots",
-    )
-    for name in names:
-        canonical_value = getattr(canonical, name)
-        assert getattr(facade, name) is canonical_value
-        assert canonical_value.__module__ == canonical.__name__
-
-
-def test_instruction_discovery_compatibility_facade_preserves_canonical_identity() -> None:
-    canonical = importlib.import_module("neuro_code.infrastructure.workspace.instructions")
-    facade = importlib.import_module("neuro_code.adapters.instruction_discovery")
-
-    assert facade.FilesystemInstructionDiscovery is canonical.FilesystemInstructionDiscovery
-    assert canonical.FilesystemInstructionDiscovery.__module__ == canonical.__name__
-
-
-def test_skill_discovery_compatibility_facade_preserves_canonical_identity() -> None:
-    canonical = importlib.import_module("neuro_code.infrastructure.workspace.skills")
-    facade = importlib.import_module("neuro_code.adapters.skill_discovery")
-
-    assert facade.FilesystemSkillDiscovery is canonical.FilesystemSkillDiscovery
-    assert canonical.FilesystemSkillDiscovery.__module__ == canonical.__name__
 
 
 def test_importing_canonical_workspace_modules_does_not_load_legacy_facades() -> None:
@@ -1687,67 +1042,12 @@ assert settings is importlib.import_module(
     assert result.returncode == 0, result.stderr or result.stdout
 
 
-def test_plan_tool_compatibility_facade_preserves_canonical_identity() -> None:
-    canonical = importlib.import_module("neuro_code.infrastructure.tools.plans")
-    facade = importlib.import_module("neuro_code.tools.plans")
-
-    assert facade.UpdatePlanTool is canonical.UpdatePlanTool
-    assert canonical.UpdatePlanTool.__module__ == canonical.__name__
-
-
-def test_skill_tool_compatibility_facade_preserves_canonical_identity() -> None:
-    canonical = importlib.import_module("neuro_code.infrastructure.tools.skills")
-    facade = importlib.import_module("neuro_code.tools.skills")
-
-    assert facade.SkillTool is canonical.SkillTool
-    assert canonical.SkillTool.__module__ == canonical.__name__
-
-
-def test_readonly_filesystem_tools_compatibility_facade_preserves_canonical_identity() -> None:
-    canonical = importlib.import_module("neuro_code.infrastructure.tools.filesystem")
-    facade = importlib.import_module("neuro_code.tools.filesystem")
-
-    for name in ("ReadFileTool", "ListDirTool", "GrepTool"):
-        canonical_tool = getattr(canonical, name)
-        facade_tool = getattr(facade, name)
-        assert facade_tool is canonical_tool
-        assert canonical_tool.__module__ == canonical.__name__
-
-
-def test_bash_tool_compatibility_facade_preserves_canonical_identity() -> None:
-    canonical = importlib.import_module("neuro_code.infrastructure.tools.bash")
-    facade = importlib.import_module("neuro_code.tools.bash")
-
-    assert facade.BashTool is canonical.BashTool
-    assert canonical.BashTool.__module__ == canonical.__name__
-
-
-def test_importing_canonical_bash_tool_does_not_load_legacy_facade() -> None:
-    script = """
-import importlib
-import sys
-
-importlib.import_module("neuro_code.infrastructure.tools.bash")
-
-assert "neuro_code.tools.bash" not in sys.modules
-"""
-    result = subprocess.run(
-        [sys.executable, "-c", script],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    assert result.returncode == 0, result.stderr or result.stdout
-
-
 def test_filesystem_canonical_owner_includes_the_write_tool() -> None:
     """Stage 5G makes the filesystem tool module the single owner.
 
     验证阶段 5G 使文件系统工具模块成为唯一所有者."""
     canonical = importlib.import_module("neuro_code.infrastructure.tools.filesystem")
-    facade = importlib.import_module("neuro_code.tools.filesystem")
 
-    assert facade.SearchReplaceTool is canonical.SearchReplaceTool
     assert canonical.SearchReplaceTool.__module__ == canonical.__name__
 
 
@@ -1767,19 +1067,6 @@ assert "neuro_code.tools.filesystem" not in sys.modules
         text=True,
     )
     assert result.returncode == 0, result.stderr or result.stdout
-
-
-def test_tool_registry_compatibility_facade_preserves_canonical_identity() -> None:
-    canonical = importlib.import_module("neuro_code.infrastructure.tools.registry")
-    facade = importlib.import_module("neuro_code.tools.registry")
-    aggregate = importlib.import_module("neuro_code.tools")
-
-    assert facade.ToolRegistry is canonical.ToolRegistry
-    assert facade.default_tool_registry is canonical.default_tool_registry
-    assert aggregate.ToolRegistry is canonical.ToolRegistry
-    assert aggregate.default_tool_registry is canonical.default_tool_registry
-    assert canonical.ToolRegistry.__module__ == canonical.__name__
-    assert canonical.default_tool_registry.__module__ == canonical.__name__
 
 
 def test_tool_registry_import_does_not_eagerly_load_tool_implementations() -> None:
@@ -1817,27 +1104,14 @@ for module_name in (
     assert result.returncode == 0, result.stderr or result.stdout
 
 
-def test_background_tools_compatibility_facade_preserves_canonical_identity() -> None:
-    canonical = importlib.import_module("neuro_code.infrastructure.tools.background_tasks")
-    facade = importlib.import_module("neuro_code.tools.background_tasks")
-
-    for name in ("KillTaskTool", "TaskOutputTool", "WaitTasksTool"):
-        canonical_tool = getattr(canonical, name)
-        facade_tool = getattr(facade, name)
-        assert facade_tool is canonical_tool
-        assert canonical_tool.__module__ == canonical.__name__
-
-
 def test_background_tasks_canonical_owner_includes_the_kill_tool() -> None:
     """Stage 5J makes the background task tools share one canonical owner.
 
     验证阶段 5J 使后台任务工具共享一个规范所有者."""
     canonical = importlib.import_module("neuro_code.infrastructure.tools.background_tasks")
-    facade = importlib.import_module("neuro_code.tools.background_tasks")
 
     for name in ("KillTaskTool", "TaskOutputTool", "WaitTasksTool"):
         canonical_tool = getattr(canonical, name)
-        assert getattr(facade, name) is canonical_tool
         assert canonical_tool.__module__ == canonical.__name__
 
 
@@ -1875,54 +1149,11 @@ for module_name in (
     assert result.returncode == 0, result.stderr or result.stdout
 
 
-def test_background_manager_compatibility_facade_preserves_canonical_identity() -> None:
-    canonical = importlib.import_module("neuro_code.infrastructure.background_tasks")
-    facade = importlib.import_module("neuro_code.adapters.background_tasks")
-
-    assert facade.LocalBackgroundTaskManager is canonical.LocalBackgroundTaskManager
-    assert canonical.LocalBackgroundTaskManager.__module__ == canonical.__name__
-
-
-def test_importing_canonical_background_manager_does_not_load_legacy_facade() -> None:
-    script = """
-import importlib
-import sys
-
-importlib.import_module("neuro_code.infrastructure.background_tasks")
-assert "neuro_code.adapters.background_tasks" not in sys.modules
-"""
-    result = subprocess.run(
-        [sys.executable, "-c", script],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    assert result.returncode == 0, result.stderr or result.stdout
-
-
-def test_client_terminal_tools_compatibility_facade_preserves_canonical_identity() -> None:
-    canonical = importlib.import_module("neuro_code.infrastructure.tools.client_terminal")
-    facade = importlib.import_module("neuro_code.tools.client_terminal")
-
-    for name in (
-        "ClientTerminalKillTool",
-        "ClientTerminalOutputTool",
-        "ClientTerminalStartTool",
-        "ClientTerminalTool",
-        "ClientTerminalWaitTool",
-    ):
-        canonical_tool = getattr(canonical, name)
-        facade_tool = getattr(facade, name)
-        assert facade_tool is canonical_tool
-        assert canonical_tool.__module__ == canonical.__name__
-
-
 def test_client_terminal_canonical_owner_includes_session_tools() -> None:
     """Stage 5I makes the client-terminal module the single tool owner.
 
     验证阶段 5I 使客户端终端模块成为唯一工具所有者."""
     canonical = importlib.import_module("neuro_code.infrastructure.tools.client_terminal")
-    legacy = importlib.import_module("neuro_code.tools.client_terminal")
 
     for name in (
         "ClientTerminalKillTool",
@@ -1932,7 +1163,6 @@ def test_client_terminal_canonical_owner_includes_session_tools() -> None:
         "ClientTerminalWaitTool",
     ):
         canonical_tool = getattr(canonical, name)
-        assert getattr(legacy, name) is canonical_tool
         assert canonical_tool.__module__ == canonical.__name__
 
 
@@ -2037,18 +1267,12 @@ assert "neuro_code.infrastructure.sandbox.process_tree" not in sys.modules
 def test_removed_configuration_compatibility_exports_are_not_public() -> None:
     canonical_app = importlib.import_module("neuro_code.configuration.app")
     canonical = importlib.import_module("neuro_code.configuration.managed_provider_settings")
-    adapter = importlib.import_module("neuro_code.adapters.provider_settings")
-    config = importlib.import_module("neuro_code.config")
 
     assert canonical.__all__ == ["load_managed_provider_settings"]
     assert canonical.load_managed_provider_settings.__module__ == canonical.__name__
-    assert adapter.__all__ == ["JsonProviderSettingsStore"]
-    assert not hasattr(adapter, "load_managed_provider_settings")
-    assert not hasattr(config, "load_managed_provider_settings")
-    assert not hasattr(config, "ProviderConfig")
-    assert config.__all__ == canonical_app.__all__
-    assert config.ProviderProfile.__module__ == canonical_app.__name__
-    assert config.AppConfig.__module__ == canonical_app.__name__
+    assert importlib.util.find_spec("neuro_code.config") is None
+    assert canonical_app.AppConfig.__module__ == canonical_app.__name__
+    assert canonical_app.ProviderProfile.__module__ == canonical_app.__name__
 
 
 def test_importing_canonical_configuration_does_not_load_legacy_facade() -> None:
@@ -2090,7 +1314,6 @@ def test_production_code_uses_canonical_configuration_owner() -> None:
 
 
 def test_permissions_expose_policy_without_approval_contract_reexports() -> None:
-    permissions = importlib.import_module("neuro_code.permissions")
     policy = importlib.import_module("neuro_code.application.permissions.policy")
     contracts = importlib.import_module("neuro_code.application.permissions.contracts")
     approval_port = importlib.import_module("neuro_code.application.ports.approval")
@@ -2108,47 +1331,13 @@ def test_permissions_expose_policy_without_approval_contract_reexports() -> None
         "build_permission_request",
     )
 
-    assert all(hasattr(permissions, name) for name in policy_names)
-    assert all(getattr(permissions, name) is getattr(policy, name) for name in policy_names)
     assert policy.__all__ == list(policy_names)
     assert all(getattr(policy, name).__module__ == policy.__name__ for name in policy_names)
     assert contracts.__all__ == list(contract_names)
-    assert not any(hasattr(permissions, name) for name in contract_names)
+    assert importlib.util.find_spec("neuro_code.permissions") is None
     assert approval_port.PermissionApprover.__module__ == "neuro_code.application.ports.approval"
 
-    script = """
-def import_approval() -> None:
-    from neuro_code.permissions import PermissionApproval
-
-def import_approval_kind() -> None:
-    from neuro_code.permissions import PermissionApprovalKind
-
-def import_request() -> None:
-    from neuro_code.permissions import PermissionRequest
-
-def import_request_builder() -> None:
-    from neuro_code.permissions import build_permission_request
-
-for import_contract in (
-    import_approval,
-    import_approval_kind,
-    import_request,
-    import_request_builder,
-):
-    try:
-        import_contract()
-    except ImportError:
-        pass
-    else:
-        raise AssertionError(f"removed root approval contract was importable: {import_contract}")
-"""
-    result = subprocess.run(
-        [sys.executable, "-c", script],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    assert result.returncode == 0, result.stderr or result.stdout
+    assert contract_names
 
 
 def test_source_and_tests_do_not_statically_import_removed_root_approval_contracts() -> None:
@@ -2169,13 +1358,6 @@ def test_source_and_tests_do_not_statically_import_removed_root_approval_contrac
                 imported_names = {alias.name for alias in node.names}
                 assert not imported_names & contract_names, path
 
-    permissions_path = _PROJECT_ROOT / "src" / "neuro_code" / "permissions.py"
-    permissions_tree = ast.parse(permissions_path.read_text(encoding="utf-8"))
-    assert not any(
-        isinstance(node, ast.ImportFrom)
-        and node.module == "neuro_code.application.permissions.contracts"
-        for node in ast.walk(permissions_tree)
-    )
     policy_path = _PROJECT_ROOT / "src" / "neuro_code" / "application" / "permissions" / "policy.py"
     policy_tree = ast.parse(policy_path.read_text(encoding="utf-8"))
     assert not any(
@@ -2200,23 +1382,6 @@ assert "neuro_code.permissions" not in sys.modules
         text=True,
     )
     assert result.returncode == 0, result.stderr or result.stdout
-
-
-def test_bash_command_analysis_facade_preserves_canonical_identity() -> None:
-    canonical = importlib.import_module("neuro_code.domain.permissions.bash_commands")
-    aggregate = importlib.import_module("neuro_code.domain.permissions")
-    facade = importlib.import_module("neuro_code.bash_commands")
-
-    for name in ("BashCommandAnalysis", "BashCommandSegment", "analyze_bash_command"):
-        owner = getattr(canonical, name)
-        assert getattr(aggregate, name) is owner
-        assert getattr(facade, name) is owner
-        assert owner.__module__ == canonical.__name__
-    assert canonical.__all__ == [
-        "BashCommandAnalysis",
-        "BashCommandSegment",
-        "analyze_bash_command",
-    ]
 
 
 def test_importing_canonical_bash_command_analysis_does_not_load_legacy_facade() -> None:
@@ -2264,7 +1429,7 @@ def test_application_package_retains_settings_without_composition_facade() -> No
 
 def test_permissions_can_initialize_before_the_tui_module() -> None:
     script = """
-import neuro_code.permissions
+import neuro_code.application.permissions
 import neuro_code.tui
 """
     result = subprocess.run(
@@ -2364,6 +1529,7 @@ def test_removed_runtime_package_cannot_be_imported() -> None:
     script = """
 import importlib
 import importlib.util
+from pathlib import Path
 
 assert importlib.util.find_spec("neuro_code.runtime") is None
 try:
@@ -2561,21 +1727,22 @@ def test_responses_provider_uses_the_canonical_module_without_xai_wrapper() -> N
     script = """
 import importlib
 import importlib.util
+from pathlib import Path
 
 canonical = importlib.import_module("neuro_code.infrastructure.providers.openai_responses")
-providers = importlib.import_module("neuro_code.providers")
-legacy = importlib.import_module("neuro_code.providers.openai_responses")
 
 assert canonical.__all__ == ["OpenAIResponsesProvider"]
 assert canonical.OpenAIResponsesProvider.__module__ == canonical.__name__
-assert providers.OpenAIResponsesProvider is canonical.OpenAIResponsesProvider
-assert legacy.OpenAIResponsesProvider is canonical.OpenAIResponsesProvider
-assert "XAIResponsesProvider" not in vars(providers)
-assert importlib.util.find_spec("neuro_code.providers.xai_responses") is None
+providers_root = Path.cwd() / "src" / "neuro_code" / "providers"
+assert not any(providers_root.glob("*.py"))
+assert not (providers_root / "xai_responses.py").exists()
 try:
     importlib.import_module("neuro_code.providers.xai_responses")
 except ModuleNotFoundError as error:
-    assert error.name == "neuro_code.providers.xai_responses"
+    assert error.name in {
+        "neuro_code.providers",
+        "neuro_code.providers.xai_responses",
+    }
 else:
     raise AssertionError("removed xAI Responses provider module was importable")
 """

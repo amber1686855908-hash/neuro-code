@@ -15,11 +15,11 @@ from neuro_code.application.sessions.profile_conversation import (
     ProviderOption,
 )
 from neuro_code.domain.background_tasks import BackgroundTaskSnapshot, BackgroundTaskStatus
+from neuro_code.domain.conversation.context import ModelContext
+from neuro_code.domain.conversation.events import ModelEvent
 from neuro_code.domain.conversation.interaction_mode import InteractionMode
+from neuro_code.domain.conversation.messages import Message, Role, SessionItem
 from neuro_code.domain.conversation.reasoning import ReasoningEffort
-from neuro_code.domain.messages import Message, Role, SessionItem
-from neuro_code.domain.model_context import ModelContext
-from neuro_code.domain.model_events import ModelEvent
 from neuro_code.domain.plans import PlanComment, PlanStep, SessionPlan
 from neuro_code.domain.sandbox import SandboxProfile
 from neuro_code.domain.session_tasks import SessionTask, SessionTaskKind, SessionTaskStatus

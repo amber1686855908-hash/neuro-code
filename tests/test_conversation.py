@@ -9,7 +9,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import patch
 
-from neuro_code.adapters.sqlite_session import SqliteSessionStore
+from neuro_code.application.permissions.policy import PermissionManager
 from neuro_code.application.ports.tools import ToolContext
 from neuro_code.application.runtime.agent import AgentRuntime
 from neuro_code.application.sessions.conversation import (
@@ -17,7 +17,15 @@ from neuro_code.application.sessions.conversation import (
     AgentConversation,
 )
 from neuro_code.domain.background_tasks import BackgroundWakeState
-from neuro_code.domain.events import AgentEvent, AgentEventKind
+from neuro_code.domain.conversation.context import ModelContext
+from neuro_code.domain.conversation.events import (
+    AgentEvent,
+    AgentEventKind,
+    ModelCompleted,
+    ModelEvent,
+    ModelTextDelta,
+)
+from neuro_code.domain.conversation.messages import Message, Role
 from neuro_code.domain.execution import (
     AgentExecutionOutcome,
     AgentExecutionStatus,
@@ -25,9 +33,6 @@ from neuro_code.domain.execution import (
     SupervisorReasonCode,
     TurnCancellationPolicy,
 )
-from neuro_code.domain.messages import Message, Role
-from neuro_code.domain.model_context import ModelContext
-from neuro_code.domain.model_events import ModelCompleted, ModelEvent, ModelTextDelta
 from neuro_code.domain.plans import PlanComment, PlanStep, PlanStepStatus, SessionPlan
 from neuro_code.domain.sandbox import SandboxProfile
 from neuro_code.domain.session_tasks import (
@@ -38,9 +43,9 @@ from neuro_code.domain.session_tasks import (
 )
 from neuro_code.domain.tools import ToolDefinition
 from neuro_code.infrastructure.background_tasks import LocalBackgroundTaskManager
-from neuro_code.permissions import PermissionManager
+from neuro_code.infrastructure.persistence.sqlite_session import SqliteSessionStore
+from neuro_code.infrastructure.tools.registry import default_tool_registry
 from neuro_code.shared.errors import ConfigurationError, ProviderError
-from neuro_code.tools import default_tool_registry
 from tests.fakes import EmptyWorkspaceChangeObserver, FakeWorkspaceIdentity
 
 

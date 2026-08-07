@@ -7,8 +7,8 @@ semantics.  Tool implementations are imported lazily inside the factory so
 that importing this module does not load bash, background-task, client
 terminal, filesystem, plan, or skill implementations.
 
-The former ``neuro_code.tools.registry`` path remains a one-way compatibility
-facade; the public ``neuro_code.tools`` aggregate re-exports the same objects.
+The former ``neuro_code.tools.registry`` facade has been removed; this module
+is the only registry owner.
 
 定义具体的工具注册表适配器. 该模块只负责连接,不执行工具、不持有副作用、权限、沙箱或取消语义.
 """

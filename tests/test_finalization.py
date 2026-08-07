@@ -13,10 +13,15 @@ from neuro_code.application.runtime.finalization import (
     FinalizationResult,
     FinalizationStatus,
 )
+from neuro_code.domain.conversation.context import ModelContext
+from neuro_code.domain.conversation.events import (
+    ModelCompleted,
+    ModelEvent,
+    ModelTextDelta,
+    ModelToolCall,
+)
+from neuro_code.domain.conversation.messages import Message, Role, ToolCall
 from neuro_code.domain.execution import SupervisorReasonCode
-from neuro_code.domain.messages import Message, Role, ToolCall
-from neuro_code.domain.model_context import ModelContext
-from neuro_code.domain.model_events import ModelCompleted, ModelEvent, ModelTextDelta, ModelToolCall
 from neuro_code.domain.tools import ToolDefinition
 from neuro_code.shared.errors import ProviderError
 

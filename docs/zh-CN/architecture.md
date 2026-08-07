@@ -41,7 +41,7 @@ canonical 进程入口位于 bootstrap。少数从入站层到 bootstrap 的兼�
 根级 shared compatibility 模块 `neuro_code.{errors,async_utils,redaction}` 和
 `neuro_code.ports`；shared 原语和端口契约仅可通过各自的 canonical 路径获得。
 `neuro_code.shared.ui_language` 现在拥有跨层 `UiLanguage` 原语；原
-`neuro_code.domain.ui_preferences` 导入仅用于兼容。UI 偏好端口、持久化、TUI 和本地化文案均使用
+`neuro_code.domain.ui_preferences` facade 已移除。UI 偏好端口、持久化、TUI 和本地化文案均使用
 shared owner，同时不改变语言值或持久化行为。
 阶段 2A 将 `neuro_code.application.settings.ApplicationSettings` 和
 `neuro_code.bootstrap.composition.ApplicationComposition` 建立为 canonical 路径。
@@ -50,7 +50,8 @@ shared owner，同时不改变语言值或持久化行为。
 具体 infrastructure。审批交互契约现在只位于 `neuro_code.application.permissions.contracts`。
 开发阶段的 breaking cleanup 已移除根级的 `PermissionApproval`、`PermissionApprovalKind`、
 `PermissionRequest` 和 `build_permission_request` re-export；
-`neuro_code.permissions` 只保留同步权限策略实现。
+原 `neuro_code.permissions` 模块也已移除；权限策略只从
+`neuro_code.application.permissions.policy` 提供。
 
 阶段 2B 将 `neuro_code.bootstrap.entrypoints` 建立为 canonical 的 CLI/TUI 启动入口，console
 scripts 和 `python -m neuro_code` 都直接使用它。它只在相应命令实际需要时选择应用组合、SQLite
@@ -119,18 +120,19 @@ identity 的兼容导出。执行记录写入、schema、事务、Runtime、Prov
 明确的 canonical 子模块获得。`neuro_code.application.runtime.__init__` 现阶段保持最小，
 不提供 aggregate API；内部生产代码直接导入 canonical 子模块。
 
-`neuro_code.config` 现阶段负责 `AppConfig` 和 `ProviderProfile`、TOML 与 CC Switch
+`neuro_code.configuration.app` 负责 `AppConfig` 和 `ProviderProfile`、TOML 与 CC Switch
 配置、环境覆盖、路由、managed overlay、sandbox 策略、stored credential 注入以及 HTTP
 proxy policy。`neuro_code.configuration.managed_provider_settings` 中的同步 managed JSON
 reader 负责 schema、protocol 和 dialect 检查、文件大小限制、metadata/credentials 合并、
 结构校验以及 `ManagedProviderSettings` 构造。managed provider 值对象和持久化契约的
 canonical owner 是
 `neuro_code.application.ports.provider_settings`；原
-`neuro_code.domain.provider_settings` 路径仅作为单向兼容 facade 保留。这样配置和基础设施消费者
-都通过 application port 边界工作，同时不改变校验或持久化行为。`neuro_code.adapters.provider_settings` 负责
-`JsonProviderSettingsStore`、异步持久化、原子写入和 POSIX 私有权限。它通过私有绑定使用
-canonical reader，不再 re-export 它。`neuro_code.config` 同样通过私有绑定使用 reader，且不再
-导入 provider-settings adapter；该边界中的 `ProviderProfile` 和 `AppConfig` 取代已移除的
+`neuro_code.domain.provider_settings` facade 已移除。这样配置和基础设施消费者
+都通过 application port 边界工作，同时不改变校验或持久化行为。
+`JsonProviderSettingsStore` 由 `neuro_code.infrastructure.providers.provider_settings` 负责，
+包括异步持久化、原子写入和 POSIX 私有权限。它通过私有绑定使用 canonical reader。
+导入 provider-settings adapter。原 `neuro_code.config` facade 已移除，调用方应直接使用
+`neuro_code.configuration.app`；该边界中的 `ProviderProfile` 和 `AppConfig` 取代已移除的
 `ProviderConfig` alias。当前 active temporary allowlist 为空。唯一剩余的 raw forbidden edge
 是 canonical package-executable entrypoint：
 `neuro_code.__main__ -> neuro_code.bootstrap.entrypoints`；它不属于待清除的兼容债务。
@@ -197,7 +199,7 @@ canonical reader，不再 re-export 它。`neuro_code.config` 同样通过私有
 
 纯指令值对象的 canonical owner 是
 `neuro_code.domain.workspace.instructions`。旧的
-`neuro_code.domain.instructions` 路径只保留单向兼容 facade；文件系统发现适配器仍位于
+`neuro_code.domain.instructions` facade 已移除；文件系统发现适配器仍位于
 `neuro_code.infrastructure.workspace.instructions`。这样可以把领域投影值与文件系统副作用分开，
 同时不改变发现端口和既有安全限制。
 
@@ -251,7 +253,7 @@ inspect 不使用与活动会话相同的运行时实例。详见
 
 纯技能元数据的 canonical owner 是
 `neuro_code.domain.workspace.skills`。旧的
-`neuro_code.domain.skills` 路径只保留单向兼容 facade；文件系统发现仍位于
+`neuro_code.domain.skills` facade 已移除；文件系统发现仍位于
 `neuro_code.infrastructure.workspace.skills`，`SkillTool` 仍是基础设施层的只读正文读取工具。
 这样可以让解析、有界元数据投影、替换、fingerprint 和合成消息构造与文件系统副作用分离。
 
@@ -736,9 +738,11 @@ TUI 通过 `Ctrl+E`、`/effort` 和 `/reasoning` 暴露选择，CLI 则使用 `-
 组合根选择命名 `ProviderProfile`；代理运行时不会按商业供应商名称分支。profile 将线路
 协议（`openai-chat`、`openai-responses`、`anthropic-messages` 或
 `gemini-generate-content`）与 xAI Responses 等可选方言行为分离。通用 Responses 适配器实现位于
-`neuro_code.providers.openai_responses.OpenAIResponsesProvider`；xAI 行为通过
+`neuro_code.infrastructure.providers.openai_responses.OpenAIResponsesProvider`；xAI 行为通过
 `dialect = "xai"` 选择，而不是独立的 Python provider 类。开发阶段的 breaking cleanup 已移除
-`neuro_code.providers.xai_responses` 和 `XAIResponsesProvider`。
+`neuro_code.providers.xai_responses` 和 `XAIResponsesProvider`；Architecture Freeze v1
+随后移除了过时的 `neuro_code.providers` 包及其 Provider 子模块 facade。该导入边界决定记录于
+ADR 0072。
 凭据只能是环境变量引用或通过校验的回环代理占位符。TUI 还通过 `ProviderSettingsStore` 端口管理用户级
 profile；其 JSON 适配器把非密钥元数据和凭据分别原子写入仅所有者可访问的文件。
 代理模式及可选环境变量名属于非密钥元数据；解析后的代理 URL 仍只存在于环境/适配器边界。
@@ -769,11 +773,11 @@ Responses、Anthropic 与 Gemini profile 映射到各自模型列表端点。适
 受管 provider 值对象（`ManagedProviderProfile`、`ManagedProviderSettings`、
 `ManagedProxyPolicy`）以及 `ProviderSettingsStore` 契约的 canonical owner 是
 `neuro_code.application.ports.provider_settings`。历史
-`neuro_code.domain.provider_settings` 导入仅用于兼容，不包含第二份实现。详见 ADR 0049 第 82 项。
+`neuro_code.domain.provider_settings` facade 已移除，且不包含第二份实现。详见 ADR 0074。
 
 请求、有限结果、分类错误和端口类型的 canonical owner 是
 `neuro_code.application.ports.provider_catalog`；原
-`neuro_code.domain.provider_catalog` 仅作为兼容 facade 保留，不再存在第二份实现。
+`neuro_code.domain.provider_catalog` facade 已移除，不再存在第二份实现。
 
 可选的正整数 `context_window_tokens` 记录供应商/模型能力元数据。它通过脱敏 profile 选择
 和故障转移事件传播，用于本地预算，但绝不会序列化为 API 请求参数；真实上限仍由模型

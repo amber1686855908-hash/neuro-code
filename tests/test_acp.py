@@ -90,19 +90,12 @@ from neuro_code.application.tools import (
 )
 from neuro_code.bootstrap.composition import ApplicationComposition
 from neuro_code.bootstrap.entrypoints import BootstrapCliServices
-from neuro_code.config import AppConfig, ProviderProfile
+from neuro_code.configuration.app import AppConfig, ProviderProfile
 from neuro_code.domain.background_tasks import BackgroundTaskStatus, BackgroundTaskWaitMode
+from neuro_code.domain.conversation.context import ModelContext
+from neuro_code.domain.conversation.events import AgentEvent, AgentEventKind, ModelEvent
 from neuro_code.domain.conversation.interaction_mode import InteractionMode
-from neuro_code.domain.conversation.reasoning import ReasoningEffort
-from neuro_code.domain.events import AgentEvent, AgentEventKind
-from neuro_code.domain.execution import (
-    AgentExecutionOutcome,
-    AgentExecutionStatus,
-    SupervisorReasonCode,
-    TurnCancellationPolicy,
-    TurnSource,
-)
-from neuro_code.domain.messages import (
+from neuro_code.domain.conversation.messages import (
     ContentPart,
     ContextItemKind,
     Message,
@@ -111,8 +104,14 @@ from neuro_code.domain.messages import (
     SessionItem,
     ToolCall,
 )
-from neuro_code.domain.model_context import ModelContext
-from neuro_code.domain.model_events import ModelEvent
+from neuro_code.domain.conversation.reasoning import ReasoningEffort
+from neuro_code.domain.execution import (
+    AgentExecutionOutcome,
+    AgentExecutionStatus,
+    SupervisorReasonCode,
+    TurnCancellationPolicy,
+    TurnSource,
+)
 from neuro_code.domain.plans import SessionPlan
 from neuro_code.domain.sandbox import SandboxProfile
 from neuro_code.domain.sessions import SessionSummary

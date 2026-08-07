@@ -6,22 +6,22 @@ import unittest
 import httpx
 
 from neuro_code.application.ports.model import ModelToolPolicy
-from neuro_code.domain.messages import (
+from neuro_code.domain.conversation.context import ModelContext
+from neuro_code.domain.conversation.events import (
+    ModelCompleted,
+    ModelReasoningDelta,
+    ModelTextDelta,
+    ModelToolCall,
+)
+from neuro_code.domain.conversation.messages import (
     IMAGE_MODEL_PLACEHOLDER,
     ContentPart,
     Message,
     Role,
     ToolCall,
 )
-from neuro_code.domain.model_context import ModelContext
-from neuro_code.domain.model_events import (
-    ModelCompleted,
-    ModelReasoningDelta,
-    ModelTextDelta,
-    ModelToolCall,
-)
 from neuro_code.domain.tools import ToolDefinition
-from neuro_code.providers.gemini import GeminiProvider
+from neuro_code.infrastructure.providers.gemini import GeminiProvider
 from neuro_code.shared.errors import ProviderError
 
 
