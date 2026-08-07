@@ -6,16 +6,19 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from neuro_code.adapters.provider_settings import JsonProviderSettingsStore
-from neuro_code.config import (
+from neuro_code.application.ports.provider_settings import (
+    ManagedProviderProfile,
+    ManagedProxyPolicy,
+)
+from neuro_code.configuration.app import (
     ProviderProfile,
     load_config,
     override_provider,
     override_sandbox,
     pin_resumed_sandbox,
 )
-from neuro_code.domain.provider_settings import ManagedProviderProfile, ManagedProxyPolicy
 from neuro_code.domain.sandbox import SandboxProfile
+from neuro_code.infrastructure.providers.provider_settings import JsonProviderSettingsStore
 from neuro_code.shared.errors import ConfigurationError
 
 
@@ -43,7 +46,7 @@ class ConfigTests(unittest.TestCase):
             )
 
             with patch(
-                "neuro_code.config.Path.home",
+                "neuro_code.configuration.app.Path.home",
                 side_effect=RuntimeError("home unavailable"),
             ):
                 config = load_config(root, environ={"NEURO_CODE_HOME": str(state_dir)})
@@ -56,7 +59,7 @@ class ConfigTests(unittest.TestCase):
         with (
             tempfile.TemporaryDirectory() as directory,
             patch(
-                "neuro_code.config.Path.home",
+                "neuro_code.configuration.app.Path.home",
                 side_effect=RuntimeError("home unavailable"),
             ),
             self.assertRaisesRegex(ConfigurationError, "set NEURO_CODE_HOME"),

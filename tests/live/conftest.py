@@ -5,8 +5,8 @@ import os
 import pytest
 
 from neuro_code.application.ports.model import ModelProvider
-from neuro_code.config import ProviderProfile
-from neuro_code.providers import create_provider
+from neuro_code.configuration.app import ProviderProfile
+from neuro_code.infrastructure.providers import create_provider
 
 
 def _environment_value(name: str, default: str = "") -> str:

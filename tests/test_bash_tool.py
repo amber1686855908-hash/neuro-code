@@ -17,8 +17,8 @@ from neuro_code.domain.sandbox import SandboxProfile
 from neuro_code.infrastructure.background_tasks import LocalBackgroundTaskManager
 from neuro_code.infrastructure.persistence.output_artifacts import FileToolOutputArtifactStore
 from neuro_code.infrastructure.tools.background_tasks import TaskOutputTool
+from neuro_code.infrastructure.tools.bash import BashTool
 from neuro_code.shared.errors import ToolError
-from neuro_code.tools.bash import BashTool
 
 
 def _python_shell_command(code: str) -> str:

@@ -17,7 +17,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from neuro_code.domain.messages import Message, Role, SyntheticReason
+from neuro_code.domain.conversation.messages import Message, Role, SyntheticReason
 from neuro_code.domain.workspace.skills import (
     MAX_NAME_LEN,
     MAX_SINGLE_SKILL_BYTES,
@@ -910,11 +910,11 @@ class TestAgentRuntimeSkillInjection:
 
         # Build a minimal AgentRuntime mock to test the injection logic.
         # We test _model_items_with_reasoning_guidance directly.
+        from neuro_code.application.permissions.policy import PermissionManager, PermissionMode
         from neuro_code.application.ports.model import ModelProvider
         from neuro_code.application.runtime.agent import AgentRuntime
-        from neuro_code.domain.messages import Role
+        from neuro_code.domain.conversation.messages import Role
         from neuro_code.infrastructure.tools.registry import ToolRegistry
-        from neuro_code.permissions import PermissionManager, PermissionMode
 
         provider = MagicMock(spec=ModelProvider)
         permissions = PermissionManager(mode=PermissionMode.BYPASS)
@@ -941,12 +941,12 @@ class TestAgentRuntimeSkillInjection:
     def test_no_skills_no_injection(self) -> None:
         from unittest.mock import MagicMock
 
+        from neuro_code.application.permissions.policy import PermissionManager, PermissionMode
         from neuro_code.application.ports.model import ModelProvider
         from neuro_code.application.runtime.agent import AgentRuntime
-        from neuro_code.domain.messages import Role
+        from neuro_code.domain.conversation.messages import Role
         from neuro_code.domain.workspace.skills import SkillDiscoveryResult
         from neuro_code.infrastructure.tools.registry import ToolRegistry
-        from neuro_code.permissions import PermissionManager, PermissionMode
 
         def skill_provider() -> SkillDiscoveryResult | None:
             return SkillDiscoveryResult(files=(), rejections=(), fingerprint="empty")
@@ -972,11 +972,11 @@ class TestAgentRuntimeSkillInjection:
     def test_skill_provider_none_no_injection(self) -> None:
         from unittest.mock import MagicMock
 
+        from neuro_code.application.permissions.policy import PermissionManager, PermissionMode
         from neuro_code.application.ports.model import ModelProvider
         from neuro_code.application.runtime.agent import AgentRuntime
-        from neuro_code.domain.messages import Role
+        from neuro_code.domain.conversation.messages import Role
         from neuro_code.infrastructure.tools.registry import ToolRegistry
-        from neuro_code.permissions import PermissionManager, PermissionMode
 
         provider = MagicMock(spec=ModelProvider)
         permissions = PermissionManager(mode=PermissionMode.BYPASS)

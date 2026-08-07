@@ -5,6 +5,10 @@
 - Status: accepted
 - Date: 2026-07-22
 - Source baseline: `c68e39f60462f28d9be5e683d9cbe2c57b1a5027`
+- Provider-facade retention portions are superseded by ADR 0072 after
+  Architecture Freeze v1.
+- Adapter, tool, and flat-domain-facade retention portions are superseded by
+  ADR 0074 after the compatibility cleanup audit.
 
 ## Context
 

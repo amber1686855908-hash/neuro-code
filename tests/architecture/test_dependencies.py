@@ -53,19 +53,12 @@ _EXACT_LAYERS = {
     "neuro_code.application.permissions.policy": _APPLICATION,
     "neuro_code.configuration.app": _CONFIGURATION,
     "neuro_code.domain.permissions.bash_commands": _DOMAIN,
-    "neuro_code.domain.provider_catalog": _PORTS,
-    "neuro_code.domain.provider_settings": _PORTS,
     "neuro_code.domain.sessions.search": _DOMAIN,
-    "neuro_code.bash_commands": _DOMAIN,
     "neuro_code.cli": _INTERFACES,
-    "neuro_code.config": _CONFIGURATION,
-    "neuro_code.permissions": _APPLICATION,
     "neuro_code.tui": _INTERFACES,
     "neuro_code.tui_commands": _INTERFACES,
     "neuro_code.tui_text": _INTERFACES,
     "neuro_code.tui_theme": _INTERFACES,
-    "neuro_code.workspace": _INFRASTRUCTURE,
-    "neuro_code.workspace_changes": _INFRASTRUCTURE,
 }
 
 # More-specific canonical prefixes must precede their parents.
@@ -79,9 +72,6 @@ _PREFIX_LAYERS = (
     ("neuro_code.bootstrap", _BOOTSTRAP),
     ("neuro_code.shared", _SHARED),
     ("neuro_code.domain", _DOMAIN),
-    ("neuro_code.adapters", _INFRASTRUCTURE),
-    ("neuro_code.providers", _INFRASTRUCTURE),
-    ("neuro_code.tools", _INFRASTRUCTURE),
 )
 
 
@@ -740,10 +730,10 @@ def test_current_production_tree_has_no_dynamic_import_violations() -> None:
             known_modules=known_modules,
         )
         issues.extend(scan.issues)
-        if source in {"neuro_code.config", "neuro_code.configuration.app"}:
+        if source == "neuro_code.configuration.app":
             config_scans[source] = scan
 
-    assert set(config_scans) == {"neuro_code.config", "neuro_code.configuration.app"}
+    assert set(config_scans) == {"neuro_code.configuration.app"}
     for config_scan in config_scans.values():
         assert not config_scan.targets
         assert not config_scan.issues
@@ -757,22 +747,9 @@ def test_managed_provider_settings_reader_is_canonical_and_consumed_privately() 
     known_modules = frozenset(modules)
     canonical = "neuro_code.configuration.managed_provider_settings"
     implementation = "neuro_code.infrastructure.providers.provider_settings"
-    adapter = "neuro_code.adapters.provider_settings"
     config = "neuro_code.configuration.app"
-    canonical_tree = ast.parse(modules[canonical].read_text(encoding="utf-8"))
     implementation_tree = ast.parse(modules[implementation].read_text(encoding="utf-8"))
-    adapter_tree = ast.parse(modules[adapter].read_text(encoding="utf-8"))
     config_tree = ast.parse(modules[config].read_text(encoding="utf-8"))
-    canonical_imports = _internal_imports(
-        modules[canonical],
-        source=canonical,
-        known_modules=known_modules,
-    )
-    adapter_imports = _internal_imports(
-        modules[adapter],
-        source=adapter,
-        known_modules=known_modules,
-    )
     implementation_imports = _internal_imports(
         modules[implementation],
         source=implementation,
@@ -783,52 +760,9 @@ def test_managed_provider_settings_reader_is_canonical_and_consumed_privately() 
         source=config,
         known_modules=known_modules,
     )
-    reader_bindings = {
-        "_SCHEMA_VERSION",
-        "_METADATA_NAME",
-        "_CREDENTIALS_NAME",
-        "_MAX_FILE_BYTES",
-        "_SUPPORTED_PROTOCOLS",
-        "_SUPPORTED_DIALECTS",
-        "_read_json",
-        "_mapping",
-        "load_managed_provider_settings",
-    }
-    canonical_bindings = {
-        node.name
-        for node in canonical_tree.body
-        if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
-    }
-    canonical_bindings.update(
-        target.id
-        for node in canonical_tree.body
-        if isinstance(node, ast.Assign)
-        for target in node.targets
-        if isinstance(target, ast.Name)
-    )
-    adapter_bindings = {
-        node.name
-        for node in adapter_tree.body
-        if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
-    }
-    adapter_bindings.update(
-        target.id
-        for node in adapter_tree.body
-        if isinstance(node, ast.Assign)
-        for target in node.targets
-        if isinstance(target, ast.Name)
-    )
-
-    assert reader_bindings <= canonical_bindings
-    assert not reader_bindings & adapter_bindings
     assert canonical in implementation_imports
     assert canonical in config_imports
-    assert implementation in adapter_imports
-    assert not {
-        module
-        for module in config_imports
-        if module == "neuro_code.adapters" or module.startswith("neuro_code.adapters.")
-    }
+    assert not (_PACKAGE_ROOT / "adapters" / "provider_settings.py").exists()
     for consumer_tree in (implementation_tree, config_tree):
         loader_imports = [
             alias
@@ -839,42 +773,27 @@ def test_managed_provider_settings_reader_is_canonical_and_consumed_privately() 
         ]
         assert len(loader_imports) == 1
         assert loader_imports[0].asname == "_load_managed_provider_settings"
-    assert not any(
-        isinstance(node, ast.ImportFrom)
-        and node.module == canonical
-        and any(alias.name == "load_managed_provider_settings" for alias in node.names)
-        for node in adapter_tree.body
-    )
     assert not {
         module
-        for module in canonical_imports
-        if module
-        in {
-            "neuro_code.adapters",
-            "neuro_code.bootstrap",
-            "neuro_code.config",
-            "neuro_code.providers",
-        }
-        or module.startswith(
-            (
-                "neuro_code.adapters.",
-                "neuro_code.bootstrap.",
-                "neuro_code.providers.",
-            )
-        )
+        for module in implementation_imports | config_imports
+        if module == "neuro_code.adapters" or module.startswith("neuro_code.adapters.")
     }
 
 
-def test_agent_runtime_no_longer_depends_on_the_concrete_tool_registry() -> None:
-    dependency = Dependency("neuro_code.application.runtime.agent", "neuro_code.tools.registry")
-    assert dependency not in _forbidden_dependencies()
-    assert dependency not in {entry.dependency for entry in _TEMPORARY_ALLOWLIST}
-
-
-def test_agent_runtime_no_longer_depends_on_concrete_workspace_change_observation() -> None:
-    dependency = Dependency("neuro_code.application.runtime.agent", "neuro_code.workspace_changes")
-    assert dependency not in _forbidden_dependencies()
-    assert dependency not in {entry.dependency for entry in _TEMPORARY_ALLOWLIST}
+def test_agent_runtime_uses_the_canonical_tool_service() -> None:
+    modules = _source_modules()
+    source = "neuro_code.application.runtime.agent"
+    imports = _internal_imports(
+        modules[source],
+        source=source,
+        known_modules=frozenset(modules),
+    )
+    assert "neuro_code.application.ports.tools" in imports
+    assert not {
+        module
+        for module in imports
+        if module == "neuro_code.tools" or module.startswith("neuro_code.tools.")
+    }
 
 
 def test_runtime_compatibility_package_is_removed() -> None:
@@ -1401,28 +1320,21 @@ def test_canonical_runtime_consumers_use_explicit_submodules() -> None:
         )
         assert canonical_imports <= imports
 
-    dependency = Dependency(
-        "neuro_code.application.sessions.terminal_sessions", "neuro_code.workspace"
+
+def test_terminal_manager_uses_platform_ports_without_adapter_facades() -> None:
+    modules = _source_modules()
+    source = "neuro_code.application.sessions.terminal_sessions"
+    imports = _internal_imports(
+        modules[source],
+        source=source,
+        known_modules=frozenset(modules),
     )
-    assert dependency not in _forbidden_dependencies()
-    assert dependency not in {entry.dependency for entry in _TEMPORARY_ALLOWLIST}
-
-
-def test_terminal_manager_no_longer_depends_on_concrete_platform_adapters() -> None:
-    dependencies = {
-        Dependency(
-            "neuro_code.application.sessions.terminal_sessions",
-            "neuro_code.adapters.posix_pty",
-        ),
-        Dependency(
-            "neuro_code.application.sessions.terminal_sessions",
-            "neuro_code.adapters.windows_pty",
-        ),
+    assert "neuro_code.application.ports.terminal" in imports
+    assert not {
+        module
+        for module in imports
+        if module == "neuro_code.adapters" or module.startswith("neuro_code.adapters.")
     }
-    actual = _forbidden_dependencies()
-    allowlist = {entry.dependency for entry in _TEMPORARY_ALLOWLIST}
-    assert not dependencies & actual
-    assert not dependencies & allowlist
 
 
 def test_canonical_bootstrap_entrypoint_dependency_is_exact_and_present() -> None:

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from neuro_code.providers.image_references import (
+from neuro_code.infrastructure.providers.image_references import (
     GEMINI_IMAGE_MEDIA_TYPES,
     GEMINI_MAX_INLINE_IMAGE_BYTES,
     InlineImageReference,

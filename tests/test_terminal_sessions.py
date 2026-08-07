@@ -9,6 +9,10 @@ from tempfile import TemporaryDirectory
 from unittest import mock
 
 from neuro_code.application.permissions.contracts import PermissionApproval, PermissionRequest
+from neuro_code.application.permissions.policy import (
+    PermissionManager,
+    PermissionMode,
+)
 from neuro_code.application.ports.sandbox import ShellLaunch
 from neuro_code.application.ports.terminal import (
     TerminalEofHandler,
@@ -26,10 +30,6 @@ from neuro_code.domain.terminal import (
     TerminalSize,
 )
 from neuro_code.infrastructure.workspace.paths import FilesystemWorkspacePathResolver
-from neuro_code.permissions import (
-    PermissionManager,
-    PermissionMode,
-)
 from neuro_code.shared.errors import PermissionDenied, TerminalError, ToolError
 from tests.fakes import FakeWorkspacePathResolver
 

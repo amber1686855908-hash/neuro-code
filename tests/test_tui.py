@@ -14,7 +14,6 @@ from textual.containers import VerticalScroll
 from textual.geometry import Size
 from textual.widgets import Button, Input, Label, Static
 
-from neuro_code.adapters.provider_settings import JsonProviderSettingsStore
 from neuro_code.application.permissions.broker import SessionApprovalBroker
 from neuro_code.application.permissions.contracts import (
     PermissionApproval,
@@ -22,6 +21,16 @@ from neuro_code.application.permissions.contracts import (
     build_permission_request,
 )
 from neuro_code.application.ports.http import HttpClientPolicy
+from neuro_code.application.ports.provider_catalog import (
+    ProviderCatalogError,
+    ProviderCatalogResult,
+    ProviderConnectionSpec,
+)
+from neuro_code.application.ports.provider_settings import (
+    ManagedProviderProfile,
+    ManagedProviderSettings,
+    ManagedProxyPolicy,
+)
 from neuro_code.application.ports.tools import ToolOutputArtifact, ToolOutputArtifactRead
 from neuro_code.application.providers import ChangeProviderRequest, ProviderChangeService
 from neuro_code.application.runtime.agent import AgentRunResult, EventSink
@@ -48,18 +57,9 @@ from neuro_code.domain.background_tasks import (
     BackgroundWakeLimits,
     BackgroundWakeState,
 )
+from neuro_code.domain.conversation.events import AgentEvent, AgentEventKind
 from neuro_code.domain.conversation.interaction_mode import InteractionMode
-from neuro_code.domain.conversation.reasoning import ReasoningEffort
-from neuro_code.domain.events import AgentEvent, AgentEventKind
-from neuro_code.domain.execution import (
-    AgentExecutionOutcome,
-    AgentExecutionStatus,
-    SessionExecutionRecord,
-    SupervisorReasonCode,
-    TurnCancellationPolicy,
-    TurnSource,
-)
-from neuro_code.domain.messages import (
+from neuro_code.domain.conversation.messages import (
     ContentPart,
     ContextItemKind,
     Message,
@@ -68,22 +68,22 @@ from neuro_code.domain.messages import (
     SessionItem,
     ToolCall,
 )
+from neuro_code.domain.conversation.reasoning import ReasoningEffort
+from neuro_code.domain.execution import (
+    AgentExecutionOutcome,
+    AgentExecutionStatus,
+    SessionExecutionRecord,
+    SupervisorReasonCode,
+    TurnCancellationPolicy,
+    TurnSource,
+)
 from neuro_code.domain.plans import PlanComment, PlanStep, PlanStepStatus, SessionPlan
-from neuro_code.domain.provider_catalog import (
-    ProviderCatalogError,
-    ProviderCatalogResult,
-    ProviderConnectionSpec,
-)
-from neuro_code.domain.provider_settings import (
-    ManagedProviderProfile,
-    ManagedProviderSettings,
-    ManagedProxyPolicy,
-)
 from neuro_code.domain.sandbox import SandboxProfile
 from neuro_code.domain.session_tasks import SessionTask, SessionTaskKind, SessionTaskStatus
 from neuro_code.domain.sessions import SessionSummary
-from neuro_code.domain.ui_preferences import UiLanguage
+from neuro_code.infrastructure.providers.provider_settings import JsonProviderSettingsStore
 from neuro_code.interfaces.tui import recoverable_terminal_status
+from neuro_code.shared.ui_language import UiLanguage
 from neuro_code.tui import (
     TUI_RELOAD_PROVIDER_SETTINGS,
     AssistantMarkdown,

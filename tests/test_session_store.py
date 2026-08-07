@@ -12,22 +12,21 @@ from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from neuro_code.adapters.sqlite_session import SqliteSessionStore
 from neuro_code.domain.background_tasks import BackgroundWakeState
-from neuro_code.domain.events import AgentEvent, AgentEventKind
-from neuro_code.domain.execution import (
-    AgentExecutionOutcome,
-    AgentExecutionStatus,
-    SessionExecutionRecord,
-    SupervisorReasonCode,
-)
-from neuro_code.domain.messages import (
+from neuro_code.domain.conversation.events import AgentEvent, AgentEventKind
+from neuro_code.domain.conversation.messages import (
     ContentPart,
     ContextItemKind,
     Message,
     PreservedContextItem,
     Role,
     ToolCall,
+)
+from neuro_code.domain.execution import (
+    AgentExecutionOutcome,
+    AgentExecutionStatus,
+    SessionExecutionRecord,
+    SupervisorReasonCode,
 )
 from neuro_code.domain.plans import (
     MAX_PLAN_COMMENTS,
@@ -44,6 +43,7 @@ from neuro_code.domain.session_tasks import (
     SessionTaskStatus,
 )
 from neuro_code.domain.sessions import SessionSnapshot, SessionSummary
+from neuro_code.infrastructure.persistence.sqlite_session import SqliteSessionStore
 from neuro_code.shared.errors import SessionError
 
 

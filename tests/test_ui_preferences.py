@@ -8,8 +8,8 @@ from pathlib import Path
 
 from neuro_code.domain.conversation.interaction_mode import InteractionMode
 from neuro_code.domain.conversation.reasoning import ReasoningEffort
-from neuro_code.domain.ui_preferences import UiLanguage
 from neuro_code.infrastructure.persistence.ui_preferences import JsonUiPreferencesStore
+from neuro_code.shared.ui_language import UiLanguage
 
 
 class JsonUiPreferencesStoreTests(unittest.IsolatedAsyncioTestCase):

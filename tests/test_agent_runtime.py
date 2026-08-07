@@ -11,8 +11,13 @@ from pathlib import Path
 from typing import Any, cast
 from unittest.mock import patch
 
-from neuro_code.adapters.sqlite_session import SqliteSessionStore
 from neuro_code.application.permissions.contracts import PermissionApproval, PermissionRequest
+from neuro_code.application.permissions.policy import (
+    PermissionEffect,
+    PermissionManager,
+    PermissionMode,
+    PermissionRule,
+)
 from neuro_code.application.ports.background_tasks import BackgroundTaskManager
 from neuro_code.application.ports.model import ModelProvider, ModelToolPolicy
 from neuro_code.application.ports.tools import Tool, ToolContext
@@ -37,9 +42,29 @@ from neuro_code.application.sessions import (
 from neuro_code.application.sessions.lifecycle import SessionLifecycleService
 from neuro_code.application.sessions.task_queries import SessionTaskQueryService
 from neuro_code.domain.background_tasks import BackgroundTaskSnapshot, BackgroundTaskStatus
+from neuro_code.domain.conversation.context import UPSTREAM_IMPORT_PROVIDER, ModelContext
+from neuro_code.domain.conversation.events import (
+    AgentEvent,
+    AgentEventKind,
+    ModelBackendToolCompleted,
+    ModelBackendToolStarted,
+    ModelCompleted,
+    ModelEvent,
+    ModelReasoningDelta,
+    ModelTextDelta,
+    ModelToolCall,
+)
 from neuro_code.domain.conversation.interaction_mode import InteractionMode
+from neuro_code.domain.conversation.messages import (
+    ContentPart,
+    ContextItemKind,
+    Message,
+    PreservedContextItem,
+    Role,
+    SessionItem,
+    ToolCall,
+)
 from neuro_code.domain.conversation.reasoning import ReasoningEffort
-from neuro_code.domain.events import AgentEvent, AgentEventKind
 from neuro_code.domain.execution import (
     AgentExecutionOutcome,
     AgentExecutionStatus,
@@ -51,40 +76,16 @@ from neuro_code.domain.execution import (
     SupervisorReasonCode,
     TurnSource,
 )
-from neuro_code.domain.messages import (
-    ContentPart,
-    ContextItemKind,
-    Message,
-    PreservedContextItem,
-    Role,
-    SessionItem,
-    ToolCall,
-)
-from neuro_code.domain.model_context import UPSTREAM_IMPORT_PROVIDER, ModelContext
-from neuro_code.domain.model_events import (
-    ModelBackendToolCompleted,
-    ModelBackendToolStarted,
-    ModelCompleted,
-    ModelEvent,
-    ModelReasoningDelta,
-    ModelTextDelta,
-    ModelToolCall,
-)
 from neuro_code.domain.plans import PlanComment, PlanStep, PlanStepStatus, SessionPlan
 from neuro_code.domain.session_tasks import SessionTask, SessionTaskKind, SessionTaskStatus
 from neuro_code.domain.tools import ToolDefinition, ToolResult
 from neuro_code.infrastructure.background_tasks import LocalBackgroundTaskManager
+from neuro_code.infrastructure.persistence.sqlite_session import SqliteSessionStore
+from neuro_code.infrastructure.providers.failover import FailoverModelProvider, ProviderCandidate
 from neuro_code.infrastructure.tools.background_tasks import TaskOutputTool
+from neuro_code.infrastructure.tools.registry import ToolRegistry, default_tool_registry
 from neuro_code.infrastructure.workspace.changes import FilesystemWorkspaceChangeObserver
-from neuro_code.permissions import (
-    PermissionEffect,
-    PermissionManager,
-    PermissionMode,
-    PermissionRule,
-)
-from neuro_code.providers.failover import FailoverModelProvider, ProviderCandidate
 from neuro_code.shared.errors import ConfigurationError, ProviderError
-from neuro_code.tools import ToolRegistry, default_tool_registry
 from tests.fakes import EmptyWorkspaceChangeObserver
 
 

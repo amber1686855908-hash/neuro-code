@@ -47,7 +47,7 @@ breaking cleanup removed the root shared compatibility modules
 `neuro_code.{errors,async_utils,redaction}` and `neuro_code.ports`; shared
 primitives and port contracts are available only from their canonical paths.
 `neuro_code.shared.ui_language` now owns the cross-layer `UiLanguage` primitive;
-the former `neuro_code.domain.ui_preferences` import is compatibility-only.
+the former `neuro_code.domain.ui_preferences` facade has been removed.
 UI preference ports, persistence, TUI, and localized text use the shared owner
 without changing language values or persistence behavior.
 Stage 2A establishes
@@ -60,8 +60,8 @@ infrastructure. Approval interaction contracts now live only in
 `neuro_code.application.permissions.contracts`. The development-stage breaking
 cleanup removed the root `PermissionApproval`, `PermissionApprovalKind`,
 `PermissionRequest`, and `build_permission_request` re-exports;
-`neuro_code.permissions` retains only synchronous permission policy
-implementation.
+the former `neuro_code.permissions` module is removed; policy is available only
+from `neuro_code.application.permissions.policy`.
 
 Stage 2B establishes `neuro_code.bootstrap.entrypoints` as the canonical CLI
 and TUI launcher, and the console scripts plus `python -m neuro_code` now use
@@ -181,7 +181,7 @@ submodules. `neuro_code.application.runtime.__init__` currently remains minimal
 and provides no aggregate API, and internal production code imports the
 canonical submodules directly.
 
-`neuro_code.config` currently owns `AppConfig` and `ProviderProfile`, TOML and
+`neuro_code.configuration.app` owns `AppConfig` and `ProviderProfile`, TOML and
 CC Switch configuration, environment overrides, routing, managed overlays,
 sandbox policy, stored-credential injection, and HTTP proxy policy. The
 synchronous managed JSON reader in
@@ -190,15 +190,15 @@ and dialect checks, the file-size limit, metadata/credentials merging,
 structural validation, and `ManagedProviderSettings` construction.
 The provider-settings value objects and persistence contract are owned by
 `neuro_code.application.ports.provider_settings`; the former
-`neuro_code.domain.provider_settings` path remains only as a one-way
-compatibility facade. This keeps configuration and infrastructure consumers on
-the application port boundary without changing validation or persistence.
-`neuro_code.adapters.provider_settings` owns `JsonProviderSettingsStore`,
+`neuro_code.domain.provider_settings` facade has been removed. This keeps
+configuration and infrastructure consumers on the application port boundary
+without changing validation or persistence. `JsonProviderSettingsStore` is
+owned by `neuro_code.infrastructure.providers.provider_settings`, including
 asynchronous persistence, atomic writes, and POSIX private permissions. It uses
-the canonical reader through a private binding and no longer re-exports it.
-`neuro_code.config` likewise uses the reader through a private binding and no
-longer imports the provider-settings adapter; `ProviderProfile` and `AppConfig`
-replace its removed `ProviderConfig` alias for this boundary.
+the canonical reader through a private binding.
+The removed `neuro_code.config` facade no longer provides a compatibility
+import; callers use `neuro_code.configuration.app` directly. `ProviderProfile`
+and `AppConfig` replace the removed `ProviderConfig` alias for this boundary.
 The active temporary allowlist is empty. The only remaining raw forbidden edge
 is the canonical package-executable entrypoint,
 `neuro_code.__main__ -> neuro_code.bootstrap.entrypoints`; it is not
@@ -286,7 +286,7 @@ model token; that buffer is presentation state and is not durable context.
 
 The pure instruction value objects are owned by
 `neuro_code.domain.workspace.instructions`. The former
-`neuro_code.domain.instructions` path remains a one-way compatibility facade;
+`neuro_code.domain.instructions` facade has been removed;
 the filesystem discovery adapter remains in
 `neuro_code.infrastructure.workspace.instructions`. This separates domain
 projection values from filesystem side effects without changing the discovery
@@ -362,7 +362,7 @@ inspect does not use the same runtime instance as a live session. See
 
 The pure skill metadata owner is
 `neuro_code.domain.workspace.skills`. The former
-`neuro_code.domain.skills` path remains a one-way compatibility facade;
+`neuro_code.domain.skills` facade has been removed;
 filesystem discovery remains in `neuro_code.infrastructure.workspace.skills`,
 and the `SkillTool` remains an infrastructure-side read-only body loader.
 This keeps parsing, bounded metadata projections, substitutions, fingerprints,
@@ -1041,10 +1041,12 @@ branches on a commercial provider name. Profiles separate wire protocol
 (`openai-chat`, `openai-responses`, `anthropic-messages`, or
 `gemini-generate-content`) from optional dialect behavior such as xAI Responses.
 The generic Responses adapter is implemented at
-`neuro_code.providers.openai_responses.OpenAIResponsesProvider`; xAI behavior
+`neuro_code.infrastructure.providers.openai_responses.OpenAIResponsesProvider`; xAI behavior
 is selected through `dialect = "xai"`, not through a separate Python provider
 class. The development-stage breaking cleanup removed
-`neuro_code.providers.xai_responses` and `XAIResponsesProvider`.
+`neuro_code.providers.xai_responses` and `XAIResponsesProvider`; Architecture
+Freeze v1 then removed the obsolete `neuro_code.providers` package and its
+provider submodule facades. ADR 0072 records that import-boundary decision.
 Credentials are environment references or a validated loopback-proxy
 placeholder for manual TOML profiles. The TUI additionally uses a
 `ProviderSettingsStore` port for user-managed profiles. Its JSON adapter writes
@@ -1083,8 +1085,8 @@ responses are added to provider metadata. Manual model input remains available
 for compatible services without a catalog endpoint.
 The request, bounded-result, classified-error, and port types are owned by
 `neuro_code.application.ports.provider_catalog`; the former
-`neuro_code.domain.provider_catalog` import remains only as a compatibility
-facade and is not a second implementation.
+`neuro_code.domain.provider_catalog` facade has been removed. There is no
+second implementation.
 See [ADR 0046](adr/0046-global-cli-and-managed-provider-settings.md) and
 [ADR 0047](adr/0047-recoverable-managed-provider-proxy-settings.md). Read-only
 connection discovery is defined by
@@ -1094,8 +1096,8 @@ The managed provider value objects (`ManagedProviderProfile`,
 `ManagedProviderSettings`, and `ManagedProxyPolicy`) and the
 `ProviderSettingsStore` contract are canonical at
 `neuro_code.application.ports.provider_settings`. The historical
-`neuro_code.domain.provider_settings` import is compatibility-only; it does not
-contain a second implementation. See ADR 0049, item 82.
+`neuro_code.domain.provider_settings` facade has been removed; it did not
+contain a second implementation. See ADR 0074.
 
 An optional positive `context_window_tokens` field records provider/model
 capability metadata. It is propagated through redacted profile selection and

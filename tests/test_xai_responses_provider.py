@@ -6,16 +6,8 @@ import unittest
 import httpx
 
 from neuro_code.application.ports.model import ModelToolPolicy
-from neuro_code.domain.messages import (
-    ContentPart,
-    ContextItemKind,
-    Message,
-    PreservedContextItem,
-    Role,
-    ToolCall,
-)
-from neuro_code.domain.model_context import UPSTREAM_IMPORT_PROVIDER, ModelContext
-from neuro_code.domain.model_events import (
+from neuro_code.domain.conversation.context import UPSTREAM_IMPORT_PROVIDER, ModelContext
+from neuro_code.domain.conversation.events import (
     ModelBackendToolCompleted,
     ModelBackendToolStarted,
     ModelCompleted,
@@ -23,8 +15,16 @@ from neuro_code.domain.model_events import (
     ModelTextDelta,
     ModelToolCall,
 )
+from neuro_code.domain.conversation.messages import (
+    ContentPart,
+    ContextItemKind,
+    Message,
+    PreservedContextItem,
+    Role,
+    ToolCall,
+)
 from neuro_code.domain.tools import ToolDefinition
-from neuro_code.providers.openai_responses import OpenAIResponsesProvider
+from neuro_code.infrastructure.providers.openai_responses import OpenAIResponsesProvider
 from neuro_code.shared.errors import ConfigurationError, ProviderError
 
 

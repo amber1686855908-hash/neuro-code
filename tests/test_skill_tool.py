@@ -728,28 +728,28 @@ class TestSkillToolDefinition:
 
 class TestSkillToolErrorBranches:
     def test_describe_read_reason_symlink(self) -> None:
-        from neuro_code.domain.instructions import InstructionRejectionReason
+        from neuro_code.domain.workspace.instructions import InstructionRejectionReason
         from neuro_code.infrastructure.tools.skills import _describe_read_reason
 
         desc = _describe_read_reason(InstructionRejectionReason.SYMLINK_NOT_SUPPORTED)
         assert "symlink" in desc.lower()
 
     def test_describe_read_reason_not_a_file(self) -> None:
-        from neuro_code.domain.instructions import InstructionRejectionReason
+        from neuro_code.domain.workspace.instructions import InstructionRejectionReason
         from neuro_code.infrastructure.tools.skills import _describe_read_reason
 
         desc = _describe_read_reason(InstructionRejectionReason.NOT_A_FILE)
         assert "regular file" in desc
 
     def test_describe_read_reason_read_error(self) -> None:
-        from neuro_code.domain.instructions import InstructionRejectionReason
+        from neuro_code.domain.workspace.instructions import InstructionRejectionReason
         from neuro_code.infrastructure.tools.skills import _describe_read_reason
 
         desc = _describe_read_reason(InstructionRejectionReason.READ_ERROR)
         assert "read error" in desc.lower()
 
     def test_describe_read_reason_fallback(self) -> None:
-        from neuro_code.domain.instructions import InstructionRejectionReason
+        from neuro_code.domain.workspace.instructions import InstructionRejectionReason
         from neuro_code.infrastructure.tools.skills import _describe_read_reason
 
         # Use a reason that doesn't have a specific handler.

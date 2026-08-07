@@ -1,9 +1,9 @@
 """Canonical filesystem tool infrastructure adapters.
 
 This module owns the bounded readers and the atomic ``search_replace`` writer.
-The legacy ``neuro_code.tools.filesystem`` path remains a compatibility facade;
-all path, instruction-tracker, sandbox, client-filesystem, and write semantics
-have one implementation owner here.
+The retired ``neuro_code.tools.filesystem`` facade has been removed. Path,
+instruction-tracker, sandbox, client-filesystem, and write semantics have one
+implementation owner here.
 
 定义规范的文件系统工具基础设施适配器. 本模块拥有有界读取器和原子 search_replace 写入器.
 """

@@ -79,16 +79,32 @@ jobs:
       - run: .wheel-smoke/bin/neuro --help
       - run: .wheel-smoke/bin/neuro-code --help
       - name: Verify removed compatibility modules stay absent
-        run: >-
-          .wheel-smoke/bin/python -c
-          "import importlib.util;
+        run: |
+          .wheel-smoke/bin/python - <<'PY'
+          import importlib.util
+
           removed = (
-          'neuro_code.runtime',
-          'neuro_code.ports',
-          'neuro_code.errors',
-          'neuro_code.async_utils',
-          'neuro_code.redaction',
-          'neuro_code.providers.xai_responses',
-          );
-          unexpected = [name for name in removed if importlib.util.find_spec(name) is not None];
-          assert not unexpected, f'unexpected compatibility modules: {unexpected}'"
+              "neuro_code.runtime",
+              "neuro_code.ports",
+              "neuro_code.errors",
+              "neuro_code.async_utils",
+              "neuro_code.redaction",
+              "neuro_code.providers",
+              "neuro_code.providers.anthropic",
+              "neuro_code.providers.failover",
+              "neuro_code.providers.gemini",
+              "neuro_code.providers.image_references",
+              "neuro_code.providers.openai_compatible",
+              "neuro_code.providers.openai_responses",
+              "neuro_code.providers.xai_responses",
+          )
+
+          def exists(name: str) -> bool:
+              try:
+                  return importlib.util.find_spec(name) is not None
+              except ModuleNotFoundError:
+                  return False
+
+          unexpected = [name for name in removed if exists(name)]
+          assert not unexpected, f"unexpected compatibility modules: {unexpected}"
+          PY

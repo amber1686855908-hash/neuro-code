@@ -3,9 +3,8 @@
 This module owns process-backed background task scopes and their bounded
 observation lifecycle. It depends on the application background-task port,
 domain task projections, and the canonical process-tree adapter; it does not
-own SQLite persistence or tool definitions. The former
-``neuro_code.adapters.background_tasks`` path remains a one-way compatibility
-facade.
+own SQLite persistence or tool definitions. The retired adapter facade has
+been removed; callers use this canonical infrastructure module.
 
 规范的本地后台任务管理器.
 """

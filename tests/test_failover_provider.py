@@ -5,17 +5,17 @@ import unittest
 from collections.abc import AsyncIterator, Sequence
 
 from neuro_code.application.ports.model import ModelToolPolicy
-from neuro_code.domain.messages import Message, Role
-from neuro_code.domain.model_context import ModelContext
-from neuro_code.domain.model_events import (
+from neuro_code.domain.conversation.context import ModelContext
+from neuro_code.domain.conversation.events import (
     ModelCompleted,
     ModelEvent,
     ModelProviderAttemptFailed,
     ModelProviderSelected,
     ModelTextDelta,
 )
+from neuro_code.domain.conversation.messages import Message, Role
 from neuro_code.domain.tools import ToolDefinition
-from neuro_code.providers.failover import FailoverModelProvider, ProviderCandidate
+from neuro_code.infrastructure.providers.failover import FailoverModelProvider, ProviderCandidate
 from neuro_code.shared.errors import ConfigurationError, ProviderError
 
 

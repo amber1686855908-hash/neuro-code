@@ -5,7 +5,10 @@ import unittest
 import httpx
 
 from neuro_code.application.ports.http import HttpClientPolicy
-from neuro_code.domain.provider_catalog import ProviderCatalogError, ProviderConnectionSpec
+from neuro_code.application.ports.provider_catalog import (
+    ProviderCatalogError,
+    ProviderConnectionSpec,
+)
 from neuro_code.infrastructure.providers.provider_catalog import HttpProviderCatalog
 from neuro_code.shared.errors import ConfigurationError
 

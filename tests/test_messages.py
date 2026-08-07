@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import unittest
 
-from neuro_code.domain.messages import (
+from neuro_code.domain.conversation.context import UPSTREAM_IMPORT_PROVIDER, ModelContext
+from neuro_code.domain.conversation.messages import (
     IMAGE_MODEL_PLACEHOLDER,
     ContentPart,
     ContentPartKind,
@@ -13,7 +14,6 @@ from neuro_code.domain.messages import (
     SyntheticReason,
     ToolCall,
 )
-from neuro_code.domain.model_context import UPSTREAM_IMPORT_PROVIDER, ModelContext
 
 
 class MessageTests(unittest.TestCase):

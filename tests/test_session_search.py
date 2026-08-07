@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 from datetime import UTC, datetime
 
-from neuro_code.domain.messages import (
+from neuro_code.domain.conversation.messages import (
     ContextItemKind,
     Message,
     PreservedContextItem,

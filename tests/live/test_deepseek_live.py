@@ -5,25 +5,25 @@ from pathlib import Path
 import pytest
 from tests.fakes import EmptyWorkspaceChangeObserver
 
-from neuro_code.adapters.provider_catalog import HttpProviderCatalog
+from neuro_code.application.permissions.policy import PermissionManager
 from neuro_code.application.ports.model import ModelProvider
+from neuro_code.application.ports.provider_catalog import ProviderConnectionSpec
 from neuro_code.application.ports.tools import ToolContext
 from neuro_code.application.runtime.agent import AgentRuntime
-from neuro_code.config import ProviderProfile
-from neuro_code.domain.events import AgentEventKind
-from neuro_code.domain.messages import Message, Role
-from neuro_code.domain.model_context import ModelContext
-from neuro_code.domain.model_events import (
+from neuro_code.configuration.app import ProviderProfile
+from neuro_code.domain.conversation.context import ModelContext
+from neuro_code.domain.conversation.events import (
+    AgentEventKind,
     ModelCompleted,
     ModelProviderAttemptFailed,
     ModelProviderSelected,
     ModelTextDelta,
 )
-from neuro_code.domain.provider_catalog import ProviderConnectionSpec
+from neuro_code.domain.conversation.messages import Message, Role
+from neuro_code.infrastructure.providers.failover import FailoverModelProvider, ProviderCandidate
+from neuro_code.infrastructure.providers.provider_catalog import HttpProviderCatalog
 from neuro_code.infrastructure.tools.filesystem import ReadFileTool
 from neuro_code.infrastructure.tools.registry import ToolRegistry
-from neuro_code.permissions import PermissionManager
-from neuro_code.providers.failover import FailoverModelProvider, ProviderCandidate
 from neuro_code.shared.errors import ConfigurationError
 
 pytestmark = pytest.mark.live

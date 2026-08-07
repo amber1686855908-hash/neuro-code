@@ -9,7 +9,7 @@ import unittest
 from pathlib import Path
 from typing import Any
 
-from neuro_code.adapters.sqlite_session import SqliteSessionStore
+from neuro_code.infrastructure.persistence.sqlite_session import SqliteSessionStore
 from neuro_code.shared.errors import SessionError
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
