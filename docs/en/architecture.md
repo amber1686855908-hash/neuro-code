@@ -914,6 +914,110 @@ conversation. There is no queue, retry, automatic scheduler, ACP method, CLI
 command, or TUI command in this slice. See
 [ADR 0071](adr/0071-explicit-bounded-subagent-lifecycle.md).
 
+Stage5CR adds the first concrete isolated read-only runtime behind that seam.
+`IsolatedSubagentExecutionService` creates a fresh child session, persists a
+metadata-only `SubagentLink` before execution, removes provider builtin tools,
+and restricts the child registry to `read_file`, `list_dir`, `grep`, and
+`skill`. Child steps and wall-clock execution are bounded, cancellation closes
+the child, and parent deletion recursively removes linked child sessions. This
+slice remains explicit and synchronous: it does not alter the normal
+`AgentRuntime` loop, reuse parent context, expose CLI/TUI/ACP entrypoints, or
+schedule/retry/recursively spawn children. See
+[ADR 0072](adr/0072-isolated-read-only-subagent-runtime.md).
+
+Stage5CS adds `ReadOnlySubagentApplicationService` as the narrow caller
+boundary for that runtime.  It requires the persisted parent/child link and
+projects the child run into a redacted, UTF-8-bounded `SubagentResultProjection`
+containing only lifecycle IDs, terminal status, step count, optional typed
+outcome, and response text.  Messages, events, tool arguments, credentials,
+and raw child context do not cross this boundary.  The projection is returned
+in memory only; it is not appended to the parent transcript or persisted as a
+second result record.  See [ADR 0073](adr/0073-bounded-read-only-subagent-result-projection.md).
+
+Stage5CT adds a read-only parent/child relationship query boundary through
+`SubagentRelationshipQueryService`.  It projects existing `SubagentLink`,
+`SessionTask`, and child-session summary records into a bounded
+`SubagentRelationshipProjection` containing only lifecycle IDs, task status,
+provider/model labels, timestamps, and capability labels for `resume`, `fork`,
+and `delete`.  Active child tasks expose no lifecycle action labels; terminal
+tasks expose labels only, while the existing lifecycle services remain the
+owners of mutation and execution.  The query never loads messages, events,
+tool output, prompts, credentials, or raw child context, adds no schema, and
+does not create a CLI, TUI, ACP, scheduler, replay, or automatic-resume path.
+See [ADR 0074](adr/0074-read-only-parent-child-subagent-relationship-projection.md).
+
+Stage5CU adds one explicit CLI entry,
+`neuro subagent --parent-session SESSION_ID PROMPT`, over the existing
+composition-owned read-only subagent application service. The command performs
+parent-session resume preflight, runs one fresh bounded child with the fixed
+read-only capability set, and emits only the redacted
+`SubagentResultProjection` (plain response or stable `--json` fields). It does
+not reuse parent context, schedule/retry/recursively spawn, or add TUI/ACP
+entrypoints. See [ADR 0075](adr/0075-explicit-cli-read-only-subagent-entry.md).
+
+Stage5CV adds the explicit private ACP extension
+`_neuro-code/session/subagent`. It accepts only an external session ID, a
+bounded prompt, and a bounded step limit, resolves the parent through the
+existing ACP alias boundary, and invokes the same composition-owned read-only
+application service as the CLI. Its response omits internal IDs and child
+transcript details, returning only bounded response/status/steps/truncation
+and typed outcome fields. It is not a standard ACP capability and does not
+add scheduling, retry, recursion, parallel children, or write-capable tools.
+See [ADR 0076](adr/0076-explicit-acp-read-only-subagent-extension.md).
+
+Stage5CW adds an explicit TUI `/subagent PROMPT` command. The TUI receives the
+same composition-owned `ReadOnlySubagentApplicationService` used by CLI and
+ACP, refuses to start without a current session or while another turn is
+running, and renders only the bounded response and step/status metadata. The
+child remains read-only, isolated, synchronous, and cancellable; its prompt,
+events, internal IDs, and temporary context are not appended to the parent
+transcript.
+
+See [ADR 0077](adr/0077-explicit-tui-read-only-subagent-command.md).
+
+Stage5CX adds an explicit TUI `/subagents` read-only view over the existing
+`SubagentRelationshipQueryService`. It displays only bounded parent-task and
+child-session identifiers, provider/model labels, task status, timestamps, and
+capability labels; it never executes resume, fork, or delete and never loads
+child transcript, prompt, tool arguments, or output. Missing sessions,
+unavailable services, and empty relationships fail closed without starting a
+model turn. See [ADR 0078](adr/0078-explicit-tui-subagent-relationship-view.md).
+
+Stage5CY adds `SubagentRelationshipLifecycleService` as the application owner
+for explicit `resume`, `fork`, and `delete` actions. It validates the
+parent-owned relationship and terminal `SUBAGENT` task before delegating to the
+existing session lifecycle service. Resume returns only a validated child
+selection and does not run a model; fork returns a new session ID without
+opening it; delete targets only the child session. The TUI exposes these
+actions as `/subagents ACTION TASK_ID`, never accesses SQLite, and keeps
+validation separate from mutation without claiming cross-process atomicity.
+See [ADR 0079](adr/0079-explicit-subagent-lifecycle-actions.md).
+
+Stage5CZ exposes the same lifecycle owner through the bounded headless command
+`neuro subagents ACTION TASK_ID --parent-session SESSION_ID`. The CLI validates
+the parent through the composition resume boundary and delegates the typed
+application request; it never starts a model turn, replays tools, or reads
+SQLite directly. Plain output is a short lifecycle message, while `--json`
+contains only bounded lifecycle identifiers, the canonical action, and an
+optional forked-session ID. See
+[ADR 0080](adr/0080-explicit-cli-subagent-lifecycle-actions.md).
+
+Stage5DA exposes the same owner through the private ACP extension
+`_neuro-code/session/subagents`. Its strict request contains only an external
+parent session alias, a bounded parent task ID, and one of `resume`, `fork`, or
+`delete`. Resume and fork return external ACP aliases rather than internal
+session IDs; delete returns only a bounded deleted flag. The adapter never
+starts a model turn, replays tools, exposes child context, or claims alias
+allocation and lifecycle mutation are one transaction. See
+[ADR 0081](adr/0081-explicit-acp-subagent-lifecycle-extension.md).
+
+Stage5DB hardens that response boundary. The ACP adapter verifies that a
+lifecycle owner returned the same parent session, parent task, and action that
+were requested, and the serializer validates non-delete external aliases for
+bounded UTF-8 size and control characters. Invalid owner results or aliases
+fail closed without changing valid wire responses. See
+[ADR 0082](adr/0082-fail-closed-acp-subagent-lifecycle-projection.md).
+
 `ProfileConversationController` in
 `neuro_code.application.sessions.profile_conversation` wraps the active
 `AgentConversation` for the interactive composition. The former
@@ -1264,7 +1368,25 @@ so it cannot replace a prior user execution record. This boundary does not
 make earlier turn events, provider/tool work, or cross-process runtime actions
 atomic. Within the execution-record boundary, SQLite serializes writes and
 rejects older event sequences or conflicting data for the same sequence, so a
-stale process cannot overwrite a newer terminal result. Rust sessions are parsed by a separate read-only adapter. It validates format
+stale process cannot overwrite a newer terminal result. Schema v12 adds the
+foreign-keyed `subagent_links` table. Each link stores only the parent session
+ID, parent `SUBAGENT` task ID, child session ID, and creation timestamp; the
+child ID is unique and parent deletion recursively removes linked children.
+Saving a link is its own short SQLite transaction and validates that the parent
+task is running and the child session exists. This does not make child creation,
+model execution, task completion, and session events one transaction. Schema
+v13 adds the foreign-keyed `session_compaction_items` table. A row keeps
+only bounded provider/window metadata, source counts and a half-open candidate
+range, an opaque source fingerprint, summary token metadata, a timezone-aware
+timestamp, and an already-redacted bounded summary. It is excluded from FTS,
+session export/import, and fork copying; deleting a session cascades to its
+rows. Saving the same ID with identical data is idempotent, while conflicting
+IDs or duplicate source ranges fail closed. `CompactionResumeRebuilder` applies
+only non-overlapping records whose source count, provider origin, and
+fingerprint match the current context, producing transient synthetic summary
+messages. It does not run a provider, replay tools, mutate storage, or claim
+whole-turn atomicity. Existing sessions without rows resume unchanged. Rust
+sessions are parsed by a separate read-only adapter. It validates format
 versions 0 and 1, reads
 bounded JSONL records, converts supported legacy/current records into an
 ordered `SessionSnapshot`, and reports corrupt or unsupported records instead
@@ -1356,3 +1478,333 @@ completion metadata is defined by
 [ADR 0023](adr/0023-model-visible-background-task-completion-reminders.md), and
 event-driven multi-task waits by
 [ADR 0024](adr/0024-event-driven-multi-background-task-wait.md).
+
+## Stage5DC ACP lifecycle alias compatibility
+
+The private subagent lifecycle adapter bounds external alias allocation to four
+attempts and resolves each allocated alias through the ACP namespace before it
+is placed on the wire. An unavailable, unresolvable, or wrong-owner alias is
+retried and then fails closed. Storage-backed `get_or_create` preserves one
+alias for a child across repeated `resume` requests and ACP client reconnects.
+This does not change lifecycle ownership, child execution, schema, standard ACP
+capabilities, or the explicit single-child read-only boundary. See
+[ADR 0083](adr/0083-acp-subagent-alias-reconnect-compatibility.md).
+
+## Stage5DD deterministic context-compaction assessment
+
+`neuro_code.application.memory.compaction` is the canonical owner of the
+typed `ContextCompactionPlanner`, usage snapshot, policy, decision, and plan.
+The planner uses known capacity thresholds and protected/recent item counts to
+produce a bounded half-open candidate range. Unknown capacity is explicitly
+`UNAVAILABLE`. The plan never contains conversation items, prompt text, tool
+output, credentials, summaries, or provider payloads.
+
+This is an assessment contract only. It does not mutate `ModelContext`, create
+durable summary items, call a provider, alter `AgentRuntime`, or change session,
+CLI, TUI, ACP, or persistence behavior. Provider-aware summarization,
+provider-affinity replay, durable compaction items, and the runtime transaction
+boundary remain a later capability. See [ADR 0084](adr/0084-context-compaction-assessment-contract.md).
+
+## Stage5DE provider-aware summary request boundary
+
+The canonical memory module now also owns `ProviderContextWindow` and
+`ContextSummaryRequest`. A window records only bounded provider/model labels,
+optional context affinity, and positive local capacity metadata. Usage may bind
+to that window, and actionable plans project to a request with a bounded,
+capacity-clamped summary budget and an index-only candidate range. Unknown
+capacity, non-actionable plans, and empty candidate ranges fail closed.
+
+This remains an application contract: it does not add a `ModelProvider`
+parameter, call a provider, tokenize or summarize messages, mutate
+`ModelContext`, persist compaction items, or change Runtime and interface
+behavior. See [ADR 0085](adr/0085-provider-aware-context-summary-request.md).
+
+## Stage5DF provider-aware redacted summary input
+
+The canonical memory module now provides `ContextSummaryInputBuilder` and the
+typed `ContextSummaryInput`, `ContextSummaryItem`, and
+`ContextSummarySourceKind` projections. The builder accepts one immutable
+`ModelContext` and a `ContextSummaryRequest`, projects only the candidate range,
+and never copies tool arguments, reasoning content, or preserved provider
+payloads. Those values are represented by bounded fixed markers.
+
+Explicit and shape-based redaction runs before control-character sanitization
+and UTF-8 byte truncation. An injected local token estimator bounds the input
+to the provider window's remaining budget after the summary reservation. The
+builder caps the number of items and bytes per item, omits content that cannot
+fit, and excludes item text from result representations.
+
+This is still an input contract only. It does not call a Provider, select a
+provider-specific tokenizer, build a prompt, mutate `ModelContext`, persist a
+compaction item, or change Runtime/interface behavior. See [ADR 0086](adr/0086-provider-aware-redacted-summary-input.md).
+
+## Stage5DH provider-backed bounded summary generation
+
+The canonical memory module now also owns `ProviderContextSummaryGenerator`
+and `ContextSummaryGenerationResult`. The generator accepts only a validated
+`ContextSummaryInput`, builds a temporary prompt context from its bounded
+projection, and performs exactly one `ModelProvider` request with no tools and
+`ModelToolPolicy.DISABLED`. Provider/model identity is checked against the
+request's window before the call.
+
+Output deltas are buffered and `ModelCompleted.response_text` wins when it is
+present. A missing completion, empty response, repeated completion, or remote
+tool call fails with `ProviderError`; provider failures and cancellation are
+not hidden. The output is redacted and bounded again, and the summary is never
+written by this generator, sent to an event sink, or used to mutate the source
+context. Automatic Runtime compaction, retries, provider-specific tokenizers,
+and whole-turn transaction semantics remain future work. See [ADR 0088](adr/0088-provider-backed-bounded-context-summary-generation.md).
+
+## Stage5DI explicit context-compaction persistence service
+
+`neuro_code.application.memory.compaction_service` now owns the explicit
+`ContextCompactionApplicationService`, `PersistContextCompactionRequest`, and
+`ContextCompactionPersistenceResult` boundary. The service rebuilds a redacted
+bounded input from the immutable source context, validates the expected source
+fingerprint before contacting the Provider, calls the existing one-request
+summary generator, builds a `DurableCompactionItem`, and persists it through
+`SessionStore.save_compaction_item`.
+
+The caller supplies the opaque compaction ID and expected source fingerprint.
+Source-count or fingerprint drift fails before model generation. Duplicate-ID
+idempotency and conflict behavior remain owned by the storage adapter. Provider
+generation and the SQLite write are separate operations, and Provider,
+cancellation, and storage failures propagate without retry. This is an
+explicit application capability only: it does not trigger from `AgentRuntime`,
+add events, alter session items, or claim whole-turn atomicity. See [ADR 0089](adr/0089-explicit-context-compaction-persistence-service.md).
+
+## Stage5DJ compaction transfer and turn-finalization boundary
+
+`DurableCompactionItem` remains an optimization record rather than canonical
+conversation history. `SessionExport` intentionally excludes compaction rows,
+so JSON/Markdown export and snapshot import preserve the existing export
+schema and canonical session items without exposing summaries, source
+fingerprints, or Provider-affinity metadata. An imported session starts with
+no compaction rows.
+
+Session forks likewise copy the canonical session projection but do not copy
+compaction rows: the child may diverge from the parent's source range and
+Provider window. Deletion still cascades through the session foreign key.
+
+`SessionStore.finalize_turn()` remains atomic only for its completion event,
+ordered session items, search projection, and optional execution record.
+Compaction persistence is a separate short transaction and is not implicitly
+saved, removed, or rolled back by turn finalization. A future runtime slice
+that needs cross-operation atomicity must add an explicit storage contract;
+sequential calls do not provide that guarantee. See [ADR 0090](adr/0090-compaction-transfer-and-turn-boundary.md).
+
+## Stage5DK explicit context-compaction trigger boundary
+
+`neuro_code.application.memory.compaction_trigger` now owns the typed
+`ContextCompactionTriggerMode`, request, assessment, result, and stateless
+`ContextCompactionTriggerService`. `DISABLED` is the default and only runs the
+existing deterministic planner; it performs no Provider or storage work.
+`EXPLICIT` may delegate a plan with a non-empty candidate range to the existing
+context-compaction persistence service, but only after the caller supplies a
+session ID, compaction ID, timezone-aware timestamp, and expected source
+fingerprint. Stale-source, Provider, cancellation, and storage failures remain
+fail-closed and are not converted into a no-op result.
+
+The trigger is intentionally not wired into `AgentRuntime`. It has no normal
+turn step counter, retry state, event emission, or cross-operation transaction
+claim. Compaction generation and persistence remain separate operations, and a
+future Runtime integration must define its safe boundary and budget semantics
+explicitly. See [ADR 0091](adr/0091-explicit-context-compaction-trigger.md).
+
+## Stage5DL explicit Runtime compaction boundary gate
+
+`neuro_code.application.memory.compaction_runtime` now defines the boundary a
+future Runtime caller must satisfy before invoking the Stage5DK trigger. The
+only modeled safe points are `BEFORE_MODEL_REQUEST` and `AFTER_TOOL_BATCH`;
+active model requests, active tool batches, and cancellation requests fail
+closed without contacting a Provider or storage adapter.
+
+The gate keeps compaction accounting separate from the ordinary turn budget:
+the current contract permits exactly one model request, zero tool calls, and
+never inherits turn limits. It returns a typed boundary decision and delegates
+an actionable request to `ContextCompactionTriggerService` only when the
+boundary is safe and the trigger is explicitly enabled. This is a contract and
+test seam only: `AgentRuntime`, events, and automatic threshold triggering
+remain unchanged. See [ADR 0092](adr/0092-runtime-compaction-safe-boundary.md).
+
+## Stage5DM enforced Runtime compaction timeout
+
+The runtime gate now enforces a finite wall-clock budget around an allowed
+explicit compaction operation. `ContextCompactionRuntimeBudget` defaults to 30
+seconds and cannot exceed 300 seconds; the limit covers both the one strict
+no-tool summary request and its following persistence call. A deadline raises
+the typed `ContextCompactionTimeoutError` and never returns a successful
+trigger result. Provider errors, storage errors, and task cancellation remain
+unchanged. Disabled, unsafe, cancelled, and non-actionable requests still make
+no Provider or storage calls. This remains a boundary contract only: normal
+`AgentRuntime` operation and automatic compaction are not enabled, and no
+cross-operation Provider/SQLite transaction is claimed. See [ADR 0093](adr/0093-enforced-context-compaction-timeout.md).
+
+## Stage5DN Runtime compaction failure projection
+
+`neuro_code.application.memory.compaction_runtime` now exposes the bounded
+`classify_context_compaction_failure()` policy projection. Only
+`ContextCompactionTimeoutError` has a controlled-terminal projection:
+`BUDGET_LIMITED` with `WALL_TIME_BUDGET`, `recoverable=True`, and
+`finalized=False`. Its execution-record policy is `TURN_FINALIZATION`, so a
+future turn owner may persist it only inside the existing turn-finalization
+transaction. Cancellation, Provider errors, and storage errors remain
+propagation-only projections with no outcome and no record request; unknown
+exceptions remain unclassified.
+
+The projection stores no exception detail and does not catch errors, modify
+`AgentRuntime`, emit events, enable automatic compaction, or claim
+Provider/SQLite cross-operation atomicity. See [ADR 0094](adr/0094-runtime-compaction-failure-projection.md).
+
+## Stage5DO explicit Runtime compaction seam
+
+`AgentRuntime` now accepts an optional `compaction_runtime_gate`, defaulting to
+`None`, and exposes `trigger_context_compaction()` for a complete caller-owned
+`ContextCompactionRuntimeRequest`. A missing gate fails closed with
+`ConfigurationError`; an injected gate receives the immutable safe-boundary
+request unchanged. The facade does not derive thresholds, mutate context,
+increment ordinary turn steps, emit events, or write an execution record.
+
+`AgentRuntime.run()` and ApplicationComposition remain unchanged, so automatic
+compaction and production gate wiring are still disabled. Timeout, cancellation,
+Provider, storage, and turn-finalization ownership continue to follow
+[ADR 0094](adr/0094-runtime-compaction-failure-projection.md). See [ADR 0095](adr/0095-explicit-runtime-compaction-seam.md).
+
+## Stage5DP application-owned explicit compaction caller
+
+`ApplicationComposition.create_binding()` now assembles one
+`ContextCompactionRuntimeGate` per binding from the existing Provider,
+`SessionStore`, redaction values, and compaction trigger/persistence services.
+The gate is injected into `AgentRuntime`, but remains opt-in: the normal Agent
+loop performs no threshold check and no automatic compaction call.
+
+`AgentConversation.trigger_context_compaction()` is the application-owned
+caller. It runs under the conversation's existing turn lock, requires a
+matching persisted session for an `EXPLICIT` request, and delegates the
+immutable caller-supplied `ContextCompactionRuntimeRequest` unchanged. The
+request context is a snapshot owned by the caller; its source fingerprint is
+the stale-snapshot guard. The method does not mutate transcript items, emit
+events, reload a turn, or claim atomicity with `finalize_turn()`. See [ADR
+0096](adr/0096-application-owned-compaction-caller.md).
+
+## Stage5DQ explicit atomic turn-finalization boundary
+
+`SessionStore` now exposes the opt-in
+`finalize_turn_with_compaction()` contract. The SQLite implementation commits
+the `TURN_COMPLETED` event, session items, search projection, optional
+`SessionExecutionRecord`, and one durable compaction item in the same
+`BEGIN IMMEDIATE` transaction. Validation, duplicate-event, compaction
+ownership/payload, uniqueness, index, and storage failures roll the whole unit
+back. Identical existing compaction IDs remain idempotent.
+
+`save_compaction_item()` and ordinary `finalize_turn()` retain their separate
+short-transaction behavior. The contract does not include Provider generation,
+does not enable automatic compaction, and is not consumed by the current
+Runtime or explicit compaction gate. See [ADR 0097](adr/0097-atomic-turn-finalization-with-compaction.md).
+
+## Stage5DR turn recorder compaction-finalization owner
+
+`TurnEventRecorder.finalize_turn_completion()` accepts an optional validated
+`DurableCompactionItem`. When supplied, the existing application completion
+path requires a persisted session and delegates the event/items/record/item
+commit to `SessionStore.finalize_turn_with_compaction()`; ordinary calls still
+use `finalize_turn()`. Invalid input fails before the in-memory completion event
+is appended, and persistence still completes before `TURN_COMPLETED` delivery.
+
+The recorder owns only this final storage commit. It does not generate a
+summary, invoke a Provider, alter the Agent loop, consume failure projections,
+or enable automatic compaction. See [ADR 0098](adr/0098-turn-recorder-compaction-finalization-owner.md).
+
+## Stage5DS typed compaction turn projection
+
+`neuro_code.application.memory.compaction_runtime` now exposes
+`ContextCompactionTurnProjection` with explicit success and failure helpers.
+Successful explicit compaction transfers only the already persisted and
+validated `DurableCompactionItem`. A timeout transfers the bounded,
+recoverable `BUDGET_LIMITED/WALL_TIME_BUDGET` outcome for a future turn owner;
+cancellation, Provider, and storage failures remain propagation-only, and
+unknown exceptions remain unclassified. The projection stores no exception
+details or raw summary and performs no persistence or event emission. It does
+not call `TurnEventRecorder`, integrate the normal Agent loop, or enable
+automatic compaction. See [ADR 0099](adr/0099-context-compaction-turn-projection.md).
+
+## Stage5DT explicit compaction turn owner
+
+`TurnEventRecorder.finalize_turn_from_compaction_projection()` is the opt-in
+consumer of `ContextCompactionTurnProjection`. A successful projection must
+provide the caller's ordinary turn outcome and uses the atomic
+`finalize_turn_with_compaction()` path. A timeout projection supplies its own
+bounded recoverable outcome and does not invent a compaction row.
+Propagation-only and no-op projections fail closed before an in-memory
+completion event is appended. The normal Agent loop, automatic compaction,
+Provider generation, and session-lock ownership remain outside this seam. See
+[ADR 0100](adr/0100-explicit-compaction-turn-owner.md).
+
+## Stage5DU application compaction owner under the turn lock
+
+`AgentConversation.run_context_compaction_with_owner()` is an explicit,
+opt-in application seam that validates the caller-owned immutable request and
+runs the Runtime compaction gate plus its typed owner callback under the
+conversation's existing `_turn_lock`. Successful results transfer only a
+persisted `DurableCompactionItem`; a bounded timeout transfers the existing
+recoverable `BUDGET_LIMITED/WALL_TIME_BUDGET` outcome. No-op projections fail
+closed before the owner is called, while cancellation, Provider, storage, and
+unknown failures preserve their original exceptions.
+
+The owner remains responsible for `TurnEventRecorder` and any finalization
+transaction. This seam does not enter the normal Agent loop, trigger automatic
+compaction, mutate transcript items, emit events, or claim that Provider
+generation and SQLite persistence are one transaction. See [ADR
+0101](adr/0101-application-compaction-owner-under-turn-lock.md).
+
+## Stage5DV context usage snapshots and stale-source request construction
+
+`neuro_code.application.memory.compaction_runtime` now provides
+`build_context_usage_snapshot()` and
+`build_explicit_context_compaction_runtime_request()` as side-effect-free
+application helpers. The usage helper follows the existing context-usage event
+convention when provider input/output counts are available, otherwise it uses
+the bounded `ModelContext` estimator and marks the value estimated. A missing
+provider capacity remains unknown rather than being inferred from a concrete
+provider implementation.
+
+The request builder performs deterministic assessment only. It computes an
+opaque source fingerprint from the exact immutable context and actionable
+candidate range, requires caller-owned persistence metadata only for an
+actionable explicit request, and leaves non-actionable requests without a
+fabricated digest. Provider/storage calls, session locking, execution-time
+stale validation, and automatic compaction remain owned by the existing
+application/runtime seams. See [ADR
+0102](adr/0102-context-usage-snapshot-and-stale-source-builder.md).
+
+## Stage5DW explicit live-context compaction command
+
+`AgentConversation.run_explicit_context_compaction_with_owner()` is now the
+narrow application command for an actionable explicit compaction. It acquires
+the existing conversation turn lock before asking `AgentRuntime` to build a
+request-scoped context snapshot with the same reasoning, interaction,
+instruction, and skill guidance used by model requests. The configured
+`ContextCompactionRuntimeGate` then reuses the usage snapshot and computes the
+stale-source guard from that exact context.
+
+The command allocates bounded identity/time metadata when necessary and reuses
+the existing typed owner projection under the same lock. It requires a
+persistent session, does not append transcript items, emit events, start a
+normal model turn, or enable automatic thresholds. Provider generation and
+compaction persistence remain outside one shared transaction. See [ADR
+0103](adr/0103-explicit-live-context-compaction-command.md).
+
+## Stage5DX explicit compaction command projection
+
+`neuro_code.application.memory.compaction_runtime` now exposes the bounded
+`ContextCompactionCommandResult` and
+`project_context_compaction_command_result()` application/interface projection.
+It distinguishes `completed`, `not_needed`, and the controlled
+`budget_limited` timeout result. Successful results expose only the opaque
+compaction ID, source/candidate counts, and summary token metadata; they never
+expose the summary, source fingerprint, prompt, messages, tool output, or
+exception details. Provider, cancellation, storage, and unknown failures
+remain propagation-only exceptions. CLI and ACP serialization helpers share
+the same bounded fields, without enabling a command, event, normal Agent loop,
+or automatic compaction. See [ADR
+0104](adr/0104-explicit-compaction-command-projection.md).

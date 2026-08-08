@@ -8,6 +8,7 @@ from neuro_code.interfaces.cli.serialization import (
     serialize_execution_outcome,
     serialize_execution_record,
     serialize_session_search_page,
+    serialize_subagent_relationship_action,
     serialize_tool_output_artifact,
     serialize_tool_output_artifact_read,
 )
@@ -17,6 +18,7 @@ __all__ = [
     "serialize_execution_outcome",
     "serialize_execution_record",
     "serialize_session_search_page",
+    "serialize_subagent_relationship_action",
     "serialize_tool_output_artifact",
     "serialize_tool_output_artifact_read",
 ]

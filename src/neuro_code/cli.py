@@ -32,12 +32,20 @@ from neuro_code.application.sessions.service import (
     ResumeSessionRequest,
     SessionApplicationService,
 )
+from neuro_code.application.sessions.subagent_lifecycle import (
+    SubagentRelationshipAction,
+    SubagentRelationshipActionRequest,
+)
 from neuro_code.application.sessions.turns import RunTurnRequest
 from neuro_code.application.settings import ApplicationSettings
 from neuro_code.application.tools.service import (
     ListSessionToolOutputArtifactsRequest,
     ReadSessionToolOutputArtifactRequest,
     SessionToolOutputArtifactApplicationService,
+)
+from neuro_code.application.workflows.subagent import (
+    MAX_SUBAGENT_STEPS,
+    RunSubagentRequest,
 )
 from neuro_code.domain.conversation.events import AgentEvent, AgentEventKind
 from neuro_code.domain.conversation.reasoning import ReasoningEffort
@@ -50,6 +58,8 @@ from neuro_code.interfaces.cli.serialization import (
     serialize_execution_outcome,
     serialize_execution_record,
     serialize_session_search_page,
+    serialize_subagent_relationship_action,
+    serialize_subagent_result,
     serialize_tool_output_artifact,
     serialize_tool_output_artifact_read,
 )
@@ -209,6 +219,18 @@ def _add_acp_arguments(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _subagent_steps(value: str) -> int:
+    try:
+        steps = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("subagent max steps must be an integer") from None
+    if not 1 <= steps <= MAX_SUBAGENT_STEPS:
+        raise argparse.ArgumentTypeError(
+            f"subagent max steps must be between 1 and {MAX_SUBAGENT_STEPS}"
+        )
+    return steps
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="neuro",
@@ -238,6 +260,70 @@ def build_parser() -> argparse.ArgumentParser:
 
     acp_parser = subparsers.add_parser("acp", help="serve partial ACP v1 over stdio")
     _add_acp_arguments(acp_parser)
+
+    subagent_parser = subparsers.add_parser(
+        "subagent",
+        help="run one explicit bounded read-only repository subagent",
+    )
+    subagent_parser.add_argument("prompt", metavar="PROMPT")
+    subagent_parser.add_argument(
+        "--parent-session",
+        required=True,
+        metavar="SESSION_ID",
+        help="existing parent session that owns the child task",
+    )
+    subagent_parser.add_argument("--cwd", type=Path, help="working directory")
+    subagent_parser.add_argument("-m", "--model", help="model identifier")
+    subagent_parser.add_argument("--provider", help="named provider profile")
+    subagent_parser.add_argument("--base-url", help="provider API base URL")
+    subagent_parser.add_argument(
+        "--no-failover",
+        action="store_true",
+        help="disable configured provider fallbacks for this run",
+    )
+    subagent_parser.add_argument(
+        "--sandbox",
+        choices=tuple(profile.value for profile in SandboxProfile),
+        help="operating-system sandbox profile for this run",
+    )
+    subagent_parser.add_argument("--allow", action="append", default=[], metavar="PATTERN")
+    subagent_parser.add_argument("--deny", action="append", default=[], metavar="PATTERN")
+    subagent_parser.add_argument(
+        "--max-steps",
+        type=_subagent_steps,
+        default=8,
+        help=f"maximum child model steps (1-{MAX_SUBAGENT_STEPS})",
+    )
+    subagent_parser.add_argument(
+        "--execution-control",
+        choices=tuple(_EXECUTION_CONTROL_CHOICES),
+        default="finalize-terminal",
+        help="supervision behavior for the child runtime",
+    )
+    subagent_parser.add_argument(
+        "--effort",
+        choices=tuple(effort.value for effort in ReasoningEffort),
+        help="agent review depth (default: high)",
+    )
+    subagent_parser.add_argument("--json", action="store_true")
+
+    subagents_parser = subparsers.add_parser(
+        "subagents",
+        help="run one explicit lifecycle action for a linked child subagent",
+    )
+    subagents_parser.add_argument(
+        "action",
+        choices=tuple(action.value for action in SubagentRelationshipAction),
+    )
+    subagents_parser.add_argument("task_id", metavar="TASK_ID")
+    subagents_parser.add_argument(
+        "--parent-session",
+        required=True,
+        metavar="SESSION_ID",
+        help="parent session that owns the child task",
+    )
+    subagents_parser.add_argument("--cwd", type=Path, help="working directory")
+    subagents_parser.add_argument("--json", action="store_true")
 
     sessions_parser = subparsers.add_parser("sessions", help="list or search persisted sessions")
     sessions_parser.add_argument(
@@ -430,7 +516,7 @@ def _skill_lines(cwd: Path, services: CliServices) -> list[str]:
 
 
 def _completion_script(shell: str) -> str:
-    commands = "code version inspect completions agent acp providers sessions export import-session"
+    commands = "code version inspect completions agent acp subagent subagents providers sessions export import-session"
     if shell == "bash":
         return (
             "_neuro_code() { COMPREPLY=( $(compgen -W '"
@@ -501,6 +587,85 @@ async def _run_agent(args: argparse.Namespace, services: CliServices) -> int:
 
 async def _run_acp(args: argparse.Namespace, services: CliServices) -> int:
     return await services.run_acp(args, _application_settings(args))
+
+
+async def _run_subagent(args: argparse.Namespace, services: CliServices) -> int:
+    """Run one explicit read-only child and print its safe projection.
+
+    运行一次明确的只读子代理并输出安全投影.
+    """
+
+    application = await services.open_application(_application_settings(args))
+    try:
+        await application.config_for_session_resume(args.parent_session)
+        try:
+            request = RunSubagentRequest(
+                args.parent_session,
+                args.prompt,
+                max_steps=args.max_steps,
+            )
+        except ValueError as error:
+            raise ConfigurationError(str(error)) from None
+        service = application.create_read_only_subagent_application_service()
+        projection = await service.run_subagent(request)
+        if args.json:
+            print(json.dumps(serialize_subagent_result(projection), ensure_ascii=False))
+        else:
+            print(projection.response)
+        return 0
+    finally:
+        await asyncio.shield(application.close())
+
+
+async def _run_subagent_lifecycle(args: argparse.Namespace, services: CliServices) -> int:
+    """Run one explicit lifecycle action for a linked child session.
+
+    对关联子会话执行一次明确的生命周期动作.
+
+    The parent is checked through the composition workspace/resume boundary;
+    the lifecycle service then owns relationship and terminal-task validation.
+    No model turn is started by this command.
+    先通过组合根工作区/恢复边界校验父会话,再由生命周期服务负责关系和终态任务校验.
+    本命令不会启动模型回合.
+    """
+
+    application = await services.open_application(
+        ApplicationSettings(
+            cwd=args.cwd,
+            resume_id=args.parent_session,
+            launch_command=(
+                sys.executable,
+                "-m",
+                "neuro_code",
+                *tuple(getattr(args, "launch_arguments", ())),
+            ),
+        )
+    )
+    try:
+        await application.config_for_session_resume(args.parent_session)
+        action = SubagentRelationshipAction(args.action)
+        result = await application.create_subagent_relationship_lifecycle_service().execute(
+            SubagentRelationshipActionRequest(
+                parent_session_id=args.parent_session,
+                parent_task_id=args.task_id,
+                action=action,
+            )
+        )
+        payload = serialize_subagent_relationship_action(result)
+        if args.json:
+            print(json.dumps(payload, ensure_ascii=False))
+        elif action is SubagentRelationshipAction.RESUME:
+            print(f"Child session {result.child_session_id} is ready to resume.")
+        elif action is SubagentRelationshipAction.FORK:
+            assert result.forked_session_id is not None
+            print(
+                f"Forked child session {result.forked_session_id}; it was not opened automatically."
+            )
+        else:
+            print(f"Deleted child session {result.child_session_id}.")
+        return 0
+    finally:
+        await asyncio.shield(application.close())
 
 
 def _application_settings(
@@ -913,6 +1078,10 @@ def run(argv: Sequence[str] | None, *, services: CliServices) -> int:
             return asyncio.run(_import_session(args, services))
         if args.command == "acp":
             return asyncio.run(_run_acp(args, services))
+        if args.command == "subagent":
+            return asyncio.run(_run_subagent(args, services))
+        if args.command == "subagents":
+            return asyncio.run(_run_subagent_lifecycle(args, services))
         if args.command in {None, "code"} and args.prompt is None:
             return asyncio.run(services.run_tui(args, _application_settings(args)))
         return asyncio.run(_run_agent(args, services))

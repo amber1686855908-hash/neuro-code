@@ -185,6 +185,62 @@ _EXPECTED_IMPORTS = (
     ("neuro_code.application.sessions.summary", "SessionSummaryQueryController"),
     ("neuro_code.application.sessions.summary", "SessionSummaryQueryService"),
     (
+        "neuro_code.application.sessions",
+        "GetSubagentRelationshipRequest",
+    ),
+    (
+        "neuro_code.application.sessions",
+        "ListSubagentRelationshipsRequest",
+    ),
+    (
+        "neuro_code.application.sessions",
+        "MAX_SUBAGENT_RELATIONSHIP_LIMIT",
+    ),
+    (
+        "neuro_code.application.sessions",
+        "SubagentRelationshipAction",
+    ),
+    (
+        "neuro_code.application.sessions",
+        "SubagentRelationshipProjection",
+    ),
+    (
+        "neuro_code.application.sessions",
+        "SubagentRelationshipQueryController",
+    ),
+    (
+        "neuro_code.application.sessions",
+        "SubagentRelationshipQueryService",
+    ),
+    (
+        "neuro_code.application.sessions.subagent_queries",
+        "GetSubagentRelationshipRequest",
+    ),
+    (
+        "neuro_code.application.sessions.subagent_queries",
+        "ListSubagentRelationshipsRequest",
+    ),
+    (
+        "neuro_code.application.sessions.subagent_queries",
+        "MAX_SUBAGENT_RELATIONSHIP_LIMIT",
+    ),
+    (
+        "neuro_code.application.sessions.subagent_queries",
+        "SubagentRelationshipAction",
+    ),
+    (
+        "neuro_code.application.sessions.subagent_queries",
+        "SubagentRelationshipProjection",
+    ),
+    (
+        "neuro_code.application.sessions.subagent_queries",
+        "SubagentRelationshipQueryController",
+    ),
+    (
+        "neuro_code.application.sessions.subagent_queries",
+        "SubagentRelationshipQueryService",
+    ),
+    (
         "neuro_code.application.sessions.task_queries",
         "GetSessionTaskRequest",
     ),
@@ -223,6 +279,162 @@ _EXPECTED_IMPORTS = (
         "InstructionTracker",
     ),
     ("neuro_code.application.memory.skill_tracker", "SkillTracker"),
+    (
+        "neuro_code.application.memory.compaction_service",
+        "ContextCompactionApplicationService",
+    ),
+    (
+        "neuro_code.application.memory.compaction_service",
+        "ContextCompactionPersistenceResult",
+    ),
+    (
+        "neuro_code.application.memory.compaction_service",
+        "PersistContextCompactionRequest",
+    ),
+    (
+        "neuro_code.application.memory.compaction_trigger",
+        "ContextCompactionTriggerAssessment",
+    ),
+    (
+        "neuro_code.application.memory.compaction_trigger",
+        "ContextCompactionTriggerMode",
+    ),
+    (
+        "neuro_code.application.memory.compaction_trigger",
+        "ContextCompactionTriggerRequest",
+    ),
+    (
+        "neuro_code.application.memory.compaction_trigger",
+        "ContextCompactionTriggerResult",
+    ),
+    (
+        "neuro_code.application.memory.compaction_trigger",
+        "ContextCompactionTriggerService",
+    ),
+    (
+        "neuro_code.application.memory.compaction_runtime",
+        "ContextCompactionBoundaryDecision",
+    ),
+    (
+        "neuro_code.application.memory.compaction_runtime",
+        "ContextCompactionExecutionRecordPolicy",
+    ),
+    (
+        "neuro_code.application.memory.compaction_runtime",
+        "ContextCompactionRuntimeAssessment",
+    ),
+    (
+        "neuro_code.application.memory.compaction_runtime",
+        "ContextCompactionRuntimeBoundary",
+    ),
+    (
+        "neuro_code.application.memory.compaction_runtime",
+        "ContextCompactionRuntimeBudget",
+    ),
+    (
+        "neuro_code.application.memory.compaction_runtime",
+        "ContextCompactionRuntimeFailureHandling",
+    ),
+    (
+        "neuro_code.application.memory.compaction_runtime",
+        "ContextCompactionRuntimeFailureKind",
+    ),
+    (
+        "neuro_code.application.memory.compaction_runtime",
+        "ContextCompactionRuntimeFailureProjection",
+    ),
+    (
+        "neuro_code.application.memory.compaction_runtime",
+        "ContextCompactionRuntimeGate",
+    ),
+    (
+        "neuro_code.application.memory.compaction_runtime",
+        "ContextCompactionRuntimeRequest",
+    ),
+    (
+        "neuro_code.application.memory.compaction_runtime",
+        "ContextCompactionRuntimeResult",
+    ),
+    (
+        "neuro_code.application.memory.compaction_runtime",
+        "ContextCompactionSafePoint",
+    ),
+    (
+        "neuro_code.application.memory.compaction_runtime",
+        "ContextCompactionTimeoutError",
+    ),
+    (
+        "neuro_code.application.memory.compaction_runtime",
+        "classify_context_compaction_failure",
+    ),
+    (
+        "neuro_code.application.memory.compaction",
+        "CompactionContextUsage",
+    ),
+    (
+        "neuro_code.application.memory.compaction",
+        "ContextCompactionDecision",
+    ),
+    (
+        "neuro_code.application.memory.compaction",
+        "ContextCompactionPlan",
+    ),
+    (
+        "neuro_code.application.memory.compaction",
+        "ContextCompactionPlanner",
+    ),
+    (
+        "neuro_code.application.memory.compaction",
+        "ContextCompactionPolicy",
+    ),
+    (
+        "neuro_code.application.memory.compaction",
+        "ContextSummaryGenerationResult",
+    ),
+    (
+        "neuro_code.application.memory.compaction",
+        "ContextSummaryRequest",
+    ),
+    (
+        "neuro_code.application.memory.compaction",
+        "ContextSummaryInput",
+    ),
+    (
+        "neuro_code.application.memory.compaction",
+        "ContextSummaryInputBuilder",
+    ),
+    (
+        "neuro_code.application.memory.compaction",
+        "ContextSummaryItem",
+    ),
+    (
+        "neuro_code.application.memory.compaction",
+        "ContextSummarySourceKind",
+    ),
+    (
+        "neuro_code.application.memory.compaction",
+        "ProviderContextSummaryGenerator",
+    ),
+    (
+        "neuro_code.application.memory.compaction",
+        "ProviderContextWindow",
+    ),
+    (
+        "neuro_code.application.memory.compaction",
+        "CompactionResumeRebuilder",
+    ),
+    (
+        "neuro_code.application.memory.compaction",
+        "CompactionResumeResult",
+    ),
+    (
+        "neuro_code.application.memory.compaction",
+        "DurableCompactionItem",
+    ),
+    (
+        "neuro_code.application.memory.compaction",
+        "build_durable_compaction_item",
+    ),
     ("neuro_code.application.workflows", "ExecutePlanRequest"),
     ("neuro_code.application.workflows", "PlanExecutionController"),
     ("neuro_code.application.workflows", "PlanExecutionService"),
@@ -232,12 +444,20 @@ _EXPECTED_IMPORTS = (
     ("neuro_code.application.workflows", "QueuedPlanExecutionService"),
     ("neuro_code.application.workflows", "RunSessionTaskRequest"),
     ("neuro_code.application.workflows", "RunSubagentRequest"),
+    ("neuro_code.application.workflows", "ReadOnlySubagentApplicationService"),
+    ("neuro_code.application.workflows", "MAX_SUBAGENT_RESULT_BYTES"),
     ("neuro_code.application.workflows", "SchedulePlanRequest"),
+    ("neuro_code.application.workflows", "SubagentExecutionController"),
+    ("neuro_code.application.workflows", "SubagentResultProjection"),
     ("neuro_code.application.workflows", "SubagentExecutionService"),
     ("neuro_code.application.workflows", "SubagentExecutor"),
     ("neuro_code.application.workflows", "SubagentExecutorFactory"),
     ("neuro_code.application.workflows", "SubagentRunResult"),
     ("neuro_code.application.workflows.subagent", "RunSubagentRequest"),
+    ("neuro_code.application.workflows.subagent", "ReadOnlySubagentApplicationService"),
+    ("neuro_code.application.workflows.subagent", "SubagentExecutionController"),
+    ("neuro_code.application.workflows.subagent", "MAX_SUBAGENT_RESULT_BYTES"),
+    ("neuro_code.application.workflows.subagent", "SubagentResultProjection"),
     ("neuro_code.application.workflows.subagent", "SubagentExecutionService"),
     ("neuro_code.application.workflows.subagent", "SubagentExecutor"),
     ("neuro_code.application.workflows.subagent", "SubagentExecutorFactory"),
@@ -287,6 +507,18 @@ _EXPECTED_IMPORTS = (
     ("neuro_code.domain.sessions.search", "SessionSearchPage"),
     ("neuro_code.domain.sessions.search", "fallback_session_title"),
     ("neuro_code.domain.sessions.search", "searchable_session_text"),
+    (
+        "neuro_code.domain.conversation.compaction",
+        "COMPACTION_SOURCE_FINGERPRINT_BYTES",
+    ),
+    (
+        "neuro_code.domain.conversation.compaction",
+        "DurableCompactionItem",
+    ),
+    (
+        "neuro_code.domain.conversation.compaction",
+        "compute_compaction_source_fingerprint",
+    ),
     ("neuro_code.domain.conversation.interaction_mode", "InteractionMode"),
     (
         "neuro_code.domain.conversation.interaction_mode",
@@ -1500,6 +1732,10 @@ def test_canonical_runtime_modules_are_independently_importable() -> None:
         "neuro_code.application.runtime.tool_pipeline",
         "neuro_code.application.memory.instruction_tracker",
         "neuro_code.application.memory.skill_tracker",
+        "neuro_code.application.memory.compaction",
+        "neuro_code.application.memory.compaction_service",
+        "neuro_code.application.memory.compaction_runtime",
+        "neuro_code.application.memory.compaction_trigger",
         "neuro_code.application.sessions.terminal_sessions",
         "neuro_code.application.sessions.conversation",
         "neuro_code.application.permissions.broker",
@@ -1896,6 +2132,60 @@ def test_canonical_runtime_public_types_keep_module_paths_and_metadata() -> None
     assert memory.InstructionTracker.__module__ == memory.__name__
     memory_skills = importlib.import_module("neuro_code.application.memory.skill_tracker")
     assert memory_skills.SkillTracker.__module__ == memory_skills.__name__
+    compaction = importlib.import_module("neuro_code.application.memory.compaction")
+    for name in (
+        "CompactionContextUsage",
+        "ContextCompactionDecision",
+        "ContextCompactionPlan",
+        "ContextCompactionPlanner",
+        "ContextCompactionPolicy",
+        "ContextSummaryGenerationResult",
+        "ContextSummaryInput",
+        "ContextSummaryInputBuilder",
+        "ContextSummaryItem",
+        "ContextSummaryRequest",
+        "ContextSummarySourceKind",
+        "ProviderContextSummaryGenerator",
+        "ProviderContextWindow",
+    ):
+        assert getattr(compaction, name).__module__ == compaction.__name__
+    assert compaction.MAX_CONTEXT_SUMMARY_TOKENS == 4_096
+    compaction_service = importlib.import_module("neuro_code.application.memory.compaction_service")
+    for name in (
+        "ContextCompactionApplicationService",
+        "ContextCompactionPersistenceResult",
+        "PersistContextCompactionRequest",
+    ):
+        assert getattr(compaction_service, name).__module__ == compaction_service.__name__
+
+    compaction_trigger = importlib.import_module("neuro_code.application.memory.compaction_trigger")
+    for name in (
+        "ContextCompactionTriggerAssessment",
+        "ContextCompactionTriggerMode",
+        "ContextCompactionTriggerRequest",
+        "ContextCompactionTriggerResult",
+        "ContextCompactionTriggerService",
+    ):
+        assert getattr(compaction_trigger, name).__module__ == compaction_trigger.__name__
+
+    compaction_runtime = importlib.import_module("neuro_code.application.memory.compaction_runtime")
+    for name in (
+        "ContextCompactionBoundaryDecision",
+        "ContextCompactionExecutionRecordPolicy",
+        "ContextCompactionRuntimeAssessment",
+        "ContextCompactionRuntimeBoundary",
+        "ContextCompactionRuntimeBudget",
+        "ContextCompactionRuntimeFailureHandling",
+        "ContextCompactionRuntimeFailureKind",
+        "ContextCompactionRuntimeFailureProjection",
+        "ContextCompactionRuntimeGate",
+        "ContextCompactionRuntimeRequest",
+        "ContextCompactionRuntimeResult",
+        "ContextCompactionSafePoint",
+        "ContextCompactionTimeoutError",
+        "classify_context_compaction_failure",
+    ):
+        assert getattr(compaction_runtime, name).__module__ == compaction_runtime.__name__
 
     profile = importlib.import_module("neuro_code.application.sessions.profile_conversation")
     legacy_profile = importlib.import_module("neuro_code.application.runtime.profile_conversation")

@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any
 
 from neuro_code.domain.background_tasks.models import BackgroundWakeState
+from neuro_code.domain.conversation.compaction import DurableCompactionItem
 from neuro_code.domain.conversation.events import AgentEvent, AgentEventKind
 from neuro_code.domain.conversation.messages import (
     ContentPart,
@@ -47,6 +48,7 @@ from neuro_code.domain.session_tasks import (
     SessionTask,
     SessionTaskKind,
     SessionTaskStatus,
+    SubagentLink,
 )
 from neuro_code.domain.sessions import (
     SessionSnapshot,
@@ -62,7 +64,7 @@ from neuro_code.domain.sessions.search import (
 from neuro_code.shared.async_utils import run_blocking
 from neuro_code.shared.errors import SessionError
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 13
 _SEARCH_SNIPPET_LIMIT = 500
 _SQLITE_TIMEOUT_SECONDS = 30.0
 _SESSION_ALIAS_NAMESPACE_LIMIT = 64
@@ -184,6 +186,18 @@ class SqliteSessionStore:
                             "UPDATE schema_meta SET version = 11 WHERE singleton = 1"
                         )
                         version = (11,)
+                    if version is not None and version[0] == 11:
+                        _ensure_subagent_link_schema(connection)
+                        connection.execute(
+                            "UPDATE schema_meta SET version = 12 WHERE singleton = 1"
+                        )
+                        version = (12,)
+                    if version is not None and version[0] == 12:
+                        _ensure_session_compaction_schema(connection)
+                        connection.execute(
+                            "UPDATE schema_meta SET version = 13 WHERE singleton = 1"
+                        )
+                        version = (13,)
                     if version is None or version[0] != SCHEMA_VERSION:
                         raise SessionError(
                             "unsupported session schema version: "
@@ -196,6 +210,8 @@ class SqliteSessionStore:
                     _ensure_session_plan_comment_schema(connection)
                     _ensure_session_execution_record_schema(connection)
                     _ensure_session_background_wake_schema(connection)
+                    _ensure_subagent_link_schema(connection)
+                    _ensure_session_compaction_schema(connection)
                     _backfill_search_documents(connection, missing_only=True)
                     connection.commit()
                 except BaseException:
@@ -285,11 +301,32 @@ class SqliteSessionStore:
     async def delete_session(self, session_id: str) -> None:
         def delete() -> None:
             with closing(self._connect()) as connection, connection:
-                cursor = connection.execute(
-                    "DELETE FROM sessions WHERE id = ?",
-                    (session_id,),
-                )
-                if cursor.rowcount != 1:
+                pending = [session_id]
+                seen: set[str] = set()
+                while pending:
+                    current = pending.pop()
+                    if current in seen:
+                        continue
+                    seen.add(current)
+                    exists = connection.execute(
+                        "SELECT 1 FROM sessions WHERE id = ?",
+                        (current,),
+                    ).fetchone()
+                    if exists is None:
+                        if current == session_id:
+                            raise SessionError(f"unknown session: {session_id}")
+                        continue
+                    child_rows = connection.execute(
+                        """
+                        SELECT child_session_id
+                        FROM subagent_links
+                        WHERE parent_session_id = ?
+                        """,
+                        (current,),
+                    ).fetchall()
+                    pending.extend(str(row[0]) for row in child_rows)
+                    connection.execute("DELETE FROM sessions WHERE id = ?", (current,))
+                if session_id not in seen:
                     raise SessionError(f"unknown session: {session_id}")
 
         async with self._write_lock:
@@ -608,100 +645,88 @@ class SqliteSessionStore:
             if record.event_sequence != event.sequence:
                 raise SessionError("execution record sequence does not match completion event")
         new_items = list(items)
-        payload = json.dumps(dict(event.data), ensure_ascii=False, separators=(",", ":"))
 
         def finalize() -> None:
             connection = self._connect()
             try:
                 connection.execute("BEGIN IMMEDIATE")
-                row = connection.execute(
-                    "SELECT messages_json, title FROM sessions WHERE id = ?", (session_id,)
-                ).fetchone()
-                if row is None:
-                    raise SessionError(f"unknown session: {session_id}")
-                try:
-                    current_items = _session_items_from_json(row[0])
-                except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
-                    raise SessionError(
-                        f"session {session_id} contains invalid session items"
-                    ) from error
-                if (
-                    len(new_items) < len(current_items)
-                    or new_items[: len(current_items)] != current_items
-                ):
-                    raise SessionError("cannot rewrite the persisted session item prefix")
-                if record is not None:
-                    _validate_execution_record_order(
-                        connection,
-                        session_id=session_id,
-                        incoming=record,
-                    )
-                duplicate = connection.execute(
-                    "SELECT 1 FROM events WHERE session_id = ? AND sequence = ?",
-                    (session_id, event.sequence),
-                ).fetchone()
-                if duplicate is not None:
-                    raise SessionError(f"completion event sequence {event.sequence} already exists")
-                items_payload = _serialize_session_items(new_items)
-                title = str(row[1]) or fallback_session_title(new_items)
-                connection.execute(
-                    """
-                    INSERT INTO events(session_id, sequence, kind, created_at, data_json)
-                    VALUES (?, ?, ?, ?, ?)
-                    """,
-                    (
-                        session_id,
-                        event.sequence,
-                        event.kind.value,
-                        event.created_at.isoformat(),
-                        payload,
-                    ),
-                )
-                cursor = connection.execute(
-                    """
-                    UPDATE sessions
-                    SET messages_json = ?, title = ?, updated_at = CURRENT_TIMESTAMP
-                    WHERE id = ?
-                    """,
-                    (items_payload, title, session_id),
-                )
-                if cursor.rowcount != 1:
-                    raise SessionError(f"unknown session: {session_id}")
-                _upsert_search_document(
+                _persist_finalized_turn(
                     connection,
                     session_id=session_id,
-                    title=title,
-                    content=searchable_session_text(new_items),
+                    event=event,
+                    items=new_items,
+                    record=record,
+                    compaction_item=None,
                 )
-                if record is not None:
-                    connection.execute(
-                        """
-                        INSERT INTO session_execution_records(
-                            session_id, event_sequence, status, reason_code,
-                            finalized, recoverable, completed_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                        ON CONFLICT(session_id) DO UPDATE SET
-                            event_sequence = excluded.event_sequence,
-                            status = excluded.status,
-                            reason_code = excluded.reason_code,
-                            finalized = excluded.finalized,
-                            recoverable = excluded.recoverable,
-                            completed_at = excluded.completed_at
-                        """,
-                        (
-                            session_id,
-                            record.event_sequence,
-                            record.outcome.status.value,
-                            (
-                                record.outcome.reason_code.value
-                                if record.outcome.reason_code is not None
-                                else None
-                            ),
-                            int(record.outcome.finalized),
-                            int(record.outcome.recoverable),
-                            record.completed_at.isoformat(),
-                        ),
-                    )
+                connection.commit()
+            except sqlite3.IntegrityError as error:
+                connection.rollback()
+                raise SessionError(
+                    f"cannot finalize turn event {event.sequence} for session {session_id}"
+                ) from error
+            except BaseException:
+                connection.rollback()
+                raise
+            finally:
+                connection.close()
+
+        async with self._write_lock:
+            await run_blocking(finalize)
+
+    async def finalize_turn_with_compaction(
+        self,
+        session_id: str,
+        event: AgentEvent,
+        items: Sequence[SessionItem],
+        record: SessionExecutionRecord | None,
+        compaction_item: DurableCompactionItem,
+    ) -> None:
+        """Atomically finalize a turn and persist one compaction item.
+
+        The event, session items, optional execution record, search projection,
+        and compaction row share one SQLite transaction.  This method is an
+        explicit opt-in contract; ``save_compaction_item`` remains an
+        independent short operation for callers that do not own turn
+        finalization.
+
+        原子地完成一个回合并持久化一个压缩条目.
+
+        事件、会话条目、可选执行记录、搜索投影和压缩行共享同一个 SQLite
+        事务. 这是显式选择的契约; ``save_compaction_item`` 对不拥有回合最终化的
+        调用方仍保持独立短操作语义.
+        """
+
+        if not isinstance(event, AgentEvent):
+            raise TypeError("event must be an AgentEvent")
+        if event.kind is not AgentEventKind.TURN_COMPLETED:
+            raise SessionError("finalize_turn requires a TURN_COMPLETED event")
+        if (
+            not isinstance(event.sequence, int)
+            or isinstance(event.sequence, bool)
+            or event.sequence <= 0
+        ):
+            raise SessionError("finalize_turn event sequence must be positive")
+        if record is not None:
+            if not isinstance(record, SessionExecutionRecord):
+                raise TypeError("record must be a SessionExecutionRecord or None")
+            if record.event_sequence != event.sequence:
+                raise SessionError("execution record sequence does not match completion event")
+        if not isinstance(compaction_item, DurableCompactionItem):
+            raise TypeError("compaction_item must be a DurableCompactionItem")
+        new_items = list(items)
+
+        def finalize() -> None:
+            connection = self._connect()
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                _persist_finalized_turn(
+                    connection,
+                    session_id=session_id,
+                    event=event,
+                    items=new_items,
+                    record=record,
+                    compaction_item=compaction_item,
+                )
                 connection.commit()
             except sqlite3.IntegrityError as error:
                 connection.rollback()
@@ -845,6 +870,64 @@ class SqliteSessionStore:
 
         async with self._write_lock:
             await run_blocking(save)
+
+    async def save_compaction_item(
+        self,
+        session_id: str,
+        item: DurableCompactionItem,
+    ) -> None:
+        if not isinstance(item, DurableCompactionItem):
+            raise TypeError("item must be a DurableCompactionItem")
+
+        def save() -> None:
+            with closing(self._connect()) as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    _persist_compaction_item(connection, session_id, item)
+                    connection.commit()
+                except sqlite3.IntegrityError as error:
+                    connection.rollback()
+                    raise SessionError(
+                        f"cannot save compaction item {item.compaction_id}"
+                    ) from error
+                except BaseException:
+                    connection.rollback()
+                    raise
+
+        async with self._write_lock:
+            await run_blocking(save)
+
+    async def load_compaction_items(self, session_id: str) -> list[DurableCompactionItem]:
+        def load() -> list[DurableCompactionItem]:
+            with closing(self._connect()) as connection:
+                exists = connection.execute(
+                    "SELECT 1 FROM sessions WHERE id = ?",
+                    (session_id,),
+                ).fetchone()
+                if exists is None:
+                    raise SessionError(f"unknown session: {session_id}")
+                rows = connection.execute(
+                    """
+                    SELECT compaction_id, session_id, provider_name, model_name,
+                           capacity_tokens, context_affinity, source_item_count,
+                           protected_item_count, recent_item_count, candidate_start,
+                           candidate_end, target_tokens, summary_tokens,
+                           source_fingerprint, summary, summary_redacted,
+                           summary_truncated, created_at
+                    FROM session_compaction_items
+                    WHERE session_id = ?
+                    ORDER BY created_at ASC, compaction_id ASC
+                    """,
+                    (session_id,),
+                ).fetchall()
+            try:
+                return [_compaction_item_from_row(row) for row in rows]
+            except (TypeError, ValueError) as error:
+                raise SessionError(
+                    f"session {session_id} contains an invalid compaction item"
+                ) from error
+
+        return await run_blocking(load)
 
     async def load_execution_record(self, session_id: str) -> SessionExecutionRecord | None:
         def load() -> SessionExecutionRecord | None:
@@ -1340,6 +1423,118 @@ class SqliteSessionStore:
                     (session_id, task_id),
                 ).fetchone()
             return _session_task_from_row(row, session_id=session_id) if row is not None else None
+
+        return await run_blocking(load)
+
+    async def save_subagent_link(self, link: SubagentLink) -> None:
+        if not isinstance(link, SubagentLink):
+            raise TypeError("subagent link must be a SubagentLink")
+
+        def save() -> None:
+            try:
+                with closing(self._connect()) as connection, connection:
+                    parent = connection.execute(
+                        """
+                        SELECT kind, status
+                        FROM session_tasks
+                        WHERE session_id = ? AND task_id = ?
+                        """,
+                        (link.parent_session_id, link.parent_task_id),
+                    ).fetchone()
+                    if parent is None:
+                        raise SessionError(f"unknown parent subagent task: {link.parent_task_id}")
+                    if parent[0] != SessionTaskKind.SUBAGENT.value:
+                        raise SessionError("subagent link parent task must have subagent kind")
+                    if parent[1] != SessionTaskStatus.RUNNING.value:
+                        raise SessionError("subagent link parent task must be running")
+                    child = connection.execute(
+                        "SELECT 1 FROM sessions WHERE id = ?",
+                        (link.child_session_id,),
+                    ).fetchone()
+                    if child is None:
+                        raise SessionError(
+                            f"unknown child subagent session: {link.child_session_id}"
+                        )
+                    connection.execute(
+                        """
+                        INSERT INTO subagent_links(
+                            parent_session_id, parent_task_id, child_session_id, created_at
+                        ) VALUES (?, ?, ?, ?)
+                        """,
+                        (
+                            link.parent_session_id,
+                            link.parent_task_id,
+                            link.child_session_id,
+                            link.created_at.isoformat(),
+                        ),
+                    )
+                    connection.execute(
+                        "UPDATE sessions SET updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                        (link.parent_session_id,),
+                    )
+            except sqlite3.IntegrityError as error:
+                raise SessionError(
+                    f"subagent link already exists for task: {link.parent_task_id}"
+                ) from error
+
+        async with self._write_lock:
+            await run_blocking(save)
+
+    async def load_subagent_link(
+        self,
+        parent_session_id: str,
+        parent_task_id: str,
+    ) -> SubagentLink | None:
+        _validated_session_task_id(parent_task_id)
+
+        def load() -> SubagentLink | None:
+            with closing(self._connect()) as connection:
+                session = connection.execute(
+                    "SELECT 1 FROM sessions WHERE id = ?",
+                    (parent_session_id,),
+                ).fetchone()
+                if session is None:
+                    raise SessionError(f"unknown session: {parent_session_id}")
+                row = connection.execute(
+                    """
+                    SELECT parent_session_id, parent_task_id, child_session_id, created_at
+                    FROM subagent_links
+                    WHERE parent_session_id = ? AND parent_task_id = ?
+                    """,
+                    (parent_session_id, parent_task_id),
+                ).fetchone()
+            return _subagent_link_from_row(row) if row is not None else None
+
+        return await run_blocking(load)
+
+    async def list_subagent_links(
+        self,
+        parent_session_id: str,
+        *,
+        limit: int = 50,
+    ) -> list[SubagentLink]:
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 1000:
+            raise ValueError("subagent link limit must be between 1 and 1000")
+
+        def load() -> list[SubagentLink]:
+            with closing(self._connect()) as connection:
+                session = connection.execute(
+                    "SELECT 1 FROM sessions WHERE id = ?",
+                    (parent_session_id,),
+                ).fetchone()
+                if session is None:
+                    raise SessionError(f"unknown session: {parent_session_id}")
+                rows = connection.execute(
+                    """
+                    SELECT parent_session_id, parent_task_id, child_session_id, created_at
+                    FROM subagent_links
+                    WHERE parent_session_id = ?
+                    ORDER BY created_at DESC, parent_task_id DESC
+                    LIMIT ?
+                    """,
+                    (parent_session_id, limit),
+                ).fetchall()
+            return [_subagent_link_from_row(row) for row in rows]
 
         return await run_blocking(load)
 
@@ -1947,6 +2142,130 @@ def _ensure_session_background_wake_schema(connection: sqlite3.Connection) -> No
     )
 
 
+def _ensure_subagent_link_schema(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS subagent_links (
+            parent_session_id TEXT NOT NULL,
+            parent_task_id TEXT NOT NULL,
+            child_session_id TEXT NOT NULL UNIQUE,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (parent_session_id, parent_task_id),
+            FOREIGN KEY (parent_session_id) REFERENCES sessions(id) ON DELETE CASCADE,
+            FOREIGN KEY (parent_task_id) REFERENCES session_tasks(task_id) ON DELETE CASCADE,
+            FOREIGN KEY (child_session_id) REFERENCES sessions(id) ON DELETE CASCADE
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS subagent_links_by_child
+        ON subagent_links(child_session_id)
+        """
+    )
+
+
+def _ensure_session_compaction_schema(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS session_compaction_items (
+            compaction_id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            provider_name TEXT NOT NULL,
+            model_name TEXT NOT NULL,
+            capacity_tokens INTEGER NOT NULL CHECK (capacity_tokens > 0),
+            context_affinity TEXT,
+            source_item_count INTEGER NOT NULL CHECK (source_item_count > 0),
+            protected_item_count INTEGER NOT NULL CHECK (protected_item_count >= 0),
+            recent_item_count INTEGER NOT NULL CHECK (recent_item_count >= 0),
+            candidate_start INTEGER NOT NULL CHECK (candidate_start >= 0),
+            candidate_end INTEGER NOT NULL CHECK (candidate_end > candidate_start),
+            target_tokens INTEGER NOT NULL CHECK (target_tokens > 0),
+            summary_tokens INTEGER NOT NULL CHECK (summary_tokens > 0),
+            source_fingerprint TEXT NOT NULL,
+            summary TEXT NOT NULL,
+            summary_redacted INTEGER NOT NULL CHECK (summary_redacted = 1),
+            summary_truncated INTEGER NOT NULL CHECK (summary_truncated IN (0, 1)),
+            created_at TEXT NOT NULL,
+            UNIQUE(session_id, source_fingerprint, candidate_start, candidate_end),
+            FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS session_compaction_items_by_session
+        ON session_compaction_items(session_id, created_at ASC, compaction_id ASC)
+        """
+    )
+
+
+def _compaction_item_from_row(row: Sequence[object]) -> DurableCompactionItem:
+    (
+        compaction_id,
+        _session_id,
+        provider_name,
+        model_name,
+        capacity_tokens,
+        context_affinity,
+        source_item_count,
+        protected_item_count,
+        recent_item_count,
+        candidate_start,
+        candidate_end,
+        target_tokens,
+        summary_tokens,
+        source_fingerprint,
+        summary,
+        summary_redacted,
+        summary_truncated,
+        created_at,
+    ) = row
+    if not isinstance(compaction_id, str):
+        raise ValueError("compaction item labels are invalid")
+    if not isinstance(provider_name, str):
+        raise ValueError("compaction item provider is invalid")
+    if not isinstance(model_name, str):
+        raise ValueError("compaction item model is invalid")
+    if context_affinity is not None and not isinstance(context_affinity, str):
+        raise ValueError("compaction item context affinity is invalid")
+    if not isinstance(summary, str) or not isinstance(source_fingerprint, str):
+        raise ValueError("compaction item summary fields are invalid")
+    if not isinstance(summary_redacted, int) or isinstance(summary_redacted, bool):
+        raise ValueError("compaction item redaction flag is invalid")
+    if not isinstance(summary_truncated, int) or isinstance(summary_truncated, bool):
+        raise ValueError("compaction item truncation flag is invalid")
+    if not isinstance(created_at, str):
+        raise ValueError("compaction item timestamp is invalid")
+
+    def row_int(value: object, name: str) -> int:
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise ValueError(f"compaction item {name} is invalid")
+        return value
+
+    return DurableCompactionItem(
+        compaction_id=compaction_id,
+        provider_name=provider_name,
+        model_name=model_name,
+        capacity_tokens=row_int(capacity_tokens, "capacity"),
+        context_affinity=context_affinity,
+        source_item_count=row_int(source_item_count, "source count"),
+        protected_item_count=row_int(protected_item_count, "protected count"),
+        recent_item_count=row_int(recent_item_count, "recent count"),
+        candidate_range=(
+            row_int(candidate_start, "candidate start"),
+            row_int(candidate_end, "candidate end"),
+        ),
+        target_tokens=row_int(target_tokens, "target tokens"),
+        summary_tokens=row_int(summary_tokens, "summary tokens"),
+        source_fingerprint=source_fingerprint,
+        summary=summary,
+        summary_redacted=summary_redacted == 1,
+        summary_truncated=summary_truncated == 1,
+        created_at=datetime.fromisoformat(created_at),
+    )
+
+
 def _plan_comment_from_row(row: Sequence[object], *, session_id: str) -> PlanComment:
     try:
         comment_id, raw_step_index, content, raw_created_at = row
@@ -2022,6 +2341,195 @@ def _validate_execution_record_order(
         raise SessionError("conflicting execution records use the same event sequence")
 
 
+def _persist_finalized_turn(
+    connection: sqlite3.Connection,
+    *,
+    session_id: str,
+    event: AgentEvent,
+    items: Sequence[SessionItem],
+    record: SessionExecutionRecord | None,
+    compaction_item: DurableCompactionItem | None,
+) -> None:
+    """Write all owned turn-finalization projections on one open transaction.
+
+    This helper deliberately does not begin, commit, or roll back a
+    transaction.  Its callers own those boundaries so the opt-in compaction
+    variant can share exactly the same atomic unit as ordinary finalization.
+
+    在一个已打开的事务中写入回合最终化所拥有的全部投影.
+
+    此辅助函数刻意不开始、提交或回滚事务. 事务边界由调用方拥有,因此显式压缩
+    变体可以与普通最终化共享完全相同的原子单元.
+    """
+
+    row = connection.execute(
+        "SELECT messages_json, title FROM sessions WHERE id = ?", (session_id,)
+    ).fetchone()
+    if row is None:
+        raise SessionError(f"unknown session: {session_id}")
+    try:
+        current_items = _session_items_from_json(row[0])
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+        raise SessionError(f"session {session_id} contains invalid session items") from error
+    if len(items) < len(current_items) or list(items)[: len(current_items)] != current_items:
+        raise SessionError("cannot rewrite the persisted session item prefix")
+    if record is not None:
+        _validate_execution_record_order(
+            connection,
+            session_id=session_id,
+            incoming=record,
+        )
+    duplicate = connection.execute(
+        "SELECT 1 FROM events WHERE session_id = ? AND sequence = ?",
+        (session_id, event.sequence),
+    ).fetchone()
+    if duplicate is not None:
+        raise SessionError(f"completion event sequence {event.sequence} already exists")
+    payload = json.dumps(dict(event.data), ensure_ascii=False, separators=(",", ":"))
+    items_payload = _serialize_session_items(items)
+    title = str(row[1]) or fallback_session_title(items)
+    connection.execute(
+        """
+        INSERT INTO events(session_id, sequence, kind, created_at, data_json)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (
+            session_id,
+            event.sequence,
+            event.kind.value,
+            event.created_at.isoformat(),
+            payload,
+        ),
+    )
+    cursor = connection.execute(
+        """
+        UPDATE sessions
+        SET messages_json = ?, title = ?, updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+        """,
+        (items_payload, title, session_id),
+    )
+    if cursor.rowcount != 1:
+        raise SessionError(f"unknown session: {session_id}")
+    _upsert_search_document(
+        connection,
+        session_id=session_id,
+        title=title,
+        content=searchable_session_text(items),
+    )
+    if record is not None:
+        connection.execute(
+            """
+            INSERT INTO session_execution_records(
+                session_id, event_sequence, status, reason_code,
+                finalized, recoverable, completed_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(session_id) DO UPDATE SET
+                event_sequence = excluded.event_sequence,
+                status = excluded.status,
+                reason_code = excluded.reason_code,
+                finalized = excluded.finalized,
+                recoverable = excluded.recoverable,
+                completed_at = excluded.completed_at
+            """,
+            (
+                session_id,
+                record.event_sequence,
+                record.outcome.status.value,
+                (
+                    record.outcome.reason_code.value
+                    if record.outcome.reason_code is not None
+                    else None
+                ),
+                int(record.outcome.finalized),
+                int(record.outcome.recoverable),
+                record.completed_at.isoformat(),
+            ),
+        )
+    if compaction_item is not None:
+        _persist_compaction_item(connection, session_id, compaction_item)
+
+
+def _persist_compaction_item(
+    connection: sqlite3.Connection,
+    session_id: str,
+    item: DurableCompactionItem,
+) -> None:
+    """Insert one compaction item into an already-open transaction.
+
+    An identical existing ID is idempotent; an owner or payload conflict is
+    rejected.  The helper never commits so callers can compose it with turn
+    finalization atomically.
+
+    在一个已打开的事务中插入一个压缩条目.
+
+    已存在且完全相同的 ID 具有幂等性; 所有者或载荷冲突都会被拒绝. 该辅助函数
+    从不提交事务,因此调用方可以将它与回合最终化组合为原子操作.
+    """
+
+    exists = connection.execute(
+        "SELECT 1 FROM sessions WHERE id = ?",
+        (session_id,),
+    ).fetchone()
+    if exists is None:
+        raise SessionError(f"unknown session: {session_id}")
+    existing = connection.execute(
+        """
+        SELECT compaction_id, session_id, provider_name, model_name,
+               capacity_tokens, context_affinity, source_item_count,
+               protected_item_count, recent_item_count, candidate_start,
+               candidate_end, target_tokens, summary_tokens,
+               source_fingerprint, summary, summary_redacted,
+               summary_truncated, created_at
+        FROM session_compaction_items
+        WHERE compaction_id = ?
+        """,
+        (item.compaction_id,),
+    ).fetchone()
+    if existing is not None:
+        if str(existing[1]) != session_id:
+            raise SessionError("compaction item belongs to another session")
+        if _compaction_item_from_row(existing) != item:
+            raise SessionError("compaction item ID already exists with different data")
+        return
+    connection.execute(
+        """
+        INSERT INTO session_compaction_items(
+            compaction_id, session_id, provider_name, model_name,
+            capacity_tokens, context_affinity, source_item_count,
+            protected_item_count, recent_item_count, candidate_start,
+            candidate_end, target_tokens, summary_tokens,
+            source_fingerprint, summary, summary_redacted,
+            summary_truncated, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            item.compaction_id,
+            session_id,
+            item.provider_name,
+            item.model_name,
+            item.capacity_tokens,
+            item.context_affinity,
+            item.source_item_count,
+            item.protected_item_count,
+            item.recent_item_count,
+            item.candidate_range[0],
+            item.candidate_range[1],
+            item.target_tokens,
+            item.summary_tokens,
+            item.source_fingerprint,
+            item.summary,
+            int(item.summary_redacted),
+            int(item.summary_truncated),
+            item.created_at.isoformat(),
+        ),
+    )
+    connection.execute(
+        "UPDATE sessions SET updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+        (session_id,),
+    )
+
+
 def _background_wake_state_from_row(
     row: Sequence[object],
     *,
@@ -2087,6 +2595,19 @@ def _session_task_from_row(row: Sequence[object], *, session_id: str) -> Session
         )
     except (TypeError, ValueError, json.JSONDecodeError) as error:
         raise SessionError(f"session {session_id} contains an invalid task") from error
+
+
+def _subagent_link_from_row(row: Sequence[object]) -> SubagentLink:
+    try:
+        parent_session_id, parent_task_id, child_session_id, raw_created_at = row
+        return SubagentLink(
+            str(parent_session_id),
+            str(parent_task_id),
+            str(child_session_id),
+            datetime.fromisoformat(str(raw_created_at)),
+        )
+    except (TypeError, ValueError) as error:
+        raise SessionError("subagent link contains invalid data") from error
 
 
 def _session_alias_value(value: str, *, field_name: str, limit: int) -> str:

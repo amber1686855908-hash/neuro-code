@@ -50,6 +50,8 @@ _COMMANDS = (
     _Command("tasks"),
     _Command("view-task", "TASK_ID"),
     _Command("run-task", "TASK_ID"),
+    _Command("subagent", "PROMPT"),
+    _Command("subagents", "ACTION TASK_ID", ("resume", "fork", "delete")),
     _Command("auto-wake", "on|off", ("on", "off")),
     _Command("settings"),
     _Command("setting"),

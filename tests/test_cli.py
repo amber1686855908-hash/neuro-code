@@ -14,8 +14,13 @@ from contextlib import redirect_stderr, redirect_stdout
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
+from typing import cast
 from unittest.mock import AsyncMock, patch
 
+from neuro_code.application.memory.compaction_runtime import (
+    ContextCompactionCommandResult,
+    ContextCompactionCommandStatus,
+)
 from neuro_code.application.ports.model import ModelToolPolicy
 from neuro_code.application.ports.provider_settings import ManagedProviderProfile
 from neuro_code.application.providers import ChangeProviderRequest, ProviderChangeService
@@ -26,20 +31,32 @@ from neuro_code.application.sessions import (
     SessionSelectionService,
     SessionTurnService,
 )
+from neuro_code.application.sessions.subagent_lifecycle import (
+    SubagentRelationshipAction,
+    SubagentRelationshipActionRequest,
+    SubagentRelationshipActionResult,
+)
 from neuro_code.application.settings import ApplicationSettings
 from neuro_code.application.tools import SessionToolOutputArtifactApplicationService
 from neuro_code.application.workflows import (
     PlanExecutionService,
     PlanSchedulingService,
     QueuedPlanExecutionService,
+    ReadOnlySubagentApplicationService,
+    RunSubagentRequest,
+    SubagentResultProjection,
 )
+from neuro_code.application.workflows.subagent import MAX_SUBAGENT_STEPS
 from neuro_code.bootstrap.entrypoints import main
 from neuro_code.cli import (
     _application_settings,
     _execution_control_mode,
     _normalize_rule,
     _run_agent,
+    _run_subagent,
+    _run_subagent_lifecycle,
     build_parser,
+    run,
 )
 from neuro_code.configuration.app import AppConfig
 from neuro_code.domain.conversation.context import ModelContext
@@ -60,14 +77,18 @@ from neuro_code.domain.execution import (
     SupervisorReasonCode,
 )
 from neuro_code.domain.sandbox import SandboxProfile
+from neuro_code.domain.session_tasks import SessionTaskStatus
 from neuro_code.domain.tools import ToolDefinition
 from neuro_code.infrastructure.persistence.output_artifacts import FileToolOutputArtifactStore
 from neuro_code.infrastructure.persistence.sqlite_session import SqliteSessionStore
 from neuro_code.infrastructure.providers.provider_catalog import HttpProviderCatalog
 from neuro_code.infrastructure.providers.provider_settings import JsonProviderSettingsStore
 from neuro_code.interfaces.cli.serialization import (
+    serialize_context_compaction_result,
     serialize_execution_outcome,
     serialize_execution_record,
+    serialize_subagent_relationship_action,
+    serialize_subagent_result,
 )
 from neuro_code.shared.errors import ConfigurationError, ProviderError
 from neuro_code.shared.ui_language import UiLanguage
@@ -206,6 +227,95 @@ class CliApplicationFixture:
         self.close_calls += 1
 
 
+class CliSubagentServiceFixture:
+    def __init__(self, projection: SubagentResultProjection) -> None:
+        self.projection = projection
+        self.requests: list[RunSubagentRequest] = []
+
+    async def run_subagent(self, request: RunSubagentRequest) -> SubagentResultProjection:
+        self.requests.append(request)
+        return self.projection
+
+
+class CliSubagentApplicationFixture:
+    def __init__(self, projection: SubagentResultProjection) -> None:
+        self.subagent_service = CliSubagentServiceFixture(projection)
+        self.resume_checks: list[str] = []
+        self.close_calls = 0
+
+    async def config_for_session_resume(self, session_id: str) -> None:
+        self.resume_checks.append(session_id)
+
+    def create_read_only_subagent_application_service(
+        self,
+    ) -> ReadOnlySubagentApplicationService:
+        return cast(ReadOnlySubagentApplicationService, self.subagent_service)
+
+    async def close(self) -> None:
+        self.close_calls += 1
+
+
+class CliSubagentServicesFixture:
+    def __init__(self, application: CliSubagentApplicationFixture) -> None:
+        self.application = application
+
+    async def open_application(
+        self, settings: ApplicationSettings
+    ) -> CliSubagentApplicationFixture:
+        del settings
+        return self.application
+
+
+class CliSubagentLifecycleServiceFixture:
+    def __init__(self) -> None:
+        self.requests: list[SubagentRelationshipActionRequest] = []
+
+    async def execute(
+        self,
+        request: SubagentRelationshipActionRequest,
+    ) -> SubagentRelationshipActionResult:
+        self.requests.append(request)
+        return SubagentRelationshipActionResult(
+            parent_session_id=request.parent_session_id,
+            parent_task_id=request.parent_task_id,
+            child_session_id="child-session",
+            action=request.action,
+            forked_session_id=(
+                "forked-session" if request.action is SubagentRelationshipAction.FORK else None
+            ),
+        )
+
+
+class CliSubagentLifecycleApplicationFixture:
+    def __init__(self) -> None:
+        self.lifecycle = CliSubagentLifecycleServiceFixture()
+        self.resume_checks: list[str] = []
+        self.close_calls = 0
+
+    async def config_for_session_resume(self, session_id: str) -> None:
+        self.resume_checks.append(session_id)
+
+    def create_subagent_relationship_lifecycle_service(
+        self,
+    ) -> CliSubagentLifecycleServiceFixture:
+        return self.lifecycle
+
+    async def close(self) -> None:
+        self.close_calls += 1
+
+
+class CliSubagentLifecycleServicesFixture:
+    def __init__(self, application: CliSubagentLifecycleApplicationFixture) -> None:
+        self.application = application
+
+    async def open_application(
+        self,
+        settings: ApplicationSettings,
+    ) -> CliSubagentLifecycleApplicationFixture:
+        del settings
+        return self.application
+
+
 class CliServicesFixture:
     def __init__(self, application: CliApplicationFixture) -> None:
         self.application = application
@@ -269,6 +379,261 @@ api_key_env = "FIXTURE_KEY"
 
         self.assertIs(settings.execution_control_mode, ExecutionControlMode.FINALIZE_TERMINAL)
 
+    def test_subagent_parser_requires_parent_and_bounds_steps(self) -> None:
+        args = build_parser().parse_args(
+            ("subagent", "inspect repository", "--parent-session", "parent-session")
+        )
+
+        self.assertEqual(args.parent_session, "parent-session")
+        self.assertEqual(args.max_steps, 8)
+        self.assertFalse(args.json)
+        with self.assertRaises(SystemExit) as error:
+            build_parser().parse_args(
+                (
+                    "subagent",
+                    "inspect repository",
+                    "--parent-session",
+                    "parent-session",
+                    "--max-steps",
+                    str(MAX_SUBAGENT_STEPS + 1),
+                )
+            )
+        self.assertEqual(error.exception.code, 2)
+
+    def test_subagents_lifecycle_parser_requires_parent_and_action(self) -> None:
+        args = build_parser().parse_args(
+            (
+                "subagents",
+                "resume",
+                "subagent-task",
+                "--parent-session",
+                "parent-session",
+            )
+        )
+
+        self.assertEqual(args.action, "resume")
+        self.assertEqual(args.task_id, "subagent-task")
+        self.assertEqual(args.parent_session, "parent-session")
+        self.assertFalse(args.json)
+        with self.assertRaises(SystemExit) as error:
+            build_parser().parse_args(
+                (
+                    "subagents",
+                    "resume",
+                    "subagent-task",
+                )
+            )
+        self.assertEqual(error.exception.code, 2)
+
+    def test_subagents_lifecycle_plain_output_is_bounded_and_does_not_run_model(self) -> None:
+        application = CliSubagentLifecycleApplicationFixture()
+        args = build_parser().parse_args(
+            (
+                "subagents",
+                "resume",
+                "subagent-task",
+                "--parent-session",
+                "parent-session",
+            )
+        )
+        output = io.StringIO()
+
+        with redirect_stdout(output):
+            exit_code = asyncio.run(
+                _run_subagent_lifecycle(
+                    args,
+                    CliSubagentLifecycleServicesFixture(application),
+                )
+            )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(output.getvalue(), "Child session child-session is ready to resume.\n")
+        self.assertEqual(application.resume_checks, ["parent-session"])
+        self.assertEqual(
+            application.lifecycle.requests,
+            [
+                SubagentRelationshipActionRequest(
+                    "parent-session",
+                    "subagent-task",
+                    SubagentRelationshipAction.RESUME,
+                )
+            ],
+        )
+        self.assertEqual(application.close_calls, 1)
+
+    def test_subagents_lifecycle_json_output_uses_bounded_serializer(self) -> None:
+        application = CliSubagentLifecycleApplicationFixture()
+        args = build_parser().parse_args(
+            (
+                "subagents",
+                "fork",
+                "subagent-task",
+                "--parent-session",
+                "parent-session",
+                "--json",
+            )
+        )
+        output = io.StringIO()
+
+        with redirect_stdout(output):
+            exit_code = asyncio.run(
+                _run_subagent_lifecycle(
+                    args,
+                    CliSubagentLifecycleServicesFixture(application),
+                )
+            )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(
+            json.loads(output.getvalue()),
+            {
+                "parent_session_id": "parent-session",
+                "parent_task_id": "subagent-task",
+                "child_session_id": "child-session",
+                "action": "fork",
+                "forked_session_id": "forked-session",
+            },
+        )
+        self.assertNotIn("prompt", output.getvalue())
+        self.assertEqual(
+            serialize_subagent_relationship_action(
+                SubagentRelationshipActionResult(
+                    "parent-session",
+                    "subagent-task",
+                    "child-session",
+                    SubagentRelationshipAction.FORK,
+                    "forked-session",
+                )
+            ),
+            json.loads(output.getvalue()),
+        )
+
+    def test_explicit_subagent_plain_output_is_only_the_safe_response(self) -> None:
+        projection = SubagentResultProjection(
+            parent_session_id="parent-session",
+            task_id="subagent-task",
+            child_session_id="child-session",
+            status=SessionTaskStatus.COMPLETED,
+            response="read-only repository answer",
+            steps=2,
+            truncated=False,
+        )
+        application = CliSubagentApplicationFixture(projection)
+        args = build_parser().parse_args(
+            ("subagent", "inspect repository", "--parent-session", "parent-session")
+        )
+        output = io.StringIO()
+
+        with redirect_stdout(output):
+            exit_code = asyncio.run(_run_subagent(args, CliSubagentServicesFixture(application)))
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(output.getvalue(), "read-only repository answer\n")
+        self.assertEqual(application.resume_checks, ["parent-session"])
+        self.assertEqual(
+            application.subagent_service.requests,
+            [RunSubagentRequest("parent-session", "inspect repository", max_steps=8)],
+        )
+        self.assertEqual(application.close_calls, 1)
+
+    def test_explicit_subagent_json_output_is_bounded_and_typed(self) -> None:
+        projection = SubagentResultProjection(
+            parent_session_id="parent-session",
+            task_id="subagent-task",
+            child_session_id="child-session",
+            status=SessionTaskStatus.COMPLETED,
+            response="bounded answer",
+            steps=3,
+            truncated=True,
+            outcome=AgentExecutionOutcome(
+                AgentExecutionStatus.BUDGET_LIMITED,
+                SupervisorReasonCode.MODEL_STEP_LIMIT,
+                finalized=True,
+                recoverable=True,
+            ),
+        )
+        application = CliSubagentApplicationFixture(projection)
+        args = build_parser().parse_args(
+            (
+                "subagent",
+                "inspect repository",
+                "--parent-session",
+                "parent-session",
+                "--max-steps",
+                "3",
+                "--json",
+            )
+        )
+        output = io.StringIO()
+
+        with redirect_stdout(output):
+            exit_code = asyncio.run(_run_subagent(args, CliSubagentServicesFixture(application)))
+
+        payload = json.loads(output.getvalue())
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(payload["parent_session_id"], "parent-session")
+        self.assertEqual(payload["status"], "completed")
+        self.assertEqual(payload["steps"], 3)
+        self.assertEqual(
+            payload["outcome"],
+            {
+                "status": "budget_limited",
+                "reason": "model_step_limit",
+                "finalized": True,
+                "recoverable": True,
+            },
+        )
+        self.assertNotIn("prompt", payload)
+        self.assertNotIn("messages", payload)
+        self.assertNotIn("tool_arguments", payload)
+
+    def test_subagent_command_dispatches_through_cli_run(self) -> None:
+        projection = SubagentResultProjection(
+            parent_session_id="parent-session",
+            task_id="subagent-task",
+            child_session_id="child-session",
+            status=SessionTaskStatus.COMPLETED,
+            response="dispatched response",
+            steps=1,
+            truncated=False,
+        )
+        application = CliSubagentApplicationFixture(projection)
+        output = io.StringIO()
+
+        with redirect_stdout(output):
+            exit_code = run(
+                (
+                    "subagent",
+                    "inspect repository",
+                    "--parent-session",
+                    "parent-session",
+                ),
+                services=CliSubagentServicesFixture(application),
+            )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(output.getvalue(), "dispatched response\n")
+        self.assertEqual(application.resume_checks, ["parent-session"])
+        self.assertEqual(application.close_calls, 1)
+
+    def test_subagent_serializer_omits_child_internal_state(self) -> None:
+        projection = SubagentResultProjection(
+            parent_session_id="parent-session",
+            task_id="subagent-task",
+            child_session_id="child-session",
+            status=SessionTaskStatus.FAILED,
+            response="safe failure summary",
+            steps=1,
+            truncated=False,
+        )
+
+        serialized = serialize_subagent_result(projection)
+
+        self.assertEqual(serialized["status"], "failed")
+        self.assertNotIn("events", serialized)
+        self.assertNotIn("items", serialized)
+        self.assertNotIn("arguments", serialized)
+
     def test_cli_serialization_helpers_keep_bounded_execution_projection(self) -> None:
         outcome = AgentExecutionOutcome(
             status=AgentExecutionStatus.BUDGET_LIMITED,
@@ -297,6 +662,25 @@ api_key_env = "FIXTURE_KEY"
         assert serialized_record is not None
         self.assertEqual(serialized_record["completed_at"], "2026-01-01T00:00:00+00:00")
         self.assertNotIn("event_sequence", serialized_record)
+
+    def test_cli_serializes_compaction_result_without_internal_context(self) -> None:
+        result = ContextCompactionCommandResult(
+            status=ContextCompactionCommandStatus.COMPLETED,
+            triggered=True,
+            compaction_id="compaction-1",
+            source_item_count=12,
+            candidate_item_count=8,
+            summary_tokens=24,
+            summary_truncated=False,
+        )
+
+        serialized = serialize_context_compaction_result(result)
+
+        self.assertEqual(serialized["status"], "completed")
+        self.assertEqual(serialized["compaction_id"], "compaction-1")
+        self.assertNotIn("summary", serialized)
+        self.assertNotIn("source_fingerprint", serialized)
+        self.assertNotIn("prompt", serialized)
 
     def test_cli_accepts_observe_only_execution_control_for_agent_acp_and_tui(self) -> None:
         parser = build_parser()
@@ -731,6 +1115,8 @@ api_key_env = "FIXTURE_KEY"
                     exit_code = main(arguments)
                 self.assertEqual(exit_code, 0)
                 self.assertIn(expected, output.getvalue())
+                if arguments[0] == "completions":
+                    self.assertIn("subagent", output.getvalue())
 
     def test_headless_plain_json_and_jsonl_output(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -998,6 +1384,9 @@ api_key_env = "FIXTURE_KEY"
                     provider_catalog: object,
                     managed_provider_settings: object,
                     tool_output_artifact_service: object,
+                    read_only_subagent_service: object,
+                    subagent_relationship_query: object,
+                    subagent_relationship_lifecycle: object,
                     language: UiLanguage,
                     initial_items: object,
                     provider_name: str,
@@ -1024,6 +1413,9 @@ api_key_env = "FIXTURE_KEY"
                         provider_catalog=provider_catalog,
                         managed_provider_settings=managed_provider_settings,
                         tool_output_artifact_service=tool_output_artifact_service,
+                        read_only_subagent_service=read_only_subagent_service,
+                        subagent_relationship_query=subagent_relationship_query,
+                        subagent_relationship_lifecycle=subagent_relationship_lifecycle,
                         language=language,
                         initial_items=initial_items,
                         provider_name=provider_name,
@@ -1223,6 +1615,9 @@ api_key_env = "FIXTURE_KEY"
                     provider_catalog: object,
                     managed_provider_settings: object,
                     tool_output_artifact_service: object,
+                    read_only_subagent_service: object,
+                    subagent_relationship_query: object,
+                    subagent_relationship_lifecycle: object,
                     language: UiLanguage,
                     initial_items: object,
                     provider_name: str,
@@ -1248,6 +1643,9 @@ api_key_env = "FIXTURE_KEY"
                         provider_catalog,
                         managed_provider_settings,
                         tool_output_artifact_service,
+                        read_only_subagent_service,
+                        subagent_relationship_query,
+                        subagent_relationship_lifecycle,
                         language,
                         initial_items,
                         provider_name,
@@ -1341,6 +1739,9 @@ api_key_env = "SECOND_KEY"
                     provider_catalog: object,
                     managed_provider_settings: object,
                     tool_output_artifact_service: object,
+                    read_only_subagent_service: object,
+                    subagent_relationship_query: object,
+                    subagent_relationship_lifecycle: object,
                     language: UiLanguage,
                     initial_items: object,
                     provider_name: str,
@@ -1362,6 +1763,9 @@ api_key_env = "SECOND_KEY"
                         provider_catalog,
                         managed_provider_settings,
                         tool_output_artifact_service,
+                        read_only_subagent_service,
+                        subagent_relationship_query,
+                        subagent_relationship_lifecycle,
                         language,
                         initial_items,
                         provider_name,
@@ -1502,6 +1906,9 @@ api_key_env = "SECOND_KEY"
                     provider_catalog: object,
                     managed_provider_settings: object,
                     tool_output_artifact_service: object,
+                    read_only_subagent_service: object,
+                    subagent_relationship_query: object,
+                    subagent_relationship_lifecycle: object,
                     language: UiLanguage,
                     initial_items: object,
                     provider_name: str,
@@ -1519,6 +1926,9 @@ api_key_env = "SECOND_KEY"
                         provider_catalog,
                         managed_provider_settings,
                         tool_output_artifact_service,
+                        read_only_subagent_service,
+                        subagent_relationship_query,
+                        subagent_relationship_lifecycle,
                         plan_controller,
                         plan_execution_service,
                         plan_scheduling_service,

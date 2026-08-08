@@ -13,6 +13,9 @@ from __future__ import annotations
 import json
 from typing import Literal, cast
 
+from neuro_code.application.memory.compaction_runtime import ContextCompactionCommandResult
+from neuro_code.application.sessions.subagent_queries import SubagentRelationshipAction
+from neuro_code.application.workflows.subagent import SubagentResultProjection
 from neuro_code.domain.execution import (
     AgentExecutionOutcome,
     AgentExecutionStatus,
@@ -27,9 +30,14 @@ __all__ = [
     "map_stop_reason",
     "safe_output_text",
     "sanitize_controls",
+    "serialize_context_compaction_result",
+    "serialize_subagent_lifecycle_action",
+    "serialize_subagent_result",
     "serialized_size_bytes",
     "truncate_utf8",
 ]
+
+_MAX_LIFECYCLE_SESSION_ID_BYTES = 512
 
 AcpStopReason = Literal[
     "end_turn",
@@ -167,3 +175,95 @@ def execution_outcome_metadata(
         "neuro_code.finalized": outcome.finalized,
         "neuro_code.recoverable": outcome.recoverable,
     }
+
+
+def serialize_context_compaction_result(
+    result: ContextCompactionCommandResult,
+) -> dict[str, object]:
+    """Serialize an explicit compaction result without internal context data.
+
+    序列化显式上下文压缩结果,不暴露内部上下文数据。
+    """
+
+    if not isinstance(result, ContextCompactionCommandResult):
+        raise TypeError("result must be a ContextCompactionCommandResult")
+    outcome = result.outcome
+    return {
+        "status": result.status.value,
+        "triggered": result.triggered,
+        "outcome": (
+            None
+            if outcome is None
+            else {
+                "status": outcome.status.value,
+                "reason": outcome.reason_code.value if outcome.reason_code is not None else None,
+                "finalized": outcome.finalized,
+                "recoverable": outcome.recoverable,
+            }
+        ),
+        "compaction_id": result.compaction_id,
+        "source_item_count": result.source_item_count,
+        "candidate_item_count": result.candidate_item_count,
+        "summary_tokens": result.summary_tokens,
+        "summary_truncated": result.summary_truncated,
+    }
+
+
+def serialize_subagent_result(
+    projection: SubagentResultProjection,
+) -> dict[str, object]:
+    """Serialize an ACP-safe child result without internal session IDs.
+
+    序列化 ACP 安全的子结果,不暴露内部会话 ID.
+    """
+
+    outcome = projection.outcome
+    return {
+        "status": projection.status.value,
+        "response": projection.response,
+        "steps": projection.steps,
+        "truncated": projection.truncated,
+        "outcome": (
+            None
+            if outcome is None
+            else {
+                "status": outcome.status.value,
+                "reason": (outcome.reason_code.value if outcome.reason_code is not None else None),
+                "finalized": outcome.finalized,
+                "recoverable": outcome.recoverable,
+            }
+        ),
+    }
+
+
+def serialize_subagent_lifecycle_action(
+    action: SubagentRelationshipAction,
+    *,
+    session_id: str | None = None,
+    deleted: bool = False,
+) -> dict[str, object]:
+    """Serialize only the external projection of one child lifecycle action.
+
+    只序列化一次子会话生命周期动作的外部投影.
+    """
+
+    if not isinstance(action, SubagentRelationshipAction):
+        raise ValueError("subagent lifecycle action must be canonical")
+    payload: dict[str, object] = {"action": action.value}
+    if action is SubagentRelationshipAction.DELETE:
+        payload["deleted"] = deleted
+    elif session_id is not None and _is_safe_lifecycle_session_id(session_id):
+        payload["sessionId"] = session_id
+    else:
+        raise ValueError("non-delete lifecycle action requires an external session ID")
+    return payload
+
+
+def _is_safe_lifecycle_session_id(value: str) -> bool:
+    return (
+        isinstance(value, str)
+        and bool(value.strip())
+        and "\x00" not in value
+        and len(value.encode("utf-8")) <= _MAX_LIFECYCLE_SESSION_ID_BYTES
+        and all(ord(character) >= 32 and ord(character) != 127 for character in value)
+    )

@@ -8,6 +8,8 @@ from neuro_code.interfaces.acp.serialization import (
     execution_outcome_metadata,
     execution_outcome_stop_reason,
     map_stop_reason,
+    serialize_subagent_lifecycle_action,
+    serialize_subagent_result,
 )
 
 __all__ = [
@@ -15,4 +17,6 @@ __all__ = [
     "execution_outcome_metadata",
     "execution_outcome_stop_reason",
     "map_stop_reason",
+    "serialize_subagent_lifecycle_action",
+    "serialize_subagent_result",
 ]

@@ -83,7 +83,11 @@ from neuro_code.application.acp.contracts import (
     AcpMcpStdioServerConfig,
     AcpMcpToolError,
     AcpMcpTools,
+    AcpReadOnlySubagentQuery,
+    AcpReadOnlySubagentQueryError,
     AcpResumeUnavailableError,
+    AcpSubagentLifecycleQuery,
+    AcpSubagentLifecycleQueryError,
     AcpToolOutputArtifactQuery,
     AcpToolOutputArtifactQueryError,
     AcpWorkspaceValidationError,
@@ -104,6 +108,7 @@ from neuro_code.application.ports.tools import (
     MAX_TOOL_OUTPUT_ARTIFACT_READ_BYTES,
 )
 from neuro_code.application.sessions.binding import ConversationBinding
+from neuro_code.application.sessions.subagent_queries import SubagentRelationshipAction
 from neuro_code.application.sessions.turns import RunTurnRequest
 from neuro_code.application.tools.service import SessionToolOutputArtifact
 from neuro_code.domain.background_tasks.models import (
@@ -131,6 +136,8 @@ from neuro_code.interfaces.acp.serialization import (
     map_stop_reason,
     safe_output_text,
     sanitize_controls,
+    serialize_subagent_lifecycle_action,
+    serialize_subagent_result,
     serialized_size_bytes,
     truncate_utf8,
 )
@@ -194,11 +201,14 @@ MAX_CLIENT_TERMINAL_SIGNAL_BYTES = 128
 MAX_CLIENT_TERMINAL_TASKS = 8
 MAX_CLIENT_TERMINAL_RETAINED_TASKS = 32
 ACP_TOOL_OUTPUT_ARTIFACT_EXTENSION = "neuro-code/session/artifacts"
+ACP_READ_ONLY_SUBAGENT_EXTENSION = "neuro-code/session/subagent"
+ACP_SUBAGENT_LIFECYCLE_EXTENSION = "neuro-code/session/subagents"
 
 _SESSION_NOT_ACTIVE = -32001
 _SESSION_NOT_FOUND = -32002
 _SESSION_BUSY = -32003
 _ACP_SESSION_ALIAS_NAMESPACE = "acp-v1"
+_ACP_SUBAGENT_LIFECYCLE_ALIAS_ATTEMPTS = 4
 _ENVIRONMENT_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 _HTTP_HEADER_NAME = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+\Z")
 _ACP_IMAGE_MEDIA_TYPES = frozenset(
@@ -2448,10 +2458,32 @@ class NeuroCodeAcpAgent:
         except SessionError:
             raise _session_not_found(external_session_id) from None
 
-    async def ext_method(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
-        """Serve the private, session-scoped tool-output artifact extension.
+    async def _lifecycle_external_session_id(self, internal_session_id: str) -> str:
+        """Allocate a bounded ACP alias for a lifecycle result session."""
 
-        提供私有的会话作用域工具输出 artifact 扩展.
+        for _attempt in range(_ACP_SUBAGENT_LIFECYCLE_ALIAS_ATTEMPTS):
+            try:
+                external_session_id = (
+                    await self._service.get_or_create_current_workspace_session_alias(
+                        internal_session_id,
+                        f"acp-{uuid.uuid4().hex}",
+                    )
+                )
+                resolved_session_id = await self._service.resolve_session_alias(
+                    _ACP_SESSION_ALIAS_NAMESPACE,
+                    external_session_id,
+                )
+                if resolved_session_id != internal_session_id:
+                    raise SessionError("session alias resolved to another session")
+                return external_session_id
+            except SessionError:
+                continue
+        raise RequestError.internal_error({"reason": "session_alias_allocation_failed"})
+
+    async def ext_method(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+        """Serve private, bounded session extensions.
+
+        提供私有且有界的会话扩展.
 
         The extension is intentionally not advertised as a standard ACP
         capability.  It accepts an external ACP session ID and never exposes
@@ -2462,21 +2494,94 @@ class NeuroCodeAcpAgent:
         """
 
         self._require_initialized()
+        if method == ACP_SUBAGENT_LIFECYCLE_EXTENSION:
+            try:
+                lifecycle_query = AcpSubagentLifecycleQuery.from_payload(params)
+            except AcpSubagentLifecycleQueryError as error:
+                raise _invalid_params(error.reason) from None
+            external_session_id = _validated_session_id(lifecycle_query.session_id)
+            if not self._service.subagent_lifecycle_available:
+                raise RequestError.internal_error({"reason": "subagent_lifecycle_unavailable"})
+            internal_session_id = await self._artifact_internal_session_id(external_session_id)
+            try:
+                result = await self._service.run_subagent_relationship_action(
+                    internal_session_id,
+                    lifecycle_query.task_id,
+                    lifecycle_query.action,
+                )
+            except SessionError:
+                raise _session_not_found(external_session_id) from None
+            except ConfigurationError:
+                raise RequestError.internal_error(
+                    {"reason": "subagent_relationship_invalid"}
+                ) from None
+            except Exception:
+                raise RequestError.internal_error({"reason": "subagent_lifecycle_failed"}) from None
+
+            if (
+                result.parent_session_id != internal_session_id
+                or result.parent_task_id != lifecycle_query.task_id
+                or result.action is not lifecycle_query.action
+            ):
+                raise RequestError.internal_error({"reason": "subagent_lifecycle_invalid_result"})
+            if result.action is SubagentRelationshipAction.DELETE:
+                return serialize_subagent_lifecycle_action(result.action, deleted=True)
+            if result.action is SubagentRelationshipAction.RESUME:
+                external_child_id = await self._lifecycle_external_session_id(
+                    result.child_session_id
+                )
+                return serialize_subagent_lifecycle_action(
+                    result.action,
+                    session_id=external_child_id,
+                )
+            if result.forked_session_id is None:
+                raise RequestError.internal_error({"reason": "subagent_lifecycle_invalid_result"})
+            external_forked_id = await self._lifecycle_external_session_id(result.forked_session_id)
+            return serialize_subagent_lifecycle_action(
+                result.action,
+                session_id=external_forked_id,
+            )
+
+        if method == ACP_READ_ONLY_SUBAGENT_EXTENSION:
+            try:
+                subagent_query = AcpReadOnlySubagentQuery.from_payload(params)
+            except AcpReadOnlySubagentQueryError as error:
+                raise _invalid_params(error.reason) from None
+            external_session_id = _validated_session_id(subagent_query.session_id)
+            if not self._service.read_only_subagent_available:
+                raise RequestError.internal_error({"reason": "subagent_unavailable"})
+            internal_session_id = await self._artifact_internal_session_id(external_session_id)
+            try:
+                projection = await self._service.run_read_only_subagent(
+                    internal_session_id,
+                    subagent_query.prompt,
+                    max_steps=subagent_query.max_steps,
+                )
+            except SessionError:
+                raise _session_not_found(external_session_id) from None
+            except ProviderError:
+                raise RequestError.internal_error({"reason": "provider_failure"}) from None
+            except ConfigurationError:
+                raise RequestError.internal_error({"reason": "subagent_unavailable"}) from None
+            except Exception:
+                raise RequestError.internal_error({"reason": "subagent_failed"}) from None
+            return serialize_subagent_result(projection)
+
         if method != ACP_TOOL_OUTPUT_ARTIFACT_EXTENSION:
             raise RequestError.method_not_found(f"_{method}")
         try:
-            query = AcpToolOutputArtifactQuery.from_payload(params)
+            artifact_query = AcpToolOutputArtifactQuery.from_payload(params)
         except AcpToolOutputArtifactQueryError as error:
             raise _invalid_params(error.reason) from None
-        external_session_id = _validated_session_id(query.session_id)
+        external_session_id = _validated_session_id(artifact_query.session_id)
         if not self._service.tool_output_artifacts_available:
             raise RequestError.internal_error({"reason": "artifact_query_unavailable"})
         internal_session_id = await self._artifact_internal_session_id(external_session_id)
-        if query.artifact_id is None:
+        if artifact_query.artifact_id is None:
             try:
                 artifacts = await self._service.list_tool_output_artifacts(
                     internal_session_id,
-                    limit=query.limit,
+                    limit=artifact_query.limit,
                 )
             except SessionError:
                 raise _session_not_found(external_session_id) from None
@@ -2485,8 +2590,8 @@ class NeuroCodeAcpAgent:
         try:
             artifact = await self._service.read_tool_output_artifact(
                 internal_session_id,
-                query.artifact_id,
-                max_bytes=query.max_bytes,
+                artifact_query.artifact_id,
+                max_bytes=artifact_query.max_bytes,
             )
         except SessionError:
             raise _invalid_params("artifact_not_found") from None
@@ -2860,7 +2965,9 @@ async def serve_acp(service: AcpApplicationService) -> None:
 
 __all__ = [
     "ACP_PROTOCOL_VERSION",
+    "ACP_READ_ONLY_SUBAGENT_EXTENSION",
     "ACP_STDIO_BUFFER_LIMIT_BYTES",
+    "ACP_SUBAGENT_LIFECYCLE_EXTENSION",
     "NeuroCodeAcpAgent",
     "convert_prompt_content",
     "serve_acp",

@@ -9,7 +9,27 @@ from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import patch
 
+from neuro_code.application.memory.compaction import (
+    CompactionContextUsage,
+    ProviderContextWindow,
+)
+from neuro_code.application.memory.compaction_runtime import (
+    ContextCompactionRuntimeBoundary,
+    ContextCompactionRuntimeGate,
+    ContextCompactionRuntimeRequest,
+    ContextCompactionRuntimeResult,
+    ContextCompactionSafePoint,
+    ContextCompactionTimeoutError,
+    ContextCompactionTurnProjection,
+)
+from neuro_code.application.memory.compaction_service import ContextCompactionApplicationService
+from neuro_code.application.memory.compaction_trigger import (
+    ContextCompactionTriggerMode,
+    ContextCompactionTriggerRequest,
+    ContextCompactionTriggerService,
+)
 from neuro_code.application.permissions.policy import PermissionManager
+from neuro_code.application.ports.model import ModelToolPolicy
 from neuro_code.application.ports.tools import ToolContext
 from neuro_code.application.runtime.agent import AgentRuntime
 from neuro_code.application.sessions.conversation import (
@@ -17,6 +37,7 @@ from neuro_code.application.sessions.conversation import (
     AgentConversation,
 )
 from neuro_code.domain.background_tasks import BackgroundWakeState
+from neuro_code.domain.conversation.compaction import compute_compaction_source_fingerprint
 from neuro_code.domain.conversation.context import ModelContext
 from neuro_code.domain.conversation.events import (
     AgentEvent,
@@ -62,8 +83,10 @@ class ConversationProvider:
         self,
         context: ModelContext,
         tools: Sequence[ToolDefinition],
+        *,
+        tool_policy: ModelToolPolicy = ModelToolPolicy.ALLOWED,
     ) -> AsyncIterator[ModelEvent]:
-        del tools
+        del tools, tool_policy
         self.contexts.append(context)
         response = self._responses.pop(0)
         yield ModelTextDelta(response)
@@ -79,7 +102,10 @@ class FailOnceConversationProvider(ConversationProvider):
         self,
         context: ModelContext,
         tools: Sequence[ToolDefinition],
+        *,
+        tool_policy: ModelToolPolicy = ModelToolPolicy.ALLOWED,
     ) -> AsyncIterator[ModelEvent]:
+        del tool_policy
         if not self._failed:
             self._failed = True
             self.contexts.append(context)
@@ -98,7 +124,10 @@ class CancelOnceConversationProvider(ConversationProvider):
         self,
         context: ModelContext,
         tools: Sequence[ToolDefinition],
+        *,
+        tool_policy: ModelToolPolicy = ModelToolPolicy.ALLOWED,
     ) -> AsyncIterator[ModelEvent]:
+        del tool_policy
         if not self._blocked:
             self._blocked = True
             self.contexts.append(context)
@@ -118,8 +147,10 @@ class CancelAfterTextConversationProvider(ConversationProvider):
         self,
         context: ModelContext,
         tools: Sequence[ToolDefinition],
+        *,
+        tool_policy: ModelToolPolicy = ModelToolPolicy.ALLOWED,
     ) -> AsyncIterator[ModelEvent]:
-        del tools
+        del tools, tool_policy
         self.contexts.append(context)
         yield ModelTextDelta("partial output")
         self.started.set()
@@ -127,7 +158,539 @@ class CancelAfterTextConversationProvider(ConversationProvider):
         raise AssertionError("unreachable")
 
 
+class BlockingCompactionGate(ContextCompactionRuntimeGate):
+    __slots__ = ("release", "started")
+
+    def __init__(self, store: SqliteSessionStore, provider: ConversationProvider) -> None:
+        super().__init__(
+            ContextCompactionTriggerService(ContextCompactionApplicationService(store, provider))
+        )
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def trigger(
+        self,
+        request: ContextCompactionRuntimeRequest,
+    ) -> ContextCompactionRuntimeResult:
+        self.started.set()
+        await self.release.wait()
+        return await super().trigger(request)
+
+
+class RaisingCompactionGate(ContextCompactionRuntimeGate):
+    __slots__ = ("error",)
+
+    def __init__(
+        self, store: SqliteSessionStore, provider: ConversationProvider, error: BaseException
+    ):
+        super().__init__(
+            ContextCompactionTriggerService(ContextCompactionApplicationService(store, provider))
+        )
+        self.error = error
+
+    async def trigger(
+        self,
+        request: ContextCompactionRuntimeRequest,
+    ) -> ContextCompactionRuntimeResult:
+        del request
+        raise self.error
+
+
+def _disabled_compaction_request(
+    *,
+    session_id: str | None = None,
+    mode: ContextCompactionTriggerMode = ContextCompactionTriggerMode.DISABLED,
+) -> ContextCompactionRuntimeRequest:
+    context = ModelContext.from_messages((Message(Role.USER, "immutable compaction snapshot"),))
+    usage = CompactionContextUsage.from_provider_window(
+        1,
+        ProviderContextWindow(
+            "conversation-fixture",
+            "fixture-model",
+            1_000,
+            context_affinity="profile-v1:conversation-fixture",
+        ),
+        estimated=True,
+    )
+    return ContextCompactionRuntimeRequest(
+        ContextCompactionTriggerRequest(
+            context=context,
+            usage=usage,
+            mode=mode,
+            session_id=session_id,
+        ),
+        ContextCompactionRuntimeBoundary(
+            safe_point=ContextCompactionSafePoint.BEFORE_MODEL_REQUEST,
+            model_step=0,
+        ),
+    )
+
+
+def _explicit_compaction_request(
+    service: ContextCompactionTriggerService,
+    *,
+    session_id: str,
+    context: ModelContext,
+    boundary: ContextCompactionRuntimeBoundary,
+) -> ContextCompactionRuntimeRequest:
+    usage = CompactionContextUsage.from_provider_window(
+        9_500,
+        ProviderContextWindow(
+            "conversation-fixture",
+            "fixture-model",
+            10_000,
+            context_affinity="profile-v1:conversation-fixture",
+        ),
+        estimated=True,
+    )
+    base = ContextCompactionTriggerRequest(
+        context=context,
+        usage=usage,
+        mode=ContextCompactionTriggerMode.EXPLICIT,
+        protected_item_count=0,
+    )
+    plan = service.assess(base).plan
+    if plan.candidate_range is None:
+        raise AssertionError("conversation fixture must produce an actionable compaction plan")
+    trigger = ContextCompactionTriggerRequest(
+        context=context,
+        usage=usage,
+        mode=ContextCompactionTriggerMode.EXPLICIT,
+        protected_item_count=0,
+        session_id=session_id,
+        compaction_id="conversation-compaction-1",
+        expected_source_fingerprint=compute_compaction_source_fingerprint(
+            context.items,
+            plan.candidate_range,
+        ),
+        created_at=datetime(2026, 8, 8, tzinfo=UTC),
+    )
+    return ContextCompactionRuntimeRequest(trigger, boundary)
+
+
 class AgentConversationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_explicit_compaction_command_builds_live_snapshot_and_runs_owner(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = SqliteSessionStore(root / "sessions.db")
+            await store.initialize()
+            session_id = await store.create_session(
+                str(root),
+                "conversation-fixture",
+                "fixture-model",
+                "profile-v1:conversation-fixture",
+            )
+            provider = ConversationProvider(("summary",))
+            service = ContextCompactionTriggerService(
+                ContextCompactionApplicationService(store, provider)
+            )
+            runtime = AgentRuntime(
+                provider=provider,
+                tools=default_tool_registry(),
+                workspace_change_observer=EmptyWorkspaceChangeObserver(),
+                permissions=PermissionManager(),
+                tool_context=ToolContext(root),
+                session_store=store,
+                compaction_runtime_gate=ContextCompactionRuntimeGate(service),
+            )
+            original_items = tuple(Message(Role.USER, f"history-{index}") for index in range(12))
+            conversation = AgentConversation(
+                runtime=runtime,
+                store=store,
+                items=original_items,
+                session_id=session_id,
+                source_provider=provider.provider_name,
+                source_model=provider.model_name,
+                source_context_affinity=provider.context_affinity,
+            )
+            boundary = ContextCompactionRuntimeBoundary(
+                ContextCompactionSafePoint.AFTER_TOOL_BATCH,
+                3,
+            )
+            provider_window = ProviderContextWindow(
+                provider.provider_name,
+                provider.model_name,
+                10_000,
+                context_affinity=provider.context_affinity,
+            )
+            seen: list[ContextCompactionTurnProjection] = []
+
+            async def owner(
+                projection: ContextCompactionTurnProjection,
+            ) -> ContextCompactionTurnProjection:
+                seen.append(projection)
+                return projection
+
+            result = await conversation.run_explicit_context_compaction_with_owner(
+                boundary=boundary,
+                provider_window=provider_window,
+                reported_input_tokens=9_500,
+                owner=owner,
+            )
+
+            self.assertIs(result, seen[0])
+            self.assertTrue(result.triggered)
+            self.assertIsNotNone(result.compaction_item)
+            self.assertEqual(len(await store.load_compaction_items(session_id)), 1)
+            self.assertEqual(conversation.items, original_items)
+            self.assertEqual(len(provider.contexts), 1)
+            self.assertEqual(provider.contexts[0].source_provider, provider.provider_name)
+            self.assertEqual(provider.contexts[0].source_model, provider.model_name)
+
+    async def test_explicit_compaction_command_requires_persisted_session_before_building(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = SqliteSessionStore(root / "sessions.db")
+            await store.initialize()
+            provider = ConversationProvider(())
+            runtime = AgentRuntime(
+                provider=provider,
+                tools=default_tool_registry(),
+                workspace_change_observer=EmptyWorkspaceChangeObserver(),
+                permissions=PermissionManager(),
+                tool_context=ToolContext(root),
+                session_store=store,
+                compaction_runtime_gate=ContextCompactionRuntimeGate(
+                    ContextCompactionTriggerService(
+                        ContextCompactionApplicationService(store, provider)
+                    )
+                ),
+            )
+            conversation = AgentConversation(
+                runtime=runtime,
+                store=store,
+                items=(Message(Role.USER, "unsaved"),),
+            )
+
+            async def owner(_: ContextCompactionTurnProjection) -> None:
+                raise AssertionError("owner must not run for an unsaved session")
+
+            with self.assertRaisesRegex(ConfigurationError, "persisted session"):
+                await conversation.run_explicit_context_compaction_with_owner(
+                    boundary=ContextCompactionRuntimeBoundary(
+                        ContextCompactionSafePoint.AFTER_TOOL_BATCH,
+                        0,
+                    ),
+                    provider_window=None,
+                    owner=owner,
+                )
+            self.assertEqual(provider.contexts, [])
+
+    async def test_explicit_compaction_uses_the_session_turn_lock_and_keeps_snapshot_immutable(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = SqliteSessionStore(root / "sessions.db")
+            await store.initialize()
+            session_id = await store.create_session(
+                str(root),
+                "conversation-fixture",
+                "fixture-model",
+                "profile-v1:conversation-fixture",
+            )
+            provider = ConversationProvider(("turn response",))
+            gate = BlockingCompactionGate(store, provider)
+            runtime = AgentRuntime(
+                provider=provider,
+                tools=default_tool_registry(),
+                workspace_change_observer=EmptyWorkspaceChangeObserver(),
+                permissions=PermissionManager(),
+                tool_context=ToolContext(root),
+                session_store=store,
+                compaction_runtime_gate=gate,
+            )
+            conversation = await AgentConversation.open(
+                runtime=runtime,
+                store=store,
+                cwd=root,
+                workspace_identity=FakeWorkspaceIdentity(),
+                resume_id=session_id,
+            )
+            request = _disabled_compaction_request(session_id=session_id)
+
+            compaction_task = asyncio.create_task(conversation.trigger_context_compaction(request))
+            await gate.started.wait()
+            turn_task = asyncio.create_task(conversation.run("run after compaction"))
+            with self.assertRaises(asyncio.TimeoutError):
+                await asyncio.wait_for(asyncio.shield(turn_task), timeout=0.02)
+
+            gate.release.set()
+            compaction_result = await compaction_task
+            turn_result = await turn_task
+
+            self.assertFalse(compaction_result.trigger_result.triggered)
+            self.assertEqual(
+                request.trigger.context.messages[0].content, "immutable compaction snapshot"
+            )
+            self.assertEqual(turn_result.response, "turn response")
+            self.assertEqual(len(provider.contexts), 1)
+
+    async def test_explicit_compaction_rejects_a_request_bound_to_another_session(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = SqliteSessionStore(root / "sessions.db")
+            await store.initialize()
+            session_id = await store.create_session(
+                str(root),
+                "conversation-fixture",
+                "fixture-model",
+            )
+            provider = ConversationProvider(())
+            runtime = AgentRuntime(
+                provider=provider,
+                tools=default_tool_registry(),
+                workspace_change_observer=EmptyWorkspaceChangeObserver(),
+                permissions=PermissionManager(),
+                tool_context=ToolContext(root),
+                session_store=store,
+                compaction_runtime_gate=BlockingCompactionGate(store, provider),
+            )
+            conversation = await AgentConversation.open(
+                runtime=runtime,
+                store=store,
+                cwd=root,
+                workspace_identity=FakeWorkspaceIdentity(),
+                resume_id=session_id,
+            )
+
+            with self.assertRaisesRegex(ConfigurationError, "different session"):
+                await conversation.trigger_context_compaction(
+                    _disabled_compaction_request(
+                        session_id="another-session",
+                        mode=ContextCompactionTriggerMode.EXPLICIT,
+                    )
+                )
+
+    async def test_compaction_owner_rejects_noop_without_calling_owner(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = SqliteSessionStore(root / "sessions.db")
+            await store.initialize()
+            session_id = await store.create_session(
+                str(root),
+                "conversation-fixture",
+                "fixture-model",
+            )
+            provider = ConversationProvider(())
+            service = ContextCompactionTriggerService(
+                ContextCompactionApplicationService(store, provider)
+            )
+            runtime = AgentRuntime(
+                provider=provider,
+                tools=default_tool_registry(),
+                workspace_change_observer=EmptyWorkspaceChangeObserver(),
+                permissions=PermissionManager(),
+                tool_context=ToolContext(root),
+                session_store=store,
+                compaction_runtime_gate=ContextCompactionRuntimeGate(service),
+            )
+            conversation = await AgentConversation.open(
+                runtime=runtime,
+                store=store,
+                cwd=root,
+                workspace_identity=FakeWorkspaceIdentity(),
+                resume_id=session_id,
+            )
+            owner_called = False
+
+            async def unexpected_owner(_: ContextCompactionTurnProjection) -> None:
+                nonlocal owner_called
+                owner_called = True
+
+            with self.assertRaisesRegex(ConfigurationError, "triggered or controlled"):
+                await conversation.run_context_compaction_with_owner(
+                    _disabled_compaction_request(session_id=session_id),
+                    unexpected_owner,
+                )
+            self.assertFalse(owner_called)
+            self.assertEqual(provider.contexts, [])
+
+    async def test_compaction_owner_runs_under_session_lock_and_receives_success_projection(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = SqliteSessionStore(root / "sessions.db")
+            await store.initialize()
+            session_id = await store.create_session(
+                str(root),
+                "conversation-fixture",
+                "fixture-model",
+                "profile-v1:conversation-fixture",
+            )
+            provider = ConversationProvider(("summary", "turn response"))
+            service = ContextCompactionTriggerService(
+                ContextCompactionApplicationService(store, provider)
+            )
+            runtime = AgentRuntime(
+                provider=provider,
+                tools=default_tool_registry(),
+                workspace_change_observer=EmptyWorkspaceChangeObserver(),
+                permissions=PermissionManager(),
+                tool_context=ToolContext(root),
+                session_store=store,
+                compaction_runtime_gate=ContextCompactionRuntimeGate(service),
+            )
+            conversation = await AgentConversation.open(
+                runtime=runtime,
+                store=store,
+                cwd=root,
+                workspace_identity=FakeWorkspaceIdentity(),
+                resume_id=session_id,
+            )
+            request = _explicit_compaction_request(
+                service,
+                session_id=session_id,
+                context=ModelContext.from_messages((Message(Role.USER, "snapshot"),) * 12),
+                boundary=ContextCompactionRuntimeBoundary(
+                    ContextCompactionSafePoint.AFTER_TOOL_BATCH,
+                    1,
+                ),
+            )
+            owner_started = asyncio.Event()
+            owner_release = asyncio.Event()
+
+            async def owner(
+                projection: ContextCompactionTurnProjection,
+            ) -> ContextCompactionTurnProjection:
+                self.assertTrue(projection.triggered)
+                self.assertIsNotNone(projection.compaction_item)
+                owner_started.set()
+                await owner_release.wait()
+                return projection
+
+            compaction_task = asyncio.create_task(
+                conversation.run_context_compaction_with_owner(request, owner)
+            )
+            await owner_started.wait()
+            turn_task = asyncio.create_task(conversation.run("after compaction"))
+            with self.assertRaises(asyncio.TimeoutError):
+                await asyncio.wait_for(asyncio.shield(turn_task), timeout=0.02)
+
+            owner_release.set()
+            projection = await compaction_task
+            result = await turn_task
+
+            self.assertTrue(projection.triggered)
+            self.assertEqual(result.response, "turn response")
+            self.assertEqual(len(await store.load_compaction_items(session_id)), 1)
+
+    async def test_compaction_owner_consumes_timeout_but_propagates_provider_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = SqliteSessionStore(root / "sessions.db")
+            await store.initialize()
+            session_id = await store.create_session(str(root), "provider", "model")
+
+            timeout_runtime = AgentRuntime(
+                provider=ConversationProvider(()),
+                tools=default_tool_registry(),
+                workspace_change_observer=EmptyWorkspaceChangeObserver(),
+                permissions=PermissionManager(),
+                tool_context=ToolContext(root),
+                session_store=store,
+                compaction_runtime_gate=RaisingCompactionGate(
+                    store,
+                    ConversationProvider(()),
+                    ContextCompactionTimeoutError("secret timeout"),
+                ),
+            )
+            timeout_conversation = await AgentConversation.open(
+                runtime=timeout_runtime,
+                store=store,
+                cwd=root,
+                workspace_identity=FakeWorkspaceIdentity(),
+                resume_id=session_id,
+            )
+            request = _disabled_compaction_request(session_id=session_id)
+            seen: list[ContextCompactionTurnProjection] = []
+
+            async def consume_timeout(
+                projection: ContextCompactionTurnProjection,
+            ) -> str:
+                seen.append(projection)
+                return projection.outcome.reason_code.value if projection.outcome else "missing"
+
+            self.assertEqual(
+                await timeout_conversation.run_context_compaction_with_owner(
+                    request,
+                    consume_timeout,
+                ),
+                "wall_time_budget",
+            )
+            self.assertEqual(len(seen), 1)
+            self.assertTrue(seen[0].ready_for_turn_finalization)
+
+            provider_error = ProviderError("provider failed")
+            provider_runtime = AgentRuntime(
+                provider=ConversationProvider(()),
+                tools=default_tool_registry(),
+                workspace_change_observer=EmptyWorkspaceChangeObserver(),
+                permissions=PermissionManager(),
+                tool_context=ToolContext(root),
+                session_store=store,
+                compaction_runtime_gate=RaisingCompactionGate(
+                    store,
+                    ConversationProvider(()),
+                    provider_error,
+                ),
+            )
+            provider_conversation = await AgentConversation.open(
+                runtime=provider_runtime,
+                store=store,
+                cwd=root,
+                workspace_identity=FakeWorkspaceIdentity(),
+                resume_id=session_id,
+            )
+            owner_called = False
+
+            async def unexpected_owner(_: ContextCompactionTurnProjection) -> None:
+                nonlocal owner_called
+                owner_called = True
+
+            with self.assertRaisesRegex(ProviderError, "provider failed"):
+                await provider_conversation.run_context_compaction_with_owner(
+                    request,
+                    unexpected_owner,
+                )
+            self.assertFalse(owner_called)
+
+            cancelled_runtime = AgentRuntime(
+                provider=ConversationProvider(()),
+                tools=default_tool_registry(),
+                workspace_change_observer=EmptyWorkspaceChangeObserver(),
+                permissions=PermissionManager(),
+                tool_context=ToolContext(root),
+                session_store=store,
+                compaction_runtime_gate=RaisingCompactionGate(
+                    store,
+                    ConversationProvider(()),
+                    asyncio.CancelledError(),
+                ),
+            )
+            cancelled_conversation = await AgentConversation.open(
+                runtime=cancelled_runtime,
+                store=store,
+                cwd=root,
+                workspace_identity=FakeWorkspaceIdentity(),
+                resume_id=session_id,
+            )
+            cancelled_owner_called = False
+
+            async def unexpected_cancelled_owner(_: ContextCompactionTurnProjection) -> None:
+                nonlocal cancelled_owner_called
+                cancelled_owner_called = True
+
+            with self.assertRaises(asyncio.CancelledError):
+                await cancelled_conversation.run_context_compaction_with_owner(
+                    request,
+                    unexpected_cancelled_owner,
+                )
+            self.assertFalse(cancelled_owner_called)
+
     async def test_resume_loads_and_next_completion_replaces_the_durable_execution_record(
         self,
     ) -> None:

@@ -2,6 +2,13 @@
 
 定义规范的会话和模型流领域契约."""
 
+from neuro_code.domain.conversation.compaction import (
+    COMPACTION_SOURCE_FINGERPRINT_BYTES,
+    MAX_DURABLE_COMPACTION_ID_BYTES,
+    MAX_DURABLE_COMPACTION_SUMMARY_BYTES,
+    DurableCompactionItem,
+    compute_compaction_source_fingerprint,
+)
 from neuro_code.domain.conversation.context import (
     UPSTREAM_IMPORT_PROVIDER,
     ModelContext,
@@ -40,13 +47,17 @@ from neuro_code.domain.conversation.messages import (
 from neuro_code.domain.conversation.reasoning import ReasoningEffort, reasoning_guidance
 
 __all__ = [
+    "COMPACTION_SOURCE_FINGERPRINT_BYTES",
     "IMAGE_MODEL_PLACEHOLDER",
+    "MAX_DURABLE_COMPACTION_ID_BYTES",
+    "MAX_DURABLE_COMPACTION_SUMMARY_BYTES",
     "UPSTREAM_IMPORT_PROVIDER",
     "AgentEvent",
     "AgentEventKind",
     "ContentPart",
     "ContentPartKind",
     "ContextItemKind",
+    "DurableCompactionItem",
     "InteractionMode",
     "Message",
     "ModelBackendToolCompleted",
@@ -65,6 +76,7 @@ __all__ = [
     "SessionItem",
     "SyntheticReason",
     "ToolCall",
+    "compute_compaction_source_fingerprint",
     "estimate_context_tokens",
     "estimate_text_tokens",
     "interaction_mode_guidance",

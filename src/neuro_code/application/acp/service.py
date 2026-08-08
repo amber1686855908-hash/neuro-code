@@ -40,6 +40,13 @@ from neuro_code.application.sessions.service import (
     ResolveSessionAliasRequest,
     SessionApplicationService,
 )
+from neuro_code.application.sessions.subagent_lifecycle import (
+    SubagentRelationshipAction,
+    SubagentRelationshipActionRequest,
+    SubagentRelationshipActionResult,
+    SubagentRelationshipLifecycleController,
+    SubagentRelationshipLifecycleService,
+)
 from neuro_code.application.sessions.summary import (
     GetSessionSummaryRequest,
     SessionSummaryQueryController,
@@ -53,8 +60,15 @@ from neuro_code.application.tools.service import (
     SessionToolOutputArtifact,
     SessionToolOutputArtifactApplicationService,
 )
+from neuro_code.application.workflows.subagent import (
+    ReadOnlySubagentApplicationService,
+    RunSubagentRequest,
+    SubagentResultProjection,
+)
 from neuro_code.domain.sessions import SessionSummary
 from neuro_code.shared.errors import SessionError
+
+_ACP_SESSION_ALIAS_NAMESPACE = "acp-v1"
 
 
 class AcpApplicationService:
@@ -74,6 +88,8 @@ class AcpApplicationService:
         summary_queries: SessionSummaryQueryController | None = None,
         lifecycle: SessionLifecycleController | None = None,
         artifacts: SessionToolOutputArtifactApplicationService | None = None,
+        subagents: ReadOnlySubagentApplicationService | None = None,
+        subagent_lifecycle: SubagentRelationshipLifecycleController | None = None,
     ) -> None:
         self._metadata = metadata
         self._store = store
@@ -84,6 +100,11 @@ class AcpApplicationService:
         self._summary_queries = summary_queries or (sessions or SessionSummaryQueryService(store))
         self._lifecycle: SessionLifecycleController = lifecycle or self._sessions
         self._artifacts = artifacts
+        self._subagents = subagents
+        self._subagent_lifecycle = subagent_lifecycle or SubagentRelationshipLifecycleService(
+            self._store,
+            self._lifecycle,
+        )
 
     @property
     def protected_environment_variables(self) -> frozenset[str]:
@@ -101,6 +122,24 @@ class AcpApplicationService:
         """
 
         return self._artifacts is not None
+
+    @property
+    def read_only_subagent_available(self) -> bool:
+        """Whether the composition supplied the explicit read-only child seam.
+
+        当前组合是否提供了明确的只读子会话接缝.
+        """
+
+        return self._subagents is not None
+
+    @property
+    def subagent_lifecycle_available(self) -> bool:
+        """Whether the explicit parent-owned child lifecycle seam is available.
+
+        当前是否提供显式且由父会话拥有的子会话生命周期接缝.
+        """
+
+        return self._subagent_lifecycle is not None
 
     async def validate_workspace(
         self,
@@ -145,6 +184,66 @@ class AcpApplicationService:
 
     async def prepare_session_resume(self, session_id: str) -> AcpPreparedSession:
         return await self._bindings.prepare_session_resume(session_id)
+
+    async def run_read_only_subagent(
+        self,
+        parent_session_id: str,
+        prompt: str,
+        *,
+        max_steps: int = 8,
+    ) -> SubagentResultProjection:
+        """Run one explicit child after validating its parent workspace.
+
+        校验父会话工作区后运行一次明确的子会话.
+        """
+
+        await self._require_current_workspace_session(parent_session_id)
+        service = self._subagents
+        if service is None:
+            raise SessionError("read-only subagent service is unavailable")
+        return await service.run_subagent(
+            RunSubagentRequest(parent_session_id, prompt, max_steps=max_steps)
+        )
+
+    async def run_subagent_relationship_action(
+        self,
+        parent_session_id: str,
+        parent_task_id: str,
+        action: SubagentRelationshipAction,
+    ) -> SubagentRelationshipActionResult:
+        """Execute one child relationship action after workspace validation.
+
+        在工作区校验后执行一次子会话关系生命周期动作.
+        """
+
+        await self._require_current_workspace_session(parent_session_id)
+        lifecycle = self._subagent_lifecycle
+        if lifecycle is None:
+            raise SessionError("subagent lifecycle service is unavailable")
+        return await lifecycle.execute(
+            SubagentRelationshipActionRequest(
+                parent_session_id=parent_session_id,
+                parent_task_id=parent_task_id,
+                action=action,
+            )
+        )
+
+    async def get_or_create_current_workspace_session_alias(
+        self,
+        session_id: str,
+        proposed_external_id: str,
+    ) -> str:
+        """Allocate an external alias after current-workspace validation.
+
+        仅在当前工作区校验后为会话分配外部 alias.
+        """
+
+        await self._require_current_workspace_session(session_id)
+        return await self.get_or_create_session_alias(
+            _ACP_SESSION_ALIAS_NAMESPACE,
+            session_id,
+            proposed_external_id,
+        )
 
     def bind_runner(self, runner: SessionTurnRunner) -> SessionTurnService:
         """Bind an ACP conversation runner to the shared turn application seam.

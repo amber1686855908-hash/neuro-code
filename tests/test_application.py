@@ -8,6 +8,7 @@ from typing import Any, cast
 from unittest.mock import patch
 
 import neuro_code.configuration.app as config_module
+from neuro_code.application.memory.compaction_runtime import ContextCompactionRuntimeGate
 from neuro_code.application.permissions.policy import (
     PermissionEffect,
     PermissionMode,
@@ -24,6 +25,7 @@ from neuro_code.application.runtime.supervision import ExecutionControlMode
 from neuro_code.application.sessions import GetSessionSummaryRequest, SessionApplicationService
 from neuro_code.application.sessions.summary import SessionSummaryQueryService
 from neuro_code.application.settings import ApplicationSettings
+from neuro_code.application.workflows import IsolatedSubagentExecutionService
 from neuro_code.bootstrap.composition import ApplicationComposition
 from neuro_code.configuration.app import AppConfig
 from neuro_code.domain.conversation.context import ModelContext
@@ -170,6 +172,10 @@ api_key_env = "FIXTURE_KEY"
                     default_binding.runner._runtime._execution_control_mode,
                     ExecutionControlMode.FINALIZE_TERMINAL,
                 )
+                self.assertIsInstance(
+                    default_binding.runner._runtime._compaction_runtime_gate,
+                    ContextCompactionRuntimeGate,
+                )
                 await default_application.close()
 
                 observe_application = await ApplicationComposition.open(
@@ -184,7 +190,46 @@ api_key_env = "FIXTURE_KEY"
                     observe_binding.runner._runtime._execution_control_mode,
                     ExecutionControlMode.OBSERVE_ONLY,
                 )
+                self.assertIsInstance(
+                    observe_binding.runner._runtime._compaction_runtime_gate,
+                    ContextCompactionRuntimeGate,
+                )
                 await observe_application.close()
+
+    async def test_read_only_subagent_binding_has_only_inspection_capabilities(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / "state"
+            self._write_config(state)
+            with patch.dict(
+                "os.environ",
+                {
+                    "HOME": str(root),
+                    "NEURO_CODE_HOME": str(state),
+                    "FIXTURE_KEY": "fixture-key",
+                },
+                clear=True,
+            ):
+                application = await ApplicationComposition.open(
+                    ApplicationSettings(cwd=root),
+                    provider_factory=lambda config, failover: ApplicationProviderFixture(),
+                )
+                binding = await application.create_binding(
+                    max_steps=3,
+                    allowed_tool_names=("read_file", "list_dir", "grep", "skill"),
+                    enable_background_tasks=False,
+                )
+                runtime = binding.runner._runtime
+                self.assertEqual(
+                    runtime._tools.names(),
+                    ("read_file", "list_dir", "grep", "skill"),
+                )
+                self.assertIsNone(runtime._tool_context.background_tasks)
+                self.assertIsInstance(
+                    application.create_read_only_subagent_service(),
+                    IsolatedSubagentExecutionService,
+                )
+                await application.close()
 
     async def test_open_create_and_close_own_shared_resources(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

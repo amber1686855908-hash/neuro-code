@@ -7,10 +7,21 @@ from __future__ import annotations
 import asyncio
 import inspect
 import uuid
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import TypeVar
 
+from neuro_code.application.memory.compaction import ProviderContextWindow
+from neuro_code.application.memory.compaction_runtime import (
+    ContextCompactionRuntimeBoundary,
+    ContextCompactionRuntimeRequest,
+    ContextCompactionRuntimeResult,
+    ContextCompactionTurnProjection,
+    project_context_compaction_failure,
+    project_context_compaction_result,
+)
+from neuro_code.application.memory.compaction_trigger import ContextCompactionTriggerMode
 from neuro_code.application.ports.storage import SessionStore
 from neuro_code.application.ports.workspace import WorkspaceIdentity
 from neuro_code.application.runtime.agent import AgentRunResult, AgentRuntime, EventSink
@@ -50,6 +61,8 @@ from neuro_code.domain.session_tasks import (
     SessionTaskStatus,
 )
 from neuro_code.shared.errors import ConfigurationError
+
+_T = TypeVar("_T")
 
 PLAN_EXECUTION_PROMPT = (
     "The user has approved the current structured plan for execution. "
@@ -308,6 +321,121 @@ class AgentConversation:
             await self._reload_execution_record()
             return result
 
+    async def trigger_context_compaction(
+        self,
+        request: ContextCompactionRuntimeRequest,
+    ) -> ContextCompactionRuntimeResult:
+        """Run one explicit compaction request under the session turn lock.
+
+        The immutable request is the caller-owned context snapshot.  A normal
+        turn and an explicit compaction cannot overlap on this conversation;
+        the trigger's source fingerprint remains the stale-snapshot guard.
+        Compaction rows are separate from canonical session items, so a
+        successful call does not mutate this conversation's transcript.
+
+        在会话回合锁下运行一次显式压缩请求。
+
+        不可变请求是调用方拥有的上下文快照。普通回合与显式压缩不能在当前会话上重叠;
+        触发请求的源指纹继续负责过期快照防护。压缩记录独立于规范会话条目,因此成功调用不会修改当前会话 transcript。
+        """
+
+        async with self._turn_lock:
+            self._validate_context_compaction_request(request)
+            return await self._runtime.trigger_context_compaction(request)
+
+    async def run_context_compaction_with_owner(
+        self,
+        request: ContextCompactionRuntimeRequest,
+        owner: Callable[[ContextCompactionTurnProjection], Awaitable[_T]],
+    ) -> _T:
+        """Run compaction and its explicit owner under one session lock.
+
+        Successful gate results are projected before the owner is called. A
+        timeout is offered to the owner as its bounded terminal projection;
+        cancellation, Provider, storage, and unknown failures are re-raised.
+        The owner callback must perform any turn finalization itself, and this
+        method never enters the normal Agent loop.
+
+        在同一个会话锁下运行压缩及其显式所有者。
+
+        门控成功结果会在调用所有者前先完成投影。超时会以自身的有界终态投影交给所有者;取消、Provider、存储和未知失败会重新抛出。
+        所有者回调必须自行完成回合最终化,本方法不会进入普通 Agent loop。
+        """
+
+        if not callable(owner):
+            raise TypeError("owner must be callable")
+        async with self._turn_lock:
+            return await self._run_context_compaction_with_owner_locked(request, owner)
+
+    async def run_explicit_context_compaction_with_owner(
+        self,
+        *,
+        boundary: ContextCompactionRuntimeBoundary,
+        provider_window: ProviderContextWindow | None,
+        owner: Callable[[ContextCompactionTurnProjection], Awaitable[_T]],
+        protected_item_count: int = 0,
+        reported_input_tokens: int | None = None,
+        reported_output_tokens: int | None = None,
+        compaction_id: str | None = None,
+        created_at: datetime | None = None,
+    ) -> _T:
+        """Build and run one explicit compaction command under the turn lock.
+
+        The live context is built inside the existing lock, then the current
+        trigger service computes the plan and stale-source guard from that
+        exact snapshot.  The owner receives only the same bounded projection
+        used by the lower-level request API; no normal Agent turn is started.
+
+        在现有回合锁下构建并运行一次显式压缩命令。
+
+        实时上下文会在现有锁内构建,随后由当前触发服务根据这份精确快照计算计划和过期源保护值。
+        所有者只会收到与底层请求 API 相同的有界投影;不会启动普通 Agent 回合。
+        """
+
+        if not callable(owner):
+            raise TypeError("owner must be callable")
+        if self._session_id is None:
+            raise ConfigurationError("explicit compaction requires a persisted session")
+        async with self._turn_lock:
+            context = self._runtime.build_context_snapshot(
+                self._items,
+                source_provider=self._source_provider,
+                source_model=self._source_model,
+                source_context_affinity=self._source_context_affinity,
+            )
+            request = self._runtime.build_explicit_context_compaction_request(
+                context=context,
+                boundary=boundary,
+                provider_window=provider_window,
+                protected_item_count=protected_item_count,
+                reported_input_tokens=reported_input_tokens,
+                reported_output_tokens=reported_output_tokens,
+                session_id=self._session_id,
+                compaction_id=compaction_id or f"compaction-{uuid.uuid4().hex}",
+                created_at=created_at or datetime.now(UTC),
+            )
+            return await self._run_context_compaction_with_owner_locked(request, owner)
+
+    async def _run_context_compaction_with_owner_locked(
+        self,
+        request: ContextCompactionRuntimeRequest,
+        owner: Callable[[ContextCompactionTurnProjection], Awaitable[_T]],
+    ) -> _T:
+        self._validate_context_compaction_request(request)
+        try:
+            result = await self._runtime.trigger_context_compaction(request)
+        except BaseException as error:
+            projection = project_context_compaction_failure(error)
+            if projection is None or projection.must_propagate:
+                raise
+        else:
+            projection = project_context_compaction_result(result)
+        if not projection.ready_for_turn_finalization:
+            raise ConfigurationError(
+                "compaction owner requires a triggered or controlled terminal projection"
+            )
+        return await owner(projection)
+
     async def run_background_wake(self, *, sink: EventSink | None = None) -> AgentRunResult:
         """Run one model turn for pending background completions without a user prompt.
 
@@ -422,6 +550,18 @@ class AgentConversation:
         await self._reload_plan_state()
         await self._reload_provider_origin()
         await self._reload_execution_record()
+
+    def _validate_context_compaction_request(
+        self,
+        request: ContextCompactionRuntimeRequest,
+    ) -> None:
+        if not isinstance(request, ContextCompactionRuntimeRequest):
+            raise TypeError("request must be a ContextCompactionRuntimeRequest")
+        if request.trigger.mode is ContextCompactionTriggerMode.EXPLICIT:
+            if self._session_id is None:
+                raise ConfigurationError("explicit compaction requires a persisted session")
+            if request.trigger.session_id != self._session_id:
+                raise ConfigurationError("compaction request is bound to a different session")
 
     async def _reload_plan_state(self) -> None:
         if self._session_id is None:

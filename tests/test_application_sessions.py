@@ -46,6 +46,17 @@ from neuro_code.application.sessions.event_queries import SessionEventQueryServi
 from neuro_code.application.sessions.execution_queries import SessionExecutionQueryService
 from neuro_code.application.sessions.item_queries import SessionItemQueryService
 from neuro_code.application.sessions.lifecycle import SessionLifecycleService
+from neuro_code.application.sessions.subagent_lifecycle import (
+    SubagentRelationshipActionRequest,
+    SubagentRelationshipActionResult,
+    SubagentRelationshipLifecycleService,
+)
+from neuro_code.application.sessions.subagent_queries import (
+    GetSubagentRelationshipRequest,
+    ListSubagentRelationshipsRequest,
+    SubagentRelationshipAction,
+    SubagentRelationshipQueryService,
+)
 from neuro_code.application.sessions.summary import SessionSummaryQueryService
 from neuro_code.application.sessions.turns import SessionTurnService as CanonicalSessionTurnService
 from neuro_code.domain.conversation.messages import ContentPart, Message, Role, SessionItem
@@ -59,10 +70,15 @@ from neuro_code.domain.execution import (
 )
 from neuro_code.domain.plans import PlanComment, PlanStep, SessionPlan
 from neuro_code.domain.sandbox import SandboxProfile
-from neuro_code.domain.session_tasks import SessionTask, SessionTaskKind, SessionTaskStatus
+from neuro_code.domain.session_tasks import (
+    SessionTask,
+    SessionTaskKind,
+    SessionTaskStatus,
+    SubagentLink,
+)
 from neuro_code.domain.sessions import SessionSnapshot, SessionSummary
 from neuro_code.domain.sessions.search import SessionSearchHit, SessionSearchPage
-from neuro_code.shared.errors import SessionError
+from neuro_code.shared.errors import ConfigurationError, SessionError
 
 
 class SessionStoreFixture:
@@ -72,6 +88,8 @@ class SessionStoreFixture:
         self.plan: SessionPlan | None = None
         self.plan_comments: list[PlanComment] = []
         self.tasks: list[SessionTask] = []
+        self.subagent_links: list[SubagentLink] = []
+        self.child_summaries: dict[str, SessionSummary] = {}
         self.calls: list[tuple[str, tuple[object, ...]]] = []
         self.create_error: SessionError | None = None
         self.sessions = (summary,)
@@ -108,7 +126,7 @@ class SessionStoreFixture:
 
     async def get_session(self, session_id: str) -> SessionSummary:
         self.calls.append(("get_session", (session_id,)))
-        return self.summary
+        return self.child_summaries.get(session_id, self.summary)
 
     async def bind_session_alias(
         self,
@@ -185,6 +203,33 @@ class SessionStoreFixture:
     async def get_session_task(self, session_id: str, task_id: str) -> SessionTask | None:
         self.calls.append(("get_session_task", (session_id, task_id)))
         return next((task for task in self.tasks if task.task_id == task_id), None)
+
+    async def load_subagent_link(
+        self,
+        parent_session_id: str,
+        parent_task_id: str,
+    ) -> SubagentLink | None:
+        self.calls.append(("load_subagent_link", (parent_session_id, parent_task_id)))
+        return next(
+            (
+                link
+                for link in self.subagent_links
+                if link.parent_session_id == parent_session_id
+                and link.parent_task_id == parent_task_id
+            ),
+            None,
+        )
+
+    async def list_subagent_links(
+        self,
+        parent_session_id: str,
+        *,
+        limit: int = 50,
+    ) -> list[SubagentLink]:
+        self.calls.append(("list_subagent_links", (parent_session_id, limit)))
+        return [
+            link for link in self.subagent_links if link.parent_session_id == parent_session_id
+        ][:limit]
 
     async def load_events(self, session_id: str) -> list[dict[str, object]]:
         self.calls.append(("load_events", (session_id,)))
@@ -882,6 +927,255 @@ class SessionApplicationServiceTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ValueError):
             await service.run_turn(cast(RunTurnRequest, object()))
         self.assertEqual(runner.calls, [])
+
+
+class SubagentRelationshipQueryServiceTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        self.summary = _summary()
+        self.child_summary = replace(
+            self.summary,
+            id="child-session",
+            provider="child-provider",
+            model="child-model",
+            updated_at=datetime(2026, 1, 1, 0, 1, tzinfo=UTC),
+        )
+        self.store = SessionStoreFixture(self.summary, None)
+        self.store.child_summaries[self.child_summary.id] = self.child_summary
+        self.service = SubagentRelationshipQueryService(cast(SessionStore, self.store))
+
+    def _link_and_task(self, status: SessionTaskStatus) -> SubagentLink:
+        started_at = datetime(2026, 1, 1, tzinfo=UTC)
+        task = SessionTask(
+            "subagent-task",
+            SessionTaskKind.SUBAGENT,
+            status,
+            started_at,
+            started_at.replace(second=1) if status.terminal else None,
+        )
+        link = SubagentLink(
+            self.summary.id,
+            task.task_id,
+            self.child_summary.id,
+            started_at.replace(second=2),
+        )
+        self.store.tasks = [task]
+        self.store.subagent_links = [link]
+        return link
+
+    async def test_terminal_relationship_exposes_only_safe_lifecycle_actions(self) -> None:
+        link = self._link_and_task(SessionTaskStatus.COMPLETED)
+
+        result = await self.service.list_subagent_relationships(
+            ListSubagentRelationshipsRequest(self.summary.id)
+        )
+
+        self.assertEqual(len(result), 1)
+        projection = result[0]
+        self.assertEqual(projection.parent_task_id, link.parent_task_id)
+        self.assertEqual(projection.child_session_id, self.child_summary.id)
+        self.assertIs(projection.task_status, SessionTaskStatus.COMPLETED)
+        self.assertEqual(projection.child_provider, "child-provider")
+        self.assertEqual(projection.child_model, "child-model")
+        self.assertEqual(
+            projection.available_actions,
+            (
+                SubagentRelationshipAction.RESUME,
+                SubagentRelationshipAction.FORK,
+                SubagentRelationshipAction.DELETE,
+            ),
+        )
+        self.assertFalse(
+            any(name in {"load_session_items", "load_events"} for name, _ in self.store.calls)
+        )
+
+    async def test_active_relationship_exposes_no_mutating_or_resume_action(self) -> None:
+        self._link_and_task(SessionTaskStatus.RUNNING)
+
+        projection = await self.service.get_subagent_relationship(
+            GetSubagentRelationshipRequest(self.summary.id, "subagent-task")
+        )
+
+        self.assertIsNotNone(projection)
+        assert projection is not None
+        self.assertIs(projection.task_status, SessionTaskStatus.RUNNING)
+        self.assertEqual(projection.available_actions, ())
+
+    async def test_missing_relationship_is_read_only_and_returns_none(self) -> None:
+        result = await self.service.get_subagent_relationship(
+            GetSubagentRelationshipRequest(self.summary.id, "missing-task")
+        )
+
+        self.assertIsNone(result)
+        self.assertEqual(self.store.calls, [("load_subagent_link", ("session-1", "missing-task"))])
+
+    async def test_relationship_rejects_non_subagent_parent_task(self) -> None:
+        started_at = datetime(2026, 1, 1, tzinfo=UTC)
+        self.store.tasks = [
+            SessionTask(
+                "plan-task",
+                SessionTaskKind.PLAN_EXECUTION,
+                SessionTaskStatus.COMPLETED,
+                started_at,
+                started_at.replace(second=1),
+            )
+        ]
+        self.store.subagent_links = [
+            SubagentLink(
+                self.summary.id,
+                "plan-task",
+                self.child_summary.id,
+                started_at.replace(second=2),
+            )
+        ]
+
+        with self.assertRaisesRegex(ConfigurationError, "parent task"):
+            await self.service.list_subagent_relationships(
+                ListSubagentRelationshipsRequest(self.summary.id)
+            )
+
+    def test_relationship_requests_are_bounded(self) -> None:
+        with self.assertRaises(ValueError):
+            ListSubagentRelationshipsRequest(" ")
+        with self.assertRaises(ValueError):
+            ListSubagentRelationshipsRequest("session-1", 0)
+        with self.assertRaises(ValueError):
+            ListSubagentRelationshipsRequest("session-1", 101)
+        with self.assertRaises(ValueError):
+            GetSubagentRelationshipRequest("session-1", " ")
+
+
+class SubagentRelationshipLifecycleServiceTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        self.summary = _summary()
+        self.child_summary = replace(
+            self.summary,
+            id="child-session",
+            provider="child-provider",
+            model="child-model",
+        )
+        self.store = SessionStoreFixture(self.summary, None)
+        self.store.child_summaries[self.child_summary.id] = self.child_summary
+        self.service = SubagentRelationshipLifecycleService(
+            cast(SessionStore, self.store),
+            SessionLifecycleService(cast(SessionStore, self.store)),
+        )
+
+    def _link_and_task(self, status: SessionTaskStatus) -> None:
+        started_at = datetime(2026, 1, 1, tzinfo=UTC)
+        task = SessionTask(
+            "subagent-task",
+            SessionTaskKind.SUBAGENT,
+            status,
+            started_at,
+            started_at.replace(second=1) if status.terminal else None,
+        )
+        self.store.tasks = [task]
+        self.store.subagent_links = [
+            SubagentLink(
+                self.summary.id,
+                task.task_id,
+                self.child_summary.id,
+                started_at.replace(second=2),
+            )
+        ]
+
+    async def test_resume_validates_parent_ownership_without_running_model(self) -> None:
+        self._link_and_task(SessionTaskStatus.COMPLETED)
+
+        result = await self.service.execute(
+            SubagentRelationshipActionRequest(
+                self.summary.id,
+                "subagent-task",
+                SubagentRelationshipAction.RESUME,
+            )
+        )
+
+        self.assertEqual(
+            result,
+            SubagentRelationshipActionResult(
+                self.summary.id,
+                "subagent-task",
+                "child-session",
+                SubagentRelationshipAction.RESUME,
+            ),
+        )
+        self.assertNotIn(("fork_session", ("child-session",)), self.store.calls)
+        self.assertNotIn(("delete_session", ("child-session",)), self.store.calls)
+
+    async def test_fork_delegates_only_after_terminal_relationship_validation(self) -> None:
+        self._link_and_task(SessionTaskStatus.FAILED)
+
+        result = await self.service.execute(
+            SubagentRelationshipActionRequest(
+                self.summary.id,
+                "subagent-task",
+                SubagentRelationshipAction.FORK,
+            )
+        )
+
+        self.assertEqual(result.forked_session_id, "forked-session")
+        self.assertEqual(self.store.calls[-1], ("fork_session", ("child-session",)))
+
+    async def test_delete_delegates_child_session_and_not_parent(self) -> None:
+        self._link_and_task(SessionTaskStatus.CANCELLED)
+
+        result = await self.service.execute(
+            SubagentRelationshipActionRequest(
+                self.summary.id,
+                "subagent-task",
+                SubagentRelationshipAction.DELETE,
+            )
+        )
+
+        self.assertEqual(result.child_session_id, "child-session")
+        self.assertEqual(self.store.calls[-1], ("delete_session", ("child-session",)))
+        self.assertNotIn(("delete_session", (self.summary.id,)), self.store.calls)
+
+    async def test_active_or_missing_relationship_is_rejected_before_mutation(self) -> None:
+        self._link_and_task(SessionTaskStatus.RUNNING)
+        with self.assertRaisesRegex(ConfigurationError, "still active"):
+            await self.service.execute(
+                SubagentRelationshipActionRequest(
+                    self.summary.id,
+                    "subagent-task",
+                    SubagentRelationshipAction.DELETE,
+                )
+            )
+        self.store.calls.clear()
+        self.store.subagent_links = []
+        with self.assertRaisesRegex(ConfigurationError, "does not exist"):
+            await self.service.execute(
+                SubagentRelationshipActionRequest(
+                    self.summary.id,
+                    "subagent-task",
+                    SubagentRelationshipAction.FORK,
+                )
+            )
+        self.assertFalse(
+            any(name in {"fork_session", "delete_session"} for name, _ in self.store.calls)
+        )
+
+    def test_action_contract_rejects_invalid_combinations(self) -> None:
+        with self.assertRaises(ValueError):
+            SubagentRelationshipActionRequest(
+                " ",
+                "task",
+                SubagentRelationshipAction.RESUME,
+            )
+        with self.assertRaises(ValueError):
+            SubagentRelationshipActionRequest(
+                "session-1",
+                "task",
+                cast(SubagentRelationshipAction, "resume"),
+            )
+        with self.assertRaises(ValueError):
+            SubagentRelationshipActionResult(
+                "session-1",
+                "task",
+                "child",
+                SubagentRelationshipAction.RESUME,
+                forked_session_id="unexpected",
+            )
 
 
 if __name__ == "__main__":

@@ -15,6 +15,11 @@ from neuro_code.application.ports.client_filesystem import ClientFileSystem
 from neuro_code.application.ports.client_terminal import ClientTerminal
 from neuro_code.application.ports.tools import Tool
 from neuro_code.application.sessions.binding import ConversationBinding
+from neuro_code.application.sessions.subagent_queries import SubagentRelationshipAction
+from neuro_code.application.workflows.subagent import (
+    MAX_SUBAGENT_PROMPT_BYTES,
+    MAX_SUBAGENT_STEPS,
+)
 
 MAX_MCP_SERVERS = 8
 MAX_ADDITIONAL_DIRECTORIES = 4
@@ -23,6 +28,9 @@ MAX_ACP_ARTIFACT_QUERY_SESSION_ID_BYTES = 512
 MAX_ACP_ARTIFACT_ID_BYTES = 64
 MAX_ACP_ARTIFACT_QUERY_LIMIT = 100
 MAX_ACP_ARTIFACT_QUERY_READ_BYTES = 256 * 1024
+MAX_ACP_SUBAGENT_PROMPT_BYTES = MAX_SUBAGENT_PROMPT_BYTES
+MAX_ACP_SUBAGENT_STEPS = MAX_SUBAGENT_STEPS
+MAX_ACP_SUBAGENT_TASK_ID_BYTES = 512
 _ARTIFACT_ID_PATTERN = re.compile(r"[0-9a-f]{32}\Z")
 
 
@@ -35,6 +43,142 @@ class AcpToolOutputArtifactQueryError(ValueError):
     def __init__(self, reason: str) -> None:
         super().__init__(reason)
         self.reason = reason
+
+
+class AcpReadOnlySubagentQueryError(ValueError):
+    """Stable validation failure for the private read-only subagent extension.
+
+    私有只读子代理扩展使用的稳定输入校验失败.
+    """
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
+class AcpSubagentLifecycleQueryError(ValueError):
+    """Stable validation failure for the private child-lifecycle extension.
+
+    私有子会话生命周期扩展使用的稳定输入校验失败.
+    """
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
+@dataclass(frozen=True, slots=True)
+class AcpReadOnlySubagentQuery:
+    """Bounded external ACP request for one explicit read-only child run.
+
+    一个明确只读子代理运行使用的有界 ACP 外部请求.
+    """
+
+    session_id: str
+    prompt: str
+    max_steps: int = 8
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.session_id, str)
+            or not self.session_id
+            or "\x00" in self.session_id
+            or any(ord(character) < 32 or ord(character) == 127 for character in self.session_id)
+            or len(self.session_id.encode("utf-8")) > MAX_ACP_ARTIFACT_QUERY_SESSION_ID_BYTES
+        ):
+            raise AcpReadOnlySubagentQueryError("session_id_invalid")
+        if (
+            not isinstance(self.prompt, str)
+            or not self.prompt.strip()
+            or "\x00" in self.prompt
+            or len(self.prompt.encode("utf-8")) > MAX_ACP_SUBAGENT_PROMPT_BYTES
+            or any(ord(character) < 32 and character not in "\n\t\r" for character in self.prompt)
+        ):
+            raise AcpReadOnlySubagentQueryError("prompt_invalid")
+        if (
+            isinstance(self.max_steps, bool)
+            or not isinstance(self.max_steps, int)
+            or not 1 <= self.max_steps <= MAX_ACP_SUBAGENT_STEPS
+        ):
+            raise AcpReadOnlySubagentQueryError("max_steps_invalid")
+
+    @classmethod
+    def from_payload(cls, payload: Mapping[str, object]) -> AcpReadOnlySubagentQuery:
+        """Parse a bounded extension payload without retaining raw fields.
+
+        解析有界扩展载荷,且不保留原始字段.
+        """
+
+        if not isinstance(payload, Mapping):
+            raise AcpReadOnlySubagentQueryError("subagent_query_invalid")
+        allowed = {"sessionId", "prompt", "maxSteps"}
+        if any(key not in allowed for key in payload):
+            raise AcpReadOnlySubagentQueryError("subagent_query_field_unsupported")
+        session_id = payload.get("sessionId")
+        prompt = payload.get("prompt")
+        max_steps = payload.get("maxSteps", 8)
+        if not isinstance(session_id, str):
+            raise AcpReadOnlySubagentQueryError("session_id_invalid")
+        if not isinstance(prompt, str):
+            raise AcpReadOnlySubagentQueryError("prompt_invalid")
+        if isinstance(max_steps, bool) or not isinstance(max_steps, int):
+            raise AcpReadOnlySubagentQueryError("max_steps_invalid")
+        return cls(session_id=session_id, prompt=prompt, max_steps=max_steps)
+
+
+@dataclass(frozen=True, slots=True)
+class AcpSubagentLifecycleQuery:
+    """Bounded external ACP request for one child relationship action.
+
+    一次子会话关系生命周期操作使用的有界 ACP 外部请求.
+    """
+
+    session_id: str
+    task_id: str
+    action: SubagentRelationshipAction
+
+    def __post_init__(self) -> None:
+        for field_name, value, limit in (
+            ("session_id", self.session_id, MAX_ACP_ARTIFACT_QUERY_SESSION_ID_BYTES),
+            ("task_id", self.task_id, MAX_ACP_SUBAGENT_TASK_ID_BYTES),
+        ):
+            if (
+                not isinstance(value, str)
+                or not value.strip()
+                or "\x00" in value
+                or len(value.encode("utf-8")) > limit
+                or any(ord(character) < 32 or ord(character) == 127 for character in value)
+            ):
+                raise AcpSubagentLifecycleQueryError(f"{field_name}_invalid")
+        if not isinstance(self.action, SubagentRelationshipAction):
+            raise AcpSubagentLifecycleQueryError("action_invalid")
+
+    @classmethod
+    def from_payload(cls, payload: Mapping[str, object]) -> AcpSubagentLifecycleQuery:
+        """Parse a strict lifecycle payload without retaining raw fields.
+
+        严格解析生命周期载荷,且不保留原始字段.
+        """
+
+        if not isinstance(payload, Mapping):
+            raise AcpSubagentLifecycleQueryError("lifecycle_query_invalid")
+        allowed = {"sessionId", "taskId", "action"}
+        if any(key not in allowed for key in payload):
+            raise AcpSubagentLifecycleQueryError("lifecycle_query_field_unsupported")
+        session_id = payload.get("sessionId")
+        task_id = payload.get("taskId")
+        action = payload.get("action")
+        if not isinstance(session_id, str):
+            raise AcpSubagentLifecycleQueryError("session_id_invalid")
+        if not isinstance(task_id, str):
+            raise AcpSubagentLifecycleQueryError("task_id_invalid")
+        if not isinstance(action, str):
+            raise AcpSubagentLifecycleQueryError("action_invalid")
+        try:
+            canonical_action = SubagentRelationshipAction(action)
+        except ValueError:
+            raise AcpSubagentLifecycleQueryError("action_invalid") from None
+        return cls(session_id=session_id, task_id=task_id, action=canonical_action)
 
 
 @dataclass(frozen=True, slots=True)

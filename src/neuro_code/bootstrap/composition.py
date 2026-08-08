@@ -5,10 +5,13 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Collection, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from neuro_code.application.memory.compaction_runtime import ContextCompactionRuntimeGate
+from neuro_code.application.memory.compaction_service import ContextCompactionApplicationService
+from neuro_code.application.memory.compaction_trigger import ContextCompactionTriggerService
 from neuro_code.application.memory.instruction_tracker import InstructionTracker
 from neuro_code.application.memory.skill_tracker import SkillTracker
 from neuro_code.application.permissions.policy import (
@@ -42,6 +45,12 @@ from neuro_code.application.sessions.selection import (
     SessionSelectionController,
     SessionSelectionService,
 )
+from neuro_code.application.sessions.subagent_lifecycle import (
+    SubagentRelationshipLifecycleService,
+)
+from neuro_code.application.sessions.subagent_queries import (
+    SubagentRelationshipQueryService,
+)
 from neuro_code.application.sessions.summary import (
     GetSessionSummaryRequest,
     SessionSummaryQueryService,
@@ -61,6 +70,9 @@ from neuro_code.application.workflows.session_task_execution import (
     QueuedPlanExecutionService,
 )
 from neuro_code.application.workflows.subagent import (
+    MAX_SUBAGENT_RESULT_BYTES,
+    IsolatedSubagentExecutionService,
+    ReadOnlySubagentApplicationService,
     SubagentExecutionService,
     SubagentExecutorFactory,
 )
@@ -255,21 +267,44 @@ class ApplicationComposition:
         additional_workspace_roots: Sequence[Path] = (),
         client_file_system: ClientFileSystem | None = None,
         client_terminal: ClientTerminal | None = None,
+        max_steps: int | None = None,
+        allowed_tool_names: Collection[str] | None = None,
+        enable_background_tasks: bool = True,
     ) -> ConversationBinding:
         if self._closed:
             raise RuntimeError("application composition is closed")
         selected_config = config or self.config
+        selected_max_steps = self.settings.max_steps if max_steps is None else max_steps
+        if (
+            isinstance(selected_max_steps, bool)
+            or not isinstance(selected_max_steps, int)
+            or selected_max_steps < 1
+        ):
+            raise ValueError("max_steps must be a positive integer")
         tools = default_tool_registry(
             selected_config.sandbox_profile,
-            enable_background_tasks=True,
+            enable_background_tasks=enable_background_tasks,
+            allowed_tool_names=allowed_tool_names,
             client_file_system=client_file_system,
             client_terminal=client_terminal,
         )
         for tool in additional_tools:
+            if allowed_tool_names is not None and tool.definition.name not in allowed_tool_names:
+                raise ConfigurationError(
+                    f"tool {tool.definition.name!r} is outside the selected capability set"
+                )
             tools.register(tool)
         task_scope = self.background_tasks.open_scope()
         try:
             provider = self._provider_factory(selected_config, self.settings.failover)
+            compaction_persistence = ContextCompactionApplicationService(
+                self.store,
+                provider,
+                redaction_values=selected_config.redaction_values(),
+            )
+            compaction_gate = ContextCompactionRuntimeGate(
+                ContextCompactionTriggerService(compaction_persistence)
+            )
             approval_service = ToolApprovalService(approver) if approver is not None else None
             shell_sandbox = self._shell_sandbox_factory(
                 selected_config.sandbox_profile,
@@ -341,7 +376,7 @@ class ApplicationComposition:
                         selected_config.protected_environment_variables
                     ),
                     redaction_values=selected_config.redaction_values(),
-                    background_tasks=task_scope,
+                    background_tasks=task_scope if enable_background_tasks else None,
                     instruction_tracker=tracker,
                     skill_tracker=skill_tracker,
                     client_file_system=client_file_system,
@@ -353,9 +388,10 @@ class ApplicationComposition:
                 ),
                 approver=approval_service,
                 session_store=self.store,
-                max_steps=self.settings.max_steps,
+                max_steps=selected_max_steps,
                 reasoning_effort=reasoning_effort or self.settings.reasoning_effort,
                 execution_control_mode=self.settings.execution_control_mode,
+                compaction_runtime_gate=compaction_gate,
                 instruction_provider=instruction_provider,
                 skill_provider=skill_provider,
             )
@@ -536,6 +572,79 @@ class ApplicationComposition:
         """
 
         return SubagentExecutionService(self.store, executor_factory)
+
+    def create_read_only_subagent_service(
+        self,
+        *,
+        timeout_seconds: float = 120.0,
+    ) -> IsolatedSubagentExecutionService:
+        """Create an explicit read-only subagent application workflow.
+
+        创建一个显式的只读子代理应用工作流.
+
+        The concrete child runtime is assembled here so capability selection
+        remains a composition-root concern.  No caller is automatically
+        scheduled and the returned service is not used by normal sessions.
+        具体子运行时在组合根创建,确保能力选择属于组合根职责. 不会自动调度调用方,
+        返回的服务也不会被普通会话使用.
+        """
+
+        from neuro_code.bootstrap.subagent import CompositionReadOnlySubagentRuntimeFactory
+
+        return IsolatedSubagentExecutionService(
+            self.store,
+            CompositionReadOnlySubagentRuntimeFactory(self),
+            timeout_seconds=timeout_seconds,
+        )
+
+    def create_read_only_subagent_application_service(
+        self,
+        *,
+        timeout_seconds: float = 120.0,
+        max_result_bytes: int = MAX_SUBAGENT_RESULT_BYTES,
+    ) -> ReadOnlySubagentApplicationService:
+        """Create the safe, explicit read-only subagent result boundary.
+
+        创建安全且明确的只读子代理结果边界.
+
+        The returned application service projects the child run into bounded,
+        redacted metadata and response text.  It does not add anything to the
+        parent transcript or expose child events to the caller.
+        返回的应用服务将子运行投影为有界、脱敏的元数据和响应文本,不会追加父 transcript 或暴露子事件.
+        """
+
+        return ReadOnlySubagentApplicationService(
+            self.create_read_only_subagent_service(timeout_seconds=timeout_seconds),
+            redaction_values=self.config.redaction_values(),
+            max_result_bytes=max_result_bytes,
+        )
+
+    def create_subagent_relationship_query_service(self) -> SubagentRelationshipQueryService:
+        """Create the read-only parent/child relationship projection service.
+
+        创建只读父子子代理关系投影服务.
+
+        The service reads bounded lifecycle metadata through the session store;
+        it never starts, resumes, forks, or deletes a child session.
+        该服务通过会话存储读取有界生命周期元数据,不会启动、恢复、分叉或删除子会话.
+        """
+
+        return SubagentRelationshipQueryService(self.store)
+
+    def create_subagent_relationship_lifecycle_service(
+        self,
+    ) -> SubagentRelationshipLifecycleService:
+        """Create the explicit parent-owned child lifecycle boundary.
+
+        创建显式且由父会话拥有的子会话生命周期边界.
+
+        The returned service validates the existing relationship before
+        delegating resume preparation, fork, or delete.  It never starts a
+        model turn or exposes SQLite to an interface.
+        返回的服务会在委托恢复准备、分叉或删除前校验既有关联,不会启动模型回合或向接口暴露 SQLite.
+        """
+
+        return SubagentRelationshipLifecycleService(self.store, self.session_service)
 
     @property
     def instruction_result(self) -> InstructionDiscoveryResult | None:

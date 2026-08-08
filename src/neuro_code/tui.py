@@ -60,6 +60,15 @@ from neuro_code.application.sessions.selection import (
     SessionSelectionController,
     SessionSelectionService,
 )
+from neuro_code.application.sessions.subagent_lifecycle import (
+    SubagentRelationshipActionRequest,
+    SubagentRelationshipLifecycleController,
+)
+from neuro_code.application.sessions.subagent_queries import (
+    ListSubagentRelationshipsRequest,
+    SubagentRelationshipAction,
+    SubagentRelationshipQueryController,
+)
 from neuro_code.application.sessions.turns import RunTurnRequest, SessionTurnService
 from neuro_code.application.tools.service import (
     ReadSessionToolOutputArtifactRequest,
@@ -76,6 +85,10 @@ from neuro_code.application.workflows.plan_scheduling import (
 from neuro_code.application.workflows.session_task_execution import (
     QueuedPlanExecutionService,
     RunSessionTaskRequest,
+)
+from neuro_code.application.workflows.subagent import (
+    ReadOnlySubagentApplicationService,
+    RunSubagentRequest,
 )
 from neuro_code.configuration.app import resolve_http_client_policy
 from neuro_code.domain.background_tasks.models import (
@@ -2943,6 +2956,9 @@ class NeuroCodeApp(App[None]):
         initial_items: Sequence[SessionItem] = (),
         execution_record: SessionExecutionRecord | None = None,
         tool_output_artifact_service: SessionToolOutputArtifactApplicationService | None = None,
+        read_only_subagent_service: ReadOnlySubagentApplicationService | None = None,
+        subagent_relationship_query: SubagentRelationshipQueryController | None = None,
+        subagent_relationship_lifecycle: SubagentRelationshipLifecycleController | None = None,
         provider_name: str,
         model_name: str,
         cwd: Path,
@@ -3030,6 +3046,9 @@ class NeuroCodeApp(App[None]):
         self._language = language
         self._initial_items = tuple(initial_items)
         self._tool_output_artifact_service = tool_output_artifact_service
+        self._read_only_subagent_service = read_only_subagent_service
+        self._subagent_relationship_query = subagent_relationship_query
+        self._subagent_relationship_lifecycle = subagent_relationship_lifecycle
         runner_record = getattr(runner, "execution_record", None)
         self._execution_record = (
             execution_record
@@ -4423,6 +4442,13 @@ class NeuroCodeApp(App[None]):
                 return
             await self._show_tasks()
             return
+        if command == "subagents":
+            normalized_arguments = arguments.strip()
+            if not normalized_arguments:
+                await self._show_subagent_relationships()
+            else:
+                await self._run_subagent_relationship_action(normalized_arguments)
+            return
         if command in {"auto-wake", "autowake"}:
             await self._apply_background_task_wake_policy(arguments)
             return
@@ -4435,6 +4461,9 @@ class NeuroCodeApp(App[None]):
                 self._write_ui_entry("error", "tasks.run.usage")
                 return
             await self._run_queued_task(task_id)
+            return
+        if command == "subagent":
+            await self._run_read_only_subagent(arguments)
             return
         if command in {"setting", "settings"}:
             if arguments.strip():
@@ -4478,6 +4507,76 @@ class NeuroCodeApp(App[None]):
             )
         else:
             self._write_ui_entry("error", "command.unknown", command=command)
+
+    async def _run_read_only_subagent(self, raw_prompt: str) -> None:
+        """Start one explicit, bounded read-only child without parent transcript reuse.
+
+        启动一次明确且有界的只读子代理运行,不复用父会话 transcript.
+        """
+
+        prompt = raw_prompt.strip()
+        if not prompt:
+            self._write_ui_entry("error", "subagent.usage")
+            return
+        if self._read_only_subagent_service is None:
+            self._write_ui_entry("error", "subagent.unavailable")
+            return
+        session_id = self._runner.session_id
+        if session_id is None:
+            self._write_ui_entry("error", "subagent.session_required")
+            return
+        if self._turn_worker is not None and self._turn_worker.is_running:
+            self._write_ui_entry("error", "turn.running")
+            return
+        self._write_ui_entry("status", "subagent.started")
+        self._turn_worker = self.run_worker(
+            self._run_read_only_subagent_task(session_id, prompt),
+            name="agent-read-only-subagent",
+            group="agent",
+            exclusive=True,
+            exit_on_error=False,
+        )
+
+    async def _run_read_only_subagent_task(self, session_id: str, prompt: str) -> None:
+        service = self._read_only_subagent_service
+        if service is None:
+            return
+        try:
+            projection = await service.run_subagent(
+                RunSubagentRequest(session_id, prompt),
+            )
+        except asyncio.CancelledError:
+            self._write_ui_entry("status", "subagent.cancelled")
+            raise
+        except Exception as error:
+            self._write_ui_entry(
+                "error",
+                "subagent.failed",
+                error=self._safe_tool_text(str(error)),
+            )
+            return
+
+        status_label = ui_text(
+            self._language,
+            f"tasks.status.{projection.status.value}",
+        )
+        if projection.status is SessionTaskStatus.COMPLETED:
+            self._write_ui_entry(
+                "status",
+                "subagent.completed",
+                steps=projection.steps,
+            )
+        else:
+            self._write_ui_entry(
+                "error",
+                "subagent.finished",
+                status=status_label,
+                steps=projection.steps,
+            )
+        if projection.truncated:
+            self._write_ui_entry("status", "subagent.truncated")
+        if projection.response:
+            self._write_entry("assistant", projection.response)
 
     async def _apply_background_task_wake_policy(self, arguments: str) -> None:
         value = arguments.strip().casefold()
@@ -5304,6 +5403,117 @@ class NeuroCodeApp(App[None]):
         )
         lines.append(ui_text(self._language, "tasks.view.reference"))
         self._write_entry("system", "\n".join(lines))
+
+    async def _show_subagent_relationships(self) -> None:
+        """Render bounded child metadata without executing lifecycle actions.
+
+        在不执行生命周期动作的前提下渲染有界子代理元数据.
+        """
+
+        controller = self._subagent_relationship_query
+        if controller is None:
+            self._write_ui_entry("error", "subagents.unavailable")
+            return
+        session_id = self._runner.session_id
+        if session_id is None:
+            self._write_ui_entry("error", "subagents.session_required")
+            return
+        try:
+            relationships = await controller.list_subagent_relationships(
+                ListSubagentRelationshipsRequest(session_id),
+            )
+        except Exception as error:
+            self._write_entry("error", f"{type(error).__name__}: {error}")
+            return
+        if not relationships:
+            self._write_ui_entry("status", "subagents.none")
+            return
+
+        lines = [
+            ui_text(
+                self._language,
+                "subagents.summary",
+                task_id=relationship.parent_task_id,
+                child_session_id=relationship.child_session_id,
+                provider=relationship.child_provider,
+                model=relationship.child_model,
+                status=ui_text(
+                    self._language,
+                    f"tasks.status.{relationship.task_status.value}",
+                ),
+                created=relationship.created_at.astimezone().strftime("%H:%M:%S"),
+                updated=relationship.child_updated_at.astimezone().strftime("%H:%M:%S"),
+                actions=(
+                    ", ".join(action.value for action in relationship.available_actions)
+                    or ui_text(self._language, "subagents.actions.none")
+                ),
+            )
+            for relationship in relationships
+        ]
+        self._write_ui_entry(
+            "system",
+            "subagents.heading",
+            lines="\n".join(lines),
+        )
+
+    async def _run_subagent_relationship_action(self, arguments: str) -> None:
+        """Run one explicit relationship action through the application owner.
+
+        通过应用 owner 执行一次明确的关系生命周期动作.
+
+        The TUI only parses the small command shape and projects the bounded
+        result.  It does not touch SQLite or infer ownership from a child ID.
+        TUI 只解析精简命令形状并投影有界结果,不会直接访问 SQLite 或仅凭子会话 ID 推断归属.
+        """
+
+        controller = self._subagent_relationship_lifecycle
+        if controller is None:
+            self._write_ui_entry("error", "subagents.actions_unavailable")
+            return
+        parent_session_id = self._runner.session_id
+        if parent_session_id is None:
+            self._write_ui_entry("error", "subagents.session_required")
+            return
+        if self._turn_worker is not None and self._turn_worker.is_running:
+            self._write_ui_entry("error", "session.resume_running")
+            return
+
+        action_text, separator, task_id = arguments.partition(" ")
+        if not separator or not action_text.strip() or not task_id.strip():
+            self._write_ui_entry("error", "subagents.actions_usage")
+            return
+        try:
+            action = SubagentRelationshipAction(action_text.casefold())
+        except ValueError:
+            self._write_ui_entry("error", "subagents.actions_usage")
+            return
+        try:
+            result = await controller.execute(
+                SubagentRelationshipActionRequest(
+                    parent_session_id=parent_session_id,
+                    parent_task_id=task_id.strip(),
+                    action=action,
+                )
+            )
+        except Exception as error:
+            self._write_entry("error", f"{type(error).__name__}: {error}")
+            return
+
+        if result.action is SubagentRelationshipAction.RESUME:
+            await self._apply_session_selection(result.child_session_id)
+        elif result.action is SubagentRelationshipAction.FORK:
+            assert result.forked_session_id is not None
+            self._write_ui_entry(
+                "status",
+                "subagents.actions.forked",
+                session_id=result.forked_session_id,
+            )
+        else:
+            self._write_ui_entry(
+                "status",
+                "subagents.actions.deleted",
+                session_id=result.child_session_id,
+            )
 
     async def _poll_background_tasks(self) -> None:
         if self._task_controller is None or self._task_polling:

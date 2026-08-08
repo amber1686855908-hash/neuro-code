@@ -198,10 +198,14 @@ class SessionExport:
     CLI remains responsible for JSON/Markdown serialization and file writes.
     Events are copied at the outer mapping boundary so a storage-owned result
     cannot be mutated through the application projection.
+    Durable context-compaction rows are intentionally not part of this
+    projection. Export/import therefore preserve the canonical session items
+    without exposing summaries or opaque source fingerprints.
 
     显式会话导出命令使用的不可变应用投影.
     该投影有意保留现有导出负载形状:JSON/Markdown 序列化和文件写入仍由 CLI 负责.
     事件会在外层映射边界复制,避免通过应用投影修改存储层结果.
+    持久化上下文压缩行有意不属于该投影,因此导入/导出只保留规范会话条目,不会暴露摘要或不透明源指纹.
     """
 
     snapshot: SessionSnapshot
