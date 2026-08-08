@@ -647,6 +647,72 @@ Stage5CQ 新增显式且有界的 `SubagentExecutionService` 应用工作流. �
 方法、CLI 命令或 TUI 命令. 详见
 [ADR 0071](adr/0071-explicit-bounded-subagent-lifecycle.md)。
 
+Stage5CR 在该接缝后增加第一版具体隔离只读运行时. `IsolatedSubagentExecutionService` 创建全新的
+子会话，在执行前持久化只含元数据的 `SubagentLink`，移除 Provider 内置工具，并将子注册表限制为
+`read_file`、`list_dir`、`grep` 和 `skill`. 子步数与墙钟执行时间有界，取消会关闭子运行时，删除父会话
+会递归删除关联子会话. 该切片仍然是显式且同步的：不改变普通 `AgentRuntime` 循环，不复用父上下文，
+不提供 CLI/TUI/ACP 入口，也不调度、重试或递归创建子 Agent. 详见
+[ADR 0072](adr/0072-isolated-read-only-subagent-runtime.md)。
+
+Stage5CS 在该运行时之上增加 `ReadOnlySubagentApplicationService` 作为窄的调用方边界。它要求存在持久化
+父子链接，并将子运行投影为脱敏且按 UTF-8 有界的 `SubagentResultProjection`，只包含生命周期 ID、任务终态、
+步数、可选类型化 outcome 和响应文本。消息、事件、工具参数、凭据及原始子上下文不会跨越该边界。投影只在
+内存中返回，不会追加到父 transcript，也不会写成第二条结果记录。参见
+[ADR 0073](adr/0073-bounded-read-only-subagent-result-projection.md)。
+
+Stage5CT 通过 `SubagentRelationshipQueryService` 增加只读的父子关系查询边界。它把已有的
+`SubagentLink`、`SessionTask` 和子会话摘要记录投影为有界的 `SubagentRelationshipProjection`，只包含生命周期
+ID、任务状态、供应商/模型标签、时间戳，以及 `resume`、`fork`、`delete` 能力标签。活动中的子任务不暴露任何
+生命周期操作标签；终态任务只暴露标签，实际变更和执行仍由既有生命周期服务负责。该查询不会读取消息、事件、
+工具输出、提示词、凭据或原始子上下文，不增加 schema，也不创建 CLI、TUI、ACP、调度器、重放或自动恢复路径。
+参见 [ADR 0074](adr/0074-read-only-parent-child-subagent-relationship-projection.md)。
+
+Stage5CU 在现有组合根只读子代理应用服务之上增加一个明确的 CLI 入口：
+`neuro subagent --parent-session SESSION_ID PROMPT`. 该命令先执行父会话恢复预检，随后使用
+固定只读能力集运行一个全新且有界的子会话，并只输出脱敏后的 `SubagentResultProjection`
+（普通响应或稳定的 `--json` 字段）. 它不复用父上下文，不调度/重试/递归创建，也不增加
+TUI/ACP 入口. 参见 [ADR 0075](adr/0075-explicit-cli-read-only-subagent-entry.md)。
+
+Stage5CV 增加显式的私有 ACP 扩展 `_neuro-code/session/subagent`. 它只接受外部会话 ID、有界提示词
+和有界步数，通过现有 ACP alias 边界解析父会话，并调用与 CLI 相同的组合根只读应用服务. 响应省略内部
+ID 和子 transcript 细节，只返回有界响应/状态/步数/截断标记与类型化 outcome 字段. 它不是标准 ACP
+capability，也不增加调度、重试、递归、并行子会话或可写工具. 参见
+[ADR 0076](adr/0076-explicit-acp-read-only-subagent-extension.md)。
+
+Stage5CW 增加显式 TUI `/subagent PROMPT` 命令。TUI 与 CLI、ACP 共用组合根提供的
+`ReadOnlySubagentApplicationService`；没有当前会话或已有其他回合运行时会拒绝启动，并且只渲染有界响应和步骤/状态元数据。
+子代理仍保持只读、隔离、同步且可取消；提示词、事件、内部 ID 和临时上下文不会追加到父 transcript。
+
+详见 [ADR 0077](adr/0077-explicit-tui-read-only-subagent-command.md)。
+
+Stage5CX 增加显式 TUI `/subagents` 只读视图,复用已有的
+`SubagentRelationshipQueryService`. 它只显示有界的父任务/子会话标识符、Provider/模型标签、任务状态、时间戳和能力标签;
+不会执行恢复、分叉或删除,也不会加载子会话 transcript、提示词、工具参数或输出. 会话缺失、服务不可用或关系为空时会失败关闭,
+且不会启动模型回合. 详见 [ADR 0078](adr/0078-explicit-tui-subagent-relationship-view.md)。
+
+Stage5CY 增加 `SubagentRelationshipLifecycleService`,作为显式 `resume`、`fork` 和 `delete`
+动作的 application owner。它会在委托现有会话生命周期服务前校验父会话拥有的关系和已终止的
+`SUBAGENT` 任务。Resume 只返回经过校验的子会话选择,不会运行模型；fork 返回新会话 ID 但不会
+自动打开；delete 只针对子会话。TUI 通过 `/subagents ACTION TASK_ID` 暴露这些动作,不访问 SQLite,
+并将校验与变更分开,不声明跨进程原子性。详见
+[ADR 0079](adr/0079-explicit-subagent-lifecycle-actions.md)。
+
+Stage5CZ 通过有界无头命令
+`neuro subagents ACTION TASK_ID --parent-session SESSION_ID` 暴露同一个生命周期 owner。
+CLI 通过组合根的恢复边界校验父会话，然后委托 typed application 请求；不会启动模型回合、重放工具或直接
+读取 SQLite。普通输出只包含简短生命周期消息，`--json` 只包含有界生命周期标识、规范动作和可选的 fork 会话 ID。
+详见 [ADR 0080](adr/0080-explicit-cli-subagent-lifecycle-actions.md)。
+
+Stage5DA 通过私有 ACP 扩展 `_neuro-code/session/subagents` 暴露同一个 owner。严格请求只包含外部父会话
+alias、有界父任务 ID 以及 `resume`、`fork` 或 `delete` 之一。Resume 和 fork 返回外部 ACP alias,而不是内部
+会话 ID；delete 只返回有界的 deleted 标志。适配器不会启动模型回合、重放工具或暴露子上下文，也不宣称
+alias 分配与生命周期变更属于同一事务。详见
+[ADR 0081](adr/0081-explicit-acp-subagent-lifecycle-extension.md)。
+
+Stage5DB 加固该响应边界。ACP 适配器会校验生命周期 owner 返回的父 session、父 task 和 action 与请求一致，serializer
+会校验非 delete 外部 alias 的 UTF-8 字节上限和控制字符。错误的 owner 结果或 alias 会失败关闭，但有效 wire 响应保持不变。
+详见 [ADR 0082](adr/0082-fail-closed-acp-subagent-lifecycle-projection.md)。
+
 交互组合使用 `neuro_code.application.sessions.profile_conversation` 中的
 `ProfileConversationController` 包装当前 `AgentConversation`。旧的
 `neuro_code.application.runtime.profile_conversation` 路径只保留兼容 facade。它让 profile
@@ -908,7 +974,16 @@ alias，供协议适配器使用；JSON export schema version 4 不变。schema 
 投影以及可选的用户轮次执行记录，在存储写锁下的一个短 SQLite 事务中一起提交。后台自动唤醒不传入记录，
 因此不会覆盖此前的用户执行记录。这个边界不会让此前的轮次事件、供应商/工具工作或跨进程运行时操作变成原子操作。
 在执行记录边界内，SQLite 会串行化写入，并拒绝更旧的事件序号或同一序号的冲突数据，因此过期进程不能覆盖更新的终态结果。
-Rust 会话由独立的只读适配器解析。该适配器校验格式版本 0 和 1，以明确上限
+schema v12 新增带外键的 `subagent_links` 表. 每条链接只保存父会话 ID、父 `SUBAGENT` 任务 ID、
+子会话 ID 和创建时间；子会话 ID 唯一，删除父会话会递归删除关联子会话. 保存链接是一个独立的短
+SQLite 事务，并校验父任务处于运行中且子会话存在. 这不会让子会话创建、模型执行、任务完成和会话
+事件成为一个事务. schema v13 新增外键关联的 `session_compaction_items` 表. 每行只保存有界
+Provider/窗口元数据、源条目计数、半开候选范围、不透明源指纹、摘要 token 元数据、带时区时间戳以及
+已经脱敏且有界的摘要. 它不进入 FTS、会话导出/导入或分叉复制；删除会话时级联清理. 相同 ID 的相同数据
+可以幂等重复保存,冲突 ID 或重复源范围会失败关闭. `CompactionResumeRebuilder` 只应用源计数、Provider
+来源和指纹均与当前上下文匹配且互不重叠的记录,生成临时合成摘要消息. 它不会调用 Provider、重放工具、
+修改存储或声称整轮原子性. 没有压缩记录的既有会话恢复结果不变. Rust 会话由独立的只读适配器解析。
+该适配器校验格式版本 0 和 1，以明确上限
 读取 JSONL 记录，把受支持的新旧记录转换为有序 `SessionSnapshot`，并报告损坏或
 不支持的记录，而不是静默编造内容。SQLite 适配器在单个事务中插入快照，并保留其
 ID、工作区、模型和时间戳；ID 已存在时不做任何修改并返回失败。源会话文件永远不会
@@ -971,3 +1046,218 @@ Linux、macOS 和 Windows 都是一等 CI 目标。平台专属代码隔离在�
 [ADR 0022](adr/0022-session-scoped-background-task-visibility.md)。面向模型的完成元数据由
 [ADR 0023](adr/0023-model-visible-background-task-completion-reminders.md) 定义，事件驱动的
 多任务等待由 [ADR 0024](adr/0024-event-driven-multi-background-task-wait.md) 定义。
+
+## Stage5DC ACP 生命周期 alias 兼容性
+
+私有子代理生命周期适配器将外部 alias 分配限制为四次尝试，并在写入 wire 前通过
+ACP 命名空间再次解析每个已分配的 alias。不可用、无法解析或归属于错误会话的 alias
+会重试，耗尽后失败关闭。持久化存储的 `get_or_create` 保证同一子会话在重复
+`resume` 请求和 ACP 客户端重连后继续使用同一个 alias。该切片不改变生命周期所有权、
+子代理执行、schema、ACP 标准 capability 或明确的单子会话只读边界。详见
+[ADR 0083](adr/0083-acp-subagent-alias-reconnect-compatibility.md)。
+
+## Stage5DD 确定性上下文压缩评估
+
+`neuro_code.application.memory.compaction` 是类型化 `ContextCompactionPlanner`、
+用量快照、策略、决策和计划的 canonical owner。Planner 根据已知容量阈值以及受保护/近期
+条目计数生成有界的半开候选区间；未知容量会明确返回 `UNAVAILABLE`。计划不包含会话条目、
+提示词、工具输出、凭据、摘要或 Provider payload。
+
+这只是评估契约，不会修改 `ModelContext`、创建可持久化摘要条目、调用 Provider、改变
+`AgentRuntime`，也不会改变会话、CLI、TUI、ACP 或持久化行为。Provider 感知的总结、Provider
+亲和回放、可持久化压缩条目和 Runtime 事务边界留待后续能力。详见
+[ADR 0084](adr/0084-context-compaction-assessment-contract.md)。
+
+## Stage5DE Provider 感知的摘要请求边界
+
+canonical memory 模块现在还拥有 `ProviderContextWindow` 和
+`ContextSummaryRequest`。窗口只记录有界的 Provider/模型标签、可选的上下文亲和标识以及
+正的本地容量元数据。用量可以绑定到该窗口，可执行计划可以投影为带有有界、按容量裁剪的
+摘要预算和仅包含索引的候选区间的请求。未知容量、不可执行的计划和空候选区间都会失败关闭。
+
+这仍然只是 application contract：不增加 `ModelProvider` 参数、不调用 Provider、不对消息
+进行 token 化或总结、不修改 `ModelContext`、不持久化压缩条目，也不改变 Runtime 和接口行为。
+参见 [ADR 0085](adr/0085-provider-aware-context-summary-request.md)。
+
+## Stage5DF Provider 感知的脱敏摘要输入
+
+canonical memory 模块现在提供 `ContextSummaryInputBuilder` 以及类型化的
+`ContextSummaryInput`、`ContextSummaryItem` 和 `ContextSummarySourceKind` 投影。Builder 接受
+一个不可变的 `ModelContext` 与 `ContextSummaryRequest`，只投影候选区间，绝不会复制工具参数、
+推理内容或保留的 Provider 载荷。这些内容会用有界固定标记表示。
+
+显式值与形状识别脱敏发生在控制字符清理和 UTF-8 字节截断之前。注入的本地 token 估算器会在
+扣除摘要预留后，将输入限制在 Provider 窗口剩余预算内。Builder 限制条目数和单条字节数，无法
+放入预算的内容会被省略，结果对象的 repr 不包含条目文本。
+
+这仍然只是输入契约：不调用 Provider、不选择 Provider 专用 tokenizer、不构建提示词、不修改
+`ModelContext`、不持久化压缩条目，也不改变 Runtime/接口行为。参见
+[ADR 0086](adr/0086-provider-aware-redacted-summary-input.md)。
+
+## Stage5DH Provider 驱动的有界摘要生成
+
+canonical memory 模块现在还拥有 `ProviderContextSummaryGenerator` 和
+`ContextSummaryGenerationResult`。生成器只接受经过校验的 `ContextSummaryInput`，从其有界投影构建临时提示上下文，
+并恰好使用无工具的 `ModelProvider` 请求与 `ModelToolPolicy.DISABLED`。调用前会校验请求窗口中的 Provider/model 身份。
+
+生成器会缓冲文本增量，存在 `ModelCompleted.response_text` 时优先使用它。缺少完成事件、空响应、重复完成事件或远端工具调用会以
+`ProviderError` 失败；Provider 错误与取消不会被隐藏。输出会再次脱敏并限制边界；生成器不会写入持久化、发送事件或修改源上下文。
+自动 Runtime 压缩、重试、Provider 专用 tokenizer 和整轮事务语义仍是后续工作。参见
+[ADR 0088](adr/0088-provider-backed-bounded-context-summary-generation.md)。
+
+## Stage5DI 显式上下文压缩持久化服务
+
+`neuro_code.application.memory.compaction_service` 现在拥有显式的
+`ContextCompactionApplicationService`、`PersistContextCompactionRequest` 和
+`ContextCompactionPersistenceResult` 边界。服务从不可变源上下文重新构建脱敏且有界的输入，在联系
+Provider 前校验预期源指纹，调用已有的单请求摘要生成器，构建 `DurableCompactionItem`，并通过
+`SessionStore.save_compaction_item` 持久化。
+
+调用方提供不透明的 compaction ID 和预期源指纹。源条目数量或指纹漂移会在模型生成前失败。重复
+ID 的幂等和冲突行为仍由存储适配器负责。Provider 生成与 SQLite 写入是两个独立操作，Provider 错误、
+取消和存储错误不重试并继续传播。这只是显式应用能力：不会由 `AgentRuntime` 触发，不新增事件，
+不改变 session item，也不宣称整轮原子性。参见 [ADR 0089](adr/0089-explicit-context-compaction-persistence-service.md)。
+
+## Stage5DJ 压缩传输与回合最终化边界
+
+`DurableCompactionItem` 仍然是优化记录而不是规范会话历史。`SessionExport` 有意排除压缩行，
+因此 JSON/Markdown 导出和快照导入保持现有导出 schema 与规范会话条目，不暴露摘要、源指纹或 Provider 亲和元数据。
+导入后的会话不包含压缩行。
+
+会话分叉同样只复制规范会话投影，不复制压缩行：子会话可能偏离父会话的源范围和 Provider 窗口。
+删除仍通过会话外键级联。
+
+`SessionStore.finalize_turn()` 的原子性仍只覆盖完成事件、有序会话条目、搜索投影和可选执行记录。
+压缩持久化是独立的短事务，不会被回合最终化隐式保存、删除或回滚。未来 Runtime 切片若需要跨操作原子性，
+必须增加明确的存储契约；连续调用不能提供该保证。详见 [ADR 0090](adr/0090-compaction-transfer-and-turn-boundary.md)。
+
+## Stage5DK 显式上下文压缩触发边界
+
+`neuro_code.application.memory.compaction_trigger` 现在拥有类型化的
+`ContextCompactionTriggerMode`、请求、评估、结果以及无状态的
+`ContextCompactionTriggerService`。默认的 `DISABLED` 只运行现有确定性规划器，不执行任何 Provider 或存储操作。
+`EXPLICIT` 可以把带非空候选区间的计划委托给现有上下文压缩持久化服务，但只有调用方提供会话 ID、压缩 ID、带时区的
+时间戳和预期源指纹后才允许执行。过期源、Provider、取消和存储错误保持失败关闭，不会被转换为空操作结果。
+
+触发服务刻意没有接入 `AgentRuntime`。它没有普通回合步骤计数器、重试状态、事件发出或跨操作事务声明。压缩生成和持久化
+仍是两个操作，未来 Runtime 接入必须显式定义安全边界和预算语义。见
+[ADR 0091](adr/0091-explicit-context-compaction-trigger.md)。
+
+## Stage5DL 显式 Runtime 压缩安全边界
+
+`neuro_code.application.memory.compaction_runtime` 定义了未来 Runtime 调用 Stage5DK 触发器前必须满足的边界。
+当前只建模 `BEFORE_MODEL_REQUEST` 和 `AFTER_TOOL_BATCH` 两个安全位置；正在进行的模型请求、工具批次或取消请求都会失败关闭，
+不会联系 Provider 或存储适配器。
+
+该门控保持压缩计量与普通回合预算隔离：当前契约只允许一次模型请求、零次工具调用，且绝不继承普通回合限制。只有边界安全且触发器
+显式启用并生成可执行计划时，才会委托 `ContextCompactionTriggerService`；否则返回类型化边界决定。这只是契约和测试接缝，
+不会修改 `AgentRuntime`、事件或自动阈值触发。见 [ADR 0092](adr/0092-runtime-compaction-safe-boundary.md)。
+
+## Stage5DM 强制执行 Runtime 压缩超时
+
+Runtime 门控现在会在允许的显式压缩操作外层真正执行有限的墙钟预算。`ContextCompactionRuntimeBudget` 默认 30 秒且不能超过 300 秒；限制覆盖一次严格无工具的摘要请求及其后续持久化调用。截止时间会抛出类型化的 `ContextCompactionTimeoutError`，不会返回成功触发结果。Provider 错误、存储错误和任务取消保持不变。关闭、不安全、已取消和不可操作的请求仍不会调用 Provider 或存储。这仍然只是边界契约：普通 `AgentRuntime` 行为和自动压缩没有启用，也不宣称 Provider/SQLite 跨操作事务。见 [ADR 0093](adr/0093-enforced-context-compaction-timeout.md)。
+
+## Stage5DN Runtime 压缩失败投影
+
+`neuro_code.application.memory.compaction_runtime` 现在提供有界的
+`classify_context_compaction_failure()` 策略投影。只有
+`ContextCompactionTimeoutError` 拥有受控终态投影：`BUDGET_LIMITED`、原因
+`WALL_TIME_BUDGET`、`recoverable=True` 且 `finalized=False`。其执行记录策略为
+`TURN_FINALIZATION`，因此未来的回合所有者只有在现有回合最终化事务内才可以持久化它。
+取消、Provider 错误和存储错误仍然只是传播投影，不携带 outcome，也不请求记录；未知异常
+保持未分类。
+
+该投影不保存异常详情，不捕获异常，不修改 `AgentRuntime`，不发出事件，不启用自动压缩，
+也不声称 Provider/SQLite 跨操作事务原子性。见 [ADR 0094](adr/0094-runtime-compaction-failure-projection.md)。
+
+## Stage5DO 显式 Runtime 压缩接缝
+
+`AgentRuntime` 现在接受可选的 `compaction_runtime_gate`，默认值为 `None`，并为调用方完整提供的
+`ContextCompactionRuntimeRequest` 暴露 `trigger_context_compaction()`。缺少 gate 时以
+`ConfigurationError` 失败关闭；注入 gate 后会原样接收不可变的安全边界请求。facade 不推导阈值、
+不修改上下文、不增加普通回合 steps、不发事件，也不写 execution record。
+
+`AgentRuntime.run()` 和 ApplicationComposition 保持不变，因此自动压缩和生产 gate 组装仍然关闭。
+超时、取消、Provider、存储和回合最终化所有权继续遵循
+[ADR 0094](adr/0094-runtime-compaction-failure-projection.md)。见
+[ADR 0095](adr/0095-explicit-runtime-compaction-seam.md)。
+
+## Stage5DP：由应用层拥有的显式压缩调用方
+
+`ApplicationComposition.create_binding()` 现在为每个 binding 使用现有 Provider、
+`SessionStore`、脱敏值以及压缩触发/持久化服务组装一个
+`ContextCompactionRuntimeGate`。gate 会注入 `AgentRuntime`，但仍然只可显式调用：
+普通 Agent loop 不检查阈值，也不会自动调用压缩。
+
+`AgentConversation.trigger_context_compaction()` 是应用层拥有的调用方。它在会话现有回合锁下运行，
+对 `EXPLICIT` 请求要求匹配的持久化会话，并原样委托调用方提供的不可变
+`ContextCompactionRuntimeRequest`。请求上下文是调用方拥有的快照，源指纹负责过期快照保护。
+该方法不会修改 transcript 条目、发出事件、重新加载回合，也不声称与 `finalize_turn()` 具有原子性。
+详见 [ADR 0096](adr/0096-application-owned-compaction-caller.md)。
+
+## Stage5DQ：显式的回合最终化原子边界
+
+`SessionStore` 现在暴露可选的 `finalize_turn_with_compaction()` 契约。SQLite 实现使用同一个
+`BEGIN IMMEDIATE` 事务提交 `TURN_COMPLETED` 事件、会话条目、搜索投影、可选的
+`SessionExecutionRecord` 和一个持久化压缩条目。校验、重复事件、压缩所有者/载荷冲突、唯一性、
+索引和存储失败都会回滚整个单元。完全相同的已有压缩 ID 仍具有幂等性。
+
+`save_compaction_item()` 和普通 `finalize_turn()` 继续保持独立短事务语义。该契约不包含 Provider
+生成，不启用自动压缩，也不会被当前 Runtime 或显式压缩 gate 调用。详见
+[ADR 0097](../en/adr/0097-atomic-turn-finalization-with-compaction.md)。
+
+## Stage5DR：由回合记录器拥有的压缩最终化
+
+`TurnEventRecorder.finalize_turn_completion()` 接受一个可选的、已经校验的
+`DurableCompactionItem`。传入时，现有应用完成路径要求存在持久化会话，并将事件/条目/记录/压缩条目的组合提交委托给
+`SessionStore.finalize_turn_with_compaction()`；普通调用仍使用 `finalize_turn()`。非法输入会在完成事件加入内存列表前失败，
+持久化仍然先于 `TURN_COMPLETED` 的交付完成。
+
+记录器只拥有这次最终存储提交。它不会生成摘要、调用 Provider、改变 Agent loop、消费失败投影或启用自动压缩。
+详见 [ADR 0098](../en/adr/0098-turn-recorder-compaction-finalization-owner.md)。
+
+## Stage5DS：类型化压缩回合投影
+
+`neuro_code.application.memory.compaction_runtime` 现在提供
+`ContextCompactionTurnProjection` 及显式成功/失败辅助函数。成功的显式压缩只转移已经持久化且校验过的
+`DurableCompactionItem`。超时为未来回合所有者转移有界、可恢复的
+`BUDGET_LIMITED/WALL_TIME_BUDGET` outcome；取消、Provider 和存储失败仍然只能传播，未知异常保持未分类。
+投影不保存异常详情或原始摘要，也不执行持久化或发事件。它不会调用 `TurnEventRecorder`、接入普通 Agent loop
+或启用自动压缩。详见 [ADR 0099](../en/adr/0099-context-compaction-turn-projection.md)。
+
+## Stage5DT：显式压缩回合所有者
+
+`TurnEventRecorder.finalize_turn_from_compaction_projection()` 是
+`ContextCompactionTurnProjection` 的可选消费方。成功投影必须提供调用方的普通回合 outcome，并使用原子
+`finalize_turn_with_compaction()` 路径。超时投影提供自身有界的可恢复 outcome，不伪造压缩行。
+只能传播的投影和无操作投影会在内存完成事件追加前失败关闭。普通 Agent loop、自动压缩、Provider 生成和会话锁所有权都不属于该接缝。详见 [ADR 0100](../en/adr/0100-explicit-compaction-turn-owner.md)。
+
+## Stage5DU：在回合锁下由应用层拥有压缩
+
+`AgentConversation.run_context_compaction_with_owner()` 是显式且可选的应用层接缝。它校验调用方拥有的不可变请求，并在会话现有 `_turn_lock` 下运行 Runtime 压缩门控及类型化所有者回调。成功结果只转移已持久化的 `DurableCompactionItem`；有界超时转移已有的可恢复 `BUDGET_LIMITED/WALL_TIME_BUDGET` outcome。无操作投影会在调用所有者前失败关闭；取消、Provider、存储和未知失败保留原始异常。
+
+所有者仍负责 `TurnEventRecorder` 和任何最终化事务。本接缝不会进入普通 Agent loop、触发自动压缩、修改 transcript 条目、发出事件，也不声称 Provider 生成与 SQLite 持久化属于同一事务。详见 [ADR 0101](../en/adr/0101-application-compaction-owner-under-turn-lock.md)。
+
+## Stage5DV：上下文用量快照与过期源请求构造
+
+`neuro_code.application.memory.compaction_runtime` 现在提供
+`build_context_usage_snapshot()` 与
+`build_explicit_context_compaction_runtime_request()` 两个无副作用的应用层辅助入口。用量辅助函数在 Provider 输入/输出计数可用时遵循现有上下文用量事件约定，否则使用有界的 `ModelContext` 估算器并标记为估算。缺失的 Provider 容量保持未知，不从具体 Provider 实现推断。
+
+请求构造器只进行确定性评估。它根据精确的不可变上下文和可执行候选区间计算不透明源指纹，仅在可执行的显式请求中要求调用方拥有的持久化元数据，对不可执行请求不伪造摘要。Provider/存储调用、会话加锁、执行时过期校验和自动压缩仍由现有应用/Runtime 接缝负责。详见 [ADR 0102](../en/adr/0102-context-usage-snapshot-and-stale-source-builder.md)。
+
+## Stage5DW：显式实时上下文压缩命令
+
+`AgentConversation.run_explicit_context_compaction_with_owner()` 现在是可执行显式压缩的窄应用命令。它会先获取现有会话回合锁，再要求 `AgentRuntime` 使用模型请求相同的推理、交互、指令和技能指引构建请求范围上下文快照。随后由已配置的 `ContextCompactionRuntimeGate` 复用 usage 快照，并从这份精确上下文计算过期源保护值。
+
+命令在需要时生成有界身份和时间元数据，并在同一把锁内复用既有 typed owner 投影。它要求持久化会话，不追加 transcript、不发事件、不启动普通模型回合，也不启用自动阈值。Provider 生成和压缩持久化仍不属于同一事务。详见 [ADR 0103](../en/adr/0103-explicit-live-context-compaction-command.md)。
+
+## Stage5DX：显式压缩命令投影
+
+`neuro_code.application.memory.compaction_runtime` 现在提供有界的
+`ContextCompactionCommandResult` 和
+`project_context_compaction_command_result()` 应用层/接口层投影。
+它区分 `completed`、`not_needed` 和受控超时的 `budget_limited` 结果。
+成功结果只暴露不透明压缩 ID、源/候选条目数和摘要 token 元数据；绝不暴露摘要、源指纹、提示词、消息、
+工具输出或异常详情。Provider、取消、存储和未知失败仍然只能传播为异常。CLI 和 ACP 序列化辅助函数共享同一组
+有界字段，但不会启用命令、事件、普通 Agent loop 或自动压缩。详见 [ADR 0104](../en/adr/0104-explicit-compaction-command-projection.md)。

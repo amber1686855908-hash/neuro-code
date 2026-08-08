@@ -9,7 +9,7 @@ from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from acp.exceptions import RequestError
 from acp.interfaces import Client
@@ -47,7 +47,9 @@ from acp.schema import (
 
 import neuro_code.acp as acp_module
 from neuro_code.acp import (
+    ACP_READ_ONLY_SUBAGENT_EXTENSION,
     ACP_STDIO_BUFFER_LIMIT_BYTES,
+    ACP_SUBAGENT_LIFECYCLE_EXTENSION,
     ACP_TOOL_OUTPUT_ARTIFACT_EXTENSION,
     MAX_ANNOTATION_AUDIENCE,
     MAX_EMBEDDED_TEXT_RESOURCE_BYTES,
@@ -62,7 +64,15 @@ from neuro_code.acp import (
     convert_prompt_content,
     serve_acp,
 )
+from neuro_code.application.acp.contracts import (
+    AcpSubagentLifecycleQuery,
+    AcpSubagentLifecycleQueryError,
+)
 from neuro_code.application.acp.service import AcpApplicationService
+from neuro_code.application.memory.compaction_runtime import (
+    ContextCompactionCommandResult,
+    ContextCompactionCommandStatus,
+)
 from neuro_code.application.permissions.contracts import PermissionApproval, PermissionRequest
 from neuro_code.application.ports.approval import PermissionApprover
 from neuro_code.application.ports.model import ModelProvider
@@ -80,6 +90,10 @@ from neuro_code.application.sessions import (
     SessionApplicationService,
     SessionTurnRunner,
     SessionTurnService,
+    SubagentRelationshipAction,
+    SubagentRelationshipActionRequest,
+    SubagentRelationshipActionResult,
+    SubagentRelationshipLifecycleController,
 )
 from neuro_code.application.sessions.profile_conversation import ConversationBinding
 from neuro_code.application.tools import (
@@ -87,6 +101,11 @@ from neuro_code.application.tools import (
     ReadSessionToolOutputArtifactRequest,
     SessionToolOutputArtifact,
     SessionToolOutputArtifactApplicationService,
+)
+from neuro_code.application.workflows import (
+    ReadOnlySubagentApplicationService,
+    RunSubagentRequest,
+    SubagentResultProjection,
 )
 from neuro_code.bootstrap.composition import ApplicationComposition
 from neuro_code.bootstrap.entrypoints import BootstrapCliServices
@@ -114,6 +133,7 @@ from neuro_code.domain.execution import (
 )
 from neuro_code.domain.plans import SessionPlan
 from neuro_code.domain.sandbox import SandboxProfile
+from neuro_code.domain.session_tasks import SessionTaskStatus
 from neuro_code.domain.sessions import SessionSummary
 from neuro_code.domain.tools import ToolDefinition, ToolResult
 from neuro_code.interfaces.acp.serialization import (
@@ -122,6 +142,9 @@ from neuro_code.interfaces.acp.serialization import (
     map_stop_reason,
     safe_output_text,
     sanitize_controls,
+    serialize_context_compaction_result,
+    serialize_subagent_lifecycle_action,
+    serialize_subagent_result,
     serialized_size_bytes,
     truncate_utf8,
 )
@@ -499,6 +522,39 @@ class ArtifactServiceFixture:
         )
 
 
+class ReadOnlySubagentServiceFixture:
+    def __init__(self, projection: SubagentResultProjection) -> None:
+        self.projection = projection
+        self.requests: list[RunSubagentRequest] = []
+
+    async def run_subagent(self, request: RunSubagentRequest) -> SubagentResultProjection:
+        self.requests.append(request)
+        return self.projection
+
+
+class SubagentLifecycleServiceFixture:
+    def __init__(self) -> None:
+        self.requests: list[SubagentRelationshipActionRequest] = []
+        self.result_override: SubagentRelationshipActionResult | None = None
+
+    async def execute(
+        self,
+        request: SubagentRelationshipActionRequest,
+    ) -> SubagentRelationshipActionResult:
+        self.requests.append(request)
+        if self.result_override is not None:
+            return self.result_override
+        return SubagentRelationshipActionResult(
+            parent_session_id=request.parent_session_id,
+            parent_task_id=request.parent_task_id,
+            child_session_id="child-internal",
+            action=request.action,
+            forked_session_id=(
+                "forked-internal" if request.action is SubagentRelationshipAction.FORK else None
+            ),
+        )
+
+
 class ApplicationFixture:
     def __init__(self, root: Path, runners: Sequence[RunnerFixture]) -> None:
         profile = ProviderProfile(
@@ -530,6 +586,8 @@ class ApplicationFixture:
         self.resume_error: ConfigurationError | None = None
         self.cleanup_events: list[str] | None = None
         self.artifact_service: SessionToolOutputArtifactApplicationService | None = None
+        self.subagent_service: ReadOnlySubagentServiceFixture | None = None
+        self.subagent_lifecycle_service: SubagentRelationshipLifecycleController | None = None
 
     async def config_for_session_resume(self, session_id: str) -> AppConfig:
         del session_id
@@ -546,6 +604,16 @@ class ApplicationFixture:
 
         del config
         return self.artifact_service
+
+    def create_read_only_subagent_application_service(
+        self,
+    ) -> ReadOnlySubagentApplicationService | None:
+        return cast(ReadOnlySubagentApplicationService | None, self.subagent_service)
+
+    def create_subagent_relationship_lifecycle_service(
+        self,
+    ) -> SubagentRelationshipLifecycleController | None:
+        return self.subagent_lifecycle_service
 
     async def create_binding(
         self,
@@ -786,11 +854,153 @@ async def initialized_artifact_agent(
     return agent, application, artifact_service
 
 
+async def initialized_subagent_agent(
+    root: Path,
+) -> tuple[NeuroCodeAcpAgent, ApplicationFixture, ReadOnlySubagentServiceFixture]:
+    projection = SubagentResultProjection(
+        parent_session_id="subagent-internal",
+        task_id="subagent-task",
+        child_session_id="child-internal",
+        status=SessionTaskStatus.COMPLETED,
+        response="safe child response",
+        steps=2,
+        truncated=False,
+        outcome=AgentExecutionOutcome(
+            AgentExecutionStatus.BUDGET_LIMITED,
+            SupervisorReasonCode.MODEL_STEP_LIMIT,
+            finalized=True,
+            recoverable=True,
+        ),
+    )
+    subagent_service = ReadOnlySubagentServiceFixture(projection)
+    application = ApplicationFixture(root, [])
+    application.subagent_service = subagent_service
+    summary = SessionSummary(
+        id="subagent-internal",
+        cwd=str(root),
+        provider="fixture",
+        model="fixture-model",
+        created_at=datetime(2026, 7, 1, tzinfo=UTC),
+        updated_at=datetime(2026, 7, 1, tzinfo=UTC),
+        title="Subagent parent",
+    )
+    application.store.summaries.append(summary)
+    application.store.session_ids.add(summary.id)
+    await application.store.bind_session_alias("acp-v1", "acp-subagent", summary.id)
+    agent = NeuroCodeAcpAgent(_acp_service(application))
+    client = AcpClientFixture()
+    agent.on_connect(cast(Client, client))
+    await agent.initialize(1, ClientCapabilities(terminal=True))
+    return agent, application, subagent_service
+
+
+async def initialized_subagent_lifecycle_agent(
+    root: Path,
+) -> tuple[NeuroCodeAcpAgent, ApplicationFixture, SubagentLifecycleServiceFixture]:
+    application = ApplicationFixture(root, [])
+    lifecycle_service = SubagentLifecycleServiceFixture()
+    application.subagent_lifecycle_service = lifecycle_service
+    timestamp = datetime(2026, 7, 1, tzinfo=UTC)
+    for session_id in ("subagent-parent-internal", "child-internal", "forked-internal"):
+        application.store.summaries.append(
+            SessionSummary(
+                id=session_id,
+                cwd=str(root),
+                provider="fixture",
+                model="fixture-model",
+                created_at=timestamp,
+                updated_at=timestamp,
+                title="Subagent lifecycle session",
+            )
+        )
+        application.store.session_ids.add(session_id)
+    await application.store.bind_session_alias(
+        "acp-v1",
+        "acp-subagents",
+        "subagent-parent-internal",
+    )
+    agent = NeuroCodeAcpAgent(_acp_service(application))
+    client = AcpClientFixture()
+    agent.on_connect(cast(Client, client))
+    await agent.initialize(1, ClientCapabilities(terminal=True))
+    return agent, application, lifecycle_service
+
+
 def _acp_service(application: ApplicationFixture) -> AcpApplicationService:
     return BootstrapCliServices().create_acp_service(cast(ApplicationComposition, application))
 
 
 class PromptContentTests(unittest.TestCase):
+    def test_acp_subagent_lifecycle_query_is_strict_and_typed(self) -> None:
+        query = AcpSubagentLifecycleQuery.from_payload(
+            {
+                "sessionId": "acp-parent",
+                "taskId": "task-1",
+                "action": "resume",
+            }
+        )
+
+        self.assertEqual(query.session_id, "acp-parent")
+        self.assertEqual(query.task_id, "task-1")
+        self.assertIs(query.action, SubagentRelationshipAction.RESUME)
+        with self.assertRaises(AcpSubagentLifecycleQueryError) as unsupported:
+            AcpSubagentLifecycleQuery.from_payload(
+                {
+                    "sessionId": "acp-parent",
+                    "taskId": "task-1",
+                    "action": "resume",
+                    "prompt": "must not be accepted",
+                }
+            )
+        self.assertEqual(unsupported.exception.reason, "lifecycle_query_field_unsupported")
+        with self.assertRaises(AcpSubagentLifecycleQueryError) as invalid_action:
+            AcpSubagentLifecycleQuery.from_payload(
+                {
+                    "sessionId": "acp-parent",
+                    "taskId": "task-1",
+                    "action": "spawn",
+                }
+            )
+        self.assertEqual(invalid_action.exception.reason, "action_invalid")
+
+    def test_acp_subagent_lifecycle_serializer_has_no_internal_fields(self) -> None:
+        resumed = serialize_subagent_lifecycle_action(
+            SubagentRelationshipAction.RESUME,
+            session_id="acp-child",
+        )
+        deleted = serialize_subagent_lifecycle_action(
+            SubagentRelationshipAction.DELETE,
+            deleted=True,
+        )
+
+        self.assertEqual(resumed, {"action": "resume", "sessionId": "acp-child"})
+        self.assertEqual(deleted, {"action": "delete", "deleted": True})
+        self.assertNotIn("internal", repr(resumed))
+        self.assertNotIn("task", repr(deleted))
+        with self.assertRaises(ValueError):
+            serialize_subagent_lifecycle_action(
+                SubagentRelationshipAction.RESUME,
+                session_id="unsafe\x00alias",
+            )
+
+    def test_acp_subagent_result_projection_omits_internal_ids(self) -> None:
+        projection = SubagentResultProjection(
+            parent_session_id="parent-internal",
+            task_id="task-internal",
+            child_session_id="child-internal",
+            status=SessionTaskStatus.COMPLETED,
+            response="safe response",
+            steps=2,
+            truncated=False,
+        )
+
+        serialized = serialize_subagent_result(projection)
+
+        self.assertEqual(serialized["status"], "completed")
+        self.assertNotIn("parent_session_id", serialized)
+        self.assertNotIn("task_id", serialized)
+        self.assertNotIn("child_session_id", serialized)
+
     def test_acp_outcome_projection_is_bounded_and_protocol_safe(self) -> None:
         budget_limited = AgentExecutionOutcome(
             AgentExecutionStatus.BUDGET_LIMITED,
@@ -831,6 +1041,34 @@ class PromptContentTests(unittest.TestCase):
             serialized_size_bytes({"b": "中文", "a": 1}),
             len('{"a":1,"b":"中文"}'.encode()),
         )
+
+    def test_acp_compaction_serializer_omits_internal_context(self) -> None:
+        result = ContextCompactionCommandResult(
+            status=ContextCompactionCommandStatus.BUDGET_LIMITED,
+            triggered=False,
+            outcome=AgentExecutionOutcome(
+                AgentExecutionStatus.BUDGET_LIMITED,
+                SupervisorReasonCode.WALL_TIME_BUDGET,
+                finalized=False,
+                recoverable=True,
+            ),
+        )
+
+        serialized = serialize_context_compaction_result(result)
+
+        self.assertEqual(serialized["status"], "budget_limited")
+        self.assertEqual(
+            serialized["outcome"],
+            {
+                "status": "budget_limited",
+                "reason": "wall_time_budget",
+                "finalized": False,
+                "recoverable": True,
+            },
+        )
+        self.assertNotIn("summary", serialized)
+        self.assertNotIn("source_fingerprint", serialized)
+        self.assertNotIn("prompt", serialized)
 
     def test_text_and_resource_links_preserve_order_and_drop_meta(self) -> None:
         resource = ResourceContentBlock.model_validate(
@@ -1446,6 +1684,294 @@ class McpConfigurationTests(unittest.TestCase):
 
 
 class AcpAgentTests(unittest.IsolatedAsyncioTestCase):
+    async def test_private_subagent_lifecycle_extension_maps_external_ids_and_actions(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            agent, application, lifecycle_service = await initialized_subagent_lifecycle_agent(
+                Path(directory)
+            )
+
+            resumed = await agent.ext_method(
+                ACP_SUBAGENT_LIFECYCLE_EXTENSION,
+                {
+                    "sessionId": "acp-subagents",
+                    "taskId": "subagent-task",
+                    "action": "resume",
+                },
+            )
+            forked = await agent.ext_method(
+                ACP_SUBAGENT_LIFECYCLE_EXTENSION,
+                {
+                    "sessionId": "acp-subagents",
+                    "taskId": "subagent-task",
+                    "action": "fork",
+                },
+            )
+            deleted = await agent.ext_method(
+                ACP_SUBAGENT_LIFECYCLE_EXTENSION,
+                {
+                    "sessionId": "acp-subagents",
+                    "taskId": "subagent-task",
+                    "action": "delete",
+                },
+            )
+
+            resume_alias = await application.store.resolve_session_alias(
+                "acp-v1", resumed["sessionId"]
+            )
+            fork_alias = await application.store.resolve_session_alias(
+                "acp-v1", forked["sessionId"]
+            )
+
+        self.assertEqual(resume_alias, "child-internal")
+        self.assertEqual(fork_alias, "forked-internal")
+        self.assertEqual(resumed["action"], "resume")
+        self.assertEqual(forked["action"], "fork")
+        self.assertEqual(deleted, {"action": "delete", "deleted": True})
+        self.assertEqual(
+            [request.action for request in lifecycle_service.requests],
+            [
+                SubagentRelationshipAction.RESUME,
+                SubagentRelationshipAction.FORK,
+                SubagentRelationshipAction.DELETE,
+            ],
+        )
+        self.assertNotIn("child-internal", repr(resumed))
+        self.assertNotIn("forked-internal", repr(forked))
+        self.assertNotIn("subagent-task", repr(resumed))
+
+    async def test_private_subagent_lifecycle_extension_reuses_alias_after_reconnect(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            agent, application, lifecycle_service = await initialized_subagent_lifecycle_agent(
+                Path(directory)
+            )
+            payload = {
+                "sessionId": "acp-subagents",
+                "taskId": "subagent-task",
+                "action": "resume",
+            }
+            first = await agent.ext_method(ACP_SUBAGENT_LIFECYCLE_EXTENSION, payload)
+            await agent.shutdown()
+
+            reconnected = NeuroCodeAcpAgent(_acp_service(application))
+            reconnected.on_connect(cast(Client, AcpClientFixture()))
+            await reconnected.initialize(1, ClientCapabilities(terminal=True))
+            second = await acp_module._build_acp_router(reconnected)(
+                "_" + ACP_SUBAGENT_LIFECYCLE_EXTENSION,
+                payload,
+                False,
+            )
+            await reconnected.shutdown()
+
+            child_aliases = [
+                external_id
+                for (namespace, external_id), session_id in application.store.aliases.items()
+                if namespace == "acp-v1" and session_id == "child-internal"
+            ]
+
+        self.assertEqual(second, first)
+        self.assertEqual(len(child_aliases), 1)
+        self.assertEqual(len(lifecycle_service.requests), 2)
+
+    async def test_private_subagent_lifecycle_extension_retries_alias_collision(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            agent, application, _ = await initialized_subagent_lifecycle_agent(Path(directory))
+            collision_owner = "collision-owner"
+            timestamp = datetime(2026, 7, 2, tzinfo=UTC)
+            application.store.summaries.append(
+                SessionSummary(
+                    id=collision_owner,
+                    cwd=str(application.config.cwd),
+                    provider="fixture",
+                    model="fixture-model",
+                    created_at=timestamp,
+                    updated_at=timestamp,
+                    title="Alias collision owner",
+                )
+            )
+            application.store.session_ids.add(collision_owner)
+            await application.store.bind_session_alias(
+                "acp-v1",
+                "acp-collision",
+                collision_owner,
+            )
+
+            with patch.object(
+                acp_module.uuid,
+                "uuid4",
+                side_effect=(Mock(hex="collision"), Mock(hex="retry")),
+            ):
+                result = await agent.ext_method(
+                    ACP_SUBAGENT_LIFECYCLE_EXTENSION,
+                    {
+                        "sessionId": "acp-subagents",
+                        "taskId": "subagent-task",
+                        "action": "resume",
+                    },
+                )
+
+        self.assertEqual(result, {"action": "resume", "sessionId": "acp-retry"})
+        self.assertEqual(
+            await application.store.resolve_session_alias("acp-v1", "acp-retry"),
+            "child-internal",
+        )
+        self.assertEqual(
+            await application.store.resolve_session_alias("acp-v1", "acp-collision"),
+            collision_owner,
+        )
+
+    async def test_private_subagent_lifecycle_extension_rejects_alias_owner_mismatch(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            agent, application, _ = await initialized_subagent_lifecycle_agent(Path(directory))
+            wrong_owner = "wrong-owner"
+            timestamp = datetime(2026, 7, 3, tzinfo=UTC)
+            application.store.summaries.append(
+                SessionSummary(
+                    id=wrong_owner,
+                    cwd=str(application.config.cwd),
+                    provider="fixture",
+                    model="fixture-model",
+                    created_at=timestamp,
+                    updated_at=timestamp,
+                    title="Wrong alias owner",
+                )
+            )
+            application.store.session_ids.add(wrong_owner)
+            await application.store.bind_session_alias("acp-v1", "acp-wrong", wrong_owner)
+            allocator = AsyncMock(return_value="acp-wrong")
+
+            with (
+                patch.object(
+                    agent._service,
+                    "get_or_create_current_workspace_session_alias",
+                    new=allocator,
+                ),
+                self.assertRaises(RequestError) as error,
+            ):
+                await agent.ext_method(
+                    ACP_SUBAGENT_LIFECYCLE_EXTENSION,
+                    {
+                        "sessionId": "acp-subagents",
+                        "taskId": "subagent-task",
+                        "action": "resume",
+                    },
+                )
+
+        self.assertEqual(error.exception.data, {"reason": "session_alias_allocation_failed"})
+        self.assertEqual(allocator.await_count, 4)
+
+    async def test_private_subagent_lifecycle_extension_rejects_unsupported_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            agent, _, _ = await initialized_subagent_lifecycle_agent(Path(directory))
+
+            with self.assertRaises(RequestError) as error:
+                await agent.ext_method(
+                    ACP_SUBAGENT_LIFECYCLE_EXTENSION,
+                    {
+                        "sessionId": "acp-subagents",
+                        "taskId": "subagent-task",
+                        "action": "resume",
+                        "prompt": "must not cross the ACP boundary",
+                    },
+                )
+
+        self.assertEqual(error.exception.data, {"reason": "lifecycle_query_field_unsupported"})
+
+    async def test_private_subagent_lifecycle_extension_rejects_mismatched_owner_result(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            agent, _, lifecycle_service = await initialized_subagent_lifecycle_agent(
+                Path(directory)
+            )
+            lifecycle_service.result_override = SubagentRelationshipActionResult(
+                parent_session_id="other-parent",
+                parent_task_id="other-task",
+                child_session_id="child-internal",
+                action=SubagentRelationshipAction.FORK,
+                forked_session_id="forked-internal",
+            )
+
+            with self.assertRaises(RequestError) as error:
+                await agent.ext_method(
+                    ACP_SUBAGENT_LIFECYCLE_EXTENSION,
+                    {
+                        "sessionId": "acp-subagents",
+                        "taskId": "subagent-task",
+                        "action": "resume",
+                    },
+                )
+
+        self.assertEqual(error.exception.data, {"reason": "subagent_lifecycle_invalid_result"})
+
+    async def test_private_read_only_subagent_extension_returns_safe_projection(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            agent, _, subagent_service = await initialized_subagent_agent(Path(directory))
+
+            result = await agent.ext_method(
+                ACP_READ_ONLY_SUBAGENT_EXTENSION,
+                {
+                    "sessionId": "acp-subagent",
+                    "prompt": "inspect the repository",
+                    "maxSteps": 3,
+                },
+            )
+
+        self.assertEqual(
+            result,
+            {
+                "status": "completed",
+                "response": "safe child response",
+                "steps": 2,
+                "truncated": False,
+                "outcome": {
+                    "status": "budget_limited",
+                    "reason": "model_step_limit",
+                    "finalized": True,
+                    "recoverable": True,
+                },
+            },
+        )
+        self.assertEqual(
+            subagent_service.requests,
+            [RunSubagentRequest("subagent-internal", "inspect the repository", max_steps=3)],
+        )
+        self.assertNotIn("prompt", repr(result))
+        self.assertNotIn("child-internal", repr(result))
+
+    async def test_private_read_only_subagent_extension_rejects_unsupported_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            agent, _, _ = await initialized_subagent_agent(Path(directory))
+
+            with self.assertRaises(RequestError) as error:
+                await agent.ext_method(
+                    ACP_READ_ONLY_SUBAGENT_EXTENSION,
+                    {
+                        "sessionId": "acp-subagent",
+                        "prompt": "inspect",
+                        "toolArguments": {"secret": "must not cross"},
+                    },
+                )
+
+        self.assertEqual(error.exception.data, {"reason": "subagent_query_field_unsupported"})
+
+    async def test_private_read_only_subagent_extension_fails_closed_when_unavailable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            agent, _, _ = await initialized_artifact_agent(Path(directory))
+
+            with self.assertRaises(RequestError) as error:
+                await agent.ext_method(
+                    ACP_READ_ONLY_SUBAGENT_EXTENSION,
+                    {"sessionId": "acp-artifacts", "prompt": "inspect"},
+                )
+
+        self.assertEqual(error.exception.data, {"reason": "subagent_unavailable"})
+
     async def test_private_artifact_extension_lists_and_reads_bounded_output(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             agent, _, artifact_service = await initialized_artifact_agent(Path(directory))
@@ -3230,6 +3756,37 @@ class AcpAgentTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(result["artifacts"][0]["artifactId"], "a" * 32)
+
+    async def test_sdk_router_dispatches_private_read_only_subagent_extension(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            agent, _, _ = await initialized_subagent_agent(Path(directory))
+
+            result = await acp_module._build_acp_router(agent)(
+                "_" + ACP_READ_ONLY_SUBAGENT_EXTENSION,
+                {"sessionId": "acp-subagent", "prompt": "inspect"},
+                False,
+            )
+
+        self.assertEqual(result["response"], "safe child response")
+        self.assertNotIn("child_session_id", result)
+
+    async def test_sdk_router_dispatches_private_subagent_lifecycle_extension(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            agent, _, _ = await initialized_subagent_lifecycle_agent(Path(directory))
+
+            result = await acp_module._build_acp_router(agent)(
+                "_" + ACP_SUBAGENT_LIFECYCLE_EXTENSION,
+                {
+                    "sessionId": "acp-subagents",
+                    "taskId": "subagent-task",
+                    "action": "resume",
+                },
+                False,
+            )
+
+        self.assertEqual(result["action"], "resume")
+        self.assertTrue(result["sessionId"].startswith("acp-"))
+        self.assertNotIn("child-internal", repr(result))
 
     async def test_serve_uses_official_sdk_streams_and_always_closes_connection(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

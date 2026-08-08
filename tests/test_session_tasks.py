@@ -4,7 +4,12 @@ import unittest
 from datetime import UTC, datetime, timedelta
 
 from neuro_code.domain.plans import PlanStep, PlanStepStatus, SessionPlan
-from neuro_code.domain.session_tasks import SessionTask, SessionTaskKind, SessionTaskStatus
+from neuro_code.domain.session_tasks import (
+    SessionTask,
+    SessionTaskKind,
+    SessionTaskStatus,
+    SubagentLink,
+)
 
 
 class SessionTaskTests(unittest.TestCase):
@@ -130,3 +135,19 @@ class SessionTaskTests(unittest.TestCase):
                 started_at,
                 plan_snapshot="not-a-plan",
             )
+
+    def test_subagent_link_is_bounded_and_cannot_self_reference(self) -> None:
+        created_at = datetime(2026, 7, 29, 12, tzinfo=UTC)
+        link = SubagentLink("parent-session", "subagent-task", "child-session", created_at)
+        self.assertEqual(link.child_session_id, "child-session")
+        with self.assertRaisesRegex(ValueError, "differ from its parent"):
+            SubagentLink("same", "subagent-task", "same", created_at)
+        with self.assertRaisesRegex(ValueError, "creation time must be timezone-aware"):
+            SubagentLink(
+                "parent-session",
+                "subagent-task",
+                "child-session",
+                datetime.fromisoformat("2026-07-29T12:00:00"),
+            )
+        with self.assertRaisesRegex(ValueError, "bounded safe identifier"):
+            SubagentLink("parent\x00session", "subagent-task", "child-session", created_at)

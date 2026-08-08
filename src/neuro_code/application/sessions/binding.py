@@ -5,10 +5,18 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
-from typing import Protocol
+from datetime import datetime
+from typing import Protocol, TypeVar
 
+from neuro_code.application.memory.compaction import ProviderContextWindow
+from neuro_code.application.memory.compaction_runtime import (
+    ContextCompactionRuntimeBoundary,
+    ContextCompactionRuntimeRequest,
+    ContextCompactionRuntimeResult,
+    ContextCompactionTurnProjection,
+)
 from neuro_code.application.ports.background_tasks import BackgroundTaskManager
 from neuro_code.application.ports.model import ModelProvider
 from neuro_code.application.runtime.agent import AgentRunResult, EventSink
@@ -19,6 +27,8 @@ from neuro_code.domain.conversation.reasoning import ReasoningEffort
 from neuro_code.domain.execution import TurnCancellationPolicy, TurnSource
 from neuro_code.domain.plans import PlanComment, SessionPlan
 from neuro_code.domain.session_tasks import SessionTask
+
+_T = TypeVar("_T")
 
 
 class ConversationRunner(Protocol):
@@ -69,6 +79,30 @@ class ConversationRunner(Protocol):
         cancellation_policy: TurnCancellationPolicy = TurnCancellationPolicy.RETAIN,
         turn_source: TurnSource = TurnSource.USER,
     ) -> AgentRunResult: ...
+
+    async def trigger_context_compaction(
+        self,
+        request: ContextCompactionRuntimeRequest,
+    ) -> ContextCompactionRuntimeResult: ...
+
+    async def run_context_compaction_with_owner(
+        self,
+        request: ContextCompactionRuntimeRequest,
+        owner: Callable[[ContextCompactionTurnProjection], Awaitable[_T]],
+    ) -> _T: ...
+
+    async def run_explicit_context_compaction_with_owner(
+        self,
+        *,
+        boundary: ContextCompactionRuntimeBoundary,
+        provider_window: ProviderContextWindow | None,
+        owner: Callable[[ContextCompactionTurnProjection], Awaitable[_T]],
+        protected_item_count: int = 0,
+        reported_input_tokens: int | None = None,
+        reported_output_tokens: int | None = None,
+        compaction_id: str | None = None,
+        created_at: datetime | None = None,
+    ) -> _T: ...
 
     async def run_background_wake(self, *, sink: EventSink | None = None) -> AgentRunResult: ...
 

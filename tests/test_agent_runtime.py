@@ -11,6 +11,21 @@ from pathlib import Path
 from typing import Any, cast
 from unittest.mock import patch
 
+from neuro_code.application.memory.compaction import (
+    CompactionContextUsage,
+    ProviderContextWindow,
+)
+from neuro_code.application.memory.compaction_runtime import (
+    ContextCompactionRuntimeBoundary,
+    ContextCompactionRuntimeGate,
+    ContextCompactionRuntimeRequest,
+    ContextCompactionRuntimeResult,
+    ContextCompactionSafePoint,
+)
+from neuro_code.application.memory.compaction_trigger import (
+    ContextCompactionTriggerMode,
+    ContextCompactionTriggerRequest,
+)
 from neuro_code.application.permissions.contracts import PermissionApproval, PermissionRequest
 from neuro_code.application.permissions.policy import (
     PermissionEffect,
@@ -136,6 +151,20 @@ class FailingProvider:
         raise ProviderError(f"{self.provider_name} unavailable")
         if False:
             yield ModelCompleted("stop")
+
+
+class RecordingCompactionRuntimeGate(ContextCompactionRuntimeGate):
+    __slots__ = ("requests",)
+
+    def __init__(self) -> None:
+        self.requests: list[ContextCompactionRuntimeRequest] = []
+
+    async def trigger(
+        self,
+        request: ContextCompactionRuntimeRequest,
+    ) -> ContextCompactionRuntimeResult:
+        self.requests.append(request)
+        raise ProviderError("compaction gate fixture failure")
 
 
 class BlockingProvider:
@@ -478,6 +507,28 @@ def observation_budget(**overrides: object) -> ExecutionBudget:
     }
     values.update(overrides)
     return ExecutionBudget(**values)  # type: ignore[arg-type]
+
+
+def compaction_runtime_request_fixture() -> ContextCompactionRuntimeRequest:
+    context = ModelContext((Message(Role.USER, "compact this context"),))
+    usage = CompactionContextUsage.from_provider_window(
+        900,
+        ProviderContextWindow(
+            "scripted",
+            "fixture-model",
+            1_000,
+            context_affinity="profile-v1:scripted",
+        ),
+        estimated=False,
+    )
+    return ContextCompactionRuntimeRequest(
+        ContextCompactionTriggerRequest(
+            context=context,
+            usage=usage,
+            mode=ContextCompactionTriggerMode.DISABLED,
+        ),
+        ContextCompactionRuntimeBoundary(ContextCompactionSafePoint.BEFORE_MODEL_REQUEST, 0),
+    )
 
 
 def observing_supervisor_factory(
@@ -3284,6 +3335,55 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 )
             with self.assertRaisesRegex(ValueError, "finalizer_max_attempts"):
                 AgentRuntime(**common, finalizer_max_attempts=True)
+
+    async def test_runtime_compaction_seam_is_default_disabled(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = AgentRuntime(
+                provider=ScriptedProvider(((ModelTextDelta("done"), ModelCompleted("stop")),)),
+                tools=default_tool_registry(),
+                workspace_change_observer=EmptyWorkspaceChangeObserver(),
+                permissions=PermissionManager(),
+                tool_context=ToolContext(Path(directory)),
+            )
+
+            with self.assertRaisesRegex(ConfigurationError, "not configured"):
+                await runtime.trigger_context_compaction(compaction_runtime_request_fixture())
+
+    async def test_runtime_compaction_seam_forwards_only_explicit_request(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            gate = RecordingCompactionRuntimeGate()
+            request = compaction_runtime_request_fixture()
+            runtime = AgentRuntime(
+                provider=ScriptedProvider(((ModelTextDelta("done"), ModelCompleted("stop")),)),
+                tools=default_tool_registry(),
+                workspace_change_observer=EmptyWorkspaceChangeObserver(),
+                permissions=PermissionManager(),
+                tool_context=ToolContext(Path(directory)),
+                compaction_runtime_gate=gate,
+            )
+
+            with self.assertRaisesRegex(ProviderError, "compaction gate fixture failure"):
+                await runtime.trigger_context_compaction(request)
+
+            self.assertEqual(gate.requests, [request])
+            self.assertIs(gate.requests[0], request)
+
+    async def test_runtime_rejects_invalid_compaction_gate_configuration(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            self.assertRaisesRegex(
+                TypeError,
+                "compaction_runtime_gate",
+            ),
+        ):
+            AgentRuntime(
+                provider=ScriptedProvider(((ModelTextDelta("done"), ModelCompleted("stop")),)),
+                tools=default_tool_registry(),
+                workspace_change_observer=EmptyWorkspaceChangeObserver(),
+                permissions=PermissionManager(),
+                tool_context=ToolContext(Path(directory)),
+                compaction_runtime_gate=cast(ContextCompactionRuntimeGate, object()),
+            )
 
     async def test_controlled_finalizer_state_is_isolated_between_turns(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

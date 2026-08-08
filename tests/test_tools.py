@@ -327,6 +327,14 @@ class PlanToolTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertIn("update_plan", default_tool_registry().names())
 
+    def test_allowed_tool_names_can_construct_a_read_only_capability_set(self) -> None:
+        registry = default_tool_registry(
+            enable_background_tasks=True,
+            allowed_tool_names=("read_file", "list_dir", "grep", "skill"),
+        )
+
+        self.assertEqual(registry.names(), ("read_file", "list_dir", "grep", "skill"))
+
     async def test_update_plan_without_a_purpose_omits_the_purpose_line(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             result = await UpdatePlanTool().execute(

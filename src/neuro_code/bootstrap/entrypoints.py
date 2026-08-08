@@ -384,6 +384,8 @@ class BootstrapCliServices:
             sessions=application.session_service,
             summary_queries=application.session_summary_queries,
             artifacts=application.create_tool_output_artifact_service(config=config),
+            subagents=application.create_read_only_subagent_application_service(),
+            subagent_lifecycle=application.create_subagent_relationship_lifecycle_service(),
         )
 
     async def run_acp(
@@ -625,6 +627,15 @@ class BootstrapCliServices:
                 tool_output_artifact_service = application.create_tool_output_artifact_service(
                     config=config
                 )
+                read_only_subagent_service = (
+                    application.create_read_only_subagent_application_service()
+                )
+                subagent_relationship_query = (
+                    application.create_subagent_relationship_query_service()
+                )
+                subagent_relationship_lifecycle = (
+                    application.create_subagent_relationship_lifecycle_service()
+                )
                 app = NeuroCodeApp(
                     controller,
                     turn_service=turn_service,
@@ -641,6 +652,9 @@ class BootstrapCliServices:
                     plan_scheduling_service=plan_scheduling_service,
                     queued_plan_execution_service=queued_plan_execution_service,
                     tool_output_artifact_service=tool_output_artifact_service,
+                    read_only_subagent_service=read_only_subagent_service,
+                    subagent_relationship_query=subagent_relationship_query,
+                    subagent_relationship_lifecycle=subagent_relationship_lifecycle,
                     ui_preferences=ui_preferences,
                     provider_settings_store=provider_settings_store,
                     provider_catalog=provider_catalog,

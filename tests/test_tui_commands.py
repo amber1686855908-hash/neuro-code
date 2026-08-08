@@ -22,6 +22,14 @@ class SlashCompletionTests(unittest.TestCase):
         self.assertEqual(slash_completions("/run-task")[0].value, "/run-task ")
         self.assertEqual(slash_completions("/view-t")[0].value, "/view-task")
         self.assertEqual(slash_completions("/view-task")[0].value, "/view-task ")
+        self.assertEqual(
+            [item.value for item in slash_completions("/subagents")],
+            [
+                "/subagents resume",
+                "/subagents fork",
+                "/subagents delete",
+            ],
+        )
 
     def test_provider_choices_and_free_form_parameter_syntax_are_exposed(self) -> None:
         provider = slash_completions(

@@ -61,6 +61,12 @@ class SessionError(NeuroCodeError):
     会话持久化或重建失败."""
 
 
+class SubagentTimeoutError(NeuroCodeError):
+    """A bounded subagent run exceeded its wall-clock budget.
+
+    有界子代理运行超过了墙钟时间预算."""
+
+
 __all__ = [
     "BackgroundTaskCapacityError",
     "ConfigurationError",
@@ -69,6 +75,7 @@ __all__ = [
     "ProviderError",
     "SandboxError",
     "SessionError",
+    "SubagentTimeoutError",
     "TerminalError",
     "ToolError",
 ]

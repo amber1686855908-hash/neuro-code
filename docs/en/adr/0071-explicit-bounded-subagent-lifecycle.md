@@ -43,8 +43,10 @@ contract.
 ## Boundaries
 
 - No AgentRuntime main-loop or ModelProvider contract changes.
-- No session schema migration is needed because `subagent` is already a
-  canonical task kind and the existing lifecycle columns are sufficient.
+- Stage5CQ itself needs no schema migration because `subagent` is a canonical
+  task kind and the existing lifecycle columns are sufficient.  The later
+  Stage5CR isolated-runtime slice adds its separate parent/child link table in
+  schema version 12; that migration is not part of this lifecycle decision.
 - No prompt, tool argument, credential, raw output, or parent transcript is
   persisted by the new application service.
 - Failure to create an executor does not leave a running task record.

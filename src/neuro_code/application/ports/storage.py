@@ -9,12 +9,13 @@ from datetime import datetime
 from typing import Any, Protocol
 
 from neuro_code.domain.background_tasks.models import BackgroundWakeState
+from neuro_code.domain.conversation.compaction import DurableCompactionItem
 from neuro_code.domain.conversation.events import AgentEvent
 from neuro_code.domain.conversation.messages import Message, SessionItem
 from neuro_code.domain.execution import SessionExecutionRecord
 from neuro_code.domain.plans import PlanComment, SessionPlan
 from neuro_code.domain.sandbox.models import SandboxProfile
-from neuro_code.domain.session_tasks import SessionTask
+from neuro_code.domain.session_tasks import SessionTask, SubagentLink
 from neuro_code.domain.sessions import SessionSnapshot, SessionSummary
 from neuro_code.domain.sessions.search import SessionSearchPage
 
@@ -70,6 +71,15 @@ class SessionStore(Protocol):
         record: SessionExecutionRecord | None,
     ) -> None: ...
 
+    async def finalize_turn_with_compaction(
+        self,
+        session_id: str,
+        event: AgentEvent,
+        items: Sequence[SessionItem],
+        record: SessionExecutionRecord | None,
+        compaction_item: DurableCompactionItem,
+    ) -> None: ...
+
     async def save_session_plan(self, session_id: str, plan: SessionPlan | None) -> None: ...
 
     async def save_execution_record(
@@ -77,6 +87,17 @@ class SessionStore(Protocol):
         session_id: str,
         record: SessionExecutionRecord,
     ) -> None: ...
+
+    async def save_compaction_item(
+        self,
+        session_id: str,
+        item: DurableCompactionItem,
+    ) -> None: ...
+
+    async def load_compaction_items(
+        self,
+        session_id: str,
+    ) -> list[DurableCompactionItem]: ...
 
     async def load_messages(self, session_id: str) -> list[Message]: ...
 
@@ -131,6 +152,21 @@ class SessionStore(Protocol):
     ) -> list[SessionTask]: ...
 
     async def get_session_task(self, session_id: str, task_id: str) -> SessionTask | None: ...
+
+    async def save_subagent_link(self, link: SubagentLink) -> None: ...
+
+    async def load_subagent_link(
+        self,
+        parent_session_id: str,
+        parent_task_id: str,
+    ) -> SubagentLink | None: ...
+
+    async def list_subagent_links(
+        self,
+        parent_session_id: str,
+        *,
+        limit: int = 50,
+    ) -> list[SubagentLink]: ...
 
     async def load_events(self, session_id: str) -> list[dict[str, Any]]: ...
 

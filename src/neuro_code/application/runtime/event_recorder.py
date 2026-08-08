@@ -20,7 +20,9 @@ from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, datetime
 from time import monotonic
 
+from neuro_code.application.memory.compaction_runtime import ContextCompactionTurnProjection
 from neuro_code.application.ports.storage import SessionStore
+from neuro_code.domain.conversation.compaction import DurableCompactionItem
 from neuro_code.domain.conversation.events import AgentEvent, AgentEventKind
 from neuro_code.domain.conversation.messages import SessionItem
 from neuro_code.domain.execution import (
@@ -29,6 +31,7 @@ from neuro_code.domain.execution import (
     TurnSource,
 )
 from neuro_code.domain.session_tasks import SessionTask, SessionTaskStatus
+from neuro_code.shared.errors import ConfigurationError
 
 EventSink = Callable[[AgentEvent], Awaitable[None] | None]
 
@@ -154,7 +157,32 @@ class TurnEventRecorder:
         outcome: AgentExecutionOutcome,
         data: dict[str, object],
         result_items: Sequence[SessionItem],
+        compaction_item: DurableCompactionItem | None = None,
     ) -> None:
+        """Persist one completed turn, optionally with its durable compaction.
+
+        The optional compaction item is already generated, redacted, and
+        validated by its caller.  Supplying it transfers only storage
+        finalization ownership to this recorder; Provider generation remains
+        outside the SQLite transaction.  Ordinary calls keep the existing
+        ``finalize_turn`` path.
+
+        持久化一个已完成回合,并可选地同时保存持久化压缩条目.
+
+        可选压缩条目必须已经由调用方生成、脱敏并校验. 传入它只把存储最终化所有权
+        交给本记录器; Provider 生成仍然在 SQLite 事务之外. 普通调用继续使用原有的
+        ``finalize_turn`` 路径.
+        """
+
+        if compaction_item is not None and not isinstance(
+            compaction_item,
+            DurableCompactionItem,
+        ):
+            raise TypeError("compaction_item must be a DurableCompactionItem or None")
+        if compaction_item is not None and (
+            self._session_store is None or self._session_id is None
+        ):
+            raise ConfigurationError("compaction finalization requires a persisted session")
         completed_event = await self.emit(
             AgentEventKind.TURN_COMPLETED,
             data,
@@ -171,13 +199,72 @@ class TurnEventRecorder:
             )
         )
         if self._session_store is not None and self._session_id is not None:
-            await self._session_store.finalize_turn(
-                self._session_id,
-                completed_event,
-                result_items,
-                record,
-            )
+            if compaction_item is None:
+                await self._session_store.finalize_turn(
+                    self._session_id,
+                    completed_event,
+                    result_items,
+                    record,
+                )
+            else:
+                await self._session_store.finalize_turn_with_compaction(
+                    self._session_id,
+                    completed_event,
+                    result_items,
+                    record,
+                    compaction_item,
+                )
         await self._deliver(completed_event)
+
+    async def finalize_turn_from_compaction_projection(
+        self,
+        projection: ContextCompactionTurnProjection,
+        data: dict[str, object],
+        result_items: Sequence[SessionItem],
+        *,
+        completed_outcome: AgentExecutionOutcome | None = None,
+    ) -> None:
+        """Consume one explicit compaction projection at turn finalization.
+
+        A successful compaction projection still needs the caller's ordinary
+        turn outcome; a timeout projection supplies its own bounded outcome.
+        Propagation-only and no-op projections fail closed before any event is
+        appended. This method is an opt-in owner seam and is never called by
+        the normal Agent loop.
+
+        在回合最终化时消费一次显式的压缩投影。
+
+        成功压缩投影仍需要调用方提供普通回合 outcome;超时投影提供自己的有界 outcome。
+        只能传播的投影和无操作投影会在追加任何事件前失败关闭。本方法是可选的所有者接缝,普通 Agent loop 不会调用。
+        """
+
+        if not isinstance(projection, ContextCompactionTurnProjection):
+            raise TypeError("projection must be a ContextCompactionTurnProjection")
+        if projection.must_propagate:
+            raise ConfigurationError(
+                "propagation-only compaction projection cannot finalize a turn"
+            )
+        if projection.triggered:
+            if completed_outcome is None:
+                raise ConfigurationError("successful compaction projection requires a turn outcome")
+            await self.finalize_turn_completion(
+                completed_outcome,
+                data,
+                result_items,
+                projection.compaction_item,
+            )
+            return
+        if projection.outcome is None:
+            raise ConfigurationError("compaction projection is not ready for finalization")
+        if completed_outcome is not None:
+            raise ConfigurationError(
+                "terminal compaction projection must not receive another turn outcome"
+            )
+        await self.finalize_turn_completion(
+            projection.outcome,
+            data,
+            result_items,
+        )
 
     async def _deliver(self, event: AgentEvent) -> None:
         if self._sink is not None:

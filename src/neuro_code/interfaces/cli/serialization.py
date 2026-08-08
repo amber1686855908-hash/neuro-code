@@ -15,8 +15,13 @@ from __future__ import annotations
 import json
 from collections.abc import Sequence
 
+from neuro_code.application.memory.compaction_runtime import ContextCompactionCommandResult
 from neuro_code.application.sessions.catalog import SessionSearchInspectionPage
+from neuro_code.application.sessions.subagent_lifecycle import (
+    SubagentRelationshipActionResult,
+)
 from neuro_code.application.tools.service import SessionToolOutputArtifact
+from neuro_code.application.workflows.subagent import SubagentResultProjection
 from neuro_code.domain.conversation.messages import (
     ContextItemKind,
     PreservedContextItem,
@@ -27,9 +32,12 @@ from neuro_code.domain.execution import AgentExecutionOutcome, SessionExecutionR
 
 __all__ = [
     "render_session_markdown",
+    "serialize_context_compaction_result",
     "serialize_execution_outcome",
     "serialize_execution_record",
     "serialize_session_search_page",
+    "serialize_subagent_relationship_action",
+    "serialize_subagent_result",
     "serialize_tool_output_artifact",
     "serialize_tool_output_artifact_read",
 ]
@@ -53,6 +61,32 @@ def serialize_execution_outcome(
     }
 
 
+def serialize_context_compaction_result(
+    result: ContextCompactionCommandResult,
+) -> dict[str, object]:
+    """Serialize the bounded public result of an explicit compaction command.
+
+    序列化显式上下文压缩命令的有界公开结果。
+
+    Summary text, source fingerprints, prompts, messages, and exception
+    details are intentionally absent from this wire projection.
+    该 wire 投影刻意不包含摘要文本、源指纹、提示词、消息或异常详情。
+    """
+
+    if not isinstance(result, ContextCompactionCommandResult):
+        raise TypeError("result must be a ContextCompactionCommandResult")
+    return {
+        "status": result.status.value,
+        "triggered": result.triggered,
+        "outcome": serialize_execution_outcome(result.outcome),
+        "compaction_id": result.compaction_id,
+        "source_item_count": result.source_item_count,
+        "candidate_item_count": result.candidate_item_count,
+        "summary_tokens": result.summary_tokens,
+        "summary_truncated": result.summary_truncated,
+    }
+
+
 def serialize_execution_record(
     record: SessionExecutionRecord | None,
 ) -> dict[str, object] | None:
@@ -68,6 +102,52 @@ def serialize_execution_record(
         return None
     outcome["completed_at"] = record.completed_at.isoformat()
     return outcome
+
+
+def serialize_subagent_result(
+    projection: SubagentResultProjection,
+) -> dict[str, object]:
+    """Serialize only the bounded public subagent result projection.
+
+    只序列化有界且公开的子代理结果投影.
+
+    The projection intentionally omits prompt, messages, events, tool
+    arguments, credentials, and child context.
+    该投影有意省略提示词、消息、事件、工具参数、凭据和子上下文.
+    """
+
+    return {
+        "parent_session_id": projection.parent_session_id,
+        "task_id": projection.task_id,
+        "child_session_id": projection.child_session_id,
+        "status": projection.status.value,
+        "response": projection.response,
+        "steps": projection.steps,
+        "truncated": projection.truncated,
+        "outcome": serialize_execution_outcome(projection.outcome),
+    }
+
+
+def serialize_subagent_relationship_action(
+    result: SubagentRelationshipActionResult,
+) -> dict[str, object]:
+    """Serialize one bounded parent/child lifecycle result.
+
+    序列化一次有界的父子子代理生命周期结果.
+
+    The projection contains only lifecycle identifiers and the canonical
+    action.  It never includes session content, prompts, tools, or provider
+    state.
+    该投影只包含生命周期标识和规范动作,不会包含会话内容、提示词、工具或 Provider 状态.
+    """
+
+    return {
+        "parent_session_id": result.parent_session_id,
+        "parent_task_id": result.parent_task_id,
+        "child_session_id": result.child_session_id,
+        "action": result.action.value,
+        "forked_session_id": result.forked_session_id,
+    }
 
 
 def serialize_tool_output_artifact(

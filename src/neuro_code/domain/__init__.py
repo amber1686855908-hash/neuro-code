@@ -19,6 +19,13 @@ from neuro_code.domain.background_tasks.models import (
     BackgroundWakeLimits,
     BackgroundWakeState,
 )
+from neuro_code.domain.conversation.compaction import (
+    COMPACTION_SOURCE_FINGERPRINT_BYTES,
+    MAX_DURABLE_COMPACTION_ID_BYTES,
+    MAX_DURABLE_COMPACTION_SUMMARY_BYTES,
+    DurableCompactionItem,
+    compute_compaction_source_fingerprint,
+)
 from neuro_code.domain.conversation.context import (
     ModelContext,
     estimate_context_tokens,
@@ -83,11 +90,14 @@ from neuro_code.domain.tools import ToolDefinition, ToolResult
 from neuro_code.shared.ui_language import UiLanguage
 
 __all__ = [
+    "COMPACTION_SOURCE_FINGERPRINT_BYTES",
     "DEFAULT_BACKGROUND_WAKE_COOLDOWN_SECONDS",
     "DEFAULT_BACKGROUND_WAKE_MAX_PER_SESSION",
     "MAX_BACKGROUND_TASK_WAIT_IDS",
     "MAX_BACKGROUND_WAKE_COUNT",
     "MAX_BACKGROUND_WAKE_TASK_IDS",
+    "MAX_DURABLE_COMPACTION_ID_BYTES",
+    "MAX_DURABLE_COMPACTION_SUMMARY_BYTES",
     "MAX_PLAN_COMMENTS",
     "MAX_PLAN_COMMENT_BYTES",
     "MAX_PLAN_COMMENT_ID_BYTES",
@@ -112,6 +122,7 @@ __all__ = [
     "ContentPart",
     "ContentPartKind",
     "ContextItemKind",
+    "DurableCompactionItem",
     "InteractionMode",
     "Message",
     "ModelBackendToolCompleted",
@@ -146,6 +157,7 @@ __all__ = [
     "ToolDefinition",
     "ToolResult",
     "UiLanguage",
+    "compute_compaction_source_fingerprint",
     "estimate_context_tokens",
     "estimate_text_tokens",
     "interaction_mode_guidance",

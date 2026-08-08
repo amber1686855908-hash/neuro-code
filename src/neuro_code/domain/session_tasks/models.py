@@ -12,6 +12,7 @@ from neuro_code.domain.plans import SessionPlan
 
 MAX_SESSION_TASK_ID_BYTES = 80
 MAX_QUEUED_SESSION_TASKS = 4
+MAX_SUBAGENT_LINK_ID_BYTES = 512
 
 
 class SessionTaskKind(StrEnum):
@@ -49,6 +50,42 @@ class SessionTaskStatus(StrEnum):
         表示任务正在等待执行还是正在接收执行."""
 
         return self in {SessionTaskStatus.QUEUED, SessionTaskStatus.RUNNING}
+
+
+@dataclass(frozen=True, slots=True)
+class SubagentLink:
+    """Durable ownership link between one parent task and one child session.
+
+    表示一个父任务与一个子会话之间的持久归属关系.
+
+    The link stores identifiers and creation time only.  Prompts, credentials,
+    tool arguments, and model output remain in their own bounded owners.
+    该链接只保存标识符和创建时间. 提示词、凭据、工具参数和模型输出仍由各自有界的所有者管理.
+    """
+
+    parent_session_id: str
+    parent_task_id: str
+    child_session_id: str
+    created_at: datetime
+
+    def __post_init__(self) -> None:
+        for value, field_name in (
+            (self.parent_session_id, "parent_session_id"),
+            (self.parent_task_id, "parent_task_id"),
+            (self.child_session_id, "child_session_id"),
+        ):
+            if (
+                not isinstance(value, str)
+                or not value.strip()
+                or "\x00" in value
+                or len(value.encode("utf-8")) > MAX_SUBAGENT_LINK_ID_BYTES
+                or any(ord(character) < 32 or ord(character) == 127 for character in value)
+            ):
+                raise ValueError(f"{field_name} must be a bounded safe identifier")
+        if self.parent_session_id == self.child_session_id:
+            raise ValueError("subagent child session must differ from its parent session")
+        if not isinstance(self.created_at, datetime) or self.created_at.tzinfo is None:
+            raise ValueError("subagent link creation time must be timezone-aware")
 
 
 @dataclass(frozen=True, slots=True)
@@ -136,7 +173,9 @@ class SessionTask:
 __all__ = [
     "MAX_QUEUED_SESSION_TASKS",
     "MAX_SESSION_TASK_ID_BYTES",
+    "MAX_SUBAGENT_LINK_ID_BYTES",
     "SessionTask",
     "SessionTaskKind",
     "SessionTaskStatus",
+    "SubagentLink",
 ]

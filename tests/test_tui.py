@@ -7,6 +7,7 @@ import unittest
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import cast
 from unittest.mock import patch
 
 from pygments.token import Keyword, Name, Number, String
@@ -44,11 +45,26 @@ from neuro_code.application.sessions.profile_conversation import (
     SessionSelectionResult,
 )
 from neuro_code.application.sessions.selection import SessionSelectionService
+from neuro_code.application.sessions.subagent_lifecycle import (
+    SubagentRelationshipActionRequest,
+    SubagentRelationshipActionResult,
+    SubagentRelationshipLifecycleController,
+)
+from neuro_code.application.sessions.subagent_queries import (
+    GetSubagentRelationshipRequest,
+    ListSubagentRelationshipsRequest,
+    SubagentRelationshipAction,
+    SubagentRelationshipProjection,
+    SubagentRelationshipQueryController,
+)
 from neuro_code.application.tools import ReadSessionToolOutputArtifactRequest
 from neuro_code.application.workflows import (
     PlanExecutionService,
     PlanSchedulingService,
     QueuedPlanExecutionService,
+    ReadOnlySubagentApplicationService,
+    RunSubagentRequest,
+    SubagentResultProjection,
 )
 from neuro_code.domain.background_tasks import (
     BackgroundTaskSnapshot,
@@ -1043,6 +1059,70 @@ class FailingTaskTuiController:
 
     async def save_background_wake_state(self, state: BackgroundWakeState) -> None:
         del state
+
+
+class ReadOnlySubagentTuiService:
+    def __init__(self, projection: SubagentResultProjection) -> None:
+        self.projection = projection
+        self.requests: list[RunSubagentRequest] = []
+
+    async def run_subagent(self, request: RunSubagentRequest) -> SubagentResultProjection:
+        self.requests.append(request)
+        return self.projection
+
+
+class SubagentRelationshipTuiService:
+    def __init__(self, projections: tuple[SubagentRelationshipProjection, ...]) -> None:
+        self.projections = projections
+        self.requests: list[str] = []
+
+    async def list_subagent_relationships(
+        self,
+        request: ListSubagentRelationshipsRequest,
+    ) -> tuple[SubagentRelationshipProjection, ...]:
+        self.requests.append(request.parent_session_id)
+        return self.projections
+
+    async def get_subagent_relationship(
+        self,
+        request: GetSubagentRelationshipRequest,
+    ) -> SubagentRelationshipProjection | None:
+        del request
+        return self.projections[0] if self.projections else None
+
+
+class FailingSubagentRelationshipTuiService:
+    async def list_subagent_relationships(
+        self,
+        request: ListSubagentRelationshipsRequest,
+    ) -> tuple[SubagentRelationshipProjection, ...]:
+        del request
+        raise RuntimeError("relationship list failed")
+
+    async def get_subagent_relationship(
+        self,
+        request: GetSubagentRelationshipRequest,
+    ) -> SubagentRelationshipProjection | None:
+        del request
+        raise RuntimeError("relationship lookup failed")
+
+
+class SubagentRelationshipLifecycleTuiService:
+    def __init__(self) -> None:
+        self.requests: list[SubagentRelationshipActionRequest] = []
+
+    async def execute(
+        self,
+        request: SubagentRelationshipActionRequest,
+    ) -> SubagentRelationshipActionResult:
+        self.requests.append(request)
+        return SubagentRelationshipActionResult(
+            parent_session_id=request.parent_session_id,
+            parent_task_id=request.parent_task_id,
+            child_session_id="child-session",
+            action=request.action,
+            forked_session_id=("forked-session" if request.action.value == "fork" else None),
+        )
 
 
 def background_snapshot(
@@ -3552,6 +3632,8 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("/rename", app.entries[-1].text)
             self.assertIn("/tasks", app.entries[-1].text)
             self.assertIn("/view-task TASK_ID", app.entries[-1].text)
+            self.assertIn("/subagent PROMPT", app.entries[-1].text)
+            self.assertIn("/subagents", app.entries[-1].text)
 
             prompt.value = "/status"
             await pilot.press("enter")
@@ -3563,6 +3645,247 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             self.assertEqual([entry.text for entry in app.entries], ["Transcript cleared."])
             self.assertEqual(runner.prompts, [])
+
+    async def test_subagent_command_uses_safe_projection_without_parent_transcript_details(
+        self,
+    ) -> None:
+        runner = TuiConversation()
+        runner._session_id = "parent-session"
+        service = ReadOnlySubagentTuiService(
+            SubagentResultProjection(
+                parent_session_id="parent-session",
+                task_id="private-task",
+                child_session_id="private-child",
+                status=SessionTaskStatus.COMPLETED,
+                response="Read-only repository findings",
+                steps=3,
+                truncated=False,
+            )
+        )
+        app = NeuroCodeApp(
+            runner,
+            read_only_subagent_service=cast(ReadOnlySubagentApplicationService, service),
+            provider_name="fixture",
+            model_name="fixture-model",
+            cwd=Path("/workspace"),
+        )
+
+        async with app.run_test(size=(100, 30)) as pilot:
+            prompt = app.query_one("#prompt", Input)
+            prompt.value = "/subagent inspect the repository"
+            await pilot.press("enter")
+            await pilot.pause()
+            await pilot.pause()
+
+        self.assertEqual(len(service.requests), 1)
+        self.assertEqual(service.requests[0].parent_session_id, "parent-session")
+        self.assertEqual(service.requests[0].prompt, "inspect the repository")
+        self.assertEqual(runner.prompts, [])
+        rendered = "\n".join(entry.text for entry in app.entries)
+        self.assertIn("Read-only subagent completed", rendered)
+        self.assertIn("Read-only repository findings", rendered)
+        self.assertNotIn("private-task", rendered)
+        self.assertNotIn("private-child", rendered)
+
+    async def test_subagent_command_fails_closed_without_session_or_service(self) -> None:
+        no_session = NeuroCodeApp(
+            TuiConversation(),
+            provider_name="fixture",
+            model_name="fixture-model",
+            cwd=Path("/workspace"),
+        )
+        async with no_session.run_test(size=(80, 24)) as pilot:
+            prompt = no_session.query_one("#prompt", Input)
+            prompt.value = "/subagent inspect"
+            await pilot.press("enter")
+            await pilot.pause()
+            self.assertIn("unavailable", no_session.entries[-1].text.lower())
+
+        runner = TuiConversation()
+        runner._session_id = "parent-session"
+        unavailable = NeuroCodeApp(
+            runner,
+            provider_name="fixture",
+            model_name="fixture-model",
+            cwd=Path("/workspace"),
+        )
+        async with unavailable.run_test(size=(80, 24)) as pilot:
+            prompt = unavailable.query_one("#prompt", Input)
+            prompt.value = "/subagent inspect"
+            await pilot.press("enter")
+            await pilot.pause()
+            self.assertIn("unavailable", unavailable.entries[-1].text.lower())
+
+    async def test_subagents_command_renders_bounded_relationship_metadata_only(self) -> None:
+        runner = TuiConversation()
+        runner._session_id = "parent-session"
+        created = datetime(2026, 8, 7, 10, 15, tzinfo=UTC)
+        service = SubagentRelationshipTuiService(
+            (
+                SubagentRelationshipProjection(
+                    parent_session_id="parent-session",
+                    parent_task_id="subagent-task",
+                    child_session_id="child-session",
+                    task_status=SessionTaskStatus.COMPLETED,
+                    created_at=created,
+                    child_provider="fixture-provider",
+                    child_model="fixture-model",
+                    child_updated_at=created,
+                    available_actions=(
+                        SubagentRelationshipAction.RESUME,
+                        SubagentRelationshipAction.FORK,
+                        SubagentRelationshipAction.DELETE,
+                    ),
+                ),
+            )
+        )
+        app = NeuroCodeApp(
+            runner,
+            subagent_relationship_query=cast(SubagentRelationshipQueryController, service),
+            provider_name="fixture",
+            model_name="fixture-model",
+            cwd=Path("/workspace"),
+        )
+
+        async with app.run_test(size=(110, 30)) as pilot:
+            prompt = app.query_one("#prompt", Input)
+            prompt.value = "/subagents"
+            await pilot.press("enter")
+            await pilot.pause()
+
+            rendered = app.entries[-1].text
+            self.assertIn("Child subagent relationships (read-only)", rendered)
+            self.assertIn("subagent-task → child-session", rendered)
+            self.assertIn("fixture-provider/fixture-model", rendered)
+            self.assertIn("completed", rendered)
+            self.assertIn("resume, fork, delete", rendered)
+            self.assertEqual(service.requests, ["parent-session"])
+            self.assertEqual(runner.prompts, [])
+
+            prompt.value = "/subagents unexpected"
+            await pilot.press("enter")
+            await pilot.pause()
+            self.assertIn("lifecycle controls are unavailable", app.entries[-1].text)
+
+    async def test_subagents_resume_action_selects_child_without_running_model(self) -> None:
+        runner = SessionTuiController(current_session="parent-session")
+        lifecycle = SubagentRelationshipLifecycleTuiService()
+        app = NeuroCodeApp(
+            runner,
+            session_controller=runner,
+            session_selection_service=SessionSelectionService(runner),
+            subagent_relationship_lifecycle=cast(
+                SubagentRelationshipLifecycleController,
+                lifecycle,
+            ),
+            provider_name="fixture",
+            model_name="fixture-model",
+            cwd=Path("/workspace"),
+        )
+
+        async with app.run_test(size=(100, 30)) as pilot:
+            prompt = app.query_one("#prompt", Input)
+            prompt.value = "/subagents resume subagent-task"
+            await pilot.press("enter")
+            await pilot.pause()
+
+            self.assertEqual(
+                lifecycle.requests,
+                [
+                    SubagentRelationshipActionRequest(
+                        "parent-session",
+                        "subagent-task",
+                        SubagentRelationshipAction.RESUME,
+                    )
+                ],
+            )
+            self.assertEqual(runner.selected, ["child-session"])
+
+    async def test_subagents_fork_and_delete_actions_only_project_bounded_result(self) -> None:
+        runner = TuiConversation()
+        runner._session_id = "parent-session"
+        lifecycle = SubagentRelationshipLifecycleTuiService()
+        app = NeuroCodeApp(
+            runner,
+            subagent_relationship_lifecycle=cast(
+                SubagentRelationshipLifecycleController,
+                lifecycle,
+            ),
+            provider_name="fixture",
+            model_name="fixture-model",
+            cwd=Path("/workspace"),
+        )
+
+        async with app.run_test(size=(100, 30)) as pilot:
+            prompt = app.query_one("#prompt", Input)
+            prompt.value = "/subagents fork subagent-task"
+            await pilot.press("enter")
+            await pilot.pause()
+            self.assertIn("Forked child session forked-session", app.entries[-1].text)
+
+            prompt.value = "/subagents delete subagent-task"
+            await pilot.press("enter")
+            await pilot.pause()
+            self.assertIn("Deleted child session child-session", app.entries[-1].text)
+            self.assertEqual(
+                [request.action for request in lifecycle.requests],
+                [SubagentRelationshipAction.FORK, SubagentRelationshipAction.DELETE],
+            )
+
+    async def test_subagents_command_handles_empty_missing_and_reader_failure(self) -> None:
+        runner = TuiConversation()
+        runner._session_id = "parent-session"
+        empty_service = SubagentRelationshipTuiService(())
+        empty = NeuroCodeApp(
+            runner,
+            subagent_relationship_query=cast(
+                SubagentRelationshipQueryController,
+                empty_service,
+            ),
+            provider_name="fixture",
+            model_name="fixture-model",
+            cwd=Path("/workspace"),
+        )
+        async with empty.run_test(size=(90, 24)) as pilot:
+            prompt = empty.query_one("#prompt", Input)
+            prompt.value = "/subagents"
+            await pilot.press("enter")
+            await pilot.pause()
+            self.assertIn("No child subagent relationships", empty.entries[-1].text)
+
+        no_session = NeuroCodeApp(
+            TuiConversation(),
+            subagent_relationship_query=cast(
+                SubagentRelationshipQueryController,
+                empty_service,
+            ),
+            provider_name="fixture",
+            model_name="fixture-model",
+            cwd=Path("/workspace"),
+        )
+        async with no_session.run_test(size=(90, 24)) as pilot:
+            prompt = no_session.query_one("#prompt", Input)
+            prompt.value = "/subagents"
+            await pilot.press("enter")
+            await pilot.pause()
+            self.assertIn("Start or resume a session", no_session.entries[-1].text)
+
+        failing = NeuroCodeApp(
+            runner,
+            subagent_relationship_query=cast(
+                SubagentRelationshipQueryController,
+                FailingSubagentRelationshipTuiService(),
+            ),
+            provider_name="fixture",
+            model_name="fixture-model",
+            cwd=Path("/workspace"),
+        )
+        async with failing.run_test(size=(90, 24)) as pilot:
+            prompt = failing.query_one("#prompt", Input)
+            prompt.value = "/subagents"
+            await pilot.press("enter")
+            await pilot.pause()
+            self.assertIn("RuntimeError: relationship list failed", failing.entries[-1].text)
 
     async def test_plan_commands_show_the_saved_plan_and_start_a_plan_turn(self) -> None:
         plan = SessionPlan(

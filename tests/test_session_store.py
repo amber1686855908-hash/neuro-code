@@ -12,7 +12,9 @@ from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+from neuro_code.application.sessions import ExportSessionRequest, SessionApplicationService
 from neuro_code.domain.background_tasks import BackgroundWakeState
+from neuro_code.domain.conversation.compaction import DurableCompactionItem
 from neuro_code.domain.conversation.events import AgentEvent, AgentEventKind
 from neuro_code.domain.conversation.messages import (
     ContentPart,
@@ -41,6 +43,7 @@ from neuro_code.domain.session_tasks import (
     SessionTask,
     SessionTaskKind,
     SessionTaskStatus,
+    SubagentLink,
 )
 from neuro_code.domain.sessions import SessionSnapshot, SessionSummary
 from neuro_code.infrastructure.persistence.sqlite_session import SqliteSessionStore
@@ -76,7 +79,261 @@ def _save_execution_record_in_process(
     asyncio.run(save())
 
 
+def _compaction_item(
+    compaction_id: str = "compact-compat",
+    *,
+    source_fingerprint: str = "c" * 64,
+) -> DurableCompactionItem:
+    return DurableCompactionItem(
+        compaction_id=compaction_id,
+        provider_name="provider",
+        model_name="model",
+        capacity_tokens=1_000,
+        context_affinity="profile-a",
+        source_item_count=3,
+        protected_item_count=0,
+        recent_item_count=1,
+        candidate_range=(0, 2),
+        target_tokens=800,
+        summary_tokens=12,
+        source_fingerprint=source_fingerprint,
+        summary="safe summary",
+        summary_redacted=True,
+        summary_truncated=False,
+        created_at=datetime(2026, 8, 8, tzinfo=UTC),
+    )
+
+
 class SessionStoreTests(unittest.IsolatedAsyncioTestCase):
+    async def test_compaction_items_round_trip_are_bounded_and_not_forked(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = SqliteSessionStore(Path(directory) / "sessions.db")
+            await store.initialize()
+            session_id = await store.create_session("/workspace", "provider", "model")
+            item = DurableCompactionItem(
+                compaction_id="compact-1",
+                provider_name="provider",
+                model_name="model",
+                capacity_tokens=1_000,
+                context_affinity="profile-a",
+                source_item_count=3,
+                protected_item_count=0,
+                recent_item_count=1,
+                candidate_range=(0, 2),
+                target_tokens=800,
+                summary_tokens=12,
+                source_fingerprint="a" * 64,
+                summary="safe summary",
+                summary_redacted=True,
+                summary_truncated=False,
+                created_at=datetime(2026, 8, 8, tzinfo=UTC),
+            )
+
+            await store.save_compaction_item(session_id, item)
+            await store.save_compaction_item(session_id, item)
+            assert await store.load_compaction_items(session_id) == [item]
+
+            forked_id = await store.fork_session(session_id)
+            assert await store.load_compaction_items(forked_id) == []
+            with self.assertRaisesRegex(SessionError, "cannot save compaction item"):
+                await store.save_compaction_item(
+                    session_id,
+                    replace(item, compaction_id="compact-2"),
+                )
+
+            await store.delete_session(session_id)
+            with self.assertRaisesRegex(SessionError, "unknown session"):
+                await store.load_compaction_items(session_id)
+
+    async def test_compaction_rows_are_excluded_from_export_and_import(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source_database = Path(directory) / "source.db"
+            target_database = Path(directory) / "target.db"
+            source = SqliteSessionStore(source_database)
+            target = SqliteSessionStore(target_database)
+            await source.initialize()
+            await target.initialize()
+            session_id = await source.create_session("/workspace", "provider", "model")
+            items = [Message(Role.USER, "canonical session item")]
+            await source.save_session_items(session_id, items)
+            await source.save_compaction_item(session_id, _compaction_item())
+
+            exported = await SessionApplicationService(source).export_session(
+                ExportSessionRequest(session_id, include_events=True)
+            )
+
+            self.assertEqual(exported.snapshot.items, tuple(items))
+            self.assertFalse(hasattr(exported, "compaction_items"))
+            self.assertNotIn("safe summary", repr(exported))
+            self.assertNotIn("source_fingerprint", repr(exported))
+
+            imported_id = await target.import_session(exported.snapshot)
+            self.assertEqual(await target.load_session_items(imported_id), items)
+            self.assertEqual(await target.load_compaction_items(imported_id), [])
+
+    async def test_compaction_rows_are_independent_from_turn_finalization(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = SqliteSessionStore(Path(directory) / "sessions.db")
+            await store.initialize()
+            session_id = await store.create_session("/workspace", "provider", "model")
+            initial_items = [Message(Role.USER, "persisted context")]
+            await store.save_session_items(session_id, initial_items)
+            item = _compaction_item()
+            await store.save_compaction_item(session_id, item)
+            event = AgentEvent.create(1, AgentEventKind.TURN_COMPLETED, {"step": 1})
+            final_items = [*initial_items, Message(Role.ASSISTANT, "done")]
+            record = SessionExecutionRecord(
+                AgentExecutionOutcome(
+                    AgentExecutionStatus.COMPLETED,
+                    None,
+                    finalized=False,
+                    recoverable=False,
+                ),
+                event.sequence,
+                event.created_at,
+            )
+
+            await store.finalize_turn(session_id, event, final_items, record)
+            self.assertEqual(await store.load_compaction_items(session_id), [item])
+
+            failed_event = AgentEvent.create(2, AgentEventKind.TURN_COMPLETED, {"step": 2})
+            with (
+                patch(
+                    "neuro_code.infrastructure.persistence.sqlite_session._upsert_search_document",
+                    side_effect=RuntimeError("index failure"),
+                ),
+                self.assertRaisesRegex(RuntimeError, "index failure"),
+            ):
+                await store.finalize_turn(
+                    session_id,
+                    failed_event,
+                    [*final_items, Message(Role.ASSISTANT, "not committed")],
+                    None,
+                )
+            self.assertEqual(await store.load_compaction_items(session_id), [item])
+
+    async def test_compaction_schema_migrates_from_v12(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "sessions.db"
+            store = SqliteSessionStore(database)
+            await store.initialize()
+            session_id = await store.create_session("/workspace", "provider", "model")
+            connection = sqlite3.connect(database)
+            connection.execute("DROP TABLE session_compaction_items")
+            connection.execute("UPDATE schema_meta SET version = 12 WHERE singleton = 1")
+            connection.commit()
+            connection.close()
+
+            migrated = SqliteSessionStore(database)
+            await migrated.initialize()
+            connection = sqlite3.connect(database)
+            self.assertEqual(
+                connection.execute(
+                    "SELECT version FROM schema_meta WHERE singleton = 1"
+                ).fetchone(),
+                (13,),
+            )
+            self.assertIn(
+                "session_compaction_items",
+                {
+                    row[0]
+                    for row in connection.execute(
+                        "SELECT name FROM sqlite_master WHERE type = 'table'"
+                    ).fetchall()
+                },
+            )
+            connection.close()
+            self.assertEqual(await migrated.load_compaction_items(session_id), [])
+
+    async def test_compaction_store_fails_closed_for_owner_conflicts_and_corrupt_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "sessions.db"
+            store = SqliteSessionStore(database)
+            await store.initialize()
+            session_id = await store.create_session("/workspace", "provider", "model")
+            other_session_id = await store.create_session("/workspace", "provider", "model")
+            item = DurableCompactionItem(
+                compaction_id="compact-owner",
+                provider_name="provider",
+                model_name="model",
+                capacity_tokens=1_000,
+                context_affinity=None,
+                source_item_count=3,
+                protected_item_count=0,
+                recent_item_count=1,
+                candidate_range=(0, 2),
+                target_tokens=800,
+                summary_tokens=12,
+                source_fingerprint="b" * 64,
+                summary="safe summary",
+                summary_redacted=True,
+                summary_truncated=False,
+                created_at=datetime(2026, 8, 8, tzinfo=UTC),
+            )
+
+            with self.assertRaises(TypeError):
+                await store.save_compaction_item(session_id, object())  # type: ignore[arg-type]
+            with self.assertRaisesRegex(SessionError, "unknown session"):
+                await store.save_compaction_item("missing", item)
+
+            await store.save_compaction_item(session_id, item)
+            with self.assertRaisesRegex(SessionError, "different data"):
+                await store.save_compaction_item(session_id, replace(item, summary="changed"))
+            with self.assertRaisesRegex(SessionError, "another session"):
+                await store.save_compaction_item(other_session_id, item)
+
+            connection = sqlite3.connect(database)
+            connection.execute(
+                "UPDATE session_compaction_items SET summary = ? WHERE compaction_id = ?",
+                ("unsafe\x00summary", item.compaction_id),
+            )
+            connection.commit()
+            connection.close()
+            with self.assertRaisesRegex(SessionError, "invalid compaction item"):
+                await store.load_compaction_items(session_id)
+
+    async def test_subagent_link_persists_and_parent_delete_cascades_child(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = SqliteSessionStore(Path(directory) / "sessions.db")
+            await store.initialize()
+            parent_id = await store.create_session("/workspace", "provider", "model")
+            child_id = await store.create_session("/workspace", "provider", "model")
+            task = SessionTask(
+                "subagent-link-task",
+                SessionTaskKind.SUBAGENT,
+                SessionTaskStatus.RUNNING,
+                datetime(2026, 7, 29, 12, tzinfo=UTC),
+            )
+            await store.create_session_task(parent_id, task)
+            link = SubagentLink(
+                parent_id,
+                task.task_id,
+                child_id,
+                datetime(2026, 7, 29, 12, 1, tzinfo=UTC),
+            )
+            await store.save_subagent_link(link)
+            self.assertEqual(await store.load_subagent_link(parent_id, task.task_id), link)
+            self.assertEqual(await store.list_subagent_links(parent_id), [link])
+            self.assertEqual(await store.list_subagent_links(parent_id, limit=1), [link])
+            with self.assertRaisesRegex(SessionError, "already exists"):
+                await store.save_subagent_link(link)
+
+            finished = task.finish(SessionTaskStatus.COMPLETED, finished_at=datetime.now(UTC))
+            await store.update_session_task(parent_id, finished)
+            with self.assertRaisesRegex(SessionError, "must be running"):
+                await store.save_subagent_link(
+                    SubagentLink(
+                        parent_id,
+                        finished.task_id,
+                        await store.create_session("/workspace", "provider", "other-model"),
+                        datetime(2026, 7, 29, 12, 2, tzinfo=UTC),
+                    )
+                )
+
+            await store.delete_session(parent_id)
+            with self.assertRaisesRegex(SessionError, "unknown session"):
+                await store.get_session(child_id)
+
     async def test_queued_plan_tasks_are_capped_and_claimed_once(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = SqliteSessionStore(Path(directory) / "sessions.db")
@@ -589,6 +846,113 @@ class SessionStoreTests(unittest.IsolatedAsyncioTestCase):
                 [1],
             )
 
+    async def test_finalize_turn_with_compaction_commits_one_atomic_unit(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = SqliteSessionStore(Path(directory) / "sessions.db")
+            await store.initialize()
+            session_id = await store.create_session("/workspace", "fixture", "model")
+            initial_items = [Message(Role.USER, "persisted context")]
+            await store.save_session_items(session_id, initial_items)
+            event = AgentEvent.create(1, AgentEventKind.TURN_COMPLETED, {"step": 1})
+            final_items = [*initial_items, Message(Role.ASSISTANT, "done")]
+            record = SessionExecutionRecord(
+                AgentExecutionOutcome(
+                    AgentExecutionStatus.STUCK,
+                    SupervisorReasonCode.NO_PROGRESS,
+                    finalized=True,
+                    recoverable=True,
+                ),
+                event.sequence,
+                event.created_at,
+            )
+            item = _compaction_item("compact-atomic")
+
+            await store.finalize_turn_with_compaction(
+                session_id,
+                event,
+                final_items,
+                record,
+                item,
+            )
+
+            self.assertEqual(await store.load_session_items(session_id), final_items)
+            self.assertEqual(await store.load_execution_record(session_id), record)
+            self.assertEqual(await store.load_compaction_items(session_id), [item])
+            self.assertEqual(
+                [event["sequence"] for event in await store.load_events(session_id)],
+                [1],
+            )
+
+    async def test_finalize_turn_with_compaction_rolls_back_every_projection(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = SqliteSessionStore(Path(directory) / "sessions.db")
+            await store.initialize()
+            session_id = await store.create_session("/workspace", "fixture", "model")
+            initial_items = [Message(Role.USER, "existing")]
+            await store.save_session_items(session_id, initial_items)
+            event = AgentEvent.create(1, AgentEventKind.TURN_COMPLETED, {"step": 1})
+            final_items = [*initial_items, Message(Role.ASSISTANT, "not committed")]
+            record = SessionExecutionRecord(
+                AgentExecutionOutcome(
+                    AgentExecutionStatus.BUDGET_LIMITED,
+                    SupervisorReasonCode.MODEL_STEP_LIMIT,
+                    finalized=True,
+                    recoverable=True,
+                ),
+                event.sequence,
+                event.created_at,
+            )
+            item = _compaction_item("compact-rollback")
+
+            with (
+                patch(
+                    "neuro_code.infrastructure.persistence.sqlite_session._upsert_search_document",
+                    side_effect=RuntimeError("index failure"),
+                ),
+                self.assertRaisesRegex(RuntimeError, "index failure"),
+            ):
+                await store.finalize_turn_with_compaction(
+                    session_id,
+                    event,
+                    final_items,
+                    record,
+                    item,
+                )
+
+            self.assertEqual(await store.load_session_items(session_id), initial_items)
+            self.assertIsNone(await store.load_execution_record(session_id))
+            self.assertEqual(await store.load_compaction_items(session_id), [])
+            self.assertEqual(await store.load_events(session_id), [])
+
+    async def test_finalize_turn_with_compaction_rejects_conflict_without_partial_turn(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = SqliteSessionStore(Path(directory) / "sessions.db")
+            await store.initialize()
+            session_id = await store.create_session("/workspace", "fixture", "model")
+            initial_items = [Message(Role.USER, "existing")]
+            await store.save_session_items(session_id, initial_items)
+            item = _compaction_item("compact-conflict")
+            await store.save_compaction_item(session_id, item)
+            event = AgentEvent.create(1, AgentEventKind.TURN_COMPLETED, {"step": 1})
+            final_items = [*initial_items, Message(Role.ASSISTANT, "not committed")]
+            conflicting = replace(item, summary="different safe summary")
+
+            with self.assertRaisesRegex(SessionError, "different data"):
+                await store.finalize_turn_with_compaction(
+                    session_id,
+                    event,
+                    final_items,
+                    None,
+                    conflicting,
+                )
+
+            self.assertEqual(await store.load_session_items(session_id), initial_items)
+            self.assertIsNone(await store.load_execution_record(session_id))
+            self.assertEqual(await store.load_events(session_id), [])
+            self.assertEqual(await store.load_compaction_items(session_id), [item])
+
     async def test_schema_v8_migration_preserves_tasks_without_plan_snapshots(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             database = Path(directory) / "sessions.db"
@@ -635,7 +999,7 @@ class SessionStoreTests(unittest.IsolatedAsyncioTestCase):
                 connection.execute(
                     "SELECT version FROM schema_meta WHERE singleton = 1"
                 ).fetchone(),
-                (11,),
+                (13,),
             )
             columns = {row[1] for row in connection.execute("PRAGMA table_info(session_tasks)")}
             tables = {
@@ -1366,12 +1730,13 @@ class SessionStoreTests(unittest.IsolatedAsyncioTestCase):
                 row[1] for row in migrated.execute("PRAGMA table_info(session_tasks)").fetchall()
             }
             migrated.close()
-            self.assertEqual(version, (11,))
+            self.assertEqual(version, (13,))
             self.assertIn("context_affinity", columns)
             self.assertIn("sandbox_profile", columns)
             self.assertIn("plan_json", columns)
             self.assertIn("session_tasks", tables)
             self.assertIn("session_plan_comments", tables)
+            self.assertIn("subagent_links", tables)
             self.assertIn("plan_snapshot_json", task_columns)
 
     async def test_schema_v2_peek_is_read_only_then_migrates_as_legacy(self) -> None:
@@ -1430,7 +1795,7 @@ class SessionStoreTests(unittest.IsolatedAsyncioTestCase):
             migrated = sqlite3.connect(database)
             self.assertEqual(
                 migrated.execute("SELECT version FROM schema_meta WHERE singleton = 1").fetchone(),
-                (11,),
+                (13,),
             )
             migrated.close()
 
@@ -1510,7 +1875,7 @@ class SessionStoreTests(unittest.IsolatedAsyncioTestCase):
             migrated = sqlite3.connect(database)
             self.assertEqual(
                 migrated.execute("SELECT version FROM schema_meta WHERE singleton = 1").fetchone(),
-                (11,),
+                (13,),
             )
             tables = {
                 row[0]
@@ -1553,7 +1918,7 @@ class SessionStoreTests(unittest.IsolatedAsyncioTestCase):
                 connection.execute(
                     "SELECT version FROM schema_meta WHERE singleton = 1"
                 ).fetchone(),
-                (11,),
+                (13,),
             )
             connection.close()
 
@@ -1622,7 +1987,7 @@ class SessionStoreTests(unittest.IsolatedAsyncioTestCase):
             recovered = sqlite3.connect(database)
             self.assertEqual(
                 recovered.execute("SELECT version FROM schema_meta WHERE singleton = 1").fetchone(),
-                (11,),
+                (13,),
             )
             recovered.close()
 
@@ -1646,7 +2011,7 @@ class SessionStoreTests(unittest.IsolatedAsyncioTestCase):
                 connection.execute(
                     "SELECT version FROM schema_meta WHERE singleton = 1"
                 ).fetchone(),
-                (11,),
+                (13,),
             )
             self.assertEqual(
                 connection.execute("SELECT COUNT(*) FROM session_search_documents").fetchone(),

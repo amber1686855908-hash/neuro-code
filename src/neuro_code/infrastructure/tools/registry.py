@@ -15,7 +15,7 @@ is the only registry owner.
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Collection, Iterable
 
 from neuro_code.application.ports.client_filesystem import ClientFileSystem
 from neuro_code.application.ports.client_terminal import ClientTerminal
@@ -51,6 +51,7 @@ def default_tool_registry(
     sandbox_profile: SandboxProfile = SandboxProfile.OFF,
     *,
     enable_background_tasks: bool = False,
+    allowed_tool_names: Collection[str] | None = None,
     client_file_system: ClientFileSystem | None = None,
     client_terminal: ClientTerminal | None = None,
 ) -> ToolRegistry:
@@ -95,6 +96,9 @@ def default_tool_registry(
         )
     if enable_background_tasks:
         tools.extend((TaskOutputTool(), WaitTasksTool(), KillTaskTool()))
+    if allowed_tool_names is not None:
+        allowed = frozenset(allowed_tool_names)
+        tools = [tool for tool in tools if tool.definition.name in allowed]
     return ToolRegistry(tools)
 
 

@@ -52,6 +52,21 @@ from neuro_code.application.sessions.service import (
     SessionApplicationService,
     SessionExport,
 )
+from neuro_code.application.sessions.subagent_lifecycle import (
+    SubagentRelationshipActionRequest,
+    SubagentRelationshipActionResult,
+    SubagentRelationshipLifecycleController,
+    SubagentRelationshipLifecycleService,
+)
+from neuro_code.application.sessions.subagent_queries import (
+    MAX_SUBAGENT_RELATIONSHIP_LIMIT,
+    GetSubagentRelationshipRequest,
+    ListSubagentRelationshipsRequest,
+    SubagentRelationshipAction,
+    SubagentRelationshipProjection,
+    SubagentRelationshipQueryController,
+    SubagentRelationshipQueryService,
+)
 from neuro_code.application.sessions.summary import (
     GetSessionSummaryRequest,
     SessionSummaryQueryController,
@@ -70,6 +85,7 @@ from neuro_code.application.sessions.turns import (
 )
 
 __all__ = [
+    "MAX_SUBAGENT_RELATIONSHIP_LIMIT",
     "BindSessionAliasRequest",
     "DeleteSessionRequest",
     "ExportSessionRequest",
@@ -77,11 +93,13 @@ __all__ = [
     "GetOrCreateSessionAliasRequest",
     "GetSessionSummaryRequest",
     "GetSessionTaskRequest",
+    "GetSubagentRelationshipRequest",
     "ImportSessionRequest",
     "ListPlanCommentsRequest",
     "ListSessionTasksRequest",
     "ListSessionsPageRequest",
     "ListSessionsRequest",
+    "ListSubagentRelationshipsRequest",
     "LoadExecutionRecordRequest",
     "LoadExecutionRecordsRequest",
     "LoadSessionEventsRequest",
@@ -116,4 +134,12 @@ __all__ = [
     "SessionTurnService",
     "SessionWorkspaceMatcher",
     "StartSessionRequest",
+    "SubagentRelationshipAction",
+    "SubagentRelationshipActionRequest",
+    "SubagentRelationshipActionResult",
+    "SubagentRelationshipLifecycleController",
+    "SubagentRelationshipLifecycleService",
+    "SubagentRelationshipProjection",
+    "SubagentRelationshipQueryController",
+    "SubagentRelationshipQueryService",
 ]
