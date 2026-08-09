@@ -56,6 +56,7 @@ class SupervisorReasonCode(StrEnum):
     INPUT_TOKEN_BUDGET = "input_token_budget"
     OUTPUT_TOKEN_BUDGET = "output_token_budget"
     TOTAL_TOKEN_BUDGET = "total_token_budget"
+    CONTEXT_WINDOW_BUDGET = "context_window_budget"
     REPEATED_ACTION_OBSERVATION = "repeated_action_observation"
     REPEATED_ACTION_ERROR = "repeated_action_error"
     PERIODIC_CYCLE = "periodic_cycle"

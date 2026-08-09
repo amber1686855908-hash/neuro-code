@@ -42,6 +42,9 @@ class SyntheticReason(StrEnum):
     PROJECT_INSTRUCTIONS = "project-instructions"
     AVAILABLE_SKILLS = "available-skills"
     COMPACTION_SUMMARY = "compaction-summary"
+    RUNTIME_BUDGET = "runtime-budget"
+    RUNTIME_CHECKPOINT = "runtime-checkpoint"
+    RUNTIME_SUPERVISION = "runtime-supervision"
 
 
 def _freeze_mapping(value: Mapping[str, Any]) -> Mapping[str, Any]:

@@ -1011,6 +1011,17 @@ class PromptContentTests(unittest.TestCase):
         self.assertEqual(map_stop_reason("length"), "max_tokens")
         self.assertEqual(map_stop_reason("unexpected"), "end_turn")
         self.assertEqual(execution_outcome_stop_reason(budget_limited), "max_tokens")
+        self.assertEqual(
+            execution_outcome_stop_reason(
+                AgentExecutionOutcome(
+                    AgentExecutionStatus.BUDGET_LIMITED,
+                    SupervisorReasonCode.CONTEXT_WINDOW_BUDGET,
+                    finalized=True,
+                    recoverable=True,
+                )
+            ),
+            "max_tokens",
+        )
         metadata = execution_outcome_metadata(budget_limited)
         self.assertEqual(
             metadata,

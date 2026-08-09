@@ -351,7 +351,8 @@ USER 候选。按名称先见为准的去重确保 LOCAL 技能遮蔽同名 REPO
 ## 动态会话中技能发现
 
 `SkillTracker` 维护一个移动目标，镜像 `InstructionTracker` 设计。当文件
-访问工具（`read_file`、`list_dir`、`grep`）触碰某路径时，`check_path()`
+访问工具（`read_file`、`read_files`、`list_dir`、`list_tree`、`grep`、
+`grep_many`）触碰某路径时，`check_path()`
 更新目标，使从被访问目录**向上**到工作区根（含）的 `SKILL.md` 文件在下一次
 `current_result()` 调用时被发现。这能发现工作区内任何嵌套深度的技能，不仅
 限于工作区根——例如，当模型读取 `src/foo/` 中的文件时，
@@ -364,9 +365,9 @@ USER 候选。按名称先见为准的去重确保 LOCAL 技能遮蔽同名 REPO
 为仅扫描根层级。
 
 子树隔离适用：从 `src/foo/` 切换到 `src/bar/` 会移动目标，`src/foo/` 配置
-目录中的技能不再被包含。`SkillTracker.check_path()` 由 `ReadFileTool`、
-`ListDirTool` 和 `GrepTool` 在已有的 `InstructionTracker.check_path()` 调用
-旁边调用。`SearchReplaceTool` 不移动技能目标（其指令追踪器另有写入预检），
+目录中的技能不再被包含。单个及有界批量读取、列举和搜索工具都会在已有的
+`InstructionTracker.check_path()` 调用旁调用 `SkillTracker.check_path()`。
+`SearchReplaceTool` 不移动技能目标（其指令追踪器另有写入预检），
 `BashTool` 则不尝试从任意 shell 语法推导路径。详见
 [ADR 0043](adr/0043-dynamic-session-skill-discovery.md)。
 
@@ -424,9 +425,11 @@ scope，释放运行时绑定，同时保留持久历史与 alias。EOF 或连�
 状态挂载误当作事后声明的目录根。这样不会通过事后挂载主机目录来削弱显式沙箱边界。
 
 当 ACP 客户端明确声明 `fs.readTextFile` 时，session 会获得一个绑定到该 ACP session 的窄
-`ClientFileSystem` 应用端口。既有 `read_file` 工具仍会先通过选定的主工作区或额外工作区
-根解析每个路径，再将绝对路径及有界行范围委托给 `fs/read_text_file`；它绝不会回退调用未声明
-的客户端操作。当客户端同时声明文本读写能力时，`search_replace` 会使用同一端口读取、保留现有
+`ClientFileSystem` 应用端口。既有 `read_file` 和 `read_files` 工具仍会先通过选定的主工作区或
+额外工作区根解析每个路径，再将每个绝对路径及有界行范围委托给 `fs/read_text_file`；它们绝不会
+回退调用未声明的客户端操作。ACP 文件系统能力不提供目录遍历或搜索操作，因此 `list_tree` 和
+`grep_many` 与 `list_dir`、`grep` 一样继续使用本地工作区语义。当客户端同时声明文本读写能力时，
+`search_replace` 会使用同一端口读取、保留现有
 精确匹配/歧义检查和指令预检规则，再通过 `fs/write_text_file` 写回结果。只读客户端不会暴露该
 工具。客户端响应与写入均限制为 1 MiB；客户端失败会成为不含原始详情的稳定失败关闭工具错误，
 最终写入的文件系统语义仍由客户端负责。
@@ -649,7 +652,7 @@ Stage5CQ 新增显式且有界的 `SubagentExecutionService` 应用工作流. �
 
 Stage5CR 在该接缝后增加第一版具体隔离只读运行时. `IsolatedSubagentExecutionService` 创建全新的
 子会话，在执行前持久化只含元数据的 `SubagentLink`，移除 Provider 内置工具，并将子注册表限制为
-`read_file`、`list_dir`、`grep` 和 `skill`. 子步数与墙钟执行时间有界，取消会关闭子运行时，删除父会话
+`read_file`、`read_files`、`list_dir`、`list_tree`、`grep`、`grep_many` 和 `skill`。子步数与墙钟执行时间有界，取消会关闭子运行时，删除父会话
 会递归删除关联子会话. 该切片仍然是显式且同步的：不改变普通 `AgentRuntime` 循环，不复用父上下文，
 不提供 CLI/TUI/ACP 入口，也不调度、重试或递归创建子 Agent. 详见
 [ADR 0072](adr/0072-isolated-read-only-subagent-runtime.md)。
@@ -1263,3 +1266,33 @@ Runtime 门控现在会在允许的显式压缩操作外层真正执行有限的
 成功结果只暴露不透明压缩 ID、源/候选条目数和摘要 token 元数据；绝不暴露摘要、源指纹、提示词、消息、
 工具输出或异常详情。Provider、取消、存储和未知失败仍然只能传播为异常。CLI 和 ACP 序列化辅助函数共享同一组
 有界字段，但不会启用命令、事件、普通 Agent loop 或自动压缩。详见 [ADR 0104](../en/adr/0104-explicit-compaction-command-projection.md)。
+
+## 统一普通执行预算与临时 REPLAN 指引
+
+`neuro_code.application.execution_policy` 把具名产品档位和旧 `max_steps` 覆盖值解析为
+现有领域 `ExecutionBudget`。正式 CLI、TUI 与 ACP 组合路径会把同一个不可变值传给
+`AgentRuntime`，因此 loop 硬上限和逐回合监督器共享同一份模型/工具预算。Finalizer 尝试
+继续作为独立的有界资源。
+
+在完整工具批次结束的安全边界，非终态 `REPLAN` 决策可以在 `FINALIZE_TERMINAL` 模式下
+为下一次请求启用 `SyntheticReason.RUNTIME_SUPERVISION`。`ContextBuilder` 负责这条仅请求
+可见的注入以及通用 batch-first 证据收集策略。两者都不会追加到会话条目；REPLAN 消息会
+在产生新进展或回合退出时清除。工具执行顺序和现有 stuck 检测保持不变。详见
+[ADR 0105](../en/adr/0105-unified-execution-budget-and-replan-guidance.md)。
+
+## 有界长任务 Runtime 指引、压缩与分段
+
+生产 `FINALIZE_TERMINAL` loop 现在通过 `ExecutionBudgetUsage` 投影其规范
+`ExecutionBudget`。仅请求可见的指引和 `EXECUTION_BUDGET_UPDATED` 会暴露有界模型/工具计数，但不包含
+提示词、工具载荷或监督器指纹。该事件仍可供需要它的接口投影使用；标准 TUI 则有意不在运行时栏展示
+原始执行计数。
+
+当 binding 同时具有持久化会话存储和已配置的 Provider 上下文窗口时，现有压缩门控会在
+`BEFORE_MODEL_REQUEST` 与 `AFTER_TOOL_BATCH` 安全点评估自动压缩。压缩保持自身独立的一次请求/无工具
+预算，保留规范 transcript 条目，不拆开工具调用/结果配对，并从最新兼容的持久化投影恢复。Provider、存储
+和取消失败保持现有语义。相同区间不会重复摘要；压缩后仍越过 hard context threshold 时，会以可恢复的
+`BUDGET_LIMITED/CONTEXT_WINDOW_BUDGET` 最终化。
+
+持续产生进展的长回合还可以发出持久化且有界的 `EXECUTION_SEGMENT_CHECKPOINTED` 事件，并在下一请求
+接收一次临时 checkpoint 指引。segment 阈值不重置或取代全局回合预算，也不承诺崩溃恢复或工作区回滚。
+详见 [ADR 0107](adr/0107-bounded-long-task-runtime.md)。

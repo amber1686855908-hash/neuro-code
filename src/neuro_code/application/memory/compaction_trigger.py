@@ -1,17 +1,17 @@
-"""Explicit, default-disabled context-compaction trigger boundary.
+"""Explicit and automatic context-compaction trigger boundary.
 
-This module is the application seam a future Runtime integration can call
-after it has reached a safe model-turn boundary.  It assesses the immutable
-context first, performs no Provider or storage work while disabled, and only
-delegates an actionable explicit request to the existing persistence service.
+This module is the application seam Runtime calls after it has reached a safe
+model-turn boundary. It assesses the immutable context first, performs no
+Provider or storage work while disabled, and only delegates an actionable
+explicit or automatic request to the existing persistence service.
 The compaction operation has no AgentRuntime step counter or retry state of
 its own; normal-turn budgets therefore remain separate until a later Runtime
 integration defines that boundary explicitly.
 
-显式且默认关闭的上下文压缩触发边界。
+显式和自动上下文压缩的触发边界。
 
-本模块是未来 Runtime 在安全模型回合边界调用的应用层接口。它先评估不可变上下文,关闭时不调用
-Provider 或存储,只有显式请求且计划可执行时才委托现有持久化服务。压缩操作不拥有
+本模块是 Runtime 在安全模型回合边界调用的应用层接口。它先评估不可变上下文,关闭时不调用
+Provider 或存储,只有显式或自动请求且计划可执行时才委托现有持久化服务。压缩操作不拥有
 AgentRuntime 步骤计数器或重试状态,因此在未来 Runtime 明确定义边界前,普通回合预算保持隔离。
 """
 
@@ -37,13 +37,21 @@ from neuro_code.domain.conversation.context import ModelContext
 
 
 class ContextCompactionTriggerMode(StrEnum):
-    """Select whether a caller may perform an explicit compaction operation.
+    """Select whether a caller may perform a compaction operation.
 
     选择调用方是否可以执行显式压缩操作。
     """
 
     DISABLED = "disabled"
     EXPLICIT = "explicit"
+    AUTOMATIC = "automatic"
+
+
+def _mode_allows_trigger(mode: ContextCompactionTriggerMode) -> bool:
+    return mode in {
+        ContextCompactionTriggerMode.EXPLICIT,
+        ContextCompactionTriggerMode.AUTOMATIC,
+    }
 
 
 def _require_non_negative_int(name: str, value: int) -> None:
@@ -139,9 +147,7 @@ class ContextCompactionTriggerAssessment:
             raise TypeError("plan must be a ContextCompactionPlan")
         if not isinstance(self.will_trigger, bool):
             raise TypeError("will_trigger must be a bool")
-        expected = self.mode is ContextCompactionTriggerMode.EXPLICIT and _is_actionable_plan(
-            self.plan
-        )
+        expected = _mode_allows_trigger(self.mode) and _is_actionable_plan(self.plan)
         if self.will_trigger is not expected:
             raise ValueError("will_trigger does not match mode and plan")
 
@@ -223,8 +229,7 @@ class ContextCompactionTriggerService:
         return ContextCompactionTriggerAssessment(
             mode=request.mode,
             plan=plan,
-            will_trigger=request.mode is ContextCompactionTriggerMode.EXPLICIT
-            and _is_actionable_plan(plan),
+            will_trigger=_mode_allows_trigger(request.mode) and _is_actionable_plan(plan),
         )
 
     async def trigger(
@@ -249,7 +254,7 @@ class ContextCompactionTriggerService:
             or request.created_at is None
         ):
             raise ValueError(
-                "explicit actionable compaction requires session, compaction, source fingerprint, and timestamp"
+                "actionable compaction requires session, compaction, source fingerprint, and timestamp"
             )
         summary_request = ContextSummaryRequest.from_plan(assessment.plan)
         persistence = await self._persistence_service.generate_and_save(

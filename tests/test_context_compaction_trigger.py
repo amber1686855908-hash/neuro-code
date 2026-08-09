@@ -30,6 +30,7 @@ from neuro_code.application.memory.compaction_runtime import (
     ContextCompactionSafePoint,
     ContextCompactionTimeoutError,
     ContextCompactionTurnProjection,
+    build_automatic_context_compaction_runtime_request,
     build_context_usage_snapshot,
     build_explicit_context_compaction_runtime_request,
     classify_context_compaction_failure,
@@ -188,6 +189,72 @@ def test_context_usage_snapshot_prefers_reported_model_usage() -> None:
     assert partial.used_tokens == 120
     assert partial.capacity_tokens is None
     assert partial.estimated is True
+
+
+def test_automatic_request_uses_projected_usage_but_guards_the_canonical_source() -> None:
+    provider = ScriptedTriggerProvider(())
+    store = RecordingTriggerStore()
+    service = _service(store, provider)
+    source = _context()
+    projected = ModelContext(
+        (*source.items, Message(Role.USER, "temporary runtime guidance " * 20))
+    )
+    window = ProviderContextWindow("provider", "model", 1_000, context_affinity="profile")
+
+    request = build_automatic_context_compaction_runtime_request(
+        service,
+        source_context=source,
+        usage_context=projected,
+        boundary=ContextCompactionRuntimeBoundary(
+            ContextCompactionSafePoint.BEFORE_MODEL_REQUEST,
+            3,
+        ),
+        provider_window=window,
+        protected_item_count=0,
+        session_id="session-1",
+        compaction_id="automatic-1",
+        created_at=datetime(2026, 8, 9, tzinfo=UTC),
+        token_estimator=lambda items: 950 if len(items) == len(projected.items) else 1,
+    )
+
+    assert request.trigger.mode is ContextCompactionTriggerMode.AUTOMATIC
+    assert request.trigger.context is source
+    assert request.trigger.usage.used_tokens == 950
+    assert request.trigger.expected_source_fingerprint is not None
+    assert service.assess(request.trigger).will_trigger is True
+
+
+def test_automatic_trigger_uses_the_same_disabled_tool_policy_as_explicit_compaction() -> None:
+    provider = ScriptedTriggerProvider(((ModelCompleted("stop", response_text="summary"),),))
+    store = RecordingTriggerStore()
+    service = _service(store, provider)
+    source = _context()
+    request = build_automatic_context_compaction_runtime_request(
+        service,
+        source_context=source,
+        usage_context=source,
+        boundary=ContextCompactionRuntimeBoundary(
+            ContextCompactionSafePoint.AFTER_TOOL_BATCH,
+            2,
+        ),
+        provider_window=ProviderContextWindow(
+            "provider",
+            "model",
+            1_000,
+            context_affinity="profile",
+        ),
+        session_id="session-1",
+        compaction_id="automatic-2",
+        created_at=datetime(2026, 8, 9, tzinfo=UTC),
+        token_estimator=lambda _items: 950,
+    )
+
+    result = asyncio.run(ContextCompactionRuntimeGate(service).trigger(request))
+
+    assert result.trigger_result.triggered is True
+    assert provider.requests[0][1] == ()
+    assert provider.requests[0][2] is ModelToolPolicy.DISABLED
+    assert store.calls[0][0] == "session-1"
 
 
 def test_context_usage_snapshot_falls_back_to_context_estimate_without_provider_usage() -> None:

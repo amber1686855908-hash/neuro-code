@@ -152,6 +152,7 @@ def execution_outcome_stop_reason(
         SupervisorReasonCode.INPUT_TOKEN_BUDGET,
         SupervisorReasonCode.OUTPUT_TOKEN_BUDGET,
         SupervisorReasonCode.TOTAL_TOKEN_BUDGET,
+        SupervisorReasonCode.CONTEXT_WINDOW_BUDGET,
     }:
         return "max_tokens"
     return "max_turn_requests"

@@ -69,15 +69,27 @@ def default_tool_registry(
         ClientTerminalWaitTool,
     )
     from neuro_code.infrastructure.tools.filesystem import (
+        GrepManyTool,
         GrepTool,
         ListDirTool,
+        ListTreeTool,
+        ReadFilesTool,
         ReadFileTool,
         SearchReplaceTool,
     )
     from neuro_code.infrastructure.tools.plans import UpdatePlanTool
     from neuro_code.infrastructure.tools.skills import SkillTool
 
-    tools: list[Tool] = [ReadFileTool(), ListDirTool(), GrepTool(), SkillTool(), UpdatePlanTool()]
+    tools: list[Tool] = [
+        ReadFileTool(),
+        ReadFilesTool(),
+        ListDirTool(),
+        ListTreeTool(),
+        GrepTool(),
+        GrepManyTool(),
+        SkillTool(),
+        UpdatePlanTool(),
+    ]
     if sandbox_profile.workspace_writable and (
         client_file_system is None
         or (client_file_system.supports_read and client_file_system.supports_write)

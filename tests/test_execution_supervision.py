@@ -5,6 +5,13 @@ from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 
+from neuro_code.application.execution_policy import (
+    DEEP_EXECUTION_BUDGET,
+    NORMAL_EXECUTION_BUDGET,
+    ExecutionBudgetPolicy,
+    ExecutionProfile,
+    ExecutionSegmentPolicy,
+)
 from neuro_code.application.runtime.supervision import (
     AgentExecutionSupervisor,
     ExecutionControlMode,
@@ -19,7 +26,10 @@ from neuro_code.domain.execution import (
     AgentExecutionOutcome,
     AgentExecutionStatus,
     ExecutionBudget,
+    ExecutionBudgetPressure,
+    ExecutionBudgetUsage,
     ExecutionCounters,
+    ExecutionSegmentCheckpoint,
     ExecutionSnapshot,
     ProgressKind,
     SessionExecutionRecord,
@@ -117,6 +127,139 @@ def execute_tool(
 
 
 class ExecutionSupervisionTests(unittest.TestCase):
+    def test_budget_usage_projects_pressure_without_exposing_execution_payloads(self) -> None:
+        budget = execution_budget(
+            max_model_calls=100,
+            max_tool_rounds=100,
+            max_tool_calls=100,
+            max_calls_per_tool=100,
+        )
+        expected = (
+            (69, ExecutionBudgetPressure.NORMAL),
+            (70, ExecutionBudgetPressure.CONSERVE),
+            (85, ExecutionBudgetPressure.FOCUS),
+            (95, ExecutionBudgetPressure.FINAL_STAGE),
+        )
+
+        for used, pressure in expected:
+            with self.subTest(used=used):
+                usage = ExecutionBudgetUsage(
+                    budget,
+                    ExecutionCounters(model_requests=used),
+                    elapsed_seconds=1.5,
+                )
+                event_data = usage.to_event_data()
+
+                self.assertIs(usage.pressure, pressure)
+                self.assertEqual(usage.model_calls_remaining, 100 - used)
+                self.assertEqual(event_data["pressure"], pressure.value)
+                self.assertNotIn("prompt", event_data)
+                self.assertNotIn("arguments", event_data)
+                self.assertNotIn("fingerprint", repr(usage))
+
+    def test_supervisor_budget_preview_does_not_reserve_a_model_call(self) -> None:
+        supervisor = self.supervisor(budget=execution_budget(max_model_calls=3))
+
+        preview = supervisor.budget_usage(include_model_reserve=True)
+
+        self.assertEqual(preview.counters.model_requests, 1)
+        self.assertEqual(supervisor.snapshot.counters.model_requests, 0)
+        self.assertEqual(supervisor.authorize_model_request().kind, SupervisorDecisionKind.CONTINUE)
+        self.assertEqual(supervisor.snapshot.counters.model_requests, 1)
+
+    def test_segment_policy_is_derived_from_but_does_not_replace_global_budget(self) -> None:
+        global_budget = execution_budget(
+            max_model_calls=96,
+            max_tool_rounds=72,
+            max_tool_calls=300,
+            max_calls_per_tool=96,
+        )
+        policy = ExecutionSegmentPolicy.from_budget(global_budget)
+        start = ExecutionCounters(model_requests=8)
+        before = ExecutionCounters(model_requests=39)
+        reached = ExecutionCounters(model_requests=40)
+
+        self.assertEqual(policy.model_calls, 32)
+        self.assertEqual(policy.tool_rounds, 24)
+        self.assertEqual(policy.tool_calls, 100)
+        self.assertFalse(policy.reached(before, start))
+        self.assertTrue(policy.reached(reached, start))
+        self.assertEqual(global_budget.max_model_calls, 96)
+        with self.assertRaisesRegex(ValueError, "monotonic"):
+            policy.reached(start, reached)
+
+    def test_segment_checkpoint_is_bounded_typed_and_contains_no_raw_evidence(self) -> None:
+        checkpoint = ExecutionSegmentCheckpoint(
+            segment_number=1,
+            model_calls=24,
+            tool_rounds=18,
+            tool_calls=31,
+            progress_kinds=(ProgressKind.EVIDENCE, ProgressKind.VERIFICATION),
+            plan_steps_total=4,
+            plan_steps_completed=2,
+            created_at=datetime(2026, 8, 9, 8, tzinfo=UTC),
+        )
+
+        event_data = checkpoint.to_event_data()
+
+        self.assertEqual(event_data["next_segment"], 2)
+        self.assertEqual(event_data["progress_kinds"], ["evidence", "verification"])
+        self.assertNotIn("output", repr(checkpoint))
+        self.assertNotIn("arguments", repr(checkpoint))
+        with self.assertRaisesRegex(ValueError, "must not contain NONE"):
+            ExecutionSegmentCheckpoint(
+                1,
+                1,
+                1,
+                1,
+                (ProgressKind.NONE,),
+                0,
+                0,
+                datetime(2026, 8, 9, 8, tzinfo=UTC),
+            )
+
+    def test_named_execution_profiles_resolve_one_complete_budget(self) -> None:
+        normal = ExecutionBudgetPolicy.for_profile(ExecutionProfile.NORMAL)
+        deep = ExecutionBudgetPolicy.for_profile(ExecutionProfile.DEEP)
+
+        self.assertIs(normal, NORMAL_EXECUTION_BUDGET)
+        self.assertIs(deep, DEEP_EXECUTION_BUDGET)
+        self.assertEqual(
+            (normal.max_model_calls, normal.max_tool_rounds, normal.max_tool_calls),
+            (48, 48, 192),
+        )
+        self.assertEqual(
+            (deep.max_model_calls, deep.max_tool_rounds, deep.max_tool_calls),
+            (96, 96, 384),
+        )
+        self.assertEqual(normal.limit_for_tool("read_file"), 48)
+        self.assertEqual(normal.limit_for_tool("grep"), 48)
+        self.assertEqual(normal.limit_for_tool("bash"), 16)
+        self.assertEqual(normal.limit_for_tool("search_replace"), 16)
+
+    def test_legacy_max_steps_scales_every_count_based_budget(self) -> None:
+        budget = ExecutionBudgetPolicy.from_max_steps(60)
+
+        self.assertEqual(
+            (
+                budget.max_model_calls,
+                budget.max_tool_rounds,
+                budget.max_tool_calls,
+                budget.max_calls_per_tool,
+            ),
+            (60, 60, 240, 60),
+        )
+        self.assertEqual(budget.limit_for_tool("read_file"), 60)
+        self.assertEqual(budget.limit_for_tool("bash"), 20)
+        self.assertNotIn("finalizer", repr(budget))
+
+    def test_execution_budget_policy_rejects_invalid_inputs(self) -> None:
+        for value in (0, -1, True):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "max_steps"):
+                ExecutionBudgetPolicy.from_max_steps(value)  # type: ignore[arg-type]
+        with self.assertRaisesRegex(TypeError, "execution profile"):
+            ExecutionBudgetPolicy.for_profile("normal")  # type: ignore[arg-type]
+
     def test_execution_control_mode_and_terminal_outcome_invariants(self) -> None:
         self.assertIs(ExecutionControlMode.OBSERVE_ONLY, ExecutionControlMode("observe_only"))
         self.assertIs(

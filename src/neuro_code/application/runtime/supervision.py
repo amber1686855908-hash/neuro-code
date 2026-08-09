@@ -19,9 +19,14 @@ from pathlib import Path
 from time import monotonic
 from typing import Protocol
 
+from neuro_code.application.execution_policy import (
+    NORMAL_EXECUTION_BUDGET,
+    ExecutionBudgetPolicy,
+)
 from neuro_code.domain.execution import (
     AgentExecutionStatus,
     ExecutionBudget,
+    ExecutionBudgetUsage,
     ExecutionCounters,
     ExecutionSnapshot,
     ProgressKind,
@@ -549,37 +554,34 @@ class SupervisionObserver(Protocol):
     def __call__(self, record: SupervisionTraceRecord) -> None: ...
 
 
-DEFAULT_OBSERVATION_BUDGET = ExecutionBudget(
-    max_model_calls=24,
-    max_tool_rounds=24,
-    max_tool_calls=96,
-    max_calls_per_tool=24,
-    max_wall_seconds=None,
-    max_input_tokens=None,
-    max_output_tokens=None,
-    max_total_tokens=None,
-)
+DEFAULT_OBSERVATION_BUDGET = NORMAL_EXECUTION_BUDGET
 
 
 def create_observing_supervisor(
     *,
+    budget: ExecutionBudget | None = None,
     max_model_calls: int | None = None,
 ) -> AgentExecutionSupervisor:
     """Create the default non-enforcing supervisor for one runtime turn.
 
     为一个运行时回合创建默认的非强制监督器.
 
-    ``max_model_calls`` is the ordinary Agent request budget.  Finalizer
-    attempts remain a separate bounded resource and are never reserved from
-    this value.
+    ``max_model_calls`` is retained as a compatibility spelling for the old
+    ``max_steps`` setting.  It now scales the complete count-based ordinary
+    execution budget instead of changing only model calls. Finalizer attempts
+    remain a separate bounded resource and are never reserved from this value.
     """
 
-    budget = (
-        DEFAULT_OBSERVATION_BUDGET
-        if max_model_calls is None
-        else replace(DEFAULT_OBSERVATION_BUDGET, max_model_calls=max_model_calls)
-    )
-    return AgentExecutionSupervisor(budget, mode=SupervisionMode.OBSERVE)
+    if budget is not None and max_model_calls is not None:
+        raise ValueError("budget and max_model_calls are mutually exclusive")
+    resolved = budget
+    if resolved is None:
+        resolved = (
+            DEFAULT_OBSERVATION_BUDGET
+            if max_model_calls is None
+            else ExecutionBudgetPolicy.from_max_steps(max_model_calls)
+        )
+    return AgentExecutionSupervisor(resolved, mode=SupervisionMode.OBSERVE)
 
 
 class AgentExecutionSupervisor:
@@ -623,6 +625,25 @@ class AgentExecutionSupervisor:
     def mode(self) -> SupervisionMode:
         return self._mode
 
+    def budget_usage(self, *, include_model_reserve: bool = False) -> ExecutionBudgetUsage:
+        """Return a live, non-sensitive projection of ordinary-turn budget use.
+
+        ``include_model_reserve`` previews the request that is about to be
+        authorized so request-scoped guidance can describe the same counts the
+        model call will consume without mutating supervision early.
+
+        返回普通回合预算实时且不含敏感内容的投影. 可预览即将授权的模型请求,
+        使请求范围指引与实际消费计数一致,而无需提前修改监督状态.
+        """
+
+        if not isinstance(include_model_reserve, bool):
+            raise TypeError("include_model_reserve must be a bool")
+        snapshot = self._require_started()
+        counters = snapshot.counters
+        if include_model_reserve:
+            counters = replace(counters, model_requests=counters.model_requests + 1)
+        return ExecutionBudgetUsage(self._budget, counters, self._elapsed_seconds())
+
     def start_turn(self) -> ExecutionSnapshot:
         """Initialize the isolated state used for one execution.
 
@@ -646,9 +667,9 @@ class AgentExecutionSupervisor:
         return self._snapshot
 
     def authorize_model_request(self) -> SupervisorDecision:
-        """Reserve one ordinary model request while retaining Finalizer capacity.
+        """Reserve one ordinary model request from the ordinary-turn budget.
 
-        预留一次普通模型请求,同时保留 Finalizer 容量."""
+        从普通回合预算中预留一次普通模型请求."""
 
         snapshot = self._require_started()
         if self._reserved_tool_names:

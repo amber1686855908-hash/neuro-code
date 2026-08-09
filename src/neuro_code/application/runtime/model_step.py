@@ -46,6 +46,7 @@ class ModelStepResult:
     reasoning: tuple[str, ...]
     tool_calls: tuple[ToolCall, ...]
     completion: ModelCompleted | None
+    selected_provider: ModelProviderSelected | None = None
 
 
 class ModelStepProcessor:
@@ -77,6 +78,7 @@ class ModelStepProcessor:
         step_reasoning: list[str] = []
         tool_calls: list[ToolCall] = []
         completion: ModelCompleted | None = None
+        selected_provider: ModelProviderSelected | None = None
         backend_tool_started_at: dict[str, float] = {}
         thinking_completed = False
 
@@ -105,6 +107,7 @@ class ModelStepProcessor:
                     },
                 )
             elif isinstance(model_event, ModelProviderSelected):
+                selected_provider = model_event
                 origin_updated = False
                 if (
                     can_adopt_provider_origin
@@ -175,10 +178,11 @@ class ModelStepProcessor:
                 completion = model_event
 
         return ModelStepResult(
-            tuple(step_text),
-            tuple(step_reasoning),
-            tuple(tool_calls),
-            completion,
+            text=tuple(step_text),
+            reasoning=tuple(step_reasoning),
+            tool_calls=tuple(tool_calls),
+            completion=completion,
+            selected_provider=selected_provider,
         )
 
 

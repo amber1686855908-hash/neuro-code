@@ -13,6 +13,8 @@ from unittest.mock import patch
 
 from neuro_code.application.memory.compaction import (
     CompactionContextUsage,
+    ContextCompactionPlanner,
+    ContextCompactionPolicy,
     ProviderContextWindow,
 )
 from neuro_code.application.memory.compaction_runtime import (
@@ -22,9 +24,11 @@ from neuro_code.application.memory.compaction_runtime import (
     ContextCompactionRuntimeResult,
     ContextCompactionSafePoint,
 )
+from neuro_code.application.memory.compaction_service import ContextCompactionApplicationService
 from neuro_code.application.memory.compaction_trigger import (
     ContextCompactionTriggerMode,
     ContextCompactionTriggerRequest,
+    ContextCompactionTriggerService,
 )
 from neuro_code.application.permissions.contracts import PermissionApproval, PermissionRequest
 from neuro_code.application.permissions.policy import (
@@ -42,6 +46,7 @@ from neuro_code.application.ports.workspace_changes import (
     WorkspaceFileChange,
 )
 from neuro_code.application.runtime.agent import AgentRuntime
+from neuro_code.application.runtime.context_builder import ContextBuilder
 from neuro_code.application.runtime.finalization import AgentFinalizer
 from neuro_code.application.runtime.supervision import (
     AgentExecutionSupervisor,
@@ -77,6 +82,7 @@ from neuro_code.domain.conversation.messages import (
     PreservedContextItem,
     Role,
     SessionItem,
+    SyntheticReason,
     ToolCall,
 )
 from neuro_code.domain.conversation.reasoning import ReasoningEffort
@@ -84,6 +90,8 @@ from neuro_code.domain.execution import (
     AgentExecutionOutcome,
     AgentExecutionStatus,
     ExecutionBudget,
+    ExecutionBudgetUsage,
+    ExecutionCounters,
     ProgressKind,
     SessionExecutionRecord,
     SupervisorDecision,
@@ -92,6 +100,7 @@ from neuro_code.domain.execution import (
     TurnSource,
 )
 from neuro_code.domain.plans import PlanComment, PlanStep, PlanStepStatus, SessionPlan
+from neuro_code.domain.sandbox import SandboxProfile
 from neuro_code.domain.session_tasks import SessionTask, SessionTaskKind, SessionTaskStatus
 from neuro_code.domain.tools import ToolDefinition, ToolResult
 from neuro_code.infrastructure.background_tasks import LocalBackgroundTaskManager
@@ -313,6 +322,21 @@ class IncrementingEvidenceFixtureTool(CollectionFixtureTool):
     ) -> ToolResult:
         result = await super().execute(arguments, context)
         return ToolResult(f"{result.content} {len(self.calls)}")
+
+
+class SequencedEvidenceFixtureTool(CollectionFixtureTool):
+    def __init__(self, name: str, contents: Sequence[str]) -> None:
+        super().__init__(name, "unused")
+        self._contents = list(contents)
+
+    async def execute(
+        self,
+        arguments: Mapping[str, object],
+        context: ToolContext,
+    ) -> ToolResult:
+        del context
+        self.calls.append(dict(arguments))
+        return ToolResult(self._contents.pop(0))
 
 
 class MetadataFixtureTool:
@@ -568,6 +592,46 @@ class DecisionInjectingSupervisor(AgentExecutionSupervisor):
 
 
 class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
+    def test_runtime_budget_guidance_has_distinct_bounded_pressure_actions(self) -> None:
+        budget = observation_budget(
+            max_model_calls=100,
+            max_tool_rounds=100,
+            max_tool_calls=100,
+            max_calls_per_tool=100,
+        )
+        expectations = (
+            (70, "Prioritize the core question"),
+            (85, "Merge independent searches and reads"),
+            (95, "Stop nonessential exploration"),
+        )
+
+        for used, expected in expectations:
+            with self.subTest(used=used):
+                builder = ContextBuilder(
+                    reasoning_effort=ReasoningEffort.MEDIUM,
+                    interaction_mode=InteractionMode.NORMAL,
+                    plan=None,
+                    instruction_provider=None,
+                    skill_provider=None,
+                )
+                builder.set_runtime_budget_usage(
+                    ExecutionBudgetUsage(
+                        budget,
+                        ExecutionCounters(model_requests=used),
+                        elapsed_seconds=0,
+                    )
+                )
+
+                rendered = builder.build((Message(Role.SYSTEM, "system"),))
+
+                guidance = next(
+                    item
+                    for item in rendered
+                    if isinstance(item, Message)
+                    and item.synthetic_reason is SyntheticReason.RUNTIME_BUDGET
+                )
+                self.assertIn(expected, guidance.content)
+
     async def test_default_supervisor_model_budget_tracks_configured_max_steps(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             runtime = AgentRuntime(
@@ -580,7 +644,685 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
             )
 
             supervisor = runtime._supervisor_factory()
-            self.assertEqual(supervisor._budget.max_model_calls, 60)
+            self.assertEqual(
+                (
+                    supervisor._budget.max_model_calls,
+                    supervisor._budget.max_tool_rounds,
+                    supervisor._budget.max_tool_calls,
+                ),
+                (60, 60, 240),
+            )
+
+    async def test_batch_first_runtime_guidance_is_request_scoped(self) -> None:
+        provider = ScriptedProvider(((ModelTextDelta("done"), ModelCompleted("stop")),))
+        runtime = AgentRuntime(
+            provider=provider,
+            tools=MinimalToolCollection(()),
+            workspace_change_observer=EmptyWorkspaceChangeObserver(),
+            permissions=PermissionManager(),
+            tool_context=ToolContext(Path("/workspace")),
+        )
+
+        result = await runtime.run("inspect the repository")
+
+        request_system = next(
+            message for message in provider.calls[0].messages if message.role is Role.SYSTEM
+        )
+        persisted_system = next(
+            message for message in result.messages if message.role is Role.SYSTEM
+        )
+        self.assertIn("multiple read-only operations are independent", request_system.content)
+        self.assertIn("list_tree, grep_many, and read_files", request_system.content)
+        self.assertIn("batch-read the related evidence", request_system.content)
+        self.assertIn("Keep operations sequential", request_system.content)
+        self.assertNotIn("multiple read-only operations are independent", persisted_system.content)
+
+    async def test_controlled_runtime_projects_budget_guidance_and_typed_telemetry(self) -> None:
+        provider = ScriptedProvider(((ModelTextDelta("done"), ModelCompleted("stop")),))
+        budget = observation_budget(
+            max_model_calls=10,
+            max_tool_rounds=10,
+            max_tool_calls=40,
+            max_calls_per_tool=10,
+        )
+        runtime = AgentRuntime(
+            provider=provider,
+            tools=MinimalToolCollection(()),
+            workspace_change_observer=EmptyWorkspaceChangeObserver(),
+            permissions=PermissionManager(),
+            tool_context=ToolContext(Path("/workspace")),
+            execution_budget=budget,
+            execution_control_mode=ExecutionControlMode.FINALIZE_TERMINAL,
+        )
+
+        result = await runtime.run("inspect the repository")
+
+        guidance = next(
+            message
+            for message in provider.calls[0].messages
+            if message.synthetic_reason is SyntheticReason.RUNTIME_BUDGET
+        )
+        self.assertIn("Model calls remaining: 9/10", guidance.content)
+        self.assertIn("Tool rounds remaining: 10/10", guidance.content)
+        budget_events = [
+            event
+            for event in result.events
+            if event.kind is AgentEventKind.EXECUTION_BUDGET_UPDATED
+        ]
+        self.assertEqual(len(budget_events), 1)
+        self.assertEqual(budget_events[0].data["model_calls_used"], 1)
+        self.assertEqual(budget_events[0].data["pressure"], "normal")
+        self.assertFalse(
+            any(
+                isinstance(item, Message)
+                and item.synthetic_reason is SyntheticReason.RUNTIME_BUDGET
+                for item in result.items
+            )
+        )
+
+    async def test_observe_only_does_not_inject_or_emit_budget_guidance(self) -> None:
+        provider = ScriptedProvider(((ModelTextDelta("done"), ModelCompleted("stop")),))
+        runtime = AgentRuntime(
+            provider=provider,
+            tools=MinimalToolCollection(()),
+            workspace_change_observer=EmptyWorkspaceChangeObserver(),
+            permissions=PermissionManager(),
+            tool_context=ToolContext(Path("/workspace")),
+        )
+
+        result = await runtime.run("inspect")
+
+        self.assertFalse(
+            any(
+                message.synthetic_reason is SyntheticReason.RUNTIME_BUDGET
+                for message in provider.calls[0].messages
+            )
+        )
+        self.assertNotIn(
+            AgentEventKind.EXECUTION_BUDGET_UPDATED,
+            [event.kind for event in result.events],
+        )
+
+    async def test_automatic_compaction_runs_at_a_safe_point_and_the_turn_continues(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = SqliteSessionStore(root / "sessions.db")
+            await store.initialize()
+            session_id = await store.create_session(str(root), "scripted", "fixture-model")
+            tool = CollectionFixtureTool("inspect", "fresh repository evidence")
+            provider = ScriptedProvider(
+                (
+                    (
+                        ModelToolCall(ToolCall("inspect-1", "inspect", {})),
+                        ModelCompleted("tool_calls"),
+                    ),
+                    (ModelCompleted("stop", response_text="bounded earlier-context summary"),),
+                    (ModelTextDelta("final answer"), ModelCompleted("stop")),
+                )
+            )
+            compaction_service = ContextCompactionApplicationService(store, provider)
+            compaction_gate = ContextCompactionRuntimeGate(
+                ContextCompactionTriggerService(
+                    compaction_service,
+                    planner=ContextCompactionPlanner(
+                        ContextCompactionPolicy(
+                            soft_limit_ratio=0.80,
+                            hard_limit_ratio=0.95,
+                            minimum_recent_items=1,
+                            max_summary_tokens=64,
+                        )
+                    ),
+                )
+            )
+            runtime = AgentRuntime(
+                provider=provider,
+                tools=MinimalToolCollection((tool,)),
+                workspace_change_observer=EmptyWorkspaceChangeObserver(),
+                permissions=PermissionManager(),
+                tool_context=ToolContext(root),
+                session_store=store,
+                execution_budget=observation_budget(max_model_calls=4),
+                execution_control_mode=ExecutionControlMode.FINALIZE_TERMINAL,
+                compaction_runtime_gate=compaction_gate,
+                provider_context_window=ProviderContextWindow(
+                    "scripted",
+                    "fixture-model",
+                    600,
+                    "profile-v1:scripted",
+                ),
+            )
+
+            result = await runtime.run("inspect this repository in depth", session_id=session_id)
+
+            self.assertEqual(result.response, "final answer")
+            self.assertEqual(result.steps, 2)
+            self.assertEqual(
+                provider.tool_policies,
+                [ModelToolPolicy.ALLOWED, ModelToolPolicy.DISABLED, ModelToolPolicy.ALLOWED],
+            )
+            kinds = [event.kind for event in result.events]
+            self.assertEqual(kinds.count(AgentEventKind.CONTEXT_COMPACTION_STARTED), 1)
+            self.assertEqual(kinds.count(AgentEventKind.CONTEXT_COMPACTION_COMPLETED), 1)
+            self.assertLess(
+                kinds.index(AgentEventKind.TOOL_COMPLETED),
+                kinds.index(AgentEventKind.CONTEXT_COMPACTION_STARTED),
+            )
+            self.assertLess(
+                kinds.index(AgentEventKind.CONTEXT_COMPACTION_COMPLETED),
+                next(
+                    index
+                    for index, event in enumerate(result.events)
+                    if event.kind is AgentEventKind.MODEL_STEP_STARTED
+                    and event.data.get("step") == 2
+                ),
+            )
+            self.assertTrue(
+                any(
+                    message.synthetic_reason is SyntheticReason.COMPACTION_SUMMARY
+                    for message in provider.calls[2].messages
+                )
+            )
+            self.assertFalse(
+                any(
+                    isinstance(item, Message)
+                    and item.synthetic_reason is SyntheticReason.COMPACTION_SUMMARY
+                    for item in result.items
+                )
+            )
+            stored = await store.load_compaction_items(session_id)
+            self.assertEqual(len(stored), 1)
+
+    async def test_automatic_compaction_provider_failure_propagates_and_records_turn_failure(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = SqliteSessionStore(root / "sessions.db")
+            await store.initialize()
+            session_id = await store.create_session(str(root), "scripted", "fixture-model")
+            tool = CollectionFixtureTool("inspect", "fresh repository evidence")
+            provider = ScriptedProvider(
+                (
+                    (
+                        ModelToolCall(ToolCall("inspect-1", "inspect", {})),
+                        ModelCompleted("tool_calls"),
+                    ),
+                    (ProviderError("summary provider failed"),),
+                )
+            )
+            gate = ContextCompactionRuntimeGate(
+                ContextCompactionTriggerService(
+                    ContextCompactionApplicationService(store, provider),
+                    planner=ContextCompactionPlanner(
+                        ContextCompactionPolicy(
+                            soft_limit_ratio=0.80,
+                            hard_limit_ratio=0.95,
+                            minimum_recent_items=1,
+                            max_summary_tokens=64,
+                        )
+                    ),
+                )
+            )
+            runtime = AgentRuntime(
+                provider=provider,
+                tools=MinimalToolCollection((tool,)),
+                workspace_change_observer=EmptyWorkspaceChangeObserver(),
+                permissions=PermissionManager(),
+                tool_context=ToolContext(root),
+                session_store=store,
+                execution_budget=observation_budget(max_model_calls=4),
+                execution_control_mode=ExecutionControlMode.FINALIZE_TERMINAL,
+                compaction_runtime_gate=gate,
+                provider_context_window=ProviderContextWindow(
+                    "scripted",
+                    "fixture-model",
+                    600,
+                    "profile-v1:scripted",
+                ),
+            )
+
+            with self.assertRaisesRegex(ProviderError, "summary provider failed"):
+                await runtime.run("inspect this repository in depth", session_id=session_id)
+
+            self.assertEqual(
+                provider.tool_policies,
+                [ModelToolPolicy.ALLOWED, ModelToolPolicy.DISABLED],
+            )
+            self.assertEqual(await store.load_compaction_items(session_id), [])
+            event_kinds = [event["kind"] for event in await store.load_events(session_id)]
+            self.assertIn(AgentEventKind.CONTEXT_COMPACTION_STARTED.value, event_kinds)
+            self.assertIn(AgentEventKind.TURN_FAILED.value, event_kinds)
+            self.assertNotIn(AgentEventKind.CONTEXT_COMPACTION_COMPLETED.value, event_kinds)
+
+    async def test_automatic_compaction_reuses_explicit_failover_window_on_later_turn(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = SqliteSessionStore(root / "sessions.db")
+            await store.initialize()
+            session_id = await store.create_session(
+                str(root),
+                "primary",
+                "primary-model",
+                "profile-v1:primary",
+            )
+            primary = FailingProvider("primary")
+            fallback = ScriptedProvider(
+                (
+                    (ModelTextDelta("first answer"), ModelCompleted("stop")),
+                    (
+                        ModelToolCall(ToolCall("inspect-1", "inspect", {})),
+                        ModelCompleted("tool_calls"),
+                    ),
+                    (ModelCompleted("stop", response_text="bounded summary"),),
+                    (ModelTextDelta("second answer"), ModelCompleted("stop")),
+                )
+            )
+            fallback.provider_name = "fallback"
+            fallback.model_name = "fallback-model"
+            fallback.context_affinity = "profile-v1:fallback"
+            provider = FailoverModelProvider(
+                (
+                    ProviderCandidate(
+                        primary.provider_name,
+                        primary.model_name,
+                        primary.context_affinity,
+                        lambda: primary,
+                        context_window_tokens=1_000,
+                    ),
+                    ProviderCandidate(
+                        fallback.provider_name,
+                        fallback.model_name,
+                        fallback.context_affinity,
+                        lambda: fallback,
+                        context_window_tokens=600,
+                    ),
+                )
+            )
+            gate = ContextCompactionRuntimeGate(
+                ContextCompactionTriggerService(
+                    ContextCompactionApplicationService(store, provider),
+                    planner=ContextCompactionPlanner(
+                        ContextCompactionPolicy(
+                            soft_limit_ratio=0.80,
+                            hard_limit_ratio=0.95,
+                            minimum_recent_items=1,
+                            max_summary_tokens=64,
+                        )
+                    ),
+                )
+            )
+            runtime = AgentRuntime(
+                provider=provider,
+                tools=MinimalToolCollection(
+                    (CollectionFixtureTool("inspect", "fresh repository evidence"),)
+                ),
+                workspace_change_observer=EmptyWorkspaceChangeObserver(),
+                permissions=PermissionManager(),
+                tool_context=ToolContext(root),
+                session_store=store,
+                execution_budget=observation_budget(max_model_calls=4),
+                execution_control_mode=ExecutionControlMode.FINALIZE_TERMINAL,
+                compaction_runtime_gate=gate,
+                provider_context_window=ProviderContextWindow(
+                    "primary",
+                    "primary-model",
+                    1_000,
+                    "profile-v1:primary",
+                ),
+            )
+
+            first = await runtime.run("establish fallback", session_id=session_id)
+            second = await runtime.run(
+                "inspect this repository in depth",
+                initial_items=first.items,
+                source_provider="fallback",
+                source_model="fallback-model",
+                source_context_affinity="profile-v1:fallback",
+                session_id=session_id,
+            )
+
+            self.assertEqual(second.response, "second answer")
+            self.assertEqual(
+                fallback.tool_policies,
+                [
+                    ModelToolPolicy.ALLOWED,
+                    ModelToolPolicy.ALLOWED,
+                    ModelToolPolicy.DISABLED,
+                    ModelToolPolicy.ALLOWED,
+                ],
+            )
+            stored = await store.load_compaction_items(session_id)
+            self.assertEqual(len(stored), 1)
+            self.assertEqual(stored[0].provider_name, "fallback")
+            self.assertEqual(stored[0].model_name, "fallback-model")
+
+    async def test_hard_context_limit_after_compaction_stops_without_repeating_summary(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = SqliteSessionStore(root / "sessions.db")
+            await store.initialize()
+            session_id = await store.create_session(str(root), "scripted", "fixture-model")
+            tool = CollectionFixtureTool("inspect", "fresh repository evidence")
+            provider = ScriptedProvider(
+                (
+                    (
+                        ModelToolCall(ToolCall("inspect-1", "inspect", {})),
+                        ModelCompleted("tool_calls"),
+                    ),
+                    (ModelCompleted("stop", response_text="bounded earlier-context summary"),),
+                    (ModelCompleted("stop", response_text="safe context-limit finalization"),),
+                )
+            )
+            gate = ContextCompactionRuntimeGate(
+                ContextCompactionTriggerService(
+                    ContextCompactionApplicationService(store, provider),
+                    planner=ContextCompactionPlanner(
+                        ContextCompactionPolicy(
+                            soft_limit_ratio=0.80,
+                            hard_limit_ratio=0.95,
+                            minimum_recent_items=1,
+                            max_summary_tokens=64,
+                        )
+                    ),
+                )
+            )
+            runtime = AgentRuntime(
+                provider=provider,
+                tools=MinimalToolCollection((tool,)),
+                workspace_change_observer=EmptyWorkspaceChangeObserver(),
+                permissions=PermissionManager(),
+                tool_context=ToolContext(root),
+                session_store=store,
+                execution_budget=observation_budget(max_model_calls=4),
+                execution_control_mode=ExecutionControlMode.FINALIZE_TERMINAL,
+                compaction_runtime_gate=gate,
+                provider_context_window=ProviderContextWindow(
+                    "scripted",
+                    "fixture-model",
+                    500,
+                    "profile-v1:scripted",
+                ),
+            )
+
+            result = await runtime.run("inspect this repository in depth", session_id=session_id)
+
+            assert result.outcome is not None
+            self.assertIs(result.outcome.status, AgentExecutionStatus.BUDGET_LIMITED)
+            self.assertIs(
+                result.outcome.reason_code,
+                SupervisorReasonCode.CONTEXT_WINDOW_BUDGET,
+            )
+            self.assertEqual(result.response, "safe context-limit finalization")
+            self.assertEqual(result.steps, 1)
+            self.assertEqual(
+                provider.tool_policies,
+                [ModelToolPolicy.ALLOWED, ModelToolPolicy.DISABLED, ModelToolPolicy.DISABLED],
+            )
+            self.assertEqual(
+                sum(
+                    event.kind is AgentEventKind.CONTEXT_COMPACTION_STARTED
+                    for event in result.events
+                ),
+                1,
+            )
+            self.assertEqual(len(await store.load_compaction_items(session_id)), 1)
+
+    async def test_progressing_long_turn_crosses_a_segment_without_resetting_global_budget(
+        self,
+    ) -> None:
+        tool = IncrementingEvidenceFixtureTool("inspect", "fresh evidence")
+        scripts: list[tuple[ModelEvent, ...]] = [
+            (
+                ModelToolCall(ToolCall(f"inspect-{index}", "inspect", {})),
+                ModelCompleted("tool_calls"),
+            )
+            for index in range(1, 25)
+        ]
+        scripts.append((ModelTextDelta("completed analysis"), ModelCompleted("stop")))
+        provider = ScriptedProvider(tuple(scripts))
+        budget = observation_budget(
+            max_model_calls=33,
+            max_tool_rounds=33,
+            max_tool_calls=132,
+            max_calls_per_tool=33,
+        )
+        runtime = AgentRuntime(
+            provider=provider,
+            tools=MinimalToolCollection((tool,)),
+            workspace_change_observer=EmptyWorkspaceChangeObserver(),
+            permissions=PermissionManager(),
+            tool_context=ToolContext(Path("/workspace")),
+            execution_budget=budget,
+            execution_control_mode=ExecutionControlMode.FINALIZE_TERMINAL,
+        )
+
+        result = await runtime.run("perform a long evidence-backed analysis")
+
+        self.assertEqual(result.response, "completed analysis")
+        self.assertEqual(result.steps, 25)
+        self.assertEqual(len(tool.calls), 24)
+        checkpoints = [
+            event
+            for event in result.events
+            if event.kind is AgentEventKind.EXECUTION_SEGMENT_CHECKPOINTED
+        ]
+        self.assertEqual(len(checkpoints), 1)
+        self.assertEqual(checkpoints[0].data["model_calls"], 24)
+        self.assertEqual(checkpoints[0].data["progress_kinds"], ["evidence"])
+        next_request_guidance = next(
+            message
+            for message in provider.calls[24].messages
+            if message.synthetic_reason is SyntheticReason.RUNTIME_CHECKPOINT
+        )
+        self.assertIn("Continue the same user task", next_request_guidance.content)
+        self.assertFalse(
+            any(
+                isinstance(item, Message)
+                and item.synthetic_reason is SyntheticReason.RUNTIME_CHECKPOINT
+                for item in result.items
+            )
+        )
+        latest_budget = next(
+            event
+            for event in reversed(result.events)
+            if event.kind is AgentEventKind.EXECUTION_BUDGET_UPDATED
+        )
+        self.assertEqual(latest_budget.data["model_calls_limit"], 33)
+        self.assertEqual(latest_budget.data["model_calls_used"], 25)
+
+    async def test_repository_analysis_uses_bounded_batch_tools_without_one_round_per_file(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            file_names = tuple(f"module_{index:02d}.py" for index in range(12))
+            for index, name in enumerate(file_names):
+                (root / name).write_text(
+                    f"class Evidence{index}:\n    value = {index}\n",
+                    encoding="utf-8",
+                )
+            provider = ScriptedProvider(
+                (
+                    (
+                        ModelToolCall(
+                            ToolCall(
+                                "tree",
+                                "list_tree",
+                                {"path": ".", "max_depth": 2, "max_entries": 100},
+                            )
+                        ),
+                        ModelCompleted("tool_calls"),
+                    ),
+                    (
+                        ModelToolCall(
+                            ToolCall(
+                                "search",
+                                "grep_many",
+                                {
+                                    "queries": ["class Evidence", "value ="],
+                                    "path": ".",
+                                    "include_globs": ["*.py"],
+                                    "max_results_per_query": 20,
+                                    "max_total_results": 40,
+                                },
+                            )
+                        ),
+                        ModelCompleted("tool_calls"),
+                    ),
+                    (
+                        ModelToolCall(
+                            ToolCall(
+                                "batch-read",
+                                "read_files",
+                                {"files": [{"path": name} for name in file_names]},
+                            )
+                        ),
+                        ModelCompleted("tool_calls"),
+                    ),
+                    (
+                        ModelToolCall(
+                            ToolCall(
+                                "follow-up",
+                                "read_file",
+                                {"path": file_names[-1], "max_lines": 2},
+                            )
+                        ),
+                        ModelCompleted("tool_calls"),
+                    ),
+                    (ModelTextDelta("repository analysis complete"), ModelCompleted("stop")),
+                )
+            )
+            runtime = AgentRuntime(
+                provider=provider,
+                tools=default_tool_registry(SandboxProfile.READ_ONLY),
+                workspace_change_observer=EmptyWorkspaceChangeObserver(),
+                permissions=PermissionManager(),
+                tool_context=ToolContext(root, sandbox_profile=SandboxProfile.READ_ONLY),
+                max_steps=5,
+            )
+
+            result = await runtime.run("analyze the repository")
+
+        self.assertEqual(result.response, "repository analysis complete")
+        self.assertEqual(result.steps, 5)
+        self.assertEqual(len(provider.calls), 5)
+        self.assertLess(result.steps, len(file_names))
+        batch_result = next(
+            message
+            for message in provider.calls[3].messages
+            if message.role is Role.TOOL and message.tool_call_id == "batch-read"
+        )
+        self.assertEqual(batch_result.content.count("status: success"), len(file_names))
+        self.assertIn("module_00.py", batch_result.content)
+        self.assertIn("module_11.py", batch_result.content)
+
+    async def test_replan_guidance_is_temporary_and_clears_after_new_progress(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            tool = SequencedEvidenceFixtureTool(
+                "inspect",
+                ("same evidence", "same evidence", "same evidence", "new evidence"),
+            )
+            provider = ScriptedProvider(
+                (
+                    (
+                        ModelToolCall(ToolCall("inspect-1", "inspect", {"path": "same.py"})),
+                        ModelCompleted("tool_calls"),
+                    ),
+                    (
+                        ModelToolCall(ToolCall("inspect-2", "inspect", {"path": "same.py"})),
+                        ModelCompleted("tool_calls"),
+                    ),
+                    (
+                        ModelToolCall(ToolCall("inspect-3", "inspect", {"path": "same.py"})),
+                        ModelCompleted("tool_calls"),
+                    ),
+                    (
+                        ModelToolCall(ToolCall("inspect-4", "inspect", {"path": "different.py"})),
+                        ModelCompleted("tool_calls"),
+                    ),
+                    (ModelTextDelta("finished"), ModelCompleted("stop")),
+                )
+            )
+            runtime = AgentRuntime(
+                provider=provider,
+                tools=MinimalToolCollection((tool,)),
+                workspace_change_observer=EmptyWorkspaceChangeObserver(),
+                permissions=PermissionManager(),
+                tool_context=ToolContext(Path(directory)),
+                max_steps=5,
+                execution_control_mode=ExecutionControlMode.FINALIZE_TERMINAL,
+            )
+
+            result = await runtime.run("inspect")
+
+        guided_messages = tuple(
+            message
+            for message in provider.calls[3].messages
+            if message.synthetic_reason is SyntheticReason.RUNTIME_SUPERVISION
+        )
+        self.assertEqual(len(guided_messages), 1)
+        self.assertIn("Change strategy", guided_messages[0].content)
+        self.assertFalse(
+            any(
+                message.synthetic_reason is SyntheticReason.RUNTIME_SUPERVISION
+                for message in provider.calls[4].messages
+            )
+        )
+        self.assertFalse(
+            any(
+                isinstance(item, Message)
+                and item.synthetic_reason is SyntheticReason.RUNTIME_SUPERVISION
+                for item in result.items
+            )
+        )
+        self.assertIsNone(runtime._context_builder.runtime_supervision_reason)
+
+    async def test_observe_only_records_replan_without_injecting_guidance(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            tool = SequencedEvidenceFixtureTool(
+                "inspect",
+                ("same evidence", "same evidence", "same evidence"),
+            )
+            provider = ScriptedProvider(
+                (
+                    *(
+                        (
+                            ModelToolCall(
+                                ToolCall(f"inspect-{index}", "inspect", {"path": "same.py"})
+                            ),
+                            ModelCompleted("tool_calls"),
+                        )
+                        for index in range(3)
+                    ),
+                    (ModelTextDelta("finished"), ModelCompleted("stop")),
+                )
+            )
+            runtime = AgentRuntime(
+                provider=provider,
+                tools=MinimalToolCollection((tool,)),
+                workspace_change_observer=EmptyWorkspaceChangeObserver(),
+                permissions=PermissionManager(),
+                tool_context=ToolContext(Path(directory)),
+                max_steps=4,
+                execution_control_mode=ExecutionControlMode.OBSERVE_ONLY,
+            )
+
+            result = await runtime.run("inspect")
+
+        self.assertEqual(result.response, "finished")
+        self.assertFalse(
+            any(
+                message.synthetic_reason is SyntheticReason.RUNTIME_SUPERVISION
+                for context in provider.calls
+                for message in context.messages
+            )
+        )
 
     async def test_controlled_mode_uses_all_configured_model_steps_before_finalizing(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -3477,15 +4219,8 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNotNone(first.outcome)
             self.assertIsNone(second.outcome)
 
-    async def test_unimplemented_decisions_remain_observation_only(self) -> None:
+    async def test_block_and_fail_decisions_remain_observation_only(self) -> None:
         decisions = (
-            SupervisorDecision(
-                SupervisorDecisionKind.REPLAN,
-                "a different approach is required",
-                AgentExecutionStatus.RUNNING,
-                False,
-                SupervisorReasonCode.NO_PROGRESS,
-            ),
             SupervisorDecision(
                 SupervisorDecisionKind.BLOCK,
                 "user intervention is required",

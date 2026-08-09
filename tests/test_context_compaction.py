@@ -24,6 +24,7 @@ from neuro_code.application.memory.compaction import (
     ProviderContextSummaryGenerator,
     ProviderContextWindow,
     build_durable_compaction_item,
+    rebuild_context_from_latest_compatible_compaction,
 )
 from neuro_code.application.ports.model import ModelToolPolicy
 from neuro_code.domain.conversation.compaction import compute_compaction_source_fingerprint
@@ -31,6 +32,7 @@ from neuro_code.domain.conversation.context import ModelContext
 from neuro_code.domain.conversation.events import (
     ModelCompleted,
     ModelEvent,
+    ModelProviderSelected,
     ModelTextDelta,
     ModelToolCall,
 )
@@ -897,6 +899,81 @@ def test_compaction_resume_rebuilder_replaces_only_validated_middle_range() -> N
     assert result.context.items[2] == context.items[3]
 
 
+def test_compaction_resume_keeps_items_appended_after_the_recorded_source() -> None:
+    source = _durable_context()
+    record = build_durable_compaction_item(
+        source,
+        _durable_request(),
+        compaction_id="compact-before-tail",
+        summary="safe summary",
+        created_at=datetime(2026, 8, 8, tzinfo=UTC),
+        token_estimator=len,
+    )
+    appended = Message(Role.ASSISTANT, "later canonical response")
+    current = ModelContext(
+        (*source.items, appended),
+        source_provider=source.source_provider,
+        source_model=source.source_model,
+        source_context_affinity=source.source_context_affinity,
+    )
+
+    result = CompactionResumeRebuilder().rebuild(current, (record,))
+
+    assert result.applied_compaction_ids == ("compact-before-tail",)
+    assert result.context.items[-1] is appended
+    assert current.items == (*source.items, appended)
+
+
+def test_latest_compatible_compaction_skips_a_newer_stale_record() -> None:
+    context = _durable_context()
+    compatible = build_durable_compaction_item(
+        context,
+        _durable_request(),
+        compaction_id="compact-compatible",
+        summary="compatible summary",
+        created_at=datetime(2026, 8, 8, tzinfo=UTC),
+        token_estimator=len,
+    )
+    stale = replace(
+        compatible,
+        compaction_id="compact-newer-stale",
+        source_fingerprint="f" * 64,
+        created_at=datetime(2026, 8, 9, tzinfo=UTC),
+    )
+
+    result = rebuild_context_from_latest_compatible_compaction(context, (compatible, stale))
+
+    assert result.applied_compaction_ids == ("compact-compatible",)
+    assert "compatible summary" in result.context.messages[1].content
+
+
+def test_compaction_planner_never_splits_an_assistant_tool_call_from_its_result() -> None:
+    items = (
+        Message(Role.SYSTEM, "rules"),
+        Message(Role.USER, "inspect the repository"),
+        Message(
+            Role.ASSISTANT,
+            tool_calls=(ToolCall("call-1", "read_file", {"path": "README.md"}),),
+        ),
+        Message(Role.TOOL, "file contents", name="read_file", tool_call_id="call-1"),
+        Message(Role.USER, "recent follow-up"),
+    )
+    usage = CompactionContextUsage.from_provider_window(
+        90,
+        ProviderContextWindow("deepseek", "deepseek-v4-flash", 100),
+        estimated=True,
+    )
+
+    plan = ContextCompactionPlanner(
+        ContextCompactionPolicy(minimum_recent_items=2, max_summary_tokens=20)
+    ).plan(items, usage, protected_item_count=1)
+
+    assert plan.decision is ContextCompactionDecision.RECOMMENDED
+    assert plan.candidate_range == (1, 2)
+    start, end = plan.candidate_range
+    assert items[start:end] == (items[1],)
+
+
 def test_compaction_resume_rebuilder_rejects_stale_overlap_and_provider_records() -> None:
     context = _durable_context()
     first = build_durable_compaction_item(
@@ -1044,6 +1121,29 @@ def test_provider_summary_generator_rejects_provider_affinity_mismatch() -> None
     with pytest.raises(ValueError, match="provider"):
         asyncio.run(ProviderContextSummaryGenerator(provider).generate(mismatched_input))
     assert provider.requests == []
+
+
+def test_provider_summary_generator_rejects_failover_origin_change() -> None:
+    source = _summary_context()
+    request = _summary_request(source_item_count=len(source.items))
+    summary_input = ContextSummaryInputBuilder().build(source, request)
+    provider = ScriptedSummaryProvider(
+        (
+            (
+                ModelProviderSelected(
+                    "fallback",
+                    "fallback-model",
+                    "fallback-profile",
+                    failover=True,
+                    context_window_tokens=2_000,
+                ),
+                ModelCompleted("stop", response_text="wrong-origin summary"),
+            ),
+        )
+    )
+
+    with pytest.raises(ProviderError, match="changed origin"):
+        asyncio.run(ProviderContextSummaryGenerator(provider).generate(summary_input))
 
 
 def test_provider_summary_generator_propagates_provider_error_and_requires_completion() -> None:

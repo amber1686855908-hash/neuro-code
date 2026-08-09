@@ -193,6 +193,77 @@ def build_explicit_context_compaction_runtime_request(
     return ContextCompactionRuntimeRequest(guarded, boundary)
 
 
+def build_automatic_context_compaction_runtime_request(
+    trigger_service: ContextCompactionTriggerService,
+    *,
+    source_context: ModelContext,
+    usage_context: ModelContext,
+    boundary: ContextCompactionRuntimeBoundary,
+    provider_window: ProviderContextWindow | None,
+    protected_item_count: int = 0,
+    session_id: str | None = None,
+    compaction_id: str | None = None,
+    created_at: datetime | None = None,
+    token_estimator: Callable[[Sequence[SessionItem]], int] = estimate_context_tokens,
+) -> ContextCompactionRuntimeRequest:
+    """Build an automatic request from canonical source and request projection.
+
+    ``source_context`` owns the durable range and stale guard. ``usage_context``
+    is the exact projected request (including current guidance) whose size
+    determines whether compaction is needed. The function has no side effects.
+
+    根据规范源上下文和请求投影构建自动压缩请求. ``source_context`` 拥有持久化范围及过期保护,
+    ``usage_context`` 是用于判断是否需要压缩的实际请求投影. 本函数不产生副作用.
+    """
+
+    if not isinstance(trigger_service, ContextCompactionTriggerService):
+        raise TypeError("trigger_service must be a ContextCompactionTriggerService")
+    if not isinstance(source_context, ModelContext):
+        raise TypeError("source_context must be a ModelContext")
+    if not isinstance(usage_context, ModelContext):
+        raise TypeError("usage_context must be a ModelContext")
+    if not isinstance(boundary, ContextCompactionRuntimeBoundary):
+        raise TypeError("boundary must be a ContextCompactionRuntimeBoundary")
+    usage = build_context_usage_snapshot(
+        usage_context,
+        provider_window,
+        token_estimator=token_estimator,
+    )
+    base = ContextCompactionTriggerRequest(
+        context=source_context,
+        usage=usage,
+        mode=ContextCompactionTriggerMode.AUTOMATIC,
+        protected_item_count=protected_item_count,
+        session_id=session_id,
+        compaction_id=compaction_id,
+        created_at=created_at,
+    )
+    assessment = trigger_service.assess(base)
+    if not assessment.will_trigger:
+        return ContextCompactionRuntimeRequest(base, boundary)
+    if session_id is None or compaction_id is None or created_at is None:
+        raise ValueError(
+            "actionable automatic compaction requires session, compaction, and timestamp"
+        )
+    candidate_range = assessment.plan.candidate_range
+    if candidate_range is None:
+        raise ValueError("actionable automatic compaction requires a candidate range")
+    guarded = ContextCompactionTriggerRequest(
+        context=source_context,
+        usage=usage,
+        mode=ContextCompactionTriggerMode.AUTOMATIC,
+        protected_item_count=protected_item_count,
+        session_id=session_id,
+        compaction_id=compaction_id,
+        expected_source_fingerprint=compute_compaction_source_fingerprint(
+            source_context.items,
+            candidate_range,
+        ),
+        created_at=created_at,
+    )
+    return ContextCompactionRuntimeRequest(guarded, boundary)
+
+
 class ContextCompactionTimeoutError(NeuroCodeError):
     """A bounded compaction operation exceeded its wall-clock limit.
 
@@ -800,7 +871,7 @@ def project_context_compaction_failure(
 
 
 class ContextCompactionRuntimeGate:
-    """Gate explicit compaction without integrating it into the main loop.
+    """Gate explicit or automatic compaction at a proven safe boundary.
 
     保护显式压缩, 但不把它接入主循环.
     """
@@ -874,6 +945,37 @@ class ContextCompactionRuntimeGate:
             token_estimator=token_estimator,
         )
 
+    def build_automatic_request(
+        self,
+        *,
+        source_context: ModelContext,
+        usage_context: ModelContext,
+        boundary: ContextCompactionRuntimeBoundary,
+        provider_window: ProviderContextWindow | None,
+        protected_item_count: int = 0,
+        session_id: str | None = None,
+        compaction_id: str | None = None,
+        created_at: datetime | None = None,
+        token_estimator: Callable[[Sequence[SessionItem]], int] = estimate_context_tokens,
+    ) -> ContextCompactionRuntimeRequest:
+        """Build a side-effect-free automatic request owned by this gate.
+
+        构建由当前门控拥有且不产生副作用的自动压缩请求。
+        """
+
+        return build_automatic_context_compaction_runtime_request(
+            self._trigger_service,
+            source_context=source_context,
+            usage_context=usage_context,
+            boundary=boundary,
+            provider_window=provider_window,
+            protected_item_count=protected_item_count,
+            session_id=session_id,
+            compaction_id=compaction_id,
+            created_at=created_at,
+            token_estimator=token_estimator,
+        )
+
     async def trigger(
         self,
         request: ContextCompactionRuntimeRequest,
@@ -918,6 +1020,7 @@ __all__ = [
     "ContextCompactionSafePoint",
     "ContextCompactionTimeoutError",
     "ContextCompactionTurnProjection",
+    "build_automatic_context_compaction_runtime_request",
     "build_context_usage_snapshot",
     "build_explicit_context_compaction_runtime_request",
     "classify_context_compaction_failure",

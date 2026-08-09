@@ -31,8 +31,11 @@ if TYPE_CHECKING:
 
 READ_ONLY_SUBAGENT_TOOL_NAMES = (
     "read_file",
+    "read_files",
     "list_dir",
+    "list_tree",
     "grep",
+    "grep_many",
     "skill",
 )
 

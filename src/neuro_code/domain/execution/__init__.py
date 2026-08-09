@@ -6,7 +6,11 @@ entry point while assigning each value-object family to a focused module.
 定义规范的执行领域包. 公共兼容入口仍为 `neuro_code.domain.execution`,各值对象分布在专用模块中.
 """
 
-from neuro_code.domain.execution.checkpoints import ExecutionSnapshot, SessionExecutionRecord
+from neuro_code.domain.execution.checkpoints import (
+    ExecutionSegmentCheckpoint,
+    ExecutionSnapshot,
+    SessionExecutionRecord,
+)
 from neuro_code.domain.execution.outcomes import (
     AgentExecutionOutcome,
     AgentExecutionStatus,
@@ -17,6 +21,8 @@ from neuro_code.domain.execution.outcomes import (
 )
 from neuro_code.domain.execution.tasks import (
     ExecutionBudget,
+    ExecutionBudgetPressure,
+    ExecutionBudgetUsage,
     ExecutionCounters,
     SupervisionThresholds,
     ToolCallBudget,
@@ -30,7 +36,10 @@ __all__ = [
     "AgentExecutionOutcome",
     "AgentExecutionStatus",
     "ExecutionBudget",
+    "ExecutionBudgetPressure",
+    "ExecutionBudgetUsage",
     "ExecutionCounters",
+    "ExecutionSegmentCheckpoint",
     "ExecutionSnapshot",
     "ProgressKind",
     "SessionExecutionRecord",
