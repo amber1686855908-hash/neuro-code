@@ -16,6 +16,7 @@ from neuro_code.domain.execution._validation import (
 from neuro_code.domain.execution.outcomes import (
     AgentExecutionOutcome,
     AgentExecutionStatus,
+    ProgressKind,
     SupervisorReasonCode,
 )
 from neuro_code.domain.execution.tasks import ExecutionCounters, ToolInteractionFingerprint
@@ -99,4 +100,65 @@ class ExecutionSnapshot:
             raise ValueError("termination_reason must be canonical")
 
 
-__all__ = ["ExecutionSnapshot", "SessionExecutionRecord"]
+@dataclass(frozen=True, slots=True)
+class ExecutionSegmentCheckpoint:
+    """A bounded in-turn continuation checkpoint without conversation payloads.
+
+    This checkpoint records why a long-running turn may continue into another
+    bounded segment. It is auditable but is not a workspace rollback point or a
+    promise of process-crash recovery.
+
+    表示不含会话载荷的有界回合内续段检查点. 它可供审计,但不是工作区回滚点,
+    也不承诺进程崩溃后的恢复.
+    """
+
+    segment_number: int
+    model_calls: int
+    tool_rounds: int
+    tool_calls: int
+    progress_kinds: tuple[ProgressKind, ...]
+    plan_steps_total: int
+    plan_steps_completed: int
+    created_at: datetime
+
+    def __post_init__(self) -> None:
+        require_positive_int(self.segment_number, field_name="segment_number")
+        require_non_negative_int(self.model_calls, field_name="model_calls")
+        require_non_negative_int(self.tool_rounds, field_name="tool_rounds")
+        require_non_negative_int(self.tool_calls, field_name="tool_calls")
+        kinds = tuple(self.progress_kinds)
+        if not all(isinstance(kind, ProgressKind) for kind in kinds):
+            raise TypeError("progress_kinds must contain ProgressKind values")
+        if ProgressKind.NONE in kinds:
+            raise ValueError("progress_kinds must not contain NONE")
+        if len(set(kinds)) != len(kinds):
+            raise ValueError("progress_kinds must be unique")
+        object.__setattr__(
+            self, "progress_kinds", tuple(sorted(kinds, key=lambda kind: kind.value))
+        )
+        require_non_negative_int(self.plan_steps_total, field_name="plan_steps_total")
+        require_non_negative_int(self.plan_steps_completed, field_name="plan_steps_completed")
+        if self.plan_steps_completed > self.plan_steps_total:
+            raise ValueError("plan_steps_completed must not exceed plan_steps_total")
+        if not isinstance(self.created_at, datetime) or self.created_at.tzinfo is None:
+            raise ValueError("created_at must be timezone-aware")
+
+    def to_event_data(self) -> dict[str, object]:
+        """Return a stable event projection with no raw evidence.
+
+        返回不含原始证据的稳定事件投影。
+        """
+
+        return {
+            "segment": self.segment_number,
+            "next_segment": self.segment_number + 1,
+            "model_calls": self.model_calls,
+            "tool_rounds": self.tool_rounds,
+            "tool_calls": self.tool_calls,
+            "progress_kinds": [kind.value for kind in self.progress_kinds],
+            "plan_steps_total": self.plan_steps_total,
+            "plan_steps_completed": self.plan_steps_completed,
+        }
+
+
+__all__ = ["ExecutionSegmentCheckpoint", "ExecutionSnapshot", "SessionExecutionRecord"]

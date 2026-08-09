@@ -14,8 +14,8 @@ from pygments.token import Keyword, Name, Number, String
 from textual import events
 from textual.containers import VerticalScroll
 from textual.geometry import Size
-from textual.widgets import Button, Input, Label, Static
-from textual.widgets._input import Selection
+from textual.widgets import Button, Input, Label, Static, TextArea
+from textual.widgets.text_area import Selection
 
 from neuro_code.application.permissions.broker import SessionApprovalBroker
 from neuro_code.application.permissions.contracts import (
@@ -101,16 +101,19 @@ from neuro_code.domain.session_tasks import SessionTask, SessionTaskKind, Sessio
 from neuro_code.domain.sessions import SessionSummary
 from neuro_code.infrastructure.providers.provider_settings import JsonProviderSettingsStore
 from neuro_code.interfaces.tui import recoverable_terminal_status
+from neuro_code.shared.errors import ProviderError
 from neuro_code.shared.ui_language import UiLanguage
 from neuro_code.tui import (
     TUI_RELOAD_PROVIDER_SETTINGS,
     AssistantMarkdown,
+    AssistantMessage,
     BackgroundWakeSettingsScreen,
     ConversationMessage,
     LanguageSettingsScreen,
     NetworkProxySettingsScreen,
     NeuroCodeApp,
     PermissionApprovalScreen,
+    PromptInput,
     ProviderSelectionScreen,
     ProviderSettingsScreen,
     ProviderSetupApp,
@@ -118,6 +121,7 @@ from neuro_code.tui import (
     SessionSelectionScreen,
     SettingsScreen,
     ToolFeedbackMessage,
+    TranscriptCopyScreen,
 )
 from neuro_code.tui_theme import (
     ACCENT_CODE,
@@ -133,6 +137,7 @@ from neuro_code.tui_theme import (
     SURFACE_SELECTED,
     TEXT_BODY,
     TEXT_EMPHASIS,
+    TEXT_PLACEHOLDER,
     TEXT_PRIMARY,
     TEXT_SECONDARY,
 )
@@ -240,6 +245,35 @@ class TuiConversation:
 
     async def run_background_wake(self, *, sink: EventSink | None = None) -> AgentRunResult:
         return await self.run("background wake", sink=sink)
+
+
+class ProviderFailureThenSuccessTuiConversation(TuiConversation):
+    """Fail one provider request without invalidating the fixture session.
+
+    让一次 Provider 请求失败,但不使 fixture 会话失效.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._fail_first_request = True
+
+    async def run(
+        self,
+        prompt: str,
+        *,
+        sink: EventSink | None = None,
+        cancellation_policy: TurnCancellationPolicy = TurnCancellationPolicy.RETAIN,
+    ) -> AgentRunResult:
+        if self._fail_first_request:
+            self._fail_first_request = False
+            self.prompts.append(prompt)
+            self._session_id = "provider-failure-session"
+            raise ProviderError("Responses API request failed with HTTP 402: insufficient balance")
+        return await super().run(
+            prompt,
+            sink=sink,
+            cancellation_policy=cancellation_policy,
+        )
 
 
 class TypedTuiConversation(TuiConversation):
@@ -1267,7 +1301,7 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
         async with app.run_test(size=(80, 24)) as pilot:
             self.assertTrue(approvals.handlers)
             self.assertIsNotNone(approvals.handlers[-1])
-            prompt = app.query_one("#prompt", Input)
+            prompt = app.query_one("#prompt", PromptInput)
             prompt.value = "/quit"
             await pilot.press("enter")
 
@@ -1284,9 +1318,9 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
         )
 
         async with app.run_test(size=(80, 24)) as pilot:
-            prompt = app.query_one("#prompt", Input)
+            prompt = app.query_one("#prompt", PromptInput)
             prompt.value = "copy this prompt"
-            prompt.selection = Selection(0, 9)
+            prompt.selection = Selection((0, 0), (0, 9))
 
             await pilot.press("ctrl+c")
 
@@ -1294,7 +1328,7 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(prompt.value, "copy this prompt")
             self.assertNotIn("Cancellation requested.", [entry.text for entry in app.entries])
 
-            prompt.selection = Selection.cursor(len(prompt.value))
+            prompt.selection = Selection.cursor((0, len(prompt.value)))
             await pilot.press("ctrl+v")
 
             self.assertEqual(prompt.value, "copy this promptcopy this")
@@ -1308,16 +1342,70 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
         )
 
         async with app.run_test(size=(80, 24)) as pilot:
-            prompt = app.query_one("#prompt", Input)
+            prompt = app.query_one("#prompt", PromptInput)
             prompt.value = "selected text"
-            prompt.selection = Selection(0, 8)
+            prompt.selection = Selection((0, 0), (0, 8))
 
             await pilot.press("ctrl+shift+c")
 
             self.assertEqual(app.clipboard, "selected")
             self.assertEqual(prompt.value, "selected text")
 
+    async def test_transcript_copy_screen_supports_arbitrary_selection(self) -> None:
+        app = NeuroCodeApp(
+            TuiConversation(),
+            provider_name="fixture",
+            model_name="fixture-model",
+            cwd=Path("/workspace"),
+        )
+
+        async with app.run_test(size=(90, 28)) as pilot:
+            app._write_entry("assistant", "First line\nSecond line")
+            await pilot.press("f8")
+            await pilot.pause()
+
+            self.assertIsInstance(app.screen, TranscriptCopyScreen)
+            editor = app.screen.query_one("#transcript-copy-text", TextArea)
+            second_line = editor.text.splitlines().index("Second line")
+            editor.selection = Selection((second_line, 0), (second_line, 6))
+            await pilot.press("ctrl+c")
+
+            self.assertEqual(app.clipboard, "Second")
+            self.assertIn(
+                "6",
+                str(app.screen.query_one("#transcript-copy-status", Label).renderable),
+            )
+            await pilot.press("escape")
+            await pilot.pause()
+            self.assertIs(app.screen, app.screen_stack[0])
+
     async def test_prompt_paste_preserves_all_lines(self) -> None:
+        runner = TuiConversation()
+        app = NeuroCodeApp(
+            runner,
+            provider_name="fixture",
+            model_name="fixture-model",
+            cwd=Path("/workspace"),
+        )
+
+        async with app.run_test(size=(80, 24)) as pilot:
+            prompt = app.query_one("#prompt", PromptInput)
+            prompt.post_message(events.Paste("first line\nsecond line\r\nthird line"))
+            await pilot.pause()
+
+            self.assertEqual(prompt.value, "first line\nsecond line\nthird line")
+            self.assertEqual(prompt.text.splitlines(), ["first line", "second line", "third line"])
+            self.assertGreater(prompt.region.height, 1)
+            self.assertLessEqual(prompt.region.height, 8)
+
+            await pilot.press("enter")
+            for _ in range(20):
+                await pilot.pause(0.01)
+                if app.entries and any(entry.category == "assistant" for entry in app.entries):
+                    break
+            self.assertEqual(runner.prompts, ["first line\nsecond line\nthird line"])
+
+    async def test_prompt_common_editing_shortcuts_select_all_and_insert_newline(self) -> None:
         app = NeuroCodeApp(
             TuiConversation(),
             provider_name="fixture",
@@ -1326,13 +1414,17 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
         )
 
         async with app.run_test(size=(80, 24)) as pilot:
-            prompt = app.query_one("#prompt", Input)
-            prompt.post_message(events.Paste("first line\nsecond line\r\nthird line"))
-            await pilot.pause()
+            prompt = app.query_one("#prompt", PromptInput)
+            prompt.value = "first line"
+            prompt.cursor_position = len(prompt.value)
+            await pilot.press("shift+enter")
+            await pilot.press("s", "e", "c", "o", "n", "d")
+            self.assertEqual(prompt.value, "first line\nsecond")
 
-            self.assertEqual(prompt.value, "first line\nsecond line\nthird line")
-            self.assertEqual(prompt._value.plain, "first line↵second line↵third line")
-            self.assertNotIn("\n", prompt._value.plain)
+            await pilot.press("ctrl+a")
+            self.assertEqual(prompt.selected_text, "first line\nsecond")
+            await pilot.press("r")
+            self.assertEqual(prompt.value, "r")
 
     async def test_monochrome_theme_uses_the_compact_custom_chrome(self) -> None:
         app = NeuroCodeApp(
@@ -1349,9 +1441,16 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(app.screen.styles.background.hex.lower(), "#0c0c0c")
             self.assertEqual(BORDER_FOCUS, "#BDBDBD")
             self.assertNotIn("#F0F0F0", NeuroCodeApp.CSS)
+            self.assertIn("background: $text-muted", NeuroCodeApp.CSS)
             self.assertFalse(app.ENABLE_COMMAND_PALETTE)
             self.assertIn("NEURO / CODE", str(app.query_one("#brand", Static).renderable))
             self.assertEqual(str(app.query_one("#clock", Static).renderable).count(":"), 1)
+            prompt = app.query_one("#prompt", PromptInput)
+            placeholder_segments = list(app.console.render(prompt.get_line(0)))
+            self.assertIn(
+                TEXT_PLACEHOLDER.lower(),
+                str(placeholder_segments[0].style).lower(),
+            )
             self.assertEqual(len(list(app.query("#header"))), 1)
             self.assertEqual(len(list(app.query("#prompt-row"))), 1)
             self.assertEqual(len(list(app.query("#prompt-mark"))), 1)
@@ -1396,7 +1495,7 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
         )
 
         async with app.run_test(size=(100, 30)) as pilot:
-            prompt = app.query_one("#prompt", Input)
+            prompt = app.query_one("#prompt", PromptInput)
             prompt.value = "inspect the repository"
             await pilot.press("enter")
             for _ in range(20):
@@ -1557,7 +1656,7 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
         )
 
         async with app.run_test(size=(100, 30)) as pilot:
-            prompt = app.query_one("#prompt", Input)
+            prompt = app.query_one("#prompt", PromptInput)
             prompt.value = "stream the answer"
             await pilot.press("enter")
             await asyncio.wait_for(runner.started.wait(), timeout=1)
@@ -1594,7 +1693,7 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
         )
 
         async with app.run_test(size=(100, 30)) as pilot:
-            prompt = app.query_one("#prompt", Input)
+            prompt = app.query_one("#prompt", PromptInput)
             prompt.value = "run through the application seam"
             await pilot.press("enter")
             for _ in range(20):
@@ -1623,7 +1722,7 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
                 )
 
                 async with app.run_test(size=(100, 30)) as pilot:
-                    prompt = app.query_one("#prompt", Input)
+                    prompt = app.query_one("#prompt", PromptInput)
                     prompt.value = "finish safely"
                     await pilot.press("enter")
                     await asyncio.wait_for(runner.started.wait(), timeout=1)
@@ -1663,7 +1762,7 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
         )
 
         async with app.run_test(size=(100, 30)) as pilot:
-            prompt = app.query_one("#prompt", Input)
+            prompt = app.query_one("#prompt", PromptInput)
             prompt.value = "complete normally"
             await pilot.press("enter")
             for _ in range(20):
@@ -1805,7 +1904,7 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
 
         async with app.run_test(size=(100, 30)) as pilot:
             app._write_entry("assistant", "literal model response")
-            prompt = app.query_one("#prompt", Input)
+            prompt = app.query_one("#prompt", PromptInput)
             prompt.value = "/setting"
             await pilot.press("enter")
             for _ in range(20):
@@ -2572,7 +2671,7 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
                 str(app.query_one("#runtime-mode", Static).renderable),
             )
 
-            prompt = app.query_one("#prompt", Input)
+            prompt = app.query_one("#prompt", PromptInput)
             prompt.value = "/mode auto"
             await pilot.press("enter")
             await pilot.pause()
@@ -2612,7 +2711,7 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
                 ).lower(),
             )
 
-            prompt = app.query_one("#prompt", Input)
+            prompt = app.query_one("#prompt", PromptInput)
             prompt.value = "/status"
             await pilot.press("enter")
             await pilot.pause()
@@ -2651,6 +2750,45 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
                 ).lower(),
             )
 
+    async def test_runtime_budget_telemetry_is_not_rendered_in_the_tui(self) -> None:
+        app = NeuroCodeApp(
+            TuiConversation(),
+            provider_name="fixture",
+            model_name="fixture-model",
+            cwd=Path("/workspace"),
+        )
+
+        async with app.run_test(size=(120, 24)) as pilot:
+            await app._handle_event(
+                AgentEvent.create(
+                    1,
+                    AgentEventKind.EXECUTION_BUDGET_UPDATED,
+                    {
+                        "model_calls_used": 17,
+                        "model_calls_limit": 48,
+                        "tool_rounds_used": 11,
+                        "tool_rounds_limit": 48,
+                        "tool_calls_used": 31,
+                        "tool_calls_limit": 192,
+                        "pressure": "normal",
+                    },
+                )
+            )
+            await pilot.pause()
+
+            self.assertEqual(len(app.query("#runtime-budget")), 0)
+            for widget_id in (
+                "#runtime-model",
+                "#runtime-workspace",
+                "#runtime-context",
+                "#runtime-effort",
+                "#runtime-mode",
+            ):
+                rendered = str(app.query_one(widget_id, Static).renderable)
+                self.assertNotIn("17/48", rendered)
+                self.assertNotIn("R 11/48", rendered)
+                self.assertNotIn("C 31/192", rendered)
+
     async def test_slash_commands_show_parameter_hints_and_tab_completes_first_option(
         self,
     ) -> None:
@@ -2665,7 +2803,7 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
         )
 
         async with app.run_test(size=(90, 24)) as pilot:
-            prompt = app.query_one("#prompt", Input)
+            prompt = app.query_one("#prompt", PromptInput)
             hints = app.query_one("#command-hints", Static)
             prompt.value = "/eff"
             await pilot.pause()
@@ -2754,7 +2892,7 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
                 str(app.query_one("#runtime-effort", Static).renderable),
             )
 
-            prompt = app.query_one("#prompt", Input)
+            prompt = app.query_one("#prompt", PromptInput)
             prompt.value = "/effort ultracode"
             await pilot.press("enter")
             await pilot.pause()
@@ -2782,7 +2920,7 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
         )
 
         async with app.run_test(size=(100, 30)) as pilot:
-            prompt = app.query_one("#prompt", Input)
+            prompt = app.query_one("#prompt", PromptInput)
             prompt.value = "/effort impossible"
             await pilot.press("enter")
             await pilot.pause()
@@ -2816,7 +2954,7 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
             context = app.query_one("#runtime-context", Static)
             effort = app.query_one("#runtime-effort", Static)
             mode = app.query_one("#runtime-mode", Static)
-            prompt = app.query_one("#prompt", Input)
+            prompt = app.query_one("#prompt", PromptInput)
             self.assertLessEqual(runtime_bar.region.bottom, prompt.region.y)
             self.assertGreater(effort.region.width, 0)
             self.assertGreater(context.region.width, 0)
@@ -2845,7 +2983,7 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
                 transcript.region.width + transcript.scrollbar_size_vertical,
                 132,
             )
-            prompt = app.query_one("#prompt", Input)
+            prompt = app.query_one("#prompt", PromptInput)
             self.assertGreater(prompt.region.width, 0)
             self.assertLessEqual(prompt.region.right, app.screen.size.width)
             shortcut_bar = app.query_one("#shortcut-bar", Static)
@@ -2876,7 +3014,7 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
         )
 
         async with app.run_test(size=(110, 35)) as pilot:
-            prompt = app.query_one("#prompt", Input)
+            prompt = app.query_one("#prompt", PromptInput)
             prompt.value = "/tasks"
             await pilot.press("enter")
             await pilot.pause()
@@ -2919,7 +3057,7 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
         )
 
         async with app.run_test(size=(110, 35)) as pilot:
-            prompt = app.query_one("#prompt", Input)
+            prompt = app.query_one("#prompt", PromptInput)
             prompt.value = "/tasks"
             await pilot.press("enter")
             await pilot.pause()
@@ -2941,7 +3079,7 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
             cwd=Path("/workspace"),
         )
         async with unavailable.run_test(size=(110, 35)) as pilot:
-            prompt = unavailable.query_one("#prompt", Input)
+            prompt = unavailable.query_one("#prompt", PromptInput)
             prompt.value = "/tasks"
             await pilot.press("enter")
             await pilot.pause()
@@ -2960,7 +3098,7 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
             cwd=Path("/workspace"),
         )
         async with empty.run_test(size=(110, 35)) as pilot:
-            prompt = empty.query_one("#prompt", Input)
+            prompt = empty.query_one("#prompt", PromptInput)
             prompt.value = "/tasks"
             await pilot.press("enter")
             await pilot.pause()
@@ -2974,7 +3112,7 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
             cwd=Path("/workspace"),
         )
         async with failing.run_test(size=(110, 35)) as pilot:
-            prompt = failing.query_one("#prompt", Input)
+            prompt = failing.query_one("#prompt", PromptInput)
             prompt.value = "/tasks"
             await pilot.press("enter")
             await pilot.pause()
@@ -2992,7 +3130,7 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
             cwd=Path("/workspace"),
         )
         async with truncated.run_test(size=(110, 35)) as pilot:
-            prompt = truncated.query_one("#prompt", Input)
+            prompt = truncated.query_one("#prompt", PromptInput)
             prompt.value = "/tasks"
             await pilot.press("enter")
             await pilot.pause()
@@ -3028,7 +3166,7 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
         )
 
         async with app.run_test(size=(110, 35)) as pilot:
-            prompt = app.query_one("#prompt", Input)
+            prompt = app.query_one("#prompt", PromptInput)
             prompt.value = "/view-task task-history"
             await pilot.press("enter")
             await pilot.pause()
@@ -3059,7 +3197,7 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
         )
 
         async with app.run_test(size=(110, 35)) as pilot:
-            prompt = app.query_one("#prompt", Input)
+            prompt = app.query_one("#prompt", PromptInput)
             prompt.value = "/view-task missing-task"
             await pilot.press("enter")
             await pilot.pause()
@@ -3080,7 +3218,7 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
         )
 
         async with app.run_test(size=(110, 35)) as pilot:
-            prompt = app.query_one("#prompt", Input)
+            prompt = app.query_one("#prompt", PromptInput)
             prompt.value = "/view-task"
             await pilot.press("enter")
             await pilot.pause()
@@ -3093,7 +3231,7 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
             cwd=Path("/workspace"),
         )
         async with unavailable.run_test(size=(110, 35)) as pilot:
-            prompt = unavailable.query_one("#prompt", Input)
+            prompt = unavailable.query_one("#prompt", PromptInput)
             prompt.value = "/view-task task-history"
             await pilot.press("enter")
             await pilot.pause()
@@ -3110,7 +3248,7 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
         )
 
         async with app.run_test(size=(110, 35)) as pilot:
-            prompt = app.query_one("#prompt", Input)
+            prompt = app.query_one("#prompt", PromptInput)
             prompt.value = "/view-task task-history"
             await pilot.press("enter")
             await pilot.pause()
@@ -3301,7 +3439,7 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
         )
 
         async with app.run_test(size=(110, 35)) as pilot:
-            prompt = app.query_one("#prompt", Input)
+            prompt = app.query_one("#prompt", PromptInput)
             prompt.value = "/auto-wake on"
             await pilot.press("enter")
             for _ in range(20):
@@ -3434,7 +3572,7 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
         )
 
         async with app.run_test(size=(100, 30)) as pilot:
-            prompt = app.query_one("#prompt", Input)
+            prompt = app.query_one("#prompt", PromptInput)
             prompt.value = "inspect the repository"
             await pilot.press("enter")
             for _ in range(20):
@@ -3446,14 +3584,53 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(runner.prompts, ["inspect the repository"])
             entries = [(entry.category, entry.text) for entry in app.entries]
             self.assertIn(("user", "inspect the repository"), entries)
-            self.assertIn(("status", "Reasoning..."), entries)
-            self.assertIn(("status", "Reasoning finished · 1.2s · model step 1"), entries)
+            self.assertFalse(
+                any(category == "status" and "Reasoning" in text for category, text in entries)
+            )
             tool_entries = [text for category, text in entries if category == "tool"]
             self.assertEqual(len(tool_entries), 1)
-            self.assertEqual(tool_entries[0], "✓ Read README.md · 420ms")
+            self.assertEqual(tool_entries[0], "read_file  ·  ✓ Read README.md · 420ms")
             self.assertIn(("assistant", "fixture response"), entries)
             self.assertEqual(entries[-1], ("status", "Turn completed in 2.8s · 1 model step(s)"))
             self.assertNotIn("private", "\n".join(text for _, text in entries))
+
+    async def test_provider_balance_failure_keeps_the_session_input_recoverable(self) -> None:
+        runner = ProviderFailureThenSuccessTuiConversation()
+        app = NeuroCodeApp(
+            runner,
+            provider_name="fixture",
+            model_name="fixture-model",
+            cwd=Path("/workspace"),
+        )
+
+        async with app.run_test(size=(100, 30)) as pilot:
+            prompt = app.query_one("#prompt", PromptInput)
+            prompt.value = "first request"
+            await pilot.press("enter")
+            for _ in range(20):
+                await pilot.pause(0.01)
+                if any(entry.category == "recoverable" for entry in app.entries):
+                    break
+
+            recoverable = next(entry for entry in app.entries if entry.category == "recoverable")
+            self.assertIn("balance is insufficient", recoverable.text)
+            self.assertIn("session is still open", recoverable.text)
+            self.assertNotIn("ProviderError", recoverable.text)
+            self.assertFalse(prompt.disabled)
+            self.assertTrue(prompt.has_focus)
+
+            prompt.value = "second request"
+            await pilot.press("enter")
+            for _ in range(20):
+                await pilot.pause(0.01)
+                if any(entry.category == "assistant" for entry in app.entries):
+                    break
+
+            self.assertEqual(runner.prompts, ["first request", "second request"])
+            self.assertIn(
+                ("assistant", "fixture response"),
+                [(entry.category, entry.text) for entry in app.entries],
+            )
 
     async def test_expanding_truncated_tool_output_reads_bounded_session_artifact(self) -> None:
         artifact_id = "a" * 32
@@ -3697,7 +3874,7 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
         )
 
         async with app.run_test(size=(100, 30)) as pilot:
-            prompt = app.query_one("#prompt", Input)
+            prompt = app.query_one("#prompt", PromptInput)
             prompt.value = "/help"
             await pilot.press("enter")
             await pilot.pause()
@@ -3746,7 +3923,7 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
         )
 
         async with app.run_test(size=(100, 30)) as pilot:
-            prompt = app.query_one("#prompt", Input)
+            prompt = app.query_one("#prompt", PromptInput)
             prompt.value = "/subagent inspect the repository"
             await pilot.press("enter")
             await pilot.pause()
@@ -3770,7 +3947,7 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
             cwd=Path("/workspace"),
         )
         async with no_session.run_test(size=(80, 24)) as pilot:
-            prompt = no_session.query_one("#prompt", Input)
+            prompt = no_session.query_one("#prompt", PromptInput)
             prompt.value = "/subagent inspect"
             await pilot.press("enter")
             await pilot.pause()
@@ -3785,7 +3962,7 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
             cwd=Path("/workspace"),
         )
         async with unavailable.run_test(size=(80, 24)) as pilot:
-            prompt = unavailable.query_one("#prompt", Input)
+            prompt = unavailable.query_one("#prompt", PromptInput)
             prompt.value = "/subagent inspect"
             await pilot.press("enter")
             await pilot.pause()
@@ -3823,7 +4000,7 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
         )
 
         async with app.run_test(size=(110, 30)) as pilot:
-            prompt = app.query_one("#prompt", Input)
+            prompt = app.query_one("#prompt", PromptInput)
             prompt.value = "/subagents"
             await pilot.press("enter")
             await pilot.pause()
@@ -3859,7 +4036,7 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
         )
 
         async with app.run_test(size=(100, 30)) as pilot:
-            prompt = app.query_one("#prompt", Input)
+            prompt = app.query_one("#prompt", PromptInput)
             prompt.value = "/subagents resume subagent-task"
             await pilot.press("enter")
             await pilot.pause()
@@ -3892,7 +4069,7 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
         )
 
         async with app.run_test(size=(100, 30)) as pilot:
-            prompt = app.query_one("#prompt", Input)
+            prompt = app.query_one("#prompt", PromptInput)
             prompt.value = "/subagents fork subagent-task"
             await pilot.press("enter")
             await pilot.pause()
@@ -3922,7 +4099,7 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
             cwd=Path("/workspace"),
         )
         async with empty.run_test(size=(90, 24)) as pilot:
-            prompt = empty.query_one("#prompt", Input)
+            prompt = empty.query_one("#prompt", PromptInput)
             prompt.value = "/subagents"
             await pilot.press("enter")
             await pilot.pause()
@@ -3939,7 +4116,7 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
             cwd=Path("/workspace"),
         )
         async with no_session.run_test(size=(90, 24)) as pilot:
-            prompt = no_session.query_one("#prompt", Input)
+            prompt = no_session.query_one("#prompt", PromptInput)
             prompt.value = "/subagents"
             await pilot.press("enter")
             await pilot.pause()
@@ -3956,7 +4133,7 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
             cwd=Path("/workspace"),
         )
         async with failing.run_test(size=(90, 24)) as pilot:
-            prompt = failing.query_one("#prompt", Input)
+            prompt = failing.query_one("#prompt", PromptInput)
             prompt.value = "/subagents"
             await pilot.press("enter")
             await pilot.pause()
@@ -3971,6 +4148,10 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
         )
 
         async with app.run_test(size=(100, 30)) as pilot:
+            app._begin_pending_assistant()
+            await app._handle_event(
+                AgentEvent.create(0, AgentEventKind.TEXT_DELTA, {"text": "Partial answer."})
+            )
             await app._handle_event(
                 AgentEvent.create(
                     1,
@@ -3978,6 +4159,15 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
                     {"id": "wait", "name": "wait_tasks", "arguments": {"timeout": 30}},
                 )
             )
+            assistant_index = next(
+                index for index, entry in enumerate(app.entries) if entry.category == "assistant"
+            )
+            tool_index = next(
+                index for index, entry in enumerate(app.entries) if entry.category == "tool"
+            )
+            self.assertLess(assistant_index, tool_index)
+            self.assertEqual(app.entries[assistant_index].text, "Partial answer.")
+            self.assertIsNone(app._pending_assistant)
             await app._handle_event(
                 AgentEvent.create(
                     2,
@@ -3987,6 +4177,7 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
             )
             state = app._tool_feedback_by_call[(False, "wait")]
             state.started_at = 100.0
+            app._turn_activity_tool_started_at = state.started_at
             with patch.object(app, "_refresh_tool_feedback") as refresh:
                 app._advance_model_loading_animation()
                 refresh.assert_not_called()
@@ -3997,6 +4188,10 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
             running_text = next(entry.text for entry in app.entries if entry.category == "tool")
             self.assertIn("Waiting", running_text)
             self.assertIn("12.7s", running_text)
+            activity = app.query_one("#turn-activity", Static)
+            self.assertTrue(activity.display)
+            self.assertIn("wait_tasks", str(activity.renderable))
+            self.assertIn("12.7s", str(activity.renderable))
 
             await app._handle_event(
                 AgentEvent.create(
@@ -4007,7 +4202,174 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
             )
             completed_text = next(entry.text for entry in app.entries if entry.category == "tool")
             self.assertIn("Completed · 13.4s", completed_text)
+            self.assertNotIn("wait_tasks", str(activity.renderable))
             await pilot.pause()
+
+    async def test_streamed_model_steps_are_not_recombined_at_turn_completion(self) -> None:
+        app = NeuroCodeApp(
+            TuiConversation(),
+            provider_name="fixture",
+            model_name="fixture-model",
+            cwd=Path("/workspace"),
+        )
+
+        async with app.run_test(size=(100, 30)):
+            app._begin_pending_assistant()
+            await app._handle_event(
+                AgentEvent.create(1, AgentEventKind.TEXT_DELTA, {"text": "First conclusion."})
+            )
+            await app._handle_event(
+                AgentEvent.create(
+                    2,
+                    AgentEventKind.TOOL_REQUESTED,
+                    {"id": "inspect", "name": "read_file", "arguments": {"path": "a.py"}},
+                )
+            )
+            await app._handle_event(
+                AgentEvent.create(3, AgentEventKind.TEXT_DELTA, {"text": "Final conclusion."})
+            )
+
+            result = AgentRunResult(
+                "session",
+                "First conclusion.Final conclusion.",
+                (
+                    Message(Role.ASSISTANT, "First conclusion."),
+                    Message(Role.ASSISTANT, "Final conclusion."),
+                ),
+                (),
+                (),
+                2,
+            )
+            app._finish_streamed_assistant_response(result, fallback=result.response)
+
+            assistant_entries = [
+                entry.text for entry in app.entries if entry.category == "assistant"
+            ]
+            self.assertEqual(assistant_entries, ["First conclusion.", "Final conclusion."])
+            self.assertNotIn(result.response, assistant_entries)
+            self.assertFalse(app._model_loading)
+
+    async def test_double_clicking_an_assistant_reply_opens_a_selectable_copy_view(self) -> None:
+        app = NeuroCodeApp(
+            TuiConversation(),
+            provider_name="fixture",
+            model_name="fixture-model",
+            cwd=Path("/workspace"),
+        )
+
+        async with app.run_test(size=(100, 30)) as pilot:
+            app._write_entry("assistant", "Copy this response.")
+            message = app._entry_widgets[-1]
+            self.assertIsInstance(message, AssistantMessage)
+            await message._on_click(
+                events.Click(message, 0, 0, 0, 0, 1, False, False, False, chain=2)
+            )
+            await pilot.pause()
+
+            self.assertIsInstance(app.screen, TranscriptCopyScreen)
+            editor = app.screen.query_one("#transcript-copy-text", TextArea)
+            self.assertEqual(editor.text, "Copy this response.")
+
+    async def test_prompt_selection_copies_before_a_running_turn_is_cancelled(self) -> None:
+        runner = CancellableTuiConversation()
+        app = NeuroCodeApp(
+            runner,
+            provider_name="fixture",
+            model_name="fixture-model",
+            cwd=Path("/workspace"),
+        )
+
+        async with app.run_test(size=(100, 30)) as pilot:
+            prompt = app.query_one("#prompt", PromptInput)
+            prompt.value = "long turn"
+            await pilot.press("enter")
+            await asyncio.wait_for(runner.started.wait(), timeout=1)
+            prompt.value = "selected draft"
+            prompt.select_all()
+
+            with patch.object(app, "copy_to_clipboard") as copy:
+                app.action_cancel_turn()
+                copy.assert_called_once_with("selected draft")
+            self.assertFalse(runner.cancelled)
+
+            prompt.selection = Selection.cursor(prompt.cursor_location)
+            app.action_cancel_turn()
+            for _ in range(20):
+                await pilot.pause(0.01)
+                if runner.cancelled:
+                    break
+            self.assertTrue(runner.cancelled)
+
+    async def test_turn_activity_uses_the_wave_without_exposing_model_steps(self) -> None:
+        app = NeuroCodeApp(
+            TuiConversation(),
+            provider_name="fixture",
+            model_name="fixture-model",
+            cwd=Path("/workspace"),
+        )
+
+        async with app.run_test(size=(100, 30)):
+            app._begin_pending_assistant()
+            await app._handle_event(
+                AgentEvent.create(1, AgentEventKind.TEXT_DELTA, {"text": "Partial answer."})
+            )
+            await app._handle_event(
+                AgentEvent.create(2, AgentEventKind.MODEL_STEP_STARTED, {"step": 20})
+            )
+            with patch("neuro_code.tui.monotonic", return_value=125.0):
+                app._advance_model_loading_animation()
+                app._advance_model_loading_animation()
+
+            activity = app.query_one("#turn-activity", Static)
+            rendered = str(activity.renderable)
+            self.assertTrue(activity.display)
+            self.assertIn("Waiting for the model", rendered)
+            self.assertTrue(any(symbol in rendered for symbol in "▁▂▃▄▅▆▇█"))
+            self.assertNotIn("step", rendered)
+            self.assertNotIn("20", rendered)
+
+    async def test_compact_tool_summary_names_the_tool_and_bounded_action(self) -> None:
+        app = NeuroCodeApp(
+            TuiConversation(),
+            provider_name="fixture",
+            model_name="fixture-model",
+            cwd=Path("/workspace"),
+        )
+
+        async with app.run_test(size=(100, 30)):
+            await app._handle_event(
+                AgentEvent.create(
+                    1,
+                    AgentEventKind.TOOL_REQUESTED,
+                    {
+                        "id": "read-many",
+                        "name": "read_files",
+                        "arguments": {
+                            "files": [
+                                {"path": "src/a.py"},
+                                {"path": "src/b.py"},
+                            ]
+                        },
+                    },
+                )
+            )
+            await app._handle_event(
+                AgentEvent.create(
+                    2,
+                    AgentEventKind.TOOL_COMPLETED,
+                    {
+                        "id": "read-many",
+                        "name": "read_files",
+                        "content": "bounded output",
+                        "duration_seconds": 0.12,
+                    },
+                )
+            )
+
+            summary = next(entry.text for entry in app.entries if entry.category == "tool")
+            self.assertIn("read_files", summary)
+            self.assertIn("Read 2 files", summary)
+            self.assertIn("120ms", summary)
 
     async def test_plan_updated_is_a_single_first_class_entry_refreshed_in_place(self) -> None:
         app = NeuroCodeApp(
@@ -4045,12 +4407,29 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("□ Verify the feedback", plan_entries[0].text)
 
             await app._handle_event(
-                AgentEvent.create(2, AgentEventKind.PLAN_UPDATED, updated_plan.to_dict())
+                AgentEvent.create(
+                    2,
+                    AgentEventKind.TOOL_REQUESTED,
+                    {"id": "plan", "name": "update_plan", "arguments": {}},
+                )
+            )
+            await app._handle_event(
+                AgentEvent.create(
+                    3,
+                    AgentEventKind.TOOL_COMPLETED,
+                    {"id": "plan", "name": "update_plan", "duration_seconds": 0.1},
+                )
+            )
+            await app._handle_event(
+                AgentEvent.create(4, AgentEventKind.PLAN_UPDATED, updated_plan.to_dict())
             )
             await pilot.pause()
             self.assertEqual(len([entry for entry in app.entries if entry.category == "plan"]), 1)
             assert app._plan_entry_index is not None
             self.assertIs(app._entry_widgets[app._plan_entry_index], widget)
+            self.assertEqual(app._plan_entry_index, len(app.entries) - 1)
+            transcript = app.query_one("#transcript", VerticalScroll)
+            self.assertIs(tuple(transcript.children)[-1], widget)
             updated_text = app.entries[app._plan_entry_index].text
             self.assertIn("✓ Check the runtime", updated_text)
             self.assertIn("\u203a Verify the feedback", updated_text)
@@ -4076,7 +4455,7 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
         )
 
         async with app.run_test(size=(100, 30)) as pilot:
-            prompt = app.query_one("#prompt", Input)
+            prompt = app.query_one("#prompt", PromptInput)
             prompt.value = "/view-plan"
             await pilot.press("enter")
             await pilot.pause()
@@ -4112,7 +4491,7 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
         )
 
         async with app.run_test(size=(100, 30)) as pilot:
-            prompt = app.query_one("#prompt", Input)
+            prompt = app.query_one("#prompt", PromptInput)
             prompt.value = "/comment-plan 2 Keep the verification check explicit"
             await pilot.press("enter")
             await pilot.pause()
@@ -4140,7 +4519,7 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
         )
 
         async with app.run_test(size=(100, 30)) as pilot:
-            prompt = app.query_one("#prompt", Input)
+            prompt = app.query_one("#prompt", PromptInput)
             prompt.value = "/execute-plan"
             await pilot.press("enter")
             for _ in range(20):
@@ -4174,7 +4553,7 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
         )
 
         async with app.run_test(size=(100, 30)) as pilot:
-            prompt = app.query_one("#prompt", Input)
+            prompt = app.query_one("#prompt", PromptInput)
             prompt.value = "/execute-plan"
             await pilot.press("enter")
             for _ in range(20):
@@ -4198,7 +4577,7 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
         )
 
         async with app.run_test(size=(100, 30)) as pilot:
-            prompt = app.query_one("#prompt", Input)
+            prompt = app.query_one("#prompt", PromptInput)
             prompt.value = "/execute-plan"
             await pilot.press("enter")
             await pilot.pause()
@@ -4239,7 +4618,7 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
         )
 
         async with app.run_test(size=(100, 30)) as pilot:
-            prompt = app.query_one("#prompt", Input)
+            prompt = app.query_one("#prompt", PromptInput)
             prompt.value = "/schedule-plan"
             await pilot.press("enter")
             await pilot.pause()
@@ -4288,7 +4667,7 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
         )
 
         async with app.run_test(size=(100, 30)) as pilot:
-            prompt = app.query_one("#prompt", Input)
+            prompt = app.query_one("#prompt", PromptInput)
             for task_id, expected in (
                 ("missing", "No durable task 'missing' exists"),
                 ("task-subagent", "is not a plan execution task"),
@@ -4311,7 +4690,7 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
         )
 
         async with app.run_test(size=(110, 35)) as pilot:
-            prompt = app.query_one("#prompt", Input)
+            prompt = app.query_one("#prompt", PromptInput)
             prompt.value = "edit the file"
             await pilot.press("enter")
             for _ in range(20):
@@ -4348,7 +4727,7 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
         )
 
         async with app.run_test(size=(110, 35)) as pilot:
-            prompt = app.query_one("#prompt", Input)
+            prompt = app.query_one("#prompt", PromptInput)
             prompt.value = "edit the file"
             await pilot.press("enter")
             for _ in range(20):
@@ -4376,7 +4755,7 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
         )
 
         async with app.run_test(size=(100, 30)) as pilot:
-            prompt = app.query_one("#prompt", Input)
+            prompt = app.query_one("#prompt", PromptInput)
             prompt.value = "long turn"
             await pilot.press("enter")
             await asyncio.wait_for(runner.started.wait(), timeout=1)
@@ -4405,7 +4784,7 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
         )
 
         async with app.run_test(size=(100, 30)) as pilot:
-            prompt = app.query_one("#prompt", Input)
+            prompt = app.query_one("#prompt", PromptInput)
             prompt.value = "restore this prompt"
             await pilot.press("enter")
             await asyncio.wait_for(runner.started.wait(), timeout=1)
@@ -4443,7 +4822,7 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
         )
 
         async with app.run_test(size=(100, 30)) as pilot:
-            prompt = app.query_one("#prompt", Input)
+            prompt = app.query_one("#prompt", PromptInput)
             prompt.value = "original prompt"
             await pilot.press("enter")
             await asyncio.wait_for(runner.started.wait(), timeout=1)
@@ -4475,7 +4854,7 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
         )
 
         async with app.run_test(size=(100, 30)) as pilot:
-            prompt = app.query_one("#prompt", Input)
+            prompt = app.query_one("#prompt", PromptInput)
             prompt.value = "first prompt"
             await pilot.press("enter")
             self.assertEqual(
@@ -4523,7 +4902,7 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
         )
 
         async with app.run_test(size=(100, 30)) as pilot:
-            prompt = app.query_one("#prompt", Input)
+            prompt = app.query_one("#prompt", PromptInput)
             prompt.value = "first prompt"
             await pilot.press("enter")
             await asyncio.wait_for(runner.started.wait(), timeout=1)
@@ -4548,7 +4927,7 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
         )
 
         async with app.run_test(size=(100, 30)) as pilot:
-            prompt = app.query_one("#prompt", Input)
+            prompt = app.query_one("#prompt", PromptInput)
             prompt.value = "first prompt"
             await pilot.press("enter")
             await asyncio.wait_for(runner.started.get(), timeout=1)
@@ -4574,7 +4953,7 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
         )
 
         async with app.run_test(size=(100, 30)) as pilot:
-            prompt = app.query_one("#prompt", Input)
+            prompt = app.query_one("#prompt", PromptInput)
             prompt.value = "first prompt"
             await pilot.press("enter")
             await asyncio.wait_for(runner.started.wait(), timeout=1)
@@ -4604,7 +4983,7 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
         )
 
         async with app.run_test(size=(100, 30)) as pilot:
-            prompt = app.query_one("#prompt", Input)
+            prompt = app.query_one("#prompt", PromptInput)
             prompt.value = "first prompt"
             await pilot.press("enter")
             await asyncio.wait_for(runner.started.wait(), timeout=1)
@@ -4632,7 +5011,7 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
         )
 
         async with app.run_test(size=(100, 30)) as pilot:
-            prompt = app.query_one("#prompt", Input)
+            prompt = app.query_one("#prompt", PromptInput)
             prompt.value = "first prompt"
             await pilot.press("enter")
             await asyncio.wait_for(runner.started.wait(), timeout=1)
@@ -4661,7 +5040,7 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
         )
 
         async with app.run_test(size=(100, 30)) as pilot:
-            prompt = app.query_one("#prompt", Input)
+            prompt = app.query_one("#prompt", PromptInput)
             prompt.value = "first prompt"
             await pilot.press("enter")
             await asyncio.wait_for(runner.started.wait(), timeout=1)
@@ -4685,7 +5064,7 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
         )
 
         async with app.run_test(size=(100, 30)) as pilot:
-            prompt = app.query_one("#prompt", Input)
+            prompt = app.query_one("#prompt", PromptInput)
             prompt.value = "long turn"
             await pilot.press("enter")
             await asyncio.wait_for(runner.started.wait(), timeout=1)
@@ -4712,7 +5091,7 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
         )
 
         async with app.run_test(size=(110, 35)) as pilot:
-            prompt = app.query_one("#prompt", Input)
+            prompt = app.query_one("#prompt", PromptInput)
             prompt.value = "/provider"
             await pilot.press("enter")
             for _ in range(20):
@@ -4768,7 +5147,7 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
         )
 
         async with direct_app.run_test(size=(100, 30)) as pilot:
-            prompt = direct_app.query_one("#prompt", Input)
+            prompt = direct_app.query_one("#prompt", PromptInput)
             prompt.value = "/model second"
             await pilot.press("enter")
             await pilot.pause()
@@ -4786,7 +5165,7 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
         )
 
         async with blocking_app.run_test(size=(100, 30)) as pilot:
-            prompt = blocking_app.query_one("#prompt", Input)
+            prompt = blocking_app.query_one("#prompt", PromptInput)
             prompt.value = "long turn"
             await pilot.press("enter")
             await asyncio.wait_for(blocking_runner.started.wait(), timeout=1)
@@ -4864,7 +5243,7 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("Previous session current-session remains saved", rendered)
             self.assertNotIn("Ready · first/first-model", rendered)
 
-            prompt = app.query_one("#prompt", Input)
+            prompt = app.query_one("#prompt", PromptInput)
             prompt.value = "/status"
             await pilot.press("enter")
             await pilot.pause()
@@ -4891,7 +5270,7 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
         )
 
         async with app.run_test(size=(120, 35)) as pilot:
-            prompt = app.query_one("#prompt", Input)
+            prompt = app.query_one("#prompt", PromptInput)
             prompt.value = "/sessions quoted"
             await pilot.press("enter")
             for _ in range(20):
@@ -4961,7 +5340,7 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
         )
 
         async with app.run_test(size=(100, 30)) as pilot:
-            prompt = app.query_one("#prompt", Input)
+            prompt = app.query_one("#prompt", PromptInput)
             prompt.value = "/rename   Manual session title"
             await pilot.press("enter")
             await pilot.pause()
@@ -4990,7 +5369,7 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
         )
 
         async with app.run_test(size=(100, 30)) as pilot:
-            prompt = app.query_one("#prompt", Input)
+            prompt = app.query_one("#prompt", PromptInput)
             prompt.value = "long turn"
             await pilot.press("enter")
             await asyncio.wait_for(runner.started.wait(), timeout=1)

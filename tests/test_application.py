@@ -127,12 +127,14 @@ protocol = "openai-chat"
 model = "fixture-model"
 base_url = "https://provider.invalid/v1"
 api_key_env = "FIXTURE_KEY"
+context_window_tokens = 131072
 
 [providers.alternate]
 protocol = "openai-chat"
 model = "alternate-model"
 base_url = "https://alternate.invalid/v1"
 api_key_env = "FIXTURE_KEY"
+context_window_tokens = 65536
 """,
             encoding="utf-8",
         )
@@ -195,6 +197,14 @@ api_key_env = "FIXTURE_KEY"
                     default_binding.runner._runtime._compaction_runtime_gate,
                     ContextCompactionRuntimeGate,
                 )
+                provider_window = (
+                    default_binding.runner._runtime._loop_runner._provider_context_window
+                )
+                self.assertIsNotNone(provider_window)
+                assert provider_window is not None
+                self.assertEqual(provider_window.provider_name, "fixture")
+                self.assertEqual(provider_window.model_name, "fixture-model")
+                self.assertEqual(provider_window.capacity_tokens, 131_072)
                 self.assertEqual(
                     (
                         default_binding.runner._runtime._execution_budget.max_model_calls,

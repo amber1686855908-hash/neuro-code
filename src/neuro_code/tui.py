@@ -26,8 +26,7 @@ from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.geometry import Size
 from textual.message import Message as TextualMessage
 from textual.screen import ModalScreen
-from textual.suggester import Suggester
-from textual.widgets import Button, Input, Label, Static
+from textual.widgets import Button, Input, Label, Static, TextArea
 from textual.worker import Worker
 
 from neuro_code.application.permissions.broker import ApprovalHandler
@@ -113,6 +112,7 @@ from neuro_code.domain.execution import (
 from neuro_code.domain.plans import PlanComment, PlanStepStatus, SessionPlan
 from neuro_code.domain.session_tasks import SessionTask, SessionTaskKind, SessionTaskStatus
 from neuro_code.interfaces.tui import recoverable_terminal_status
+from neuro_code.shared.errors import ProviderError
 from neuro_code.shared.redaction import redact_sensitive_text
 from neuro_code.shared.ui_language import UiLanguage
 from neuro_code.tui_commands import SlashCompletion, slash_completions
@@ -149,6 +149,7 @@ from neuro_code.tui_theme import (
     TEXT_DISABLED,
     TEXT_EMPHASIS,
     TEXT_MUTED,
+    TEXT_PLACEHOLDER,
     TEXT_PRIMARY,
     TEXT_SECONDARY,
     TEXTUAL_THEME,
@@ -173,11 +174,23 @@ _DEFAULT_BACKGROUND_WAKE_LIMITS = BackgroundWakeLimits()
 _TERMINAL_SIZE_POLL_SECONDS = 0.25
 _LOADING_ANIMATION_TICK_SECONDS = 0.05
 _TOOL_ELAPSED_UPDATE_SECONDS = 0.25
+_PROMPT_MAX_VISIBLE_LINES = 8
 _COMMAND_HINT_LIMIT = 5
 _TOOL_OUTPUT_MAX_LINES = 40
 _TOOL_OUTPUT_MAX_CHARACTERS = 6_000
 _TOOL_DIFF_MAX_FILES = 8
-_COMPACT_READ_TOOLS = frozenset({"grep", "list_dir", "read_file", "skill", "view_image"})
+_COMPACT_READ_TOOLS = frozenset(
+    {
+        "grep",
+        "grep_many",
+        "list_dir",
+        "list_tree",
+        "read_file",
+        "read_files",
+        "skill",
+        "view_image",
+    }
+)
 TUI_RELOAD_PROVIDER_SETTINGS = 75
 _PROMPT_MARK = "\N{SINGLE RIGHT-POINTING ANGLE QUOTATION MARK}"
 _ERROR_MARK = "\N{MULTIPLICATION SIGN}"
@@ -480,25 +493,6 @@ class AssistantMarkdown(Markdown):
         return self.markup
 
 
-class SlashCommandSuggester(Suggester):
-    """Show the same first completion that Tab will apply.
-
-    显示 Tab 键将应用的第一条补全结果."""
-
-    def __init__(
-        self,
-        completions: Callable[[str], tuple[SlashCompletion, ...]],
-    ) -> None:
-        super().__init__(use_cache=False, case_sensitive=False)
-        self._completions = completions
-
-    async def get_suggestion(self, value: str) -> str | None:
-        completions = self._completions(value)
-        if not completions or completions[0].value == value:
-            return None
-        return completions[0].value
-
-
 class ConversationMessage(Static):
     """One stable message node in the scrollable conversation.
 
@@ -521,42 +515,149 @@ class ConversationMessage(Static):
         self.set_class(pending, "message-pending")
 
 
-class PromptInput(Input):
-    """Prompt input that preserves all lines from a terminal paste.
+class AssistantMessage(ConversationMessage):
+    """Assistant Markdown with an explicit route to selectable source text.
 
-    保留终端粘贴内容中全部行的提示输入框.
-
-    Textual's single-line ``Input`` intentionally keeps only the first line of a
-    bracketed paste. The prompt still submits through the same ``Input`` message
-    contract, but pasted newlines remain in its value so multi-line prompts are
-    not silently truncated.
-    Textual 的单行 ``Input`` 默认只保留 bracketed paste 的第一行.提示框仍沿用
-    原有 ``Input`` 消息契约,但会保留粘贴值中的换行,避免多行提示被静默截断.
+    带有明确可选择原文入口的助手 Markdown.
     """
 
-    @property
-    def _value(self) -> Text:
-        """Render pasted newlines without allowing them to escape the input row.
+    class CopyRequested(TextualMessage):
+        """Ask the owning app to show this reply in the selection view.
 
-        将粘贴内容中的换行渲染为单字符标记,避免突破单行输入框的布局.
+        请求所属应用在选择视图中显示此回复.
         """
 
-        if self.password:
-            return Text("•" * len(self.value), no_wrap=True, overflow="ignore", end="")
-        text = Text(self.value.replace("\n", "↵"), no_wrap=True, overflow="ignore", end="")
-        if self.highlighter is not None:
-            text = self.highlighter(text)
-        return text
+        def __init__(self, message: AssistantMessage) -> None:
+            self.message = message
+            super().__init__()
 
-    def _on_paste(self, event: events.Paste) -> None:
+    def __init__(
+        self,
+        rendered: RenderableType,
+        *,
+        content: str = "",
+        pending: bool = False,
+        copy_hint: str | None = None,
+    ) -> None:
+        super().__init__("assistant", rendered, pending=pending)
+        self.content = content
+        self.tooltip = copy_hint
+
+    def set_content(self, content: str) -> None:
+        self.content = content
+
+    async def _on_click(self, event: events.Click) -> None:
+        if event.chain < 2 or not self.content:
+            return
+        event.stop()
+        self.post_message(self.CopyRequested(self))
+
+
+class PromptInput(TextArea):
+    """Bounded multi-line prompt editor with explicit submit semantics.
+
+    带有明确提交语义且高度有界的多行提示编辑器.
+
+    Terminal bracketed paste is preserved as real document lines. ``Enter``
+    submits the complete prompt, while ``Shift+Enter`` (or ``Ctrl+J``) inserts a
+    newline. Common editor selection remains local to the prompt.
+
+    终端 bracketed paste 会保留为真实文档行.``Enter`` 提交完整提示,
+    ``Shift+Enter`` (或 ``Ctrl+J``) 插入换行,常用编辑选择操作保持在提示框内.
+    """
+
+    @dataclass
+    class Submitted(TextualMessage):
+        """Prompt submission carrying the complete multi-line value.
+
+        携带完整多行内容的提示提交消息.
+        """
+
+        input: PromptInput
+        value: str
+
+        @property
+        def control(self) -> PromptInput:
+            return self.input
+
+    def __init__(
+        self,
+        *,
+        placeholder: str = "",
+        id: str | None = None,
+    ) -> None:
+        super().__init__(soft_wrap=True, tab_behavior="focus", id=id)
+        self.placeholder = placeholder
+
+    @property
+    def value(self) -> str:
+        """Compatibility alias used by the existing prompt lifecycle.
+
+        供现有提示生命周期使用的兼容别名.
+        """
+
+        return self.text
+
+    @value.setter
+    def value(self, value: str) -> None:
+        self.load_text(value.replace("\r\n", "\n").replace("\r", "\n"))
+
+    @property
+    def cursor_position(self) -> int:
+        row, column = self.cursor_location
+        lines = self.text.split("\n")
+        return sum(len(line) + 1 for line in lines[:row]) + column
+
+    @cursor_position.setter
+    def cursor_position(self, position: int) -> None:
+        bounded = max(0, min(position, len(self.text)))
+        prefix = self.text[:bounded]
+        row = prefix.count("\n")
+        column = len(prefix.rsplit("\n", maxsplit=1)[-1])
+        self.move_cursor((row, column))
+
+    def get_line(self, line_index: int) -> Text:
+        if line_index == 0 and not self.text and self.placeholder:
+            return Text(self.placeholder, style=TEXT_PLACEHOLDER, end="")
+        return super().get_line(line_index)
+
+    async def _on_key(self, event: events.Key) -> None:
+        if event.key == "enter":
+            event.prevent_default().stop()
+            self.post_message(self.Submitted(self, self.text))
+            return
+        if event.key in {"shift+enter", "ctrl+j"}:
+            event.prevent_default().stop()
+            result = self.replace("\n", *self.selection, maintain_selection_offset=False)
+            self.move_cursor(result.end_location)
+            return
+        if event.key == "ctrl+a":
+            event.prevent_default().stop()
+            self.action_select_all()
+            return
+        await super()._on_key(event)
+
+    async def _on_paste(self, event: events.Paste) -> None:
         text = event.text.replace("\r\n", "\n").replace("\r", "\n")
         if text:
-            start, end = self.selection
-            if start == end:
-                self.insert_text_at_cursor(text)
-            else:
-                self.replace(text, start, end)
+            result = self.replace(text, *self.selection, maintain_selection_offset=False)
+            self.move_cursor(result.end_location)
         event.prevent_default().stop()
+
+    def sync_content_height(self) -> None:
+        """Fit short prompts and scroll longer prompts without moving the layout.
+
+        短提示自动适配高度,长提示在固定上限内滚动,不改变整体布局.
+        """
+
+        visible_lines = max(1, min(self.wrapped_document.height, _PROMPT_MAX_VISIBLE_LINES))
+        self.styles.height = visible_lines
+        if self.parent is not None:
+            self.parent.styles.height = visible_lines + 2
+
+    def _on_resize(self) -> None:
+        super()._on_resize()
+        self.call_after_refresh(self.sync_content_height)
 
 
 class ToolFeedbackMessage(ConversationMessage, can_focus=True):
@@ -589,6 +690,118 @@ class ToolFeedbackMessage(ConversationMessage, can_focus=True):
 
     def action_toggle_details(self) -> None:
         self.post_message(self.ToggleRequested(self))
+
+
+class TranscriptCopyScreen(ModalScreen[None]):
+    """Selectable, read-only projection of the visible transcript.
+
+    当前可见会话记录的可选择只读投影.
+
+    Textual owns terminal mouse reporting while the full-screen app is active,
+    so native terminal drag-selection is not portable. This screen provides a
+    real text selection model and copies through Textual's OSC 52 clipboard path
+    without exposing hidden Runtime or tool state.
+
+    全屏应用运行时由 Textual 管理终端鼠标上报,原生终端拖选无法跨平台保证.此界面
+    提供真实文本选择模型,并通过 Textual 的 OSC 52 剪贴板路径复制,不会暴露隐藏的
+    Runtime 或工具状态.
+    """
+
+    CSS = """
+    TranscriptCopyScreen {
+        align: center middle;
+        background: $background 80%;
+    }
+
+    #transcript-copy-dialog {
+        width: 92%;
+        height: 88%;
+        padding: 1 2;
+        background: $surface;
+        border: solid $border;
+    }
+
+    #transcript-copy-title {
+        height: 1;
+        color: $text-primary;
+        text-style: bold;
+    }
+
+    #transcript-copy-help,
+    #transcript-copy-status {
+        height: 1;
+        color: $text-secondary;
+    }
+
+    #transcript-copy-text {
+        width: 100%;
+        height: 1fr;
+        margin: 1 0;
+        padding: 0 1;
+        border: solid $border-dim;
+        background: $background;
+        color: $text-body;
+    }
+
+    #transcript-copy-text:focus {
+        border: solid $border-focus;
+    }
+    """
+
+    BINDINGS: ClassVar[list[BindingType]] = [
+        Binding("escape", "cancel", "Close", priority=True, show=False),
+        Binding("ctrl+a", "select_all", "Select all", priority=True, show=False),
+        Binding("ctrl+c", "copy_selection", "Copy", priority=True, show=False),
+        Binding("ctrl+shift+c", "copy_selection", "Copy", priority=True, show=False),
+    ]
+
+    def __init__(self, content: str, *, language: UiLanguage) -> None:
+        super().__init__()
+        self._content = content
+        self._language = language
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="transcript-copy-dialog"):
+            yield Label(
+                ui_text(self._language, "transcript_copy.title"),
+                id="transcript-copy-title",
+            )
+            yield Label(
+                ui_text(self._language, "transcript_copy.help"),
+                id="transcript-copy-help",
+            )
+            yield TextArea(
+                self._content,
+                read_only=True,
+                soft_wrap=True,
+                id="transcript-copy-text",
+            )
+            yield Label("", id="transcript-copy-status")
+
+    def on_mount(self) -> None:
+        self.query_one("#transcript-copy-text", TextArea).focus()
+
+    def action_select_all(self) -> None:
+        self.query_one("#transcript-copy-text", TextArea).select_all()
+
+    def action_copy_selection(self) -> None:
+        editor = self.query_one("#transcript-copy-text", TextArea)
+        selected = editor.selected_text
+        status = self.query_one("#transcript-copy-status", Label)
+        if not selected:
+            status.update(ui_text(self._language, "transcript_copy.select_first"))
+            return
+        self.app.copy_to_clipboard(selected)
+        status.update(
+            ui_text(
+                self._language,
+                "transcript_copy.copied",
+                characters=len(selected),
+            )
+        )
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
 
 
 class SettingsScreen(ModalScreen[str | None]):
@@ -2854,6 +3067,16 @@ class NeuroCodeApp(App[None]):
         background: $background;
     }
 
+    #turn-activity {
+        display: none;
+        width: 100%;
+        height: 1;
+        padding: 0 1;
+        background: $background;
+        color: $text-secondary;
+        overflow: hidden hidden;
+    }
+
     #runtime-bar {
         width: 100%;
         height: 2;
@@ -2903,7 +3126,9 @@ class NeuroCodeApp(App[None]):
     }
 
     #prompt-row {
-        height: 3;
+        height: auto;
+        min-height: 3;
+        max-height: 10;
         padding: 0 1;
         background: $surface;
         border-left: tall $border;
@@ -2921,15 +3146,26 @@ class NeuroCodeApp(App[None]):
     #prompt {
         width: 1fr;
         height: 1;
+        max-height: 8;
         padding: 0;
         margin: 0;
         border: none;
         background: $surface;
         color: $text-primary;
+        scrollbar-size-vertical: 1;
     }
 
-    #prompt > .input--placeholder {
-        color: $text-disabled;
+    #prompt > .text-area--cursor-line {
+        background: $surface;
+    }
+
+    #prompt > .text-area--selection {
+        background: $surface-selected;
+    }
+
+    #prompt > .text-area--cursor {
+        color: $surface;
+        background: $text-muted;
     }
 
     #prompt-row:focus-within {
@@ -2957,6 +3193,7 @@ class NeuroCodeApp(App[None]):
     BINDINGS: ClassVar[list[BindingType]] = [
         Binding("ctrl+c", "cancel_turn", "Cancel", priority=True, show=False),
         Binding("ctrl+shift+c", "copy_prompt", "Copy", priority=True, show=False),
+        Binding("f8", "copy_transcript", "Copy transcript", priority=True, show=False),
         Binding("ctrl+p", "select_provider", "Provider", priority=True, show=False),
         Binding("ctrl+r", "select_session", "Sessions", priority=True, show=False),
         Binding("ctrl+e", "select_reasoning_effort", "Effort", priority=True, show=False),
@@ -3149,6 +3386,10 @@ class NeuroCodeApp(App[None]):
         self._model_loading = False
         self._loading_animation = CollapsingPulseAnimation()
         self._loading_animation_elapsed = 0.0
+        self._turn_activity_started_at: float | None = None
+        self._turn_activity_kind = "thinking"
+        self._turn_activity_tool_name: str | None = None
+        self._turn_activity_tool_started_at: float | None = None
         self._announced_terminal_tasks: set[str] = set()
         self._pending_auto_wake_tasks: set[str] = set()
         self._background_wake_state = BackgroundWakeState()
@@ -3168,6 +3409,7 @@ class NeuroCodeApp(App[None]):
             yield Static(id="clock")
         yield VerticalScroll(id="transcript")
         with Vertical(id="composer"):
+            yield Static(id="turn-activity")
             yield Horizontal(
                 Static(id="runtime-model"),
                 Static(id="runtime-workspace"),
@@ -3180,7 +3422,6 @@ class NeuroCodeApp(App[None]):
                 yield Static(_PROMPT_MARK, id="prompt-mark")
                 yield PromptInput(
                     placeholder=ui_text(self._language, "prompt.placeholder"),
-                    suggester=SlashCommandSuggester(self._slash_completions),
                     id="prompt",
                 )
             yield Static(id="command-hints")
@@ -3221,7 +3462,9 @@ class NeuroCodeApp(App[None]):
         self.set_interval(_TOOL_ELAPSED_UPDATE_SECONDS, self._refresh_running_tool_elapsed)
         if not self.is_headless and not self.is_inline and not self.is_web:
             self.set_interval(_TERMINAL_SIZE_POLL_SECONDS, self._synchronize_terminal_size)
-        self.query_one("#prompt", Input).focus()
+        prompt = self.query_one("#prompt", PromptInput)
+        prompt.sync_content_height()
+        prompt.focus()
 
     def _synchronize_terminal_size(self) -> None:
         """Recover when a terminal drops its normal resize notification.
@@ -3257,7 +3500,7 @@ class NeuroCodeApp(App[None]):
             PermissionApprovalScreen(request, language=self._language)
         )
 
-    async def on_input_submitted(self, event: Input.Submitted) -> None:
+    async def on_prompt_input_submitted(self, event: PromptInput.Submitted) -> None:
         prompt = event.value.strip()
         event.input.value = ""
         if not prompt:
@@ -3328,7 +3571,7 @@ class NeuroCodeApp(App[None]):
             return
         queued = tuple(self._queued_interjections)
         self._queued_interjections.clear()
-        prompt = self.query_one("#prompt", Input)
+        prompt = self.query_one("#prompt", PromptInput)
         prompt.value = "\n\n".join((*queued, prompt.value)) if prompt.value else "\n\n".join(queued)
         prompt.cursor_position = len(prompt.value)
         self._write_ui_entry("status", "turn.interjections_restored", count=len(queued))
@@ -3338,7 +3581,7 @@ class NeuroCodeApp(App[None]):
         if not prompt_text:
             return
         entry_index = self._active_prompt_entry_index
-        prompt = self.query_one("#prompt", Input)
+        prompt = self.query_one("#prompt", PromptInput)
         if not prompt.value:
             if entry_index is not None and 0 <= entry_index < len(self._entries):
                 entry = self._entries[entry_index]
@@ -3376,9 +3619,10 @@ class NeuroCodeApp(App[None]):
         if widget.parent is not None:
             await widget.remove()
 
-    def on_input_changed(self, event: Input.Changed) -> None:
-        if event.input.id == "prompt" and event.input.screen is self.screen:
-            self._refresh_command_hints(event.value)
+    def on_text_area_changed(self, event: TextArea.Changed) -> None:
+        if isinstance(event.text_area, PromptInput) and event.text_area.screen is self.screen:
+            event.text_area.sync_content_height()
+            self._refresh_command_hints(event.text_area.value)
 
     def on_tool_feedback_message_toggle_requested(
         self,
@@ -3395,6 +3639,19 @@ class NeuroCodeApp(App[None]):
         if state.expanded:
             self._request_tool_artifact(state)
         event.card.focus()
+
+    def on_assistant_message_copy_requested(
+        self,
+        event: AssistantMessage.CopyRequested,
+    ) -> None:
+        if isinstance(self.screen, TranscriptCopyScreen) or not event.message.content:
+            return
+        self.push_screen(
+            TranscriptCopyScreen(
+                event.message.content,
+                language=self._language,
+            )
+        )
 
     def _request_tool_artifact(self, state: ToolFeedbackState) -> None:
         if (
@@ -3452,7 +3709,7 @@ class NeuroCodeApp(App[None]):
         if isinstance(self.screen, ModalScreen):
             self.screen.focus_next()
             return
-        prompt = self.query_one("#prompt", Input)
+        prompt = self.query_one("#prompt", PromptInput)
         if not prompt.has_focus:
             self.screen.focus_next()
             return
@@ -3531,7 +3788,7 @@ class NeuroCodeApp(App[None]):
         self,
         run: Callable[[], Awaitable[AgentRunResult]],
     ) -> None:
-        prompt_input = self.query_one("#prompt", Input)
+        prompt_input = self.query_one("#prompt", PromptInput)
         completed = False
         try:
             result = await run()
@@ -3547,7 +3804,7 @@ class NeuroCodeApp(App[None]):
                 )
                 self._context_usage_estimated = True
                 self._refresh_runtime_bar()
-            self._finish_pending_assistant(response)
+            self._finish_streamed_assistant_response(result, fallback=response)
             if self._terminal_execution_recoverable and self._terminal_execution_status is not None:
                 self._write_ui_entry(
                     "recoverable",
@@ -3571,7 +3828,7 @@ class NeuroCodeApp(App[None]):
         except Exception as error:
             await self._discard_pending_assistant()
             self._restore_queued_interjections()
-            self._write_entry("error", f"{type(error).__name__}: {error}")
+            self._write_turn_failure(error)
         finally:
             if self._background_wake_active:
                 self._background_wake_state = self._background_wake_state.abandon_wake(
@@ -3588,18 +3845,59 @@ class NeuroCodeApp(App[None]):
                 self._active_prompt = None
                 self._active_prompt_entry_index = None
 
+    def _write_turn_failure(self, error: Exception) -> None:
+        """Render a failed turn without implying that its durable session was lost.
+
+        将失败回合显示为可恢复状态,避免暗示其持久化会话已经丢失.
+        """
+
+        if isinstance(error, ProviderError):
+            key = (
+                "turn.provider_balance_recoverable"
+                if self._provider_balance_is_insufficient(error)
+                else "turn.provider_failure_recoverable"
+            )
+            self._write_ui_entry("recoverable", key)
+            return
+        detail = redact_sensitive_text(str(error))
+        self._write_entry("error", f"{type(error).__name__}: {detail}")
+
+    @staticmethod
+    def _provider_balance_is_insufficient(error: ProviderError) -> bool:
+        """Recognize the actionable payment failure without parsing provider payloads.
+
+        识别可操作的付款失败,但不解析或暴露 Provider 原始载荷.
+        """
+
+        detail = str(error).casefold()
+        return "http 402" in detail or "insufficient balance" in detail
+
     async def _handle_event(self, event: AgentEvent) -> None:
         data = event.data
-        if event.kind is AgentEventKind.TEXT_DELTA:
+        if event.kind is AgentEventKind.MODEL_STEP_STARTED:
+            self._seal_pending_assistant()
+            self._turn_activity_kind = "model"
+            self._turn_activity_tool_name = None
+            self._turn_activity_tool_started_at = None
+            self._refresh_turn_activity()
+        elif event.kind is AgentEventKind.TEXT_DELTA:
             text = data.get("text")
             if isinstance(text, str):
                 self._finalizing = False
                 if text:
                     self._first_token_seen = True
+                    self._turn_activity_kind = "responding"
+                    self._turn_activity_tool_name = None
+                    self._turn_activity_tool_started_at = None
                 self._assistant_parts.append(text)
                 self._update_pending_assistant("".join(self._assistant_parts))
+                self._refresh_turn_activity()
         elif event.kind is AgentEventKind.FINALIZING_STARTED:
             self._finalizing = True
+            self._turn_activity_kind = "finalizing"
+            self._turn_activity_tool_name = None
+            self._turn_activity_tool_started_at = None
+            self._refresh_turn_activity()
             pending = self._pending_assistant
             if pending is not None and not self._assistant_parts:
                 pending.update(self._render_model_loading())
@@ -3607,16 +3905,11 @@ class NeuroCodeApp(App[None]):
             text = data.get("text")
             if isinstance(text, str) and text:
                 self._first_token_seen = True
-            if not self._reasoning_announced:
-                self._reasoning_announced = True
-                self._write_ui_entry("status", "turn.reasoning")
+                self._turn_activity_kind = "reasoning"
+                self._refresh_turn_activity()
         elif event.kind is AgentEventKind.MODEL_THINKING_COMPLETED:
-            self._write_ui_entry(
-                "status",
-                "turn.thinking_completed",
-                duration=self._event_duration(data),
-                step=self._positive_int(data.get("step"), fallback=1),
-            )
+            self._turn_activity_kind = "continuing"
+            self._refresh_turn_activity()
         elif event.kind is AgentEventKind.CONTEXT_USAGE_UPDATED:
             used_tokens = data.get("used_tokens")
             if isinstance(used_tokens, int) and not isinstance(used_tokens, bool):
@@ -3673,6 +3966,11 @@ class NeuroCodeApp(App[None]):
             AgentEventKind.TOOL_COMPLETED,
             AgentEventKind.TOOL_FAILED,
         }:
+            if event.kind in {
+                AgentEventKind.BACKEND_TOOL_STARTED,
+                AgentEventKind.TOOL_REQUESTED,
+            }:
+                self._seal_pending_assistant()
             self._handle_tool_feedback_event(event)
         elif event.kind is AgentEventKind.PLAN_UPDATED:
             try:
@@ -3685,6 +3983,8 @@ class NeuroCodeApp(App[None]):
             self._write_ui_entry("status", "plan.execution_requested")
         elif event.kind is AgentEventKind.TURN_COMPLETED:
             self._finalizing = False
+            self._turn_activity_kind = "completed"
+            self._refresh_turn_activity()
             self._turn_completion = (
                 self._event_duration(data),
                 self._positive_int(data.get("step"), fallback=1),
@@ -3697,6 +3997,8 @@ class NeuroCodeApp(App[None]):
                 self._terminal_execution_status = None
                 self._terminal_execution_recoverable = False
         elif event.kind is AgentEventKind.TURN_FAILED:
+            self._turn_activity_kind = "failed"
+            self._refresh_turn_activity()
             self._turn_pristine_rewound = data.get("pristine_rewound") is True
 
     def _handle_tool_feedback_event(self, event: AgentEvent) -> None:
@@ -3718,10 +4020,12 @@ class NeuroCodeApp(App[None]):
             state.phase = "running"
             if state.started_at is None:
                 state.started_at = monotonic()
+            self._activate_tool_activity(state)
         elif event.kind is AgentEventKind.BACKEND_TOOL_COMPLETED:
             state.phase = "completed"
             state.duration = self._event_duration(data)
             state.started_at = None
+            self._finish_tool_activity(state)
         elif event.kind is AgentEventKind.TOOL_PERMISSION:
             state.permission_effect = self._optional_text(data.get("effect"))
             state.permission_reason = self._optional_text(data.get("reason"))
@@ -3744,6 +4048,7 @@ class NeuroCodeApp(App[None]):
             state.phase = "running"
             if state.started_at is None:
                 state.started_at = monotonic()
+            self._activate_tool_activity(state)
         elif event.kind in {AgentEventKind.TOOL_COMPLETED, AgentEventKind.TOOL_FAILED}:
             state.phase = "failed" if event.kind is AgentEventKind.TOOL_FAILED else "completed"
             state.duration = self._event_duration(data)
@@ -3768,7 +4073,22 @@ class NeuroCodeApp(App[None]):
                 or state.workspace_changes is not None
                 or state.name in {"apply_patch", "search_replace"}
             )
+            self._finish_tool_activity(state)
         self._refresh_tool_feedback(state)
+
+    def _activate_tool_activity(self, state: ToolFeedbackState) -> None:
+        self._turn_activity_kind = "tool"
+        self._turn_activity_tool_name = state.name
+        self._turn_activity_tool_started_at = state.started_at
+        self._refresh_turn_activity()
+
+    def _finish_tool_activity(self, state: ToolFeedbackState) -> None:
+        if self._turn_activity_kind != "tool" or self._turn_activity_tool_name != state.name:
+            return
+        self._turn_activity_kind = "continuing"
+        self._turn_activity_tool_name = None
+        self._turn_activity_tool_started_at = None
+        self._refresh_turn_activity()
 
     def _start_tool_feedback(
         self,
@@ -3924,6 +4244,8 @@ class NeuroCodeApp(App[None]):
         compact_summary = self._compact_read_summary(state)
         if compact_summary is not None and not state.expanded:
             body = Text(overflow="fold")
+            body.append(state.name, style=TOOL_TITLE_STYLE)
+            body.append("  ·  ", style=TOOL_GUIDE_STYLE)
             body.append(f"{marker} ", style=marker_style)
             body.append(compact_summary, style=TOOL_DETAIL_STYLE)
             if state.phase == "completed" and state.duration is not None:
@@ -4085,6 +4407,32 @@ class NeuroCodeApp(App[None]):
                 f"tool.compact.grep.{key}",
                 query=query,
                 path=path,
+            )
+        if state.name == "grep_many":
+            raw_queries = state.arguments.get("queries")
+            count = (
+                len(raw_queries)
+                if isinstance(raw_queries, Sequence) and not isinstance(raw_queries, str | bytes)
+                else 0
+            )
+            path = self._bounded_inline(state.arguments.get("path"), limit=80)
+            return ui_text(
+                self._language,
+                f"tool.compact.grep_many.{key}",
+                count=count,
+                path=path,
+            )
+        if state.name == "read_files":
+            raw_files = state.arguments.get("files")
+            count = (
+                len(raw_files)
+                if isinstance(raw_files, Sequence) and not isinstance(raw_files, str | bytes)
+                else 0
+            )
+            return ui_text(
+                self._language,
+                f"tool.compact.read_files.{key}",
+                count=count,
             )
         target_key = "name" if state.name == "skill" else "path"
         target = self._bounded_inline(state.arguments.get(target_key), limit=120)
@@ -4717,16 +5065,53 @@ class NeuroCodeApp(App[None]):
         self._write_ui_entry("system", "transcript.cleared")
 
     def action_copy_prompt(self) -> None:
-        """Copy selected prompt text without changing turn control behavior.
+        """Copy selected prompt text or open the transcript selection view.
 
-        复制提示框中的选中文本,不改变轮次控制行为.
+        复制提示框选中文本;没有选区时打开会话记录选择界面.
         """
 
-        prompt = self.query_one("#prompt", Input)
+        if isinstance(self.screen, TranscriptCopyScreen):
+            self.screen.action_copy_selection()
+            return
+        prompt = self.query_one("#prompt", PromptInput)
         if prompt.has_focus and prompt.selected_text:
             prompt.action_copy()
+            return
+        self.action_copy_transcript()
+
+    def action_copy_transcript(self) -> None:
+        if isinstance(self.screen, TranscriptCopyScreen):
+            return
+        self.push_screen(
+            TranscriptCopyScreen(
+                self._copyable_transcript(),
+                language=self._language,
+            )
+        )
+
+    def _copyable_transcript(self) -> str:
+        labels = {
+            "assistant": "NEURO",
+            "error": ui_text(self._language, "label.error"),
+            "plan": ui_text(self._language, "plan.heading").rstrip(":\N{FULLWIDTH COLON}"),
+            "recoverable": ui_text(self._language, "label.status"),
+            "status": ui_text(self._language, "label.status"),
+            "system": "SYSTEM",
+            "tool": ui_text(self._language, "label.tool"),
+            "user": "YOU",
+        }
+        sections = [
+            f"{labels.get(entry.category, entry.category.upper())}\n{entry.text}"
+            for entry in self._entries
+        ]
+        if self._pending_assistant is not None and self._assistant_parts:
+            sections.append(f"NEURO\n{''.join(self._assistant_parts)}")
+        return "\n\n".join(sections) or ui_text(self._language, "transcript_copy.empty")
 
     def action_cancel_turn(self) -> None:
+        if isinstance(self.screen, TranscriptCopyScreen):
+            self.screen.action_copy_selection()
+            return
         if isinstance(self.screen, PermissionApprovalScreen):
             self.screen.action_deny()
             return
@@ -4751,13 +5136,13 @@ class NeuroCodeApp(App[None]):
         ):
             self.screen.action_cancel()
             return
+        prompt = self.query_one("#prompt", PromptInput)
+        if prompt.has_focus and prompt.selected_text:
+            prompt.action_copy()
+            return
         if self._turn_worker is not None and self._turn_worker.is_running:
             self._write_ui_entry("status", "turn.cancel_requested")
             self._turn_worker.cancel()
-            return
-        prompt = self.query_one("#prompt", Input)
-        if prompt.has_focus and prompt.selected_text:
-            prompt.action_copy()
             return
         if prompt.value:
             prompt.value = ""
@@ -5417,8 +5802,10 @@ class NeuroCodeApp(App[None]):
         index = self._plan_entry_index
         if index is not None and 0 <= index < len(self._entries):
             self._entries[index] = TranscriptEntry("plan", rendered.plain)
-            self._entry_widgets[index].update(rendered)
+            widget = self._entry_widgets[index]
+            widget.update(rendered)
             transcript = self.query_one("#transcript", VerticalScroll)
+            self._move_plan_entry_to_latest_position(index, widget, transcript)
             if transcript.is_vertical_scroll_end:
                 transcript.scroll_end(animate=False)
             return
@@ -5436,6 +5823,41 @@ class NeuroCodeApp(App[None]):
         self._plan_entry_index = len(self._entries) - 1
         if follow:
             transcript.scroll_end(animate=False)
+
+    def _move_plan_entry_to_latest_position(
+        self,
+        index: int,
+        widget: ConversationMessage,
+        transcript: VerticalScroll,
+    ) -> None:
+        """Keep one Plan node adjacent to the update that most recently changed it.
+
+        保留一个计划节点,并让它紧邻最近一次更新计划的操作.
+        """
+
+        if index != len(self._entries) - 1:
+            plan_entry = self._entries.pop(index)
+            plan_widget = self._entry_widgets.pop(index)
+            self._entries.append(plan_entry)
+            self._entry_widgets.append(plan_widget)
+            remapped_tool_feedback: dict[int, ToolFeedbackState] = {}
+            for entry_index, state in self._tool_feedback_by_entry.items():
+                remapped_index = entry_index - 1 if entry_index > index else entry_index
+                state.entry_index = remapped_index
+                remapped_tool_feedback[remapped_index] = state
+                remapped_widget = self._entry_widgets[remapped_index]
+                if isinstance(remapped_widget, ToolFeedbackMessage):
+                    remapped_widget.entry_index = remapped_index
+            self._tool_feedback_by_entry = remapped_tool_feedback
+            self._plan_entry_index = len(self._entries) - 1
+
+        pending = self._pending_assistant
+        if pending is not None and pending.parent is transcript:
+            transcript.move_child(widget, before=pending)
+            return
+        children = tuple(transcript.children)
+        if children and children[-1] is not widget:
+            transcript.move_child(widget, after=children[-1])
 
     async def _show_tasks(self) -> None:
         if self._task_controller is None and self._session_task_controller is None:
@@ -6072,6 +6494,17 @@ class NeuroCodeApp(App[None]):
             )
             self._configure_tool_feedback_widget(tool_widget, tool_state)
             widget: ConversationMessage = tool_widget
+        elif category == "assistant":
+            widget = AssistantMessage(
+                self._render_entry(
+                    category,
+                    content,
+                    ui_key=ui_key,
+                    ui_values=ui_values,
+                ),
+                content=content,
+                copy_hint=ui_text(self._language, "assistant.copy_hint"),
+            )
         else:
             widget = ConversationMessage(
                 category,
@@ -6098,10 +6531,11 @@ class NeuroCodeApp(App[None]):
         if self._pending_assistant is not None:
             return
         self._start_model_loading()
-        pending = ConversationMessage(
-            "assistant",
+        pending = AssistantMessage(
             self._render_model_loading(),
+            content="",
             pending=True,
+            copy_hint=ui_text(self._language, "assistant.copy_hint"),
         )
         self._pending_assistant = pending
         transcript = self.query_one("#transcript", VerticalScroll)
@@ -6116,11 +6550,54 @@ class NeuroCodeApp(App[None]):
         transcript = self.query_one("#transcript", VerticalScroll)
         follow = transcript.is_vertical_scroll_end
         pending.set_pending(False)
+        if isinstance(pending, AssistantMessage):
+            pending.set_content(content)
         pending.update(self._render_entry("assistant", content))
         if follow:
             transcript.scroll_end(animate=False)
 
-    def _finish_pending_assistant(self, content: str) -> None:
+    def _seal_pending_assistant(self) -> bool:
+        """Commit streamed text for the current model step without ending the turn.
+
+        提交当前模型步骤的流式文本,但不结束本次回合.
+        """
+
+        content = "".join(self._assistant_parts)
+        if not content:
+            return False
+        self._finish_pending_assistant(content, stop_loading=False)
+        return True
+
+    def _finish_streamed_assistant_response(
+        self,
+        result: AgentRunResult,
+        *,
+        fallback: str,
+    ) -> None:
+        """Finish only the active model-step response, never the aggregate turn text.
+
+        只完成当前模型步骤的回复,绝不把整轮聚合文本重新显示一次.
+        """
+
+        if self._seal_pending_assistant():
+            self._stop_model_loading()
+            return
+        if self._pending_assistant is None:
+            self._stop_model_loading()
+            return
+        final_content = self._last_assistant_message_content(result.messages) or fallback
+        self._finish_pending_assistant(final_content)
+
+    @staticmethod
+    def _last_assistant_message_content(messages: Sequence[Message]) -> str | None:
+        for message in reversed(messages):
+            if message.role is Role.ASSISTANT:
+                content = message.model_content()
+                if content:
+                    return content
+        return None
+
+    def _finish_pending_assistant(self, content: str, *, stop_loading: bool = True) -> None:
         if self._pending_assistant is None:
             self._begin_pending_assistant()
         pending = self._pending_assistant
@@ -6128,11 +6605,15 @@ class NeuroCodeApp(App[None]):
         transcript = self.query_one("#transcript", VerticalScroll)
         follow = transcript.is_vertical_scroll_end
         pending.set_pending(False)
+        if isinstance(pending, AssistantMessage):
+            pending.set_content(content)
         pending.update(self._render_entry("assistant", content))
         self._entries.append(TranscriptEntry("assistant", content))
         self._entry_widgets.append(pending)
         self._pending_assistant = None
-        self._stop_model_loading()
+        self._assistant_parts.clear()
+        if stop_loading:
+            self._stop_model_loading()
         if follow:
             transcript.scroll_end(animate=False)
 
@@ -6148,12 +6629,23 @@ class NeuroCodeApp(App[None]):
         self._model_loading = True
         self._loading_animation.reset()
         self._loading_animation_elapsed = 0.0
+        self._turn_activity_started_at = monotonic()
+        self._turn_activity_kind = "thinking"
+        self._turn_activity_tool_name = None
+        self._turn_activity_tool_started_at = None
+        self._refresh_turn_activity()
 
     def _stop_model_loading(self) -> None:
-        if not self._model_loading:
-            return
         self._model_loading = False
         self._loading_animation_elapsed = 0.0
+        self._turn_activity_started_at = None
+        self._turn_activity_kind = "thinking"
+        self._turn_activity_tool_name = None
+        self._turn_activity_tool_started_at = None
+        activity = next(iter(self.query("#turn-activity")), None)
+        if isinstance(activity, Static):
+            activity.update("")
+            activity.display = False
 
     def _advance_model_loading_animation(self) -> None:
         if self._model_loading:
@@ -6164,22 +6656,67 @@ class NeuroCodeApp(App[None]):
                 pending = self._pending_assistant
                 if pending is not None and not self._assistant_parts and pending.parent is not None:
                     pending.update(self._render_model_loading())
+                self._refresh_turn_activity()
 
     def _refresh_running_tool_elapsed(self) -> None:
         for state in tuple(self._tool_feedback_by_entry.values()):
             if state.phase == "running":
                 self._refresh_tool_feedback(state)
+        self._refresh_turn_activity()
+
+    def _refresh_turn_activity(self) -> None:
+        activity = next(iter(self.query("#turn-activity")), None)
+        if not isinstance(activity, Static) or not self._model_loading:
+            return
+        show = self._model_loading and (
+            self._first_token_seen
+            or self._turn_activity_kind in {"tool", "finalizing", "continuing"}
+        )
+        if not show:
+            if activity.display:
+                activity.update("")
+                activity.display = False
+            return
+
+        if self._turn_activity_kind == "tool":
+            key = (
+                "turn.activity.waiting_tool"
+                if self._turn_activity_tool_name in {"wait_tasks", "task_output", "wait_for_tasks"}
+                else "turn.activity.running_tool"
+            )
+            label = ui_text(
+                self._language,
+                key,
+                tool=self._turn_activity_tool_name or ui_text(self._language, "value.unknown"),
+            )
+            started_at = self._turn_activity_tool_started_at
+        else:
+            label = ui_text(self._language, f"turn.activity.{self._turn_activity_kind}")
+            started_at = self._turn_activity_started_at
+
+        elapsed = (
+            self._event_duration({"duration_seconds": max(0.0, monotonic() - started_at)})
+            if started_at is not None
+            else "—"
+        )
+        rendered = self._loading_wave()
+        rendered.append("  ")
+        rendered.append(label, style=TEXT_SECONDARY)
+        rendered.append(f"  ·  {elapsed:>7}", style=TEXT_DIM)
+        activity.update(rendered)
+        activity.display = True
 
     def _apply_language_to_chrome(self) -> None:
         self.sub_title = ui_text(self._language, "subtitle")
-        self.query_one("#prompt", Input).placeholder = ui_text(
-            self._language,
-            "prompt.placeholder",
-        )
+        prompt = self.query_one("#prompt", PromptInput)
+        prompt.placeholder = ui_text(self._language, "prompt.placeholder")
+        prompt.refresh()
         shortcuts = Text(ui_text(self._language, "shortcuts"), style=TEXT_MUTED)
-        shortcuts.highlight_regex(r"\^(?:[A-Z]|,)|Shift\+Tab", style=f"bold {TEXT_EMPHASIS}")
+        shortcuts.highlight_regex(
+            r"\^(?:[A-Z]|,)|Shift\+Tab|F8",
+            style=f"bold {TEXT_EMPHASIS}",
+        )
         self.query_one("#shortcut-bar", Static).update(shortcuts)
-        prompt = self.query_one("#prompt", Input)
         self._refresh_command_hints(prompt.value)
         self._refresh_runtime_bar()
 
@@ -6422,6 +6959,7 @@ __all__ = [
     "TUI_RELOAD_PROVIDER_SETTINGS",
     "ApprovalController",
     "AssistantMarkdown",
+    "AssistantMessage",
     "BackgroundWakeSettingsScreen",
     "ConversationMessage",
     "ConversationRunner",
@@ -6429,6 +6967,7 @@ __all__ = [
     "NetworkProxySettingsScreen",
     "NeuroCodeApp",
     "PermissionApprovalScreen",
+    "PromptInput",
     "ProviderController",
     "ProviderSelectionScreen",
     "ProviderSettingsScreen",
@@ -6442,5 +6981,6 @@ __all__ = [
     "SettingsScreen",
     "TaskController",
     "ToolFeedbackMessage",
+    "TranscriptCopyScreen",
     "TranscriptEntry",
 ]

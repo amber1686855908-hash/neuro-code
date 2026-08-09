@@ -102,6 +102,7 @@ class AgentRuntime:
         finalizer_factory: FinalizerFactory | None = None,
         finalizer_max_attempts: int = 2,
         compaction_runtime_gate: ContextCompactionRuntimeGate | None = None,
+        provider_context_window: ProviderContextWindow | None = None,
     ) -> None:
         if execution_budget is not None and not isinstance(execution_budget, ExecutionBudget):
             raise TypeError("execution_budget must be an ExecutionBudget or None")
@@ -126,6 +127,11 @@ class AgentRuntime:
             raise TypeError(
                 "compaction_runtime_gate must be a ContextCompactionRuntimeGate or None"
             )
+        if provider_context_window is not None and not isinstance(
+            provider_context_window,
+            ProviderContextWindow,
+        ):
+            raise TypeError("provider_context_window must be a ProviderContextWindow or None")
         self._provider = provider
         self._tools = tools
         self._workspace_change_observer = workspace_change_observer
@@ -181,7 +187,7 @@ class AgentRuntime:
             tool_context=self._tool_context,
             session_store=self._session_store,
             system_prompt=self._system_prompt,
-            max_steps=self._max_steps,
+            execution_budget=self._execution_budget,
             context_builder=self._context_builder,
             supervisor_factory=self._supervisor_factory,
             supervision_observer=self._supervision_observer,
@@ -189,6 +195,8 @@ class AgentRuntime:
             finalizer_factory=self._finalizer_factory,
             finalizer_max_attempts=self._finalizer_max_attempts,
             tool_executor=self._tool_executor,
+            compaction_runtime_gate=self._compaction_runtime_gate,
+            provider_context_window=provider_context_window,
         )
         self._apply_interaction_mode_permissions()
 
@@ -313,14 +321,14 @@ class AgentRuntime:
     ) -> ContextCompactionRuntimeResult:
         """Run one explicitly supplied compaction request at the injected gate.
 
-        The gate is absent by default, so normal turns never trigger
-        compaction.  The caller must supply a complete safe-boundary request;
+        The gate is absent by default for directly constructed runtimes. The
+        caller must supply a complete safe-boundary request;
         this method does not derive thresholds, mutate the current context,
         emit events, or persist an execution record.
 
         在注入的门控处运行一次调用方显式提供的压缩请求。
 
-        默认没有门控,因此普通回合永远不会触发压缩。调用方必须提供完整的安全边界请求;本方法不会推导阈值、修改当前上下文、发出事件或持久化执行记录。
+        对于直接构造的 Runtime,默认不注入门控。调用方必须提供完整的安全边界请求;本方法不会推导阈值、修改当前上下文、发出事件或持久化执行记录。
         """
 
         if not isinstance(request, ContextCompactionRuntimeRequest):
@@ -341,11 +349,12 @@ class AgentRuntime:
 
         The same guidance and instruction/skill injection used by model steps
         is applied, but the returned immutable context is owned by the caller.
-        This is an explicit application seam; normal ``run`` does not call it.
+        This remains an explicit inspection seam; normal ``run`` builds its
+        own request snapshot through the same context builder.
 
         构建一次请求范围的上下文快照但不持久化。
         使用与模型步骤相同的指引及指令/技能注入,但返回的不可变上下文由调用方持有。
-        这是显式应用接缝,普通 ``run`` 不会调用它。
+        这仍是显式检查接缝;普通 ``run`` 会通过同一上下文构建器创建自己的请求快照。
         """
 
         if not isinstance(items, Sequence):

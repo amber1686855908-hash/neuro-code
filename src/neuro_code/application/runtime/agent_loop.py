@@ -23,6 +23,19 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from time import monotonic
 
+from neuro_code.application.execution_policy import ExecutionSegmentPolicy
+from neuro_code.application.memory.compaction import (
+    CompactionResumeRebuilder,
+    ContextCompactionDecision,
+    ProviderContextWindow,
+    rebuild_context_from_latest_compatible_compaction,
+)
+from neuro_code.application.memory.compaction_runtime import (
+    ContextCompactionRuntimeBoundary,
+    ContextCompactionRuntimeGate,
+    ContextCompactionSafePoint,
+    ContextCompactionTimeoutError,
+)
 from neuro_code.application.ports.model import ModelProvider
 from neuro_code.application.ports.storage import SessionStore
 from neuro_code.application.ports.tools import ToolCollection, ToolContext
@@ -57,6 +70,7 @@ from neuro_code.application.sessions.task_queries import (
     SessionTaskQueryService,
 )
 from neuro_code.domain.background_tasks.models import BackgroundTaskSnapshot
+from neuro_code.domain.conversation.compaction import DurableCompactionItem
 from neuro_code.domain.conversation.context import ModelContext
 from neuro_code.domain.conversation.events import AgentEvent, AgentEventKind
 from neuro_code.domain.conversation.messages import (
@@ -69,6 +83,9 @@ from neuro_code.domain.conversation.messages import (
 from neuro_code.domain.execution import (
     AgentExecutionOutcome,
     AgentExecutionStatus,
+    ExecutionBudget,
+    ExecutionCounters,
+    ExecutionSegmentCheckpoint,
     ProgressKind,
     SupervisorDecision,
     SupervisorDecisionKind,
@@ -76,7 +93,7 @@ from neuro_code.domain.execution import (
     TurnCancellationPolicy,
     TurnSource,
 )
-from neuro_code.domain.plans import SessionPlan
+from neuro_code.domain.plans import PlanStepStatus, SessionPlan
 from neuro_code.domain.session_tasks import SessionTask, SessionTaskKind, SessionTaskStatus
 from neuro_code.shared.async_utils import run_blocking
 from neuro_code.shared.errors import ConfigurationError, ProviderError
@@ -105,12 +122,16 @@ class AgentLoopRunner:
     管理一个 Agent 回合的步骤循环和最终化编排."""
 
     __slots__ = (
+        "_compaction_runtime_gate",
         "_context_builder",
+        "_execution_budget",
         "_execution_control_mode",
         "_finalizer_factory",
         "_finalizer_max_attempts",
         "_max_steps",
         "_provider",
+        "_provider_context_window",
+        "_segment_policy",
         "_session_store",
         "_supervision_observer",
         "_supervisor_factory",
@@ -128,7 +149,7 @@ class AgentLoopRunner:
         tool_context: ToolContext,
         session_store: SessionStore | None,
         system_prompt: str,
-        max_steps: int,
+        execution_budget: ExecutionBudget,
         context_builder: ContextBuilder,
         supervisor_factory: Callable[[], AgentExecutionSupervisor],
         supervision_observer: SupervisionObserver | None,
@@ -136,13 +157,31 @@ class AgentLoopRunner:
         finalizer_factory: Callable[[ModelProvider, int, tuple[str, ...]], Finalizer],
         finalizer_max_attempts: int,
         tool_executor: ToolExecutor,
+        compaction_runtime_gate: ContextCompactionRuntimeGate | None,
+        provider_context_window: ProviderContextWindow | None,
     ) -> None:
         self._provider = provider
         self._tools = tools
         self._tool_context = tool_context
         self._session_store = session_store
         self._system_prompt = system_prompt
-        self._max_steps = max_steps
+        if not isinstance(execution_budget, ExecutionBudget):
+            raise TypeError("execution_budget must be an ExecutionBudget")
+        if compaction_runtime_gate is not None and not isinstance(
+            compaction_runtime_gate,
+            ContextCompactionRuntimeGate,
+        ):
+            raise TypeError(
+                "compaction_runtime_gate must be a ContextCompactionRuntimeGate or None"
+            )
+        if provider_context_window is not None and not isinstance(
+            provider_context_window,
+            ProviderContextWindow,
+        ):
+            raise TypeError("provider_context_window must be a ProviderContextWindow or None")
+        self._execution_budget = execution_budget
+        self._max_steps = execution_budget.max_model_calls
+        self._segment_policy = ExecutionSegmentPolicy.from_budget(execution_budget)
         self._context_builder = context_builder
         self._supervisor_factory = supervisor_factory
         self._supervision_observer = supervision_observer
@@ -150,6 +189,8 @@ class AgentLoopRunner:
         self._finalizer_factory = finalizer_factory
         self._finalizer_max_attempts = finalizer_max_attempts
         self._tool_executor = tool_executor
+        self._compaction_runtime_gate = compaction_runtime_gate
+        self._provider_context_window = provider_context_window
 
     async def run(
         self,
@@ -277,6 +318,12 @@ class AgentLoopRunner:
         finalize_turn_completion = recorder.finalize_turn_completion
 
         supervisor: AgentExecutionSupervisor | None = None
+        active_provider_window = self._provider_context_window
+        active_compaction_item: DurableCompactionItem | None = None
+        has_completed_model_step = False
+        segment_number = 1
+        segment_start_counters = ExecutionCounters()
+        segment_progress_kinds: set[ProgressKind] = set()
 
         def disable_supervision(failure: str, error: Exception | None = None) -> None:
             nonlocal supervisor
@@ -367,6 +414,156 @@ class AgentLoopRunner:
             )
             self._context_builder.set_runtime_supervision_reason(reason)
 
+        def canonical_model_context() -> ModelContext:
+            return ModelContext(
+                tuple(context_items),
+                context_source_provider,
+                context_source_model,
+                context_source_affinity,
+                self._context_builder.reasoning_effort,
+            )
+
+        def projected_model_context() -> ModelContext:
+            context = canonical_model_context()
+            if active_compaction_item is None:
+                return context
+            return (
+                CompactionResumeRebuilder()
+                .rebuild(
+                    context,
+                    (active_compaction_item,),
+                )
+                .context
+            )
+
+        async def build_request_context(
+            additional_items: Sequence[SessionItem] = (),
+        ) -> ModelContext:
+            projected = projected_model_context()
+            model_items = await run_blocking(
+                self._context_builder.build,
+                (*projected.items, *additional_items),
+            )
+            return ModelContext(
+                model_items,
+                projected.source_provider,
+                projected.source_model,
+                projected.source_context_affinity,
+                self._context_builder.reasoning_effort,
+            )
+
+        def preview_budget_guidance() -> None:
+            current = supervisor
+            if (
+                current is None
+                or self._execution_control_mode is not ExecutionControlMode.FINALIZE_TERMINAL
+            ):
+                self._context_builder.set_runtime_budget_usage(None)
+                return
+            self._context_builder.set_runtime_budget_usage(
+                current.budget_usage(include_model_reserve=True)
+            )
+
+        async def emit_budget_usage() -> None:
+            current = supervisor
+            if (
+                current is None
+                or self._execution_control_mode is not ExecutionControlMode.FINALIZE_TERMINAL
+            ):
+                return
+            usage = current.budget_usage()
+            self._context_builder.set_runtime_budget_usage(usage)
+            await emit(AgentEventKind.EXECUTION_BUDGET_UPDATED, usage.to_event_data())
+
+        async def maybe_compact_context(
+            safe_point: ContextCompactionSafePoint,
+            *,
+            step: int,
+            usage_context: ModelContext,
+        ) -> SupervisorDecision | None:
+            nonlocal active_compaction_item
+            gate = self._compaction_runtime_gate
+            if (
+                self._execution_control_mode is not ExecutionControlMode.FINALIZE_TERMINAL
+                or not has_completed_model_step
+                or gate is None
+                or active_provider_window is None
+                or self._session_store is None
+                or session_id is None
+            ):
+                return None
+            source_context = canonical_model_context()
+            request = gate.build_automatic_request(
+                source_context=source_context,
+                usage_context=usage_context,
+                boundary=ContextCompactionRuntimeBoundary(safe_point, step),
+                provider_window=active_provider_window,
+                protected_item_count=(
+                    1
+                    if source_context.items
+                    and isinstance(source_context.items[0], Message)
+                    and source_context.items[0].role is Role.SYSTEM
+                    else 0
+                ),
+                session_id=session_id,
+                compaction_id=f"compact-{uuid.uuid4().hex}",
+                created_at=datetime.now(UTC),
+            )
+            assessment = gate.assess(request)
+            if not assessment.will_trigger:
+                return None
+            plan = assessment.trigger.plan
+            if (
+                active_compaction_item is not None
+                and active_compaction_item.source_item_count == plan.source_item_count
+                and active_compaction_item.candidate_range == plan.candidate_range
+            ):
+                if plan.decision is ContextCompactionDecision.REQUIRED:
+                    return SupervisorDecision(
+                        SupervisorDecisionKind.MARK_BUDGET_LIMITED,
+                        "context remains above its hard limit after bounded compaction",
+                        AgentExecutionStatus.BUDGET_LIMITED,
+                        False,
+                        SupervisorReasonCode.CONTEXT_WINDOW_BUDGET,
+                    )
+                return None
+            await emit(
+                AgentEventKind.CONTEXT_COMPACTION_STARTED,
+                {
+                    "safe_point": safe_point.value,
+                    "decision": plan.decision.value,
+                    "source_item_count": plan.source_item_count,
+                    "candidate_item_count": plan.candidate_item_count,
+                },
+            )
+            try:
+                result = await gate.trigger(request)
+            except ContextCompactionTimeoutError:
+                return SupervisorDecision(
+                    SupervisorDecisionKind.MARK_BUDGET_LIMITED,
+                    "automatic context compaction exceeded its wall-clock budget",
+                    AgentExecutionStatus.BUDGET_LIMITED,
+                    False,
+                    SupervisorReasonCode.WALL_TIME_BUDGET,
+                )
+            persistence = result.trigger_result.persistence
+            if persistence is None:
+                return None
+            active_compaction_item = persistence.item
+            await emit(
+                AgentEventKind.CONTEXT_COMPACTION_COMPLETED,
+                {
+                    "safe_point": safe_point.value,
+                    "source_item_count": persistence.item.source_item_count,
+                    "candidate_item_count": (
+                        persistence.item.candidate_range[1] - persistence.item.candidate_range[0]
+                    ),
+                    "summary_tokens": persistence.item.summary_tokens,
+                    "summary_truncated": persistence.item.summary_truncated,
+                },
+            )
+            return None
+
         def outcome_for_terminal_decision(
             decision: SupervisorDecision,
         ) -> AgentExecutionOutcome:
@@ -434,13 +631,7 @@ class AgentLoopRunner:
                 self._tool_context.redaction_values,
             )
             finalization = await finalizer.finalize(
-                ModelContext(
-                    tuple(context_items),
-                    context_source_provider,
-                    context_source_model,
-                    context_source_affinity,
-                    self._context_builder.reasoning_effort,
-                ),
+                projected_model_context(),
                 FinalizationEvidence(
                     decision.reason_code,
                     workspace_changes=tuple(workspace_evidence),
@@ -554,6 +745,24 @@ class AgentLoopRunner:
                 messages.append(user_message)
                 await emit(AgentEventKind.USER_MESSAGE, {"content": user_message.model_content()})
 
+            if (
+                self._execution_control_mode is ExecutionControlMode.FINALIZE_TERMINAL
+                and self._compaction_runtime_gate is not None
+                and active_provider_window is not None
+                and self._session_store is not None
+                and session_id is not None
+            ):
+                records = await self._session_store.load_compaction_items(session_id)
+                resumed = rebuild_context_from_latest_compatible_compaction(
+                    canonical_model_context(),
+                    records,
+                )
+                if resumed.applied_compaction_ids:
+                    selected_id = resumed.applied_compaction_ids[0]
+                    active_compaction_item = next(
+                        record for record in records if record.compaction_id == selected_id
+                    )
+
             for step in range(1, self._max_steps + 1):
                 if pending_terminal_decision is not None:
                     return await complete_finalized_turn(pending_terminal_decision, step=step - 1)
@@ -599,17 +808,18 @@ class AgentLoopRunner:
                                 "model_context_only": True,
                             },
                         )
-                model_items = await run_blocking(
-                    self._context_builder.build,
-                    (*context_items, *completion_reminders),
+                preview_budget_guidance()
+                context = await build_request_context(completion_reminders)
+                prior_compaction_item = active_compaction_item
+                compaction_decision = await maybe_compact_context(
+                    ContextCompactionSafePoint.BEFORE_MODEL_REQUEST,
+                    step=step,
+                    usage_context=context,
                 )
-                context = ModelContext(
-                    model_items,
-                    context_source_provider,
-                    context_source_model,
-                    context_source_affinity,
-                    self._context_builder.reasoning_effort,
-                )
+                if compaction_decision is not None:
+                    return await complete_finalized_turn(compaction_decision, step=step - 1)
+                if active_compaction_item is not prior_compaction_item:
+                    context = await build_request_context(completion_reminders)
                 before_model_decision = record_supervision(
                     SupervisionCheckpoint.BEFORE_MODEL,
                     step,
@@ -618,6 +828,8 @@ class AgentLoopRunner:
                 terminal_before_model = controlled_terminal_decision(before_model_decision)
                 if terminal_before_model is not None:
                     return await complete_finalized_turn(terminal_before_model, step=step - 1)
+                await emit_budget_usage()
+                self._context_builder.set_runtime_segment_checkpoint(None)
                 step_result = await ModelStepProcessor(session_store=self._session_store).consume(
                     self._provider.stream(context, self._tools.definitions()),
                     emit=emit,
@@ -634,6 +846,33 @@ class AgentLoopRunner:
 
                 if completion is None:
                     raise ProviderError("provider stream ended without a completion event")
+                has_completed_model_step = True
+                if step_result.selected_provider is not None:
+                    selected = step_result.selected_provider
+                    active_provider_window = (
+                        ProviderContextWindow(
+                            selected.provider,
+                            selected.model,
+                            selected.context_window_tokens,
+                            selected.context_affinity,
+                        )
+                        if selected.context_window_tokens is not None
+                        else None
+                    )
+                    # A failover provider can keep its selected candidate across
+                    # turns without announcing it again. Retain the last explicit
+                    # selection so the next turn never falls back to stale primary
+                    # context-window metadata.
+                    self._provider_context_window = active_provider_window
+                    if active_compaction_item is not None and (
+                        active_compaction_item.provider_name != selected.provider
+                        or active_compaction_item.model_name != selected.model
+                        or (
+                            active_compaction_item.context_affinity is not None
+                            and active_compaction_item.context_affinity != selected.context_affinity
+                        )
+                    ):
+                        active_compaction_item = None
                 if completion.input_tokens is not None:
                     output_tokens = completion.output_tokens or 0
                     await emit(
@@ -661,6 +900,15 @@ class AgentLoopRunner:
                     step,
                     observe_model_completion,
                 )
+                if any(
+                    limit is not None
+                    for limit in (
+                        self._execution_budget.max_input_tokens,
+                        self._execution_budget.max_output_tokens,
+                        self._execution_budget.max_total_tokens,
+                    )
+                ):
+                    await emit_budget_usage()
                 if completion_batch and background_tasks is not None:
                     await background_tasks.mark_completions_reported(
                         tuple(snapshot.task_id for snapshot in completion_batch)
@@ -743,6 +991,7 @@ class AgentLoopRunner:
                     pending_terminal_decision,
                     after_tool_batch_decision,
                 )
+                await emit_budget_usage()
 
                 def record_tool_outcome(
                     observation: ToolExecutionObservation,
@@ -788,6 +1037,11 @@ class AgentLoopRunner:
                         else:
                             record_verification_evidence(observation)
                             last_tool_decision = record_tool_outcome(observation)
+                            if (
+                                supervisor is not None
+                                and observation.progress_kind is not ProgressKind.NONE
+                            ):
+                                segment_progress_kinds.add(observation.progress_kind)
                             pending_terminal_decision = select_terminal_decision(
                                 pending_terminal_decision,
                                 last_tool_decision,
@@ -806,6 +1060,65 @@ class AgentLoopRunner:
                 update_runtime_supervision_guidance(
                     last_tool_decision or after_tool_batch_decision or after_model_decision
                 )
+                preview_budget_guidance()
+                post_batch_context = await build_request_context(completion_reminders)
+                compaction_decision = await maybe_compact_context(
+                    ContextCompactionSafePoint.AFTER_TOOL_BATCH,
+                    step=step,
+                    usage_context=post_batch_context,
+                )
+                if compaction_decision is not None:
+                    return await complete_finalized_turn(compaction_decision, step=step)
+
+                current_supervisor = supervisor
+                if (
+                    self._execution_control_mode is ExecutionControlMode.FINALIZE_TERMINAL
+                    and current_supervisor is not None
+                    and segment_progress_kinds
+                    and current_supervisor.snapshot.consecutive_no_progress_rounds == 0
+                    and self._segment_policy.reached(
+                        current_supervisor.snapshot.counters,
+                        segment_start_counters,
+                    )
+                ):
+                    usage = current_supervisor.budget_usage()
+                    if (
+                        usage.model_calls_remaining > 0
+                        and usage.tool_rounds_remaining > 0
+                        and usage.tool_calls_remaining > 0
+                    ):
+                        counters = current_supervisor.snapshot.counters
+                        plan = self._context_builder.plan
+                        checkpoint = ExecutionSegmentCheckpoint(
+                            segment_number=segment_number,
+                            model_calls=(
+                                counters.model_requests - segment_start_counters.model_requests
+                            ),
+                            tool_rounds=(counters.tool_rounds - segment_start_counters.tool_rounds),
+                            tool_calls=(
+                                counters.tool_calls_requested
+                                - segment_start_counters.tool_calls_requested
+                            ),
+                            progress_kinds=tuple(segment_progress_kinds),
+                            plan_steps_total=len(plan.steps) if plan is not None else 0,
+                            plan_steps_completed=(
+                                sum(
+                                    step_item.status is PlanStepStatus.COMPLETED
+                                    for step_item in plan.steps
+                                )
+                                if plan is not None
+                                else 0
+                            ),
+                            created_at=datetime.now(UTC),
+                        )
+                        await emit(
+                            AgentEventKind.EXECUTION_SEGMENT_CHECKPOINTED,
+                            checkpoint.to_event_data(),
+                        )
+                        self._context_builder.set_runtime_segment_checkpoint(checkpoint)
+                        segment_number += 1
+                        segment_start_counters = counters
+                        segment_progress_kinds.clear()
             if self._execution_control_mode is ExecutionControlMode.FINALIZE_TERMINAL:
                 return await complete_finalized_turn(
                     SupervisorDecision(
@@ -829,6 +1142,8 @@ class AgentLoopRunner:
             raise
         finally:
             self._context_builder.set_runtime_supervision_reason(None)
+            self._context_builder.set_runtime_budget_usage(None)
+            self._context_builder.set_runtime_segment_checkpoint(None)
 
 
 __all__ = ["AgentLoopRunner", "AgentRunResult"]

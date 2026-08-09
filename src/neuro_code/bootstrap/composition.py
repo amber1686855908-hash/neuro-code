@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from neuro_code.application.execution_policy import ExecutionBudgetPolicy
+from neuro_code.application.memory.compaction import ProviderContextWindow
 from neuro_code.application.memory.compaction_runtime import ContextCompactionRuntimeGate
 from neuro_code.application.memory.compaction_service import ContextCompactionApplicationService
 from neuro_code.application.memory.compaction_trigger import ContextCompactionTriggerService
@@ -391,6 +392,16 @@ class ApplicationComposition:
                 reasoning_effort=reasoning_effort or self.settings.reasoning_effort,
                 execution_control_mode=self.settings.execution_control_mode,
                 compaction_runtime_gate=compaction_gate,
+                provider_context_window=(
+                    ProviderContextWindow(
+                        selected_config.provider.name,
+                        selected_config.provider.model,
+                        selected_config.provider.context_window_tokens,
+                        selected_config.provider.context_affinity,
+                    )
+                    if selected_config.provider.context_window_tokens is not None
+                    else None
+                ),
                 instruction_provider=instruction_provider,
                 skill_provider=skill_provider,
             )

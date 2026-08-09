@@ -1279,3 +1279,20 @@ Runtime 门控现在会在允许的显式压缩操作外层真正执行有限的
 可见的注入以及通用 batch-first 证据收集策略。两者都不会追加到会话条目；REPLAN 消息会
 在产生新进展或回合退出时清除。工具执行顺序和现有 stuck 检测保持不变。详见
 [ADR 0105](../en/adr/0105-unified-execution-budget-and-replan-guidance.md)。
+
+## 有界长任务 Runtime 指引、压缩与分段
+
+生产 `FINALIZE_TERMINAL` loop 现在通过 `ExecutionBudgetUsage` 投影其规范
+`ExecutionBudget`。仅请求可见的指引和 `EXECUTION_BUDGET_UPDATED` 会暴露有界模型/工具计数，但不包含
+提示词、工具载荷或监督器指纹。该事件仍可供需要它的接口投影使用；标准 TUI 则有意不在运行时栏展示
+原始执行计数。
+
+当 binding 同时具有持久化会话存储和已配置的 Provider 上下文窗口时，现有压缩门控会在
+`BEFORE_MODEL_REQUEST` 与 `AFTER_TOOL_BATCH` 安全点评估自动压缩。压缩保持自身独立的一次请求/无工具
+预算，保留规范 transcript 条目，不拆开工具调用/结果配对，并从最新兼容的持久化投影恢复。Provider、存储
+和取消失败保持现有语义。相同区间不会重复摘要；压缩后仍越过 hard context threshold 时，会以可恢复的
+`BUDGET_LIMITED/CONTEXT_WINDOW_BUDGET` 最终化。
+
+持续产生进展的长回合还可以发出持久化且有界的 `EXECUTION_SEGMENT_CHECKPOINTED` 事件，并在下一请求
+接收一次临时 checkpoint 指引。segment 阈值不重置或取代全局回合预算，也不承诺崩溃恢复或工作区回滚。
+详见 [ADR 0107](adr/0107-bounded-long-task-runtime.md)。

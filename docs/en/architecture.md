@@ -1832,3 +1832,28 @@ the general batch-first evidence-gathering policy. Neither message is appended
 to session items, and the replan message is cleared on new progress or turn
 exit. Tool execution order and the existing stuck detectors are unchanged. See
 [ADR 0105](adr/0105-unified-execution-budget-and-replan-guidance.md).
+
+## Bounded long-task Runtime guidance, compaction, and segments
+
+The production `FINALIZE_TERMINAL` loop now projects its canonical
+`ExecutionBudget` through `ExecutionBudgetUsage`. Request-only guidance and
+`EXECUTION_BUDGET_UPDATED` expose bounded model/tool counts without prompts,
+tool payloads, or supervisor fingerprints. The event remains available to
+interested interface projections, while the standard TUI deliberately keeps
+raw execution counters out of its runtime bar.
+
+When a binding also has persistent session storage and a configured provider
+context window, the existing compaction gate is assessed automatically at the
+`BEFORE_MODEL_REQUEST` and `AFTER_TOOL_BATCH` safe points. Compaction keeps its
+independent one-request/no-tool budget, preserves canonical transcript items,
+never splits tool call/result pairs, and resumes from the newest compatible
+durable projection. Provider/storage/cancellation failures keep their existing
+semantics. Repeating the same range is suppressed; a projection that remains
+above the hard context threshold finalizes as recoverable
+`BUDGET_LIMITED/CONTEXT_WINDOW_BUDGET`.
+
+Progressing long turns may also emit a durable, bounded
+`EXECUTION_SEGMENT_CHECKPOINTED` event and receive one transient checkpoint
+guidance message. Segment thresholds do not reset or replace the global turn
+budget and do not promise crash recovery or workspace rollback. See [ADR
+0107](adr/0107-bounded-long-task-runtime.md).

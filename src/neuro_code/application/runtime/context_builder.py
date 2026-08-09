@@ -22,7 +22,12 @@ from neuro_code.domain.conversation.interaction_mode import (
 )
 from neuro_code.domain.conversation.messages import Message, Role, SessionItem, SyntheticReason
 from neuro_code.domain.conversation.reasoning import ReasoningEffort, reasoning_guidance
-from neuro_code.domain.execution import SupervisorReasonCode
+from neuro_code.domain.execution import (
+    ExecutionBudgetPressure,
+    ExecutionBudgetUsage,
+    ExecutionSegmentCheckpoint,
+    SupervisorReasonCode,
+)
 from neuro_code.domain.plans import PlanComment, SessionPlan
 from neuro_code.domain.workspace.instructions import InstructionDiscoveryResult
 from neuro_code.domain.workspace.skills import SkillDiscoveryResult
@@ -39,6 +44,40 @@ REPLAN_RUNTIME_GUIDANCE = """Runtime supervision guidance:
 The current approach is repeating results without sufficient progress. Change strategy. Avoid
 repeating the same tool or action with equivalent arguments. Narrow or broaden the search,
 inspect different evidence, or revise the current assumption."""
+
+
+def _budget_runtime_guidance(usage: ExecutionBudgetUsage) -> str:
+    pressure_guidance = {
+        ExecutionBudgetPressure.NORMAL: "Continue normally and keep evidence gathering purposeful.",
+        ExecutionBudgetPressure.CONSERVE: (
+            "Prioritize the core question and avoid open-ended exploration."
+        ),
+        ExecutionBudgetPressure.FOCUS: (
+            "Merge independent searches and reads; perform only necessary follow-up."
+        ),
+        ExecutionBudgetPressure.FINAL_STAGE: (
+            "Stop nonessential exploration, complete only necessary verification, and prepare the answer."
+        ),
+    }[usage.pressure]
+    return (
+        "Runtime budget guidance:\n"
+        f"Model calls remaining: {usage.model_calls_remaining}/{usage.budget.max_model_calls}. "
+        f"Tool rounds remaining: {usage.tool_rounds_remaining}/{usage.budget.max_tool_rounds}. "
+        f"Tool calls remaining: {usage.tool_calls_remaining}/{usage.budget.max_tool_calls}.\n"
+        f"{pressure_guidance}"
+    )
+
+
+def _segment_runtime_guidance(checkpoint: ExecutionSegmentCheckpoint) -> str:
+    progress = ", ".join(kind.value for kind in checkpoint.progress_kinds)
+    return (
+        "Runtime segment checkpoint:\n"
+        f"Segment {checkpoint.segment_number} completed after "
+        f"{checkpoint.model_calls} model calls, {checkpoint.tool_rounds} tool rounds, and "
+        f"{checkpoint.tool_calls} tool calls. Confirmed progress categories: {progress}. "
+        "Continue the same user task in the next bounded segment. Reuse recorded evidence, avoid "
+        "repeating equivalent actions, and do not claim unrecorded work."
+    )
 
 
 class ContextBuilder:
@@ -62,6 +101,8 @@ class ContextBuilder:
         "_plan",
         "_plan_comments",
         "_reasoning_effort",
+        "_runtime_budget_usage",
+        "_runtime_segment_checkpoint",
         "_runtime_supervision_reason",
         "_skill_provider",
     )
@@ -83,6 +124,8 @@ class ContextBuilder:
         self._skill_provider = skill_provider
         self._last_instruction_result: InstructionDiscoveryResult | None = None
         self._last_skill_result: SkillDiscoveryResult | None = None
+        self._runtime_budget_usage: ExecutionBudgetUsage | None = None
+        self._runtime_segment_checkpoint: ExecutionSegmentCheckpoint | None = None
         self._runtime_supervision_reason: SupervisorReasonCode | None = None
 
     @property
@@ -147,6 +190,27 @@ class ContextBuilder:
         if reason is not None and not isinstance(reason, SupervisorReasonCode):
             raise TypeError("runtime supervision reason must be canonical or None")
         self._runtime_supervision_reason = reason
+
+    @property
+    def runtime_budget_usage(self) -> ExecutionBudgetUsage | None:
+        return self._runtime_budget_usage
+
+    def set_runtime_budget_usage(self, usage: ExecutionBudgetUsage | None) -> None:
+        if usage is not None and not isinstance(usage, ExecutionBudgetUsage):
+            raise TypeError("runtime budget usage must be ExecutionBudgetUsage or None")
+        self._runtime_budget_usage = usage
+
+    @property
+    def runtime_segment_checkpoint(self) -> ExecutionSegmentCheckpoint | None:
+        return self._runtime_segment_checkpoint
+
+    def set_runtime_segment_checkpoint(
+        self,
+        checkpoint: ExecutionSegmentCheckpoint | None,
+    ) -> None:
+        if checkpoint is not None and not isinstance(checkpoint, ExecutionSegmentCheckpoint):
+            raise TypeError("runtime segment checkpoint must be ExecutionSegmentCheckpoint or None")
+        self._runtime_segment_checkpoint = checkpoint
 
     @property
     def instruction_result(self) -> InstructionDiscoveryResult | None:
@@ -232,7 +296,32 @@ class ContextBuilder:
                     break
             rendered.insert(insert_at, skill_msg)
 
+        runtime_messages: list[Message] = []
+        if self._runtime_budget_usage is not None:
+            runtime_messages.append(
+                Message(
+                    Role.USER,
+                    _budget_runtime_guidance(self._runtime_budget_usage),
+                    synthetic_reason=SyntheticReason.RUNTIME_BUDGET,
+                )
+            )
+        if self._runtime_segment_checkpoint is not None:
+            runtime_messages.append(
+                Message(
+                    Role.USER,
+                    _segment_runtime_guidance(self._runtime_segment_checkpoint),
+                    synthetic_reason=SyntheticReason.RUNTIME_CHECKPOINT,
+                )
+            )
         if self._runtime_supervision_reason is not None:
+            runtime_messages.append(
+                Message(
+                    Role.USER,
+                    REPLAN_RUNTIME_GUIDANCE,
+                    synthetic_reason=SyntheticReason.RUNTIME_SUPERVISION,
+                )
+            )
+        if runtime_messages:
             insert_at = system_index + 1
             while insert_at < len(rendered):
                 item = rendered[insert_at]
@@ -242,14 +331,9 @@ class ContextBuilder:
                 }:
                     break
                 insert_at += 1
-            rendered.insert(
-                insert_at,
-                Message(
-                    Role.USER,
-                    REPLAN_RUNTIME_GUIDANCE,
-                    synthetic_reason=SyntheticReason.RUNTIME_SUPERVISION,
-                ),
-            )
+            for runtime_message in runtime_messages:
+                rendered.insert(insert_at, runtime_message)
+                insert_at += 1
 
         return tuple(rendered)
 

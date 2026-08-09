@@ -1,14 +1,15 @@
 """Deterministic context-compaction assessment and resume projection.
 
 This module plans a possible compaction range and exposes bounded application
-contracts for redacted summary input, durable summary creation, and explicit
-resume reconstruction. It never calls a Provider, mutates the caller's
-context, executes a tool, or enables automatic Runtime compaction.
+contracts for redacted summary input, durable summary creation, and resume
+reconstruction. Planning never calls a Provider, mutates the caller's context,
+or executes a tool; the Runtime may use these contracts through its separately
+injected compaction gate.
 
 为应用层记忆提供确定性的上下文压缩评估与恢复投影。
 
-本模块规划可能的压缩范围, 并提供脱敏摘要输入、持久化摘要创建和显式恢复重建的有界应用契约。
-它不会调用 Provider、修改调用方上下文、执行工具或启用 Runtime 自动压缩。
+本模块规划可能的压缩范围, 并提供脱敏摘要输入、持久化摘要创建和恢复重建的有界应用契约。
+规划过程不会调用 Provider、修改调用方上下文或执行工具; Runtime 可通过单独注入的压缩门控使用这些契约。
 """
 
 from __future__ import annotations
@@ -26,7 +27,12 @@ from neuro_code.domain.conversation.compaction import (
     compute_compaction_source_fingerprint,
 )
 from neuro_code.domain.conversation.context import ModelContext, estimate_text_tokens
-from neuro_code.domain.conversation.events import ModelCompleted, ModelTextDelta, ModelToolCall
+from neuro_code.domain.conversation.events import (
+    ModelCompleted,
+    ModelProviderSelected,
+    ModelTextDelta,
+    ModelToolCall,
+)
 from neuro_code.domain.conversation.messages import (
     ContextItemKind,
     Message,
@@ -875,6 +881,17 @@ class ProviderContextSummaryGenerator:
         ):
             if isinstance(event, ModelTextDelta):
                 text_parts.append(event.text)
+            elif isinstance(event, ModelProviderSelected):
+                expected = request.provider_window
+                if (
+                    event.provider != expected.provider_name
+                    or event.model != expected.model_name
+                    or (
+                        expected.context_affinity is not None
+                        and event.context_affinity != expected.context_affinity
+                    )
+                ):
+                    raise ProviderError("context summary provider changed origin during generation")
             elif isinstance(event, ModelToolCall):
                 raise ProviderError("context summary provider emitted an unexpected tool call")
             elif isinstance(event, ModelCompleted):
@@ -1042,7 +1059,7 @@ class CompactionResumeRebuilder:
         applied_ids: list[str] = []
         omitted_count = 0
         for record in ordered:
-            if record.source_item_count != len(context.items):
+            if record.source_item_count > len(context.items):
                 raise ValueError("compaction record source item count is stale")
             self._validate_provider_origin(context, record)
             start, end = record.candidate_range
@@ -1094,6 +1111,75 @@ class CompactionResumeRebuilder:
             raise ValueError("compaction record affinity does not match context origin")
 
 
+def rebuild_context_from_latest_compatible_compaction(
+    context: ModelContext,
+    records: Sequence[DurableCompactionItem],
+) -> CompactionResumeResult:
+    """Apply only the newest durable record compatible with the current context.
+
+    A newer summary supersedes older overlapping summaries. Stale records are
+    ignored at this projection boundary; malformed persisted rows remain the
+    storage adapter's error and are not accepted here.
+
+    只应用与当前上下文兼容的最新持久化记录. 较新的摘要取代旧的重叠摘要;
+    过期记录会在该投影边界被忽略,格式错误的持久化行仍由存储适配器报错.
+    """
+
+    if not isinstance(context, ModelContext):
+        raise TypeError("context must be a ModelContext")
+    normalized = tuple(records)
+    if not all(isinstance(record, DurableCompactionItem) for record in normalized):
+        raise TypeError("records must contain DurableCompactionItem values")
+    rebuilder = CompactionResumeRebuilder()
+    for record in sorted(
+        normalized,
+        key=lambda item: (item.created_at, item.compaction_id),
+        reverse=True,
+    ):
+        try:
+            return rebuilder.rebuild(context, (record,))
+        except ValueError:
+            continue
+    return CompactionResumeResult(context, (), 0)
+
+
+def _safe_compaction_candidate_range(
+    items: Sequence[SessionItem],
+    *,
+    candidate_start: int,
+    candidate_end: int,
+) -> tuple[int, int] | None:
+    """Choose inner boundaries that never split assistant tool-call pairing."""
+
+    pending_call_ids: set[str] = set()
+    safe_boundaries = {0}
+    for index, item in enumerate(items):
+        if isinstance(item, Message):
+            if item.role is Role.ASSISTANT:
+                pending_call_ids.update(call.id for call in item.tool_calls)
+            elif item.role is Role.TOOL and item.tool_call_id is not None:
+                pending_call_ids.discard(item.tool_call_id)
+        if not pending_call_ids:
+            safe_boundaries.add(index + 1)
+    safe_start = next(
+        (boundary for boundary in sorted(safe_boundaries) if boundary >= candidate_start),
+        None,
+    )
+    if safe_start is None:
+        return None
+    safe_end = next(
+        (
+            boundary
+            for boundary in sorted(safe_boundaries, reverse=True)
+            if boundary <= candidate_end
+        ),
+        None,
+    )
+    if safe_end is None or safe_end <= safe_start:
+        return None
+    return (safe_start, safe_end)
+
+
 @dataclass(frozen=True, slots=True)
 class ContextCompactionPlanner:
     """Create a non-mutating compaction assessment for ordered session items.
@@ -1126,7 +1212,8 @@ class ContextCompactionPlanner:
         if not isinstance(usage, CompactionContextUsage):
             raise TypeError("usage must be a CompactionContextUsage")
         _require_int("protected_item_count", protected_item_count)
-        source_item_count = len(tuple(items))
+        normalized_items = tuple(items)
+        source_item_count = len(normalized_items)
         if protected_item_count > source_item_count:
             raise ValueError("protected_item_count must not exceed item count")
 
@@ -1166,7 +1253,11 @@ class ContextCompactionPlanner:
             candidate_start = protected_item_count
             candidate_end = source_item_count - recent_item_count
             if candidate_end > candidate_start:
-                candidate_range = (candidate_start, candidate_end)
+                candidate_range = _safe_compaction_candidate_range(
+                    normalized_items,
+                    candidate_start=candidate_start,
+                    candidate_end=candidate_end,
+                )
 
         return ContextCompactionPlan(
             decision=decision,
@@ -1213,4 +1304,5 @@ __all__ = [
     "ProviderContextSummaryGenerator",
     "ProviderContextWindow",
     "build_durable_compaction_item",
+    "rebuild_context_from_latest_compatible_compaction",
 ]

@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from enum import StrEnum
 
@@ -35,6 +36,18 @@ class TurnSource(StrEnum):
 
     USER = "user"
     BACKGROUND_TASK_AUTO_WAKE = "background_task_auto_wake"
+
+
+class ExecutionBudgetPressure(StrEnum):
+    """A bounded, user-safe pressure level derived from execution usage.
+
+    表示根据执行用量推导出的有界且可安全展示的预算压力等级。
+    """
+
+    NORMAL = "normal"
+    CONSERVE = "conserve"
+    FOCUS = "focus"
+    FINAL_STAGE = "final_stage"
 
 
 @dataclass(frozen=True, slots=True)
@@ -264,8 +277,116 @@ class ExecutionCounters:
         return 0
 
 
+@dataclass(frozen=True, slots=True)
+class ExecutionBudgetUsage:
+    """Project live counters against the one canonical ordinary-turn budget.
+
+    The projection contains only bounded counters, limits, and elapsed time. It
+    never retains prompts, tool arguments, output, or supervisor fingerprints.
+
+    将实时计数器投影到唯一的普通回合预算上. 该投影只包含有界计数、上限和耗时,
+    不保留提示词、工具参数、输出或监督指纹.
+    """
+
+    budget: ExecutionBudget
+    counters: ExecutionCounters
+    elapsed_seconds: float
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.budget, ExecutionBudget):
+            raise TypeError("budget must be an ExecutionBudget")
+        if not isinstance(self.counters, ExecutionCounters):
+            raise TypeError("counters must be ExecutionCounters")
+        if (
+            isinstance(self.elapsed_seconds, bool)
+            or not isinstance(self.elapsed_seconds, int | float)
+            or not math.isfinite(float(self.elapsed_seconds))
+            or self.elapsed_seconds < 0
+        ):
+            raise ValueError("elapsed_seconds must be a finite non-negative number")
+
+    @staticmethod
+    def _remaining(limit: int, used: int) -> int:
+        return max(0, limit - used)
+
+    @property
+    def model_calls_remaining(self) -> int:
+        return self._remaining(self.budget.max_model_calls, self.counters.model_requests)
+
+    @property
+    def tool_rounds_remaining(self) -> int:
+        return self._remaining(self.budget.max_tool_rounds, self.counters.tool_rounds)
+
+    @property
+    def tool_calls_remaining(self) -> int:
+        return self._remaining(
+            self.budget.max_tool_calls,
+            self.counters.tool_calls_requested,
+        )
+
+    @property
+    def utilization_ratio(self) -> float:
+        ratios = [
+            self.counters.model_requests / self.budget.max_model_calls,
+            self.counters.tool_rounds / self.budget.max_tool_rounds,
+            self.counters.tool_calls_requested / self.budget.max_tool_calls,
+        ]
+        if self.budget.max_wall_seconds is not None:
+            ratios.append(self.elapsed_seconds / self.budget.max_wall_seconds)
+        if self.budget.max_input_tokens is not None and self.counters.input_tokens is not None:
+            ratios.append(self.counters.input_tokens / self.budget.max_input_tokens)
+        if self.budget.max_output_tokens is not None and self.counters.output_tokens is not None:
+            ratios.append(self.counters.output_tokens / self.budget.max_output_tokens)
+        if (
+            self.budget.max_total_tokens is not None
+            and self.counters.input_tokens is not None
+            and self.counters.output_tokens is not None
+        ):
+            ratios.append(
+                (self.counters.input_tokens + self.counters.output_tokens)
+                / self.budget.max_total_tokens
+            )
+        ratios.extend(
+            count.count / self.budget.limit_for_tool(count.tool_name)
+            for count in self.counters.per_tool_counts
+        )
+        return max(ratios)
+
+    @property
+    def pressure(self) -> ExecutionBudgetPressure:
+        ratio = self.utilization_ratio
+        if ratio >= 0.95:
+            return ExecutionBudgetPressure.FINAL_STAGE
+        if ratio >= 0.85:
+            return ExecutionBudgetPressure.FOCUS
+        if ratio >= 0.70:
+            return ExecutionBudgetPressure.CONSERVE
+        return ExecutionBudgetPressure.NORMAL
+
+    def to_event_data(self) -> dict[str, object]:
+        """Return the stable, non-sensitive event projection.
+
+        返回稳定且不含敏感内容的事件投影。
+        """
+
+        return {
+            "model_calls_used": self.counters.model_requests,
+            "model_calls_limit": self.budget.max_model_calls,
+            "model_calls_remaining": self.model_calls_remaining,
+            "tool_rounds_used": self.counters.tool_rounds,
+            "tool_rounds_limit": self.budget.max_tool_rounds,
+            "tool_rounds_remaining": self.tool_rounds_remaining,
+            "tool_calls_used": self.counters.tool_calls_requested,
+            "tool_calls_limit": self.budget.max_tool_calls,
+            "tool_calls_remaining": self.tool_calls_remaining,
+            "pressure": self.pressure.value,
+        }
+
+
 __all__ = [
     "ExecutionBudget",
+    "ExecutionBudgetPressure",
+    "ExecutionBudgetUsage",
     "ExecutionCounters",
     "SupervisionThresholds",
     "ToolCallBudget",

@@ -26,6 +26,7 @@ from neuro_code.application.execution_policy import (
 from neuro_code.domain.execution import (
     AgentExecutionStatus,
     ExecutionBudget,
+    ExecutionBudgetUsage,
     ExecutionCounters,
     ExecutionSnapshot,
     ProgressKind,
@@ -624,6 +625,25 @@ class AgentExecutionSupervisor:
     def mode(self) -> SupervisionMode:
         return self._mode
 
+    def budget_usage(self, *, include_model_reserve: bool = False) -> ExecutionBudgetUsage:
+        """Return a live, non-sensitive projection of ordinary-turn budget use.
+
+        ``include_model_reserve`` previews the request that is about to be
+        authorized so request-scoped guidance can describe the same counts the
+        model call will consume without mutating supervision early.
+
+        返回普通回合预算实时且不含敏感内容的投影. 可预览即将授权的模型请求,
+        使请求范围指引与实际消费计数一致,而无需提前修改监督状态.
+        """
+
+        if not isinstance(include_model_reserve, bool):
+            raise TypeError("include_model_reserve must be a bool")
+        snapshot = self._require_started()
+        counters = snapshot.counters
+        if include_model_reserve:
+            counters = replace(counters, model_requests=counters.model_requests + 1)
+        return ExecutionBudgetUsage(self._budget, counters, self._elapsed_seconds())
+
     def start_turn(self) -> ExecutionSnapshot:
         """Initialize the isolated state used for one execution.
 
@@ -647,9 +667,9 @@ class AgentExecutionSupervisor:
         return self._snapshot
 
     def authorize_model_request(self) -> SupervisorDecision:
-        """Reserve one ordinary model request while retaining Finalizer capacity.
+        """Reserve one ordinary model request from the ordinary-turn budget.
 
-        预留一次普通模型请求,同时保留 Finalizer 容量."""
+        从普通回合预算中预留一次普通模型请求."""
 
         snapshot = self._require_started()
         if self._reserved_tool_names:

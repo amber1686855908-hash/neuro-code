@@ -37,6 +37,7 @@ BORDER_DIM = "#252525"
 BORDER = "#3A3A3A"
 BORDER_FOCUS = "#BDBDBD"
 TEXT_DIM = "#444444"
+TEXT_PLACEHOLDER = "#383838"
 TEXT_DISABLED = "#555555"
 TEXT_MUTED = "#666666"
 TEXT_SECONDARY = "#8A8A8A"
@@ -64,6 +65,7 @@ MONO_COLORS = (
     BORDER,
     BORDER_FOCUS,
     TEXT_DIM,
+    TEXT_PLACEHOLDER,
     TEXT_DISABLED,
     TEXT_MUTED,
     TEXT_SECONDARY,
@@ -99,6 +101,7 @@ TEXTUAL_THEME = Theme(
         "text-secondary": TEXT_SECONDARY,
         "text-muted": TEXT_MUTED,
         "text-dim": TEXT_DIM,
+        "text-placeholder": TEXT_PLACEHOLDER,
         "text-disabled": TEXT_DISABLED,
         "text-emphasis": TEXT_EMPHASIS,
         "brand-text": BRAND_TEXT,
@@ -301,6 +304,7 @@ __all__ = [
     "TEXT_DISABLED",
     "TEXT_EMPHASIS",
     "TEXT_MUTED",
+    "TEXT_PLACEHOLDER",
     "TEXT_PRIMARY",
     "TEXT_SECONDARY",
     "TOOL_ACTIVE_STYLE",
