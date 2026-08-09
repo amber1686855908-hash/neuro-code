@@ -11,9 +11,11 @@ from typing import cast
 from unittest.mock import patch
 
 from pygments.token import Keyword, Name, Number, String
+from textual import events
 from textual.containers import VerticalScroll
 from textual.geometry import Size
 from textual.widgets import Button, Input, Label, Static
+from textual.widgets._input import Selection
 
 from neuro_code.application.permissions.broker import SessionApprovalBroker
 from neuro_code.application.permissions.contracts import (
@@ -1273,6 +1275,65 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(app.return_code, 0)
         self.assertIsNone(approvals.handlers[-1])
 
+    async def test_prompt_copy_and_paste_are_not_intercepted_by_cancel_binding(self) -> None:
+        app = NeuroCodeApp(
+            TuiConversation(),
+            provider_name="fixture",
+            model_name="fixture-model",
+            cwd=Path("/workspace"),
+        )
+
+        async with app.run_test(size=(80, 24)) as pilot:
+            prompt = app.query_one("#prompt", Input)
+            prompt.value = "copy this prompt"
+            prompt.selection = Selection(0, 9)
+
+            await pilot.press("ctrl+c")
+
+            self.assertEqual(app.clipboard, "copy this")
+            self.assertEqual(prompt.value, "copy this prompt")
+            self.assertNotIn("Cancellation requested.", [entry.text for entry in app.entries])
+
+            prompt.selection = Selection.cursor(len(prompt.value))
+            await pilot.press("ctrl+v")
+
+            self.assertEqual(prompt.value, "copy this promptcopy this")
+
+    async def test_prompt_ctrl_shift_c_copies_a_selection_explicitly(self) -> None:
+        app = NeuroCodeApp(
+            TuiConversation(),
+            provider_name="fixture",
+            model_name="fixture-model",
+            cwd=Path("/workspace"),
+        )
+
+        async with app.run_test(size=(80, 24)) as pilot:
+            prompt = app.query_one("#prompt", Input)
+            prompt.value = "selected text"
+            prompt.selection = Selection(0, 8)
+
+            await pilot.press("ctrl+shift+c")
+
+            self.assertEqual(app.clipboard, "selected")
+            self.assertEqual(prompt.value, "selected text")
+
+    async def test_prompt_paste_preserves_all_lines(self) -> None:
+        app = NeuroCodeApp(
+            TuiConversation(),
+            provider_name="fixture",
+            model_name="fixture-model",
+            cwd=Path("/workspace"),
+        )
+
+        async with app.run_test(size=(80, 24)) as pilot:
+            prompt = app.query_one("#prompt", Input)
+            prompt.post_message(events.Paste("first line\nsecond line\r\nthird line"))
+            await pilot.pause()
+
+            self.assertEqual(prompt.value, "first line\nsecond line\nthird line")
+            self.assertEqual(prompt._value.plain, "first line↵second line↵third line")
+            self.assertNotIn("\n", prompt._value.plain)
+
     async def test_monochrome_theme_uses_the_compact_custom_chrome(self) -> None:
         app = NeuroCodeApp(
             TuiConversation(),
@@ -1799,6 +1860,18 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
             ),
             "openai",
         )
+        self.assertEqual(
+            ProviderSettingsScreen._preset_for_profile(
+                ManagedProviderProfile(
+                    name="deepseek-explicit",
+                    protocol="openai-chat",
+                    dialect="deepseek-v4",
+                    model="fixture-model",
+                    base_url="https://proxy.invalid/v1",
+                )
+            ),
+            "deepseek",
+        )
         with tempfile.TemporaryDirectory() as directory, patch.dict("os.environ", {}, clear=True):
             store = JsonProviderSettingsStore(Path(directory))
             app = ProviderSetupApp(
@@ -1843,6 +1916,7 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
             saved = await store.load()
             self.assertEqual(saved.default_provider, "personal")
             self.assertEqual(saved.profiles[0].protocol, "openai-chat")
+            self.assertEqual(saved.profiles[0].dialect, "deepseek-v4")
             self.assertEqual(saved.profiles[0].model, "deepseek-v4-pro")
             self.assertNotIn("never-echo-this-key", repr(saved))
 
@@ -1971,6 +2045,7 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(len(catalog.calls), 1)
                 spec, policy = catalog.calls[0]
                 self.assertEqual(spec.protocol, "openai-chat")
+                self.assertEqual(spec.dialect, "deepseek-v4")
                 self.assertEqual(spec.base_url, "https://api.deepseek.com")
                 self.assertFalse(policy.trust_env)
                 self.assertNotIn("never-render-key", repr(spec))
@@ -3372,7 +3447,7 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
             entries = [(entry.category, entry.text) for entry in app.entries]
             self.assertIn(("user", "inspect the repository"), entries)
             self.assertIn(("status", "Reasoning..."), entries)
-            self.assertIn(("status", "Thought for 1.2s · model step 1"), entries)
+            self.assertIn(("status", "Reasoning finished · 1.2s · model step 1"), entries)
             tool_entries = [text for category, text in entries if category == "tool"]
             self.assertEqual(len(tool_entries), 1)
             self.assertEqual(tool_entries[0], "✓ Read README.md · 420ms")
@@ -3887,6 +3962,99 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             self.assertIn("RuntimeError: relationship list failed", failing.entries[-1].text)
 
+    async def test_running_tool_feedback_shows_elapsed_time_without_output(self) -> None:
+        app = NeuroCodeApp(
+            TuiConversation(),
+            provider_name="fixture",
+            model_name="fixture-model",
+            cwd=Path("/workspace"),
+        )
+
+        async with app.run_test(size=(100, 30)) as pilot:
+            await app._handle_event(
+                AgentEvent.create(
+                    1,
+                    AgentEventKind.TOOL_REQUESTED,
+                    {"id": "wait", "name": "wait_tasks", "arguments": {"timeout": 30}},
+                )
+            )
+            await app._handle_event(
+                AgentEvent.create(
+                    2,
+                    AgentEventKind.TOOL_STARTED,
+                    {"id": "wait", "name": "wait_tasks"},
+                )
+            )
+            state = app._tool_feedback_by_call[(False, "wait")]
+            state.started_at = 100.0
+            with patch.object(app, "_refresh_tool_feedback") as refresh:
+                app._advance_model_loading_animation()
+                refresh.assert_not_called()
+                app._refresh_running_tool_elapsed()
+                refresh.assert_called_once_with(state)
+            with patch("neuro_code.tui.monotonic", return_value=112.7):
+                app._refresh_running_tool_elapsed()
+            running_text = next(entry.text for entry in app.entries if entry.category == "tool")
+            self.assertIn("Waiting", running_text)
+            self.assertIn("12.7s", running_text)
+
+            await app._handle_event(
+                AgentEvent.create(
+                    3,
+                    AgentEventKind.TOOL_COMPLETED,
+                    {"id": "wait", "name": "wait_tasks", "duration_seconds": 13.4},
+                )
+            )
+            completed_text = next(entry.text for entry in app.entries if entry.category == "tool")
+            self.assertIn("Completed · 13.4s", completed_text)
+            await pilot.pause()
+
+    async def test_plan_updated_is_a_single_first_class_entry_refreshed_in_place(self) -> None:
+        app = NeuroCodeApp(
+            TuiConversation(),
+            provider_name="fixture",
+            model_name="fixture-model",
+            cwd=Path("/workspace"),
+        )
+        first_plan = SessionPlan(
+            (
+                PlanStep("Read the architecture", PlanStepStatus.COMPLETED),
+                PlanStep("Check the runtime", PlanStepStatus.IN_PROGRESS),
+                PlanStep("Verify the feedback", PlanStepStatus.PENDING),
+            )
+        )
+        updated_plan = SessionPlan(
+            (
+                PlanStep("Read the architecture", PlanStepStatus.COMPLETED),
+                PlanStep("Check the runtime", PlanStepStatus.COMPLETED),
+                PlanStep("Verify the feedback", PlanStepStatus.IN_PROGRESS),
+            )
+        )
+
+        async with app.run_test(size=(100, 30)) as pilot:
+            await app._handle_event(
+                AgentEvent.create(1, AgentEventKind.PLAN_UPDATED, first_plan.to_dict())
+            )
+            await pilot.pause()
+            plan_entries = [entry for entry in app.entries if entry.category == "plan"]
+            self.assertEqual(len(plan_entries), 1)
+            assert app._plan_entry_index is not None
+            widget = app._entry_widgets[app._plan_entry_index]
+            self.assertIn("✓ Read the architecture", plan_entries[0].text)
+            self.assertIn("\u203a Check the runtime", plan_entries[0].text)
+            self.assertIn("□ Verify the feedback", plan_entries[0].text)
+
+            await app._handle_event(
+                AgentEvent.create(2, AgentEventKind.PLAN_UPDATED, updated_plan.to_dict())
+            )
+            await pilot.pause()
+            self.assertEqual(len([entry for entry in app.entries if entry.category == "plan"]), 1)
+            assert app._plan_entry_index is not None
+            self.assertIs(app._entry_widgets[app._plan_entry_index], widget)
+            updated_text = app.entries[app._plan_entry_index].text
+            self.assertIn("✓ Check the runtime", updated_text)
+            self.assertIn("\u203a Verify the feedback", updated_text)
+
     async def test_plan_commands_show_the_saved_plan_and_start_a_plan_turn(self) -> None:
         plan = SessionPlan(
             (
@@ -3913,9 +4081,9 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
             await pilot.press("enter")
             await pilot.pause()
             displayed = app.entries[-1].text
-            self.assertIn("Current plan:", displayed)
+            self.assertIn("Updated plan:", displayed)
             self.assertIn("Keep the agreed work visible", displayed)
-            self.assertIn("[in progress] Implement the safe follow-up", displayed)
+            self.assertIn("\u203a Implement the safe follow-up", displayed)
 
             prompt.value = "/plan Verify the implementation before editing"
             await pilot.press("enter")
@@ -3951,7 +4119,7 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(len(await profiles.list_plan_comments()), 1)
             self.assertIn("Saved comment for plan step 2.", app.entries[-2].text)
-            self.assertIn("Comment: Keep the verification check explicit", app.entries[-1].text)
+            self.assertIn("· Keep the verification check explicit", app.entries[-1].text)
 
     async def test_execute_plan_switches_only_to_accept_edits_and_records_the_handoff(self) -> None:
         plan = SessionPlan(

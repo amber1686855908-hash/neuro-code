@@ -21,6 +21,7 @@ def deepseek_profile() -> ProviderProfile:
     return ProviderProfile(
         name="live-deepseek",
         protocol="openai-chat",
+        dialect="deepseek-v4",
         model=_environment_value("NEURO_CODE_LIVE_DEEPSEEK_MODEL", "deepseek-chat"),
         base_url=_environment_value(
             "NEURO_CODE_LIVE_DEEPSEEK_BASE_URL", "https://api.deepseek.com"

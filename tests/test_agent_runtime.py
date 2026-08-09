@@ -305,6 +305,16 @@ class CollectionFixtureTool:
         return ToolResult(self._content)
 
 
+class IncrementingEvidenceFixtureTool(CollectionFixtureTool):
+    async def execute(
+        self,
+        arguments: Mapping[str, object],
+        context: ToolContext,
+    ) -> ToolResult:
+        result = await super().execute(arguments, context)
+        return ToolResult(f"{result.content} {len(self.calls)}")
+
+
 class MetadataFixtureTool:
     def __init__(self, name: str, result: ToolResult, *, side_effecting: bool = False) -> None:
         self.definition = ToolDefinition(
@@ -503,7 +513,6 @@ def observation_budget(**overrides: object) -> ExecutionBudget:
         "max_input_tokens": None,
         "max_output_tokens": None,
         "max_total_tokens": None,
-        "finalizer_model_calls": 2,
     }
     values.update(overrides)
     return ExecutionBudget(**values)  # type: ignore[arg-type]
@@ -559,6 +568,57 @@ class DecisionInjectingSupervisor(AgentExecutionSupervisor):
 
 
 class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_default_supervisor_model_budget_tracks_configured_max_steps(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = AgentRuntime(
+                provider=ScriptedProvider(((ModelTextDelta("done"), ModelCompleted("stop")),)),
+                tools=MinimalToolCollection(()),
+                workspace_change_observer=EmptyWorkspaceChangeObserver(),
+                permissions=PermissionManager(),
+                tool_context=ToolContext(Path(directory)),
+                max_steps=60,
+            )
+
+            supervisor = runtime._supervisor_factory()
+            self.assertEqual(supervisor._budget.max_model_calls, 60)
+
+    async def test_controlled_mode_uses_all_configured_model_steps_before_finalizing(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            tool = IncrementingEvidenceFixtureTool("inspect", "new evidence")
+            scripts = [
+                (
+                    ModelToolCall(
+                        ToolCall(f"inspect-{index}", "inspect", {"path": f"file-{index}.py"})
+                    ),
+                    ModelCompleted("tool_calls"),
+                )
+                for index in range(24)
+            ]
+            scripts.append((ModelTextDelta("safe summary"), ModelCompleted("stop")))
+            provider = ScriptedProvider(scripts)
+            runtime = AgentRuntime(
+                provider=provider,
+                tools=MinimalToolCollection((tool,)),
+                workspace_change_observer=EmptyWorkspaceChangeObserver(),
+                permissions=PermissionManager(),
+                tool_context=ToolContext(Path(directory)),
+                max_steps=24,
+                supervisor_factory=observing_supervisor_factory(
+                    observation_budget(max_model_calls=24)
+                ),
+                execution_control_mode=ExecutionControlMode.FINALIZE_TERMINAL,
+            )
+
+            result = await runtime.run("inspect all evidence")
+
+            self.assertEqual(result.steps, 24)
+            self.assertEqual(len(tool.calls), 24)
+            self.assertEqual(len(provider.calls), 25)
+            self.assertEqual(provider.tool_policies[-1], ModelToolPolicy.DISABLED)
+            assert result.outcome is not None
+            self.assertIs(result.outcome.status, AgentExecutionStatus.BUDGET_LIMITED)
+            self.assertIs(result.outcome.reason_code, SupervisorReasonCode.MODEL_STEP_LIMIT)
+
     async def test_update_plan_is_persisted_emitted_and_added_to_follow_up_context(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -2478,7 +2538,7 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 permissions=PermissionManager(),
                 tool_context=ToolContext(Path(directory)),
                 supervisor_factory=observing_supervisor_factory(
-                    observation_budget(max_model_calls=2, finalizer_model_calls=1)
+                    observation_budget(max_model_calls=2)
                 ),
                 supervision_observer=traces.append,
             )
@@ -2487,7 +2547,7 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(result.response, "finished")
             self.assertEqual(len(provider.calls), 2)
-            self.assertIn(
+            self.assertNotIn(
                 SupervisorDecisionKind.FINALIZE, [record.decision.kind for record in traces]
             )
             self.assertEqual(provider.tool_definitions[0], provider.tool_definitions[1])
@@ -2677,7 +2737,7 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 permissions=PermissionManager(),
                 tool_context=ToolContext(Path(directory)),
                 supervisor_factory=observing_supervisor_factory(
-                    observation_budget(max_model_calls=2, finalizer_model_calls=1)
+                    observation_budget(max_model_calls=1)
                 ),
                 execution_control_mode=ExecutionControlMode.FINALIZE_TERMINAL,
             )
@@ -2705,7 +2765,7 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 finalizing[0].data,
                 {
                     "execution_status": "budget_limited",
-                    "execution_reason": "model_call_reserve",
+                    "execution_reason": "model_call_budget",
                     "recoverable": True,
                 },
             )
@@ -2748,7 +2808,7 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 tool_context=ToolContext(root),
                 session_store=store,
                 supervisor_factory=observing_supervisor_factory(
-                    observation_budget(max_model_calls=2, finalizer_model_calls=1)
+                    observation_budget(max_model_calls=1)
                 ),
                 execution_control_mode=ExecutionControlMode.FINALIZE_TERMINAL,
             )
@@ -3006,7 +3066,7 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 permissions=PermissionManager(),
                 tool_context=ToolContext(Path(directory)),
                 supervisor_factory=observing_supervisor_factory(
-                    observation_budget(max_model_calls=3, finalizer_model_calls=1, max_tool_calls=1)
+                    observation_budget(max_model_calls=3, max_tool_calls=1)
                 ),
                 execution_control_mode=ExecutionControlMode.FINALIZE_TERMINAL,
             )
@@ -3056,7 +3116,7 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 permissions=PermissionManager(),
                 tool_context=ToolContext(Path(directory), redaction_values=("hidden",)),
                 supervisor_factory=observing_supervisor_factory(
-                    observation_budget(max_model_calls=2, finalizer_model_calls=1)
+                    observation_budget(max_model_calls=1)
                 ),
                 execution_control_mode=ExecutionControlMode.FINALIZE_TERMINAL,
             )
@@ -3099,7 +3159,7 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 permissions=PermissionManager(),
                 tool_context=ToolContext(Path(directory)),
                 supervisor_factory=observing_supervisor_factory(
-                    observation_budget(max_model_calls=2, finalizer_model_calls=1)
+                    observation_budget(max_model_calls=1)
                 ),
                 execution_control_mode=ExecutionControlMode.FINALIZE_TERMINAL,
                 finalizer_factory=failing_factory,
@@ -3130,7 +3190,7 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 permissions=PermissionManager(),
                 tool_context=ToolContext(Path(directory)),
                 supervisor_factory=observing_supervisor_factory(
-                    observation_budget(max_model_calls=2, finalizer_model_calls=1)
+                    observation_budget(max_model_calls=1)
                 ),
                 execution_control_mode=ExecutionControlMode.FINALIZE_TERMINAL,
             )
@@ -3161,7 +3221,7 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 permissions=PermissionManager(),
                 tool_context=ToolContext(Path(directory)),
                 supervisor_factory=observing_supervisor_factory(
-                    observation_budget(max_model_calls=2, finalizer_model_calls=1)
+                    observation_budget(max_model_calls=1)
                 ),
                 execution_control_mode=ExecutionControlMode.FINALIZE_TERMINAL,
             )
@@ -3192,7 +3252,7 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 permissions=PermissionManager(),
                 tool_context=ToolContext(Path(directory), redaction_values=(secret,)),
                 supervisor_factory=observing_supervisor_factory(
-                    observation_budget(max_model_calls=2, finalizer_model_calls=1)
+                    observation_budget(max_model_calls=1)
                 ),
                 execution_control_mode=ExecutionControlMode.FINALIZE_TERMINAL,
             )
@@ -3246,7 +3306,7 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 permissions=PermissionManager(mode=PermissionMode.BYPASS),
                 tool_context=ToolContext(Path(directory), redaction_values=(secret,)),
                 supervisor_factory=observing_supervisor_factory(
-                    observation_budget(max_model_calls=2, finalizer_model_calls=1)
+                    observation_budget(max_model_calls=1)
                 ),
                 execution_control_mode=ExecutionControlMode.FINALIZE_TERMINAL,
             )
@@ -3405,7 +3465,7 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 permissions=PermissionManager(),
                 tool_context=ToolContext(Path(directory)),
                 supervisor_factory=observing_supervisor_factory(
-                    observation_budget(max_model_calls=2, finalizer_model_calls=1)
+                    observation_budget(max_model_calls=1)
                 ),
                 execution_control_mode=ExecutionControlMode.FINALIZE_TERMINAL,
             )

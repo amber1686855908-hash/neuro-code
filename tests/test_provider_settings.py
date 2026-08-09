@@ -66,6 +66,11 @@ class JsonProviderSettingsStoreTests(unittest.IsolatedAsyncioTestCase):
             credentials = store.credentials_path.read_text(encoding="utf-8")
             self.assertNotIn("secret-value", metadata)
             self.assertIn("secret-value", credentials)
+            metadata_payload = json.loads(metadata)
+            credentials_payload = json.loads(credentials)
+            self.assertEqual(metadata_payload["version"], 2)
+            self.assertEqual(metadata_payload["providers"][0]["dialect"], "standard")
+            self.assertEqual(credentials_payload["version"], 2)
             self.assertNotIn("secret-value", repr(saved))
             self.assertEqual(list(state_dir.glob("*.tmp")), [])
             if os.name == "posix":
@@ -142,6 +147,147 @@ class JsonProviderSettingsStoreTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(loaded.profiles[0].proxy_mode)
             self.assertIsNone(loaded.profiles[0].proxy_url_env)
             self.assertEqual(loaded.proxy_defaults, ManagedProxyPolicy())
+
+    async def test_legacy_official_deepseek_profile_without_dialect_is_migrated(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state_dir = Path(directory)
+            store = JsonProviderSettingsStore(state_dir)
+            store.metadata_path.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "default_provider": "deepseek",
+                        "providers": [
+                            {
+                                "name": "deepseek",
+                                "protocol": "openai-chat",
+                                "model": "deepseek-v4-flash",
+                                "base_url": "https://api.deepseek.com",
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            store.credentials_path.write_text(
+                json.dumps({"version": 1, "api_keys": {"deepseek": "secret"}}),
+                encoding="utf-8",
+            )
+
+            loaded = await store.load()
+            profile = loaded.profile("deepseek")
+            assert profile is not None
+            self.assertEqual(profile.dialect, "deepseek-v4")
+
+            await store.save_profile(profile)
+            metadata = json.loads(store.metadata_path.read_text(encoding="utf-8"))
+            self.assertEqual(metadata["version"], 2)
+            self.assertEqual(metadata["providers"][0]["dialect"], "deepseek-v4")
+
+    async def test_legacy_managed_profiles_without_dialect_use_conservative_defaults(self) -> None:
+        cases = (
+            (
+                "ordinary",
+                "ordinary-provider",
+                "fixture-model",
+                "https://provider.invalid/v1",
+                "standard",
+            ),
+            (
+                "marked-proxy",
+                "deepseek-proxy",
+                "v4-flash",
+                "https://llm.company.com/v1",
+                "deepseek-v4",
+            ),
+            (
+                "ambiguous-proxy",
+                "company-proxy",
+                "v4-flash",
+                "https://llm.company.com/v1",
+                "standard",
+            ),
+        )
+        for name, provider_name, model, base_url, expected in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                state_dir = Path(directory)
+                store = JsonProviderSettingsStore(state_dir)
+                store.metadata_path.write_text(
+                    json.dumps(
+                        {
+                            "version": 1,
+                            "default_provider": provider_name,
+                            "providers": [
+                                {
+                                    "name": provider_name,
+                                    "protocol": "openai-chat",
+                                    "model": model,
+                                    "base_url": base_url,
+                                }
+                            ],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                store.credentials_path.write_text(
+                    json.dumps({"version": 1, "api_keys": {provider_name: "secret"}}),
+                    encoding="utf-8",
+                )
+
+                loaded = await store.load()
+                profile = loaded.profile(provider_name)
+                assert profile is not None
+                self.assertEqual(profile.dialect, expected)
+
+    async def test_explicit_managed_dialect_wins_in_new_schema(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state_dir = Path(directory)
+            store = JsonProviderSettingsStore(state_dir)
+            store.metadata_path.write_text(
+                json.dumps(
+                    {
+                        "version": 2,
+                        "default_provider": "standard-deepseek",
+                        "providers": [
+                            {
+                                "name": "standard-deepseek",
+                                "protocol": "openai-chat",
+                                "dialect": "standard",
+                                "model": "deepseek-v4-flash",
+                                "base_url": "https://api.deepseek.com",
+                            },
+                            {
+                                "name": "explicit-deepseek",
+                                "protocol": "openai-chat",
+                                "dialect": "deepseek-v4",
+                                "model": "deepseek-v4-flash",
+                                "base_url": "https://proxy.invalid/v1",
+                            },
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            store.credentials_path.write_text(
+                json.dumps(
+                    {
+                        "version": 2,
+                        "api_keys": {
+                            "standard-deepseek": "secret",
+                            "explicit-deepseek": "secret",
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            loaded = await store.load()
+            profile = loaded.profile("standard-deepseek")
+            assert profile is not None
+            self.assertEqual(profile.dialect, "standard")
+            explicit = loaded.profile("explicit-deepseek")
+            assert explicit is not None
+            self.assertEqual(explicit.dialect, "deepseek-v4")
 
     async def test_global_proxy_default_and_provider_override_round_trip(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

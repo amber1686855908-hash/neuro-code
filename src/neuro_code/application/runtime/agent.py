@@ -126,7 +126,12 @@ class AgentRuntime:
         self._session_store = session_store
         self._system_prompt = system_prompt
         self._max_steps = max_steps
-        self._supervisor_factory = supervisor_factory or create_observing_supervisor
+        if supervisor_factory is None:
+            self._supervisor_factory = lambda: create_observing_supervisor(
+                max_model_calls=self._max_steps
+            )
+        else:
+            self._supervisor_factory = supervisor_factory
         self._supervision_observer = supervision_observer
         self._execution_control_mode = execution_control_mode
         self._finalizer_factory = finalizer_factory or _create_finalizer

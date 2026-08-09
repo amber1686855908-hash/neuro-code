@@ -394,6 +394,17 @@ class AgentLoopRunner:
             *,
             step: int,
         ) -> AgentRunResult:
+            if (
+                decision.reason_code is SupervisorReasonCode.MODEL_CALL_BUDGET
+                and step >= self._max_steps
+            ):
+                decision = SupervisorDecision(
+                    SupervisorDecisionKind.MARK_BUDGET_LIMITED,
+                    "agent reached its hard model-step limit",
+                    AgentExecutionStatus.BUDGET_LIMITED,
+                    False,
+                    SupervisorReasonCode.MODEL_STEP_LIMIT,
+                )
             outcome = outcome_for_terminal_decision(decision)
             await emit(
                 AgentEventKind.FINALIZING_STARTED,
