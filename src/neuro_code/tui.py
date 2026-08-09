@@ -2752,6 +2752,7 @@ class SessionSelectionScreen(ModalScreen[str | None]):
         self._search_callback = search_callback
         self._search_generation = 0
         self._search_ready = False
+        self._initial_query_pending = query is not None
         self._choice_ids = {
             f"session-choice-{index}": option.session_id for index, option in enumerate(options)
         }
@@ -2856,6 +2857,11 @@ class SessionSelectionScreen(ModalScreen[str | None]):
             or not self._search_ready
         ):
             return
+        normalized_query = event.value.strip() or None
+        if self._initial_query_pending:
+            self._initial_query_pending = False
+            if normalized_query == self.search_query:
+                return
         self._search_generation += 1
         generation = self._search_generation
         self.run_worker(
