@@ -5,6 +5,12 @@ from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 
+from neuro_code.application.execution_policy import (
+    DEEP_EXECUTION_BUDGET,
+    NORMAL_EXECUTION_BUDGET,
+    ExecutionBudgetPolicy,
+    ExecutionProfile,
+)
 from neuro_code.application.runtime.supervision import (
     AgentExecutionSupervisor,
     ExecutionControlMode,
@@ -117,6 +123,48 @@ def execute_tool(
 
 
 class ExecutionSupervisionTests(unittest.TestCase):
+    def test_named_execution_profiles_resolve_one_complete_budget(self) -> None:
+        normal = ExecutionBudgetPolicy.for_profile(ExecutionProfile.NORMAL)
+        deep = ExecutionBudgetPolicy.for_profile(ExecutionProfile.DEEP)
+
+        self.assertIs(normal, NORMAL_EXECUTION_BUDGET)
+        self.assertIs(deep, DEEP_EXECUTION_BUDGET)
+        self.assertEqual(
+            (normal.max_model_calls, normal.max_tool_rounds, normal.max_tool_calls),
+            (48, 48, 192),
+        )
+        self.assertEqual(
+            (deep.max_model_calls, deep.max_tool_rounds, deep.max_tool_calls),
+            (96, 96, 384),
+        )
+        self.assertEqual(normal.limit_for_tool("read_file"), 48)
+        self.assertEqual(normal.limit_for_tool("grep"), 48)
+        self.assertEqual(normal.limit_for_tool("bash"), 16)
+        self.assertEqual(normal.limit_for_tool("search_replace"), 16)
+
+    def test_legacy_max_steps_scales_every_count_based_budget(self) -> None:
+        budget = ExecutionBudgetPolicy.from_max_steps(60)
+
+        self.assertEqual(
+            (
+                budget.max_model_calls,
+                budget.max_tool_rounds,
+                budget.max_tool_calls,
+                budget.max_calls_per_tool,
+            ),
+            (60, 60, 240, 60),
+        )
+        self.assertEqual(budget.limit_for_tool("read_file"), 60)
+        self.assertEqual(budget.limit_for_tool("bash"), 20)
+        self.assertNotIn("finalizer", repr(budget))
+
+    def test_execution_budget_policy_rejects_invalid_inputs(self) -> None:
+        for value in (0, -1, True):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "max_steps"):
+                ExecutionBudgetPolicy.from_max_steps(value)  # type: ignore[arg-type]
+        with self.assertRaisesRegex(TypeError, "execution profile"):
+            ExecutionBudgetPolicy.for_profile("normal")  # type: ignore[arg-type]
+
     def test_execution_control_mode_and_terminal_outcome_invariants(self) -> None:
         self.assertIs(ExecutionControlMode.OBSERVE_ONLY, ExecutionControlMode("observe_only"))
         self.assertIs(

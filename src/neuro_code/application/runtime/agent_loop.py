@@ -355,6 +355,18 @@ class AgentLoopRunner:
             }
             return candidate if priority[candidate.kind] > priority[current.kind] else current
 
+        def update_runtime_supervision_guidance(
+            decision: SupervisorDecision | None,
+        ) -> None:
+            if self._execution_control_mode is not ExecutionControlMode.FINALIZE_TERMINAL:
+                return
+            reason = (
+                decision.reason_code
+                if decision is not None and decision.kind is SupervisorDecisionKind.REPLAN
+                else None
+            )
+            self._context_builder.set_runtime_supervision_reason(reason)
+
         def outcome_for_terminal_decision(
             decision: SupervisorDecision,
         ) -> AgentExecutionOutcome:
@@ -494,6 +506,7 @@ class AgentLoopRunner:
         response_parts: list[str] = []
         completion_reminders: list[Message] = []
         pending_terminal_decision: SupervisorDecision | None = None
+        self._context_builder.set_runtime_supervision_reason(None)
         try:
             try:
                 supervisor = self._supervisor_factory()
@@ -753,6 +766,7 @@ class AgentLoopRunner:
                 ) -> None:
                     record_tool_outcome(observation)
 
+                last_tool_decision: SupervisorDecision | None = None
                 for index, call in enumerate(tool_calls):
                     try:
                         observation = await self._tool_executor.execute(
@@ -773,9 +787,10 @@ class AgentLoopRunner:
                             disable_supervision("tool_observation_unavailable")
                         else:
                             record_verification_evidence(observation)
+                            last_tool_decision = record_tool_outcome(observation)
                             pending_terminal_decision = select_terminal_decision(
                                 pending_terminal_decision,
-                                record_tool_outcome(observation),
+                                last_tool_decision,
                             )
                     except BaseException as error:
                         await self._tool_executor.record_unstarted_tool_calls(
@@ -788,6 +803,9 @@ class AgentLoopRunner:
                         raise
                 if pending_terminal_decision is not None:
                     return await complete_finalized_turn(pending_terminal_decision, step=step)
+                update_runtime_supervision_guidance(
+                    last_tool_decision or after_tool_batch_decision or after_model_decision
+                )
             if self._execution_control_mode is ExecutionControlMode.FINALIZE_TERMINAL:
                 return await complete_finalized_turn(
                     SupervisorDecision(
@@ -809,6 +827,8 @@ class AgentLoopRunner:
             # Preserve cancellation semantics while still making the session auditable.
             await record_turn_failure(error)
             raise
+        finally:
+            self._context_builder.set_runtime_supervision_reason(None)
 
 
 __all__ = ["AgentLoopRunner", "AgentRunResult"]

@@ -307,6 +307,14 @@ capability-gated. Selecting `ultracode` does not start sub-agents and explicitly
 reports its `xhigh` fallback. See
 [ADR 0027](adr/0027-semantic-tui-and-application-reasoning-effort.md).
 
+Ordinary Agent execution uses the `normal` budget profile by default (48 model
+calls, 48 tool rounds, and 192 tool calls). `--execution-profile deep` selects
+the bounded 96/96/384 profile for longer investigations. The compatibility
+option `--max-steps N` overrides the selected profile and scales the complete
+ordinary budget to N model calls, N tool rounds, and 4N tool calls; it no longer
+leaves a separate fixed tool ceiling. Finalizer attempts remain independently
+bounded. See [ADR 0105](adr/0105-unified-execution-budget-and-replan-guidance.md).
+
 Use `Shift+Tab` to cycle `normal`, `accept-edits`, `plan`, and `auto`, or use
 `/mode MODE` to select directly. `normal` automatically permits reads and asks
 for side effects; `accept-edits` additionally permits workspace edit tools;

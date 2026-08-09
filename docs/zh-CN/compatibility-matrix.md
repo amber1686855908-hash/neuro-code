@@ -76,6 +76,7 @@
 | 上下文用量快照与过期源请求构造 | M5 | partial | Stage5DV 新增无副作用的应用层辅助入口：有 Provider 输入/输出用量时使用报告值，否则使用有界 `ModelContext` 估算；未知 Provider 容量保持未知；仅对可执行的显式请求计算过期源指纹。它们不调用 Provider/存储、不修改上下文，也不启用自动压缩。详见 [ADR 0102](../en/adr/0102-context-usage-snapshot-and-stale-source-builder.md)。 |
 | 显式实时上下文压缩命令 | M5 | partial | Stage5DW 新增 `AgentConversation.run_explicit_context_compaction_with_owner()`。它在现有会话锁内构建带实时指引的上下文，委托已配置 Runtime gate 构造 usage/过期源保护，并生成有界身份/时间元数据后复用 typed owner 投影。要求已有持久化会话，仍是显式操作：不接入普通 loop、不自动触发、不发事件、不修改 transcript，也不把 Provider 与存储放入同一事务。详见 [ADR 0103](../en/adr/0103-explicit-live-context-compaction-command.md)。 |
 | 显式压缩命令投影 | M5 | partial | Stage5DX 新增 `ContextCompactionCommandResult` 以及有界 CLI/ACP 序列化器。`completed`、`not_needed` 和受控 `budget_limited` 超时结果只暴露不透明 ID、计数和摘要 token 元数据；Provider、取消、存储和未知失败仍然是异常。不启用命令、事件、普通 loop 接入或自动触发。详见 [ADR 0104](../en/adr/0104-explicit-compaction-command-projection.md)。 |
+| 统一普通执行预算与 REPLAN 指引 | M3/M5 | partial | 正式 CLI/TUI/ACP 入口默认使用应用层拥有的 `normal` 48/48/192 模型/工具轮次/工具调用档位，`deep` 使用 96/96/384。旧 `--max-steps N` 现在把全部计数型普通上限同步映射为 N/N/4N；Finalizer 尝试继续独立。在受控模式下，批次结束的 `REPLAN` 决策会注入不持久化的合成指引直到产生新进展，每次请求还会收到与 Provider 无关的 batch-first 指引。现有顺序工具执行和 stuck 检测保持不变。详见 [ADR 0105](../en/adr/0105-unified-execution-budget-and-replan-guidance.md)。 |
 | LSP、工作树与检查点 | M5 | planned | 工具/工作区/worktree crate |
 | 语音、图像、视频和网页工具 | M5 | planned | 需要由提供商支持的适配器 |
 | Leader、relay 与 Computer Hub | M5 | planned | 本地组件与外部服务边界 |

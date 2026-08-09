@@ -22,9 +22,22 @@ from neuro_code.domain.conversation.interaction_mode import (
 )
 from neuro_code.domain.conversation.messages import Message, Role, SessionItem, SyntheticReason
 from neuro_code.domain.conversation.reasoning import ReasoningEffort, reasoning_guidance
+from neuro_code.domain.execution import SupervisorReasonCode
 from neuro_code.domain.plans import PlanComment, SessionPlan
 from neuro_code.domain.workspace.instructions import InstructionDiscoveryResult
 from neuro_code.domain.workspace.skills import SkillDiscoveryResult
+
+BATCH_FIRST_RUNTIME_GUIDANCE = """Runtime evidence-gathering guidance:
+When multiple read-only operations are independent, request them in the same model step instead
+of alternating one read with one reasoning round. For repository analysis, first map the
+repository, then locate relevant symbols, batch-read the related evidence, analyze it together,
+and only then perform targeted follow-up. Keep operations sequential when a later request truly
+depends on an earlier result."""
+
+REPLAN_RUNTIME_GUIDANCE = """Runtime supervision guidance:
+The current approach is repeating results without sufficient progress. Change strategy. Avoid
+repeating the same tool or action with equivalent arguments. Narrow or broaden the search,
+inspect different evidence, or revise the current assumption."""
 
 
 class ContextBuilder:
@@ -48,6 +61,7 @@ class ContextBuilder:
         "_plan",
         "_plan_comments",
         "_reasoning_effort",
+        "_runtime_supervision_reason",
         "_skill_provider",
     )
 
@@ -68,6 +82,7 @@ class ContextBuilder:
         self._skill_provider = skill_provider
         self._last_instruction_result: InstructionDiscoveryResult | None = None
         self._last_skill_result: SkillDiscoveryResult | None = None
+        self._runtime_supervision_reason: SupervisorReasonCode | None = None
 
     @property
     def reasoning_effort(self) -> ReasoningEffort:
@@ -114,6 +129,25 @@ class ContextBuilder:
         self._plan_comments = normalized
 
     @property
+    def runtime_supervision_reason(self) -> SupervisorReasonCode | None:
+        """Return the request-scoped supervision reason, if one is active.
+
+        返回当前生效的请求范围监督原因,如果存在。
+        """
+
+        return self._runtime_supervision_reason
+
+    def set_runtime_supervision_reason(self, reason: SupervisorReasonCode | None) -> None:
+        """Set or clear temporary supervision guidance for later model requests.
+
+        设置或清除供后续模型请求使用的临时监督指引。
+        """
+
+        if reason is not None and not isinstance(reason, SupervisorReasonCode):
+            raise TypeError("runtime supervision reason must be canonical or None")
+        self._runtime_supervision_reason = reason
+
+    @property
     def instruction_result(self) -> InstructionDiscoveryResult | None:
         """Return the most recent instruction discovery result, if any.
 
@@ -145,6 +179,7 @@ class ContextBuilder:
         guidance_parts = [
             reasoning_guidance(self._reasoning_effort),
             interaction_mode_guidance(self._interaction_mode),
+            BATCH_FIRST_RUNTIME_GUIDANCE,
         ]
         if self._plan is not None:
             guidance_parts.append(self._plan.model_guidance())
@@ -196,6 +231,25 @@ class ContextBuilder:
                     break
             rendered.insert(insert_at, skill_msg)
 
+        if self._runtime_supervision_reason is not None:
+            insert_at = system_index + 1
+            while insert_at < len(rendered):
+                item = rendered[insert_at]
+                if not isinstance(item, Message) or item.synthetic_reason not in {
+                    SyntheticReason.PROJECT_INSTRUCTIONS,
+                    SyntheticReason.AVAILABLE_SKILLS,
+                }:
+                    break
+                insert_at += 1
+            rendered.insert(
+                insert_at,
+                Message(
+                    Role.USER,
+                    REPLAN_RUNTIME_GUIDANCE,
+                    synthetic_reason=SyntheticReason.RUNTIME_SUPERVISION,
+                ),
+            )
+
         return tuple(rendered)
 
     def _refresh_instructions(self) -> InstructionDiscoveryResult | None:
@@ -227,4 +281,8 @@ class ContextBuilder:
         return self._last_skill_result
 
 
-__all__ = ["ContextBuilder"]
+__all__ = [
+    "BATCH_FIRST_RUNTIME_GUIDANCE",
+    "REPLAN_RUNTIME_GUIDANCE",
+    "ContextBuilder",
+]

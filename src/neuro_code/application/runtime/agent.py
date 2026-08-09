@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable, Sequence
 from datetime import datetime
 
+from neuro_code.application.execution_policy import ExecutionBudgetPolicy
 from neuro_code.application.memory.compaction import ProviderContextWindow
 from neuro_code.application.memory.compaction_runtime import (
     ContextCompactionRuntimeBoundary,
@@ -41,6 +42,7 @@ from neuro_code.domain.conversation.messages import (
 )
 from neuro_code.domain.conversation.reasoning import ReasoningEffort
 from neuro_code.domain.execution import (
+    ExecutionBudget,
     TurnCancellationPolicy,
     TurnSource,
 )
@@ -86,7 +88,8 @@ class AgentRuntime:
         approver: PermissionApprover | None = None,
         session_store: SessionStore | None = None,
         system_prompt: str = DEFAULT_SYSTEM_PROMPT,
-        max_steps: int = 24,
+        max_steps: int | None = None,
+        execution_budget: ExecutionBudget | None = None,
         reasoning_effort: ReasoningEffort = ReasoningEffort.HIGH,
         interaction_mode: InteractionMode | None = None,
         instruction_provider: Callable[[], InstructionDiscoveryResult | None] | None = None,
@@ -100,8 +103,14 @@ class AgentRuntime:
         finalizer_max_attempts: int = 2,
         compaction_runtime_gate: ContextCompactionRuntimeGate | None = None,
     ) -> None:
-        if max_steps < 1:
-            raise ValueError("max_steps must be positive")
+        if execution_budget is not None and not isinstance(execution_budget, ExecutionBudget):
+            raise TypeError("execution_budget must be an ExecutionBudget or None")
+        if execution_budget is None:
+            execution_budget = ExecutionBudgetPolicy.from_max_steps(
+                24 if max_steps is None else max_steps
+            )
+        elif max_steps is not None and max_steps != execution_budget.max_model_calls:
+            raise ValueError("max_steps must match execution_budget.max_model_calls")
         if not isinstance(execution_control_mode, ExecutionControlMode):
             raise TypeError("execution_control_mode must be an ExecutionControlMode")
         if (
@@ -125,10 +134,11 @@ class AgentRuntime:
         self._approver = approver
         self._session_store = session_store
         self._system_prompt = system_prompt
-        self._max_steps = max_steps
+        self._execution_budget = execution_budget
+        self._max_steps = execution_budget.max_model_calls
         if supervisor_factory is None:
             self._supervisor_factory = lambda: create_observing_supervisor(
-                max_model_calls=self._max_steps
+                budget=self._execution_budget
             )
         else:
             self._supervisor_factory = supervisor_factory

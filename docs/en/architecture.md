@@ -1812,3 +1812,19 @@ remain propagation-only exceptions. CLI and ACP serialization helpers share
 the same bounded fields, without enabling a command, event, normal Agent loop,
 or automatic compaction. See [ADR
 0104](adr/0104-explicit-compaction-command-projection.md).
+
+## Unified ordinary execution budget and transient replan guidance
+
+`neuro_code.application.execution_policy` resolves named product profiles and
+the legacy `max_steps` override into the existing domain `ExecutionBudget`.
+Formal CLI, TUI, and ACP composition paths pass that same immutable value to
+`AgentRuntime`; the loop hard cap and the per-turn supervisor therefore share
+one model/tool budget. Finalizer attempts remain a separate bounded resource.
+
+At a safe completed tool-batch boundary, a non-terminal `REPLAN` decision can
+activate `SyntheticReason.RUNTIME_SUPERVISION` for the next request in
+`FINALIZE_TERMINAL` mode. `ContextBuilder` owns that request-only injection and
+the general batch-first evidence-gathering policy. Neither message is appended
+to session items, and the replan message is cleared on new progress or turn
+exit. Tool execution order and the existing stuck detectors are unchanged. See
+[ADR 0105](adr/0105-unified-execution-budget-and-replan-guidance.md).

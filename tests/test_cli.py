@@ -17,6 +17,7 @@ from types import SimpleNamespace
 from typing import cast
 from unittest.mock import AsyncMock, patch
 
+from neuro_code.application.execution_policy import ExecutionProfile
 from neuro_code.application.memory.compaction_runtime import (
     ContextCompactionCommandResult,
     ContextCompactionCommandStatus,
@@ -378,6 +379,36 @@ api_key_env = "FIXTURE_KEY"
         settings = _application_settings(build_parser().parse_args(("-p", "answer")))
 
         self.assertIs(settings.execution_control_mode, ExecutionControlMode.FINALIZE_TERMINAL)
+        self.assertIs(settings.execution_profile, ExecutionProfile.NORMAL)
+        self.assertEqual(settings.max_steps, 48)
+
+    def test_cli_execution_profile_is_shared_by_agent_tui_and_acp(self) -> None:
+        parser = build_parser()
+        settings = tuple(
+            _application_settings(parser.parse_args(arguments))
+            for arguments in (
+                ("agent", "-p", "answer", "--execution-profile", "deep"),
+                ("code", "--execution-profile", "deep"),
+                ("acp", "--execution-profile", "deep"),
+            )
+        )
+
+        self.assertTrue(all(item.execution_profile is ExecutionProfile.DEEP for item in settings))
+        self.assertTrue(all(item.execution_budget.max_model_calls == 96 for item in settings))
+        self.assertTrue(all(item.execution_budget.max_tool_rounds == 96 for item in settings))
+        self.assertTrue(all(item.execution_budget.max_tool_calls == 384 for item in settings))
+
+    def test_cli_max_steps_compatibility_override_scales_complete_budget(self) -> None:
+        settings = _application_settings(
+            build_parser().parse_args(
+                ("agent", "-p", "answer", "--execution-profile", "deep", "--max-steps", "60")
+            )
+        )
+
+        self.assertEqual(settings.max_steps, 60)
+        self.assertEqual(settings.execution_budget.max_model_calls, 60)
+        self.assertEqual(settings.execution_budget.max_tool_rounds, 60)
+        self.assertEqual(settings.execution_budget.max_tool_calls, 240)
 
     def test_subagent_parser_requires_parent_and_bounds_steps(self) -> None:
         args = build_parser().parse_args(

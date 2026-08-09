@@ -77,6 +77,7 @@ from neuro_code.domain.conversation.messages import (
     PreservedContextItem,
     Role,
     SessionItem,
+    SyntheticReason,
     ToolCall,
 )
 from neuro_code.domain.conversation.reasoning import ReasoningEffort
@@ -313,6 +314,21 @@ class IncrementingEvidenceFixtureTool(CollectionFixtureTool):
     ) -> ToolResult:
         result = await super().execute(arguments, context)
         return ToolResult(f"{result.content} {len(self.calls)}")
+
+
+class SequencedEvidenceFixtureTool(CollectionFixtureTool):
+    def __init__(self, name: str, contents: Sequence[str]) -> None:
+        super().__init__(name, "unused")
+        self._contents = list(contents)
+
+    async def execute(
+        self,
+        arguments: Mapping[str, object],
+        context: ToolContext,
+    ) -> ToolResult:
+        del context
+        self.calls.append(dict(arguments))
+        return ToolResult(self._contents.pop(0))
 
 
 class MetadataFixtureTool:
@@ -580,7 +596,139 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
             )
 
             supervisor = runtime._supervisor_factory()
-            self.assertEqual(supervisor._budget.max_model_calls, 60)
+            self.assertEqual(
+                (
+                    supervisor._budget.max_model_calls,
+                    supervisor._budget.max_tool_rounds,
+                    supervisor._budget.max_tool_calls,
+                ),
+                (60, 60, 240),
+            )
+
+    async def test_batch_first_runtime_guidance_is_request_scoped(self) -> None:
+        provider = ScriptedProvider(((ModelTextDelta("done"), ModelCompleted("stop")),))
+        runtime = AgentRuntime(
+            provider=provider,
+            tools=MinimalToolCollection(()),
+            workspace_change_observer=EmptyWorkspaceChangeObserver(),
+            permissions=PermissionManager(),
+            tool_context=ToolContext(Path("/workspace")),
+        )
+
+        result = await runtime.run("inspect the repository")
+
+        request_system = next(
+            message for message in provider.calls[0].messages if message.role is Role.SYSTEM
+        )
+        persisted_system = next(
+            message for message in result.messages if message.role is Role.SYSTEM
+        )
+        self.assertIn("multiple read-only operations are independent", request_system.content)
+        self.assertIn("batch-read the related evidence", request_system.content)
+        self.assertIn("Keep operations sequential", request_system.content)
+        self.assertNotIn("multiple read-only operations are independent", persisted_system.content)
+
+    async def test_replan_guidance_is_temporary_and_clears_after_new_progress(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            tool = SequencedEvidenceFixtureTool(
+                "inspect",
+                ("same evidence", "same evidence", "same evidence", "new evidence"),
+            )
+            provider = ScriptedProvider(
+                (
+                    (
+                        ModelToolCall(ToolCall("inspect-1", "inspect", {"path": "same.py"})),
+                        ModelCompleted("tool_calls"),
+                    ),
+                    (
+                        ModelToolCall(ToolCall("inspect-2", "inspect", {"path": "same.py"})),
+                        ModelCompleted("tool_calls"),
+                    ),
+                    (
+                        ModelToolCall(ToolCall("inspect-3", "inspect", {"path": "same.py"})),
+                        ModelCompleted("tool_calls"),
+                    ),
+                    (
+                        ModelToolCall(ToolCall("inspect-4", "inspect", {"path": "different.py"})),
+                        ModelCompleted("tool_calls"),
+                    ),
+                    (ModelTextDelta("finished"), ModelCompleted("stop")),
+                )
+            )
+            runtime = AgentRuntime(
+                provider=provider,
+                tools=MinimalToolCollection((tool,)),
+                workspace_change_observer=EmptyWorkspaceChangeObserver(),
+                permissions=PermissionManager(),
+                tool_context=ToolContext(Path(directory)),
+                max_steps=5,
+                execution_control_mode=ExecutionControlMode.FINALIZE_TERMINAL,
+            )
+
+            result = await runtime.run("inspect")
+
+        guided_messages = tuple(
+            message
+            for message in provider.calls[3].messages
+            if message.synthetic_reason is SyntheticReason.RUNTIME_SUPERVISION
+        )
+        self.assertEqual(len(guided_messages), 1)
+        self.assertIn("Change strategy", guided_messages[0].content)
+        self.assertFalse(
+            any(
+                message.synthetic_reason is SyntheticReason.RUNTIME_SUPERVISION
+                for message in provider.calls[4].messages
+            )
+        )
+        self.assertFalse(
+            any(
+                isinstance(item, Message)
+                and item.synthetic_reason is SyntheticReason.RUNTIME_SUPERVISION
+                for item in result.items
+            )
+        )
+        self.assertIsNone(runtime._context_builder.runtime_supervision_reason)
+
+    async def test_observe_only_records_replan_without_injecting_guidance(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            tool = SequencedEvidenceFixtureTool(
+                "inspect",
+                ("same evidence", "same evidence", "same evidence"),
+            )
+            provider = ScriptedProvider(
+                (
+                    *(
+                        (
+                            ModelToolCall(
+                                ToolCall(f"inspect-{index}", "inspect", {"path": "same.py"})
+                            ),
+                            ModelCompleted("tool_calls"),
+                        )
+                        for index in range(3)
+                    ),
+                    (ModelTextDelta("finished"), ModelCompleted("stop")),
+                )
+            )
+            runtime = AgentRuntime(
+                provider=provider,
+                tools=MinimalToolCollection((tool,)),
+                workspace_change_observer=EmptyWorkspaceChangeObserver(),
+                permissions=PermissionManager(),
+                tool_context=ToolContext(Path(directory)),
+                max_steps=4,
+                execution_control_mode=ExecutionControlMode.OBSERVE_ONLY,
+            )
+
+            result = await runtime.run("inspect")
+
+        self.assertEqual(result.response, "finished")
+        self.assertFalse(
+            any(
+                message.synthetic_reason is SyntheticReason.RUNTIME_SUPERVISION
+                for context in provider.calls
+                for message in context.messages
+            )
+        )
 
     async def test_controlled_mode_uses_all_configured_model_steps_before_finalizing(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -3477,15 +3625,8 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNotNone(first.outcome)
             self.assertIsNone(second.outcome)
 
-    async def test_unimplemented_decisions_remain_observation_only(self) -> None:
+    async def test_block_and_fail_decisions_remain_observation_only(self) -> None:
         decisions = (
-            SupervisorDecision(
-                SupervisorDecisionKind.REPLAN,
-                "a different approach is required",
-                AgentExecutionStatus.RUNNING,
-                False,
-                SupervisorReasonCode.NO_PROGRESS,
-            ),
             SupervisorDecision(
                 SupervisorDecisionKind.BLOCK,
                 "user intervention is required",

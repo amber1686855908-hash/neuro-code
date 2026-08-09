@@ -19,6 +19,10 @@ from pathlib import Path
 from time import monotonic
 from typing import Protocol
 
+from neuro_code.application.execution_policy import (
+    NORMAL_EXECUTION_BUDGET,
+    ExecutionBudgetPolicy,
+)
 from neuro_code.domain.execution import (
     AgentExecutionStatus,
     ExecutionBudget,
@@ -549,37 +553,34 @@ class SupervisionObserver(Protocol):
     def __call__(self, record: SupervisionTraceRecord) -> None: ...
 
 
-DEFAULT_OBSERVATION_BUDGET = ExecutionBudget(
-    max_model_calls=24,
-    max_tool_rounds=24,
-    max_tool_calls=96,
-    max_calls_per_tool=24,
-    max_wall_seconds=None,
-    max_input_tokens=None,
-    max_output_tokens=None,
-    max_total_tokens=None,
-)
+DEFAULT_OBSERVATION_BUDGET = NORMAL_EXECUTION_BUDGET
 
 
 def create_observing_supervisor(
     *,
+    budget: ExecutionBudget | None = None,
     max_model_calls: int | None = None,
 ) -> AgentExecutionSupervisor:
     """Create the default non-enforcing supervisor for one runtime turn.
 
     为一个运行时回合创建默认的非强制监督器.
 
-    ``max_model_calls`` is the ordinary Agent request budget.  Finalizer
-    attempts remain a separate bounded resource and are never reserved from
-    this value.
+    ``max_model_calls`` is retained as a compatibility spelling for the old
+    ``max_steps`` setting.  It now scales the complete count-based ordinary
+    execution budget instead of changing only model calls. Finalizer attempts
+    remain a separate bounded resource and are never reserved from this value.
     """
 
-    budget = (
-        DEFAULT_OBSERVATION_BUDGET
-        if max_model_calls is None
-        else replace(DEFAULT_OBSERVATION_BUDGET, max_model_calls=max_model_calls)
-    )
-    return AgentExecutionSupervisor(budget, mode=SupervisionMode.OBSERVE)
+    if budget is not None and max_model_calls is not None:
+        raise ValueError("budget and max_model_calls are mutually exclusive")
+    resolved = budget
+    if resolved is None:
+        resolved = (
+            DEFAULT_OBSERVATION_BUDGET
+            if max_model_calls is None
+            else ExecutionBudgetPolicy.from_max_steps(max_model_calls)
+        )
+    return AgentExecutionSupervisor(resolved, mode=SupervisionMode.OBSERVE)
 
 
 class AgentExecutionSupervisor:

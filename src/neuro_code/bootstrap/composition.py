@@ -9,6 +9,7 @@ from collections.abc import Callable, Collection, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from neuro_code.application.execution_policy import ExecutionBudgetPolicy
 from neuro_code.application.memory.compaction_runtime import ContextCompactionRuntimeGate
 from neuro_code.application.memory.compaction_service import ContextCompactionApplicationService
 from neuro_code.application.memory.compaction_trigger import ContextCompactionTriggerService
@@ -274,13 +275,11 @@ class ApplicationComposition:
         if self._closed:
             raise RuntimeError("application composition is closed")
         selected_config = config or self.config
-        selected_max_steps = self.settings.max_steps if max_steps is None else max_steps
-        if (
-            isinstance(selected_max_steps, bool)
-            or not isinstance(selected_max_steps, int)
-            or selected_max_steps < 1
-        ):
-            raise ValueError("max_steps must be a positive integer")
+        selected_execution_budget = (
+            self.settings.execution_budget
+            if max_steps is None
+            else ExecutionBudgetPolicy.from_max_steps(max_steps)
+        )
         tools = default_tool_registry(
             selected_config.sandbox_profile,
             enable_background_tasks=enable_background_tasks,
@@ -388,7 +387,7 @@ class ApplicationComposition:
                 ),
                 approver=approval_service,
                 session_store=self.store,
-                max_steps=selected_max_steps,
+                execution_budget=selected_execution_budget,
                 reasoning_effort=reasoning_effort or self.settings.reasoning_effort,
                 execution_control_mode=self.settings.execution_control_mode,
                 compaction_runtime_gate=compaction_gate,

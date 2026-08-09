@@ -8,6 +8,7 @@ from typing import Any, cast
 from unittest.mock import patch
 
 import neuro_code.configuration.app as config_module
+from neuro_code.application.execution_policy import ExecutionProfile
 from neuro_code.application.memory.compaction_runtime import ContextCompactionRuntimeGate
 from neuro_code.application.permissions.policy import (
     PermissionEffect,
@@ -140,8 +141,26 @@ api_key_env = "FIXTURE_KEY"
         settings = ApplicationSettings()
 
         self.assertIs(settings.execution_control_mode, ExecutionControlMode.FINALIZE_TERMINAL)
-        self.assertEqual(settings.max_steps, 24)
+        self.assertIs(settings.execution_profile, ExecutionProfile.NORMAL)
+        self.assertEqual(settings.max_steps, 48)
+        self.assertEqual(settings.execution_budget.max_model_calls, 48)
+        self.assertEqual(settings.execution_budget.max_tool_rounds, 48)
+        self.assertEqual(settings.execution_budget.max_tool_calls, 192)
         self.assertIs(settings.reasoning_effort, ReasoningEffort.HIGH)
+
+    def test_application_settings_select_deep_or_legacy_step_budget(self) -> None:
+        deep = ApplicationSettings(execution_profile=ExecutionProfile.DEEP)
+        compatibility = ApplicationSettings(
+            execution_profile=ExecutionProfile.DEEP,
+            max_steps=60,
+        )
+
+        self.assertEqual(deep.max_steps, 96)
+        self.assertEqual(deep.execution_budget.max_tool_rounds, 96)
+        self.assertEqual(deep.execution_budget.max_tool_calls, 384)
+        self.assertEqual(compatibility.max_steps, 60)
+        self.assertEqual(compatibility.execution_budget.max_tool_rounds, 60)
+        self.assertEqual(compatibility.execution_budget.max_tool_calls, 240)
 
     def test_application_settings_can_select_observe_only(self) -> None:
         settings = ApplicationSettings(execution_control_mode=ExecutionControlMode.OBSERVE_ONLY)
@@ -175,6 +194,14 @@ api_key_env = "FIXTURE_KEY"
                 self.assertIsInstance(
                     default_binding.runner._runtime._compaction_runtime_gate,
                     ContextCompactionRuntimeGate,
+                )
+                self.assertEqual(
+                    (
+                        default_binding.runner._runtime._execution_budget.max_model_calls,
+                        default_binding.runner._runtime._execution_budget.max_tool_rounds,
+                        default_binding.runner._runtime._execution_budget.max_tool_calls,
+                    ),
+                    (48, 48, 192),
                 )
                 await default_application.close()
 
@@ -225,6 +252,14 @@ api_key_env = "FIXTURE_KEY"
                     ("read_file", "list_dir", "grep", "skill"),
                 )
                 self.assertIsNone(runtime._tool_context.background_tasks)
+                self.assertEqual(
+                    (
+                        runtime._execution_budget.max_model_calls,
+                        runtime._execution_budget.max_tool_rounds,
+                        runtime._execution_budget.max_tool_calls,
+                    ),
+                    (3, 3, 12),
+                )
                 self.assertIsInstance(
                     application.create_read_only_subagent_service(),
                     IsolatedSubagentExecutionService,

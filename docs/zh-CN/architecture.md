@@ -1263,3 +1263,16 @@ Runtime 门控现在会在允许的显式压缩操作外层真正执行有限的
 成功结果只暴露不透明压缩 ID、源/候选条目数和摘要 token 元数据；绝不暴露摘要、源指纹、提示词、消息、
 工具输出或异常详情。Provider、取消、存储和未知失败仍然只能传播为异常。CLI 和 ACP 序列化辅助函数共享同一组
 有界字段，但不会启用命令、事件、普通 Agent loop 或自动压缩。详见 [ADR 0104](../en/adr/0104-explicit-compaction-command-projection.md)。
+
+## 统一普通执行预算与临时 REPLAN 指引
+
+`neuro_code.application.execution_policy` 把具名产品档位和旧 `max_steps` 覆盖值解析为
+现有领域 `ExecutionBudget`。正式 CLI、TUI 与 ACP 组合路径会把同一个不可变值传给
+`AgentRuntime`，因此 loop 硬上限和逐回合监督器共享同一份模型/工具预算。Finalizer 尝试
+继续作为独立的有界资源。
+
+在完整工具批次结束的安全边界，非终态 `REPLAN` 决策可以在 `FINALIZE_TERMINAL` 模式下
+为下一次请求启用 `SyntheticReason.RUNTIME_SUPERVISION`。`ContextBuilder` 负责这条仅请求
+可见的注入以及通用 batch-first 证据收集策略。两者都不会追加到会话条目；REPLAN 消息会
+在产生新进展或回合退出时清除。工具执行顺序和现有 stuck 检测保持不变。详见
+[ADR 0105](../en/adr/0105-unified-execution-budget-and-replan-guidance.md)。

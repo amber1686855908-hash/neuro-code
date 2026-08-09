@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 
 from neuro_code import __version__
+from neuro_code.application.execution_policy import ExecutionProfile
 from neuro_code.application.permissions.policy import (
     PermissionEffect,
     PermissionMode,
@@ -173,7 +174,18 @@ def _add_run_arguments(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--allow", action="append", default=[], metavar="PATTERN")
     parser.add_argument("--deny", action="append", default=[], metavar="PATTERN")
-    parser.add_argument("--max-steps", type=int, default=24)
+    parser.add_argument(
+        "--execution-profile",
+        choices=tuple(profile.value for profile in ExecutionProfile),
+        default=ExecutionProfile.NORMAL.value,
+        help="ordinary Agent execution budget profile",
+    )
+    parser.add_argument(
+        "--max-steps",
+        type=int,
+        default=None,
+        help="compatibility override that scales the complete ordinary execution budget",
+    )
     parser.add_argument(
         "--execution-control",
         choices=tuple(_EXECUTION_CONTROL_CHOICES),
@@ -205,7 +217,18 @@ def _add_acp_arguments(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--allow", action="append", default=[], metavar="PATTERN")
     parser.add_argument("--deny", action="append", default=[], metavar="PATTERN")
-    parser.add_argument("--max-steps", type=int, default=24)
+    parser.add_argument(
+        "--execution-profile",
+        choices=tuple(profile.value for profile in ExecutionProfile),
+        default=ExecutionProfile.NORMAL.value,
+        help="ordinary Agent execution budget profile",
+    )
+    parser.add_argument(
+        "--max-steps",
+        type=int,
+        default=None,
+        help="compatibility override that scales the complete ordinary execution budget",
+    )
     parser.add_argument(
         "--execution-control",
         choices=tuple(_EXECUTION_CONTROL_CHOICES),
@@ -688,6 +711,9 @@ def _application_settings(
         ),
         permission_rules=_rules(args),
         max_steps=args.max_steps,
+        execution_profile=ExecutionProfile(
+            getattr(args, "execution_profile", ExecutionProfile.NORMAL.value)
+        ),
         execution_control_mode=_execution_control_mode(
             getattr(args, "execution_control", "finalize-terminal")
         ),

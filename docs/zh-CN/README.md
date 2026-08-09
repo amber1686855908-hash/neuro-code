@@ -239,6 +239,12 @@ TUI 管理的供应商元数据会原子写入 `~/.neuro-code/providers.json`；
 `xhigh`。详见
 [ADR 0027](adr/0027-semantic-tui-and-application-reasoning-effort.md)。
 
+普通 Agent 执行默认使用 `normal` 预算档位（48 次模型调用、48 个工具轮次和 192 次工具
+调用）。`--execution-profile deep` 为较长调查选择有界的 96/96/384 档位。兼容选项
+`--max-steps N` 会覆盖所选档位，并把完整普通预算映射为 N 次模型调用、N 个工具轮次和
+4N 次工具调用；它不再留下独立的固定工具上限。Finalizer 尝试继续独立设限。详见
+[ADR 0105](adr/0105-unified-execution-budget-and-replan-guidance.md)。
+
 使用 `Shift+Tab` 可在 `normal`、`accept-edits`、`plan` 和 `auto` 之间循环，也可用
 `/mode MODE` 直接选择。`normal` 自动允许读取并询问副作用操作；`accept-edits` 还会自动
 允许工作区编辑工具；`plan` 不弹出授权而是直接拒绝副作用。安全分类器实现前，`auto`
