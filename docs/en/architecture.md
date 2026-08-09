@@ -481,7 +481,8 @@ applies. See
 
 The `SkillTracker` maintains a moving target, mirroring the
 `InstructionTracker` design. When file-access tools (`read_file`,
-`list_dir`, `grep`) touch a path, `check_path()` updates the target so
+`read_files`, `list_dir`, `list_tree`, `grep`, `grep_many`) touch a path,
+`check_path()` updates the target so
 that `SKILL.md` files from the accessed directory **upward** to the
 workspace root (inclusive) are discovered in the next `current_result()`
 call. This finds skills located at any nesting depth in the workspace,
@@ -498,8 +499,8 @@ the walk degenerates to scanning just the root level.
 
 Sibling subtrees are isolated: switching from `src/foo/` to `src/bar/`
 moves the target, and skills from `src/foo/`'s config dirs are no longer
-included. The `SkillTracker.check_path()` is called by `ReadFileTool`,
-`ListDirTool`, and `GrepTool` alongside their existing
+included. The `SkillTracker.check_path()` is called by single and bounded
+batch read/list/search tools alongside their existing
 `InstructionTracker.check_path()` calls. `SearchReplaceTool` does not move the
 skill target (its instruction tracker has a separate write preflight), and
 `BashTool` does not attempt to infer paths from arbitrary shell syntax. See
@@ -577,10 +578,13 @@ preserves the explicit sandbox boundary rather than adding late host mounts.
 
 When an ACP client explicitly advertises `fs.readTextFile`, a session receives
 a narrow `ClientFileSystem` application port bound to that ACP session. The
-existing `read_file` tool still resolves every path through the selected primary
-or additional workspace roots, then delegates the absolute path and its bounded
-line range to `fs/read_text_file`; it never falls back to an unadvertised client
-operation. When the client advertises both text read and write, `search_replace`
+existing `read_file` and `read_files` tools still resolve every path through the
+selected primary or additional workspace roots, then delegate each absolute path
+and its bounded line range to `fs/read_text_file`; they never fall back to an
+unadvertised client operation. The ACP filesystem capability does not expose a
+directory walk or search operation, so `list_tree` and `grep_many` retain the
+same local workspace semantics as `list_dir` and `grep`. When the client
+advertises both text read and write, `search_replace`
 uses the same port to read, preserve the existing exact-match/ambiguity and
 instruction preflight rules, then write the result through `fs/write_text_file`.
 The tool is not exposed for a read-only client. Client responses and writes are
@@ -917,8 +921,8 @@ command, or TUI command in this slice. See
 Stage5CR adds the first concrete isolated read-only runtime behind that seam.
 `IsolatedSubagentExecutionService` creates a fresh child session, persists a
 metadata-only `SubagentLink` before execution, removes provider builtin tools,
-and restricts the child registry to `read_file`, `list_dir`, `grep`, and
-`skill`. Child steps and wall-clock execution are bounded, cancellation closes
+and restricts the child registry to `read_file`, `read_files`, `list_dir`,
+`list_tree`, `grep`, `grep_many`, and `skill`. Child steps and wall-clock execution are bounded, cancellation closes
 the child, and parent deletion recursively removes linked child sessions. This
 slice remains explicit and synchronous: it does not alter the normal
 `AgentRuntime` loop, reuse parent context, expose CLI/TUI/ACP entrypoints, or

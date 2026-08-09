@@ -714,6 +714,18 @@ class CompositionReadOnlySubagentRuntimeFactoryTests(unittest.IsolatedAsyncioTes
         self.assertEqual(call["resume_id"], "child-session")
         self.assertEqual(call["max_steps"], 3)
         self.assertEqual(call["allowed_tool_names"], READ_ONLY_SUBAGENT_TOOL_NAMES)
+        self.assertEqual(
+            READ_ONLY_SUBAGENT_TOOL_NAMES,
+            (
+                "read_file",
+                "read_files",
+                "list_dir",
+                "list_tree",
+                "grep",
+                "grep_many",
+                "skill",
+            ),
+        )
         self.assertFalse(call["enable_background_tasks"])
         selected = cast(AppConfig, call["config"])
         self.assertEqual(selected.provider.builtin_tools, ())

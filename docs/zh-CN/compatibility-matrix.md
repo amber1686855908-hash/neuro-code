@@ -24,7 +24,7 @@
 | Anthropic 提供商 | M2 | partial | 已实现原生 Messages SSE、文本/推理、工具、用量、错误、密钥脱敏，以及经过校验的用户/工具结果图片块；仍需在线/模型专用夹具 |
 | Gemini 提供商 | M2 | partial | 已实现原生 `streamGenerateContent` SSE、文本/思维、工具、用量、错误、thought-signature 往返，以及经过校验的用户内联/File API 图片项；仍需在线/模型专用夹具 |
 | 核心工具注册表与模式 | M2 | partial | 已实现独立 Python 契约，以及按能力启用的后台 Bash/任务输出/多任务等待/终止 schema |
-| 读取/列举/grep 工具 | M2 | partial | 已实现限制在工作区内的 UTF-8 基线 |
+| 读取/列举/grep 工具 | M2 | partial | 在工作区内 UTF-8 单文件兼容能力之外，已实现有序有界 `read_files`、拒绝链接并过滤生成目录的 `list_tree`，以及确定性多查询 `grep_many`；批量输出会脱敏并受字节限制，部分读取失败仍可用，工具调用继续顺序执行 |
 | 搜索/替换编辑 | M2 | partial | 已实现原子精确替换与路径边界检查 |
 | Bash 执行与取消 | M2/M3 | partial | 已实现有界前台输出、空标准输入、已配置供应商/代理凭据剥离、超时/取消清理、POSIX 进程组 TERM/KILL、失败关闭的 Windows Job Object 创建与原子 `PROC_THREAD_ATTRIBUTE_JOB_LIST` 加入/受限标准句柄继承/后代等待/整 Job 终止、会话作用域受管后台启动/快照/有界单任务与多任务事件等待/超时/幂等终止/绑定切换/应用关闭生命周期、带任务输出/多任务等待/终止去重的有界模型专用完成提醒、重启感知的有界会话唤醒账本，以及复用同一进程树的前台自动转后台；持久全局默认、供应商覆盖和会话级 `/auto-wake on|off` 优先级已实现；已通过可选状态目录存储为截断的本地 Bash 预览提供有界脱敏完整输出文件，显式审查后的密钥注入以及 ACP 客户端终端/文件读取器的产物支持仍待实现；明确的自动唤醒可注入每任务 2 KiB、每批 8 KiB 的脱敏输出预览 |
 | 权限规则优先级 | M2/M3 | partial | 已实现 deny/ask/allow 优先级、逐片段检查 `&&`/`||`/`;`/管道、包装器剥离、嵌套 `bash -c`、复杂脚本失败关闭、异步单次允许/拒绝、仅保存在内存中的精确操作会话批准，以及每个 ACP session 独立的 `session/request_permission` 适配；本地 deny/工作区/沙箱结论始终拥有最终优先级，客户端审批前会先发送 pending 工具 update。审批请求/响应契约现在只可从 `neuro_code.application.permissions.contracts` 获得；根级 `neuro_code.permissions` 兼容 facade 已移除，策略调用方应使用 `neuro_code.application.permissions.policy`。仍需持久化审查规则和完整规则/文件访问语法 |

@@ -315,6 +315,16 @@ ordinary budget to N model calls, N tool rounds, and 4N tool calls; it no longer
 leaves a separate fixed tool ceiling. Finalizer attempts remain independently
 bounded. See [ADR 0105](adr/0105-unified-execution-budget-and-replan-guidance.md).
 
+Repository inspection also exposes bounded `read_files`, `list_tree`, and
+`grep_many` tools alongside the compatible single-file operations. They keep
+tool execution sequential while reducing model/tool round trips: batch reads
+isolate per-file errors, tree traversal skips links and common generated
+directories, and multi-query search applies deterministic path ordering plus
+per-query, total-result, scanned-file, and UTF-8 byte limits. All paths still
+pass through the workspace resolver, model-visible output is redacted, and an
+ACP client with text-read capability can serve each explicit `read_files`
+request. See [ADR 0106](adr/0106-bounded-batch-repository-inspection.md).
+
 Use `Shift+Tab` to cycle `normal`, `accept-edits`, `plan`, and `auto`, or use
 `/mode MODE` to select directly. `normal` automatically permits reads and asks
 for side effects; `accept-edits` additionally permits workspace edit tools;

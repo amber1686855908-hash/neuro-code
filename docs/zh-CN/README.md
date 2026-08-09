@@ -245,6 +245,13 @@ TUI 管理的供应商元数据会原子写入 `~/.neuro-code/providers.json`；
 4N 次工具调用；它不再留下独立的固定工具上限。Finalizer 尝试继续独立设限。详见
 [ADR 0105](adr/0105-unified-execution-budget-and-replan-guidance.md)。
 
+仓库检查还在兼容的单文件操作旁提供有界 `read_files`、`list_tree` 和 `grep_many`
+工具。它们保持工具顺序执行，同时减少模型与工具之间的往返：批量读取会隔离单文件错误，
+目录树遍历会跳过链接和常见生成目录，多查询搜索则采用确定路径顺序以及单查询、总结果、
+扫描文件数和 UTF-8 字节上限。所有路径仍通过工作区解析器，模型可见输出会脱敏；声明文本
+读取能力的 ACP 客户端也可逐个处理明确的 `read_files` 请求。详见
+[ADR 0106](adr/0106-bounded-batch-repository-inspection.md)。
+
 使用 `Shift+Tab` 可在 `normal`、`accept-edits`、`plan` 和 `auto` 之间循环，也可用
 `/mode MODE` 直接选择。`normal` 自动允许读取并询问副作用操作；`accept-edits` 还会自动
 允许工作区编辑工具；`plan` 不弹出授权而是直接拒绝副作用。安全分类器实现前，`auto`

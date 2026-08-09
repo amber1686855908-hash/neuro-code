@@ -4,6 +4,7 @@ import os
 import tempfile
 import unittest
 from collections.abc import Sequence
+from contextlib import suppress
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
@@ -19,8 +20,16 @@ from neuro_code.domain.background_tasks import (
     BackgroundTaskWaitResult,
 )
 from neuro_code.domain.sandbox import SandboxProfile
+from neuro_code.domain.workspace.skills import SkillDiscoveryResult
 from neuro_code.infrastructure.tools.client_terminal import ClientTerminalTool
-from neuro_code.infrastructure.tools.filesystem import GrepTool, ReadFileTool, SearchReplaceTool
+from neuro_code.infrastructure.tools.filesystem import (
+    GrepManyTool,
+    GrepTool,
+    ListTreeTool,
+    ReadFilesTool,
+    ReadFileTool,
+    SearchReplaceTool,
+)
 from neuro_code.infrastructure.tools.plans import UpdatePlanTool
 from neuro_code.infrastructure.tools.registry import default_tool_registry
 from neuro_code.infrastructure.workspace.paths import resolve_workspace_path, workspaces_match
@@ -29,6 +38,25 @@ from neuro_code.shared.errors import ToolError
 
 def _canonical_path(path: str | Path) -> Path:
     return Path(path).resolve()
+
+
+class PathRecordingTracker:
+    def __init__(self, workspace_root: Path) -> None:
+        self.paths: list[Path] = []
+        self._workspace_root = workspace_root
+
+    def check_path(self, path: Path) -> None:
+        self.paths.append(path)
+
+    def check_path_for_write(self, path: Path) -> None:
+        self.paths.append(path)
+
+    def current_result(self) -> SkillDiscoveryResult:
+        return SkillDiscoveryResult((), (), "0" * 64)
+
+    @property
+    def workspace_root(self) -> Path:
+        return self._workspace_root
 
 
 class ClientFileSystemFixture:
@@ -295,6 +323,246 @@ class FilesystemToolTests(unittest.IsolatedAsyncioTestCase):
                 ToolContext(root, output_byte_limit=12, client_file_system=bounded),
             )
             self.assertIn("[output truncated]", result.content)
+
+    async def test_read_files_preserves_order_isolates_errors_and_updates_trackers(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = _canonical_path(directory)
+            first = root / "first.py"
+            second = root / "second.py"
+            first.write_text("alpha\napi_key=fixture-secret\n", encoding="utf-8")
+            second.write_text("beta\ngamma\n", encoding="utf-8")
+            instruction_tracker = PathRecordingTracker(root)
+            skill_tracker = PathRecordingTracker(root)
+            result = await ReadFilesTool().execute(
+                {
+                    "files": [
+                        {"path": "second.py", "start_line": 2, "max_lines": 1},
+                        {"path": "missing.py"},
+                        {"path": "first.py", "max_lines": 2},
+                    ]
+                },
+                ToolContext(
+                    root,
+                    redaction_values=("fixture-secret",),
+                    instruction_tracker=instruction_tracker,
+                    skill_tracker=skill_tracker,
+                ),
+            )
+
+            second_header = result.content.index("=== file: second.py ===")
+            missing_header = result.content.index("=== file: missing.py ===")
+            first_header = result.content.index("=== file: first.py ===")
+            self.assertLess(second_header, missing_header)
+            self.assertLess(missing_header, first_header)
+            self.assertIn("     2\tgamma", result.content)
+            self.assertIn("status: error", result.content)
+            self.assertIn("api_key=[REDACTED]", result.content)
+            self.assertNotIn("fixture-secret", result.content)
+            self.assertFalse(result.is_error)
+            self.assertEqual(
+                result.metadata,
+                {
+                    "requested": 3,
+                    "succeeded": 2,
+                    "failed": 1,
+                    "truncated": False,
+                    "client_delegated": False,
+                },
+            )
+            self.assertEqual(instruction_tracker.paths, [second, first])
+            self.assertEqual(skill_tracker.paths, [second, first])
+
+    async def test_read_files_enforces_count_output_and_workspace_bounds(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            tempfile.TemporaryDirectory() as outside_directory,
+        ):
+            root = _canonical_path(directory)
+            outside = _canonical_path(outside_directory) / "outside.txt"
+            outside.write_text("outside", encoding="utf-8")
+            target = root / "large.txt"
+            target.write_text("line\n" * 100, encoding="utf-8")
+            with self.assertRaisesRegex(ToolError, "between 1 and 16"):
+                await ReadFilesTool().execute(
+                    {"files": [{"path": "large.txt"}] * 17},
+                    ToolContext(root),
+                )
+            invalid_lines = await ReadFilesTool().execute(
+                {"files": [{"path": "large.txt", "max_lines": 5001}]},
+                ToolContext(root),
+            )
+            self.assertTrue(invalid_lines.is_error)
+            self.assertIn("max_lines must be between 1 and 5000", invalid_lines.content)
+
+            bounded = await ReadFilesTool().execute(
+                {"files": [{"path": "large.txt", "max_lines": 100}]},
+                ToolContext(root, output_byte_limit=80),
+            )
+            self.assertLessEqual(len(bounded.content.encode("utf-8")), 80)
+            self.assertTrue(bounded.metadata and bounded.metadata["truncated"])
+            self.assertTrue(bounded.content.endswith("[output truncated]"))
+
+            escaped = await ReadFilesTool().execute(
+                {
+                    "files": [
+                        {"path": "large.txt", "max_lines": 1},
+                        {"path": str(outside)},
+                    ]
+                },
+                ToolContext(root),
+            )
+            self.assertFalse(escaped.is_error)
+            self.assertIn("large.txt", escaped.content)
+            self.assertIn("escapes the workspace", escaped.content)
+
+    async def test_read_files_delegates_each_request_to_client_filesystem(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = _canonical_path(directory)
+            first = root / "first.txt"
+            second = root / "second.txt"
+            client = ClientFileSystemFixture(
+                contents={
+                    str(first): "one\ntwo\nthree",
+                    str(second): "four\nfive",
+                }
+            )
+            result = await ReadFilesTool().execute(
+                {
+                    "files": [
+                        {"path": "first.txt", "start_line": 2, "max_lines": 2},
+                        {"path": "second.txt", "max_lines": 1},
+                    ]
+                },
+                ToolContext(root, client_file_system=client),
+            )
+
+            self.assertEqual(client.reads, [(first, 2, 2), (second, 1, 1)])
+            self.assertIn("     2\ttwo", result.content)
+            self.assertIn("     1\tfour", result.content)
+            self.assertTrue(result.metadata and result.metadata["client_delegated"])
+
+    async def test_list_tree_is_deterministic_bounded_and_skips_unsafe_directories(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as outside:
+            root = _canonical_path(directory)
+            (root / "src" / "nested").mkdir(parents=True)
+            (root / "src" / "z.py").write_text("z", encoding="utf-8")
+            (root / "src" / "a.py").write_text("a", encoding="utf-8")
+            (root / "src" / "nested" / "deep.py").write_text("deep", encoding="utf-8")
+            for ignored in (".git", ".venv", "node_modules", "dist", "__pycache__"):
+                (root / ignored).mkdir()
+                (root / ignored / "hidden.txt").write_text("hidden", encoding="utf-8")
+            if hasattr(os, "symlink"):
+                with suppress(OSError):
+                    (root / "outside-link").symlink_to(Path(outside), target_is_directory=True)
+
+            result = await ListTreeTool().execute(
+                {"path": ".", "max_depth": 2, "max_entries": 20},
+                ToolContext(root),
+            )
+
+            self.assertEqual(result.content.splitlines(), ["src/", "  a.py", "  nested/", "  z.py"])
+            self.assertNotIn("hidden.txt", result.content)
+            self.assertNotIn("outside-link", result.content)
+            self.assertEqual(result.metadata and result.metadata["ignored_directories"], 5)
+
+            limited = await ListTreeTool().execute(
+                {"path": ".", "max_depth": 3, "max_entries": 2},
+                ToolContext(root),
+            )
+            self.assertEqual(len(limited.content.splitlines()), 2)
+            self.assertTrue(limited.metadata and limited.metadata["entry_limited"])
+            byte_limited = await ListTreeTool().execute(
+                {"path": ".", "max_depth": 3, "max_entries": 20},
+                ToolContext(root, output_byte_limit=20),
+            )
+            self.assertTrue(byte_limited.metadata and byte_limited.metadata["byte_limited"])
+            self.assertLessEqual(len(byte_limited.content.encode("utf-8")), 20)
+            with self.assertRaisesRegex(ToolError, "escapes the workspace"):
+                await ListTreeTool().execute({"path": str(Path(outside))}, ToolContext(root))
+
+    async def test_grep_many_groups_queries_filters_paths_and_isolates_invalid_regex(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = _canonical_path(directory)
+            (root / "src").mkdir()
+            (root / "src" / "b.py").write_text("alpha\nbeta\n", encoding="utf-8")
+            (root / "src" / "a.py").write_text("alpha beta\n", encoding="utf-8")
+            (root / "README.md").write_text("alpha", encoding="utf-8")
+            (root / ".git").mkdir()
+            (root / ".git" / "config").write_text("alpha", encoding="utf-8")
+
+            result = await GrepManyTool().execute(
+                {
+                    "queries": ["alpha", "beta", "["],
+                    "path": ".",
+                    "include_globs": ["*.py"],
+                    "exclude_globs": ["src/b.py"],
+                    "max_results_per_query": 5,
+                    "max_total_results": 10,
+                },
+                ToolContext(root),
+            )
+
+            self.assertFalse(result.is_error)
+            self.assertIn("=== query 1: 'alpha' ===", result.content)
+            self.assertIn("=== query 2: 'beta' ===", result.content)
+            self.assertIn("=== query 3: '[' ===\nstatus: error", result.content)
+            self.assertIn("src/a.py:1:alpha beta", result.content)
+            self.assertNotIn("src/b.py", result.content)
+            self.assertNotIn("README.md", result.content)
+            self.assertNotIn(".git", result.content)
+            self.assertEqual(result.metadata and result.metadata["match_count"], 2)
+            self.assertEqual(result.metadata and result.metadata["valid_queries"], 2)
+
+    async def test_grep_many_enforces_result_output_and_workspace_bounds(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            tempfile.TemporaryDirectory() as outside_directory,
+        ):
+            root = _canonical_path(directory)
+            outside = _canonical_path(outside_directory)
+            (root / "matches.txt").write_text("match\n" * 20, encoding="utf-8")
+            result = await GrepManyTool().execute(
+                {
+                    "queries": ["match", "mat"],
+                    "max_results_per_query": 20,
+                    "max_total_results": 3,
+                },
+                ToolContext(root, output_byte_limit=100),
+            )
+
+            self.assertTrue(result.metadata and result.metadata["result_limited"])
+            self.assertTrue(result.metadata and result.metadata["byte_limited"])
+            self.assertEqual(result.metadata and result.metadata["match_count"], 3)
+            self.assertLessEqual(len(result.content.encode("utf-8")), 100)
+            with self.assertRaisesRegex(ToolError, "between 1 and 16"):
+                await GrepManyTool().execute(
+                    {"queries": ["match"] * 17},
+                    ToolContext(root),
+                )
+            with self.assertRaisesRegex(ToolError, "escapes the workspace"):
+                await GrepManyTool().execute(
+                    {"queries": ["match"], "path": str(outside)},
+                    ToolContext(root),
+                )
+
+    def test_default_registry_exposes_bounded_batch_read_only_tools(self) -> None:
+        registry = default_tool_registry(SandboxProfile.READ_ONLY)
+
+        self.assertTrue(
+            {
+                "read_file",
+                "read_files",
+                "list_dir",
+                "list_tree",
+                "grep",
+                "grep_many",
+            }.issubset(registry.names())
+        )
+        for name in ("read_files", "list_tree", "grep_many"):
+            tool = registry.get(name)
+            self.assertIsNotNone(tool)
+            assert tool is not None
+            self.assertFalse(tool.side_effecting)
 
 
 class PlanToolTests(unittest.IsolatedAsyncioTestCase):

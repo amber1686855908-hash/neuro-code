@@ -93,6 +93,7 @@ from neuro_code.domain.execution import (
     TurnSource,
 )
 from neuro_code.domain.plans import PlanComment, PlanStep, PlanStepStatus, SessionPlan
+from neuro_code.domain.sandbox import SandboxProfile
 from neuro_code.domain.session_tasks import SessionTask, SessionTaskKind, SessionTaskStatus
 from neuro_code.domain.tools import ToolDefinition, ToolResult
 from neuro_code.infrastructure.background_tasks import LocalBackgroundTaskManager
@@ -624,9 +625,96 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
             message for message in result.messages if message.role is Role.SYSTEM
         )
         self.assertIn("multiple read-only operations are independent", request_system.content)
+        self.assertIn("list_tree, grep_many, and read_files", request_system.content)
         self.assertIn("batch-read the related evidence", request_system.content)
         self.assertIn("Keep operations sequential", request_system.content)
         self.assertNotIn("multiple read-only operations are independent", persisted_system.content)
+
+    async def test_repository_analysis_uses_bounded_batch_tools_without_one_round_per_file(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            file_names = tuple(f"module_{index:02d}.py" for index in range(12))
+            for index, name in enumerate(file_names):
+                (root / name).write_text(
+                    f"class Evidence{index}:\n    value = {index}\n",
+                    encoding="utf-8",
+                )
+            provider = ScriptedProvider(
+                (
+                    (
+                        ModelToolCall(
+                            ToolCall(
+                                "tree",
+                                "list_tree",
+                                {"path": ".", "max_depth": 2, "max_entries": 100},
+                            )
+                        ),
+                        ModelCompleted("tool_calls"),
+                    ),
+                    (
+                        ModelToolCall(
+                            ToolCall(
+                                "search",
+                                "grep_many",
+                                {
+                                    "queries": ["class Evidence", "value ="],
+                                    "path": ".",
+                                    "include_globs": ["*.py"],
+                                    "max_results_per_query": 20,
+                                    "max_total_results": 40,
+                                },
+                            )
+                        ),
+                        ModelCompleted("tool_calls"),
+                    ),
+                    (
+                        ModelToolCall(
+                            ToolCall(
+                                "batch-read",
+                                "read_files",
+                                {"files": [{"path": name} for name in file_names]},
+                            )
+                        ),
+                        ModelCompleted("tool_calls"),
+                    ),
+                    (
+                        ModelToolCall(
+                            ToolCall(
+                                "follow-up",
+                                "read_file",
+                                {"path": file_names[-1], "max_lines": 2},
+                            )
+                        ),
+                        ModelCompleted("tool_calls"),
+                    ),
+                    (ModelTextDelta("repository analysis complete"), ModelCompleted("stop")),
+                )
+            )
+            runtime = AgentRuntime(
+                provider=provider,
+                tools=default_tool_registry(SandboxProfile.READ_ONLY),
+                workspace_change_observer=EmptyWorkspaceChangeObserver(),
+                permissions=PermissionManager(),
+                tool_context=ToolContext(root, sandbox_profile=SandboxProfile.READ_ONLY),
+                max_steps=5,
+            )
+
+            result = await runtime.run("analyze the repository")
+
+        self.assertEqual(result.response, "repository analysis complete")
+        self.assertEqual(result.steps, 5)
+        self.assertEqual(len(provider.calls), 5)
+        self.assertLess(result.steps, len(file_names))
+        batch_result = next(
+            message
+            for message in provider.calls[3].messages
+            if message.role is Role.TOOL and message.tool_call_id == "batch-read"
+        )
+        self.assertEqual(batch_result.content.count("status: success"), len(file_names))
+        self.assertIn("module_00.py", batch_result.content)
+        self.assertIn("module_11.py", batch_result.content)
 
     async def test_replan_guidance_is_temporary_and_clears_after_new_progress(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
