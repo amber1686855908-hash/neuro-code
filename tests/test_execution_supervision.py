@@ -51,7 +51,6 @@ def execution_budget(**overrides: object) -> ExecutionBudget:
         "max_input_tokens": 1_000,
         "max_output_tokens": 1_000,
         "max_total_tokens": 2_000,
-        "finalizer_model_calls": 2,
     }
     values.update(overrides)
     return ExecutionBudget(**values)  # type: ignore[arg-type]
@@ -198,7 +197,6 @@ class ExecutionSupervisionTests(unittest.TestCase):
             "max_tool_rounds",
             "max_tool_calls",
             "max_calls_per_tool",
-            "finalizer_model_calls",
         ):
             with (
                 self.subTest(field_name=field_name, value=0),
@@ -218,8 +216,8 @@ class ExecutionSupervisionTests(unittest.TestCase):
         ):
             with self.subTest(field_name=field_name):
                 self.assertIsNotNone(execution_budget(**{field_name: None}))
-        with self.assertRaisesRegex(ValueError, "finalizer_model_calls"):
-            execution_budget(max_model_calls=2, finalizer_model_calls=3)
+        ordinary_budget = execution_budget(max_model_calls=2)
+        self.assertEqual(ordinary_budget.max_model_calls, 2)
         with self.assertRaisesRegex(ValueError, "duplicate"):
             execution_budget(
                 per_tool_limits=(ToolCallBudget("read_file", 2), ToolCallBudget("read_file", 1))
@@ -625,18 +623,27 @@ class ExecutionSupervisionTests(unittest.TestCase):
         self.assertEqual(supervisor.snapshot.counters.tool_calls_requested, 2)
         self.assertEqual(supervisor.snapshot.counters.tool_calls_executed, 2)
 
-    def test_model_budget_reserves_finalizer_calls(self) -> None:
-        supervisor = self.supervisor(
-            budget=execution_budget(max_model_calls=3, finalizer_model_calls=1)
-        )
+    def test_model_budget_is_not_reduced_by_finalizer_calls(self) -> None:
+        supervisor = self.supervisor(budget=execution_budget(max_model_calls=3))
         first = observation(progress_kind=ProgressKind.NONE)
         second = observation(arguments={"path": "other.py"}, progress_kind=ProgressKind.NONE)
+        third = observation(arguments={"path": "third.py"}, progress_kind=ProgressKind.NONE)
 
         self.assertIs(execute_tool(supervisor, first), SupervisorDecisionKind.CONTINUE)
-        self.assertIs(execute_tool(supervisor, second), SupervisorDecisionKind.FINALIZE)
-        decision = supervisor.authorize_model_request()
-        self.assertIs(decision.kind, SupervisorDecisionKind.FINALIZE)
-        self.assertIs(supervisor.snapshot.status, AgentExecutionStatus.FINALIZING)
+        self.assertIs(execute_tool(supervisor, second), SupervisorDecisionKind.CONTINUE)
+        self.assertIs(
+            execute_tool(supervisor, third),
+            SupervisorDecisionKind.MARK_BUDGET_LIMITED,
+        )
+        self.assertIs(
+            supervisor.authorize_model_request().kind,
+            SupervisorDecisionKind.MARK_BUDGET_LIMITED,
+        )
+        self.assertIs(supervisor.snapshot.status, AgentExecutionStatus.BUDGET_LIMITED)
+
+    def test_execution_budget_contains_only_ordinary_agent_limits(self) -> None:
+        supervisor = self.supervisor(budget=execution_budget(max_model_calls=1))
+        self.assertEqual(supervisor._budget.max_model_calls, 1)
 
     def test_missing_usage_is_deterministic_and_history_is_bounded(self) -> None:
         supervisor = self.supervisor(
@@ -664,16 +671,19 @@ class ExecutionSupervisionTests(unittest.TestCase):
 
     def test_observe_mode_records_model_calls_after_finalizer_decisions(self) -> None:
         supervisor = self.supervisor(
-            budget=execution_budget(max_model_calls=3, finalizer_model_calls=1),
+            budget=execution_budget(max_model_calls=2),
             mode=SupervisionMode.OBSERVE,
         )
         first = observation(progress_kind=ProgressKind.NONE)
         second = observation(arguments={"path": "second.py"}, progress_kind=ProgressKind.NONE)
 
         self.assertIs(execute_tool(supervisor, first), SupervisorDecisionKind.CONTINUE)
-        self.assertIs(execute_tool(supervisor, second), SupervisorDecisionKind.FINALIZE)
+        self.assertIs(
+            execute_tool(supervisor, second),
+            SupervisorDecisionKind.MARK_BUDGET_LIMITED,
+        )
         decision = supervisor.authorize_model_request()
-        self.assertIs(decision.kind, SupervisorDecisionKind.FINALIZE)
+        self.assertIs(decision.kind, SupervisorDecisionKind.MARK_BUDGET_LIMITED)
         self.assertEqual(supervisor.snapshot.counters.model_requests, 3)
         self.assertIs(supervisor.snapshot.status, AgentExecutionStatus.RUNNING)
         self.assertIs(

@@ -4,7 +4,9 @@
 
 from __future__ import annotations
 
+import html
 import json
+import re
 from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -36,7 +38,7 @@ from neuro_code.infrastructure.providers.image_references import (
     InlineImageReference,
     parse_image_reference,
 )
-from neuro_code.shared.errors import ProviderError
+from neuro_code.shared.errors import ConfigurationError, ProviderError
 
 BACKEND_SUMMARY_FIELD_CHARS = 1000
 CODE_SUMMARY_CHARS = 100
@@ -47,6 +49,165 @@ class _ToolCallBuffer:
     identifier: str = ""
     name: str = ""
     arguments: str = ""
+
+
+@dataclass(slots=True)
+class _DeepSeekDSMLStreamParser:
+    """Parse DeepSeek V4's streamed DSML tool-call dialect.
+
+    DeepSeek can encode tool calls in ``content`` rather than the standard
+    ``delta.tool_calls`` field.  Keeping this parser at the provider boundary
+    prevents the proprietary wire format from leaking into runtime or UI
+    layers, and allows incomplete protocol fragments to remain buffered across
+    SSE chunks.
+    """
+
+    _buffer: str = ""
+    _active_end: str | None = None
+    _next_tool_id: int = 1
+
+    _FULLWIDTH_TOKEN = "\uff5cDSML\uff5c"
+    _OPEN_MARKERS = ("<|DSML|tool_calls>", f"<{_FULLWIDTH_TOKEN}tool_calls>")
+    _DSML_PREFIXES = ("<|DSML|", f"<{_FULLWIDTH_TOKEN}")
+    _INVOKE_PATTERN = re.compile(
+        r"<(?P<token>\|DSML\||\uFF5CDSML\uFF5C)invoke(?P<attributes>[^>]*)>"
+        r"(?P<body>.*?)</(?P=token)invoke>",
+        re.DOTALL,
+    )
+    _PARAMETER_PATTERN = re.compile(
+        r"<(?P<token>\|DSML\||\uFF5CDSML\uFF5C)parameter(?P<attributes>[^>]*)>"
+        r"(?P<body>.*?)</(?P=token)parameter>",
+        re.DOTALL,
+    )
+
+    def feed(self, text: str) -> tuple[tuple[str, ...], tuple[ToolCall, ...]]:
+        self._buffer += text
+        return self._drain(final=False)
+
+    def finish(self) -> tuple[tuple[str, ...], tuple[ToolCall, ...]]:
+        return self._drain(final=True)
+
+    def _drain(self, *, final: bool) -> tuple[tuple[str, ...], tuple[ToolCall, ...]]:
+        visible: list[str] = []
+        calls: list[ToolCall] = []
+        while True:
+            if self._active_end is not None:
+                end_index = self._buffer.find(self._active_end)
+                if end_index < 0:
+                    if final:
+                        raise ProviderError("provider returned incomplete DeepSeek DSML tool call")
+                    return tuple(visible), tuple(calls)
+                block = self._buffer[:end_index]
+                self._buffer = self._buffer[end_index + len(self._active_end) :]
+                calls.extend(self._parse_block(block))
+                self._active_end = None
+                continue
+
+            marker = self._find_open_marker()
+            if marker is not None:
+                index, opening, closing = marker
+                if index:
+                    visible.append(self._buffer[:index])
+                self._buffer = self._buffer[index + len(opening) :]
+                self._active_end = closing
+                continue
+
+            if final:
+                if any(prefix in self._buffer for prefix in self._DSML_PREFIXES):
+                    raise ProviderError("provider returned malformed DeepSeek DSML content")
+                if self._buffer:
+                    visible.append(self._buffer)
+                    self._buffer = ""
+                return tuple(visible), tuple(calls)
+
+            keep = self._partial_marker_suffix_length()
+            for prefix in self._DSML_PREFIXES:
+                index = self._buffer.find(prefix)
+                if index >= 0 and index < len(self._buffer) - keep:
+                    raise ProviderError("provider returned malformed DeepSeek DSML content")
+            if keep:
+                if len(self._buffer) > keep:
+                    visible.append(self._buffer[:-keep])
+                    self._buffer = self._buffer[-keep:]
+                return tuple(visible), tuple(calls)
+            if self._buffer:
+                visible.append(self._buffer)
+                self._buffer = ""
+            return tuple(visible), tuple(calls)
+
+    def _find_open_marker(self) -> tuple[int, str, str] | None:
+        matches = [
+            (self._buffer.find(marker), marker)
+            for marker in self._OPEN_MARKERS
+            if self._buffer.find(marker) >= 0
+        ]
+        if not matches:
+            return None
+        index, opening = min(matches, key=lambda item: item[0])
+        token = "|DSML|" if opening.startswith("<|DSML|") else self._FULLWIDTH_TOKEN
+        return index, opening, f"</{token}tool_calls>"
+
+    def _partial_marker_suffix_length(self) -> int:
+        longest = 0
+        for marker in self._OPEN_MARKERS:
+            for size in range(1, min(len(marker), len(self._buffer)) + 1):
+                if self._buffer.endswith(marker[:size]):
+                    longest = max(longest, size)
+        for prefix in self._DSML_PREFIXES:
+            for size in range(1, min(len(prefix), len(self._buffer)) + 1):
+                if self._buffer.endswith(prefix[:size]):
+                    longest = max(longest, size)
+        return longest
+
+    def _parse_block(self, block: str) -> list[ToolCall]:
+        calls: list[ToolCall] = []
+        cursor = 0
+        for match in self._INVOKE_PATTERN.finditer(block):
+            if block[cursor : match.start()].strip():
+                raise ProviderError("provider returned malformed DeepSeek DSML tool call")
+            attributes = match.group("attributes")
+            name_match = re.search(r'\bname\s*=\s*"([^"]+)"', attributes)
+            if name_match is None:
+                raise ProviderError("provider returned a DeepSeek DSML call without a name")
+            arguments: dict[str, object] = {}
+            body = match.group("body")
+            parameter_cursor = 0
+            for parameter in self._PARAMETER_PATTERN.finditer(body):
+                if body[parameter_cursor : parameter.start()].strip():
+                    raise ProviderError("provider returned malformed DeepSeek DSML parameters")
+                parameter_attributes = parameter.group("attributes")
+                parameter_name = re.search(r'\bname\s*=\s*"([^"]+)"', parameter_attributes)
+                string_flag = re.search(r'\bstring\s*=\s*"(true|false)"', parameter_attributes)
+                if parameter_name is None or string_flag is None:
+                    raise ProviderError("provider returned malformed DeepSeek DSML parameter")
+                key = html.unescape(parameter_name.group(1))
+                if key in arguments:
+                    raise ProviderError("provider returned duplicate DeepSeek DSML parameter")
+                raw_value = html.unescape(parameter.group("body"))
+                if string_flag.group(1) == "true":
+                    arguments[key] = raw_value
+                else:
+                    try:
+                        arguments[key] = json.loads(raw_value)
+                    except json.JSONDecodeError as error:
+                        raise ProviderError(
+                            "provider returned invalid JSON in a DeepSeek DSML parameter"
+                        ) from error
+                parameter_cursor = parameter.end()
+            if body[parameter_cursor:].strip():
+                raise ProviderError("provider returned malformed DeepSeek DSML parameters")
+            calls.append(
+                ToolCall(
+                    f"dsml-{self._next_tool_id}",
+                    html.unescape(name_match.group(1)),
+                    arguments,
+                )
+            )
+            self._next_tool_id += 1
+            cursor = match.end()
+        if not calls or block[cursor:].strip():
+            raise ProviderError("provider returned malformed DeepSeek DSML tool call")
+        return calls
 
 
 class OpenAICompatibleProvider:
@@ -65,16 +226,20 @@ class OpenAICompatibleProvider:
         base_url: str,
         api_key: str,
         provider_name: str = "openai-compatible",
+        dialect: str = "standard",
         context_affinity: str | None = None,
         timeout_seconds: float = 120.0,
         max_output_tokens: int = 8192,
         transport: Any | None = None,
         http_policy: HttpClientPolicy | None = None,
     ) -> None:
+        if dialect not in {"standard", "deepseek-v4"}:
+            raise ConfigurationError(f"unsupported OpenAI-compatible dialect: {dialect}")
         self._model = model
         self._base_url = base_url.rstrip("/")
         self._api_key = api_key
         self._provider_name = provider_name
+        self._dialect = dialect
         self._context_affinity = context_affinity
         self._timeout_seconds = timeout_seconds
         self._max_output_tokens = max_output_tokens
@@ -95,6 +260,14 @@ class OpenAICompatibleProvider:
 
     def _safe_detail(self, detail: str) -> str:
         return self._http_policy.redact(detail, self._api_key)
+
+    def _uses_deepseek_dsml(self) -> bool:
+        """Return whether the configured dialect emits DeepSeek DSML.
+
+        返回当前显式配置的方言是否会发出 DeepSeek DSML.
+        """
+
+        return self._dialect == "deepseek-v4"
 
     @staticmethod
     def _user_content(message: Message) -> str | list[dict[str, Any]]:
@@ -303,6 +476,7 @@ class OpenAICompatibleProvider:
 
         headers = {"Authorization": f"Bearer {self._api_key}"}
         buffers: dict[int, _ToolCallBuffer] = {}
+        dsml_parser = _DeepSeekDSMLStreamParser() if self._uses_deepseek_dsml() else None
         stop_reason = "stop"
         input_tokens: int | None = None
         output_tokens: int | None = None
@@ -351,7 +525,15 @@ class OpenAICompatibleProvider:
                         continue
                     content = delta.get("content")
                     if isinstance(content, str) and content:
-                        yield ModelTextDelta(content)
+                        if dsml_parser is None:
+                            yield ModelTextDelta(content)
+                        else:
+                            visible, dsml_calls = dsml_parser.feed(content)
+                            for text in visible:
+                                if text:
+                                    yield ModelTextDelta(text)
+                            for call in dsml_calls:
+                                yield ModelToolCall(call)
                     reasoning = delta.get("reasoning_content")
                     if isinstance(reasoning, str) and reasoning:
                         yield ModelReasoningDelta(reasoning)
@@ -366,6 +548,14 @@ class OpenAICompatibleProvider:
             raise ProviderError(
                 f"provider stream failed: {type(error).__name__}: {detail}"
             ) from error
+
+        if dsml_parser is not None:
+            visible, dsml_calls = dsml_parser.finish()
+            for text in visible:
+                if text:
+                    yield ModelTextDelta(text)
+            for call in dsml_calls:
+                yield ModelToolCall(call)
 
         for index in sorted(buffers):
             buffer = buffers[index]

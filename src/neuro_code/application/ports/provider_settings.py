@@ -84,10 +84,12 @@ class ManagedProviderProfile:
             raise ConfigurationError("provider protocol must not be empty")
         if self.protocol not in _SUPPORTED_PROTOCOLS:
             raise ConfigurationError(f"unsupported provider protocol: {self.protocol}")
-        if self.dialect not in {"standard", "xai"}:
+        if self.dialect not in {"standard", "xai", "deepseek-v4"}:
             raise ConfigurationError(f"unsupported provider dialect: {self.dialect}")
         if self.dialect == "xai" and self.protocol != "openai-responses":
             raise ConfigurationError("xAI dialect requires protocol 'openai-responses'")
+        if self.dialect == "deepseek-v4" and self.protocol != "openai-chat":
+            raise ConfigurationError("DeepSeek V4 dialect requires protocol 'openai-chat'")
         if not self.model.strip():
             raise ConfigurationError("provider model must not be empty")
         if len(self.model) > _MAX_MODEL_CHARACTERS:

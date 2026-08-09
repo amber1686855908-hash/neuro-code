@@ -19,7 +19,7 @@ _SUPPORTED_PROTOCOLS = frozenset(
         "gemini-generate-content",
     }
 )
-_SUPPORTED_DIALECTS = frozenset({"standard", "xai"})
+_SUPPORTED_DIALECTS = frozenset({"standard", "xai", "deepseek-v4"})
 _MAX_URL_CHARACTERS = 2_048
 _MAX_API_KEY_CHARACTERS = 16_384
 _MAX_MODELS = 200
@@ -44,6 +44,8 @@ class ProviderConnectionSpec:
             raise ConfigurationError(f"unsupported provider dialect: {self.dialect}")
         if self.dialect == "xai" and self.protocol != "openai-responses":
             raise ConfigurationError("xAI dialect requires protocol 'openai-responses'")
+        if self.dialect == "deepseek-v4" and self.protocol != "openai-chat":
+            raise ConfigurationError("DeepSeek V4 dialect requires protocol 'openai-chat'")
         base_url = self.base_url.strip()
         if not base_url:
             raise ConfigurationError("provider base URL must not be empty")

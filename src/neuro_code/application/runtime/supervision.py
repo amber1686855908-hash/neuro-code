@@ -558,16 +558,28 @@ DEFAULT_OBSERVATION_BUDGET = ExecutionBudget(
     max_input_tokens=None,
     max_output_tokens=None,
     max_total_tokens=None,
-    finalizer_model_calls=2,
 )
 
 
-def create_observing_supervisor() -> AgentExecutionSupervisor:
+def create_observing_supervisor(
+    *,
+    max_model_calls: int | None = None,
+) -> AgentExecutionSupervisor:
     """Create the default non-enforcing supervisor for one runtime turn.
 
-    为一个运行时回合创建默认的非强制监督器."""
+    为一个运行时回合创建默认的非强制监督器.
 
-    return AgentExecutionSupervisor(DEFAULT_OBSERVATION_BUDGET, mode=SupervisionMode.OBSERVE)
+    ``max_model_calls`` is the ordinary Agent request budget.  Finalizer
+    attempts remain a separate bounded resource and are never reserved from
+    this value.
+    """
+
+    budget = (
+        DEFAULT_OBSERVATION_BUDGET
+        if max_model_calls is None
+        else replace(DEFAULT_OBSERVATION_BUDGET, max_model_calls=max_model_calls)
+    )
+    return AgentExecutionSupervisor(budget, mode=SupervisionMode.OBSERVE)
 
 
 class AgentExecutionSupervisor:
@@ -893,13 +905,6 @@ class AgentExecutionSupervisor:
                 return self._budget_limited(
                     SupervisorReasonCode.MODEL_CALL_BUDGET,
                     "model call budget is exhausted",
-                )
-            if (
-                counters.model_requests + self._budget.finalizer_model_calls
-                >= self._budget.max_model_calls
-            ):
-                return self._finalize(
-                    "model call budget is reserved for finalization",
                 )
         return self._continue_decision()
 

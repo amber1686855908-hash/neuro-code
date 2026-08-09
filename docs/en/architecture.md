@@ -1144,6 +1144,9 @@ The composition root selects a named `ProviderProfile`; the agent runtime never
 branches on a commercial provider name. Profiles separate wire protocol
 (`openai-chat`, `openai-responses`, `anthropic-messages`, or
 `gemini-generate-content`) from optional dialect behavior such as xAI Responses.
+DeepSeek V4's DSML tool-call stream is an explicit `openai-chat` dialect selected
+through `dialect = "deepseek-v4"`; it is never inferred from a provider name,
+model name, or hostname.
 The generic Responses adapter is implemented at
 `neuro_code.infrastructure.providers.openai_responses.OpenAIResponsesProvider`; xAI behavior
 is selected through `dialect = "xai"`, not through a separate Python provider
@@ -1171,8 +1174,9 @@ all background scopes close before configuration and the provider binding are
 rebuilt. First-run setup occurs before application composition, so an absent
 provider never creates a partial runtime. Normal Settings routes through a
 category screen to separate language/provider detail screens. Presets map
-explicitly to wire behavior: OpenAI Responses uses `openai-responses`, while
-Compatible Chat and DeepSeek use `openai-chat`. The provider detail screen runs
+explicitly to wire behavior: OpenAI Responses uses `openai-responses`, Compatible
+Chat uses `openai-chat` with the standard dialect, and DeepSeek uses `openai-chat`
+with `dialect = "deepseek-v4"`. The provider detail screen runs
 the same `HttpClientPolicy` resolver before persistence, requires a second
 confirmation before deleting metadata plus credentials, and requests a safe
 reload afterward. Startup preflight routes an invalid managed default back to

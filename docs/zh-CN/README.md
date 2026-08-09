@@ -423,6 +423,7 @@ fallbacks = ["anthropic"]
 
 [providers.deepseek]
 protocol = "openai-chat"
+dialect = "deepseek-v4"
 model = "deepseek-v4-pro"
 base_url = "https://api.deepseek.com"
 auth = "env"
@@ -494,6 +495,7 @@ neuro-code -p "Explain this repository" --no-failover
 ```toml
 [providers.deepseek]
 protocol = "openai-chat"
+dialect = "deepseek-v4"
 model = "deepseek-v4-pro"
 base_url = "https://api.deepseek.com"
 api_key_env = "DEEPSEEK_API_KEY"
@@ -552,8 +554,9 @@ builtin_tools = ["web_search", "x_search", "code_interpreter"]
 本地工具链；运行时会为其产生独立后端生命周期事件，并且它们可能产生额外费用。目前
 尚未实现有状态 `previous_response_id` 链接和压缩项。
 
-DeepSeek 及其他 Chat Completions 服务使用 `openai-chat`。思考模式工具调用关联的
-assistant 推理会被持久化并在下一请求回放；没有工具调用的已完成推理只保留在本地。
+DeepSeek V4 使用带显式 `dialect = "deepseek-v4"` 的 `openai-chat`；其他 Chat
+Completions 服务使用 standard 方言。思考模式工具调用关联的 assistant 推理会被持久化并在
+下一请求回放；没有工具调用的已完成推理只保留在本地。
 运行所选 profile 前，应通过 Shell 或密钥管理器加载 `DEEPSEEK_API_KEY`。
 
 ### 可选在线回归测试

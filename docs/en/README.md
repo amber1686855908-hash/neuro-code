@@ -557,6 +557,7 @@ fallbacks = ["anthropic"]
 
 [providers.deepseek]
 protocol = "openai-chat"
+dialect = "deepseek-v4"
 model = "deepseek-v4-pro"
 base_url = "https://api.deepseek.com"
 auth = "env"
@@ -634,6 +635,7 @@ For example:
 ```toml
 [providers.deepseek]
 protocol = "openai-chat"
+dialect = "deepseek-v4"
 model = "deepseek-v4-pro"
 base_url = "https://api.deepseek.com"
 api_key_env = "DEEPSEEK_API_KEY"
@@ -700,8 +702,9 @@ by xAI, bypass local tool execution, emit separate backend lifecycle events,
 and may incur additional charges. Stateful `previous_response_id` chaining and
 compaction items are not yet implemented.
 
-DeepSeek and other Chat Completions services use `openai-chat`. During
-thinking-mode tool use, assistant reasoning associated with a tool call is
+DeepSeek V4 uses `openai-chat` with the explicit `dialect = "deepseek-v4"`;
+other Chat Completions services use the standard dialect. During thinking-mode
+tool use, assistant reasoning associated with a tool call is
 persisted and replayed on the next request; completed no-tool reasoning remains
 local. Load `DEEPSEEK_API_KEY` through the shell or a secret manager before
 running the selected profile.

@@ -607,6 +607,230 @@ class OpenAICompatibleProviderTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(events[0], ModelToolCall)
         self.assertEqual(events[0].call.name, "read_file")
 
+    async def test_deepseek_dsml_tool_call_is_parsed_across_sse_chunks(self) -> None:
+        fragments = (
+            "before ",
+            "<|DSML|tool_",
+            'calls><|DSML|invoke name="bash">',
+            '<|DSML|parameter name="command" string="true">',
+            "echo hi</|DSML|parameter></|DSML|invoke></|DSML|tool_calls>",
+            " after",
+        )
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                text=_sse(
+                    {"choices": [{"delta": {"reasoning_content": "planning"}}]},
+                    *({"choices": [{"delta": {"content": fragment}}]} for fragment in fragments),
+                ),
+                headers={"content-type": "text/event-stream"},
+            )
+
+        provider = OpenAICompatibleProvider(
+            model="deepseek-v4-flash",
+            base_url="https://api.deepseek.com",
+            api_key="fixture",
+            dialect="deepseek-v4",
+            transport=httpx.MockTransport(handler),
+        )
+        events = [
+            event
+            async for event in provider.stream(
+                ModelContext((Message(Role.USER, "inspect"),)),
+                (),
+            )
+        ]
+
+        text = "".join(event.text for event in events if isinstance(event, ModelTextDelta))
+        calls = [event.call for event in events if isinstance(event, ModelToolCall)]
+        self.assertEqual(text, "before  after")
+        self.assertEqual(
+            [event.text for event in events if isinstance(event, ModelReasoningDelta)],
+            ["planning"],
+        )
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].name, "bash")
+        self.assertEqual(calls[0].arguments, {"command": "echo hi"})
+        self.assertNotIn("DSML", text)
+
+    async def test_standard_deepseek_named_provider_does_not_enable_dsml(self) -> None:
+        content = (
+            '<|DSML|tool_calls><|DSML|invoke name="read_file">'
+            '<|DSML|parameter name="path" string="true">a.py</|DSML|parameter>'
+            "</|DSML|invoke></|DSML|tool_calls>"
+        )
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                text=_sse({"choices": [{"delta": {"content": content}}]}),
+                headers={"content-type": "text/event-stream"},
+            )
+
+        provider = OpenAICompatibleProvider(
+            model="deepseek-v4-flash",
+            base_url="https://proxy.invalid/v1",
+            api_key="fixture",
+            provider_name="deepseek-compatible",
+            dialect="standard",
+            transport=httpx.MockTransport(handler),
+        )
+        events = [
+            event
+            async for event in provider.stream(
+                ModelContext((Message(Role.USER, "answer"),)),
+                (),
+            )
+        ]
+
+        self.assertFalse(any(isinstance(event, ModelToolCall) for event in events))
+        self.assertEqual(
+            [event.text for event in events if isinstance(event, ModelTextDelta)],
+            [content],
+        )
+
+    async def test_deepseek_plain_assistant_text_remains_text(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                text=_sse(
+                    {"choices": [{"delta": {"content": "ordinary DeepSeek answer"}}]},
+                ),
+                headers={"content-type": "text/event-stream"},
+            )
+
+        provider = OpenAICompatibleProvider(
+            model="deepseek-v4-flash",
+            base_url="https://api.deepseek.com",
+            api_key="fixture",
+            dialect="deepseek-v4",
+            transport=httpx.MockTransport(handler),
+        )
+        events = [
+            event
+            async for event in provider.stream(
+                ModelContext((Message(Role.USER, "answer"),)),
+                (),
+            )
+        ]
+        self.assertEqual(
+            [event.text for event in events if isinstance(event, ModelTextDelta)],
+            ["ordinary DeepSeek answer"],
+        )
+
+    async def test_deepseek_dsml_unicode_multiple_calls_and_json_parameters(self) -> None:
+        content = (
+            "<\uff5cDSML\uff5ctool_calls>"
+            '<\uff5cDSML\uff5cinvoke name="read_file">'
+            '<\uff5cDSML\uff5cparameter name="path" string="true">a.py</\uff5cDSML\uff5cparameter>'
+            "</\uff5cDSML\uff5cinvoke>"
+            '<\uff5cDSML\uff5cinvoke name="search">'
+            '<\uff5cDSML\uff5cparameter name="limit" string="false">5</\uff5cDSML\uff5cparameter>'
+            "</\uff5cDSML\uff5cinvoke>"
+            "</\uff5cDSML\uff5ctool_calls>"
+        )
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            midpoint = len(content) // 2
+            return httpx.Response(
+                200,
+                text=_sse(
+                    {"choices": [{"delta": {"content": content[:midpoint]}}]},
+                    {"choices": [{"delta": {"content": content[midpoint:]}}]},
+                ),
+                headers={"content-type": "text/event-stream"},
+            )
+
+        provider = OpenAICompatibleProvider(
+            model="fixture-model",
+            base_url="https://proxy.invalid/v1",
+            api_key="fixture",
+            provider_name="generic",
+            dialect="deepseek-v4",
+            transport=httpx.MockTransport(handler),
+        )
+        events = [
+            event
+            async for event in provider.stream(
+                ModelContext((Message(Role.USER, "inspect"),)),
+                (),
+            )
+        ]
+        calls = [event.call for event in events if isinstance(event, ModelToolCall)]
+        self.assertEqual(
+            [(call.name, dict(call.arguments)) for call in calls],
+            [("read_file", {"path": "a.py"}), ("search", {"limit": 5})],
+        )
+        self.assertEqual(
+            "".join(event.text for event in events if isinstance(event, ModelTextDelta)), ""
+        )
+
+    async def test_deepseek_incomplete_dsml_is_rejected_without_leaking_protocol_text(self) -> None:
+        content = '<|DSML|tool_calls><|DSML|invoke name="bash">'
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                text=_sse({"choices": [{"delta": {"content": content}}]}),
+                headers={"content-type": "text/event-stream"},
+            )
+
+        provider = OpenAICompatibleProvider(
+            model="deepseek-v4-flash",
+            base_url="https://api.deepseek.com",
+            api_key="fixture",
+            dialect="deepseek-v4",
+            transport=httpx.MockTransport(handler),
+        )
+        with self.assertRaisesRegex(ProviderError, "DeepSeek DSML"):
+            [
+                event
+                async for event in provider.stream(
+                    ModelContext((Message(Role.USER, "inspect"),)),
+                    (),
+                )
+            ]
+
+    async def test_deepseek_dsml_with_disabled_tools_remains_a_model_tool_call(self) -> None:
+        content = (
+            '<|DSML|tool_calls><|DSML|invoke name="read_file">'
+            '<|DSML|parameter name="path" string="true">a.py</|DSML|parameter>'
+            "</|DSML|invoke></|DSML|tool_calls>"
+        )
+        captured: dict[str, object] = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured["body"] = json.loads(request.content)
+            return httpx.Response(
+                200,
+                text=_sse({"choices": [{"delta": {"content": content}}]}),
+                headers={"content-type": "text/event-stream"},
+            )
+
+        provider = OpenAICompatibleProvider(
+            model="deepseek-v4-flash",
+            base_url="https://api.deepseek.com",
+            api_key="fixture",
+            dialect="deepseek-v4",
+            transport=httpx.MockTransport(handler),
+        )
+        events = [
+            event
+            async for event in provider.stream(
+                ModelContext((Message(Role.USER, "finalize"),)),
+                (ToolDefinition("read_file", "Read", {"type": "object"}),),
+                tool_policy=ModelToolPolicy.DISABLED,
+            )
+        ]
+        body = captured["body"]
+        assert isinstance(body, dict)
+        self.assertNotIn("tools", body)
+        self.assertEqual(
+            [event.call.name for event in events if isinstance(event, ModelToolCall)],
+            ["read_file"],
+        )
+
     async def test_http_error_is_bounded_and_does_not_echo_api_key(self) -> None:
         def handler(request: httpx.Request) -> httpx.Response:
             return httpx.Response(401, text="unauthorized must-not-leak")
@@ -734,6 +958,19 @@ class OpenAICompatibleProviderTests(unittest.IsolatedAsyncioTestCase):
                 ("web_search", "code_interpreter"),
             )
             self.assertEqual(xai_provider.provider_name, "xai")
+            deepseek_provider = create_provider(
+                ProviderProfile(
+                    name="deepseek",
+                    protocol="openai-chat",
+                    dialect="deepseek-v4",
+                    model="deepseek-v4-flash",
+                    base_url="https://proxy.invalid/v1",
+                    api_key_env="TOKEN",
+                    proxy_mode="direct",
+                )
+            )
+            assert isinstance(deepseek_provider, OpenAICompatibleProvider)
+            self.assertEqual(deepseek_provider._dialect, "deepseek-v4")
             with self.assertRaisesRegex(ConfigurationError, "require dialect"):
                 ProviderProfile(
                     name="invalid-tools",

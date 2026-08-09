@@ -11,6 +11,7 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
+from time import monotonic
 from typing import Any, ClassVar, Protocol, cast
 from urllib.parse import urlsplit
 
@@ -109,7 +110,7 @@ from neuro_code.domain.execution import (
     SessionExecutionRecord,
     TurnCancellationPolicy,
 )
-from neuro_code.domain.plans import PlanComment, SessionPlan
+from neuro_code.domain.plans import PlanComment, PlanStepStatus, SessionPlan
 from neuro_code.domain.session_tasks import SessionTask, SessionTaskKind, SessionTaskStatus
 from neuro_code.interfaces.tui import recoverable_terminal_status
 from neuro_code.shared.redaction import redact_sensitive_text
@@ -171,6 +172,7 @@ _MAX_QUEUED_INTERJECTIONS = 4
 _DEFAULT_BACKGROUND_WAKE_LIMITS = BackgroundWakeLimits()
 _TERMINAL_SIZE_POLL_SECONDS = 0.25
 _LOADING_ANIMATION_TICK_SECONDS = 0.05
+_TOOL_ELAPSED_UPDATE_SECONDS = 0.25
 _COMMAND_HINT_LIMIT = 5
 _TOOL_OUTPUT_MAX_LINES = 40
 _TOOL_OUTPUT_MAX_CHARACTERS = 6_000
@@ -288,7 +290,7 @@ class CollapsingPulseAnimation:
 _PROVIDER_PRESETS: tuple[ProviderPreset, ...] = (
     ProviderPreset("openai", "openai-responses", "standard", "https://api.openai.com/v1"),
     ProviderPreset("compatible", "openai-chat", "standard", ""),
-    ProviderPreset("deepseek", "openai-chat", "standard", "https://api.deepseek.com"),
+    ProviderPreset("deepseek", "openai-chat", "deepseek-v4", "https://api.deepseek.com"),
     ProviderPreset("anthropic", "anthropic-messages", "standard", "https://api.anthropic.com"),
     ProviderPreset(
         "gemini",
@@ -450,6 +452,7 @@ class ToolFeedbackState:
     approval_outcome: str | None = None
     approval_reason: str | None = None
     duration: str | None = None
+    started_at: float | None = None
     content: str | None = None
     is_error: bool = False
     metadata: dict[str, Any] | None = None
@@ -516,6 +519,44 @@ class ConversationMessage(Static):
 
     def set_pending(self, pending: bool) -> None:
         self.set_class(pending, "message-pending")
+
+
+class PromptInput(Input):
+    """Prompt input that preserves all lines from a terminal paste.
+
+    保留终端粘贴内容中全部行的提示输入框.
+
+    Textual's single-line ``Input`` intentionally keeps only the first line of a
+    bracketed paste. The prompt still submits through the same ``Input`` message
+    contract, but pasted newlines remain in its value so multi-line prompts are
+    not silently truncated.
+    Textual 的单行 ``Input`` 默认只保留 bracketed paste 的第一行.提示框仍沿用
+    原有 ``Input`` 消息契约,但会保留粘贴值中的换行,避免多行提示被静默截断.
+    """
+
+    @property
+    def _value(self) -> Text:
+        """Render pasted newlines without allowing them to escape the input row.
+
+        将粘贴内容中的换行渲染为单字符标记,避免突破单行输入框的布局.
+        """
+
+        if self.password:
+            return Text("•" * len(self.value), no_wrap=True, overflow="ignore", end="")
+        text = Text(self.value.replace("\n", "↵"), no_wrap=True, overflow="ignore", end="")
+        if self.highlighter is not None:
+            text = self.highlighter(text)
+        return text
+
+    def _on_paste(self, event: events.Paste) -> None:
+        text = event.text.replace("\r\n", "\n").replace("\r", "\n")
+        if text:
+            start, end = self.selection
+            if start == end:
+                self.insert_text_at_cursor(text)
+            else:
+                self.replace(text, start, end)
+        event.prevent_default().stop()
 
 
 class ToolFeedbackMessage(ConversationMessage, can_focus=True):
@@ -1599,7 +1640,7 @@ class ProviderSettingsScreen(ModalScreen[ProviderSettingsSubmission | None]):
     def _preset_for_profile(profile: ManagedProviderProfile) -> str:
         base_url = profile.base_url.rstrip("/").casefold()
         if _is_deepseek_base_url(profile.base_url):
-            if profile.protocol == "openai-chat" and profile.dialect == "standard":
+            if profile.protocol == "openai-chat" and profile.dialect == "deepseek-v4":
                 return "deepseek"
             if profile.protocol == "openai-responses" and profile.dialect == "standard":
                 return "openai"
@@ -2915,6 +2956,7 @@ class NeuroCodeApp(App[None]):
     """
     BINDINGS: ClassVar[list[BindingType]] = [
         Binding("ctrl+c", "cancel_turn", "Cancel", priority=True, show=False),
+        Binding("ctrl+shift+c", "copy_prompt", "Copy", priority=True, show=False),
         Binding("ctrl+p", "select_provider", "Provider", priority=True, show=False),
         Binding("ctrl+r", "select_session", "Sessions", priority=True, show=False),
         Binding("ctrl+e", "select_reasoning_effort", "Effort", priority=True, show=False),
@@ -3084,6 +3126,8 @@ class NeuroCodeApp(App[None]):
         self._context_used_tokens = estimate_context_tokens(self._initial_items)
         self._context_usage_estimated = True
         self._plan = plan_controller.plan if plan_controller is not None else None
+        self._plan_comments: tuple[PlanComment, ...] = ()
+        self._plan_entry_index: int | None = None
         self._entries: list[TranscriptEntry] = []
         self._entry_widgets: list[ConversationMessage] = []
         self._tool_feedback_by_call: dict[tuple[bool, str], ToolFeedbackState] = {}
@@ -3134,7 +3178,7 @@ class NeuroCodeApp(App[None]):
             )
             with Horizontal(id="prompt-row"):
                 yield Static(_PROMPT_MARK, id="prompt-mark")
-                yield Input(
+                yield PromptInput(
                     placeholder=ui_text(self._language, "prompt.placeholder"),
                     suggester=SlashCommandSuggester(self._slash_completions),
                     id="prompt",
@@ -3174,6 +3218,7 @@ class NeuroCodeApp(App[None]):
             _LOADING_ANIMATION_TICK_SECONDS,
             self._advance_model_loading_animation,
         )
+        self.set_interval(_TOOL_ELAPSED_UPDATE_SECONDS, self._refresh_running_tool_elapsed)
         if not self.is_headless and not self.is_inline and not self.is_web:
             self.set_interval(_TERMINAL_SIZE_POLL_SECONDS, self._synchronize_terminal_size)
         self.query_one("#prompt", Input).focus()
@@ -3316,6 +3361,10 @@ class NeuroCodeApp(App[None]):
                 (removed_state.hosted, removed_state.call_id),
                 None,
             )
+        if self._plan_entry_index == index:
+            self._plan_entry_index = None
+        elif self._plan_entry_index is not None and self._plan_entry_index > index:
+            self._plan_entry_index -= 1
         shifted: dict[int, ToolFeedbackState] = {}
         for entry_index, state in self._tool_feedback_by_entry.items():
             if entry_index > index:
@@ -3630,6 +3679,8 @@ class NeuroCodeApp(App[None]):
                 self._plan = SessionPlan.from_dict(data)
             except ValueError:
                 return
+            self._plan_comments = ()
+            self._upsert_plan_entry(self._plan)
         elif event.kind is AgentEventKind.PLAN_EXECUTION_REQUESTED:
             self._write_ui_entry("status", "plan.execution_requested")
         elif event.kind is AgentEventKind.TURN_COMPLETED:
@@ -3665,9 +3716,12 @@ class NeuroCodeApp(App[None]):
         data = event.data
         if event.kind is AgentEventKind.BACKEND_TOOL_STARTED:
             state.phase = "running"
+            if state.started_at is None:
+                state.started_at = monotonic()
         elif event.kind is AgentEventKind.BACKEND_TOOL_COMPLETED:
             state.phase = "completed"
             state.duration = self._event_duration(data)
+            state.started_at = None
         elif event.kind is AgentEventKind.TOOL_PERMISSION:
             state.permission_effect = self._optional_text(data.get("effect"))
             state.permission_reason = self._optional_text(data.get("reason"))
@@ -3688,9 +3742,12 @@ class NeuroCodeApp(App[None]):
             )
         elif event.kind is AgentEventKind.TOOL_STARTED:
             state.phase = "running"
+            if state.started_at is None:
+                state.started_at = monotonic()
         elif event.kind in {AgentEventKind.TOOL_COMPLETED, AgentEventKind.TOOL_FAILED}:
             state.phase = "failed" if event.kind is AgentEventKind.TOOL_FAILED else "completed"
             state.duration = self._event_duration(data)
+            state.started_at = None
             state.content = self._optional_text(data.get("content"), allow_empty=True)
             state.is_error = (
                 event.kind is AgentEventKind.TOOL_FAILED or data.get("is_error") is True
@@ -3949,11 +4006,20 @@ class NeuroCodeApp(App[None]):
             )
 
         if state.phase == "running":
+            running_label = (
+                "tool.card.waiting"
+                if state.name in {"wait_tasks", "task_output", "wait_for_tasks"}
+                else "tool.card.running"
+            )
             self._append_tool_line(
                 body,
                 "├",
-                ui_text(self._language, "tool.card.running"),
+                ui_text(self._language, running_label),
                 style=WAITING_STYLE,
+            )
+            body.append(
+                f" · {self._running_tool_duration(state)}",
+                style=TOOL_META_STYLE,
             )
         if state.phase == "completed":
             duration = state.duration or "—"
@@ -4001,7 +4067,13 @@ class NeuroCodeApp(App[None]):
             or state.name not in _COMPACT_READ_TOOLS
             or state.is_error
             or state.phase
-            in {"failed", "permission_denied", "approval_denied", "awaiting_approval"}
+            in {
+                "running",
+                "failed",
+                "permission_denied",
+                "approval_denied",
+                "awaiting_approval",
+            }
         ):
             return None
         key = "completed" if state.phase == "completed" else "running"
@@ -4021,6 +4093,11 @@ class NeuroCodeApp(App[None]):
             f"tool.compact.{state.name}.{key}",
             target=target,
         )
+
+    def _running_tool_duration(self, state: ToolFeedbackState) -> str:
+        if state.started_at is None:
+            return "—"
+        return self._event_duration({"duration_seconds": max(0.0, monotonic() - state.started_at)})
 
     @staticmethod
     def _append_tool_line(body: Text, connector: str, content: str, *, style: str) -> None:
@@ -4634,8 +4711,20 @@ class NeuroCodeApp(App[None]):
         self._entry_widgets.clear()
         self._tool_feedback_by_call.clear()
         self._tool_feedback_by_entry.clear()
+        self._plan_entry_index = None
+        self._plan_comments = ()
         self._queued_interjections.clear()
         self._write_ui_entry("system", "transcript.cleared")
+
+    def action_copy_prompt(self) -> None:
+        """Copy selected prompt text without changing turn control behavior.
+
+        复制提示框中的选中文本,不改变轮次控制行为.
+        """
+
+        prompt = self.query_one("#prompt", Input)
+        if prompt.has_focus and prompt.selected_text:
+            prompt.action_copy()
 
     def action_cancel_turn(self) -> None:
         if isinstance(self.screen, PermissionApprovalScreen):
@@ -4667,6 +4756,9 @@ class NeuroCodeApp(App[None]):
             self._turn_worker.cancel()
             return
         prompt = self.query_one("#prompt", Input)
+        if prompt.has_focus and prompt.selected_text:
+            prompt.action_copy()
+            return
         if prompt.value:
             prompt.value = ""
             self._write_ui_entry("status", "turn.draft_cleared")
@@ -5286,25 +5378,64 @@ class NeuroCodeApp(App[None]):
             except Exception as error:
                 self._write_entry("error", f"{type(error).__name__}: {error}")
                 return
-        lines = [ui_text(self._language, "plan.heading")]
+        self._plan_comments = comments
+        self._upsert_plan_entry(plan, comments)
+
+    def _render_plan(self, plan: SessionPlan, comments: Sequence[PlanComment] = ()) -> Text:
+        body = Text(overflow="fold")
+        body.append(
+            ui_text(self._language, "plan.heading"),
+            style=f"bold {TEXT_PRIMARY}",
+        )
         if plan.explanation is not None:
-            lines.append(ui_text(self._language, "plan.purpose", explanation=plan.explanation))
+            body.append("\n")
+            body.append(
+                ui_text(self._language, "plan.purpose", explanation=plan.explanation),
+                style=TEXT_SECONDARY,
+            )
         for index, step in enumerate(plan.steps, start=1):
-            lines.append(
-                ui_text(
-                    self._language,
-                    "plan.step",
-                    index=index,
-                    status=ui_text(self._language, f"plan.status.{step.status.value}"),
-                    step=step.step,
-                )
-            )
-            lines.extend(
-                ui_text(self._language, "plan.comment", content=comment.content)
-                for comment in comments
-                if comment.step_index == index
-            )
-        self._write_entry("system", "\n".join(lines))
+            marker, marker_style = {
+                PlanStepStatus.COMPLETED: (_SUCCESS_MARK, ACCENT_SUCCESS),
+                PlanStepStatus.IN_PROGRESS: (_PROMPT_MARK, ACCENT_CODE),
+                PlanStepStatus.PENDING: ("□", TEXT_SECONDARY),
+            }[step.status]
+            body.append("\n")
+            body.append(f"{marker} ", style=marker_style)
+            body.append(step.step, style=TEXT_BODY)
+            for comment in comments:
+                if comment.step_index == index:
+                    body.append("\n  · ", style=TEXT_MUTED)
+                    body.append(comment.content, style=TEXT_SECONDARY)
+        return body
+
+    def _upsert_plan_entry(
+        self,
+        plan: SessionPlan,
+        comments: Sequence[PlanComment] = (),
+    ) -> None:
+        rendered = self._render_plan(plan, comments)
+        index = self._plan_entry_index
+        if index is not None and 0 <= index < len(self._entries):
+            self._entries[index] = TranscriptEntry("plan", rendered.plain)
+            self._entry_widgets[index].update(rendered)
+            transcript = self.query_one("#transcript", VerticalScroll)
+            if transcript.is_vertical_scroll_end:
+                transcript.scroll_end(animate=False)
+            return
+
+        transcript = self.query_one("#transcript", VerticalScroll)
+        follow = transcript.is_vertical_scroll_end
+        widget = ConversationMessage("plan", rendered)
+        pending = self._pending_assistant
+        if pending is not None and pending.parent is transcript:
+            transcript.mount(widget, before=pending)
+        else:
+            transcript.mount(widget)
+        self._entries.append(TranscriptEntry("plan", rendered.plain))
+        self._entry_widgets.append(widget)
+        self._plan_entry_index = len(self._entries) - 1
+        if follow:
+            transcript.scroll_end(animate=False)
 
     async def _show_tasks(self) -> None:
         if self._task_controller is None and self._session_task_controller is None:
@@ -5784,6 +5915,8 @@ class NeuroCodeApp(App[None]):
         self._entry_widgets.clear()
         self._tool_feedback_by_call.clear()
         self._tool_feedback_by_entry.clear()
+        self._plan_entry_index = None
+        self._plan_comments = ()
         self._pending_assistant = None
         self._assistant_parts.clear()
         for item in items:
@@ -5803,6 +5936,8 @@ class NeuroCodeApp(App[None]):
             if item.role is Role.ASSISTANT and item.tool_calls:
                 names = ", ".join(call.name for call in item.tool_calls)
                 self._write_ui_entry("tool", "restore.request", names=names)
+        if self._plan is not None:
+            self._upsert_plan_entry(self._plan, self._plan_comments)
 
     def _bounded_restored_text(self, content: str) -> str:
         if len(content) <= _RESTORED_MESSAGE_LIMIT:
@@ -5880,6 +6015,8 @@ class NeuroCodeApp(App[None]):
             "system": SYSTEM_TEXT_STYLE,
             "tool": TOOL_TEXT_STYLE,
         }
+        if category == "plan" and self._plan is not None:
+            return self._render_plan(self._plan, self._plan_comments)
         label, label_style = labels.get(category, (category.title(), f"bold {TEXT_PRIMARY}"))
         body = Text(content, style=body_styles.get(category, TEXT_BODY), overflow="fold")
         for name, value in ui_values:
@@ -6019,16 +6156,19 @@ class NeuroCodeApp(App[None]):
         self._loading_animation_elapsed = 0.0
 
     def _advance_model_loading_animation(self) -> None:
-        if not self._model_loading:
-            return
-        self._loading_animation_elapsed += _LOADING_ANIMATION_TICK_SECONDS
-        if self._loading_animation_elapsed + 1e-9 < self._loading_animation.delay_seconds:
-            return
-        self._loading_animation_elapsed = 0.0
-        self._loading_animation.advance()
-        pending = self._pending_assistant
-        if pending is not None and not self._assistant_parts and pending.parent is not None:
-            pending.update(self._render_model_loading())
+        if self._model_loading:
+            self._loading_animation_elapsed += _LOADING_ANIMATION_TICK_SECONDS
+            if self._loading_animation_elapsed + 1e-9 >= self._loading_animation.delay_seconds:
+                self._loading_animation_elapsed = 0.0
+                self._loading_animation.advance()
+                pending = self._pending_assistant
+                if pending is not None and not self._assistant_parts and pending.parent is not None:
+                    pending.update(self._render_model_loading())
+
+    def _refresh_running_tool_elapsed(self) -> None:
+        for state in tuple(self._tool_feedback_by_entry.values()):
+            if state.phase == "running":
+                self._refresh_tool_feedback(state)
 
     def _apply_language_to_chrome(self) -> None:
         self.sub_title = ui_text(self._language, "subtitle")
@@ -6240,6 +6380,11 @@ class NeuroCodeApp(App[None]):
         for index, (entry, widget) in enumerate(
             zip(self._entries, self._entry_widgets, strict=True)
         ):
+            if entry.category == "plan" and self._plan is not None:
+                rendered_plan = self._render_plan(self._plan, self._plan_comments)
+                self._entries[index] = TranscriptEntry("plan", rendered_plan.plain)
+                widget.update(rendered_plan)
+                continue
             tool_state = self._tool_feedback_by_entry.get(index)
             if tool_state is not None:
                 body = self._tool_feedback_body(tool_state)

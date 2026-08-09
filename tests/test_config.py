@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -18,6 +19,7 @@ from neuro_code.configuration.app import (
     pin_resumed_sandbox,
 )
 from neuro_code.domain.sandbox import SandboxProfile
+from neuro_code.infrastructure.providers import create_provider
 from neuro_code.infrastructure.providers.provider_settings import JsonProviderSettingsStore
 from neuro_code.shared.errors import ConfigurationError
 
@@ -524,6 +526,129 @@ max_output_tokens = 2048
                 with self.assertRaisesRegex(ConfigurationError, expected):
                     load_config(root, home=root)
 
+    def test_legacy_native_dialect_resolution_is_conservative_and_explicit(self) -> None:
+        cases = (
+            (
+                "official",
+                "deepseek",
+                "deepseek-v4-flash",
+                "https://api.deepseek.com",
+                None,
+                "deepseek-v4",
+            ),
+            (
+                "marked-proxy",
+                "deepseek-proxy",
+                "v4-flash",
+                "https://llm.company.com/v1",
+                None,
+                "deepseek-v4",
+            ),
+            (
+                "ambiguous-proxy",
+                "company-proxy",
+                "v4-flash",
+                "https://llm.company.com/v1",
+                None,
+                "standard",
+            ),
+            (
+                "explicit-standard",
+                "deepseek",
+                "deepseek-v4-flash",
+                "https://api.deepseek.com",
+                "standard",
+                "standard",
+            ),
+        )
+        for name, provider_name, model, base_url, explicit_dialect, expected in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                state = root / ".neuro-code"
+                state.mkdir()
+                dialect_line = (
+                    f'dialect = "{explicit_dialect}"\n' if explicit_dialect is not None else ""
+                )
+                (state / "config.toml").write_text(
+                    f"""
+[routing]
+default = "{provider_name}"
+
+[providers.{provider_name}]
+protocol = "openai-chat"
+{dialect_line}model = "{model}"
+base_url = "{base_url}"
+api_key_env = "FIXTURE_KEY"
+proxy_mode = "direct"
+""",
+                    encoding="utf-8",
+                )
+
+                config = load_config(root, home=root, environ={"FIXTURE_KEY": "secret"})
+
+                self.assertEqual(config.provider.dialect, expected)
+
+    def test_legacy_native_deepseek_profile_reaches_provider_as_explicit_dialect(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch.dict("os.environ", {"FIXTURE_KEY": "secret"}, clear=True),
+        ):
+            root = Path(directory)
+            state = root / ".neuro-code"
+            state.mkdir()
+            (state / "config.toml").write_text(
+                """
+[routing]
+default = "deepseek"
+
+[providers.deepseek]
+protocol = "openai-chat"
+model = "deepseek-v4-flash"
+base_url = "https://api.deepseek.com"
+api_key_env = "FIXTURE_KEY"
+proxy_mode = "direct"
+""",
+                encoding="utf-8",
+            )
+
+            config = load_config(root, home=root, environ={"FIXTURE_KEY": "secret"})
+            provider = create_provider(config.provider)
+
+            self.assertEqual(getattr(provider, "_dialect", None), "deepseek-v4")
+
+    def test_legacy_managed_deepseek_profile_reaches_provider_as_explicit_dialect(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, patch.dict("os.environ", {}, clear=True):
+            root = Path(directory)
+            state = root / ".neuro-code"
+            state.mkdir()
+            (state / "providers.json").write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "default_provider": "deepseek",
+                        "proxy_defaults": {"mode": "direct", "proxy_url_env": None},
+                        "providers": [
+                            {
+                                "name": "deepseek",
+                                "protocol": "openai-chat",
+                                "model": "deepseek-v4-flash",
+                                "base_url": "https://api.deepseek.com",
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (state / "credentials.json").write_text(
+                json.dumps({"version": 1, "api_keys": {"deepseek": "secret"}}),
+                encoding="utf-8",
+            )
+
+            config = load_config(root, home=root, environ={})
+            provider = create_provider(config.provider)
+
+            self.assertEqual(getattr(provider, "_dialect", None), "deepseek-v4")
+
     def test_xai_builtin_tools_are_loaded_and_redacted_for_inspection(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -595,6 +720,7 @@ fallbacks = ["xai"]
 
 [providers.deepseek]
 protocol = "openai-chat"
+dialect = "deepseek-v4"
 model = "deepseek-chat"
 base_url = "https://api.deepseek.com"
 api_key_env = "DEEPSEEK_API_KEY"
@@ -616,6 +742,7 @@ builtin_tools = ["web_search"]
             self.assertEqual(config.selected_provider, "deepseek")
             self.assertEqual(config.fallback_providers, ("xai",))
             self.assertEqual(config.provider.protocol, "openai-chat")
+            self.assertEqual(config.provider.dialect, "deepseek-v4")
             self.assertEqual(config.provider.proxy_mode, "explicit")
             self.assertEqual(config.provider.proxy_url_env, "DEEPSEEK_PROXY_URL")
             self.assertEqual(config.redacted_dict()["routing"]["fallbacks"], ["xai"])

@@ -803,7 +803,8 @@ TUI 通过 `Ctrl+E`、`/effort` 和 `/reasoning` 暴露选择，CLI 则使用 `-
 
 组合根选择命名 `ProviderProfile`；代理运行时不会按商业供应商名称分支。profile 将线路
 协议（`openai-chat`、`openai-responses`、`anthropic-messages` 或
-`gemini-generate-content`）与 xAI Responses 等可选方言行为分离。通用 Responses 适配器实现位于
+`gemini-generate-content`）与 xAI Responses 等可选方言行为分离。DeepSeek V4 的 DSML 工具流
+通过 `dialect = "deepseek-v4"` 显式选择，绝不会根据供应商名、模型名或主机名推断。通用 Responses 适配器实现位于
 `neuro_code.infrastructure.providers.openai_responses.OpenAIResponsesProvider`；xAI 行为通过
 `dialect = "xai"` 选择，而不是独立的 Python provider 类。开发阶段的 breaking cleanup 已移除
 `neuro_code.providers.xai_responses` 和 `XAIResponsesProvider`；Architecture Freeze v1
@@ -821,7 +822,8 @@ profile；其 JSON 适配器把非密钥元数据和凭据分别原子写入仅�
 会以有界应用重启码退出；组合根和全部后台 scope 关闭后，才会重新加载配置并创建供应商
 绑定。首次设置在应用组合之前执行，所以缺失供应商时不会创建半成品运行时。
 普通设置通过一级分类页进入独立的语言/供应商详情页。预设显式映射线路行为：OpenAI
-Responses 使用 `openai-responses`，兼容 Chat 与 DeepSeek 使用 `openai-chat`。供应商详情
+Responses 使用 `openai-responses`，兼容 Chat 使用 standard 方言的 `openai-chat`，DeepSeek 使用
+`dialect = "deepseek-v4"` 的 `openai-chat`。供应商详情
 会在持久化前运行与运行时相同的 `HttpClientPolicy` 解析器；全局代理默认策略与可选的
 单 profile 覆盖都是非敏感元数据；删除元数据与凭据前需要二次
 确认，随后请求安全重载。启动预检会把无效的受管默认项送回该详情页，带上脱敏错误并选中

@@ -19,6 +19,7 @@ from neuro_code.application.ports.http import HttpClientPolicy
 from neuro_code.configuration.managed_provider_settings import (
     load_managed_provider_settings as _load_managed_provider_settings,
 )
+from neuro_code.configuration.provider_dialects import resolve_legacy_dialect
 from neuro_code.domain.sandbox.models import SandboxProfile
 from neuro_code.shared.errors import ConfigurationError
 
@@ -30,7 +31,7 @@ SUPPORTED_PROTOCOLS = frozenset(
         "gemini-generate-content",
     }
 )
-SUPPORTED_DIALECTS = frozenset({"standard", "xai"})
+SUPPORTED_DIALECTS = frozenset({"standard", "xai", "deepseek-v4"})
 SUPPORTED_AUTH = frozenset({"env", "stored", "proxy-managed", "unsupported-inline"})
 SUPPORTED_NATIVE_CONTEXT = frozenset({"disabled", "profile"})
 SUPPORTED_PROXY_MODES = frozenset({"environment", "direct", "explicit"})
@@ -250,6 +251,8 @@ class ProviderProfile:
             raise ConfigurationError(f"unsupported provider dialect: {self.dialect}")
         if self.dialect == "xai" and self.protocol != "openai-responses":
             raise ConfigurationError("xAI dialect requires protocol 'openai-responses'")
+        if self.dialect == "deepseek-v4" and self.protocol != "openai-chat":
+            raise ConfigurationError("DeepSeek V4 dialect requires protocol 'openai-chat'")
         if not self.model:
             raise ConfigurationError(f"provider profile {self.name!r} requires an explicit model")
         if not self.base_url:
@@ -563,7 +566,20 @@ def _native_profile(
         default_env = ""
         default_model = ""
     protocol = _string(raw.get("protocol"), protocol)
-    dialect = _string(raw.get("dialect"), default_dialect)
+    model = _string(raw.get("model"), default_model)
+    base_url = _string(raw.get("base_url"), default_url).rstrip("/")
+    raw_dialect = raw.get("dialect")
+    if raw_dialect is not None and (not isinstance(raw_dialect, str) or not raw_dialect.strip()):
+        raise ConfigurationError("provider dialect must be a non-empty string")
+    explicit_dialect = raw_dialect.strip() if isinstance(raw_dialect, str) else None
+    dialect = resolve_legacy_dialect(
+        explicit_dialect=explicit_dialect,
+        provider_name=name,
+        protocol=protocol,
+        model=model,
+        base_url=base_url,
+        legacy_default_dialect=default_dialect,
+    )
     if protocol == "openai-responses" and dialect == "xai":
         default_url = default_url or "https://api.x.ai/v1"
         default_env = default_env or "XAI_API_KEY"
@@ -584,8 +600,8 @@ def _native_profile(
         name=name,
         protocol=protocol,
         dialect=dialect,
-        model=_string(raw.get("model"), default_model),
-        base_url=_string(raw.get("base_url"), default_url).rstrip("/"),
+        model=model,
+        base_url=base_url,
         auth=auth,
         api_key_env=api_key_env,
         timeout_seconds=_number(raw.get("timeout_seconds"), name="timeout_seconds", default=120.0),
@@ -615,12 +631,21 @@ def _legacy_model_profile(raw: Mapping[str, object]) -> ProviderProfile:
     env_value = raw.get("env_key", "XAI_API_KEY")
     if isinstance(env_value, list):
         env_value = next((item for item in env_value if isinstance(item, str)), "XAI_API_KEY")
+    model = _string(raw.get("model"))
+    base_url = _string(raw.get("base_url"), "https://api.x.ai/v1").rstrip("/")
+    dialect = resolve_legacy_dialect(
+        explicit_dialect=None,
+        provider_name="default",
+        protocol="openai-chat",
+        model=model,
+        base_url=base_url,
+    )
     return ProviderProfile(
         name="default",
         protocol="openai-chat",
-        dialect="standard",
-        model=_string(raw.get("model")),
-        base_url=_string(raw.get("base_url"), "https://api.x.ai/v1").rstrip("/"),
+        dialect=dialect,
+        model=model,
+        base_url=base_url,
         auth="env",
         api_key_env=_string(env_value, "XAI_API_KEY"),
         source="legacy-config",
@@ -655,10 +680,17 @@ def _cc_switch_profile(alias: str, raw: Mapping[str, object]) -> ProviderProfile
             f"CC Switch profile {alias!r} uses an inline API key; configure env_key "
             "or enable CC Switch proxy takeover instead"
         )
+    dialect = resolve_legacy_dialect(
+        explicit_dialect=None,
+        provider_name=name,
+        protocol=protocol,
+        model=model,
+        base_url=base_url,
+    )
     return ProviderProfile(
         name=name,
         protocol=protocol,
-        dialect="standard",
+        dialect=dialect,
         model=model,
         base_url=base_url,
         auth=auth,

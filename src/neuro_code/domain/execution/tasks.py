@@ -55,7 +55,12 @@ class ToolCallBudget:
 class ExecutionBudget:
     """Independent bounded resources for one agent turn.
 
-    定义一次 Agent 回合使用的彼此独立的有界资源."""
+    Finalizer attempts are owned by ``AgentFinalizer`` and are intentionally
+    not part of this ordinary Agent budget.
+
+    定义一次 Agent 回合使用的彼此独立的有界资源.
+    Finalizer 尝试由 ``AgentFinalizer`` 独立管理,有意不属于普通 Agent 预算.
+    """
 
     max_model_calls: int
     max_tool_rounds: int
@@ -65,7 +70,6 @@ class ExecutionBudget:
     max_input_tokens: int | None
     max_output_tokens: int | None
     max_total_tokens: int | None
-    finalizer_model_calls: int
     per_tool_limits: tuple[ToolCallBudget, ...] = ()
 
     def __post_init__(self) -> None:
@@ -77,9 +81,6 @@ class ExecutionBudget:
         require_optional_positive_int(self.max_input_tokens, field_name="max_input_tokens")
         require_optional_positive_int(self.max_output_tokens, field_name="max_output_tokens")
         require_optional_positive_int(self.max_total_tokens, field_name="max_total_tokens")
-        require_positive_int(self.finalizer_model_calls, field_name="finalizer_model_calls")
-        if self.finalizer_model_calls > self.max_model_calls:
-            raise ValueError("finalizer_model_calls must not exceed max_model_calls")
 
         limits = tuple(self.per_tool_limits)
         if not all(isinstance(limit, ToolCallBudget) for limit in limits):
