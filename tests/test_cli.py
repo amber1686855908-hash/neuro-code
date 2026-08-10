@@ -219,7 +219,13 @@ class CliApplicationFixture:
         self.created_resume_ids: list[str | None] = []
         self.close_calls = 0
 
-    async def create_binding(self, *, resume_id: str | None = None) -> SimpleNamespace:
+    async def create_binding(
+        self,
+        *,
+        resume_id: str | None = None,
+        user_interaction: object | None = None,
+    ) -> SimpleNamespace:
+        del user_interaction
         self.operations.append("create_binding")
         self.created_resume_ids.append(resume_id)
         return SimpleNamespace(runner=self.runner)
@@ -1423,6 +1429,7 @@ api_key_env = "FIXTURE_KEY"
                     provider_name: str,
                     model_name: str,
                     cwd: Path,
+                    user_interaction: object,
                 ) -> None:
                     captured.update(
                         runner=runner,
@@ -1654,6 +1661,7 @@ api_key_env = "FIXTURE_KEY"
                     provider_name: str,
                     model_name: str,
                     cwd: Path,
+                    user_interaction: object,
                 ) -> None:
                     del (
                         runner,
@@ -1778,6 +1786,7 @@ api_key_env = "SECOND_KEY"
                     provider_name: str,
                     model_name: str,
                     cwd: Path,
+                    user_interaction: object,
                 ) -> None:
                     del (
                         approval_controller,
@@ -1945,6 +1954,7 @@ api_key_env = "SECOND_KEY"
                     provider_name: str,
                     model_name: str,
                     cwd: Path,
+                    user_interaction: object,
                 ) -> None:
                     del (
                         approval_controller,

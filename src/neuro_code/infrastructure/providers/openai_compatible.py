@@ -21,6 +21,7 @@ from neuro_code.domain.conversation.events import (
     ModelReasoningDelta,
     ModelTextDelta,
     ModelToolCall,
+    ModelUsage,
 )
 from neuro_code.domain.conversation.messages import (
     IMAGE_MODEL_PLACEHOLDER,
@@ -270,6 +271,112 @@ class OpenAICompatibleProvider:
         return self._dialect == "deepseek-v4"
 
     @staticmethod
+    def _token_count(value: object) -> int | None:
+        return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+    @classmethod
+    def _first_usage_token(
+        cls,
+        usage: Mapping[str, object],
+        *names: str,
+    ) -> int | None:
+        for name in names:
+            value = cls._token_count(usage.get(name))
+            if value is not None:
+                return value
+        return None
+
+    @classmethod
+    def _usage_from_payload(cls, usage: Mapping[str, object]) -> ModelUsage | None:
+        """Normalize standard and compatible prompt-cache usage fields.
+
+        DeepSeek-compatible endpoints commonly report the cache hit/miss
+        values at the usage top level.  Other compatible endpoints may use
+        OpenAI's nested ``prompt_tokens_details`` shape.  Preserve only fields
+        that are actually reported rather than inferring a cache split.
+
+        规范化标准和兼容端点的 prompt cache 用量字段。只保留实际上报字段,不推断
+        缓存拆分。
+        """
+
+        details = usage.get("prompt_tokens_details")
+        detail_usage = details if isinstance(details, Mapping) else {}
+        cache_read_tokens = cls._first_usage_token(
+            usage,
+            "prompt_cache_hit_tokens",
+            "cache_read_tokens",
+            "cached_tokens",
+        )
+        if cache_read_tokens is None:
+            cache_read_tokens = cls._first_usage_token(
+                detail_usage,
+                "cached_tokens",
+                "prompt_cache_hit_tokens",
+                "cache_read_tokens",
+            )
+        cache_write_tokens = cls._first_usage_token(
+            usage,
+            "prompt_cache_write_tokens",
+            "cache_write_tokens",
+        )
+        if cache_write_tokens is None:
+            cache_write_tokens = cls._first_usage_token(
+                detail_usage,
+                "prompt_cache_write_tokens",
+                "cache_write_tokens",
+            )
+        cache_miss_tokens = cls._first_usage_token(
+            usage,
+            "prompt_cache_miss_tokens",
+            "cache_miss_tokens",
+        )
+        if cache_miss_tokens is None:
+            cache_miss_tokens = cls._first_usage_token(
+                detail_usage,
+                "prompt_cache_miss_tokens",
+                "cache_miss_tokens",
+            )
+        normalized = ModelUsage(
+            input_tokens=cls._first_usage_token(usage, "prompt_tokens"),
+            output_tokens=cls._first_usage_token(usage, "completion_tokens"),
+            cache_read_tokens=cache_read_tokens,
+            cache_write_tokens=cache_write_tokens,
+            cache_miss_tokens=cache_miss_tokens,
+        )
+        return normalized if normalized.has_reported_tokens else None
+
+    @staticmethod
+    def _merge_usage(current: ModelUsage | None, update: ModelUsage | None) -> ModelUsage | None:
+        if update is None:
+            return current
+        if current is None:
+            return update
+        return ModelUsage(
+            input_tokens=(
+                update.input_tokens if update.input_tokens is not None else current.input_tokens
+            ),
+            output_tokens=(
+                update.output_tokens if update.output_tokens is not None else current.output_tokens
+            ),
+            cache_read_tokens=(
+                update.cache_read_tokens
+                if update.cache_read_tokens is not None
+                else current.cache_read_tokens
+            ),
+            cache_write_tokens=(
+                update.cache_write_tokens
+                if update.cache_write_tokens is not None
+                else current.cache_write_tokens
+            ),
+            cache_miss_tokens=(
+                update.cache_miss_tokens
+                if update.cache_miss_tokens is not None
+                else current.cache_miss_tokens
+            ),
+            input_token_semantics=update.input_token_semantics,
+        )
+
+    @staticmethod
     def _user_content(message: Message) -> str | list[dict[str, Any]]:
         if not message.content_parts or not any(
             part.kind is ContentPartKind.IMAGE for part in message.content_parts
@@ -478,8 +585,7 @@ class OpenAICompatibleProvider:
         buffers: dict[int, _ToolCallBuffer] = {}
         dsml_parser = _DeepSeekDSMLStreamParser() if self._uses_deepseek_dsml() else None
         stop_reason = "stop"
-        input_tokens: int | None = None
-        output_tokens: int | None = None
+        model_usage: ModelUsage | None = None
         endpoint = f"{self._base_url}/chat/completions"
         try:
             timeout = httpx.Timeout(self._timeout_seconds)
@@ -507,11 +613,11 @@ class OpenAICompatibleProvider:
                     except json.JSONDecodeError as error:
                         raise ProviderError("provider returned malformed streaming JSON") from error
                     usage = chunk.get("usage")
-                    if isinstance(usage, dict):
-                        if isinstance(usage.get("prompt_tokens"), int):
-                            input_tokens = usage["prompt_tokens"]
-                        if isinstance(usage.get("completion_tokens"), int):
-                            output_tokens = usage["completion_tokens"]
+                    if isinstance(usage, Mapping):
+                        model_usage = self._merge_usage(
+                            model_usage,
+                            self._usage_from_payload(usage),
+                        )
                     choices = chunk.get("choices")
                     if not isinstance(choices, list) or not choices:
                         continue
@@ -570,7 +676,7 @@ class OpenAICompatibleProvider:
             if not buffer.identifier or not buffer.name:
                 raise ProviderError("provider emitted an incomplete tool call")
             yield ModelToolCall(ToolCall(buffer.identifier, buffer.name, arguments))
-        yield ModelCompleted(stop_reason, input_tokens, output_tokens)
+        yield ModelCompleted(stop_reason, usage=model_usage)
 
     @staticmethod
     def _accumulate_tool_calls(

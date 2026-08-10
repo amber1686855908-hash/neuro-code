@@ -1277,7 +1277,8 @@ Runtime 门控现在会在允许的显式压缩操作外层真正执行有限的
 在完整工具批次结束的安全边界，非终态 `REPLAN` 决策可以在 `FINALIZE_TERMINAL` 模式下
 为下一次请求启用 `SyntheticReason.RUNTIME_SUPERVISION`。`ContextBuilder` 负责这条仅请求
 可见的注入以及通用 batch-first 证据收集策略。两者都不会追加到会话条目；REPLAN 消息会
-在产生新进展或回合退出时清除。工具执行顺序和现有 stuck 检测保持不变。详见
+在产生新进展后通过追加一条有界的“已解决”通知来收束，而不是改写已经发送过的请求前缀；
+回合退出时也不会持久化。工具执行顺序和现有 stuck 检测保持不变。详见
 [ADR 0105](../en/adr/0105-unified-execution-budget-and-replan-guidance.md)。
 
 ## 有界长任务 Runtime 指引、压缩与分段
@@ -1296,3 +1297,28 @@ Runtime 门控现在会在允许的显式压缩操作外层真正执行有限的
 持续产生进展的长回合还可以发出持久化且有界的 `EXECUTION_SEGMENT_CHECKPOINTED` 事件，并在下一请求
 接收一次临时 checkpoint 指引。segment 阈值不重置或取代全局回合预算，也不承诺崩溃恢复或工作区回滚。
 详见 [ADR 0107](adr/0107-bounded-long-task-runtime.md)。
+
+## 面向 Prompt Cache 的模型请求投影与用量
+
+`ContextBuilder` 拥有稳定的请求前缀：请求范围 system 策略、确定顺序的工具定义，以及当前序列化后的
+项目指令和技能目录发现结果。发现结果会在每次请求时刷新，以便真实的工作区变更能够生效；但其源内容
+不变时，有序序列化结果保持稳定。
+
+可变的计划修订、segment checkpoint、预算压力和 REPLAN 状态不会再写回 system 消息，也不会插入到
+持久化会话条目之前。`AgentLoopRunner` 会在安全的会话边界之后追加有界的合成运行时通知。预算指引只会
+在离散的 `CONSERVE`、`FOCUS`、`FINAL_STAGE` 压力状态发生转换时追加，不会在每个模型步骤重写精确的
+剩余计数。这些通知不会进入会话持久化、恢复重放或压缩源条目。后台任务完成提醒是一个有意保留的
+单请求尾部例外：只有 Provider 成功完成后才会确认它。
+
+因此，在未变化的长回合中，请求 *N + 1* 通常等于请求 *N* 加上新追加的持久化会话条目，以及至多一条
+新近相关的有界运行时通知。这不承诺一定命中缓存：各 Provider 的缓存键、分词方式、保留时间和可缓存
+条件不同；真实项目指令或技能发生变更时，使相应前缀失效正是正确行为。
+
+`ModelCompleted.usage` 现在携带与 Provider 无关的 `ModelUsage` 值：Provider 原始的输入/输出字段，以及可选的
+缓存读取（同时以 `cache_hit_tokens` 作为别名）、缓存写入和缓存未命中 token。输入 token 的语义会被明确标识。
+大多数 Provider 上报总输入；Anthropic 上报缓存断点之后的未缓存尾部，只有 cache-read 与 cache-creation
+字段足以精确计算时，Runtime 才会推导完整处理输入。`CONTEXT_USAGE_UPDATED` 只投影这些有界字段；接口可以
+消费它们，但不会获得 prompt、工具参数或隐藏运行时上下文。OpenAI-compatible Provider 保留实际返回的
+prompt-cache 字段，OpenAI Responses 保留 cached-input 详情，Anthropic 使用原生顶层 automatic ephemeral cache
+control，使缓存断点可随着仅追加的 Agent 会话前移，并保留 cache creation/read 用量，Gemini 保留其实际返回的
+implicit cached-content 用量。未上报字段保持 `None`；Runtime 不从总输入 token 推断缓存拆分，也不会声称命中了缓存。

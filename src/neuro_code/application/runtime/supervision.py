@@ -608,6 +608,8 @@ class AgentExecutionSupervisor:
         self._clock = clock
         self._mode = mode
         self._started_at: float | None = None
+        self._wall_paused_at: float | None = None
+        self._wall_paused_seconds = 0.0
         self._snapshot: ExecutionSnapshot | None = None
         self._reserved_tool_names: list[str] = []
         self._model_completion_pending = False
@@ -655,6 +657,8 @@ class AgentExecutionSupervisor:
         if not math.isfinite(started_at):
             raise RuntimeError("supervisor clock must return a finite value")
         self._started_at = started_at
+        self._wall_paused_at = None
+        self._wall_paused_seconds = 0.0
         self._snapshot = ExecutionSnapshot(
             AgentExecutionStatus.RUNNING,
             ExecutionCounters(),
@@ -665,6 +669,33 @@ class AgentExecutionSupervisor:
             0,
         )
         return self._snapshot
+
+    def pause_wall_clock(self) -> None:
+        """Pause active wall-time accounting while waiting for user input.
+
+        用户交互等待期间暂停活动墙钟计时,但不暂停模型/工具计数.
+        """
+
+        self._require_started()
+        if self._wall_paused_at is not None:
+            raise RuntimeError("supervisor wall clock is already paused")
+        now = self._clock()
+        if not math.isfinite(now):
+            raise RuntimeError("supervisor clock must return a finite value")
+        self._wall_paused_at = now
+
+    def resume_wall_clock(self) -> None:
+        """Resume active wall-time accounting after user input is resolved."""
+
+        self._require_started()
+        paused_at = self._wall_paused_at
+        if paused_at is None:
+            raise RuntimeError("supervisor wall clock is not paused")
+        now = self._clock()
+        if not math.isfinite(now) or now < paused_at:
+            raise RuntimeError("supervisor clock moved backwards")
+        self._wall_paused_seconds += now - paused_at
+        self._wall_paused_at = None
 
     def authorize_model_request(self) -> SupervisorDecision:
         """Reserve one ordinary model request from the ordinary-turn budget.
@@ -1153,7 +1184,12 @@ class AgentExecutionSupervisor:
         now = self._clock()
         if not math.isfinite(now):
             raise RuntimeError("supervisor clock must return a finite value")
-        elapsed = now - self._started_at
+        paused_seconds = self._wall_paused_seconds
+        if self._wall_paused_at is not None:
+            if now < self._wall_paused_at:
+                raise RuntimeError("supervisor clock moved backwards")
+            paused_seconds += now - self._wall_paused_at
+        elapsed = now - self._started_at - paused_seconds
         if elapsed < 0:
             raise RuntimeError("supervisor clock moved backwards")
         return elapsed

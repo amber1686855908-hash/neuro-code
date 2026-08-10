@@ -127,6 +127,26 @@ def execute_tool(
 
 
 class ExecutionSupervisionTests(unittest.TestCase):
+    def test_interaction_wait_is_excluded_from_active_wall_budget(self) -> None:
+        clock = Clock()
+        supervisor = self.supervisor(
+            budget=execution_budget(max_wall_seconds=10.0),
+            clock=clock,
+        )
+
+        clock.value = 103.0
+        before_wait = supervisor.budget_usage().elapsed_seconds
+        supervisor.pause_wall_clock()
+        clock.value = 3_603.0
+        during_wait = supervisor.budget_usage().elapsed_seconds
+        supervisor.resume_wall_clock()
+        clock.value = 3_608.0
+        after_wait = supervisor.budget_usage().elapsed_seconds
+
+        self.assertEqual(before_wait, 3.0)
+        self.assertEqual(during_wait, 3.0)
+        self.assertEqual(after_wait, 8.0)
+
     def test_budget_usage_projects_pressure_without_exposing_execution_payloads(self) -> None:
         budget = execution_budget(
             max_model_calls=100,
@@ -235,7 +255,44 @@ class ExecutionSupervisionTests(unittest.TestCase):
         self.assertEqual(normal.limit_for_tool("read_file"), 48)
         self.assertEqual(normal.limit_for_tool("grep"), 48)
         self.assertEqual(normal.limit_for_tool("bash"), 16)
+        self.assertEqual(normal.limit_for_tool("apply_patch"), 16)
         self.assertEqual(normal.limit_for_tool("search_replace"), 16)
+
+    def test_segment_policy_validates_boundaries_and_tracks_each_counter(self) -> None:
+        with self.assertRaisesRegex(ValueError, "model_calls"):
+            ExecutionSegmentPolicy(0, 1, 1)
+        with self.assertRaisesRegex(ValueError, "tool_rounds"):
+            ExecutionSegmentPolicy(1, True, 1)
+        with self.assertRaisesRegex(TypeError, "ExecutionBudget"):
+            ExecutionSegmentPolicy.from_budget("budget")  # type: ignore[arg-type]
+
+        for max_model_calls, expected_segment_calls in ((20, 20), (48, 24), (96, 32)):
+            policy = ExecutionSegmentPolicy.from_budget(
+                execution_budget(
+                    max_model_calls=max_model_calls,
+                    max_tool_rounds=max_model_calls,
+                    max_tool_calls=max_model_calls * 4,
+                )
+            )
+            self.assertEqual(policy.model_calls, expected_segment_calls)
+
+        policy = ExecutionSegmentPolicy(2, 2, 2)
+        start = ExecutionCounters()
+        self.assertFalse(policy.reached(ExecutionCounters(model_requests=1), start))
+        self.assertTrue(
+            policy.reached(
+                ExecutionCounters(
+                    tool_rounds=2,
+                    tool_calls_requested=2,
+                    per_tool_counts=(ToolCallCount("read_file", 2),),
+                ),
+                start,
+            )
+        )
+        with self.assertRaisesRegex(TypeError, "ExecutionCounters"):
+            policy.reached("current", start)  # type: ignore[arg-type]
+        with self.assertRaisesRegex(ValueError, "monotonic"):
+            policy.reached(ExecutionCounters(), ExecutionCounters(model_requests=1))
 
     def test_legacy_max_steps_scales_every_count_based_budget(self) -> None:
         budget = ExecutionBudgetPolicy.from_max_steps(60)
@@ -256,7 +313,7 @@ class ExecutionSupervisionTests(unittest.TestCase):
     def test_execution_budget_policy_rejects_invalid_inputs(self) -> None:
         for value in (0, -1, True):
             with self.subTest(value=value), self.assertRaisesRegex(ValueError, "max_steps"):
-                ExecutionBudgetPolicy.from_max_steps(value)  # type: ignore[arg-type]
+                ExecutionBudgetPolicy.from_max_steps(value)
         with self.assertRaisesRegex(TypeError, "execution profile"):
             ExecutionBudgetPolicy.for_profile("normal")  # type: ignore[arg-type]
 
@@ -389,7 +446,7 @@ class ExecutionSupervisionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "tool call budget max_calls"):
             ToolCallBudget("read_file", True)
         with self.assertRaisesRegex(ValueError, "ToolCallBudget"):
-            execution_budget(per_tool_limits=("read_file",))  # type: ignore[arg-type]
+            execution_budget(per_tool_limits=("read_file",))
         with self.assertRaisesRegex(ValueError, "must not exceed"):
             execution_budget(
                 max_calls_per_tool=2,

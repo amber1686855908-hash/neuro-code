@@ -7,7 +7,7 @@ from __future__ import annotations
 from collections.abc import Collection, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Protocol, runtime_checkable
 
 from neuro_code.application.ports.background_tasks import BackgroundTaskManager
 from neuro_code.application.ports.client_filesystem import ClientFileSystem
@@ -15,6 +15,11 @@ from neuro_code.application.ports.client_terminal import ClientTerminal
 from neuro_code.application.ports.instructions import InstructionContextTracker
 from neuro_code.application.ports.sandbox import ShellSandbox
 from neuro_code.application.ports.skills import SkillContextTracker
+from neuro_code.application.ports.user_interaction import (
+    InteractionEventSink,
+    UserInteractionPort,
+)
+from neuro_code.application.ports.workspace_changes import WorkspaceChangeJournal
 from neuro_code.domain.sandbox.models import SandboxProfile
 from neuro_code.domain.tools import ToolDefinition, ToolResult
 
@@ -151,6 +156,9 @@ class ToolContext:
     client_file_system: ClientFileSystem | None = None
     client_terminal: ClientTerminal | None = None
     output_artifact_store: ToolOutputArtifactStore | None = None
+    workspace_change_journal: WorkspaceChangeJournal | None = None
+    user_interaction: UserInteractionPort | None = None
+    interaction_event_sink: InteractionEventSink | None = field(default=None, repr=False)
 
 
 class Tool(Protocol):
@@ -167,6 +175,13 @@ class Tool(Protocol):
     ) -> ToolResult: ...
 
 
+@runtime_checkable
+class InteractionControlTool(Protocol):
+    """Typed marker for a tool that controls user-interaction flow."""
+
+    interaction_control: str
+
+
 class ToolCollection(Protocol):
     """Resolve tools and expose their ordered model definitions.
 
@@ -181,6 +196,7 @@ __all__ = [
     "MAX_TOOL_OUTPUT_ARTIFACT_BYTES",
     "MAX_TOOL_OUTPUT_ARTIFACT_READ_BYTES",
     "TOOL_OUTPUT_ARTIFACT_PRUNE_GRACE_SECONDS",
+    "InteractionControlTool",
     "Tool",
     "ToolCollection",
     "ToolContext",

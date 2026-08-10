@@ -1,19 +1,21 @@
 """Canonical filesystem tool infrastructure adapters.
 
-This module owns the bounded readers and the atomic ``search_replace`` writer.
+This module owns bounded workspace discovery/readers and atomic text patch writers.
 The retired ``neuro_code.tools.filesystem`` facade has been removed. Path,
 instruction-tracker, sandbox, client-filesystem, and write semantics have one
 implementation owner here.
 
-定义规范的文件系统工具基础设施适配器. 本模块拥有有界读取器和原子 search_replace 写入器.
+定义规范的文件系统工具基础设施适配器. 本模块拥有有界发现/读取器和原子文本补丁写入器.
 """
 
 from __future__ import annotations
 
+import fnmatch
 import os
 import re
 import tempfile
 from collections.abc import Mapping, Sequence
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -40,10 +42,15 @@ MAX_GREP_GLOBS = 32
 MAX_GREP_RESULTS_PER_QUERY = 200
 MAX_GREP_TOTAL_RESULTS = 1000
 MAX_GREP_SCANNED_FILES = 20_000
+MAX_GLOB_RESULTS = 2000
+MAX_GLOB_PATTERN_LENGTH = 500
+MAX_GREP_CONTEXT_LINES = 20
+MAX_FILE_SCAN_ENTRIES = 100_000
 
 _DEFAULT_IGNORED_DIRECTORY_NAMES = frozenset(
     {
         ".git",
+        ".cache",
         ".mypy_cache",
         ".nox",
         ".pytest_cache",
@@ -65,6 +72,325 @@ class _FileReadRequest:
     requested_path: str
     start_line: int
     max_lines: int
+
+
+@dataclass(frozen=True, slots=True)
+class _FileSelectionResult:
+    files: tuple[Path, ...]
+    scan_limited: bool
+    ignored_directories: int
+    ignored_links: int
+    scanned_entries: int
+
+
+@dataclass(frozen=True, slots=True)
+class _GitIgnoreRule:
+    base: Path
+    pattern: str
+    negated: bool
+    directory_only: bool
+
+    def matches(self, path: Path, *, is_directory: bool) -> bool:
+        if self.directory_only and not is_directory:
+            return False
+        try:
+            relative = path.relative_to(self.base).as_posix()
+        except ValueError:
+            return False
+        pattern = self.pattern
+        if pattern.startswith("/"):
+            pattern = pattern[1:]
+        candidates = [relative]
+        if "/" not in pattern:
+            candidates.append(path.name)
+        return any(
+            _glob_pattern_matches(candidate, pattern, case_sensitive=True)
+            for candidate in candidates
+        )
+
+
+def _glob_pattern_matches(relative: str, pattern: str, *, case_sensitive: bool) -> bool:
+    """Match a workspace-relative path with forgiving ``**`` semantics.
+
+    ``pathlib.PurePath.match`` does not treat ``src/**/*.py`` as matching
+    ``src/main.py``.  Tool callers reasonably expect the usual glob meaning,
+    so the zero-directory form is checked explicitly while keeping matching
+    deterministic and dependency-free.
+
+    使用宽松的 ``**`` 语义匹配工作区相对路径.
+    """
+
+    normalized_path = relative.replace("\\", "/")
+    normalized_pattern = pattern.replace("\\", "/")
+    if normalized_pattern.startswith("./"):
+        normalized_pattern = normalized_pattern[2:]
+
+    def matches_segments(path_parts: tuple[str, ...], pattern_parts: tuple[str, ...]) -> bool:
+        if not pattern_parts:
+            return not path_parts
+        if pattern_parts[0] == "**":
+            return matches_segments(path_parts, pattern_parts[1:]) or bool(
+                path_parts and matches_segments(path_parts[1:], pattern_parts)
+            )
+        return bool(
+            path_parts
+            and fnmatch.fnmatchcase(path_parts[0], pattern_parts[0])
+            and matches_segments(path_parts[1:], pattern_parts[1:])
+        )
+
+    if not case_sensitive:
+        normalized_path = normalized_path.casefold()
+        normalized_pattern = normalized_pattern.casefold()
+    path_parts = tuple(part for part in normalized_path.split("/") if part)
+    pattern_parts = tuple(part for part in normalized_pattern.split("/") if part)
+    candidates = (path_parts, (path_parts[-1],)) if "/" not in normalized_pattern else (path_parts,)
+    return any(matches_segments(candidate, pattern_parts) for candidate in candidates)
+
+
+def _git_root(path: Path) -> Path | None:
+    current = path if path.is_dir() else path.parent
+    for candidate in (current, *current.parents):
+        try:
+            if (candidate / ".git").exists():
+                return candidate
+        except OSError:
+            continue
+    return None
+
+
+def _read_gitignore_rules(directory: Path) -> tuple[_GitIgnoreRule, ...]:
+    ignore_file = directory / ".gitignore"
+    if _is_link_like(ignore_file):
+        return ()
+    try:
+        lines = ignore_file.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError):
+        return ()
+    rules: list[_GitIgnoreRule] = []
+    for raw_line in lines:
+        pattern = raw_line.strip()
+        if not pattern or pattern.startswith("#"):
+            continue
+        negated = pattern.startswith("!")
+        if negated:
+            pattern = pattern[1:]
+        if not pattern:
+            continue
+        directory_only = pattern.endswith("/")
+        if directory_only:
+            pattern = pattern.rstrip("/")
+        if pattern:
+            rules.append(_GitIgnoreRule(directory, pattern, negated, directory_only))
+    return tuple(rules)
+
+
+class _WorkspaceFileSelector:
+    """Select bounded local workspace files with one shared ignore policy.
+
+    The selector deliberately refuses delegated ACP filesystems: the current
+    client capability only exposes text-file reads/writes, not directory
+    enumeration or globbing.  Falling back to the local process filesystem
+    would violate the delegated workspace boundary.
+
+    使用统一忽略策略选择有界的本地工作区文件. 对当前不支持目录枚举的 ACP
+    委托文件系统直接失败关闭,避免绕过客户端边界.
+    """
+
+    __slots__ = (
+        "_base",
+        "_case_sensitive",
+        "_context",
+        "_exclude_globs",
+        "_git_root",
+        "_include_globs",
+        "_respect_git_ignore",
+        "_root",
+    )
+
+    def __init__(
+        self,
+        context: ToolContext,
+        root: Path,
+        *,
+        include_globs: tuple[str, ...] = (),
+        exclude_globs: tuple[str, ...] = (),
+        case_sensitive: bool = True,
+        respect_git_ignore: bool = True,
+    ) -> None:
+        if context.client_file_system is not None:
+            raise ToolError(
+                "ACP client does not support local workspace file discovery; "
+                "directory enumeration capability is required"
+            )
+        self._context = context
+        self._root = root
+        self._base = root if root.is_dir() else root.parent
+        self._include_globs = include_globs
+        self._exclude_globs = exclude_globs
+        self._case_sensitive = case_sensitive
+        self._respect_git_ignore = respect_git_ignore
+        self._git_root = _git_root(self._base) if respect_git_ignore else None
+
+    def _matches(self, path: Path, patterns: tuple[str, ...]) -> bool:
+        try:
+            relative = path.relative_to(self._base).as_posix()
+        except ValueError:
+            return False
+        return any(
+            _glob_pattern_matches(relative, pattern, case_sensitive=self._case_sensitive)
+            for pattern in patterns
+        )
+
+    def _rules_for(
+        self, directory: Path, inherited: tuple[_GitIgnoreRule, ...]
+    ) -> tuple[_GitIgnoreRule, ...]:
+        if not self._respect_git_ignore:
+            return inherited
+        return inherited + _read_gitignore_rules(directory)
+
+    def _base_rules(self) -> tuple[_GitIgnoreRule, ...]:
+        if self._git_root is None:
+            return ()
+        chain = [self._base, *self._base.parents]
+        try:
+            git_index = chain.index(self._git_root)
+            directories = tuple(reversed(chain[1 : git_index + 1]))
+        except ValueError:
+            directories = (self._git_root,)
+        rules: tuple[_GitIgnoreRule, ...] = ()
+        for directory in directories:
+            rules = self._rules_for(directory, rules)
+        return rules
+
+    def _ignored(
+        self,
+        path: Path,
+        *,
+        is_directory: bool,
+        rules: tuple[_GitIgnoreRule, ...],
+    ) -> bool:
+        ignored = False
+        for rule in rules:
+            if rule.matches(path, is_directory=is_directory):
+                ignored = not rule.negated
+        return ignored
+
+    def select_files(self, *, max_files: int) -> _FileSelectionResult:
+        files: list[Path] = []
+        ignored_directories = 0
+        ignored_links = 0
+        scanned_entries = 0
+        scan_limited = False
+        base_rules = self._base_rules()
+
+        def visit(directory: Path, rules: tuple[_GitIgnoreRule, ...]) -> None:
+            nonlocal ignored_directories, ignored_links, scanned_entries, scan_limited
+            try:
+                children = sorted(
+                    directory.iterdir(), key=lambda item: (item.name.casefold(), item.name)
+                )
+            except OSError:
+                return
+            local_rules = self._rules_for(directory, rules)
+            for child in children:
+                if _is_link_like(child):
+                    ignored_links += 1
+                    continue
+                if scanned_entries >= MAX_FILE_SCAN_ENTRIES:
+                    scan_limited = True
+                    return
+                scanned_entries += 1
+                try:
+                    is_directory = child.is_dir()
+                except OSError:
+                    continue
+                if is_directory:
+                    if child.name.casefold() in _DEFAULT_IGNORED_DIRECTORY_NAMES:
+                        ignored_directories += 1
+                        continue
+                    if self._ignored(child, is_directory=True, rules=local_rules):
+                        ignored_directories += 1
+                        continue
+                    visit(child, local_rules)
+                    if scan_limited:
+                        return
+                    continue
+                if not child.is_file() or self._ignored(
+                    child, is_directory=False, rules=local_rules
+                ):
+                    continue
+                if self._include_globs and not self._matches(child, self._include_globs):
+                    continue
+                if self._exclude_globs and self._matches(child, self._exclude_globs):
+                    continue
+                if len(files) >= max_files:
+                    scan_limited = True
+                    return
+                files.append(child)
+
+        if self._root.is_file():
+            file_rules = self._rules_for(self._base, base_rules)
+            if (
+                not _is_link_like(self._root)
+                and not self._ignored(self._root, is_directory=False, rules=file_rules)
+                and (not self._include_globs or self._matches(self._root, self._include_globs))
+                and (not self._exclude_globs or not self._matches(self._root, self._exclude_globs))
+            ):
+                files.append(self._root)
+        elif self._root.is_dir():
+            visit(self._root, base_rules)
+        else:
+            raise ToolError(f"not a file or directory: {self._root}")
+        return _FileSelectionResult(
+            tuple(files), scan_limited, ignored_directories, ignored_links, scanned_entries
+        )
+
+    def tree_entries(
+        self, *, max_depth: int, max_entries: int
+    ) -> tuple[list[tuple[Path, bool, int]], bool, int, int]:
+        entries: list[tuple[Path, bool, int]] = []
+        entry_limited = False
+        ignored_directories = 0
+        ignored_links = 0
+        base_rules = self._base_rules()
+
+        def visit(directory: Path, depth: int, rules: tuple[_GitIgnoreRule, ...]) -> None:
+            nonlocal entry_limited, ignored_directories, ignored_links
+            try:
+                children = sorted(
+                    directory.iterdir(), key=lambda item: (item.name.casefold(), item.name)
+                )
+            except OSError:
+                return
+            local_rules = self._rules_for(directory, rules)
+            for child in children:
+                if len(entries) >= max_entries:
+                    entry_limited = True
+                    return
+                if _is_link_like(child):
+                    ignored_links += 1
+                    continue
+                try:
+                    is_directory = child.is_dir()
+                except OSError:
+                    continue
+                if is_directory and child.name.casefold() in _DEFAULT_IGNORED_DIRECTORY_NAMES:
+                    ignored_directories += 1
+                    continue
+                if self._ignored(child, is_directory=is_directory, rules=local_rules):
+                    if is_directory:
+                        ignored_directories += 1
+                    continue
+                entries.append((child, is_directory, depth))
+                if is_directory and depth < max_depth:
+                    visit(child, depth + 1, local_rules)
+                    if entry_limited:
+                        return
+
+        if not self._root.is_dir():
+            raise ToolError(f"not a directory: {self._root}")
+        visit(self._root, 1, base_rules)
+        return entries, entry_limited, ignored_directories, ignored_links
 
 
 def _require_bounded_integer(
@@ -163,6 +489,13 @@ def _require_string(arguments: Mapping[str, Any], key: str) -> str:
     return value
 
 
+def _require_bool(arguments: Mapping[str, Any], key: str, *, default: bool) -> bool:
+    value = arguments.get(key, default)
+    if not isinstance(value, bool):
+        raise ToolError(f"{key} must be a boolean")
+    return value
+
+
 def _resolve_path(context: ToolContext, requested: str, *, must_exist: bool) -> Path:
     return resolve_workspace_path(
         context.cwd,
@@ -210,7 +543,10 @@ def _track_primary_workspace_path(context: ToolContext, path: Path) -> None:
 class ReadFileTool:
     definition = ToolDefinition(
         name="read_file",
-        description="Read a UTF-8 text file from the current workspace.",
+        description=(
+            "Read one targeted UTF-8 workspace file or line range. "
+            "Use read_files when several known files can be read independently."
+        ),
         input_schema={
             "type": "object",
             "properties": {
@@ -291,8 +627,9 @@ class ReadFilesTool:
     definition = ToolDefinition(
         name="read_files",
         description=(
-            "Read several UTF-8 workspace files in one bounded request. "
-            "Each file reports success or error independently."
+            "Read several known UTF-8 workspace files in one bounded request. "
+            "Use it when multiple independent files are already identified; each "
+            "file reports success or error independently."
         ),
         input_schema={
             "type": "object",
@@ -404,7 +741,10 @@ class ReadFilesTool:
 class ListDirTool:
     definition = ToolDefinition(
         name="list_dir",
-        description="List files and directories directly beneath a workspace path.",
+        description=(
+            "List files and directories directly beneath a workspace path. "
+            "Use list_tree for a bounded structure overview and glob for a known pattern."
+        ),
         input_schema={
             "type": "object",
             "properties": {"path": {"type": "string", "default": "."}},
@@ -414,9 +754,15 @@ class ListDirTool:
     side_effecting = False
 
     async def execute(self, arguments: Mapping[str, Any], context: ToolContext) -> ToolResult:
+        if context.client_file_system is not None:
+            raise ToolError(
+                "ACP client does not support local directory discovery; "
+                "directory enumeration capability is required"
+            )
         raw_path = arguments.get("path", ".")
         if not isinstance(raw_path, str):
             raise ToolError("path must be a string")
+        _ensure_no_link_components(context, raw_path)
         path = _resolve_path(context, raw_path, must_exist=True)
         if not path.is_dir():
             raise ToolError(f"not a directory: {path}")
@@ -445,7 +791,8 @@ class ListTreeTool:
         name="list_tree",
         description=(
             "List a bounded workspace directory tree, skipping common metadata, "
-            "dependency, cache, and build directories."
+            "dependency, cache, and build directories. Use glob to locate files "
+            "matching a known pattern."
         ),
         input_schema={
             "type": "object",
@@ -461,6 +808,7 @@ class ListTreeTool:
                     "minimum": 1,
                     "maximum": MAX_TREE_ENTRIES,
                 },
+                "respect_git_ignore": {"type": "boolean", "default": True},
             },
             "additionalProperties": False,
         },
@@ -471,6 +819,7 @@ class ListTreeTool:
         raw_path = arguments.get("path", ".")
         if not isinstance(raw_path, str):
             raise ToolError("path must be a string")
+        _ensure_no_link_components(context, raw_path)
         max_depth = _require_bounded_integer(
             arguments.get("max_depth", 3),
             field_name="max_depth",
@@ -483,51 +832,27 @@ class ListTreeTool:
             minimum=1,
             maximum=MAX_TREE_ENTRIES,
         )
+        respect_git_ignore = arguments.get("respect_git_ignore", True)
+        if not isinstance(respect_git_ignore, bool):
+            raise ToolError("respect_git_ignore must be a boolean")
         root = _resolve_path(context, raw_path, must_exist=True)
         if not root.is_dir():
             raise ToolError(f"not a directory: {root}")
         _track_primary_workspace_path(context, root)
-
-        def build_tree() -> tuple[list[str], bool, int, int]:
-            entries: list[str] = []
-            entry_limited = False
-            ignored_directories = 0
-            ignored_links = 0
-
-            def visit(directory: Path, depth: int) -> None:
-                nonlocal entry_limited, ignored_directories, ignored_links
-                try:
-                    children = sorted(
-                        directory.iterdir(),
-                        key=lambda item: (item.name.casefold(), item.name),
-                    )
-                except OSError:
-                    return
-                for child in children:
-                    if len(entries) >= max_entries:
-                        entry_limited = True
-                        return
-                    if _is_link_like(child):
-                        ignored_links += 1
-                        continue
-                    try:
-                        is_directory = child.is_dir()
-                    except OSError:
-                        continue
-                    if is_directory and child.name.casefold() in _DEFAULT_IGNORED_DIRECTORY_NAMES:
-                        ignored_directories += 1
-                        continue
-                    suffix = "/" if is_directory else ""
-                    entries.append(f"{'  ' * (depth - 1)}{child.name}{suffix}")
-                    if is_directory and depth < max_depth:
-                        visit(child, depth + 1)
-                        if entry_limited:
-                            return
-
-            visit(root, 1)
-            return entries, entry_limited, ignored_directories, ignored_links
-
-        entries, entry_limited, ignored_directories, ignored_links = await run_blocking(build_tree)
+        selector = _WorkspaceFileSelector(
+            context,
+            root,
+            respect_git_ignore=respect_git_ignore,
+        )
+        raw_entries, entry_limited, ignored_directories, ignored_links = await run_blocking(
+            selector.tree_entries,
+            max_depth=max_depth,
+            max_entries=max_entries,
+        )
+        entries = [
+            f"{'  ' * (depth - 1)}{path.name}{'/' if is_directory else ''}"
+            for path, is_directory, depth in raw_entries
+        ]
         rendered = "\n".join(entries) if entries else "[empty tree]"
         content, byte_limited = _safe_bounded_output(rendered, context)
         return ToolResult(
@@ -540,6 +865,95 @@ class ListTreeTool:
                 "byte_limited": byte_limited,
                 "ignored_directories": ignored_directories,
                 "ignored_links": ignored_links,
+                "respect_git_ignore": respect_git_ignore,
+            },
+        )
+
+
+class GlobTool:
+    """Find workspace files by path pattern without following links."""
+
+    definition = ToolDefinition(
+        name="glob",
+        description=(
+            "Find workspace files by a bounded path pattern. Use glob when you know "
+            "the filename or path shape but not its exact location; use grep for "
+            "file contents and list_tree for a structural overview."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "pattern": {"type": "string"},
+                "path": {"type": "string", "default": "."},
+                "case_sensitive": {"type": "boolean", "default": True},
+                "respect_git_ignore": {"type": "boolean", "default": True},
+                "max_results": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": MAX_GLOB_RESULTS,
+                },
+            },
+            "required": ["pattern"],
+            "additionalProperties": False,
+        },
+    )
+    side_effecting = False
+
+    async def execute(self, arguments: Mapping[str, Any], context: ToolContext) -> ToolResult:
+        pattern = _require_string(arguments, "pattern")
+        if len(pattern) > MAX_GLOB_PATTERN_LENGTH:
+            raise ToolError(f"pattern must be at most {MAX_GLOB_PATTERN_LENGTH} characters")
+        raw_path = arguments.get("path", ".")
+        if not isinstance(raw_path, str):
+            raise ToolError("path must be a string")
+        _ensure_no_link_components(context, raw_path)
+        case_sensitive = _require_bool(arguments, "case_sensitive", default=True)
+        respect_git_ignore = _require_bool(arguments, "respect_git_ignore", default=True)
+        max_results = _require_bounded_integer(
+            arguments.get("max_results", 500),
+            field_name="max_results",
+            minimum=1,
+            maximum=MAX_GLOB_RESULTS,
+        )
+        root = _resolve_path(
+            context,
+            raw_path,
+            must_exist=True,
+        )
+        if not root.is_dir() and not root.is_file():
+            raise ToolError(f"not a file or directory: {root}")
+        _track_primary_workspace_path(context, root)
+        selector = _WorkspaceFileSelector(
+            context,
+            root,
+            include_globs=(pattern,),
+            case_sensitive=case_sensitive,
+            respect_git_ignore=respect_git_ignore,
+        )
+        selection = await run_blocking(selector.select_files, max_files=max_results)
+        rendered = (
+            "\n".join(_display_path(context, path) for path in selection.files) or "[no matches]"
+        )
+        content, byte_limited = _safe_bounded_output(rendered, context)
+        result_limited = selection.scan_limited
+        if byte_limited:
+            result_limited = True
+        if result_limited:
+            suffix = "\n[glob truncated: result or output limit reached]"
+            content = _bounded_output(f"{content}{suffix}", byte_limit=context.output_byte_limit)[0]
+        return ToolResult(
+            content,
+            metadata={
+                "pattern": pattern,
+                "path": str(root),
+                "count": len(selection.files),
+                "truncated": result_limited,
+                "byte_limited": byte_limited,
+                "scan_limited": selection.scan_limited,
+                "scanned_entries": selection.scanned_entries,
+                "ignored_directories": selection.ignored_directories,
+                "ignored_links": selection.ignored_links,
+                "respect_git_ignore": respect_git_ignore,
             },
         )
 
@@ -547,12 +961,26 @@ class ListTreeTool:
 class GrepTool:
     definition = ToolDefinition(
         name="grep",
-        description="Search UTF-8 workspace files with a regular expression.",
+        description=(
+            "Search workspace file contents for one regular expression or fixed string. "
+            "Use grep for one query; use grep_many for several independent queries. "
+            "Use glob when searching paths rather than contents."
+        ),
         input_schema={
             "type": "object",
             "properties": {
                 "query": {"type": "string"},
                 "path": {"type": "string", "default": "."},
+                "include_globs": {"type": "array", "items": {"type": "string"}},
+                "exclude_globs": {"type": "array", "items": {"type": "string"}},
+                "fixed_strings": {"type": "boolean", "default": False},
+                "case_sensitive": {"type": "boolean", "default": True},
+                "names_only": {"type": "boolean", "default": False},
+                "context": {"type": "integer", "minimum": 0, "maximum": MAX_GREP_CONTEXT_LINES},
+                "before": {"type": "integer", "minimum": 0, "maximum": MAX_GREP_CONTEXT_LINES},
+                "after": {"type": "integer", "minimum": 0, "maximum": MAX_GREP_CONTEXT_LINES},
+                "max_matches_per_file": {"type": "integer", "minimum": 1, "maximum": 100},
+                "max_total_results": {"type": "integer", "minimum": 1, "maximum": 1000},
                 "max_results": {"type": "integer", "minimum": 1, "maximum": 1000},
             },
             "required": ["query"],
@@ -564,45 +992,144 @@ class GrepTool:
     async def execute(self, arguments: Mapping[str, Any], context: ToolContext) -> ToolResult:
         query = _require_string(arguments, "query")
         raw_path = arguments.get("path", ".")
-        max_results = arguments.get("max_results", 200)
         if not isinstance(raw_path, str):
             raise ToolError("path must be a string")
-        if not isinstance(max_results, int) or not 1 <= max_results <= 1000:
-            raise ToolError("max_results must be between 1 and 1000")
-        try:
-            pattern = re.compile(query)
-        except re.error as error:
-            raise ToolError(f"invalid regular expression: {error}") from error
+        _ensure_no_link_components(context, raw_path)
+        include_globs = self._optional_globs(arguments.get("include_globs"), "include_globs")
+        exclude_globs = self._optional_globs(arguments.get("exclude_globs"), "exclude_globs")
+        fixed_strings = _require_bool(arguments, "fixed_strings", default=False)
+        case_sensitive = _require_bool(arguments, "case_sensitive", default=True)
+        names_only = _require_bool(arguments, "names_only", default=False)
+        context_lines = _require_bounded_integer(
+            arguments.get("context", 0),
+            field_name="context",
+            minimum=0,
+            maximum=MAX_GREP_CONTEXT_LINES,
+        )
+        before = _require_bounded_integer(
+            arguments.get("before", context_lines),
+            field_name="before",
+            minimum=0,
+            maximum=MAX_GREP_CONTEXT_LINES,
+        )
+        after = _require_bounded_integer(
+            arguments.get("after", context_lines),
+            field_name="after",
+            minimum=0,
+            maximum=MAX_GREP_CONTEXT_LINES,
+        )
+        max_per_file = _require_bounded_integer(
+            arguments.get("max_matches_per_file", 100),
+            field_name="max_matches_per_file",
+            minimum=1,
+            maximum=100,
+        )
+        raw_limit = arguments.get("max_total_results", arguments.get("max_results", 200))
+        max_total = _require_bounded_integer(
+            raw_limit,
+            field_name="max_total_results",
+            minimum=1,
+            maximum=1000,
+        )
         root = _resolve_path(context, raw_path, must_exist=True)
         _track_primary_workspace_path(context, root)
+        selector = _WorkspaceFileSelector(
+            context,
+            root,
+            include_globs=include_globs,
+            exclude_globs=exclude_globs,
+        )
+        selection = await run_blocking(selector.select_files, max_files=MAX_GREP_SCANNED_FILES)
+        flags = 0 if case_sensitive else re.IGNORECASE
+        pattern: re.Pattern[str] | None = None
+        if not fixed_strings:
+            try:
+                pattern = re.compile(query, flags)
+            except re.error as error:
+                raise ToolError(f"invalid regular expression: {error}") from error
 
-        def search() -> tuple[list[str], Path | None]:
-            paths = (root,) if root.is_file() else root.rglob("*")
-            matches: list[str] = []
+        def matches_line(line: str) -> bool:
+            if fixed_strings:
+                if case_sensitive:
+                    return query in line
+                return query.casefold() in line.casefold()
+            assert pattern is not None
+            return pattern.search(line) is not None
+
+        def search() -> tuple[list[str], Path | None, int, bool, int]:
+            rendered: list[str] = []
             last_matched_path: Path | None = None
-            for path in paths:
-                if not path.is_file() or ".git" in path.parts:
-                    continue
+            total_matches = 0
+            result_limited = selection.scan_limited
+            files_matched = 0
+            for path in selection.files:
                 try:
-                    with path.open("r", encoding="utf-8") as file:
-                        for line_number, line in enumerate(file, start=1):
-                            if pattern.search(line):
-                                display_path = _display_path(context, path)
-                                matches.append(f"{display_path}:{line_number}:{line.rstrip()}")
-                                last_matched_path = path
-                                if len(matches) >= max_results:
-                                    return matches, last_matched_path
+                    lines = path.read_text(encoding="utf-8").splitlines()
                 except (OSError, UnicodeError):
                     continue
-            return matches, last_matched_path
+                matching_lines = [
+                    line_number
+                    for line_number, line in enumerate(lines, start=1)
+                    if matches_line(line)
+                ][:max_per_file]
+                if not matching_lines:
+                    continue
+                last_matched_path = path
+                files_matched += 1
+                if names_only:
+                    rendered.append(_display_path(context, path))
+                    total_matches += 1
+                else:
+                    for line_number in matching_lines:
+                        if total_matches >= max_total:
+                            result_limited = True
+                            break
+                        start = max(1, line_number - before)
+                        end = min(len(lines), line_number + after)
+                        for current in range(start, end + 1):
+                            rendered.append(
+                                f"{_display_path(context, path)}:{current}:{lines[current - 1]}"
+                            )
+                        total_matches += 1
+                    if total_matches >= max_total:
+                        result_limited = True
+                if total_matches >= max_total:
+                    break
+            return rendered, last_matched_path, total_matches, result_limited, files_matched
 
-        matches, last_matched_path = await run_blocking(search)
-        # Trackers are binding-local mutable state. Update them on the event
-        # loop after the blocking filesystem walk rather than from a worker
-        # thread. The last match retains the documented single-target policy.
+        (
+            matches,
+            last_matched_path,
+            total_matches,
+            result_limited,
+            files_matched,
+        ) = await run_blocking(search)
         if last_matched_path is not None:
             _track_primary_workspace_path(context, last_matched_path)
-        return ToolResult("\n".join(matches), metadata={"count": len(matches)})
+        content, byte_limited = _safe_bounded_output("\n".join(matches), context)
+        return ToolResult(
+            content,
+            metadata={
+                "count": total_matches,
+                "files_matched": files_matched,
+                "scanned_files": len(selection.files),
+                "scan_limited": selection.scan_limited,
+                "result_limited": result_limited,
+                "byte_limited": byte_limited,
+                "names_only": names_only,
+            },
+        )
+
+    @staticmethod
+    def _optional_globs(value: object, field_name: str) -> tuple[str, ...]:
+        if value is None:
+            return ()
+        return _require_string_sequence(
+            value,
+            field_name=field_name,
+            minimum_items=0,
+            maximum_items=MAX_GREP_GLOBS,
+        )
 
 
 class GrepManyTool:
@@ -614,8 +1141,9 @@ class GrepManyTool:
     definition = ToolDefinition(
         name="grep_many",
         description=(
-            "Search workspace files for several regular expressions in one bounded request. "
-            "Results are grouped in query order."
+            "Search workspace files for several independent regular expressions or fixed "
+            "strings in one bounded request. Use grep for one query; use glob for path "
+            "patterns. Results are grouped in query order."
         ),
         input_schema={
             "type": "object",
@@ -637,6 +1165,9 @@ class GrepManyTool:
                     "maxItems": MAX_GREP_GLOBS,
                     "items": {"type": "string"},
                 },
+                "fixed_strings": {"type": "boolean", "default": False},
+                "case_sensitive": {"type": "boolean", "default": True},
+                "names_only": {"type": "boolean", "default": False},
                 "max_results_per_query": {
                     "type": "integer",
                     "minimum": 1,
@@ -664,8 +1195,12 @@ class GrepManyTool:
         raw_path = arguments.get("path", ".")
         if not isinstance(raw_path, str):
             raise ToolError("path must be a string")
+        _ensure_no_link_components(context, raw_path)
         include_globs = self._optional_globs(arguments.get("include_globs"), "include_globs")
         exclude_globs = self._optional_globs(arguments.get("exclude_globs"), "exclude_globs")
+        fixed_strings = _require_bool(arguments, "fixed_strings", default=False)
+        case_sensitive = _require_bool(arguments, "case_sensitive", default=True)
+        names_only = _require_bool(arguments, "names_only", default=False)
         max_results_per_query = _require_bounded_integer(
             arguments.get("max_results_per_query", 100),
             field_name="max_results_per_query",
@@ -680,60 +1215,75 @@ class GrepManyTool:
         )
         root = _resolve_path(context, raw_path, must_exist=True)
         _track_primary_workspace_path(context, root)
+        selector = _WorkspaceFileSelector(
+            context,
+            root,
+            include_globs=include_globs,
+            exclude_globs=exclude_globs,
+            case_sensitive=case_sensitive,
+        )
+        selection = await run_blocking(selector.select_files, max_files=MAX_GREP_SCANNED_FILES)
 
         compiled: list[re.Pattern[str] | None] = []
         query_errors: list[str | None] = []
+        flags = 0 if case_sensitive else re.IGNORECASE
         for query in queries:
             try:
-                compiled.append(re.compile(query))
+                compiled.append(None if fixed_strings else re.compile(query, flags))
                 query_errors.append(None)
             except re.error as error:
                 compiled.append(None)
                 query_errors.append(f"invalid regular expression: {error}")
 
         def search() -> tuple[list[list[str]], int, int, bool, bool, Path | None]:
-            paths, scan_limited = self._search_paths(
-                root,
-                include_globs=include_globs,
-                exclude_globs=exclude_globs,
-            )
             matches: list[list[str]] = [[] for _query in queries]
             total_matches = 0
             unreadable_files = 0
             total_limited = False
             last_matched_path: Path | None = None
-            for path in paths:
+            for path in selection.files:
                 try:
-                    with path.open("r", encoding="utf-8") as file:
-                        for line_number, line in enumerate(file, start=1):
-                            for query_index, pattern in enumerate(compiled):
-                                if (
-                                    pattern is None
-                                    or len(matches[query_index]) >= max_results_per_query
-                                ):
-                                    continue
-                                if pattern.search(line) is None:
-                                    continue
-                                display_path = _display_path(context, path)
-                                matches[query_index].append(
-                                    f"{display_path}:{line_number}:{line.rstrip()}"
+                    lines = path.read_text(encoding="utf-8").splitlines()
+                    for line_number, line in enumerate(lines, start=1):
+                        for query_index, pattern in enumerate(compiled):
+                            if len(matches[query_index]) >= max_results_per_query:
+                                continue
+                            if pattern is None:
+                                matched = (
+                                    query_index < len(query_errors)
+                                    and query_errors[query_index] is None
+                                    and (
+                                        queries[query_index] in line
+                                        if case_sensitive
+                                        else queries[query_index].casefold() in line.casefold()
+                                    )
                                 )
-                                last_matched_path = path
-                                total_matches += 1
-                                if total_matches >= max_total_results:
-                                    total_limited = True
-                                    break
-                            if total_limited:
+                            else:
+                                matched = pattern.search(line) is not None
+                            if not matched:
+                                continue
+                            display_path = _display_path(context, path)
+                            matches[query_index].append(
+                                display_path
+                                if names_only
+                                else f"{display_path}:{line_number}:{line.rstrip()}"
+                            )
+                            last_matched_path = path
+                            total_matches += 1
+                            if total_matches >= max_total_results:
+                                total_limited = True
                                 break
+                        if total_limited:
+                            break
                     if total_limited:
                         break
                 except (OSError, UnicodeError):
                     unreadable_files += 1
             return (
                 matches,
-                len(paths),
+                len(selection.files),
                 unreadable_files,
-                scan_limited,
+                selection.scan_limited,
                 total_limited,
                 last_matched_path,
             )
@@ -779,6 +1329,9 @@ class GrepManyTool:
                 "scan_limited": scan_limited,
                 "result_limited": total_limited,
                 "byte_limited": byte_limited,
+                "fixed_strings": fixed_strings,
+                "case_sensitive": case_sensitive,
+                "names_only": names_only,
             },
         )
 
@@ -793,71 +1346,469 @@ class GrepManyTool:
             maximum_items=MAX_GREP_GLOBS,
         )
 
-    @staticmethod
-    def _search_paths(
-        root: Path,
-        *,
-        include_globs: tuple[str, ...],
-        exclude_globs: tuple[str, ...],
-    ) -> tuple[list[Path], bool]:
-        base = root if root.is_dir() else root.parent
-        paths: list[Path] = []
-        limited = False
 
-        def included(path: Path) -> bool:
-            relative = path.relative_to(base)
-            if include_globs and not any(relative.match(pattern) for pattern in include_globs):
-                return False
-            return not any(relative.match(pattern) for pattern in exclude_globs)
+@dataclass(frozen=True, slots=True)
+class _PatchHunk:
+    old_start: int
+    lines: tuple[str, ...]
 
-        def add(path: Path) -> bool:
-            nonlocal limited
-            if not included(path):
-                return True
-            if len(paths) >= MAX_GREP_SCANNED_FILES:
-                limited = True
-                return False
-            paths.append(path)
-            return True
 
-        def visit(directory: Path) -> bool:
-            try:
-                children = sorted(
-                    directory.iterdir(),
-                    key=lambda item: (item.name.casefold(), item.name),
+@dataclass(frozen=True, slots=True)
+class _PatchOperation:
+    kind: str
+    path: str
+    move_to: str | None = None
+    add_lines: tuple[str, ...] = ()
+    hunks: tuple[_PatchHunk, ...] = ()
+
+
+_PATCH_HEADER_PREFIXES = (
+    "*** Add File: ",
+    "*** Update File: ",
+    "*** Delete File: ",
+)
+_PATCH_HUNK_HEADER = re.compile(r"^(?:@@|@@(?: -(\d+)(?:,\d+)?)?(?: \+\d+(?:,\d+)?)? @@(?:.*))$")
+MAX_APPLY_PATCH_BYTES = 2 * 1024 * 1024
+MAX_APPLY_PATCH_FILE_BYTES = 8 * 1024 * 1024
+
+
+def _patch_path(header: str, prefix: str) -> str:
+    path = header[len(prefix) :].strip()
+    if not path or "\x00" in path:
+        raise ToolError("patch file path must be a non-empty text path")
+    return path
+
+
+def _parse_patch_hunk_header(header: str) -> int:
+    match = _PATCH_HUNK_HEADER.match(header)
+    if match is None:
+        raise ToolError("malformed patch hunk header")
+    return int(match.group(1) or "1")
+
+
+def _parse_patch(patch: str) -> tuple[_PatchOperation, ...]:
+    if len(patch.encode("utf-8")) > MAX_APPLY_PATCH_BYTES:
+        raise ToolError(f"patch must be at most {MAX_APPLY_PATCH_BYTES} bytes")
+    lines = patch.splitlines()
+    if len(lines) < 2 or lines[0].strip() != "*** Begin Patch":
+        raise ToolError("patch must start with *** Begin Patch")
+    if "*** End Patch" not in lines:
+        raise ToolError("patch must end with *** End Patch")
+    operations: list[_PatchOperation] = []
+    index = 1
+    while index < len(lines):
+        header = lines[index]
+        if header == "*** End Patch":
+            if any(line.strip() for line in lines[index + 1 :]):
+                raise ToolError("unexpected content after *** End Patch")
+            break
+        prefix = next((value for value in _PATCH_HEADER_PREFIXES if header.startswith(value)), None)
+        if prefix is None:
+            raise ToolError(f"unexpected patch line {index + 1}")
+        path = _patch_path(header, prefix)
+        kind = prefix.removeprefix("*** ").removesuffix(" File: ").lower()
+        index += 1
+        if kind == "add":
+            added: list[str] = []
+            while index < len(lines) and not lines[index].startswith("*** "):
+                line = lines[index]
+                if not line.startswith("+"):
+                    raise ToolError(f"add-file content line {index + 1} must start with +")
+                added.append(line[1:])
+                index += 1
+            operations.append(_PatchOperation("add", path, add_lines=tuple(added)))
+            continue
+        if kind == "delete":
+            if index < len(lines) and not lines[index].startswith("*** "):
+                raise ToolError(f"delete-file operation at line {index + 1} has unexpected content")
+            operations.append(_PatchOperation("delete", path))
+            continue
+
+        move_to: str | None = None
+        if index < len(lines) and lines[index].startswith("*** Move to: "):
+            move_to = _patch_path(lines[index], "*** Move to: ")
+            index += 1
+        hunks: list[_PatchHunk] = []
+        while index < len(lines) and not lines[index].startswith("*** "):
+            header_line = lines[index]
+            if not header_line.startswith("@@"):
+                raise ToolError(f"update-file content at line {index + 1} must start with @@")
+            old_start = _parse_patch_hunk_header(header_line)
+            index += 1
+            hunk_lines: list[str] = []
+            while (
+                index < len(lines)
+                and not lines[index].startswith("@@")
+                and not lines[index].startswith("*** ")
+            ):
+                hunk_line = lines[index]
+                if hunk_line == "\\ No newline at end of file":
+                    index += 1
+                    continue
+                if not hunk_line or hunk_line[0] not in " +-":
+                    raise ToolError(f"malformed patch hunk line {index + 1}")
+                hunk_lines.append(hunk_line)
+                index += 1
+            if not hunk_lines:
+                raise ToolError(f"patch hunk at line {index + 1} must not be empty")
+            hunks.append(_PatchHunk(old_start, tuple(hunk_lines)))
+        if not hunks and move_to is None:
+            raise ToolError(f"update operation for {path!r} has no hunks")
+        operations.append(_PatchOperation("update", path, move_to=move_to, hunks=tuple(hunks)))
+    if not operations:
+        raise ToolError("patch must contain at least one file operation")
+    return tuple(operations)
+
+
+def _apply_patch_hunks(original: str, hunks: tuple[_PatchHunk, ...]) -> str:
+    if len(original.encode("utf-8")) > MAX_APPLY_PATCH_FILE_BYTES:
+        raise ToolError(f"target file exceeds {MAX_APPLY_PATCH_FILE_BYTES} bytes")
+    newline = "\r\n" if "\r\n" in original else "\n"
+    original_lines = original.splitlines()
+    had_final_newline = original.endswith(("\n", "\r"))
+    current = list(original_lines)
+    for hunk in hunks:
+        old_lines = tuple(line[1:] for line in hunk.lines if line[0] in " -")
+        new_lines = tuple(line[1:] for line in hunk.lines if line[0] in " +")
+        if not old_lines:
+            # A hunk containing only ``+`` lines is a valid insertion.  The
+            # location is still validated against the bounded old-line index,
+            # but no existing text is required to match.
+            expected = min(max(hunk.old_start, 0), len(current))
+            if expected > len(current):
+                raise ToolError("patch hunk insertion point is outside the current file")
+            current[expected:expected] = new_lines
+            continue
+        expected = min(max(hunk.old_start - 1, 0), len(current))
+        candidates = (
+            [expected] if current[expected : expected + len(old_lines)] == list(old_lines) else []
+        )
+        if not candidates:
+            candidates = [
+                offset
+                for offset in range(len(current) - len(old_lines) + 1)
+                if tuple(current[offset : offset + len(old_lines)]) == old_lines
+            ]
+        if len(candidates) != 1:
+            raise ToolError("patch hunk does not match the current file exactly")
+        offset = candidates[0]
+        current[offset : offset + len(old_lines)] = new_lines
+    rendered = newline.join(current)
+    return rendered + (newline if had_final_newline else "")
+
+
+def _add_file_content(lines: tuple[str, ...]) -> str:
+    return "\n".join(lines) + ("\n" if lines else "")
+
+
+def _ensure_no_link_components(context: ToolContext, requested: str) -> None:
+    candidate = Path(requested).expanduser()
+    if not candidate.is_absolute():
+        candidate = context.cwd / candidate
+    for parent in reversed(candidate.parents):
+        if _is_link_like(parent):
+            raise ToolError("patch paths must not traverse symlinks or junctions")
+    if _is_link_like(candidate):
+        raise ToolError("patch paths must not target symlinks or junctions")
+
+
+class ApplyPatchTool:
+    """Apply a validated multi-file patch as one local filesystem mutation."""
+
+    definition = ToolDefinition(
+        name="apply_patch",
+        description=(
+            "Apply a structured workspace patch that may add, update, delete, or move files. "
+            "Use it for structural, multi-hunk, or multi-file edits; use search_replace only "
+            "for one known exact replacement. Patch content is validated before any write."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {"patch": {"type": "string"}},
+            "required": ["patch"],
+            "additionalProperties": False,
+        },
+    )
+    side_effecting = True
+
+    def workspace_target_paths(self, arguments: Mapping[str, Any]) -> tuple[str, ...]:
+        """Return patch source and destination paths without touching the workspace."""
+
+        patch = arguments.get("patch")
+        if not isinstance(patch, str):
+            return ()
+        try:
+            operations = _parse_patch(patch)
+        except ToolError:
+            return ()
+        paths: list[str] = []
+        for operation in operations:
+            paths.append(operation.path)
+            if operation.move_to is not None:
+                paths.append(operation.move_to)
+        return tuple(dict.fromkeys(paths))
+
+    async def execute(self, arguments: Mapping[str, Any], context: ToolContext) -> ToolResult:
+        patch = _require_string(arguments, "patch")
+        operations = _parse_patch(patch)
+        if not context.sandbox_profile.workspace_writable:
+            raise ToolError(
+                f"sandbox profile {context.sandbox_profile.value!r} prohibits workspace edits"
+            )
+        resolved = self._resolve_operations(operations, context)
+        preflight = self._instruction_preflight(resolved, context)
+        if preflight is not None:
+            path, instructions_text = preflight
+            return ToolResult(
+                "I discovered project instructions in the target directory "
+                f"that you haven't seen yet ({_display_path(context, path)}). "
+                "Please review them before proceeding with the write. "
+                "Re-issue the command if you wish to proceed.\n\n" + instructions_text,
+                is_error=True,
+                metadata={"preflight": "new_instructions", "path": str(path)},
+            )
+        client = context.client_file_system
+        if client is not None:
+            return await self._execute_client(resolved, client, context)
+        return await run_blocking(self._execute_local, resolved, context)
+
+    def _resolve_operations(
+        self,
+        operations: tuple[_PatchOperation, ...],
+        context: ToolContext,
+    ) -> tuple[tuple[_PatchOperation, Path, Path | None], ...]:
+        resolved: list[tuple[_PatchOperation, Path, Path | None]] = []
+        occupied: set[Path] = set()
+        for operation in operations:
+            _ensure_no_link_components(context, operation.path)
+            source = _resolve_path(
+                context,
+                operation.path,
+                must_exist=operation.kind != "add" and context.client_file_system is None,
+            )
+            destination: Path | None = None
+            if operation.move_to is not None:
+                _ensure_no_link_components(context, operation.move_to)
+                destination = _resolve_path(context, operation.move_to, must_exist=False)
+            targets = (source, destination) if destination is not None else (source,)
+            for target in targets:
+                if target is None or target in occupied:
+                    raise ToolError("patch contains duplicate or overlapping file targets")
+                occupied.add(target)
+                if (
+                    not _is_primary_workspace_path(context, target)
+                    and context.sandbox_profile is not SandboxProfile.OFF
+                ):
+                    raise ToolError(
+                        "sandboxed sessions permit only read access to additional workspace directories"
+                    )
+                if context.client_file_system is None and not target.parent.is_dir():
+                    raise ToolError(f"patch target parent is not a directory: {target.parent}")
+            if operation.kind == "add":
+                if context.client_file_system is None and source.exists():
+                    raise ToolError(f"cannot add existing file: {_display_path(context, source)}")
+            elif context.client_file_system is None and not source.is_file():
+                raise ToolError(f"patch source is not a file: {_display_path(context, source)}")
+            if (
+                destination is not None
+                and context.client_file_system is None
+                and destination.exists()
+            ):
+                raise ToolError(
+                    f"move destination already exists: {_display_path(context, destination)}"
                 )
-            except OSError:
-                return True
-            for child in children:
-                if _is_link_like(child):
-                    continue
-                try:
-                    is_directory = child.is_dir()
-                except OSError:
-                    continue
-                if is_directory:
-                    if child.name.casefold() in _DEFAULT_IGNORED_DIRECTORY_NAMES:
-                        continue
-                    if not visit(child):
-                        return False
-                elif child.is_file() and not add(child):
-                    return False
-            return True
+            resolved.append((operation, source, destination))
+        return tuple(resolved)
 
-        if root.is_file():
-            if not _is_link_like(root):
-                add(root)
-        elif root.is_dir():
-            visit(root)
-        else:
-            raise ToolError(f"not a file or directory: {root}")
-        return paths, limited
+    @staticmethod
+    def _instruction_preflight(
+        operations: tuple[tuple[_PatchOperation, Path, Path | None], ...],
+        context: ToolContext,
+    ) -> tuple[Path, str] | None:
+        if context.instruction_tracker is None:
+            return None
+        checked: set[Path] = set()
+        for _operation, source, destination in operations:
+            for path in (source, destination):
+                if path is None or path in checked or not _is_primary_workspace_path(context, path):
+                    continue
+                checked.add(path)
+                discovered = context.instruction_tracker.check_path_for_write(path)
+                if discovered is not None:
+                    return path, discovered.model_context_text()
+        return None
+
+    async def _execute_client(
+        self,
+        operations: tuple[tuple[_PatchOperation, Path, Path | None], ...],
+        client: ClientFileSystem,
+        context: ToolContext,
+    ) -> ToolResult:
+        if not (client.supports_read and client.supports_write):
+            raise ToolError("ACP client does not support patch text-file reads and writes")
+        if (
+            len(operations) != 1
+            or operations[0][0].kind != "update"
+            or operations[0][2] is not None
+        ):
+            raise ToolError(
+                "ACP delegated filesystem supports only one-file update patches; "
+                "add/delete/move and multi-file transactions are unavailable"
+            )
+        operation, path, _destination = operations[0]
+        try:
+            original = await client.read_text_file(path)
+        except Exception as error:
+            raise ToolError("ACP client could not read the patch target") from error
+        updated = _apply_patch_hunks(original, operation.hunks)
+        try:
+            await client.write_text_file(path, updated)
+        except Exception as error:
+            raise ToolError("ACP client could not write the patch target") from error
+        return ToolResult(
+            f"updated {_display_path(context, path)}",
+            metadata={
+                "changed_files": [_display_path(context, path)],
+                "added_files": [],
+                "deleted_files": [],
+                "moved_files": [],
+                "hunks_applied": len(operation.hunks),
+                "client_delegated": True,
+                "truncated": False,
+            },
+        )
+
+    @staticmethod
+    def _execute_local(
+        operations: tuple[tuple[_PatchOperation, Path, Path | None], ...],
+        context: ToolContext,
+    ) -> ToolResult:
+        originals: dict[Path, bytes | None] = {}
+        modes: dict[Path, int] = {}
+        prepared: dict[Path, tuple[bytes, int]] = {}
+        changed: list[str] = []
+        added: list[str] = []
+        deleted: list[str] = []
+        moved: list[dict[str, str]] = []
+        hunks_applied = 0
+        affected: set[Path] = set()
+        for operation, source, destination in operations:
+            affected.add(source)
+            if destination is not None:
+                affected.add(destination)
+            if source.exists():
+                originals[source] = source.read_bytes()
+                modes[source] = source.stat().st_mode
+            else:
+                originals[source] = None
+            if destination is not None:
+                originals.setdefault(destination, None)
+            if operation.kind == "add":
+                added_content = _add_file_content(operation.add_lines)
+                prepared[source] = (added_content.encode("utf-8"), 0o100644)
+                added.append(_display_path(context, source))
+                changed.append(_display_path(context, source))
+                continue
+            original_bytes = originals[source]
+            if original_bytes is None:
+                raise ToolError(f"patch source disappeared: {_display_path(context, source)}")
+            try:
+                original = original_bytes.decode("utf-8")
+            except UnicodeDecodeError as error:
+                raise ToolError(
+                    f"patch source is not UTF-8 text: {_display_path(context, source)}"
+                ) from error
+            if operation.kind == "delete":
+                deleted.append(_display_path(context, source))
+                changed.append(_display_path(context, source))
+                continue
+            updated = _apply_patch_hunks(original, operation.hunks)
+            hunks_applied += len(operation.hunks)
+            target = destination or source
+            prepared[target] = (updated.encode("utf-8"), modes[source])
+            if destination is None:
+                changed.append(_display_path(context, source))
+            else:
+                moved.append(
+                    {
+                        "from": _display_path(context, source),
+                        "to": _display_path(context, destination),
+                    }
+                )
+                deleted.append(_display_path(context, source))
+                changed.extend(
+                    (_display_path(context, source), _display_path(context, destination))
+                )
+
+        temporary_paths: list[Path] = []
+
+        def stage(path: Path, content: bytes, mode: int) -> Path:
+            with tempfile.NamedTemporaryFile(
+                mode="wb",
+                dir=path.parent,
+                prefix=f".{path.name}.",
+                suffix=".patch.tmp",
+                delete=False,
+            ) as temporary:
+                temporary.write(content)
+                temporary.flush()
+                os.fsync(temporary.fileno())
+                temporary_path = Path(temporary.name)
+            os.chmod(temporary_path, mode)
+            temporary_paths.append(temporary_path)
+            return temporary_path
+
+        staged: dict[Path, Path] = {}
+        try:
+            for path, (content, mode) in prepared.items():
+                staged[path] = stage(path, content, mode)
+            for path, temporary in staged.items():
+                os.replace(temporary, path)
+            for operation, source, destination in operations:
+                if operation.kind == "delete" or destination is not None:
+                    source.unlink()
+        except BaseException as error:
+            for path in affected:
+                original_bytes_for_restore = originals.get(path)
+                try:
+                    if original_bytes_for_restore is None:
+                        if path.exists():
+                            path.unlink()
+                    else:
+                        restore = stage(
+                            path,
+                            original_bytes_for_restore,
+                            modes.get(path, 0o100644),
+                        )
+                        os.replace(restore, path)
+                except OSError:
+                    pass
+            raise ToolError("patch transaction failed and was rolled back") from error
+        finally:
+            for temporary in temporary_paths:
+                with suppress(OSError):
+                    temporary.unlink()
+        return ToolResult(
+            f"applied patch to {len(changed)} file change(s)",
+            metadata={
+                "changed_files": list(dict.fromkeys(changed)),
+                "added_files": added,
+                "deleted_files": deleted,
+                "moved_files": moved,
+                "hunks_applied": hunks_applied,
+                "truncated": False,
+                "client_delegated": False,
+            },
+        )
 
 
 class SearchReplaceTool:
     definition = ToolDefinition(
         name="search_replace",
-        description="Replace an exact text occurrence in a UTF-8 workspace file atomically.",
+        description=(
+            "Replace a known exact text occurrence in one UTF-8 workspace file atomically. "
+            "Use apply_patch for structural, multi-hunk, multi-file, add, delete, or move edits."
+        ),
         input_schema={
             "type": "object",
             "properties": {
@@ -871,6 +1822,10 @@ class SearchReplaceTool:
         },
     )
     side_effecting = True
+
+    def workspace_target_paths(self, arguments: Mapping[str, Any]) -> tuple[str, ...]:
+        path = arguments.get("path")
+        return (path,) if isinstance(path, str) and path else ()
 
     async def execute(self, arguments: Mapping[str, Any], context: ToolContext) -> ToolResult:
         if not context.sandbox_profile.workspace_writable:
@@ -971,6 +1926,8 @@ class SearchReplaceTool:
 
 
 __all__ = [
+    "ApplyPatchTool",
+    "GlobTool",
     "GrepManyTool",
     "GrepTool",
     "ListDirTool",

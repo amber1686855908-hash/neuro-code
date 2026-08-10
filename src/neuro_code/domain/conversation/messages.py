@@ -32,9 +32,10 @@ class SyntheticReason(StrEnum):
     Synthetic messages are injected by the application for context shaping
     but must never masquerade as real conversation turns.
 
-    This is deliberately an in-memory annotation. Synthetic context is
-    rebuilt before every model step and is neither persisted nor projected
-    through ACP/UI conversation history.
+    This is deliberately an in-memory annotation. Stable discovery context
+    may be rebuilt before a model step, while runtime notices are appended at
+    safe turn boundaries. Neither form is persisted nor projected through
+    ACP/UI conversation history.
 
     将消息标记为合成消息,而不是真实的用户或助手回合. 该标记仅用于内存中的上下文组装,不会持久化.
     """
@@ -42,9 +43,11 @@ class SyntheticReason(StrEnum):
     PROJECT_INSTRUCTIONS = "project-instructions"
     AVAILABLE_SKILLS = "available-skills"
     COMPACTION_SUMMARY = "compaction-summary"
+    RUNTIME_PLAN = "runtime-plan"
     RUNTIME_BUDGET = "runtime-budget"
     RUNTIME_CHECKPOINT = "runtime-checkpoint"
     RUNTIME_SUPERVISION = "runtime-supervision"
+    RUNTIME_BACKGROUND_TASK = "runtime-background-task"
 
 
 def _freeze_mapping(value: Mapping[str, Any]) -> Mapping[str, Any]:

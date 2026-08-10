@@ -440,7 +440,13 @@ class OpenAICompatibleProviderTests(unittest.IsolatedAsyncioTestCase):
                             },
                         }
                     ],
-                    "usage": {"prompt_tokens": 4, "completion_tokens": 7},
+                    "usage": {
+                        "prompt_tokens": 4,
+                        "completion_tokens": 7,
+                        "prompt_cache_hit_tokens": 3,
+                        "prompt_cache_miss_tokens": 1,
+                        "prompt_cache_write_tokens": 2,
+                    },
                 },
             )
             return httpx.Response(200, text=body, headers={"content-type": "text/event-stream"})
@@ -496,6 +502,10 @@ class OpenAICompatibleProviderTests(unittest.IsolatedAsyncioTestCase):
                 7,
             ),
         )
+        assert completed.usage is not None
+        self.assertEqual(completed.usage.cache_read_tokens, 3)
+        self.assertEqual(completed.usage.cache_miss_tokens, 1)
+        self.assertEqual(completed.usage.cache_write_tokens, 2)
         self.assertEqual(captured["authorization"], "Bearer secret-key")
         body = captured["body"]
         assert isinstance(body, dict)

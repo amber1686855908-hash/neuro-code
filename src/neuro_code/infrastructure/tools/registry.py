@@ -20,6 +20,7 @@ from collections.abc import Collection, Iterable
 from neuro_code.application.ports.client_filesystem import ClientFileSystem
 from neuro_code.application.ports.client_terminal import ClientTerminal
 from neuro_code.application.ports.tools import Tool
+from neuro_code.application.ports.user_interaction import UserInteractionPort
 from neuro_code.domain.sandbox.models import SandboxProfile
 from neuro_code.domain.tools import ToolDefinition
 from neuro_code.shared.errors import ToolError
@@ -54,6 +55,7 @@ def default_tool_registry(
     allowed_tool_names: Collection[str] | None = None,
     client_file_system: ClientFileSystem | None = None,
     client_terminal: ClientTerminal | None = None,
+    user_interaction: UserInteractionPort | None = None,
 ) -> ToolRegistry:
     from neuro_code.infrastructure.tools.background_tasks import (
         KillTaskTool,
@@ -69,6 +71,8 @@ def default_tool_registry(
         ClientTerminalWaitTool,
     )
     from neuro_code.infrastructure.tools.filesystem import (
+        ApplyPatchTool,
+        GlobTool,
         GrepManyTool,
         GrepTool,
         ListDirTool,
@@ -77,23 +81,40 @@ def default_tool_registry(
         ReadFileTool,
         SearchReplaceTool,
     )
+    from neuro_code.infrastructure.tools.interaction import AskUserTool
     from neuro_code.infrastructure.tools.plans import UpdatePlanTool
     from neuro_code.infrastructure.tools.skills import SkillTool
+    from neuro_code.infrastructure.tools.workspace_diff import WorkspaceDiffTool
 
     tools: list[Tool] = [
         ReadFileTool(),
         ReadFilesTool(),
-        ListDirTool(),
-        ListTreeTool(),
-        GrepTool(),
-        GrepManyTool(),
         SkillTool(),
         UpdatePlanTool(),
     ]
-    if sandbox_profile.workspace_writable and (
-        client_file_system is None
-        or (client_file_system.supports_read and client_file_system.supports_write)
+    if user_interaction is not None:
+        tools.append(AskUserTool())
+    if client_file_system is None:
+        tools[2:2] = [
+            ListDirTool(),
+            ListTreeTool(),
+            GlobTool(),
+            GrepTool(),
+            GrepManyTool(),
+            WorkspaceDiffTool(),
+        ]
+    if sandbox_profile.workspace_writable and client_file_system is None:
+        tools.append(SearchReplaceTool())
+        tools.append(ApplyPatchTool())
+    elif (
+        sandbox_profile.workspace_writable
+        and client_file_system is not None
+        and client_file_system.supports_read
+        and client_file_system.supports_write
     ):
+        # Delegated ACP filesystems can only express one-file text updates.
+        # Do not expose the local transactional patch contract to a model that
+        # cannot actually perform add/delete/move or multi-file operations.
         tools.append(SearchReplaceTool())
     tools.append(BashTool(background_enabled=enable_background_tasks))
     if client_terminal is not None and not sandbox_profile.enabled:

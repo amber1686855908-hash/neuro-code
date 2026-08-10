@@ -45,6 +45,12 @@ from neuro_code.application.ports.provider_settings import (
     ProviderSettingsStore,
 )
 from neuro_code.application.ports.ui_preferences import UiPreferencesStore
+from neuro_code.application.ports.user_interaction import (
+    InteractionUnavailable,
+    UserInputRequest,
+    UserInputResponse,
+    UserInteractionPort,
+)
 from neuro_code.application.providers.contracts import (
     ProviderOption,
     ProviderSelectionResult,
@@ -166,6 +172,51 @@ from neuro_code.tui_theme import (
     loading_style,
 )
 
+
+class TuiUserInteraction(UserInteractionPort):
+    """Queue-backed same-process interaction adapter for the TUI."""
+
+    def __init__(self) -> None:
+        self._pending: dict[str, asyncio.Future[str]] = {}
+        self._early_answers: dict[str, str] = {}
+
+    async def request(self, request: UserInputRequest) -> UserInputResponse:
+        loop = asyncio.get_running_loop()
+        answer = self._early_answers.pop(request.request_id, None)
+        if answer is None:
+            future = loop.create_future()
+            self._pending[request.request_id] = future
+            try:
+                answer = await future
+            finally:
+                self._pending.pop(request.request_id, None)
+        if request.options and answer.strip().isdigit():
+            index = int(answer.strip())
+            if 1 <= index <= len(request.options):
+                return UserInputResponse(request.request_id, str(index))
+        if not request.allow_free_text:
+            raise InteractionUnavailable("free-text input is unavailable for this request")
+        if not answer.strip():
+            raise InteractionUnavailable("an answer is required")
+        return UserInputResponse(request.request_id, text=answer.strip())
+
+    def resolve(self, request_id: str, answer: str) -> bool:
+        future = self._pending.get(request_id)
+        if future is None:
+            self._early_answers[request_id] = answer
+            return True
+        if not future.done():
+            future.set_result(answer)
+        return True
+
+    def cancel(self, request_id: str | None = None) -> None:
+        ids = (request_id,) if request_id is not None else tuple(self._pending)
+        for item in ids:
+            future = self._pending.get(item)
+            if future is not None and not future.done():
+                future.set_exception(asyncio.CancelledError())
+
+
 _RESTORED_MESSAGE_LIMIT = 20_000
 _TASK_LIST_LIMIT = 20
 _TASK_POLL_SECONDS = 0.5
@@ -183,6 +234,7 @@ _COMPACT_READ_TOOLS = frozenset(
     {
         "grep",
         "grep_many",
+        "glob",
         "list_dir",
         "list_tree",
         "read_file",
@@ -3252,6 +3304,7 @@ class NeuroCodeApp(App[None]):
         context_window_tokens: int | None = None,
         background_task_wake_policy: BackgroundTaskWakePolicy | None = None,
         background_wake_limits: BackgroundWakeLimits = _DEFAULT_BACKGROUND_WAKE_LIMITS,
+        user_interaction: TuiUserInteraction | None = None,
     ) -> None:
         if context_window_tokens is not None and context_window_tokens <= 0:
             raise ValueError("context window tokens must be positive")
@@ -3259,6 +3312,7 @@ class NeuroCodeApp(App[None]):
         self.register_theme(TEXTUAL_THEME)
         self.theme = TEXTUAL_THEME.name
         self._runner = runner
+        self._user_interaction = user_interaction
         self._turn_service = turn_service
         self._approval_controller = approval_controller
         self._provider_controller = provider_controller
@@ -3403,6 +3457,7 @@ class NeuroCodeApp(App[None]):
         self._background_wake_active = False
         self._background_wake_task_ids: tuple[str, ...] = ()
         self._task_polling = False
+        self._pending_interaction_request_id: str | None = None
 
     @property
     def entries(self) -> tuple[TranscriptEntry, ...]:
@@ -3510,6 +3565,12 @@ class NeuroCodeApp(App[None]):
         prompt = event.value.strip()
         event.input.value = ""
         if not prompt:
+            return
+        if self._pending_interaction_request_id is not None and self._user_interaction is not None:
+            request_id = self._pending_interaction_request_id
+            self._pending_interaction_request_id = None
+            self._user_interaction.resolve(request_id, prompt)
+            self._write_ui_entry("status", "interaction.submitted")
             return
         if prompt.startswith("/"):
             await self._dispatch_slash_command(prompt)
@@ -3836,6 +3897,7 @@ class NeuroCodeApp(App[None]):
             self._restore_queued_interjections()
             self._write_turn_failure(error)
         finally:
+            self._pending_interaction_request_id = None
             if self._background_wake_active:
                 self._background_wake_state = self._background_wake_state.abandon_wake(
                     failed_at=datetime.now(UTC)
@@ -3880,7 +3942,26 @@ class NeuroCodeApp(App[None]):
 
     async def _handle_event(self, event: AgentEvent) -> None:
         data = event.data
-        if event.kind is AgentEventKind.MODEL_STEP_STARTED:
+        if event.kind is AgentEventKind.USER_INPUT_REQUESTED:
+            request_id = data.get("request_id")
+            question = data.get("question")
+            if isinstance(request_id, str) and isinstance(question, str):
+                self._pending_interaction_request_id = request_id
+                self._turn_activity_kind = "waiting_input"
+                self._turn_activity_started_at = monotonic()
+                self._refresh_turn_activity()
+                options = data.get("options")
+                lines = [question]
+                if isinstance(options, Sequence) and not isinstance(options, str | bytes):
+                    for index, option in enumerate(options, start=1):
+                        if isinstance(option, Mapping) and isinstance(option.get("label"), str):
+                            lines.append(f"{index}. {option['label']}")
+                self._write_entry("status", "\n".join(lines))
+        elif event.kind is AgentEventKind.USER_INPUT_RESOLVED:
+            self._pending_interaction_request_id = None
+            self._turn_activity_kind = "continuing"
+            self._refresh_turn_activity()
+        elif event.kind is AgentEventKind.MODEL_STEP_STARTED:
             self._seal_pending_assistant()
             self._turn_activity_kind = "model"
             self._turn_activity_tool_name = None
@@ -3904,9 +3985,6 @@ class NeuroCodeApp(App[None]):
             self._turn_activity_tool_name = None
             self._turn_activity_tool_started_at = None
             self._refresh_turn_activity()
-            pending = self._pending_assistant
-            if pending is not None and not self._assistant_parts:
-                pending.update(self._render_model_loading())
         elif event.kind is AgentEventKind.REASONING_DELTA:
             text = data.get("text")
             if isinstance(text, str) and text:
@@ -4439,6 +4517,15 @@ class NeuroCodeApp(App[None]):
                 self._language,
                 f"tool.compact.read_files.{key}",
                 count=count,
+            )
+        if state.name == "glob":
+            pattern = self._bounded_inline(state.arguments.get("pattern"), limit=100)
+            path = self._bounded_inline(state.arguments.get("path"), limit=80)
+            return ui_text(
+                self._language,
+                f"tool.compact.glob.{key}",
+                pattern=pattern,
+                path=path,
             )
         target_key = "name" if state.name == "skill" else "path"
         target = self._bounded_inline(state.arguments.get(target_key), limit=120)
@@ -5148,6 +5235,11 @@ class NeuroCodeApp(App[None]):
             return
         if self._turn_worker is not None and self._turn_worker.is_running:
             self._write_ui_entry("status", "turn.cancel_requested")
+            if (
+                self._pending_interaction_request_id is not None
+                and self._user_interaction is not None
+            ):
+                self._user_interaction.cancel(self._pending_interaction_request_id)
             self._turn_worker.cancel()
             return
         if prompt.value:
@@ -6538,11 +6630,15 @@ class NeuroCodeApp(App[None]):
             return
         self._start_model_loading()
         pending = AssistantMessage(
-            self._render_model_loading(),
+            Text(),
             content="",
             pending=True,
             copy_hint=ui_text(self._language, "assistant.copy_hint"),
         )
+        # Keep a stable node for streamed assistant text, but render activity
+        # only in the dedicated turn-activity row below the transcript.
+        # 保留流式助手文本的稳定节点,但只在 transcript 下方的活动行渲染运行状态.
+        pending.display = False
         self._pending_assistant = pending
         transcript = self.query_one("#transcript", VerticalScroll)
         transcript.mount(pending)
@@ -6556,6 +6652,7 @@ class NeuroCodeApp(App[None]):
         transcript = self.query_one("#transcript", VerticalScroll)
         follow = transcript.is_vertical_scroll_end
         pending.set_pending(False)
+        pending.display = True
         if isinstance(pending, AssistantMessage):
             pending.set_content(content)
         pending.update(self._render_entry("assistant", content))
@@ -6611,6 +6708,7 @@ class NeuroCodeApp(App[None]):
         transcript = self.query_one("#transcript", VerticalScroll)
         follow = transcript.is_vertical_scroll_end
         pending.set_pending(False)
+        pending.display = True
         if isinstance(pending, AssistantMessage):
             pending.set_content(content)
         pending.update(self._render_entry("assistant", content))
@@ -6659,9 +6757,6 @@ class NeuroCodeApp(App[None]):
             if self._loading_animation_elapsed + 1e-9 >= self._loading_animation.delay_seconds:
                 self._loading_animation_elapsed = 0.0
                 self._loading_animation.advance()
-                pending = self._pending_assistant
-                if pending is not None and not self._assistant_parts and pending.parent is not None:
-                    pending.update(self._render_model_loading())
                 self._refresh_turn_activity()
 
     def _refresh_running_tool_elapsed(self) -> None:
@@ -6673,15 +6768,6 @@ class NeuroCodeApp(App[None]):
     def _refresh_turn_activity(self) -> None:
         activity = next(iter(self.query("#turn-activity")), None)
         if not isinstance(activity, Static) or not self._model_loading:
-            return
-        show = self._model_loading and (
-            self._first_token_seen
-            or self._turn_activity_kind in {"tool", "finalizing", "continuing"}
-        )
-        if not show:
-            if activity.display:
-                activity.update("")
-                activity.display = False
             return
 
         if self._turn_activity_kind == "tool":
@@ -6952,13 +7038,10 @@ class NeuroCodeApp(App[None]):
                     ui_values=entry.ui_values,
                 )
             )
-        if self._pending_assistant is not None:
-            if self._assistant_parts:
-                self._pending_assistant.update(
-                    self._render_entry("assistant", "".join(self._assistant_parts))
-                )
-            else:
-                self._pending_assistant.update(self._render_model_loading())
+        if self._pending_assistant is not None and self._assistant_parts:
+            self._pending_assistant.update(
+                self._render_entry("assistant", "".join(self._assistant_parts))
+            )
 
 
 __all__ = [

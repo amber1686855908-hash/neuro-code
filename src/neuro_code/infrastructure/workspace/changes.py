@@ -165,6 +165,84 @@ def capture_workspace_snapshot(root: Path) -> WorkspaceSnapshot:
     return WorkspaceSnapshot(files, scan_limited=scan_limited)
 
 
+def capture_workspace_paths(root: Path, paths: Sequence[str | Path]) -> WorkspaceSnapshot:
+    """Capture only the explicitly named workspace files.
+
+    Structured edits already know their mutation targets.  This narrow
+    capture therefore avoids walking an entire repository while retaining the
+    same sensitive, binary, size, and aggregate-byte limits as the normal
+    bounded observer.
+
+    仅捕获显式指定的工作区文件. 结构化编辑已经知道目标路径, 因此这里不遍历整个
+    仓库, 同时继续使用普通观察器相同的敏感文件、二进制、大小和总字节限制.
+    """
+
+    resolved_root = root.expanduser().resolve()
+    files: dict[str, WorkspaceFileSnapshot] = {}
+    captured_bytes = 0
+    scan_limited = False
+    for raw_path in sorted({Path(path).as_posix() for path in paths}):
+        candidate = Path(raw_path).expanduser()
+        if not candidate.is_absolute():
+            candidate = resolved_root / candidate
+        try:
+            # Reject links before resolving them.  Resolving first would turn
+            # an in-workspace symlink into an ordinary target path and could
+            # accidentally make a link look like a safe structured-edit
+            # target.
+            if candidate.is_symlink():
+                continue
+            resolved = candidate.resolve(strict=False)
+            relative = resolved.relative_to(resolved_root)
+            if any(part in _IGNORED_DIRECTORIES for part in relative.parts):
+                continue
+            current = resolved_root
+            for part in relative.parts[:-1]:
+                current /= part
+                if current.is_symlink():
+                    raise OSError("workspace path traverses a symlink")
+            if resolved.is_symlink():
+                continue
+            if not resolved.is_file():
+                continue
+            stat = resolved.stat()
+        except (OSError, ValueError):
+            continue
+        key = relative.as_posix()
+        if _sensitive_path(relative):
+            files[key] = WorkspaceFileSnapshot(
+                stat.st_size, stat.st_mtime_ns, None, None, "sensitive"
+            )
+            continue
+        if stat.st_size > _MAX_TEXT_FILE_BYTES:
+            files[key] = WorkspaceFileSnapshot(stat.st_size, stat.st_mtime_ns, None, None, "large")
+            continue
+        if captured_bytes + stat.st_size > _MAX_CAPTURED_BYTES:
+            scan_limited = True
+            files[key] = WorkspaceFileSnapshot(stat.st_size, stat.st_mtime_ns, None, None, "budget")
+            continue
+        try:
+            content = resolved.read_bytes()
+        except OSError:
+            continue
+        captured_bytes += len(content)
+        digest = hashlib.sha256(content).hexdigest()
+        try:
+            text = content.decode("utf-8")
+            hidden_reason = None
+        except UnicodeDecodeError:
+            text = None
+            hidden_reason = "binary"
+        files[key] = WorkspaceFileSnapshot(
+            stat.st_size,
+            stat.st_mtime_ns,
+            digest,
+            text,
+            hidden_reason,
+        )
+    return WorkspaceSnapshot(files, scan_limited=scan_limited)
+
+
 def _file_changed(before: WorkspaceFileSnapshot, after: WorkspaceFileSnapshot) -> bool:
     if before.digest is not None and after.digest is not None:
         return before.digest != after.digest
@@ -267,6 +345,31 @@ def compare_workspace_snapshots(
         "omitted_files": omitted_files,
         "scan_limited": before.scan_limited or after.scan_limited,
     }
+
+
+def workspace_change_report_from_snapshots(
+    before: WorkspaceSnapshot,
+    after: WorkspaceSnapshot,
+    *,
+    explicit_redactions: tuple[str, ...],
+) -> WorkspaceChangeReport:
+    """Build the canonical report for already-captured snapshots.
+
+    Constructing a report from snapshots lets targeted structured edits reuse
+    the observer's redaction and diff semantics without another filesystem
+    traversal.
+
+    从已捕获的快照构建规范报告,使定向结构化编辑无需再次遍历文件系统即可复用观察器
+    的脱敏和差异语义。
+    """
+
+    return _workspace_change_report_from_comparison(
+        compare_workspace_snapshots(
+            before,
+            after,
+            explicit_redactions=explicit_redactions,
+        )
+    )
 
 
 class _FilesystemWorkspaceChangeCheckpoint(WorkspaceChangeCheckpoint):
@@ -527,6 +630,8 @@ __all__ = [
     "FilesystemWorkspaceChangeObserver",
     "WorkspaceFileSnapshot",
     "WorkspaceSnapshot",
+    "capture_workspace_paths",
     "capture_workspace_snapshot",
     "compare_workspace_snapshots",
+    "workspace_change_report_from_snapshots",
 ]

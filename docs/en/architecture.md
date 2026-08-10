@@ -1829,9 +1829,10 @@ At a safe completed tool-batch boundary, a non-terminal `REPLAN` decision can
 activate `SyntheticReason.RUNTIME_SUPERVISION` for the next request in
 `FINALIZE_TERMINAL` mode. `ContextBuilder` owns that request-only injection and
 the general batch-first evidence-gathering policy. Neither message is appended
-to session items, and the replan message is cleared on new progress or turn
-exit. Tool execution order and the existing stuck detectors are unchanged. See
-[ADR 0105](adr/0105-unified-execution-budget-and-replan-guidance.md).
+to session items. When new progress resolves an active replan notice, the loop
+appends a bounded resolution notice rather than rewriting an already-sent
+request prefix. Tool execution order and the existing stuck detectors are
+unchanged. See [ADR 0105](adr/0105-unified-execution-budget-and-replan-guidance.md).
 
 ## Bounded long-task Runtime guidance, compaction, and segments
 
@@ -1857,3 +1858,45 @@ Progressing long turns may also emit a durable, bounded
 guidance message. Segment thresholds do not reset or replace the global turn
 budget and do not promise crash recovery or workspace rollback. See [ADR
 0107](adr/0107-bounded-long-task-runtime.md).
+
+## Cache-friendly model request projection and usage
+
+`ContextBuilder` owns the stable early request prefix: the request-scoped
+system policy, deterministic tool definitions, and the current serialized
+project-instruction and skill catalog discoveries. A discovery is refreshed on
+each request so a real workspace change can take effect, but its ordered
+serialization is stable while its source content is unchanged.
+
+Mutable plan revisions, segment checkpoints, budget pressure, and replan
+state are not folded back into the system message or inserted before durable
+conversation items. `AgentLoopRunner` instead appends bounded synthetic
+runtime notices after safe conversation boundaries. Budget guidance uses only
+the discrete `CONSERVE`, `FOCUS`, and `FINAL_STAGE` pressure transitions; it
+does not rewrite exact remaining counters on every model step. These notices
+are excluded from session persistence, resume replay, and compaction source
+items. A one-request background-completion reminder remains a deliberate tail
+exception because it is acknowledged only after a successful provider
+completion.
+
+This preserves the intended shape of an unchanged long turn: request *N + 1*
+is normally request *N* plus newly appended durable conversation items and, at
+most, a newly relevant bounded runtime notice. It does not promise a cache hit:
+providers may use different cache keys, tokenization, retention windows, and
+eligibility rules, and a real project-instruction or skill change correctly
+invalidates the affected prefix.
+
+`ModelCompleted.usage` now carries the provider-neutral `ModelUsage` value:
+provider-native input/output fields plus optional cache-read (also exposed as
+`cache_hit_tokens`), cache-write, and cache-miss token counts. The input-token
+semantics are explicit. Most providers report total input, while Anthropic
+reports the uncached tail after its cache breakpoint; the Runtime derives a
+complete processed-input total only when cache-read and cache-creation fields
+make that calculation exact. `CONTEXT_USAGE_UPDATED` projects only those
+bounded fields, so interfaces receive neither prompts, tool arguments, nor
+hidden runtime context. OpenAI-compatible providers preserve reported
+prompt-cache fields, OpenAI Responses preserves cached-input detail, Anthropic
+uses native top-level automatic ephemeral cache control so its cache breakpoint
+can advance with an append-only Agent conversation and preserves cache
+creation/read usage, and Gemini preserves reported implicit cached-content usage.
+Unreported fields remain `None`; the Runtime never infers a cache split or
+claims a cache hit from an aggregate input total.

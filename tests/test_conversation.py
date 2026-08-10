@@ -46,7 +46,7 @@ from neuro_code.domain.conversation.events import (
     ModelEvent,
     ModelTextDelta,
 )
-from neuro_code.domain.conversation.messages import Message, Role
+from neuro_code.domain.conversation.messages import Message, Role, SyntheticReason
 from neuro_code.domain.execution import (
     AgentExecutionOutcome,
     AgentExecutionStatus,
@@ -804,10 +804,16 @@ class AgentConversationTests(unittest.IsolatedAsyncioTestCase):
             system = next(
                 message for message in provider.contexts[0].messages if message.role is Role.SYSTEM
             )
-            self.assertIn("Resume work without losing the agreed plan", system.content)
-            self.assertIn("Inspect the existing implementation", system.content)
-            self.assertIn("User comments on the current structured plan", system.content)
-            self.assertIn("Show the exact verification command", system.content)
+            self.assertNotIn("Resume work without losing the agreed plan", system.content)
+            plan_notice = next(
+                message
+                for message in provider.contexts[0].messages
+                if message.synthetic_reason is SyntheticReason.RUNTIME_PLAN
+            )
+            self.assertIn("Resume work without losing the agreed plan", plan_notice.content)
+            self.assertIn("Inspect the existing implementation", plan_notice.content)
+            self.assertIn("User comments on the current structured plan", plan_notice.content)
+            self.assertIn("Show the exact verification command", plan_notice.content)
 
     async def test_adding_a_plan_comment_persists_without_starting_a_turn(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

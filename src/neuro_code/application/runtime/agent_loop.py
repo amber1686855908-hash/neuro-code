@@ -38,7 +38,11 @@ from neuro_code.application.memory.compaction_runtime import (
 )
 from neuro_code.application.ports.model import ModelProvider
 from neuro_code.application.ports.storage import SessionStore
-from neuro_code.application.ports.tools import ToolCollection, ToolContext
+from neuro_code.application.ports.tools import (
+    InteractionControlTool,
+    ToolCollection,
+    ToolContext,
+)
 from neuro_code.application.ports.workspace_changes import WorkspaceChangeReport
 from neuro_code.application.runtime.background_task_reminders import (
     BACKGROUND_TASK_COMPLETION_BATCH_LIMIT,
@@ -79,11 +83,13 @@ from neuro_code.domain.conversation.messages import (
     PreservedContextItem,
     Role,
     SessionItem,
+    SyntheticReason,
 )
 from neuro_code.domain.execution import (
     AgentExecutionOutcome,
     AgentExecutionStatus,
     ExecutionBudget,
+    ExecutionBudgetPressure,
     ExecutionCounters,
     ExecutionSegmentCheckpoint,
     ProgressKind,
@@ -221,6 +227,14 @@ class AgentLoopRunner:
             raise ConfigurationError("a session task requires plan execution")
         if not isinstance(cancellation_policy, TurnCancellationPolicy):
             raise TypeError("cancellation_policy must be a TurnCancellationPolicy")
+        # Until suspended-task resume exists, one run is exactly one logical
+        # user task.  A future task coordinator must move this reset to task
+        # creation so resuming another execution segment preserves the first
+        # mutation baseline.
+        # 在支持挂起任务恢复之前,一次 run 正好对应一个逻辑用户任务. 未来任务协调器
+        # 必须把重置移到任务创建处,使恢复新的执行段时保留首次变更基线.
+        if self._tool_context.workspace_change_journal is not None:
+            self._tool_context.workspace_change_journal.begin_task()
         turn_started_at = monotonic()
         context_items = list(initial_items)
         messages = [item for item in context_items if isinstance(item, Message)]
@@ -324,6 +338,9 @@ class AgentLoopRunner:
         segment_number = 1
         segment_start_counters = ExecutionCounters()
         segment_progress_kinds: set[ProgressKind] = set()
+        last_runtime_plan_content: str | None = None
+        last_budget_pressure: ExecutionBudgetPressure | None = None
+        replan_notice_active = False
 
         def disable_supervision(failure: str, error: Exception | None = None) -> None:
             nonlocal supervisor
@@ -402,17 +419,88 @@ class AgentLoopRunner:
             }
             return candidate if priority[candidate.kind] > priority[current.kind] else current
 
+        def append_runtime_plan_notice() -> None:
+            """Append a plan revision after the latest durable turn item.
+
+            Runtime plan notices are transient, but keeping each revision in
+            the in-memory sequence makes the next request an append-only
+            extension rather than a rewrite of its stable system prefix.
+
+            在最新持久回合条目之后追加计划修订。运行时计划通知是临时的,但将每个修订
+            保留在内存序列中,可使下一请求仅追加而不改写稳定 system 前缀。
+            """
+
+            nonlocal last_runtime_plan_content
+            notice = self._context_builder.plan_runtime_message()
+            if notice is None:
+                if last_runtime_plan_content is not None:
+                    context_items.append(
+                        Message(
+                            Role.USER,
+                            "Runtime plan update:\nNo structured plan is currently active.",
+                            synthetic_reason=SyntheticReason.RUNTIME_PLAN,
+                        )
+                    )
+                    last_runtime_plan_content = None
+                return
+            if notice.content != last_runtime_plan_content:
+                context_items.append(notice)
+                last_runtime_plan_content = notice.content
+
+        def append_budget_pressure_notice(*, include_model_reserve: bool) -> None:
+            """Append only discrete runtime-pressure transitions.
+
+            仅追加离散的运行时压力转换通知。
+            """
+
+            nonlocal last_budget_pressure
+            current = supervisor
+            if (
+                current is None
+                or self._execution_control_mode is not ExecutionControlMode.FINALIZE_TERMINAL
+            ):
+                return
+            usage = current.budget_usage(include_model_reserve=include_model_reserve)
+            if usage.pressure is last_budget_pressure:
+                return
+            last_budget_pressure = usage.pressure
+            notice = self._context_builder.budget_runtime_message(usage)
+            if notice is not None:
+                context_items.append(notice)
+
         def update_runtime_supervision_guidance(
             decision: SupervisorDecision | None,
         ) -> None:
+            nonlocal replan_notice_active
             if self._execution_control_mode is not ExecutionControlMode.FINALIZE_TERMINAL:
                 return
-            reason = (
-                decision.reason_code
-                if decision is not None and decision.kind is SupervisorDecisionKind.REPLAN
-                else None
+            if decision is not None and decision.kind is SupervisorDecisionKind.REPLAN:
+                if not replan_notice_active:
+                    context_items.append(self._context_builder.supervision_runtime_message())
+                    replan_notice_active = True
+                return
+            current = supervisor
+            if (
+                replan_notice_active
+                and current is not None
+                and current.snapshot.consecutive_no_progress_rounds == 0
+            ):
+                context_items.append(
+                    self._context_builder.supervision_runtime_message(resolved=True)
+                )
+                replan_notice_active = False
+
+        def persistent_context_items() -> tuple[SessionItem, ...]:
+            """Exclude all in-memory synthetic context from session writes.
+
+            从会话写入中排除全部仅内存合成上下文。
+            """
+
+            return tuple(
+                item
+                for item in context_items
+                if not (isinstance(item, Message) and item.synthetic_reason is not None)
             )
-            self._context_builder.set_runtime_supervision_reason(reason)
 
         def canonical_model_context() -> ModelContext:
             return ModelContext(
@@ -427,13 +515,32 @@ class AgentLoopRunner:
             context = canonical_model_context()
             if active_compaction_item is None:
                 return context
-            return (
+            durable_context = ModelContext(
+                persistent_context_items(),
+                context_source_provider,
+                context_source_model,
+                context_source_affinity,
+                self._context_builder.reasoning_effort,
+            )
+            rebuilt = (
                 CompactionResumeRebuilder()
                 .rebuild(
-                    context,
+                    durable_context,
                     (active_compaction_item,),
                 )
                 .context
+            )
+            runtime_notices = tuple(
+                item
+                for item in context_items
+                if isinstance(item, Message) and item.synthetic_reason is not None
+            )
+            return ModelContext(
+                (*rebuilt.items, *runtime_notices),
+                rebuilt.source_provider,
+                rebuilt.source_model,
+                rebuilt.source_context_affinity,
+                rebuilt.reasoning_effort,
             )
 
         async def build_request_context(
@@ -452,18 +559,6 @@ class AgentLoopRunner:
                 self._context_builder.reasoning_effort,
             )
 
-        def preview_budget_guidance() -> None:
-            current = supervisor
-            if (
-                current is None
-                or self._execution_control_mode is not ExecutionControlMode.FINALIZE_TERMINAL
-            ):
-                self._context_builder.set_runtime_budget_usage(None)
-                return
-            self._context_builder.set_runtime_budget_usage(
-                current.budget_usage(include_model_reserve=True)
-            )
-
         async def emit_budget_usage() -> None:
             current = supervisor
             if (
@@ -472,7 +567,6 @@ class AgentLoopRunner:
             ):
                 return
             usage = current.budget_usage()
-            self._context_builder.set_runtime_budget_usage(usage)
             await emit(AgentEventKind.EXECUTION_BUDGET_UPDATED, usage.to_event_data())
 
         async def maybe_compact_context(
@@ -492,7 +586,13 @@ class AgentLoopRunner:
                 or session_id is None
             ):
                 return None
-            source_context = canonical_model_context()
+            source_context = ModelContext(
+                persistent_context_items(),
+                context_source_provider,
+                context_source_model,
+                context_source_affinity,
+                self._context_builder.reasoning_effort,
+            )
             request = gate.build_automatic_request(
                 source_context=source_context,
                 usage_context=usage_context,
@@ -662,7 +762,9 @@ class AgentLoopRunner:
                 context_items.append(final_message)
             await emit(AgentEventKind.TEXT_DELTA, {"text": finalization.response})
             await finish_session_task(SessionTaskStatus.COMPLETED)
-            result_items = tuple(context_items) if persist_turn_context else turn_context_prefix
+            result_items = (
+                persistent_context_items() if persist_turn_context else turn_context_prefix
+            )
             await finalize_turn_completion(
                 outcome,
                 {
@@ -695,9 +797,17 @@ class AgentLoopRunner:
             )
 
         response_parts: list[str] = []
+        # A completion reminder is intentionally a one-request tail item.  It
+        # is acknowledged only after a completed provider response, after
+        # which it must not be shown again.  Keeping it outside
+        # ``context_items`` preserves that lifecycle while the durable
+        # conversation prefix remains append-only.
+        #
+        # 完成提醒有意作为仅一次请求的尾部条目。仅在 Provider 完成响应后确认,此后不得
+        # 再展示。将其放在 ``context_items`` 之外可保持该生命周期,同时持久化对话前缀仍
+        # 仅追加。
         completion_reminders: list[Message] = []
         pending_terminal_decision: SupervisorDecision | None = None
-        self._context_builder.set_runtime_supervision_reason(None)
         try:
             try:
                 supervisor = self._supervisor_factory()
@@ -744,6 +854,7 @@ class AgentLoopRunner:
                 context_items.append(user_message)
                 messages.append(user_message)
                 await emit(AgentEventKind.USER_MESSAGE, {"content": user_message.model_content()})
+            append_runtime_plan_notice()
 
             if (
                 self._execution_control_mode is ExecutionControlMode.FINALIZE_TERMINAL
@@ -754,7 +865,13 @@ class AgentLoopRunner:
             ):
                 records = await self._session_store.load_compaction_items(session_id)
                 resumed = rebuild_context_from_latest_compatible_compaction(
-                    canonical_model_context(),
+                    ModelContext(
+                        persistent_context_items(),
+                        context_source_provider,
+                        context_source_model,
+                        context_source_affinity,
+                        self._context_builder.reasoning_effort,
+                    ),
                     records,
                 )
                 if resumed.applied_compaction_ids:
@@ -794,6 +911,7 @@ class AgentLoopRunner:
                                         else ()
                                     ),
                                 ),
+                                synthetic_reason=SyntheticReason.RUNTIME_BACKGROUND_TASK,
                             )
                         )
                         await emit(
@@ -808,7 +926,7 @@ class AgentLoopRunner:
                                 "model_context_only": True,
                             },
                         )
-                preview_budget_guidance()
+                append_budget_pressure_notice(include_model_reserve=True)
                 context = await build_request_context(completion_reminders)
                 prior_compaction_item = active_compaction_item
                 compaction_decision = await maybe_compact_context(
@@ -829,7 +947,6 @@ class AgentLoopRunner:
                 if terminal_before_model is not None:
                     return await complete_finalized_turn(terminal_before_model, step=step - 1)
                 await emit_budget_usage()
-                self._context_builder.set_runtime_segment_checkpoint(None)
                 step_result = await ModelStepProcessor(session_store=self._session_store).consume(
                     self._provider.stream(context, self._tools.definitions()),
                     emit=emit,
@@ -873,15 +990,20 @@ class AgentLoopRunner:
                         )
                     ):
                         active_compaction_item = None
-                if completion.input_tokens is not None:
-                    output_tokens = completion.output_tokens or 0
+                if completion.usage is not None:
+                    processed_input_tokens = completion.usage.processed_input_tokens
+                    used_tokens = (
+                        processed_input_tokens + completion.output_tokens
+                        if processed_input_tokens is not None
+                        and completion.output_tokens is not None
+                        else None
+                    )
                     await emit(
                         AgentEventKind.CONTEXT_USAGE_UPDATED,
                         {
-                            "input_tokens": completion.input_tokens,
-                            "output_tokens": completion.output_tokens,
-                            "used_tokens": completion.input_tokens + output_tokens,
-                            "estimated": completion.output_tokens is None,
+                            **completion.usage.to_event_data(),
+                            "used_tokens": used_tokens,
+                            "estimated": used_tokens is None,
                         },
                     )
 
@@ -913,8 +1035,6 @@ class AgentLoopRunner:
                     await background_tasks.mark_completions_reported(
                         tuple(snapshot.task_id for snapshot in completion_batch)
                     )
-                    # The manager has now acknowledged this batch. Never
-                    # include it in a later model step of the same turn.
                     completion_reminders.clear()
                 if completion.context_items:
                     context_items.extend(completion.context_items)
@@ -942,7 +1062,7 @@ class AgentLoopRunner:
                 if not tool_calls:
                     await finish_session_task(SessionTaskStatus.COMPLETED)
                     result_items = (
-                        tuple(context_items) if persist_turn_context else turn_context_prefix
+                        persistent_context_items() if persist_turn_context else turn_context_prefix
                     )
                     await finalize_turn_completion(
                         AgentExecutionOutcome(
@@ -1016,7 +1136,27 @@ class AgentLoopRunner:
                     record_tool_outcome(observation)
 
                 last_tool_decision: SupervisorDecision | None = None
+                interaction_calls = tuple(
+                    call
+                    for call in tool_calls
+                    if isinstance(self._tools.get(call.name), InteractionControlTool)
+                )
+                if interaction_calls and len(tool_calls) != 1:
+                    await self._tool_executor.record_rejected_tool_calls(
+                        tool_calls,
+                        messages,
+                        context_items,
+                        emit,
+                        reason="ask_user must be issued as the only tool call in this model step.",
+                    )
+                    update_runtime_supervision_guidance(after_tool_batch_decision)
+                    continue
                 for index, call in enumerate(tool_calls):
+                    interaction_tool = isinstance(
+                        self._tools.get(call.name), InteractionControlTool
+                    )
+                    if interaction_tool and supervisor is not None:
+                        supervisor.pause_wall_clock()
                     try:
                         observation = await self._tool_executor.execute(
                             call,
@@ -1055,13 +1195,17 @@ class AgentLoopRunner:
                             cancelled=isinstance(error, asyncio.CancelledError),
                         )
                         raise
+                    finally:
+                        if interaction_tool and supervisor is not None:
+                            supervisor.resume_wall_clock()
                 if pending_terminal_decision is not None:
                     return await complete_finalized_turn(pending_terminal_decision, step=step)
                 update_runtime_supervision_guidance(
                     last_tool_decision or after_tool_batch_decision or after_model_decision
                 )
-                preview_budget_guidance()
-                post_batch_context = await build_request_context(completion_reminders)
+                append_runtime_plan_notice()
+                append_budget_pressure_notice(include_model_reserve=True)
+                post_batch_context = await build_request_context()
                 compaction_decision = await maybe_compact_context(
                     ContextCompactionSafePoint.AFTER_TOOL_BATCH,
                     step=step,
@@ -1115,7 +1259,9 @@ class AgentLoopRunner:
                             AgentEventKind.EXECUTION_SEGMENT_CHECKPOINTED,
                             checkpoint.to_event_data(),
                         )
-                        self._context_builder.set_runtime_segment_checkpoint(checkpoint)
+                        context_items.append(
+                            self._context_builder.segment_runtime_message(checkpoint)
+                        )
                         segment_number += 1
                         segment_start_counters = counters
                         segment_progress_kinds.clear()
@@ -1133,17 +1279,13 @@ class AgentLoopRunner:
             if self._session_store is not None and session_id is not None:
                 await self._session_store.save_session_items(
                     session_id,
-                    context_items if persist_turn_context else turn_context_prefix,
+                    persistent_context_items() if persist_turn_context else turn_context_prefix,
                 )
             raise ProviderError(f"agent exceeded the maximum of {self._max_steps} model steps")
         except BaseException as error:
             # Preserve cancellation semantics while still making the session auditable.
             await record_turn_failure(error)
             raise
-        finally:
-            self._context_builder.set_runtime_supervision_reason(None)
-            self._context_builder.set_runtime_budget_usage(None)
-            self._context_builder.set_runtime_segment_checkpoint(None)
 
 
 __all__ = ["AgentLoopRunner", "AgentRunResult"]

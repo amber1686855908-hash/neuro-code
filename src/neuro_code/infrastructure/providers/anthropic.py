@@ -15,9 +15,11 @@ from neuro_code.domain.conversation.context import ModelContext
 from neuro_code.domain.conversation.events import (
     ModelCompleted,
     ModelEvent,
+    ModelInputTokenSemantics,
     ModelReasoningDelta,
     ModelTextDelta,
     ModelToolCall,
+    ModelUsage,
 )
 from neuro_code.domain.conversation.messages import (
     IMAGE_MODEL_PLACEHOLDER,
@@ -59,9 +61,12 @@ class AnthropicProvider:
         context_affinity: str | None = None,
         timeout_seconds: float = 120.0,
         max_output_tokens: int = 8192,
+        prompt_caching: bool = True,
         transport: Any | None = None,
         http_policy: HttpClientPolicy | None = None,
     ) -> None:
+        if not isinstance(prompt_caching, bool):
+            raise TypeError("prompt_caching must be a bool")
         self._model = model
         self._base_url = base_url.rstrip("/")
         self._api_key = api_key
@@ -69,6 +74,7 @@ class AnthropicProvider:
         self._context_affinity = context_affinity
         self._timeout_seconds = timeout_seconds
         self._max_output_tokens = max_output_tokens
+        self._prompt_caching = prompt_caching
         self._transport = transport
         self._http_policy = http_policy or HttpClientPolicy()
 
@@ -210,12 +216,25 @@ class AnthropicProvider:
         }
         if system is not None:
             body["system"] = system
+        if self._prompt_caching:
+            # Anthropic automatic prompt caching advances the cache breakpoint
+            # to the latest cacheable conversation block.  That keeps a
+            # growing Agent transcript cacheable instead of pinning the cache
+            # at the static system message only.
+            #
+            # Anthropic 的自动提示词缓存会将缓存断点推进到最新的可缓存对话块,
+            # 因而持续增长的 Agent transcript 可被缓存,而不是只固定缓存 system 消息。
+            body["cache_control"] = {"type": "ephemeral"}
         if tool_policy is ModelToolPolicy.ALLOWED and tools:
             body["tools"] = [tool.to_dict() for tool in tools]
         return body
 
     def _safe_detail(self, detail: str) -> str:
         return self._http_policy.redact(detail, self._api_key)
+
+    @staticmethod
+    def _token_count(value: object) -> int | None:
+        return value if isinstance(value, int) and not isinstance(value, bool) else None
 
     @staticmethod
     def _finish_tool(buffer: _ToolUseBuffer) -> ToolCall:
@@ -258,6 +277,8 @@ class AnthropicProvider:
         stop_reason = "end_turn"
         input_tokens: int | None = None
         output_tokens: int | None = None
+        cache_read_tokens: int | None = None
+        cache_write_tokens: int | None = None
         saw_message_stop = False
         try:
             options = self._http_policy.client_options(
@@ -296,10 +317,14 @@ class AnthropicProvider:
                         message = event.get("message")
                         usage = message.get("usage") if isinstance(message, dict) else None
                         if isinstance(usage, dict):
-                            if isinstance(usage.get("input_tokens"), int):
-                                input_tokens = usage["input_tokens"]
-                            if isinstance(usage.get("output_tokens"), int):
-                                output_tokens = usage["output_tokens"]
+                            input_tokens = self._token_count(usage.get("input_tokens"))
+                            output_tokens = self._token_count(usage.get("output_tokens"))
+                            cache_read_tokens = self._token_count(
+                                usage.get("cache_read_input_tokens")
+                            )
+                            cache_write_tokens = self._token_count(
+                                usage.get("cache_creation_input_tokens")
+                            )
                     elif event_type == "content_block_start":
                         index = event.get("index")
                         block = event.get("content_block")
@@ -354,8 +379,10 @@ class AnthropicProvider:
                         usage = event.get("usage")
                         if isinstance(delta, dict) and isinstance(delta.get("stop_reason"), str):
                             stop_reason = delta["stop_reason"]
-                        if isinstance(usage, dict) and isinstance(usage.get("output_tokens"), int):
-                            output_tokens = usage["output_tokens"]
+                        if isinstance(usage, dict):
+                            updated_output_tokens = self._token_count(usage.get("output_tokens"))
+                            if updated_output_tokens is not None:
+                                output_tokens = updated_output_tokens
                     elif event_type == "message_stop":
                         saw_message_stop = True
         except ProviderError:
@@ -370,4 +397,14 @@ class AnthropicProvider:
             raise ProviderError("Anthropic stream ended during a tool call")
         if not saw_message_stop:
             raise ProviderError("Anthropic stream ended without message_stop")
-        yield ModelCompleted(stop_reason, input_tokens, output_tokens)
+        usage = ModelUsage(
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cache_read_tokens=cache_read_tokens,
+            cache_write_tokens=cache_write_tokens,
+            input_token_semantics=ModelInputTokenSemantics.UNCACHED_TAIL,
+        )
+        yield ModelCompleted(
+            stop_reason,
+            usage=(usage if usage.has_reported_tokens else None),
+        )

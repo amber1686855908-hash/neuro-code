@@ -18,6 +18,7 @@ from neuro_code.domain.conversation.events import (
     ModelReasoningDelta,
     ModelTextDelta,
     ModelToolCall,
+    ModelUsage,
 )
 from neuro_code.domain.conversation.messages import (
     IMAGE_MODEL_PLACEHOLDER,
@@ -84,6 +85,10 @@ class GeminiProvider:
         if not base_url.endswith(("/v1", "/v1beta")):
             base_url = f"{base_url}/v1beta"
         return f"{base_url}/models/{quote(self._model, safe='')}:streamGenerateContent?alt=sse"
+
+    @staticmethod
+    def _token_count(value: object) -> int | None:
+        return value if isinstance(value, int) and not isinstance(value, bool) else None
 
     @staticmethod
     def _append_content(
@@ -241,6 +246,7 @@ class GeminiProvider:
         stop_reason = "stop"
         input_tokens: int | None = None
         output_tokens: int | None = None
+        cache_read_tokens: int | None = None
         tool_index = 0
         try:
             options = self._http_policy.client_options(
@@ -273,13 +279,22 @@ class GeminiProvider:
                         raise ProviderError(f"Gemini stream error: {self._safe_detail(detail)}")
                     usage = chunk.get("usageMetadata")
                     if isinstance(usage, dict):
-                        if isinstance(usage.get("promptTokenCount"), int):
-                            input_tokens = usage["promptTokenCount"]
+                        parsed_input_tokens = self._token_count(usage.get("promptTokenCount"))
+                        if parsed_input_tokens is not None:
+                            input_tokens = parsed_input_tokens
                         candidate_tokens = usage.get(
                             "candidatesTokenCount", usage.get("outputTokenCount")
                         )
-                        if isinstance(candidate_tokens, int):
-                            output_tokens = candidate_tokens
+                        parsed_output_tokens = self._token_count(candidate_tokens)
+                        if parsed_output_tokens is not None:
+                            output_tokens = parsed_output_tokens
+                        parsed_cached_tokens = self._token_count(
+                            usage.get("cachedContentTokenCount")
+                        )
+                        if parsed_cached_tokens is None:
+                            parsed_cached_tokens = self._token_count(usage.get("totalCachedTokens"))
+                        if parsed_cached_tokens is not None:
+                            cache_read_tokens = parsed_cached_tokens
                     candidates = chunk.get("candidates")
                     if not isinstance(candidates, list) or not candidates:
                         feedback = chunk.get("promptFeedback")
@@ -339,4 +354,12 @@ class GeminiProvider:
                 f"Gemini stream failed: {type(error).__name__}: {detail}"
             ) from error
 
-        yield ModelCompleted(stop_reason, input_tokens, output_tokens)
+        usage = ModelUsage(
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cache_read_tokens=cache_read_tokens,
+        )
+        yield ModelCompleted(
+            stop_reason,
+            usage=(usage if usage.has_reported_tokens else None),
+        )

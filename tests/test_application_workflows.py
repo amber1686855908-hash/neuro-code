@@ -721,6 +721,7 @@ class CompositionReadOnlySubagentRuntimeFactoryTests(unittest.IsolatedAsyncioTes
                 "read_files",
                 "list_dir",
                 "list_tree",
+                "glob",
                 "grep",
                 "grep_many",
                 "skill",
