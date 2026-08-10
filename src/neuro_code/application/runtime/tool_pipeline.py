@@ -20,6 +20,8 @@ import json
 import logging
 import os
 from collections.abc import Awaitable, Callable, Mapping, Sequence
+from dataclasses import replace
+from pathlib import Path
 from time import monotonic
 from typing import Any
 
@@ -39,6 +41,8 @@ from neuro_code.application.ports.workspace_changes import (
     WorkspaceChangeCheckpoint,
     WorkspaceChangeObserver,
     WorkspaceChangeReport,
+    WorkspaceMutationJournalProjection,
+    WorkspaceMutationTargetProvider,
 )
 from neuro_code.application.runtime.context_builder import ContextBuilder
 from neuro_code.application.runtime.supervision import (
@@ -274,6 +278,10 @@ class ToolExecutor:
         change_report: WorkspaceChangeReport | None = None
         tool: Tool | None = None
         result: ToolResult | None = None
+        journal_started = False
+        journal_recorded = False
+        targeted_mutation = False
+        target_paths: tuple[str, ...] = ()
         plan_fingerprint_before = (
             self._context_builder.plan.fingerprint
             if self._context_builder.plan is not None
@@ -297,6 +305,29 @@ class ToolExecutor:
             messages.append(message)
             context_items.append(message)
             resolved = True
+
+        async def record_journal() -> None:
+            nonlocal journal_recorded
+            if journal_recorded or not journal_started:
+                return
+            journal_recorded = True
+            journal = self._tool_context.workspace_change_journal
+            if journal is None:
+                return
+            try:
+                await run_blocking(
+                    journal.after_mutation,
+                    self._workspace_roots(),
+                    tool_name=call.name,
+                    mutation_metadata=(result.metadata if result is not None else None),
+                    explicit_redactions=self._journal_redaction_values(),
+                    target_paths=target_paths,
+                )
+            except Exception as error:
+                LOGGER.debug(
+                    "workspace mutation journal after-capture unavailable error_type=%s",
+                    type(error).__name__,
+                )
 
         try:
             await emit(
@@ -383,9 +414,41 @@ class ToolExecutor:
 
             await emit(AgentEventKind.TOOL_STARTED, {"id": call.id, "name": call.name})
             if tool.side_effecting:
-                workspace_before = await self.capture_workspace_snapshot()
+                journal = self._tool_context.workspace_change_journal
+                target_paths = _workspace_target_paths(tool, call.arguments)
+                targeted_mutation = bool(target_paths and journal is not None)
+                if not targeted_mutation:
+                    workspace_before = await self.capture_workspace_snapshot()
+                if targeted_mutation and journal is not None:
+                    try:
+                        await run_blocking(
+                            journal.before_mutation,
+                            self._workspace_roots(),
+                            tool_name=call.name,
+                            explicit_redactions=self._journal_redaction_values(),
+                            target_paths=target_paths,
+                        )
+                        journal_started = True
+                    except Exception as error:
+                        LOGGER.debug(
+                            "workspace mutation journal before-capture unavailable error_type=%s",
+                            type(error).__name__,
+                        )
+
+            async def interaction_event_sink(
+                kind: AgentEventKind,
+                data: Mapping[str, object],
+            ) -> AgentEvent:
+                return await emit(kind, dict(data))
+
             try:
-                result = await tool.execute(call.arguments, self._tool_context)
+                result = await tool.execute(
+                    call.arguments,
+                    replace(
+                        self._tool_context,
+                        interaction_event_sink=interaction_event_sink,
+                    ),
+                )
             except (ToolError, OSError, UnicodeError) as error:
                 result = ToolResult(f"{type(error).__name__}: {error}", is_error=True)
             safe_content = redact_sensitive_text(
@@ -407,7 +470,18 @@ class ToolExecutor:
                 self._context_builder.set_plan(plan)
             record_result(result)
             terminal_data = terminal_event_data(result)
-            change_report = await self.workspace_change_report(workspace_before)
+            await record_journal()
+            if targeted_mutation:
+                change_report = _journal_change_report(
+                    self._tool_context.workspace_change_journal,
+                    self._journal_redaction_values(),
+                )
+            else:
+                change_report = await self.workspace_change_report(workspace_before)
+                _record_external_observation(
+                    self._tool_context.workspace_change_journal,
+                    change_report,
+                )
             if change_report is not None:
                 terminal_data["workspace_changes"] = change_report.to_event_payload()
             await emit(kind, terminal_data)
@@ -435,12 +509,23 @@ class ToolExecutor:
                 )
                 record_result(result)
                 terminal_data = terminal_event_data(result, cancelled=cancelled)
-                change_report = await self.workspace_change_report(workspace_before)
+                if not targeted_mutation:
+                    change_report = await self.workspace_change_report(workspace_before)
+                    _record_external_observation(
+                        self._tool_context.workspace_change_journal,
+                        change_report,
+                    )
                 if change_report is not None:
                     terminal_data["workspace_changes"] = change_report.to_event_payload()
                 await emit(
                     AgentEventKind.TOOL_FAILED,
                     terminal_data,
+                )
+            await record_journal()
+            if targeted_mutation:
+                change_report = _journal_change_report(
+                    self._tool_context.workspace_change_journal,
+                    self._journal_redaction_values(),
                 )
             if result is not None and interrupted_observation_sink is not None:
                 observation = self._tool_execution_observation(
@@ -497,6 +582,26 @@ class ToolExecutor:
             )
         except (OSError, RuntimeError):
             return None
+
+    def _workspace_roots(self) -> tuple[Path, ...]:
+        return (self._tool_context.cwd, *self._tool_context.additional_workspace_roots)
+
+    def _journal_redaction_values(self) -> tuple[str, ...]:
+        protected_names = {
+            name.casefold() for name in self._tool_context.protected_environment_variables
+        }
+        return tuple(
+            dict.fromkeys(
+                (
+                    *self._tool_context.redaction_values,
+                    *(
+                        value
+                        for name, value in os.environ.items()
+                        if name.casefold() in protected_names and value
+                    ),
+                )
+            )
+        )
 
     async def workspace_change_report(
         self,
@@ -559,6 +664,81 @@ class ToolExecutor:
                     "not_started": True,
                 },
             )
+
+    @staticmethod
+    async def record_rejected_tool_calls(
+        calls: Sequence[ToolCall],
+        messages: list[Message],
+        context_items: list[SessionItem],
+        emit: Callable[[AgentEventKind, dict[str, object]], Awaitable[AgentEvent]],
+        *,
+        reason: str,
+    ) -> None:
+        """Pair a control-tool batch rejection without executing any call."""
+
+        result = ToolResult(reason, is_error=True)
+        for call in calls:
+            message = Message(Role.TOOL, reason, name=call.name, tool_call_id=call.id)
+            messages.append(message)
+            context_items.append(message)
+        for call in calls:
+            await emit(
+                AgentEventKind.TOOL_FAILED,
+                {
+                    "id": call.id,
+                    "name": call.name,
+                    **result.to_dict(),
+                    "not_started": True,
+                    "control_batch_rejected": True,
+                },
+            )
+
+
+def _workspace_target_paths(tool: Tool, arguments: Mapping[str, Any]) -> tuple[str, ...]:
+    if not isinstance(tool, WorkspaceMutationTargetProvider):
+        return ()
+    try:
+        paths = tool.workspace_target_paths(arguments)
+    except Exception as error:
+        LOGGER.debug(
+            "workspace target discovery unavailable error_type=%s",
+            type(error).__name__,
+        )
+        return ()
+    if not isinstance(paths, tuple) or not all(isinstance(path, str) for path in paths):
+        return ()
+    return tuple(dict.fromkeys(path for path in paths if path))
+
+
+def _journal_change_report(
+    journal: object | None,
+    redactions: tuple[str, ...],
+) -> WorkspaceChangeReport | None:
+    if not isinstance(journal, WorkspaceMutationJournalProjection):
+        return None
+    try:
+        return journal.last_change_report(explicit_redactions=redactions)
+    except Exception as error:
+        LOGGER.debug(
+            "workspace journal report unavailable error_type=%s",
+            type(error).__name__,
+        )
+        return None
+
+
+def _record_external_observation(
+    journal: object | None,
+    report: WorkspaceChangeReport | None,
+) -> None:
+    if report is None or not isinstance(journal, WorkspaceMutationJournalProjection):
+        return
+    try:
+        journal.record_external_observation(report)
+    except Exception as error:
+        LOGGER.debug(
+            "workspace journal external observation unavailable error_type=%s",
+            type(error).__name__,
+        )
 
 
 __all__ = ["ToolExecutor", "ToolObservationBuilder"]

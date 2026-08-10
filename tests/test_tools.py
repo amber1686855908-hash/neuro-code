@@ -8,8 +8,10 @@ from contextlib import suppress
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
+from unittest.mock import patch
 
 from neuro_code.application.ports.client_terminal import ClientTerminalResult
+from neuro_code.application.ports.instructions import InstructionContextTracker
 from neuro_code.application.ports.tools import ToolContext
 from neuro_code.domain.background_tasks import (
     BackgroundTaskKillOutcome,
@@ -23,8 +25,11 @@ from neuro_code.domain.sandbox import SandboxProfile
 from neuro_code.domain.workspace.skills import SkillDiscoveryResult
 from neuro_code.infrastructure.tools.client_terminal import ClientTerminalTool
 from neuro_code.infrastructure.tools.filesystem import (
+    ApplyPatchTool,
+    GlobTool,
     GrepManyTool,
     GrepTool,
+    ListDirTool,
     ListTreeTool,
     ReadFilesTool,
     ReadFileTool,
@@ -237,6 +242,7 @@ class FilesystemToolTests(unittest.IsolatedAsyncioTestCase):
 
             registry = default_tool_registry(SandboxProfile.READ_ONLY)
             self.assertNotIn("search_replace", registry.names())
+            self.assertNotIn("apply_patch", registry.names())
             with self.assertRaisesRegex(ToolError, "prohibits workspace edits"):
                 await SearchReplaceTool().execute(
                     {"path": "values.txt", "old": "before", "new": "after"},
@@ -300,11 +306,22 @@ class FilesystemToolTests(unittest.IsolatedAsyncioTestCase):
 
             registry = default_tool_registry(client_file_system=client_file_system)
             self.assertNotIn("search_replace", registry.names())
+            self.assertNotIn("list_dir", registry.names())
+            self.assertNotIn("list_tree", registry.names())
+            self.assertNotIn("glob", registry.names())
+            self.assertNotIn("grep", registry.names())
+            self.assertNotIn("grep_many", registry.names())
             with self.assertRaisesRegex(ToolError, "does not support text-file replacement"):
                 await SearchReplaceTool().execute(
                     {"path": "remote.txt", "old": "before", "new": "after"},
                     ToolContext(root, client_file_system=client_file_system),
                 )
+
+    async def test_client_file_registry_does_not_expose_local_patch_or_diff(self) -> None:
+        registry = default_tool_registry(client_file_system=ClientFileSystemFixture())
+        self.assertIn("search_replace", registry.names())
+        self.assertNotIn("apply_patch", registry.names())
+        self.assertNotIn("workspace_diff", registry.names())
 
     async def test_client_file_read_requires_capability_and_honors_output_limit(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -448,7 +465,7 @@ class FilesystemToolTests(unittest.IsolatedAsyncioTestCase):
             (root / "src" / "z.py").write_text("z", encoding="utf-8")
             (root / "src" / "a.py").write_text("a", encoding="utf-8")
             (root / "src" / "nested" / "deep.py").write_text("deep", encoding="utf-8")
-            for ignored in (".git", ".venv", "node_modules", "dist", "__pycache__"):
+            for ignored in (".git", ".cache", ".venv", "node_modules", "dist", "__pycache__"):
                 (root / ignored).mkdir()
                 (root / ignored / "hidden.txt").write_text("hidden", encoding="utf-8")
             if hasattr(os, "symlink"):
@@ -463,7 +480,7 @@ class FilesystemToolTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(result.content.splitlines(), ["src/", "  a.py", "  nested/", "  z.py"])
             self.assertNotIn("hidden.txt", result.content)
             self.assertNotIn("outside-link", result.content)
-            self.assertEqual(result.metadata and result.metadata["ignored_directories"], 5)
+            self.assertEqual(result.metadata and result.metadata["ignored_directories"], 6)
 
             limited = await ListTreeTool().execute(
                 {"path": ".", "max_depth": 3, "max_entries": 2},
@@ -545,6 +562,660 @@ class FilesystemToolTests(unittest.IsolatedAsyncioTestCase):
                     ToolContext(root),
                 )
 
+    async def test_glob_is_nested_deterministic_bounded_and_gitignore_aware(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as outside:
+            root = _canonical_path(directory)
+            (root / ".git").mkdir()
+            (root / ".gitignore").write_text("ignored/\n*.tmp\n", encoding="utf-8")
+            (root / "src" / "nested").mkdir(parents=True)
+            (root / "src" / "a.py").write_text("a", encoding="utf-8")
+            (root / "src" / "nested" / "b.py").write_text("b", encoding="utf-8")
+            (root / "src" / "scratch.tmp").write_text("tmp", encoding="utf-8")
+            (root / "ignored").mkdir()
+            (root / "ignored" / "hidden.py").write_text("hidden", encoding="utf-8")
+            (root / ".venv").mkdir()
+            (root / ".venv" / "hidden.py").write_text("hidden", encoding="utf-8")
+            if hasattr(os, "symlink"):
+                with suppress(OSError):
+                    (root / "outside-link.py").symlink_to(Path(outside) / "outside.py")
+                    (root / "inside-link").symlink_to(root / "src", target_is_directory=True)
+
+            tracker = PathRecordingTracker(root)
+            result = await GlobTool().execute(
+                {"pattern": "src/**/*.py"},
+                ToolContext(root, instruction_tracker=tracker, skill_tracker=tracker),
+            )
+            self.assertEqual(result.content.splitlines(), ["src/a.py", "src/nested/b.py"])
+            self.assertEqual(result.metadata and result.metadata["count"], 2)
+            self.assertFalse(result.metadata and result.metadata["truncated"])
+            self.assertIn(root, tracker.paths)
+
+            limited = await GlobTool().execute(
+                {"pattern": "**/*.py", "max_results": 1}, ToolContext(root)
+            )
+            self.assertEqual(
+                limited.content, "src/a.py\n[glob truncated: result or output limit reached]"
+            )
+            assert limited.metadata is not None
+            self.assertTrue(limited.metadata["scan_limited"])
+            self.assertGreaterEqual(limited.metadata["ignored_directories"], 2)
+            if (root / "outside-link.py").exists() or (root / "outside-link.py").is_symlink():
+                self.assertGreaterEqual(limited.metadata["ignored_links"], 1)
+            if (root / "inside-link").exists() or (root / "inside-link").is_symlink():
+                with self.assertRaisesRegex(ToolError, "symlinks"):
+                    await GlobTool().execute(
+                        {"pattern": "*.py", "path": "inside-link"}, ToolContext(root)
+                    )
+
+            no_ignore = await GlobTool().execute(
+                {"pattern": "**/*.py", "respect_git_ignore": False}, ToolContext(root)
+            )
+            self.assertIn("ignored/hidden.py", no_ignore.content)
+            with self.assertRaisesRegex(ToolError, "escapes the workspace"):
+                await GlobTool().execute(
+                    {"pattern": "*.py", "path": str(Path(outside))}, ToolContext(root)
+                )
+
+    async def test_glob_supports_additional_workspace_roots_without_local_escape(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as extra:
+            root = _canonical_path(directory)
+            extra_root = _canonical_path(extra)
+            (extra_root / "external.txt").write_text("external", encoding="utf-8")
+            result = await GlobTool().execute(
+                {"pattern": "*.txt", "path": str(extra_root)},
+                ToolContext(root, additional_workspace_roots=(extra_root,)),
+            )
+            self.assertEqual(result.content, str(extra_root / "external.txt"))
+
+    async def test_grep_supports_fixed_case_insensitive_names_and_context_filters(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = _canonical_path(directory)
+            (root / "src").mkdir()
+            (root / "src" / "main.py").write_text(
+                "before\nNeedle\nafter\nneedle again\n", encoding="utf-8"
+            )
+            (root / "src" / "notes.txt").write_text("needle\n", encoding="utf-8")
+            result = await GrepTool().execute(
+                {
+                    "query": "needle",
+                    "path": ".",
+                    "include_globs": ["**/*.py"],
+                    "fixed_strings": True,
+                    "case_sensitive": False,
+                    "before": 1,
+                    "after": 1,
+                    "max_matches_per_file": 1,
+                },
+                ToolContext(root),
+            )
+            self.assertIn("main.py:1:before", result.content)
+            self.assertIn("main.py:2:Needle", result.content)
+            self.assertIn("main.py:3:after", result.content)
+            self.assertNotIn("notes.txt", result.content)
+
+            names = await GrepTool().execute(
+                {"query": "NEEDLE", "names_only": True, "case_sensitive": False},
+                ToolContext(root),
+            )
+            self.assertEqual(names.content.splitlines(), ["src/main.py", "src/notes.txt"])
+
+    async def test_apply_patch_updates_multiple_hunks_and_files_atomically(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = _canonical_path(directory)
+            first = root / "first.txt"
+            second = root / "second.txt"
+            first.write_text("one\ntwo\nthree\nfour\n", encoding="utf-8")
+            second.write_text("old\n", encoding="utf-8")
+            patch = """*** Begin Patch
+*** Update File: first.txt
+@@ -1,2 +1,2 @@ first section
+ one
+-two
++TWO
+@@ -4,1 +4,1 @@
+-four
++FOUR
+*** Update File: second.txt
+@@
+-old
++new
+*** End Patch"""
+            result = await ApplyPatchTool().execute({"patch": patch}, ToolContext(root))
+            self.assertFalse(result.is_error)
+            self.assertEqual(first.read_text(encoding="utf-8"), "one\nTWO\nthree\nFOUR\n")
+            self.assertEqual(second.read_text(encoding="utf-8"), "new\n")
+            self.assertEqual(result.metadata and result.metadata["hunks_applied"], 3)
+            self.assertEqual(
+                result.metadata and result.metadata["changed_files"], ["first.txt", "second.txt"]
+            )
+
+    async def test_apply_patch_supports_add_delete_move_and_rejects_stale_transaction(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = _canonical_path(directory)
+            source = root / "source.txt"
+            doomed = root / "doomed.txt"
+            source.write_text("source\n", encoding="utf-8")
+            doomed.write_text("delete\n", encoding="utf-8")
+            patch = """*** Begin Patch
+*** Update File: source.txt
+*** Move to: moved.txt
+@@
+-source
++moved
+*** Add File: added.txt
++added
+*** Delete File: doomed.txt
+*** End Patch"""
+            result = await ApplyPatchTool().execute({"patch": patch}, ToolContext(root))
+            self.assertEqual((root / "moved.txt").read_text(encoding="utf-8"), "moved\n")
+            self.assertEqual((root / "added.txt").read_text(encoding="utf-8"), "added\n")
+            self.assertFalse(source.exists())
+            self.assertFalse(doomed.exists())
+            self.assertEqual(result.metadata and len(result.metadata["moved_files"]), 1)
+
+            before = (root / "moved.txt").read_text(encoding="utf-8")
+            stale = """*** Begin Patch
+*** Update File: moved.txt
+@@
+-not present
++bad
+*** Add File: never-created.txt
++must not appear
+*** End Patch"""
+            with self.assertRaisesRegex(ToolError, "does not match"):
+                await ApplyPatchTool().execute({"patch": stale}, ToolContext(root))
+            self.assertEqual((root / "moved.txt").read_text(encoding="utf-8"), before)
+            self.assertFalse((root / "never-created.txt").exists())
+
+            pure_move = """*** Begin Patch
+*** Update File: moved.txt
+*** Move to: renamed.txt
+*** End Patch"""
+            await ApplyPatchTool().execute({"patch": pure_move}, ToolContext(root))
+            self.assertFalse((root / "moved.txt").exists())
+            self.assertEqual((root / "renamed.txt").read_text(encoding="utf-8"), "moved\n")
+
+    async def test_apply_patch_rolls_back_if_commit_replace_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = _canonical_path(directory)
+            first = root / "first.txt"
+            second = root / "second.txt"
+            first.write_text("first\n", encoding="utf-8")
+            second.write_text("second\n", encoding="utf-8")
+            patch_text = """*** Begin Patch
+*** Update File: first.txt
+@@
+-first
++changed first
+*** Update File: second.txt
+@@
+-second
++changed second
+*** End Patch"""
+            real_replace = os.replace
+            calls = 0
+
+            def replace_with_one_commit_failure(
+                source: str | bytes, destination: str | bytes
+            ) -> None:
+                nonlocal calls
+                calls += 1
+                if calls == 2:
+                    raise OSError("simulated commit failure")
+                real_replace(source, destination)
+
+            with (
+                patch(
+                    "neuro_code.infrastructure.tools.filesystem.os.replace",
+                    side_effect=replace_with_one_commit_failure,
+                ),
+                self.assertRaisesRegex(ToolError, "rolled back"),
+            ):
+                await ApplyPatchTool().execute({"patch": patch_text}, ToolContext(root))
+
+            self.assertEqual(first.read_text(encoding="utf-8"), "first\n")
+            self.assertEqual(second.read_text(encoding="utf-8"), "second\n")
+            self.assertEqual(list(root.glob("*.patch.tmp")), [])
+
+    async def test_apply_patch_supports_insertion_only_hunks(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = _canonical_path(directory)
+            target = root / "target.txt"
+            target.write_text("first\nsecond\n", encoding="utf-8")
+            patch = """*** Begin Patch
+*** Update File: target.txt
+@@ -2,0 +3,2 @@
++inserted one
++inserted two
+*** End Patch"""
+
+            result = await ApplyPatchTool().execute({"patch": patch}, ToolContext(root))
+
+            self.assertFalse(result.is_error)
+            self.assertEqual(
+                target.read_text(encoding="utf-8"),
+                "first\nsecond\ninserted one\ninserted two\n",
+            )
+            self.assertEqual(result.metadata and result.metadata["hunks_applied"], 1)
+
+    async def test_apply_patch_fails_closed_for_paths_permissions_and_client_capabilities(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as outside:
+            root = _canonical_path(directory)
+            (root / "target.txt").write_text("old\n", encoding="utf-8")
+            update = """*** Begin Patch
+*** Update File: target.txt
+@@
+-old
++new
+*** End Patch"""
+            with self.assertRaisesRegex(ToolError, "prohibits workspace edits"):
+                await ApplyPatchTool().execute(
+                    {"patch": update},
+                    ToolContext(root, sandbox_profile=SandboxProfile.READ_ONLY),
+                )
+            with self.assertRaisesRegex(ToolError, "escapes the workspace"):
+                await ApplyPatchTool().execute(
+                    {"patch": "*** Begin Patch\n*** Add File: ../outside.txt\n+x\n*** End Patch"},
+                    ToolContext(root),
+                )
+            if hasattr(os, "symlink"):
+                with suppress(OSError):
+                    (root / "link").symlink_to(Path(outside), target_is_directory=True)
+                    with self.assertRaisesRegex(ToolError, "symlinks"):
+                        await ApplyPatchTool().execute(
+                            {
+                                "patch": "*** Begin Patch\n*** Add File: link/escaped.txt\n+x\n*** End Patch"
+                            },
+                            ToolContext(root),
+                        )
+
+            target = _canonical_path(directory) / "remote.txt"
+            client = ClientFileSystemFixture(contents={str(target): "old\n"})
+            delegated = await ApplyPatchTool().execute(
+                {"patch": update.replace("target.txt", "remote.txt")},
+                ToolContext(root, client_file_system=client),
+            )
+            self.assertTrue(delegated.metadata and delegated.metadata["client_delegated"])
+            self.assertEqual(client.contents[str(target)], "new\n")
+            with self.assertRaisesRegex(ToolError, "only one-file update"):
+                await ApplyPatchTool().execute(
+                    {"patch": "*** Begin Patch\n*** Add File: remote-new.txt\n+x\n*** End Patch"},
+                    ToolContext(root, client_file_system=client),
+                )
+
+    async def test_filesystem_tools_fail_closed_for_invalid_arguments_and_capabilities(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = _canonical_path(directory)
+            target = root / "target.txt"
+            target.write_text("one\ntwo\nneedle\n", encoding="utf-8")
+            context = ToolContext(root)
+
+            invalid_read_arguments = (
+                {"path": "target.txt", "start_line": "1"},
+                {"path": "target.txt", "max_lines": 0},
+                {"path": "target.txt", "max_lines": 5001},
+                {"path": "target.txt", "start_line": "2"},
+            )
+            for arguments in invalid_read_arguments:
+                with self.subTest(arguments=arguments), self.assertRaises(ToolError):
+                    await ReadFileTool().execute(arguments, context)
+            with self.assertRaisesRegex(ToolError, "not a file"):
+                await ReadFileTool().execute({"path": "."}, context)
+            tiny = await ReadFileTool().execute(
+                {"path": "target.txt"}, ToolContext(root, output_byte_limit=1)
+            )
+            self.assertTrue(tiny.content)
+            self.assertIn("output truncated", tiny.content)
+
+            invalid_batches = (
+                {"files": [{"path": 1}]},
+                {"files": [{"path": "target.txt", "extra": True}]},
+                {"files": [{"path": "target.txt", "start_line": 0}]},
+                {"files": [{"path": "target.txt", "max_lines": 5001}]},
+            )
+            with self.assertRaisesRegex(ToolError, "files must be an array"):
+                await ReadFilesTool().execute({"files": "target.txt"}, context)
+            for batch_arguments in invalid_batches:
+                with self.subTest(arguments=batch_arguments):
+                    result = await ReadFilesTool().execute(batch_arguments, context)
+                    self.assertTrue(result.is_error)
+            missing = await ReadFilesTool().execute({"files": [{"path": "missing.txt"}]}, context)
+            self.assertTrue(missing.is_error)
+            self.assertIn("missing.txt", missing.content)
+
+            for tool, tool_arguments in (
+                (ListDirTool(), {"path": 1}),
+                (ListDirTool(), {"path": "target.txt"}),
+                (ListTreeTool(), {"path": 1}),
+                (ListTreeTool(), {"path": "target.txt"}),
+                (ListTreeTool(), {"path": ".", "respect_git_ignore": "yes"}),
+                (ListTreeTool(), {"path": ".", "max_depth": 0}),
+                (GlobTool(), {"pattern": "*.txt", "path": 1}),
+                (GlobTool(), {"pattern": "*.txt", "case_sensitive": "yes"}),
+                (GlobTool(), {"pattern": "*.txt", "respect_git_ignore": "yes"}),
+                (GrepTool(), {"query": "needle", "path": 1}),
+                (GrepTool(), {"query": "needle", "fixed_strings": "yes"}),
+                (GrepManyTool(), {"queries": ["needle"], "path": 1}),
+            ):
+                with (
+                    self.subTest(tool=type(tool).__name__, arguments=tool_arguments),
+                    self.assertRaises(ToolError),
+                ):
+                    await tool.execute(tool_arguments, context)
+
+            with self.assertRaisesRegex(ToolError, "at most"):
+                await GlobTool().execute({"pattern": "x" * 501}, context)
+            with self.assertRaises(ToolError):
+                await GlobTool().execute({"pattern": "*.txt", "max_results": 0}, context)
+            with self.assertRaisesRegex(ToolError, "invalid regular expression"):
+                await GrepTool().execute({"query": "["}, context)
+            with self.assertRaises(ToolError):
+                await GrepTool().execute({"query": "needle", "before": 21}, context)
+            with self.assertRaises(ToolError):
+                await GrepManyTool().execute(
+                    {"queries": ["needle"], "max_total_results": 0}, context
+                )
+
+            client = ClientFileSystemFixture(supports_read=False)
+            with self.assertRaisesRegex(ToolError, "directory discovery"):
+                await ListDirTool().execute({}, ToolContext(root, client_file_system=client))
+            with self.assertRaisesRegex(ToolError, "directory enumeration"):
+                await ListTreeTool().execute({}, ToolContext(root, client_file_system=client))
+            with self.assertRaisesRegex(ToolError, "directory enumeration"):
+                await GlobTool().execute(
+                    {"pattern": "*.txt"}, ToolContext(root, client_file_system=client)
+                )
+
+    async def test_filesystem_scanner_handles_file_roots_limits_and_unreadable_files(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = _canonical_path(directory)
+            target = root / "target.txt"
+            target.write_text("Needle\nsecond\n", encoding="utf-8")
+            (root / "binary.dat").write_bytes(bytes([0x80, 0x81]))
+
+            glob_file = await GlobTool().execute(
+                {"pattern": "target.txt", "path": "target.txt"}, ToolContext(root)
+            )
+            self.assertEqual(glob_file.content, "target.txt")
+            grep_file = await GrepTool().execute(
+                {"query": "needle", "path": "target.txt", "case_sensitive": False},
+                ToolContext(root),
+            )
+            self.assertIn("target.txt:1:Needle", grep_file.content)
+            many = await GrepManyTool().execute(
+                {"queries": ["needle", "missing"], "path": "."}, ToolContext(root)
+            )
+            self.assertIn("unreadable_files", str(many.metadata))
+            assert many.metadata is not None
+            self.assertGreaterEqual(many.metadata["unreadable_files"], 1)
+
+            with patch("neuro_code.infrastructure.tools.filesystem.MAX_FILE_SCAN_ENTRIES", 1):
+                limited = await GrepTool().execute(
+                    {"query": "Needle", "path": "."}, ToolContext(root)
+                )
+            self.assertTrue(limited.metadata and limited.metadata["scan_limited"])
+
+    async def test_apply_patch_parser_and_validation_reject_invalid_transactions(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = _canonical_path(directory)
+            target = root / "target.txt"
+            target.write_text("old\n", encoding="utf-8")
+            malformed_patches = (
+                "not a patch",
+                "*** Begin Patch\n*** Add File: missing-end.txt\n+x",
+                "*** Begin Patch\n*** End Patch\ntrailing",
+                "*** Begin Patch\nbogus\n*** End Patch",
+                "*** Begin Patch\n*** Add File: \n+x\n*** End Patch",
+                "*** Begin Patch\n*** Add File: bad.txt\ncontent\n*** End Patch",
+                "*** Begin Patch\n*** Delete File: target.txt\n+unexpected\n*** End Patch",
+                "*** Begin Patch\n*** Update File: target.txt\nnot-a-hunk\n*** End Patch",
+                "*** Begin Patch\n*** Update File: target.txt\n@@ bad\n-old\n+new\n*** End Patch",
+                "*** Begin Patch\n*** Update File: target.txt\n@@\n*** End Patch",
+                "*** Begin Patch\n*** Update File: target.txt\n@@\n\\ No newline at end of file\n*** End Patch",
+                "*** Begin Patch\n*** Update File: target.txt\n@@\n?bad\n*** End Patch",
+                "*** Begin Patch\n*** Update File: target.txt\n*** End Patch",
+                "*** Begin Patch\n*** End Patch",
+            )
+            for patch_text in malformed_patches:
+                with self.subTest(patch=patch_text), self.assertRaises(ToolError):
+                    await ApplyPatchTool().execute({"patch": patch_text}, ToolContext(root))
+            with (
+                patch("neuro_code.infrastructure.tools.filesystem.MAX_APPLY_PATCH_BYTES", 1),
+                self.assertRaisesRegex(ToolError, "at most"),
+            ):
+                await ApplyPatchTool().execute(
+                    {"patch": "*** Begin Patch\n*** End Patch"}, ToolContext(root)
+                )
+            with patch("neuro_code.infrastructure.tools.filesystem.MAX_APPLY_PATCH_FILE_BYTES", 1):
+                oversized = (
+                    "*** Begin Patch\n*** Update File: target.txt\n@@\n-old\n+new\n*** End Patch"
+                )
+                with self.assertRaisesRegex(ToolError, "exceeds"):
+                    await ApplyPatchTool().execute({"patch": oversized}, ToolContext(root))
+
+            invalid_targets = (
+                "*** Begin Patch\n*** Add File: target.txt\n+x\n*** End Patch",
+                "*** Begin Patch\n*** Update File: missing.txt\n@@\n-old\n+new\n*** End Patch",
+                "*** Begin Patch\n*** Update File: target.txt\n*** Move to: target.txt\n*** End Patch",
+                "*** Begin Patch\n*** Update File: target.txt\n*** Move to: target.txt\n*** End Patch",
+                "*** Begin Patch\n*** Add File: missing/child.txt\n+x\n*** End Patch",
+            )
+            for patch_text in invalid_targets:
+                with self.subTest(patch=patch_text), self.assertRaises(ToolError):
+                    await ApplyPatchTool().execute({"patch": patch_text}, ToolContext(root))
+            self.assertEqual(target.read_text(encoding="utf-8"), "old\n")
+
+    async def test_filesystem_gitignore_variants_and_bounded_outputs(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = _canonical_path(directory)
+            (root / ".git").mkdir()
+            (root / ".gitignore").write_text(
+                "# comment\n\n/*.ignored\n!keep.ignored\n!\n", encoding="utf-8"
+            )
+            (root / "one.txt").write_text("one", encoding="utf-8")
+            (root / "two.txt").write_text("two", encoding="utf-8")
+            (root / "drop.ignored").write_text("drop", encoding="utf-8")
+            (root / "keep.ignored").write_text("keep", encoding="utf-8")
+            ignored_link = root / ".gitignore-link"
+            if hasattr(os, "symlink"):
+                with suppress(OSError):
+                    ignored_link.symlink_to(root / ".gitignore")
+
+            case_insensitive = await GlobTool().execute(
+                {"pattern": "./*.TXT", "case_sensitive": False}, ToolContext(root)
+            )
+            self.assertEqual(case_insensitive.content.splitlines(), ["one.txt", "two.txt"])
+            ignored = await GlobTool().execute({"pattern": "*.ignored"}, ToolContext(root))
+            self.assertNotIn("drop.ignored", ignored.content)
+            self.assertIn("keep.ignored", ignored.content)
+            with self.assertRaises(ToolError):
+                await ListTreeTool().execute(
+                    {"path": ".", "respect_git_ignore": True, "max_entries": 0},
+                    ToolContext(root),
+                )
+            tiny = await GlobTool().execute(
+                {"pattern": "*.txt", "max_results": 1},
+                ToolContext(root, output_byte_limit=1),
+            )
+            self.assertTrue(tiny.metadata and tiny.metadata["truncated"])
+            with self.assertRaises(ToolError):
+                await GlobTool().execute(
+                    {"pattern": "*.txt", "max_results": 1},
+                    ToolContext(root, output_byte_limit=0),
+                )
+
+    async def test_grep_limits_and_client_batch_failures_are_explicit(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = _canonical_path(directory)
+            target = root / "target.txt"
+            target.write_text("needle\nneedle\nneedle\n", encoding="utf-8")
+            (root / "second.txt").write_text("needle\n", encoding="utf-8")
+            fixed = await GrepTool().execute(
+                {"query": "needle", "fixed_strings": True}, ToolContext(root)
+            )
+            assert fixed.metadata is not None
+            self.assertGreaterEqual(int(fixed.metadata["count"]), 3)
+            limited = await GrepTool().execute(
+                {"query": "needle", "max_total_results": 1}, ToolContext(root)
+            )
+            self.assertTrue(limited.metadata and limited.metadata["result_limited"])
+            many_limited = await GrepManyTool().execute(
+                {"queries": ["needle"], "max_results_per_query": 1}, ToolContext(root)
+            )
+            self.assertEqual(many_limited.metadata and many_limited.metadata["match_count"], 1)
+            with patch("neuro_code.infrastructure.tools.filesystem.MAX_FILE_SCAN_ENTRIES", 1):
+                many_scan_limited = await GrepManyTool().execute(
+                    {"queries": ["needle"]}, ToolContext(root)
+                )
+            self.assertTrue(
+                many_scan_limited.metadata and many_scan_limited.metadata["scan_limited"]
+            )
+
+            client = ClientFileSystemFixture(supports_read=False)
+            result = await ReadFilesTool().execute(
+                {"files": [{"path": "target.txt"}]},
+                ToolContext(root, client_file_system=client),
+            )
+            self.assertTrue(result.is_error)
+            self.assertIn("does not support text-file reads", result.content)
+
+            class FailingClient(ClientFileSystemFixture):
+                fail_read = True
+
+                async def read_text_file(
+                    self,
+                    path: Path,
+                    /,
+                    *,
+                    line: int | None = None,
+                    limit: int | None = None,
+                ) -> str:
+                    del line, limit
+                    if self.fail_read:
+                        raise RuntimeError("read failed")
+                    return self.contents[str(path)]
+
+                async def write_text_file(self, path: Path, content: str, /) -> None:
+                    del path, content
+                    raise RuntimeError("write failed")
+
+            failing = FailingClient(contents={str(root / "target.txt"): "needle\n"})
+            patch_text = (
+                "*** Begin Patch\n*** Update File: target.txt\n@@\n-needle\n+changed\n*** End Patch"
+            )
+            with self.assertRaisesRegex(ToolError, "could not read"):
+                await ApplyPatchTool().execute(
+                    {"patch": patch_text}, ToolContext(root, client_file_system=failing)
+                )
+            failing.supports_read = True
+            failing.fail_read = False
+            with self.assertRaisesRegex(ToolError, "could not write"):
+                await ApplyPatchTool().execute(
+                    {"patch": patch_text}, ToolContext(root, client_file_system=failing)
+                )
+
+    async def test_structured_write_validation_preflight_and_replace_errors(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as extra:
+            root = _canonical_path(directory)
+            target = root / "target.txt"
+            target.write_text("old\n", encoding="utf-8")
+            destination = root / "destination.txt"
+            destination.write_text("already here\n", encoding="utf-8")
+            binary = root / "binary.txt"
+            binary.write_bytes(bytes([0x80, 0x81]))
+            extra_target = _canonical_path(extra) / "external.txt"
+            extra_target.write_text("old\n", encoding="utf-8")
+            update = "*** Begin Patch\n*** Update File: target.txt\n@@\n-old\n+new\n*** End Patch"
+
+            with self.assertRaisesRegex(ToolError, "only read access"):
+                await ApplyPatchTool().execute(
+                    {"patch": update.replace("target.txt", str(extra_target))},
+                    ToolContext(
+                        root,
+                        additional_workspace_roots=(_canonical_path(extra),),
+                        sandbox_profile=SandboxProfile.WORKSPACE,
+                    ),
+                )
+            with self.assertRaisesRegex(ToolError, "move destination already exists"):
+                await ApplyPatchTool().execute(
+                    {
+                        "patch": "*** Begin Patch\n*** Update File: target.txt\n*** Move to: destination.txt\n*** End Patch"
+                    },
+                    ToolContext(root),
+                )
+            with self.assertRaisesRegex(ToolError, "not a file"):
+                await ApplyPatchTool().execute(
+                    {"patch": "*** Begin Patch\n*** Update File: .\n@@\n-old\n+new\n*** End Patch"},
+                    ToolContext(root),
+                )
+            with self.assertRaisesRegex(ToolError, "not a directory"):
+                await ApplyPatchTool().execute(
+                    {
+                        "patch": "*** Begin Patch\n*** Add File: missing/child.txt\n+x\n*** End Patch"
+                    },
+                    ToolContext(root),
+                )
+            with self.assertRaisesRegex(ToolError, "not UTF-8"):
+                await ApplyPatchTool().execute(
+                    {
+                        "patch": "*** Begin Patch\n*** Update File: binary.txt\n@@\n-old\n+new\n*** End Patch"
+                    },
+                    ToolContext(root),
+                )
+
+            class BlockingTracker:
+                def __init__(self) -> None:
+                    self.paths: list[Path] = []
+
+                def check_path(self, path: Path) -> None:
+                    del path
+
+                def check_path_for_write(self, path: Path) -> object:
+                    self.paths.append(path)
+
+                    class Discovery:
+                        @staticmethod
+                        def model_context_text() -> str:
+                            return "review the project instructions first"
+
+                    return Discovery()
+
+            blocked = await ApplyPatchTool().execute(
+                {"patch": update},
+                ToolContext(
+                    root,
+                    instruction_tracker=cast(InstructionContextTracker, BlockingTracker()),
+                ),
+            )
+            self.assertTrue(blocked.is_error)
+            self.assertEqual(target.read_text(encoding="utf-8"), "old\n")
+
+            for arguments in (
+                {"path": "target.txt", "old": "old", "new": 1},
+                {"path": "target.txt", "old": "old", "new": "new", "replace_all": 1},
+                {"path": ".", "old": "old", "new": "new"},
+                {"path": "target.txt", "old": "missing", "new": "new"},
+            ):
+                with self.subTest(arguments=arguments), self.assertRaises(ToolError):
+                    await SearchReplaceTool().execute(arguments, ToolContext(root))
+
+            with (
+                patch(
+                    "neuro_code.infrastructure.tools.filesystem.os.replace",
+                    side_effect=OSError("replace failed"),
+                ),
+                self.assertRaises(OSError),
+            ):
+                await SearchReplaceTool().execute(
+                    {"path": "target.txt", "old": "old", "new": "new"},
+                    ToolContext(root),
+                )
+            self.assertEqual(list(root.glob("*.tmp")), [])
+
     def test_default_registry_exposes_bounded_batch_read_only_tools(self) -> None:
         registry = default_tool_registry(SandboxProfile.READ_ONLY)
 
@@ -554,8 +1225,10 @@ class FilesystemToolTests(unittest.IsolatedAsyncioTestCase):
                 "read_files",
                 "list_dir",
                 "list_tree",
+                "glob",
                 "grep",
                 "grep_many",
+                "workspace_diff",
             }.issubset(registry.names())
         )
         for name in ("read_files", "list_tree", "grep_many"):
@@ -563,6 +1236,10 @@ class FilesystemToolTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNotNone(tool)
             assert tool is not None
             self.assertFalse(tool.side_effecting)
+
+    def test_default_registry_exposes_patch_only_when_workspace_is_writable(self) -> None:
+        self.assertIn("apply_patch", default_tool_registry(SandboxProfile.OFF).names())
+        self.assertNotIn("apply_patch", default_tool_registry(SandboxProfile.READ_ONLY).names())
 
 
 class PlanToolTests(unittest.IsolatedAsyncioTestCase):

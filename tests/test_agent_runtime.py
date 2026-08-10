@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import os
 import sys
 import tempfile
@@ -70,9 +72,11 @@ from neuro_code.domain.conversation.events import (
     ModelBackendToolStarted,
     ModelCompleted,
     ModelEvent,
+    ModelInputTokenSemantics,
     ModelReasoningDelta,
     ModelTextDelta,
     ModelToolCall,
+    ModelUsage,
 )
 from neuro_code.domain.conversation.interaction_mode import InteractionMode
 from neuro_code.domain.conversation.messages import (
@@ -103,10 +107,23 @@ from neuro_code.domain.plans import PlanComment, PlanStep, PlanStepStatus, Sessi
 from neuro_code.domain.sandbox import SandboxProfile
 from neuro_code.domain.session_tasks import SessionTask, SessionTaskKind, SessionTaskStatus
 from neuro_code.domain.tools import ToolDefinition, ToolResult
+from neuro_code.domain.workspace.instructions import (
+    InstructionDiscoveryResult,
+    InstructionFile,
+    compute_instruction_fingerprint,
+)
+from neuro_code.domain.workspace.skills import (
+    SkillDiscoveryResult,
+    SkillInfo,
+    SkillScope,
+    compute_skill_fingerprint,
+)
 from neuro_code.infrastructure.background_tasks import LocalBackgroundTaskManager
 from neuro_code.infrastructure.persistence.sqlite_session import SqliteSessionStore
 from neuro_code.infrastructure.providers.failover import FailoverModelProvider, ProviderCandidate
+from neuro_code.infrastructure.providers.openai_compatible import OpenAICompatibleProvider
 from neuro_code.infrastructure.tools.background_tasks import TaskOutputTool
+from neuro_code.infrastructure.tools.plans import UpdatePlanTool
 from neuro_code.infrastructure.tools.registry import ToolRegistry, default_tool_registry
 from neuro_code.infrastructure.workspace.changes import FilesystemWorkspaceChangeObserver
 from neuro_code.shared.errors import ConfigurationError, ProviderError
@@ -138,6 +155,35 @@ class ScriptedProvider:
         for event in script:
             if isinstance(event, BaseException):
                 raise event
+            yield event
+
+
+class WireCapturingScriptedProvider(ScriptedProvider):
+    """Scripted provider that records the production OpenAI wire payload.
+
+    使用真实 OpenAI-compatible 序列化器记录请求体的脚本 Provider。
+    """
+
+    def __init__(self, scripts: Sequence[Sequence[ModelEvent | BaseException]]) -> None:
+        super().__init__(scripts)
+        self.request_bodies: list[dict[str, object]] = []
+        self._wire_provider = OpenAICompatibleProvider(
+            model=self.model_name,
+            base_url="https://provider.invalid",
+            api_key="fixture",
+        )
+
+    async def stream(
+        self,
+        context: ModelContext,
+        tools: Sequence[ToolDefinition],
+        *,
+        tool_policy: ModelToolPolicy = ModelToolPolicy.ALLOWED,
+    ) -> AsyncIterator[ModelEvent]:
+        self.request_bodies.append(
+            self._wire_provider._request_body(context, tools, tool_policy=tool_policy)
+        )
+        async for event in super().stream(context, tools, tool_policy=tool_policy):
             yield event
 
 
@@ -607,30 +653,16 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
 
         for used, expected in expectations:
             with self.subTest(used=used):
-                builder = ContextBuilder(
-                    reasoning_effort=ReasoningEffort.MEDIUM,
-                    interaction_mode=InteractionMode.NORMAL,
-                    plan=None,
-                    instruction_provider=None,
-                    skill_provider=None,
+                usage = ExecutionBudgetUsage(
+                    budget,
+                    ExecutionCounters(model_requests=used),
+                    elapsed_seconds=0,
                 )
-                builder.set_runtime_budget_usage(
-                    ExecutionBudgetUsage(
-                        budget,
-                        ExecutionCounters(model_requests=used),
-                        elapsed_seconds=0,
-                    )
-                )
-
-                rendered = builder.build((Message(Role.SYSTEM, "system"),))
-
-                guidance = next(
-                    item
-                    for item in rendered
-                    if isinstance(item, Message)
-                    and item.synthetic_reason is SyntheticReason.RUNTIME_BUDGET
-                )
+                guidance = ContextBuilder.budget_runtime_message(usage)
+                assert guidance is not None
                 self.assertIn(expected, guidance.content)
+                self.assertNotIn("remaining", guidance.content.lower())
+                self.assertNotIn(str(used), guidance.content)
 
     async def test_default_supervisor_model_budget_tracks_configured_max_steps(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -674,7 +706,8 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("multiple read-only operations are independent", request_system.content)
         self.assertIn("list_tree, grep_many, and read_files", request_system.content)
         self.assertIn("batch-read the related evidence", request_system.content)
-        self.assertIn("Keep operations sequential", request_system.content)
+        self.assertIn("workspace_diff before verification", request_system.content)
+        self.assertIn("dependent operations sequential", request_system.content)
         self.assertNotIn("multiple read-only operations are independent", persisted_system.content)
 
     async def test_controlled_runtime_projects_budget_guidance_and_typed_telemetry(self) -> None:
@@ -697,13 +730,12 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
 
         result = await runtime.run("inspect the repository")
 
-        guidance = next(
-            message
-            for message in provider.calls[0].messages
-            if message.synthetic_reason is SyntheticReason.RUNTIME_BUDGET
+        self.assertFalse(
+            any(
+                message.synthetic_reason is SyntheticReason.RUNTIME_BUDGET
+                for message in provider.calls[0].messages
+            )
         )
-        self.assertIn("Model calls remaining: 9/10", guidance.content)
-        self.assertIn("Tool rounds remaining: 10/10", guidance.content)
         budget_events = [
             event
             for event in result.events
@@ -719,6 +751,276 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 for item in result.items
             )
         )
+
+    async def test_runtime_context_keeps_a_stable_prefix_and_appends_budget_pressure(
+        self,
+    ) -> None:
+        """A budget transition must extend, rather than rewrite, prior requests.
+
+        预算压力转换必须扩展而非改写先前请求。
+        """
+
+        provider = ScriptedProvider(
+            (
+                (
+                    ModelToolCall(ToolCall("inspect-1", "inspect", {"scope": "one"})),
+                    ModelCompleted("tool_calls"),
+                ),
+                (
+                    ModelToolCall(ToolCall("inspect-2", "inspect", {"scope": "two"})),
+                    ModelCompleted("tool_calls"),
+                ),
+                (ModelTextDelta("done"), ModelCompleted("stop")),
+            )
+        )
+        runtime = AgentRuntime(
+            provider=provider,
+            tools=MinimalToolCollection((IncrementingEvidenceFixtureTool("inspect", "evidence"),)),
+            workspace_change_observer=EmptyWorkspaceChangeObserver(),
+            permissions=PermissionManager(),
+            tool_context=ToolContext(Path("/workspace")),
+            execution_budget=observation_budget(
+                max_model_calls=4,
+                max_tool_rounds=4,
+                max_tool_calls=16,
+                max_calls_per_tool=4,
+            ),
+            execution_control_mode=ExecutionControlMode.FINALIZE_TERMINAL,
+        )
+
+        result = await runtime.run("inspect the repository")
+
+        self.assertEqual(result.response, "done")
+        self.assertEqual(len(provider.calls), 3)
+        self.assertEqual(
+            provider.calls[0].items,
+            provider.calls[1].items[: len(provider.calls[0].items)],
+        )
+        self.assertEqual(
+            provider.calls[1].items,
+            provider.calls[2].items[: len(provider.calls[1].items)],
+        )
+        notices = tuple(
+            message
+            for message in provider.calls[2].messages
+            if message.synthetic_reason is SyntheticReason.RUNTIME_BUDGET
+        )
+        self.assertEqual(len(notices), 1)
+        self.assertIn("conserve", notices[0].content)
+        self.assertNotIn("remaining", notices[0].content.lower())
+        self.assertNotIn("3/4", notices[0].content)
+        self.assertFalse(
+            any(
+                isinstance(item, Message)
+                and item.synthetic_reason is SyntheticReason.RUNTIME_BUDGET
+                for item in result.items
+            )
+        )
+
+    async def test_openai_wire_payload_keeps_stable_prefix_through_plan_revisions(
+        self,
+    ) -> None:
+        """The final provider payload must only append model-visible state.
+
+        最终 Provider 请求体只能追加模型可见状态,不能改写已发送前缀。
+        """
+
+        def plan_arguments(
+            explanation: str,
+            statuses: tuple[str, str],
+        ) -> dict[str, object]:
+            return {
+                "explanation": explanation,
+                "plan": [
+                    {"step": "Inspect the repository", "status": statuses[0]},
+                    {"step": "Summarize the evidence", "status": statuses[1]},
+                ],
+            }
+
+        def fingerprint(value: object) -> str:
+            rendered = json.dumps(
+                value,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            return hashlib.sha256(rendered.encode("utf-8")).hexdigest()
+
+        def payload_messages(body: dict[str, object]) -> list[dict[str, object]]:
+            messages = body["messages"]
+            assert isinstance(messages, list)
+            return cast(list[dict[str, object]], messages)
+
+        def plan_notices(messages: Sequence[dict[str, object]]) -> tuple[str, ...]:
+            return tuple(
+                content
+                for message in messages
+                if isinstance((content := message.get("content")), str)
+                and content.startswith("Runtime plan update:")
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = SqliteSessionStore(root / "sessions.db")
+            await store.initialize()
+            instruction_files = (InstructionFile("AGENTS.md", "Use evidence.", 0),)
+            skill_files = (
+                SkillInfo(
+                    name="repository-review",
+                    description="Review repository evidence.",
+                    when_to_use="reviewing a repository",
+                    relative_path="skills/repository-review/SKILL.md",
+                    scope=SkillScope.REPO,
+                    depth=0,
+                ),
+            )
+            instructions = InstructionDiscoveryResult(
+                instruction_files,
+                (),
+                compute_instruction_fingerprint(instruction_files),
+            )
+            skills = SkillDiscoveryResult(
+                skill_files,
+                (),
+                compute_skill_fingerprint(skill_files),
+            )
+            provider = WireCapturingScriptedProvider(
+                (
+                    (
+                        ModelToolCall(
+                            ToolCall(
+                                "plan-1",
+                                "update_plan",
+                                plan_arguments(
+                                    "Start with repository inspection.",
+                                    ("in_progress", "pending"),
+                                ),
+                            )
+                        ),
+                        ModelCompleted("tool_calls"),
+                    ),
+                    (
+                        ModelToolCall(
+                            ToolCall(
+                                "plan-2",
+                                "update_plan",
+                                plan_arguments(
+                                    "Inspection is complete; synthesize it.",
+                                    ("completed", "in_progress"),
+                                ),
+                            )
+                        ),
+                        ModelCompleted("tool_calls"),
+                    ),
+                    (ModelTextDelta("Final answer."), ModelCompleted("stop")),
+                )
+            )
+            runtime = AgentRuntime(
+                provider=provider,
+                tools=MinimalToolCollection((UpdatePlanTool(),)),
+                workspace_change_observer=EmptyWorkspaceChangeObserver(),
+                permissions=PermissionManager(),
+                tool_context=ToolContext(root),
+                session_store=store,
+                instruction_provider=lambda: instructions,
+                skill_provider=lambda: skills,
+            )
+
+            result = await runtime.run("Analyze the repository")
+
+        self.assertEqual(result.response, "Final answer.")
+        self.assertEqual(len(provider.request_bodies), 3)
+        first, second, third = provider.request_bodies
+        first_messages = payload_messages(first)
+        second_messages = payload_messages(second)
+        third_messages = payload_messages(third)
+
+        # Verify the serialised wire payload, not only the ModelContext.
+        self.assertEqual(first_messages, second_messages[: len(first_messages)])
+        self.assertEqual(second_messages, third_messages[: len(second_messages)])
+        self.assertEqual(fingerprint(first["tools"]), fingerprint(second["tools"]))
+        self.assertEqual(fingerprint(second["tools"]), fingerprint(third["tools"]))
+        self.assertEqual(fingerprint(first_messages[0]), fingerprint(second_messages[0]))
+        self.assertEqual(fingerprint(second_messages[0]), fingerprint(third_messages[0]))
+        self.assertEqual(fingerprint(first_messages[1]), fingerprint(second_messages[1]))
+        self.assertEqual(fingerprint(second_messages[1]), fingerprint(third_messages[1]))
+        self.assertEqual(fingerprint(first_messages[2]), fingerprint(second_messages[2]))
+        self.assertEqual(fingerprint(second_messages[2]), fingerprint(third_messages[2]))
+
+        first_plan_notices = plan_notices(first_messages)
+        second_plan_notices = plan_notices(second_messages)
+        third_plan_notices = plan_notices(third_messages)
+        self.assertEqual(first_plan_notices, ())
+        self.assertEqual(len(second_plan_notices), 1)
+        self.assertIn("Start with repository inspection.", second_plan_notices[0])
+        self.assertEqual(third_plan_notices[:1], second_plan_notices)
+        self.assertEqual(len(third_plan_notices), 2)
+        self.assertIn("Inspection is complete; synthesize it.", third_plan_notices[1])
+        self.assertFalse(
+            any(
+                isinstance(item, Message) and item.synthetic_reason is not None
+                for item in result.items
+            )
+        )
+
+    async def test_budget_pressure_wire_notices_are_transition_only_and_append_only(
+        self,
+    ) -> None:
+        """Budget pressure changes must extend the final provider payload.
+
+        预算压力变化必须只扩展最终 Provider 请求体.
+        """
+
+        def budget_notices(body: dict[str, object]) -> tuple[str, ...]:
+            messages = body["messages"]
+            assert isinstance(messages, list)
+            return tuple(
+                content
+                for message in cast(list[dict[str, object]], messages)
+                if isinstance((content := message.get("content")), str)
+                and content.startswith("Runtime budget guidance")
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            tool = IncrementingEvidenceFixtureTool("inspect", "new evidence")
+            scripts: list[tuple[ModelEvent | BaseException, ...]] = [
+                (
+                    ModelToolCall(ToolCall(f"inspect-{index}", "inspect", {"path": f"{index}.py"})),
+                    ModelCompleted("tool_calls"),
+                )
+                for index in range(1, 20)
+            ]
+            scripts.append((ModelTextDelta("done"), ModelCompleted("stop")))
+            provider = WireCapturingScriptedProvider(scripts)
+            runtime = AgentRuntime(
+                provider=provider,
+                tools=MinimalToolCollection((tool,)),
+                workspace_change_observer=EmptyWorkspaceChangeObserver(),
+                permissions=PermissionManager(),
+                tool_context=ToolContext(Path(directory)),
+                execution_budget=observation_budget(
+                    max_model_calls=20,
+                    max_tool_rounds=20,
+                    max_tool_calls=80,
+                    max_calls_per_tool=20,
+                ),
+                execution_control_mode=ExecutionControlMode.FINALIZE_TERMINAL,
+            )
+
+            result = await runtime.run("inspect all repository evidence")
+
+        self.assertEqual(result.response, "done")
+        self.assertEqual(len(provider.request_bodies), 20)
+        previous: tuple[str, ...] = ()
+        for body in provider.request_bodies:
+            notices = budget_notices(body)
+            self.assertEqual(previous, notices[: len(previous)])
+            previous = notices
+        self.assertEqual(len(previous), 3)
+        self.assertIn("conserve", previous[0])
+        self.assertIn("focus", previous[1])
+        self.assertIn("final_stage", previous[2])
+        self.assertTrue(all("remaining" not in notice.lower() for notice in previous))
 
     async def test_observe_only_does_not_inject_or_emit_budget_guidance(self) -> None:
         provider = ScriptedProvider(((ModelTextDelta("done"), ModelCompleted("stop")),))
@@ -789,7 +1091,7 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 provider_context_window=ProviderContextWindow(
                     "scripted",
                     "fixture-model",
-                    600,
+                    500,
                     "profile-v1:scripted",
                 ),
             )
@@ -878,7 +1180,7 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 provider_context_window=ProviderContextWindow(
                     "scripted",
                     "fixture-model",
-                    600,
+                    500,
                     "profile-v1:scripted",
                 ),
             )
@@ -938,7 +1240,7 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
                         fallback.model_name,
                         fallback.context_affinity,
                         lambda: fallback,
-                        context_window_tokens=600,
+                        context_window_tokens=500,
                     ),
                 )
             )
@@ -1045,7 +1347,7 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 provider_context_window=ProviderContextWindow(
                     "scripted",
                     "fixture-model",
-                    500,
+                    400,
                     "profile-v1:scripted",
                 ),
             )
@@ -1082,10 +1384,10 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 ModelToolCall(ToolCall(f"inspect-{index}", "inspect", {})),
                 ModelCompleted("tool_calls"),
             )
-            for index in range(1, 25)
+            for index in range(1, 26)
         ]
         scripts.append((ModelTextDelta("completed analysis"), ModelCompleted("stop")))
-        provider = ScriptedProvider(tuple(scripts))
+        provider = WireCapturingScriptedProvider(tuple(scripts))
         budget = observation_budget(
             max_model_calls=33,
             max_tool_rounds=33,
@@ -1105,8 +1407,8 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
         result = await runtime.run("perform a long evidence-backed analysis")
 
         self.assertEqual(result.response, "completed analysis")
-        self.assertEqual(result.steps, 25)
-        self.assertEqual(len(tool.calls), 24)
+        self.assertEqual(result.steps, 26)
+        self.assertEqual(len(tool.calls), 25)
         checkpoints = [
             event
             for event in result.events
@@ -1121,6 +1423,26 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
             if message.synthetic_reason is SyntheticReason.RUNTIME_CHECKPOINT
         )
         self.assertIn("Continue the same user task", next_request_guidance.content)
+        subsequent_request_guidance = next(
+            message
+            for message in provider.calls[25].messages
+            if message.synthetic_reason is SyntheticReason.RUNTIME_CHECKPOINT
+        )
+        self.assertEqual(subsequent_request_guidance.content, next_request_guidance.content)
+
+        def checkpoint_notices(body: dict[str, object]) -> tuple[str, ...]:
+            messages = body["messages"]
+            assert isinstance(messages, list)
+            return tuple(
+                content
+                for message in cast(list[dict[str, object]], messages)
+                if isinstance((content := message.get("content")), str)
+                and content.startswith("Runtime segment checkpoint:")
+            )
+
+        checkpoint_request = checkpoint_notices(provider.request_bodies[24])
+        subsequent_request = checkpoint_notices(provider.request_bodies[25])
+        self.assertEqual(checkpoint_request, subsequent_request[: len(checkpoint_request)])
         self.assertFalse(
             any(
                 isinstance(item, Message)
@@ -1134,7 +1456,7 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
             if event.kind is AgentEventKind.EXECUTION_BUDGET_UPDATED
         )
         self.assertEqual(latest_budget.data["model_calls_limit"], 33)
-        self.assertEqual(latest_budget.data["model_calls_used"], 25)
+        self.assertEqual(latest_budget.data["model_calls_used"], 26)
 
     async def test_repository_analysis_uses_bounded_batch_tools_without_one_round_per_file(
         self,
@@ -1228,7 +1550,7 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 "inspect",
                 ("same evidence", "same evidence", "same evidence", "new evidence"),
             )
-            provider = ScriptedProvider(
+            provider = WireCapturingScriptedProvider(
                 (
                     (
                         ModelToolCall(ToolCall("inspect-1", "inspect", {"path": "same.py"})),
@@ -1268,12 +1590,30 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(len(guided_messages), 1)
         self.assertIn("Change strategy", guided_messages[0].content)
-        self.assertFalse(
-            any(
-                message.synthetic_reason is SyntheticReason.RUNTIME_SUPERVISION
-                for message in provider.calls[4].messages
-            )
+        resolved_messages = tuple(
+            message
+            for message in provider.calls[4].messages
+            if message.synthetic_reason is SyntheticReason.RUNTIME_SUPERVISION
         )
+        self.assertEqual(len(resolved_messages), 2)
+        self.assertIn("New evidence has been recorded", resolved_messages[-1].content)
+
+        def supervision_notices(body: dict[str, object]) -> tuple[str, ...]:
+            messages = body["messages"]
+            assert isinstance(messages, list)
+            return tuple(
+                content
+                for message in cast(list[dict[str, object]], messages)
+                if isinstance((content := message.get("content")), str)
+                and content.startswith("Runtime supervision")
+            )
+
+        replan_request = supervision_notices(provider.request_bodies[3])
+        resolved_request = supervision_notices(provider.request_bodies[4])
+        self.assertEqual(replan_request, resolved_request[: len(replan_request)])
+        self.assertEqual(len(resolved_request), 2)
+        self.assertIn("Change strategy", resolved_request[0])
+        self.assertIn("New evidence has been recorded", resolved_request[1])
         self.assertFalse(
             any(
                 isinstance(item, Message)
@@ -1281,7 +1621,6 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 for item in result.items
             )
         )
-        self.assertIsNone(runtime._context_builder.runtime_supervision_reason)
 
     async def test_observe_only_records_replan_without_injecting_guidance(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1427,14 +1766,35 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 event for event in result.events if event.kind is AgentEventKind.PLAN_UPDATED
             )
             self.assertEqual(plan_event.data, plan.to_dict())
+            first_system = next(
+                message
+                for message in provider.calls[0].messages
+                if isinstance(message, Message) and message.role is Role.SYSTEM
+            )
             second_system = next(
                 message
                 for message in provider.calls[1].messages
                 if isinstance(message, Message) and message.role is Role.SYSTEM
             )
-            self.assertIn("Current structured plan:", second_system.content)
-            self.assertIn("Implement the next vertical slice", second_system.content)
-            self.assertNotIn("Replace this draft with a more concrete plan", second_system.content)
+            self.assertEqual(first_system.content, second_system.content)
+            plan_guidance = tuple(
+                message
+                for message in provider.calls[1].messages
+                if message.synthetic_reason is SyntheticReason.RUNTIME_PLAN
+            )
+            self.assertEqual(len(plan_guidance), 2)
+            self.assertIn("Current structured plan:", plan_guidance[-1].content)
+            self.assertIn("Implement the next vertical slice", plan_guidance[-1].content)
+            self.assertNotIn(
+                "Replace this draft with a more concrete plan", plan_guidance[-1].content
+            )
+            self.assertFalse(
+                any(
+                    isinstance(item, Message)
+                    and item.synthetic_reason is SyntheticReason.RUNTIME_PLAN
+                    for item in result.items
+                )
+            )
 
     async def test_explicit_plan_execution_is_recorded_before_the_user_message(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1493,7 +1853,13 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
             system = next(
                 message for message in provider.calls[0].messages if message.role is Role.SYSTEM
             )
-            self.assertIn("Implement the approved slice", system.content)
+            self.assertNotIn("Implement the approved slice", system.content)
+            plan_notice = next(
+                message
+                for message in provider.calls[0].messages
+                if message.synthetic_reason is SyntheticReason.RUNTIME_PLAN
+            )
+            self.assertIn("Implement the approved slice", plan_notice.content)
 
     async def test_queued_plan_execution_reads_task_through_application_session_seam(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -2022,7 +2388,23 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("extra-high review depth", persisted_system.content)
 
     async def test_provider_usage_emits_current_context_metadata(self) -> None:
-        provider = ScriptedProvider(((ModelTextDelta("done"), ModelCompleted("stop", 900, 100)),))
+        provider = ScriptedProvider(
+            (
+                (
+                    ModelTextDelta("done"),
+                    ModelCompleted(
+                        "stop",
+                        usage=ModelUsage(
+                            input_tokens=900,
+                            output_tokens=100,
+                            cache_read_tokens=700,
+                            cache_write_tokens=50,
+                            cache_miss_tokens=200,
+                        ),
+                    ),
+                ),
+            )
+        )
         runtime = AgentRuntime(
             provider=provider,
             tools=ToolRegistry(),
@@ -2040,6 +2422,82 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(usage.data["output_tokens"], 100)
         self.assertEqual(usage.data["used_tokens"], 1_000)
         self.assertFalse(usage.data["estimated"])
+        self.assertEqual(usage.data["cache_read_tokens"], 700)
+        self.assertEqual(usage.data["cache_write_tokens"], 50)
+        self.assertEqual(usage.data["cache_miss_tokens"], 200)
+        self.assertEqual(usage.data["input_token_semantics"], "total")
+        self.assertEqual(usage.data["processed_input_tokens"], 900)
+
+    async def test_anthropic_usage_projects_exact_processed_context_tokens(self) -> None:
+        provider = ScriptedProvider(
+            (
+                (
+                    ModelTextDelta("done"),
+                    ModelCompleted(
+                        "stop",
+                        usage=ModelUsage(
+                            input_tokens=12,
+                            output_tokens=9,
+                            cache_read_tokens=8,
+                            cache_write_tokens=4,
+                            input_token_semantics=ModelInputTokenSemantics.UNCACHED_TAIL,
+                        ),
+                    ),
+                ),
+            )
+        )
+        runtime = AgentRuntime(
+            provider=provider,
+            tools=ToolRegistry(),
+            workspace_change_observer=EmptyWorkspaceChangeObserver(),
+            permissions=PermissionManager(),
+            tool_context=ToolContext(Path("/workspace")),
+        )
+
+        result = await runtime.run("Measure an Anthropic context")
+
+        usage = next(
+            event for event in result.events if event.kind is AgentEventKind.CONTEXT_USAGE_UPDATED
+        )
+        self.assertEqual(usage.data["input_tokens"], 12)
+        self.assertEqual(usage.data["processed_input_tokens"], 24)
+        self.assertEqual(usage.data["used_tokens"], 33)
+        self.assertEqual(usage.data["input_token_semantics"], "uncached_tail")
+        self.assertFalse(usage.data["estimated"])
+
+    async def test_anthropic_usage_without_cache_breakdown_remains_estimated(self) -> None:
+        provider = ScriptedProvider(
+            (
+                (
+                    ModelTextDelta("done"),
+                    ModelCompleted(
+                        "stop",
+                        usage=ModelUsage(
+                            input_tokens=12,
+                            output_tokens=9,
+                            input_token_semantics=ModelInputTokenSemantics.UNCACHED_TAIL,
+                        ),
+                    ),
+                ),
+            )
+        )
+        runtime = AgentRuntime(
+            provider=provider,
+            tools=ToolRegistry(),
+            workspace_change_observer=EmptyWorkspaceChangeObserver(),
+            permissions=PermissionManager(),
+            tool_context=ToolContext(Path("/workspace")),
+        )
+
+        result = await runtime.run("Measure an incomplete Anthropic usage report")
+
+        usage = next(
+            event for event in result.events if event.kind is AgentEventKind.CONTEXT_USAGE_UPDATED
+        )
+        self.assertEqual(usage.data["input_tokens"], 12)
+        self.assertIsNone(usage.data["processed_input_tokens"])
+        self.assertIsNone(usage.data["used_tokens"])
+        self.assertTrue(usage.data["estimated"])
 
     async def test_completion_reminder_batch_is_bounded_and_defers_overflow(self) -> None:
         snapshots = tuple(completion_snapshot(f"task-{index:02d}") for index in range(21))

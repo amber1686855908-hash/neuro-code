@@ -416,6 +416,7 @@ class BootstrapCliServices:
                 TUI_RELOAD_PROVIDER_SETTINGS,
                 NeuroCodeApp,
                 ProviderSetupApp,
+                TuiUserInteraction,
             )
         except ModuleNotFoundError as error:
             if error.name in {"rich", "textual"}:
@@ -488,6 +489,7 @@ class BootstrapCliServices:
 
             application = await self.open_application(settings)
             try:
+                user_interaction = TuiUserInteraction()
                 if args.resume is not None:
                     await application.session_service.prepare_resume(
                         ResumeSessionRequest(args.resume)
@@ -515,12 +517,14 @@ class BootstrapCliServices:
                     application_: ApplicationComposition = application,
                     approvals_: SessionApprovalBroker = approvals,
                     reasoning_effort_: ReasoningEffort = reasoning_effort,
+                    user_interaction_: TuiUserInteraction = user_interaction,
                 ) -> ConversationBinding:
                     return await application_.create_binding(
                         config=selected_config,
                         approver=approvals_,
                         resume_id=resume_id,
                         reasoning_effort=reasoning_effort_,
+                        user_interaction=user_interaction_,
                     )
 
                 binding = await compose_scoped(config, args.resume)
@@ -664,6 +668,7 @@ class BootstrapCliServices:
                     provider_name=controller.provider_name,
                     model_name=controller.model_name,
                     cwd=config.cwd,
+                    user_interaction=user_interaction,
                 )
                 await app.run_async()
                 return_code = app.return_code if app.return_code is not None else 0

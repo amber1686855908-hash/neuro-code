@@ -34,6 +34,7 @@ READ_ONLY_SUBAGENT_TOOL_NAMES = (
     "read_files",
     "list_dir",
     "list_tree",
+    "glob",
     "grep",
     "grep_many",
     "skill",

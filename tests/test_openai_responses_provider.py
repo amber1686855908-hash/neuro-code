@@ -156,7 +156,15 @@ class OpenAIResponsesProviderTests(unittest.IsolatedAsyncioTestCase):
                                         "content": [{"type": "output_text", "text": "done"}],
                                     }
                                 ],
-                                "usage": {"input_tokens": 2, "output_tokens": 1},
+                                "usage": {
+                                    "input_tokens": 2,
+                                    "output_tokens": 1,
+                                    "input_tokens_details": {
+                                        "cached_tokens": 1,
+                                        "cache_write_tokens": 2,
+                                        "cache_miss_tokens": 1,
+                                    },
+                                },
                             },
                         }
                     ),
@@ -189,6 +197,12 @@ class OpenAIResponsesProviderTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(first[-1], ModelCompleted)
         self.assertIsInstance(disabled[-1], ModelCompleted)
         self.assertIsInstance(second[-1], ModelCompleted)
+        completed = first[-1]
+        assert isinstance(completed, ModelCompleted)
+        assert completed.usage is not None
+        self.assertEqual(completed.usage.cache_read_tokens, 1)
+        self.assertEqual(completed.usage.cache_write_tokens, 2)
+        self.assertEqual(completed.usage.cache_miss_tokens, 1)
         self.assertEqual(captured[0]["tools"], captured[2]["tools"])
         self.assertNotIn("tools", captured[1])
         self.assertNotIn("tool_choice", captured[1])

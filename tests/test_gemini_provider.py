@@ -127,6 +127,7 @@ class GeminiProviderTests(unittest.IsolatedAsyncioTestCase):
                     "usageMetadata": {
                         "promptTokenCount": 10,
                         "candidatesTokenCount": 6,
+                        "cachedContentTokenCount": 4,
                     },
                 },
             )
@@ -190,6 +191,8 @@ class GeminiProviderTests(unittest.IsolatedAsyncioTestCase):
             (completed.stop_reason, completed.input_tokens, completed.output_tokens),
             ("stop", 10, 6),
         )
+        assert completed.usage is not None
+        self.assertEqual(completed.usage.cache_read_tokens, 4)
         self.assertIn(
             "/v1beta/models/gemini%2Ffixture:streamGenerateContent?alt=sse",
             captured["url"],

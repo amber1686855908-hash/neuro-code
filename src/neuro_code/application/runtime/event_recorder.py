@@ -24,7 +24,7 @@ from neuro_code.application.memory.compaction_runtime import ContextCompactionTu
 from neuro_code.application.ports.storage import SessionStore
 from neuro_code.domain.conversation.compaction import DurableCompactionItem
 from neuro_code.domain.conversation.events import AgentEvent, AgentEventKind
-from neuro_code.domain.conversation.messages import SessionItem
+from neuro_code.domain.conversation.messages import Message, SessionItem
 from neuro_code.domain.execution import (
     AgentExecutionOutcome,
     SessionExecutionRecord,
@@ -34,6 +34,24 @@ from neuro_code.domain.session_tasks import SessionTask, SessionTaskStatus
 from neuro_code.shared.errors import ConfigurationError
 
 EventSink = Callable[[AgentEvent], Awaitable[None] | None]
+
+
+def _durable_session_items(items: Sequence[SessionItem]) -> tuple[SessionItem, ...]:
+    """Drop all in-memory synthetic notices before a session-store write.
+
+    Context shaping and append-only runtime notices are request-only control
+    data.  They must not become historical user messages or alter resume
+    replay after a turn is persisted.
+
+    在写入会话存储前移除全部仅内存合成通知。上下文整形和仅追加的运行时通知是请求
+    范围的控制数据,不得成为历史用户消息或改变恢复后的重放。
+    """
+
+    return tuple(
+        item
+        for item in items
+        if not (isinstance(item, Message) and item.synthetic_reason is not None)
+    )
 
 
 class TurnEventRecorder:
@@ -148,7 +166,7 @@ class TurnEventRecorder:
                 (
                     self._turn_context_prefix
                     if pristine_rewound or not self._persist_turn_context
-                    else self._context_items
+                    else _durable_session_items(self._context_items)
                 ),
             )
 
@@ -198,19 +216,20 @@ class TurnEventRecorder:
                 completed_event.created_at,
             )
         )
+        durable_result_items = _durable_session_items(result_items)
         if self._session_store is not None and self._session_id is not None:
             if compaction_item is None:
                 await self._session_store.finalize_turn(
                     self._session_id,
                     completed_event,
-                    result_items,
+                    durable_result_items,
                     record,
                 )
             else:
                 await self._session_store.finalize_turn_with_compaction(
                     self._session_id,
                     completed_event,
-                    result_items,
+                    durable_result_items,
                     record,
                     compaction_item,
                 )

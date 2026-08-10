@@ -50,6 +50,7 @@ def _budget_for_model_calls(max_model_calls: int) -> ExecutionBudget:
         max_total_tokens=None,
         per_tool_limits=(
             ToolCallBudget("bash", stricter_side_effect_limit),
+            ToolCallBudget("apply_patch", stricter_side_effect_limit),
             ToolCallBudget("kill_task", state_transition_limit),
             ToolCallBudget("search_replace", stricter_side_effect_limit),
             ToolCallBudget("terminal_exec", stricter_side_effect_limit),

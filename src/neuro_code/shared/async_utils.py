@@ -29,11 +29,24 @@ async def run_blocking[**P, R](function: Callable[P, R], *args: P.args, **kwargs
             completed.set()
 
     # A daemon worker avoids coupling loop shutdown to the default executor.
-    # Cancellation cannot stop synchronous OS work, so callers must keep each
-    # operation bounded and idempotent just as they would with `to_thread`.
+    # Cancellation cannot stop synchronous OS work.  When the caller is
+    # cancelled, wait for the bounded operation to release its resources before
+    # propagating cancellation; otherwise a SQLite/file handle can outlive the
+    # cancelled task (notably on Windows where open files cannot be unlinked).
     threading.Thread(target=invoke, name="neuro-code-blocking", daemon=True).start()
-    while not completed.is_set():  # noqa: ASYNC110 - threading.Event has no async wait
-        await asyncio.sleep(0.01)
+    cancelled = False
+    while not completed.is_set():
+        try:
+            await asyncio.sleep(0.01)
+        except asyncio.CancelledError:
+            cancelled = True
+            break
+    if cancelled:
+        while not completed.is_set():  # noqa: ASYNC110 - threading.Event has no async wait
+            await asyncio.sleep(0.01)
+        # Cancellation remains the caller-visible outcome; the worker
+        # failure is intentionally not substituted for it.
+        raise asyncio.CancelledError
     if failure:
         raise failure[0]
     return result[0]

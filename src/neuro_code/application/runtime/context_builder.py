@@ -2,9 +2,10 @@
 
 Stage 3C of the Runtime Kernel split: this module owns the request-scoped
 policy guidance, repository instruction refresh, and skill listing injection
-previously embedded in ``AgentRuntime``.  It also owns the mutable
-``reasoning_effort``, ``interaction_mode``, ``plan``, and ``plan_comments``
-state so the runtime loop and external setters share one source of truth.
+previously embedded in ``AgentRuntime``.  It owns the stable request prefix
+and the current ``reasoning_effort``, ``interaction_mode``, ``plan``, and
+``plan_comments`` values so the runtime loop and external setters share one
+source of truth.
 
 The module intentionally does not import :mod:`agent`; it depends only on
 domain values and callable providers.
@@ -26,7 +27,6 @@ from neuro_code.domain.execution import (
     ExecutionBudgetPressure,
     ExecutionBudgetUsage,
     ExecutionSegmentCheckpoint,
-    SupervisorReasonCode,
 )
 from neuro_code.domain.plans import PlanComment, SessionPlan
 from neuro_code.domain.workspace.instructions import InstructionDiscoveryResult
@@ -37,8 +37,8 @@ When multiple read-only operations are independent, request them in the same mod
 of alternating one read with one reasoning round. Prefer list_tree, grep_many, and read_files for
 bounded repository-wide evidence gathering. For repository analysis, first map the repository,
 then locate relevant symbols, batch-read the related evidence, analyze it together, and only then
-perform targeted follow-up. Keep operations sequential when a later request truly depends on an
-earlier result."""
+perform targeted follow-up. Use glob when a known filename or path pattern must be located.
+Review related edits with workspace_diff before verification; keep dependent operations sequential."""
 
 REPLAN_RUNTIME_GUIDANCE = """Runtime supervision guidance:
 The current approach is repeating results without sufficient progress. Change strategy. Avoid
@@ -46,9 +46,8 @@ repeating the same tool or action with equivalent arguments. Narrow or broaden t
 inspect different evidence, or revise the current assumption."""
 
 
-def _budget_runtime_guidance(usage: ExecutionBudgetUsage) -> str:
+def _budget_runtime_guidance(pressure: ExecutionBudgetPressure) -> str:
     pressure_guidance = {
-        ExecutionBudgetPressure.NORMAL: "Continue normally and keep evidence gathering purposeful.",
         ExecutionBudgetPressure.CONSERVE: (
             "Prioritize the core question and avoid open-ended exploration."
         ),
@@ -58,14 +57,8 @@ def _budget_runtime_guidance(usage: ExecutionBudgetUsage) -> str:
         ExecutionBudgetPressure.FINAL_STAGE: (
             "Stop nonessential exploration, complete only necessary verification, and prepare the answer."
         ),
-    }[usage.pressure]
-    return (
-        "Runtime budget guidance:\n"
-        f"Model calls remaining: {usage.model_calls_remaining}/{usage.budget.max_model_calls}. "
-        f"Tool rounds remaining: {usage.tool_rounds_remaining}/{usage.budget.max_tool_rounds}. "
-        f"Tool calls remaining: {usage.tool_calls_remaining}/{usage.budget.max_tool_calls}.\n"
-        f"{pressure_guidance}"
-    )
+    }[pressure]
+    return f"Runtime budget guidance ({pressure.value}):\n{pressure_guidance}"
 
 
 def _segment_runtime_guidance(checkpoint: ExecutionSegmentCheckpoint) -> str:
@@ -83,14 +76,20 @@ def _segment_runtime_guidance(checkpoint: ExecutionSegmentCheckpoint) -> str:
 class ContextBuilder:
     """Build each model request's guided, injected context.
 
-    Guidance (reasoning effort, interaction mode, plan state) is applied to
-    the system message without persisting control text.  Repository
+    Stable guidance (reasoning effort, interaction mode, batch-first work)
+    is applied to the system message without persisting control text.
+    Repository
     ``AGENTS.md`` instructions and available skills are refreshed before each
     model step and injected as synthetic ``User`` messages; the latest
     discovery results remain observable via ``instruction_result`` and
     ``skill_result``.
 
+    Dynamic plan and runtime state are rendered by explicit helper methods;
+    the loop appends those notices at safe turn boundaries rather than
+    rewriting the early request prefix.
+
     为每个模型请求构建带指引和注入内容的上下文. 指令和技能会在每个模型步骤刷新并作为合成 User 消息注入.
+    动态计划和运行时状态由显式辅助方法渲染,并在安全的回合边界追加,不会改写请求前缀.
     """
 
     __slots__ = (
@@ -101,9 +100,6 @@ class ContextBuilder:
         "_plan",
         "_plan_comments",
         "_reasoning_effort",
-        "_runtime_budget_usage",
-        "_runtime_segment_checkpoint",
-        "_runtime_supervision_reason",
         "_skill_provider",
     )
 
@@ -124,9 +120,6 @@ class ContextBuilder:
         self._skill_provider = skill_provider
         self._last_instruction_result: InstructionDiscoveryResult | None = None
         self._last_skill_result: SkillDiscoveryResult | None = None
-        self._runtime_budget_usage: ExecutionBudgetUsage | None = None
-        self._runtime_segment_checkpoint: ExecutionSegmentCheckpoint | None = None
-        self._runtime_supervision_reason: SupervisorReasonCode | None = None
 
     @property
     def reasoning_effort(self) -> ReasoningEffort:
@@ -172,45 +165,84 @@ class ContextBuilder:
             raise ValueError("plan comments must refer to saved steps")
         self._plan_comments = normalized
 
-    @property
-    def runtime_supervision_reason(self) -> SupervisorReasonCode | None:
-        """Return the request-scoped supervision reason, if one is active.
+    def plan_runtime_message(self) -> Message | None:
+        """Render the current plan as one append-only runtime notice.
 
-        返回当前生效的请求范围监督原因,如果存在。
+        The caller owns placement and must keep this message out of durable
+        session history.  Rendering it separately prevents plan revisions
+        from invalidating the stable system prefix of prior requests.
+
+        将当前计划渲染为一条仅追加的运行时通知。调用方负责放置该消息并确保其不进入
+        持久会话历史,独立渲染可避免计划修订使早先请求的稳定 system 前缀失效。
         """
 
-        return self._runtime_supervision_reason
+        if self._plan is None:
+            return None
+        parts = [
+            "Runtime plan update:\n"
+            "The following plan supersedes every earlier runtime plan notice.",
+            self._plan.model_guidance(),
+        ]
+        comments = self._plan.comment_guidance(self._plan_comments)
+        if comments:
+            parts.append(comments)
+        return Message(
+            Role.USER,
+            "\n\n".join(parts),
+            synthetic_reason=SyntheticReason.RUNTIME_PLAN,
+        )
 
-    def set_runtime_supervision_reason(self, reason: SupervisorReasonCode | None) -> None:
-        """Set or clear temporary supervision guidance for later model requests.
+    @staticmethod
+    def budget_runtime_message(usage: ExecutionBudgetUsage) -> Message | None:
+        """Render a pressure transition without mutable exact counters.
 
-        设置或清除供后续模型请求使用的临时监督指引。
+        Normal execution receives no budget notice.  Higher pressure levels
+        are discrete and intentionally contain no remaining-count values, so
+        a stable pressure does not rewrite or churn request context.
+
+        渲染不含精确动态计数的预算压力转换。正常执行不发送预算通知,更高压力级别
+        使用离散状态,避免稳定压力反复改写或抖动请求上下文。
         """
 
-        if reason is not None and not isinstance(reason, SupervisorReasonCode):
-            raise TypeError("runtime supervision reason must be canonical or None")
-        self._runtime_supervision_reason = reason
+        if usage.pressure is ExecutionBudgetPressure.NORMAL:
+            return None
+        return Message(
+            Role.USER,
+            _budget_runtime_guidance(usage.pressure),
+            synthetic_reason=SyntheticReason.RUNTIME_BUDGET,
+        )
 
-    @property
-    def runtime_budget_usage(self) -> ExecutionBudgetUsage | None:
-        return self._runtime_budget_usage
+    @staticmethod
+    def segment_runtime_message(checkpoint: ExecutionSegmentCheckpoint) -> Message:
+        """Render one immutable segment checkpoint runtime notice.
 
-    def set_runtime_budget_usage(self, usage: ExecutionBudgetUsage | None) -> None:
-        if usage is not None and not isinstance(usage, ExecutionBudgetUsage):
-            raise TypeError("runtime budget usage must be ExecutionBudgetUsage or None")
-        self._runtime_budget_usage = usage
+        渲染一条不可变的分段检查点运行时通知。
+        """
 
-    @property
-    def runtime_segment_checkpoint(self) -> ExecutionSegmentCheckpoint | None:
-        return self._runtime_segment_checkpoint
+        return Message(
+            Role.USER,
+            _segment_runtime_guidance(checkpoint),
+            synthetic_reason=SyntheticReason.RUNTIME_CHECKPOINT,
+        )
 
-    def set_runtime_segment_checkpoint(
-        self,
-        checkpoint: ExecutionSegmentCheckpoint | None,
-    ) -> None:
-        if checkpoint is not None and not isinstance(checkpoint, ExecutionSegmentCheckpoint):
-            raise TypeError("runtime segment checkpoint must be ExecutionSegmentCheckpoint or None")
-        self._runtime_segment_checkpoint = checkpoint
+    @staticmethod
+    def supervision_runtime_message(*, resolved: bool = False) -> Message:
+        """Render a replan instruction or its append-only resolution notice.
+
+        渲染重新规划指引,或其仅追加的已解决通知。
+        """
+
+        content = (
+            "Runtime supervision update:\nNew evidence has been recorded after the prior "
+            "replan notice. Continue from that evidence without repeating the earlier approach."
+            if resolved
+            else REPLAN_RUNTIME_GUIDANCE
+        )
+        return Message(
+            Role.USER,
+            content,
+            synthetic_reason=SyntheticReason.RUNTIME_SUPERVISION,
+        )
 
     @property
     def instruction_result(self) -> InstructionDiscoveryResult | None:
@@ -229,8 +261,8 @@ class ContextBuilder:
     def build(self, items: Sequence[SessionItem]) -> tuple[SessionItem, ...]:
         """Apply the selected policy to a request without persisting control text.
 
-        Reasoning effort and interaction mode guidance are appended to the
-        system message.  Repository AGENTS.md instructions are injected as a
+        Reasoning effort, interaction mode, and batch-first guidance are
+        appended to the system message.  Repository AGENTS.md instructions are injected as a
         separate synthetic ``User`` message tagged with
         ``SyntheticReason.PROJECT_INSTRUCTIONS``, placed after the system
         message and before the first genuine user message.  This follows the
@@ -246,11 +278,6 @@ class ContextBuilder:
             interaction_mode_guidance(self._interaction_mode),
             BATCH_FIRST_RUNTIME_GUIDANCE,
         ]
-        if self._plan is not None:
-            guidance_parts.append(self._plan.model_guidance())
-            comments = self._plan.comment_guidance(self._plan_comments)
-            if comments:
-                guidance_parts.append(comments)
         guidance = "\n\n".join(guidance_parts)
         rendered = list(items)
 
@@ -295,45 +322,6 @@ class ContextBuilder:
                     insert_at = i + 1
                     break
             rendered.insert(insert_at, skill_msg)
-
-        runtime_messages: list[Message] = []
-        if self._runtime_budget_usage is not None:
-            runtime_messages.append(
-                Message(
-                    Role.USER,
-                    _budget_runtime_guidance(self._runtime_budget_usage),
-                    synthetic_reason=SyntheticReason.RUNTIME_BUDGET,
-                )
-            )
-        if self._runtime_segment_checkpoint is not None:
-            runtime_messages.append(
-                Message(
-                    Role.USER,
-                    _segment_runtime_guidance(self._runtime_segment_checkpoint),
-                    synthetic_reason=SyntheticReason.RUNTIME_CHECKPOINT,
-                )
-            )
-        if self._runtime_supervision_reason is not None:
-            runtime_messages.append(
-                Message(
-                    Role.USER,
-                    REPLAN_RUNTIME_GUIDANCE,
-                    synthetic_reason=SyntheticReason.RUNTIME_SUPERVISION,
-                )
-            )
-        if runtime_messages:
-            insert_at = system_index + 1
-            while insert_at < len(rendered):
-                item = rendered[insert_at]
-                if not isinstance(item, Message) or item.synthetic_reason not in {
-                    SyntheticReason.PROJECT_INSTRUCTIONS,
-                    SyntheticReason.AVAILABLE_SKILLS,
-                }:
-                    break
-                insert_at += 1
-            for runtime_message in runtime_messages:
-                rendered.insert(insert_at, runtime_message)
-                insert_at += 1
 
         return tuple(rendered)
 

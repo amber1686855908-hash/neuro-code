@@ -9,6 +9,7 @@ from neuro_code.application.ports.model import ModelToolPolicy
 from neuro_code.domain.conversation.context import ModelContext
 from neuro_code.domain.conversation.events import (
     ModelCompleted,
+    ModelInputTokenSemantics,
     ModelReasoningDelta,
     ModelTextDelta,
     ModelToolCall,
@@ -126,7 +127,14 @@ class AnthropicProviderTests(unittest.IsolatedAsyncioTestCase):
                 [],
                 {
                     "type": "message_start",
-                    "message": {"usage": {"input_tokens": 12, "output_tokens": 1}},
+                    "message": {
+                        "usage": {
+                            "input_tokens": 12,
+                            "output_tokens": 1,
+                            "cache_read_input_tokens": 8,
+                            "cache_creation_input_tokens": 4,
+                        }
+                    },
                 },
                 {
                     "type": "content_block_start",
@@ -233,6 +241,14 @@ class AnthropicProviderTests(unittest.IsolatedAsyncioTestCase):
             (completed.stop_reason, completed.input_tokens, completed.output_tokens),
             ("tool_use", 12, 9),
         )
+        assert completed.usage is not None
+        self.assertIs(
+            completed.usage.input_token_semantics,
+            ModelInputTokenSemantics.UNCACHED_TAIL,
+        )
+        self.assertEqual(completed.usage.cache_read_tokens, 8)
+        self.assertEqual(completed.usage.cache_write_tokens, 4)
+        self.assertEqual(completed.usage.processed_input_tokens, 24)
         self.assertEqual(captured["url"], "https://api.anthropic.invalid/v1/messages")
         self.assertEqual(captured["api_key"], "secret-key")
         self.assertEqual(captured["version"], "2023-06-01")
@@ -241,6 +257,7 @@ class AnthropicProviderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(body["model"], "claude-fixture")
         self.assertEqual(body["max_tokens"], 4096)
         self.assertEqual(body["system"], "Be precise.")
+        self.assertEqual(body["cache_control"], {"type": "ephemeral"})
         self.assertEqual(body["messages"][1]["content"][1]["name"], "read_file")
         self.assertEqual(body["messages"][2]["content"][0]["tool_use_id"], "old-1")
         self.assertEqual(body["messages"][2]["content"][1]["text"], "Continue.")
@@ -271,7 +288,92 @@ class AnthropicProviderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(disabled["model"], "claude-fixture")
         self.assertEqual(disabled["max_tokens"], 4096)
         self.assertEqual(disabled["system"], "Be precise.")
+        self.assertEqual(disabled["cache_control"], {"type": "ephemeral"})
         self.assertEqual(tools[0].name, "read_file")
+
+    def test_prompt_caching_can_be_explicitly_disabled_for_a_compatible_gateway(self) -> None:
+        provider = AnthropicProvider(
+            model="claude-fixture",
+            base_url="https://gateway.invalid",
+            api_key="fixture",
+            max_output_tokens=4096,
+            prompt_caching=False,
+        )
+
+        body = provider._request_body(
+            (Message(Role.SYSTEM, "Be precise."), Message(Role.USER, "Inspect it.")),
+            (),
+        )
+
+        self.assertEqual(body["system"], "Be precise.")
+        self.assertNotIn("cache_control", body)
+
+    def test_prompt_caching_uses_an_automatic_top_level_breakpoint(self) -> None:
+        provider = AnthropicProvider(
+            model="claude-fixture",
+            base_url="https://api.anthropic.invalid",
+            api_key="fixture",
+            max_output_tokens=4096,
+        )
+        messages = (
+            Message(Role.SYSTEM, "Be precise."),
+            Message(Role.USER, "Inspect the repository."),
+            Message(Role.ASSISTANT, "I will inspect it."),
+            Message(Role.USER, "Continue with the next file."),
+        )
+
+        body = provider._request_body(messages, ())
+
+        self.assertEqual(body["cache_control"], {"type": "ephemeral"})
+        self.assertEqual(body["system"], "Be precise.")
+        self.assertEqual(
+            [message["role"] for message in body["messages"]],
+            ["user", "assistant", "user"],
+        )
+        self.assertNotIn("cache_control", body["messages"][0]["content"][0])
+
+    def test_prompt_caching_keeps_anthropic_wire_prefix_append_only(self) -> None:
+        """A growing tool conversation must retain its prior wire prefix.
+
+        持续增长的工具对话必须保留先前的实际请求前缀。
+        """
+
+        provider = AnthropicProvider(
+            model="claude-fixture",
+            base_url="https://api.anthropic.invalid",
+            api_key="fixture",
+            max_output_tokens=4096,
+        )
+        tools = (ToolDefinition("read_file", "Read a file", {"type": "object"}),)
+        first_request = (
+            Message(Role.SYSTEM, "Be precise."),
+            Message(Role.USER, "Inspect the repository."),
+            Message(
+                Role.ASSISTANT,
+                tool_calls=(ToolCall("call-1", "read_file", {"path": "a.py"}),),
+            ),
+            Message(Role.TOOL, "first evidence", tool_call_id="call-1"),
+            Message(Role.USER, "Runtime plan update:\nContinue the inspection."),
+        )
+        second_request = (
+            *first_request,
+            Message(
+                Role.ASSISTANT,
+                tool_calls=(ToolCall("call-2", "read_file", {"path": "b.py"}),),
+            ),
+            Message(Role.TOOL, "second evidence", tool_call_id="call-2"),
+            Message(Role.USER, "Runtime budget guidance [conserve]: focus on evidence."),
+        )
+
+        first_body = provider._request_body(first_request, tools)
+        second_body = provider._request_body(second_request, tools)
+
+        self.assertEqual(first_body["system"], second_body["system"])
+        self.assertEqual(first_body["tools"], second_body["tools"])
+        first_messages = first_body["messages"]
+        second_messages = second_body["messages"]
+        self.assertEqual(first_messages, second_messages[: len(first_messages)])
+        self.assertEqual(second_body["cache_control"], {"type": "ephemeral"})
 
     async def test_stream_rejects_http_json_stream_and_transport_failures(self) -> None:
         cases = (

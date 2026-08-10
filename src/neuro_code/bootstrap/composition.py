@@ -32,6 +32,7 @@ from neuro_code.application.ports.sandbox import ShellSandbox
 from neuro_code.application.ports.skills import SkillDiscovery
 from neuro_code.application.ports.storage import SessionStore
 from neuro_code.application.ports.tools import Tool, ToolContext
+from neuro_code.application.ports.user_interaction import UserInteractionPort
 from neuro_code.application.ports.workspace_changes import WorkspaceChangeObserver
 from neuro_code.application.providers.service import (
     ProviderChangeService,
@@ -91,6 +92,7 @@ from neuro_code.infrastructure.sandbox.sandbox import (
     enforce_configured_sandbox,
 )
 from neuro_code.infrastructure.tools.registry import default_tool_registry
+from neuro_code.infrastructure.tools.workspace_diff import WorkspaceMutationJournal
 from neuro_code.infrastructure.workspace.changes import (
     FilesystemWorkspaceChangeObserver,
     MultiRootWorkspaceChangeObserver,
@@ -272,6 +274,7 @@ class ApplicationComposition:
         max_steps: int | None = None,
         allowed_tool_names: Collection[str] | None = None,
         enable_background_tasks: bool = True,
+        user_interaction: UserInteractionPort | None = None,
     ) -> ConversationBinding:
         if self._closed:
             raise RuntimeError("application composition is closed")
@@ -287,6 +290,7 @@ class ApplicationComposition:
             allowed_tool_names=allowed_tool_names,
             client_file_system=client_file_system,
             client_terminal=client_terminal,
+            user_interaction=user_interaction,
         )
         for tool in additional_tools:
             if allowed_tool_names is not None and tool.definition.name not in allowed_tool_names:
@@ -362,6 +366,9 @@ class ApplicationComposition:
                     workspace_change_observer,
                     additional_workspace_roots,
                 )
+            workspace_change_journal = (
+                WorkspaceMutationJournal() if client_file_system is None else None
+            )
             runtime = AgentRuntime(
                 provider=provider,
                 tools=tools,
@@ -385,6 +392,8 @@ class ApplicationComposition:
                         selected_config.state_dir / "tool-output",
                         redaction_values=selected_config.redaction_values(),
                     ),
+                    workspace_change_journal=workspace_change_journal,
+                    user_interaction=user_interaction,
                 ),
                 approver=approval_service,
                 session_store=self.store,

@@ -20,6 +20,7 @@ from neuro_code.domain.conversation.events import (
     ModelReasoningDelta,
     ModelTextDelta,
     ModelToolCall,
+    ModelUsage,
 )
 from neuro_code.domain.conversation.messages import (
     IMAGE_MODEL_PLACEHOLDER,
@@ -512,13 +513,36 @@ class OpenAIResponsesProvider:
         return value if isinstance(value, int) and not isinstance(value, bool) else None
 
     @classmethod
-    def _usage(cls, response: Mapping[str, Any]) -> tuple[int | None, int | None]:
+    def _usage(cls, response: Mapping[str, Any]) -> ModelUsage | None:
+        """Normalize Responses usage without inferring unreported cache values.
+
+        Responses reports cached input in ``input_tokens_details.cached_tokens``.
+        Keep the raw total input/output accounting and expose the detail only
+        when this API response includes it.
+
+        规范化 Responses 用量,不推断未上报的缓存值。Responses 在
+        ``input_tokens_details.cached_tokens`` 中上报缓存输入。
+        """
+
         usage = response.get("usage")
         if not isinstance(usage, Mapping):
-            return None, None
-        return cls._token_count(usage.get("input_tokens")), cls._token_count(
-            usage.get("output_tokens")
+            return None
+        details = usage.get("input_tokens_details")
+        detail_usage: Mapping[str, object] = details if isinstance(details, Mapping) else {}
+        cache_read_tokens = cls._token_count(detail_usage.get("cached_tokens"))
+        if cache_read_tokens is None:
+            cache_read_tokens = cls._token_count(detail_usage.get("cache_read_tokens"))
+        cache_miss_tokens = cls._token_count(detail_usage.get("cache_miss_tokens"))
+        if cache_miss_tokens is None:
+            cache_miss_tokens = cls._token_count(detail_usage.get("prompt_cache_miss_tokens"))
+        normalized = ModelUsage(
+            input_tokens=cls._token_count(usage.get("input_tokens")),
+            output_tokens=cls._token_count(usage.get("output_tokens")),
+            cache_read_tokens=cache_read_tokens,
+            cache_write_tokens=cls._token_count(detail_usage.get("cache_write_tokens")),
+            cache_miss_tokens=cache_miss_tokens,
         )
+        return normalized if normalized.has_reported_tokens else None
 
     @staticmethod
     def _stop_reason(response: Mapping[str, Any], tool_calls: Sequence[ToolCall]) -> str:
@@ -740,7 +764,7 @@ class OpenAIResponsesProvider:
         tool_calls = self._response_tool_calls(terminal)
         for call in tool_calls:
             yield ModelToolCall(call)
-        input_tokens, output_tokens = self._usage(terminal)
+        usage = self._usage(terminal)
         context_items = self._preserved_output_items(terminal)
         if self._context_affinity is not None or self._is_official_target():
             context_items = self._with_reasoning_fallback(
@@ -749,10 +773,9 @@ class OpenAIResponsesProvider:
             )
         yield ModelCompleted(
             self._stop_reason(terminal, tool_calls),
-            input_tokens,
-            output_tokens,
-            context_items,
-            self._response_text(terminal),
+            context_items=context_items,
+            response_text=self._response_text(terminal),
+            usage=usage,
         )
 
 

@@ -1730,7 +1730,9 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
 
                     pending = app._pending_assistant
                     assert pending is not None
-                    self.assertIn("Safely finalizing", str(pending.renderable))
+                    activity = app.query_one("#turn-activity", Static)
+                    self.assertIn("Safely finalizing", str(activity.renderable))
+                    self.assertNotIn("Safely finalizing", str(pending.renderable))
                     self.assertTrue(pending.has_class("message-pending"))
 
                     runner.release.set()
@@ -1862,32 +1864,28 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
             pending = app._pending_assistant
             assert pending is not None
             first_frame = str(pending.renderable)
-            self.assertIn("█", first_frame)
-            self.assertIn("Thinking", first_frame)
-            self.assertIn("↓≈0 tok", first_frame)
+            self.assertEqual(first_frame, "")
+            self.assertFalse(pending.display)
+            activity = app.query_one("#turn-activity", Static)
+            self.assertTrue(activity.display)
+            self.assertIn("Working", str(activity.renderable))
+            self.assertTrue(any(symbol in str(activity.renderable) for symbol in "▁▂▃▄▅▆▇█"))
             loading_segments = list(
-                app.console.render(pending.renderable, app.console.options.update(width=80))
+                app.console.render(activity.renderable, app.console.options.update(width=80))
             )
             self.assertIn(
                 TEXT_SECONDARY.lower(),
                 str(
-                    next(
-                        segment.style for segment in loading_segments if "Thinking" in segment.text
-                    )
+                    next(segment.style for segment in loading_segments if "Working" in segment.text)
                 ).lower(),
             )
-            self.assertIn(
-                TEXT_SECONDARY.lower(),
-                str(
-                    next(segment.style for segment in loading_segments if "≈0 tok" in segment.text)
-                ).lower(),
-            )
+            first_activity_frame = str(activity.renderable)
 
             app._advance_model_loading_animation()
             app._advance_model_loading_animation()
 
-            second_frame = str(pending.renderable)
-            self.assertNotEqual(first_frame, second_frame)
+            second_frame = str(activity.renderable)
+            self.assertNotEqual(first_activity_frame, second_frame)
             self.assertNotIn("█", str(app.query_one("#runtime-model", Static).renderable))
             await app._discard_pending_assistant()
             self.assertFalse(app._model_loading)
