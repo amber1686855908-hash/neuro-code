@@ -494,11 +494,25 @@ def _ensure_no_link_components(context: ToolContext, raw_path: str) -> None:
     candidate = Path(raw_path).expanduser()
     if not candidate.is_absolute():
         candidate = context.cwd / candidate
-    for parent in reversed(candidate.parents):
-        if _is_link_like(parent):
-            raise ToolError("workspace diff paths must not traverse symlinks or junctions")
-    if _is_link_like(candidate):
-        raise ToolError("workspace diff paths must not target symlinks or junctions")
+    # Ignore symlink aliases above the workspace root (for example macOS's
+    # /var -> /private/var).  Security checks apply to components inside an
+    # explicitly allowed root, not to the root spelling itself.
+    roots = (context.cwd, *context.additional_workspace_roots)
+    for root in roots:
+        root_path = root.expanduser()
+        try:
+            relative = candidate.relative_to(root_path)
+        except ValueError:
+            continue
+        current = root_path
+        relative_parts = relative.parts
+        for part in relative_parts[:-1]:
+            current /= part
+            if _is_link_like(current):
+                raise ToolError("workspace diff paths must not traverse symlinks or junctions")
+        if _is_link_like(candidate):
+            raise ToolError("workspace diff paths must not target symlinks or junctions")
+        return
 
 
 def _is_link_like(path: Path) -> bool:

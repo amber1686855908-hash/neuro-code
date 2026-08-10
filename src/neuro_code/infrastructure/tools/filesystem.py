@@ -1505,11 +1505,26 @@ def _ensure_no_link_components(context: ToolContext, requested: str) -> None:
     candidate = Path(requested).expanduser()
     if not candidate.is_absolute():
         candidate = context.cwd / candidate
-    for parent in reversed(candidate.parents):
-        if _is_link_like(parent):
-            raise ToolError("patch paths must not traverse symlinks or junctions")
-    if _is_link_like(candidate):
-        raise ToolError("patch paths must not target symlinks or junctions")
+    # Do not inspect symlink aliases that belong to the platform's temporary
+    # directory (macOS commonly exposes ``/var`` as a symlink to
+    # ``/private/var``).  The workspace root itself is an accepted boundary;
+    # only components below an explicitly allowed root are unsafe.
+    roots = (context.cwd, *context.additional_workspace_roots)
+    for root in roots:
+        root_path = root.expanduser()
+        try:
+            relative = candidate.relative_to(root_path)
+        except ValueError:
+            continue
+        current = root_path
+        relative_parts = relative.parts
+        for part in relative_parts[:-1]:
+            current /= part
+            if _is_link_like(current):
+                raise ToolError("patch paths must not traverse symlinks or junctions")
+        if _is_link_like(candidate):
+            raise ToolError("patch paths must not target symlinks or junctions")
+        return
 
 
 class ApplyPatchTool:

@@ -331,7 +331,10 @@ class WorkspaceDiffTests(unittest.IsolatedAsyncioTestCase):
             )
 
             result = await WorkspaceDiffTool().execute({}, context)
-            self.assertIn(str(extra), result.content)
+            # The implementation renders additional roots with slash-separated
+            # paths; normalize the spelling returned by tempfile on Windows.
+            canonical_extra = str(extra).replace("\\", "/")
+            self.assertIn(canonical_extra, result.content)
             assert result.metadata is not None
             self.assertFalse(result.metadata["unattributed_changes_detected"])
 

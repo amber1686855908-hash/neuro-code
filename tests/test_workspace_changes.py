@@ -25,7 +25,9 @@ def test_snapshot_and_diff_limits_preserve_safe_metadata(tmp_path: Path) -> None
     binary = tmp_path / "binary.bin"
     secret = tmp_path / ".env"
     budget = tmp_path / "z-budget.txt"
-    text.write_text("b\n", encoding="utf-8")
+    # Use bytes so the fixture has the same size on POSIX and Windows (where
+    # text-mode writes otherwise translate ``\n`` to ``\r\n``).
+    text.write_bytes(b"b\n")
     large.write_text("l" * 21, encoding="utf-8")
     binary.write_bytes(b"\xff")
     secret.write_text("TOKEN=secret\n", encoding="utf-8")
@@ -37,7 +39,7 @@ def test_snapshot_and_diff_limits_preserve_safe_metadata(tmp_path: Path) -> None
         patch.object(changes_module, "_MAX_DIFF_LINES", 1),
     ):
         before = capture_workspace_snapshot(tmp_path)
-        text.write_text("a\nb\nc\n", encoding="utf-8")
+        text.write_bytes(b"a\nb\nc\n")
         after = capture_workspace_snapshot(tmp_path)
 
         assert before.files["large.txt"].hidden_reason == "large"
