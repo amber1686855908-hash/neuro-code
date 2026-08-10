@@ -33,6 +33,10 @@ from neuro_code.infrastructure.workspace.changes import FilesystemWorkspaceChang
 from neuro_code.shared.errors import ToolError
 
 
+def _canonical_posix(path: Path) -> str:
+    return path.resolve().as_posix()
+
+
 class WorkspaceDiffTests(unittest.IsolatedAsyncioTestCase):
     async def test_structured_edit_capture_is_targeted_not_repository_scoped(self) -> None:
         """A known edit target must not trigger a full repository walk."""
@@ -333,7 +337,7 @@ class WorkspaceDiffTests(unittest.IsolatedAsyncioTestCase):
             result = await WorkspaceDiffTool().execute({}, context)
             # The implementation renders additional roots with slash-separated
             # paths; normalize the spelling returned by tempfile on Windows.
-            canonical_extra = str(extra).replace("\\", "/")
+            canonical_extra = _canonical_posix(extra)
             self.assertIn(canonical_extra, result.content)
             assert result.metadata is not None
             self.assertFalse(result.metadata["unattributed_changes_detected"])
