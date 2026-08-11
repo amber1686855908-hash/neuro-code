@@ -33,6 +33,17 @@ class LinuxPidfdOpsTests(unittest.TestCase):
         self.assertIsInstance(operations, linux_pidfd._LibcLinuxPidfdOps)
         operations.probe()
 
+    def test_libc_syscall_fallback_probes_supported_architecture(self) -> None:
+        library_name = linux_pidfd.ctypes.util.find_library("c")
+        self.assertIsNotNone(library_name)
+        libc = linux_pidfd.ctypes.CDLL(library_name, use_errno=True)
+
+        class SyscallOnly:
+            syscall = libc.syscall
+
+        operations = linux_pidfd._LibcLinuxPidfdOps(SyscallOnly())
+        operations.probe()
+
     def test_missing_libc_symbols_fail_closed(self) -> None:
         fake_libc = object()
         with (

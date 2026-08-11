@@ -19,6 +19,7 @@ import ctypes
 import ctypes.util
 import errno
 import os
+import platform
 import signal
 from collections.abc import Callable
 from typing import Protocol, cast
@@ -80,27 +81,43 @@ class _LibcLinuxPidfdOps:
             _CFunction | None,
             getattr(libc, "pidfd_send_signal", None),
         )
-        if self._pidfd_open is None or self._pidfd_send_signal is None:
-            raise OSError(errno.ENOSYS, "libc does not export the required pidfd interfaces")
+        self._syscall = cast(_CFunction | None, getattr(libc, "syscall", None))
+        self._syscall_numbers = _SYSCALL_NUMBERS.get(platform.machine().lower())
 
-        pidfd_open = self._pidfd_open
-        pidfd_send_signal = self._pidfd_send_signal
-        assert pidfd_open is not None
-        assert pidfd_send_signal is not None
-        pidfd_open.argtypes = [ctypes.c_int, ctypes.c_uint]
-        pidfd_open.restype = ctypes.c_int
-        pidfd_send_signal.argtypes = [
-            ctypes.c_int,
-            ctypes.c_int,
-            ctypes.c_void_p,
-            ctypes.c_uint,
-        ]
-        pidfd_send_signal.restype = ctypes.c_int
+        if self._pidfd_open is not None:
+            self._pidfd_open.argtypes = [ctypes.c_int, ctypes.c_uint]
+            self._pidfd_open.restype = ctypes.c_int
+        if self._pidfd_send_signal is not None:
+            self._pidfd_send_signal.argtypes = [
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_void_p,
+                ctypes.c_uint,
+            ]
+            self._pidfd_send_signal.restype = ctypes.c_int
+        if self._syscall is not None:
+            self._syscall.restype = ctypes.c_long
+
+        if self._pidfd_open is None and (
+            self._syscall is None or self._syscall_numbers is None
+        ):
+            raise OSError(errno.ENOSYS, "libc does not provide a supported pidfd_open path")
+        if self._pidfd_send_signal is None and (
+            self._syscall is None or self._syscall_numbers is None
+        ):
+            raise OSError(
+                errno.ENOSYS,
+                "libc does not provide a supported pidfd_send_signal path",
+            )
 
     def open(self, pid: int) -> int:
         pidfd_open = self._pidfd_open
-        assert pidfd_open is not None
-        fd = pidfd_open(pid, 0)
+        if pidfd_open is not None:
+            fd = pidfd_open(pid, 0)
+        else:
+            assert self._syscall is not None
+            assert self._syscall_numbers is not None
+            fd = self._syscall(self._syscall_numbers[0], pid, 0)
         if fd < 0:
             _raise_errno("pidfd_open")
         _make_close_on_exec(fd)
@@ -108,8 +125,18 @@ class _LibcLinuxPidfdOps:
 
     def send_signal(self, pidfd: int, native_signal: int | signal.Signals) -> None:
         pidfd_send_signal = self._pidfd_send_signal
-        assert pidfd_send_signal is not None
-        result = pidfd_send_signal(pidfd, int(native_signal), None, 0)
+        if pidfd_send_signal is not None:
+            result = pidfd_send_signal(pidfd, int(native_signal), None, 0)
+        else:
+            assert self._syscall is not None
+            assert self._syscall_numbers is not None
+            result = self._syscall(
+                self._syscall_numbers[1],
+                pidfd,
+                int(native_signal),
+                None,
+                0,
+            )
         if result != 0:
             _raise_errno("pidfd_send_signal")
 
@@ -167,3 +194,15 @@ def _raise_errno(operation: str) -> None:
 
 
 __all__ = ["LinuxPidfdOps", "default_linux_pidfd_ops"]
+
+
+# Linux UAPI ``asm-generic/unistd.h`` assigns these syscall numbers.  The
+# entries are deliberately limited to architectures whose syscall ABI is
+# verified here; an unknown architecture fails closed instead of guessing.
+_SYSCALL_NUMBERS: dict[str, tuple[int, int]] = {
+    "x86_64": (434, 424),
+    "amd64": (434, 424),
+    "aarch64": (434, 424),
+    "arm64": (434, 424),
+    "riscv64": (434, 424),
+}

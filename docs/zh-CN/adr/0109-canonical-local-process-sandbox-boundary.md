@@ -58,7 +58,8 @@ inode 别名重新引入 controller 私有数据。
 优先使用 Python 标准库接口。如果某个 Python 发行版没有编译出其中一个包装器，但运行中的 Linux libc 导出了
 `pidfd_open` 和 `pidfd_send_signal`，受信任的 sandbox infrastructure 会通过带 close-on-exec 的 native wrapper
 调用这些 libc 接口。内核、libc 或架构能力不足时仍然失败关闭；不会把基于 PID 或进程组的信号回退描述为无竞态。
-同一个 pidfd 所有权也传递给 Linux POSIX PTY 适配器，而前台终端中断仍保留既有的进程组语义。
+当 libc 只导出 `syscall(2)` 时，wrapper 仅对明确支持的 x86_64、aarch64 和 riscv64 ABI 使用 Linux UAPI 编号；未知
+架构仍失败关闭。同一个 pidfd 所有权也传递给 Linux POSIX PTY 适配器，而前台终端中断仍保留既有的进程组语义。
 
 ## 影响
 

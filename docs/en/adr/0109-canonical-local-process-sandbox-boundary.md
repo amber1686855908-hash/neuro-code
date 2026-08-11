@@ -95,7 +95,9 @@ wrappers but the running Linux libc exports `pidfd_open` and
 `pidfd_send_signal`, the trusted sandbox infrastructure calls those libc
 interfaces through a close-on-exec native wrapper. Kernel, libc, or architecture
 capability failures remain fail-closed; no PID or process-group signal fallback
-is presented as race-free. The same pidfd ownership is passed to the Linux
+is presented as race-free. When libc exports only `syscall(2)`, the wrapper uses
+the Linux UAPI numbers only for its explicitly supported x86_64, aarch64, and
+riscv64 ABIs; unknown architectures fail closed. The same pidfd ownership is passed to the Linux
 POSIX PTY adapter, while foreground terminal interrupts retain their existing
 process-group semantics.
 
