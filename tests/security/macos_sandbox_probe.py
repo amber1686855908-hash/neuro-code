@@ -234,7 +234,7 @@ class ProbeHarness:
         return self._policy_with_rules(read_rules=read_rules)
 
     def _root_cause_matrix(self) -> dict[str, object]:
-        """Run only /usr/bin/true while narrowing runtime read roots."""
+        """Run only /usr/bin/true from / while narrowing runtime read roots."""
         root_groups: dict[str, tuple[str, ...]] = {
             "system": ("/System", "/usr", "/bin", "/sbin", "/private/etc", "/dev"),
             "private": ("/private",),
@@ -281,7 +281,9 @@ class ProbeHarness:
         matrix: dict[str, object] = {}
         for name, policy in profiles.items():
             command_result = _run_process(
-                [str(self.sandbox_exec), "-p", policy, "/usr/bin/true"], timeout=5
+                [str(self.sandbox_exec), "-p", policy, "/usr/bin/true"],
+                cwd="/",
+                timeout=5,
             )
             evidence = {"policy": policy, **_command_evidence(command_result)}
             if command_result.signal_number is not None:
@@ -289,6 +291,7 @@ class ProbeHarness:
             matrix[name] = evidence
         return {
             "target": "/usr/bin/true",
+            "cwd": "/",
             "profiles": matrix,
             "root_groups": root_groups,
             "probe_strategy": {
@@ -1082,7 +1085,7 @@ def _collect_os_diagnostics() -> dict[str, object]:
 
 def _collect_process_diagnostics(pid: int) -> dict[str, object]:
     """Collect a bounded public unified-log slice for one failed child PID."""
-    predicate = f"processID == {pid}"
+    predicate = f'(processID == {pid}) OR (eventMessage CONTAINS[c] "true({pid})")'
     return _safe_command(
         [
             "/usr/bin/log",
