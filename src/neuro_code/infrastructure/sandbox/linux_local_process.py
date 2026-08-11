@@ -505,7 +505,25 @@ class LinuxBubblewrapLocalProcessSandbox(LocalProcessSandbox):
             if logical_path.exists():
                 candidates.append((logical_path.resolve(), logical_path))
         package_root = Path(__file__).resolve().parents[3]
-        for runtime_path in (Path(sys.base_prefix), Path(sys.prefix), package_root):
+        runtime_paths = [Path(sys.base_prefix), Path(sys.prefix), package_root]
+        # uv-managed virtual environments may point ``.venv/bin/python`` at a
+        # standalone interpreter outside ``sys.prefix``.  Mount that resolved
+        # interpreter root as trusted runtime data as well; otherwise the
+        # symlink remains visible but its target disappears inside Bubblewrap.
+        # This is controller-owned runtime material, never a model-selected
+        # executable or workspace path.
+        try:
+            resolved_executable = Path(sys.executable).resolve(strict=True)
+        except OSError:
+            resolved_executable = Path(sys.executable).resolve()
+        interpreter_root = resolved_executable.parent.parent
+        if (
+            resolved_executable.parent.name == "bin"
+            and interpreter_root != Path("/")
+            and interpreter_root.is_dir()
+        ):
+            runtime_paths.append(interpreter_root)
+        for runtime_path in runtime_paths:
             resolved = runtime_path.expanduser().resolve()
             if (
                 resolved.exists()
