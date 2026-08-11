@@ -975,6 +975,22 @@ def _metadata() -> dict[str, object]:
             name: _safe_command([str(sandbox_exec), "-p", profile, "/usr/bin/true"])
             for name, profile in preflight_profiles.items()
         }
+        profile_fd, profile_name = tempfile.mkstemp(prefix="neuro-code-seatbelt-", suffix=".sb")
+        os.close(profile_fd)
+        profile_path = Path(profile_name)
+        try:
+            profile_path.write_text(
+                "(version 1) (deny default) "
+                "(allow process-fork) (allow process-exec) "
+                '(allow file-read* (subpath "/usr"))',
+                encoding="utf-8",
+            )
+            info["sandbox_exec_profile_file_preflight"] = _safe_command(
+                [str(sandbox_exec), "-f", str(profile_path), "/usr/bin/true"]
+            )
+        finally:
+            with contextlib.suppress(OSError):
+                profile_path.unlink()
     csrutil = shutil.which("csrutil")
     if csrutil is not None:
         status = subprocess.run(
