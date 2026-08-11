@@ -1,0 +1,73 @@
+name: macOS sandbox evidence
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/macos-sandbox-evidence.yml"
+      - "tests/security/macos_sandbox_probe.py"
+      - "src/neuro_code/infrastructure/sandbox/**"
+      - "src/neuro_code/application/ports/sandbox.py"
+      - "src/neuro_code/domain/sandbox/**"
+
+permissions:
+  contents: read
+
+jobs:
+  macos-sandbox-evidence:
+    name: macOS sandbox evidence (${{ matrix.runner }}, Python ${{ matrix.python }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        # Keep both architecture families explicit; do not silently replace
+        # Intel evidence with a floating macos-latest label.
+        runner: [macos-15, macos-15-intel]
+        python: ["3.12", "3.14"]
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7.0.0
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8.3.2
+        with:
+          version: "0.11.29"
+          python-version: ${{ matrix.python }}
+          enable-cache: true
+
+      - name: Install the locked test environment
+        run: uv sync --locked --extra dev
+
+      - name: Run macOS OS-level evidence probe
+        id: probe
+        continue-on-error: true
+        env:
+          REPORT: ${{ runner.temp }}/neuro-code-macos-sandbox-evidence.json
+        run: |
+          set -o pipefail
+          uv run python tests/security/macos_sandbox_probe.py --report "$REPORT" | tee "$RUNNER_TEMP/probe-summary.json"
+
+      - name: Upload capability report
+        if: always()
+        uses: actions/upload-artifact@v4.6.2
+        with:
+          name: macos-sandbox-evidence-${{ matrix.runner }}-py${{ matrix.python }}
+          path: |
+            ${{ runner.temp }}/neuro-code-macos-sandbox-evidence.json
+            ${{ runner.temp }}/probe-summary.json
+          if-no-files-found: error
+
+      - name: Require an explicit probe result
+        if: always()
+        env:
+          REPORT: ${{ runner.temp }}/neuro-code-macos-sandbox-evidence.json
+        run: |
+          test -f "$REPORT"
+          status="$(uv run python -c 'import json, os; print(json.load(open(os.environ["REPORT"], encoding="utf-8"))["status"])')"
+          echo "macOS sandbox evidence status: $status"
+          # PASS is the only green security result.  BLOCKED_CAPABILITY is
+          # deliberately a failed research gate, not a skipped test.
+          test "$status" = PASS
