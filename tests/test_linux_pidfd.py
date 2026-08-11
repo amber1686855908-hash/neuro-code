@@ -27,7 +27,9 @@ class LinuxPidfdOpsTests(unittest.TestCase):
             os.close(pidfd)
 
     def test_missing_stdlib_open_uses_libc_fallback(self) -> None:
-        with mock.patch.object(linux_pidfd.os, "pidfd_open", None):
+        # Python 3.14 builds may not expose the attribute at all; both an
+        # absent wrapper and an explicit ``None`` must exercise the fallback.
+        with mock.patch.object(linux_pidfd.os, "pidfd_open", None, create=True):
             operations = linux_pidfd.default_linux_pidfd_ops()
 
         self.assertIsInstance(operations, linux_pidfd._LibcLinuxPidfdOps)
@@ -47,7 +49,7 @@ class LinuxPidfdOpsTests(unittest.TestCase):
     def test_missing_libc_symbols_fail_closed(self) -> None:
         fake_libc = object()
         with (
-            mock.patch.object(linux_pidfd.os, "pidfd_open", None),
+            mock.patch.object(linux_pidfd.os, "pidfd_open", None, create=True),
             mock.patch.object(linux_pidfd.ctypes.util, "find_library", return_value="c"),
             mock.patch.object(linux_pidfd.ctypes, "CDLL", return_value=fake_libc),
             self.assertRaisesRegex(OSError, "pidfd wrappers are unavailable"),
