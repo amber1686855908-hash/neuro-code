@@ -166,29 +166,82 @@ class ProbeHarness:
         if workspace_mode not in {"read-only", "read-write"}:
             raise ValueError(f"unsupported workspace mode {workspace_mode!r}")
         workspace = self._canonical(self.workspace)
+        workspace_alias = self.workspace_alias
         synthetic_home = self._canonical(self.synthetic_home)
         private_tmp = self._canonical(self.private_tmp)
+        private_tmp_alias = self.private_tmp_alias
         additional = tuple(self._canonical(path) for path in extra_read_roots)
         executable_roots = tuple(self._canonical(path) for path in extra_exec_roots)
         read_roots = self._SYSTEM_READ_ROOTS + additional + executable_roots
         lines = ["(version 1)", "(deny default)", "(allow process-fork)", "(allow process-exec)"]
         lines.append("(allow signal (target self))")
+        # macOS's dyld/runtime startup performs a data access on the root
+        # directory object itself.  This is deliberately a literal rule: a
+        # recursive ``(subpath \"/\")`` read would expose the host filesystem
+        # and would invalidate the evidence for controller-state isolation.
+        lines.append('(allow file-read-data (literal "/"))')
+        lines.append('(allow file-read-metadata (literal "/"))')
+        lines.append("(allow sysctl-read)")
+        metadata_roots: set[Path] = set()
         for root in read_roots:
             lines.append(f"(allow file-read* (subpath {self._sbpl_literal(root)}))")
             lines.append(f"(allow file-read-metadata (subpath {self._sbpl_literal(root)}))")
+            # Seatbelt path matchers still need metadata access on every
+            # ancestor while a launcher resolves its executable/framework.
+            # Keep these metadata-only grants bounded to the explicit root;
+            # never broaden data access to an ancestor directory.
+            metadata_roots.update(root.parents)
+        for root in sorted(metadata_roots, key=lambda path: (len(path.parts), str(path))):
+            lines.append(f"(allow file-read-metadata (subpath {self._sbpl_literal(root)}))")
         lines.append(f"(allow file-read* (subpath {self._sbpl_literal(workspace)}))")
         lines.append(f"(allow file-read-metadata (subpath {self._sbpl_literal(workspace)}))")
+        # Seatbelt does not necessarily collapse /var and /private/var in a
+        # dynamic matcher.  Grant both canonical spellings explicitly so the
+        # evidence covers the same filesystem identity through either alias.
+        if workspace_alias != workspace:
+            lines.append(f"(allow file-read* (subpath {self._sbpl_literal(workspace_alias)}))")
+            lines.append(
+                f"(allow file-read-metadata (subpath {self._sbpl_literal(workspace_alias)}))"
+            )
+            for parent in workspace_alias.parents:
+                lines.append(f"(allow file-read-metadata (subpath {self._sbpl_literal(parent)}))")
+                if parent == Path("/var"):
+                    break
         lines.append(f"(allow file-read* (subpath {self._sbpl_literal(synthetic_home)}))")
         lines.append(f"(allow file-write* (subpath {self._sbpl_literal(synthetic_home)}))")
         lines.append(f"(allow file-read-metadata (subpath {self._sbpl_literal(synthetic_home)}))")
         lines.append(f"(allow file-read* (subpath {self._sbpl_literal(private_tmp)}))")
         lines.append(f"(allow file-write* (subpath {self._sbpl_literal(private_tmp)}))")
         lines.append(f"(allow file-read-metadata (subpath {self._sbpl_literal(private_tmp)}))")
+        if private_tmp_alias != private_tmp:
+            lines.append(f"(allow file-read* (subpath {self._sbpl_literal(private_tmp_alias)}))")
+            lines.append(f"(allow file-write* (subpath {self._sbpl_literal(private_tmp_alias)}))")
+            lines.append(
+                f"(allow file-read-metadata (subpath {self._sbpl_literal(private_tmp_alias)}))"
+            )
+            for parent in private_tmp_alias.parents:
+                lines.append(f"(allow file-read-metadata (subpath {self._sbpl_literal(parent)}))")
+                if parent == Path("/var"):
+                    break
         if workspace_mode == "read-write":
             lines.append(f"(allow file-write* (subpath {self._sbpl_literal(workspace)}))")
+            if workspace_alias != workspace:
+                lines.append(f"(allow file-write* (subpath {self._sbpl_literal(workspace_alias)}))")
+        # Shells and diagnostics commonly use /dev/null for bounded output.
+        # Permit only that device node, never recursive writes to /dev.
+        lines.append('(allow file-write-data (literal "/dev/null"))')
         if network_allowed:
             lines.append("(allow network-outbound)")
-        return "\n".join(lines)
+        policy = "\n".join(lines)
+        if '(allow file-read* (subpath "/"))' in policy:
+            raise ProbeInfrastructureError(
+                "macOS evidence policy accidentally grants recursive host-root read"
+            )
+        if '(allow file-read-data (literal "/"))' not in policy:
+            raise ProbeInfrastructureError(
+                "macOS evidence policy is missing the verified literal root-data rule"
+            )
+        return policy
 
     @staticmethod
     def _subpath_rule(operation: str, path: Path | str) -> str:
@@ -548,6 +601,10 @@ class ProbeHarness:
             ),
             ["/bin/sh", "-c", command],
         )
+        policy_assertions = {
+            "literal_root_data_rule": '(allow file-read-data (literal "/"))' in policy,
+            "recursive_root_read_absent": '(allow file-read* (subpath "/"))' not in policy,
+        }
         try:
             data = _read_json_result(result_path)
         except ProbeInfrastructureError as error:
@@ -561,12 +618,14 @@ class ProbeHarness:
                 "stdout": command_result.stdout[-2_000:],
                 "stderr": command_result.stderr[-2_000:],
                 "policy": policy,
+                "policy_assertions": policy_assertions,
             }
         # Restore the controller sentinel if a policy allowed a hardlink write;
         # the result remains evidence of the attempted escape.
         self._write_fixture(self.state_dir / "credentials.json", "controller-secret")
         data["returncode"] = command_result.returncode
         data["stderr"] = command_result.stderr[-2_000:]
+        data["policy_assertions"] = policy_assertions
         return data
 
     def filesystem(self) -> dict[str, object]:
@@ -636,26 +695,19 @@ class ProbeHarness:
             }
         return result
 
-    def python_subprocess(self) -> dict[str, object]:
+    def python_subprocess(self, listener_port: int) -> dict[str, object]:
         executable = self._canonical(Path(os.sys.executable))
-        roots = tuple(
-            dict.fromkeys(
-                [
-                    self._canonical(Path(os.sys.prefix)),
-                    self._canonical(Path(os.sys.base_prefix)),
-                    executable.parent,
-                    executable.parent.parent,
-                ]
-            )
-        )
+        roots = self._python_runtime_roots(executable)
         result_path = self._result_path("python-subprocess")
         code = (
-            "import json,pathlib;"
+            "import json,pathlib,socket;"
             f"p=pathlib.Path({str(self._canonical(result_path))!r});"
             f"outside=pathlib.Path({str(self._canonical(self.state_dir / 'credentials.json'))!r});"
             "read_ok=False;"
             "\ntry: outside.read_text(); read_ok=True\nexcept OSError: pass;"
-            "p.write_text(json.dumps({'outside_read':read_ok}))"
+            "network_ok=False;"
+            f"\ntry: socket.create_connection(('127.0.0.1',{listener_port}), timeout=1).close(); network_ok=True\nexcept OSError: pass;"
+            "\np.write_text(json.dumps({'outside_read':read_ok,'network':network_ok}))"
         )
         policy = self._policy(
             workspace_mode="read-write",
@@ -668,12 +720,79 @@ class ProbeHarness:
             [str(executable), "-I", "-c", code],
             env={"PYTHONNOUSERSITE": "1"},
         )
-        data = _read_json_result(result_path)
+        try:
+            data = _read_json_result(result_path)
+        except ProbeInfrastructureError as error:
+            data = {"result_available": False, "result_error": str(error)}
         data["returncode"] = command_result.returncode
         data["stderr"] = command_result.stderr[-2_000:]
+        data["target_exec_state"] = command_result.target_exec_state
         data["executable"] = str(executable)
         data["runtime_roots"] = [str(root) for root in roots]
         return data
+
+    def strict_runtime(self) -> dict[str, object]:
+        """Probe STRICT's narrow runtime roots without broadening them."""
+        executable = self._canonical(Path(os.sys.executable))
+        runtime_roots = self._python_runtime_roots(executable)
+        probes: dict[str, object] = {}
+        true_result = self._run_sandboxed(
+            self._policy(workspace_mode="read-write", network_allowed=False),
+            ["/usr/bin/true"],
+            cwd=Path("/"),
+        )
+        probes["true"] = _command_evidence(true_result)
+        shell_result = self._run_sandboxed(
+            self._policy(workspace_mode="read-write", network_allowed=False),
+            ["/bin/sh", "-c", "printf 'strict-shell-ok\\n'"],
+        )
+        probes["shell"] = _command_evidence(shell_result)
+        python_result = self._run_sandboxed(
+            self._policy(
+                workspace_mode="read-write",
+                network_allowed=False,
+                extra_read_roots=runtime_roots,
+                extra_exec_roots=(executable.parent,),
+            ),
+            [str(executable), "-I", "-c", "print('strict-python-ok')"],
+            env={"PYTHONNOUSERSITE": "1"},
+        )
+        probes["python"] = {
+            **_command_evidence(python_result),
+            "executable": str(executable),
+            "runtime_roots": [str(root) for root in runtime_roots],
+        }
+        return {
+            "policy_contract": {
+                "workspace_mode": "read-write",
+                "network_allowed": False,
+                "recursive_root_read": False,
+                "literal_root_data": True,
+            },
+            "probes": probes,
+        }
+
+    def _python_runtime_roots(self, executable: Path) -> tuple[Path, ...]:
+        """Return bounded interpreter roots, including launcher parent traversal."""
+        roots: list[Path] = [
+            self._canonical(Path(os.sys.prefix)),
+            self._canonical(Path(os.sys.base_prefix)),
+            executable.parent,
+            executable.parent.parent,
+        ]
+        current = executable.parent
+        # macOS Python launchers call realpath() through their framework/homebrew
+        # parents.  Grant only the known runtime families, never the host root.
+        while current != current.parent and str(current) not in {
+            "/Library",
+            "/opt/homebrew",
+            "/opt",
+        }:
+            current = current.parent
+            if current in {Path("/Library"), Path("/opt/homebrew"), Path("/opt")}:
+                roots.append(current)
+                break
+        return tuple(dict.fromkeys(roots))
 
     def mcp_stdio(self, listener_port: int) -> dict[str, object]:
         nc = shutil.which("nc", path="/usr/bin:/bin")
@@ -689,13 +808,21 @@ class ProbeHarness:
             state = shlex.quote(str(self._canonical(self.state_dir / "credentials.json")))
             workspace = shlex.quote(str(self._canonical(self.workspace)))
             result_file = shlex.quote(str(self._canonical(result_path)))
+            grandchild_command = shlex.quote(
+                f"if cat {state} >/dev/null 2>&1; then printf '1 '; else printf '0 '; fi; "
+                f"if printf x > {workspace}/mcp-grandchild-write; then printf '1 '; else printf '0 '; fi; "
+                f"if {shlex.quote(nc)} -z -w 1 127.0.0.1 {listener_port} >/dev/null 2>&1; then printf 1; else printf 0; fi"
+            )
             command = (
                 "IFS= read -r request; "
                 "fs=0; net=0; write=0; "
+                "grandchild='000'; "
                 f"if cat {state} >/dev/null 2>&1; then fs=1; fi; "
                 f"if printf x > {workspace}/mcp-write; then write=1; fi; "
                 f"if {shlex.quote(nc)} -z -w 1 127.0.0.1 {listener_port} >/dev/null 2>&1; then net=1; fi; "
-                f'printf \'{{"request":"%s","outside_read":%s,"workspace_write":%s,"network":%s}}\\n\' "$request" "$fs" "$write" "$net" > {result_file}; '
+                f"grandchild=$(/bin/sh -c {grandchild_command}); "
+                f"set -- $grandchild; "
+                f'printf \'{{"request":"%s","outside_read":%s,"workspace_write":%s,"network":%s,"grandchild_outside_read":%s,"grandchild_workspace_write":%s,"grandchild_network":%s}}\\n\' "$request" "$fs" "$write" "$net" "$1" "$2" "$3" > {result_file}; '
                 "printf 'pong\\n'"
             )
             completed = self._run_sandboxed(
@@ -703,15 +830,19 @@ class ProbeHarness:
                 ["/bin/sh", "-c", command],
                 input_text="ping\n",
             )
+            try:
+                data = _read_json_result(result_path)
+            except ProbeInfrastructureError as error:
+                data = {"result_available": False, "result_error": str(error)}
             result[profile] = {
                 "returncode": completed.returncode,
                 "protocol_pong": "pong" in completed.stdout,
                 "stderr": completed.stderr[-2_000:],
-                **_read_json_result(result_path),
+                **data,
             }
         return result
 
-    def access_inheritance(self, helper: Path) -> dict[str, object]:
+    def access_inheritance(self, helper: Path, listener_port: int) -> dict[str, object]:
         result: dict[str, object] = {}
         for profile in ("workspace", "read-only", "strict"):
             result_path = self._result_path(f"access-{profile}")
@@ -732,58 +863,82 @@ class ProbeHarness:
                     str(self._canonical(self.state_dir / "credentials.json")),
                     str(self._canonical(result_path)),
                     "access",
+                    str(self._canonical(self.workspace)),
+                    str(listener_port),
                 ],
                 timeout=15,
             )
+            try:
+                data = _read_json_result(result_path)
+            except ProbeInfrastructureError as error:
+                data = {"result_available": False, "result_error": str(error)}
             result[profile] = {
                 "returncode": command_result.returncode,
-                "setsid_outside_read": _read_json_result(result_path).get("outside_read"),
+                **data,
                 "stderr": command_result.stderr[-2_000:],
             }
         return result
 
     def lifecycle(self, helper: Path) -> dict[str, object]:
-        result: dict[str, object] = {}
-        for mode in ("ordinary", "setsid"):
-            ready = self._result_path(f"lifecycle-ready-{mode}")
-            release = self._result_path(f"lifecycle-release-{mode}")
-            leaked = self._result_path(f"lifecycle-leaked-{mode}")
-            pid_file = self._result_path(f"lifecycle-pid-{mode}")
-            policy = self._policy(
-                workspace_mode="read-write",
-                network_allowed=True,
-            )
-            process = self._start_sandboxed_process(
-                policy,
-                [
-                    str(self._canonical(helper)),
-                    str(self._canonical(ready)),
-                    str(self._canonical(release)),
-                    str(self._canonical(leaked)),
-                    str(self._canonical(self.state_dir / "credentials.json")),
-                    str(self._canonical(pid_file)),
-                    mode,
-                ],
-            )
-            ready_seen = _wait_for_path(ready, timeout=5)
-            self._terminate_process_group(process)
-            release.write_text("release", encoding="utf-8")
-            time.sleep(0.4)
-            child_pid = _read_pid(pid_file)
-            pid_alive_before_cleanup = child_pid is not None and _pid_alive(child_pid)
-            leaked_seen = leaked.exists()
-            if child_pid is not None and _pid_alive(child_pid):
-                with contextlib.suppress(OSError):
-                    os.kill(child_pid, signal.SIGKILL)
-            with contextlib.suppress(ProcessLookupError):
-                process.wait(timeout=2)
-            result[mode] = {
-                "ready_seen": ready_seen,
-                "leaked_after_group_termination": leaked_seen,
-                "pid_alive_before_cleanup": pid_alive_before_cleanup,
-                "outer_returncode": process.returncode,
-                "evidence_recorded_before_cleanup": True,
-            }
+        result: dict[str, object] = {
+            "termination_model": (
+                "timeout, cancellation, background shutdown, and explicit termination "
+                "use the same process-group boundary in this evidence probe"
+            ),
+            "scenarios": {},
+        }
+        actions = ("explicit_terminate", "timeout", "cancellation", "background_shutdown")
+        for action in actions:
+            for mode in ("ordinary", "setsid"):
+                label = f"lifecycle-{action}-{mode}"
+                ready = self._result_path(f"{label}-ready")
+                release = self._result_path(f"{label}-release")
+                leaked = self._result_path(f"{label}-leaked")
+                pid_file = self._result_path(f"{label}-pid")
+                policy = self._policy(
+                    workspace_mode="read-write",
+                    network_allowed=True,
+                )
+                process = self._start_sandboxed_process(
+                    policy,
+                    [
+                        str(self._canonical(helper)),
+                        str(self._canonical(ready)),
+                        str(self._canonical(release)),
+                        str(self._canonical(leaked)),
+                        str(self._canonical(self.state_dir / "credentials.json")),
+                        str(self._canonical(pid_file)),
+                        mode,
+                    ],
+                )
+                ready_seen = _wait_for_path(ready, timeout=5)
+                self._terminate_process_group(process)
+                # A detached child observes this only after the evidence
+                # window.  Do not release it before measuring survival.
+                release.write_text("release", encoding="utf-8")
+                time.sleep(0.4)
+                child_pid = _read_pid(pid_file)
+                pid_alive_before_cleanup = child_pid is not None and _pid_alive(child_pid)
+                leaked_seen = leaked.exists()
+                evidence = {
+                    "action": action,
+                    "mode": mode,
+                    "ready_seen": ready_seen,
+                    "leaked_after_group_termination": leaked_seen,
+                    "pid_alive_before_cleanup": pid_alive_before_cleanup,
+                    "outer_returncode": process.returncode,
+                    "evidence_recorded_before_cleanup": True,
+                }
+                scenario_records = result["scenarios"]
+                if isinstance(scenario_records, dict):
+                    scenario_records[f"{action}:{mode}"] = evidence
+                if action == "explicit_terminate":
+                    result[mode] = evidence
+                if child_pid is not None and _pid_alive(child_pid):
+                    with contextlib.suppress(OSError):
+                        os.kill(child_pid, signal.SIGKILL)
+                with contextlib.suppress(ProcessLookupError):
+                    process.wait(timeout=2)
         return result
 
     def pty(self, helper: Path, listener_port: int) -> dict[str, object]:
@@ -1179,6 +1334,10 @@ def _compile_lifecycle_helper(root: Path) -> Path:
             #include <stdio.h>
             #include <stdlib.h>
             #include <string.h>
+            #include <arpa/inet.h>
+            #include <netinet/in.h>
+            #include <stdint.h>
+            #include <sys/socket.h>
             #include <sys/types.h>
             #include <unistd.h>
 
@@ -1193,18 +1352,21 @@ def _compile_lifecycle_helper(root: Path) -> Path:
             static int exists(const char *path) { return access(path, F_OK) == 0; }
 
             int main(int argc, char **argv) {
-                if (argc != 7) return 2;
+                if (argc < 7 || argc > 9) return 2;
                 const char *ready = argv[1];
                 const char *release = argv[2];
                 const char *leaked = argv[3];
                 const char *outside = argv[4];
                 const char *aux_path = argv[5];
                 const char *mode = argv[6];
+                const char *workspace = argc >= 8 ? argv[7] : "";
+                int listener_port = argc >= 9 ? atoi(argv[8]) : 0;
                 pid_t child = fork();
                 if (child < 0) return 3;
                 if (child == 0) {
+                    int setsid_ok = 1;
                     if (strcmp(mode, "setsid") == 0 || strcmp(mode, "access") == 0) {
-                        if (setsid() < 0) _exit(4);
+                        if (setsid() < 0) setsid_ok = 0;
                     }
                     char pid[32];
                     snprintf(pid, sizeof(pid), "%ld", (long)getpid());
@@ -1216,10 +1378,35 @@ def _compile_lifecycle_helper(root: Path) -> Path:
                         fd = open(outside, O_WRONLY | O_APPEND);
                         int write_ok = fd >= 0;
                         if (fd >= 0) close(fd);
-                        char data[96];
-                        snprintf(data, sizeof(data), "{\"outside_read\":%d,\"outside_write\":%d}", read_ok, write_ok);
+                        char workspace_file[1024];
+                        snprintf(workspace_file, sizeof(workspace_file), "%s/readable.txt", workspace);
+                        fd = open(workspace_file, O_RDONLY);
+                        int workspace_read = fd >= 0;
+                        if (fd >= 0) close(fd);
+                        snprintf(workspace_file, sizeof(workspace_file), "%s/access-write", workspace);
+                        fd = open(workspace_file, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+                        int workspace_write = fd >= 0;
+                        if (fd >= 0) close(fd);
+                        int network_ok = 0;
+                        if (listener_port > 0) {
+                            int sock = socket(AF_INET, SOCK_STREAM, 0);
+                            if (sock >= 0) {
+                                struct sockaddr_in address;
+                                memset(&address, 0, sizeof(address));
+                                address.sin_family = AF_INET;
+                                address.sin_port = htons((uint16_t)listener_port);
+                                inet_pton(AF_INET, "127.0.0.1", &address.sin_addr);
+                                network_ok = connect(sock, (struct sockaddr *)&address, sizeof(address)) == 0;
+                                close(sock);
+                            }
+                        }
+                        char data[192];
+                        snprintf(data, sizeof(data), "{\"setsid\":%d,\"outside_read\":%d,\"outside_write\":%d,\"workspace_read\":%d,\"workspace_write\":%d,\"network\":%d}", setsid_ok, read_ok, write_ok, workspace_read, workspace_write, network_ok);
                         mark(aux_path, data);
                         mark(ready, "ready");
+                        close(STDIN_FILENO);
+                        close(STDOUT_FILENO);
+                        close(STDERR_FILENO);
                         _exit(0);
                     }
                     mark(ready, "ready");
@@ -1257,7 +1444,10 @@ def _start_listener() -> tuple[socket.socket, int]:
     listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:
         listener.bind(("127.0.0.1", 0))
-        listener.listen(4)
+        # The probes intentionally leave the controller-owned listener open
+        # while several child/grandchild checks run.  A generous backlog keeps
+        # a failed Seatbelt connect distinguishable from a full queue.
+        listener.listen(128)
     except OSError:
         listener.close()
         raise
@@ -1538,7 +1728,10 @@ def _evaluate(report: dict[str, object]) -> tuple[str, list[str]]:
     filesystem = report.get("filesystem")
     if isinstance(filesystem, dict):
         for profile, expected in (
-            ("workspace", {"workspace_write": 1, "outside_read": 0, "host_home_read": 0}),
+            (
+                "workspace",
+                {"workspace_read": 1, "workspace_write": 1, "outside_read": 0, "host_home_read": 0},
+            ),
             ("read-only", {"workspace_write": 0, "workspace_read": 1, "outside_read": 0}),
             ("strict", {"workspace_write": 1, "outside_read": 0, "host_home_read": 0}),
         ):
@@ -1563,6 +1756,15 @@ def _evaluate(report: dict[str, object]) -> tuple[str, list[str]]:
                     failures.append(f"filesystem {profile} canonical path escape was readable")
                 if actual.get("additional_read") != 1 or actual.get("additional_write") != 0:
                     failures.append(f"filesystem {profile} additional root policy mismatch")
+                assertions = actual.get("policy_assertions")
+                if (
+                    not isinstance(assertions, dict)
+                    or not assertions.get("literal_root_data_rule")
+                    or not assertions.get("recursive_root_read_absent")
+                ):
+                    failures.append(f"filesystem {profile} policy root-read assertion failed")
+            else:
+                failures.append(f"filesystem {profile} produced no result")
         for profile in ("workspace", "read-only", "strict"):
             actual = filesystem.get(profile)
             if isinstance(actual, dict) and (
@@ -1575,29 +1777,75 @@ def _evaluate(report: dict[str, object]) -> tuple[str, list[str]]:
     if isinstance(network, dict):
         for profile, expected in (("workspace", True), ("read-only", False), ("strict", False)):
             actual = network.get(profile)
-            if isinstance(actual, dict) and actual.get("direct_tcp_allowed") is not expected:
-                failures.append(f"network {profile} direct TCP result is not {expected!r}")
+            if isinstance(actual, dict):
+                for key in ("direct_tcp_allowed", "grandchild_tcp_allowed"):
+                    if actual.get(key) is not expected:
+                        failures.append(f"network {profile} {key} is not {expected!r}")
+            else:
+                failures.append(f"network {profile} report is missing")
     python_subprocess = report.get("python_subprocess")
-    if not isinstance(python_subprocess, dict) or python_subprocess.get("outside_read") != 0:
-        failures.append("Python subprocess could read controller-private state")
+    if not isinstance(python_subprocess, dict):
+        failures.append("Python subprocess report is missing")
+    else:
+        if python_subprocess.get("returncode") != 0:
+            failures.append("Python subprocess did not start under WORKSPACE")
+        if python_subprocess.get("outside_read") != 0:
+            failures.append("Python subprocess could read controller-private state")
+        if python_subprocess.get("network") is not True:
+            failures.append("Python subprocess could not use WORKSPACE localhost network")
+    strict_runtime = report.get("strict_runtime")
+    if not isinstance(strict_runtime, dict):
+        failures.append("STRICT runtime report is missing")
+    else:
+        contract = strict_runtime.get("policy_contract")
+        if not isinstance(contract, dict) or contract.get("recursive_root_read") is not False:
+            failures.append("STRICT policy unexpectedly grants recursive host-root read")
+        probes = strict_runtime.get("probes")
+        if not isinstance(probes, dict):
+            failures.append("STRICT runtime probes are missing")
+        else:
+            for name in ("true", "shell", "python"):
+                probe = probes.get(name)
+                if not isinstance(probe, dict) or probe.get("returncode") != 0:
+                    failures.append(f"STRICT runtime probe failed: {name}")
     inheritance = report.get("access_inheritance")
     if isinstance(inheritance, dict):
         for profile in ("workspace", "read-only", "strict"):
             actual = inheritance.get(profile)
-            if isinstance(actual, dict) and actual.get("setsid_outside_read") == 1:
-                failures.append(
-                    f"access control inherited by setsid child allowed outside read ({profile})"
-                )
+            if isinstance(actual, dict):
+                if actual.get("setsid") != 1:
+                    failures.append(f"setsid access child could not detach ({profile})")
+                if actual.get("outside_read") == 1 or actual.get("outside_write") == 1:
+                    failures.append(f"setsid access child reached controller state ({profile})")
+                if actual.get("workspace_read") != 1:
+                    failures.append(f"setsid access child lost workspace read ({profile})")
+                expected_write = profile != "read-only"
+                if (actual.get("workspace_write") == 1) is not expected_write:
+                    failures.append(f"setsid access child workspace write mismatch ({profile})")
+                expected_network = profile == "workspace"
+                if (actual.get("network") == 1) is not expected_network:
+                    failures.append(f"setsid access child network mismatch ({profile})")
+            else:
+                failures.append(f"setsid access inheritance report missing ({profile})")
     lifecycle = report.get("lifecycle")
-    if (
-        isinstance(lifecycle, dict)
-        and isinstance(lifecycle.get("setsid"), dict)
-        and (
-            lifecycle["setsid"].get("leaked_after_group_termination")
-            or lifecycle["setsid"].get("pid_alive_before_cleanup")
-        )
-    ):
-        failures.append("setsid descendant survived process-group termination")
+    if isinstance(lifecycle, dict):
+        records: list[dict[str, object]] = []
+        for value in lifecycle.values():
+            if isinstance(value, dict) and "mode" in value:
+                records.append(value)
+            elif isinstance(value, dict):
+                records.extend(
+                    item for item in value.values() if isinstance(item, dict) and "mode" in item
+                )
+        for record in records:
+            if record.get("leaked_after_group_termination") or record.get(
+                "pid_alive_before_cleanup"
+            ):
+                failures.append(
+                    f"{record.get('mode')} descendant survived {record.get('action')} termination"
+                )
+    else:
+        failures.append("lifecycle report is missing")
     pty_result = report.get("pty")
     if isinstance(pty_result, dict):
         for profile in ("workspace", "read-only", "strict"):
@@ -1605,8 +1853,8 @@ def _evaluate(report: dict[str, object]) -> tuple[str, list[str]]:
             if isinstance(actual, dict) and not actual.get("ready"):
                 failures.append(f"PTY did not start ({profile})")
             if isinstance(actual, dict) and (
-                (profile == "workspace" and not actual.get("workspace_write"))
-                or (profile != "workspace" and actual.get("workspace_write"))
+                (profile != "read-only" and not actual.get("workspace_write"))
+                or (profile == "read-only" and actual.get("workspace_write"))
                 or actual.get("outside_read")
                 or (profile == "workspace" and not actual.get("network"))
                 or (profile != "workspace" and actual.get("network"))
@@ -1617,21 +1865,109 @@ def _evaluate(report: dict[str, object]) -> tuple[str, list[str]]:
             or pty_result["setsid_lifecycle"].get("pid_alive_before_cleanup")
         ):
             failures.append("PTY setsid descendant survived close")
+        ctrl_c = pty_result.get("ctrl_c")
+        if (
+            not isinstance(ctrl_c, dict)
+            or not ctrl_c.get("ready")
+            or not ctrl_c.get("interrupt_observed")
+        ):
+            failures.append("PTY Ctrl-C lifecycle probe did not observe interruption")
     mcp = report.get("mcp_stdio")
     if isinstance(mcp, dict):
         for profile in ("workspace", "read-only", "strict"):
             actual = mcp.get(profile)
-            if isinstance(actual, dict) and not actual.get("protocol_pong"):
+            if isinstance(actual, dict) and (
+                actual.get("returncode") != 0 or not actual.get("protocol_pong")
+            ):
                 failures.append(f"MCP-like stdio protocol failed ({profile})")
             if isinstance(actual, dict) and (
                 actual.get("outside_read")
-                or (profile == "workspace" and not actual.get("workspace_write"))
-                or (profile != "workspace" and actual.get("workspace_write"))
+                or (profile != "read-only" and not actual.get("workspace_write"))
+                or (profile == "read-only" and actual.get("workspace_write"))
                 or (profile == "workspace" and not actual.get("network"))
                 or (profile != "workspace" and actual.get("network"))
+                or actual.get("grandchild_outside_read")
+                or (profile != "read-only" and not actual.get("grandchild_workspace_write"))
+                or (profile == "read-only" and actual.get("grandchild_workspace_write"))
+                or (profile == "workspace" and not actual.get("grandchild_network"))
+                or (profile != "workspace" and actual.get("grandchild_network"))
             ):
                 failures.append(f"MCP-like stdio policy mismatch ({profile})")
+            if not isinstance(actual, dict):
+                failures.append(f"MCP-like stdio report missing ({profile})")
     return ("BLOCKED_CAPABILITY" if failures else "PASS"), failures
+
+
+def _capability_matrix(report: dict[str, object]) -> dict[str, dict[str, str]]:
+    """Project raw evidence into a per-profile capability matrix."""
+    matrix: dict[str, dict[str, str]] = {}
+    filesystem = report.get("filesystem")
+    network = report.get("network")
+    inheritance = report.get("access_inheritance")
+    mcp = report.get("mcp_stdio")
+    pty_report = report.get("pty")
+    lifecycle = report.get("lifecycle")
+    lifecycle_records: list[dict[str, object]] = []
+    if isinstance(lifecycle, dict):
+        for value in lifecycle.values():
+            if isinstance(value, dict) and "mode" in value:
+                lifecycle_records.append(value)
+            elif isinstance(value, dict):
+                lifecycle_records.extend(
+                    item for item in value.values() if isinstance(item, dict) and "mode" in item
+                )
+    lifecycle_pass = bool(lifecycle_records) and not any(
+        item.get("leaked_after_group_termination") or item.get("pid_alive_before_cleanup")
+        for item in lifecycle_records
+    )
+    for profile in ("workspace", "read-only", "strict"):
+        fs = filesystem.get(profile) if isinstance(filesystem, dict) else None
+        net = network.get(profile) if isinstance(network, dict) else None
+        access = inheritance.get(profile) if isinstance(inheritance, dict) else None
+        mcp_item = mcp.get(profile) if isinstance(mcp, dict) else None
+        pty_item = pty_report.get(profile) if isinstance(pty_report, dict) else None
+        fs_pass = isinstance(fs, dict) and all(
+            (
+                fs.get("outside_read") == 0,
+                fs.get("workspace_write") == (0 if profile == "read-only" else 1),
+                fs.get("hardlink_read") == 0,
+                fs.get("hardlink_write") == 0,
+                isinstance(fs.get("policy_assertions"), dict),
+            )
+        )
+        net_pass = isinstance(net, dict) and all(
+            (
+                net.get("direct_tcp_allowed") is (profile == "workspace"),
+                net.get("grandchild_tcp_allowed") is (profile == "workspace"),
+            )
+        )
+        access_pass = isinstance(access, dict) and all(
+            (
+                access.get("outside_read") == 0,
+                access.get("outside_write") == 0,
+                access.get("workspace_write") == (0 if profile == "read-only" else 1),
+                access.get("network") == (1 if profile == "workspace" else 0),
+            )
+        )
+        mcp_pass = isinstance(mcp_item, dict) and mcp_item.get("protocol_pong") is True
+        pty_pass = isinstance(pty_item, dict) and pty_item.get("ready") is True
+        matrix[profile.upper().replace("-", "_")] = {
+            "filesystem": "PASS" if fs_pass else "BLOCKED",
+            "network": "PASS" if net_pass else "BLOCKED",
+            "access_control_inheritance": "PASS" if access_pass else "BLOCKED",
+            "mcp_stdio": "PASS" if mcp_pass else "BLOCKED",
+            "pty": "PASS" if pty_pass else "BLOCKED",
+            "lifecycle": "PASS" if lifecycle_pass else "BLOCKED",
+        }
+    strict_runtime = report.get("strict_runtime")
+    if isinstance(strict_runtime, dict):
+        probes = strict_runtime.get("probes")
+        strict_ready = isinstance(probes, dict) and all(
+            isinstance(probes.get(name), dict) and probes[name].get("returncode") == 0
+            for name in ("true", "shell", "python")
+        )
+        matrix.setdefault("STRICT", {})["runtime_policy"] = "PASS" if strict_ready else "BLOCKED"
+    return matrix
 
 
 def main() -> int:
@@ -1671,10 +2007,11 @@ def main() -> int:
                     listener, port = _start_listener()
                     try:
                         report["filesystem"] = harness.filesystem()
-                        report["python_subprocess"] = harness.python_subprocess()
+                        report["python_subprocess"] = harness.python_subprocess(port)
+                        report["strict_runtime"] = harness.strict_runtime()
                         report["network"] = harness.network(port)
                         helper = _compile_lifecycle_helper(harness.private_tmp)
-                        report["access_inheritance"] = harness.access_inheritance(helper)
+                        report["access_inheritance"] = harness.access_inheritance(helper, port)
                         report["lifecycle"] = harness.lifecycle(helper)
                         report["pty"] = harness.pty(helper, port)
                         report["mcp_stdio"] = harness.mcp_stdio(port)
@@ -1683,6 +2020,8 @@ def main() -> int:
                     status, failures = _evaluate(report)
             report["status"] = status
             report["failures"] = failures
+            if args.mode == "full":
+                report["capability_matrix"] = _capability_matrix(report)
             exit_code = (
                 0 if status in {"PASS", "READY_FOR_NEXT_MACOS_EVIDENCE"} else CAPABILITY_FAILURE
             )

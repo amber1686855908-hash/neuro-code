@@ -25,10 +25,9 @@ jobs:
         # Keep both architecture families explicit; do not silently replace
         # Intel evidence with a floating macos-latest label.
         runner: [macos-15, macos-15-intel]
-        # Root-cause mode intentionally uses one Python per architecture.  It
-        # only launches /usr/bin/true; the full Python matrix follows once a
-        # usable filesystem policy is identified.
-        python: ["3.12"]
+        # Run the actual workload evidence on both supported Python runtimes;
+        # ordinary macOS CI is not a substitute for this OS-level matrix.
+        python: ["3.12", "3.14"]
 
     steps:
       - name: Check out source
@@ -52,7 +51,7 @@ jobs:
         run: |
           set -o pipefail
           uv run python tests/security/macos_sandbox_probe.py \
-            --mode root-cause \
+            --mode full \
             --report "$REPORT" | tee "$RUNNER_TEMP/probe-summary.json"
 
       - name: Upload capability report
@@ -73,6 +72,6 @@ jobs:
           test -f "$REPORT"
           status="$(uv run python -c 'import json, os; print(json.load(open(os.environ["REPORT"], encoding="utf-8"))["status"])')"
           echo "macOS sandbox evidence status: $status"
-          # A usable root-cause result is the only green research result.
-          # BLOCKED_CAPABILITY is deliberately a failed gate, not a skip.
-          test "$status" = READY_FOR_NEXT_MACOS_EVIDENCE
+          # Capability failures are deliberately a failed gate, not a skip.
+          # A PASS is required before production macOS design can begin.
+          test "$status" = PASS
