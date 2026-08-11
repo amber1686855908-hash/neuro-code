@@ -1187,9 +1187,11 @@ def main() -> int:
             report["failures"] = failures
             exit_code = 0 if status == "PASS" else CAPABILITY_FAILURE
     except ProbeInfrastructureError as error:
-        report["status"] = "BLOCKED_INFRASTRUCTURE"
+        message = str(error)
+        capability_failure = "probe result " in message
+        report["status"] = "BLOCKED_CAPABILITY" if capability_failure else "BLOCKED_INFRASTRUCTURE"
         report["failures"] = [str(error)]
-        exit_code = INFRASTRUCTURE_FAILURE
+        exit_code = CAPABILITY_FAILURE if capability_failure else INFRASTRUCTURE_FAILURE
     except (OSError, subprocess.SubprocessError, TimeoutError) as error:
         report["status"] = "BLOCKED_INFRASTRUCTURE"
         report["failures"] = [f"unexpected probe infrastructure error: {error}"]
