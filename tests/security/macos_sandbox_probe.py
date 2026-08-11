@@ -724,12 +724,15 @@ class ProbeHarness:
         for name, alias in self._hardlink_aliases.items():
             target_json.append((name, shlex.quote(str(self._canonical(alias)))))
         target_fields: list[str] = []
+        target_values: list[str] = []
         for name, _alias in target_json:
             prefix = f"h_{name}"
             target_fields.append(
-                f'"{name}":{{"read":${prefix}_read,"append":${prefix}_append,'
-                f'"overwrite":${prefix}_overwrite,"truncate":${prefix}_truncate,'
-                f'"stat":${prefix}_stat}}'
+                f'"{name}":{{"read":%s,"append":%s,"overwrite":%s,"truncate":%s,"stat":%s}}'
+            )
+            target_values.extend(
+                f'"${prefix}_{operation}"'
+                for operation in ("read", "append", "overwrite", "truncate", "stat")
             )
         for profile in ("workspace", "read-only", "strict"):
             result_path = self._result_path(f"hardlink-scope-{profile}")
@@ -750,7 +753,9 @@ class ProbeHarness:
                     ]
                 )
             values = ",".join(target_fields)
-            lines.append(f"printf '{{\"targets\":{{{values}}}}}' > {result_file}")
+            format_string = f'{{"targets":{{{values}}}}}'
+            escaped_format = format_string.replace('"', '\\"')
+            lines.append(f'printf "{escaped_format}" {" ".join(target_values)} > {result_file}')
             policy = self._policy(
                 workspace_mode="read-only" if profile == "read-only" else "read-write",
                 network_allowed=False,
