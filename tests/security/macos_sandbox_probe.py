@@ -959,6 +959,18 @@ def _metadata() -> dict[str, object]:
                 "(allow process-fork) (allow process-exec) "
                 '(allow file-read* (regex "^/usr/bin/true$"))'
             ),
+            "deny_default_process_read_root": (
+                "(version 1) (deny default) "
+                "(allow process-fork) (allow process-exec) "
+                '(allow file-read* (subpath "/"))'
+            ),
+            "deny_default_process_read_private_var": (
+                "(version 1) (deny default) "
+                "(allow process-fork) (allow process-exec) "
+                '(allow file-read* (subpath "/System")) '
+                '(allow file-read* (subpath "/usr")) '
+                '(allow file-read* (subpath "/private/var"))'
+            ),
             "deny_default_process": (
                 "(version 1) (deny default) "
                 "(allow process-fork) (allow process-exec) "
