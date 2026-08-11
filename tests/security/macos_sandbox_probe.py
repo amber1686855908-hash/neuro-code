@@ -1172,6 +1172,115 @@ class ProbeHarness:
             },
         }
 
+    def cross_root_hardlink_modes(self) -> dict[str, object]:
+        """Probe hardlinks between read-write and read-only authorized roots.
+
+        This is evidence-only.  The primary workspace is the read-write root
+        and ``additional_root`` is exposed as a read-only root.  The probe
+        therefore tests the same mixed-mode layout that a future multi-root
+        sandbox policy would have to enforce, without changing production
+        policy construction.
+
+        探测读写授权根与只读授权根之间的硬链接.
+
+        本方法仅收集证据:主工作区作为读写根,``additional_root`` 作为只读根公开,
+        从而验证未来多根沙箱策略必须处理的混合模式布局,不会修改生产策略构造.
+        """
+
+        from hardlink_mode_probe_common import (  # type: ignore[import-not-found]
+            APIS,
+            DIRECTIONS,
+            build_child_code,
+            classify_findings,
+        )
+
+        root_rw = self._canonical(self.workspace)
+        root_ro = self._canonical(self.additional_root)
+        executable = self._canonical(Path(os.sys.executable))
+        runtime_roots = self._python_runtime_roots(executable)
+        root_pairs = {
+            "ro_to_rw": (root_ro, root_rw),
+            "rw_to_ro": (root_rw, root_ro),
+            "rw_to_rw": (root_rw, root_rw),
+            "ro_to_ro": (root_ro, root_ro),
+        }
+        operations: dict[str, dict[str, str]] = {}
+        source_contents: dict[str, str] = {}
+        for direction in DIRECTIONS:
+            source_root, destination_root = root_pairs[direction]
+            for api in APIS:
+                name = f"{direction}.{api}"
+                source = source_root / f"mode-source-{direction}-{api}"
+                destination = destination_root / f"mode-alias-{direction}-{api}"
+                content = f"source:{direction}:{api}"
+                source.write_text(content, encoding="utf-8")
+                with contextlib.suppress(FileNotFoundError):
+                    destination.unlink()
+                operations[name] = {
+                    "direction": direction,
+                    "api": api,
+                    "source": str(source),
+                    "destination": str(destination),
+                }
+                source_contents[str(source)] = content
+
+        profiles: dict[str, object] = {}
+        for profile in ("workspace", "strict", "read-only"):
+            result_path = self._result_path(f"cross-root-hardlink-{profile}")
+            policy = self._policy(
+                workspace_mode="read-only" if profile == "read-only" else "read-write",
+                network_allowed=False,
+                extra_read_roots=(root_ro, *runtime_roots),
+                extra_exec_roots=(executable.parent,),
+            )
+            code = build_child_code(
+                operations,
+                result_path=str(self._canonical(result_path)),
+            )
+            command_result = self._run_sandboxed(
+                policy,
+                [str(executable), "-I", "-c", code],
+                cwd=root_rw,
+            )
+            try:
+                data = _read_json_result(result_path)
+            except ProbeInfrastructureError as error:
+                data = {"result_available": False, "result_error": str(error)}
+            data.update(_command_evidence(command_result))
+            data["policy"] = policy
+            data["root_modes"] = {
+                "workspace": "read-only" if profile == "read-only" else "read-write",
+                "additional": "read-only",
+            }
+            profiles[profile] = data
+
+            for operation in operations.values():
+                with contextlib.suppress(FileNotFoundError):
+                    Path(operation["destination"]).unlink()
+                Path(operation["source"]).write_text(
+                    source_contents[operation["source"]], encoding="utf-8"
+                )
+
+        findings = classify_findings(
+            {profile: value for profile, value in profiles.items() if isinstance(value, dict)}
+        )
+        return {
+            "probe": "macos-cross-root-hardlink-mode-v1",
+            "roots": {
+                "read_write": str(root_rw),
+                "read_only": str(root_ro),
+            },
+            "directions": DIRECTIONS,
+            "apis": APIS,
+            "profiles": profiles,
+            "findings": findings,
+            "status": "BLOCKED_CAPABILITY" if findings else "NO_MODE_BYPASS_OBSERVED",
+            "interpretation": (
+                "A mixed-mode inode is unsafe if a read-only-root inode can be linked "
+                "into a read-write root and modified through that alias."
+            ),
+        }
+
     def python_subprocess(self, listener_port: int) -> dict[str, object]:
         executable = self._canonical(Path(os.sys.executable))
         roots = self._python_runtime_roots(executable)

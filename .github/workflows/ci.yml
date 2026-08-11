@@ -119,6 +119,17 @@ jobs:
           name: linux-hardlink-alias-${{ matrix.python }}
           path: ${{ runner.temp }}/neuro-code-linux-hardlink-alias.json
           if-no-files-found: error
+      - name: Probe cross-root hardlink mode semantics (evidence only)
+        env:
+          REPORT: ${{ runner.temp }}/neuro-code-linux-hardlink-mode.json
+        run: uv run python tests/security/linux_hardlink_mode_probe.py --report "$REPORT"
+      - name: Upload cross-root hardlink evidence
+        if: always()
+        uses: actions/upload-artifact@v4.6.2
+        with:
+          name: linux-hardlink-mode-${{ matrix.python }}
+          path: ${{ runner.temp }}/neuro-code-linux-hardlink-mode.json
+          if-no-files-found: error
 
   windows-process-lifecycle:
     runs-on: windows-latest

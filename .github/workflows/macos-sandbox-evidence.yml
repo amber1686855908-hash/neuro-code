@@ -7,6 +7,8 @@ on:
     paths:
       - ".github/workflows/macos-sandbox-evidence.yml"
       - "tests/security/macos_sandbox_probe.py"
+      - "tests/security/macos_hardlink_mode_probe.py"
+      - "tests/security/hardlink_mode_probe_common.py"
       - "src/neuro_code/infrastructure/sandbox/**"
       - "src/neuro_code/application/ports/sandbox.py"
       - "src/neuro_code/domain/sandbox/**"
@@ -62,6 +64,20 @@ jobs:
           path: |
             ${{ runner.temp }}/neuro-code-macos-sandbox-evidence.json
             ${{ runner.temp }}/probe-summary.json
+          if-no-files-found: error
+
+      - name: Probe cross-root hardlink mode semantics (evidence only)
+        if: always()
+        env:
+          REPORT: ${{ runner.temp }}/neuro-code-macos-hardlink-mode.json
+        run: uv run python tests/security/macos_hardlink_mode_probe.py --report "$REPORT"
+
+      - name: Upload cross-root hardlink evidence
+        if: always()
+        uses: actions/upload-artifact@v4.6.2
+        with:
+          name: macos-hardlink-mode-${{ matrix.runner }}-py${{ matrix.python }}
+          path: ${{ runner.temp }}/neuro-code-macos-hardlink-mode.json
           if-no-files-found: error
 
       - name: Require an explicit probe result
