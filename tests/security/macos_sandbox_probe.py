@@ -949,6 +949,16 @@ def _metadata() -> dict[str, object]:
                 '(allow file-read-metadata (subpath "/private")) '
                 "(allow sysctl-read)"
             ),
+            "deny_default_process_literal": (
+                "(version 1) (deny default) "
+                "(allow process-fork) (allow process-exec) "
+                '(allow file-read* (literal "/usr/bin/true"))'
+            ),
+            "deny_default_process_regex": (
+                "(version 1) (deny default) "
+                "(allow process-fork) (allow process-exec) "
+                '(allow file-read* (regex "^/usr/bin/true$"))'
+            ),
             "deny_default_process": (
                 "(version 1) (deny default) "
                 "(allow process-fork) (allow process-exec) "
