@@ -4,15 +4,14 @@ import asyncio
 import difflib
 import logging
 import os
-import re
 import sys
 from collections import deque
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from time import monotonic
-from typing import Any, ClassVar, Protocol, cast
+from typing import Any, ClassVar, Literal, Protocol, TypeVar, cast
 from urllib.parse import urlsplit
 
 from rich.console import RenderableType
@@ -20,12 +19,13 @@ from rich.markdown import Markdown
 from rich.table import Table
 from rich.text import Text
 from textual import events
-from textual.app import App, ComposeResult
+from textual.app import App, ComposeResult, RenderResult
 from textual.binding import Binding, BindingType
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.geometry import Size
 from textual.message import Message as TextualMessage
 from textual.screen import ModalScreen
+from textual.widget import Widget
 from textual.widgets import Button, Input, Label, Static, TextArea
 from textual.worker import Worker
 
@@ -44,6 +44,7 @@ from neuro_code.application.ports.provider_settings import (
     ManagedProxyPolicy,
     ProviderSettingsStore,
 )
+from neuro_code.application.ports.tools import MAX_TOOL_OUTPUT_ARTIFACT_READ_BYTES
 from neuro_code.application.ports.ui_preferences import UiPreferencesStore
 from neuro_code.application.ports.user_interaction import (
     InteractionUnavailable,
@@ -116,8 +117,29 @@ from neuro_code.domain.execution import (
     TurnCancellationPolicy,
 )
 from neuro_code.domain.plans import PlanComment, PlanStepStatus, SessionPlan
+from neuro_code.domain.sandbox.models import SandboxProfile
 from neuro_code.domain.session_tasks import SessionTask, SessionTaskKind, SessionTaskStatus
 from neuro_code.interfaces.tui import recoverable_terminal_status
+from neuro_code.interfaces.tui.clipboard import (
+    ClipboardWriter,
+    ClipboardWriteResult,
+    SystemClipboardWriter,
+)
+from neuro_code.interfaces.tui.tool_activity import (
+    TOOL_PEEK_LOGICAL_LINE_BUDGET,
+    ToolActivityPeekPresentation,
+    ToolCallSnapshot,
+    ToolDisclosureLevel,
+    ToolInspectorPresentation,
+    ToolInspectorScreen,
+    ToolPeekLine,
+    present_tool_activity_peek,
+    present_tool_inspector,
+)
+from neuro_code.interfaces.tui.tool_activity.renderers import (
+    bounded_inline,
+    safe_tool_text,
+)
 from neuro_code.shared.errors import ProviderError
 from neuro_code.shared.redaction import redact_sensitive_text
 from neuro_code.shared.ui_language import UiLanguage
@@ -130,13 +152,6 @@ from neuro_code.tui_theme import (
     ASSISTANT_TEXT_STYLE,
     BRAND_TEXT,
     CONNECTION_STATUS_STYLES,
-    DIFF_ADDITION_STYLE,
-    DIFF_CONTEXT_STYLE,
-    DIFF_DELETION_STYLE,
-    DIFF_FILE_STYLE,
-    DIFF_HUNK_STYLE,
-    DIFF_SUMMARY_ADDITION_STYLE,
-    DIFF_SUMMARY_DELETION_STYLE,
     EFFORT_STYLES,
     ERROR_DETAIL_STYLE,
     ERROR_LABEL_STYLE,
@@ -227,29 +242,17 @@ _LOADING_ANIMATION_TICK_SECONDS = 0.05
 _TOOL_ELAPSED_UPDATE_SECONDS = 0.25
 _PROMPT_MAX_VISIBLE_LINES = 8
 _COMMAND_HINT_LIMIT = 5
-_TOOL_OUTPUT_MAX_LINES = 40
-_TOOL_OUTPUT_MAX_CHARACTERS = 6_000
-_TOOL_DIFF_MAX_FILES = 8
-_COMPACT_READ_TOOLS = frozenset(
-    {
-        "grep",
-        "grep_many",
-        "glob",
-        "list_dir",
-        "list_tree",
-        "read_file",
-        "read_files",
-        "skill",
-        "view_image",
-    }
-)
+_TOOL_READ_NAMES = frozenset({"read_file", "read_files", "view_image"})
+_TOOL_SEARCH_NAMES = frozenset({"glob", "grep", "grep_many", "list_dir", "list_tree", "skill"})
+_TOOL_EDIT_NAMES = frozenset({"apply_patch", "search_replace", "write_file"})
+_TOOL_WAIT_NAMES = frozenset({"task_output", "wait_for_tasks", "wait_tasks"})
 TUI_RELOAD_PROVIDER_SETTINGS = 75
 _PROMPT_MARK = "\N{SINGLE RIGHT-POINTING ANGLE QUOTATION MARK}"
 _ERROR_MARK = "\N{MULTIPLICATION SIGN}"
 _SUCCESS_MARK = "\N{CHECK MARK}"
 _WARNING_MARK = "!"
-_ANSI_ESCAPE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
 _LOGGER = logging.getLogger(__name__)
+_WidgetType = TypeVar("_WidgetType", bound=Widget)
 
 
 def _markdown_code_theme() -> str:
@@ -517,6 +520,7 @@ class ToolFeedbackState:
     approval_outcome: str | None = None
     approval_reason: str | None = None
     duration: str | None = None
+    duration_seconds: float | None = None
     started_at: float | None = None
     content: str | None = None
     is_error: bool = False
@@ -524,10 +528,93 @@ class ToolFeedbackState:
     workspace_changes: dict[str, Any] | None = None
     artifact_id: str | None = None
     artifact_content: str | None = None
+    artifact_stored_truncated: bool = False
     artifact_read_truncated: bool = False
     artifact_loading: bool = False
     artifact_unavailable: bool = False
-    expanded: bool = False
+
+
+@dataclass(slots=True)
+class ToolActivityGroupState:
+    """Consecutive tool calls projected as one presentation-only activity block.
+
+    连续工具调用在表现层聚合为一个活动块,不改变领域事件或执行语义。
+    """
+
+    tools: list[ToolFeedbackState] = field(default_factory=list)
+    disclosure: ToolDisclosureLevel = ToolDisclosureLevel.SUMMARY
+    selected_tool_index: int = 0
+
+    @property
+    def entry_index(self) -> int:
+        return self.tools[0].entry_index
+
+    @property
+    def selected_tool(self) -> ToolFeedbackState:
+        selected = max(0, min(self.selected_tool_index, len(self.tools) - 1))
+        return self.tools[selected]
+
+
+@dataclass(slots=True)
+class _ActiveToolInspector:
+    """One modal Inspector bound to a live presentation-only tool state."""
+
+    state: ToolFeedbackState
+    group: ToolActivityGroupState
+    screen: ToolInspectorScreen
+    artifact_worker: Worker[None] | None = None
+
+
+class MenuOptionButton(Button):
+    """Sparse modal row with independent focus and selected-state signals.
+
+    使用独立焦点与已选择信号的克制模态列表行。
+    """
+
+    def __init__(
+        self,
+        primary: str,
+        *,
+        secondary: str = "",
+        selected: bool = False,
+        muted: bool = False,
+        primary_width: int | None = None,
+        secondary_justify: Literal["left", "right"] = "right",
+        id: str | None = None,
+        disabled: bool = False,
+    ) -> None:
+        accessible_label = " · ".join(part for part in (primary, secondary) if part)
+        super().__init__(accessible_label, id=id, disabled=disabled)
+        self._primary = primary
+        self._secondary = secondary
+        self._selected = selected
+        self._muted = muted
+        self._primary_width = primary_width
+        self._secondary_justify = secondary_justify
+
+    def render(self) -> RenderResult:
+        primary_style = TEXT_DISABLED if self.disabled or self._muted else TEXT_PRIMARY
+        secondary_style = TEXT_DISABLED if self.disabled or self._muted else TEXT_SECONDARY
+        table = Table.grid(expand=True, padding=(0, 1))
+        table.add_column(width=1, no_wrap=True)
+        if self._primary_width is None:
+            table.add_column(ratio=1, overflow="ellipsis", no_wrap=True)
+        else:
+            table.add_column(width=self._primary_width, overflow="ellipsis", no_wrap=True)
+        table.add_column(
+            ratio=1,
+            justify=self._secondary_justify,
+            overflow="ellipsis",
+            no_wrap=True,
+        )
+        table.add_column(width=1, no_wrap=True)
+        table.add_row(
+            Text(_PROMPT_MARK if self.has_focus else " ", style=ACCENT_CODE),
+            Text(self._primary, style=primary_style),
+            Text(self._secondary, style=secondary_style),
+            Text(_SUCCESS_MARK if self._selected else " ", style=TOOL_COMPLETE_STYLE),
+        )
+        return table
 
 
 @dataclass(frozen=True, slots=True)
@@ -713,35 +800,86 @@ class PromptInput(TextArea):
 
 
 class ToolFeedbackMessage(ConversationMessage, can_focus=True):
-    """A stable tool card whose already-bounded details can be toggled.
+    """A stable Tool Activity card with a bounded selection viewport.
 
-    可切换已限制详情显示的稳定工具卡片."""
+    带有有界选择 viewport 的稳定 Tool Activity 卡片."""
 
     BINDINGS: ClassVar[list[BindingType]] = [
-        Binding("enter", "toggle_details", "Toggle details", show=False),
-        Binding("space", "toggle_details", "Toggle details", show=False),
+        Binding("enter", "advance_disclosure", "Inspect", show=False),
+        Binding("space", "toggle_peek", "Toggle peek", show=False),
+        Binding("escape", "collapse_peek", "Summary", priority=True, show=False),
+        Binding("up", "select_previous_tool", "Previous tool", show=False),
+        Binding("down", "select_next_tool", "Next tool", show=False),
     ]
 
-    class ToggleRequested(TextualMessage):
-        """Request that the owning app toggle one tool card.
-
-        请求所属应用切换一个工具卡片."""
+    class AdvanceRequested(TextualMessage):
+        """Advance Summary to Peek, or Peek to Inspector."""
 
         def __init__(self, card: ToolFeedbackMessage) -> None:
             self.card = card
             super().__init__()
 
+    class TogglePeekRequested(TextualMessage):
+        """Toggle only the Conversation-local Summary/Peek state."""
+
+        def __init__(self, card: ToolFeedbackMessage) -> None:
+            self.card = card
+            super().__init__()
+
+    class CollapseRequested(TextualMessage):
+        """Return a Peek viewport to its stable Summary."""
+
+        def __init__(self, card: ToolFeedbackMessage) -> None:
+            self.card = card
+            super().__init__()
+
+    class SelectionRequested(TextualMessage):
+        """Move the selected tool within a multi-tool Peek viewport."""
+
+        def __init__(self, card: ToolFeedbackMessage, delta: int) -> None:
+            self.card = card
+            self.delta = delta
+            super().__init__()
+
     def __init__(self, rendered: RenderableType, *, entry_index: int) -> None:
         super().__init__("tool", rendered)
         self.entry_index = entry_index
+        self.peek_active = False
+        self.tool_count = 1
 
     async def _on_click(self, event: events.Click) -> None:
         event.stop()
         self.focus()
-        self.post_message(self.ToggleRequested(self))
+        message = (
+            self.TogglePeekRequested(self) if self.peek_active else self.AdvanceRequested(self)
+        )
+        self.post_message(message)
 
-    def action_toggle_details(self) -> None:
-        self.post_message(self.ToggleRequested(self))
+    def action_advance_disclosure(self) -> None:
+        self.post_message(self.AdvanceRequested(self))
+
+    def action_toggle_peek(self) -> None:
+        self.post_message(self.TogglePeekRequested(self))
+
+    def action_collapse_peek(self) -> None:
+        if self.peek_active:
+            self.post_message(self.CollapseRequested(self))
+
+    def action_select_previous_tool(self) -> None:
+        if self.peek_active and self.tool_count > 1:
+            self.post_message(self.SelectionRequested(self, -1))
+
+    def action_select_next_tool(self) -> None:
+        if self.peek_active and self.tool_count > 1:
+            self.post_message(self.SelectionRequested(self, 1))
+
+    def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
+        del parameters
+        if action in {"select_previous_tool", "select_next_tool"}:
+            return self.peek_active and self.tool_count > 1
+        if action == "collapse_peek":
+            return self.peek_active
+        return True
 
 
 class TranscriptCopyScreen(ModalScreen[None]):
@@ -751,12 +889,13 @@ class TranscriptCopyScreen(ModalScreen[None]):
 
     Textual owns terminal mouse reporting while the full-screen app is active,
     so native terminal drag-selection is not portable. This screen provides a
-    real text selection model and copies through Textual's OSC 52 clipboard path
-    without exposing hidden Runtime or tool state.
+    real text selection model and uses the app's native clipboard adapter before
+    falling back to Textual's terminal clipboard path, without exposing hidden
+    Runtime or tool state.
 
     全屏应用运行时由 Textual 管理终端鼠标上报,原生终端拖选无法跨平台保证.此界面
-    提供真实文本选择模型,并通过 Textual 的 OSC 52 剪贴板路径复制,不会暴露隐藏的
-    Runtime 或工具状态.
+    提供真实文本选择模型,会先使用应用的原生剪贴板适配器,再回退到 Textual 的终端
+    剪贴板路径,不会暴露隐藏的 Runtime 或工具状态.
     """
 
     CSS = """
@@ -767,8 +906,9 @@ class TranscriptCopyScreen(ModalScreen[None]):
 
     #transcript-copy-dialog {
         width: 92%;
+        max-width: 116;
         height: 88%;
-        padding: 1 2;
+        padding: $space-2 $space-3;
         background: $surface;
         border: solid $border;
     }
@@ -788,15 +928,19 @@ class TranscriptCopyScreen(ModalScreen[None]):
     #transcript-copy-text {
         width: 100%;
         height: 1fr;
-        margin: 1 0;
-        padding: 0 1;
-        border: solid $border-dim;
+        margin: $space-1 $space-0;
+        padding: $space-1;
+        border: none;
+        border-top: solid $border;
+        border-bottom: solid $border;
         background: $background;
         color: $text-body;
     }
 
     #transcript-copy-text:focus {
-        border: solid $border-focus;
+        border: none;
+        border-top: solid $border-focus;
+        border-bottom: solid $border-focus;
     }
     """
 
@@ -813,7 +957,7 @@ class TranscriptCopyScreen(ModalScreen[None]):
         self._language = language
 
     def compose(self) -> ComposeResult:
-        with Vertical(id="transcript-copy-dialog"):
+        with Vertical(id="transcript-copy-dialog", classes="modal-dialog modal-l"):
             yield Label(
                 ui_text(self._language, "transcript_copy.title"),
                 id="transcript-copy-title",
@@ -843,14 +987,18 @@ class TranscriptCopyScreen(ModalScreen[None]):
         if not selected:
             status.update(ui_text(self._language, "transcript_copy.select_first"))
             return
-        self.app.copy_to_clipboard(selected)
-        status.update(
-            ui_text(
-                self._language,
-                "transcript_copy.copied",
-                characters=len(selected),
+        app = cast("NeuroCodeApp", self.app)
+        result = app.copy_text_to_clipboard(selected)
+        if result.native_copied:
+            status.update(
+                ui_text(
+                    self._language,
+                    "transcript_copy.copied",
+                    characters=len(selected),
+                )
             )
-        )
+            return
+        status.update(ui_text(self._language, "transcript_copy.clipboard_unavailable"))
 
     def action_cancel(self) -> None:
         self.dismiss(None)
@@ -869,10 +1017,10 @@ class SettingsScreen(ModalScreen[str | None]):
 
     #settings-dialog {
         width: 82%;
-        max-width: 78;
+        max-width: 88;
         height: auto;
         max-height: 85%;
-        padding: 1 2;
+        padding: $space-2 $space-3;
         border: solid $border;
         background: $surface;
     }
@@ -880,21 +1028,22 @@ class SettingsScreen(ModalScreen[str | None]):
     #settings-title {
         text-style: bold;
         color: $text-primary;
-        margin-bottom: 1;
+        margin-bottom: $space-1;
     }
 
     #settings-description {
         color: $text-muted;
-        margin-bottom: 1;
+        margin-bottom: $space-1;
     }
 
     #settings-categories {
         height: auto;
     }
 
-    #settings-categories Button {
+    #settings-categories MenuOptionButton {
         width: 100%;
-        margin-bottom: 1;
+        height: 3;
+        margin-bottom: $space-0;
         content-align: left middle;
     }
 
@@ -925,27 +1074,29 @@ class SettingsScreen(ModalScreen[str | None]):
             Label(ui_text(self.language, "settings.title"), id="settings-title"),
             Static(ui_text(self.language, "settings.description"), id="settings-description"),
             Vertical(
-                Button(
-                    ui_text(
-                        self.language,
-                        "settings.category.language",
-                        current=language_summary,
-                    ),
+                MenuOptionButton(
+                    ui_text(self.language, "settings.category.language.label"),
+                    secondary=language_summary,
                     id="settings-category-language",
-                    variant="primary",
                 ),
-                Button(
-                    ui_text(self.language, "settings.category.providers"),
+                MenuOptionButton(
+                    ui_text(self.language, "settings.category.providers.label"),
+                    secondary=ui_text(self.language, "settings.category.providers.value"),
                     id="settings-category-providers",
                     disabled=not self.provider_settings_available,
                 ),
-                Button(
-                    ui_text(self.language, "settings.category.network"),
+                MenuOptionButton(
+                    ui_text(self.language, "settings.category.network.label"),
+                    secondary=ui_text(self.language, "settings.category.network.value"),
                     id="settings-category-network",
                     disabled=not self.provider_settings_available,
                 ),
-                Button(
-                    ui_text(self.language, "settings.category.background_wake"),
+                MenuOptionButton(
+                    ui_text(self.language, "settings.category.background_wake.label"),
+                    secondary=ui_text(
+                        self.language,
+                        "settings.category.background_wake.value",
+                    ),
                     id="settings-category-background-wake",
                     disabled=not self.provider_settings_available,
                 ),
@@ -953,6 +1104,7 @@ class SettingsScreen(ModalScreen[str | None]):
             ),
             Static(ui_text(self.language, "settings.help"), id="settings-help"),
             id="settings-dialog",
+            classes="modal-dialog modal-m",
         )
 
     def on_mount(self) -> None:
@@ -985,10 +1137,10 @@ class LanguageSettingsScreen(ModalScreen[UiLanguage | None]):
     }
 
     #language-settings-dialog {
-        width: 82%;
-        max-width: 78;
+        width: 76%;
+        max-width: 72;
         height: auto;
-        padding: 1 2;
+        padding: $space-2 $space-3;
         border: solid $border;
         background: $surface;
     }
@@ -1010,9 +1162,9 @@ class LanguageSettingsScreen(ModalScreen[UiLanguage | None]):
         height: auto;
     }
 
-    #settings-languages Button {
-        width: 1fr;
-        margin-right: 1;
+    #settings-languages MenuOptionButton {
+        width: 100%;
+        height: 3;
     }
 
     #language-settings-actions {
@@ -1045,18 +1197,19 @@ class LanguageSettingsScreen(ModalScreen[UiLanguage | None]):
                 ui_text(self.language, "settings.language.description"),
                 id="language-settings-description",
             ),
-            Horizontal(
-                Button(
-                    self._choice_label(UiLanguage.SIMPLIFIED_CHINESE),
-                    id="settings-language-zh-cn",
-                    variant=(
-                        "primary" if self.selected is UiLanguage.SIMPLIFIED_CHINESE else "default"
+            Vertical(
+                MenuOptionButton(
+                    language_name(
+                        UiLanguage.SIMPLIFIED_CHINESE,
+                        in_language=UiLanguage.SIMPLIFIED_CHINESE,
                     ),
+                    id="settings-language-zh-cn",
+                    selected=self.selected is UiLanguage.SIMPLIFIED_CHINESE,
                 ),
-                Button(
-                    self._choice_label(UiLanguage.ENGLISH),
+                MenuOptionButton(
+                    language_name(UiLanguage.ENGLISH, in_language=UiLanguage.ENGLISH),
                     id="settings-language-en",
-                    variant="primary" if self.selected is UiLanguage.ENGLISH else "default",
+                    selected=self.selected is UiLanguage.ENGLISH,
                 ),
                 id="settings-languages",
             ),
@@ -1069,6 +1222,7 @@ class LanguageSettingsScreen(ModalScreen[UiLanguage | None]):
                 id="language-settings-actions",
             ),
             id="language-settings-dialog",
+            classes="modal-dialog modal-s",
         )
 
     def on_mount(self) -> None:
@@ -1109,7 +1263,7 @@ class NetworkProxySettingsScreen(ModalScreen[ManagedProviderSettings | None]):
         width: 82%;
         max-width: 88;
         height: auto;
-        padding: 1 2;
+        padding: $space-2 $space-3;
         border: solid $border;
         background: $surface;
     }
@@ -1212,6 +1366,7 @@ class NetworkProxySettingsScreen(ModalScreen[ManagedProviderSettings | None]):
                 id="network-settings-actions",
             ),
             id="network-settings-dialog",
+            classes="modal-dialog modal-m",
         )
 
     def on_mount(self) -> None:
@@ -1282,7 +1437,7 @@ class BackgroundWakeSettingsScreen(ModalScreen[ManagedProviderSettings | None]):
         width: 82%;
         max-width: 88;
         height: auto;
-        padding: 1 2;
+        padding: $space-2 $space-3;
         border: solid $border;
         background: $surface;
     }
@@ -1377,6 +1532,7 @@ class BackgroundWakeSettingsScreen(ModalScreen[ManagedProviderSettings | None]):
                 id="background-wake-settings-actions",
             ),
             id="background-wake-settings-dialog",
+            classes="modal-dialog modal-m",
         )
 
     def on_mount(self) -> None:
@@ -1432,11 +1588,11 @@ class ProviderSettingsScreen(ModalScreen[ProviderSettingsSubmission | None]):
     }
 
     #provider-settings-dialog {
-        width: 90%;
-        max-width: 105;
+        width: 92%;
+        max-width: 116;
         height: 95%;
         max-height: 95%;
-        padding: 1 2;
+        padding: $space-2 $space-3;
         border: solid $border;
         background: $surface;
     }
@@ -1802,6 +1958,7 @@ class ProviderSettingsScreen(ModalScreen[ProviderSettingsSubmission | None]):
             ),
             Horizontal(*actions, id="provider-settings-actions"),
             id="provider-settings-dialog",
+            classes="modal-dialog modal-l",
         )
 
     def _provider_label(self, profile: ManagedProviderProfile) -> str:
@@ -2301,6 +2458,7 @@ class ProviderSetupApp(App[bool]):
         background: $surface;
         color: $text-primary;
         border: none;
+        text-style: none;
     }
 
     Button:hover {
@@ -2308,9 +2466,29 @@ class ProviderSetupApp(App[bool]):
     }
 
     Button:focus {
-        background: $surface-selected;
+        background: $surface;
         border-left: tall $border-focus;
-        text-style: bold;
+        text-style: none;
+    }
+
+    Button.-primary,
+    Button.-success,
+    Button.-warning,
+    Button.-error {
+        background: $surface;
+        border: none;
+    }
+
+    Button.-success {
+        color: $success;
+    }
+
+    Button.-warning {
+        color: $warning;
+    }
+
+    Button.-error {
+        color: $error;
     }
 
     Button:disabled {
@@ -2385,11 +2563,11 @@ class ReasoningEffortScreen(ModalScreen[ReasoningEffort | None]):
     }
 
     #effort-dialog {
-        width: 90%;
-        max-width: 100;
+        width: 82%;
+        max-width: 88;
         height: auto;
         max-height: 90%;
-        padding: 1 2;
+        padding: $space-2 $space-3;
         border: solid $border;
         background: $surface;
     }
@@ -2405,9 +2583,10 @@ class ReasoningEffortScreen(ModalScreen[ReasoningEffort | None]):
         max-height: 20;
     }
 
-    #effort-options Button {
+    #effort-options MenuOptionButton {
         width: 100%;
-        margin-bottom: 1;
+        height: 3;
+        margin-bottom: $space-0;
         content-align: left middle;
     }
 
@@ -2434,31 +2613,21 @@ class ReasoningEffortScreen(ModalScreen[ReasoningEffort | None]):
             f"effort-choice-{index}": effort for index, effort in enumerate(ReasoningEffort)
         }
 
-    def _label(self, effort: ReasoningEffort) -> Text:
-        color = EFFORT_STYLES[effort.value]
-        rendered = Text(f"{effort.glyph}  {effort.value}", style=f"bold {color}")
-        rendered.append(
-            f"  ·  {ui_text(self.language, f'effort.description.{effort.value}')}",
-            style=TEXT_SECONDARY,
-        )
-        if effort is self.selected:
-            rendered.append(
-                f"  ({ui_text(self.language, 'marker.current')})",
-                style=f"bold {TEXT_PRIMARY}",
-            )
-        if effort is ReasoningEffort.ULTRACODE:
-            rendered.append(
-                f"  ({ui_text(self.language, 'effort.workflow_planned')})",
-                style=TEXT_MUTED,
-            )
-        return rendered
-
     def compose(self) -> ComposeResult:
         buttons = [
-            Button(
-                self._label(effort),
+            MenuOptionButton(
+                effort.value,
+                secondary=(
+                    f"{ui_text(self.language, f'effort.description.{effort.value}')} · "
+                    f"{ui_text(self.language, 'effort.workflow_planned')}"
+                    if effort is ReasoningEffort.ULTRACODE
+                    else ui_text(self.language, f"effort.description.{effort.value}")
+                ),
+                selected=effort is self.selected,
+                muted=effort is ReasoningEffort.ULTRACODE,
+                primary_width=14,
+                secondary_justify="left",
                 id=f"effort-choice-{index}",
-                variant="primary" if effort is self.selected else "default",
             )
             for index, effort in enumerate(ReasoningEffort)
         ]
@@ -2467,6 +2636,7 @@ class ReasoningEffortScreen(ModalScreen[ReasoningEffort | None]):
             VerticalScroll(*buttons, id="effort-options"),
             Static(ui_text(self.language, "effort.help"), id="effort-help"),
             id="effort-dialog",
+            classes="modal-dialog modal-m",
         )
 
     def on_mount(self) -> None:
@@ -2494,12 +2664,12 @@ class PermissionApprovalScreen(ModalScreen[PermissionApproval]):
     }
 
     #approval-dialog {
-        width: 80%;
-        max-width: 100;
+        width: 82%;
+        max-width: 88;
         height: auto;
         max-height: 90%;
-        padding: 1 2;
-        border: solid $border-focus;
+        padding: $space-2 $space-3;
+        border: solid $border;
         background: $surface;
     }
 
@@ -2513,9 +2683,10 @@ class PermissionApprovalScreen(ModalScreen[PermissionApproval]):
         height: auto;
         max-height: 12;
         overflow-y: auto;
-        margin: 1 0;
-        padding: 1;
-        border: round $border;
+        margin: $space-1 $space-0;
+        padding: $space-1;
+        border: none;
+        background: $background;
     }
 
     #approval-reason {
@@ -2598,6 +2769,7 @@ class PermissionApprovalScreen(ModalScreen[PermissionApproval]):
                 id="approval-actions",
             ),
             id="approval-dialog",
+            classes="modal-dialog modal-m",
         )
 
     def on_mount(self) -> None:
@@ -2636,10 +2808,10 @@ class ProviderSelectionScreen(ModalScreen[str | None]):
     }
 
     #provider-dialog {
-        width: 90%;
-        max-width: 110;
+        width: 92%;
+        max-width: 116;
         height: 80%;
-        padding: 1 2;
+        padding: $space-2 $space-3;
         border: solid $border;
         background: $surface;
     }
@@ -2717,6 +2889,7 @@ class ProviderSelectionScreen(ModalScreen[str | None]):
                 id="provider-help",
             ),
             id="provider-dialog",
+            classes="modal-dialog modal-l",
         )
 
     def on_mount(self) -> None:
@@ -2752,10 +2925,10 @@ class SessionSelectionScreen(ModalScreen[str | None]):
     }
 
     #session-dialog {
-        width: 90%;
-        max-width: 115;
+        width: 92%;
+        max-width: 116;
         height: 80%;
-        padding: 1 2;
+        padding: $space-2 $space-3;
         border: solid $border;
         background: $surface;
     }
@@ -2834,10 +3007,15 @@ class SessionSelectionScreen(ModalScreen[str | None]):
         if option.sandbox_profile is None:
             markers.append(ui_text(language, "session.legacy_sandbox"))
         else:
+            sandbox_key = (
+                "session.sandbox_off"
+                if option.sandbox_profile is SandboxProfile.OFF
+                else "session.sandbox"
+            )
             markers.append(
                 ui_text(
                     language,
-                    "session.sandbox",
+                    sandbox_key,
                     profile=option.sandbox_profile.value,
                 )
             )
@@ -2884,6 +3062,7 @@ class SessionSelectionScreen(ModalScreen[str | None]):
                 id="session-help",
             ),
             id="session-dialog",
+            classes="modal-dialog modal-l",
         )
 
     def on_mount(self) -> None:
@@ -2996,6 +3175,7 @@ class NeuroCodeApp(App[None]):
         background: $surface;
         color: $text-primary;
         border: none;
+        text-style: none;
     }
 
     Button:hover {
@@ -3003,10 +3183,38 @@ class NeuroCodeApp(App[None]):
     }
 
     Button:focus {
-        background: $surface-selected;
+        background: $surface;
         color: $text-primary;
         border-left: tall $border-focus;
-        text-style: bold;
+        text-style: none;
+    }
+
+    Button.-primary,
+    Button.-success,
+    Button.-warning,
+    Button.-error {
+        background: $surface;
+        border: none;
+    }
+
+    Button.-success {
+        color: $success;
+    }
+
+    Button.-warning {
+        color: $warning;
+    }
+
+    Button.-error {
+        color: $error;
+    }
+
+    MenuOptionButton,
+    MenuOptionButton:hover,
+    MenuOptionButton:focus {
+        background: $surface;
+        border: none;
+        text-style: none;
     }
 
     Button:disabled {
@@ -3025,9 +3233,30 @@ class NeuroCodeApp(App[None]):
         border: tall $border-focus;
     }
 
+    .modal-dialog {
+        padding: $space-2 $space-3;
+        background: $surface;
+        border: solid $border;
+    }
+
+    .modal-s {
+        width: 76%;
+        max-width: 72;
+    }
+
+    .modal-m {
+        width: 82%;
+        max-width: 88;
+    }
+
+    .modal-l {
+        width: 92%;
+        max-width: 116;
+    }
+
     #header {
         height: 3;
-        padding: 1 2 0 2;
+        padding: $space-1 $space-4 $space-0 $space-4;
         background: $background;
     }
 
@@ -3050,23 +3279,23 @@ class NeuroCodeApp(App[None]):
     #transcript {
         width: 100%;
         height: 1fr;
-        padding: 1 2;
+        padding: $space-2 $space-4;
         background: $background;
         color: $text-body;
     }
 
     .conversation-message {
         width: 100%;
+        max-width: 116;
         height: auto;
         min-height: 1;
-        margin-bottom: 1;
-        padding: 0;
+        margin-bottom: $space-1;
+        padding: $space-0 $space-1;
         color: $text-body;
     }
 
     .message-user {
-        margin-left: 2;
-        padding: 0 1;
+        margin-bottom: $space-2;
         background: $surface;
         color: $text-primary;
         border-left: solid $border;
@@ -3074,8 +3303,7 @@ class NeuroCodeApp(App[None]):
     }
 
     .message-assistant {
-        margin-right: 2;
-        padding: 0 1;
+        margin-bottom: $space-2;
         background: $background;
         color: $text-body;
     }
@@ -3086,50 +3314,53 @@ class NeuroCodeApp(App[None]):
     }
 
     .message-system {
-        padding: 0 1;
         color: $text-emphasis;
     }
 
     .message-tool {
-        padding: 0 1;
+        margin-bottom: $space-2;
         color: $text-body;
     }
 
     .message-tool.tool-interactive:hover,
     .message-tool.tool-interactive:focus {
-        background: $surface-hover;
+        background: $background;
         border-left: solid $border-focus;
     }
 
+    .message-tool.tool-peek {
+        height: 12;
+        max-height: 12;
+        overflow-y: hidden;
+    }
+
     .message-status {
-        padding: 0 1;
         color: $text-secondary;
     }
 
     .message-recoverable {
-        padding: 0 1;
         color: $text-emphasis;
         border-left: solid $border;
     }
 
     .message-error {
-        padding: 0 1;
         color: $text-primary;
-        border-left: tall $border-focus;
+        border-left: tall $error;
         text-style: bold;
     }
 
     #composer {
         height: auto;
-        padding: 0 2 1 2;
+        padding: $space-0 $space-4 $space-1 $space-4;
         background: $background;
     }
 
     #turn-activity {
         display: none;
         width: 100%;
+        max-width: 116;
         height: 1;
-        padding: 0 1;
+        padding: $space-0 $space-1;
         background: $background;
         color: $text-secondary;
         overflow: hidden hidden;
@@ -3137,57 +3368,29 @@ class NeuroCodeApp(App[None]):
 
     #runtime-bar {
         width: 100%;
-        height: 2;
-        padding: 0 1;
+        height: 1;
+        padding: $space-0 $space-1;
         background: $background;
-        border-top: solid $border-dim;
         color: $text-secondary;
         align-vertical: middle;
     }
 
-    #runtime-model {
+    #runtime-primary,
+    #runtime-secondary {
         width: 1fr;
         height: 1;
         overflow: hidden hidden;
     }
 
-    #runtime-workspace {
-        width: 1fr;
-        height: 1;
-        padding-left: 2;
+    #runtime-secondary {
         text-align: right;
-        overflow: hidden hidden;
-    }
-
-    #runtime-context {
-        width: auto;
-        max-width: 20;
-        height: 1;
-        padding-left: 2;
-        overflow: hidden hidden;
-    }
-
-    #runtime-effort {
-        width: auto;
-        max-width: 34;
-        height: 1;
-        padding-left: 2;
-        overflow: hidden hidden;
-    }
-
-    #runtime-mode {
-        width: auto;
-        max-width: 30;
-        height: 1;
-        padding-left: 2;
-        overflow: hidden hidden;
     }
 
     #prompt-row {
         height: auto;
         min-height: 3;
         max-height: 10;
-        padding: 0 1;
+        padding: $space-0 $space-1;
         background: $surface;
         border-left: tall $border;
         align-vertical: middle;
@@ -3235,18 +3438,12 @@ class NeuroCodeApp(App[None]):
         width: 100%;
         height: auto;
         max-height: 3;
-        padding: 0 1;
+        padding: $space-0 $space-1;
         background: $background;
         color: $text-secondary;
         overflow: hidden hidden;
     }
 
-    #shortcut-bar {
-        height: 2;
-        padding: 0 1;
-        background: $background;
-        color: $text-muted;
-    }
     """
     BINDINGS: ClassVar[list[BindingType]] = [
         Binding("ctrl+c", "cancel_turn", "Cancel", priority=True, show=False),
@@ -3258,6 +3455,8 @@ class NeuroCodeApp(App[None]):
         Binding("ctrl+comma", "open_settings", "Settings", priority=True, show=False),
         Binding("ctrl+q", "quit", "Quit", show=False),
         Binding("ctrl+l", "clear_transcript", "Clear", show=False),
+        Binding("f1", "show_help", "Help", priority=True, show=False),
+        Binding("escape", "collapse_active_tool_peek", "Summary", show=False),
         Binding(
             "shift+tab",
             "cycle_interaction_mode",
@@ -3305,6 +3504,7 @@ class NeuroCodeApp(App[None]):
         background_task_wake_policy: BackgroundTaskWakePolicy | None = None,
         background_wake_limits: BackgroundWakeLimits = _DEFAULT_BACKGROUND_WAKE_LIMITS,
         user_interaction: TuiUserInteraction | None = None,
+        clipboard_writer: ClipboardWriter | None = None,
     ) -> None:
         if context_window_tokens is not None and context_window_tokens <= 0:
             raise ValueError("context window tokens must be positive")
@@ -3429,6 +3629,10 @@ class NeuroCodeApp(App[None]):
         self._entry_widgets: list[ConversationMessage] = []
         self._tool_feedback_by_call: dict[tuple[bool, str], ToolFeedbackState] = {}
         self._tool_feedback_by_entry: dict[int, ToolFeedbackState] = {}
+        self._tool_activity_groups: list[ToolActivityGroupState] = []
+        self._tool_activity_group_by_entry: dict[int, ToolActivityGroupState] = {}
+        self._active_tool_activity_group: ToolActivityGroupState | None = None
+        self._active_tool_inspector: _ActiveToolInspector | None = None
         self._assistant_parts: list[str] = []
         self._first_token_seen = False
         self._queued_interjections: deque[str] = deque()
@@ -3458,10 +3662,59 @@ class NeuroCodeApp(App[None]):
         self._background_wake_task_ids: tuple[str, ...] = ()
         self._task_polling = False
         self._pending_interaction_request_id: str | None = None
+        self._clipboard_writer = (
+            SystemClipboardWriter() if clipboard_writer is None else clipboard_writer
+        )
+        self._last_clipboard_write = ClipboardWriteResult(native_copied=False)
+
+    def copy_to_clipboard(self, text: str) -> None:
+        """Copy through the native adapter while retaining Textual's OSC 52 fallback.
+
+        通过原生适配器复制,并保留 Textual 的 OSC 52 终端回退路径。
+        """
+
+        self._last_clipboard_write = self._clipboard_writer.copy(text)
+        super().copy_to_clipboard(text)
+
+    def copy_text_to_clipboard(self, text: str) -> ClipboardWriteResult:
+        """Copy text and return whether a native system clipboard accepted it.
+
+        复制文本,并返回原生系统剪贴板是否已接受该文本。
+        """
+
+        self.copy_to_clipboard(text)
+        return self._last_clipboard_write
 
     @property
     def entries(self) -> tuple[TranscriptEntry, ...]:
         return tuple(self._entries)
+
+    def _main_screen_query_one(
+        self,
+        selector: str,
+        expect_type: type[_WidgetType],
+    ) -> _WidgetType:
+        """Query persistent Conversation chrome even while a modal is active.
+
+        ``App.query_one`` is scoped to the current screen. Tool lifecycle events
+        continue while Inspector is pushed, so live Conversation updates must
+        target the base screen instead of whichever modal currently has focus.
+        """
+
+        return self.screen_stack[0].query_one(selector, expect_type)
+
+    def _main_screen_query_optional(
+        self,
+        selector: str,
+        expect_type: type[_WidgetType],
+    ) -> _WidgetType | None:
+        """Return a base-screen widget, or ``None`` during screen teardown."""
+
+        screen_stack = self.screen_stack
+        if not screen_stack:
+            return None
+        candidate = next(iter(screen_stack[0].query(selector)), None)
+        return candidate if isinstance(candidate, expect_type) else None
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="header"):
@@ -3471,14 +3724,6 @@ class NeuroCodeApp(App[None]):
         yield VerticalScroll(id="transcript")
         with Vertical(id="composer"):
             yield Static(id="turn-activity")
-            yield Horizontal(
-                Static(id="runtime-model"),
-                Static(id="runtime-workspace"),
-                Static(id="runtime-context"),
-                Static(id="runtime-effort"),
-                Static(id="runtime-mode"),
-                id="runtime-bar",
-            )
             with Horizontal(id="prompt-row"):
                 yield Static(_PROMPT_MARK, id="prompt-mark")
                 yield PromptInput(
@@ -3486,7 +3731,11 @@ class NeuroCodeApp(App[None]):
                     id="prompt",
                 )
             yield Static(id="command-hints")
-            yield Static(ui_text(self._language, "shortcuts"), id="shortcut-bar")
+            yield Horizontal(
+                Static(id="runtime-primary"),
+                Static(id="runtime-secondary"),
+                id="runtime-bar",
+            )
 
     def on_mount(self) -> None:
         self.console.push_theme(MARKDOWN_THEME)
@@ -3523,7 +3772,7 @@ class NeuroCodeApp(App[None]):
         self.set_interval(_TOOL_ELAPSED_UPDATE_SECONDS, self._refresh_running_tool_elapsed)
         if not self.is_headless and not self.is_inline and not self.is_web:
             self.set_interval(_TERMINAL_SIZE_POLL_SECONDS, self._synchronize_terminal_size)
-        prompt = self.query_one("#prompt", PromptInput)
+        prompt = self._main_screen_query_one("#prompt", PromptInput)
         prompt.sync_content_height()
         prompt.focus()
 
@@ -3547,13 +3796,13 @@ class NeuroCodeApp(App[None]):
         brand = Text()
         brand.append("NEURO", style=f"bold {BRAND_TEXT}")
         brand.append(" / CODE", style=TEXT_MUTED)
-        self.query_one("#brand", Static).update(brand)
+        self._main_screen_query_one("#brand", Static).update(brand)
         self._update_clock()
 
     def _update_clock(self) -> None:
         current_time = datetime.now(tz=UTC).astimezone()
-        clock = next(iter(self.query("#clock")), None)
-        if isinstance(clock, Static):
+        clock = self._main_screen_query_optional("#clock", Static)
+        if clock is not None:
             clock.update(current_time.strftime("%H:%M"))
 
     async def _request_approval(self, request: PermissionRequest) -> PermissionApproval:
@@ -3638,7 +3887,7 @@ class NeuroCodeApp(App[None]):
             return
         queued = tuple(self._queued_interjections)
         self._queued_interjections.clear()
-        prompt = self.query_one("#prompt", PromptInput)
+        prompt = self._main_screen_query_one("#prompt", PromptInput)
         prompt.value = "\n\n".join((*queued, prompt.value)) if prompt.value else "\n\n".join(queued)
         prompt.cursor_position = len(prompt.value)
         self._write_ui_entry("status", "turn.interjections_restored", count=len(queued))
@@ -3648,7 +3897,7 @@ class NeuroCodeApp(App[None]):
         if not prompt_text:
             return
         entry_index = self._active_prompt_entry_index
-        prompt = self.query_one("#prompt", PromptInput)
+        prompt = self._main_screen_query_one("#prompt", PromptInput)
         if not prompt.value:
             if entry_index is not None and 0 <= entry_index < len(self._entries):
                 entry = self._entries[entry_index]
@@ -3666,11 +3915,27 @@ class NeuroCodeApp(App[None]):
         widget = self._entry_widgets.pop(index)
         self._entries.pop(index)
         removed_state = self._tool_feedback_by_entry.pop(index, None)
+        removed_group = self._tool_activity_group_by_entry.pop(index, None)
         if removed_state is not None:
             self._tool_feedback_by_call.pop(
                 (removed_state.hosted, removed_state.call_id),
                 None,
             )
+            if removed_group is not None:
+                removed_group.tools = [
+                    tool for tool in removed_group.tools if tool is not removed_state
+                ]
+                if removed_group.tools:
+                    removed_group.selected_tool_index = min(
+                        removed_group.selected_tool_index,
+                        len(removed_group.tools) - 1,
+                    )
+                if not removed_group.tools:
+                    self._tool_activity_groups = [
+                        group for group in self._tool_activity_groups if group is not removed_group
+                    ]
+                    if self._active_tool_activity_group is removed_group:
+                        self._active_tool_activity_group = None
         if self._plan_entry_index == index:
             self._plan_entry_index = None
         elif self._plan_entry_index is not None and self._plan_entry_index > index:
@@ -3685,26 +3950,97 @@ class NeuroCodeApp(App[None]):
         self._tool_feedback_by_entry = shifted
         if widget.parent is not None:
             await widget.remove()
+        self._rebuild_tool_activity_indexes()
+
+    def _rebuild_tool_activity_indexes(self) -> None:
+        self._tool_activity_group_by_entry = {
+            state.entry_index: group
+            for group in self._tool_activity_groups
+            for state in group.tools
+        }
+        for entry_index, _state in self._tool_feedback_by_entry.items():
+            if entry_index >= len(self._entry_widgets):
+                continue
+            widget = self._entry_widgets[entry_index]
+            if isinstance(widget, ToolFeedbackMessage):
+                widget.entry_index = entry_index
+        for group in self._tool_activity_groups:
+            self._refresh_tool_activity_group(group)
 
     def on_text_area_changed(self, event: TextArea.Changed) -> None:
         if isinstance(event.text_area, PromptInput) and event.text_area.screen is self.screen:
             event.text_area.sync_content_height()
             self._refresh_command_hints(event.text_area.value)
 
-    def on_tool_feedback_message_toggle_requested(
+    def on_tool_feedback_message_advance_requested(
         self,
-        event: ToolFeedbackMessage.ToggleRequested,
+        event: ToolFeedbackMessage.AdvanceRequested,
     ) -> None:
         state = self._tool_feedback_by_entry.get(event.card.entry_index)
-        if state is None or not self._tool_details_available(
-            state,
-            self._tool_change_report(state),
+        if state is None:
+            return
+        group = self._tool_activity_group_by_entry.get(state.entry_index)
+        if group is None:
+            return
+        if group.disclosure is ToolDisclosureLevel.SUMMARY:
+            group.disclosure = ToolDisclosureLevel.PEEK
+            group.selected_tool_index = min(group.selected_tool_index, len(group.tools) - 1)
+            self._refresh_tool_activity_group(group)
+            event.card.focus()
+            return
+        self._open_tool_inspector(group)
+
+    def on_tool_feedback_message_toggle_peek_requested(
+        self,
+        event: ToolFeedbackMessage.TogglePeekRequested,
+    ) -> None:
+        state = self._tool_feedback_by_entry.get(event.card.entry_index)
+        if state is None:
+            return
+        group = self._tool_activity_group_by_entry.get(state.entry_index)
+        if group is None:
+            return
+        group.disclosure = (
+            ToolDisclosureLevel.SUMMARY
+            if group.disclosure is ToolDisclosureLevel.PEEK
+            else ToolDisclosureLevel.PEEK
+        )
+        self._refresh_tool_activity_group(group)
+        event.card.focus()
+
+    def on_tool_feedback_message_collapse_requested(
+        self,
+        event: ToolFeedbackMessage.CollapseRequested,
+    ) -> None:
+        state = self._tool_feedback_by_entry.get(event.card.entry_index)
+        if state is None:
+            return
+        group = self._tool_activity_group_by_entry.get(state.entry_index)
+        if group is None or group.disclosure is ToolDisclosureLevel.SUMMARY:
+            return
+        group.disclosure = ToolDisclosureLevel.SUMMARY
+        self._refresh_tool_activity_group(group)
+        event.card.focus()
+
+    def on_tool_feedback_message_selection_requested(
+        self,
+        event: ToolFeedbackMessage.SelectionRequested,
+    ) -> None:
+        state = self._tool_feedback_by_entry.get(event.card.entry_index)
+        if state is None:
+            return
+        group = self._tool_activity_group_by_entry.get(state.entry_index)
+        if (
+            group is None
+            or group.disclosure is not ToolDisclosureLevel.PEEK
+            or len(group.tools) < 2
         ):
             return
-        state.expanded = not state.expanded
-        self._refresh_tool_feedback(state)
-        if state.expanded:
-            self._request_tool_artifact(state)
+        group.selected_tool_index = max(
+            0,
+            min(group.selected_tool_index + event.delta, len(group.tools) - 1),
+        )
+        self._refresh_tool_activity_group(group)
         event.card.focus()
 
     def on_assistant_message_copy_requested(
@@ -3720,37 +4056,107 @@ class NeuroCodeApp(App[None]):
             )
         )
 
-    def _request_tool_artifact(self, state: ToolFeedbackState) -> None:
-        if (
-            state.artifact_id is None
-            or self._tool_output_artifact_service is None
-            or self._runner.session_id is None
-            or state.artifact_loading
-            or state.artifact_content is not None
-        ):
+    def _open_tool_inspector(self, group: ToolActivityGroupState) -> None:
+        state = group.selected_tool
+        presentation = self._tool_inspector_presentation(state, group)
+        inspector = ToolInspectorScreen(
+            presentation,
+            language=self._language,
+            copy_text=self.copy_text_to_clipboard,
+        )
+        active = _ActiveToolInspector(state, group, inspector)
+        self._active_tool_inspector = active
+
+        def inspector_closed(_: None) -> None:
+            self._on_tool_inspector_closed(active)
+
+        self.push_screen(inspector, inspector_closed)
+        self._maybe_load_active_tool_inspector_artifact(active)
+
+    def _on_tool_inspector_closed(self, active: _ActiveToolInspector) -> None:
+        if self._active_tool_inspector is active:
+            self._active_tool_inspector = None
+        group = active.group
+        if not any(candidate is group for candidate in self._tool_activity_groups):
             return
-        state.artifact_loading = True
-        self._refresh_tool_feedback(state)
-        self.run_worker(
-            self._load_tool_artifact(state),
-            name=f"tool-output-artifact-{state.entry_index}",
-            group="tool-output-artifact",
-            exclusive=False,
+        if not group.tools or group.entry_index >= len(self._entry_widgets):
+            return
+        widget = self._entry_widgets[group.entry_index]
+        if isinstance(widget, ToolFeedbackMessage) and widget.display:
+            widget.focus()
+
+    def _maybe_load_active_tool_inspector_artifact(
+        self,
+        active: _ActiveToolInspector,
+    ) -> None:
+        state = active.state
+        worker = active.artifact_worker
+        can_load_artifact = (
+            state.artifact_id is not None
+            and state.artifact_content is None
+            and not state.artifact_unavailable
+            and not state.artifact_loading
+            and self._tool_output_artifact_service is not None
+            and self._runner.session_id is not None
+            and (worker is None or not worker.is_running)
+        )
+        if not can_load_artifact:
+            return
+        active.artifact_worker = self.run_worker(
+            self._load_tool_inspector_output(active),
+            name=f"tool-inspector-output-{state.entry_index}",
+            group="tool-inspector-output",
+            exclusive=True,
             exit_on_error=False,
         )
+
+    async def _load_tool_inspector_output(
+        self,
+        active: _ActiveToolInspector,
+    ) -> None:
+        await self._load_tool_artifact(active.state)
+        if self._active_tool_inspector is active:
+            active.screen.update_presentation(
+                self._tool_inspector_presentation(active.state, active.group)
+            )
+
+    def _refresh_active_tool_inspector(self, state: ToolFeedbackState) -> None:
+        active = self._active_tool_inspector
+        if active is None or active.state is not state:
+            return
+        self._update_active_tool_inspector(active)
+
+    def _refresh_active_tool_inspector_group(self, group: ToolActivityGroupState) -> None:
+        active = self._active_tool_inspector
+        if active is None or active.group is not group:
+            return
+        self._update_active_tool_inspector(active)
+
+    def _update_active_tool_inspector(self, active: _ActiveToolInspector) -> None:
+        active.screen.update_presentation(
+            self._tool_inspector_presentation(active.state, active.group)
+        )
+        self._maybe_load_active_tool_inspector_artifact(active)
 
     async def _load_tool_artifact(self, state: ToolFeedbackState) -> None:
         service = self._tool_output_artifact_service
         session_id = self._runner.session_id
         artifact_id = state.artifact_id
-        if service is None or session_id is None or artifact_id is None:
-            state.artifact_loading = False
+        if (
+            service is None
+            or session_id is None
+            or artifact_id is None
+            or state.artifact_loading
+            or state.artifact_content is not None
+        ):
             return
+        state.artifact_loading = True
         try:
             result = await service.read(
                 ReadSessionToolOutputArtifactRequest(
                     session_id=session_id,
                     artifact_id=artifact_id,
+                    max_bytes=MAX_TOOL_OUTPUT_ARTIFACT_READ_BYTES,
                 )
             )
             if (
@@ -3765,18 +4171,17 @@ class NeuroCodeApp(App[None]):
             state.artifact_unavailable = True
         else:
             state.artifact_content = result.content
+            state.artifact_stored_truncated = result.artifact.truncated
             state.artifact_read_truncated = result.read_truncated
             state.artifact_unavailable = False
         finally:
             state.artifact_loading = False
-            if self._tool_feedback_by_entry.get(state.entry_index) is state:
-                self._refresh_tool_feedback(state)
 
     def action_complete_slash_command(self) -> None:
         if isinstance(self.screen, ModalScreen):
             self.screen.focus_next()
             return
-        prompt = self.query_one("#prompt", PromptInput)
+        prompt = self._main_screen_query_one("#prompt", PromptInput)
         if not prompt.has_focus:
             self.screen.focus_next()
             return
@@ -3855,7 +4260,7 @@ class NeuroCodeApp(App[None]):
         self,
         run: Callable[[], Awaitable[AgentRunResult]],
     ) -> None:
-        prompt_input = self.query_one("#prompt", PromptInput)
+        prompt_input = self._main_screen_query_one("#prompt", PromptInput)
         completed = False
         try:
             result = await run()
@@ -3972,6 +4377,7 @@ class NeuroCodeApp(App[None]):
             if isinstance(text, str):
                 self._finalizing = False
                 if text:
+                    self._active_tool_activity_group = None
                     self._first_token_seen = True
                     self._turn_activity_kind = "responding"
                     self._turn_activity_tool_name = None
@@ -4108,6 +4514,7 @@ class NeuroCodeApp(App[None]):
         elif event.kind is AgentEventKind.BACKEND_TOOL_COMPLETED:
             state.phase = "completed"
             state.duration = self._event_duration(data)
+            state.duration_seconds = self._event_duration_seconds(data)
             state.started_at = None
             self._finish_tool_activity(state)
         elif event.kind is AgentEventKind.TOOL_PERMISSION:
@@ -4136,6 +4543,7 @@ class NeuroCodeApp(App[None]):
         elif event.kind in {AgentEventKind.TOOL_COMPLETED, AgentEventKind.TOOL_FAILED}:
             state.phase = "failed" if event.kind is AgentEventKind.TOOL_FAILED else "completed"
             state.duration = self._event_duration(data)
+            state.duration_seconds = self._event_duration_seconds(data)
             state.started_at = None
             state.content = self._optional_text(data.get("content"), allow_empty=True)
             state.is_error = (
@@ -4145,17 +4553,16 @@ class NeuroCodeApp(App[None]):
             state.metadata = dict(raw_metadata) if isinstance(raw_metadata, Mapping) else None
             state.artifact_id = self._artifact_id_from_metadata(raw_metadata)
             state.artifact_content = None
+            state.artifact_stored_truncated = (
+                isinstance(raw_metadata, Mapping)
+                and raw_metadata.get("output_artifact_truncated") is True
+            )
             state.artifact_read_truncated = False
             state.artifact_loading = False
             state.artifact_unavailable = False
             raw_changes = data.get("workspace_changes")
             state.workspace_changes = (
                 dict(raw_changes) if isinstance(raw_changes, Mapping) else None
-            )
-            state.expanded = (
-                state.is_error
-                or state.workspace_changes is not None
-                or state.name in {"apply_patch", "search_replace"}
             )
             self._finish_tool_activity(state)
         self._refresh_tool_feedback(state)
@@ -4191,10 +4598,18 @@ class NeuroCodeApp(App[None]):
             entry_index=len(self._entries),
             hosted=hosted,
         )
+        group = self._active_tool_activity_group
+        if group is None or group.tools[-1].entry_index != len(self._entries) - 1:
+            group = ToolActivityGroupState()
+            self._tool_activity_groups.append(group)
+            self._active_tool_activity_group = group
+        group.tools.append(state)
         self._tool_feedback_by_call[(hosted, call_id)] = state
         self._tool_feedback_by_entry[state.entry_index] = state
-        content = self._tool_feedback_body(state).plain
+        self._tool_activity_group_by_entry[state.entry_index] = group
+        content = self._tool_summary_line(state)
         self._write_entry("tool", content, tool_state=state)
+        self._refresh_tool_activity_group(group)
         return state
 
     def _find_or_start_tool_feedback(
@@ -4244,16 +4659,314 @@ class NeuroCodeApp(App[None]):
     def _refresh_tool_feedback(self, state: ToolFeedbackState) -> None:
         if state.entry_index >= len(self._entries):
             return
-        transcript = self.query_one("#transcript", VerticalScroll)
+        group = self._tool_activity_group_by_entry.get(state.entry_index)
+        if group is None:
+            body = Text(self._tool_summary_line(state), style=TOOL_DETAIL_STYLE)
+            self._entries[state.entry_index] = TranscriptEntry("tool", body.plain)
+            widget = self._entry_widgets[state.entry_index]
+            widget.update(self._render_tool_feedback(state, body=body))
+            if isinstance(widget, ToolFeedbackMessage):
+                self._configure_tool_feedback_widget(widget, state)
+            self._refresh_active_tool_inspector(state)
+            return
+        self._refresh_tool_activity_group(group)
+
+    def _refresh_tool_activity_group(self, group: ToolActivityGroupState) -> None:
+        if not group.tools or group.entry_index >= len(self._entry_widgets):
+            return
+        transcript = self._main_screen_query_one("#transcript", VerticalScroll)
         follow = transcript.is_vertical_scroll_end
-        body = self._tool_feedback_body(state)
-        self._entries[state.entry_index] = TranscriptEntry("tool", body.plain)
-        widget = self._entry_widgets[state.entry_index]
-        widget.update(self._render_tool_feedback(state, body=body))
-        if isinstance(widget, ToolFeedbackMessage):
-            self._configure_tool_feedback_widget(widget, state)
+        leader_index = group.entry_index
+        transcript_summary = self._tool_activity_text(group)
+        for state in group.tools:
+            if state.entry_index >= len(self._entry_widgets):
+                continue
+            self._entries[state.entry_index] = TranscriptEntry(
+                "tool",
+                (
+                    transcript_summary
+                    if state.entry_index == leader_index
+                    else self._tool_summary_line(state)
+                ),
+            )
+            widget = self._entry_widgets[state.entry_index]
+            if not isinstance(widget, ToolFeedbackMessage):
+                continue
+            is_leader = state.entry_index == leader_index
+            widget.display = is_leader
+            widget.can_focus = is_leader
+            if is_leader:
+                widget.update(self._render_tool_activity_group(group))
+                self._configure_tool_feedback_widget(widget, state)
+            else:
+                widget.set_class(False, "tool-interactive")
+                widget.set_class(False, "tool-peek")
         if follow:
             transcript.scroll_end(animate=False)
+        self._refresh_active_tool_inspector_group(group)
+
+    def _render_tool_activity_group(self, group: ToolActivityGroupState) -> RenderableType:
+        title = ui_text(self._language, f"tool.activity.{self._tool_activity_kind(group)}")
+        if group.disclosure is ToolDisclosureLevel.PEEK:
+            return self._render_tool_activity_peek(group, title=title)
+
+        table = Table.grid(expand=True, padding=(0, 1))
+        table.add_column(width=1, no_wrap=True)
+        table.add_column(ratio=1, overflow="ellipsis", no_wrap=True)
+        table.add_column(width=8, justify="right", no_wrap=True)
+        table.add_row("", Text(title, style=f"bold {TEXT_EMPHASIS}"), "")
+        for marker, marker_style, summary, duration in self._tool_activity_rows(group):
+            table.add_row(
+                Text(marker, style=marker_style),
+                Text(summary, style=TOOL_DETAIL_STYLE),
+                Text(duration, style=TOOL_META_STYLE),
+            )
+        return table
+
+    def _tool_activity_text(self, group: ToolActivityGroupState) -> str:
+        """Stable Summary transcript independent from temporary UI disclosure."""
+
+        title = ui_text(self._language, f"tool.activity.{self._tool_activity_kind(group)}")
+        lines = [title]
+        for marker, _, summary, duration in self._tool_activity_rows(group):
+            suffix = f"  {duration}" if duration else ""
+            lines.append(f"{marker} {summary}{suffix}")
+        return "\n".join(lines)
+
+    def _tool_call_snapshot(self, state: ToolFeedbackState) -> ToolCallSnapshot:
+        return ToolCallSnapshot(
+            call_id=state.call_id,
+            name=state.name,
+            arguments=dict(state.arguments),
+            phase=state.phase,
+            hosted=state.hosted,
+            permission_effect=state.permission_effect,
+            permission_reason=state.permission_reason,
+            approval_effect=state.approval_effect,
+            approval_outcome=state.approval_outcome,
+            approval_reason=state.approval_reason,
+            duration=state.duration,
+            content=state.content,
+            is_error=state.is_error,
+            metadata=dict(state.metadata or {}),
+            workspace_changes=self._tool_change_report(state),
+            has_artifact=state.artifact_id is not None,
+            artifact_content=state.artifact_content,
+            artifact_stored_truncated=state.artifact_stored_truncated,
+            artifact_read_truncated=state.artifact_read_truncated,
+            artifact_loading=state.artifact_loading,
+            artifact_unavailable=state.artifact_unavailable,
+        )
+
+    def _tool_activity_peek_presentation(
+        self,
+        group: ToolActivityGroupState,
+        *,
+        title: str,
+    ) -> ToolActivityPeekPresentation:
+        return present_tool_activity_peek(
+            title=title,
+            calls=tuple(self._tool_call_snapshot(state) for state in group.tools),
+            selected_index=group.selected_tool_index,
+            language=self._language,
+            logical_line_budget=TOOL_PEEK_LOGICAL_LINE_BUDGET,
+        )
+
+    def _render_tool_activity_peek(
+        self,
+        group: ToolActivityGroupState,
+        *,
+        title: str,
+    ) -> Text:
+        peek = self._tool_activity_peek_presentation(group, title=title)
+        rendered = Text(overflow="fold")
+        rendered.append(peek.title, style=f"bold {TEXT_EMPHASIS}")
+        rendered.append("\n")
+        rendered.append(peek.help, style=TOOL_META_STYLE)
+        rendered.append("\n")
+        marker_style = (
+            ERROR_TEXT_STYLE
+            if peek.marker == _ERROR_MARK
+            else TOOL_COMPLETE_STYLE
+            if peek.marker == _SUCCESS_MARK
+            else TOOL_ACTIVE_STYLE
+        )
+        rendered.append(f"{peek.marker} ", style=marker_style)
+        rendered.append(f"{peek.position}  ", style=TOOL_META_STYLE)
+        rendered.append(peek.selected_summary, style=TOOL_TITLE_STYLE)
+        if peek.duration:
+            rendered.append(f"  {peek.duration}", style=TOOL_META_STYLE)
+        for line in peek.lines:
+            rendered.append("\n  ", style=TOOL_GUIDE_STYLE)
+            rendered.append(line.text, style=self._tool_peek_line_style(line))
+        return rendered
+
+    @staticmethod
+    def _tool_peek_line_style(line: ToolPeekLine) -> str:
+        if line.tone == "error":
+            return ERROR_TEXT_STYLE
+        if line.tone == "warning":
+            return ACCENT_WARNING
+        if line.tone == "primary":
+            return TOOL_DETAIL_STYLE
+        if line.tone == "output":
+            return TOOL_TEXT_STYLE
+        return TOOL_META_STYLE
+
+    def _tool_inspector_presentation(
+        self,
+        state: ToolFeedbackState,
+        group: ToolActivityGroupState,
+    ) -> ToolInspectorPresentation:
+        return present_tool_inspector(
+            self._tool_call_snapshot(state),
+            language=self._language,
+            position=group.selected_tool_index + 1,
+            total=len(group.tools),
+        )
+
+    def _tool_activity_kind(self, group: ToolActivityGroupState) -> str:
+        names = {state.name for state in group.tools}
+        if any(
+            state.name in _TOOL_EDIT_NAMES or state.workspace_changes is not None
+            for state in group.tools
+        ):
+            return "updating"
+        if names and names <= _TOOL_WAIT_NAMES:
+            return "waiting"
+        if (
+            names
+            and names <= (_TOOL_READ_NAMES | _TOOL_SEARCH_NAMES | {"bash"})
+            and (names & (_TOOL_READ_NAMES | _TOOL_SEARCH_NAMES))
+        ):
+            return "inspecting"
+        return "working"
+
+    def _tool_activity_rows(
+        self,
+        group: ToolActivityGroupState,
+    ) -> tuple[tuple[str, str, str, str], ...]:
+        if len(group.tools) == 1:
+            state = group.tools[0]
+            marker, marker_style = self._tool_status_marker((state,))
+            summary = self._tool_summary_line(state)
+            duration = self._tool_activity_duration((state,))
+            return ((marker, marker_style, summary, duration),)
+
+        buckets: dict[str, list[ToolFeedbackState]] = {}
+        counts: dict[str, int] = {}
+        for state in group.tools:
+            bucket, count = self._tool_activity_bucket(state)
+            buckets.setdefault(bucket, []).append(state)
+            counts[bucket] = counts.get(bucket, 0) + count
+
+        rows: list[tuple[str, str, str, str]] = []
+        for bucket in ("read_files", "searched", "commands", "edits", "actions"):
+            states = buckets.get(bucket)
+            if not states:
+                continue
+            marker, marker_style = self._tool_status_marker(states)
+            rows.append(
+                (
+                    marker,
+                    marker_style,
+                    self._tool_activity_count_label(bucket, counts[bucket]),
+                    self._tool_activity_duration(states),
+                )
+            )
+        for state in group.tools:
+            if state.phase not in {"failed", "permission_denied", "approval_denied"}:
+                continue
+            reason = state.approval_reason or state.permission_reason or state.content
+            rows.append(
+                (
+                    _ERROR_MARK,
+                    ERROR_TEXT_STYLE,
+                    f"{state.name} · {self._bounded_inline(reason, limit=96)}",
+                    state.duration or "",
+                )
+            )
+        return tuple(rows)
+
+    @staticmethod
+    def _tool_activity_bucket(state: ToolFeedbackState) -> tuple[str, int]:
+        if state.name in _TOOL_READ_NAMES:
+            if state.name == "read_files":
+                raw_files = state.arguments.get("files")
+                count = (
+                    len(raw_files)
+                    if isinstance(raw_files, Sequence) and not isinstance(raw_files, str | bytes)
+                    else 1
+                )
+                return "read_files", max(1, count)
+            return "read_files", 1
+        if state.name in _TOOL_SEARCH_NAMES:
+            return "searched", 1
+        if state.name == "bash":
+            return "commands", 1
+        if state.name in _TOOL_EDIT_NAMES or state.workspace_changes is not None:
+            return "edits", 1
+        return "actions", 1
+
+    def _tool_summary_line(self, state: ToolFeedbackState) -> str:
+        display_name = {
+            "read_file": "read",
+            "read_files": "read",
+        }.get(state.name, state.name)
+        target = self._tool_summary_target(state)
+        summary = f"{display_name}  {target}" if target else display_name
+        if state.phase in {"failed", "permission_denied", "approval_denied"}:
+            reason = state.approval_reason or state.permission_reason or state.content
+            if reason:
+                summary += f" · {self._bounded_inline(reason, limit=80)}"
+        return summary
+
+    def _tool_summary_target(self, state: ToolFeedbackState) -> str:
+        if state.name == "bash":
+            return self._bounded_inline(state.arguments.get("command"), limit=64)
+        if state.name == "read_files":
+            raw_files = state.arguments.get("files")
+            count = (
+                len(raw_files)
+                if isinstance(raw_files, Sequence) and not isinstance(raw_files, str | bytes)
+                else 0
+            )
+            return self._tool_activity_count_label("read_files", count)
+        if state.name == "grep":
+            query = self._bounded_inline(state.arguments.get("query"), limit=32)
+            path = self._bounded_inline(state.arguments.get("path"), limit=28)
+            return f"{query} · {path}"
+        for key in ("path", "pattern", "query", "task_id", "name"):
+            value = state.arguments.get(key)
+            if isinstance(value, str) and value:
+                return self._bounded_inline(value, limit=64)
+        return ""
+
+    def _tool_activity_count_label(self, bucket: str, count: int) -> str:
+        suffix = ".one" if count == 1 else ""
+        return ui_text(self._language, f"tool.activity.{bucket}{suffix}", count=count)
+
+    def _tool_activity_duration(self, states: Sequence[ToolFeedbackState]) -> str:
+        total = 0.0
+        available = False
+        now = monotonic()
+        for state in states:
+            if state.duration_seconds is not None:
+                total += state.duration_seconds
+                available = True
+            elif state.started_at is not None:
+                total += max(0.0, now - state.started_at)
+                available = True
+        return self._event_duration({"duration_seconds": total}) if available else ""
+
+    @staticmethod
+    def _tool_status_marker(states: Sequence[ToolFeedbackState]) -> tuple[str, str]:
+        phases = {state.phase for state in states}
+        if phases & {"failed", "permission_denied", "approval_denied"}:
+            return _ERROR_MARK, ERROR_TEXT_STYLE
+        if phases <= {"completed"}:
+            return _SUCCESS_MARK, TOOL_COMPLETE_STYLE
+        return "…", TOOL_ACTIVE_STYLE
 
     def _field(self, data: Mapping[str, Any], name: str) -> str:
         value = data.get(name)
@@ -4269,26 +4982,17 @@ class NeuroCodeApp(App[None]):
 
     @staticmethod
     def _bounded_inline(value: object, *, limit: int = 140) -> str:
-        if not isinstance(value, str) or not value:
-            return "—"
-        rendered = " ".join(NeuroCodeApp._safe_tool_text(value).split())
-        return rendered if len(rendered) <= limit else f"{rendered[: limit - 1]}…"
+        return bounded_inline(value, limit=limit)
 
     @staticmethod
     def _safe_tool_text(value: str) -> str:
-        normalized = _ANSI_ESCAPE.sub("", value.replace("\r\n", "\n").replace("\r", "\n"))
-        printable = "".join(
-            character if character in {"\n", "\t"} or ord(character) >= 32 else "�"
-            for character in normalized
-        )
-        return redact_sensitive_text(printable)
+        return safe_tool_text(value)
 
     @classmethod
     def _event_duration(cls, data: Mapping[str, Any]) -> str:
-        value = data.get("duration_seconds")
-        if not isinstance(value, int | float) or isinstance(value, bool) or value < 0:
+        seconds = cls._event_duration_seconds(data)
+        if seconds is None:
             return "—"
-        seconds = float(value)
         if seconds < 0.001:
             return "<1ms"
         if seconds < 1:
@@ -4298,399 +5002,35 @@ class NeuroCodeApp(App[None]):
         minutes, remainder = divmod(round(seconds), 60)
         return f"{minutes}m {remainder:02d}s"
 
-    @classmethod
-    def _tool_invocation(cls, name: str, raw_arguments: object) -> str:
-        if not isinstance(raw_arguments, Mapping):
-            return name
-        preferred_keys = {
-            "bash": ("command",),
-            "read_file": ("path",),
-            "list_dir": ("path",),
-            "grep": ("query", "path"),
-            "search_replace": ("path",),
-            "apply_patch": ("path",),
-            "task_output": ("task_id",),
-        }.get(name, ("path", "query", "pattern", "task_id"))
-        values = [
-            cls._bounded_inline(raw_arguments.get(key), limit=100)
-            for key in preferred_keys
-            if isinstance(raw_arguments.get(key), str) and raw_arguments.get(key)
-        ]
-        return f"{name}({', '.join(values)})" if values else name
-
-    def _tool_feedback_body(self, state: ToolFeedbackState) -> Text:
-        if state.phase == "completed":
-            marker, marker_style = _SUCCESS_MARK, TOOL_COMPLETE_STYLE
-        elif state.phase in {"failed", "permission_denied", "approval_denied"}:
-            marker, marker_style = _ERROR_MARK, ERROR_TEXT_STYLE
-        else:
-            marker, marker_style = "…", TOOL_ACTIVE_STYLE
-        compact_summary = self._compact_read_summary(state)
-        if compact_summary is not None and not state.expanded:
-            body = Text(overflow="fold")
-            body.append(state.name, style=TOOL_TITLE_STYLE)
-            body.append("  ·  ", style=TOOL_GUIDE_STYLE)
-            body.append(f"{marker} ", style=marker_style)
-            body.append(compact_summary, style=TOOL_DETAIL_STYLE)
-            if state.phase == "completed" and state.duration is not None:
-                body.append(f" · {state.duration}", style=TOOL_META_STYLE)
-            return body
-
-        body = Text(overflow="fold")
-        body.append(f"{marker} ", style=marker_style)
-        if state.hosted:
-            body.append(ui_text(self._language, "tool.card.hosted"), style=TOOL_META_STYLE)
-            body.append(" ")
-        invocation = self._tool_invocation(state.name, state.arguments)
-        body.append(invocation, style=TOOL_TITLE_STYLE)
-
-        if state.permission_effect == "allow":
-            self._append_tool_line(
-                body,
-                "├",
-                ui_text(
-                    self._language,
-                    "tool.card.allowed",
-                    reason=self._bounded_inline(state.permission_reason),
-                ),
-                style=TOOL_COMPLETE_STYLE,
-            )
-        elif state.permission_effect == "ask":
-            if state.approval_outcome is not None:
-                outcome = ui_text(
-                    self._language,
-                    f"tool.approval.{self._known_approval_outcome(state.approval_outcome)}",
-                )
-                self._append_tool_line(
-                    body,
-                    "├",
-                    ui_text(self._language, "tool.card.approval", outcome=outcome),
-                    style=(
-                        TOOL_COMPLETE_STYLE
-                        if state.approval_effect == "allow"
-                        else ERROR_TEXT_STYLE
-                    ),
-                )
-            elif state.phase == "awaiting_approval":
-                self._append_tool_line(
-                    body,
-                    "├",
-                    ui_text(self._language, "tool.card.awaiting_approval"),
-                    style=WAITING_STYLE,
-                )
-            else:
-                self._append_tool_line(
-                    body,
-                    "├",
-                    ui_text(
-                        self._language,
-                        "tool.card.approval_required",
-                        reason=self._bounded_inline(state.permission_reason),
-                    ),
-                    style=WAITING_STYLE,
-                )
-
-        change_report = self._tool_change_report(state)
-        details_available = self._tool_details_available(state, change_report)
-        if state.content is not None and (state.content or change_report is None):
-            self._append_tool_output(body, state, expanded=state.expanded)
-        if change_report is not None:
-            self._append_tool_changes(body, change_report, expanded=state.expanded)
-        if details_available:
-            self._append_tool_line(
-                body,
-                "├",
-                ui_text(
-                    self._language,
-                    (
-                        "tool.card.details_expanded"
-                        if state.expanded
-                        else "tool.card.details_collapsed"
-                    ),
-                ),
-                style=TOOL_ACTIVE_STYLE,
-            )
-
-        if state.phase == "running":
-            running_label = (
-                "tool.card.waiting"
-                if state.name in {"wait_tasks", "task_output", "wait_for_tasks"}
-                else "tool.card.running"
-            )
-            self._append_tool_line(
-                body,
-                "├",
-                ui_text(self._language, running_label),
-                style=WAITING_STYLE,
-            )
-            body.append(
-                f" · {self._running_tool_duration(state)}",
-                style=TOOL_META_STYLE,
-            )
-        if state.phase == "completed":
-            duration = state.duration or "—"
-            self._append_tool_line(
-                body,
-                "└",
-                ui_text(
-                    self._language,
-                    "tool.card.completed",
-                    duration=duration,
-                ),
-                style=TOOL_COMPLETE_STYLE,
-            )
-            body.stylize(TOOL_META_STYLE, len(body.plain) - len(duration), len(body.plain))
-        elif state.phase == "failed":
-            duration = state.duration or "—"
-            self._append_tool_line(
-                body,
-                "└",
-                ui_text(
-                    self._language,
-                    "tool.card.failed",
-                    duration=duration,
-                ),
-                style=ERROR_TEXT_STYLE,
-            )
-            body.stylize(TOOL_META_STYLE, len(body.plain) - len(duration), len(body.plain))
-        elif state.phase in {"permission_denied", "approval_denied"}:
-            reason = state.approval_reason or state.permission_reason
-            self._append_tool_line(
-                body,
-                "└",
-                ui_text(
-                    self._language,
-                    "tool.card.denied",
-                    reason=self._bounded_inline(reason),
-                ),
-                style=ERROR_TEXT_STYLE,
-            )
-        return body
-
-    def _compact_read_summary(self, state: ToolFeedbackState) -> str | None:
-        if (
-            state.hosted
-            or state.name not in _COMPACT_READ_TOOLS
-            or state.is_error
-            or state.phase
-            in {
-                "running",
-                "failed",
-                "permission_denied",
-                "approval_denied",
-                "awaiting_approval",
-            }
-        ):
+    @staticmethod
+    def _event_duration_seconds(data: Mapping[str, Any]) -> float | None:
+        value = data.get("duration_seconds")
+        if not isinstance(value, int | float) or isinstance(value, bool) or value < 0:
             return None
-        key = "completed" if state.phase == "completed" else "running"
-        if state.name == "grep":
-            query = self._bounded_inline(state.arguments.get("query"), limit=80)
-            path = self._bounded_inline(state.arguments.get("path"), limit=80)
-            return ui_text(
-                self._language,
-                f"tool.compact.grep.{key}",
-                query=query,
-                path=path,
-            )
-        if state.name == "grep_many":
-            raw_queries = state.arguments.get("queries")
-            count = (
-                len(raw_queries)
-                if isinstance(raw_queries, Sequence) and not isinstance(raw_queries, str | bytes)
-                else 0
-            )
-            path = self._bounded_inline(state.arguments.get("path"), limit=80)
-            return ui_text(
-                self._language,
-                f"tool.compact.grep_many.{key}",
-                count=count,
-                path=path,
-            )
-        if state.name == "read_files":
-            raw_files = state.arguments.get("files")
-            count = (
-                len(raw_files)
-                if isinstance(raw_files, Sequence) and not isinstance(raw_files, str | bytes)
-                else 0
-            )
-            return ui_text(
-                self._language,
-                f"tool.compact.read_files.{key}",
-                count=count,
-            )
-        if state.name == "glob":
-            pattern = self._bounded_inline(state.arguments.get("pattern"), limit=100)
-            path = self._bounded_inline(state.arguments.get("path"), limit=80)
-            return ui_text(
-                self._language,
-                f"tool.compact.glob.{key}",
-                pattern=pattern,
-                path=path,
-            )
-        target_key = "name" if state.name == "skill" else "path"
-        target = self._bounded_inline(state.arguments.get(target_key), limit=120)
-        return ui_text(
-            self._language,
-            f"tool.compact.{state.name}.{key}",
-            target=target,
-        )
-
-    def _running_tool_duration(self, state: ToolFeedbackState) -> str:
-        if state.started_at is None:
-            return "—"
-        return self._event_duration({"duration_seconds": max(0.0, monotonic() - state.started_at)})
-
-    @staticmethod
-    def _append_tool_line(body: Text, connector: str, content: str, *, style: str) -> None:
-        body.append("\n")
-        body.append(f"{connector} ", style=TOOL_GUIDE_STYLE)
-        body.append(content, style=style)
-
-    @staticmethod
-    def _known_approval_outcome(outcome: str) -> str:
-        return outcome if outcome in {"allow_once", "allow_session", "deny"} else "unknown"
-
-    def _tool_details_available(
-        self,
-        state: ToolFeedbackState,
-        change_report: Mapping[str, Any] | None,
-    ) -> bool:
-        if state.content is not None and self._safe_tool_text(state.content).strip():
-            return True
-        if (
-            state.artifact_id is not None
-            and self._tool_output_artifact_service is not None
-            and self._runner.session_id is not None
-        ):
-            return True
-        if change_report is None:
-            return False
-        raw_files = change_report.get("files")
-        if not isinstance(raw_files, Sequence) or isinstance(raw_files, str | bytes):
-            return False
-        return any(
-            isinstance(change, Mapping)
-            and isinstance(change.get("diff"), str)
-            and bool(self._safe_tool_text(change["diff"]).strip())
-            for change in raw_files
-        )
+        return float(value)
 
     def _configure_tool_feedback_widget(
         self,
         widget: ToolFeedbackMessage,
         state: ToolFeedbackState,
     ) -> None:
-        available = self._tool_details_available(state, self._tool_change_report(state))
+        group = self._tool_activity_group_by_entry.get(state.entry_index)
+        is_leader = group is None or group.entry_index == state.entry_index
+        available = is_leader and group is not None and bool(group.tools)
+        peek_active = group is not None and group.disclosure is ToolDisclosureLevel.PEEK
         widget.can_focus = available
+        widget.peek_active = peek_active
+        widget.tool_count = len(group.tools) if group is not None else 1
         widget.set_class(available, "tool-interactive")
-        widget.set_class(available and state.expanded, "tool-expanded")
+        widget.set_class(available and peek_active, "tool-peek")
         widget.tooltip = (
             ui_text(
                 self._language,
-                ("tool.card.details_expanded" if state.expanded else "tool.card.details_collapsed"),
+                ("tool.peek.tooltip.close" if peek_active else "tool.peek.tooltip.open"),
             )
             if available
             else None
         )
-
-    def _append_tool_output(
-        self,
-        body: Text,
-        state: ToolFeedbackState,
-        *,
-        expanded: bool,
-    ) -> None:
-        content = (
-            state.artifact_content
-            if expanded and state.artifact_content is not None
-            else state.content or ""
-        )
-        lines, total_lines, omitted_lines, truncated = self._bounded_tool_preview(content)
-        if not lines:
-            heading = ui_text(
-                self._language,
-                "tool.card.error_empty" if state.is_error else "tool.card.output_empty",
-            )
-        else:
-            heading = ui_text(
-                self._language,
-                "tool.card.error" if state.is_error else "tool.card.output",
-                lines=total_lines,
-            )
-        self._append_tool_line(
-            body,
-            "├",
-            heading,
-            style=ERROR_TEXT_STYLE if state.is_error else TOOL_META_STYLE,
-        )
-        if not expanded:
-            return
-        for line in lines:
-            body.append("\n│   ", style=TOOL_GUIDE_STYLE)
-            body.append(line, style=TOOL_DETAIL_STYLE)
-        if omitted_lines:
-            body.append("\n│   ", style=TOOL_GUIDE_STYLE)
-            body.append(
-                ui_text(self._language, "tool.card.lines_omitted", count=omitted_lines),
-                style=f"italic {TOOL_META_STYLE}",
-            )
-        if truncated:
-            body.append("\n│   ", style=TOOL_GUIDE_STYLE)
-            body.append(
-                ui_text(self._language, "tool.card.preview_truncated"),
-                style=f"italic {TOOL_META_STYLE}",
-            )
-        if expanded and state.artifact_id is not None:
-            if state.artifact_loading:
-                self._append_tool_line(
-                    body,
-                    "├",
-                    ui_text(self._language, "tool.card.artifact_loading"),
-                    style=TOOL_META_STYLE,
-                )
-            elif state.artifact_unavailable:
-                self._append_tool_line(
-                    body,
-                    "├",
-                    ui_text(self._language, "tool.card.artifact_unavailable"),
-                    style=TOOL_META_STYLE,
-                )
-            elif state.artifact_read_truncated:
-                self._append_tool_line(
-                    body,
-                    "├",
-                    ui_text(self._language, "tool.card.artifact_read_truncated"),
-                    style=f"italic {TOOL_META_STYLE}",
-                )
-
-    @classmethod
-    def _bounded_tool_preview(cls, content: str) -> tuple[tuple[str, ...], int, int, bool]:
-        safe = cls._safe_tool_text(content)
-        raw_lines = safe.splitlines()
-        total_lines = len(raw_lines)
-        omitted_lines = 0
-        if total_lines > _TOOL_OUTPUT_MAX_LINES:
-            head_count = _TOOL_OUTPUT_MAX_LINES - 10
-            selected = [*raw_lines[:head_count], *raw_lines[-10:]]
-            omitted_lines = total_lines - len(selected)
-        else:
-            selected = raw_lines
-
-        rendered: list[str] = []
-        characters = 0
-        truncated = False
-        for line in selected:
-            remaining = _TOOL_OUTPUT_MAX_CHARACTERS - characters
-            if remaining <= 0:
-                truncated = True
-                break
-            if len(line) > remaining:
-                rendered.append(f"{line[: max(0, remaining - 1)]}…")
-                truncated = True
-                break
-            rendered.append(line)
-            characters += len(line) + 1
-        return tuple(rendered), total_lines, omitted_lines, truncated
 
     def _tool_change_report(self, state: ToolFeedbackState) -> dict[str, Any] | None:
         if state.workspace_changes is not None:
@@ -4767,110 +5107,6 @@ class NeuroCodeApp(App[None]):
                     "scan_limited": False,
                 }
         return None
-
-    def _append_tool_changes(
-        self,
-        body: Text,
-        report: Mapping[str, Any],
-        *,
-        expanded: bool,
-    ) -> None:
-        raw_files = report.get("files")
-        if not isinstance(raw_files, Sequence) or isinstance(raw_files, str | bytes):
-            return
-        files = [item for item in raw_files if isinstance(item, Mapping)]
-        visible = files[:_TOOL_DIFF_MAX_FILES]
-        for change in visible:
-            path = self._bounded_inline(change.get("path"), limit=180)
-            status = change.get("status")
-            additions = self._non_negative_int(change.get("additions"))
-            deletions = self._non_negative_int(change.get("deletions"))
-            status_key = status if status in {"created", "modified", "deleted"} else "modified"
-            summary = ui_text(
-                self._language,
-                f"tool.card.change.{status_key}",
-                path=path,
-                additions=additions,
-                deletions=deletions,
-            )
-            content_start = len(body) + 3
-            self._append_tool_line(body, "├", summary, style=TOOL_TITLE_STYLE)
-            body.highlight_words((path,), style=TOOL_TITLE_STYLE, case_sensitive=True)
-            addition_text = f"+{additions}"
-            addition_offset = summary.find(addition_text)
-            if addition_offset >= 0:
-                body.stylize(
-                    DIFF_SUMMARY_ADDITION_STYLE,
-                    content_start + addition_offset,
-                    content_start + addition_offset + len(addition_text),
-                )
-            deletion_text = f"-{deletions}"
-            deletion_offset = summary.find(deletion_text)
-            if deletion_offset >= 0:
-                body.stylize(
-                    DIFF_SUMMARY_DELETION_STYLE,
-                    content_start + deletion_offset,
-                    content_start + deletion_offset + len(deletion_text),
-                )
-
-            raw_diff = change.get("diff")
-            if expanded and isinstance(raw_diff, str) and raw_diff:
-                diff_lines, _, omitted, truncated = self._bounded_tool_preview(raw_diff)
-                for line in diff_lines:
-                    body.append("\n│   ", style=TOOL_GUIDE_STYLE)
-                    body.append(line, style=self._diff_line_style(line))
-                if omitted or truncated or change.get("diff_truncated") is True:
-                    body.append("\n│   ", style=TOOL_GUIDE_STYLE)
-                    body.append(
-                        ui_text(self._language, "tool.card.diff_truncated"),
-                        style=f"italic {TOOL_META_STYLE}",
-                    )
-            hidden_reason = change.get("hidden_reason")
-            if isinstance(hidden_reason, str):
-                known_reason = (
-                    hidden_reason
-                    if hidden_reason in {"sensitive", "large", "budget", "binary", "redacted"}
-                    else "unavailable"
-                )
-                body.append("\n│   ", style=TOOL_GUIDE_STYLE)
-                body.append(
-                    ui_text(self._language, f"tool.card.hidden.{known_reason}"),
-                    style=f"italic {TOOL_META_STYLE}",
-                )
-
-        omitted_files = self._non_negative_int(report.get("omitted_files")) + max(
-            0, len(files) - len(visible)
-        )
-        if omitted_files:
-            self._append_tool_line(
-                body,
-                "├",
-                ui_text(self._language, "tool.card.files_omitted", count=omitted_files),
-                style=f"italic {TOOL_META_STYLE}",
-            )
-        if report.get("scan_limited") is True:
-            self._append_tool_line(
-                body,
-                "├",
-                ui_text(self._language, "tool.card.scan_limited"),
-                style=f"italic {TOOL_META_STYLE}",
-            )
-
-    @staticmethod
-    def _non_negative_int(value: object) -> int:
-        return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
-
-    @staticmethod
-    def _diff_line_style(line: str) -> str:
-        if line.startswith("@@"):
-            return DIFF_HUNK_STYLE
-        if line.startswith(("+++", "---")):
-            return DIFF_FILE_STYLE
-        if line.startswith("+"):
-            return DIFF_ADDITION_STYLE
-        if line.startswith("-"):
-            return DIFF_DELETION_STYLE
-        return DIFF_CONTEXT_STYLE
 
     async def _dispatch_slash_command(self, raw: str) -> None:
         command, _, arguments = raw[1:].partition(" ")
@@ -5146,16 +5382,40 @@ class NeuroCodeApp(App[None]):
         )
 
     def action_clear_transcript(self) -> None:
-        transcript = self.query_one("#transcript", VerticalScroll)
+        transcript = self._main_screen_query_one("#transcript", VerticalScroll)
         transcript.remove_children(tuple(self._entry_widgets))
         self._entries.clear()
         self._entry_widgets.clear()
         self._tool_feedback_by_call.clear()
         self._tool_feedback_by_entry.clear()
+        self._tool_activity_groups.clear()
+        self._tool_activity_group_by_entry.clear()
+        self._active_tool_activity_group = None
         self._plan_entry_index = None
         self._plan_comments = ()
         self._queued_interjections.clear()
         self._write_ui_entry("system", "transcript.cleared")
+
+    def action_collapse_active_tool_peek(self) -> None:
+        """Make Escape reliably restore Summary even after focus moved away."""
+
+        if isinstance(self.screen, ModalScreen):
+            return
+        for group in self._tool_activity_groups:
+            if group.disclosure is not ToolDisclosureLevel.PEEK:
+                continue
+            group.disclosure = ToolDisclosureLevel.SUMMARY
+            self._refresh_tool_activity_group(group)
+
+    def action_show_help(self) -> None:
+        """Reveal the command reference on demand instead of reserving a footer row.
+
+        按需显示命令参考,不再永久占用底部快捷键栏。
+        """
+
+        if isinstance(self.screen, ModalScreen):
+            return
+        self._write_ui_entry("system", "command.help")
 
     def action_copy_prompt(self) -> None:
         """Copy selected prompt text or open the transcript selection view.
@@ -5166,7 +5426,10 @@ class NeuroCodeApp(App[None]):
         if isinstance(self.screen, TranscriptCopyScreen):
             self.screen.action_copy_selection()
             return
-        prompt = self.query_one("#prompt", PromptInput)
+        if isinstance(self.screen, ToolInspectorScreen):
+            self.screen.action_copy_current()
+            return
+        prompt = self._main_screen_query_one("#prompt", PromptInput)
         if prompt.has_focus and prompt.selected_text:
             prompt.action_copy()
             return
@@ -5193,10 +5456,14 @@ class NeuroCodeApp(App[None]):
             "tool": ui_text(self._language, "label.tool"),
             "user": "YOU",
         }
-        sections = [
-            f"{labels.get(entry.category, entry.category.upper())}\n{entry.text}"
-            for entry in self._entries
-        ]
+        sections: list[str] = []
+        for index, entry in enumerate(self._entries):
+            group = self._tool_activity_group_by_entry.get(index)
+            if group is not None:
+                if index == group.entry_index:
+                    sections.append(self._tool_activity_text(group))
+                continue
+            sections.append(f"{labels.get(entry.category, entry.category.upper())}\n{entry.text}")
         if self._pending_assistant is not None and self._assistant_parts:
             sections.append(f"NEURO\n{''.join(self._assistant_parts)}")
         return "\n\n".join(sections) or ui_text(self._language, "transcript_copy.empty")
@@ -5204,6 +5471,9 @@ class NeuroCodeApp(App[None]):
     def action_cancel_turn(self) -> None:
         if isinstance(self.screen, TranscriptCopyScreen):
             self.screen.action_copy_selection()
+            return
+        if isinstance(self.screen, ToolInspectorScreen):
+            self.screen.action_copy_current()
             return
         if isinstance(self.screen, PermissionApprovalScreen):
             self.screen.action_deny()
@@ -5229,7 +5499,7 @@ class NeuroCodeApp(App[None]):
         ):
             self.screen.action_cancel()
             return
-        prompt = self.query_one("#prompt", PromptInput)
+        prompt = self._main_screen_query_one("#prompt", PromptInput)
         if prompt.has_focus and prompt.selected_text:
             prompt.action_copy()
             return
@@ -5896,19 +6166,20 @@ class NeuroCodeApp(App[None]):
         plan: SessionPlan,
         comments: Sequence[PlanComment] = (),
     ) -> None:
+        self._active_tool_activity_group = None
         rendered = self._render_plan(plan, comments)
         index = self._plan_entry_index
         if index is not None and 0 <= index < len(self._entries):
             self._entries[index] = TranscriptEntry("plan", rendered.plain)
             widget = self._entry_widgets[index]
             widget.update(rendered)
-            transcript = self.query_one("#transcript", VerticalScroll)
+            transcript = self._main_screen_query_one("#transcript", VerticalScroll)
             self._move_plan_entry_to_latest_position(index, widget, transcript)
             if transcript.is_vertical_scroll_end:
                 transcript.scroll_end(animate=False)
             return
 
-        transcript = self.query_one("#transcript", VerticalScroll)
+        transcript = self._main_screen_query_one("#transcript", VerticalScroll)
         follow = transcript.is_vertical_scroll_end
         widget = ConversationMessage("plan", rendered)
         pending = self._pending_assistant
@@ -5947,6 +6218,7 @@ class NeuroCodeApp(App[None]):
                 if isinstance(remapped_widget, ToolFeedbackMessage):
                     remapped_widget.entry_index = remapped_index
             self._tool_feedback_by_entry = remapped_tool_feedback
+            self._rebuild_tool_activity_indexes()
             self._plan_entry_index = len(self._entries) - 1
 
         pending = self._pending_assistant
@@ -6429,12 +6701,15 @@ class NeuroCodeApp(App[None]):
             self._write_ui_entry("recoverable", key)
 
     def _replace_transcript(self, items: Sequence[SessionItem]) -> None:
-        transcript = self.query_one("#transcript", VerticalScroll)
+        transcript = self._main_screen_query_one("#transcript", VerticalScroll)
         transcript.remove_children()
         self._entries.clear()
         self._entry_widgets.clear()
         self._tool_feedback_by_call.clear()
         self._tool_feedback_by_entry.clear()
+        self._tool_activity_groups.clear()
+        self._tool_activity_group_by_entry.clear()
+        self._active_tool_activity_group = None
         self._plan_entry_index = None
         self._plan_comments = ()
         self._pending_assistant = None
@@ -6469,11 +6744,11 @@ class NeuroCodeApp(App[None]):
     @staticmethod
     def _semantic_value_style(name: str, value: object) -> str | None:
         if name in {"provider", "model", "profile", "source"}:
-            return f"bold {ACCENT_CODE}"
+            return f"bold {TEXT_EMPHASIS}"
         if name in {"name", "task_id", "session_id", "title"}:
-            return f"bold {ACCENT_CODE}"
+            return f"bold {TEXT_EMPHASIS}"
         if name == "path":
-            return ACCENT_CODE
+            return TEXT_SECONDARY
         if name == "cwd":
             return TEXT_SECONDARY
         if name in {"effect", "outcome", "status"}:
@@ -6520,13 +6795,10 @@ class NeuroCodeApp(App[None]):
 
         labels = {
             "error": (f"{_ERROR_MARK} {ui_text(self._language, 'label.error')}", ERROR_LABEL_STYLE),
-            "recoverable": (
-                f"! {ui_text(self._language, 'label.status')}",
-                RECOVERABLE_LABEL_STYLE,
-            ),
-            "status": (f"… {ui_text(self._language, 'label.status')}", STATUS_LABEL_STYLE),
+            "recoverable": ("!", RECOVERABLE_LABEL_STYLE),
+            "status": ("·", STATUS_LABEL_STYLE),
             "system": ("NEURO", SYSTEM_LABEL_STYLE),
-            "tool": (f"• {ui_text(self._language, 'label.tool')}", TOOL_LABEL_STYLE),
+            "tool": ("•", TOOL_LABEL_STYLE),
         }
         body_styles = {
             "error": ERROR_DETAIL_STYLE,
@@ -6538,18 +6810,20 @@ class NeuroCodeApp(App[None]):
         if category == "plan" and self._plan is not None:
             return self._render_plan(self._plan, self._plan_comments)
         label, label_style = labels.get(category, (category.title(), f"bold {TEXT_PRIMARY}"))
-        body = Text(content, style=body_styles.get(category, TEXT_BODY), overflow="fold")
+        body = Text(overflow="fold")
+        body.append(label, style=label_style)
+        body.append("  ", style=TEXT_DIM)
+        content_start = len(body)
+        body.append(content, style=body_styles.get(category, TEXT_BODY))
         for name, value in ui_values:
             style = self._semantic_value_style(name, value)
             rendered_value = str(value)
             if style is not None and rendered_value:
-                body.highlight_words((rendered_value,), style=style, case_sensitive=True)
-
-        table = Table.grid(expand=True, padding=(0, 1))
-        table.add_column(width=10, justify="right", no_wrap=True)
-        table.add_column(ratio=1, overflow="fold")
-        table.add_row(Text(label, style=label_style), body)
-        return table
+                offset = body.plain.find(rendered_value, content_start)
+                while offset >= 0:
+                    body.stylize(style, offset, offset + len(rendered_value))
+                    offset = body.plain.find(rendered_value, offset + len(rendered_value))
+        return body
 
     def _render_tool_feedback(
         self,
@@ -6557,15 +6831,11 @@ class NeuroCodeApp(App[None]):
         *,
         body: Text | None = None,
     ) -> RenderableType:
-        table = Table.grid(expand=True, padding=(0, 1))
-        table.add_column(width=10, justify="right", no_wrap=True)
-        table.add_column(ratio=1, overflow="fold")
-        label_style = ERROR_LABEL_STYLE if state.is_error else TOOL_LABEL_STYLE
-        table.add_row(
-            Text(ui_text(self._language, "label.tool"), style=label_style),
-            body if body is not None else self._tool_feedback_body(state),
+        return (
+            body
+            if body is not None
+            else Text(self._tool_summary_line(state), style=TOOL_DETAIL_STYLE)
         )
-        return table
 
     def _write_ui_entry(self, category: str, key: str, **values: object) -> None:
         self._write_entry(
@@ -6584,12 +6854,21 @@ class NeuroCodeApp(App[None]):
         ui_values: tuple[tuple[str, object], ...] = (),
         tool_state: ToolFeedbackState | None = None,
     ) -> None:
+        if category != "tool" or tool_state is None:
+            self._active_tool_activity_group = None
         entry = TranscriptEntry(category, content, ui_key, ui_values)
         if tool_state is not None:
+            group = self._tool_activity_group_by_entry.get(tool_state.entry_index)
+            is_group_leader = group is None or group.entry_index == tool_state.entry_index
             tool_widget = ToolFeedbackMessage(
-                self._render_tool_feedback(tool_state),
+                (
+                    self._render_tool_activity_group(group)
+                    if group is not None and is_group_leader
+                    else self._render_tool_feedback(tool_state)
+                ),
                 entry_index=tool_state.entry_index,
             )
+            tool_widget.display = is_group_leader
             self._configure_tool_feedback_widget(tool_widget, tool_state)
             widget: ConversationMessage = tool_widget
         elif category == "assistant":
@@ -6613,7 +6892,7 @@ class NeuroCodeApp(App[None]):
                     ui_values=ui_values,
                 ),
             )
-        transcript = self.query_one("#transcript", VerticalScroll)
+        transcript = self._main_screen_query_one("#transcript", VerticalScroll)
         follow = transcript.is_vertical_scroll_end
         pending = self._pending_assistant
         if pending is not None and pending.parent is transcript:
@@ -6640,7 +6919,7 @@ class NeuroCodeApp(App[None]):
         # 保留流式助手文本的稳定节点,但只在 transcript 下方的活动行渲染运行状态.
         pending.display = False
         self._pending_assistant = pending
-        transcript = self.query_one("#transcript", VerticalScroll)
+        transcript = self._main_screen_query_one("#transcript", VerticalScroll)
         transcript.mount(pending)
         transcript.scroll_end(animate=False)
 
@@ -6649,7 +6928,7 @@ class NeuroCodeApp(App[None]):
             self._begin_pending_assistant()
         pending = self._pending_assistant
         assert pending is not None
-        transcript = self.query_one("#transcript", VerticalScroll)
+        transcript = self._main_screen_query_one("#transcript", VerticalScroll)
         follow = transcript.is_vertical_scroll_end
         pending.set_pending(False)
         pending.display = True
@@ -6705,13 +6984,14 @@ class NeuroCodeApp(App[None]):
             self._begin_pending_assistant()
         pending = self._pending_assistant
         assert pending is not None
-        transcript = self.query_one("#transcript", VerticalScroll)
+        transcript = self._main_screen_query_one("#transcript", VerticalScroll)
         follow = transcript.is_vertical_scroll_end
         pending.set_pending(False)
         pending.display = True
         if isinstance(pending, AssistantMessage):
             pending.set_content(content)
         pending.update(self._render_entry("assistant", content))
+        self._active_tool_activity_group = None
         self._entries.append(TranscriptEntry("assistant", content))
         self._entry_widgets.append(pending)
         self._pending_assistant = None
@@ -6746,8 +7026,8 @@ class NeuroCodeApp(App[None]):
         self._turn_activity_kind = "thinking"
         self._turn_activity_tool_name = None
         self._turn_activity_tool_started_at = None
-        activity = next(iter(self.query("#turn-activity")), None)
-        if isinstance(activity, Static):
+        activity = self._main_screen_query_optional("#turn-activity", Static)
+        if activity is not None:
             activity.update("")
             activity.display = False
 
@@ -6760,14 +7040,30 @@ class NeuroCodeApp(App[None]):
                 self._refresh_turn_activity()
 
     def _refresh_running_tool_elapsed(self) -> None:
+        if self._main_screen_query_optional("#transcript", VerticalScroll) is None:
+            return
+        groups: dict[int, ToolActivityGroupState] = {}
+        ungrouped: list[ToolFeedbackState] = []
         for state in tuple(self._tool_feedback_by_entry.values()):
-            if state.phase == "running":
-                self._refresh_tool_feedback(state)
+            if state.phase != "running":
+                continue
+            group = self._tool_activity_group_by_entry.get(state.entry_index)
+            if group is None:
+                ungrouped.append(state)
+            else:
+                groups[id(group)] = group
+        for state in ungrouped:
+            self._refresh_tool_feedback(state)
+        for group in groups.values():
+            if group.disclosure is ToolDisclosureLevel.SUMMARY:
+                self._refresh_tool_activity_group(group)
         self._refresh_turn_activity()
 
     def _refresh_turn_activity(self) -> None:
-        activity = next(iter(self.query("#turn-activity")), None)
-        if not isinstance(activity, Static) or not self._model_loading:
+        if not self._model_loading:
+            return
+        activity = self._main_screen_query_optional("#turn-activity", Static)
+        if activity is None:
             return
 
         if self._turn_activity_kind == "tool":
@@ -6800,15 +7096,9 @@ class NeuroCodeApp(App[None]):
 
     def _apply_language_to_chrome(self) -> None:
         self.sub_title = ui_text(self._language, "subtitle")
-        prompt = self.query_one("#prompt", PromptInput)
+        prompt = self._main_screen_query_one("#prompt", PromptInput)
         prompt.placeholder = ui_text(self._language, "prompt.placeholder")
         prompt.refresh()
-        shortcuts = Text(ui_text(self._language, "shortcuts"), style=TEXT_MUTED)
-        shortcuts.highlight_regex(
-            r"\^(?:[A-Z]|,)|Shift\+Tab|F8",
-            style=f"bold {TEXT_EMPHASIS}",
-        )
-        self.query_one("#shortcut-bar", Static).update(shortcuts)
         self._refresh_command_hints(prompt.value)
         self._refresh_runtime_bar()
 
@@ -6821,7 +7111,7 @@ class NeuroCodeApp(App[None]):
         return slash_completions(value, provider_names=provider_names)
 
     def _refresh_command_hints(self, value: str) -> None:
-        widget = self.query_one("#command-hints", Static)
+        widget = self._main_screen_query_one("#command-hints", Static)
         completions = self._slash_completions(value)
         if not completions:
             widget.update("")
@@ -6896,42 +7186,59 @@ class NeuroCodeApp(App[None]):
         return loading
 
     def _refresh_runtime_bar(self) -> None:
-        model = Text()
-        model.append(
-            f"{ui_text(self._language, 'runtime.model')}  ",
-            style=f"bold {TEXT_DIM}",
+        model = Text(self._model_name, style=TEXT_EMPHASIS, overflow="ellipsis", no_wrap=True)
+        requested = self._reasoning_effort
+        effective = self._effective_reasoning_effort
+        effort = Text()
+        effort.append(" · ", style=TEXT_DIM)
+        effort.append(
+            requested.value,
+            style=TEXT_MUTED if requested is ReasoningEffort.ULTRACODE else TEXT_SECONDARY,
         )
-        model.append(self._provider_name, style=f"bold {ACCENT_CODE}")
-        if self._model_name != self._provider_name:
-            model.append(" · ", style=TEXT_DIM)
-            model.append(self._model_name, style=f"bold {ACCENT_CODE}")
-        self.query_one("#runtime-model", Static).update(model)
+        if effective is not requested:
+            effort.append(" → ", style=TEXT_DIM)
+            effort.append(
+                effective.value,
+                style=TEXT_SECONDARY,
+            )
+        mode = Text()
+        mode.append(" · ", style=TEXT_DIM)
+        mode.append(self._interaction_mode.value, style=TEXT_SECONDARY)
 
-        workspace = Text(justify="right", overflow="ellipsis", no_wrap=True)
-        workspace.append(
-            f"{ui_text(self._language, 'runtime.workspace')}  ",
-            style=f"bold {TEXT_DIM}",
+        primary = Table.grid(expand=True, padding=(0, 0))
+        primary.add_column(ratio=1, overflow="ellipsis", no_wrap=True)
+        primary.add_column(width=len(effort.plain), no_wrap=True)
+        primary.add_column(width=len(mode.plain), no_wrap=True)
+        primary.add_row(model, effort, mode)
+        primary_widget = self._main_screen_query_one("#runtime-primary", Static)
+        primary_widget.update(primary)
+        mode_help = ui_text(
+            self._language,
+            (
+                "runtime.mode_help_auto_unrestricted"
+                if self._interaction_mode is InteractionMode.AUTO and self._auto_mode_unrestricted
+                else f"runtime.mode_help.{self._interaction_mode.value}"
+            ),
         )
-        workspace.append(self._display_cwd(), style=TEXT_DIM)
-        workspace_widget = self.query_one("#runtime-workspace", Static)
-        workspace_widget.update(workspace)
-        workspace_widget.tooltip = str(self._cwd)
+        primary_widget.tooltip = (
+            f"{self._provider_name}/{self._model_name}\n"
+            f"{ui_text(self._language, 'runtime.effort_help')}\n{mode_help}"
+        )
 
         context = Text()
-        context.append(
-            f"{ui_text(self._language, 'runtime.context')}  ",
-            style=f"bold {TEXT_DIM}",
-        )
-        context.append(
-            self._context_percentage(),
-            style=f"bold {self._context_color()}",
-        )
-        context_widget = self.query_one("#runtime-context", Static)
-        context_widget.update(context)
-        if self._context_window_tokens is None:
-            context_widget.tooltip = self._context_token_usage()
-        else:
-            context_widget.tooltip = ui_text(
+        context.append("ctx ", style=TEXT_MUTED)
+        context.append(self._context_percentage(), style=self._context_color())
+        workspace = Text(self._display_cwd(), style=TEXT_MUTED, overflow="ellipsis", no_wrap=True)
+        secondary = Table.grid(expand=True, padding=(0, 0))
+        secondary.add_column(width=len(context.plain), no_wrap=True)
+        secondary.add_column(ratio=1, justify="right", overflow="ellipsis", no_wrap=True)
+        secondary.add_row(context, workspace)
+        secondary_widget = self._main_screen_query_one("#runtime-secondary", Static)
+        secondary_widget.update(secondary)
+        context_help = (
+            self._context_token_usage()
+            if self._context_window_tokens is None
+            else ui_text(
                 self._language,
                 (
                     "runtime.context_help_estimated"
@@ -6941,47 +7248,8 @@ class NeuroCodeApp(App[None]):
                 used=f"{self._context_used_tokens:,}",
                 window=f"{self._context_window_tokens:,}",
             )
-
-        requested = self._reasoning_effort
-        effective = self._effective_reasoning_effort
-        effort = Text()
-        effort.append(
-            f"{ui_text(self._language, 'runtime.effort')}  ",
-            style=f"bold {TEXT_DIM}",
         )
-        effort.append(
-            f"{requested.glyph} {requested.value}",
-            style=f"bold {EFFORT_STYLES[requested.value]}",
-        )
-        if effective is not requested:
-            effort.append(" → ", style=TEXT_DIM)
-            effort.append(
-                f"{effective.glyph} {effective.value}",
-                style=f"bold {EFFORT_STYLES[effective.value]}",
-            )
-        effort_widget = self.query_one("#runtime-effort", Static)
-        effort_widget.update(effort)
-        effort_widget.tooltip = ui_text(self._language, "runtime.effort_help")
-
-        mode = Text()
-        mode.append(
-            f"{ui_text(self._language, 'runtime.mode')}  ",
-            style=f"bold {TEXT_DIM}",
-        )
-        mode.append(
-            f"{self._interaction_mode.glyph} {self._interaction_mode.value}",
-            style=f"bold {MODE_STYLES[self._interaction_mode.value]}",
-        )
-        mode_widget = self.query_one("#runtime-mode", Static)
-        mode_widget.update(mode)
-        mode_widget.tooltip = ui_text(
-            self._language,
-            (
-                "runtime.mode_help_auto_unrestricted"
-                if self._interaction_mode is InteractionMode.AUTO and self._auto_mode_unrestricted
-                else f"runtime.mode_help.{self._interaction_mode.value}"
-            ),
-        )
+        secondary_widget.tooltip = f"{context_help}\n{self._cwd}"
 
     def _display_cwd(self) -> str:
         try:
@@ -7016,11 +7284,13 @@ class NeuroCodeApp(App[None]):
                 continue
             tool_state = self._tool_feedback_by_entry.get(index)
             if tool_state is not None:
-                body = self._tool_feedback_body(tool_state)
-                self._entries[index] = TranscriptEntry("tool", body.plain)
-                widget.update(self._render_tool_feedback(tool_state, body=body))
-                if isinstance(widget, ToolFeedbackMessage):
-                    self._configure_tool_feedback_widget(widget, tool_state)
+                group = self._tool_activity_group_by_entry.get(index)
+                content = (
+                    self._tool_activity_text(group)
+                    if group is not None and group.entry_index == index
+                    else self._tool_summary_line(tool_state)
+                )
+                self._entries[index] = TranscriptEntry("tool", content)
                 continue
             if entry.ui_key is not None:
                 content = ui_text(
@@ -7038,6 +7308,8 @@ class NeuroCodeApp(App[None]):
                     ui_values=entry.ui_values,
                 )
             )
+        for group in self._tool_activity_groups:
+            self._refresh_tool_activity_group(group)
         if self._pending_assistant is not None and self._assistant_parts:
             self._pending_assistant.update(
                 self._render_entry("assistant", "".join(self._assistant_parts))

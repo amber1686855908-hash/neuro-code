@@ -71,6 +71,10 @@ Textual 的无头测试 pilot 验证，应用控制器也可以在不导入 Text
 [ADR 0030](0030-bounded-interactive-tool-card-details.md) 加入。可恢复的运行中取消由
 [ADR 0016](0016-recoverable-turn-cancellation.md) 定义。
 
+后续的编辑式表现细化 [ADR 0108](0108-editorial-tui-presentation.md) 替换了固定标签栏、
+独立可见工具卡、永久快捷键栏和提示框上方运行栏等视觉细节；本 ADR 的事件、权限、终端与
+应用控制器边界保持不变。
+
 ## 验证
 
 Neuro Code 在可执行文件边界验证终端启动与退出恢复，而不只依赖无头组件推断。

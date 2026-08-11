@@ -11,18 +11,32 @@ import math
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from neuro_code.application.ports.background_tasks import BackgroundTaskManager
-from neuro_code.application.ports.sandbox import ShellLaunch
+from neuro_code.application.ports.sandbox import (
+    LocalProcessEnvironmentPolicy,
+    LocalProcessFilesystemPolicy,
+    LocalProcessLifecycle,
+    LocalProcessNetworkPolicy,
+    LocalProcessOutput,
+    LocalProcessPurpose,
+    LocalProcessSandbox,
+    LocalProcessStdioMode,
+    LocalWorkspaceAccess,
+    LocalWorkspaceAccessMode,
+    SandboxedProcessRequest,
+)
 from neuro_code.application.ports.tools import (
     MAX_TOOL_OUTPUT_ARTIFACT_BYTES,
     ToolContext,
     ToolOutputArtifact,
 )
 from neuro_code.domain.background_tasks.models import BackgroundTaskSnapshot, BackgroundTaskStatus
+from neuro_code.domain.sandbox.models import SandboxProfile
 from neuro_code.domain.tools import ToolDefinition, ToolResult
-from neuro_code.infrastructure.sandbox.process_tree import ProcessTree
+from neuro_code.infrastructure.sandbox.local_process import ProcessTreeLocalProcessSandbox
 from neuro_code.shared.errors import BackgroundTaskCapacityError, ToolError
 
 LOGGER = logging.getLogger(__name__)
@@ -39,8 +53,19 @@ class _CapturedOutput:
 class BashTool:
     side_effecting = True
 
-    def __init__(self, *, background_enabled: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        background_enabled: bool = False,
+        local_process_sandbox: LocalProcessSandbox | None = None,
+    ) -> None:
         self._background_enabled = background_enabled
+        self._requires_context_process_sandbox = local_process_sandbox is None
+        self._local_process_sandbox = (
+            local_process_sandbox
+            if local_process_sandbox is not None
+            else ProcessTreeLocalProcessSandbox()
+        )
         properties: dict[str, object] = {
             "command": {"type": "string"},
             "timeout_seconds": {"type": "number", "exclusiveMinimum": 0},
@@ -69,7 +94,7 @@ class BashTool:
 
     @staticmethod
     async def _read_limited(
-        stream: asyncio.StreamReader,
+        stream: LocalProcessOutput,
         byte_limit: int,
         artifact_limit: int = 0,
     ) -> _CapturedOutput:
@@ -138,86 +163,52 @@ class BashTool:
         ):
             raise ToolError("termination_grace_seconds must be positive")
 
-        protected = {name.casefold() for name in context.protected_environment_variables}
-        env = {
-            name: value for name, value in os.environ.items() if name.casefold() not in protected
-        }
-        env["PAGER"] = "cat"
-        env["GIT_PAGER"] = "cat"
-        env["GIT_TERMINAL_PROMPT"] = "0"
+        env = self._child_environment(context)
         background_timeout = float(timeout) if has_explicit_timeout else None
         auto_promote = (
             self._background_enabled and not is_background and context.background_tasks is not None
         )
-        if context.sandbox_profile.enabled:
-            if context.shell_sandbox is None:
-                raise ToolError(
-                    f"sandbox profile {context.sandbox_profile.value!r} is not enforced"
-                )
-            if context.shell_sandbox.profile is not context.sandbox_profile:
-                raise ToolError("tool context sandbox profile does not match its shell adapter")
-            launch = context.shell_sandbox.shell_launch(command)
-            if is_background:
-                if context.background_tasks is None:
-                    raise ToolError("background command execution is unavailable")
-                snapshot = await context.background_tasks.start_exec(
-                    launch.executable,
-                    launch.arguments,
-                    display_command=command,
-                    cwd=context.cwd,
-                    env=env,
-                    output_byte_limit=context.output_byte_limit,
-                    termination_grace_seconds=context.termination_grace_seconds,
-                    timeout_seconds=background_timeout,
-                    output_artifact_store=context.output_artifact_store,
-                )
-                return self._background_result(snapshot.task_id)
-            if auto_promote:
-                managed_result = await self._managed_foreground_result(
+        if is_background:
+            if context.background_tasks is None:
+                raise ToolError("background command execution is unavailable")
+            snapshot = await context.background_tasks.start_process(
+                self._process_request(
                     command=command,
-                    wait_budget=float(timeout),
                     context=context,
-                    env=env,
-                    launch=launch,
-                )
-                if managed_result is not None:
-                    return managed_result
-            tree = await ProcessTree.spawn_exec(
-                launch.executable,
-                launch.arguments,
-                cwd=context.cwd,
-                env=env,
+                    environment=env,
+                    purpose=LocalProcessPurpose.BACKGROUND_BASH,
+                    stdio_mode=LocalProcessStdioMode.MERGED_CAPTURE,
+                ),
+                display_command=command,
+                output_byte_limit=context.output_byte_limit,
+                timeout_seconds=background_timeout,
+                output_artifact_store=context.output_artifact_store,
             )
-        else:
-            if is_background:
-                if context.background_tasks is None:
-                    raise ToolError("background command execution is unavailable")
-                snapshot = await context.background_tasks.start_shell(
-                    command,
-                    cwd=context.cwd,
-                    env=env,
-                    output_byte_limit=context.output_byte_limit,
-                    termination_grace_seconds=context.termination_grace_seconds,
-                    timeout_seconds=background_timeout,
-                    output_artifact_store=context.output_artifact_store,
-                )
-                return self._background_result(snapshot.task_id)
-            if auto_promote:
-                managed_result = await self._managed_foreground_result(
+            return self._background_result(snapshot.task_id)
+        if auto_promote:
+            managed_result = await self._managed_foreground_result(
+                command=command,
+                wait_budget=float(timeout),
+                context=context,
+                request=self._process_request(
                     command=command,
-                    wait_budget=float(timeout),
                     context=context,
-                    env=env,
-                    launch=None,
-                )
-                if managed_result is not None:
-                    return managed_result
-            tree = await ProcessTree.spawn_shell(
-                command,
-                cwd=context.cwd,
-                env=env,
+                    environment=env,
+                    purpose=LocalProcessPurpose.BACKGROUND_BASH,
+                    stdio_mode=LocalProcessStdioMode.MERGED_CAPTURE,
+                ),
             )
-        process = tree.process
+            if managed_result is not None:
+                return managed_result
+        process = await self._process_sandbox(context).spawn(
+            self._process_request(
+                command=command,
+                context=context,
+                environment=env,
+                purpose=LocalProcessPurpose.BASH,
+                stdio_mode=LocalProcessStdioMode.CAPTURE,
+            )
+        )
         assert process.stdout is not None
         assert process.stderr is not None
         artifact_limit = (
@@ -226,26 +217,26 @@ class BashTool:
         execution = asyncio.gather(
             self._read_limited(process.stdout, context.output_byte_limit, artifact_limit),
             self._read_limited(process.stderr, context.output_byte_limit, artifact_limit),
-            tree.wait(),
+            process.wait(),
         )
         try:
             stdout_capture, stderr_capture, _ = await asyncio.wait_for(
                 asyncio.shield(execution), float(timeout)
             )
         except TimeoutError as error:
-            await tree.terminate(grace_seconds=context.termination_grace_seconds)
+            await process.terminate(grace_seconds=context.termination_grace_seconds)
             execution.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await execution
             raise ToolError(f"command timed out after {timeout:g} seconds") from error
         except asyncio.CancelledError:
-            await tree.terminate(grace_seconds=context.termination_grace_seconds)
+            await process.terminate(grace_seconds=context.termination_grace_seconds)
             execution.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await execution
             raise
         except Exception:
-            await tree.terminate(grace_seconds=context.termination_grace_seconds)
+            await process.terminate(grace_seconds=context.termination_grace_seconds)
             execution.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await execution
@@ -332,8 +323,7 @@ class BashTool:
         command: str,
         wait_budget: float,
         context: ToolContext,
-        env: Mapping[str, str],
-        launch: ShellLaunch | None,
+        request: SandboxedProcessRequest,
     ) -> ToolResult | None:
         """Wait on one manager-owned launch, promoting it without a respawn.
 
@@ -344,28 +334,13 @@ class BashTool:
         loop = asyncio.get_running_loop()
         start_time = loop.time()
         try:
-            if launch is None:
-                started = await manager.start_shell(
-                    command,
-                    cwd=context.cwd,
-                    env=env,
-                    output_byte_limit=context.output_byte_limit,
-                    termination_grace_seconds=context.termination_grace_seconds,
-                    timeout_seconds=None,
-                    output_artifact_store=context.output_artifact_store,
-                )
-            else:
-                started = await manager.start_exec(
-                    launch.executable,
-                    launch.arguments,
-                    display_command=command,
-                    cwd=context.cwd,
-                    env=env,
-                    output_byte_limit=context.output_byte_limit,
-                    termination_grace_seconds=context.termination_grace_seconds,
-                    timeout_seconds=None,
-                    output_artifact_store=context.output_artifact_store,
-                )
+            started = await manager.start_process(
+                request,
+                display_command=command,
+                output_byte_limit=context.output_byte_limit,
+                timeout_seconds=None,
+                output_artifact_store=context.output_artifact_store,
+            )
         except BackgroundTaskCapacityError:
             # A full managed registry must not turn an ordinary short command
             # into a new failure. Fall back to the established foreground
@@ -408,6 +383,142 @@ class BashTool:
             raise ToolError("managed foreground task could not be cleaned up")
         if not await manager.discard_completed(task_id):
             raise ToolError("managed foreground task record could not be discarded")
+
+    def _process_sandbox(self, context: ToolContext) -> LocalProcessSandbox:
+        """Resolve the composition-owned launcher without exposing ProcessTree.
+
+        解析由 composition 拥有的启动器,而不暴露 ProcessTree.
+        """
+
+        if context.local_process_sandbox is not None:
+            return context.local_process_sandbox
+        if context.sandbox_profile.enabled and self._requires_context_process_sandbox:
+            raise ToolError(
+                f"sandbox profile {context.sandbox_profile.value!r} requires a child process sandbox"
+            )
+        return self._local_process_sandbox
+
+    @staticmethod
+    def _child_environment(context: ToolContext) -> dict[str, str]:
+        """Build the environment request without leaking protected controller state.
+
+        为环境请求构建变量,而不泄露受保护的 controller 状态.
+
+        Enabled profiles intentionally use a small allowlist.  The Linux child
+        adapter repeats that filtering before adding ``--clearenv`` so neither
+        layer can accidentally turn an approval decision into credential
+        exposure.  ``off`` retains the historic filtered host environment.
+
+        启用的 profile 刻意使用小型白名单.Linux 子适配器会在添加 ``--clearenv``
+        前再次过滤,因此两个层级都不会意外把审批决定变成凭据暴露.``off`` 保留
+        历史上的已过滤宿主环境.
+        """
+
+        protected = {name.casefold() for name in context.protected_environment_variables}
+        if context.sandbox_profile.enabled:
+            allowed = {
+                "COLORTERM",
+                "LANG",
+                "LC_ALL",
+                "LC_CTYPE",
+                "NO_COLOR",
+                "PATH",
+                "TERM",
+            }
+            environment = {
+                name: value
+                for name, value in os.environ.items()
+                if name in allowed and name.casefold() not in protected
+            }
+        else:
+            environment = {
+                name: value
+                for name, value in os.environ.items()
+                if name.casefold() not in protected
+            }
+        environment["PAGER"] = "cat"
+        environment["GIT_PAGER"] = "cat"
+        environment["GIT_TERMINAL_PROMPT"] = "0"
+        return environment
+
+    @staticmethod
+    def _process_request(
+        *,
+        command: str,
+        context: ToolContext,
+        environment: Mapping[str, str],
+        purpose: LocalProcessPurpose,
+        stdio_mode: LocalProcessStdioMode,
+    ) -> SandboxedProcessRequest:
+        """Project a validated Bash execution into the canonical process request.
+
+        将经过验证的 Bash 执行投影为规范进程请求.
+        """
+
+        workspace_mode = (
+            LocalWorkspaceAccessMode.READ_ONLY
+            if context.sandbox_profile is SandboxProfile.READ_ONLY
+            else LocalWorkspaceAccessMode.READ_WRITE
+        )
+        roots = BashTool._workspace_access_roots(context, workspace_mode)
+        filesystem_policy = LocalProcessFilesystemPolicy(
+            roots,
+            private_home=context.sandbox_profile.enabled,
+            private_temporary_directory=context.sandbox_profile.enabled,
+        )
+        lifecycle = LocalProcessLifecycle(
+            termination_grace_seconds=context.termination_grace_seconds,
+        )
+        cwd = context.cwd.expanduser().resolve()
+        network_policy = (
+            LocalProcessNetworkPolicy.ISOLATED
+            if context.sandbox_profile.restricts_child_network
+            else LocalProcessNetworkPolicy.INHERIT
+        )
+        environment_policy = LocalProcessEnvironmentPolicy(environment)
+        return SandboxedProcessRequest.shell(
+            command,
+            purpose=purpose,
+            cwd=cwd,
+            sandbox_profile=context.sandbox_profile,
+            filesystem_policy=filesystem_policy,
+            network_policy=network_policy,
+            environment_policy=environment_policy,
+            stdio_mode=stdio_mode,
+            lifecycle=lifecycle,
+        )
+
+    @staticmethod
+    def _workspace_access_roots(
+        context: ToolContext,
+        mode: LocalWorkspaceAccessMode,
+    ) -> tuple[LocalWorkspaceAccess, ...]:
+        """Return non-overlapping roots visible to one Bash child.
+
+        返回对一个 Bash 子进程可见且互不重叠的根目录.
+
+        A nested additional root adds no capability beyond its already exposed
+        parent.  Removing it avoids ambiguous Bubblewrap mount ordering while
+        preserving all authorized paths.
+
+        嵌套的 additional root 不会超出已公开父目录的能力.移除它可避免含糊的
+        Bubblewrap 挂载顺序,同时保留所有已授权路径.
+        """
+
+        candidates = [context.cwd.expanduser().resolve()]
+        candidates.extend(
+            root.expanduser().resolve() for root in context.additional_workspace_roots
+        )
+        roots: list[Path] = []
+        for candidate in candidates:
+            if any(candidate == root or candidate.is_relative_to(root) for root in roots):
+                continue
+            if any(root.is_relative_to(candidate) for root in roots):
+                raise ToolError(
+                    "additional workspace roots must not contain the configured workspace"
+                )
+            roots.append(candidate)
+        return tuple(LocalWorkspaceAccess(root, mode) for root in roots)
 
     @staticmethod
     def _foreground_result(snapshot: BackgroundTaskSnapshot) -> ToolResult:

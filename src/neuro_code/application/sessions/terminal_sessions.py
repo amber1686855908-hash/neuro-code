@@ -23,8 +23,19 @@ from neuro_code.application.permissions.policy import (
     PermissionManager,
 )
 from neuro_code.application.ports.approval import PermissionApprover
-from neuro_code.application.ports.sandbox import ShellSandbox
-from neuro_code.application.ports.terminal import TerminalPlatform, TerminalPlatformSession
+from neuro_code.application.ports.sandbox import (
+    LocalProcessEnvironmentPolicy,
+    LocalProcessFilesystemPolicy,
+    LocalProcessLifecycle,
+    LocalProcessNetworkPolicy,
+    LocalProcessPurpose,
+    LocalProcessSandbox,
+    LocalProcessStdioMode,
+    LocalWorkspaceAccess,
+    LocalWorkspaceAccessMode,
+    SandboxedProcessRequest,
+)
+from neuro_code.application.ports.terminal import TerminalPlatformSession
 from neuro_code.application.ports.workspace import WorkspacePathResolver
 from neuro_code.domain.sandbox.models import SandboxProfile
 from neuro_code.domain.terminal.models import (
@@ -308,9 +319,8 @@ class LocalInteractiveTerminalManager:
         permissions: PermissionManager,
         approver: PermissionApprover | None = None,
         sandbox_profile: SandboxProfile = SandboxProfile.OFF,
-        shell_sandbox: ShellSandbox | None = None,
+        local_process_sandbox: LocalProcessSandbox,
         protected_environment_variables: frozenset[str] = frozenset(),
-        platform: TerminalPlatform,
         max_sessions: int = 8,
     ) -> None:
         if not isinstance(workspace, Path):
@@ -322,9 +332,8 @@ class LocalInteractiveTerminalManager:
         self._permissions = permissions
         self._approver = approver
         self._sandbox_profile = sandbox_profile
-        self._shell_sandbox = shell_sandbox
+        self._local_process_sandbox = local_process_sandbox
         self._protected_environment = {name.casefold() for name in protected_environment_variables}
-        self._platform = platform
         self._max_sessions = max_sessions
         self._sessions: dict[str, LocalInteractiveTerminalSession] = {}
         self._pending_creations = 0
@@ -376,15 +385,16 @@ class LocalInteractiveTerminalManager:
                 "rows": size.rows,
             }
             await self._authorize(call_id, permission_arguments)
-            launch_executable, launch_arguments = self._prepare_launch(argv)
+            request = self._build_process_request(
+                argv,
+                resolved_cwd=resolved_cwd,
+                environment=environment,
+            )
 
             spawn = asyncio.create_task(
                 run_blocking(
-                    self._platform.spawn_exec,
-                    launch_executable,
-                    launch_arguments,
-                    cwd=resolved_cwd,
-                    env=environment,
+                    self._local_process_sandbox.spawn_terminal,
+                    request,
                     size=size,
                     on_output=output.append,
                     on_eof=output.finish,
@@ -468,16 +478,36 @@ class LocalInteractiveTerminalManager:
         if not approval.allowed:
             raise PermissionDenied(f"interactive terminal denied: {approval.reason}")
 
-    def _prepare_launch(self, argv: tuple[str, ...]) -> tuple[str, tuple[str, ...]]:
-        executable, arguments = argv[0], argv[1:]
-        if not self._sandbox_profile.enabled:
-            return executable, arguments
-        if self._shell_sandbox is None:
-            raise TerminalError(f"sandbox profile {self._sandbox_profile.value!r} is not enforced")
-        if self._shell_sandbox.profile is not self._sandbox_profile:
-            raise TerminalError("terminal sandbox profile does not match its platform adapter")
-        launch = self._shell_sandbox.exec_launch(executable, arguments)
-        return launch.executable, launch.arguments
+    def _build_process_request(
+        self,
+        argv: tuple[str, ...],
+        *,
+        resolved_cwd: Path,
+        environment: Mapping[str, str],
+    ) -> SandboxedProcessRequest:
+        access_mode = (
+            LocalWorkspaceAccessMode.READ_ONLY
+            if self._sandbox_profile is SandboxProfile.READ_ONLY
+            else LocalWorkspaceAccessMode.READ_WRITE
+        )
+        return SandboxedProcessRequest.exec(
+            argv[0],
+            argv[1:],
+            purpose=LocalProcessPurpose.INTERACTIVE_TERMINAL,
+            cwd=resolved_cwd,
+            sandbox_profile=self._sandbox_profile,
+            filesystem_policy=LocalProcessFilesystemPolicy(
+                (LocalWorkspaceAccess(self._workspace, access_mode),)
+            ),
+            network_policy=(
+                LocalProcessNetworkPolicy.ISOLATED
+                if self._sandbox_profile.restricts_child_network
+                else LocalProcessNetworkPolicy.INHERIT
+            ),
+            environment_policy=LocalProcessEnvironmentPolicy(environment),
+            stdio_mode=LocalProcessStdioMode.PTY,
+            lifecycle=LocalProcessLifecycle(),
+        )
 
     async def _register_session(self, session: LocalInteractiveTerminalSession) -> bool:
         async with self._registry_lock:

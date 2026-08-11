@@ -199,8 +199,9 @@ terminal substrate through client terminal APIs; interactive framing and
 backpressure remain pending. See
 [ADR 0034](adr/0034-bounded-owned-interactive-terminal-sessions.md).
 
-User prompts render as full-width muted blocks, while assistant output uses a
-separate response block without `You:`/`Assistant:` log prefixes. A streamed
+User prompts and assistant responses use distinct restrained blocks on one
+shared reading axis, with a 116-column maximum and no `You:`/`Assistant:` log
+prefixes. A streamed
 response is mounted once in the conversation and updated in place through its
 final text, so completion does not move it from a temporary area into the
 scrollback. Automatic following stops when the user scrolls upward.
@@ -209,26 +210,23 @@ Assistant text is rendered as Markdown with an application-owned semantic
 palette for headings, emphasis, code, lists, links, and tables. Model text is
 not interpreted as Rich/Textual markup, and hyperlink activation is disabled.
 User prompts and local/external values remain literal text. System, status,
-tool, and error notices use one aligned label gutter, while provider/model,
-tool/session, path, outcome, duration, mode, effort, and error values receive
-restrained semantic highlights. Each model step reports client-observed time to
-its first actionable output, each tool call owns one stable
-invocation/permission/result card with elapsed time, and a completed turn
-reports total elapsed time after the final assistant message. Completed cards
-retain bounded, control-safe, credential-redacted previews of actual tool output.
-Read/list/search/image/skill calls default to one concise action line; their safe
-preview can still be opened in place.
-Side-effecting local tools also report bounded per-call workspace changes with
-file paths and unified text diffs; sensitive, binary, oversized, dependency,
-cache, and version-control-internal content stays hidden. Successful edits
-automatically show their changed slices. Added and removed lines use green/red
-foregrounds plus distinct tinted backgrounds. Safe details can be collapsed or
-reopened in place by click, or by focusing the card and pressing
-`Enter`/`Space`. Mermaid and inline media are not part of this slice.
+activity, plan, and error notices use inline labels and semantic hierarchy;
+models, paths, and tools do not receive accent color solely by type. Each model
+step reports client-observed time to its first actionable output, and a completed
+turn reports total elapsed time after the final assistant message. Consecutive
+tool calls appear as one default-collapsed activity group with state, bounded
+intent or aggregate counts, failures, and elapsed time. Long Bash commands are
+truncated in the summary. Click the group or focus it and press `Enter`/`Space`
+to reveal the existing bounded, control-safe, credential-redacted permissions,
+full commands, output, output artifacts, and workspace diffs. Sensitive, binary,
+oversized, dependency, cache, and version-control-internal content stays hidden.
+Added and removed lines use green/red foregrounds plus distinct tinted
+backgrounds. Mermaid and inline media are not part of this slice.
 
-A persistent one-line runtime bar above the prompt shows the active provider
-and model, compact working directory, current context-window use, requested
-reasoning effort, and interaction mode. While waiting for model output, the
+Below the composer, one compact label-free status row shows model, effort, and
+mode on the left and context-window use plus working directory on the right.
+Long values ellipsize in narrow layouts. The permanent shortcut row is omitted;
+use `/help` or F1 for the existing command reference. While waiting for model output, the
 supplied seven-cell collapsing pulse animates before the pending-assistant text. The
 context percentage starts as a visibly approximate local estimate and switches
 to provider-reported input/output token usage after a model step. A configured
@@ -236,9 +234,8 @@ to provider-reported input/output token usage after a model step. A configured
 configured, the bar shows the known token use without inventing a percentage.
 Managed provider details expose this local capability field so every configured
 model can supply its own real denominator. When a requested effort has a different
-implemented policy, the bar shows both values, for example
-`⚡ ultracode → ⬤ xhigh`. The labels update with the selected UI language and
-remain visible in narrow layouts.
+implemented policy, the status projection shows both values, for example
+`ultracode → xhigh`. Its text updates with the selected UI language.
 
 Typing `/` shows command syntax and parameter hints. The suggestions include
 the five effort values, four modes, and currently selectable provider profile names; free
@@ -532,17 +529,18 @@ profile = "workspace"
 neuro-code -p "Inspect and test this repository" --sandbox workspace
 ```
 
-On Linux, non-`off` profiles require usable, non-workspace-controlled `bwrap`;
-`read-only` and `strict` also require `unshare`. Neuro Code probes these
-capabilities and re-executes before opening the session store or starting model
-work. It never falls back to an unsandboxed run after an explicit request.
+On Linux, non-`off` profiles require usable, non-workspace-controlled `bwrap`.
+Neuro Code preflights the required user, mount, PID, and (for `read-only` and
+`strict`) network namespaces before exposing each child. The trusted controller,
+provider connections, credentials, and session store remain on the host. An
+explicit enabled profile never falls back to an unsandboxed child.
 
 | Profile | Filesystem | Local Bash network |
 |---|---|---|
-| `off` | No OS sandbox | Available |
-| `workspace` | Host readable; workspace, state, and temporary paths writable | Available |
-| `read-only` | Host/workspace read-only; state and temporary paths writable; edit tool unavailable | Isolated |
-| `strict` | Only required system/runtime paths and workspace visible; workspace, state, and temporary paths writable | Isolated |
+| `off` | Explicitly no OS filesystem, network, controller-state, or detached-descendant isolation | Available |
+| `workspace` | Empty child root; required runtime read-only; authorized workspace roots writable; private HOME and temporary storage | Available |
+| `read-only` | Same empty child root, but authorized workspace roots read-only; edit tool unavailable | Isolated |
+| `strict` | Same allowlist root as `workspace`; authorized workspace roots remain writable | Isolated |
 
 The parent process retains network access for model APIs. Permissions still run
 before tools and remain necessary: a sandbox limits an approved action but does
@@ -552,6 +550,17 @@ selections for a new session; they cannot change a saved session's profile
 during resume. `neuro-code inspect` reports the canonical profile and its source.
 Local Bash also strips configured provider API-key variables and standard or
 explicit proxy variables instead of inheriting their secret values.
+
+`off` remains the compatibility default and is a deliberate request to run
+children without an OS security boundary; POSIX cleanup then owns only the
+original process group and cannot guarantee termination of descendants that
+call `setsid()`. Enabled Linux profiles add a PID namespace and
+`--die-with-parent`, so process-group escape does not escape the sandbox
+lifecycle boundary. Before enabled-profile startup, Neuro Code also rejects a
+controller-state regular file with multiple hardlinks: otherwise an existing
+workspace hardlink could name the same private inode through an authorized bind
+mount. Other pre-existing files inside an explicitly authorized workspace are
+within that workspace's trust boundary.
 
 macOS and Windows currently fail closed for explicit non-`off` profiles.
 Every new session, including `off`, stores its canonical profile. Resume without

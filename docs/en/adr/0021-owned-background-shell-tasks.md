@@ -54,7 +54,7 @@ bytes but retains only a configured head/tail preview in memory. It merges
 stderr into stdout at process creation so the captured stream preserves the
 operating system's pipe order. Provider and proxy credentials are stripped
 before both foreground and background launches, and sandboxed launches use the
-same `ShellSandbox` plan.
+same `LocalProcessSandbox` request boundary.
 
 `ProcessTree.wait` waits for the direct child and then the owned POSIX process
 group or Windows Job Object. This keeps a shell command containing an internal

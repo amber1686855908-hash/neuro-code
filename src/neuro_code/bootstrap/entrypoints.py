@@ -30,6 +30,7 @@ from neuro_code.application.permissions.broker import SessionApprovalBroker
 from neuro_code.application.ports.approval import PermissionApprover
 from neuro_code.application.ports.client_filesystem import ClientFileSystem
 from neuro_code.application.ports.client_terminal import ClientTerminal
+from neuro_code.application.ports.sandbox import LocalProcessSandbox
 from neuro_code.application.ports.storage import SessionStore
 from neuro_code.application.ports.tools import Tool
 from neuro_code.application.providers.contracts import ProviderOption
@@ -70,7 +71,7 @@ from neuro_code.infrastructure.providers.provider_catalog import HttpProviderCat
 from neuro_code.infrastructure.providers.provider_settings import JsonProviderSettingsStore
 from neuro_code.infrastructure.workspace.paths import workspaces_match
 from neuro_code.shared.async_utils import run_blocking
-from neuro_code.shared.errors import ConfigurationError
+from neuro_code.shared.errors import ConfigurationError, SandboxError
 
 if TYPE_CHECKING:
     from neuro_code.domain.workspace.instructions import InstructionDiscoveryResult
@@ -160,6 +161,15 @@ class _BootstrapMcpToolFactory:
 
     提供由适配器支持的 MCP 工厂,打开操作仍延迟到会话创建之后."""
 
+    def __init__(
+        self,
+        *,
+        local_process_sandbox_factory: Callable[[], LocalProcessSandbox],
+        sandbox_profile: SandboxProfile,
+    ) -> None:
+        self._local_process_sandbox_factory = local_process_sandbox_factory
+        self._sandbox_profile = sandbox_profile
+
     async def open(
         self,
         configurations: Sequence[AcpMcpServerConfig],
@@ -171,9 +181,15 @@ class _BootstrapMcpToolFactory:
         tools: list[Tool] = []
         names: set[str] = set()
         try:
+            local_process_sandbox: LocalProcessSandbox | None = None
             for configuration in configurations:
                 collection: AcpMcpTools
                 if isinstance(configuration, AcpMcpStdioServerConfig):
+                    if local_process_sandbox is None:
+                        try:
+                            local_process_sandbox = self._local_process_sandbox_factory()
+                        except (OSError, SandboxError, ValueError):
+                            raise AcpMcpToolError("mcp_child_sandbox_unavailable") from None
                     collection = await McpStdioToolCollection.open(
                         (
                             McpStdioServerConfig(
@@ -185,6 +201,8 @@ class _BootstrapMcpToolFactory:
                         ),
                         cwd=cwd,
                         explicit_redactions=explicit_redactions,
+                        local_process_sandbox=local_process_sandbox,
+                        sandbox_profile=self._sandbox_profile,
                     )
                 elif isinstance(configuration, AcpMcpHttpServerConfig):
                     collection = await McpHttpToolCollection.open(
@@ -379,7 +397,12 @@ class BootstrapCliServices:
             ),
             store=application.store,
             bindings=_CompositionAcpBindingFactory(application),
-            mcp_tools=_BootstrapMcpToolFactory(),
+            mcp_tools=_BootstrapMcpToolFactory(
+                local_process_sandbox_factory=lambda: application.create_local_process_sandbox(
+                    config=config,
+                ),
+                sandbox_profile=config.sandbox_profile,
+            ),
             workspace=_BootstrapWorkspaceValidator(config.cwd, config.sandbox_profile),
             sessions=application.session_service,
             summary_queries=application.session_summary_queries,

@@ -20,13 +20,16 @@ and `FileToolOutputArtifactStore`, and injects that application boundary into
 `NeuroCodeApp`. The TUI stores only the bounded `output_artifact_id` from a
 terminal tool event. It never receives a filesystem path or artifact store.
 
-When a user expands a tool card, the TUI asynchronously requests the artifact
-for the runner's current session. The application service checks the persisted
-session event association, and the reader enforces the opaque-handle path
-boundary, redaction, and read byte limit. The TUI renders the returned content
-through its existing display line/character bounds and shows a generic,
-localized unavailable message for read failures. The artifact ID, path,
-arguments, raw metadata, and exception text are never rendered.
+When a user advances from a bounded Inline Peek into the independent Tool
+Inspector, the TUI asynchronously requests the artifact for the runner's current
+session. Summary and Peek never request or render artifact content. The
+application service checks the persisted session event association, and the
+reader enforces the opaque-handle path boundary, redaction, and 256 KiB read
+limit. Inspector Output is scrollable and explicitly states read-limit or
+artifact-storage truncation instead of implying that a truncated projection is
+the original complete output. Read failures show a generic localized notice.
+Artifact IDs, paths, arbitrary metadata, and exception text are never rendered;
+the separately selectable Input view is recursively redacted.
 
 The read is opt-in at expansion time, bounded, and does not alter events,
 session items, Runtime behavior, Provider behavior, permissions, or SQLite
@@ -39,8 +42,10 @@ service; session authorization is evaluated by the service for every read.
   model-visible conversation or session event payload.
 - A missing, deleted, malformed, or cross-session artifact degrades to a safe
   UI notice instead of exposing storage details.
-- The TUI gains a small asynchronous worker for an expanded card; the existing
-  card layout, collapse behavior, and streaming event flow remain unchanged.
+- The TUI owns a small asynchronous worker that starts only after Inspector is
+  opened. ADR 0108 moves disclosure to Summary → selected-call Peek → Inspector;
+  the session-authorized application seam and streaming event flow remain
+  unchanged.
 - CLI, ACP, and other inbound artifact views remain separate future slices.
 
 ## Rejected alternatives

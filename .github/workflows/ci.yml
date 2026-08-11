@@ -45,6 +45,57 @@ jobs:
       - run: uv sync --extra dev --locked
       - run: uv run pytest tests/test_terminal_smoke.py
 
+  linux-sandbox-integration:
+    # Pin 22.04: ubuntu-latest currently resolves to 24.04, whose default
+    # AppArmor user-namespace restriction can deny Bubblewrap capabilities.
+    # This security gate must execute the boundary, not pass by skipping it.
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    env:
+      NEURO_CODE_REQUIRE_SANDBOX_INTEGRATION: "1"
+    steps:
+      - uses: actions/checkout@v7.0.0
+      - uses: astral-sh/setup-uv@v8.3.2
+        with:
+          version: "0.11.29"
+          python-version: "3.12"
+          enable-cache: true
+      - name: Install and identify Bubblewrap
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes bubblewrap
+          bwrap --version
+          sysctl kernel.unprivileged_userns_clone
+      - run: uv sync --extra dev --locked
+      - name: Prove Linux child sandbox boundaries
+        run: >-
+          uv run pytest
+          tests/security/test_linux_sandbox_integration.py
+          -m sandbox_integration
+          -q -rs
+
+  windows-process-lifecycle:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    env:
+      NEURO_CODE_RUN_TERMINAL_SMOKE: "1"
+    steps:
+      - uses: actions/checkout@v7.0.0
+      - uses: astral-sh/setup-uv@v8.3.2
+        with:
+          version: "0.11.29"
+          python-version: "3.12"
+          enable-cache: true
+      - run: uv sync --extra dev --locked
+      - name: Prove native Job Object and ConPTY lifecycle
+        run: >-
+          uv run pytest
+          tests/test_process_tree.py::WindowsProcessTreeIntegrationTests
+          tests/test_background_tasks.py::LocalBackgroundTaskManagerTests::test_windows_shutdown_terminates_atomically_owned_descendant
+          tests/test_terminal_smoke.py::test_production_cli_ctrl_keys_resize_and_restore_through_windows_conpty
+          tests/test_terminal_smoke.py::test_windows_conpty_reports_resize_and_preserves_nonzero_exit
+          -q -rs
+
   quality:
     runs-on: ubuntu-latest
     steps:

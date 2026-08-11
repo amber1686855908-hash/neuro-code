@@ -525,12 +525,20 @@ update 数、单字段和序列化总字节。
 
 最小 TUI 是 `AgentEvent` 之上的表现适配器，负责提示输入、滚动记录、实时文本表面和
 本地斜杠命令。它绝不渲染原始推理或不受限制的参数/结果映射；只有路径、命令、模式、
-查询与任务 ID 等有界白名单参数可进入调用摘要。每个本地工具调用再按调用 ID 持有一张
-稳定卡片，后续在原地更新权限路径、脱敏结果预览、耗时和有界工作区变更报告。读取类调用
-默认投影为一条完成说明，用户仍可打开已有的有界详情；编辑报告则自动展开变更切片，差异
-角色同时使用前景色和淡色背景。详见
+查询与任务 ID 等有界白名单参数可进入调用摘要。每个本地工具调用仍保留按 call ID 标识的
+稳定状态，但 TUI 会把连续调用投影为一个活动组。活动组默认折叠，编辑也不例外；摘要只
+保留状态、有界意图或聚合数量、关键失败信息与耗时。按 Enter 或单击会打开只显示一个所选
+调用的固定高度 Inline Peek；上/下方向键选择其他调用，Enter 打开独立 Tool Inspector，Esc
+返回稳定摘要。再次单击已打开的 Peek 会收起；应用级 fallback 会在焦点移动后继续保证 Esc
+能够收起。Inspector 打开期间，实时生命周期事件会更新所选 presentation，并通过持久基础
+screen 定位 Conversation widget，而不是在当前 Modal 内查找；运行计时器每次 tick 对每个
+活动组最多刷新一次，并跳过已打开的 Peek/Inspector 布局。Peek 的十个逻辑行 presenter
+预算由十二行 widget 最大高度兜底，因此终端
+换行不能让 Conversation 无限增高。长 Bash 意图会截断，正常 allow 判定不会进入 Summary/
+Peek，完成状态只由勾号表达一次。详见
 [ADR 0014](adr/0014-minimal-event-stream-tui.md) 与
-[ADR 0029](adr/0029-auditable-in-place-tool-cards.md)。
+[ADR 0029](adr/0029-auditable-in-place-tool-cards.md)，以及表现层细化
+[ADR 0108](adr/0108-editorial-tui-presentation.md)。
 
 滚动记录由稳定消息组件组成的纵向对话实现，而不是“预渲染日志 + 临时流式区域”。用户
 提示和助手回答使用不同布局；待完成的助手组件始终位于对话末尾，生命周期通知插入其前，
@@ -539,12 +547,17 @@ update 数、单字段和序列化总字节。
 
 助手组件使用 Rich 的 Markdown 文档模型和应用自有语义主题，同时禁用链接点击；模型
 输出绝不会进入 Rich/Textual markup 解析。用户内容以及应用或外部值使用字面 `Text`。
-本地系统、状态、工具和错误记录统一使用两列表格：固定宽度标签栏配合可折行正文。
-颜色由供应商、模型、工具、会话、路径、结果、耗时、模式、强度和错误等语义值类型决定，
-而不是由任意载荷 markup 决定。工具输出与差异使用应用赋予样式的字面 `Text`，绝不会把
-载荷当作 markup。有界详情可以聚焦并收起或展开，且不会获取新数据；详见
-[ADR 0030](adr/0030-bounded-interactive-tool-card-details.md)。Mermaid 与媒体仍在该渲染器
-边界之外。另见 [ADR 0027](adr/0027-semantic-tui-and-application-reasoning-effort.md)。
+对话消息与本地系统、状态、活动、计划和错误记录共享同一左侧阅读轴，并限制为最多 116
+列；标签使用行内形式，不再永久占据固定宽度栏。颜色由信息层级而非对象类型本身决定，
+只保留克制交互 accent 与 success/warning/error 语义色。工具输出与差异使用应用赋予样式
+的字面文本，绝不会把载荷当作 markup。Tool Activity 的 tree、grep、file-read、Bash 与
+generic renderer 优先投影 metadata；格式化 stdout 只作为有界 fallback。Conversation 永不
+渲染 artifact 或完整工具输出。独立 Inspector 提供可滚动、可复制的 Output/Input/Meta，
+递归脱敏 Input、白名单化 Meta，并且只在此时通过既有 256 KiB、已脱敏且属于当前会话的
+应用边界懒加载输出 artifact；读取或存储截断会明确显示。Transcript Copy 始终投影稳定的
+Activity Summary。详见 [ADR 0030](adr/0030-bounded-interactive-tool-card-details.md) 与
+[ADR 0067](adr/0067-tui-bounded-tool-output-details.md)。Mermaid 与媒体仍在该渲染器边界之外。
+另见 [ADR 0027](adr/0027-semantic-tui-and-application-reasoning-effort.md)。
 
 应用自有 TUI 文案通过 `UiLanguage` 选择。注入的 `UiPreferencesStore` 端口持久化界面
 语言、请求的思考强度和交互模式；JSON 适配器使用与供应商配置分离、原子写入且仅用户可访问的状态
@@ -552,11 +565,13 @@ update 数、单字段和序列化总字节。
 切换语言会重新渲染界面外壳和可翻译的本地历史，但可见的用户/模型文本以及已经清理的
 工具预览不会翻译，也绝不会送入翻译器。
 
-表现适配器持有一套固定的冷色中性深色主题，不暴露 Textual 无关的主题与命令面板表面。
+表现适配器持有一套紧凑的中性深色语义主题，不暴露 Textual 无关的主题与命令面板表面。
+三层背景、一种边框、三档前景、一种克制交互 accent、语义结果色与共享间距共同定义层级。
 内建命令面板会被禁用，供应商与会话发现通过明确的应用命令完成，会话查询按字面纯文本
-渲染。提示框上方的常驻运行栏直接从控制器状态显示当前供应商/模型、压缩后的工作路径、
-上下文窗口占用、请求/实际强度及交互模式；本地化、供应商故障转移或用户选择发生变化时主动刷新，不会从对话文本
-反向解析状态。纯折叠脉冲状态机由 Textual 定时器推进，并且只在等待模型输出时渲染到待
+渲染。提示框下方的一行无冗余字段名运行投影，在有界左侧区域显示模型、强度与模式，在有界
+右侧区域显示上下文占用和压缩工作路径；窄终端会省略过长模型与路径。它由控制器状态在本地化、供应商故障转移
+或用户选择变化时主动刷新，不会从对话文本反向解析状态。永久快捷键栏被移除；`/help` 和
+F1 按需显示现有命令参考。纯折叠脉冲状态机由 Textual 定时器推进，并且只在等待模型输出时渲染到待
 完成助手文案前。上下文用量先对规范会话项进行供应商中立的本地估算；模型完成事件带有
 token 元数据时，运行时发出 `CONTEXT_USAGE_UPDATED`，并用供应商报告的输入加输出用量
 替换估算值。分母来自显式 profile 元数据 `context_window_tokens`；字段缺失时只显示已知
@@ -592,7 +607,7 @@ ConPTY 创建会原子组合伪控制台与 Job 列表属性，终止/关闭作�
 运行时计时使用单调时钟。`MODEL_THINKING_COMPLETED` 测量每个模型步骤从发出请求到首个
 可见或可行动结果的时间，并不宣称能够读取供应商私有推理遥测。工具终态事件携带耗时，
 `TURN_COMPLETED` 则在稳定助手节点之后显示整轮摘要。工具调用、权限路径、输出预览、
-工作区变更和终态会在同一张原地更新的有界树状卡片中渲染。对于带副作用的本地工具，
+工作区变更和终态仍保留有界的 call-ID 状态，并由 TUI 投影到连续活动组中。对于带副作用的本地工具，
 运行时只在权限通过后、紧邻执行前后比较有界的只读工作区快照；这份报告只是审计元数据，
 既不授予权限，也不代表执行成功。`WorkspaceChangeObserver` 是由 bootstrap 为每个 binding
 创建的应用组合依赖；`AgentRuntime` 的构造不承诺为稳定的外部 Python API。详见
@@ -776,8 +791,9 @@ TUI 通过 `Ctrl+E`、`/effort` 和 `/reasoning` 暴露选择，CLI 则使用 `-
   供适配器自行作出回放决策，同时携带供应商中立的请求思考强度，供显式能力处理。
 - `Tool`：发布 JSON schema，并在受限 `ToolContext` 中执行。
 - `ToolRegistry`：解析规范工具名称并拒绝重复注册。
-- `ShellSandbox`：把 Shell 字符串转换为参数边界安全、由平台强制执行的启动计划，
-  无需向工具暴露命名空间实现细节。
+- `LocalProcessSandbox`：拥有所有模型可控本地 child 的边界，包括管道命令、stdio MCP
+  以及本地 PTY/ConPTY 会话；终端调用方提交 typed `SandboxedProcessRequest`，而不是
+  直接调用平台 spawn 适配器。
 - `BackgroundTaskSupervisor`：创建隔离的会话任务作用域，并在应用关闭时终止每一棵仍存活
   的进程树。
 - `BackgroundTaskManager`：在单个会话作用域内启动受控 Shell/exec 进程树，并提供有界
@@ -916,9 +932,16 @@ Runtime 与协议行为仍由 service 及其端口/适配器负责。
   取消会给当前调用以及同一模型批次中的所有剩余调用记录错误结果。
 - 写入前必须解析并校验目标；工作区工具不能通过 `..` 或符号链接逃逸。
 - 平台无法实施显式沙箱要求时必须失败关闭。
-- 沙箱激活标记本身不足以作为证据。Linux 组合层会在暴露工具前校验根目录、工作区与
-  状态目录的挂载标志；`strict` 还会校验白名单根目录的文件系统类型。
-- `read-only` 会移除编辑工具并在直接调用时再次拒绝。`read-only` 与 `strict` 的 Shell
+- 每个启用的本地 child 都由 `LocalProcessSandbox` 启动器预检；不再存在 controller 范围
+  的激活 marker 或挂载 attestation。启动器仍会在暴露 child 前校验可信辅助程序、显式
+  挂载、私有状态以及 `strict` 白名单根目录的文件系统。
+- 启用的 Linux child 使用 PID 命名空间作为后代生命周期边界，因此 `setsid()` 不能逃离
+  timeout、cancel 或 shutdown。显式 POSIX `off` profile 只提供原始进程组清理，不提供
+  文件系统、网络、controller 状态或任意后代隔离。
+- 进程创建架构 guard 审计内置 production code。同进程 Python 扩展（`additional_tools`、
+  注入 executor 与未来 plugin）以 controller 权限运行，因此属于可信代码；不可信 plugin
+  必须另建进程/能力边界。
+- `read-only` 会移除编辑工具并在直接调用时再次拒绝。`read-only` 与 `strict` 的本地进程
   后代不继承父代理的网络命名空间，而父进程仍可执行供应商 HTTP 请求。
 - inspect 输出、日志、会话事件和异常都不得包含密钥。
 - Bash 后代不会继承已配置的供应商 API Key 环境变量，也不会继承标准/显式代理变量；
@@ -1029,16 +1052,23 @@ Linux、macOS 和 Windows 都是一等 CI 目标。平台专属代码隔离在�
 和进程隔离可以使用小型原生辅助程序或系统设施，但业务与编排逻辑必须保留在 Python
 中。不受支持的安全保证必须在启动时报告，绝不能静默降级。
 
-第一版具体实现会在 Linux 上使用 bubblewrap 重新执行 `workspace`、`read-only` 和
-`strict` 运行；`off` 仍是可移植默认值。文件系统挂载会同时约束进程内 Python 工具与
-后代进程。独立的 `ShellSandbox` 启动计划会把 `read-only` 和 `strict` 下的 Bash 后代
-放入嵌套网络命名空间。macOS 与 Windows 当前会拒绝显式非 `off` profile，而不会宣称
-未执行的安全能力。详见
+第一版具体实现会在 Linux 上为 `workspace`、`read-only` 和 `strict` 的本地进程请求使用
+子进程范围的 Bubblewrap；`off` 仍是可移植默认值。受信任 controller 不会在命名空间内
+重新执行。每个 Bash、后台 Bash、stdio MCP 或启用 profile 的 PTY 请求都会获得独立 child
+边界、显式工作区挂载、私有 HOME 和临时目录以及最小环境。只读和 strict child 还会使用
+隔离网络命名空间。macOS 与 Windows 当前会拒绝显式非 `off` profile，而不会宣称未执行的
+安全能力。详见
 [ADR 0019](adr/0019-fail-closed-linux-sandbox-profiles.md) 和
 [ADR 0020](adr/0020-session-fixed-sandbox-profiles.md)。
 
-前台和受管后台 Shell 命令共享 `ProcessTree`。POSIX 等待会在 Shell 入口退出后继续观察
-受控进程组；终止使用有界 TERM→KILL 序列。Windows 上的惰性 ctypes 平台适配器会在
+启用的 Linux 启动器会在挂载任何授权工作区前，对 controller 状态目录执行有界硬链接审计。
+私有常规文件存在另一个 inode 名称时失败关闭，防止工作区中既存硬链接重新引入凭据或会话
+状态，同时不扫描整个工作区。专用 Linux CI 必须无 skip 地执行真实 namespace 测试；专用
+Windows CI 必须执行原生 Job Object 与 ConPTY 生命周期测试。
+
+前台和受管后台 Shell 命令共享 `ProcessTree`。未启用沙箱的 POSIX 等待会在 Shell 入口退出后继续观察
+受控进程组；终止使用有界 TERM→KILL 序列；创建新 session 的后代不属于该 `off` profile
+进程组契约。Windows 上的惰性 ctypes 平台适配器会在
 启动进程前创建关闭即终止的 Job Object，通过 `PROC_THREAD_ATTRIBUTE_JOB_LIST` 传入借用
 句柄，并创建一个已经属于该 Job 的入口进程。同一次 `STARTUPINFOEXW` 调用还通过
 `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` 把继承范围限制为空输入与选定输出管道句柄。独立的

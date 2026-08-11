@@ -136,6 +136,7 @@ from neuro_code.domain.sandbox import SandboxProfile
 from neuro_code.domain.session_tasks import SessionTaskStatus
 from neuro_code.domain.sessions import SessionSummary
 from neuro_code.domain.tools import ToolDefinition, ToolResult
+from neuro_code.infrastructure.sandbox.local_process import ProcessTreeLocalProcessSandbox
 from neuro_code.interfaces.acp.serialization import (
     execution_outcome_metadata,
     execution_outcome_stop_reason,
@@ -604,6 +605,10 @@ class ApplicationFixture:
 
         del config
         return self.artifact_service
+
+    def create_local_process_sandbox(self, *, config: AppConfig | None = None) -> object:
+        del config
+        return ProcessTreeLocalProcessSandbox()
 
     def create_read_only_subagent_application_service(
         self,
@@ -2682,6 +2687,11 @@ class AcpAgentTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(configurations[0].command, "fixture-command")
             self.assertEqual(configurations[0].args, ("--stdio",))
             self.assertEqual(configurations[0].env, (("MCP_TOKEN", "fixture-secret"),))
+            self.assertIsNotNone(open_mcp.await_args_list[0].kwargs["local_process_sandbox"])
+            self.assertEqual(
+                open_mcp.await_args_list[0].kwargs["sandbox_profile"],
+                SandboxProfile.OFF,
+            )
             self.assertNotIn("must", repr(configurations))
             self.assertEqual(
                 application.additional_tool_names,

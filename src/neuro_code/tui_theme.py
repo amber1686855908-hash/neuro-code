@@ -29,31 +29,51 @@ from rich.syntax import PygmentsSyntaxTheme
 from rich.theme import Theme as RichTheme
 from textual.theme import Theme
 
-BACKGROUND = "#0C0C0C"
-SURFACE = "#111111"
-SURFACE_HOVER = "#181818"
-SURFACE_SELECTED = "#1A1A1A"
-BORDER_DIM = "#252525"
-BORDER = "#3A3A3A"
-BORDER_FOCUS = "#BDBDBD"
-TEXT_DIM = "#444444"
-TEXT_PLACEHOLDER = "#383838"
-TEXT_DISABLED = "#555555"
-TEXT_MUTED = "#666666"
-TEXT_SECONDARY = "#8A8A8A"
-TEXT_EMPHASIS = "#BDBDBD"
-TEXT_BODY = "#DEDEDE"
-TEXT_PRIMARY = "#EEEEEE"
-BRAND_TEXT = "#F2F2F2"
+BG_0 = "#0B0B0B"
+BG_1 = "#121212"
+BG_2 = "#1C1C1C"
+BORDER = "#303030"
+FG_DIM = "#505050"
+FG_MUTED = "#6A6A6A"
+FG_SECONDARY = "#929292"
+FG_EMPHASIS = "#BDBDBD"
+FG_BODY = "#D8D8D8"
+FG_PRIMARY = "#EEEEEE"
+
+# One restrained cool accent is reserved for focus, interaction, links, and
+# inline technical emphasis. Object types such as paths, tools, and models do
+# not receive an accent merely because of their type.
+ACCENT = "#789A9E"
+SUCCESS = "#839A7D"
+WARNING = "#AC9669"
+ERROR = "#A77A7A"
+
+# Compatibility aliases keep render call sites explicit while all values still
+# originate from the compact semantic token set above.
+BACKGROUND = BG_0
+SURFACE = BG_1
+SURFACE_HOVER = BG_2
+SURFACE_SELECTED = BG_2
+BORDER_DIM = BORDER
+BORDER_FOCUS = ACCENT
+TEXT_DIM = FG_DIM
+TEXT_PLACEHOLDER = FG_DIM
+TEXT_DISABLED = FG_DIM
+TEXT_MUTED = FG_MUTED
+TEXT_SECONDARY = FG_SECONDARY
+TEXT_EMPHASIS = FG_EMPHASIS
+TEXT_BODY = FG_BODY
+TEXT_PRIMARY = FG_PRIMARY
+BRAND_TEXT = FG_PRIMARY
 
 # Semantic accents stay deliberately muted so the terminal remains primarily
 # monochrome while structured technical information remains scannable.
-ACCENT_CODE = "#72A7AD"
-ACCENT_LINK = "#7F95AA"
-ACCENT_NUMBER = "#B3A070"
-ACCENT_SUCCESS = "#829B7B"
-ACCENT_WARNING = "#B09A6C"
-ACCENT_ERROR = "#A97B7B"
+ACCENT_CODE = ACCENT
+ACCENT_LINK = ACCENT
+ACCENT_NUMBER = FG_EMPHASIS
+ACCENT_SUCCESS = SUCCESS
+ACCENT_WARNING = WARNING
+ACCENT_ERROR = ERROR
 SYNTAX_OPERATOR = "#9A9A9A"
 
 MONO_COLORS = (
@@ -63,7 +83,6 @@ MONO_COLORS = (
     SURFACE_SELECTED,
     BORDER_DIM,
     BORDER,
-    BORDER_FOCUS,
     TEXT_DIM,
     TEXT_PLACEHOLDER,
     TEXT_DISABLED,
@@ -80,9 +99,9 @@ TEXTUAL_THEME = Theme(
     primary=BORDER_FOCUS,
     secondary=TEXT_SECONDARY,
     accent=TEXT_EMPHASIS,
-    warning=TEXT_EMPHASIS,
-    error=TEXT_PRIMARY,
-    success=TEXT_PRIMARY,
+    warning=WARNING,
+    error=ERROR,
+    success=SUCCESS,
     foreground=TEXT_PRIMARY,
     background=BACKGROUND,
     surface=SURFACE,
@@ -94,6 +113,19 @@ TEXTUAL_THEME = Theme(
         "border": BORDER,
         "border-dim": BORDER_DIM,
         "border-focus": BORDER_FOCUS,
+        "bg-0": BG_0,
+        "bg-1": BG_1,
+        "bg-2": BG_2,
+        "fg-primary": FG_PRIMARY,
+        "fg-secondary": FG_SECONDARY,
+        "fg-muted": FG_MUTED,
+        "space-0": "0",
+        "space-1": "1",
+        "space-2": "2",
+        "space-3": "3",
+        "space-4": "4",
+        "space-6": "6",
+        "space-8": "8",
         "surface-hover": SURFACE_HOVER,
         "surface-selected": SURFACE_SELECTED,
         "text-primary": TEXT_PRIMARY,
@@ -211,7 +243,7 @@ RECOVERABLE_LABEL_STYLE = f"bold {TEXT_PRIMARY} on {BORDER_DIM}"
 RECOVERABLE_TEXT_STYLE = f"bold {TEXT_EMPHASIS}"
 TOOL_LABEL_STYLE = f"bold {TEXT_EMPHASIS}"
 TOOL_TEXT_STYLE = TEXT_BODY
-TOOL_TITLE_STYLE = f"bold {ACCENT_CODE}"
+TOOL_TITLE_STYLE = f"bold {TEXT_EMPHASIS}"
 TOOL_ACTIVE_STYLE = TEXT_SECONDARY
 TOOL_COMPLETE_STYLE = f"bold {ACCENT_SUCCESS}"
 TOOL_META_STYLE = TEXT_SECONDARY
@@ -223,7 +255,7 @@ ERROR_DETAIL_STYLE = ACCENT_ERROR
 WAITING_STYLE = TEXT_SECONDARY
 
 DIFF_HUNK_STYLE = f"bold {TEXT_EMPHASIS} on {SURFACE_SELECTED}"
-DIFF_FILE_STYLE = f"bold {ACCENT_CODE}"
+DIFF_FILE_STYLE = f"bold {TEXT_EMPHASIS}"
 DIFF_ADDITION_STYLE = f"{ACCENT_SUCCESS} on {SURFACE_SELECTED}"
 DIFF_DELETION_STYLE = f"{ACCENT_ERROR} on {SURFACE_HOVER}"
 DIFF_CONTEXT_STYLE = TEXT_BODY
@@ -259,6 +291,7 @@ def loading_style(level: int) -> str:
 
 
 __all__ = [
+    "ACCENT",
     "ACCENT_CODE",
     "ACCENT_ERROR",
     "ACCENT_LINK",
@@ -267,6 +300,9 @@ __all__ = [
     "ACCENT_WARNING",
     "ASSISTANT_TEXT_STYLE",
     "BACKGROUND",
+    "BG_0",
+    "BG_1",
+    "BG_2",
     "BORDER",
     "BORDER_DIM",
     "BORDER_FOCUS",
@@ -280,6 +316,7 @@ __all__ = [
     "DIFF_SUMMARY_ADDITION_STYLE",
     "DIFF_SUMMARY_DELETION_STYLE",
     "EFFORT_STYLES",
+    "ERROR",
     "ERROR_DETAIL_STYLE",
     "ERROR_LABEL_STYLE",
     "ERROR_TEXT_STYLE",
@@ -292,6 +329,7 @@ __all__ = [
     "RECOVERABLE_TEXT_STYLE",
     "STATUS_LABEL_STYLE",
     "STATUS_TEXT_STYLE",
+    "SUCCESS",
     "SURFACE",
     "SURFACE_HOVER",
     "SURFACE_SELECTED",
@@ -317,5 +355,6 @@ __all__ = [
     "TOOL_TITLE_STYLE",
     "USER_TEXT_STYLE",
     "WAITING_STYLE",
+    "WARNING",
     "loading_style",
 ]

@@ -157,7 +157,12 @@ class BackgroundTaskSupervisorFixture:
     def __init__(self) -> None:
         self.shutdown_calls = 0
 
-    def open_scope(self) -> BackgroundTaskSupervisorFixture:
+    def open_scope(
+        self,
+        *,
+        local_process_sandbox: object | None = None,
+    ) -> BackgroundTaskSupervisorFixture:
+        del local_process_sandbox
         return self
 
     async def shutdown(self) -> None:
@@ -941,7 +946,6 @@ api_key_env = "FIXTURE_KEY"
                     },
                     clear=True,
                 ),
-                patch("neuro_code.bootstrap.composition.enforce_configured_sandbox"),
                 patch(
                     "neuro_code.bootstrap.composition.create_routed_provider", return_value=provider
                 ),
@@ -997,13 +1001,12 @@ api_key_env = "FIXTURE_KEY"
             self.assertTrue(payload["provider"]["credential_configured"])
             self.assertEqual(payload["sandbox"], {"profile": "off", "source": "default"})
 
-    def test_run_sandbox_flag_is_enforced_before_runtime_composition(self) -> None:
+    def test_run_sandbox_flag_selects_child_launcher_during_composition(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             state = root / "state"
             self._write_provider_config(state)
             output = io.StringIO()
-            shell_sandbox = object()
             with (
                 patch.dict(
                     "os.environ",
@@ -1014,11 +1017,10 @@ api_key_env = "FIXTURE_KEY"
                     },
                     clear=True,
                 ),
-                patch("neuro_code.bootstrap.composition.enforce_configured_sandbox") as enforce,
                 patch(
-                    "neuro_code.bootstrap.composition.create_shell_sandbox",
-                    return_value=shell_sandbox,
-                ) as create_sandbox,
+                    "neuro_code.bootstrap.composition.LinuxBubblewrapLocalProcessSandbox",
+                    return_value=object(),
+                ) as create_local_sandbox,
                 patch(
                     "neuro_code.bootstrap.composition.create_routed_provider",
                     return_value=CliProvider(),
@@ -1038,12 +1040,7 @@ api_key_env = "FIXTURE_KEY"
 
             self.assertEqual(exit_code, 0)
             self.assertIn("fixture response", output.getvalue())
-            enforce.assert_called_once()
-            self.assertIs(enforce.call_args.args[0], SandboxProfile.WORKSPACE)
-            self.assertEqual(enforce.call_args.args[1], root.resolve())
-            self.assertEqual(enforce.call_args.args[2], state.resolve())
-            self.assertIn("--sandbox", enforce.call_args.args[3])
-            create_sandbox.assert_called_once_with(
+            create_local_sandbox.assert_called_once_with(
                 SandboxProfile.WORKSPACE,
                 root.resolve(),
                 state.resolve(),
@@ -1070,14 +1067,12 @@ api_key_env = "FIXTURE_KEY"
                 "FIXTURE_KEY": "fixture-key",
             }
             output = io.StringIO()
-            shell_sandbox = object()
             with (
                 patch.dict("os.environ", environment, clear=True),
-                patch("neuro_code.bootstrap.composition.enforce_configured_sandbox") as enforce,
                 patch(
-                    "neuro_code.bootstrap.composition.create_shell_sandbox",
-                    return_value=shell_sandbox,
-                ) as create_sandbox,
+                    "neuro_code.bootstrap.composition.LinuxBubblewrapLocalProcessSandbox",
+                    return_value=object(),
+                ) as create_local_sandbox,
                 patch(
                     "neuro_code.bootstrap.composition.create_routed_provider",
                     return_value=CliProvider(),
@@ -1096,9 +1091,7 @@ api_key_env = "FIXTURE_KEY"
                 )
 
             self.assertEqual(exit_code, 0)
-            enforce.assert_called_once()
-            self.assertIs(enforce.call_args.args[0], SandboxProfile.WORKSPACE)
-            create_sandbox.assert_called_once_with(
+            create_local_sandbox.assert_called_once_with(
                 SandboxProfile.WORKSPACE,
                 root.resolve(),
                 state.resolve(),
@@ -1107,9 +1100,6 @@ api_key_env = "FIXTURE_KEY"
             error_output = io.StringIO()
             with (
                 patch.dict("os.environ", environment, clear=True),
-                patch(
-                    "neuro_code.bootstrap.composition.enforce_configured_sandbox"
-                ) as conflicting_enforce,
                 redirect_stderr(error_output),
             ):
                 conflict_code = main(
@@ -1127,7 +1117,6 @@ api_key_env = "FIXTURE_KEY"
 
             self.assertEqual(conflict_code, 2)
             self.assertIn("created with 'workspace'", error_output.getvalue())
-            conflicting_enforce.assert_not_called()
 
     def test_plain_inspect_version_and_completion_outputs(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -46,6 +46,12 @@ not retain an unbounded transcript, expansion cannot reveal content beyond the
 original safety limits; durable full command transcripts remain a separate
 future capability.
 
+[ADR 0108](0108-editorial-tui-presentation.md) later supersedes the card-level
+default disclosure, automatic edit expansion, and in-Conversation detail body
+with a default-collapsed consecutive activity Summary, a fixed-height
+single-call Peek, and an independent Inspector. The redaction, literal-text,
+focus, and display-bound guarantees in this ADR remain in force.
+
 ## Verification
 
 Textual tests verify a one-line completed read, then complete an edit lifecycle,

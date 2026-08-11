@@ -13,7 +13,7 @@ from neuro_code.application.ports.background_tasks import BackgroundTaskManager
 from neuro_code.application.ports.client_filesystem import ClientFileSystem
 from neuro_code.application.ports.client_terminal import ClientTerminal
 from neuro_code.application.ports.instructions import InstructionContextTracker
-from neuro_code.application.ports.sandbox import ShellSandbox
+from neuro_code.application.ports.sandbox import LocalProcessSandbox
 from neuro_code.application.ports.skills import SkillContextTracker
 from neuro_code.application.ports.user_interaction import (
     InteractionEventSink,
@@ -147,7 +147,7 @@ class ToolContext:
     command_timeout_seconds: float = 120.0
     termination_grace_seconds: float = 1.0
     sandbox_profile: SandboxProfile = SandboxProfile.OFF
-    shell_sandbox: ShellSandbox | None = None
+    local_process_sandbox: LocalProcessSandbox | None = None
     protected_environment_variables: frozenset[str] = frozenset()
     redaction_values: tuple[str, ...] = field(default=(), repr=False)
     background_tasks: BackgroundTaskManager | None = None

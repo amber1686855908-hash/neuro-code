@@ -13,11 +13,16 @@ from neuro_code.application.permissions.policy import (
     PermissionManager,
     PermissionMode,
 )
-from neuro_code.application.ports.sandbox import ShellLaunch
+from neuro_code.application.ports.sandbox import (
+    LocalProcessSandbox,
+    OwnedLocalProcess,
+    SandboxedProcessRequest,
+)
 from neuro_code.application.ports.terminal import (
     TerminalEofHandler,
     TerminalErrorHandler,
     TerminalOutputHandler,
+    TerminalPlatformSession,
 )
 from neuro_code.application.ports.workspace import WorkspacePathResolver
 from neuro_code.application.sessions.terminal_sessions import LocalInteractiveTerminalManager
@@ -160,20 +165,50 @@ class _FakeApprover:
         return self.approval
 
 
-class _FakeSandbox:
-    def __init__(self, profile: SandboxProfile, *, events: list[str] | None = None) -> None:
-        self.profile = profile
-        self.calls: list[tuple[str, tuple[str, ...]]] = []
-        self._events = events
+class _FakeLocalProcessSandbox(LocalProcessSandbox):
+    """Route test PTY creation through the canonical local-process port.
 
-    def shell_launch(self, command: str) -> ShellLaunch:
-        raise AssertionError(f"terminal manager must not use shell_launch: {command}")
+    让测试 PTY 创建通过规范本地进程端口.
+    """
 
-    def exec_launch(self, executable: str, arguments: tuple[str, ...]) -> ShellLaunch:
-        if self._events is not None:
-            self._events.append("sandbox")
-        self.calls.append((executable, arguments))
-        return ShellLaunch("/sandbox/exec", ("--", executable, *arguments))
+    def __init__(
+        self,
+        platform: _FakeTerminalPlatform,
+        *,
+        reject_enabled: bool = False,
+    ) -> None:
+        self._platform = platform
+        self._reject_enabled = reject_enabled
+        self.requests: list[SandboxedProcessRequest] = []
+
+    async def spawn(self, request: SandboxedProcessRequest) -> OwnedLocalProcess:
+        raise AssertionError(f"unexpected pipe spawn: {request.purpose.value}")
+
+    def spawn_terminal(
+        self,
+        request: SandboxedProcessRequest,
+        *,
+        size: TerminalSize,
+        on_output: TerminalOutputHandler,
+        on_eof: TerminalEofHandler,
+        on_error: TerminalErrorHandler,
+    ) -> TerminalPlatformSession:
+        self.requests.append(request)
+        if request.sandbox_profile.enabled and self._reject_enabled:
+            raise TerminalError(
+                f"sandbox profile {request.sandbox_profile.value!r} is not enforced"
+            )
+        assert request.executable is not None
+        return self._platform.spawn_exec(
+            request.executable,
+            request.arguments,
+            cwd=request.cwd,
+            env=request.environment_policy.variables,
+            size=size,
+            on_output=on_output,
+            on_eof=on_eof,
+            on_error=on_error,
+        )
 
 
 class LocalInteractiveTerminalManagerTests(unittest.IsolatedAsyncioTestCase):
@@ -185,7 +220,7 @@ class LocalInteractiveTerminalManagerTests(unittest.IsolatedAsyncioTestCase):
         permissions: PermissionManager | None = None,
         approver: _FakeApprover | None = None,
         sandbox_profile: SandboxProfile = SandboxProfile.OFF,
-        shell_sandbox: _FakeSandbox | None = None,
+        reject_enabled: bool = False,
         workspace_path_resolver: WorkspacePathResolver | None = None,
         max_sessions: int = 8,
     ) -> LocalInteractiveTerminalManager:
@@ -199,9 +234,8 @@ class LocalInteractiveTerminalManagerTests(unittest.IsolatedAsyncioTestCase):
             permissions=permissions or PermissionManager(mode=PermissionMode.BYPASS),
             approver=approver,
             sandbox_profile=sandbox_profile,
-            shell_sandbox=shell_sandbox,
+            local_process_sandbox=_FakeLocalProcessSandbox(platform, reject_enabled=reject_enabled),
             protected_environment_variables=frozenset({"fixture_api_key"}),
-            platform=platform,
             max_sessions=max_sessions,
         )
 
@@ -403,12 +437,10 @@ class LocalInteractiveTerminalManagerTests(unittest.IsolatedAsyncioTestCase):
             outside = root.parent / f"{root.name}-outside"
             outside.mkdir()
             platform = _FakeTerminalPlatform()
-            sandbox = _FakeSandbox(SandboxProfile.READ_ONLY)
             manager = self._manager(
                 root,
                 platform,
                 sandbox_profile=SandboxProfile.READ_ONLY,
-                shell_sandbox=sandbox,
             )
             try:
                 with self.assertRaisesRegex(ToolError, "escapes"):
@@ -432,37 +464,17 @@ class LocalInteractiveTerminalManagerTests(unittest.IsolatedAsyncioTestCase):
                     size=TerminalSize(80, 24),
                     output_capacity=100,
                 )
-                self.assertEqual(sandbox.calls, [("python", ("-V",))])
-                self.assertEqual(platform.spawn_calls[0]["executable"], "/sandbox/exec")
-                self.assertEqual(platform.spawn_calls[0]["arguments"], ("--", "python", "-V"))
+                self.assertEqual(platform.spawn_calls[0]["executable"], "python")
+                self.assertEqual(platform.spawn_calls[0]["arguments"], ("-V",))
                 await session.close()
                 await manager.shutdown()
-
-                mismatch_platform = _FakeTerminalPlatform()
-                mismatch = self._manager(
-                    root,
-                    mismatch_platform,
-                    sandbox_profile=SandboxProfile.STRICT,
-                    shell_sandbox=sandbox,
-                )
-                with self.assertRaisesRegex(TerminalError, "does not match"):
-                    await mismatch.create_exec(
-                        "call-mismatch",
-                        "python",
-                        (),
-                        cwd=".",
-                        env={},
-                        size=TerminalSize(80, 24),
-                        output_capacity=100,
-                    )
-                self.assertEqual(mismatch_platform.spawn_calls, [])
-                await mismatch.shutdown()
 
                 missing_platform = _FakeTerminalPlatform()
                 missing = self._manager(
                     root,
                     missing_platform,
                     sandbox_profile=SandboxProfile.WORKSPACE,
+                    reject_enabled=True,
                 )
                 with self.assertRaisesRegex(TerminalError, "is not enforced"):
                     await missing.create_exec(
@@ -491,14 +503,12 @@ class LocalInteractiveTerminalManagerTests(unittest.IsolatedAsyncioTestCase):
             )
             platform = _FakeTerminalPlatform(events=events)
             approver = _FakeApprover(PermissionApproval.allow_once(), events=events)
-            sandbox = _FakeSandbox(SandboxProfile.WORKSPACE, events=events)
             manager = self._manager(
                 root,
                 platform,
                 permissions=PermissionManager(interactive=True),
                 approver=approver,
                 sandbox_profile=SandboxProfile.WORKSPACE,
-                shell_sandbox=sandbox,
                 workspace_path_resolver=resolver,
             )
             try:
@@ -515,7 +525,7 @@ class LocalInteractiveTerminalManagerTests(unittest.IsolatedAsyncioTestCase):
                     resolver.calls,
                     [(expected_workspace, "requested-by-caller")],
                 )
-                self.assertEqual(events, ["resolver", "approval", "sandbox", "spawn"])
+                self.assertEqual(events, ["resolver", "approval", "spawn"])
                 await session.close()
             finally:
                 await manager.shutdown()
@@ -569,14 +579,12 @@ class LocalInteractiveTerminalManagerTests(unittest.IsolatedAsyncioTestCase):
                     )
                     platform = _FakeTerminalPlatform(events=events)
                     approver = _FakeApprover(PermissionApproval.allow_once(), events=events)
-                    sandbox = _FakeSandbox(SandboxProfile.WORKSPACE, events=events)
                     manager = self._manager(
                         root,
                         platform,
                         permissions=PermissionManager(interactive=True),
                         approver=approver,
                         sandbox_profile=SandboxProfile.WORKSPACE,
-                        shell_sandbox=sandbox,
                         workspace_path_resolver=resolver,
                     )
                     try:
@@ -596,7 +604,6 @@ class LocalInteractiveTerminalManagerTests(unittest.IsolatedAsyncioTestCase):
                         )
                         self.assertEqual(events, ["resolver"])
                         self.assertEqual(approver.requests, [])
-                        self.assertEqual(sandbox.calls, [])
                         self.assertEqual(platform.spawn_calls, [])
                         self.assertEqual(manager._pending_creations, 0)
                         self.assertTrue(manager._pending_done.is_set())
@@ -616,7 +623,7 @@ class LocalInteractiveTerminalManagerTests(unittest.IsolatedAsyncioTestCase):
                     workspace=root,
                     workspace_path_resolver=resolver,
                     permissions=PermissionManager(),
-                    platform=platform,
+                    local_process_sandbox=_FakeLocalProcessSandbox(platform),
                 )
             with (
                 mock.patch.object(Path, "resolve", side_effect=RuntimeError("resolver failure")),
@@ -626,7 +633,7 @@ class LocalInteractiveTerminalManagerTests(unittest.IsolatedAsyncioTestCase):
                     workspace=root,
                     workspace_path_resolver=resolver,
                     permissions=PermissionManager(),
-                    platform=platform,
+                    local_process_sandbox=_FakeLocalProcessSandbox(platform),
                 )
 
     async def test_platform_is_required(self) -> None:

@@ -152,11 +152,11 @@ application 和 domain 模块不得导入具体 infrastructure 实现。所有�
     `neuro_code.infrastructure.sandbox`。旧 `adapters.posix_pty` 和 `adapters.windows_pty` 路径
     保留为兼容 facade；native ConPTY、Job Object、bubblewrap、权限和 terminal session 行为保持
     不变，且不复制第二份实现。
-27. 阶段 2K 将 Linux bubblewrap `ShellSandbox` 的具体实现确立为
-    `neuro_code.infrastructure.sandbox.sandbox` 的 canonical owner。旧
-    `adapters.sandbox` 路径保留为兼容 facade，组合根从 infrastructure 模块导入具体工厂。
-    native Windows ConPTY 和 Job Object 实现仍保留在独立 adapter 中，作为后续平台专用切片；
-    sandbox 策略、fail-closed 检查、权限和取消语义均不改变。
+27. 阶段 2K 将 `neuro_code.infrastructure.sandbox.sandbox` 确立为子进程沙箱
+    安全辅助函数的 owner。PR5 用规范的 `LocalProcessSandbox` 子进程启动边界替代了
+    旧的 controller 范围 Linux bubblewrap `ShellSandbox` 实现。native Windows
+    ConPTY 和 Job Object 实现仍保留在独立 adapter 中；sandbox 策略、fail-closed
+    检查、权限和取消语义均不改变。
 28. 阶段 2L 将无状态的 Windows 环境块原语确立为
     `neuro_code.infrastructure.sandbox.windows_process` 的 canonical owner。旧
     `adapters.windows_process` 路径保留为兼容 facade；Job Object、ConPTY 和 Windows 进程生命周期
