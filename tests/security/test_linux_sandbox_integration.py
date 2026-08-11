@@ -38,6 +38,11 @@ pytestmark = [
 ]
 
 _REQUIRE_INTEGRATION_ENV = "NEURO_CODE_REQUIRE_SANDBOX_INTEGRATION"
+# The controller itself runs under the matrix's uv-managed Python.  Sandbox
+# fixtures intentionally use the runner's stable system interpreter so the
+# test exercises Bubblewrap boundaries rather than uv's external venv symlink
+# layout, which is not a child capability of the sandbox.
+_SANDBOX_FIXTURE_PYTHON = "/usr/bin/python3"
 
 
 def _capability_unavailable(reason: str) -> None:
@@ -84,7 +89,7 @@ def _request(
         else LocalWorkspaceAccessMode.READ_WRITE
     )
     return SandboxedProcessRequest.exec(
-        sys.executable,
+        _SANDBOX_FIXTURE_PYTHON,
         ("-c", code),
         purpose=purpose,
         cwd=workspace,
@@ -387,7 +392,7 @@ async def test_real_bash_timeout_and_cancellation_kill_detached_descendants(
     with pytest.raises(ToolError, match="timed out"):
         await tool.execute(
             {
-                "command": shlex.join((sys.executable, "-c", timeout_code)),
+                "command": shlex.join((_SANDBOX_FIXTURE_PYTHON, "-c", timeout_code)),
                 "timeout_seconds": 0.2,
             },
             ToolContext(
@@ -403,7 +408,7 @@ async def test_real_bash_timeout_and_cancellation_kill_detached_descendants(
     )
     operation = asyncio.create_task(
         tool.execute(
-            {"command": shlex.join((sys.executable, "-c", cancel_code))},
+            {"command": shlex.join((_SANDBOX_FIXTURE_PYTHON, "-c", cancel_code))},
             ToolContext(
                 workspace,
                 sandbox_profile=SandboxProfile.WORKSPACE,
