@@ -583,7 +583,12 @@ class WindowsJobProcess:
         if not command.strip() or "\x00" in command:
             raise ValueError("command must be non-empty and contain no null bytes")
         _environment_block(env)
-        comspec = _windows_shell(env)
+        # ``env`` is the deliberately minimal child environment.  Shell
+        # resolution is a trusted launcher concern and must not depend on
+        # values (or PATH lookup) supplied to the untrusted child.
+        # ``env`` 是刻意精简的子进程环境. Shell 定位属于受信任启动器职责,
+        # 不得依赖不可信子进程提供的值(或 PATH 查找).
+        comspec = _windows_shell()
         return cls._spawn(
             application_name=comspec,
             command_line=f'{comspec} /c "{command}"',
@@ -830,16 +835,33 @@ def _validated_arguments(arguments: Sequence[str]) -> tuple[str, ...]:
     return argv
 
 
-def _windows_shell(environment: Mapping[str, str]) -> str:
-    folded = {name.casefold(): value for name, value in environment.items()}
+def _windows_shell(host_environment: Mapping[str, str] | None = None) -> str:
+    """Return an absolute trusted Windows shell path without using child env.
+
+    The optional mapping is only a testable projection of the trusted host
+    environment; it is never the environment passed to the child process.
+
+    可选映射只是受信任宿主环境的可测试投影,绝不会作为环境传给子进程.
+    """
+
+    source = os.environ if host_environment is None else host_environment
+    folded = {name.casefold(): value for name, value in source.items()}
     comspec = folded.get("comspec")
-    if not comspec:
-        system_root = folded.get("systemroot", "")
-        comspec = ntpath.join(system_root, "System32", "cmd.exe")
-    if not ntpath.isabs(comspec) or "\x00" in comspec:
+    system_root = folded.get("systemroot", "")
+    system_shell = ntpath.join(system_root, "System32", "cmd.exe") if system_root else ""
+    if comspec and system_shell:
+        if ntpath.normcase(ntpath.normpath(comspec)) != ntpath.normcase(
+            ntpath.normpath(system_shell)
+        ):
+            raise FileNotFoundError("shell not found: %ComSpec% is not the trusted system shell")
+    elif not comspec:
+        comspec = system_shell
+    if not comspec or not ntpath.isabs(comspec) or "\x00" in comspec:
         raise FileNotFoundError(
             "shell not found: neither an absolute %ComSpec% nor %SystemRoot% is set"
         )
+    if ntpath.basename(comspec).casefold() != "cmd.exe":
+        raise FileNotFoundError("shell not found: trusted shell must be cmd.exe")
     return comspec
 
 

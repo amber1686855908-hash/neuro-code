@@ -98,7 +98,12 @@ class LocalWorkspaceAccess:
             raise TypeError("local workspace access path must be a pathlib.Path")
         if not self.path.is_absolute():
             raise ValueError("local workspace access path must be absolute")
-        if self.path == Path("/"):
+        try:
+            canonical_path = self.path.expanduser().resolve(strict=False)
+        except (OSError, RuntimeError) as error:
+            raise ValueError("local workspace access path must be resolvable") from error
+        object.__setattr__(self, "path", canonical_path)
+        if canonical_path == Path("/"):
             raise ValueError("local workspace access path must not be the filesystem root")
         if not isinstance(self.mode, LocalWorkspaceAccessMode):
             raise TypeError("local workspace access mode must be canonical")
@@ -246,6 +251,11 @@ class SandboxedProcessRequest:
             raise TypeError("local process purpose must be canonical")
         if not isinstance(self.cwd, Path) or not self.cwd.is_absolute():
             raise ValueError("local process cwd must be an absolute pathlib.Path")
+        try:
+            canonical_cwd = self.cwd.expanduser().resolve(strict=False)
+        except (OSError, RuntimeError) as error:
+            raise ValueError("local process cwd must be resolvable") from error
+        object.__setattr__(self, "cwd", canonical_cwd)
         if not isinstance(self.sandbox_profile, SandboxProfile):
             raise TypeError("local process sandbox profile must be canonical")
         if not isinstance(self.filesystem_policy, LocalProcessFilesystemPolicy):

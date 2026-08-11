@@ -38,6 +38,10 @@ def _python_shell_command(code: str) -> str:
     return subprocess.list2cmdline(argv) if os.name == "nt" else shlex.join(argv)
 
 
+def _canonical_path(path: Path) -> Path:
+    return path.expanduser().resolve(strict=False)
+
+
 class _RecordingLocalProcessSandbox(LocalProcessSandbox):
     """Record canonical requests while retaining real process ownership."""
 
@@ -81,7 +85,7 @@ class BashToolTests(unittest.IsolatedAsyncioTestCase):
             request = sandbox.requests[0]
             self.assertEqual(request.purpose, LocalProcessPurpose.BASH)
             self.assertEqual(request.stdio_mode, LocalProcessStdioMode.CAPTURE)
-            self.assertEqual(request.cwd, root)
+            self.assertEqual(request.cwd, _canonical_path(root))
 
     async def test_background_bash_uses_a_canonical_sandbox_request(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -102,7 +106,7 @@ class BashToolTests(unittest.IsolatedAsyncioTestCase):
                 request = sandbox.requests[0]
                 self.assertEqual(request.purpose, LocalProcessPurpose.BACKGROUND_BASH)
                 self.assertEqual(request.stdio_mode, LocalProcessStdioMode.MERGED_CAPTURE)
-                self.assertEqual(request.cwd, root)
+                self.assertEqual(request.cwd, _canonical_path(root))
             finally:
                 await manager.shutdown()
 

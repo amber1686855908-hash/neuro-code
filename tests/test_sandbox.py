@@ -64,10 +64,12 @@ class SandboxHelperTests(unittest.TestCase):
                     "neuro_code.infrastructure.sandbox.sandbox.shutil.which",
                     return_value=str(helper),
                 ),
-                self.assertRaisesRegex(SandboxError, "workspace-controlled"),
+                self.assertRaises(SandboxError) as error,
             ):
                 _trusted_system_executable("bwrap", workspace)
+            self.assertRegex(str(error.exception), "workspace-controlled|caller-writable")
 
+    @unittest.skipUnless(os.name == "posix", "POSIX ownership validation only")
     def test_trusted_executable_rejects_caller_writable_system_path(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

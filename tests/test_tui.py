@@ -3077,7 +3077,7 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
                 rendered_text(app, secondary.renderable, width=secondary.region.width),
             )
             self.assertIn(
-                "/workspace",
+                str(Path("/workspace")),
                 rendered_text(app, secondary.renderable, width=secondary.region.width),
             )
 
