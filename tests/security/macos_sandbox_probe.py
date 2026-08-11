@@ -263,6 +263,17 @@ class ProbeHarness:
             "all_candidate_roots": self._root_cause_profile(roots=all_roots),
             "root_control": self._root_cause_profile(roots=("/",)),
         }
+        for root_name, root_group in root_groups.items():
+            for root in root_group:
+                profiles[f"single_{root_name}_{root.lstrip('/').replace('/', '_')}"] = (
+                    self._root_cause_profile(roots=(root,))
+                )
+        prefix_roots: list[str] = []
+        for index, root in enumerate(all_roots, start=1):
+            prefix_roots.append(root)
+            profiles[f"prefix_{index:02d}_{root.lstrip('/').replace('/', '_')}"] = (
+                self._root_cause_profile(roots=tuple(prefix_roots))
+            )
         for group_name, group_roots in root_groups.items():
             remaining = tuple(root for root in all_roots if root not in group_roots)
             profiles[f"all_without_{group_name}"] = self._root_cause_profile(roots=remaining)
@@ -272,15 +283,24 @@ class ProbeHarness:
             command_result = _run_process(
                 [str(self.sandbox_exec), "-p", policy, "/usr/bin/true"], timeout=5
             )
-            matrix[name] = {"policy": policy, **_command_evidence(command_result)}
+            evidence = {"policy": policy, **_command_evidence(command_result)}
+            if command_result.signal_number is not None:
+                evidence["process_diagnostics"] = _collect_process_diagnostics(command_result.pid)
+            matrix[name] = evidence
         return {
             "target": "/usr/bin/true",
             "profiles": matrix,
             "root_groups": root_groups,
+            "probe_strategy": {
+                "single_roots": True,
+                "incremental_prefixes": True,
+                "negative_process_logs": True,
+            },
             "interpretation": (
                 "A profile with returncode 0 proves only that /usr/bin/true starts; "
                 "a negative signal is recorded without attributing it to sandbox-exec "
-                "or the target process."
+                "or the target process. Per-process diagnostics are collected for "
+                "negative probes when the runner exposes them."
             ),
         }
 
@@ -1058,6 +1078,23 @@ def _collect_os_diagnostics() -> dict[str, object]:
             continue
     diagnostics["recent_diagnostic_reports"] = sorted(report_paths)
     return diagnostics
+
+
+def _collect_process_diagnostics(pid: int) -> dict[str, object]:
+    """Collect a bounded public unified-log slice for one failed child PID."""
+    predicate = f"processID == {pid}"
+    return _safe_command(
+        [
+            "/usr/bin/log",
+            "show",
+            "--last",
+            "30s",
+            "--style",
+            "compact",
+            "--predicate",
+            predicate,
+        ]
+    )
 
 
 def _decode_output(value: bytes | str | None) -> str:
