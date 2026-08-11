@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import hashlib
 import json
 import os
 import platform
@@ -45,6 +46,10 @@ class CommandResult:
     stdout: str
     stderr: str
     timed_out: bool = False
+    pid: int | None = None
+    signal_number: int | None = None
+    argv: tuple[str, ...] = ()
+    target_exec_state: str = "unknown"
 
 
 class ProbeInfrastructureError(RuntimeError):
@@ -185,6 +190,224 @@ class ProbeHarness:
             lines.append("(allow network-outbound)")
         return "\n".join(lines)
 
+    @staticmethod
+    def _subpath_rule(operation: str, path: Path | str) -> str:
+        return f"(allow {operation} (subpath {ProbeHarness._sbpl_literal(path)}))"
+
+    @staticmethod
+    def _deny_subpath_rule(operation: str, path: Path | str) -> str:
+        return f"(deny {operation} (subpath {ProbeHarness._sbpl_literal(path)}))"
+
+    @staticmethod
+    def _deny_literal_rule(operation: str, path: Path | str) -> str:
+        return f"(deny {operation} (literal {ProbeHarness._sbpl_literal(path)}))"
+
+    def _policy_with_rules(
+        self,
+        *,
+        read_rules: tuple[str, ...] = (),
+        write_rules: tuple[str, ...] = (),
+        deny_rules: tuple[str, ...] = (),
+        network_allowed: bool = False,
+    ) -> str:
+        """Build a differential-only policy without changing production policy."""
+        lines = [
+            "(version 1)",
+            "(deny default)",
+            "(allow process-fork)",
+            "(allow process-exec)",
+            "(allow signal (target self))",
+            *read_rules,
+            *write_rules,
+            *deny_rules,
+        ]
+        if network_allowed:
+            lines.append("(allow network-outbound)")
+        return "\n".join(lines)
+
+    def _root_cause_profile(self, *, roots: tuple[str, ...] = (), broad_read: bool = False) -> str:
+        read_rules = (
+            ("(allow file-read*)",)
+            if broad_read
+            else tuple(self._subpath_rule("file-read*", root) for root in roots)
+        )
+        return self._policy_with_rules(read_rules=read_rules)
+
+    def _root_cause_matrix(self) -> dict[str, object]:
+        """Run only /usr/bin/true while narrowing runtime read roots."""
+        root_groups: dict[str, tuple[str, ...]] = {
+            "system": ("/System", "/usr", "/bin", "/sbin", "/private/etc", "/dev"),
+            "private": ("/private",),
+            "private_var": ("/private/var",),
+            "private_var_db": ("/private/var/db",),
+            "private_var_folders": ("/private/var/folders",),
+            "library": ("/Library",),
+            "system_volumes": ("/System/Volumes",),
+            "preboot_cryptex": (
+                "/System/Volumes/Preboot",
+                "/System/Volumes/Preboot/Cryptexes/OS",
+            ),
+            "apple_system_library": (
+                "/System/Library",
+                "/Library/Apple/System/Library",
+            ),
+        }
+        all_roots = tuple(root for group in root_groups.values() for root in group)
+        profiles: dict[str, str] = {
+            "A_allow_default": "(version 1) (allow default)",
+            "B_broad_file_read": self._root_cause_profile(broad_read=True),
+            "deny_default_only": "(version 1) (deny default)",
+            "old_narrow_system": self._root_cause_profile(
+                roots=root_groups["system"] + ("/private",)
+            ),
+            "all_candidate_roots": self._root_cause_profile(roots=all_roots),
+            "root_control": self._root_cause_profile(roots=("/",)),
+        }
+        for group_name, group_roots in root_groups.items():
+            remaining = tuple(root for root in all_roots if root not in group_roots)
+            profiles[f"all_without_{group_name}"] = self._root_cause_profile(roots=remaining)
+
+        matrix: dict[str, object] = {}
+        for name, policy in profiles.items():
+            command_result = _run_process(
+                [str(self.sandbox_exec), "-p", policy, "/usr/bin/true"], timeout=5
+            )
+            matrix[name] = {"policy": policy, **_command_evidence(command_result)}
+        return {
+            "target": "/usr/bin/true",
+            "profiles": matrix,
+            "root_groups": root_groups,
+            "interpretation": (
+                "A profile with returncode 0 proves only that /usr/bin/true starts; "
+                "a negative signal is recorded without attributing it to sandbox-exec "
+                "or the target process."
+            ),
+        }
+
+    def _targeted_deny_policy(self, *, workspace_mode: str, deny_form: str) -> str:
+        workspace = self._canonical(self.workspace)
+        private_tmp = self._canonical(self.private_tmp)
+        synthetic_home = self._canonical(self.synthetic_home)
+        state_dir = self._canonical(self.state_dir)
+        host_home = self._canonical(self.host_home)
+        state_file = self._canonical(self.state_dir / "credentials.json")
+        read_rules = ("(allow file-read*)",)
+        write_rules = (
+            self._subpath_rule("file-write*", workspace),
+            self._subpath_rule("file-write*", private_tmp),
+            self._subpath_rule("file-write*", synthetic_home),
+        )
+        if workspace_mode == "read-only":
+            write_rules = tuple(rule for rule in write_rules if str(workspace) not in rule)
+        if deny_form == "subpath":
+            deny_rules = (
+                self._deny_subpath_rule("file-read*", state_dir),
+                self._deny_subpath_rule("file-write*", state_dir),
+                self._deny_subpath_rule("file-read*", host_home),
+            )
+        elif deny_form == "literal":
+            deny_rules = (
+                self._deny_literal_rule("file-read*", state_file),
+                self._deny_literal_rule("file-write*", state_file),
+                self._deny_subpath_rule("file-read*", host_home),
+            )
+        else:
+            raise ValueError(f"unsupported deny form {deny_form!r}")
+        deny_rules += (self._deny_literal_rule("file-read*", self.real_host_home_sentinel),)
+        return self._policy_with_rules(
+            read_rules=read_rules,
+            write_rules=write_rules,
+            deny_rules=deny_rules,
+        )
+
+    def _dynamic_path_probe(self) -> dict[str, object]:
+        """Test dynamic path predicates after the known-good broad-read baseline."""
+        result: dict[str, object] = {}
+        state = shlex.quote(str(self._canonical(self.state_dir / "credentials.json")))
+        state_alias = shlex.quote(str(self._var_alias(self.state_dir / "credentials.json")))
+        host_home = shlex.quote(str(self._canonical(self.host_home / "host-home-sentinel")))
+        real_host_home = shlex.quote(str(self.real_host_home_sentinel))
+        workspace_file = shlex.quote(str(self._canonical(self.workspace / "unicode-空 格")))
+        workspace_alias_file = shlex.quote(str(self.workspace_alias / "alias-unicode-空 格"))
+        state_write_file = shlex.quote(str(self._canonical(self.state_dir / "credentials.json")))
+        home_file = shlex.quote(str(self._canonical(self.synthetic_home / "home-write")))
+        tmp_file = shlex.quote(str(self._canonical(self.private_tmp / "tmp-write")))
+        result_path = self._result_path("dynamic-path")
+        result_file = shlex.quote(str(self._canonical(result_path)))
+        command = textwrap.dedent(
+            f"""
+            state_read=0; state_alias_read=0; host_read=0; real_home_read=0
+            workspace_write=0; alias_workspace_write=0; state_write=0
+            home_write=0; tmp_write=0
+            if cat {state} >/dev/null 2>&1; then state_read=1; fi
+            if cat {state_alias} >/dev/null 2>&1; then state_alias_read=1; fi
+            if cat {host_home} >/dev/null 2>&1; then host_read=1; fi
+            if cat {real_host_home} >/dev/null 2>&1; then real_home_read=1; fi
+            if printf x > {workspace_file}; then workspace_write=1; fi
+            if printf x > {workspace_alias_file}; then alias_workspace_write=1; fi
+            if printf x > {state_write_file}; then state_write=1; fi
+            if printf x > {home_file}; then home_write=1; fi
+            if printf x > {tmp_file}; then tmp_write=1; fi
+            printf '{{"state_read":%s,"state_alias_read":%s,"host_read":%s,"real_home_read":%s,"workspace_write":%s,"alias_workspace_write":%s,"state_write":%s,"home_write":%s,"tmp_write":%s}}' \\
+              "$state_read" "$state_alias_read" "$host_read" "$real_home_read" "$workspace_write" \\
+              "$alias_workspace_write" "$state_write" "$home_write" "$tmp_write" > {result_file}
+            """
+        ).strip()
+        for workspace_mode in ("read-write", "read-only"):
+            for deny_form in ("subpath", "literal"):
+                policy = self._targeted_deny_policy(
+                    workspace_mode=workspace_mode, deny_form=deny_form
+                )
+                command_result = self._run_sandboxed(policy, ["/bin/sh", "-c", command])
+                try:
+                    data = _read_json_result(result_path)
+                except (ProbeInfrastructureError, ValueError):
+                    data = {"result_available": False}
+                result[f"{workspace_mode}_{deny_form}"] = {
+                    "workspace_mode": workspace_mode,
+                    "deny_form": deny_form,
+                    "policy": policy,
+                    **_command_evidence(command_result),
+                    "data": data,
+                }
+                self._write_fixture(self.state_dir / "credentials.json", "controller-secret")
+        return result
+
+    def _profile_file_comparison(self, policy: str) -> dict[str, object]:
+        """Compare -p and -f with byte-identical policy text."""
+        profile_fd, profile_name = tempfile.mkstemp(
+            prefix="neuro-code-seatbelt-root-cause-", suffix=".sb", dir=self.private_tmp
+        )
+        os.close(profile_fd)
+        profile_path = Path(profile_name)
+        try:
+            profile_path.write_text(policy, encoding="utf-8")
+            inline = self._run_sandboxed(policy, ["/usr/bin/true"])
+            file_result = _run_process(
+                [str(self.sandbox_exec), "-f", str(profile_path), "/usr/bin/true"], timeout=5
+            )
+            return {
+                "policy_sha256": _sha256_text(policy),
+                "profile_path": str(profile_path),
+                "inline_p": _command_evidence(inline),
+                "file_f": _command_evidence(file_result),
+            }
+        finally:
+            with contextlib.suppress(OSError):
+                profile_path.unlink()
+
+    def root_cause(self) -> dict[str, object]:
+        matrix = self._root_cause_matrix()
+        profiles = matrix["profiles"]
+        broad_policy = profiles["B_broad_file_read"]["policy"]  # type: ignore[index]
+        return {
+            "target": "/usr/bin/true",
+            "differential_profiles": matrix,
+            "dynamic_path": self._dynamic_path_probe(),
+            "profile_invocation": self._profile_file_comparison(broad_policy),
+            "os_diagnostics": _collect_os_diagnostics(),
+        }
+
     def _run_sandboxed(
         self,
         policy: str,
@@ -198,16 +421,14 @@ class ProbeHarness:
         child_env = self._minimal_environment()
         if env is not None:
             child_env.update(env)
+        argv = [str(self.sandbox_exec), "-p", policy, *command]
         try:
-            result = subprocess.run(
-                [str(self.sandbox_exec), "-p", policy, *command],
+            result = _run_process(
+                argv,
                 cwd=str(self._canonical(cwd or self.workspace)),
                 env=child_env,
-                input=input_text,
-                capture_output=True,
-                text=True,
+                input_text=input_text,
                 timeout=timeout,
-                check=False,
             )
         except subprocess.TimeoutExpired as error:
             return CommandResult(
@@ -215,10 +436,11 @@ class ProbeHarness:
                 stdout=_decode_output(error.stdout),
                 stderr=_decode_output(error.stderr),
                 timed_out=True,
+                argv=tuple(argv),
             )
         except OSError as error:
             raise ProbeInfrastructureError(f"sandbox-exec failed to start: {error}") from error
-        return CommandResult(result.returncode, result.stdout, result.stderr)
+        return result
 
     def _shell_probe(self, profile: str) -> dict[str, object]:
         result_path = self._result_path(f"filesystem-{profile}")
@@ -728,6 +950,116 @@ class ProbeHarness:
         }
 
 
+def _target_exec_state(returncode: int, stderr: str) -> str:
+    """Classify whether the target reached exec without guessing on SIGABRT."""
+    if returncode == 0:
+        return "observed_success"
+    if "execvp()" in stderr and "failed" in stderr:
+        return "sandbox_exec_denied_before_target"
+    if returncode < 0:
+        return "unknown_after_signal"
+    return "unknown"
+
+
+def _run_process(
+    argv: list[str],
+    *,
+    cwd: str | None = None,
+    env: dict[str, str] | None = None,
+    input_text: str | None = None,
+    timeout: float = 5.0,
+) -> CommandResult:
+    """Run one bounded evidence command while retaining process identity facts."""
+    process = subprocess.Popen(
+        argv,
+        cwd=cwd,
+        env=env,
+        stdin=subprocess.PIPE if input_text is not None else None,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        stdout, stderr = process.communicate(input=input_text, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        stdout, stderr = process.communicate()
+        return CommandResult(
+            returncode=124,
+            stdout=_decode_output(stdout),
+            stderr=_decode_output(stderr),
+            timed_out=True,
+            pid=process.pid,
+            argv=tuple(argv),
+            target_exec_state="timeout",
+        )
+    returncode = process.returncode
+    signal_number = -returncode if returncode is not None and returncode < 0 else None
+    bounded_stdout = _decode_output(stdout)
+    bounded_stderr = _decode_output(stderr)
+    return CommandResult(
+        returncode=returncode if returncode is not None else 125,
+        stdout=bounded_stdout,
+        stderr=bounded_stderr,
+        pid=process.pid,
+        signal_number=signal_number,
+        argv=tuple(argv),
+        target_exec_state=_target_exec_state(
+            returncode if returncode is not None else 125, bounded_stderr
+        ),
+    )
+
+
+def _command_evidence(result: CommandResult) -> dict[str, object]:
+    """Serialize process/target facts without interpreting SIGABRT as exec success."""
+    return {
+        "argv": list(result.argv),
+        "pid": result.pid,
+        "returncode": result.returncode,
+        "signal_number": result.signal_number,
+        "target_exec_state": result.target_exec_state,
+        "timed_out": result.timed_out,
+        "stdout": result.stdout,
+        "stderr": result.stderr,
+    }
+
+
+def _sha256_text(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _collect_os_diagnostics() -> dict[str, object]:
+    """Collect public diagnostics when the runner exposes them."""
+    diagnostics: dict[str, object] = {}
+    log_command = [
+        "/usr/bin/log",
+        "show",
+        "--last",
+        "2m",
+        "--style",
+        "compact",
+        "--predicate",
+        '(process == "sandbox-exec") OR (process == "sandboxd") OR '
+        '(eventMessage CONTAINS[c] "sandbox")',
+    ]
+    diagnostics["unified_log"] = _safe_command(log_command)
+    report_paths: list[str] = []
+    for directory in (
+        Path("/Library/Logs/DiagnosticReports"),
+        Path.home() / "Library/Logs/DiagnosticReports",
+    ):
+        try:
+            report_paths.extend(
+                str(path)
+                for path in directory.iterdir()
+                if path.is_file() and path.stat().st_mtime >= time.time() - 180
+            )
+        except OSError:
+            continue
+    diagnostics["recent_diagnostic_reports"] = sorted(report_paths)
+    return diagnostics
+
+
 def _decode_output(value: bytes | str | None) -> str:
     if value is None:
         return ""
@@ -1022,21 +1354,99 @@ def _safe_command(command: list[str]) -> dict[str, object]:
     仅用于环境元数据;命令失败会被记录,不会伪装成探针能力结果.
     """
     try:
-        result = subprocess.run(
-            command,
-            capture_output=True,
-            text=True,
-            timeout=5,
-            check=False,
-        )
+        result = _run_process(command)
     except (OSError, subprocess.SubprocessError) as error:
         return {"available": False, "error": str(error)}
-    return {
-        "available": result.returncode == 0,
-        "returncode": result.returncode,
-        "stdout": result.stdout[-2_000:],
-        "stderr": result.stderr[-2_000:],
+    return {"available": result.returncode == 0, **_command_evidence(result)}
+
+
+def _evaluate_root_cause(report: dict[str, object]) -> tuple[str, list[str]]:
+    failures: list[str] = []
+    metadata = report.get("metadata", {})
+    if not isinstance(metadata, dict) or not metadata.get("sandbox_exec_present"):
+        return "BLOCKED_CAPABILITY", ["sandbox-exec is not present"]
+    if not metadata.get("sandbox_exec_executable"):
+        return "BLOCKED_CAPABILITY", ["sandbox-exec is not executable"]
+
+    root_cause = report.get("root_cause")
+    if not isinstance(root_cause, dict):
+        return "BLOCKED_INFRASTRUCTURE", ["root-cause report is missing"]
+    matrix = root_cause.get("differential_profiles")
+    profiles = matrix.get("profiles") if isinstance(matrix, dict) else None
+    broad = profiles.get("B_broad_file_read") if isinstance(profiles, dict) else None
+    if not isinstance(broad, dict) or broad.get("returncode") != 0:
+        failures.append("broad file-read baseline did not start /usr/bin/true")
+
+    dynamic = root_cause.get("dynamic_path")
+    profile_ready: dict[str, str] = {
+        "WORKSPACE": "BLOCKED",
+        "READ_ONLY": "BLOCKED",
+        "STRICT": "BLOCKED",
     }
+    if isinstance(dynamic, dict):
+        for mode, expected_write in (("read-write", 1), ("read-only", 0)):
+            evidence = dynamic.get(f"{mode}_subpath")
+            data = evidence.get("data") if isinstance(evidence, dict) else None
+            expected = {
+                "state_read": 0,
+                "state_alias_read": 0,
+                "host_read": 0,
+                "real_home_read": 0,
+                "workspace_write": expected_write,
+                "alias_workspace_write": expected_write,
+                "state_write": 0,
+                "home_write": 1,
+                "tmp_write": 1,
+            }
+            if isinstance(data, dict) and data.get("result_available") is not False:
+                mismatches = [
+                    f"{key}={data.get(key)!r}, expected {value!r}"
+                    for key, value in expected.items()
+                    if data.get(key) != value
+                ]
+                if mismatches:
+                    failures.extend(
+                        f"{mode} broad-read targeted subpath mismatch: {item}"
+                        for item in mismatches
+                    )
+                elif isinstance(evidence, dict) and evidence.get("returncode") == 0:
+                    profile_ready["WORKSPACE" if mode == "read-write" else "READ_ONLY"] = "READY"
+            else:
+                failures.append(f"{mode} broad-read targeted subpath probe produced no result")
+
+            literal = dynamic.get(f"{mode}_literal")
+            literal_data = literal.get("data") if isinstance(literal, dict) else None
+            if isinstance(literal_data, dict) and literal_data.get("result_available") is not False:
+                for key in ("state_read", "state_alias_read", "state_write"):
+                    if literal_data.get(key) != 0:
+                        failures.append(
+                            f"{mode} literal deny did not block {key}={literal_data.get(key)!r}"
+                        )
+            else:
+                failures.append(f"{mode} broad-read targeted literal probe produced no result")
+    else:
+        failures.append("dynamic path report is missing")
+
+    invocation = root_cause.get("profile_invocation")
+    if isinstance(invocation, dict):
+        inline = invocation.get("inline_p")
+        file_result = invocation.get("file_f")
+        if not isinstance(inline, dict) or not isinstance(file_result, dict):
+            failures.append("profile invocation comparison is incomplete")
+        elif (
+            inline.get("returncode") != 0
+            or file_result.get("returncode") != 0
+            or inline.get("target_exec_state") != "observed_success"
+            or file_result.get("target_exec_state") != "observed_success"
+        ):
+            failures.append("identical broad-read policy differs or fails between -p and -f")
+    else:
+        failures.append("profile invocation comparison is missing")
+
+    root_cause["profile_assessment"] = profile_ready
+    if failures:
+        return "BLOCKED_CAPABILITY", failures
+    return "READY_FOR_NEXT_MACOS_EVIDENCE", failures
 
 
 def _evaluate(report: dict[str, object]) -> tuple[str, list[str]]:
@@ -1150,9 +1560,16 @@ def _evaluate(report: dict[str, object]) -> tuple[str, list[str]]:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run macOS Seatbelt evidence probes")
     parser.add_argument("--report", type=Path, required=True)
+    parser.add_argument(
+        "--mode",
+        choices=("full", "root-cause"),
+        default="full",
+        help="Run the complete evidence probe or only the minimal /usr/bin/true differential probe.",
+    )
     args = parser.parse_args()
     report: dict[str, object] = {
-        "probe": "neuro-code-macos-sandbox-evidence-v1",
+        "probe": "neuro-code-macos-sandbox-evidence-v2",
+        "mode": args.mode,
         "metadata": _metadata(),
         "app_sandbox": {
             "probe_scope": "documentation/packaging feasibility only; no app was built",
@@ -1169,23 +1586,29 @@ def main() -> int:
             report["failures"] = ["sandbox-exec is not present"]
             exit_code = CAPABILITY_FAILURE
         else:
-            listener, port = _start_listener()
-            try:
-                with ProbeHarness(Path("/usr/bin/sandbox-exec")) as harness:
-                    report["filesystem"] = harness.filesystem()
-                    report["python_subprocess"] = harness.python_subprocess()
-                    report["network"] = harness.network(port)
-                    helper = _compile_lifecycle_helper(harness.private_tmp)
-                    report["access_inheritance"] = harness.access_inheritance(helper)
-                    report["lifecycle"] = harness.lifecycle(helper)
-                    report["pty"] = harness.pty(helper, port)
-                    report["mcp_stdio"] = harness.mcp_stdio(port)
-            finally:
-                listener.close()
-            status, failures = _evaluate(report)
+            with ProbeHarness(Path("/usr/bin/sandbox-exec")) as harness:
+                if args.mode == "root-cause":
+                    report["root_cause"] = harness.root_cause()
+                    status, failures = _evaluate_root_cause(report)
+                else:
+                    listener, port = _start_listener()
+                    try:
+                        report["filesystem"] = harness.filesystem()
+                        report["python_subprocess"] = harness.python_subprocess()
+                        report["network"] = harness.network(port)
+                        helper = _compile_lifecycle_helper(harness.private_tmp)
+                        report["access_inheritance"] = harness.access_inheritance(helper)
+                        report["lifecycle"] = harness.lifecycle(helper)
+                        report["pty"] = harness.pty(helper, port)
+                        report["mcp_stdio"] = harness.mcp_stdio(port)
+                    finally:
+                        listener.close()
+                    status, failures = _evaluate(report)
             report["status"] = status
             report["failures"] = failures
-            exit_code = 0 if status == "PASS" else CAPABILITY_FAILURE
+            exit_code = (
+                0 if status in {"PASS", "READY_FOR_NEXT_MACOS_EVIDENCE"} else CAPABILITY_FAILURE
+            )
     except ProbeInfrastructureError as error:
         message = str(error)
         capability_failure = "probe result " in message
