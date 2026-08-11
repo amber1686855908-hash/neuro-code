@@ -54,6 +54,12 @@ profile 实现，不被描述为操作系统隔离。没有具备对应 profile 
 任意后代保证。Linux 适配器还会在挂载授权工作区前拒绝存在多个硬链接的 controller 状态文件，防止工作区
 inode 别名重新引入 controller 私有数据。
 
+启用 Linux 的生命周期边界由外层 Bubblewrap supervisor 的 pidfd 拥有。`linux_pidfd.py` 在两个包装器都存在时
+优先使用 Python 标准库接口。如果某个 Python 发行版没有编译出其中一个包装器，但运行中的 Linux libc 导出了
+`pidfd_open` 和 `pidfd_send_signal`，受信任的 sandbox infrastructure 会通过带 close-on-exec 的 native wrapper
+调用这些 libc 接口。内核、libc 或架构能力不足时仍然失败关闭；不会把基于 PID 或进程组的信号回退描述为无竞态。
+同一个 pidfd 所有权也传递给 Linux POSIX PTY 适配器，而前台终端中断仍保留既有的进程组语义。
+
 ## 影响
 
 每个新增的模型可控本地进程都必须通过 `LocalProcessSandbox`，其用途和生命周期可在一个规范请求中审查。平台适配器

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import contextlib
 import os
+import signal
 import sys
 import threading
 import time
@@ -142,6 +144,43 @@ while True:
                 on_eof=lambda: None,
                 on_error=lambda _: None,
             )
+
+    def test_secure_boundary_close_uses_pidfd_operations(self) -> None:
+        class RecordingPidfdOps:
+            def __init__(self) -> None:
+                self.pid: int | None = None
+                self.signals: list[int] = []
+
+            def open(self, pid: int) -> int:
+                self.pid = pid
+                return os.open(os.devnull, os.O_RDONLY)
+
+            def send_signal(self, pidfd: int, native_signal: int) -> None:
+                self.signals.append(native_signal)
+                if self.pid is not None:
+                    with contextlib.suppress(ProcessLookupError):
+                        os.kill(self.pid, native_signal)
+
+            def probe(self) -> None:
+                return
+
+        operations = RecordingPidfdOps()
+        with TemporaryDirectory() as directory:
+            session = PosixPtySession.spawn(
+                sys.executable,
+                ("-c", "import time; time.sleep(30)"),
+                cwd=Path(directory),
+                env=os.environ,
+                size=TerminalSize(80, 24),
+                on_output=lambda _: None,
+                on_eof=lambda: None,
+                on_error=lambda _: None,
+                pidfd_ops=operations,
+            )
+            session.close()
+
+        self.assertIn(signal.SIGTERM, operations.signals)
+        self.assertIsNotNone(operations.pid)
 
 
 if __name__ == "__main__":

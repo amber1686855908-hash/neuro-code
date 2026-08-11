@@ -88,6 +88,17 @@ The Linux adapter also rejects multiply hardlinked controller-state files before
 mounting an authorized workspace, preventing a workspace inode alias from
 reintroducing controller-private data.
 
+The enabled Linux lifecycle boundary is owned by a pidfd for the outer
+Bubblewrap supervisor. `linux_pidfd.py` prefers the Python standard-library
+wrappers when both are present. If a Python distribution omitted one of those
+wrappers but the running Linux libc exports `pidfd_open` and
+`pidfd_send_signal`, the trusted sandbox infrastructure calls those libc
+interfaces through a close-on-exec native wrapper. Kernel, libc, or architecture
+capability failures remain fail-closed; no PID or process-group signal fallback
+is presented as race-free. The same pidfd ownership is passed to the Linux
+POSIX PTY adapter, while foreground terminal interrupts retain their existing
+process-group semantics.
+
 ## Consequences
 
 Every newly added model-controlled local process must enter through
