@@ -282,7 +282,19 @@ class ProbeHarness:
             ),
             ["/bin/sh", "-c", command],
         )
-        data = _read_json_result(result_path)
+        try:
+            data = _read_json_result(result_path)
+        except ProbeInfrastructureError as error:
+            # Keep the command evidence when Seatbelt denies even the result
+            # path; evaluation will classify the missing capability explicitly.
+            return {
+                "result_available": False,
+                "result_error": str(error),
+                "returncode": command_result.returncode,
+                "timed_out": command_result.timed_out,
+                "stdout": command_result.stdout[-2_000:],
+                "stderr": command_result.stderr[-2_000:],
+            }
         # Restore the controller sentinel if a policy allowed a hardlink write;
         # the result remains evidence of the attempted escape.
         self._write_fixture(self.state_dir / "credentials.json", "controller-secret")
