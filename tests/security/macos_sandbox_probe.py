@@ -1265,6 +1265,10 @@ class ProbeHarness:
         findings = classify_findings(
             {profile: value for profile, value in profiles.items() if isinstance(value, dict)}
         )
+        mixed_mode = self.preexisting_mixed_mode_alias()
+        mixed_findings = mixed_mode.get("findings")
+        if isinstance(mixed_findings, list):
+            findings.extend(str(finding) for finding in mixed_findings)
         return {
             "probe": "macos-cross-root-hardlink-mode-v1",
             "roots": {
@@ -1274,11 +1278,107 @@ class ProbeHarness:
             "directions": DIRECTIONS,
             "apis": APIS,
             "profiles": profiles,
+            "preexisting_mixed_mode": mixed_mode,
             "findings": findings,
             "status": "BLOCKED_CAPABILITY" if findings else "NO_MODE_BYPASS_OBSERVED",
             "interpretation": (
                 "A mixed-mode inode is unsafe if a read-only-root inode can be linked "
                 "into a read-write root and modified through that alias."
+            ),
+        }
+
+    def preexisting_mixed_mode_alias(self) -> dict[str, object]:
+        """Probe a pre-existing inode exposed through RO and RW roots.
+
+        探测启动前已存在、同时通过只读和读写授权根暴露的同一 inode.
+
+        This is deliberately separate from post-launch ``link(2)`` probes:
+        Seatbelt may reject creating a new cross-root link while still
+        allowing a pre-existing alias to be written through the RW path.
+
+        该探针与启动后 ``link(2)`` 探针分开:Seatbelt 可能阻止新建跨根链接,却
+        仍允许通过读写路径写入启动前已经存在的别名.
+        """
+
+        from hardlink_mode_probe_common import (  # type: ignore[import-not-found]
+            build_mixed_mode_access_code,
+            classify_mixed_mode_access,
+        )
+
+        root_rw = self._canonical(self.workspace)
+        root_ro = self._canonical(self.additional_root)
+        source = self.additional_root / "preexisting-mixed-ro-source"
+        alias = self.workspace / "preexisting-mixed-rw-alias"
+        executable = self._canonical(Path(os.sys.executable))
+        runtime_roots = self._python_runtime_roots(executable)
+        profiles: dict[str, object] = {}
+        for profile in ("workspace", "strict", "read-only"):
+            with contextlib.suppress(FileNotFoundError):
+                alias.unlink()
+            source.write_text("mixed-mode-source", encoding="utf-8")
+            try:
+                os.link(source, alias)
+            except OSError as error:
+                profiles[profile] = {
+                    "fixture": "unavailable",
+                    "errno": error.errno,
+                    "error": str(error),
+                }
+                continue
+            result_path = self._result_path(f"preexisting-mixed-mode-{profile}")
+            policy = self._policy(
+                workspace_mode="read-only" if profile == "read-only" else "read-write",
+                network_allowed=False,
+                extra_read_roots=(root_ro, *runtime_roots),
+                extra_exec_roots=(executable.parent,),
+            )
+            code = build_mixed_mode_access_code(
+                source=str(self._canonical(source)),
+                alias=str(self._canonical(alias)),
+                result_path=str(self._canonical(result_path)),
+            )
+            command_result = self._run_sandboxed(
+                policy,
+                [str(executable), "-I", "-c", code],
+                cwd=root_rw,
+            )
+            try:
+                data = _read_json_result(result_path)
+            except ProbeInfrastructureError as error:
+                data = {"result_available": False, "result_error": str(error)}
+            data.update(_command_evidence(command_result))
+            data["policy"] = policy
+            data["root_modes"] = {
+                "workspace": "read-only" if profile == "read-only" else "read-write",
+                "additional": "read-only",
+            }
+            profiles[profile] = data
+            with contextlib.suppress(FileNotFoundError):
+                alias.unlink()
+            source.write_text("mixed-mode-source", encoding="utf-8")
+        findings = classify_mixed_mode_access(
+            {
+                profile: value
+                for profile, value in profiles.items()
+                if isinstance(value, dict) and value.get("fixture") != "unavailable"
+            }
+        )
+        findings.extend(
+            f"{profile}: mixed-mode fixture unavailable"
+            for profile, value in profiles.items()
+            if isinstance(value, dict) and value.get("fixture") == "unavailable"
+        )
+        return {
+            "probe": "macos-preexisting-mixed-mode-hardlink-v1",
+            "roots": {"read_write": str(root_rw), "read_only": str(root_ro)},
+            "source": str(self._canonical(source)),
+            "alias": str(self._canonical(alias)),
+            "profiles": profiles,
+            "findings": findings,
+            "status": "BLOCKED_CAPABILITY" if findings else "NO_MIXED_MODE_BYPASS_OBSERVED",
+            "interpretation": (
+                "A pre-existing inode visible through both RO and RW roots must be rejected "
+                "before launch when the RW alias can modify the RO-root path."
             ),
         }
 

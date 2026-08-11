@@ -166,6 +166,101 @@ def classify_findings(
     return findings
 
 
+def build_mixed_mode_access_code(
+    *,
+    source: str,
+    alias: str,
+    result_path: str | None = None,
+) -> str:
+    """Build a child that probes a pre-existing RO/RW inode alias.
+
+    构造子进程,探测启动前已经存在的 RO/RW 同 inode 别名.
+
+    The source is exposed through a read-only authorized root and the alias
+    through a read-write root.  The child never creates the link; it only
+    checks whether the writable alias can change the source inode.
+
+    source 位于只读授权根,alias 位于读写授权根.子进程不会创建链接,只检查读写
+    别名是否可以修改 source inode.
+    """
+
+    report = "json.dumps(result, sort_keys=True)"
+    destination = (
+        f"pathlib.Path({result_path!r}).write_text({report}, encoding='utf-8')"
+        if result_path is not None
+        else f"print({report})"
+    )
+    return f"""
+import json
+import pathlib
+import os
+
+source = pathlib.Path({source!r})
+alias = pathlib.Path({alias!r})
+result = {{
+    "source": str(source),
+    "alias": str(alias),
+    "same_inode": False,
+    "source_read": False,
+    "alias_read": False,
+    "alias_write": False,
+    "source_before": None,
+    "source_after": None,
+    "errors": [],
+}}
+try:
+    source_stat = os.stat(source, follow_symlinks=False)
+    alias_stat = os.stat(alias, follow_symlinks=False)
+    result["same_inode"] = (
+        source_stat.st_dev == alias_stat.st_dev
+        and source_stat.st_ino == alias_stat.st_ino
+    )
+except OSError as error:
+    result["errors"].append({{"operation": "stat", "errno": error.errno, "error": str(error)}})
+try:
+    result["source_before"] = source.read_text(encoding="utf-8")
+    result["source_read"] = True
+except OSError as error:
+    result["errors"].append({{"operation": "source_read", "errno": error.errno, "error": str(error)}})
+try:
+    result["alias_read"] = bool(alias.read_text(encoding="utf-8"))
+except OSError as error:
+    result["errors"].append({{"operation": "alias_read", "errno": error.errno, "error": str(error)}})
+try:
+    alias.write_text("mixed-mode-alias-write", encoding="utf-8")
+    result["alias_write"] = True
+except OSError as error:
+    result["errors"].append({{"operation": "alias_write", "errno": error.errno, "error": str(error)}})
+try:
+    result["source_after"] = source.read_text(encoding="utf-8")
+except OSError as error:
+    result["errors"].append({{"operation": "source_after", "errno": error.errno, "error": str(error)}})
+{destination}
+""".strip()
+
+
+def classify_mixed_mode_access(
+    profiles: Mapping[str, Mapping[str, object]],
+) -> list[str]:
+    """Flag a pre-existing mixed-mode inode that remains writable.
+
+    标记启动前存在且仍可写的混合模式 inode.
+    """
+
+    findings: list[str] = []
+    for profile, report in profiles.items():
+        if not isinstance(report, Mapping):
+            findings.append(f"{profile}: mixed-mode access report missing")
+            continue
+        if report.get("same_inode") is not True:
+            findings.append(f"{profile}: mixed-mode fixture is not one inode")
+        if report.get("source_read") is not True:
+            findings.append(f"{profile}: mixed-mode source was not readable")
+        if report.get("alias_write") is True:
+            findings.append(f"{profile}: mixed-mode inode writable through RW alias")
+    return findings
+
+
 def build_concurrent_actor_code(
     actor: str,
     *,

@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import shutil
 import tempfile
 from pathlib import Path
@@ -25,8 +26,10 @@ from hardlink_mode_probe_common import (
     DIRECTIONS,
     build_child_code,
     build_concurrent_actor_code,
+    build_mixed_mode_access_code,
     classify_concurrent_findings,
     classify_findings,
+    classify_mixed_mode_access,
 )
 
 from neuro_code.application.ports.sandbox import (
@@ -92,6 +95,38 @@ async def _probe_profile(
     operations: dict[str, dict[str, str]],
 ) -> dict[str, object]:
     code = build_child_code(operations)
+    try:
+        adapter = LinuxBubblewrapLocalProcessSandbox(profile, root_rw, state_dir)
+    except SandboxError as error:
+        return {"capability": "unavailable", "error": str(error)}
+    process = await adapter.spawn(_request(profile, root_rw, root_ro, code))
+    if process.stdout is None or process.stderr is None:
+        return {"capability": "unavailable", "error": "capture streams unavailable"}
+    stdout, stderr, returncode = await asyncio.gather(
+        process.stdout.read(), process.stderr.read(), process.wait()
+    )
+    decoded = stdout.decode("utf-8", errors="replace")
+    try:
+        child = json.loads(decoded)
+    except json.JSONDecodeError:
+        child = {"result_available": False, "raw_stdout": decoded}
+    return {
+        "capability": "available",
+        "returncode": returncode,
+        "stderr": stderr.decode("utf-8", errors="replace")[-2_000:],
+        "child": child,
+    }
+
+
+async def _probe_mixed_mode_profile(
+    profile: SandboxProfile,
+    root_rw: Path,
+    root_ro: Path,
+    state_dir: Path,
+    source: Path,
+    alias: Path,
+) -> dict[str, object]:
+    code = build_mixed_mode_access_code(source=str(source), alias=str(alias))
     try:
         adapter = LinuxBubblewrapLocalProcessSandbox(profile, root_rw, state_dir)
     except SandboxError as error:
@@ -218,6 +253,54 @@ async def _run() -> dict[str, object]:
             profiles[profile.value] = result
             await asyncio.to_thread(_restore_operations, operations, source_contents)
 
+        mixed_source = root_ro / "preexisting-mixed-ro-source"
+        mixed_alias = root_rw / "preexisting-mixed-rw-alias"
+        mixed_profiles: dict[str, object] = {}
+        mixed_findings: list[str] = []
+        for profile in (
+            SandboxProfile.WORKSPACE,
+            SandboxProfile.STRICT,
+            SandboxProfile.READ_ONLY,
+        ):
+            mixed_alias.unlink(missing_ok=True)
+            mixed_source.write_text("mixed-mode-source", encoding="utf-8")
+            try:
+                os.link(mixed_source, mixed_alias)
+            except OSError as error:
+                mixed_profiles[profile.value] = {
+                    "fixture": "unavailable",
+                    "errno": error.errno,
+                    "error": str(error),
+                }
+                continue
+            result = await _probe_mixed_mode_profile(
+                profile,
+                root_rw,
+                root_ro,
+                state_dir,
+                mixed_source,
+                mixed_alias,
+            )
+            mixed_profiles[profile.value] = result
+            mixed_alias.unlink(missing_ok=True)
+            mixed_source.write_text("mixed-mode-source", encoding="utf-8")
+        mixed_findings.extend(
+            classify_mixed_mode_access(
+                {
+                    profile: value["child"]
+                    for profile, value in mixed_profiles.items()
+                    if isinstance(value, dict)
+                    and value.get("capability") == "available"
+                    and isinstance(value.get("child"), dict)
+                }
+            )
+        )
+        mixed_findings.extend(
+            f"{profile}: mixed-mode fixture unavailable"
+            for profile, value in mixed_profiles.items()
+            if isinstance(value, dict) and value.get("fixture") == "unavailable"
+        )
+
         concurrent_root_pairs = {
             "external_to_rw": (
                 state_dir / "credentials.json",
@@ -285,7 +368,7 @@ async def _run() -> dict[str, object]:
                 and isinstance(value.get("child"), dict)
             }
         )
-        all_findings = [*findings, *concurrent_findings]
+        all_findings = [*findings, *mixed_findings, *concurrent_findings]
         return {
             "probe": "linux-cross-root-hardlink-mode-v1",
             "status": "BLOCKED_CAPABILITY" if all_findings else "NO_MODE_BYPASS_OBSERVED",
@@ -293,6 +376,15 @@ async def _run() -> dict[str, object]:
             "directions": DIRECTIONS,
             "apis": APIS,
             "profiles": profiles,
+            "preexisting_mixed_mode": {
+                "source": str(mixed_source),
+                "alias": str(mixed_alias),
+                "profiles": mixed_profiles,
+                "findings": mixed_findings,
+                "status": (
+                    "BLOCKED_CAPABILITY" if mixed_findings else "NO_MIXED_MODE_BYPASS_OBSERVED"
+                ),
+            },
             "findings": all_findings,
             "concurrent_children": {
                 "profiles": concurrent_profiles,
