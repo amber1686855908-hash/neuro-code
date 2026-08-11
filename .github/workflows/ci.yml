@@ -130,6 +130,13 @@ jobs:
           name: linux-hardlink-mode-${{ matrix.python }}
           path: ${{ runner.temp }}/neuro-code-linux-hardlink-mode.json
           if-no-files-found: error
+      - name: Upload concurrent hardlink evidence
+        if: always()
+        uses: actions/upload-artifact@v4.6.2
+        with:
+          name: linux-hardlink-concurrent-${{ matrix.python }}
+          path: ${{ runner.temp }}/neuro-code-linux-hardlink-mode.json
+          if-no-files-found: error
 
   windows-process-lifecycle:
     runs-on: windows-latest

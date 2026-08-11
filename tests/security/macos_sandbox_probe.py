@@ -28,6 +28,7 @@ import tempfile
 import textwrap
 import time
 import tracemalloc
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
@@ -1278,6 +1279,144 @@ class ProbeHarness:
             "interpretation": (
                 "A mixed-mode inode is unsafe if a read-only-root inode can be linked "
                 "into a read-write root and modified through that alias."
+            ),
+        }
+
+    def concurrent_cross_root_hardlinks(self) -> dict[str, object]:
+        """Run two sandbox children against the same mixed-mode roots.
+
+        并发运行两个沙箱子进程,共同访问混合模式授权根.
+
+        The writer may create an internal RW→RW alias, but must not create an
+        outside→RW or RO→RW alias that the observer can later read or modify.
+        This is evidence-only and deliberately does not install a production
+        hardlink guard.
+
+        写入者可以创建 RW→RW 的内部别名,但不得创建观察者随后能够读取或修改的
+        外部→RW/RO→RW 别名.本方法仅收集证据,不会安装生产硬链接防护.
+        """
+
+        from hardlink_mode_probe_common import (  # type: ignore[import-not-found]
+            build_concurrent_actor_code,
+            classify_concurrent_findings,
+        )
+
+        root_rw = self._canonical(self.workspace)
+        root_ro = self._canonical(self.additional_root)
+        outside = self._canonical(self.state_dir / "credentials.json")
+        executable = self._canonical(Path(os.sys.executable))
+        runtime_roots = self._python_runtime_roots(executable)
+        # Use the already-authorized private temp root for synchronization so
+        # the READ_ONLY workspace profile can still complete the two-child
+        # observation without making the workspace writable.
+        ready = self._canonical(self.private_tmp / "concurrent-writer-ready")
+        root_rw_source = self.workspace / "concurrent-rw-source"
+        root_ro_source = self.additional_root / "concurrent-ro-source"
+        external_alias = self.workspace / "concurrent-external-alias"
+        mixed_alias = self.workspace / "concurrent-ro-alias"
+        internal_alias = self.workspace / "concurrent-rw-alias"
+        for path in (root_rw_source, root_ro_source):
+            path.write_text("concurrent-source", encoding="utf-8")
+        operations = {
+            "external_to_rw.os_link": {
+                "source": str(outside),
+                "destination": str(external_alias),
+                "api": "os_link",
+            },
+            "ro_to_rw.os_link": {
+                "source": str(root_ro_source),
+                "destination": str(mixed_alias),
+                "api": "os_link",
+            },
+            "rw_to_rw.os_link": {
+                "source": str(root_rw_source),
+                "destination": str(internal_alias),
+                "api": "os_link",
+            },
+        }
+        profiles: dict[str, object] = {}
+        for profile in ("workspace", "strict", "read-only"):
+            for path in (ready, external_alias, mixed_alias, internal_alias):
+                with contextlib.suppress(FileNotFoundError):
+                    path.unlink()
+            policy = self._policy(
+                workspace_mode="read-only" if profile == "read-only" else "read-write",
+                network_allowed=False,
+                extra_read_roots=(root_ro, *runtime_roots),
+                extra_exec_roots=(executable.parent,),
+            )
+            writer_code = build_concurrent_actor_code(
+                "writer", operations=operations, ready_path=str(ready)
+            )
+            observer_code = build_concurrent_actor_code(
+                "observer", operations=operations, ready_path=str(ready)
+            )
+            commands = (
+                [str(executable), "-I", "-c", writer_code],
+                [str(executable), "-I", "-c", observer_code],
+            )
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                writer_result, observer_result = tuple(
+                    executor.map(
+                        lambda command, active_policy=policy: self._run_sandboxed(
+                            active_policy,
+                            command,
+                            cwd=root_rw,
+                            timeout=15,
+                        ),
+                        commands,
+                    )
+                )
+            try:
+                writer = json.loads(writer_result.stdout)
+            except json.JSONDecodeError:
+                writer = {"raw_stdout": writer_result.stdout}
+            try:
+                observer = json.loads(observer_result.stdout)
+            except json.JSONDecodeError:
+                observer = {"raw_stdout": observer_result.stdout}
+            if not isinstance(writer, dict):
+                writer = {"malformed": writer}
+            if not isinstance(observer, dict):
+                observer = {"malformed": observer}
+            profiles[profile] = {
+                "writer": {
+                    **writer,
+                    "command": _command_evidence(writer_result),
+                },
+                "observer": {
+                    **observer,
+                    "command": _command_evidence(observer_result),
+                },
+                "external_source_after": outside.read_text(encoding="utf-8"),
+            }
+        findings: list[str] = []
+        for profile, report in profiles.items():
+            if not isinstance(report, dict):
+                findings.append(f"{profile}: malformed profile report")
+                continue
+            writer = report.get("writer")
+            observer = report.get("observer")
+            if isinstance(writer, dict) and isinstance(observer, dict):
+                findings.extend(
+                    f"{profile}: {finding}"
+                    for finding in classify_concurrent_findings(writer, observer)
+                )
+            else:
+                findings.append(f"{profile}: writer/observer report missing")
+        return {
+            "probe": "macos-concurrent-cross-root-hardlink-v1",
+            "roots": {
+                "read_write": str(root_rw),
+                "read_only": str(root_ro),
+                "outside": str(outside),
+            },
+            "profiles": profiles,
+            "findings": findings,
+            "status": "BLOCKED_CAPABILITY" if findings else "NO_CONCURRENT_ALIAS_BYPASS",
+            "interpretation": (
+                "Two independently sandboxed children share the authorized roots. "
+                "An internal RW alias is expected; an external or RO-origin alias is not."
             ),
         }
 

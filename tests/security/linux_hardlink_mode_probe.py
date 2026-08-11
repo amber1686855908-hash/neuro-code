@@ -18,8 +18,16 @@ import json
 import shutil
 import tempfile
 from pathlib import Path
+from typing import Any
 
-from hardlink_mode_probe_common import APIS, DIRECTIONS, build_child_code, classify_findings
+from hardlink_mode_probe_common import (
+    APIS,
+    DIRECTIONS,
+    build_child_code,
+    build_concurrent_actor_code,
+    classify_concurrent_findings,
+    classify_findings,
+)
 
 from neuro_code.application.ports.sandbox import (
     LocalProcessEnvironmentPolicy,
@@ -107,6 +115,53 @@ async def _probe_profile(
     }
 
 
+async def _probe_concurrent_profile(
+    profile: SandboxProfile,
+    root_rw: Path,
+    root_ro: Path,
+    state_dir: Path,
+    operations: dict[str, dict[str, str]],
+    ready_path: Path,
+) -> dict[str, object]:
+    writer_code = build_concurrent_actor_code(
+        "writer", operations=operations, ready_path=str(ready_path)
+    )
+    observer_code = build_concurrent_actor_code(
+        "observer", operations=operations, ready_path=str(ready_path)
+    )
+    try:
+        adapter = LinuxBubblewrapLocalProcessSandbox(profile, root_rw, state_dir)
+    except SandboxError as error:
+        return {"capability": "unavailable", "error": str(error)}
+    writer_process, observer_process = await asyncio.gather(
+        adapter.spawn(_request(profile, root_rw, root_ro, writer_code)),
+        adapter.spawn(_request(profile, root_rw, root_ro, observer_code)),
+    )
+
+    async def collect(process: Any) -> dict[str, object]:
+        stdout = process.stdout
+        stderr = process.stderr
+        if stdout is None or stderr is None:
+            return {"capability": "unavailable", "error": "capture streams unavailable"}
+        output, error_output, returncode = await asyncio.gather(
+            stdout.read(), stderr.read(), process.wait()
+        )
+        decoded = output.decode("utf-8", errors="replace")
+        try:
+            child = json.loads(decoded)
+        except json.JSONDecodeError:
+            child = {"raw_stdout": decoded}
+        return {
+            "capability": "available",
+            "returncode": returncode,
+            "stderr": error_output.decode("utf-8", errors="replace")[-2_000:],
+            **(child if isinstance(child, dict) else {"child": child}),
+        }
+
+    writer, observer = await asyncio.gather(collect(writer_process), collect(observer_process))
+    return {"writer": writer, "observer": observer}
+
+
 def _restore_operations(
     operations: dict[str, dict[str, str]],
     source_contents: dict[str, str],
@@ -163,6 +218,64 @@ async def _run() -> dict[str, object]:
             profiles[profile.value] = result
             await asyncio.to_thread(_restore_operations, operations, source_contents)
 
+        concurrent_root_pairs = {
+            "external_to_rw": (
+                state_dir / "credentials.json",
+                root_rw / "concurrent-external-alias",
+            ),
+            "ro_to_rw": (root_ro / "concurrent-ro-source", root_rw / "concurrent-ro-alias"),
+            "rw_to_rw": (root_rw / "concurrent-rw-source", root_rw / "concurrent-rw-alias"),
+        }
+        concurrent_operations = {
+            f"{name}.os_link": {
+                "source": str(source),
+                "destination": str(destination),
+                "api": "os_link",
+            }
+            for name, (source, destination) in concurrent_root_pairs.items()
+        }
+        for source, _destination in concurrent_root_pairs.values():
+            source.write_text("concurrent-source", encoding="utf-8")
+        ready_path = root_rw / "concurrent-writer-ready"
+        concurrent_profiles: dict[str, object] = {}
+        for profile in (
+            SandboxProfile.WORKSPACE,
+            SandboxProfile.STRICT,
+            SandboxProfile.READ_ONLY,
+        ):
+            for path in (
+                ready_path,
+                *(destination for _, destination in concurrent_root_pairs.values()),
+            ):
+                path.unlink(missing_ok=True)
+            concurrent_profiles[profile.value] = await _probe_concurrent_profile(
+                profile,
+                root_rw,
+                root_ro,
+                state_dir,
+                concurrent_operations,
+                ready_path,
+            )
+
+        concurrent_findings: list[str] = []
+        for profile, raw in concurrent_profiles.items():
+            if not isinstance(raw, dict):
+                concurrent_findings.append(f"{profile}: malformed concurrent report")
+                continue
+            writer = raw.get("writer")
+            observer = raw.get("observer")
+            if isinstance(writer, dict) and isinstance(observer, dict):
+                concurrent_findings.extend(
+                    f"{profile}: {finding}"
+                    for finding in classify_concurrent_findings(
+                        writer,
+                        observer,
+                        require_ready=profile != SandboxProfile.READ_ONLY.value,
+                    )
+                )
+            else:
+                concurrent_findings.append(f"{profile}: writer/observer report missing")
+
         findings = classify_findings(
             {
                 profile: value["child"]
@@ -172,14 +285,22 @@ async def _run() -> dict[str, object]:
                 and isinstance(value.get("child"), dict)
             }
         )
+        all_findings = [*findings, *concurrent_findings]
         return {
             "probe": "linux-cross-root-hardlink-mode-v1",
-            "status": "BLOCKED_CAPABILITY" if findings else "NO_MODE_BYPASS_OBSERVED",
+            "status": "BLOCKED_CAPABILITY" if all_findings else "NO_MODE_BYPASS_OBSERVED",
             "roots": {"read_write": str(root_rw), "read_only": str(root_ro)},
             "directions": DIRECTIONS,
             "apis": APIS,
             "profiles": profiles,
-            "findings": findings,
+            "findings": all_findings,
+            "concurrent_children": {
+                "profiles": concurrent_profiles,
+                "findings": concurrent_findings,
+                "status": (
+                    "BLOCKED_CAPABILITY" if concurrent_findings else "NO_CONCURRENT_ALIAS_BYPASS"
+                ),
+            },
             "production_guard_scope": "controller-state hardlink validation only",
             "interpretation": (
                 "A BLOCKED_CAPABILITY result is an evidence finding; this probe does not "

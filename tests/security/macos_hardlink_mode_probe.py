@@ -33,6 +33,16 @@ def main() -> int:
         try:
             with ProbeHarness(sandbox_exec) as harness:
                 report = harness.cross_root_hardlink_modes()
+                concurrent = harness.concurrent_cross_root_hardlinks()
+                report["concurrent_children"] = concurrent
+                combined_findings = [
+                    *(report.get("findings") or []),
+                    *(concurrent.get("findings") or []),
+                ]
+                report["findings"] = combined_findings
+                report["status"] = (
+                    "BLOCKED_CAPABILITY" if combined_findings else "NO_MODE_BYPASS_OBSERVED"
+                )
         except ProbeInfrastructureError as error:
             report = {
                 "probe": "macos-cross-root-hardlink-mode-v1",

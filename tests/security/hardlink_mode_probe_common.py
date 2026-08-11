@@ -164,3 +164,179 @@ def classify_findings(
             if profile == "read-only" and raw.get("ok") is True:
                 findings.append(f"{profile}/{name}: read-only profile created a hardlink")
     return findings
+
+
+def build_concurrent_actor_code(
+    actor: str,
+    *,
+    operations: Mapping[str, Mapping[str, str]],
+    ready_path: str,
+) -> str:
+    """Build the writer/observer payload for the concurrent-child probe.
+
+    构造并发写入者/观察者探针负载.
+
+    The writer attempts external, mixed-mode, and internal links before
+    publishing a workspace marker.  The observer then checks whether any
+    forbidden alias became visible or writable.  Both payloads are emitted as
+    fixed Python source so the platform runner controls the actual sandbox.
+
+    写入者在发布工作区标记前尝试外部、混合模式和内部硬链接;观察者随后检查
+    是否出现了禁止的别名或可写别名.两个负载均是固定 Python 源码,实际沙箱由
+    平台探针负责创建.
+    """
+
+    if actor not in {"writer", "observer"}:
+        raise ValueError(f"unsupported concurrent probe actor: {actor!r}")
+    operations_json = repr(json.dumps(operations, ensure_ascii=False, sort_keys=True))
+    ready_literal = repr(ready_path)
+    if actor == "writer":
+        return f"""
+import ctypes
+import json
+import os
+import pathlib
+import subprocess
+
+operations = json.loads({operations_json})
+results = {{}}
+libc = ctypes.CDLL(None, use_errno=True)
+libc.link.argtypes = [ctypes.c_char_p, ctypes.c_char_p]
+libc.link.restype = ctypes.c_int
+libc.linkat.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_int]
+libc.linkat.restype = ctypes.c_int
+
+
+def _errno_error() -> OSError:
+    value = ctypes.get_errno()
+    return OSError(value, os.strerror(value))
+
+
+def _link(source, destination, api):
+    source_bytes = os.fsencode(source)
+    destination_bytes = os.fsencode(destination)
+    if api == "os_link":
+        os.link(source, destination)
+    elif api == "link":
+        if libc.link(source_bytes, destination_bytes) != 0:
+            raise _errno_error()
+    elif api == "linkat":
+        if libc.linkat(-100, source_bytes, -100, destination_bytes, 0) != 0:
+            raise _errno_error()
+    elif api == "ln":
+        completed = subprocess.run(
+            ["/bin/ln", source, destination],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+        if completed.returncode != 0:
+            detail = completed.stderr.strip() or "ln failed"
+            raise OSError(
+                completed.returncode,
+                f"{{detail}} (returncode={{completed.returncode}})",
+            )
+    else:
+        raise ValueError(api)
+
+
+for name, operation in operations.items():
+    value = {{"ok": False, "errno": None, "error": None, "alias_write": False}}
+    try:
+        _link(operation["source"], operation["destination"], operation["api"])
+        value["ok"] = True
+        try:
+            pathlib.Path(operation["destination"]).write_text(
+                f"writer:{{name}}", encoding="utf-8"
+            )
+            value["alias_write"] = True
+        except OSError as error:
+            value["alias_write_error"] = {{"errno": error.errno, "error": str(error)}}
+    except OSError as error:
+        value["errno"] = error.errno
+        value["error"] = str(error)
+    results[name] = value
+
+try:
+    pathlib.Path({ready_literal}).write_text("ready", encoding="utf-8")
+    ready_write = True
+except OSError as error:
+    ready_write = False
+    ready_error = {{"errno": error.errno, "error": str(error)}}
+report = {{"actor": "writer", "operations": results, "ready_write": ready_write}}
+if not ready_write:
+    report["ready_error"] = ready_error
+print(json.dumps(report, sort_keys=True))
+""".strip()
+
+    return f"""
+import json
+import pathlib
+import time
+
+operations = json.loads({operations_json})
+ready = pathlib.Path({ready_literal})
+deadline = time.monotonic() + 5.0
+while not ready.exists() and time.monotonic() < deadline:
+    time.sleep(0.01)
+results = {{}}
+for name, operation in operations.items():
+    destination = pathlib.Path(operation["destination"])
+    value = {{"exists": destination.exists(), "read": False, "write": False}}
+    if value["exists"]:
+        try:
+            destination.read_text(encoding="utf-8")
+            value["read"] = True
+        except OSError as error:
+            value["read_error"] = {{"errno": error.errno, "error": str(error)}}
+        try:
+            destination.write_text(f"observer:{{name}}", encoding="utf-8")
+            value["write"] = True
+        except OSError as error:
+            value["write_error"] = {{"errno": error.errno, "error": str(error)}}
+    results[name] = value
+print(json.dumps({{"actor": "observer", "ready_seen": ready.exists(), "operations": results}}, sort_keys=True))
+""".strip()
+
+
+def classify_concurrent_findings(
+    writer: Mapping[str, object],
+    observer: Mapping[str, object],
+    *,
+    require_ready: bool = True,
+) -> list[str]:
+    """Classify external/mixed aliases observed by concurrent children.
+
+    分类并发子进程观察到的外部/混合模式别名.
+    """
+
+    findings: list[str] = []
+    writer_operations = writer.get("operations")
+    if not isinstance(writer_operations, Mapping):
+        findings.append("writer operation report missing")
+    else:
+        for name, raw in writer_operations.items():
+            if not isinstance(raw, Mapping):
+                findings.append(f"writer/{name}: malformed operation report")
+                continue
+            if name.startswith(("external_to_rw", "ro_to_rw")) and raw.get("ok") is True:
+                findings.append(f"writer/{name}: forbidden alias created")
+            if name.startswith(("external_to_rw", "ro_to_rw")) and raw.get("alias_write") is True:
+                findings.append(f"writer/{name}: forbidden alias writable")
+
+    observer_operations = observer.get("operations")
+    if not isinstance(observer_operations, Mapping):
+        findings.append("observer operation report missing")
+    else:
+        for name, raw in observer_operations.items():
+            if not isinstance(raw, Mapping):
+                findings.append(f"observer/{name}: malformed operation report")
+                continue
+            if name.startswith(("external_to_rw", "ro_to_rw")) and (
+                raw.get("read") is True or raw.get("write") is True
+            ):
+                findings.append(f"observer/{name}: forbidden alias observable")
+    if require_ready and observer.get("ready_seen") is not True:
+        findings.append("observer did not observe writer completion marker")
+    return findings
