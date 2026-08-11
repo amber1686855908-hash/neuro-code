@@ -253,14 +253,31 @@ class ProbeHarness:
             ),
         }
         all_roots = tuple(root for group in root_groups.values() for root in group)
+        root_data_rule = '(allow file-read-data (literal "/"))'
+        root_metadata_rule = '(allow file-read-metadata (literal "/"))'
+        old_narrow_roots = root_groups["system"] + ("/private",)
+        candidate_read_rules = tuple(self._subpath_rule("file-read*", root) for root in all_roots)
         profiles: dict[str, str] = {
             "A_allow_default": "(version 1) (allow default)",
             "B_broad_file_read": self._root_cause_profile(broad_read=True),
             "deny_default_only": "(version 1) (deny default)",
-            "old_narrow_system": self._root_cause_profile(
-                roots=root_groups["system"] + ("/private",)
-            ),
+            "old_narrow_system": self._root_cause_profile(roots=old_narrow_roots),
             "all_candidate_roots": self._root_cause_profile(roots=all_roots),
+            "old_narrow_plus_root_data": self._policy_with_rules(
+                read_rules=(
+                    *(self._subpath_rule("file-read*", root) for root in old_narrow_roots),
+                    root_data_rule,
+                )
+            ),
+            "all_candidate_plus_root_data": self._policy_with_rules(
+                read_rules=(*candidate_read_rules, root_data_rule)
+            ),
+            "old_narrow_plus_root_metadata": self._policy_with_rules(
+                read_rules=(
+                    *(self._subpath_rule("file-read*", root) for root in old_narrow_roots),
+                    root_metadata_rule,
+                )
+            ),
             "root_control": self._root_cause_profile(roots=("/",)),
         }
         for root_name, root_group in root_groups.items():
@@ -294,6 +311,10 @@ class ProbeHarness:
             "cwd": "/",
             "profiles": matrix,
             "root_groups": root_groups,
+            "runtime_dependency_candidates": [
+                "file-read-data literal /",
+                "sysctl-read (denials are recorded separately)",
+            ],
             "probe_strategy": {
                 "single_roots": True,
                 "incremental_prefixes": True,
