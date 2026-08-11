@@ -293,10 +293,10 @@ class ProbeHarness:
     def filesystem(self) -> dict[str, object]:
         symlink = self.workspace / "symlink-to-state"
         hardlink = self.workspace / "hardlink-to-state"
-        with contextlib.suppress(FileExistsError):
+        with contextlib.suppress(FileNotFoundError, FileExistsError):
             symlink.unlink()
         symlink.symlink_to(self.state_dir / "credentials.json")
-        with contextlib.suppress(FileExistsError):
+        with contextlib.suppress(FileNotFoundError, FileExistsError):
             (self.workspace / "hardlink-to-state").unlink()
         hardlink = self.workspace / "hardlink-to-state"
         hardlink_supported = True
