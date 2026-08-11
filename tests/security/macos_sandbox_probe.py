@@ -887,6 +887,7 @@ def _metadata() -> dict[str, object]:
         "sandbox_exec_executable": os.access(sandbox_exec, os.X_OK),
         "sandbox_exec_mode": None,
         "sandbox_exec_usage": None,
+        "sandbox_exec_preflight": None,
         "csrutil_status": None,
         "sandbox_exec_file": None,
         "sandbox_exec_codesign": None,
@@ -908,6 +909,24 @@ def _metadata() -> dict[str, object]:
             "returncode": usage.returncode,
             "stdout": usage.stdout[-2_000:],
             "stderr": usage.stderr[-2_000:],
+        }
+        preflight_profiles = {
+            "allow_default": "(version 1) (allow default)",
+            "deny_default_process": (
+                "(version 1) (deny default) "
+                "(allow process-fork) (allow process-exec) "
+                "(allow signal (target self))"
+            ),
+            "deny_default_usr_read": (
+                "(version 1) (deny default) "
+                "(allow process-fork) (allow process-exec) "
+                "(allow signal (target self)) "
+                '(allow file-read* (subpath "/usr"))'
+            ),
+        }
+        info["sandbox_exec_preflight"] = {
+            name: _safe_command([str(sandbox_exec), "-p", profile, "/usr/bin/true"])
+            for name, profile in preflight_profiles.items()
         }
     csrutil = shutil.which("csrutil")
     if csrutil is not None:
