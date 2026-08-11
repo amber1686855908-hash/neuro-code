@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import shlex
+import shutil
 import sys
 from dataclasses import replace
 from pathlib import Path
@@ -48,6 +49,16 @@ def _capability_unavailable(reason: str) -> None:
     if os.environ.get(_REQUIRE_INTEGRATION_ENV) == "1":
         pytest.fail(f"required sandbox integration capability is unavailable: {reason}")
     pytest.skip(reason)
+
+
+def _require_bwrap() -> None:
+    """Skip ordinary matrix runs when Bubblewrap is not installed.
+
+    普通矩阵未安装 Bubblewrap 时跳过; dedicated security job 会将缺失能力视为失败.
+    """
+
+    if shutil.which("bwrap") is None:
+        _capability_unavailable("sandbox profile requires the 'bwrap' system executable")
 
 
 def _layout(tmp_path: Path) -> tuple[Path, Path, Path]:
@@ -125,6 +136,7 @@ async def _run_json(
 
 
 async def test_real_workspace_hardlink_is_rejected_before_child_launch(tmp_path: Path) -> None:
+    _require_bwrap()
     workspace, state_dir, _ = _layout(tmp_path)
     private_file = state_dir / "credentials.json"
     workspace_alias = workspace / "credentials-hardlink"
@@ -143,6 +155,7 @@ async def test_real_external_workspace_aliases_fail_closed(
     outside_name: str,
     profile: SandboxProfile,
 ) -> None:
+    _require_bwrap()
     workspace, state_dir, host_home = _layout(tmp_path)
     outside_root = host_home if outside_name == "host-home" else (tmp_path / outside_name)
     if outside_name == "denied-root":

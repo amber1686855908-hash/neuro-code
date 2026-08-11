@@ -14,6 +14,11 @@ from neuro_code.application.ports.sandbox import (
 from neuro_code.infrastructure.sandbox.posix_workspace_inode import PosixWorkspaceInodeAudit
 from neuro_code.shared.errors import SandboxError
 
+pytestmark = pytest.mark.skipif(
+    os.name != "posix",
+    reason="POSIX workspace inode audit is not available on this platform",
+)
+
 
 def _policy(
     *roots: tuple[Path, LocalWorkspaceAccessMode],
