@@ -916,6 +916,14 @@ def _metadata() -> dict[str, object]:
             "deny_default_process_no_signal": (
                 "(version 1) (deny default) (allow process-fork) (allow process-exec)"
             ),
+            "deny_default_process_star": (
+                "(version 1) (deny default) (allow process-fork*) (allow process-exec*)"
+            ),
+            "deny_default_process_and_read": (
+                "(version 1) (deny default) "
+                "(allow process-fork) (allow process-exec) "
+                "(allow file-read*)"
+            ),
             "deny_default_process": (
                 "(version 1) (deny default) "
                 "(allow process-fork) (allow process-exec) "
