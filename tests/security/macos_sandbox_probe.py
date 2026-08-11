@@ -142,8 +142,8 @@ class ProbeHarness:
 
     def _minimal_environment(self) -> dict[str, str]:
         return {
-            "HOME": str(self.synthetic_home),
-            "TMPDIR": str(self.private_tmp),
+            "HOME": str(self._canonical(self.synthetic_home)),
+            "TMPDIR": str(self._canonical(self.private_tmp)),
             "PATH": "/usr/bin:/bin",
             "LANG": "C",
             "LC_ALL": "C",
@@ -201,7 +201,7 @@ class ProbeHarness:
         try:
             result = subprocess.run(
                 [str(self.sandbox_exec), "-p", policy, *command],
-                cwd=str(cwd or self.workspace),
+                cwd=str(self._canonical(cwd or self.workspace)),
                 env=child_env,
                 input=input_text,
                 capture_output=True,
@@ -222,14 +222,14 @@ class ProbeHarness:
 
     def _shell_probe(self, profile: str) -> dict[str, object]:
         result_path = self._result_path(f"filesystem-{profile}")
-        workspace = shlex.quote(str(self.workspace))
+        workspace = shlex.quote(str(self._canonical(self.workspace)))
         workspace_alias = shlex.quote(str(self.workspace_alias))
-        state = shlex.quote(str(self.state_dir / "credentials.json"))
-        host_home = shlex.quote(str(self.host_home / "host-home-sentinel"))
+        state = shlex.quote(str(self._canonical(self.state_dir / "credentials.json")))
+        host_home = shlex.quote(str(self._canonical(self.host_home / "host-home-sentinel")))
         real_host_home = shlex.quote(str(self.real_host_home_sentinel))
-        additional = shlex.quote(str(self.additional_root / "read-only.txt"))
-        additional_write = shlex.quote(str(self.additional_root / "write-attempt"))
-        result = shlex.quote(str(result_path))
+        additional = shlex.quote(str(self._canonical(self.additional_root / "read-only.txt")))
+        additional_write = shlex.quote(str(self._canonical(self.additional_root / "write-attempt")))
+        result = shlex.quote(str(self._canonical(result_path)))
         private_tmp_alias = shlex.quote(str(self.private_tmp_alias / "alias-write"))
         command = textwrap.dedent(
             f"""
@@ -275,7 +275,7 @@ class ProbeHarness:
             """
         ).strip()
         command_result = self._run_sandboxed(
-            self._policy(
+            policy := self._policy(
                 workspace_mode="read-only" if profile == "read-only" else "read-write",
                 network_allowed=profile == "workspace",
                 extra_read_roots=(self.additional_root,),
@@ -294,6 +294,7 @@ class ProbeHarness:
                 "timed_out": command_result.timed_out,
                 "stdout": command_result.stdout[-2_000:],
                 "stderr": command_result.stderr[-2_000:],
+                "policy": policy,
             }
         # Restore the controller sentinel if a policy allowed a hardlink write;
         # the result remains evidence of the attempted escape.
@@ -384,8 +385,8 @@ class ProbeHarness:
         result_path = self._result_path("python-subprocess")
         code = (
             "import json,pathlib;"
-            f"p=pathlib.Path({str(result_path)!r});"
-            f"outside=pathlib.Path({str(self.state_dir / 'credentials.json')!r});"
+            f"p=pathlib.Path({str(self._canonical(result_path))!r});"
+            f"outside=pathlib.Path({str(self._canonical(self.state_dir / 'credentials.json'))!r});"
             "read_ok=False;"
             "\ntry: outside.read_text(); read_ok=True\nexcept OSError: pass;"
             "p.write_text(json.dumps({'outside_read':read_ok}))"
@@ -419,9 +420,9 @@ class ProbeHarness:
                 workspace_mode="read-only" if profile == "read-only" else "read-write",
                 network_allowed=profile == "workspace",
             )
-            state = shlex.quote(str(self.state_dir / "credentials.json"))
-            workspace = shlex.quote(str(self.workspace))
-            result_file = shlex.quote(str(result_path))
+            state = shlex.quote(str(self._canonical(self.state_dir / "credentials.json")))
+            workspace = shlex.quote(str(self._canonical(self.workspace)))
+            result_file = shlex.quote(str(self._canonical(result_path)))
             command = (
                 "IFS= read -r request; "
                 "fs=0; net=0; write=0; "
@@ -458,12 +459,12 @@ class ProbeHarness:
             command_result = self._run_sandboxed(
                 policy,
                 [
-                    str(helper),
+                    str(self._canonical(helper)),
                     str(ready),
                     str(release),
                     str(leaked),
-                    str(self.state_dir / "credentials.json"),
-                    str(result_path),
+                    str(self._canonical(self.state_dir / "credentials.json")),
+                    str(self._canonical(result_path)),
                     "access",
                 ],
                 timeout=15,
@@ -489,12 +490,12 @@ class ProbeHarness:
             process = self._start_sandboxed_process(
                 policy,
                 [
-                    str(helper),
-                    str(ready),
-                    str(release),
-                    str(leaked),
-                    str(self.state_dir / "credentials.json"),
-                    str(pid_file),
+                    str(self._canonical(helper)),
+                    str(self._canonical(ready)),
+                    str(self._canonical(release)),
+                    str(self._canonical(leaked)),
+                    str(self._canonical(self.state_dir / "credentials.json")),
+                    str(self._canonical(pid_file)),
                     mode,
                 ],
             )
@@ -532,8 +533,8 @@ class ProbeHarness:
             command = (
                 "stty rows 24 columns 80; "
                 "printf 'READY\\n'; "
-                f"if printf x > {shlex.quote(str(self.workspace / 'pty-write'))}; then printf 'WRITE=1\\n'; else printf 'WRITE=0\\n'; fi; "
-                f"if cat {shlex.quote(str(self.state_dir / 'credentials.json'))} >/dev/null 2>&1; then printf 'READ=1\\n'; else printf 'READ=0\\n'; fi; "
+                f"if printf x > {shlex.quote(str(self._canonical(self.workspace / 'pty-write')))}; then printf 'WRITE=1\\n'; else printf 'WRITE=0\\n'; fi; "
+                f"if cat {shlex.quote(str(self._canonical(self.state_dir / 'credentials.json')))} >/dev/null 2>&1; then printf 'READ=1\\n'; else printf 'READ=0\\n'; fi; "
                 f"if {shlex.quote(nc)} -z -w 1 127.0.0.1 {listener_port} >/dev/null 2>&1; then printf 'NET=1\\n'; else printf 'NET=0\\n'; fi; "
                 "IFS= read -r input; printf 'INPUT=%s\\n' \"$input\""
             )
@@ -556,7 +557,7 @@ class ProbeHarness:
         try:
             return subprocess.Popen(
                 [str(self.sandbox_exec), "-p", policy, *command],
-                cwd=self.workspace,
+                cwd=self._canonical(self.workspace),
                 env=environment,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -584,7 +585,7 @@ class ProbeHarness:
         try:
             process = subprocess.Popen(
                 [str(self.sandbox_exec), "-p", policy, "/bin/sh", "-c", command],
-                cwd=self.workspace,
+                cwd=self._canonical(self.workspace),
                 env=self._minimal_environment(),
                 stdin=slave_fd,
                 stdout=slave_fd,
@@ -634,7 +635,7 @@ class ProbeHarness:
         try:
             process = subprocess.Popen(
                 [str(self.sandbox_exec), "-p", policy, "/bin/sh", "-c", command],
-                cwd=self.workspace,
+                cwd=self._canonical(self.workspace),
                 env=self._minimal_environment(),
                 stdin=slave_fd,
                 stdout=slave_fd,
@@ -689,15 +690,15 @@ class ProbeHarness:
                     str(self.sandbox_exec),
                     "-p",
                     policy,
-                    str(helper),
+                    str(self._canonical(helper)),
                     str(ready),
                     str(release),
                     str(leaked),
-                    str(self.state_dir / "credentials.json"),
-                    str(pid_file),
+                    str(self._canonical(self.state_dir / "credentials.json")),
+                    str(self._canonical(pid_file)),
                     "setsid",
                 ],
-                cwd=self.workspace,
+                cwd=self._canonical(self.workspace),
                 env=self._minimal_environment(),
                 stdin=slave_fd,
                 stdout=slave_fd,
