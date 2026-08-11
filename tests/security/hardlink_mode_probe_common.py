@@ -83,9 +83,11 @@ def _link(source: str, destination: str, api: str) -> None:
             check=False,
         )
         if completed.returncode != 0:
-            error = OSError(completed.returncode, completed.stderr.strip() or "ln failed")
-            error.add_note(f"returncode={{completed.returncode}}")
-            raise error
+            detail = completed.stderr.strip() or "ln failed"
+            raise OSError(
+                completed.returncode,
+                f"{{detail}} (returncode={{completed.returncode}})",
+            )
     else:
         raise ValueError(f"unknown link API: {{api}}")
 
