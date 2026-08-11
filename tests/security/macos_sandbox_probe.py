@@ -912,6 +912,10 @@ def _metadata() -> dict[str, object]:
         }
         preflight_profiles = {
             "allow_default": "(version 1) (allow default)",
+            "deny_default_only": "(version 1) (deny default)",
+            "deny_default_process_no_signal": (
+                "(version 1) (deny default) (allow process-fork) (allow process-exec)"
+            ),
             "deny_default_process": (
                 "(version 1) (deny default) "
                 "(allow process-fork) (allow process-exec) "
