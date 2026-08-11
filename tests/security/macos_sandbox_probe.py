@@ -1437,6 +1437,22 @@ def _evaluate_root_cause(report: dict[str, object]) -> tuple[str, list[str]]:
     broad = profiles.get("B_broad_file_read") if isinstance(profiles, dict) else None
     if not isinstance(broad, dict) or broad.get("returncode") != 0:
         failures.append("broad file-read baseline did not start /usr/bin/true")
+    dependency_evidence = {
+        "missing_capability": "file-read-data literal /",
+        "causal_profile": (
+            profiles.get("old_narrow_plus_root_data") if isinstance(profiles, dict) else None
+        ),
+        "insufficient_metadata_only_profile": (
+            profiles.get("old_narrow_plus_root_metadata") if isinstance(profiles, dict) else None
+        ),
+    }
+    root_cause["runtime_dependency_evidence"] = dependency_evidence
+    causal_profile = dependency_evidence["causal_profile"]
+    metadata_profile = dependency_evidence["insufficient_metadata_only_profile"]
+    if not isinstance(causal_profile, dict) or causal_profile.get("returncode") != 0:
+        failures.append("adding file-read-data literal / did not restore narrow startup")
+    if isinstance(metadata_profile, dict) and metadata_profile.get("returncode") == 0:
+        failures.append("file-read-metadata literal / unexpectedly hid the startup dependency")
 
     dynamic = root_cause.get("dynamic_path")
     profile_ready: dict[str, str] = {
