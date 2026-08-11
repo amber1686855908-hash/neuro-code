@@ -108,6 +108,17 @@ jobs:
           if tests == 0 or skipped:
               raise SystemExit("Linux sandbox security gate did not execute every test")
           PY
+      - name: Probe broader external-inode aliases (evidence only)
+        env:
+          REPORT: ${{ runner.temp }}/neuro-code-linux-hardlink-alias.json
+        run: uv run python tests/security/linux_hardlink_alias_probe.py --report "$REPORT"
+      - name: Upload external-inode evidence
+        if: always()
+        uses: actions/upload-artifact@v4.6.2
+        with:
+          name: linux-hardlink-alias-${{ matrix.python }}
+          path: ${{ runner.temp }}/neuro-code-linux-hardlink-alias.json
+          if-no-files-found: error
 
   windows-process-lifecycle:
     runs-on: windows-latest

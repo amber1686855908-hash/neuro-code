@@ -27,6 +27,7 @@ import subprocess
 import tempfile
 import textwrap
 import time
+import tracemalloc
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
@@ -81,6 +82,8 @@ class ProbeHarness:
         self.state_dir = self.root / "controller state"
         self.host_home = self.root / "host home"
         self.additional_root = self.root / "additional read-only root"
+        self.denied_root = self.root / "denied outside root"
+        self.additional_denied_root = self.root / "additional denied root"
         self.synthetic_home = self.root / "synthetic home"
         self.private_tmp = self.root / "private tmp"
         for path in (
@@ -88,6 +91,8 @@ class ProbeHarness:
             self.state_dir,
             self.host_home,
             self.additional_root,
+            self.denied_root,
+            self.additional_denied_root,
             self.synthetic_home,
             self.private_tmp,
         ):
@@ -96,6 +101,8 @@ class ProbeHarness:
         self._write_fixture(self.state_dir / "sessions.db", "session-secret")
         self._write_fixture(self.host_home / "host-home-sentinel", "host-home-secret")
         self._write_fixture(self.additional_root / "read-only.txt", "additional-root")
+        self._write_fixture(self.denied_root / "denied.txt", "denied-outside")
+        self._write_fixture(self.additional_denied_root / "denied.txt", "denied-additional")
         self._write_fixture(self.workspace / "readable.txt", "workspace-readable")
         # The real runner home is probed separately.  A unique sentinel keeps
         # the check honest without relying on a guessed host path.
@@ -106,6 +113,7 @@ class ProbeHarness:
         self.workspace_alias = self._var_alias(self.workspace)
         self.private_tmp_alias = self._var_alias(self.private_tmp)
         self._result_paths: list[Path] = []
+        self._hardlink_aliases: dict[str, Path] = {}
 
     def __enter__(self) -> ProbeHarness:
         return self
@@ -144,6 +152,48 @@ class ProbeHarness:
         path = self.private_tmp / f"{label}-{len(self._result_paths)}.json"
         self._result_paths.append(path)
         return path
+
+    def _hardlink_targets(self) -> dict[str, Path]:
+        """Return every outside inode used by the alias evidence probes."""
+        return {
+            "controller_state": self.state_dir / "credentials.json",
+            "synthetic_host_home": self.host_home / "host-home-sentinel",
+            "real_host_home": self.real_host_home_sentinel,
+            "denied_outside": self.denied_root / "denied.txt",
+            "denied_additional": self.additional_denied_root / "denied.txt",
+        }
+
+    def _prepare_hardlink_aliases(self) -> dict[str, object]:
+        """Create pre-existing workspace aliases and retain their inode facts."""
+        targets = self._hardlink_targets()
+        result: dict[str, object] = {}
+        self._hardlink_aliases.clear()
+        for name, target in targets.items():
+            alias = self.workspace / f"hardlink-{name}"
+            with contextlib.suppress(FileNotFoundError, IsADirectoryError):
+                alias.unlink()
+            try:
+                os.link(target, alias)
+            except OSError as error:
+                result[name] = {
+                    "target": str(self._canonical(target)),
+                    "alias": str(self._canonical(alias)),
+                    "created": False,
+                    "errno": error.errno,
+                    "error": str(error),
+                }
+                continue
+            self._hardlink_aliases[name] = alias
+            target_stat = target.stat()
+            result[name] = {
+                "target": str(self._canonical(target)),
+                "alias": str(self._canonical(alias)),
+                "created": True,
+                "dev": target_stat.st_dev,
+                "ino": target_stat.st_ino,
+                "target_nlink": target_stat.st_nlink,
+            }
+        return result
 
     def _minimal_environment(self) -> dict[str, str]:
         return {
@@ -514,6 +564,7 @@ class ProbeHarness:
         input_text: str | None = None,
         timeout: float = 15.0,
         env: dict[str, str] | None = None,
+        inherit_fds: tuple[int, ...] = (),
     ) -> CommandResult:
         child_env = self._minimal_environment()
         if env is not None:
@@ -526,6 +577,7 @@ class ProbeHarness:
                 env=child_env,
                 input_text=input_text,
                 timeout=timeout,
+                inherit_fds=inherit_fds,
             )
         except subprocess.TimeoutExpired as error:
             return CommandResult(
@@ -651,12 +703,81 @@ class ProbeHarness:
             "private_tmp_var_alias": str(self.private_tmp_alias),
             "hardlink_created": hardlink_supported,
             "hardlink_target": str(self.state_dir / "credentials.json"),
+            "preexisting_hardlinks": self._prepare_hardlink_aliases(),
         }
         if not hardlink_supported:
             result["hardlink_creation_error"] = hardlink_error
         for profile in ("workspace", "read-only", "strict"):
             result[profile] = self._shell_probe(profile)
         return result
+
+    def hardlink_scope(self) -> dict[str, object]:
+        """Probe pre-existing aliases for every protected outside inode.
+
+        This is deliberately evidence-only.  It compares the same path-based
+        Seatbelt policy against state, home, and arbitrary denied roots so a
+        result is not accidentally over-specialized to ``state_dir``.
+        """
+        aliases = self._prepare_hardlink_aliases()
+        result: dict[str, object] = {"aliases": aliases, "profiles": {}}
+        target_json: list[tuple[str, str]] = []
+        for name, alias in self._hardlink_aliases.items():
+            target_json.append((name, shlex.quote(str(self._canonical(alias)))))
+        target_fields: list[str] = []
+        for name, _alias in target_json:
+            prefix = f"h_{name}"
+            target_fields.append(
+                f'"{name}":{{"read":${prefix}_read,"append":${prefix}_append,'
+                f'"overwrite":${prefix}_overwrite,"truncate":${prefix}_truncate,'
+                f'"stat":${prefix}_stat}}'
+            )
+        for profile in ("workspace", "read-only", "strict"):
+            result_path = self._result_path(f"hardlink-scope-{profile}")
+            result_file = shlex.quote(str(self._canonical(result_path)))
+            lines = ["set +e"]
+            for name, alias in target_json:
+                prefix = f"h_{name}"
+                lines.extend(
+                    [
+                        f"{prefix}_read=0; {prefix}_append=0; {prefix}_overwrite=0; "
+                        f"{prefix}_truncate=0; {prefix}_stat=0",
+                        f"if cat {alias} >/dev/null 2>&1; then {prefix}_read=1; fi",
+                        f"if printf append >> {alias}; then {prefix}_append=1; fi",
+                        f"if printf overwrite > {alias}; then {prefix}_overwrite=1; fi",
+                        f"if : > {alias}; then {prefix}_truncate=1; fi",
+                        f"if /usr/bin/stat -f '%d:%i:%l' {alias} >/dev/null 2>&1; then "
+                        f"{prefix}_stat=1; fi",
+                    ]
+                )
+            values = ",".join(target_fields)
+            lines.append(f"printf '{{\"targets\":{{{values}}}}}' > {result_file}")
+            policy = self._policy(
+                workspace_mode="read-only" if profile == "read-only" else "read-write",
+                network_allowed=False,
+                extra_read_roots=(self.additional_root,),
+            )
+            command_result = self._run_sandboxed(policy, ["/bin/sh", "-c", "\n".join(lines)])
+            try:
+                data = _read_json_result(result_path)
+            except ProbeInfrastructureError as error:
+                data = {"result_available": False, "result_error": str(error)}
+            data.update(_command_evidence(command_result))
+            data["policy"] = policy
+            result["profiles"][profile] = data  # type: ignore[index]
+            self._restore_hardlink_targets()
+        return result
+
+    def _restore_hardlink_targets(self) -> None:
+        contents = {
+            "controller_state": "controller-secret",
+            "synthetic_host_home": "host-home-secret",
+            "real_host_home": "real-host-home-secret",
+            "denied_outside": "denied-outside",
+            "denied_additional": "denied-additional",
+        }
+        for name, target in self._hardlink_targets().items():
+            if name in contents:
+                self._write_fixture(target, contents[name])
 
     def network(self, listener_port: int) -> dict[str, object]:
         nc = shutil.which("nc", path="/usr/bin:/bin")
@@ -694,6 +815,357 @@ class ProbeHarness:
                 "stderr": (direct.stderr + grandchild.stderr + dns.stderr)[-2_000:],
             }
         return result
+
+    def _python_child_policy(
+        self,
+        profile: str,
+        executable: Path,
+        *,
+        network_allowed: bool = False,
+    ) -> tuple[Path, tuple[Path, ...], str]:
+        roots = self._python_runtime_roots(executable)
+        policy = self._policy(
+            workspace_mode="read-only" if profile == "read-only" else "read-write",
+            network_allowed=network_allowed,
+            extra_read_roots=roots,
+            extra_exec_roots=(executable.parent,),
+        )
+        return executable, roots, policy
+
+    def post_launch_alias_operations(self) -> dict[str, object]:
+        """Probe link/rename/symlink/clone operations from inside each child."""
+        executable = self._canonical(Path(os.sys.executable))
+        targets = {
+            name: str(self._canonical(path)) for name, path in self._hardlink_targets().items()
+        }
+        result: dict[str, object] = {"profiles": {}, "apis": {}}
+        targets_literal = repr(json.dumps(targets, ensure_ascii=False))
+        workspace_literal = repr(str(self._canonical(self.workspace)))
+        code = textwrap.dedent(
+            f"""
+            import ctypes
+            import errno
+            import json
+            import os
+            import pathlib
+            import shutil
+            import subprocess
+
+            targets = json.loads({targets_literal})
+            workspace = pathlib.Path({workspace_literal})
+            result_path = pathlib.Path(__RESULT_PATH__)
+            operations = {{}}
+
+            def finish(name, value):
+                operations[name] = value
+                return value
+
+            def inspect_link(path):
+                value = {{"read": False, "write": False}}
+                try:
+                    path.read_bytes()
+                    value["read"] = True
+                except OSError:
+                    pass
+                try:
+                    with path.open("ab") as stream:
+                        stream.write(b"child-write")
+                    value["write"] = True
+                except OSError:
+                    pass
+                return value
+
+            def attempt(name, operation):
+                try:
+                    value = operation()
+                except OSError as error:
+                    return finish(name, {{"ok": False, "errno": error.errno, "error": str(error)}})
+                except Exception as error:
+                    return finish(name, {{"ok": False, "errno": None, "error": str(error)}})
+                return finish(name, {{"ok": True, **value}})
+
+            for target_name, source_text in targets.items():
+                source = pathlib.Path(source_text)
+                for api_name in ("os_link", "linkat", "ln"):
+                    destination = workspace / f"post-{{target_name}}-{{api_name}}"
+                    try:
+                        destination.unlink()
+                    except OSError:
+                        pass
+                    if api_name == "os_link":
+                        def do_os_link(source=source, destination=destination):
+                            os.link(source, destination, follow_symlinks=False)
+                            return inspect_link(destination)
+                        attempt(f"{{target_name}}.{{api_name}}", do_os_link)
+                    elif api_name == "linkat":
+                        libc = ctypes.CDLL(None, use_errno=True)
+                        function = getattr(libc, "linkat", None)
+                        if function is None:
+                            finish(f"{{target_name}}.{{api_name}}", {{"available": False}})
+                        else:
+                            function.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_int]
+                            function.restype = ctypes.c_int
+                            def do_linkat(source=source, destination=destination):
+                                ctypes.set_errno(0)
+                                return_code = function(-2, os.fsencode(source), -2, os.fsencode(destination), 0)
+                                if return_code != 0:
+                                    error_number = ctypes.get_errno()
+                                    raise OSError(error_number, os.strerror(error_number))
+                                return inspect_link(destination)
+                            attempt(f"{{target_name}}.{{api_name}}", do_linkat)
+                    else:
+                        def do_ln(source=source, destination=destination):
+                            completed = subprocess.run(
+                                ["/bin/ln", str(source), str(destination)],
+                                capture_output=True,
+                                text=True,
+                                check=False,
+                            )
+                            if completed.returncode != 0:
+                                return {{"ok": False, "returncode": completed.returncode, "stderr": completed.stderr[-500:]}}
+                            return {{"returncode": completed.returncode, **inspect_link(destination)}}
+                        attempt(f"{{target_name}}.{{api_name}}", do_ln)
+                    try:
+                        destination.unlink()
+                    except OSError:
+                        pass
+
+                symlink = workspace / f"post-{{target_name}}-symlink"
+                try:
+                    symlink.unlink()
+                except OSError:
+                    pass
+                def do_symlink(source=source, symlink=symlink):
+                    os.symlink(source, symlink)
+                    inspected = {{"created": True}}
+                    try:
+                        symlink.read_bytes()
+                        inspected["dereference_read"] = True
+                    except OSError:
+                        inspected["dereference_read"] = False
+                    return inspected
+                attempt(f"{{target_name}}.symlink", do_symlink)
+                try:
+                    symlink.unlink()
+                except OSError:
+                    pass
+
+                copied = workspace / f"post-{{target_name}}-copy"
+                def do_copy(source=source, copied=copied):
+                    shutil.copyfile(source, copied)
+                    return inspect_link(copied)
+                attempt(f"{{target_name}}.copyfile", do_copy)
+                try:
+                    copied.unlink()
+                except OSError:
+                    pass
+
+                cloned = workspace / f"post-{{target_name}}-clone"
+                libc = ctypes.CDLL(None, use_errno=True)
+                clonefile = getattr(libc, "clonefile", None)
+                if clonefile is None:
+                    finish(f"{{target_name}}.clonefile", {{"available": False}})
+                else:
+                    clonefile.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint32]
+                    clonefile.restype = ctypes.c_int
+                    def do_clone(source=source, cloned=cloned):
+                        ctypes.set_errno(0)
+                        return_code = clonefile(os.fsencode(source), os.fsencode(cloned), 0)
+                        if return_code != 0:
+                            error_number = ctypes.get_errno()
+                            raise OSError(error_number, os.strerror(error_number))
+                        return inspect_link(cloned)
+                    attempt(f"{{target_name}}.clonefile", do_clone)
+                try:
+                    cloned.unlink()
+                except OSError:
+                    pass
+
+                directory_link = workspace / f"post-{{target_name}}-directory-link"
+                try:
+                    directory_link.unlink()
+                except OSError:
+                    pass
+                def do_directory_link(source=source, directory_link=directory_link):
+                    os.link(source.parent, directory_link, follow_symlinks=False)
+                    return {{"created": True}}
+                attempt(f"{{target_name}}.directory_hardlink", do_directory_link)
+                try:
+                    directory_link.unlink()
+                except OSError:
+                    pass
+
+                destination = workspace / f"post-{{target_name}}-rename-in"
+                def do_rename_in(source=source, destination=destination):
+                    os.rename(source, destination)
+                    return {{"moved": True}}
+                attempt(f"{{target_name}}.rename_outside_to_workspace", do_rename_in)
+                try:
+                    destination.unlink()
+                except OSError:
+                    pass
+
+                source_in = workspace / f"post-{{target_name}}-rename-source"
+                try:
+                    source_in.write_text("workspace-source")
+                except OSError:
+                    pass
+                destination_out = source.parent / f"neuro-code-rename-out-{{os.getpid()}}"
+                def do_rename_out(source_in=source_in, destination_out=destination_out):
+                    os.rename(source_in, destination_out)
+                    return {{"moved": True}}
+                attempt(f"{{target_name}}.rename_workspace_to_outside", do_rename_out)
+                try:
+                    destination_out.unlink()
+                except OSError:
+                    pass
+                if not source_in.exists():
+                    try:
+                        source_in.write_text("workspace-source")
+                    except OSError:
+                        pass
+
+                replaced = source.parent / f"neuro-code-replace-out-{{os.getpid()}}"
+                def do_replace(source_in=source_in, replaced=replaced):
+                    os.replace(source_in, replaced)
+                    return {{"replaced": True}}
+                attempt(f"{{target_name}}.atomic_replace_workspace_to_outside", do_replace)
+                try:
+                    replaced.unlink()
+                except OSError:
+                    pass
+                if not source_in.exists():
+                    try:
+                        source_in.write_text("workspace-source")
+                    except OSError:
+                        pass
+
+            result_path.write_text(json.dumps({{"operations": operations}}))
+            """
+        ).strip()
+        for profile in ("workspace", "read-only", "strict"):
+            result_path = self._result_path(f"post-launch-alias-{profile}")
+            child_code = code.replace("__RESULT_PATH__", repr(str(self._canonical(result_path))))
+            _, roots, policy = self._python_child_policy(profile, executable)
+            completed = self._run_sandboxed(
+                policy,
+                [str(executable), "-I", "-c", child_code],
+            )
+            try:
+                data = _read_json_result(result_path)
+            except ProbeInfrastructureError as error:
+                data = {"result_available": False, "result_error": str(error)}
+            data.update(
+                {
+                    "returncode": completed.returncode,
+                    "stderr": completed.stderr[-2_000:],
+                    "target_exec_state": completed.target_exec_state,
+                    "runtime_roots": [str(root) for root in roots],
+                    "policy": policy,
+                }
+            )
+            result["profiles"][profile] = data  # type: ignore[index]
+            self._restore_hardlink_targets()
+        return result
+
+    def inherited_fd_probe(self) -> dict[str, object]:
+        """Check whether an intentionally inherited sensitive FD bypasses Seatbelt."""
+        executable = self._canonical(Path(os.sys.executable))
+        fd = os.open(self.state_dir / "credentials.json", os.O_RDONLY)
+        os.set_inheritable(fd, True)
+        result: dict[str, object] = {"fd": fd, "profiles": {}}
+        code_template = textwrap.dedent(
+            """
+            import json, os, pathlib
+            destination = pathlib.Path(__RESULT_PATH__)
+            fd = int(os.environ["NEURO_INHERITED_FD"])
+            value = {"read": False, "error": None}
+            try:
+                os.lseek(fd, 0, os.SEEK_SET)
+                os.read(fd, 4096)
+                value["read"] = True
+            except OSError as error:
+                value["error"] = {"errno": error.errno, "error": str(error)}
+            destination.write_text(json.dumps(value))
+            """
+        ).strip()
+        try:
+            for profile in ("workspace", "read-only", "strict"):
+                result_path = self._result_path(f"inherited-fd-{profile}")
+                _, roots, policy = self._python_child_policy(profile, executable)
+                code = code_template.replace(
+                    "__RESULT_PATH__", repr(str(self._canonical(result_path)))
+                )
+                completed = self._run_sandboxed(
+                    policy,
+                    [str(executable), "-I", "-c", code],
+                    env={"NEURO_INHERITED_FD": str(fd)},
+                    inherit_fds=(fd,),
+                )
+                try:
+                    data = _read_json_result(result_path)
+                except ProbeInfrastructureError as error:
+                    data = {"result_available": False, "result_error": str(error)}
+                data.update(
+                    {
+                        "returncode": completed.returncode,
+                        "stderr": completed.stderr[-2_000:],
+                        "target_exec_state": completed.target_exec_state,
+                        "runtime_roots": [str(root) for root in roots],
+                        "policy": policy,
+                    }
+                )
+                result["profiles"][profile] = data  # type: ignore[index]
+        finally:
+            os.close(fd)
+        return result
+
+    def inode_audit(self) -> dict[str, object]:
+        """Measure simple/provenance-aware inode audits on synthetic layouts."""
+        audit_root_a = self.root / "authorized-root-a"
+        audit_root_b = self.root / "authorized-root-b"
+        audit_outside = self.root / "audit-outside"
+        for path in (audit_root_a, audit_root_b, audit_outside):
+            path.mkdir(exist_ok=True)
+        safe_source = audit_root_a / "safe.txt"
+        safe_link = audit_root_b / "safe-link.txt"
+        safe_source.write_text("safe", encoding="utf-8")
+        with contextlib.suppress(FileNotFoundError):
+            safe_link.unlink()
+        os.link(safe_source, safe_link)
+        external_source = audit_outside / "external.txt"
+        external_alias = audit_root_a / "external-link.txt"
+        external_source.write_text("external", encoding="utf-8")
+        with contextlib.suppress(FileNotFoundError):
+            external_alias.unlink()
+        os.link(external_source, external_alias)
+        return {
+            "workspace_single_root": _audit_inode_roots((self.workspace,)),
+            "multiple_authorized_roots": {
+                "roots": [str(audit_root_a), str(audit_root_b)],
+                "audit": _audit_inode_roots((audit_root_a, audit_root_b)),
+                "safe_internal_hardlink": {
+                    "inode": safe_source.stat().st_ino,
+                    "nlink": safe_source.stat().st_nlink,
+                },
+                "external_alias": {
+                    "inode": external_source.stat().st_ino,
+                    "nlink": external_source.stat().st_nlink,
+                },
+            },
+            "protected_root_scan": _audit_protected_roots(
+                (self.state_dir, self.host_home, self.real_host_home_sentinel.parent)
+            ),
+            "benchmark": _inode_scan_benchmark(self.root),
+            "semantics": {
+                "simple_st_nlink_gt_one": "rejects all hardlinks, including links wholly inside authorized roots",
+                "precise_dev_ino_count": "rejects only st_nlink greater than entries observed in authorized roots",
+                "symlinks_followed": False,
+                "scan_is_race_free": False,
+                "race_trust_assumption": "preflight is not a defense against a concurrent host process changing the filesystem after the scan",
+                "errors_fail_closed": True,
+            },
+        }
 
     def python_subprocess(self, listener_port: int) -> dict[str, object]:
         executable = self._canonical(Path(os.sys.executable))
@@ -1167,6 +1639,7 @@ def _run_process(
     env: dict[str, str] | None = None,
     input_text: str | None = None,
     timeout: float = 5.0,
+    inherit_fds: tuple[int, ...] = (),
 ) -> CommandResult:
     """Run one bounded evidence command while retaining process identity facts."""
     process = subprocess.Popen(
@@ -1177,6 +1650,11 @@ def _run_process(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        # Keep the default close-on-exec boundary even for the explicit FD
+        # probe; only descriptors named in ``pass_fds`` are intentionally
+        # inherited.
+        close_fds=True,
+        pass_fds=inherit_fds if os.name == "posix" else (),
     )
     try:
         stdout, stderr = process.communicate(input=input_text, timeout=timeout)
@@ -1316,8 +1794,170 @@ def _pid_alive(pid: int) -> bool:
         return False
     except PermissionError:
         return True
-    else:
-        return True
+    return True
+
+
+def _audit_inode_roots(roots: tuple[Path, ...]) -> dict[str, object]:
+    """Audit regular-file inode aliases without following symlinks."""
+    canonical_roots: list[Path] = []
+    seen_roots: set[Path] = set()
+    errors: list[str] = []
+    for root in roots:
+        try:
+            canonical = root.expanduser().resolve(strict=True)
+        except OSError as error:
+            errors.append(f"root {root}: {error}")
+            continue
+        if canonical not in seen_roots:
+            seen_roots.add(canonical)
+            canonical_roots.append(canonical)
+    started = time.perf_counter()
+    tracemalloc.start()
+    inode_counts: dict[tuple[int, int], int] = {}
+    inode_nlinks: dict[tuple[int, int], int] = {}
+    files_seen = 0
+    directories_seen = 0
+    devices: set[int] = set()
+    stack = list(canonical_roots)
+    while stack:
+        directory = stack.pop()
+        try:
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    try:
+                        info = entry.stat(follow_symlinks=False)
+                    except OSError as error:
+                        errors.append(f"{entry.path}: {error}")
+                        continue
+                    devices.add(info.st_dev)
+                    mode = info.st_mode
+                    if stat.S_ISDIR(mode):
+                        if not entry.is_symlink():
+                            directories_seen += 1
+                            stack.append(Path(entry.path))
+                    elif stat.S_ISREG(mode):
+                        files_seen += 1
+                        key = (info.st_dev, info.st_ino)
+                        inode_counts[key] = inode_counts.get(key, 0) + 1
+                        inode_nlinks[key] = info.st_nlink
+        except OSError as error:
+            errors.append(f"{directory}: {error}")
+    _current, peak_bytes = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    simple_rejections = [
+        {"dev": dev, "ino": ino, "nlink": inode_nlinks[(dev, ino)]}
+        for dev, ino in inode_counts
+        if inode_nlinks[(dev, ino)] > 1
+    ]
+    external_aliases = [
+        {
+            "dev": dev,
+            "ino": ino,
+            "nlink": inode_nlinks[(dev, ino)],
+            "authorized_entries": inode_counts[(dev, ino)],
+        }
+        for dev, ino in inode_counts
+        if inode_nlinks[(dev, ino)] > inode_counts[(dev, ino)]
+    ]
+    return {
+        "roots": [str(root) for root in canonical_roots],
+        "files_seen": files_seen,
+        "directories_seen": directories_seen,
+        "inode_map_size": len(inode_counts),
+        "devices": sorted(devices),
+        "errors": errors,
+        "duration_ms": round((time.perf_counter() - started) * 1000, 3),
+        "peak_tracemalloc_bytes": peak_bytes,
+        "simple_policy": {
+            "rejected": bool(simple_rejections),
+            "entries": simple_rejections[:32],
+        },
+        "precise_policy": {
+            "safe": not errors and not external_aliases,
+            "external_aliases": external_aliases[:32],
+        },
+    }
+
+
+def _audit_protected_roots(roots: tuple[Path, ...]) -> dict[str, object]:
+    """Record the narrower protected-root ``st_nlink`` audit trade-off."""
+    started = time.perf_counter()
+    files_seen = 0
+    hardlinked_files: list[dict[str, object]] = []
+    errors: list[str] = []
+    seen_roots: set[Path] = set()
+    for root in roots:
+        try:
+            canonical = root.resolve(strict=True)
+        except OSError as error:
+            errors.append(f"root {root}: {error}")
+            continue
+        if canonical in seen_roots:
+            continue
+        seen_roots.add(canonical)
+        stack = [canonical]
+        while stack:
+            directory = stack.pop()
+            try:
+                directory_info = os.stat(directory, follow_symlinks=False)
+            except OSError as error:
+                errors.append(f"{directory}: {error}")
+                continue
+            if stat.S_ISREG(directory_info.st_mode):
+                entries = ((directory, directory_info),)
+            elif stat.S_ISDIR(directory_info.st_mode):
+                try:
+                    with os.scandir(directory) as directory_entries:
+                        entries = tuple(
+                            (Path(entry.path), entry.stat(follow_symlinks=False))
+                            for entry in directory_entries
+                        )
+                except OSError as error:
+                    errors.append(f"{directory}: {error}")
+                    continue
+            else:
+                entries = ()
+            for path, info in entries:
+                mode = info.st_mode
+                if stat.S_ISDIR(mode):
+                    if not path.is_symlink():
+                        stack.append(path)
+                    continue
+                if not stat.S_ISREG(mode):
+                    continue
+                files_seen += 1
+                if info.st_nlink > 1:
+                    hardlinked_files.append(
+                        {
+                            "path": str(path),
+                            "dev": info.st_dev,
+                            "ino": info.st_ino,
+                            "nlink": info.st_nlink,
+                        }
+                    )
+    return {
+        "roots": [str(root) for root in seen_roots],
+        "files_seen": files_seen,
+        "hardlinked_files": hardlinked_files[:64],
+        "errors": errors,
+        "duration_ms": round((time.perf_counter() - started) * 1000, 3),
+        "interpretation": "protected-root scan detects aliases only for roots included in this list; it cannot detect an unprotected outside inode linked into workspace",
+    }
+
+
+def _inode_scan_benchmark(root: Path) -> dict[str, object]:
+    """Measure the prototype audit at the requested scales."""
+    measurements: dict[str, object] = {}
+    for count in (1_000, 10_000, 100_000):
+        directory = root / f"inode-benchmark-{count}"
+        directory.mkdir(exist_ok=True)
+        try:
+            for index in range(count):
+                (directory / f"file-{index:06d}").write_bytes(b"x")
+            measurements[str(count)] = _audit_inode_roots((directory,))
+        finally:
+            shutil.rmtree(directory, ignore_errors=True)
+    return measurements
 
 
 def _compile_lifecycle_helper(root: Path) -> Path:
@@ -1773,6 +2413,75 @@ def _evaluate(report: dict[str, object]) -> tuple[str, list[str]]:
                 failures.append(f"filesystem {profile} hardlink escaped outside inode")
         if filesystem.get("hardlink_created") is not True:
             failures.append("hardlink probe could not create an outside-inode link")
+    hardlink_scope = report.get("hardlink_scope")
+    if not isinstance(hardlink_scope, dict):
+        failures.append("hardlink scope report is missing")
+    else:
+        profiles = hardlink_scope.get("profiles")
+        if not isinstance(profiles, dict):
+            failures.append("hardlink scope profile matrix is missing")
+        else:
+            for profile in ("workspace", "read-only", "strict"):
+                actual = profiles.get(profile)
+                targets = actual.get("targets") if isinstance(actual, dict) else None
+                if not isinstance(targets, dict):
+                    failures.append(f"hardlink scope targets missing ({profile})")
+                    continue
+                for target_name, operations in targets.items():
+                    if not isinstance(operations, dict):
+                        failures.append(
+                            f"hardlink scope operation record missing ({profile}/{target_name})"
+                        )
+                        continue
+                    for operation in ("read", "append", "overwrite", "truncate"):
+                        if operations.get(operation) == 1:
+                            failures.append(
+                                f"hardlink scope {profile}/{target_name} {operation} bypassed deny"
+                            )
+    post_launch = report.get("post_launch_alias_operations")
+    if not isinstance(post_launch, dict):
+        failures.append("post-launch alias operation report is missing")
+    else:
+        profiles = post_launch.get("profiles")
+        if not isinstance(profiles, dict):
+            failures.append("post-launch alias profile matrix is missing")
+        else:
+            for profile in ("workspace", "read-only", "strict"):
+                actual = profiles.get(profile)
+                operations = actual.get("operations") if isinstance(actual, dict) else None
+                if not isinstance(operations, dict):
+                    failures.append(f"post-launch alias operations missing ({profile})")
+                    continue
+                for name, value in operations.items():
+                    if not isinstance(value, dict):
+                        continue
+                    denied_alias_creation = (
+                        not name.endswith(".symlink") and value.get("ok") is True
+                    )
+                    if denied_alias_creation:
+                        failures.append(
+                            f"post-launch denied alias operation succeeded ({profile}/{name})"
+                        )
+                    if value.get("moved") is True or value.get("replaced") is True:
+                        failures.append(f"post-launch outside rename escaped ({profile}/{name})")
+                    if value.get("dereference_read") is True:
+                        failures.append(
+                            f"post-launch symlink dereference escaped ({profile}/{name})"
+                        )
+    inherited_fd = report.get("inherited_fd")
+    if not isinstance(inherited_fd, dict):
+        failures.append("inherited FD report is missing")
+    else:
+        profiles = inherited_fd.get("profiles")
+        if not isinstance(profiles, dict):
+            failures.append("inherited FD profile matrix is missing")
+        else:
+            for profile in ("workspace", "read-only", "strict"):
+                actual = profiles.get(profile)
+                if not isinstance(actual, dict):
+                    failures.append(f"inherited FD probe missing ({profile})")
+                elif actual.get("read") is True:
+                    failures.append(f"inherited sensitive FD bypassed Seatbelt ({profile})")
     network = report.get("network")
     if isinstance(network, dict):
         for profile, expected in (("workspace", True), ("read-only", False), ("strict", False)):
@@ -1906,6 +2615,9 @@ def _capability_matrix(report: dict[str, object]) -> dict[str, dict[str, str]]:
     inheritance = report.get("access_inheritance")
     mcp = report.get("mcp_stdio")
     pty_report = report.get("pty")
+    hardlink_scope = report.get("hardlink_scope")
+    post_launch = report.get("post_launch_alias_operations")
+    inherited_fd = report.get("inherited_fd")
     lifecycle = report.get("lifecycle")
     lifecycle_records: list[dict[str, object]] = []
     if isinstance(lifecycle, dict):
@@ -1926,6 +2638,21 @@ def _capability_matrix(report: dict[str, object]) -> dict[str, dict[str, str]]:
         access = inheritance.get(profile) if isinstance(inheritance, dict) else None
         mcp_item = mcp.get(profile) if isinstance(mcp, dict) else None
         pty_item = pty_report.get(profile) if isinstance(pty_report, dict) else None
+        hardlink_item = (
+            hardlink_scope.get("profiles", {}).get(profile)
+            if isinstance(hardlink_scope, dict) and isinstance(hardlink_scope.get("profiles"), dict)
+            else None
+        )
+        post_launch_item = (
+            post_launch.get("profiles", {}).get(profile)
+            if isinstance(post_launch, dict) and isinstance(post_launch.get("profiles"), dict)
+            else None
+        )
+        fd_item = (
+            inherited_fd.get("profiles", {}).get(profile)
+            if isinstance(inherited_fd, dict) and isinstance(inherited_fd.get("profiles"), dict)
+            else None
+        )
         fs_pass = isinstance(fs, dict) and all(
             (
                 fs.get("outside_read") == 0,
@@ -1951,12 +2678,34 @@ def _capability_matrix(report: dict[str, object]) -> dict[str, dict[str, str]]:
         )
         mcp_pass = isinstance(mcp_item, dict) and mcp_item.get("protocol_pong") is True
         pty_pass = isinstance(pty_item, dict) and pty_item.get("ready") is True
+        hardlink_pass = isinstance(hardlink_item, dict) and not any(
+            isinstance(value, dict)
+            and any(
+                value.get(operation) == 1
+                for operation in ("read", "append", "overwrite", "truncate")
+            )
+            for value in (hardlink_item.get("targets", {}) or {}).values()
+        )
+        post_launch_pass = isinstance(post_launch_item, dict) and not any(
+            isinstance(value, dict)
+            and (
+                (not str(name).endswith(".symlink") and value.get("ok") is True)
+                or value.get("moved") is True
+                or value.get("replaced") is True
+                or value.get("dereference_read") is True
+            )
+            for name, value in (post_launch_item.get("operations", {}) or {}).items()
+        )
+        inherited_fd_pass = isinstance(fd_item, dict) and fd_item.get("read") is not True
         matrix[profile.upper().replace("-", "_")] = {
             "filesystem": "PASS" if fs_pass else "BLOCKED",
             "network": "PASS" if net_pass else "BLOCKED",
             "access_control_inheritance": "PASS" if access_pass else "BLOCKED",
             "mcp_stdio": "PASS" if mcp_pass else "BLOCKED",
             "pty": "PASS" if pty_pass else "BLOCKED",
+            "preexisting_external_inode": "PASS" if hardlink_pass else "BLOCKED",
+            "post_launch_alias_creation": "PASS" if post_launch_pass else "BLOCKED",
+            "inherited_fd": "PASS" if inherited_fd_pass else "BLOCKED",
             "lifecycle": "PASS" if lifecycle_pass else "BLOCKED",
         }
     strict_runtime = report.get("strict_runtime")
@@ -2007,6 +2756,12 @@ def main() -> int:
                     listener, port = _start_listener()
                     try:
                         report["filesystem"] = harness.filesystem()
+                        report["hardlink_scope"] = harness.hardlink_scope()
+                        report["post_launch_alias_operations"] = (
+                            harness.post_launch_alias_operations()
+                        )
+                        report["inherited_fd"] = harness.inherited_fd_probe()
+                        report["inode_audit"] = harness.inode_audit()
                         report["python_subprocess"] = harness.python_subprocess(port)
                         report["strict_runtime"] = harness.strict_runtime()
                         report["network"] = harness.network(port)
