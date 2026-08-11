@@ -924,6 +924,31 @@ def _metadata() -> dict[str, object]:
                 "(allow process-fork) (allow process-exec) "
                 "(allow file-read*)"
             ),
+            "deny_default_process_system": (
+                "(version 1) (deny default) "
+                "(allow process-fork) (allow process-exec) "
+                '(allow file-read* (subpath "/System")) '
+                '(allow file-read* (subpath "/usr")) '
+                '(allow file-read* (subpath "/bin")) '
+                '(allow file-read* (subpath "/sbin")) '
+                '(allow file-read* (subpath "/private/etc")) '
+                '(allow file-read* (subpath "/dev")) '
+                '(allow file-read-metadata (subpath "/private")) '
+                "(allow sysctl-read)"
+            ),
+            "deny_default_process_system_var": (
+                "(version 1) (deny default) "
+                "(allow process-fork) (allow process-exec) "
+                '(allow file-read* (subpath "/System")) '
+                '(allow file-read* (subpath "/usr")) '
+                '(allow file-read* (subpath "/bin")) '
+                '(allow file-read* (subpath "/sbin")) '
+                '(allow file-read* (subpath "/private/etc")) '
+                '(allow file-read* (subpath "/private/var/db")) '
+                '(allow file-read* (subpath "/dev")) '
+                '(allow file-read-metadata (subpath "/private")) '
+                "(allow sysctl-read)"
+            ),
             "deny_default_process": (
                 "(version 1) (deny default) "
                 "(allow process-fork) (allow process-exec) "
