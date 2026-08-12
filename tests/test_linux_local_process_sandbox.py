@@ -388,6 +388,56 @@ class LinuxBubblewrapLocalProcessSandboxTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(call.kwargs["cwd"], workspace)
             self.assertEqual(call.kwargs["size"], TerminalSize(100, 30))
 
+    def test_pty_launch_audits_all_requested_workspace_roots(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace = (root / "workspace").resolve()
+            additional = (root / "additional").resolve()
+            outside = (root / "outside").resolve()
+            state_dir = (root / "controller-state").resolve()
+            workspace.mkdir()
+            additional.mkdir()
+            outside.mkdir()
+            state_dir.mkdir()
+            source = outside / "private.txt"
+            source.write_text("private", encoding="utf-8")
+            platform = mock.Mock()
+            adapter = self._adapter(
+                SandboxProfile.WORKSPACE,
+                workspace,
+                state_dir,
+                terminal_platform=platform,
+            )
+            alias = workspace / "private-alias.txt"
+            alias.hardlink_to(source)
+            request = SandboxedProcessRequest.exec(
+                "/usr/bin/python3",
+                ("-c", "pass"),
+                purpose=LocalProcessPurpose.INTERACTIVE_TERMINAL,
+                cwd=workspace,
+                sandbox_profile=SandboxProfile.WORKSPACE,
+                filesystem_policy=LocalProcessFilesystemPolicy(
+                    (
+                        LocalWorkspaceAccess(workspace, LocalWorkspaceAccessMode.READ_WRITE),
+                        LocalWorkspaceAccess(additional, LocalWorkspaceAccessMode.READ_WRITE),
+                    )
+                ),
+                network_policy=LocalProcessNetworkPolicy.INHERIT,
+                environment_policy=LocalProcessEnvironmentPolicy(),
+                stdio_mode=LocalProcessStdioMode.PTY,
+                lifecycle=LocalProcessLifecycle(),
+            )
+
+            with self.assertRaisesRegex(SandboxError, "outside the authorized roots"):
+                adapter.spawn_terminal(
+                    request,
+                    size=TerminalSize(100, 30),
+                    on_output=lambda data: None,
+                    on_eof=lambda: None,
+                    on_error=lambda error: None,
+                )
+            platform.spawn_exec.assert_not_called()
+
     async def test_real_read_only_child_cannot_write_when_network_namespace_is_available(
         self,
     ) -> None:

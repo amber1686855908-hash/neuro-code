@@ -84,9 +84,25 @@ Enabled Linux children use an independent PID namespace plus Bubblewrap's
 parent-death lifecycle, so a child-created `setsid()` descendant cannot escape
 termination with the namespace owner. `off` on POSIX retains only original
 process-group cleanup and makes no stronger arbitrary-descendant guarantee.
-The Linux adapter also rejects multiply hardlinked controller-state files before
-mounting an authorized workspace, preventing a workspace inode alias from
-reintroducing controller-private data.
+Before an enabled Linux child is mounted, the adapter performs a fail-closed
+authorized-workspace inode audit using the request's actual workspace roots.
+For every regular-file `(st_dev, st_ino)`, the number of directory entries
+found in the normalized authorized roots must equal `st_nlink`; otherwise a
+pre-existing external hardlink could reintroduce host-private data through a
+path inside the workspace. An inode that appears in both `READ_ONLY` and
+`READ_WRITE` roots is also rejected because the writable alias would upgrade
+the effective access to the whole inode. Internal `READ_WRITE`/`READ_WRITE`
+and `READ_ONLY`/`READ_ONLY` hardlinks remain valid. Symlinks are not followed,
+scan/stat errors fail closed, and the existing controller-state hardlink check
+is retained as defense in depth. The audit covers every root in the request,
+including additional roots, and a successful exact root/mode fingerprint is
+cached only for that sandbox instance.
+
+The evidence probes establish that an enabled child cannot create a new
+cross-boundary hardlink after launch. A trusted unsandboxed process running as
+the same host user remains outside the LocalProcessSandbox ownership boundary;
+the pre-launch audit therefore does not claim to defeat a concurrent hostile
+host process that already has the user's filesystem authority.
 
 The enabled Linux lifecycle boundary is owned by a pidfd for the outer
 Bubblewrap supervisor. `linux_pidfd.py` prefers the Python standard-library

@@ -48,6 +48,7 @@ from neuro_code.infrastructure.sandbox.linux_pidfd import (
     default_linux_pidfd_ops,
 )
 from neuro_code.infrastructure.sandbox.local_process import ProcessTreeOwnedLocalProcess
+from neuro_code.infrastructure.sandbox.posix_workspace_inode import PosixWorkspaceInodeAudit
 from neuro_code.infrastructure.sandbox.process_tree import ProcessTree
 from neuro_code.infrastructure.sandbox.sandbox import _trusted_system_executable, _within
 from neuro_code.shared.errors import SandboxError
@@ -204,6 +205,7 @@ class LinuxBubblewrapLocalProcessSandbox(LocalProcessSandbox):
         self._state_dir = state_dir.expanduser().resolve()
         self._bubblewrap = _trusted_system_executable("bwrap", self._workspace)
         self._runtime_mounts = self._runtime_mounts_for_host()
+        self._workspace_inode_audit = PosixWorkspaceInodeAudit()
         self._validate_controller_private_state()
         self._validate_pidfd_support(self._pidfd_ops)
         self._preflight()
@@ -314,6 +316,7 @@ class LinuxBubblewrapLocalProcessSandbox(LocalProcessSandbox):
         """
 
         self._validate_request(request)
+        self._workspace_inode_audit.ensure(request.filesystem_policy)
         args = [
             str(self._bubblewrap),
             "--die-with-parent",
@@ -455,21 +458,18 @@ class LinuxBubblewrapLocalProcessSandbox(LocalProcessSandbox):
         self._validate_controller_state_hardlinks()
 
     def _validate_controller_state_hardlinks(self) -> None:
-        """Reject aliases that would expose controller files through a workspace bind.
+        """Keep a narrow controller-state hardlink check as defense in depth.
 
-        A bind mount is path based, but a pre-existing hardlink inside an
-        authorized workspace names the same inode as its source.  Scanning the
-        entire workspace would be both expensive and insufficiently precise.
-        Controller state is the smaller security boundary, so enabled Linux
-        profiles fail closed when any regular controller-state file has more
-        than one link.  The sandboxed child cannot create a new link to an
-        unmounted state path after launch.
+        The authoritative request-scoped audit in
+        :class:`PosixWorkspaceInodeAudit` covers every authorized workspace
+        root. This smaller check runs during construction as an additional
+        guard for controller-private files before any request is built.
 
-        拒绝会通过工作区绑定暴露 controller 文件的 inode 别名.
+        保留狭窄的 controller 状态硬链接检查作为纵深防御.
 
-        绑定挂载以路径为边界,但工作区中预先存在的硬链接与源文件指向同一个 inode.
-        扫描整个工作区既昂贵也无法精确表达这一边界,因此只扫描规模更小的 controller
-        状态目录.启用的 Linux profile 遇到链接数大于一的常规状态文件时失败关闭.
+        :class:`PosixWorkspaceInodeAudit` 执行权威的请求范围审计,覆盖每个授权工作区
+        根目录.这个较小的检查在构造期间运行,作为构建请求之前针对 controller 私有
+        文件的额外保护.
         """
 
         if not self._state_dir.exists():

@@ -51,8 +51,18 @@ profile 实现，不被描述为操作系统隔离。没有具备对应 profile 
 
 启用的 Linux child 使用独立 PID 命名空间与 Bubblewrap 父进程死亡生命周期，因此 child 创建的
 `setsid()` 后代不能逃离命名空间所有者的终止。POSIX 上的 `off` 只保留原始进程组清理，不提供更强的
-任意后代保证。Linux 适配器还会在挂载授权工作区前拒绝存在多个硬链接的 controller 状态文件，防止工作区
-inode 别名重新引入 controller 私有数据。
+任意后代保证。
+
+在挂载启用的 Linux child 之前,适配器会根据请求实际携带的工作区根目录执行失败关闭的授权工作区 inode 审计。
+对于每个常规文件 `(st_dev, st_ino)`,规范化授权根目录内发现的目录项数量必须等于 `st_nlink`;否则预先存在的外部
+硬链接可能通过工作区内路径重新暴露宿主私有数据。同时出现在 `READ_ONLY` 与 `READ_WRITE` 根目录中的 inode
+也会被拒绝,因为可写别名会把整个 inode 的有效权限提升为可写。仅位于 `READ_WRITE` 根目录之间或仅位于
+`READ_ONLY` 根目录之间的内部硬链接仍然有效。审计不跟随符号链接,扫描/stat 错误会失败关闭,现有 controller 状态
+硬链接检查作为纵深防御保留。审计覆盖请求中的每个根目录(包括 additional roots);成功的精确根目录/模式指纹只在
+当前沙箱实例内缓存。
+
+证据探针已经证明启用的 child 启动后不能创建新的跨边界硬链接。以同一宿主用户运行的受信任沙箱外进程仍然不属于
+`LocalProcessSandbox` 的所有权边界;因此启动前审计不声称能够抵御一个已经拥有该用户文件系统权限的并发恶意宿主进程。
 
 启用 Linux 的生命周期边界由外层 Bubblewrap supervisor 的 pidfd 拥有。`linux_pidfd.py` 在两个包装器都存在时
 优先使用 Python 标准库接口。如果某个 Python 发行版没有编译出其中一个包装器，但运行中的 Linux libc 导出了
