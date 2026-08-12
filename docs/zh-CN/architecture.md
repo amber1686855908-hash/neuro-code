@@ -1071,9 +1071,10 @@ Windows CI 必须执行原生 Job Object 与 ConPTY 生命周期测试。
 接缝对启用的 Linux Bubblewrap 与 Windows Job Object 路径报告
 `STRONG_DESCENDANT_OWNERSHIP`，对普通 POSIX ProcessTree 报告
 `PROCESS_GROUP_BEST_EFFORT`。普通 Bash、background Bash、MCP stdio 和 PTY request 的最低要求是后者；
-如果 workload 显式要求强所有权，best-effort 适配器必须在创建 child 前失败关闭。未来 macOS
-Seatbelt policy 可以 enforced 文件系统/网络/访问控制，但仍然是 `PROCESS_GROUP_BEST_EFFORT`。
-详见 [ADR 0110](adr/0110-cross-platform-lifecycle-capability-contract.md)。
+如果 workload 显式要求强所有权，best-effort 适配器必须在创建 child 前失败关闭。启用的 macOS
+profile 使用 Seatbelt adapter 强制文件系统/网络/访问控制，并始终报告
+`PROCESS_GROUP_BEST_EFFORT`。详见 [ADR 0110](adr/0110-cross-platform-lifecycle-capability-contract.md)
+和 [ADR 0111](adr/0111-macos-seatbelt-local-process-sandbox.md)。
 
 ## Stage5DC ACP 生命周期 alias 兼容性
 

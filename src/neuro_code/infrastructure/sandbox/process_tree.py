@@ -119,6 +119,7 @@ class ProcessTree:
         is_windows = os.name == "nt"
         if os.name == "posix":
             options["start_new_session"] = True
+            options["close_fds"] = True
             options["pass_fds"] = pass_fds
         elif pass_fds:
             raise ValueError("pass_fds is supported only by the POSIX process adapter")

@@ -60,12 +60,12 @@ member; termination algorithms and grace/force bounds are unchanged.
 | Linux enabled Bubblewrap | Enforced by the existing child-scoped adapter | `STRONG_DESCENDANT_OWNERSHIP` |
 | Windows Job Object / ConPTY Job | Existing Job and handle boundaries | `STRONG_DESCENDANT_OWNERSHIP` |
 | POSIX `ProcessTree` (`off`) | No OS sandbox claim | `PROCESS_GROUP_BEST_EFFORT` |
-| Future macOS Seatbelt adapter | Seatbelt filesystem/network/access-control may be enforced | `PROCESS_GROUP_BEST_EFFORT` |
+| macOS Seatbelt adapter (ADR 0111) | Enforced filesystem/network/access control | `PROCESS_GROUP_BEST_EFFORT` |
 
-The future macOS adapter is not part of this ADR's implementation. Endpoint
-Security, a System Extension, a privileged helper, and any other hardened
-macOS architecture remain future candidates and are not lifecycle solutions in
-this phase.
+The adapter is implemented by the later [ADR 0111](0111-macos-seatbelt-local-process-sandbox.md).
+Endpoint Security, a System Extension, a privileged helper, and any other
+hardened macOS architecture remain future candidates and are not lifecycle
+solutions in this phase.
 
 ## Call-site and compatibility boundaries
 

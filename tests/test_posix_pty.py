@@ -90,6 +90,46 @@ raise SystemExit(7)
             finally:
                 session.close()
 
+    def test_spawn_closes_inheritable_controller_file_descriptors(self) -> None:
+        output = bytearray()
+        lock = threading.Lock()
+
+        def capture(data: bytes) -> None:
+            with lock:
+                output.extend(data)
+
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            sensitive = root / "sensitive"
+            sensitive.write_text("controller-secret", encoding="utf-8")
+            descriptor = os.open(sensitive, os.O_RDONLY)
+            try:
+                os.set_inheritable(descriptor, True)
+                details = os.fstat(descriptor)
+                code = (
+                    "import os,sys; fd=int(sys.argv[1]); expected=(int(sys.argv[2]),int(sys.argv[3]));"
+                    "\ntry: actual=(os.fstat(fd).st_dev,os.fstat(fd).st_ino)"
+                    "\nexcept OSError: actual=None"
+                    "\nprint('inherited' if actual == expected else 'closed', flush=True)"
+                )
+                session = PosixPtySession.spawn(
+                    sys.executable,
+                    ("-c", code, str(descriptor), str(details.st_dev), str(details.st_ino)),
+                    cwd=root,
+                    env=os.environ,
+                    size=TerminalSize(80, 24),
+                    on_output=capture,
+                    on_eof=lambda: None,
+                    on_error=lambda _: None,
+                )
+                try:
+                    captured = self._wait_for_output(output, lock, b"closed")
+                    self.assertNotIn(b"inherited", captured)
+                finally:
+                    session.close()
+            finally:
+                os.close(descriptor)
+
     def test_interrupt_targets_the_owned_process_group(self) -> None:
         output = bytearray()
         lock = threading.Lock()
