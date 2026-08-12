@@ -636,7 +636,7 @@ def _journal_records(path: Path) -> list[dict[str, object]]:
 
 
 def _journal_phase_a(api: _WinApi, root: Path, journal: Path, stage: str) -> NoReturn:
-    profile = _Profile(api, _profile_name(f"crash-{stage}"))
+    profile = _Profile(api, _profile_name("crash-a" if stage == "after-mutation" else "crash-b"))
     identity = _object_identity(api, root)
     prepared = {
         "state": "PREPARED",
@@ -1022,7 +1022,7 @@ def _crash_recovery_gate(
 ) -> tuple[dict[str, object], dict[str, object]]:
     crash_root = fixture / "crash-root"
     crash_root.mkdir()
-    unrelated_name = _profile_name("crash-unrelated")
+    unrelated_name = _profile_name("crash-u")
     unrelated = _Profile(api, unrelated_name)
     _grant(crash_root, unrelated.sid_text, "(RX)")
     unrelated_before = _contains_sid(api, crash_root, unrelated.sid_text)
@@ -1043,7 +1043,7 @@ def _crash_recovery_gate(
     records_before = _journal_records(journal)
     stale_sid = cast(str, records_before[0]["sid"])
     stale_present = _contains_sid(api, crash_root, stale_sid)
-    concurrent_name = _profile_name("crash-concurrent")
+    concurrent_name = _profile_name("crash-c")
     concurrent = _Profile(api, concurrent_name)
     _grant(crash_root, concurrent.sid_text, "(RX)")
     recovery = _recover_journal(api, journal)

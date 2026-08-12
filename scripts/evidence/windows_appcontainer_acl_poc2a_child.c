@@ -161,7 +161,7 @@ static int run_rw(const wchar_t *root, const wchar_t *report) {
     dir_ok = CreateDirectoryW(directory, NULL);
     rename_ok = MoveFileExW(created, renamed, 0);
     replace_ok = write_utf8_file(replacement, "replacement") &&
-                 ReplaceFileW(existing, replacement, NULL, 0, NULL, NULL);
+                 MoveFileExW(replacement, existing, MOVEFILE_REPLACE_EXISTING);
     delete_ok = DeleteFileW(renamed) && RemoveDirectoryW(directory);
     ads_ok = write_utf8_file(ads, "ads-authorized");
     handle = CreateFileW(existing, WRITE_OWNER, 0, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
