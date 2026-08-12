@@ -22,6 +22,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import traceback
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -2276,11 +2277,18 @@ def _real_shell_cancellation_gate(
 def _token_facts(api: _WinApi) -> dict[str, object]:
     facts = _controller_token_facts(api)
     facts["user_sid"] = _controller_user_sid()
+    whoami = Path(os.environ.get("SYSTEMROOT", r"C:\Windows")) / "System32" / "whoami.exe"
     groups = subprocess.run(
-        ["whoami", "/groups", "/fo", "csv"], capture_output=True, text=True, check=False
+        [str(whoami), "/groups", "/fo", "csv"],
+        capture_output=True,
+        text=True,
+        check=False,
     ).stdout
     privileges = subprocess.run(
-        ["whoami", "/priv", "/fo", "csv"], capture_output=True, text=True, check=False
+        [str(whoami), "/priv", "/fo", "csv"],
+        capture_output=True,
+        text=True,
+        check=False,
     ).stdout
     if "Medium Mandatory Level" in groups:
         integrity = "MEDIUM"
@@ -2294,7 +2302,7 @@ def _token_facts(api: _WinApi) -> dict[str, object]:
         {
             "integrity_level": integrity,
             "whoami": subprocess.run(
-                ["whoami"], capture_output=True, text=True, check=False
+                [str(whoami)], capture_output=True, text=True, check=False
             ).stdout.strip(),
             "privileges_csv": privileges,
         }
@@ -3659,7 +3667,11 @@ def main() -> int:
             "mode": "REAL_STANDARD_USER_LOGON" if args.standard_user else "CONTROLLER",
             "overall": "FAIL",
             "critical_failures": ["UNCAUGHT_HARNESS_ERROR"],
-            "harness_error": {"type": type(error).__name__, "message": str(error)},
+            "harness_error": {
+                "type": type(error).__name__,
+                "message": str(error),
+                "traceback": traceback.format_exc(),
+            },
         }
         Path(args.report).write_text(
             json.dumps(failure, indent=2, sort_keys=True) + "\n", encoding="utf-8"
