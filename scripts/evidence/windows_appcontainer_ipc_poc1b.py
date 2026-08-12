@@ -880,7 +880,10 @@ def _create_named_pipe(api: _WinApi, profile: _Profile) -> _NamedPipe:
     if not api.process_id_to_session_id(api.get_current_process_id(), ctypes.byref(session_id)):
         api.error("ProcessIdToSessionId")
     server_name = rf"\\.\pipe\Sessions\{session_id.value}\{object_path.lstrip(chr(92))}\{leaf}"
-    configured_sddl = f"D:P(A;;GA;;;SY)(A;;GRGW;;;{profile.sid_text})S:(ML;;NW;;;LW)"
+    controller_sid = _controller_user_sid()
+    configured_sddl = (
+        f"D:P(A;;GA;;;SY)(A;;GRGW;;;{controller_sid})(A;;GRGW;;;{profile.sid_text})S:(ML;;NW;;;LW)"
+    )
     descriptor = ctypes.c_void_p()
     if not api.convert_sddl(
         configured_sddl,
@@ -1167,30 +1170,42 @@ def _unauthorized_client_gate(
     child: Path,
 ) -> dict[str, object]:
     pipe: _NamedPipe | None = None
-    completed: subprocess.CompletedProcess[str] | None = None
+    unauthorized_profile: _Profile | None = None
+    process: _CreatedProcess | None = None
     try:
         pipe = _create_named_pipe(api, launcher.profile)
-        completed = subprocess.run(
-            [str(child), "pipe-denied", pipe.server_name],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=20,
+        unauthorized_profile = _Profile(
+            api,
+            f"NeuroCode.Poc1B.Unauthorized.{uuid.uuid4().hex}",
         )
-        observation = json.loads(completed.stdout.strip())
+        acl_command = _grant_fixture(child.parent, unauthorized_profile.sid_text)
+        unauthorized_launcher = _Launcher(api, unauthorized_profile, child.parent)
+        with WindowsJobObject.create() as job:
+            process = unauthorized_launcher.spawn_appcontainer(
+                child,
+                ["pipe-denied", pipe.server_name],
+                job_handle=job.process_creation_handle,
+            )
+            api.close(process.thread_handle)
+            process.thread_handle = 0
+            exact_job = _is_in_job(api, process.process_handle, job.process_creation_handle)
+            exit_code = _wait_exit(api, process, 20000)
         passed = bool(
-            completed.returncode == 0
-            and isinstance(observation, dict)
-            and observation.get("connected") is False
-            and observation.get("error") == _ERROR_ACCESS_DENIED
+            exit_code == 0
+            and exact_job
+            and unauthorized_profile.sid_text.casefold() != launcher.profile.sid_text.casefold()
         )
         return _status(
             passed,
             {
+                "probe_is_appcontainer": True,
                 "probe_is_target_appcontainer": False,
-                "exit_code": completed.returncode,
-                "observation": observation,
-                "expected_win32_error": _ERROR_ACCESS_DENIED,
+                "target_appcontainer_sid": launcher.profile.sid_text,
+                "probe_appcontainer_sid": unauthorized_profile.sid_text,
+                "fixture_acl_command": acl_command,
+                "exit_code": exit_code,
+                "observed_win32_error_by_child_contract": _ERROR_ACCESS_DENIED,
+                "exact_job_membership": exact_job,
                 "configured_sddl": pipe.configured_sddl,
                 "effective_dacl_sddl": pipe.effective_dacl_sddl,
                 "client_pipe_name": pipe.client_name,
@@ -1207,10 +1222,17 @@ def _unauthorized_client_gate(
             {
                 "error_type": type(error).__name__,
                 "error": str(error),
-                "exit_code": completed.returncode if completed else None,
+                "target_appcontainer_sid": launcher.profile.sid_text,
+                "probe_appcontainer_sid": (
+                    unauthorized_profile.sid_text if unauthorized_profile else None
+                ),
             },
         )
     finally:
+        _close_process(api, process)
+        if unauthorized_profile is not None:
+            with contextlib.suppress(BaseException):
+                unauthorized_profile.close()
         _close_named_pipe(api, pipe)
 
 
