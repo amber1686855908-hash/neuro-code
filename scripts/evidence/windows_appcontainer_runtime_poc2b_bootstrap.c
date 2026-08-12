@@ -598,6 +598,82 @@ cleanup:
     return result;
 }
 
+static int relay_json_lines_mode(const wchar_t *name, const wchar_t *command_line) {
+    HANDLE pipe = connect_local_pipe(name);
+    CHILD_PIPES target;
+    BYTE kind;
+    BYTE *payload = NULL;
+    DWORD length = 0;
+    BYTE *stderr_payload = NULL;
+    DWORD stderr_length = 0;
+    DWORD exit_code = 0;
+    char facts[2048];
+    char target_json[128];
+    int target_json_length;
+    BOOL target_in_job = FALSE;
+    int index;
+    int result = 101;
+
+    ZeroMemory(&target, sizeof(target));
+    if (pipe == INVALID_HANDLE_VALUE) return (int)GetLastError();
+    token_facts(facts, sizeof(facts));
+    if (!send_frame(pipe, FRAME_HELLO, facts, (DWORD)strlen(facts)) ||
+        !spawn_command(command_line, &target)) {
+        goto cleanup;
+    }
+    IsProcessInJob(target.process.hProcess, NULL, &target_in_job);
+    target_json_length = _snprintf_s(
+        target_json,
+        sizeof(target_json),
+        _TRUNCATE,
+        "{\"pid\":%lu,\"in_job\":%s}",
+        target.process.dwProcessId,
+        target_in_job ? "true" : "false");
+    if (target_json_length < 0 ||
+        !send_frame(pipe, FRAME_TARGET, target_json, (DWORD)target_json_length)) {
+        goto cleanup;
+    }
+    for (index = 0; index < 4; index++) {
+        BYTE *response = NULL;
+        DWORD response_length = 0;
+        if (!receive_frame(pipe, &kind, &payload, &length) || kind != FRAME_DATA ||
+            !write_all(target.stdin_write, payload, length)) {
+            if (response != NULL) HeapFree(GetProcessHeap(), 0, response);
+            goto cleanup;
+        }
+        if (payload != NULL) HeapFree(GetProcessHeap(), 0, payload);
+        payload = NULL;
+        if (index != 1) {
+            if (!read_line(target.stdout_read, &response, &response_length) ||
+                !send_frame(pipe, FRAME_STDOUT, response, response_length)) {
+                if (response != NULL) HeapFree(GetProcessHeap(), 0, response);
+                goto cleanup;
+            }
+            HeapFree(GetProcessHeap(), 0, response);
+        }
+    }
+    if (!receive_frame(pipe, &kind, &payload, &length) || kind != FRAME_EOF) goto cleanup;
+    if (payload != NULL) HeapFree(GetProcessHeap(), 0, payload);
+    payload = NULL;
+    CloseHandle(target.stdin_write);
+    target.stdin_write = NULL;
+    if (!read_all(target.stderr_read, &stderr_payload, &stderr_length) ||
+        WaitForSingleObject(target.process.hProcess, 60000) != WAIT_OBJECT_0 ||
+        !GetExitCodeProcess(target.process.hProcess, &exit_code) ||
+        !send_frame(pipe, FRAME_STDERR, stderr_payload, stderr_length) ||
+        !send_frame(pipe, FRAME_EXIT, &exit_code, sizeof(exit_code))) {
+        goto cleanup;
+    }
+    result = 0;
+
+cleanup:
+    if (payload != NULL) HeapFree(GetProcessHeap(), 0, payload);
+    if (stderr_payload != NULL) HeapFree(GetProcessHeap(), 0, stderr_payload);
+    close_child(&target);
+    if (pipe != INVALID_HANDLE_VALUE) CloseHandle(pipe);
+    return result;
+}
+
 static int network_pipe_mode(
     const wchar_t *name,
     const wchar_t *host,
@@ -1016,6 +1092,8 @@ int wmain(int argc, wchar_t **argv) {
         return byte_stream_mode(argv[2]);
     if (wcscmp(argv[1], L"relay-command") == 0 && argc == 5)
         return relay_command_mode(argv[2], argv[3], argv[4]);
+    if (wcscmp(argv[1], L"relay-json-lines") == 0 && argc == 4)
+        return relay_json_lines_mode(argv[2], argv[3]);
     if (wcscmp(argv[1], L"network-pipe") == 0 && argc == 5)
         return network_pipe_mode(argv[2], argv[3], argv[4]);
     if (wcscmp(argv[1], L"nul-pipe") == 0 && argc == 3)

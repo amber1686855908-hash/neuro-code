@@ -2504,30 +2504,76 @@ def _mcp_gate(
             "params": {"name": "echo", "arguments": {"text": "runtime-poc2b"}},
         },
     ]
-    payload = b"".join(
-        json.dumps(request, separators=(",", ":")).encode("utf-8") + b"\n" for request in requests
-    )
-    gate = _command_relay_gate(
-        api,
-        launcher,
-        bootstrap,
-        [str(python), str(mcp_server)],
-        input_payload=payload,
-        drain_delay_ms=1000,
-    )
-    detail = cast(dict[str, object], gate["detail"])
     responses: list[dict[str, object]] = []
-    clean = True
-    for line in str(detail.get("stdout_text", "")).splitlines():
-        try:
-            value = json.loads(line)
-        except ValueError:
-            clean = False
-            continue
-        if not isinstance(value, dict):
-            clean = False
-            continue
-        responses.append(cast(dict[str, object], value))
+    pipe: _NamedPipe | None = None
+    process: _CreatedProcess | None = None
+    target_handle = 0
+    detail: dict[str, object] = {"requests": requests}
+    base_pass = False
+    try:
+        pipe = _create_named_pipe(api, launcher.profile)
+        with _EvidenceJob.create(api) as job:
+            process = launcher.spawn_appcontainer(
+                bootstrap,
+                [
+                    "relay-json-lines",
+                    pipe.client_name,
+                    subprocess.list2cmdline([str(python), str(mcp_server)]),
+                ],
+                job_handle=job.process_creation_handle,
+            )
+            api.close(process.thread_handle)
+            process.thread_handle = 0
+            client_pid = _connect_named_pipe(api, pipe, process)
+            bootstrap_facts = _receive_json_frame(api, pipe.handle, _FRAME_HELLO)
+            target = _receive_json_frame(api, pipe.handle, _FRAME_TARGET)
+            target_handle = _open_process(api, cast(int, target["pid"]))
+            target_job = _is_in_job(api, target_handle, job.process_creation_handle)
+            for index, request in enumerate(requests):
+                encoded = json.dumps(request, separators=(",", ":")).encode("utf-8") + b"\n"
+                _send_frame(api, pipe.handle, _FRAME_DATA, encoded)
+                if index != 1:
+                    kind, payload = _receive_frame(api, pipe.handle)
+                    if kind != _FRAME_STDOUT:
+                        raise OSError(f"unexpected MCP response frame {kind!r}")
+                    value = json.loads(payload.decode("utf-8"))
+                    if not isinstance(value, dict):
+                        raise OSError("MCP response was not an object")
+                    responses.append(cast(dict[str, object], value))
+            _send_frame(api, pipe.handle, _FRAME_EOF)
+            stderr_kind, stderr = _receive_frame(api, pipe.handle)
+            exit_kind, exit_payload = _receive_frame(api, pipe.handle)
+            bootstrap_exit = _wait_exit(api, process)
+            target_exit = struct.unpack("<I", exit_payload)[0] if len(exit_payload) == 4 else None
+            base_pass = bool(
+                client_pid == process.pid
+                and _valid_appcontainer_facts(bootstrap_facts, launcher.profile.sid_text)
+                and target_job
+                and stderr_kind == _FRAME_STDERR
+                and exit_kind == _FRAME_EXIT
+                and target_exit == 0
+                and bootstrap_exit == 0
+            )
+            detail.update(
+                {
+                    "bootstrap_facts": bootstrap_facts,
+                    "target": target,
+                    "target_exact_job_membership": target_job,
+                    "stderr_hex": stderr.hex(),
+                    "stderr_text": stderr.decode("utf-8", errors="replace"),
+                    "target_exit_code": target_exit,
+                    "bootstrap_exit_code": bootstrap_exit,
+                    "stdout_protocol_clean": True,
+                    "stderr_isolated": True,
+                    "interactive_request_response": True,
+                }
+            )
+    except BaseException as error:
+        detail.update({"error_type": type(error).__name__, "error": str(error)})
+    finally:
+        api.close(target_handle)
+        _close_named_pipe(api, pipe)
+        _close_process(api, process)
     by_id = {value.get("id"): value for value in responses}
     tool_result_text = ""
     call_result = cast(dict[str, object], by_id.get(3, {}).get("result", {}))
@@ -2539,17 +2585,12 @@ def _mcp_gate(
         isolation = cast(dict[str, object], json.loads(tool_result_text))
     detail.update(
         {
-            "requests": requests,
             "response_ids": sorted(value for value in by_id if isinstance(value, int)),
-            "stdout_protocol_clean": clean,
-            "stderr_isolated": True,
             "tool_result": isolation,
         }
     )
     passed = bool(
-        gate["status"] == "PASS"
-        and detail.get("target_exit_code") == 0
-        and clean
+        base_pass
         and set(by_id) >= {1, 2, 3}
         and "echo" in json.dumps(by_id[2])
         and isolation.get("echo") == "runtime-poc2b"
@@ -2557,8 +2598,7 @@ def _mcp_gate(
         and cast(dict[str, object], isolation.get("outside", {})).get("read") is False
         and cast(dict[str, object], isolation.get("host", {})).get("read") is False
     )
-    gate["status"] = "PASS" if passed else "FAIL"
-    return gate
+    return _status(passed, detail)
 
 
 def _real_conpty_gate(
@@ -2931,25 +2971,16 @@ def _create_standard_user_and_run(
         created = True
         _run_checked(["icacls", str(public_root), "/grant", f"{username}:(OI)(CI)(M)"])
         standard_python = Path(sys.base_prefix) / "python.exe"
-        child_command = subprocess.list2cmdline(
-            [
-                str(standard_python),
-                str(script),
-                "--standard-user",
-                "--bootstrap",
-                str(bootstrap),
-                "--report",
-                str(child_report),
-            ]
-        )
         command = ctypes.create_unicode_buffer(
             subprocess.list2cmdline(
                 [
-                    str(Path(os.environ.get("COMSPEC", r"C:\Windows\System32\cmd.exe"))),
-                    "/d",
-                    "/s",
-                    "/c",
-                    f'{child_command} > "{child_stdout}" 2> "{child_stderr}"',
+                    str(standard_python),
+                    str(script),
+                    "--standard-user",
+                    "--bootstrap",
+                    str(bootstrap),
+                    "--report",
+                    str(child_report),
                 ]
             )
         )
@@ -2983,7 +3014,7 @@ def _create_standard_user_and_run(
             ".",
             password,
             _LOGON_WITH_PROFILE,
-            str(Path(environment["COMSPEC"])),
+            str(standard_python),
             command,
             _CREATE_UNICODE_ENVIRONMENT | _CREATE_NO_WINDOW,
             environment_block,
@@ -3620,7 +3651,21 @@ def main() -> int:
     parser.add_argument("--report", required=True)
     parser.add_argument("--standard-user", action="store_true")
     args = parser.parse_args()
-    _, passed = _standard_user_run(args) if args.standard_user else _main_run(args)
+    try:
+        _, passed = _standard_user_run(args) if args.standard_user else _main_run(args)
+    except BaseException as error:
+        failure = {
+            "classification": "EVIDENCE_ONLY_DO_NOT_MERGE",
+            "mode": "REAL_STANDARD_USER_LOGON" if args.standard_user else "CONTROLLER",
+            "overall": "FAIL",
+            "critical_failures": ["UNCAUGHT_HARNESS_ERROR"],
+            "harness_error": {"type": type(error).__name__, "message": str(error)},
+        }
+        Path(args.report).write_text(
+            json.dumps(failure, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        print(json.dumps(failure, indent=2, sort_keys=True))
+        passed = False
     return 0 if passed else 1
 
 
