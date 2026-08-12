@@ -428,7 +428,7 @@ static int byte_stream_mode(const wchar_t *name) {
     BYTE *payload = NULL;
     DWORD length = 0;
     char facts[2048];
-    if (pipe == INVALID_HANDLE_VALUE) return 90;
+    if (pipe == INVALID_HANDLE_VALUE) return (int)GetLastError();
     token_facts(facts, sizeof(facts));
     if (!send_frame(pipe, FRAME_HELLO, facts, (DWORD)strlen(facts)) ||
         !receive_frame(pipe, &kind, &payload, &length) || kind != FRAME_DATA ||
@@ -458,7 +458,7 @@ static int relay_stdio_mode(const wchar_t *name) {
     int result = 100;
 
     ZeroMemory(&target, sizeof(target));
-    if (pipe == INVALID_HANDLE_VALUE) return 101;
+    if (pipe == INVALID_HANDLE_VALUE) return (int)GetLastError();
     token_facts(facts, sizeof(facts));
     if (!send_frame(pipe, FRAME_HELLO, facts, (DWORD)strlen(facts)) ||
         !spawn_target(L"stdio-target", &target) ||
@@ -507,7 +507,7 @@ static int relay_mcp_mode(const wchar_t *name) {
     int index;
     int result = 110;
     ZeroMemory(&target, sizeof(target));
-    if (pipe == INVALID_HANDLE_VALUE) return 111;
+    if (pipe == INVALID_HANDLE_VALUE) return (int)GetLastError();
     token_facts(facts, sizeof(facts));
     if (!send_frame(pipe, FRAME_HELLO, facts, (DWORD)strlen(facts)) ||
         !spawn_target(L"mcp-target", &target) ||
@@ -563,7 +563,7 @@ static int relay_cancel_mode(const wchar_t *name) {
     DWORD received = 0;
     int result = 120;
     ZeroMemory(&target, sizeof(target));
-    if (pipe == INVALID_HANDLE_VALUE) return 121;
+    if (pipe == INVALID_HANDLE_VALUE) return (int)GetLastError();
     token_facts(facts, sizeof(facts));
     if (!send_frame(pipe, FRAME_HELLO, facts, (DWORD)strlen(facts)) ||
         !spawn_target(L"hold-target", &target) ||

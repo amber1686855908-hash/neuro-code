@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import csv
 import ctypes
+import io
 import json
 import os
 import platform
@@ -859,7 +861,19 @@ def _create_named_pipe(api: _WinApi, appcontainer_sid: str) -> _NamedPipe:
             api.local_free(descriptor)
 
 
-def _connect_named_pipe(api: _WinApi, pipe: _NamedPipe, timeout_seconds: float = 15) -> int:
+def _process_exit_code(api: _WinApi, process: _CreatedProcess) -> int:
+    exit_code = ctypes.c_uint32()
+    if not api.exit_code(process.process_handle, ctypes.byref(exit_code)):
+        api.error("GetExitCodeProcess")
+    return int(exit_code.value)
+
+
+def _connect_named_pipe(
+    api: _WinApi,
+    pipe: _NamedPipe,
+    process: _CreatedProcess,
+    timeout_seconds: float = 15,
+) -> int:
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
         if api.connect_named_pipe(pipe.handle, None):
@@ -869,6 +883,13 @@ def _connect_named_pipe(api: _WinApi, pipe: _NamedPipe, timeout_seconds: float =
             break
         if error != _ERROR_PIPE_LISTENING:
             raise OSError(error, f"ConnectNamedPipe failed with Windows error {error}")
+        if int(api.wait(process.process_handle, 0)) == _WAIT_OBJECT_0:
+            exit_code = _process_exit_code(api, process)
+            raise ChildProcessError(
+                exit_code,
+                f"AppContainer bootstrap exited before pipe connection; "
+                f"exit/Win32 code {exit_code}",
+            )
         time.sleep(0.025)
     else:
         raise TimeoutError("bounded named-pipe connection timed out")
@@ -897,7 +918,10 @@ def _make_anonymous_pipe(
 ) -> tuple[int, int]:
     descriptor = ctypes.c_void_p()
     if appcontainer_sid is not None:
-        sddl = f"D:P(A;;GA;;;SY)(A;;GA;;;{appcontainer_sid})S:(ML;;NW;;;LW)"
+        controller_sid = _controller_user_sid()
+        sddl = (
+            f"D:P(A;;GA;;;SY)(A;;GA;;;{controller_sid})(A;;GA;;;{appcontainer_sid})S:(ML;;NW;;;LW)"
+        )
         if not api.convert_sddl(sddl, _SDDL_REVISION_1, ctypes.byref(descriptor), None):
             api.error("ConvertStringSecurityDescriptorToSecurityDescriptorW(anonymous pipe)")
     security = _SecurityAttributes(ctypes.sizeof(_SecurityAttributes), descriptor.value, True)
@@ -920,6 +944,19 @@ def _make_anonymous_pipe(
     if not api.set_handle_information(parent_handle, _HANDLE_FLAG_INHERIT, 0):
         api.error("SetHandleInformation(parent pipe end)")
     return read_value, write_value
+
+
+def _controller_user_sid() -> str:
+    completed = subprocess.run(
+        ["whoami", "/user", "/fo", "csv", "/nh"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    rows = list(csv.reader(io.StringIO(completed.stdout)))
+    if len(rows) != 1 or len(rows[0]) < 2 or not rows[0][1].startswith("S-1-"):
+        raise OSError(f"unable to parse controller SID from whoami: {rows!r}")
+    return rows[0][1]
 
 
 def _controller_token_facts(api: _WinApi) -> dict[str, object]:
@@ -1006,7 +1043,7 @@ def _named_pipe_connect_gate(
             process = _spawn_pipe_bootstrap(launcher, child, "byte-stream", pipe, job)
             api.close(process.thread_handle)
             process.thread_handle = 0
-            client_pid = _connect_named_pipe(api, pipe)
+            client_pid = _connect_named_pipe(api, pipe, process)
             facts = _receive_json_frame(api, pipe.handle, _FRAME_HELLO)
             exact_job = _is_in_job(api, process.process_handle, job.process_creation_handle)
             payload = (
@@ -1124,7 +1161,7 @@ def _stdio_relay_gate(
             process = _spawn_pipe_bootstrap(launcher, child, "relay-stdio", pipe, job)
             api.close(process.thread_handle)
             process.thread_handle = 0
-            client_pid = _connect_named_pipe(api, pipe)
+            client_pid = _connect_named_pipe(api, pipe, process)
             bootstrap = _receive_json_frame(api, pipe.handle, _FRAME_HELLO)
             target = _receive_json_frame(api, pipe.handle, _FRAME_TARGET)
             target_pid = cast(int, target["pid"])
@@ -1201,7 +1238,7 @@ def _mcp_relay_gate(
             process = _spawn_pipe_bootstrap(launcher, child, "relay-mcp", pipe, job)
             api.close(process.thread_handle)
             process.thread_handle = 0
-            client_pid = _connect_named_pipe(api, pipe)
+            client_pid = _connect_named_pipe(api, pipe, process)
             bootstrap = _receive_json_frame(api, pipe.handle, _FRAME_HELLO)
             target = _receive_json_frame(api, pipe.handle, _FRAME_TARGET)
             target_handle = _open_process(api, cast(int, target["pid"]))
@@ -1273,7 +1310,7 @@ def _cancellation_gate(
             process = _spawn_pipe_bootstrap(launcher, child, "relay-cancel", pipe, job)
             api.close(process.thread_handle)
             process.thread_handle = 0
-            client_pid = _connect_named_pipe(api, pipe)
+            client_pid = _connect_named_pipe(api, pipe, process)
             bootstrap = _receive_json_frame(api, pipe.handle, _FRAME_HELLO)
             target = _receive_json_frame(api, pipe.handle, _FRAME_TARGET)
             ready_kind, _ = _receive_frame(api, pipe.handle)
