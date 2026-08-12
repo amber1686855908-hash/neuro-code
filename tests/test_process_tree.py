@@ -60,6 +60,46 @@ class _WindowsJobFixture:
 
 @unittest.skipUnless(hasattr(os, "killpg"), "POSIX process-group API required")
 class ProcessTreeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_posix_spawn_closes_inheritable_fds_unless_explicitly_passed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sensitive = root / "sensitive"
+            sensitive.write_text("controller-secret", encoding="utf-8")
+            descriptor = os.open(sensitive, os.O_RDONLY)
+            try:
+                os.set_inheritable(descriptor, True)
+                details = os.fstat(descriptor)
+                code = (
+                    "import os,sys; fd=int(sys.argv[1]); expected=(int(sys.argv[2]),int(sys.argv[3]));"
+                    "\ntry: actual=(os.fstat(fd).st_dev,os.fstat(fd).st_ino)"
+                    "\nexcept OSError: actual=None"
+                    "\nprint('inherited' if actual == expected else 'closed', flush=True)"
+                )
+                closed_tree = await ProcessTree.spawn_exec(
+                    sys.executable,
+                    ("-c", code, str(descriptor), str(details.st_dev), str(details.st_ino)),
+                    cwd=root,
+                    env=os.environ,
+                )
+                assert closed_tree.process.stdout is not None
+                self.assertEqual((await closed_tree.process.stdout.readline()).strip(), b"closed")
+                self.assertEqual(await closed_tree.wait(), 0)
+
+                passed_tree = await ProcessTree.spawn_exec(
+                    sys.executable,
+                    ("-c", code, str(descriptor), str(details.st_dev), str(details.st_ino)),
+                    cwd=root,
+                    env=os.environ,
+                    pass_fds=(descriptor,),
+                )
+                assert passed_tree.process.stdout is not None
+                self.assertEqual(
+                    (await passed_tree.process.stdout.readline()).strip(), b"inherited"
+                )
+                self.assertEqual(await passed_tree.wait(), 0)
+            finally:
+                os.close(descriptor)
+
     async def test_posix_termination_retries_transient_permission_error_after_reap(self) -> None:
         process = _FastExitProcess()
         tree = ProcessTree(cast(asyncio.subprocess.Process, process), process.pid)

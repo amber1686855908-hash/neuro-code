@@ -51,10 +51,11 @@ deprecated 兼容成员保留；终止算法以及 grace/force 边界保持不�
 | Linux enabled Bubblewrap | 由现有 child-scoped 适配器强制执行 | `STRONG_DESCENDANT_OWNERSHIP` |
 | Windows Job Object / ConPTY Job | 现有 Job 与句柄边界 | `STRONG_DESCENDANT_OWNERSHIP` |
 | POSIX `ProcessTree`（`off`） | 不声称 OS sandbox | `PROCESS_GROUP_BEST_EFFORT` |
-| 未来 macOS Seatbelt 适配器 | Seatbelt 文件系统/网络/访问控制可以 enforced | `PROCESS_GROUP_BEST_EFFORT` |
+| macOS Seatbelt 适配器（ADR 0111） | 强制文件系统/网络/访问控制 | `PROCESS_GROUP_BEST_EFFORT` |
 
-未来 macOS 适配器不属于本 ADR 的实现范围。Endpoint Security、System Extension、privileged
-helper 以及其他 hardened macOS architecture 都是未来候选，本阶段不把它们当作生命周期方案。
+该适配器由后续 [ADR 0111](0111-macos-seatbelt-local-process-sandbox.md) 实现。Endpoint Security、
+System Extension、privileged helper 以及其他 hardened macOS architecture 仍是未来候选，
+本阶段不把它们当作生命周期方案。
 
 ## 调用方与兼容边界
 

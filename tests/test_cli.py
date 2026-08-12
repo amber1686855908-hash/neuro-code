@@ -1021,6 +1021,7 @@ api_key_env = "FIXTURE_KEY"
                     "neuro_code.bootstrap.composition.LinuxBubblewrapLocalProcessSandbox",
                     return_value=object(),
                 ) as create_local_sandbox,
+                patch("neuro_code.bootstrap.composition._runtime_platform", return_value="linux"),
                 patch(
                     "neuro_code.bootstrap.composition.create_routed_provider",
                     return_value=CliProvider(),
@@ -1073,6 +1074,7 @@ api_key_env = "FIXTURE_KEY"
                     "neuro_code.bootstrap.composition.LinuxBubblewrapLocalProcessSandbox",
                     return_value=object(),
                 ) as create_local_sandbox,
+                patch("neuro_code.bootstrap.composition._runtime_platform", return_value="linux"),
                 patch(
                     "neuro_code.bootstrap.composition.create_routed_provider",
                     return_value=CliProvider(),
