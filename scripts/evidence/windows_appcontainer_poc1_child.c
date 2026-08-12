@@ -1,5 +1,3 @@
-#define UNICODE
-#define _UNICODE
 #include <winsock2.h>
 #include <windows.h>
 #include <sddl.h>
