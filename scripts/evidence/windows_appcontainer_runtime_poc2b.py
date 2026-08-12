@@ -2087,13 +2087,25 @@ def _cleanup_root(root: _AuthorityRoot, sid: str) -> dict[str, object]:
 
 
 def _runtime_root_record(root: _AuthorityRoot) -> dict[str, object]:
+    powershell = (
+        Path(os.environ.get("SYSTEMROOT", r"C:\Windows"))
+        / "System32"
+        / "WindowsPowerShell"
+        / "v1.0"
+        / "powershell.exe"
+    )
     return {
         "path": str(root.path),
         "mode": root.mode,
         "purpose": root.purpose,
         "trust": root.trust,
         "owner": subprocess.run(
-            ["powershell", "-NoProfile", "-Command", f"(Get-Acl -LiteralPath '{root.path}').Owner"],
+            [
+                str(powershell),
+                "-NoProfile",
+                "-Command",
+                f"(Get-Acl -LiteralPath '{root.path}').Owner",
+            ],
             capture_output=True,
             text=True,
             check=False,
