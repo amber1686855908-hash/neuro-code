@@ -25,6 +25,7 @@ from neuro_code.application.ports.sandbox import (
     LocalProcessEnvironmentPolicy,
     LocalProcessFilesystemPolicy,
     LocalProcessLifecycle,
+    LocalProcessLifecycleCapability,
     LocalProcessNetworkPolicy,
     LocalProcessOutput,
     LocalProcessPurpose,
@@ -170,6 +171,12 @@ class LocalBackgroundTaskManager:
         self._scope_process_sandboxes: dict[str, LocalProcessSandbox] = {
             self._root_scope_id: self._local_process_sandbox,
         }
+
+    @property
+    def lifecycle_capability(self) -> LocalProcessLifecycleCapability:
+        """Return the actual capability of the root task-scope adapter."""
+
+        return self._local_process_sandbox.lifecycle_capability
 
     def open_scope(
         self,
@@ -340,6 +347,7 @@ class LocalBackgroundTaskManager:
             environment_policy=LocalProcessEnvironmentPolicy(environment),
             stdio_mode=LocalProcessStdioMode.MERGED_CAPTURE,
             lifecycle=LocalProcessLifecycle(
+                required_capability=LocalProcessLifecycleCapability.PROCESS_GROUP_BEST_EFFORT,
                 termination_grace_seconds=termination_grace_seconds,
             ),
         )
@@ -371,6 +379,7 @@ class LocalBackgroundTaskManager:
             environment_policy=LocalProcessEnvironmentPolicy(environment),
             stdio_mode=LocalProcessStdioMode.MERGED_CAPTURE,
             lifecycle=LocalProcessLifecycle(
+                required_capability=LocalProcessLifecycleCapability.PROCESS_GROUP_BEST_EFFORT,
                 termination_grace_seconds=termination_grace_seconds,
             ),
         )
@@ -810,6 +819,15 @@ class _LocalBackgroundTaskScope:
     def __init__(self, supervisor: LocalBackgroundTaskManager, scope_id: str) -> None:
         self._supervisor = supervisor
         self._scope_id = scope_id
+
+    @property
+    def lifecycle_capability(self) -> LocalProcessLifecycleCapability:
+        """Return the actual capability of this scope's process adapter."""
+
+        sandbox = self._supervisor._scope_process_sandboxes.get(self._scope_id)
+        if sandbox is None:
+            raise ToolError("background task scope is closed")
+        return sandbox.lifecycle_capability
 
     async def start_shell(
         self,

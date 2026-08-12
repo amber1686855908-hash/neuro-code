@@ -39,6 +39,12 @@ or the lower-level terminal `spawn_exec` adapter.
 user-requested desktop clipboard command; it is not a model-controlled process
 launcher.
 
+The separate lifecycle capability contract is defined by
+[ADR 0110](0110-cross-platform-lifecycle-capability-contract.md). Filesystem
+and network authority do not imply descendant lifecycle ownership. The port
+reports `STRONG_DESCENDANT_OWNERSHIP` for enabled Linux Bubblewrap and Windows
+Job Object paths, and `PROCESS_GROUP_BEST_EFFORT` for plain POSIX ProcessTree.
+
 The trusted controller remains outside a child sandbox. Permission approval is
 still independent from the operating-system boundary and cannot relax the
 request's profile or declared policy.

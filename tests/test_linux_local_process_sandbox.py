@@ -10,6 +10,7 @@ from neuro_code.application.ports.sandbox import (
     LocalProcessEnvironmentPolicy,
     LocalProcessFilesystemPolicy,
     LocalProcessLifecycle,
+    LocalProcessLifecycleCapability,
     LocalProcessNetworkPolicy,
     LocalProcessPurpose,
     LocalProcessStdioMode,
@@ -99,6 +100,10 @@ class LinuxBubblewrapLocalProcessSandboxTests(unittest.IsolatedAsyncioTestCase):
             state_dir.mkdir()
             adapter = self._adapter(SandboxProfile.WORKSPACE, workspace, state_dir)
 
+            self.assertIs(
+                adapter.lifecycle_capability,
+                LocalProcessLifecycleCapability.STRONG_DESCENDANT_OWNERSHIP,
+            )
             plan = adapter.build_launch_argv(self._request(workspace, SandboxProfile.WORKSPACE))
 
             self.assertIn("--tmpfs", plan)
@@ -348,7 +353,12 @@ class LinuxBubblewrapLocalProcessSandboxTests(unittest.IsolatedAsyncioTestCase):
             workspace.mkdir()
             state_dir.mkdir()
             platform = mock.Mock()
-            platform.spawn_exec.return_value = object()
+            platform.lifecycle_capability = (
+                LocalProcessLifecycleCapability.STRONG_DESCENDANT_OWNERSHIP
+            )
+            platform.spawn_exec.return_value = mock.Mock(
+                lifecycle_capability=LocalProcessLifecycleCapability.STRONG_DESCENDANT_OWNERSHIP
+            )
             adapter = self._adapter(
                 SandboxProfile.WORKSPACE,
                 workspace,

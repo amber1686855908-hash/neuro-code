@@ -32,6 +32,7 @@ from neuro_code.application.ports.sandbox import (
     LocalProcessEnvironmentPolicy,
     LocalProcessFilesystemPolicy,
     LocalProcessLifecycle,
+    LocalProcessLifecycleCapability,
     LocalProcessNetworkPolicy,
     LocalProcessPurpose,
     LocalProcessSandbox,
@@ -40,6 +41,7 @@ from neuro_code.application.ports.sandbox import (
     LocalWorkspaceAccessMode,
     OwnedLocalProcess,
     SandboxedProcessRequest,
+    lifecycle_capability_satisfies,
 )
 from neuro_code.domain.sandbox.models import SandboxProfile
 from neuro_code.domain.terminal.models import TerminalSize
@@ -219,6 +221,12 @@ class LinuxBubblewrapLocalProcessSandbox(LocalProcessSandbox):
 
         return self._profile
 
+    @property
+    def lifecycle_capability(self) -> LocalProcessLifecycleCapability:
+        """Return the strong Bubblewrap descendant ownership contract."""
+
+        return LocalProcessLifecycleCapability.STRONG_DESCENDANT_OWNERSHIP
+
     async def spawn(self, request: SandboxedProcessRequest) -> OwnedLocalProcess:
         """Create one Bubblewrap-owned Bash process tree.
 
@@ -265,6 +273,7 @@ class LinuxBubblewrapLocalProcessSandbox(LocalProcessSandbox):
         return _LinuxBubblewrapOwnedLocalProcess(
             tree,
             request,
+            self.lifecycle_capability,
             boundary_pidfd,
             self._pidfd_ops,
         )
@@ -291,7 +300,16 @@ class LinuxBubblewrapLocalProcessSandbox(LocalProcessSandbox):
         assert request.executable is not None
         launch = self.build_launch_argv(request)
         platform = self._terminal_platform or _default_terminal_platform(self._pidfd_ops)
-        return platform.spawn_exec(
+        if not lifecycle_capability_satisfies(
+            platform.lifecycle_capability,
+            request.lifecycle.required_capability,
+        ):
+            raise SandboxError(
+                "terminal lifecycle capability "
+                f"{platform.lifecycle_capability.value!r} does not satisfy required "
+                f"{request.lifecycle.required_capability.value!r}"
+            )
+        session = platform.spawn_exec(
             str(self._bubblewrap),
             tuple(launch[1:]),
             cwd=request.cwd,
@@ -303,6 +321,19 @@ class LinuxBubblewrapLocalProcessSandbox(LocalProcessSandbox):
             on_eof=on_eof,
             on_error=on_error,
         )
+        if not lifecycle_capability_satisfies(
+            session.lifecycle_capability,
+            request.lifecycle.required_capability,
+        ):
+            try:
+                session.close()
+            finally:
+                raise SandboxError(
+                    "terminal lifecycle capability "
+                    f"{session.lifecycle_capability.value!r} does not satisfy required "
+                    f"{request.lifecycle.required_capability.value!r}"
+                )
+        return session
 
     def build_launch_argv(
         self,
@@ -372,6 +403,15 @@ class LinuxBubblewrapLocalProcessSandbox(LocalProcessSandbox):
         return args
 
     def _validate_request(self, request: SandboxedProcessRequest) -> None:
+        if not lifecycle_capability_satisfies(
+            self.lifecycle_capability,
+            request.lifecycle.required_capability,
+        ):
+            raise SandboxError(
+                "local process lifecycle capability "
+                f"{self.lifecycle_capability.value!r} does not satisfy required "
+                f"{request.lifecycle.required_capability.value!r}"
+            )
         if request.sandbox_profile is not self._profile:
             raise SandboxError("local process request sandbox profile does not match its launcher")
         if request.purpose not in _SUPPORTED_PURPOSES:
@@ -587,7 +627,9 @@ class LinuxBubblewrapLocalProcessSandbox(LocalProcessSandbox):
             ),
             environment_policy=LocalProcessEnvironmentPolicy(),
             stdio_mode=LocalProcessStdioMode.CAPTURE,
-            lifecycle=LocalProcessLifecycle(),
+            lifecycle=LocalProcessLifecycle(
+                required_capability=LocalProcessLifecycleCapability.PROCESS_GROUP_BEST_EFFORT,
+            ),
         )
         try:
             completed = subprocess.run(
@@ -697,7 +739,10 @@ def _default_terminal_platform(pidfd_ops: LinuxPidfdOps) -> TerminalPlatform:
     if sys.platform.startswith("linux"):
         from neuro_code.infrastructure.sandbox.posix_pty import PosixPtyPlatform
 
-        return PosixPtyPlatform(pidfd_ops=pidfd_ops)
+        return PosixPtyPlatform(
+            pidfd_ops=pidfd_ops,
+            lifecycle_capability=LocalProcessLifecycleCapability.STRONG_DESCENDANT_OWNERSHIP,
+        )
     raise SandboxError(f"interactive terminal sandbox is unavailable on {sys.platform}")
 
 

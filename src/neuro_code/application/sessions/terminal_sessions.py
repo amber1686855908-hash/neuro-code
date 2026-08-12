@@ -27,6 +27,7 @@ from neuro_code.application.ports.sandbox import (
     LocalProcessEnvironmentPolicy,
     LocalProcessFilesystemPolicy,
     LocalProcessLifecycle,
+    LocalProcessLifecycleCapability,
     LocalProcessNetworkPolicy,
     LocalProcessPurpose,
     LocalProcessSandbox,
@@ -159,6 +160,12 @@ class LocalInteractiveTerminalSession:
     @property
     def process_id(self) -> int:
         return self._platform_session.process_id
+
+    @property
+    def lifecycle_capability(self) -> LocalProcessLifecycleCapability:
+        """Return the capability of the local platform-owned PTY."""
+
+        return self._platform_session.lifecycle_capability
 
     @property
     def size(self) -> TerminalSize:
@@ -519,7 +526,9 @@ class LocalInteractiveTerminalManager:
             ),
             environment_policy=LocalProcessEnvironmentPolicy(environment),
             stdio_mode=LocalProcessStdioMode.PTY,
-            lifecycle=LocalProcessLifecycle(),
+            lifecycle=LocalProcessLifecycle(
+                required_capability=LocalProcessLifecycleCapability.PROCESS_GROUP_BEST_EFFORT,
+            ),
         )
 
     async def _register_session(self, session: LocalInteractiveTerminalSession) -> bool:

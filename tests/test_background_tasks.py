@@ -27,6 +27,17 @@ from neuro_code.shared.errors import ToolError
 
 
 class LocalBackgroundTaskManagerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_manager_and_scope_report_their_adapter_capability(self) -> None:
+        manager = LocalBackgroundTaskManager()
+        scope = manager.open_scope()
+        try:
+            self.assertIs(scope.lifecycle_capability, manager.lifecycle_capability)
+        finally:
+            await scope.shutdown()
+            await manager.shutdown()
+        with self.assertRaises(ToolError):
+            _ = scope.lifecycle_capability
+
     async def test_wait_any_then_wait_all_uses_completion_events_and_input_order(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -1067,6 +1067,14 @@ Windows CI 必须执行原生 Job Object 与 ConPTY 生命周期测试。
 [ADR 0023](adr/0023-model-visible-background-task-completion-reminders.md) 定义，事件驱动的
 多任务等待由 [ADR 0024](adr/0024-event-driven-multi-background-task-wait.md) 定义。
 
+生命周期能力契约与文件系统、网络权限分离。`LocalProcessSandbox` 及其受管 child/terminal
+接缝对启用的 Linux Bubblewrap 与 Windows Job Object 路径报告
+`STRONG_DESCENDANT_OWNERSHIP`，对普通 POSIX ProcessTree 报告
+`PROCESS_GROUP_BEST_EFFORT`。普通 Bash、background Bash、MCP stdio 和 PTY request 的最低要求是后者；
+如果 workload 显式要求强所有权，best-effort 适配器必须在创建 child 前失败关闭。未来 macOS
+Seatbelt policy 可以 enforced 文件系统/网络/访问控制，但仍然是 `PROCESS_GROUP_BEST_EFFORT`。
+详见 [ADR 0110](adr/0110-cross-platform-lifecycle-capability-contract.md)。
+
 ## Stage5DC ACP 生命周期 alias 兼容性
 
 私有子代理生命周期适配器将外部 alias 分配限制为四次尝试，并在写入 wire 前通过
