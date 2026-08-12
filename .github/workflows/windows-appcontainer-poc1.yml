@@ -1,0 +1,68 @@
+name: Windows AppContainer POC1 (evidence only)
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/windows-appcontainer-poc1.yml"
+      - "scripts/evidence/windows_appcontainer_poc1.py"
+      - "scripts/evidence/windows_appcontainer_poc1_child.c"
+
+permissions:
+  contents: read
+
+jobs:
+  appcontainer-primitives:
+    name: AppContainer primitives (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [windows-2025, windows-2022]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7.0.0
+      - uses: astral-sh/setup-uv@v8.3.2
+        with:
+          version: "0.11.29"
+          python-version: "3.12"
+          enable-cache: true
+      - run: uv sync --extra dev --locked
+      - name: Compile evidence-only native child probe
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $installation = & $vswhere -latest -products * `
+            -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+            -property installationPath
+          if (-not $installation) {
+            throw "Visual C++ toolchain not found"
+          }
+          Import-Module "$installation\Common7\Tools\Microsoft.VisualStudio.DevShell.dll"
+          Enter-VsDevShell `
+            -VsInstallPath $installation `
+            -SkipAutomaticLocation `
+            -DevCmdArguments "-arch=amd64 -host_arch=amd64"
+          cl.exe /nologo /W4 /WX /MT /DUNICODE /D_UNICODE `
+            scripts/evidence/windows_appcontainer_poc1_child.c `
+            /Fe:"${env:RUNNER_TEMP}\windows_appcontainer_poc1_child.exe" `
+            /link advapi32.lib userenv.lib ws2_32.lib `
+            2>&1 | Tee-Object -FilePath "${env:RUNNER_TEMP}\appcontainer-poc1-build.txt"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Native evidence child compilation failed with $LASTEXITCODE"
+          }
+      - name: Execute stable AppContainer composition gates
+        shell: pwsh
+        run: |
+          uv run python scripts/evidence/windows_appcontainer_poc1.py `
+            --child "${env:RUNNER_TEMP}\windows_appcontainer_poc1_child.exe" `
+            --report "${env:RUNNER_TEMP}\windows-appcontainer-poc1.json"
+      - name: Upload evidence artifact
+        if: always()
+        uses: actions/upload-artifact@v4.6.2
+        with:
+          name: windows-appcontainer-poc1-${{ matrix.runner }}
+          path: |
+            ${{ runner.temp }}/appcontainer-poc1-build.txt
+            ${{ runner.temp }}/windows-appcontainer-poc1.json
+          if-no-files-found: error
