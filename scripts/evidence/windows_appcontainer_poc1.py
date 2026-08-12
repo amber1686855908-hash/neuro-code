@@ -662,7 +662,9 @@ def _make_pipe(
     descriptor = ctypes.c_void_p()
     if appcontainer_sid is not None:
         controller_sid = _controller_user_sid()
-        sddl = f"D:P(A;;GA;;;SY)(A;;GA;;;{controller_sid})(A;;GA;;;{appcontainer_sid})"
+        sddl = (
+            f"D:P(A;;GA;;;SY)(A;;GA;;;{controller_sid})(A;;GA;;;{appcontainer_sid})S:(ML;;NW;;;LW)"
+        )
         if not api.convert_sddl(
             sddl,
             _SDDL_REVISION_1,
