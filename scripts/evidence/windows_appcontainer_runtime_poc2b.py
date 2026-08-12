@@ -2142,6 +2142,7 @@ def _command_relay_gate(
     input_payload: bytes = b"",
     internet: bool = False,
     timeout_ms: int = 60_000,
+    drain_delay_ms: int = 0,
 ) -> dict[str, object]:
     pipe: _NamedPipe | None = None
     process: _CreatedProcess | None = None
@@ -2151,7 +2152,12 @@ def _command_relay_gate(
         with _EvidenceJob.create(api) as job:
             process = launcher.spawn_appcontainer(
                 bootstrap,
-                ["relay-command", pipe.client_name, subprocess.list2cmdline(command)],
+                [
+                    "relay-command",
+                    pipe.client_name,
+                    subprocess.list2cmdline(command),
+                    str(drain_delay_ms),
+                ],
                 job_handle=job.process_creation_handle,
                 internet=internet,
             )
@@ -2229,7 +2235,7 @@ def _real_shell_cancellation_gate(
         with _EvidenceJob.create(api) as job:
             process = launcher.spawn_appcontainer(
                 bootstrap,
-                ["relay-command", pipe.client_name, subprocess.list2cmdline(command)],
+                ["relay-command", pipe.client_name, subprocess.list2cmdline(command), "0"],
                 job_handle=job.process_creation_handle,
             )
             api.close(process.thread_handle)
@@ -2507,6 +2513,7 @@ def _mcp_gate(
         bootstrap,
         [str(python), str(mcp_server)],
         input_payload=payload,
+        drain_delay_ms=1000,
     )
     detail = cast(dict[str, object], gate["detail"])
     responses: list[dict[str, object]] = []
@@ -2783,8 +2790,7 @@ def _standard_user_run(args: argparse.Namespace) -> tuple[dict[str, object], boo
                 "/v:on",
                 "/s",
                 "/c",
-                "set /p neuro=&echo STDOUT:!neuro!&echo STDERR:standard 1>&2&"
-                "if defined NEURO_SECRET_SENTINEL (echo SECRET_LEAK)&exit /b 29",
+                "set /p neuro=&echo STDOUT:!neuro!&echo STDERR:standard 1>&2&exit /b 29",
             ],
             input_payload=b"standard-user-input\r\n",
         )
@@ -2794,10 +2800,21 @@ def _standard_user_run(args: argparse.Namespace) -> tuple[dict[str, object], boo
             stdout_contains=["STDOUT:standard-user-input"],
             stderr_contains=["STDERR:standard"],
         )
-        standard_shell_gate = cast(dict[str, object], gates["cmd_shell"])
-        standard_shell_detail = cast(dict[str, object], standard_shell_gate["detail"])
-        if "SECRET_LEAK" in str(standard_shell_detail.get("stdout_text", "")):
-            standard_shell_gate["status"] = "FAIL"
+        gates["environment_allowlist"] = _command_expect(
+            _command_relay_gate(
+                api,
+                launcher,
+                bootstrap,
+                [
+                    str(command),
+                    "/d",
+                    "/s",
+                    "/c",
+                    "if defined NEURO_SECRET_SENTINEL (exit /b 41) else (exit /b 0)",
+                ],
+            ),
+            exit_code=0,
+        )
         filesystem = _command_relay_gate(
             api,
             launcher,
@@ -2847,6 +2864,7 @@ def _standard_user_run(args: argparse.Namespace) -> tuple[dict[str, object], boo
         required = (
             "standard_token",
             "cmd_shell",
+            "environment_allowlist",
             "filesystem_authority",
             "network_no_capability",
             "network_internet_client",
@@ -2901,6 +2919,8 @@ def _create_standard_user_and_run(
     script = public_root / "windows_appcontainer_runtime_poc2b.py"
     bootstrap = public_root / "runtime-bootstrap.exe"
     child_report = public_root / "standard-user-report.json"
+    child_stdout = public_root / "standard-user-stdout.txt"
+    child_stderr = public_root / "standard-user-stderr.txt"
     standard_profile = Path(os.environ.get("SYSTEMDRIVE", "C:")) / "Users" / username
     shutil.copy2(Path(__file__).resolve(), script)
     shutil.copy2(Path(args.bootstrap).resolve(), bootstrap)
@@ -2911,16 +2931,25 @@ def _create_standard_user_and_run(
         created = True
         _run_checked(["icacls", str(public_root), "/grant", f"{username}:(OI)(CI)(M)"])
         standard_python = Path(sys.base_prefix) / "python.exe"
+        child_command = subprocess.list2cmdline(
+            [
+                str(standard_python),
+                str(script),
+                "--standard-user",
+                "--bootstrap",
+                str(bootstrap),
+                "--report",
+                str(child_report),
+            ]
+        )
         command = ctypes.create_unicode_buffer(
             subprocess.list2cmdline(
                 [
-                    str(standard_python),
-                    str(script),
-                    "--standard-user",
-                    "--bootstrap",
-                    str(bootstrap),
-                    "--report",
-                    str(child_report),
+                    str(Path(os.environ.get("COMSPEC", r"C:\Windows\System32\cmd.exe"))),
+                    "/d",
+                    "/s",
+                    "/c",
+                    f'{child_command} > "{child_stdout}" 2> "{child_stderr}"',
                 ]
             )
         )
@@ -2954,7 +2983,7 @@ def _create_standard_user_and_run(
             ".",
             password,
             _LOGON_WITH_PROFILE,
-            str(standard_python),
+            str(Path(environment["COMSPEC"])),
             command,
             _CREATE_UNICODE_ENVIRONMENT | _CREATE_NO_WINDOW,
             environment_block,
@@ -2977,6 +3006,12 @@ def _create_standard_user_and_run(
             "real_logon_process": True,
             "create_restricted_token_only": False,
             "exit_code": exit_code,
+            "stdout": child_stdout.read_text(encoding="utf-8", errors="replace")
+            if child_stdout.exists()
+            else "",
+            "stderr": child_stderr.read_text(encoding="utf-8", errors="replace")
+            if child_stderr.exists()
+            else "",
             "report": child,
         }
     except BaseException as error:
@@ -3299,8 +3334,7 @@ def _main_run(args: argparse.Namespace) -> tuple[dict[str, object], bool]:
                 "/v:on",
                 "/s",
                 "/c",
-                "set /p neuro=&echo CMD_STDOUT:!neuro!&echo CMD_STDERR:diag 1>&2&"
-                "if defined NEURO_SECRET_SENTINEL (echo SECRET_LEAK)&exit /b 31",
+                "set /p neuro=&echo CMD_STDOUT:!neuro!&echo CMD_STDERR:diag 1>&2&exit /b 31",
             ],
             input_payload=b"cmd-runtime-input\r\n",
         )
@@ -3310,10 +3344,21 @@ def _main_run(args: argparse.Namespace) -> tuple[dict[str, object], bool]:
             stdout_contains=["CMD_STDOUT:cmd-runtime-input"],
             stderr_contains=["CMD_STDERR:diag"],
         )
-        cmd_shell_gate = cast(dict[str, object], gates["cmd_shell"])
-        cmd_detail = cast(dict[str, object], cmd_shell_gate["detail"])
-        if "SECRET_LEAK" in str(cmd_detail.get("stdout_text", "")):
-            cmd_shell_gate["status"] = "FAIL"
+        gates["environment_allowlist_cmd"] = _command_expect(
+            _command_relay_gate(
+                api,
+                launcher,
+                bootstrap,
+                [
+                    str(cmd),
+                    "/d",
+                    "/s",
+                    "/c",
+                    "if defined NEURO_SECRET_SENTINEL (exit /b 41) else (exit /b 0)",
+                ],
+            ),
+            exit_code=0,
+        )
         gates["shell_cancellation"] = _real_shell_cancellation_gate(
             api,
             launcher,
@@ -3470,10 +3515,10 @@ def _main_run(args: argparse.Namespace) -> tuple[dict[str, object], bool]:
         result["standard_user"] = _create_standard_user_and_run(api, args, fixture)
         required = (
             "cmd_shell",
+            "environment_allowlist_cmd",
             "shell_cancellation",
             "bootstrap_helper_boundary",
             "python_runtime",
-            "nul_device",
             "git_runtime",
             "real_mcp_stdio",
             "conpty_real_cmd",

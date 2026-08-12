@@ -525,7 +525,10 @@ static int byte_stream_mode(const wchar_t *name) {
     return 0;
 }
 
-static int relay_command_mode(const wchar_t *name, const wchar_t *command_line) {
+static int relay_command_mode(
+    const wchar_t *name,
+    const wchar_t *command_line,
+    const wchar_t *drain_delay_text) {
     HANDLE pipe = connect_local_pipe(name);
     CHILD_PIPES target;
     BYTE kind;
@@ -541,6 +544,7 @@ static int relay_command_mode(const wchar_t *name, const wchar_t *command_line) 
     int target_json_length;
     BOOL target_in_job = FALSE;
     int result = 95;
+    DWORD drain_delay_ms = wcstoul(drain_delay_text, NULL, 10);
 
     ZeroMemory(&target, sizeof(target));
     if (pipe == INVALID_HANDLE_VALUE) return (int)GetLastError();
@@ -570,6 +574,8 @@ static int relay_command_mode(const wchar_t *name, const wchar_t *command_line) 
     }
     if (input != NULL) HeapFree(GetProcessHeap(), 0, input);
     input = NULL;
+    if (drain_delay_ms > 5000) goto cleanup;
+    if (drain_delay_ms > 0) Sleep(drain_delay_ms);
     CloseHandle(target.stdin_write);
     target.stdin_write = NULL;
     if (!read_all(target.stdout_read, &stdout_payload, &stdout_length) ||
@@ -1008,8 +1014,8 @@ int wmain(int argc, wchar_t **argv) {
         return pipe_denied_mode(argv[2]);
     if (wcscmp(argv[1], L"byte-stream") == 0 && argc == 3)
         return byte_stream_mode(argv[2]);
-    if (wcscmp(argv[1], L"relay-command") == 0 && argc == 4)
-        return relay_command_mode(argv[2], argv[3]);
+    if (wcscmp(argv[1], L"relay-command") == 0 && argc == 5)
+        return relay_command_mode(argv[2], argv[3], argv[4]);
     if (wcscmp(argv[1], L"network-pipe") == 0 && argc == 5)
         return network_pipe_mode(argv[2], argv[3], argv[4]);
     if (wcscmp(argv[1], L"nul-pipe") == 0 && argc == 3)
