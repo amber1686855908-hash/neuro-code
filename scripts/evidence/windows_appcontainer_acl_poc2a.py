@@ -795,7 +795,7 @@ def _run_child(
     report.unlink(missing_ok=True)
     with WindowsJobObject.create() as job:
         process = _spawn_appcontainer(
-            api, profile, job, executable, [mode, str(target), str(report)], cwd
+            api, profile, job, executable, [mode, str(target), str(report), profile.sid_text], cwd
         )
         in_job = ctypes.c_int32()
         if not api.is_process_in_job(
@@ -804,10 +804,11 @@ def _run_child(
             api.error("IsProcessInJob(child)")
     exit_code = _wait_process(api, process)
     payload = json.loads(report.read_text(encoding="utf-8")) if report.exists() else None
-    exact_sid = bool(
-        isinstance(payload, dict)
-        and str(payload.get("appcontainer_sid", "")).casefold() == profile.sid_text.casefold()
-    )
+    if payload is None:
+        raise RuntimeError(
+            f"AppContainer child {process.pid} exited {exit_code} without durable report"
+        )
+    exact_sid = bool(isinstance(payload, dict) and payload.get("exact_sid") is True)
     return {
         "exit_code": exit_code,
         "exact_job_membership": bool(in_job.value),
