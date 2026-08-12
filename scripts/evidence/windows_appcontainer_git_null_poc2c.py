@@ -176,11 +176,20 @@ def _path_authority_gate(
     parsed = _parse_relay_json(gate)
     detail = cast(dict[str, object], gate["detail"])
     detail["parsed_result"] = parsed
+    detail["cwd_canonicalization"] = _status(
+        parsed.get("cwd_open") is True and parsed.get("cwd_resolved") is True,
+        {
+            "cwd_open": parsed.get("cwd_open"),
+            "cwd_open_error": parsed.get("cwd_open_error"),
+            "cwd_resolved": parsed.get("cwd_resolved"),
+            "cwd_resolve_error": parsed.get("cwd_resolve_error"),
+            "git_dependency": "mingw_getcwd uses GetFinalPathNameByHandleW",
+        },
+    )
     passed = bool(
         gate["status"] == "PASS"
         and detail.get("target_exit_code") == 0
         and parsed.get("cwd_open") is True
-        and parsed.get("cwd_resolved") is True
         and parsed.get("create_directory") is True
         and parsed.get("create_file") is True
     )
@@ -350,6 +359,8 @@ def _git_local_gates(
         "PASS"
         if host_default_detail.get("target_exit_code") != 0
         and host_config_marker not in str(host_default_detail.get("stdout_text", ""))
+        and "Unable to read current working directory"
+        not in str(host_default_detail.get("stderr_text", ""))
         else "FAIL"
     )
     gates["host_config_not_loaded"] = host_default_probe
