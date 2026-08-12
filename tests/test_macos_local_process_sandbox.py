@@ -266,7 +266,25 @@ class MacOSSeatbeltLocalProcessSandboxTests(unittest.IsolatedAsyncioTestCase):
                 )
                 self.assertIn("(deny default)", policy)
                 self.assertIn(str(workspace.resolve()).replace("\\", "\\\\"), policy)
-                self.assertNotIn('(allow file-read* (subpath "/"))', policy)
+                for forbidden in (
+                    '(allow file-read* (subpath "/"))',
+                    '(allow file-read-metadata (subpath "/"))',
+                    '(allow file-write* (subpath "/"))',
+                ):
+                    self.assertNotIn(forbidden, policy)
+                self.assertIn('(allow file-read-metadata (literal "/"))', policy)
+                self.assertIn(
+                    _MacOSSeatbeltPolicyBuilder._literal_rule(
+                        "file-read-metadata", workspace.parent.resolve()
+                    ),
+                    policy,
+                )
+                self.assertNotIn(
+                    _MacOSSeatbeltPolicyBuilder._subpath_rule(
+                        "file-read-metadata", workspace.parent.resolve()
+                    ),
+                    policy,
+                )
                 self.assertNotIn(str(state), policy)
                 self.assertEqual(
                     "(allow network-outbound)" in policy, profile is SandboxProfile.WORKSPACE
@@ -279,6 +297,10 @@ class MacOSSeatbeltLocalProcessSandboxTests(unittest.IsolatedAsyncioTestCase):
                 "file-read*", Path('workspace Ω "quoted" \\ slash')
             )
             self.assertIn('workspace Ω \\"quoted\\" \\\\ slash', escaped_rule)
+            escaped_literal = _MacOSSeatbeltPolicyBuilder._literal_rule(
+                "file-read-metadata", Path('ancestor Ω "quoted" \\ slash')
+            )
+            self.assertIn('ancestor Ω \\"quoted\\" \\\\ slash', escaped_literal)
 
     def test_environment_is_allowlisted_and_pty_terminal_values_are_scoped(self) -> None:
         policy = self._request(Path("/tmp").resolve(), SandboxProfile.WORKSPACE).environment_policy

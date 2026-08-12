@@ -192,30 +192,35 @@ class _MacOSSeatbeltPolicyBuilder:
             '(allow file-read-metadata (literal "/"))',
             "(allow sysctl-read)",
         ]
-        metadata_roots: set[Path] = set()
+        metadata_ancestors: set[Path] = set()
         for runtime_root in self._runtime_read_roots:
             for spelling in _path_spellings(runtime_root):
                 self._append_read(lines, spelling)
-                metadata_roots.update(spelling.parents)
+                metadata_ancestors.update(spelling.parents)
         for root in filesystem_policy.workspace_roots:
             for spelling in _path_spellings(root.path):
                 self._append_read(lines, spelling)
-                metadata_roots.update(spelling.parents)
+                metadata_ancestors.update(spelling.parents)
                 if root.mode is LocalWorkspaceAccessMode.READ_WRITE:
                     lines.append(self._subpath_rule("file-write*", spelling))
         for private_path in (private_home, private_temporary_directory):
             for spelling in _path_spellings(private_path):
                 self._append_read(lines, spelling)
                 lines.append(self._subpath_rule("file-write*", spelling))
-                metadata_roots.update(spelling.parents)
-        for metadata_root in sorted(metadata_roots, key=lambda path: (len(path.parts), str(path))):
-            lines.append(self._subpath_rule("file-read-metadata", metadata_root))
+                metadata_ancestors.update(spelling.parents)
+        for ancestor in sorted(metadata_ancestors, key=lambda path: (len(path.parts), str(path))):
+            lines.append(self._literal_rule("file-read-metadata", ancestor))
         lines.append('(allow file-write-data (literal "/dev/null"))')
         if network_policy is LocalProcessNetworkPolicy.INHERIT:
             lines.append("(allow network-outbound)")
         policy = "\n".join(dict.fromkeys(lines))
-        if '(allow file-read* (subpath "/"))' in policy:
-            raise SandboxError("macOS Seatbelt policy must not grant recursive host-root read")
+        forbidden_root_grants = (
+            self._subpath_rule("file-read*", Path("/")),
+            self._subpath_rule("file-read-metadata", Path("/")),
+            self._subpath_rule("file-write*", Path("/")),
+        )
+        if any(rule in policy for rule in forbidden_root_grants):
+            raise SandboxError("macOS Seatbelt policy must not grant recursive host-root access")
         return policy
 
     @classmethod
@@ -225,11 +230,19 @@ class _MacOSSeatbeltPolicyBuilder:
 
     @staticmethod
     def _subpath_rule(operation: str, path: Path) -> str:
+        return _MacOSSeatbeltPolicyBuilder._path_rule(operation, "subpath", path)
+
+    @staticmethod
+    def _literal_rule(operation: str, path: Path) -> str:
+        return _MacOSSeatbeltPolicyBuilder._path_rule(operation, "literal", path)
+
+    @staticmethod
+    def _path_rule(operation: str, filter_name: str, path: Path) -> str:
         value = str(path)
         if "\x00" in value:
             raise SandboxError("macOS Seatbelt policy path contains a null byte")
         literal = json.dumps(value, ensure_ascii=False)
-        return f"(allow {operation} (subpath {literal}))"
+        return f"(allow {operation} ({filter_name} {literal}))"
 
 
 class MacOSSeatbeltLocalProcessSandbox(LocalProcessSandbox):

@@ -32,6 +32,11 @@ outside writes remain denied. `workspace` permits outbound networking;
 writes, while `strict` preserves the requested per-root modes and the main
 workspace remains writable.
 
+Authorized runtime, workspace, and private roots receive recursive metadata
+authority for their own subtrees. Their ancestors receive exact `literal`
+metadata authority only for pathname traversal, including exact `/`; no
+ancestor, including `/`, receives recursive `subpath` metadata authority.
+
 Before either pipe or PTY creation, `PosixWorkspaceInodeAudit` checks every
 authorized root and rejects external hardlink aliases or mixed read-only and
 read-write aliases. Child environments are reconstructed only from
