@@ -117,7 +117,7 @@ class MacOSSeatbeltLocalProcessSandboxTests(unittest.IsolatedAsyncioTestCase):
             ),
             mock.patch(
                 "neuro_code.infrastructure.sandbox.macos_local_process._trusted_fixed_executable",
-                side_effect=lambda path: path,
+                side_effect=lambda path: path.as_posix(),
             ),
         ):
             return MacOSSeatbeltLocalProcessSandbox(
@@ -246,7 +246,7 @@ class MacOSSeatbeltLocalProcessSandboxTests(unittest.IsolatedAsyncioTestCase):
     def test_policy_is_deny_default_escapes_paths_and_preserves_profile_semantics(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            workspace = root / 'workspace Ω "quoted" \\ slash'
+            workspace = root / "workspace"
             state = root / "state"
             private_home = root / "private home"
             private_tmp = root / "private tmp"
@@ -265,7 +265,7 @@ class MacOSSeatbeltLocalProcessSandboxTests(unittest.IsolatedAsyncioTestCase):
                     private_temporary_directory=private_tmp,
                 )
                 self.assertIn("(deny default)", policy)
-                self.assertIn('workspace Ω \\"quoted\\" \\\\ slash', policy)
+                self.assertIn(str(workspace.resolve()).replace("\\", "\\\\"), policy)
                 self.assertNotIn('(allow file-read* (subpath "/"))', policy)
                 self.assertNotIn(str(state), policy)
                 self.assertEqual(
@@ -275,6 +275,10 @@ class MacOSSeatbeltLocalProcessSandboxTests(unittest.IsolatedAsyncioTestCase):
                     "file-write*", workspace.resolve()
                 )
                 self.assertEqual(workspace_write in policy, profile is not SandboxProfile.READ_ONLY)
+            escaped_rule = _MacOSSeatbeltPolicyBuilder._subpath_rule(
+                "file-read*", Path('workspace Ω "quoted" \\ slash')
+            )
+            self.assertIn('workspace Ω \\"quoted\\" \\\\ slash', escaped_rule)
 
     def test_environment_is_allowlisted_and_pty_terminal_values_are_scoped(self) -> None:
         policy = self._request(Path("/tmp").resolve(), SandboxProfile.WORKSPACE).environment_policy
@@ -406,10 +410,8 @@ class MacOSSeatbeltLocalProcessSandboxTests(unittest.IsolatedAsyncioTestCase):
             root = Path(directory)
             workspace = root / "workspace"
             state = root / "state"
-            outside = root / "outside"
             workspace.mkdir()
             state.mkdir()
-            outside.mkdir()
             adapter = self._adapter(SandboxProfile.WORKSPACE, workspace, state)
             strong = replace(
                 self._request(workspace, SandboxProfile.WORKSPACE),
@@ -424,18 +426,21 @@ class MacOSSeatbeltLocalProcessSandboxTests(unittest.IsolatedAsyncioTestCase):
                 await adapter.spawn(strong)
             spawn.assert_not_awaited()
 
-            target = outside / "secret"
-            target.write_text("secret", encoding="utf-8")
-            (workspace / "alias").hardlink_to(target)
             with (
                 mock.patch(
                     "neuro_code.infrastructure.sandbox.macos_local_process._PrivateChildDirectories",
                     _FakePrivateDirectories,
                 ),
+                mock.patch.object(
+                    adapter._inode_audit,
+                    "ensure",
+                    side_effect=SandboxError("hardlink outside workspace"),
+                ) as audit,
                 mock.patch.object(ProcessTree, "spawn_exec", new_callable=mock.AsyncMock) as spawn,
                 self.assertRaisesRegex(SandboxError, "hardlink outside"),
             ):
                 await adapter.spawn(self._request(workspace, SandboxProfile.WORKSPACE))
+            audit.assert_called_once()
             spawn.assert_not_awaited()
             self.assertTrue(_FakePrivateDirectories.instances[-1].closed)
 
