@@ -203,7 +203,7 @@ def _add_run_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--sandbox",
         choices=tuple(profile.value for profile in SandboxProfile),
-        help="operating-system sandbox profile for this run",
+        help="operating-system child sandbox (off explicitly provides no OS isolation)",
     )
     parser.add_argument("--allow", action="append", default=[], metavar="PATTERN")
     parser.add_argument("--deny", action="append", default=[], metavar="PATTERN")
@@ -246,7 +246,7 @@ def _add_acp_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--sandbox",
         choices=tuple(profile.value for profile in SandboxProfile),
-        help="operating-system sandbox profile for this process",
+        help="operating-system child sandbox (off explicitly provides no OS isolation)",
     )
     parser.add_argument("--allow", action="append", default=[], metavar="PATTERN")
     parser.add_argument("--deny", action="append", default=[], metavar="PATTERN")
@@ -340,7 +340,7 @@ def build_parser() -> argparse.ArgumentParser:
     subagent_parser.add_argument(
         "--sandbox",
         choices=tuple(profile.value for profile in SandboxProfile),
-        help="operating-system sandbox profile for this run",
+        help="operating-system child sandbox (off explicitly provides no OS isolation)",
     )
     subagent_parser.add_argument("--allow", action="append", default=[], metavar="PATTERN")
     subagent_parser.add_argument("--deny", action="append", default=[], metavar="PATTERN")
@@ -692,12 +692,6 @@ async def _run_subagent_lifecycle(args: argparse.Namespace, services: CliService
         ApplicationSettings(
             cwd=args.cwd,
             resume_id=args.parent_session,
-            launch_command=(
-                sys.executable,
-                "-m",
-                "neuro_code",
-                *tuple(getattr(args, "launch_arguments", ())),
-            ),
         )
     )
     try:
@@ -732,7 +726,6 @@ def _application_settings(
     *,
     reasoning_effort: ReasoningEffort | None = None,
 ) -> ApplicationSettings:
-    raw_arguments = tuple(getattr(args, "launch_arguments", ()))
     return ApplicationSettings(
         cwd=args.cwd,
         provider=args.provider,
@@ -759,7 +752,6 @@ def _application_settings(
             else reasoning_effort or ReasoningEffort.HIGH
         ),
         resume_id=getattr(args, "resume", None),
-        launch_command=(sys.executable, "-m", "neuro_code", *raw_arguments),
     )
 
 
@@ -1065,9 +1057,7 @@ def run(argv: Sequence[str] | None, *, services: CliServices) -> int:
 
     解析参数,并使用 bootstrap 提供的服务渲染 CLI 响应."""
     parser = build_parser()
-    launch_arguments = tuple(sys.argv[1:] if argv is None else argv)
-    args = parser.parse_args(launch_arguments)
-    args.launch_arguments = launch_arguments
+    args = parser.parse_args(tuple(sys.argv[1:] if argv is None else argv))
     try:
         if args.command == "version":
             payload = _version_payload()

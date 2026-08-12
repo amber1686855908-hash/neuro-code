@@ -28,9 +28,23 @@ from mcp import ClientSession
 from mcp.client.stdio import get_default_environment
 from mcp.shared.message import SessionMessage
 
+from neuro_code.application.ports.sandbox import (
+    LocalProcessEnvironmentPolicy,
+    LocalProcessFilesystemPolicy,
+    LocalProcessLifecycle,
+    LocalProcessNetworkPolicy,
+    LocalProcessPurpose,
+    LocalProcessSandbox,
+    LocalProcessStdioMode,
+    LocalWorkspaceAccess,
+    LocalWorkspaceAccessMode,
+    OwnedLocalProcess,
+    SandboxedProcessRequest,
+)
 from neuro_code.application.ports.tools import ToolContext
+from neuro_code.domain.sandbox.models import SandboxProfile
 from neuro_code.domain.tools import ToolDefinition, ToolResult
-from neuro_code.infrastructure.sandbox.process_tree import ProcessTree
+from neuro_code.infrastructure.sandbox.local_process import ProcessTreeLocalProcessSandbox
 from neuro_code.shared.async_utils import run_blocking
 from neuro_code.shared.errors import ToolError
 from neuro_code.shared.redaction import redact_sensitive_text
@@ -174,18 +188,30 @@ class McpStdioToolCollection:
         *,
         cwd: Path,
         explicit_redactions: Sequence[str] = (),
+        local_process_sandbox: LocalProcessSandbox | None = None,
+        sandbox_profile: SandboxProfile = SandboxProfile.OFF,
     ) -> McpStdioToolCollection:
         if len(configurations) > MAX_MCP_SERVERS:
             raise McpStdioError("too_many_mcp_servers")
+        if sandbox_profile.enabled and local_process_sandbox is None:
+            raise McpStdioError("mcp_child_sandbox_unavailable")
         connections: list[_McpServerConnection] = []
         tools: list[McpTool] = []
         names: set[str] = set()
+        launcher = (
+            local_process_sandbox
+            if local_process_sandbox is not None
+            else ProcessTreeLocalProcessSandbox()
+        )
+        resolved_cwd = await run_blocking(_normalized_cwd, cwd)
         try:
             for configuration in configurations:
                 connection = _McpServerConnection(
                     configuration,
-                    cwd=cwd,
+                    cwd=resolved_cwd,
                     explicit_redactions=explicit_redactions,
+                    local_process_sandbox=launcher,
+                    sandbox_profile=sandbox_profile,
                 )
                 remote_tools = await connection.start()
                 connections.append(connection)
@@ -234,9 +260,14 @@ class _McpServerConnection:
         *,
         cwd: Path,
         explicit_redactions: Sequence[str],
+        local_process_sandbox: LocalProcessSandbox,
+        sandbox_profile: SandboxProfile,
     ) -> None:
         self._configuration = configuration
         self._cwd = cwd
+        self._local_process_sandbox = local_process_sandbox
+        self._sandbox_profile = sandbox_profile
+        self._explicit_environment_names = frozenset(name for name, _ in configuration.env)
         self.explicit_redactions = tuple(
             dict.fromkeys(
                 (
@@ -334,7 +365,7 @@ class _McpServerConnection:
             self._closed = True
 
     async def _run(self) -> None:
-        tree: ProcessTree | None = None
+        process: OwnedLocalProcess | None = None
         transport_tasks: list[asyncio.Task[None]] = []
         read_send: MemoryObjectSendStream[SessionMessage | Exception] | None = None
         write_send: MemoryObjectSendStream[SessionMessage] | None = None
@@ -353,12 +384,12 @@ class _McpServerConnection:
                     arguments,
                     environment,
                 )
-            tree = await ProcessTree.spawn_exec(
-                executable,
-                arguments,
-                cwd=self._cwd,
-                env=environment,
-                pipe_stdin=True,
+            process = await self._local_process_sandbox.spawn(
+                self._process_request(
+                    executable,
+                    arguments,
+                    environment,
+                )
             )
             read_send, read_receive = anyio.create_memory_object_stream[SessionMessage | Exception](
                 16
@@ -366,19 +397,19 @@ class _McpServerConnection:
             write_send, write_receive = anyio.create_memory_object_stream[SessionMessage](16)
             transport_tasks = [
                 asyncio.create_task(
-                    self._stdout_reader(tree, read_send),
+                    self._stdout_reader(process, read_send),
                     name=f"neuro-code-mcp-stdout-{self._configuration.name}",
                 ),
                 asyncio.create_task(
-                    self._stdin_writer(tree, write_receive),
+                    self._stdin_writer(process, write_receive),
                     name=f"neuro-code-mcp-stdin-{self._configuration.name}",
                 ),
                 asyncio.create_task(
-                    self._stderr_drainer(tree),
+                    self._stderr_drainer(process),
                     name=f"neuro-code-mcp-stderr-{self._configuration.name}",
                 ),
                 asyncio.create_task(
-                    self._process_watcher(tree, read_send),
+                    self._process_watcher(process, read_send),
                     name=f"neuro-code-mcp-wait-{self._configuration.name}",
                 ),
             ]
@@ -426,8 +457,8 @@ class _McpServerConnection:
                 task.cancel()
             if transport_tasks:
                 await asyncio.gather(*transport_tasks, return_exceptions=True)
-            if tree is not None:
-                await self._close_tree(tree)
+            if process is not None:
+                await self._close_process(process)
             if current is not None and not current.result.done():
                 current.result.set_exception(McpStdioError(failure_reason))
             self._closed = True
@@ -517,10 +548,10 @@ class _McpServerConnection:
 
     async def _stdout_reader(
         self,
-        tree: ProcessTree,
+        process: OwnedLocalProcess,
         send_stream: MemoryObjectSendStream[SessionMessage | Exception],
     ) -> None:
-        stream = tree.process.stdout
+        stream = process.stdout
         if stream is None:
             self._transport_ended.set()
             return
@@ -557,7 +588,7 @@ class _McpServerConnection:
 
     async def _stdin_writer(
         self,
-        tree: ProcessTree,
+        process: OwnedLocalProcess,
         receive_stream: MemoryObjectReceiveStream[SessionMessage],
     ) -> None:
         try:
@@ -569,15 +600,15 @@ class _McpServerConnection:
                     ).encode("utf-8")
                     if len(payload) > MAX_MCP_STDIO_FRAME_BYTES:
                         raise McpStdioError("mcp_frame_too_large")
-                    await tree.write_stdin(payload + b"\n")
+                    await process.write_stdin(payload + b"\n")
         except asyncio.CancelledError:
             raise
         except Exception:
             self._transport_ended.set()
 
     @staticmethod
-    async def _stderr_drainer(tree: ProcessTree) -> None:
-        stream = tree.process.stderr
+    async def _stderr_drainer(process: OwnedLocalProcess) -> None:
+        stream = process.stderr
         if stream is None:
             return
         with contextlib.suppress(asyncio.CancelledError, Exception):
@@ -586,32 +617,82 @@ class _McpServerConnection:
 
     async def _process_watcher(
         self,
-        tree: ProcessTree,
+        process: OwnedLocalProcess,
         read_send: MemoryObjectSendStream[SessionMessage | Exception],
     ) -> None:
         with contextlib.suppress(asyncio.CancelledError, Exception):
-            await tree.process.wait()
+            await process.wait()
             await asyncio.sleep(0.05)
         self._transport_ended.set()
         with contextlib.suppress(BaseException):
             await read_send.aclose()
 
-    async def _close_tree(self, tree: ProcessTree) -> None:
+    async def _close_process(self, process: OwnedLocalProcess) -> None:
         with contextlib.suppress(BaseException):
-            await tree.close_stdin()
+            await process.close_stdin()
         try:
             await asyncio.wait_for(
-                tree.wait(),
+                process.wait(),
                 timeout=MCP_CLOSE_TIMEOUT_SECONDS,
             )
         except BaseException:
             with contextlib.suppress(BaseException):
                 await asyncio.shield(
-                    tree.terminate(
+                    process.terminate(
                         grace_seconds=0.5,
-                        force_wait_seconds=MCP_CLOSE_TIMEOUT_SECONDS,
                     )
                 )
+
+    def _process_request(
+        self,
+        executable: str,
+        arguments: tuple[str, ...],
+        environment: Mapping[str, str],
+    ) -> SandboxedProcessRequest:
+        """Project this stdio server into the canonical local-process port.
+
+        将此 stdio server 投影为规范本地进程端口.
+
+        The private HOME/TMP mounts and minimal environment are enforced by the
+        selected child-scoped platform adapter. Explicit variables belong only
+        to this configured MCP server; they are not inherited from the
+        controller environment.
+
+        私有 HOME/TMP 挂载和最小环境由选定的子进程范围平台适配器强制执行.显式
+        变量只属于这个已配置的 MCP server,不会从 controller 环境继承.
+        """
+
+        workspace_mode = (
+            LocalWorkspaceAccessMode.READ_ONLY
+            if self._sandbox_profile is SandboxProfile.READ_ONLY
+            else LocalWorkspaceAccessMode.READ_WRITE
+        )
+        return SandboxedProcessRequest.exec(
+            executable,
+            arguments,
+            purpose=LocalProcessPurpose.MCP_STDIO,
+            cwd=self._cwd,
+            sandbox_profile=self._sandbox_profile,
+            filesystem_policy=LocalProcessFilesystemPolicy(
+                (LocalWorkspaceAccess(self._cwd, workspace_mode),),
+                private_home=self._sandbox_profile.enabled,
+                private_temporary_directory=self._sandbox_profile.enabled,
+            ),
+            network_policy=(
+                LocalProcessNetworkPolicy.ISOLATED
+                if self._sandbox_profile.restricts_child_network
+                else LocalProcessNetworkPolicy.INHERIT
+            ),
+            environment_policy=LocalProcessEnvironmentPolicy(
+                environment,
+                explicitly_authorized_names=self._explicit_environment_names,
+            ),
+            stdio_mode=LocalProcessStdioMode.PROTOCOL,
+            lifecycle=LocalProcessLifecycle(
+                termination_grace_seconds=0.5,
+                force_wait_seconds=MCP_CLOSE_TIMEOUT_SECONDS,
+            ),
+        )
 
     def _set_ready_result(self, tools: tuple[mcp_types.Tool, ...]) -> None:
         ready = self._ready
@@ -654,6 +735,15 @@ async def _resolved_executable(
     if located is None:
         raise McpStdioError("mcp_server_command_not_found")
     return located
+
+
+def _normalized_cwd(cwd: Path) -> Path:
+    """Resolve one MCP workspace path outside the async event loop.
+
+    在异步事件循环之外解析一个 MCP 工作区路径.
+    """
+
+    return cwd.expanduser().resolve()
 
 
 def _windows_server_command(

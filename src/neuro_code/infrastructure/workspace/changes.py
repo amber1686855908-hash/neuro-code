@@ -27,6 +27,13 @@ from neuro_code.shared.redaction import redact_sensitive_text
 _MAX_FILES = 4_000
 _MAX_TEXT_FILE_BYTES = 256_000
 _MAX_CAPTURED_BYTES = 8_000_000
+# Large files are intentionally not retained as text, but their metadata alone
+# is not a reliable change signal on filesystems with coarse timestamp
+# resolution.  Hash a small, deterministic head/tail sample so same-sized
+# rewrites remain observable without reading the whole file.
+# 大文件不会保留为文本, 但仅依赖元数据在时间戳粒度较粗的文件系统上并不可靠.
+# 因此对首尾小片段计算确定性摘要, 在不读取整个文件的情况下识别同大小重写.
+_LARGE_FILE_SAMPLE_BYTES = 4_096
 _MAX_CHANGED_FILES = 20
 _MAX_DIFF_LINES = 240
 _MAX_DIFF_CHARACTERS = 24_000
@@ -86,6 +93,31 @@ def _sensitive_path(relative_path: Path) -> bool:
     )
 
 
+def _bounded_file_digest(path: Path, size: int) -> str | None:
+    """Hash bounded file samples without retaining potentially sensitive text.
+
+    对文件有界采样计算摘要, 不保留可能敏感的完整文本.
+    """
+
+    try:
+        with path.open("rb") as stream:
+            head = stream.read(_LARGE_FILE_SAMPLE_BYTES)
+            if size > _LARGE_FILE_SAMPLE_BYTES:
+                stream.seek(max(0, size - _LARGE_FILE_SAMPLE_BYTES))
+                tail = stream.read(_LARGE_FILE_SAMPLE_BYTES)
+            else:
+                tail = b""
+    except OSError:
+        return None
+    digest = hashlib.sha256()
+    digest.update(size.to_bytes(16, "big", signed=False))
+    digest.update(len(head).to_bytes(8, "big", signed=False))
+    digest.update(head)
+    digest.update(len(tail).to_bytes(8, "big", signed=False))
+    digest.update(tail)
+    return digest.hexdigest()
+
+
 def capture_workspace_snapshot(root: Path) -> WorkspaceSnapshot:
     """Capture a bounded, read-only snapshot used to isolate one tool's file changes.
 
@@ -128,7 +160,7 @@ def capture_workspace_snapshot(root: Path) -> WorkspaceSnapshot:
                 files[key] = WorkspaceFileSnapshot(
                     stat.st_size,
                     stat.st_mtime_ns,
-                    None,
+                    _bounded_file_digest(path, stat.st_size),
                     None,
                     "large",
                 )
@@ -215,7 +247,13 @@ def capture_workspace_paths(root: Path, paths: Sequence[str | Path]) -> Workspac
             )
             continue
         if stat.st_size > _MAX_TEXT_FILE_BYTES:
-            files[key] = WorkspaceFileSnapshot(stat.st_size, stat.st_mtime_ns, None, None, "large")
+            files[key] = WorkspaceFileSnapshot(
+                stat.st_size,
+                stat.st_mtime_ns,
+                _bounded_file_digest(resolved, stat.st_size),
+                None,
+                "large",
+            )
             continue
         if captured_bytes + stat.st_size > _MAX_CAPTURED_BYTES:
             scan_limited = True

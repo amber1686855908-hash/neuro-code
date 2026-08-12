@@ -19,6 +19,7 @@ from neuro_code.application.ports.terminal import (
     TerminalPlatformSession,
 )
 from neuro_code.domain.terminal.models import TerminalSignal, TerminalSize
+from neuro_code.infrastructure.sandbox.linux_pidfd import LinuxPidfdOps
 
 
 class PosixPtySession:
@@ -35,9 +36,13 @@ class PosixPtySession:
         on_output: TerminalOutputHandler,
         on_eof: TerminalEofHandler,
         on_error: TerminalErrorHandler,
+        pidfd: int | None = None,
+        pidfd_ops: LinuxPidfdOps | None = None,
     ) -> None:
         self._master_fd: int | None = master_fd
         self._process = process
+        self._boundary_pidfd = pidfd
+        self._pidfd_ops = pidfd_ops
         self._size = size
         self._on_output = on_output
         self._on_eof = on_eof
@@ -70,6 +75,7 @@ class PosixPtySession:
         on_output: TerminalOutputHandler,
         on_eof: TerminalEofHandler,
         on_error: TerminalErrorHandler,
+        pidfd_ops: LinuxPidfdOps | None = None,
     ) -> Self:
         if os.name != "posix":
             raise OSError("POSIX pseudoterminals are only available on POSIX")
@@ -85,6 +91,7 @@ class PosixPtySession:
         master_fd: int | None = None
         slave_fd: int | None = None
         process: subprocess.Popen[bytes] | None = None
+        boundary_pidfd: int | None = None
         try:
             master_fd, slave_fd = pty.openpty()
             fcntl.ioctl(
@@ -104,6 +111,8 @@ class PosixPtySession:
             )
             if process.pid <= 1 or process.pid == os.getpgrp():
                 raise OSError(f"unsafe PTY process-group id: {process.pid}")
+            if pidfd_ops is not None:
+                boundary_pidfd = pidfd_ops.open(process.pid)
             os.close(slave_fd)
             slave_fd = None
             session = cls(
@@ -113,16 +122,25 @@ class PosixPtySession:
                 on_output=on_output,
                 on_eof=on_eof,
                 on_error=on_error,
+                pidfd=boundary_pidfd,
+                pidfd_ops=pidfd_ops,
             )
             master_fd = None
             process = None
+            boundary_pidfd = None
             return session
         except BaseException:
+            if boundary_pidfd is not None and pidfd_ops is not None:
+                with contextlib.suppress(OSError, ProcessLookupError):
+                    pidfd_ops.send_signal(boundary_pidfd, signal.SIGKILL)
             if process is not None:
                 with contextlib.suppress(OSError, ProcessLookupError):
                     os.killpg(process.pid, signal.SIGKILL)
                 with contextlib.suppress(BaseException):
                     process.wait(timeout=5)
+            if boundary_pidfd is not None:
+                with contextlib.suppress(OSError):
+                    os.close(boundary_pidfd)
             for fd in (slave_fd, master_fd):
                 if fd is not None:
                     with contextlib.suppress(OSError):
@@ -188,11 +206,11 @@ class PosixPtySession:
 
             errors: list[BaseException] = []
             try:
-                self._signal_group(signal.SIGTERM)
+                self._signal_boundary(signal.SIGTERM)
                 deadline = time.monotonic() + 1.0
                 while self._process.poll() is None and time.monotonic() < deadline:
                     time.sleep(0.01)
-                self._signal_group(signal.SIGKILL)
+                self._signal_boundary(signal.SIGKILL)
             except BaseException as error:
                 errors.append(error)
             try:
@@ -204,6 +222,13 @@ class PosixPtySession:
                     os.close(master_fd)
                 except OSError as error:
                     errors.append(error)
+            if self._boundary_pidfd is not None:
+                try:
+                    os.close(self._boundary_pidfd)
+                except OSError as error:
+                    errors.append(error)
+                finally:
+                    self._boundary_pidfd = None
 
         self._reader.join(timeout=5)
         self._waiter.join(timeout=5)
@@ -222,6 +247,18 @@ class PosixPtySession:
             os.killpg(self._process.pid, native_signal)
         except ProcessLookupError:
             return
+
+    def _signal_boundary(self, native_signal: signal.Signals) -> None:
+        """Signal the sandbox supervisor without a PID-reuse race."""
+
+        if self._boundary_pidfd is None or self._pidfd_ops is None:
+            self._signal_group(native_signal)
+            return
+        try:
+            self._pidfd_ops.send_signal(self._boundary_pidfd, native_signal)
+        except OSError as error:
+            if error.errno != errno.ESRCH:
+                raise
 
     def _drain_output(self) -> None:
         while True:
@@ -269,6 +306,9 @@ class PosixPtySession:
 
 
 class PosixPtyPlatform:
+    def __init__(self, *, pidfd_ops: LinuxPidfdOps | None = None) -> None:
+        self._pidfd_ops = pidfd_ops
+
     def spawn_exec(
         self,
         executable: str,
@@ -290,6 +330,7 @@ class PosixPtyPlatform:
             on_output=on_output,
             on_eof=on_eof,
             on_error=on_error,
+            pidfd_ops=self._pidfd_ops,
         )
 
 

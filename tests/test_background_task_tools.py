@@ -4,13 +4,19 @@ import os
 import sys
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
-from neuro_code.application.ports.sandbox import ShellLaunch
+from neuro_code.application.ports.sandbox import (
+    LocalProcessSandbox,
+    OwnedLocalProcess,
+    SandboxedProcessRequest,
+)
 from neuro_code.application.ports.tools import ToolContext
 from neuro_code.domain.sandbox import SandboxProfile
 from neuro_code.infrastructure.background_tasks import LocalBackgroundTaskManager
+from neuro_code.infrastructure.sandbox.local_process import ProcessTreeLocalProcessSandbox
 from neuro_code.infrastructure.tools.background_tasks import (
     KillTaskTool,
     TaskOutputTool,
@@ -19,6 +25,18 @@ from neuro_code.infrastructure.tools.background_tasks import (
 from neuro_code.infrastructure.tools.bash import BashTool
 from neuro_code.infrastructure.tools.registry import default_tool_registry
 from neuro_code.shared.errors import ToolError
+
+
+class _EnabledProcessSandboxFixture(LocalProcessSandbox):
+    """Record enabled requests while using the host bridge only inside this unit fixture."""
+
+    def __init__(self) -> None:
+        self.requests: list[SandboxedProcessRequest] = []
+        self._delegate = ProcessTreeLocalProcessSandbox()
+
+    async def spawn(self, request: SandboxedProcessRequest) -> OwnedLocalProcess:
+        self.requests.append(request)
+        return await self._delegate.spawn(replace(request, sandbox_profile=SandboxProfile.OFF))
 
 
 class BackgroundTaskToolTests(unittest.IsolatedAsyncioTestCase):
@@ -74,22 +92,14 @@ class BackgroundTaskToolTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 await manager.shutdown()
 
-    async def test_background_command_uses_sandbox_launch_and_strips_secrets(self) -> None:
-        class FixtureSandbox:
-            profile = SandboxProfile.WORKSPACE
-
-            def shell_launch(self, command: str) -> ShellLaunch:
-                self.command = command
-                code = "import os;print(os.environ.get('FIXTURE_API_KEY','missing'))"
-                return ShellLaunch(sys.executable, ("-c", code))
-
+    async def test_background_command_uses_child_sandbox_request_and_strips_secrets(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            manager = LocalBackgroundTaskManager()
-            sandbox = FixtureSandbox()
+            sandbox = _EnabledProcessSandboxFixture()
+            manager = LocalBackgroundTaskManager(local_process_sandbox=sandbox)
             context = ToolContext(
                 Path(directory),
                 sandbox_profile=SandboxProfile.WORKSPACE,
-                shell_sandbox=sandbox,
+                local_process_sandbox=sandbox,
                 protected_environment_variables=frozenset({"fixture_api_key"}),
                 background_tasks=manager,
             )
@@ -100,7 +110,13 @@ class BackgroundTaskToolTests(unittest.IsolatedAsyncioTestCase):
                     clear=False,
                 ):
                     started = await BashTool(background_enabled=True).execute(
-                        {"command": "original command", "is_background": True},
+                        {
+                            "command": (
+                                f'"{sys.executable}" -c '
+                                "\"import os;print(os.environ.get('FIXTURE_API_KEY','missing'))\""
+                            ),
+                            "is_background": True,
+                        },
                         context,
                     )
                 assert started.metadata is not None
@@ -111,8 +127,8 @@ class BackgroundTaskToolTests(unittest.IsolatedAsyncioTestCase):
                     context,
                 )
                 self.assertEqual(await manager.pending_completions(), ())
-                self.assertEqual(sandbox.command, "original command")
-                self.assertIn("command: original command", output.content)
+                self.assertEqual(len(sandbox.requests), 1)
+                self.assertTrue(sandbox.requests[0].filesystem_policy.private_home)
                 self.assertIn("missing", output.content)
                 self.assertNotIn("provider-secret", output.content)
             finally:

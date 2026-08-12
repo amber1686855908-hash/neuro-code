@@ -401,6 +401,11 @@ class AppConfig:
     loaded_files: tuple[Path, ...] = ()
 
     def __post_init__(self) -> None:
+        try:
+            object.__setattr__(self, "cwd", self.cwd.expanduser().resolve(strict=False))
+            object.__setattr__(self, "state_dir", self.state_dir.expanduser().resolve(strict=False))
+        except (AttributeError, OSError, RuntimeError) as error:
+            raise ConfigurationError("application filesystem paths must be resolvable") from error
         object.__setattr__(self, "providers", MappingProxyType(dict(self.providers)))
 
     @property

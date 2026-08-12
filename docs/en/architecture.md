@@ -1107,8 +1107,10 @@ continues to fail closed. See
   effort for explicit capability handling.
 - `Tool`: publishes a JSON schema and executes with a scoped `ToolContext`.
 - `ToolRegistry`: resolves canonical tool names and rejects duplicates.
-- `ShellSandbox`: turns a shell string into an argv-safe, platform-enforced
-  launch without exposing namespace implementation details to tools.
+- `LocalProcessSandbox`: owns every model-controlled local child boundary,
+  including pipe-based commands, stdio MCP, and local PTY/ConPTY sessions;
+  terminal callers submit a typed `SandboxedProcessRequest` rather than
+  invoking a platform spawn adapter directly.
 - `BackgroundTaskSupervisor`: creates isolated conversation task scopes and
   terminates every live tree during application shutdown.
 - `BackgroundTaskManager`: starts owned shell/exec trees and exposes bounded
@@ -1280,11 +1282,20 @@ pair from terminal backend output when intermediate events were absent.
 - Writes resolve and validate their target before mutation; a workspace-scoped
   tool cannot escape through `..` or symlinks.
 - Explicit sandbox requests fail closed when the platform cannot enforce them.
-- A sandbox activation marker is insufficient evidence by itself. Linux
-  composition attests root, workspace, and state mount flags before tools are
-  exposed; `strict` also attests its allowlist-root filesystem type.
+- Each enabled local child is preflighted by its `LocalProcessSandbox` launcher;
+  there is no controller-wide activation marker or mount attestation. The
+  launcher still validates its trusted helper, explicit mounts, private state,
+  and `strict` allowlist-root filesystem before exposing a child.
+- Enabled Linux children use a PID namespace as the descendant lifecycle
+  boundary, so `setsid()` cannot escape timeout, cancellation, or shutdown.
+  The explicit POSIX `off` profile provides only original-process-group cleanup
+  and no filesystem, network, controller-state, or arbitrary-descendant isolation.
+- The process-creation architecture guard audits built-in production code. Same-process
+  Python extensions (`additional_tools`, injected executors, and future plugins)
+  run with controller authority and are trusted; an untrusted plugin requires a
+  separate process/capability boundary.
 - `read-only` removes and independently rejects the workspace edit tool.
-  `read-only` and `strict` shell descendants run without the parent agent's
+  `read-only` and `strict` local-process descendants run without the parent agent's
   network namespace, while provider HTTP remains available to the parent.
 - Secrets never appear in inspect output, logs, session events, or exceptions.
 - Bash descendants do not inherit configured provider API-key variables or
@@ -1457,18 +1468,29 @@ for kernel sandboxing and process containment, but business and orchestration
 logic remains Python. Unsupported security guarantees must be reported at
 startup, never silently weakened.
 
-The first concrete implementation re-executes Linux runs under bubblewrap for
-`workspace`, `read-only`, and `strict`; `off` remains the portable default.
-Filesystem mounts cover in-process Python tools and descendants. A separate
-`ShellSandbox` launch plan places Bash descendants of `read-only` and `strict`
-inside a nested network namespace. macOS and Windows currently reject explicit
-non-`off` profiles rather than advertising unenforced behavior. See
+The first concrete implementation uses child-scoped Bubblewrap for Linux
+`workspace`, `read-only`, and `strict` local-process requests; `off` remains
+the portable default. The trusted controller is never re-executed inside the
+namespace. Each Bash, background Bash, stdio MCP, or enabled-profile PTY
+request receives its own child boundary with explicit workspace mounts,
+private HOME and temporary directories, and a minimal environment. Read-only
+and strict children additionally use an isolated network namespace. macOS and
+Windows currently reject explicit non-`off` profiles rather than advertising
+unenforced behavior. See
 [ADR 0019](adr/0019-fail-closed-linux-sandbox-profiles.md) and
 [ADR 0020](adr/0020-session-fixed-sandbox-profiles.md).
 
-Foreground and managed-background shell commands share `ProcessTree`. POSIX
+Enabled Linux startup performs a bounded controller-state hardlink audit before
+mounting any authorized workspace. It fails closed when a private regular file
+has another inode name, preventing a pre-existing workspace hardlink from
+reintroducing credentials or session state without scanning the whole workspace.
+Dedicated Linux CI must execute the real namespace tests without skips; dedicated
+Windows CI must execute the native Job Object and ConPTY lifecycle tests.
+
+Foreground and managed-background shell commands share `ProcessTree`. Unsandboxed POSIX
 waiting observes the owned process group after its shell leader exits, while
-termination uses a bounded TERM-to-KILL sequence. On Windows, a lazy ctypes
+termination uses a bounded TERM-to-KILL sequence; a descendant that creates a
+new session is outside that `off`-profile process-group contract. On Windows, a lazy ctypes
 platform adapter creates a kill-on-close Job Object before process launch,
 passes its borrowed handle through `PROC_THREAD_ATTRIBUTE_JOB_LIST`, and creates
 the leader already assigned to the Job. The same `STARTUPINFOEXW` call restricts

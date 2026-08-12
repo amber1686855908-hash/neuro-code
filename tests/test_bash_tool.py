@@ -8,14 +8,22 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
-from neuro_code.application.ports.sandbox import ShellLaunch
+from neuro_code.application.ports.sandbox import (
+    LocalProcessPurpose,
+    LocalProcessSandbox,
+    LocalProcessStdioMode,
+    OwnedLocalProcess,
+    SandboxedProcessRequest,
+)
 from neuro_code.application.ports.tools import ToolContext
 from neuro_code.domain.sandbox import SandboxProfile
 from neuro_code.infrastructure.background_tasks import LocalBackgroundTaskManager
 from neuro_code.infrastructure.persistence.output_artifacts import FileToolOutputArtifactStore
+from neuro_code.infrastructure.sandbox.local_process import ProcessTreeLocalProcessSandbox
 from neuro_code.infrastructure.tools.background_tasks import TaskOutputTool
 from neuro_code.infrastructure.tools.bash import BashTool
 from neuro_code.shared.errors import ToolError
@@ -30,36 +38,105 @@ def _python_shell_command(code: str) -> str:
     return subprocess.list2cmdline(argv) if os.name == "nt" else shlex.join(argv)
 
 
+def _canonical_path(path: Path) -> Path:
+    return path.expanduser().resolve(strict=False)
+
+
+class _RecordingLocalProcessSandbox(LocalProcessSandbox):
+    """Record canonical requests while retaining real process ownership."""
+
+    def __init__(self) -> None:
+        self.requests: list[SandboxedProcessRequest] = []
+        self._delegate = ProcessTreeLocalProcessSandbox()
+
+    async def spawn(self, request: SandboxedProcessRequest) -> OwnedLocalProcess:
+        self.requests.append(request)
+        return await self._delegate.spawn(request)
+
+
+class _EnabledRecordingLocalProcessSandbox(LocalProcessSandbox):
+    """Exercise the enabled request boundary without requiring Bubblewrap in unit tests."""
+
+    def __init__(self) -> None:
+        self.requests: list[SandboxedProcessRequest] = []
+        self._delegate = ProcessTreeLocalProcessSandbox()
+
+    async def spawn(self, request: SandboxedProcessRequest) -> OwnedLocalProcess:
+        self.requests.append(request)
+        # The fixture must not claim it enforces the profile.  It converts the
+        # request only to execute the shell command after the test asserted the
+        # canonical enabled-profile request sent by Bash.
+        return await self._delegate.spawn(replace(request, sandbox_profile=SandboxProfile.OFF))
+
+
 class BashToolTests(unittest.IsolatedAsyncioTestCase):
-    async def test_enabled_profile_requires_a_matching_shell_sandbox(self) -> None:
+    async def test_foreground_bash_uses_a_canonical_sandbox_request(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sandbox = _RecordingLocalProcessSandbox()
+
+            result = await BashTool(local_process_sandbox=sandbox).execute(
+                {"command": _python_shell_command("print('through port')")},
+                ToolContext(root),
+            )
+
+            self.assertEqual(result.content.strip(), "through port")
+            self.assertEqual(len(sandbox.requests), 1)
+            request = sandbox.requests[0]
+            self.assertEqual(request.purpose, LocalProcessPurpose.BASH)
+            self.assertEqual(request.stdio_mode, LocalProcessStdioMode.CAPTURE)
+            self.assertEqual(request.cwd, _canonical_path(root))
+
+    async def test_background_bash_uses_a_canonical_sandbox_request(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sandbox = _RecordingLocalProcessSandbox()
+            manager = LocalBackgroundTaskManager(local_process_sandbox=sandbox)
+            try:
+                result = await BashTool(background_enabled=True).execute(
+                    {
+                        "command": _python_shell_command("print('background through port')"),
+                        "is_background": True,
+                    },
+                    ToolContext(root, background_tasks=manager),
+                )
+
+                self.assertFalse(result.is_error)
+                self.assertEqual(len(sandbox.requests), 1)
+                request = sandbox.requests[0]
+                self.assertEqual(request.purpose, LocalProcessPurpose.BACKGROUND_BASH)
+                self.assertEqual(request.stdio_mode, LocalProcessStdioMode.MERGED_CAPTURE)
+                self.assertEqual(request.cwd, _canonical_path(root))
+            finally:
+                await manager.shutdown()
+
+    async def test_enabled_profile_requires_a_child_process_sandbox(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             context = ToolContext(
                 Path(directory),
                 sandbox_profile=SandboxProfile.WORKSPACE,
             )
-            with self.assertRaisesRegex(ToolError, "is not enforced"):
+            with self.assertRaisesRegex(ToolError, "requires a child process sandbox"):
                 await BashTool().execute({"command": "echo unsafe"}, context)
 
-    async def test_shell_sandbox_supplies_an_argv_safe_launch(self) -> None:
-        class FixtureSandbox:
-            profile = SandboxProfile.WORKSPACE
-
-            def shell_launch(self, command: str) -> ShellLaunch:
-                self.command = command
-                return ShellLaunch(sys.executable, ("-c", "print('sandbox launch')"))
-
+    async def test_enabled_profile_uses_the_context_child_process_sandbox(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            sandbox = FixtureSandbox()
+            sandbox = _EnabledRecordingLocalProcessSandbox()
             result = await BashTool().execute(
-                {"command": "ignored by fixture"},
+                {"command": _python_shell_command("print('child sandbox launch')")},
                 ToolContext(
                     Path(directory),
                     sandbox_profile=SandboxProfile.WORKSPACE,
-                    shell_sandbox=sandbox,
+                    local_process_sandbox=sandbox,
                 ),
             )
-            self.assertEqual(sandbox.command, "ignored by fixture")
-            self.assertEqual(result.content.strip(), "sandbox launch")
+            self.assertEqual(result.content.strip(), "child sandbox launch")
+            self.assertEqual(len(sandbox.requests), 1)
+            request = sandbox.requests[0]
+            self.assertTrue(request.uses_shell)
+            self.assertTrue(request.filesystem_policy.private_home)
+            self.assertTrue(request.filesystem_policy.private_temporary_directory)
+            self.assertEqual(request.network_policy.value, "inherit")
 
     async def test_captures_stdout_stderr_and_exit_code(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -406,23 +483,15 @@ class BashToolTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("provider-secret", result.content)
             self.assertNotIn("proxy-secret", result.content)
 
-    async def test_auto_promotion_reuses_sandbox_launch_and_protected_environment(self) -> None:
-        class FixtureSandbox:
-            profile = SandboxProfile.WORKSPACE
-
-            def shell_launch(self, command: str) -> ShellLaunch:
-                self.command = command
-                code = "import os;print(os.environ.get('FIXTURE_API_KEY','missing'))"
-                return ShellLaunch(sys.executable, ("-c", code))
-
+    async def test_auto_promotion_reuses_child_sandbox_and_minimal_environment(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            manager = LocalBackgroundTaskManager()
-            sandbox = FixtureSandbox()
+            sandbox = _EnabledRecordingLocalProcessSandbox()
+            manager = LocalBackgroundTaskManager(local_process_sandbox=sandbox)
             context = ToolContext(
                 Path(directory),
                 command_timeout_seconds=2,
                 sandbox_profile=SandboxProfile.WORKSPACE,
-                shell_sandbox=sandbox,
+                local_process_sandbox=sandbox,
                 protected_environment_variables=frozenset({"fixture_api_key"}),
                 background_tasks=manager,
             )
@@ -433,11 +502,16 @@ class BashToolTests(unittest.IsolatedAsyncioTestCase):
                     clear=False,
                 ):
                     result = await BashTool(background_enabled=True).execute(
-                        {"command": "sandboxed foreground"},
+                        {
+                            "command": _python_shell_command(
+                                "import os;print(os.environ.get('FIXTURE_API_KEY','missing'))"
+                            )
+                        },
                         context,
                     )
                 self.assertEqual(result.content.strip(), "missing")
-                self.assertEqual(sandbox.command, "sandboxed foreground")
+                self.assertEqual(len(sandbox.requests), 1)
+                self.assertTrue(sandbox.requests[0].filesystem_policy.private_home)
                 self.assertEqual(await manager.list(), ())
                 self.assertNotIn("provider-secret", result.content)
             finally:

@@ -22,6 +22,7 @@ from neuro_code.application.ports.background_tasks import (
     BackgroundTaskSupervisor,
 )
 from neuro_code.application.ports.model import ModelProvider
+from neuro_code.application.ports.sandbox import LocalProcessSandbox
 from neuro_code.application.runtime.supervision import ExecutionControlMode
 from neuro_code.application.sessions import GetSessionSummaryRequest, SessionApplicationService
 from neuro_code.application.sessions.summary import SessionSummaryQueryService
@@ -38,6 +39,10 @@ from neuro_code.domain.tools import ToolDefinition, ToolResult
 from neuro_code.infrastructure.workspace.paths import workspaces_match
 from neuro_code.shared.errors import ConfigurationError, ToolError
 from tests.fakes import EmptyWorkspaceChangeObserver
+
+
+def _canonical_path(path: Path) -> Path:
+    return path.expanduser().resolve(strict=False)
 
 
 class ApplicationProviderFixture:
@@ -84,9 +89,15 @@ class ApplicationTaskScopeFixture:
 class ApplicationSupervisorFixture:
     def __init__(self) -> None:
         self.scopes: list[ApplicationTaskScopeFixture] = []
+        self.local_process_sandboxes: list[LocalProcessSandbox | None] = []
         self.shutdown_calls = 0
 
-    def open_scope(self) -> BackgroundTaskManager:
+    def open_scope(
+        self,
+        *,
+        local_process_sandbox: LocalProcessSandbox | None = None,
+    ) -> BackgroundTaskManager:
+        self.local_process_sandboxes.append(local_process_sandbox)
         scope = ApplicationTaskScopeFixture()
         self.scopes.append(scope)
         return cast(BackgroundTaskManager, scope)
@@ -233,6 +244,89 @@ context_window_tokens = 65536
                 )
                 await observe_application.close()
 
+    async def test_composition_injects_the_canonical_local_process_port(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / "state"
+            self._write_config(state)
+            process_sandbox = cast(LocalProcessSandbox, object())
+            with patch.dict(
+                "os.environ",
+                {
+                    "HOME": str(root),
+                    "NEURO_CODE_HOME": str(state),
+                    "FIXTURE_KEY": "fixture-key",
+                },
+                clear=True,
+            ):
+                application = await ApplicationComposition.open(
+                    ApplicationSettings(cwd=root),
+                    provider_factory=lambda config, failover: ApplicationProviderFixture(),
+                    local_process_sandbox_factory=lambda profile, cwd, state_dir: process_sandbox,
+                )
+                try:
+                    binding = await application.create_binding()
+                    self.assertIs(
+                        binding.runner._runtime._tool_context.local_process_sandbox,
+                        process_sandbox,
+                    )
+                finally:
+                    await application.close()
+
+    async def test_composition_shares_one_process_launcher_with_its_background_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / "state"
+            self._write_config(state)
+            process_sandbox = cast(LocalProcessSandbox, object())
+            supervisor = ApplicationSupervisorFixture()
+            factory_calls: list[tuple[SandboxProfile, Path, Path]] = []
+
+            def process_sandbox_factory(
+                profile: SandboxProfile,
+                cwd: Path,
+                state_dir: Path,
+            ) -> LocalProcessSandbox:
+                factory_calls.append((profile, cwd, state_dir))
+                return process_sandbox
+
+            with patch.dict(
+                "os.environ",
+                {
+                    "HOME": str(root),
+                    "NEURO_CODE_HOME": str(state),
+                    "FIXTURE_KEY": "fixture-key",
+                },
+                clear=True,
+            ):
+                application = await ApplicationComposition.open(
+                    ApplicationSettings(cwd=root),
+                    provider_factory=lambda config, failover: ApplicationProviderFixture(),
+                    background_supervisor_factory=lambda: cast(
+                        BackgroundTaskSupervisor, supervisor
+                    ),
+                    local_process_sandbox_factory=process_sandbox_factory,
+                )
+                try:
+                    binding = await application.create_binding()
+                    self.assertEqual(
+                        factory_calls,
+                        [
+                            (
+                                SandboxProfile.OFF,
+                                _canonical_path(root),
+                                _canonical_path(state),
+                            )
+                        ],
+                    )
+                    self.assertIs(supervisor.local_process_sandboxes[0], process_sandbox)
+                    self.assertIs(
+                        binding.runner._runtime._tool_context.local_process_sandbox,
+                        process_sandbox,
+                    )
+                finally:
+                    await application.close()
+
     async def test_read_only_subagent_binding_has_only_inspection_capabilities(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -282,15 +376,6 @@ context_window_tokens = 65536
             state = root / "state"
             self._write_config(state)
             supervisor = ApplicationSupervisorFixture()
-            enforced: list[tuple[SandboxProfile, Path, Path, tuple[str, ...]]] = []
-
-            def enforce(
-                profile: SandboxProfile,
-                cwd: Path,
-                state_dir: Path,
-                command: Sequence[str],
-            ) -> None:
-                enforced.append((profile, cwd, state_dir, tuple(command)))
 
             with patch.dict(
                 "os.environ",
@@ -302,16 +387,11 @@ context_window_tokens = 65536
                 clear=True,
             ):
                 application = await ApplicationComposition.open(
-                    ApplicationSettings(
-                        cwd=root,
-                        launch_command=("neuro-code", "agent"),
-                    ),
+                    ApplicationSettings(cwd=root),
                     provider_factory=lambda config, failover: cast(
                         ModelProvider,
                         ApplicationProviderFixture(),
                     ),
-                    shell_sandbox_factory=lambda profile, cwd, state_dir: None,
-                    process_sandbox_enforcer=enforce,
                     background_supervisor_factory=lambda: cast(
                         BackgroundTaskSupervisor,
                         supervisor,
@@ -320,7 +400,6 @@ context_window_tokens = 65536
                 binding = await application.create_binding(reasoning_effort=ReasoningEffort.LOW)
                 self.assertEqual(binding.runner.reasoning_effort, ReasoningEffort.LOW)
                 self.assertTrue(workspaces_match(application.config.cwd, root))
-                self.assertEqual(enforced[0][0], SandboxProfile.OFF)
                 await application.close()
                 await application.close()
 
@@ -377,10 +456,6 @@ context_window_tokens = 65536
                 calls.append("create session store")
                 return store
 
-            def enforce(*args: object) -> None:
-                del args
-                calls.append("enforce process sandbox")
-
             def instruction_discovery_factory() -> object:
                 calls.append("create instruction discovery")
                 return object()
@@ -418,9 +493,7 @@ context_window_tokens = 65536
                             cwd=root,
                             sandbox="workspace",
                             resume_id="saved-session",
-                            launch_command=("neuro-code", "agent"),
                         ),
-                        process_sandbox_enforcer=enforce,
                         store_factory=store_factory,
                         background_supervisor_factory=ApplicationSupervisorFixture,
                         instruction_discovery_factory=instruction_discovery_factory,
@@ -437,7 +510,6 @@ context_window_tokens = 65536
                 "create session store",
                 "peek session sandbox",
                 "pin resumed sandbox",
-                "enforce process sandbox",
                 "initialize session store",
                 "create instruction discovery",
                 "create skill discovery",
@@ -467,7 +539,6 @@ context_window_tokens = 65536
                 application = await ApplicationComposition.open(
                     ApplicationSettings(cwd=root),
                     provider_factory=fail_provider,
-                    process_sandbox_enforcer=lambda *args: None,
                     background_supervisor_factory=lambda: cast(
                         BackgroundTaskSupervisor,
                         supervisor,
@@ -504,7 +575,6 @@ context_window_tokens = 65536
                 application = await ApplicationComposition.open(
                     ApplicationSettings(cwd=root),
                     provider_factory=lambda config, failover: ApplicationProviderFixture(),
-                    process_sandbox_enforcer=lambda *args: None,
                     background_supervisor_factory=lambda: cast(
                         BackgroundTaskSupervisor,
                         supervisor,
@@ -543,7 +613,6 @@ context_window_tokens = 65536
                 application = await ApplicationComposition.open(
                     ApplicationSettings(cwd=root),
                     provider_factory=lambda config, failover: ApplicationProviderFixture(),
-                    process_sandbox_enforcer=lambda *args: None,
                     background_supervisor_factory=lambda: cast(
                         BackgroundTaskSupervisor,
                         supervisor,
@@ -583,7 +652,6 @@ context_window_tokens = 65536
                         ModelProvider,
                         ApplicationProviderFixture(),
                     ),
-                    process_sandbox_enforcer=lambda *args: None,
                     background_supervisor_factory=lambda: cast(
                         BackgroundTaskSupervisor,
                         supervisor,
@@ -638,7 +706,6 @@ context_window_tokens = 65536
                         ModelProvider,
                         ApplicationProviderFixture(),
                     ),
-                    process_sandbox_enforcer=lambda *args: None,
                 )
                 restored_id = await application.store.create_session(
                     str(root),
@@ -707,7 +774,6 @@ context_window_tokens = 65536
                         ModelProvider,
                         ApplicationProviderFixture(),
                     ),
-                    process_sandbox_enforcer=lambda *args: None,
                 )
                 session_id = await application.store.create_session(
                     str(root),
@@ -730,42 +796,31 @@ context_window_tokens = 65536
                 self.assertEqual(requests, [GetSessionSummaryRequest(session_id)])
                 await application.close()
 
-    async def test_failed_open_closes_the_process_supervisor(self) -> None:
+    async def test_enabled_profile_does_not_reexec_the_controller(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             state = root / "state"
             self._write_config(state)
             supervisor = ApplicationSupervisorFixture()
-            sandbox_preflight_calls = 0
-
-            def enforce(*args: object) -> None:
-                nonlocal sandbox_preflight_calls
-                del args
-                sandbox_preflight_calls += 1
-
-            with (
-                patch.dict(
-                    "os.environ",
-                    {
-                        "HOME": str(root),
-                        "NEURO_CODE_HOME": str(state),
-                        "FIXTURE_KEY": "fixture-key",
-                    },
-                    clear=True,
-                ),
-                self.assertRaisesRegex(ValueError, "launch command"),
+            with patch.dict(
+                "os.environ",
+                {
+                    "HOME": str(root),
+                    "NEURO_CODE_HOME": str(state),
+                    "FIXTURE_KEY": "fixture-key",
+                },
+                clear=True,
             ):
-                await ApplicationComposition.open(
+                application = await ApplicationComposition.open(
                     ApplicationSettings(cwd=root, sandbox="workspace"),
-                    process_sandbox_enforcer=enforce,
                     background_supervisor_factory=lambda: cast(
                         BackgroundTaskSupervisor,
                         supervisor,
                     ),
                 )
+                await application.close()
 
         self.assertEqual(supervisor.shutdown_calls, 1)
-        self.assertEqual(sandbox_preflight_calls, 0)
 
 
 if __name__ == "__main__":

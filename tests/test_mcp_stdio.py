@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
@@ -9,6 +10,13 @@ from unittest.mock import AsyncMock, patch
 import mcp.types as mcp_types
 
 import neuro_code.infrastructure.mcp.stdio as mcp_stdio
+from neuro_code.application.ports.sandbox import (
+    LocalProcessPurpose,
+    LocalProcessSandbox,
+    LocalProcessStdioMode,
+    OwnedLocalProcess,
+    SandboxedProcessRequest,
+)
 from neuro_code.application.ports.tools import ToolContext
 from neuro_code.domain.sandbox import SandboxProfile
 from neuro_code.infrastructure.mcp.stdio import (
@@ -17,9 +25,25 @@ from neuro_code.infrastructure.mcp.stdio import (
     McpStdioServerConfig,
     McpStdioToolCollection,
 )
-from neuro_code.shared.errors import ToolError
+from neuro_code.infrastructure.sandbox.linux_local_process import (
+    LinuxBubblewrapLocalProcessSandbox,
+)
+from neuro_code.infrastructure.sandbox.local_process import ProcessTreeLocalProcessSandbox
+from neuro_code.shared.errors import SandboxError, ToolError
 
 _FIXTURE = Path(__file__).parent / "fixtures" / "mcp_stdio_server.py"
+
+
+class _RecordingLocalProcessSandbox(LocalProcessSandbox):
+    """Record stdio process requests while delegating lifecycle ownership."""
+
+    def __init__(self) -> None:
+        self.requests: list[SandboxedProcessRequest] = []
+        self._delegate = ProcessTreeLocalProcessSandbox()
+
+    async def spawn(self, request: SandboxedProcessRequest) -> OwnedLocalProcess:
+        self.requests.append(request)
+        return await self._delegate.spawn(request)
 
 
 class McpStdioToolCollectionTests(unittest.IsolatedAsyncioTestCase):
@@ -132,8 +156,110 @@ class McpStdioToolCollectionTests(unittest.IsolatedAsyncioTestCase):
                 ToolContext(_FIXTURE.parent, sandbox_profile=SandboxProfile.OFF),
             )
 
+    async def test_stdio_mcp_uses_a_protocol_process_request(self) -> None:
+        sandbox = _RecordingLocalProcessSandbox()
+        collection = await McpStdioToolCollection.open(
+            (
+                McpStdioServerConfig(
+                    name="recorded",
+                    command=sys.executable,
+                    args=(str(_FIXTURE),),
+                ),
+            ),
+            cwd=_FIXTURE.parent,
+            local_process_sandbox=sandbox,
+        )
+        try:
+            self.assertEqual(len(sandbox.requests), 1)
+            request = sandbox.requests[0]
+            self.assertEqual(request.purpose, LocalProcessPurpose.MCP_STDIO)
+            self.assertEqual(request.stdio_mode, LocalProcessStdioMode.PROTOCOL)
+            self.assertEqual(request.cwd, _FIXTURE.parent)
+        finally:
+            await collection.close()
+
+    async def test_enabled_mcp_request_has_private_runtime_and_explicit_server_env(self) -> None:
+        connection = mcp_stdio._McpServerConnection(
+            McpStdioServerConfig(
+                name="protected-runtime",
+                command=sys.executable,
+                env=(("MCP_FIXTURE_SECRET", "fixture-secret-value"),),
+            ),
+            cwd=_FIXTURE.parent,
+            explicit_redactions=(),
+            local_process_sandbox=ProcessTreeLocalProcessSandbox(),
+            sandbox_profile=SandboxProfile.WORKSPACE,
+        )
+
+        request = connection._process_request(
+            sys.executable,
+            (str(_FIXTURE),),
+            {"PATH": "/usr/bin", "MCP_FIXTURE_SECRET": "fixture-secret-value"},
+        )
+
+        self.assertTrue(request.filesystem_policy.private_home)
+        self.assertTrue(request.filesystem_policy.private_temporary_directory)
+        self.assertEqual(
+            request.environment_policy.variables["MCP_FIXTURE_SECRET"], "fixture-secret-value"
+        )
+        self.assertEqual(
+            request.environment_policy.explicitly_authorized_names,
+            frozenset({"MCP_FIXTURE_SECRET"}),
+        )
+        self.assertEqual(request.sandbox_profile, SandboxProfile.WORKSPACE)
+
+    async def test_linux_enabled_mcp_server_runs_inside_the_child_boundary(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state_dir = Path(directory)
+            try:
+                sandbox = LinuxBubblewrapLocalProcessSandbox(
+                    SandboxProfile.WORKSPACE,
+                    _FIXTURE.parent,
+                    state_dir,
+                )
+            except SandboxError as error:
+                self.skipTest(str(error))
+            collection = await McpStdioToolCollection.open(
+                (
+                    McpStdioServerConfig(
+                        name="sandboxed-fixture",
+                        command=sys.executable,
+                        args=(str(_FIXTURE),),
+                        env=(("MCP_FIXTURE_SECRET", "fixture-secret-value"),),
+                    ),
+                ),
+                cwd=_FIXTURE.parent,
+                explicit_redactions=("fixture-secret-value",),
+                local_process_sandbox=sandbox,
+                sandbox_profile=SandboxProfile.WORKSPACE,
+            )
+            try:
+                configured = {tool.definition.name: tool for tool in collection.tools}[
+                    "configured_secret"
+                ]
+                result = await configured.execute(
+                    {},
+                    ToolContext(_FIXTURE.parent, sandbox_profile=SandboxProfile.WORKSPACE),
+                )
+                self.assertEqual(result.content, "[REDACTED]")
+            finally:
+                await collection.close()
+
 
 class McpStdioValidationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_enabled_profile_requires_a_child_sandbox_launcher(self) -> None:
+        with self.assertRaisesRegex(McpStdioError, "mcp_child_sandbox_unavailable"):
+            await McpStdioToolCollection.open(
+                (
+                    McpStdioServerConfig(
+                        name="missing-launcher",
+                        command=sys.executable,
+                    ),
+                ),
+                cwd=_FIXTURE.parent,
+                sandbox_profile=SandboxProfile.WORKSPACE,
+            )
+
     async def test_missing_command_fails_without_publishing_tools(self) -> None:
         with self.assertRaisesRegex(McpStdioError, "initialization_failed"):
             await McpStdioToolCollection.open(

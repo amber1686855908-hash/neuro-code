@@ -532,17 +532,18 @@ profile = "workspace"
 neuro-code -p "Inspect and test this repository" --sandbox workspace
 ```
 
-On Linux, non-`off` profiles require usable, non-workspace-controlled `bwrap`;
-`read-only` and `strict` also require `unshare`. Neuro Code probes these
-capabilities and re-executes before opening the session store or starting model
-work. It never falls back to an unsandboxed run after an explicit request.
+On Linux, non-`off` profiles require usable, non-workspace-controlled `bwrap`.
+Neuro Code preflights the required user, mount, PID, and (for `read-only` and
+`strict`) network namespaces before exposing each child. The trusted controller,
+provider connections, credentials, and session store remain on the host. An
+explicit enabled profile never falls back to an unsandboxed child.
 
 | Profile | Filesystem | Local Bash network |
 |---|---|---|
-| `off` | No OS sandbox | Available |
-| `workspace` | Host readable; workspace, state, and temporary paths writable | Available |
-| `read-only` | Host/workspace read-only; state and temporary paths writable; edit tool unavailable | Isolated |
-| `strict` | Only required system/runtime paths and workspace visible; workspace, state, and temporary paths writable | Isolated |
+| `off` | Explicitly no OS filesystem, network, controller-state, or detached-descendant isolation | Available |
+| `workspace` | Empty child root; required runtime read-only; authorized workspace roots writable; private HOME and temporary storage | Available |
+| `read-only` | Same empty child root, but authorized workspace roots read-only; edit tool unavailable | Isolated |
+| `strict` | Same allowlist root as `workspace`; authorized workspace roots remain writable | Isolated |
 
 The parent process retains network access for model APIs. Permissions still run
 before tools and remain necessary: a sandbox limits an approved action but does
@@ -550,6 +551,17 @@ not decide whether to approve it. A user-level profile cannot be weakened by a
 project file. CLI and environment choices are explicit higher-priority
 selections for a new session; they cannot change a saved session's profile
 during resume. `neuro-code inspect` reports the canonical profile and its source.
+`off` remains the compatibility default and is a deliberate request to run
+children without an OS security boundary; POSIX cleanup then owns only the
+original process group and cannot guarantee termination of descendants that
+call `setsid()`. Enabled Linux profiles add a PID namespace and
+`--die-with-parent`, so process-group escape does not escape the sandbox
+lifecycle boundary. Before enabled-profile startup, Neuro Code also rejects a
+controller-state regular file with multiple hardlinks: otherwise an existing
+workspace hardlink could name the same private inode through an authorized bind
+mount. Other pre-existing files inside an explicitly authorized workspace are
+within that workspace's trust boundary.
+
 Local Bash also strips configured provider API-key variables and standard or
 explicit proxy variables instead of inheriting their secret values.
 

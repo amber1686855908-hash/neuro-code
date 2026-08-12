@@ -21,6 +21,20 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from neuro_code.application.ports.background_tasks import BackgroundTaskManager
+from neuro_code.application.ports.sandbox import (
+    LocalProcessEnvironmentPolicy,
+    LocalProcessFilesystemPolicy,
+    LocalProcessLifecycle,
+    LocalProcessNetworkPolicy,
+    LocalProcessOutput,
+    LocalProcessPurpose,
+    LocalProcessSandbox,
+    LocalProcessStdioMode,
+    LocalWorkspaceAccess,
+    LocalWorkspaceAccessMode,
+    OwnedLocalProcess,
+    SandboxedProcessRequest,
+)
 from neuro_code.application.ports.tools import (
     MAX_TOOL_OUTPUT_ARTIFACT_BYTES,
     ToolOutputArtifact,
@@ -35,7 +49,8 @@ from neuro_code.domain.background_tasks.models import (
     BackgroundTaskWaitMode,
     BackgroundTaskWaitResult,
 )
-from neuro_code.infrastructure.sandbox.process_tree import ProcessTree
+from neuro_code.domain.sandbox.models import SandboxProfile
+from neuro_code.infrastructure.sandbox.local_process import ProcessTreeLocalProcessSandbox
 from neuro_code.shared.errors import BackgroundTaskCapacityError, ToolError
 
 
@@ -105,7 +120,7 @@ class _TaskRecord:
     task_id: str
     command: str
     cwd: Path
-    tree: ProcessTree
+    process: OwnedLocalProcess
     output: _BoundedOutput
     output_artifact_store: ToolOutputArtifactStore | None
     termination_grace_seconds: float
@@ -134,6 +149,7 @@ class LocalBackgroundTaskManager:
         *,
         max_running_tasks: int = 16,
         max_retained_tasks: int = 64,
+        local_process_sandbox: LocalProcessSandbox | None = None,
     ) -> None:
         if max_running_tasks <= 0:
             raise ValueError("max_running_tasks must be positive")
@@ -141,13 +157,25 @@ class LocalBackgroundTaskManager:
             raise ValueError("max_retained_tasks must cover max_running_tasks")
         self._max_running_tasks = max_running_tasks
         self._max_retained_tasks = max_retained_tasks
+        self._local_process_sandbox = (
+            local_process_sandbox
+            if local_process_sandbox is not None
+            else ProcessTreeLocalProcessSandbox()
+        )
         self._records: dict[str, _TaskRecord] = {}
         self._registry_lock = asyncio.Lock()
         self._closed = False
         self._root_scope_id = uuid.uuid4().hex
         self._open_scopes = {self._root_scope_id}
+        self._scope_process_sandboxes: dict[str, LocalProcessSandbox] = {
+            self._root_scope_id: self._local_process_sandbox,
+        }
 
-    def open_scope(self) -> BackgroundTaskManager:
+    def open_scope(
+        self,
+        *,
+        local_process_sandbox: LocalProcessSandbox | None = None,
+    ) -> BackgroundTaskManager:
         """Return a manager whose task IDs and lifecycle are isolated from peers.
 
         返回一个与其他范围隔离任务 ID 和生命周期的管理器."""
@@ -155,6 +183,11 @@ class LocalBackgroundTaskManager:
             raise ToolError("background task manager is closed")
         scope_id = uuid.uuid4().hex
         self._open_scopes.add(scope_id)
+        self._scope_process_sandboxes[scope_id] = (
+            local_process_sandbox
+            if local_process_sandbox is not None
+            else self._local_process_sandbox
+        )
         return _LocalBackgroundTaskScope(self, scope_id)
 
     async def start_shell(
@@ -168,18 +201,16 @@ class LocalBackgroundTaskManager:
         timeout_seconds: float | None = None,
         output_artifact_store: ToolOutputArtifactStore | None = None,
     ) -> BackgroundTaskSnapshot:
-        return await self._start(
-            self._root_scope_id,
-            lambda: ProcessTree.spawn_shell(
-                command,
-                cwd=cwd,
-                env=env,
-                merge_output=True,
-            ),
-            command=command,
+        request = self._legacy_shell_request(
+            command,
             cwd=cwd,
-            output_byte_limit=output_byte_limit,
+            environment=env,
             termination_grace_seconds=termination_grace_seconds,
+        )
+        return await self.start_process(
+            request,
+            display_command=command,
+            output_byte_limit=output_byte_limit,
             timeout_seconds=timeout_seconds,
             output_artifact_store=output_artifact_store,
         )
@@ -197,27 +228,157 @@ class LocalBackgroundTaskManager:
         timeout_seconds: float | None = None,
         output_artifact_store: ToolOutputArtifactStore | None = None,
     ) -> BackgroundTaskSnapshot:
-        return await self._start(
-            self._root_scope_id,
-            lambda: ProcessTree.spawn_exec(
-                executable,
-                arguments,
-                cwd=cwd,
-                env=env,
-                merge_output=True,
-            ),
-            command=display_command,
+        request = self._legacy_exec_request(
+            executable,
+            arguments,
             cwd=cwd,
-            output_byte_limit=output_byte_limit,
+            environment=env,
             termination_grace_seconds=termination_grace_seconds,
+        )
+        return await self.start_process(
+            request,
+            display_command=display_command,
+            output_byte_limit=output_byte_limit,
             timeout_seconds=timeout_seconds,
             output_artifact_store=output_artifact_store,
+        )
+
+    async def start_process(
+        self,
+        request: SandboxedProcessRequest,
+        *,
+        display_command: str,
+        output_byte_limit: int,
+        timeout_seconds: float | None = None,
+        output_artifact_store: ToolOutputArtifactStore | None = None,
+    ) -> BackgroundTaskSnapshot:
+        """Start one background task through the canonical local-process port.
+
+        通过规范本地进程端口启动一个后台任务.
+        """
+
+        return await self._start_process(
+            self._root_scope_id,
+            request,
+            display_command=display_command,
+            output_byte_limit=output_byte_limit,
+            timeout_seconds=timeout_seconds,
+            output_artifact_store=output_artifact_store,
+        )
+
+    async def _start_process(
+        self,
+        scope_id: str,
+        request: SandboxedProcessRequest,
+        *,
+        display_command: str,
+        output_byte_limit: int,
+        timeout_seconds: float | None,
+        output_artifact_store: ToolOutputArtifactStore | None,
+    ) -> BackgroundTaskSnapshot:
+        launcher = self._scope_process_sandboxes.get(scope_id)
+        if launcher is None:
+            raise ToolError("background task manager is closed")
+        return await self._start(
+            scope_id,
+            lambda: launcher.spawn(request),
+            command=display_command,
+            cwd=request.cwd,
+            output_byte_limit=output_byte_limit,
+            termination_grace_seconds=request.lifecycle.termination_grace_seconds,
+            timeout_seconds=timeout_seconds,
+            output_artifact_store=output_artifact_store,
+        )
+
+    @staticmethod
+    def _legacy_filesystem_policy(cwd: Path) -> LocalProcessFilesystemPolicy:
+        """Describe the historic host process view for compatibility callers.
+
+        描述兼容调用方的历史宿主进程视图.
+
+        PR2 replaces this compatibility projection with an enforced private
+        child filesystem policy.  Keeping it here prevents legacy callers from
+        regaining direct ``ProcessTree`` ownership during the migration.
+
+        PR2 会用受强制的私有子进程文件系统策略替代这一兼容投影.把它保留在这里
+        可以防止旧调用方在迁移期间重新获得直接 ``ProcessTree`` 所有权.
+        """
+
+        return LocalProcessFilesystemPolicy(
+            (
+                LocalWorkspaceAccess(
+                    cwd.expanduser().resolve(),
+                    LocalWorkspaceAccessMode.READ_WRITE,
+                ),
+            ),
+            private_home=False,
+            private_temporary_directory=False,
+        )
+
+    @classmethod
+    def _legacy_shell_request(
+        cls,
+        command: str,
+        *,
+        cwd: Path,
+        environment: Mapping[str, str],
+        termination_grace_seconds: float,
+    ) -> SandboxedProcessRequest:
+        """Adapt the retained shell-start API into the canonical request port.
+
+        将保留的 shell-start API 适配为规范请求端口.
+        """
+
+        resolved_cwd = cwd.expanduser().resolve()
+        return SandboxedProcessRequest.shell(
+            command,
+            purpose=LocalProcessPurpose.BACKGROUND_BASH,
+            cwd=resolved_cwd,
+            sandbox_profile=SandboxProfile.OFF,
+            filesystem_policy=cls._legacy_filesystem_policy(resolved_cwd),
+            network_policy=LocalProcessNetworkPolicy.INHERIT,
+            environment_policy=LocalProcessEnvironmentPolicy(environment),
+            stdio_mode=LocalProcessStdioMode.MERGED_CAPTURE,
+            lifecycle=LocalProcessLifecycle(
+                termination_grace_seconds=termination_grace_seconds,
+            ),
+        )
+
+    @classmethod
+    def _legacy_exec_request(
+        cls,
+        executable: str,
+        arguments: tuple[str, ...],
+        *,
+        cwd: Path,
+        environment: Mapping[str, str],
+        termination_grace_seconds: float,
+    ) -> SandboxedProcessRequest:
+        """Adapt the retained argv-start API into the canonical request port.
+
+        将保留的 argv-start API 适配为规范请求端口.
+        """
+
+        resolved_cwd = cwd.expanduser().resolve()
+        return SandboxedProcessRequest.exec(
+            executable,
+            arguments,
+            purpose=LocalProcessPurpose.BACKGROUND_BASH,
+            cwd=resolved_cwd,
+            sandbox_profile=SandboxProfile.OFF,
+            filesystem_policy=cls._legacy_filesystem_policy(resolved_cwd),
+            network_policy=LocalProcessNetworkPolicy.INHERIT,
+            environment_policy=LocalProcessEnvironmentPolicy(environment),
+            stdio_mode=LocalProcessStdioMode.MERGED_CAPTURE,
+            lifecycle=LocalProcessLifecycle(
+                termination_grace_seconds=termination_grace_seconds,
+            ),
         )
 
     async def _start(
         self,
         scope_id: str,
-        spawn: Callable[[], Awaitable[ProcessTree]],
+        spawn: Callable[[], Awaitable[OwnedLocalProcess]],
         *,
         command: str,
         cwd: Path,
@@ -249,13 +410,13 @@ class LocalBackgroundTaskManager:
                 )
             self._prune_completed(scope_id)
 
-            spawn_task: asyncio.Future[ProcessTree] = asyncio.ensure_future(spawn())
+            spawn_task: asyncio.Future[OwnedLocalProcess] = asyncio.ensure_future(spawn())
             try:
-                tree = await asyncio.shield(spawn_task)
+                process = await asyncio.shield(spawn_task)
             except asyncio.CancelledError:
                 with contextlib.suppress(Exception):
-                    tree = await spawn_task
-                    await tree.terminate(grace_seconds=termination_grace_seconds)
+                    process = await spawn_task
+                    await process.terminate(grace_seconds=termination_grace_seconds)
                 raise
 
             task_id = f"task-{uuid.uuid4().hex[:12]}"
@@ -264,7 +425,7 @@ class LocalBackgroundTaskManager:
                 task_id=task_id,
                 command=command,
                 cwd=cwd,
-                tree=tree,
+                process=process,
                 output=_BoundedOutput(
                     output_byte_limit,
                     MAX_TOOL_OUTPUT_ARTIFACT_BYTES if output_artifact_store is not None else 0,
@@ -298,11 +459,11 @@ class LocalBackgroundTaskManager:
             )
 
     async def _watch(self, record: _TaskRecord) -> None:
-        process = record.tree.process
+        process = record.process
         assert process.stdout is not None
         capture = asyncio.create_task(self._capture(process.stdout, record.output))
         try:
-            wait = record.tree.wait()
+            wait = process.wait()
             if record.timeout_seconds is None:
                 await wait
             else:
@@ -365,13 +526,13 @@ class LocalBackgroundTaskManager:
             record.done.set()
 
     @staticmethod
-    async def _capture(stream: asyncio.StreamReader, output: _BoundedOutput) -> None:
+    async def _capture(stream: LocalProcessOutput, output: _BoundedOutput) -> None:
         while chunk := await stream.read(65_536):
             output.append(chunk)
 
     async def _terminate(self, record: _TaskRecord) -> None:
         async with record.termination_lock:
-            await record.tree.terminate(
+            await record.process.terminate(
                 grace_seconds=record.termination_grace_seconds,
             )
 
@@ -571,6 +732,7 @@ class LocalBackgroundTaskManager:
             if scope_id not in self._open_scopes:
                 return
             self._open_scopes.remove(scope_id)
+            self._scope_process_sandboxes.pop(scope_id, None)
             records = tuple(
                 record for record in self._records.values() if record.scope_id == scope_id
             )
@@ -595,6 +757,7 @@ class LocalBackgroundTaskManager:
                 return
             self._closed = True
             self._open_scopes.clear()
+            self._scope_process_sandboxes.clear()
             records = tuple(self._records.values())
         await asyncio.gather(
             *(self._kill_record(record) for record in records if not record.done.is_set())
@@ -659,18 +822,16 @@ class _LocalBackgroundTaskScope:
         timeout_seconds: float | None = None,
         output_artifact_store: ToolOutputArtifactStore | None = None,
     ) -> BackgroundTaskSnapshot:
-        return await self._supervisor._start(
-            self._scope_id,
-            lambda: ProcessTree.spawn_shell(
-                command,
-                cwd=cwd,
-                env=env,
-                merge_output=True,
-            ),
-            command=command,
+        request = self._supervisor._legacy_shell_request(
+            command,
             cwd=cwd,
-            output_byte_limit=output_byte_limit,
+            environment=env,
             termination_grace_seconds=termination_grace_seconds,
+        )
+        return await self.start_process(
+            request,
+            display_command=command,
+            output_byte_limit=output_byte_limit,
             timeout_seconds=timeout_seconds,
             output_artifact_store=output_artifact_store,
         )
@@ -688,19 +849,40 @@ class _LocalBackgroundTaskScope:
         timeout_seconds: float | None = None,
         output_artifact_store: ToolOutputArtifactStore | None = None,
     ) -> BackgroundTaskSnapshot:
-        return await self._supervisor._start(
-            self._scope_id,
-            lambda: ProcessTree.spawn_exec(
-                executable,
-                arguments,
-                cwd=cwd,
-                env=env,
-                merge_output=True,
-            ),
-            command=display_command,
+        request = self._supervisor._legacy_exec_request(
+            executable,
+            arguments,
             cwd=cwd,
-            output_byte_limit=output_byte_limit,
+            environment=env,
             termination_grace_seconds=termination_grace_seconds,
+        )
+        return await self.start_process(
+            request,
+            display_command=display_command,
+            output_byte_limit=output_byte_limit,
+            timeout_seconds=timeout_seconds,
+            output_artifact_store=output_artifact_store,
+        )
+
+    async def start_process(
+        self,
+        request: SandboxedProcessRequest,
+        *,
+        display_command: str,
+        output_byte_limit: int,
+        timeout_seconds: float | None = None,
+        output_artifact_store: ToolOutputArtifactStore | None = None,
+    ) -> BackgroundTaskSnapshot:
+        """Delegate one canonical process request into this isolated task scope.
+
+        将一个规范进程请求委托到这个隔离的任务范围.
+        """
+
+        return await self._supervisor._start_process(
+            self._scope_id,
+            request,
+            display_command=display_command,
+            output_byte_limit=output_byte_limit,
             timeout_seconds=timeout_seconds,
             output_artifact_store=output_artifact_store,
         )
