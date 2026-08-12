@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 from typing import cast
 from unittest.mock import patch
@@ -52,6 +53,31 @@ def test_snapshot_and_diff_limits_preserve_safe_metadata(tmp_path: Path) -> None
         text_change = next(item for item in files if item["path"] == "text.txt")
         assert text_change["diff_truncated"] is True
         assert report["scan_limited"] is True
+
+
+def test_large_same_size_rewrite_is_detected_without_timestamp_changes(tmp_path: Path) -> None:
+    """Large-file change detection must not depend only on timestamp precision.
+
+    大文件变更检测不能只依赖时间戳精度.
+    """
+
+    large = tmp_path / "large.txt"
+    large.write_bytes(b"x" * 256_001)
+    before = capture_workspace_snapshot(tmp_path)
+    original_stat = large.stat()
+
+    large.write_bytes(b"y" * 256_001)
+    # Restore the observed timestamp to model Windows filesystems/runtimes
+    # whose timestamp granularity can hide a same-sized rapid rewrite.
+    # 恢复已观察到的时间戳, 模拟 Windows 文件系统/运行时隐藏快速同大小重写.
+    os.utime(large, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+    after = capture_workspace_snapshot(tmp_path)
+
+    report = compare_workspace_snapshots(before, after)
+    files = cast(list[dict[str, object]], report["files"])
+    change = next(item for item in files if item["path"] == "large.txt")
+    assert change["status"] == "modified"
+    assert change["hidden_reason"] == "large"
 
 
 def test_observer_rejects_malformed_serialized_change_details(tmp_path: Path) -> None:
