@@ -15,6 +15,8 @@ Linux 子进程范围的 Bubblewrap 本地进程端口实现.
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import errno
 import json
 import os
 import select
@@ -41,6 +43,10 @@ from neuro_code.application.ports.sandbox import (
 )
 from neuro_code.domain.sandbox.models import SandboxProfile
 from neuro_code.domain.terminal.models import TerminalSize
+from neuro_code.infrastructure.sandbox.linux_pidfd import (
+    LinuxPidfdOps,
+    default_linux_pidfd_ops,
+)
 from neuro_code.infrastructure.sandbox.local_process import ProcessTreeOwnedLocalProcess
 from neuro_code.infrastructure.sandbox.process_tree import ProcessTree
 from neuro_code.infrastructure.sandbox.sandbox import _trusted_system_executable, _within
@@ -116,6 +122,7 @@ class _LinuxBubblewrapOwnedLocalProcess(ProcessTreeOwnedLocalProcess):
     """
 
     _boundary_pidfd: int
+    _pidfd_ops: LinuxPidfdOps
     _pidfd_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
 
     async def wait(self) -> int:
@@ -129,7 +136,11 @@ class _LinuxBubblewrapOwnedLocalProcess(ProcessTreeOwnedLocalProcess):
         del grace_seconds  # An enabled sandbox boundary is fail-closed, not best-effort TERM.
         async with self._pidfd_lock:
             if self._boundary_pidfd >= 0:
-                signal.pidfd_send_signal(self._boundary_pidfd, signal.SIGKILL)
+                try:
+                    self._pidfd_ops.send_signal(self._boundary_pidfd, signal.SIGKILL)
+                except OSError as error:
+                    if error.errno != errno.ESRCH:
+                        raise
                 self._tree.kill_direct_boundary()
                 loop = asyncio.get_running_loop()
                 deadline = loop.time() + self._request.lifecycle.force_wait_seconds
@@ -173,6 +184,7 @@ class LinuxBubblewrapLocalProcessSandbox(LocalProcessSandbox):
         workspace: Path,
         state_dir: Path,
         terminal_platform: TerminalPlatform | None = None,
+        pidfd_ops: LinuxPidfdOps | None = None,
     ) -> None:
         if not profile.enabled:
             raise ValueError("LinuxBubblewrapLocalProcessSandbox requires an enabled profile")
@@ -182,12 +194,18 @@ class LinuxBubblewrapLocalProcessSandbox(LocalProcessSandbox):
             )
         self._profile = profile
         self._terminal_platform = terminal_platform
+        try:
+            self._pidfd_ops = pidfd_ops or default_linux_pidfd_ops()
+        except OSError as error:
+            raise SandboxError(
+                f"enabled Linux sandbox requires pidfd lifecycle ownership: {error}"
+            ) from error
         self._workspace = self._resolve_directory(workspace, "sandbox workspace")
         self._state_dir = state_dir.expanduser().resolve()
         self._bubblewrap = _trusted_system_executable("bwrap", self._workspace)
         self._runtime_mounts = self._runtime_mounts_for_host()
         self._validate_controller_private_state()
-        self._validate_pidfd_support()
+        self._validate_pidfd_support(self._pidfd_ops)
         self._preflight()
 
     @property
@@ -223,7 +241,7 @@ class LinuxBubblewrapLocalProcessSandbox(LocalProcessSandbox):
                 pipe_stdin=request.stdio_mode is LocalProcessStdioMode.PROTOCOL,
                 pass_fds=(status_writer,),
             )
-            boundary_pidfd = os.pidfd_open(tree.process.pid)
+            boundary_pidfd = self._pidfd_ops.open(tree.process.pid)
         except OSError as error:
             if tree is not None:
                 await tree.terminate(grace_seconds=0.01)
@@ -234,13 +252,20 @@ class LinuxBubblewrapLocalProcessSandbox(LocalProcessSandbox):
         try:
             child_pid = await self._read_child_pid(status_reader, timeout_seconds=5)
         except (OSError, TimeoutError, ValueError) as error:
+            with contextlib.suppress(OSError, ProcessLookupError):
+                self._pidfd_ops.send_signal(boundary_pidfd, signal.SIGKILL)
             os.close(boundary_pidfd)
             await tree.terminate(grace_seconds=0.01)
             raise SandboxError(f"cannot attest Bubblewrap child process: {error}") from error
         finally:
             os.close(status_reader)
         del child_pid  # The status proves launch; the outer bwrap pidfd owns the full boundary.
-        return _LinuxBubblewrapOwnedLocalProcess(tree, request, boundary_pidfd)
+        return _LinuxBubblewrapOwnedLocalProcess(
+            tree,
+            request,
+            boundary_pidfd,
+            self._pidfd_ops,
+        )
 
     def spawn_terminal(
         self,
@@ -263,7 +288,7 @@ class LinuxBubblewrapLocalProcessSandbox(LocalProcessSandbox):
             raise SandboxError("interactive terminal requests require an argv-safe executable")
         assert request.executable is not None
         launch = self.build_launch_argv(request)
-        platform = self._terminal_platform or _default_terminal_platform()
+        platform = self._terminal_platform or _default_terminal_platform(self._pidfd_ops)
         return platform.spawn_exec(
             str(self._bubblewrap),
             tuple(launch[1:]),
@@ -566,14 +591,13 @@ class LinuxBubblewrapLocalProcessSandbox(LocalProcessSandbox):
             raise SandboxError(f"Bubblewrap cannot enforce child sandbox{suffix}")
 
     @staticmethod
-    def _validate_pidfd_support() -> None:
+    def _validate_pidfd_support(pidfd_ops: LinuxPidfdOps) -> None:
         try:
-            pidfd = os.pidfd_open(os.getpid())
-        except (AttributeError, OSError) as error:
+            pidfd_ops.probe()
+        except OSError as error:
             raise SandboxError(
                 f"enabled Linux sandbox requires pidfd lifecycle ownership: {error}"
             ) from error
-        os.close(pidfd)
 
     @staticmethod
     async def _read_child_pid(status_fd: int, *, timeout_seconds: float) -> int:
@@ -651,11 +675,11 @@ class LinuxBubblewrapLocalProcessSandbox(LocalProcessSandbox):
         return dict(sorted(environment.items()))
 
 
-def _default_terminal_platform() -> TerminalPlatform:
+def _default_terminal_platform(pidfd_ops: LinuxPidfdOps) -> TerminalPlatform:
     if sys.platform.startswith("linux"):
         from neuro_code.infrastructure.sandbox.posix_pty import PosixPtyPlatform
 
-        return PosixPtyPlatform()
+        return PosixPtyPlatform(pidfd_ops=pidfd_ops)
     raise SandboxError(f"interactive terminal sandbox is unavailable on {sys.platform}")
 
 

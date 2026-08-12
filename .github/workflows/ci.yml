@@ -49,6 +49,10 @@ jobs:
     # Pin 22.04: ubuntu-latest currently resolves to 24.04, whose default
     # AppArmor user-namespace restriction can deny Bubblewrap capabilities.
     # This security gate must execute the boundary, not pass by skipping it.
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.12", "3.14"]
     runs-on: ubuntu-22.04
     timeout-minutes: 10
     env:
@@ -58,7 +62,7 @@ jobs:
       - uses: astral-sh/setup-uv@v8.3.2
         with:
           version: "0.11.29"
-          python-version: "3.12"
+          python-version: ${{ matrix.python }}
           enable-cache: true
       - name: Install and identify Bubblewrap
         run: |
@@ -67,12 +71,42 @@ jobs:
           bwrap --version
           sysctl kernel.unprivileged_userns_clone
       - run: uv sync --extra dev --locked
-      - name: Prove Linux child sandbox boundaries
+      - name: Record Linux pidfd runtime capability
+        run: |
+          uv run python - <<'PY'
+          import os
+          import platform
+          import signal
+          import sys
+
+          print("sys.version:", sys.version.replace("\\n", " "))
+          print("sys.executable:", sys.executable)
+          print("platform.platform:", platform.platform())
+          print("os.uname:", os.uname())
+          print("has os.pidfd_open:", hasattr(os, "pidfd_open"))
+          print("has signal.pidfd_send_signal:", hasattr(signal, "pidfd_send_signal"))
+          print("uv-managed prefix:", sys.prefix)
+          PY
+      - name: Prove Linux child sandbox boundaries (Python ${{ matrix.python }})
         run: >-
           uv run pytest
           tests/security/test_linux_sandbox_integration.py
           -m sandbox_integration
           -q -rs
+          --junitxml=/tmp/neuro-code-linux-sandbox-${{ matrix.python }}.xml
+      - name: Require every Linux security test to execute
+        run: |
+          uv run python - <<'PY'
+          import xml.etree.ElementTree as ET
+
+          path = "/tmp/neuro-code-linux-sandbox-${{ matrix.python }}.xml"
+          root = ET.parse(path).getroot()
+          skipped = int(root.attrib.get("skipped", "0"))
+          tests = int(root.attrib.get("tests", "0"))
+          print(f"executed={tests} skipped={skipped}")
+          if tests == 0 or skipped:
+              raise SystemExit("Linux sandbox security gate did not execute every test")
+          PY
 
   windows-process-lifecycle:
     runs-on: windows-latest
