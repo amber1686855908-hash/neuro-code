@@ -345,7 +345,7 @@ class MacOSSeatbeltLocalProcessSandboxTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertIn(virtual_environment, adapter._runtime_read_roots)
             self.assertIn(opt, adapter._runtime_read_roots)
-            self.assertIn(cellar, adapter._runtime_read_roots)
+            self.assertIn(cellar.resolve(), adapter._runtime_read_roots)
             private_home = root / "private-home"
             private_tmp = root / "private-tmp"
             private_home.mkdir()
