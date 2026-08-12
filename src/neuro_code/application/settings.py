@@ -32,7 +32,6 @@ class ApplicationSettings:
     reasoning_effort: ReasoningEffort = ReasoningEffort.HIGH
     execution_control_mode: ExecutionControlMode = ExecutionControlMode.FINALIZE_TERMINAL
     resume_id: str | None = None
-    launch_command: tuple[str, ...] = ()
     execution_profile: ExecutionProfile = ExecutionProfile.NORMAL
     _execution_budget: ExecutionBudget = field(init=False, repr=False)
 

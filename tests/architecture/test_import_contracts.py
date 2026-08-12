@@ -2343,7 +2343,7 @@ def test_canonical_runtime_public_types_keep_module_paths_and_metadata() -> None
         assert getattr(terminal, name).__module__ == terminal.__name__
     signature = inspect.signature(terminal.LocalInteractiveTerminalManager)
     assert signature.parameters["workspace_path_resolver"].default is inspect.Parameter.empty
-    assert signature.parameters["platform"].default is inspect.Parameter.empty
+    assert signature.parameters["local_process_sandbox"].default is inspect.Parameter.empty
 
     conversation = importlib.import_module("neuro_code.application.sessions.conversation")
     legacy_conversation = importlib.import_module("neuro_code.application.runtime.conversation")

@@ -38,8 +38,8 @@
 3. 判定带副作用的 `create_terminal` 权限；结果为 `ask` 时取得异步审批；
 4. 剥离配置的受保护环境变量，由应用替换终端/pager 控制值，并且只把不透明环境指纹放入
    审批 scope；
-5. 启用沙箱 profile 时，必须取得匹配的 `ShellSandbox` 和参数边界安全的
-   `exec_launch`；
+5. 启用沙箱 profile 时，必须取得匹配的 `LocalProcessSandbox` 并提交 typed
+   `SandboxedProcessRequest`；
 6. 通过所选 `TerminalPlatform` 启动。
 
 不存在 Shell 字符串回退。审批拒绝、沙箱缺失或不匹配、工作区逃逸、不支持的平台或适配器

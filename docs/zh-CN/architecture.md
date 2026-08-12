@@ -776,8 +776,9 @@ TUI 通过 `Ctrl+E`、`/effort` 和 `/reasoning` 暴露选择，CLI 则使用 `-
   供适配器自行作出回放决策，同时携带供应商中立的请求思考强度，供显式能力处理。
 - `Tool`：发布 JSON schema，并在受限 `ToolContext` 中执行。
 - `ToolRegistry`：解析规范工具名称并拒绝重复注册。
-- `ShellSandbox`：把 Shell 字符串转换为参数边界安全、由平台强制执行的启动计划，
-  无需向工具暴露命名空间实现细节。
+- `LocalProcessSandbox`：拥有所有模型可控本地 child 的边界，包括管道命令、stdio MCP
+  以及本地 PTY/ConPTY 会话；终端调用方提交 typed `SandboxedProcessRequest`，而不是
+  直接调用平台 spawn 适配器。
 - `BackgroundTaskSupervisor`：创建隔离的会话任务作用域，并在应用关闭时终止每一棵仍存活
   的进程树。
 - `BackgroundTaskManager`：在单个会话作用域内启动受控 Shell/exec 进程树，并提供有界
@@ -916,9 +917,16 @@ Runtime 与协议行为仍由 service 及其端口/适配器负责。
   取消会给当前调用以及同一模型批次中的所有剩余调用记录错误结果。
 - 写入前必须解析并校验目标；工作区工具不能通过 `..` 或符号链接逃逸。
 - 平台无法实施显式沙箱要求时必须失败关闭。
-- 沙箱激活标记本身不足以作为证据。Linux 组合层会在暴露工具前校验根目录、工作区与
-  状态目录的挂载标志；`strict` 还会校验白名单根目录的文件系统类型。
-- `read-only` 会移除编辑工具并在直接调用时再次拒绝。`read-only` 与 `strict` 的 Shell
+- 每个启用的本地 child 都由 `LocalProcessSandbox` 启动器预检；不再存在 controller 范围
+  的激活 marker 或挂载 attestation。启动器仍会在暴露 child 前校验可信辅助程序、显式
+  挂载、私有状态以及 `strict` 白名单根目录的文件系统。
+- 启用的 Linux child 使用 PID 命名空间作为后代生命周期边界，因此 `setsid()` 不能逃离
+  timeout、cancel 或 shutdown。显式 POSIX `off` profile 只提供原始进程组清理，不提供
+  文件系统、网络、controller 状态或任意后代隔离。
+- 进程创建架构 guard 审计内置 production code。同进程 Python 扩展（`additional_tools`、
+  注入 executor 与未来 plugin）以 controller 权限运行，因此属于可信代码；不可信 plugin
+  必须另建进程/能力边界。
+- `read-only` 会移除编辑工具并在直接调用时再次拒绝。`read-only` 与 `strict` 的本地进程
   后代不继承父代理的网络命名空间，而父进程仍可执行供应商 HTTP 请求。
 - inspect 输出、日志、会话事件和异常都不得包含密钥。
 - Bash 后代不会继承已配置的供应商 API Key 环境变量，也不会继承标准/显式代理变量；
@@ -1029,16 +1037,23 @@ Linux、macOS 和 Windows 都是一等 CI 目标。平台专属代码隔离在�
 和进程隔离可以使用小型原生辅助程序或系统设施，但业务与编排逻辑必须保留在 Python
 中。不受支持的安全保证必须在启动时报告，绝不能静默降级。
 
-第一版具体实现会在 Linux 上使用 bubblewrap 重新执行 `workspace`、`read-only` 和
-`strict` 运行；`off` 仍是可移植默认值。文件系统挂载会同时约束进程内 Python 工具与
-后代进程。独立的 `ShellSandbox` 启动计划会把 `read-only` 和 `strict` 下的 Bash 后代
-放入嵌套网络命名空间。macOS 与 Windows 当前会拒绝显式非 `off` profile，而不会宣称
-未执行的安全能力。详见
+第一版具体实现会在 Linux 上为 `workspace`、`read-only` 和 `strict` 的本地进程请求使用
+子进程范围的 Bubblewrap；`off` 仍是可移植默认值。受信任 controller 不会在命名空间内
+重新执行。每个 Bash、后台 Bash、stdio MCP 或启用 profile 的 PTY 请求都会获得独立 child
+边界、显式工作区挂载、私有 HOME 和临时目录以及最小环境。只读和 strict child 还会使用
+隔离网络命名空间。macOS 与 Windows 当前会拒绝显式非 `off` profile，而不会宣称未执行的
+安全能力。详见
 [ADR 0019](adr/0019-fail-closed-linux-sandbox-profiles.md) 和
 [ADR 0020](adr/0020-session-fixed-sandbox-profiles.md)。
 
-前台和受管后台 Shell 命令共享 `ProcessTree`。POSIX 等待会在 Shell 入口退出后继续观察
-受控进程组；终止使用有界 TERM→KILL 序列。Windows 上的惰性 ctypes 平台适配器会在
+启用的 Linux 启动器会在挂载任何授权工作区前，对 controller 状态目录执行有界硬链接审计。
+私有常规文件存在另一个 inode 名称时失败关闭，防止工作区中既存硬链接重新引入凭据或会话
+状态，同时不扫描整个工作区。专用 Linux CI 必须无 skip 地执行真实 namespace 测试；专用
+Windows CI 必须执行原生 Job Object 与 ConPTY 生命周期测试。
+
+前台和受管后台 Shell 命令共享 `ProcessTree`。未启用沙箱的 POSIX 等待会在 Shell 入口退出后继续观察
+受控进程组；终止使用有界 TERM→KILL 序列；创建新 session 的后代不属于该 `off` profile
+进程组契约。Windows 上的惰性 ctypes 平台适配器会在
 启动进程前创建关闭即终止的 Job Object，通过 `PROC_THREAD_ATTRIBUTE_JOB_LIST` 传入借用
 句柄，并创建一个已经属于该 Job 的入口进程。同一次 `STARTUPINFOEXW` 调用还通过
 `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` 把继承范围限制为空输入与选定输出管道句柄。独立的

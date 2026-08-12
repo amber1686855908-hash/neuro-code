@@ -23,12 +23,15 @@ from neuro_code.application.permissions.policy import (
 )
 from neuro_code.application.permissions.service import ToolApprovalService
 from neuro_code.application.ports.approval import PermissionApprover
-from neuro_code.application.ports.background_tasks import BackgroundTaskSupervisor
+from neuro_code.application.ports.background_tasks import (
+    BackgroundTaskManager,
+    BackgroundTaskSupervisor,
+)
 from neuro_code.application.ports.client_filesystem import ClientFileSystem
 from neuro_code.application.ports.client_terminal import ClientTerminal
 from neuro_code.application.ports.instructions import InstructionDiscovery
 from neuro_code.application.ports.model import ModelProvider
-from neuro_code.application.ports.sandbox import ShellSandbox
+from neuro_code.application.ports.sandbox import LocalProcessSandbox
 from neuro_code.application.ports.skills import SkillDiscovery
 from neuro_code.application.ports.storage import SessionStore
 from neuro_code.application.ports.tools import Tool, ToolContext
@@ -87,10 +90,8 @@ from neuro_code.infrastructure.background_tasks import LocalBackgroundTaskManage
 from neuro_code.infrastructure.persistence.output_artifacts import FileToolOutputArtifactStore
 from neuro_code.infrastructure.persistence.sqlite_session import SqliteSessionStore
 from neuro_code.infrastructure.providers import create_routed_provider
-from neuro_code.infrastructure.sandbox.sandbox import (
-    create_shell_sandbox,
-    enforce_configured_sandbox,
-)
+from neuro_code.infrastructure.sandbox.linux_local_process import LinuxBubblewrapLocalProcessSandbox
+from neuro_code.infrastructure.sandbox.local_process import ProcessTreeLocalProcessSandbox
 from neuro_code.infrastructure.tools.registry import default_tool_registry
 from neuro_code.infrastructure.tools.workspace_diff import WorkspaceMutationJournal
 from neuro_code.infrastructure.workspace.changes import (
@@ -107,8 +108,7 @@ if TYPE_CHECKING:
 
 
 ProviderFactory = Callable[["AppConfig", bool], ModelProvider]
-ShellSandboxFactory = Callable[[SandboxProfile, Path, Path], ShellSandbox | None]
-ProcessSandboxEnforcer = Callable[[SandboxProfile, Path, Path, Sequence[str]], None]
+LocalProcessSandboxFactory = Callable[[SandboxProfile, Path, Path], LocalProcessSandbox]
 SessionStoreFactory = Callable[[Path], SessionStore]
 BackgroundSupervisorFactory = Callable[[], BackgroundTaskSupervisor]
 InstructionDiscoveryFactory = Callable[[], InstructionDiscovery]
@@ -120,21 +120,26 @@ def _default_provider_factory(config: AppConfig, failover: bool) -> ModelProvide
     return create_routed_provider(config, failover=failover)
 
 
-def _default_shell_sandbox_factory(
+def _default_local_process_sandbox_factory(
     profile: SandboxProfile,
-    cwd: Path,
+    workspace: Path,
     state_dir: Path,
-) -> ShellSandbox | None:
-    return create_shell_sandbox(profile, cwd, state_dir)
+) -> LocalProcessSandbox:
+    """Choose the canonical local-process launcher for one session binding.
 
+    为一个会话绑定选择规范本地进程启动器.
 
-def _default_process_sandbox_enforcer(
-    profile: SandboxProfile,
-    cwd: Path,
-    state_dir: Path,
-    launch_command: Sequence[str],
-) -> None:
-    enforce_configured_sandbox(profile, cwd, state_dir, launch_command)
+    ``off`` preserves the existing owned-process bridge. Every enabled profile
+    instead creates a child-scoped Linux Bubblewrap launcher. The controller is
+    never re-executed inside a sandbox namespace.
+
+    ``off`` 保留既有的受管进程桥接器.每个启用的 profile 都创建子进程范围的
+    Linux Bubblewrap 启动器.controller 不会重新执行到沙箱命名空间中.
+    """
+
+    if not profile.enabled:
+        return ProcessTreeLocalProcessSandbox()
+    return LinuxBubblewrapLocalProcessSandbox(profile, workspace, state_dir)
 
 
 def _default_session_store_factory(path: Path) -> SessionStore:
@@ -170,7 +175,9 @@ class ApplicationComposition:
         store: SessionStore,
         background_tasks: BackgroundTaskSupervisor,
         provider_factory: ProviderFactory,
-        shell_sandbox_factory: ShellSandboxFactory,
+        local_process_sandbox_factory: LocalProcessSandboxFactory = (
+            _default_local_process_sandbox_factory
+        ),
         instruction_discovery: InstructionDiscovery | None = None,
         skill_discovery: SkillDiscovery | None = None,
         workspace_change_observer_factory: WorkspaceChangeObserverFactory = (
@@ -187,7 +194,7 @@ class ApplicationComposition:
         self._session_summary_queries = SessionSummaryQueryService(store)
         self.background_tasks = background_tasks
         self._provider_factory = provider_factory
-        self._shell_sandbox_factory = shell_sandbox_factory
+        self._local_process_sandbox_factory = local_process_sandbox_factory
         self._instruction_discovery = (
             instruction_discovery
             if instruction_discovery is not None
@@ -199,14 +206,41 @@ class ApplicationComposition:
         self._workspace_change_observer_factory = workspace_change_observer_factory
         self._closed = False
 
+    def create_local_process_sandbox(
+        self,
+        *,
+        config: AppConfig | None = None,
+    ) -> LocalProcessSandbox:
+        """Create a composition-owned local process launcher for one config.
+
+        为一个配置创建由组合根拥有的本地进程启动器.
+
+        Bootstrap adapters use this narrow factory when a session-scoped
+        process, such as an ACP stdio MCP server, starts outside a conversation
+        binding. The launcher is still selected by the same composition path as
+        Bash and background tasks.
+
+        当会话范围的进程(例如 ACP stdio MCP server)在 conversation binding 之外
+        启动时,bootstrap 适配器使用这个精简工厂.启动器仍由与 Bash 和后台任务
+        相同的组合路径选择.
+        """
+
+        selected_config = config or self.config
+        return self._local_process_sandbox_factory(
+            selected_config.sandbox_profile,
+            selected_config.cwd,
+            selected_config.state_dir,
+        )
+
     @classmethod
     async def open(
         cls,
         settings: ApplicationSettings,
         *,
         provider_factory: ProviderFactory = _default_provider_factory,
-        shell_sandbox_factory: ShellSandboxFactory = _default_shell_sandbox_factory,
-        process_sandbox_enforcer: ProcessSandboxEnforcer = _default_process_sandbox_enforcer,
+        local_process_sandbox_factory: LocalProcessSandboxFactory = (
+            _default_local_process_sandbox_factory
+        ),
         store_factory: SessionStoreFactory = _default_session_store_factory,
         background_supervisor_factory: BackgroundSupervisorFactory = _default_background_supervisor_factory,
         instruction_discovery_factory: InstructionDiscoveryFactory = _default_instruction_discovery_factory,
@@ -236,14 +270,6 @@ class ApplicationComposition:
             if settings.resume_id is not None:
                 saved_profile = await store.peek_session_sandbox_profile(settings.resume_id)
                 config = pin_resumed_sandbox(config, saved_profile)
-            if config.sandbox_profile.enabled and not settings.launch_command:
-                raise ValueError("a launch command is required for an enabled process sandbox")
-            process_sandbox_enforcer(
-                config.sandbox_profile,
-                config.cwd,
-                config.state_dir,
-                settings.launch_command,
-            )
             await store.initialize()
             return cls(
                 settings=settings,
@@ -251,7 +277,7 @@ class ApplicationComposition:
                 store=store,
                 background_tasks=background_tasks,
                 provider_factory=provider_factory,
-                shell_sandbox_factory=shell_sandbox_factory,
+                local_process_sandbox_factory=local_process_sandbox_factory,
                 instruction_discovery=instruction_discovery_factory(),
                 skill_discovery=skill_discovery_factory(),
                 workspace_change_observer_factory=workspace_change_observer_factory,
@@ -298,8 +324,16 @@ class ApplicationComposition:
                     f"tool {tool.definition.name!r} is outside the selected capability set"
                 )
             tools.register(tool)
-        task_scope = self.background_tasks.open_scope()
+        task_scope: BackgroundTaskManager | None = None
         try:
+            local_process_sandbox = self._local_process_sandbox_factory(
+                selected_config.sandbox_profile,
+                selected_config.cwd,
+                selected_config.state_dir,
+            )
+            task_scope = self.background_tasks.open_scope(
+                local_process_sandbox=local_process_sandbox,
+            )
             provider = self._provider_factory(selected_config, self.settings.failover)
             compaction_persistence = ContextCompactionApplicationService(
                 self.store,
@@ -310,11 +344,6 @@ class ApplicationComposition:
                 ContextCompactionTriggerService(compaction_persistence)
             )
             approval_service = ToolApprovalService(approver) if approver is not None else None
-            shell_sandbox = self._shell_sandbox_factory(
-                selected_config.sandbox_profile,
-                selected_config.cwd,
-                selected_config.state_dir,
-            )
             # Build a per-binding instruction tracker that re-discovers
             # AGENTS.md files from the workspace root toward the current
             # focus directory.  File-access tools call ``check_path()`` to
@@ -378,7 +407,7 @@ class ApplicationComposition:
                     selected_config.cwd,
                     additional_workspace_roots=tuple(additional_workspace_roots),
                     sandbox_profile=selected_config.sandbox_profile,
-                    shell_sandbox=shell_sandbox,
+                    local_process_sandbox=local_process_sandbox,
                     protected_environment_variables=(
                         selected_config.protected_environment_variables
                     ),
@@ -423,7 +452,8 @@ class ApplicationComposition:
             )
             return ConversationBinding(conversation, provider, task_scope)
         except BaseException:
-            await asyncio.shield(task_scope.shutdown())
+            if task_scope is not None:
+                await asyncio.shield(task_scope.shutdown())
             raise
 
     async def config_for_session_resume(self, session_id: str) -> AppConfig:
@@ -742,10 +772,9 @@ __all__ = [
     "ApplicationComposition",
     "BackgroundSupervisorFactory",
     "InstructionDiscoveryFactory",
-    "ProcessSandboxEnforcer",
+    "LocalProcessSandboxFactory",
     "ProviderFactory",
     "SessionStoreFactory",
-    "ShellSandboxFactory",
     "SkillDiscoveryFactory",
     "WorkspaceChangeObserverFactory",
 ]

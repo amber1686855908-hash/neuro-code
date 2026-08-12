@@ -203,13 +203,13 @@ session formats, ACP behavior, permissions, sandboxing, or security semantics.
     `adapters.windows_pty` paths remain compatibility facades; native ConPTY,
     Job Object, bubblewrap, permission, and terminal-session behavior remains
     unchanged and is not duplicated.
-27. Stage 2K establishes `neuro_code.infrastructure.sandbox.sandbox` as the
-    canonical owner of the Linux bubblewrap `ShellSandbox` implementation.
-    `adapters.sandbox` remains a compatibility facade, and the composition root
-    imports the concrete factory from the infrastructure module. Native Windows
-    ConPTY and Job Object implementations remain separate adapters for a later,
-    platform-specific slice; sandbox policy, fail-closed checks, permissions,
-    and cancellation behavior are unchanged.
+27. Stage 2K established `neuro_code.infrastructure.sandbox.sandbox` as the
+    owner of shared child-sandbox security helpers. PR5 superseded the former
+    controller-wide Linux bubblewrap `ShellSandbox` implementation with the
+    canonical `LocalProcessSandbox` child-launch boundary. Native Windows
+    ConPTY and Job Object implementations remain separate adapters; sandbox
+    policy, fail-closed checks, permissions, and cancellation behavior remain
+    unchanged.
 28. Stage 2L establishes `neuro_code.infrastructure.sandbox.windows_process` as
     the canonical owner of the stateless Windows environment-block primitive.
     `adapters.windows_process` remains a compatibility facade, and the Job

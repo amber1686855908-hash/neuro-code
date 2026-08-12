@@ -38,9 +38,16 @@ class _ManagedProcess(Protocol):
 
 @dataclass(slots=True)
 class ProcessTree:
-    """An owned shell process and its platform process-group boundary.
+    """An owned process and its platform lifecycle boundary.
 
-    表示一个被拥有的 Shell 进程及其平台进程组边界."""
+    Windows Job Objects own arbitrary descendants.  A plain POSIX process
+    group owns only descendants that remain in that group; a process that
+    successfully creates a new session is outside the unsandboxed ``off``
+    profile's enforceable boundary.  Enabled Linux profiles add the stronger
+    PID-namespace boundary in ``LinuxBubblewrapLocalProcessSandbox``.
+
+    表示一个受管进程及其平台生命周期边界.普通 POSIX 进程组无法拥有成功创建新会话的
+    后代;启用的 Linux profile 由 Bubblewrap PID namespace 提供更强边界."""
 
     process: _ManagedProcess
     _unix_process_group: int | None = None
@@ -76,6 +83,7 @@ class ProcessTree:
         env: Mapping[str, str],
         merge_output: bool = False,
         pipe_stdin: bool = False,
+        pass_fds: tuple[int, ...] = (),
     ) -> ProcessTree:
         return await cls._spawn(
             executable,
@@ -85,6 +93,7 @@ class ProcessTree:
             env=env,
             merge_output=merge_output,
             pipe_stdin=pipe_stdin,
+            pass_fds=pass_fds,
         )
 
     @classmethod
@@ -98,6 +107,7 @@ class ProcessTree:
         env: Mapping[str, str],
         merge_output: bool,
         pipe_stdin: bool = False,
+        pass_fds: tuple[int, ...] = (),
     ) -> ProcessTree:
         options: dict[str, Any] = {
             "cwd": cwd,
@@ -109,6 +119,9 @@ class ProcessTree:
         is_windows = os.name == "nt"
         if os.name == "posix":
             options["start_new_session"] = True
+            options["pass_fds"] = pass_fds
+        elif pass_fds:
+            raise ValueError("pass_fds is supported only by the POSIX process adapter")
 
         windows_job = WindowsJobObject.create() if is_windows else None
         process: _ManagedProcess | None = None
@@ -270,9 +283,13 @@ class ProcessTree:
         grace_seconds: float = 1.0,
         force_wait_seconds: float = 5.0,
     ) -> None:
-        """Terminate the entire owned tree and reap the direct child.
+        """Terminate the owned platform boundary and reap the direct child.
 
-        终止整个已拥有的进程树并回收直接子进程."""
+        Windows Job Objects and enabled Linux child sandboxes provide a strong
+        descendant boundary.  Plain POSIX ``off`` execution is limited to the
+        original process group and cannot promise ownership after ``setsid``.
+
+        终止受管的平台边界并回收直接子进程.普通 POSIX ``off`` 执行只能保证原进程组."""
 
         self._termination_requested = True
         async with self._termination_lock:
@@ -295,6 +312,21 @@ class ProcessTree:
                 raise
             if stdin_error is not None:
                 raise stdin_error
+
+    def kill_direct_boundary(self) -> None:
+        """Kill a direct child that is itself an externally observed boundary.
+
+        The platform adapter remains responsible for proving boundary exit,
+        for example through a Linux pidfd. This method only records termination
+        intent and sends the unambiguous direct-child signal.
+
+        终止本身就是安全边界的直接 child.平台适配器仍负责通过 pidfd 等机制证明
+        边界已经退出.
+        """
+
+        self._termination_requested = True
+        if self.process.returncode is None:
+            self.process.kill()
 
     async def _terminate_posix(self, grace_seconds: float, force_wait_seconds: float) -> None:
         process_group = self._unix_process_group
@@ -368,10 +400,21 @@ class ProcessTree:
         if self.process.returncode is not None:
             return
         try:
-            await asyncio.wait_for(asyncio.shield(self.process.wait()), timeout=timeout_seconds)
+            await asyncio.wait_for(
+                asyncio.shield(self._wait_for_direct_returncode()),
+                timeout=timeout_seconds,
+            )
         except TimeoutError:
             self.process.kill()
-            await self.process.wait()
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(self._wait_for_direct_returncode()),
+                    timeout=timeout_seconds,
+                )
+            except TimeoutError as error:
+                raise TimeoutError(
+                    "owned direct process did not exit after forced termination"
+                ) from error
 
     async def _wait_for_direct_exit(self, timeout_seconds: float) -> bool:
         if self.process.returncode is not None:

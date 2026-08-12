@@ -48,8 +48,8 @@ Creation follows this order:
 4. strip configured protected environment variables, replace terminal/pager
    controls with application-owned values, and put only an opaque environment
    fingerprint in the approval scope;
-5. when a sandbox profile is enabled, require the matching `ShellSandbox` and
-   obtain an argv-safe `exec_launch`; and
+5. when a sandbox profile is enabled, require the matching `LocalProcessSandbox`
+   and submit a typed `SandboxedProcessRequest`; and
 6. spawn through the selected `TerminalPlatform`.
 
 There is no shell-string fallback. Approval denial, missing/mismatched sandbox

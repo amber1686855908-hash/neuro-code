@@ -399,22 +399,30 @@ profile = "workspace"
 neuro-code -p "Inspect and test this repository" --sandbox workspace
 ```
 
-Linux 上的非 `off` profile 要求存在可用且不受工作区控制的 `bwrap`；`read-only` 与
-`strict` 还需要 `unshare`。Neuro Code 会探测这些能力，并在打开会话存储或开始模型工作
-之前重新执行自身。显式请求之后绝不会回退到未启用沙箱的运行。
+Linux 上的非 `off` profile 要求存在可用且不受工作区控制的 `bwrap`。Neuro Code 会在
+暴露每个 child 前预检所需的 user、mount、PID 命名空间，以及 `read-only`/`strict`
+所需的 network 命名空间。受信任 controller、Provider 连接、凭据与会话存储继续留在
+宿主。显式启用 profile 之后绝不会回退到未启用沙箱的 child。
 
 | Profile | 文件系统 | 本地 Bash 网络 |
 |---|---|---|
-| `off` | 不启用操作系统沙箱 | 可用 |
-| `workspace` | 宿主可读；工作区、状态目录与临时路径可写 | 可用 |
-| `read-only` | 宿主/工作区只读；状态目录与临时路径可写；编辑工具不可用 | 隔离 |
-| `strict` | 仅暴露必需的系统/运行时路径和工作区；工作区、状态目录与临时路径可写 | 隔离 |
+| `off` | 显式不提供操作系统文件系统、网络、controller 状态或 detached descendant 隔离 | 可用 |
+| `workspace` | 空 child 根；必需运行时只读；授权工作区根可写；私有 HOME 与临时存储 | 可用 |
+| `read-only` | 同样为空 child 根，但授权工作区根只读；编辑工具不可用 | 隔离 |
+| `strict` | 与 `workspace` 相同的白名单根；授权工作区根仍可写 | 隔离 |
 
 父进程仍可访问模型 API。权限系统依然会在工具之前运行且仍有必要：沙箱限制获批操作的
 范围，但不负责决定是否批准。项目文件不能弱化用户级 profile；CLI 与环境变量是新会话
 中显式且优先级更高的选择，但恢复时不能改变已保存会话的 profile。
 `neuro-code inspect` 会报告规范 profile 及其来源。
 本地 Bash 还会移除已配置的供应商 API Key 变量和标准/显式代理变量，不继承其中的密钥值。
+`off` 为兼容性继续作为默认值，并明确表示 child 不受操作系统安全边界保护；此时 POSIX
+清理只能拥有原始进程组，无法保证终止调用 `setsid()` 的后代。启用的 Linux profile
+增加 PID 命名空间和 `--die-with-parent`，因此进程组逃逸不会逃出沙箱生命周期边界。
+启用 profile 启动前，Neuro Code 还会拒绝链接数大于一的 controller 状态常规文件；否则
+工作区中已有硬链接可以通过授权 bind mount 指向同一私有 inode。显式授权工作区内其他
+既存文件属于该工作区的信任边界。
+
 
 macOS 与 Windows 当前会对显式非 `off` profile 失败关闭。每个新会话（包括 `off`）都会
 保存规范 profile。恢复时若未显式指定沙箱，就还原保存值；显式 `--sandbox` 或
