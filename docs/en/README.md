@@ -199,36 +199,36 @@ terminal substrate through client terminal APIs; interactive framing and
 backpressure remain pending. See
 [ADR 0034](adr/0034-bounded-owned-interactive-terminal-sessions.md).
 
-User prompts render as full-width muted blocks, while assistant output uses a
-separate response block without `You:`/`Assistant:` log prefixes. A streamed
-response is mounted once in the conversation and updated in place through its
-final text, so completion does not move it from a temporary area into the
-scrollback. Automatic following stops when the user scrolls upward.
+User prompts and assistant responses use distinct restrained blocks on one
+shared reading axis, with a 116-column maximum and no `You:`/`Assistant:` log
+prefixes. A streamed response is mounted once in the conversation and updated
+in place through its final text, so completion does not move it from a
+temporary area into the scrollback. Automatic following stops when the user
+scrolls upward.
 
 Assistant text is rendered as Markdown with an application-owned semantic
 palette for headings, emphasis, code, lists, links, and tables. Model text is
 not interpreted as Rich/Textual markup, and hyperlink activation is disabled.
-User prompts and local/external values remain literal text. System, status,
-tool, and error notices use one aligned label gutter, while provider/model,
-tool/session, path, outcome, duration, mode, effort, and error values receive
-restrained semantic highlights. Each model step reports client-observed time to
-its first actionable output, each tool call owns one stable
-invocation/permission/result card with elapsed time, and a completed turn
-reports total elapsed time after the final assistant message. Completed cards
-retain bounded, control-safe, credential-redacted previews of actual tool output.
-Read/list/search/image/skill calls default to one concise action line; their safe
-preview can still be opened in place.
-Side-effecting local tools also report bounded per-call workspace changes with
-file paths and unified text diffs; sensitive, binary, oversized, dependency,
-cache, and version-control-internal content stays hidden. Successful edits
-automatically show their changed slices. Added and removed lines use green/red
-foregrounds plus distinct tinted backgrounds. Safe details can be collapsed or
-reopened in place by click, or by focusing the card and pressing
-`Enter`/`Space`. Mermaid and inline media are not part of this slice.
+User prompts and local/external values remain literal text. Activity, plan, and
+error notices use inline labels and semantic hierarchy; models, paths, and
+tools do not receive accent color solely by type. Each model step reports
+client-observed time to its first actionable output, and a completed turn
+reports total elapsed time after the final assistant message. Consecutive tool
+calls appear as one default-collapsed activity group with state, bounded intent
+or aggregate counts, failures, and elapsed time. Long Bash commands are
+truncated in the summary. Click the group or focus it and press `Enter`/`Space`
+to open the fixed-height Inline Peek; `Up`/`Down` selects a call and `Enter`
+opens the independent Tool Inspector. Summary and Peek never render full
+stdout or load artifacts. Inspector Output/Input/Meta views retain bounded,
+control-safe, credential-redacted content and workspace diffs; sensitive,
+binary, oversized, dependency, cache, and version-control-internal content
+stays hidden. Added and removed lines use green/red foregrounds plus distinct
+tinted backgrounds. Mermaid and inline media are not part of this slice.
 
-A persistent one-line runtime bar above the prompt shows the active provider
-and model, compact working directory, current context-window use, requested
-reasoning effort, and interaction mode. While waiting for model output, the
+Below the composer, one compact label-free status row shows model, effort, and
+mode on the left and context-window use plus working directory on the right.
+Long values ellipsize in narrow layouts. The permanent shortcut row is omitted;
+use `/help` or F1 for the existing command reference. While waiting for model output, the
 supplied seven-cell collapsing pulse animates before the pending-assistant text. The
 context percentage starts as a visibly approximate local estimate and switches
 to provider-reported input/output token usage after a model step. A configured
@@ -236,9 +236,8 @@ to provider-reported input/output token usage after a model step. A configured
 configured, the bar shows the known token use without inventing a percentage.
 Managed provider details expose this local capability field so every configured
 model can supply its own real denominator. When a requested effort has a different
-implemented policy, the bar shows both values, for example
-`⚡ ultracode → ⬤ xhigh`. The labels update with the selected UI language and
-remain visible in narrow layouts.
+implemented policy, the status projection shows both values, for example
+`ultracode → xhigh`. Its text updates with the selected UI language.
 
 Typing `/` shows command syntax and parameter hints. The suggestions include
 the five effort values, four modes, and currently selectable provider profile names; free

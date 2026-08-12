@@ -525,12 +525,19 @@ update 数、单字段和序列化总字节。
 
 最小 TUI 是 `AgentEvent` 之上的表现适配器，负责提示输入、滚动记录、实时文本表面和
 本地斜杠命令。它绝不渲染原始推理或不受限制的参数/结果映射；只有路径、命令、模式、
-查询与任务 ID 等有界白名单参数可进入调用摘要。每个本地工具调用再按调用 ID 持有一张
-稳定卡片，后续在原地更新权限路径、脱敏结果预览、耗时和有界工作区变更报告。读取类调用
-默认投影为一条完成说明，用户仍可打开已有的有界详情；编辑报告则自动展开变更切片，差异
-角色同时使用前景色和淡色背景。详见
+查询与任务 ID 等有界白名单参数可进入调用摘要。每个本地工具调用仍保留按 call ID 标识的
+稳定状态，但 TUI 会把连续调用投影为一个活动组。活动组默认折叠，编辑也不例外；摘要只
+保留状态、有界意图或聚合数量、关键失败信息与耗时。按 Enter 或单击会打开只显示一个所选
+调用的固定高度 Inline Peek；上/下方向键选择其他调用，Enter 打开独立 Tool Inspector，Esc
+返回稳定摘要。再次单击已打开的 Peek 会收起；应用级 fallback 会在焦点移动后继续保证 Esc
+能够收起。Inspector 打开期间，实时生命周期事件会更新所选 presentation，并通过持久基础
+screen 定位 Conversation widget，而不是在当前 Modal 内查找；运行计时器每次 tick 对每个
+活动组最多刷新一次，并跳过已打开的 Peek/Inspector 布局。Peek 的十个逻辑行 presenter
+预算由十二行 widget 最大高度兜底，因此终端换行不能让 Conversation 无限增高。长 Bash 意图
+会截断，正常 allow 判定不会进入 Summary/Peek，完成状态只由勾号表达一次。详见
 [ADR 0014](adr/0014-minimal-event-stream-tui.md) 与
-[ADR 0029](adr/0029-auditable-in-place-tool-cards.md)。
+[ADR 0029](adr/0029-auditable-in-place-tool-cards.md)，以及表现层细化
+[ADR 0108](adr/0108-editorial-tui-presentation.md)。
 
 滚动记录由稳定消息组件组成的纵向对话实现，而不是“预渲染日志 + 临时流式区域”。用户
 提示和助手回答使用不同布局；待完成的助手组件始终位于对话末尾，生命周期通知插入其前，
@@ -539,12 +546,16 @@ update 数、单字段和序列化总字节。
 
 助手组件使用 Rich 的 Markdown 文档模型和应用自有语义主题，同时禁用链接点击；模型
 输出绝不会进入 Rich/Textual markup 解析。用户内容以及应用或外部值使用字面 `Text`。
-本地系统、状态、工具和错误记录统一使用两列表格：固定宽度标签栏配合可折行正文。
-颜色由供应商、模型、工具、会话、路径、结果、耗时、模式、强度和错误等语义值类型决定，
-而不是由任意载荷 markup 决定。工具输出与差异使用应用赋予样式的字面 `Text`，绝不会把
-载荷当作 markup。有界详情可以聚焦并收起或展开，且不会获取新数据；详见
-[ADR 0030](adr/0030-bounded-interactive-tool-card-details.md)。Mermaid 与媒体仍在该渲染器
-边界之外。另见 [ADR 0027](adr/0027-semantic-tui-and-application-reasoning-effort.md)。
+对话消息与本地系统、状态、活动、计划和错误记录共享同一左侧阅读轴，并限制为最多 116 列；
+标签使用行内形式，不再永久占据固定宽度栏。颜色由信息层级而非对象类型本身决定，只保留克制
+交互 accent 与 success/warning/error 语义色。Tool Activity 的 tree、grep、file-read、Bash 与
+generic renderer 优先投影 metadata；格式化 stdout 只作为有界 fallback。Conversation 永不
+渲染 artifact 或完整工具输出。独立 Inspector 提供可滚动、可复制的 Output/Input/Meta，递归脱敏
+Input、白名单化 Meta，并且只在此时通过既有 256 KiB、已脱敏且属于当前会话的应用边界懒加载输出
+artifact；读取或存储截断会明确显示。Transcript Copy 始终投影稳定的 Activity Summary。详见
+[ADR 0030](adr/0030-bounded-interactive-tool-card-details.md) 与
+[ADR 0067](adr/0067-tui-bounded-tool-output-details.md)。Mermaid 与媒体仍在该渲染器边界之外。
+另见 [ADR 0027](adr/0027-semantic-tui-and-application-reasoning-effort.md)。
 
 应用自有 TUI 文案通过 `UiLanguage` 选择。注入的 `UiPreferencesStore` 端口持久化界面
 语言、请求的思考强度和交互模式；JSON 适配器使用与供应商配置分离、原子写入且仅用户可访问的状态
@@ -552,11 +563,13 @@ update 数、单字段和序列化总字节。
 切换语言会重新渲染界面外壳和可翻译的本地历史，但可见的用户/模型文本以及已经清理的
 工具预览不会翻译，也绝不会送入翻译器。
 
-表现适配器持有一套固定的冷色中性深色主题，不暴露 Textual 无关的主题与命令面板表面。
+表现适配器持有一套紧凑的中性深色语义主题，不暴露 Textual 无关的主题与命令面板表面。
+三层背景、一种边框、三档前景、一种克制交互 accent、语义结果色与共享间距共同定义层级。
 内建命令面板会被禁用，供应商与会话发现通过明确的应用命令完成，会话查询按字面纯文本
-渲染。提示框上方的常驻运行栏直接从控制器状态显示当前供应商/模型、压缩后的工作路径、
-上下文窗口占用、请求/实际强度及交互模式；本地化、供应商故障转移或用户选择发生变化时主动刷新，不会从对话文本
-反向解析状态。纯折叠脉冲状态机由 Textual 定时器推进，并且只在等待模型输出时渲染到待
+渲染。提示框下方的一行无冗余字段名运行投影，在有界左侧区域显示模型、强度与模式，在有界
+右侧区域显示上下文占用和压缩工作路径；窄终端会省略过长模型与路径。它由控制器状态在本地化、
+供应商故障转移或用户选择变化时主动刷新，不会从对话文本反向解析状态。永久快捷键栏被移除；
+`/help` 和 F1 按需显示现有命令参考。纯折叠脉冲状态机由 Textual 定时器推进，并且只在等待模型输出时渲染到待
 完成助手文案前。上下文用量先对规范会话项进行供应商中立的本地估算；模型完成事件带有
 token 元数据时，运行时发出 `CONTEXT_USAGE_UPDATED`，并用供应商报告的输入加输出用量
 替换估算值。分母来自显式 profile 元数据 `context_window_tokens`；字段缺失时只显示已知
@@ -592,7 +605,7 @@ ConPTY 创建会原子组合伪控制台与 Job 列表属性，终止/关闭作�
 运行时计时使用单调时钟。`MODEL_THINKING_COMPLETED` 测量每个模型步骤从发出请求到首个
 可见或可行动结果的时间，并不宣称能够读取供应商私有推理遥测。工具终态事件携带耗时，
 `TURN_COMPLETED` 则在稳定助手节点之后显示整轮摘要。工具调用、权限路径、输出预览、
-工作区变更和终态会在同一张原地更新的有界树状卡片中渲染。对于带副作用的本地工具，
+工作区变更和终态仍保留有界的 call-ID 状态，并由 TUI 投影到连续活动组中。对于带副作用的本地工具，
 运行时只在权限通过后、紧邻执行前后比较有界的只读工作区快照；这份报告只是审计元数据，
 既不授予权限，也不代表执行成功。`WorkspaceChangeObserver` 是由 bootstrap 为每个 binding
 创建的应用组合依赖；`AgentRuntime` 的构造不承诺为稳定的外部 Python API。详见

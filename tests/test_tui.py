@@ -34,7 +34,11 @@ from neuro_code.application.ports.provider_settings import (
     ManagedProviderSettings,
     ManagedProxyPolicy,
 )
-from neuro_code.application.ports.tools import ToolOutputArtifact, ToolOutputArtifactRead
+from neuro_code.application.ports.tools import (
+    MAX_TOOL_OUTPUT_ARTIFACT_READ_BYTES,
+    ToolOutputArtifact,
+    ToolOutputArtifactRead,
+)
 from neuro_code.application.providers import ChangeProviderRequest, ProviderChangeService
 from neuro_code.application.runtime.agent import AgentRunResult, EventSink
 from neuro_code.application.sessions import SessionTurnService
@@ -101,6 +105,8 @@ from neuro_code.domain.session_tasks import SessionTask, SessionTaskKind, Sessio
 from neuro_code.domain.sessions import SessionSummary
 from neuro_code.infrastructure.providers.provider_settings import JsonProviderSettingsStore
 from neuro_code.interfaces.tui import recoverable_terminal_status
+from neuro_code.interfaces.tui.clipboard import ClipboardWriteResult
+from neuro_code.interfaces.tui.tool_activity import ToolInspectorScreen
 from neuro_code.shared.errors import ProviderError
 from neuro_code.shared.ui_language import UiLanguage
 from neuro_code.tui import (
@@ -130,17 +136,28 @@ from neuro_code.tui_theme import (
     ACCENT_NUMBER,
     ACCENT_SUCCESS,
     ACCENT_WARNING,
+    BACKGROUND,
     BORDER_FOCUS,
     MONO_COLORS,
     MONO_SYNTAX_THEME,
-    SURFACE_HOVER,
-    SURFACE_SELECTED,
     TEXT_BODY,
+    TEXT_DISABLED,
     TEXT_EMPHASIS,
     TEXT_PLACEHOLDER,
     TEXT_PRIMARY,
     TEXT_SECONDARY,
+    TEXTUAL_THEME,
 )
+
+
+def rendered_text(app: NeuroCodeApp, renderable: object, *, width: int = 120) -> str:
+    return "".join(
+        segment.text
+        for segment in app.console.render(
+            renderable,
+            app.console.options.update(width=width),
+        )
+    )
 
 
 class TuiConversation:
@@ -245,6 +262,19 @@ class TuiConversation:
 
     async def run_background_wake(self, *, sink: EventSink | None = None) -> AgentRunResult:
         return await self.run("background wake", sink=sink)
+
+
+class ClipboardWriterFixture:
+    def __init__(self, *, native_copied: bool) -> None:
+        self._result = ClipboardWriteResult(
+            native_copied=native_copied,
+            method="fixture" if native_copied else None,
+        )
+        self.copied_text: list[str] = []
+
+    def copy(self, text: str) -> ClipboardWriteResult:
+        self.copied_text.append(text)
+        return self._result
 
 
 class ProviderFailureThenSuccessTuiConversation(TuiConversation):
@@ -1310,8 +1340,10 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(approvals.handlers[-1])
 
     async def test_prompt_copy_and_paste_are_not_intercepted_by_cancel_binding(self) -> None:
+        clipboard = ClipboardWriterFixture(native_copied=True)
         app = NeuroCodeApp(
             TuiConversation(),
+            clipboard_writer=clipboard,
             provider_name="fixture",
             model_name="fixture-model",
             cwd=Path("/workspace"),
@@ -1325,6 +1357,7 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
             await pilot.press("ctrl+c")
 
             self.assertEqual(app.clipboard, "copy this")
+            self.assertEqual(clipboard.copied_text, ["copy this"])
             self.assertEqual(prompt.value, "copy this prompt")
             self.assertNotIn("Cancellation requested.", [entry.text for entry in app.entries])
 
@@ -1334,8 +1367,10 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(prompt.value, "copy this promptcopy this")
 
     async def test_prompt_ctrl_shift_c_copies_a_selection_explicitly(self) -> None:
+        clipboard = ClipboardWriterFixture(native_copied=True)
         app = NeuroCodeApp(
             TuiConversation(),
+            clipboard_writer=clipboard,
             provider_name="fixture",
             model_name="fixture-model",
             cwd=Path("/workspace"),
@@ -1349,11 +1384,14 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
             await pilot.press("ctrl+shift+c")
 
             self.assertEqual(app.clipboard, "selected")
+            self.assertEqual(clipboard.copied_text, ["selected"])
             self.assertEqual(prompt.value, "selected text")
 
     async def test_transcript_copy_screen_supports_arbitrary_selection(self) -> None:
+        clipboard = ClipboardWriterFixture(native_copied=True)
         app = NeuroCodeApp(
             TuiConversation(),
+            clipboard_writer=clipboard,
             provider_name="fixture",
             model_name="fixture-model",
             cwd=Path("/workspace"),
@@ -1365,12 +1403,16 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
 
             self.assertIsInstance(app.screen, TranscriptCopyScreen)
+            self.assertTrue(app.screen.query_one("#transcript-copy-dialog").has_class("modal-l"))
+            self.assertIn("border: none", TranscriptCopyScreen.CSS)
+            self.assertNotIn("border: solid $border-dim", TranscriptCopyScreen.CSS)
             editor = app.screen.query_one("#transcript-copy-text", TextArea)
             second_line = editor.text.splitlines().index("Second line")
             editor.selection = Selection((second_line, 0), (second_line, 6))
             await pilot.press("ctrl+c")
 
             self.assertEqual(app.clipboard, "Second")
+            self.assertEqual(clipboard.copied_text, ["Second"])
             self.assertIn(
                 "6",
                 str(app.screen.query_one("#transcript-copy-status", Label).renderable),
@@ -1378,6 +1420,34 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
             await pilot.press("escape")
             await pilot.pause()
             self.assertIs(app.screen, app.screen_stack[0])
+
+    async def test_transcript_copy_screen_does_not_claim_native_clipboard_success(
+        self,
+    ) -> None:
+        clipboard = ClipboardWriterFixture(native_copied=False)
+        app = NeuroCodeApp(
+            TuiConversation(),
+            clipboard_writer=clipboard,
+            language=UiLanguage.ENGLISH,
+            provider_name="fixture",
+            model_name="fixture-model",
+            cwd=Path("/workspace"),
+        )
+
+        async with app.run_test(size=(90, 28)) as pilot:
+            app._write_entry("assistant", "Copy this response.")
+            await pilot.press("f8")
+            await pilot.pause()
+
+            self.assertIsInstance(app.screen, TranscriptCopyScreen)
+            editor = app.screen.query_one("#transcript-copy-text", TextArea)
+            editor.select_all()
+            await pilot.press("ctrl+c")
+
+            status = str(app.screen.query_one("#transcript-copy-status", Label).renderable)
+            self.assertIn("System clipboard support is unavailable", status)
+            self.assertNotIn("Copied", status)
+            self.assertEqual(clipboard.copied_text, [app._copyable_transcript()])
 
     async def test_prompt_paste_preserves_all_lines(self) -> None:
         runner = TuiConversation()
@@ -1438,10 +1508,25 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
 
             self.assertEqual(app.theme, "neuro-code-mono")
-            self.assertEqual(app.screen.styles.background.hex.lower(), "#0c0c0c")
-            self.assertEqual(BORDER_FOCUS, "#BDBDBD")
+            self.assertEqual(app.screen.styles.background.hex.lower(), BACKGROUND.lower())
+            self.assertEqual(BORDER_FOCUS, ACCENT_CODE)
             self.assertNotIn("#F0F0F0", NeuroCodeApp.CSS)
             self.assertIn("background: $text-muted", NeuroCodeApp.CSS)
+            self.assertTrue(
+                {
+                    "bg-0",
+                    "bg-1",
+                    "bg-2",
+                    "border",
+                    "fg-primary",
+                    "fg-secondary",
+                    "fg-muted",
+                    "space-1",
+                    "space-2",
+                    "space-3",
+                }
+                <= TEXTUAL_THEME.variables.keys()
+            )
             self.assertFalse(app.ENABLE_COMMAND_PALETTE)
             self.assertIn("NEURO / CODE", str(app.query_one("#brand", Static).renderable))
             self.assertEqual(str(app.query_one("#clock", Static).renderable).count(":"), 1)
@@ -1494,7 +1579,7 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
             cwd=Path("/workspace"),
         )
 
-        async with app.run_test(size=(100, 30)) as pilot:
+        async with app.run_test(size=(160, 30)) as pilot:
             prompt = app.query_one("#prompt", PromptInput)
             prompt.value = "inspect the repository"
             await pilot.press("enter")
@@ -1514,6 +1599,11 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("fixture response", assistant_text)
             self.assertNotIn("You:", user_text)
             self.assertNotIn("Assistant:", assistant_text)
+            tool = next(message for message in messages if message.category == "tool")
+            self.assertEqual({user.region.x, assistant.region.x, tool.region.x}, {4})
+            self.assertLessEqual(user.region.width, 116)
+            self.assertLessEqual(assistant.region.width, 116)
+            self.assertLessEqual(tool.region.width, 116)
 
     async def test_assistant_markdown_uses_semantic_styles_without_markup_injection(
         self,
@@ -1625,7 +1715,7 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
                     self.assertIn(marker, str(rendered))
                     self.assertIn(accent.lower(), str(rendered.style).lower())
 
-    async def test_tool_notice_highlights_the_tool_name_in_an_aligned_gutter(self) -> None:
+    async def test_tool_notice_uses_semantic_weight_without_a_repeated_label(self) -> None:
         app = NeuroCodeApp(
             TuiConversation(),
             provider_name="fixture",
@@ -1636,7 +1726,7 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
         async with app.run_test(size=(80, 24)):
             rendered = app._render_entry(
                 "tool",
-                "Tool read_file completed.",
+                "read_file completed.",
                 ui_key="tool.completed",
                 ui_values=(("name", "read_file"),),
             )
@@ -1644,7 +1734,9 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
             tool_segments = [segment for segment in segments if "read_file" in segment.text]
 
             self.assertTrue(tool_segments)
-            self.assertIn(ACCENT_CODE.lower(), str(tool_segments[0].style).lower())
+            self.assertIn(TEXT_EMPHASIS.lower(), str(tool_segments[0].style).lower())
+            self.assertNotIn(ACCENT_CODE.lower(), str(tool_segments[0].style).lower())
+            self.assertNotIn("Tool", rendered.plain)
 
     async def test_streaming_response_updates_one_stable_transcript_node(self) -> None:
         runner = StreamingTuiConversation()
@@ -1886,7 +1978,10 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
 
             second_frame = str(activity.renderable)
             self.assertNotEqual(first_activity_frame, second_frame)
-            self.assertNotIn("█", str(app.query_one("#runtime-model", Static).renderable))
+            self.assertNotIn(
+                "█",
+                rendered_text(app, app.query_one("#runtime-primary", Static).renderable),
+            )
             await app._discard_pending_assistant()
             self.assertFalse(app._model_loading)
 
@@ -1913,6 +2008,13 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsInstance(app.screen, SettingsScreen)
             self.assertEqual(list(app.screen.query("#provider-settings-form")), [])
             self.assertEqual(list(app.screen.query("#settings-languages")), [])
+            self.assertTrue(app.screen.query_one("#settings-dialog").has_class("modal-m"))
+            language_row = app.screen.query_one("#settings-category-language", Button)
+            language_row_text = rendered_text(app, language_row.render(), width=72)
+            self.assertIn("\N{SINGLE RIGHT-POINTING ANGLE QUOTATION MARK}", language_row_text)
+            self.assertIn("Interface language", language_row_text)
+            self.assertIn("English", language_row_text)
+            self.assertNotIn("████", language_row_text)
             clicked = await pilot.click("#settings-category-language")
             self.assertTrue(clicked)
             for _ in range(20):
@@ -1921,6 +2023,7 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
                     break
 
             self.assertIsInstance(app.screen, LanguageSettingsScreen)
+            self.assertTrue(app.screen.query_one("#language-settings-dialog").has_class("modal-s"))
             clicked = await pilot.click("#settings-language-zh-cn")
             self.assertTrue(clicked)
             for _ in range(20):
@@ -1931,7 +2034,7 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(preferences.saved, [UiLanguage.SIMPLIFIED_CHINESE])
             self.assertEqual(app.sub_title, "终端编程智能体")
             self.assertIn("输入 /help", prompt.placeholder)
-            self.assertIn("设置", str(app.query_one("#shortcut-bar", Static).renderable))
+            self.assertEqual(len(app.query("#shortcut-bar")), 0)
             self.assertTrue(app.entries[0].text.startswith("已就绪"))
             self.assertIn(
                 "literal model response",
@@ -2581,7 +2684,7 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(remaining.default_provider, "first")
             self.assertEqual(app.return_code, TUI_RELOAD_PROVIDER_SETTINGS)
 
-    async def test_runtime_bar_shows_model_and_effort_and_localizes_labels(self) -> None:
+    async def test_runtime_bar_is_compact_semantic_and_label_free(self) -> None:
         profiles = ProfileTuiController()
         app = NeuroCodeApp(
             TuiConversation(),
@@ -2593,59 +2696,53 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
         )
 
         async with app.run_test(size=(80, 24)) as pilot:
-            model = app.query_one("#runtime-model", Static)
-            context = app.query_one("#runtime-context", Static)
-            effort = app.query_one("#runtime-effort", Static)
-            workspace = app.query_one("#runtime-workspace", Static)
-            mode = app.query_one("#runtime-mode", Static)
-            self.assertIn("MODEL", str(model.renderable))
-            self.assertIn("first · first-model", str(model.renderable))
-            self.assertIn("EFFORT", str(effort.renderable))
-            self.assertIn("● high", str(effort.renderable))
-            self.assertIn("CTX", str(context.renderable))
-            self.assertIn("~0.0%", str(context.renderable))
-            self.assertIn("CWD", str(workspace.renderable))
-            self.assertIn(str(Path("/workspace")), str(workspace.renderable))
-            self.assertIn("MODE", str(mode.renderable))
-            self.assertIn("normal", str(mode.renderable))
-            model_segments = list(app.console.render(model.renderable))
-            effort_segments = list(app.console.render(effort.renderable))
-            mode_segments = list(app.console.render(mode.renderable))
+            primary = app.query_one("#runtime-primary", Static)
+            secondary = app.query_one("#runtime-secondary", Static)
+            primary_text = rendered_text(app, primary.renderable, width=40)
+            secondary_text = rendered_text(app, secondary.renderable, width=40)
+            self.assertIn("first-model", primary_text)
+            self.assertIn(" · high", primary_text)
+            self.assertIn(" · normal", primary_text)
+            self.assertNotIn("MODEL", primary_text)
+            self.assertNotIn("EFFORT", primary_text)
+            self.assertIn("ctx ~0.0%", secondary_text)
+            self.assertIn(str(Path("/workspace")), secondary_text)
+            self.assertNotIn("CWD", secondary_text)
+            primary_segments = list(app.console.render(primary.renderable))
             self.assertIn(
-                ACCENT_CODE.lower(),
+                TEXT_EMPHASIS.lower(),
                 str(
                     next(
-                        segment.style for segment in model_segments if "first-model" in segment.text
+                        segment.style
+                        for segment in primary_segments
+                        if "first-model" in segment.text
                     )
                 ).lower(),
             )
             self.assertIn(
-                TEXT_EMPHASIS.lower(),
+                TEXT_SECONDARY.lower(),
                 str(
-                    next(segment.style for segment in effort_segments if "high" in segment.text)
+                    next(segment.style for segment in primary_segments if "high" in segment.text)
                 ).lower(),
             )
             self.assertIn(
-                TEXT_EMPHASIS.lower(),
+                TEXT_SECONDARY.lower(),
                 str(
-                    next(segment.style for segment in mode_segments if "normal" in segment.text)
+                    next(segment.style for segment in primary_segments if "normal" in segment.text)
                 ).lower(),
             )
+            self.assertNotIn(ACCENT_CODE.lower(), str(primary.renderable).lower())
 
             await app._language_settings_selected(UiLanguage.SIMPLIFIED_CHINESE)
             await pilot.pause()
-            self.assertIn("模型", str(model.renderable))
-            self.assertIn("上下文", str(context.renderable))
-            self.assertIn("强度", str(effort.renderable))
-            self.assertIn("工作区", str(workspace.renderable))
-            self.assertIn("模式", str(mode.renderable))
-            self.assertIn("first · first-model", str(model.renderable))
+            self.assertIn("first-model", rendered_text(app, primary.renderable, width=40))
+            self.assertIn("ctx ~0.0%", rendered_text(app, secondary.renderable, width=40))
 
             app._provider_name = "same-name"
             app._model_name = "same-name"
             app._refresh_runtime_bar()
-            self.assertEqual(str(model.renderable).count("same-name"), 1)
-            self.assertNotIn(" · same-name", str(model.renderable))
+            self.assertEqual(rendered_text(app, primary.renderable, width=40).count("same-name"), 1)
+            self.assertEqual(primary.tooltip.splitlines()[0], "same-name/same-name")
 
     async def test_shift_tab_cycles_modes_and_persists_safe_auto_preview(self) -> None:
         profiles = ProfileTuiController()
@@ -2666,7 +2763,7 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(preferences.saved_modes[-1], InteractionMode.ACCEPT_EDITS)
             self.assertIn(
                 "accept-edits",
-                str(app.query_one("#runtime-mode", Static).renderable),
+                rendered_text(app, app.query_one("#runtime-primary", Static).renderable),
             )
 
             prompt = app.query_one("#prompt", PromptInput)
@@ -2676,7 +2773,10 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(profiles.mode_selections[-1], InteractionMode.AUTO)
             self.assertIn("safe preview", app.entries[-1].text)
-            self.assertIn("auto", str(app.query_one("#runtime-mode", Static).renderable))
+            self.assertIn(
+                "auto",
+                rendered_text(app, app.query_one("#runtime-primary", Static).renderable),
+            )
 
     async def test_context_bar_uses_provider_usage_and_status_reports_token_budget(self) -> None:
         app = NeuroCodeApp(
@@ -2697,9 +2797,10 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
             )
             await pilot.pause()
 
-            context = app.query_one("#runtime-context", Static)
-            self.assertIn("85.0%", str(context.renderable))
-            self.assertNotIn("~", str(context.renderable))
+            context = app.query_one("#runtime-secondary", Static)
+            context_text = rendered_text(app, context.renderable)
+            self.assertIn("85.0%", context_text)
+            self.assertNotIn("~", context_text)
             self.assertIn("850,000 / 1,000,000", str(context.tooltip))
             context_segments = list(app.console.render(context.renderable))
             self.assertIn(
@@ -2733,11 +2834,12 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
             )
             await pilot.pause()
 
-            context = app.query_one("#runtime-context", Static)
-            self.assertIn("1.5k tok", str(context.renderable))
-            self.assertNotIn("?", str(context.renderable))
-            self.assertNotIn("Unknown", str(context.renderable))
-            self.assertEqual(context.tooltip, "1.5k tok")
+            context = app.query_one("#runtime-secondary", Static)
+            context_text = rendered_text(app, context.renderable)
+            self.assertIn("1.5k tok", context_text)
+            self.assertNotIn("?", context_text)
+            self.assertNotIn("Unknown", context_text)
+            self.assertTrue(str(context.tooltip).startswith("1.5k tok\n"))
             context_segments = list(app.console.render(context.renderable))
             self.assertIn(
                 TEXT_SECONDARY.lower(),
@@ -2775,14 +2877,8 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
 
             self.assertEqual(len(app.query("#runtime-budget")), 0)
-            for widget_id in (
-                "#runtime-model",
-                "#runtime-workspace",
-                "#runtime-context",
-                "#runtime-effort",
-                "#runtime-mode",
-            ):
-                rendered = str(app.query_one(widget_id, Static).renderable)
+            for widget_id in ("#runtime-primary", "#runtime-secondary"):
+                rendered = rendered_text(app, app.query_one(widget_id, Static).renderable)
                 self.assertNotIn("17/48", rendered)
                 self.assertNotIn("R 11/48", rendered)
                 self.assertNotIn("C 31/192", rendered)
@@ -2876,6 +2972,19 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
             labels = "\n".join(str(button.label) for button in app.screen.query(Button))
             for effort in ReasoningEffort:
                 self.assertIn(effort.value, labels)
+            current = app.screen.query_one("#effort-choice-2", Button)
+            current_text = rendered_text(app, current.render(), width=72)
+            self.assertIn("\N{SINGLE RIGHT-POINTING ANGLE QUOTATION MARK}", current_text)
+            self.assertIn("✓", current_text)
+            self.assertFalse(any(effort.glyph in current_text for effort in ReasoningEffort))
+            ultracode = app.screen.query_one("#effort-choice-4", Button)
+            ultracode_segments = list(
+                app.console.render(ultracode.render(), app.console.options.update(width=72))
+            )
+            coming_soon = next(
+                segment for segment in ultracode_segments if "coming soon" in segment.text
+            )
+            self.assertIn(TEXT_DISABLED.lower(), str(coming_soon.style).lower())
             clicked = await pilot.click("#effort-choice-3")
             self.assertTrue(clicked)
             for _ in range(20):
@@ -2886,8 +2995,8 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(profiles.effort_selections, [ReasoningEffort.XHIGH])
             self.assertEqual(preferences.saved_efforts, [ReasoningEffort.XHIGH])
             self.assertIn(
-                "⬤ xhigh",
-                str(app.query_one("#runtime-effort", Static).renderable),
+                "xhigh",
+                rendered_text(app, app.query_one("#runtime-primary", Static).renderable),
             )
 
             prompt = app.query_one("#prompt", PromptInput)
@@ -2897,8 +3006,8 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(profiles.effort_selections[-1], ReasoningEffort.ULTRACODE)
             self.assertIn("workflow orchestration is not implemented", app.entries[-1].text)
             self.assertIn(
-                "⚡ ultracode → ⬤ xhigh",
-                str(app.query_one("#runtime-effort", Static).renderable),
+                "ultracode → xhigh",
+                rendered_text(app, app.query_one("#runtime-primary", Static).renderable),
             )
 
             prompt.value = "/status"
@@ -2938,7 +3047,7 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
             )
             await pilot.press("ctrl+c")
 
-    async def test_narrow_runtime_bar_keeps_effort_visible_above_the_prompt(self) -> None:
+    async def test_narrow_runtime_bar_keeps_compact_status_below_the_prompt(self) -> None:
         app = NeuroCodeApp(
             TuiConversation(),
             provider_name="provider-with-a-very-long-name",
@@ -2949,17 +3058,28 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
         async with app.run_test(size=(52, 18)) as pilot:
             await pilot.pause()
             runtime_bar = app.query_one("#runtime-bar")
-            context = app.query_one("#runtime-context", Static)
-            effort = app.query_one("#runtime-effort", Static)
-            mode = app.query_one("#runtime-mode", Static)
+            primary = app.query_one("#runtime-primary", Static)
+            secondary = app.query_one("#runtime-secondary", Static)
             prompt = app.query_one("#prompt", PromptInput)
-            self.assertLessEqual(runtime_bar.region.bottom, prompt.region.y)
-            self.assertGreater(effort.region.width, 0)
-            self.assertGreater(context.region.width, 0)
-            self.assertGreater(mode.region.width, 0)
-            self.assertIn("≈0 tok", str(context.renderable))
-            self.assertIn("● high", str(effort.renderable))
-            self.assertIn("normal", str(mode.renderable))
+            self.assertLessEqual(prompt.region.bottom, runtime_bar.region.y)
+            self.assertGreater(primary.region.width, 0)
+            self.assertGreater(secondary.region.width, 0)
+            self.assertLessEqual(primary.region.right, runtime_bar.region.right)
+            self.assertLessEqual(secondary.region.right, runtime_bar.region.right)
+            self.assertIn(
+                "high", rendered_text(app, primary.renderable, width=primary.region.width)
+            )
+            self.assertIn(
+                "normal", rendered_text(app, primary.renderable, width=primary.region.width)
+            )
+            self.assertIn(
+                "≈0 tok",
+                rendered_text(app, secondary.renderable, width=secondary.region.width),
+            )
+            self.assertIn(
+                str(Path("/workspace")),
+                rendered_text(app, secondary.renderable, width=secondary.region.width),
+            )
 
     async def test_terminal_size_fallback_expands_the_full_screen_layout(self) -> None:
         app = NeuroCodeApp(
@@ -2984,10 +3104,11 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
             prompt = app.query_one("#prompt", PromptInput)
             self.assertGreater(prompt.region.width, 0)
             self.assertLessEqual(prompt.region.right, app.screen.size.width)
-            shortcut_bar = app.query_one("#shortcut-bar", Static)
-            self.assertLess(prompt.region.bottom, shortcut_bar.region.y)
-            self.assertGreater(shortcut_bar.region.height, 0)
-            self.assertLessEqual(shortcut_bar.region.bottom, app.screen.size.height)
+            runtime_bar = app.query_one("#runtime-bar")
+            self.assertLessEqual(prompt.region.bottom, runtime_bar.region.y)
+            self.assertGreater(runtime_bar.region.height, 0)
+            self.assertLessEqual(runtime_bar.region.bottom, app.screen.size.height)
+            self.assertEqual(len(app.query("#shortcut-bar")), 0)
 
     async def test_tasks_command_lists_current_scope_without_rendering_command_or_output(
         self,
@@ -3560,6 +3681,9 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("restart required", label)
         self.assertIn("unavailable", label)
 
+        off_option = replace(option, sandbox_profile=SandboxProfile.OFF)
+        self.assertIn("sandbox off · no OS isolation", SessionSelectionScreen._label(off_option))
+
     async def test_prompt_streams_events_and_commits_response(self) -> None:
         runner = TuiConversation()
         app = NeuroCodeApp(
@@ -3587,7 +3711,9 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
             )
             tool_entries = [text for category, text in entries if category == "tool"]
             self.assertEqual(len(tool_entries), 1)
-            self.assertEqual(tool_entries[0], "read_file  ·  ✓ Read README.md · 420ms")
+            self.assertIn("Inspecting repository", tool_entries[0])
+            self.assertIn("✓ read  README.md  420ms", tool_entries[0])
+            self.assertNotIn("Neuro Code project", tool_entries[0])
             self.assertIn(("assistant", "fixture response"), entries)
             self.assertEqual(entries[-1], ("status", "Turn completed in 2.8s · 1 model step(s)"))
             self.assertNotIn("private", "\n".join(text for _, text in entries))
@@ -3630,7 +3756,7 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
                 [(entry.category, entry.text) for entry in app.entries],
             )
 
-    async def test_expanding_truncated_tool_output_reads_bounded_session_artifact(self) -> None:
+    async def test_inspector_lazily_reads_bounded_session_artifact(self) -> None:
         artifact_id = "a" * 32
 
         class ArtifactService:
@@ -3648,7 +3774,7 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
                         byte_count=64,
                         truncated=True,
                     ),
-                    "full output line 1\nfull output line 2",
+                    "full output line 1\nAPI_KEY=sk-inspectorsecret123\nfull output line 2",
                     read_truncated=True,
                 )
 
@@ -3687,29 +3813,342 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
                             "output_artifact_id": artifact_id,
                             "output_artifact_path": f"tool-output/{artifact_id}.log",
                             "output_artifact_bytes": 64,
-                            "output_artifact_truncated": True,
                         },
                     },
                 )
             )
             card = app.query_one(ToolFeedbackMessage)
             self.assertTrue(card.can_focus)
+            stable_transcript = app._copyable_transcript()
             card.focus()
+            await pilot.press("enter")
+            await pilot.pause()
+
+            self.assertEqual(artifact_service.requests, [])
+            self.assertLessEqual(card.region.height, 12)
+            self.assertEqual(app._copyable_transcript(), stable_transcript)
+            self.assertNotIn("full output line 2", rendered_text(app, card.renderable))
+            self.assertEqual(
+                app._tool_feedback_by_entry[card.entry_index].artifact_id,
+                artifact_id,
+            )
+
             await pilot.press("enter")
             for _ in range(40):
                 await pilot.pause(0.02)
-                if any("full output line 2" in entry.text for entry in app.entries):
-                    break
+                if artifact_service.requests:
+                    inspector = cast(ToolInspectorScreen, app.screen)
+                    if "full output line 2" in inspector.presentation.output:
+                        break
 
+            self.assertIsInstance(app.screen, ToolInspectorScreen)
+            inspector = cast(ToolInspectorScreen, app.screen)
             self.assertEqual(len(artifact_service.requests), 1)
             request = artifact_service.requests[0]
             self.assertEqual(request.session_id, "artifact-session")
             self.assertEqual(request.artifact_id, artifact_id)
-            card_text = next(entry.text for entry in app.entries if entry.category == "tool")
-            self.assertIn("full output line 1", card_text)
-            self.assertIn("full output line 2", card_text)
-            self.assertIn("bounded at the read limit", card_text)
-            self.assertNotIn(artifact_id, card_text)
+            self.assertEqual(request.max_bytes, MAX_TOOL_OUTPUT_ARTIFACT_READ_BYTES)
+            self.assertIn("full output line 1", inspector.presentation.output)
+            self.assertIn("full output line 2", inspector.presentation.output)
+            self.assertNotIn("sk-inspectorsecret123", inspector.presentation.output)
+            self.assertIn("[REDACTED]", inspector.presentation.output)
+            self.assertIn("256 KiB", inspector.presentation.output_notice)
+            self.assertIn("stored output artifact", inspector.presentation.output_notice)
+            self.assertNotIn(artifact_id, inspector.presentation.output)
+
+            await pilot.press("2")
+            self.assertIn("printf output", inspector.presentation.input)
+            await pilot.press("3")
+            self.assertIn("call_id", inspector.presentation.meta)
+            self.assertIn("bash-call", inspector.presentation.meta)
+            self.assertIn("status", inspector.presentation.meta)
+            self.assertIn("completed", inspector.presentation.meta)
+            self.assertNotIn("output_artifact_id", inspector.presentation.meta)
+            self.assertNotIn("output_artifact_path", inspector.presentation.meta)
+
+            self.assertEqual(app._copyable_transcript(), stable_transcript)
+            self.assertNotIn("full output line 2", app._copyable_transcript())
+
+    async def test_running_tool_inspector_tracks_completion_and_returns_to_summary(
+        self,
+    ) -> None:
+        app = NeuroCodeApp(
+            TuiConversation(),
+            provider_name="fixture",
+            model_name="fixture-model",
+            cwd=Path("/workspace"),
+        )
+
+        async with app.run_test(size=(100, 30)) as pilot:
+            await app._handle_event(
+                AgentEvent.create(
+                    1,
+                    AgentEventKind.TOOL_REQUESTED,
+                    {
+                        "id": "live-tool",
+                        "name": "bash",
+                        "arguments": {"command": "printf ready"},
+                    },
+                )
+            )
+            await app._handle_event(
+                AgentEvent.create(
+                    2,
+                    AgentEventKind.TOOL_STARTED,
+                    {"id": "live-tool", "name": "bash"},
+                )
+            )
+            card = app.query_one(ToolFeedbackMessage)
+            card.focus()
+            await pilot.press("enter")
+            await pilot.press("enter")
+            await pilot.pause()
+
+            inspector = cast(ToolInspectorScreen, app.screen)
+            self.assertIn("running", inspector.presentation.meta)
+
+            await app._handle_event(
+                AgentEvent.create(
+                    3,
+                    AgentEventKind.TOOL_COMPLETED,
+                    {
+                        "id": "live-tool",
+                        "name": "bash",
+                        "content": "ready",
+                        "duration_seconds": 0.25,
+                        "metadata": {"exit_code": 0},
+                    },
+                )
+            )
+            await pilot.pause()
+
+            self.assertIs(app.screen, inspector)
+            self.assertIn("ready", inspector.presentation.output)
+            self.assertIn("completed", inspector.presentation.meta)
+            await pilot.press("escape")
+            await pilot.pause()
+            self.assertTrue(card.has_focus)
+            await pilot.press("escape")
+            await pilot.pause()
+            self.assertNotIn("Enter inspect", rendered_text(app, card.renderable))
+
+    async def test_running_inspector_loads_an_artifact_published_on_completion(self) -> None:
+        artifact_id = "b" * 32
+
+        class ArtifactService:
+            def __init__(self) -> None:
+                self.requests: list[ReadSessionToolOutputArtifactRequest] = []
+
+            async def read(
+                self, request: ReadSessionToolOutputArtifactRequest
+            ) -> ToolOutputArtifactRead:
+                self.requests.append(request)
+                return ToolOutputArtifactRead(
+                    ToolOutputArtifact(
+                        artifact_id,
+                        f"tool-output/{artifact_id}.log",
+                        byte_count=13,
+                        truncated=False,
+                    ),
+                    "artifact done",
+                    read_truncated=False,
+                )
+
+        runner = TuiConversation()
+        runner._session_id = "live-artifact-session"
+        artifact_service = ArtifactService()
+        app = NeuroCodeApp(
+            runner,
+            tool_output_artifact_service=artifact_service,
+            provider_name="fixture",
+            model_name="fixture-model",
+            cwd=Path("/workspace"),
+        )
+
+        async with app.run_test(size=(100, 30)) as pilot:
+            await app._handle_event(
+                AgentEvent.create(
+                    1,
+                    AgentEventKind.TOOL_REQUESTED,
+                    {
+                        "id": "live-artifact",
+                        "name": "bash",
+                        "arguments": {"command": "printf done"},
+                    },
+                )
+            )
+            await app._handle_event(
+                AgentEvent.create(
+                    2,
+                    AgentEventKind.TOOL_STARTED,
+                    {"id": "live-artifact", "name": "bash"},
+                )
+            )
+            card = app.query_one(ToolFeedbackMessage)
+            card.focus()
+            await pilot.press("enter")
+            await pilot.press("enter")
+            await pilot.pause()
+            self.assertEqual(artifact_service.requests, [])
+
+            await app._handle_event(
+                AgentEvent.create(
+                    3,
+                    AgentEventKind.TOOL_COMPLETED,
+                    {
+                        "id": "live-artifact",
+                        "name": "bash",
+                        "content": "preview",
+                        "metadata": {"output_artifact_id": artifact_id},
+                    },
+                )
+            )
+            for _ in range(40):
+                await pilot.pause(0.02)
+                inspector = cast(ToolInspectorScreen, app.screen)
+                if "artifact done" in inspector.presentation.output:
+                    break
+
+            self.assertEqual(len(artifact_service.requests), 1)
+            request = artifact_service.requests[0]
+            self.assertEqual(request.session_id, "live-artifact-session")
+            self.assertEqual(request.max_bytes, MAX_TOOL_OUTPUT_ARTIFACT_READ_BYTES)
+            self.assertIn("artifact done", inspector.presentation.output)
+
+    async def test_running_tool_peek_can_collapse_after_focus_moves_or_by_click(self) -> None:
+        app = NeuroCodeApp(
+            TuiConversation(),
+            provider_name="fixture",
+            model_name="fixture-model",
+            cwd=Path("/workspace"),
+        )
+
+        async with app.run_test(size=(100, 30)) as pilot:
+            await app._handle_event(
+                AgentEvent.create(
+                    1,
+                    AgentEventKind.TOOL_REQUESTED,
+                    {
+                        "id": "live-tool",
+                        "name": "bash",
+                        "arguments": {"command": "sleep 1"},
+                    },
+                )
+            )
+            await app._handle_event(
+                AgentEvent.create(
+                    2,
+                    AgentEventKind.TOOL_STARTED,
+                    {"id": "live-tool", "name": "bash"},
+                )
+            )
+            card = app.query_one(ToolFeedbackMessage)
+            card.focus()
+            await pilot.press("enter")
+            await pilot.pause()
+            self.assertIn("Enter inspect", rendered_text(app, card.renderable))
+            with patch.object(app, "_refresh_tool_activity_group") as refresh_group:
+                app._refresh_running_tool_elapsed()
+                refresh_group.assert_not_called()
+
+            app.query_one("#prompt", PromptInput).focus()
+            await pilot.press("escape")
+            await pilot.pause()
+            self.assertNotIn("Enter inspect", rendered_text(app, card.renderable))
+
+            await card._on_click(events.Click(card, 0, 0, 0, 0, 1, False, False, False, chain=1))
+            await pilot.pause()
+            self.assertIn("Enter inspect", rendered_text(app, card.renderable))
+            await card._on_click(events.Click(card, 0, 0, 0, 0, 1, False, False, False, chain=1))
+            await pilot.pause()
+            self.assertNotIsInstance(app.screen, ToolInspectorScreen)
+            self.assertNotIn("Enter inspect", rendered_text(app, card.renderable))
+
+    async def test_running_elapsed_refresh_updates_a_multi_tool_group_once(self) -> None:
+        app = NeuroCodeApp(
+            TuiConversation(),
+            provider_name="fixture",
+            model_name="fixture-model",
+            cwd=Path("/workspace"),
+        )
+
+        async with app.run_test(size=(100, 30)):
+            for sequence, call_id in enumerate(("first", "second"), start=1):
+                await app._handle_event(
+                    AgentEvent.create(
+                        sequence * 2 - 1,
+                        AgentEventKind.TOOL_REQUESTED,
+                        {"id": call_id, "name": "bash", "arguments": {"command": call_id}},
+                    )
+                )
+                await app._handle_event(
+                    AgentEvent.create(
+                        sequence * 2,
+                        AgentEventKind.TOOL_STARTED,
+                        {"id": call_id, "name": "bash"},
+                    )
+                )
+
+            with patch.object(
+                app,
+                "_refresh_tool_activity_group",
+                wraps=app._refresh_tool_activity_group,
+            ) as refresh_group:
+                app._refresh_running_tool_elapsed()
+
+            self.assertEqual(refresh_group.call_count, 1)
+
+    async def test_tool_inspector_copies_each_view_independently(self) -> None:
+        clipboard = ClipboardWriterFixture(native_copied=True)
+        app = NeuroCodeApp(
+            TuiConversation(),
+            clipboard_writer=clipboard,
+            provider_name="fixture",
+            model_name="fixture-model",
+            cwd=Path("/workspace"),
+        )
+
+        async with app.run_test(size=(100, 30)) as pilot:
+            await app._handle_event(
+                AgentEvent.create(
+                    1,
+                    AgentEventKind.TOOL_REQUESTED,
+                    {
+                        "id": "copy-tool",
+                        "name": "custom_tool",
+                        "arguments": {"query": "needle"},
+                    },
+                )
+            )
+            await app._handle_event(
+                AgentEvent.create(
+                    2,
+                    AgentEventKind.TOOL_COMPLETED,
+                    {
+                        "id": "copy-tool",
+                        "name": "custom_tool",
+                        "content": "copyable output",
+                        "metadata": {"count": 1},
+                    },
+                )
+            )
+            card = app.query_one(ToolFeedbackMessage)
+            card.focus()
+            await pilot.press("enter")
+            await pilot.press("enter")
+            await pilot.pause()
+
+            inspector = cast(ToolInspectorScreen, app.screen)
+            await pilot.press("ctrl+c")
+            self.assertEqual(clipboard.copied_text[-1], inspector.presentation.output)
+
+            await pilot.press("2")
+            await pilot.press("ctrl+c")
+            self.assertEqual(clipboard.copied_text[-1], inspector.presentation.input)
+
+            await pilot.press("3")
+            await pilot.press("ctrl+c")
+            self.assertEqual(clipboard.copied_text[-1], inspector.presentation.meta)
 
     async def test_tool_card_updates_in_place_and_renders_a_redacted_file_diff(self) -> None:
         app = NeuroCodeApp(
@@ -3790,77 +4229,91 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
 
             tool_entries = [entry for entry in app.entries if entry.category == "tool"]
             self.assertEqual(len(tool_entries), 1)
-            card = tool_entries[0].text
-            self.assertIn("✓ bash(", card)
-            self.assertIn("├ Allowed · fixture policy", card)
-            self.assertIn("├ Created src/new.py (+2)", card)
-            self.assertIn("+++ b/src/new.py", card)
-            self.assertIn('+API_KEY = "[REDACTED]"', card)
-            self.assertIn('+print("ready")', card)
-            self.assertIn("└ Completed · 125ms", card)
-            self.assertNotIn("sk-fixturesecret123", card)
+            stable_summary = tool_entries[0].text
+            self.assertIn("Updating workspace", stable_summary)
+            self.assertIn("✓ bash  ", stable_summary)
+            self.assertIn("125ms", stable_summary)
+            self.assertNotIn("Allowed", stable_summary)
+            self.assertNotIn("Completed", stable_summary)
+            self.assertNotIn("+++ b/src/new.py", stable_summary)
+            self.assertNotIn('+print("ready")', stable_summary)
+            self.assertNotIn("sk-fixturesecret123", stable_summary)
+            stable_copy = app._copyable_transcript()
 
-            rendered_segments = list(
+            card_widget = app.query_one(ToolFeedbackMessage)
+            collapsed_segments = list(
                 app.console.render(
-                    app.query_one(ToolFeedbackMessage).renderable,
+                    card_widget.renderable,
                     app.console.options.update(width=100),
                 )
             )
-            added_segments = [
-                segment for segment in rendered_segments if '+print("ready")' in segment.text
-            ]
-            removed_or_header_segments = [
-                segment for segment in rendered_segments if "--- /dev/null" in segment.text
-            ]
-            command_segments = [segment for segment in rendered_segments if "bash(" in segment.text]
-            success_segments = [segment for segment in rendered_segments if "✓" in segment.text]
+            collapsed_text = "".join(segment.text for segment in collapsed_segments)
+            self.assertIn("Updating workspace", collapsed_text)
+            self.assertIn("bash", collapsed_text)
+            self.assertIn("125ms", collapsed_text)
+            self.assertNotIn("Allowed", collapsed_text)
+            self.assertNotIn("Output", collapsed_text)
+            self.assertNotIn("Details", collapsed_text)
+            self.assertNotIn("+++ b/src/new.py", collapsed_text)
+            success_segments = [segment for segment in collapsed_segments if "✓" in segment.text]
             duration_segments = [
-                segment for segment in rendered_segments if "125ms" in segment.text
+                segment for segment in collapsed_segments if "125ms" in segment.text
             ]
-            details_segments = [
-                segment for segment in rendered_segments if "Details shown" in segment.text
-            ]
-            self.assertTrue(added_segments)
-            self.assertIn(ACCENT_SUCCESS.lower(), str(added_segments[0].style).lower())
-            self.assertIn(SURFACE_SELECTED.lower(), str(added_segments[0].style).lower())
-            self.assertTrue(removed_or_header_segments)
-            self.assertIn(ACCENT_ERROR.lower(), app._diff_line_style("-removed line").lower())
-            self.assertIn(SURFACE_HOVER.lower(), app._diff_line_style("-removed line").lower())
-            self.assertIn(ACCENT_CODE.lower(), str(command_segments[0].style).lower())
             self.assertIn(ACCENT_SUCCESS.lower(), str(success_segments[0].style).lower())
             self.assertIn(TEXT_SECONDARY.lower(), str(duration_segments[0].style).lower())
-            self.assertIn(TEXT_SECONDARY.lower(), str(details_segments[0].style).lower())
 
-            card_widget = app.query_one(ToolFeedbackMessage)
             self.assertTrue(card_widget.can_focus)
-            self.assertIn("Details shown", card)
             card_widget.focus()
             await pilot.press("enter")
             await pilot.pause()
 
-            collapsed_card = next(entry.text for entry in app.entries if entry.category == "tool")
-            self.assertIn("Created src/new.py (+2)", collapsed_card)
-            self.assertIn("Details hidden", collapsed_card)
-            self.assertIn("Completed · 125ms", collapsed_card)
-            self.assertNotIn("+++ b/src/new.py", collapsed_card)
-            self.assertNotIn('+print("ready")', collapsed_card)
-            self.assertNotIn("sk-fixturesecret123", collapsed_card)
+            peek = rendered_text(app, card_widget.renderable, width=100)
+            self.assertIn("Enter inspect", peek)
+            self.assertIn("bash", peek)
+            self.assertNotIn("Allowed", peek)
+            self.assertNotIn("Completed", peek)
+            self.assertNotIn("fixture policy", peek)
+            self.assertNotIn("+++ b/src/new.py", peek)
+            self.assertNotIn('+print("ready")', peek)
+            self.assertLessEqual(card_widget.region.height, 12)
+            self.assertEqual(app._copyable_transcript(), stable_copy)
 
-            self.assertTrue(await pilot.click(card_widget, offset=(12, 0)))
+            await pilot.press("enter")
             await pilot.pause()
-            expanded_card = next(entry.text for entry in app.entries if entry.category == "tool")
-            self.assertIn("+++ b/src/new.py", expanded_card)
-            self.assertIn('+print("ready")', expanded_card)
-            self.assertNotIn("sk-fixturesecret123", expanded_card)
+
+            self.assertIsInstance(app.screen, ToolInspectorScreen)
+            inspector = cast(ToolInspectorScreen, app.screen)
+            self.assertIn("Workspace changes", inspector.presentation.output)
+            self.assertIn("+++ b/src/new.py", inspector.presentation.output)
+            self.assertIn('+API_KEY = "[REDACTED]"', inspector.presentation.output)
+            self.assertIn('+print("ready")', inspector.presentation.output)
+            self.assertNotIn("sk-fixturesecret123", inspector.presentation.output)
+            await pilot.press("3")
+            self.assertIn("permission", inspector.presentation.meta)
+            self.assertIn("allow · fixture policy", inspector.presentation.meta)
+            self.assertIn("status", inspector.presentation.meta)
+            self.assertIn("completed", inspector.presentation.meta)
+
+            await pilot.press("escape")
+            await pilot.pause()
+            self.assertNotIsInstance(app.screen, ToolInspectorScreen)
+            self.assertIn("Enter inspect", rendered_text(app, card_widget.renderable, width=100))
+            card_widget.focus()
+            await pilot.press("escape")
+            await pilot.pause()
+            self.assertNotIn("Enter inspect", rendered_text(app, card_widget.renderable, width=100))
+            self.assertEqual(
+                next(entry.text for entry in app.entries if entry.category == "tool"),
+                stable_summary,
+            )
 
             await app._language_settings_selected(UiLanguage.SIMPLIFIED_CHINESE)
             await pilot.pause()
             localized_card = next(entry.text for entry in app.entries if entry.category == "tool")
-            self.assertIn("已允许 · fixture policy", localized_card)
-            self.assertIn("新建 src/new.py", localized_card)
-            self.assertIn("+2", localized_card)
-            self.assertIn("完成 · 125ms", localized_card)
-            self.assertIn("已展开详细信息", localized_card)
+            self.assertNotIn("已允许", localized_card)
+            self.assertNotIn("fixture policy", localized_card)
+            self.assertNotIn("完成 ·", localized_card)
+            self.assertIn("正在更新工作区", rendered_text(app, card_widget.renderable))
 
     async def test_local_slash_commands_do_not_call_the_model(self) -> None:
         runner = TuiConversation()
@@ -4174,13 +4627,14 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
                 )
             )
             state = app._tool_feedback_by_call[(False, "wait")]
+            group = app._tool_activity_group_by_entry[state.entry_index]
             state.started_at = 100.0
             app._turn_activity_tool_started_at = state.started_at
-            with patch.object(app, "_refresh_tool_feedback") as refresh:
+            with patch.object(app, "_refresh_tool_activity_group") as refresh:
                 app._advance_model_loading_animation()
                 refresh.assert_not_called()
                 app._refresh_running_tool_elapsed()
-                refresh.assert_called_once_with(state)
+                refresh.assert_called_once_with(group)
             with patch("neuro_code.tui.monotonic", return_value=112.7):
                 app._refresh_running_tool_elapsed()
             running_text = next(entry.text for entry in app.entries if entry.category == "tool")
@@ -4199,7 +4653,8 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
                 )
             )
             completed_text = next(entry.text for entry in app.entries if entry.category == "tool")
-            self.assertIn("Completed · 13.4s", completed_text)
+            self.assertIn("✓ wait_tasks  13.4s", completed_text)
+            self.assertNotIn("Completed", completed_text)
             self.assertNotIn("wait_tasks", str(activity.renderable))
             await pilot.pause()
 
@@ -4365,9 +4820,218 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
             )
 
             summary = next(entry.text for entry in app.entries if entry.category == "tool")
-            self.assertIn("read_files", summary)
             self.assertIn("Read 2 files", summary)
             self.assertIn("120ms", summary)
+            self.assertNotIn("bounded output", summary)
+
+    async def test_consecutive_tools_share_one_progressively_disclosed_activity_group(
+        self,
+    ) -> None:
+        app = NeuroCodeApp(
+            TuiConversation(),
+            provider_name="fixture",
+            model_name="fixture-model",
+            cwd=Path("/workspace"),
+        )
+        long_command = (
+            "grep tool docs/en/compatibility-matrix.md "
+            "--with-a-deliberately-long-tail-visible-only-in-details"
+        )
+
+        async with app.run_test(size=(120, 32)) as pilot:
+            events = (
+                AgentEvent.create(
+                    1,
+                    AgentEventKind.TOOL_REQUESTED,
+                    {"id": "read-one", "name": "read_file", "arguments": {"path": "a.py"}},
+                ),
+                AgentEvent.create(
+                    2,
+                    AgentEventKind.TOOL_COMPLETED,
+                    {
+                        "id": "read-one",
+                        "name": "read_file",
+                        "content": "private preview",
+                        "duration_seconds": 0.1,
+                    },
+                ),
+                AgentEvent.create(
+                    3,
+                    AgentEventKind.TOOL_REQUESTED,
+                    {
+                        "id": "read-many",
+                        "name": "read_files",
+                        "arguments": {"files": [{"path": "b.py"}, {"path": "c.py"}]},
+                    },
+                ),
+                AgentEvent.create(
+                    4,
+                    AgentEventKind.TOOL_COMPLETED,
+                    {
+                        "id": "read-many",
+                        "name": "read_files",
+                        "content": "private preview",
+                        "duration_seconds": 0.2,
+                    },
+                ),
+                AgentEvent.create(
+                    5,
+                    AgentEventKind.TOOL_REQUESTED,
+                    {"id": "grep", "name": "bash", "arguments": {"command": long_command}},
+                ),
+                AgentEvent.create(
+                    6,
+                    AgentEventKind.TOOL_COMPLETED,
+                    {
+                        "id": "grep",
+                        "name": "bash",
+                        "content": "one\ntwo",
+                        "duration_seconds": 5.3,
+                    },
+                ),
+            )
+            for event in events:
+                await app._handle_event(event)
+            await pilot.pause()
+
+            cards = list(app.query(ToolFeedbackMessage))
+            self.assertEqual(len(cards), 3)
+            self.assertEqual([card.display for card in cards], [True, False, False])
+            self.assertEqual([card.can_focus for card in cards], [True, False, False])
+            summary = rendered_text(app, cards[0].renderable, width=108)
+            self.assertIn("Inspecting repository", summary)
+            self.assertIn("Read 3 files", summary)
+            self.assertIn("Ran 1 command", summary)
+            self.assertNotIn("private preview", summary)
+            self.assertNotIn("Tool", summary)
+            self.assertNotIn("deliberately-long-tail", summary)
+            stable_copy = app._copyable_transcript()
+            self.assertEqual(stable_copy.count("Inspecting repository"), 1)
+            self.assertNotIn("TOOL\n", stable_copy)
+
+            cards[0].focus()
+            await pilot.press("enter")
+            await pilot.pause()
+            first_peek = rendered_text(app, cards[0].renderable, width=108)
+            self.assertIn("1/3", first_peek)
+            self.assertIn("read_file", first_peek)
+            self.assertIn("a.py", first_peek)
+            self.assertIn("private preview", first_peek)
+            self.assertNotIn("read_files", first_peek)
+            self.assertNotIn("deliberately-long-tail", first_peek)
+            self.assertLessEqual(cards[0].region.height, 12)
+            self.assertEqual(app._copyable_transcript(), stable_copy)
+
+            await pilot.press("down")
+            await pilot.pause()
+            second_peek = rendered_text(app, cards[0].renderable, width=108)
+            self.assertIn("2/3", second_peek)
+            self.assertIn("read_files", second_peek)
+            self.assertNotIn("deliberately-long-tail", second_peek)
+            self.assertLessEqual(cards[0].region.height, 12)
+
+            await pilot.press("down")
+            await pilot.pause()
+            third_peek = rendered_text(app, cards[0].renderable, width=108)
+            self.assertIn("3/3", third_peek)
+            self.assertIn("bash", third_peek)
+            self.assertIn("deliberately-long-tail", third_peek)
+            self.assertNotIn("a.py", third_peek)
+            self.assertLessEqual(cards[0].region.height, 12)
+
+            await pilot.press("enter")
+            await pilot.pause()
+            self.assertIsInstance(app.screen, ToolInspectorScreen)
+            inspector = cast(ToolInspectorScreen, app.screen)
+            self.assertIn("one\ntwo", inspector.presentation.output)
+            self.assertIn(
+                "deliberately-long-tail-visible-only-in-details",
+                inspector.presentation.input,
+            )
+            self.assertEqual(app._copyable_transcript(), stable_copy)
+            await pilot.press("escape")
+            await pilot.pause()
+            cards[0].focus()
+            await pilot.press("escape")
+            await pilot.pause()
+            self.assertNotIn("Enter inspect", rendered_text(app, cards[0].renderable, width=108))
+            self.assertEqual(app._copyable_transcript(), stable_copy)
+
+            app._write_entry("assistant", "Repository inspection complete.")
+            await app._handle_event(
+                AgentEvent.create(
+                    7,
+                    AgentEventKind.TOOL_REQUESTED,
+                    {"id": "next", "name": "read_file", "arguments": {"path": "next.py"}},
+                )
+            )
+            await pilot.pause()
+            self.assertEqual(sum(card.display for card in app.query(ToolFeedbackMessage)), 2)
+
+    async def test_large_multi_tool_peek_is_a_fixed_height_selection_viewport(self) -> None:
+        app = NeuroCodeApp(
+            TuiConversation(),
+            provider_name="fixture",
+            model_name="fixture-model",
+            cwd=Path("/workspace"),
+        )
+
+        async with app.run_test(size=(54, 24)) as pilot:
+            sequence = 0
+            for index in range(30):
+                sequence += 1
+                await app._handle_event(
+                    AgentEvent.create(
+                        sequence,
+                        AgentEventKind.TOOL_REQUESTED,
+                        {
+                            "id": f"generic-{index}",
+                            "name": "custom_tool",
+                            "arguments": {
+                                "path": f"very/long/path/that/wraps/in/a/narrow/terminal/{index}.txt"
+                            },
+                        },
+                    )
+                )
+                sequence += 1
+                await app._handle_event(
+                    AgentEvent.create(
+                        sequence,
+                        AgentEventKind.TOOL_COMPLETED,
+                        {
+                            "id": f"generic-{index}",
+                            "name": "custom_tool",
+                            "content": "\n".join(
+                                f"private-{index}-line-{line}" for line in range(40)
+                            ),
+                            "metadata": {"count": 40},
+                        },
+                    )
+                )
+            await pilot.pause()
+
+            cards = list(app.query(ToolFeedbackMessage))
+            self.assertEqual(len(cards), 30)
+            self.assertEqual(sum(card.display for card in cards), 1)
+            card = cards[0]
+            card.focus()
+            await pilot.press("enter")
+            await pilot.pause()
+
+            peek = rendered_text(app, card.renderable, width=42)
+            self.assertIn("1/30", peek)
+            self.assertIn("private-0-line-0", peek)
+            self.assertNotIn("private-1-line-0", peek)
+            self.assertNotIn("private-29-line-0", peek)
+            self.assertEqual(card.region.height, 12)
+
+            await pilot.press("down")
+            await pilot.pause()
+            selected = rendered_text(app, card.renderable, width=42)
+            self.assertIn("2/30", selected)
+            self.assertIn("private-1-line-0", selected)
+            self.assertNotIn("private-0-line-0", selected)
+            self.assertEqual(card.region.height, 12)
 
     async def test_plan_updated_is_a_single_first_class_entry_refreshed_in_place(self) -> None:
         app = NeuroCodeApp(
@@ -5112,8 +5776,13 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(profiles.selections, ["second"])
             self.assertIn("previous session old-session remains saved", app.entries[-1].text)
             self.assertIn(
-                "second · second-model",
-                str(app.query_one("#runtime-model", Static).renderable),
+                "second-model",
+                rendered_text(app, app.query_one("#runtime-primary", Static).renderable),
+            )
+            self.assertTrue(
+                str(app.query_one("#runtime-primary", Static).tooltip).startswith(
+                    "second/second-model"
+                )
             )
 
             prompt.value = "/status"

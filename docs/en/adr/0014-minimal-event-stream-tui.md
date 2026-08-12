@@ -99,6 +99,12 @@ complete the broader remaining M3 work. Bounded interactive tool-card details we
 Recoverable in-flight cancellation is defined by
 [ADR 0016](0016-recoverable-turn-cancellation.md).
 
+The later editorial presentation refinement in
+[ADR 0108](0108-editorial-tui-presentation.md) replaces the fixed label gutter,
+independent visible tool-card layout, persistent shortcut row, and above-prompt
+runtime-bar details. It does not change this ADR's event, permission, terminal,
+or application-controller boundaries.
+
 ## Validation
 
 Neuro Code verifies terminal startup and exit restoration at the executable

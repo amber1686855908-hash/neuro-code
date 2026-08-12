@@ -718,14 +718,24 @@ The minimal TUI is a presentation adapter over `AgentEvent`. It owns prompt
 input, scrollback, a live text surface, and local slash commands. It never
 renders raw reasoning or unrestricted argument/result mappings. A bounded
 allowlist supplies invocation previews such as path, command, pattern, query,
-and task ID. Each local tool call then owns one stable card, keyed by call ID,
-which is updated with its permission path, redacted result preview, elapsed
-time, and any bounded workspace-change report. Read-like calls project a
-one-line completed summary until the user opens the existing bounded details;
-edit reports open their changed slices automatically. Diff roles use both
-foreground and tinted-background styling. See
+and task ID. Each local tool call retains stable call-ID state, while the TUI
+projects consecutive calls as one activity group. The group is collapsed by
+default, including edits, and summarizes state, bounded intent or aggregate
+counts, key failure text, and elapsed time. Enter or click opens a fixed-height
+Inline Peek for one selected call; Up/Down selects another call, Enter opens its
+independent Tool Inspector, and Escape returns to the stable Summary. Clicking
+an open Peek collapses it, and an app-level fallback preserves Escape collapse
+after focus moves. While Inspector is open, live lifecycle events update the
+selected presentation and target Conversation widgets through the persistent
+base screen rather than the current modal. Running timers refresh each activity
+group at most once per tick and skip open Peek/Inspector layouts. The Peek's
+ten-logical-line presenter budget is backed by a twelve-row widget maximum so
+terminal wrapping cannot grow Conversation without bound. Long Bash intent is
+truncated, normal allow decisions remain out of Summary/Peek, and completion is
+represented once by its check mark. See
 [ADR 0014](adr/0014-minimal-event-stream-tui.md) and
-[ADR 0029](adr/0029-auditable-in-place-tool-cards.md).
+[ADR 0029](adr/0029-auditable-in-place-tool-cards.md), with the presentation
+refinement in [ADR 0108](adr/0108-editorial-tui-presentation.md).
 
 The scrollback is a vertical conversation of stable message widgets rather
 than a pre-rendered log plus a temporary streaming surface. User prompts and
@@ -738,14 +748,21 @@ only while the viewport is already at the end. See
 Assistant widgets use Rich's Markdown document model with an application-owned
 semantic theme and disabled hyperlink activation; model output is never passed
 through Rich/Textual markup parsing. User content and application/external
-values use literal `Text`. Local system, status, tool, and error records are
-two-column grids with a fixed label gutter and a folding body. Semantic value
-classes—not arbitrary payload markup—select restrained colors for provider,
-model, tool, session, path, outcome, duration, mode, effort, and error fields.
-Tool output and diffs are literal application-styled `Text`, never payload
-markup. Bounded details are focusable and can be collapsed or expanded without
-fetching new data, as specified by
-[ADR 0030](adr/0030-bounded-interactive-tool-card-details.md). Mermaid and media
+values use literal `Text`. Conversation messages and local system, status,
+activity, plan, and error records share one left reading axis and a 116-column
+maximum; labels remain inline rather than reserving a fixed gutter. Semantic
+hierarchy—not an object's type alone—selects restrained foregrounds, the single
+interaction accent, and success/warning/error colors. Tool output and diffs are
+literal application-styled text, never payload markup. Metadata-first Tool
+Activity renderers project tree, grep, file-read, Bash, and generic previews;
+formatted stdout is only a bounded fallback. Conversation never renders an
+artifact or full tool output. The independent Inspector exposes scrollable and
+copyable Output/Input/Meta documents, recursively redacts Input, allowlists
+Meta, and only then lazily reads session-scoped output artifacts through the
+existing 256 KiB, redacted, session-owned application boundary. Read/storage
+truncation is explicit. Transcript Copy always projects the stable Activity
+Summary, as specified by [ADR 0030](adr/0030-bounded-interactive-tool-card-details.md)
+and [ADR 0067](adr/0067-tui-bounded-tool-output-details.md). Mermaid and media
 remain outside this renderer. See
 [ADR 0027](adr/0027-semantic-tui-and-application-reasoning-effort.md).
 
@@ -759,15 +776,19 @@ keys. Switching language rerenders chrome and translatable local history, while
 visible user/model text and already-sanitized tool previews remain untranslated
 and are never sent to a translator.
 
-The presentation adapter owns one fixed cool neutral-dark theme instead of exposing
-Textual's unrelated theme and command-palette surfaces. The built-in palette is
-disabled, provider and session discovery use the explicit application commands,
-and session queries are rendered as literal plain text. A persistent runtime
-bar above the prompt renders the active provider/model, compact working path,
-context-window usage, requested/effective effort, and interaction mode from
-controller state; it updates on
-localization, profile failover, and selection rather than scraping transcript
-messages. A pure collapsing-pulse state machine is advanced by a Textual timer
+The presentation adapter owns one compact neutral-dark semantic theme instead of
+exposing Textual's unrelated theme and command-palette surfaces. Three background
+levels, one border, three foreground levels, one restrained interaction accent,
+semantic outcome colors, and shared spacing values define its hierarchy. The
+built-in palette is disabled, provider and session discovery use the explicit
+application commands, and session queries are rendered as literal plain text.
+Below the prompt, one label-free runtime row keeps model, effort, and mode in a
+bounded left region and context usage plus compact working path in a bounded
+right region. Long model and path values ellipsize in narrow terminals. It
+updates from controller state on localization, profile failover, and selection
+rather than scraping transcript messages. The permanent shortcut row is
+omitted; `/help` and F1 show the existing command reference on demand. A pure
+collapsing-pulse state machine is advanced by a Textual timer
 and rendered before the pending-assistant text only while waiting for model
 output. Context
 starts with a provider-neutral estimate over canonical
@@ -823,8 +844,9 @@ model step from dispatch to the first visible/actionable result; it does not
 claim access to private provider reasoning telemetry. Tool terminal events carry
 elapsed time, while `TURN_COMPLETED` places the whole-turn summary after the
 stable assistant node. Tool invocation, permission path, output preview,
-workspace changes, and terminal status are rendered in one bounded, in-place
-tree. For a side-effecting local tool, the runtime compares bounded read-only
+workspace changes, and terminal status retain their bounded call-ID state inside
+the TUI's consecutive activity-group projection. For a side-effecting local
+tool, the runtime compares bounded read-only
 workspace snapshots taken after permission succeeds and immediately around the
 execution. The report is audit metadata, not a permission or success signal.
 `WorkspaceChangeObserver` is an application-composition dependency created per
