@@ -153,6 +153,7 @@ class _NamedPipe:
     handle: int
     client_name: str
     server_name: str
+    session_id: int
     appcontainer_named_object_path: str
     configured_sddl: str
     effective_dacl_sddl: str
@@ -298,6 +299,18 @@ class _WinApi:
                 ctypes.c_void_p,
                 ctypes.c_void_p,
             ],
+            ctypes.c_int32,
+        )
+        self.get_current_process_id = _load_function(
+            self.kernel32,
+            "GetCurrentProcessId",
+            [],
+            ctypes.c_uint32,
+        )
+        self.process_id_to_session_id = _load_function(
+            self.kernel32,
+            "ProcessIdToSessionId",
+            [ctypes.c_uint32, ctypes.POINTER(ctypes.c_uint32)],
             ctypes.c_int32,
         )
         self.create_named_pipe = _load_function(
@@ -863,7 +876,10 @@ def _create_named_pipe(api: _WinApi, profile: _Profile) -> _NamedPipe:
     leaf = f"NeuroCode-Poc1B-{uuid.uuid4().hex}"
     client_name = rf"\\.\pipe\LOCAL\{leaf}"
     object_path = _appcontainer_named_object_path(api, profile)
-    server_name = rf"\\.\pipe\{object_path.lstrip(chr(92))}\{leaf}"
+    session_id = ctypes.c_uint32()
+    if not api.process_id_to_session_id(api.get_current_process_id(), ctypes.byref(session_id)):
+        api.error("ProcessIdToSessionId")
+    server_name = rf"\\.\pipe\Sessions\{session_id.value}\{object_path.lstrip(chr(92))}\{leaf}"
     configured_sddl = f"D:P(A;;GA;;;SY)(A;;GRGW;;;{profile.sid_text})S:(ML;;NW;;;LW)"
     descriptor = ctypes.c_void_p()
     if not api.convert_sddl(
@@ -893,6 +909,7 @@ def _create_named_pipe(api: _WinApi, profile: _Profile) -> _NamedPipe:
             value,
             client_name,
             server_name,
+            int(session_id.value),
             object_path,
             configured_sddl,
             effective,
@@ -1102,6 +1119,7 @@ def _named_pipe_connect_gate(
                 "pipe_name_entropy_bits": 128,
                 "client_pipe_name": pipe.client_name,
                 "server_pipe_name": pipe.server_name,
+                "session_id": pipe.session_id,
                 "appcontainer_named_object_path": pipe.appcontainer_named_object_path,
                 "configured_sddl": pipe.configured_sddl,
                 "effective_dacl_sddl": pipe.effective_dacl_sddl,
@@ -1133,6 +1151,7 @@ def _named_pipe_connect_gate(
                     "effective_dacl_sddl": pipe.effective_dacl_sddl,
                     "client_pipe_name": pipe.client_name,
                     "server_pipe_name": pipe.server_name,
+                    "session_id": pipe.session_id,
                     "appcontainer_named_object_path": pipe.appcontainer_named_object_path,
                 }
             )
@@ -1176,6 +1195,7 @@ def _unauthorized_client_gate(
                 "effective_dacl_sddl": pipe.effective_dacl_sddl,
                 "client_pipe_name": pipe.client_name,
                 "server_pipe_name": pipe.server_name,
+                "session_id": pipe.session_id,
                 "appcontainer_named_object_path": pipe.appcontainer_named_object_path,
                 "no_everyone_or_broad_users_ace": ";;;WD)" not in pipe.effective_dacl_sddl
                 and ";;;BU)" not in pipe.effective_dacl_sddl,
