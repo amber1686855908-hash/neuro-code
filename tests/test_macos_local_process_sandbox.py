@@ -187,7 +187,13 @@ class MacOSSeatbeltLocalProcessSandboxTests(unittest.IsolatedAsyncioTestCase):
                 adapter.lifecycle_capability,
                 LocalProcessLifecycleCapability.PROCESS_GROUP_BEST_EFFORT,
             )
-            with self.assertRaisesRegex(SandboxError, "not enforceable"):
+            with (
+                mock.patch(
+                    "neuro_code.infrastructure.sandbox.macos_local_process._runtime_platform",
+                    return_value="linux",
+                ),
+                self.assertRaisesRegex(SandboxError, "not enforceable"),
+            ):
                 MacOSSeatbeltLocalProcessSandbox(SandboxProfile.WORKSPACE, workspace, state)
             with self.assertRaisesRegex(ValueError, "enabled profile"):
                 self._adapter(SandboxProfile.OFF, workspace, state)
