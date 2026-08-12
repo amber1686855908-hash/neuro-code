@@ -103,6 +103,7 @@ jobs:
             mingw-w64-x86_64-gcc
             mingw-w64-x86_64-openssl
             mingw-w64-x86_64-pcre2
+            mingw-w64-x86_64-rust
             mingw-w64-x86_64-zlib
       - name: Build evidence-only patched Git for Windows
         shell: msys2 {0}
