@@ -151,7 +151,9 @@ class _CreatedProcess:
 @dataclass(slots=True)
 class _NamedPipe:
     handle: int
-    name: str
+    client_name: str
+    server_name: str
+    appcontainer_named_object_path: str
     configured_sddl: str
     effective_dacl_sddl: str
 
@@ -188,6 +190,18 @@ class _WinApi:
                 ctypes.POINTER(ctypes.c_void_p),
             ],
             ctypes.c_long,
+        )
+        self.get_appcontainer_named_object_path = _load_function(
+            self.kernel32,
+            "GetAppContainerNamedObjectPath",
+            [
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_uint32,
+                ctypes.c_wchar_p,
+                ctypes.POINTER(ctypes.c_uint32),
+            ],
+            ctypes.c_int32,
         )
         self.derive_profile_sid = _load_function(
             self.userenv,
@@ -828,9 +842,29 @@ def _effective_dacl_sddl(api: _WinApi, handle: int) -> str:
         api.local_free(descriptor)
 
 
-def _create_named_pipe(api: _WinApi, appcontainer_sid: str) -> _NamedPipe:
-    name = rf"\\.\pipe\LOCAL\NeuroCode-Poc1B-{uuid.uuid4().hex}"
-    configured_sddl = f"D:P(A;;GA;;;SY)(A;;GRGW;;;{appcontainer_sid})S:(ML;;NW;;;LW)"
+def _appcontainer_named_object_path(api: _WinApi, profile: _Profile) -> str:
+    required = ctypes.c_uint32()
+    api.get_appcontainer_named_object_path(None, profile.sid, 0, None, ctypes.byref(required))
+    if not required.value:
+        api.error("GetAppContainerNamedObjectPath(size)")
+    buffer = ctypes.create_unicode_buffer(required.value)
+    if not api.get_appcontainer_named_object_path(
+        None,
+        profile.sid,
+        len(buffer),
+        buffer,
+        ctypes.byref(required),
+    ):
+        api.error("GetAppContainerNamedObjectPath")
+    return buffer.value
+
+
+def _create_named_pipe(api: _WinApi, profile: _Profile) -> _NamedPipe:
+    leaf = f"NeuroCode-Poc1B-{uuid.uuid4().hex}"
+    client_name = rf"\\.\pipe\LOCAL\{leaf}"
+    object_path = _appcontainer_named_object_path(api, profile)
+    server_name = rf"\\.\pipe\{object_path.lstrip(chr(92))}\{leaf}"
+    configured_sddl = f"D:P(A;;GA;;;SY)(A;;GRGW;;;{profile.sid_text})S:(ML;;NW;;;LW)"
     descriptor = ctypes.c_void_p()
     if not api.convert_sddl(
         configured_sddl,
@@ -842,7 +876,7 @@ def _create_named_pipe(api: _WinApi, appcontainer_sid: str) -> _NamedPipe:
     security = _SecurityAttributes(ctypes.sizeof(_SecurityAttributes), descriptor.value, False)
     try:
         handle = api.create_named_pipe(
-            name,
+            server_name,
             _PIPE_ACCESS_DUPLEX | _FILE_FLAG_FIRST_PIPE_INSTANCE,
             _PIPE_TYPE_BYTE | _PIPE_READMODE_BYTE | _PIPE_NOWAIT | _PIPE_REJECT_REMOTE_CLIENTS,
             _PIPE_UNLIMITED_INSTANCES,
@@ -855,7 +889,14 @@ def _create_named_pipe(api: _WinApi, appcontainer_sid: str) -> _NamedPipe:
         if not value or value == _INVALID_HANDLE_VALUE:
             api.error("CreateNamedPipeW")
         effective = _effective_dacl_sddl(api, value)
-        return _NamedPipe(value, name, configured_sddl, effective)
+        return _NamedPipe(
+            value,
+            client_name,
+            server_name,
+            object_path,
+            configured_sddl,
+            effective,
+        )
     finally:
         if descriptor.value:
             api.local_free(descriptor)
@@ -1025,7 +1066,7 @@ def _spawn_pipe_bootstrap(
 ) -> _CreatedProcess:
     return launcher.spawn_appcontainer(
         child,
-        [mode, pipe.name],
+        [mode, pipe.client_name],
         job_handle=job.process_creation_handle,
     )
 
@@ -1038,7 +1079,7 @@ def _named_pipe_connect_gate(
     pipe: _NamedPipe | None = None
     process: _CreatedProcess | None = None
     try:
-        pipe = _create_named_pipe(api, launcher.profile.sid_text)
+        pipe = _create_named_pipe(api, launcher.profile)
         with WindowsJobObject.create() as job:
             process = _spawn_pipe_bootstrap(launcher, child, "byte-stream", pipe, job)
             api.close(process.thread_handle)
@@ -1059,7 +1100,9 @@ def _named_pipe_connect_gate(
             stream_pass = kind == _FRAME_DATA and echoed == payload and len(payload) > 65536
             detail = {
                 "pipe_name_entropy_bits": 128,
-                "pipe_name": pipe.name,
+                "client_pipe_name": pipe.client_name,
+                "server_pipe_name": pipe.server_name,
+                "appcontainer_named_object_path": pipe.appcontainer_named_object_path,
                 "configured_sddl": pipe.configured_sddl,
                 "effective_dacl_sddl": pipe.effective_dacl_sddl,
                 "pipe_reject_remote_clients": True,
@@ -1088,7 +1131,9 @@ def _named_pipe_connect_gate(
                 {
                     "configured_sddl": pipe.configured_sddl,
                     "effective_dacl_sddl": pipe.effective_dacl_sddl,
-                    "pipe_name": pipe.name,
+                    "client_pipe_name": pipe.client_name,
+                    "server_pipe_name": pipe.server_name,
+                    "appcontainer_named_object_path": pipe.appcontainer_named_object_path,
                 }
             )
         return _status(False, detail), _status(False, detail)
@@ -1105,9 +1150,9 @@ def _unauthorized_client_gate(
     pipe: _NamedPipe | None = None
     completed: subprocess.CompletedProcess[str] | None = None
     try:
-        pipe = _create_named_pipe(api, launcher.profile.sid_text)
+        pipe = _create_named_pipe(api, launcher.profile)
         completed = subprocess.run(
-            [str(child), "pipe-denied", pipe.name],
+            [str(child), "pipe-denied", pipe.server_name],
             check=False,
             capture_output=True,
             text=True,
@@ -1129,6 +1174,9 @@ def _unauthorized_client_gate(
                 "expected_win32_error": _ERROR_ACCESS_DENIED,
                 "configured_sddl": pipe.configured_sddl,
                 "effective_dacl_sddl": pipe.effective_dacl_sddl,
+                "client_pipe_name": pipe.client_name,
+                "server_pipe_name": pipe.server_name,
+                "appcontainer_named_object_path": pipe.appcontainer_named_object_path,
                 "no_everyone_or_broad_users_ace": ";;;WD)" not in pipe.effective_dacl_sddl
                 and ";;;BU)" not in pipe.effective_dacl_sddl,
             },
@@ -1156,7 +1204,7 @@ def _stdio_relay_gate(
     target_handle = 0
     input_payload = b"stdin:\x00utf8:" + "桥接".encode() + b"\r|\n|\r\n|" + bytes(range(251)) * 300
     try:
-        pipe = _create_named_pipe(api, launcher.profile.sid_text)
+        pipe = _create_named_pipe(api, launcher.profile)
         with WindowsJobObject.create() as job:
             process = _spawn_pipe_bootstrap(launcher, child, "relay-stdio", pipe, job)
             api.close(process.thread_handle)
@@ -1233,7 +1281,7 @@ def _mcp_relay_gate(
     responses: list[bytes] = []
     diagnostics: list[bytes] = []
     try:
-        pipe = _create_named_pipe(api, launcher.profile.sid_text)
+        pipe = _create_named_pipe(api, launcher.profile)
         with WindowsJobObject.create() as job:
             process = _spawn_pipe_bootstrap(launcher, child, "relay-mcp", pipe, job)
             api.close(process.thread_handle)
@@ -1305,7 +1353,7 @@ def _cancellation_gate(
     process: _CreatedProcess | None = None
     target_handle = 0
     try:
-        pipe = _create_named_pipe(api, launcher.profile.sid_text)
+        pipe = _create_named_pipe(api, launcher.profile)
         with WindowsJobObject.create() as job:
             process = _spawn_pipe_bootstrap(launcher, child, "relay-cancel", pipe, job)
             api.close(process.thread_handle)
