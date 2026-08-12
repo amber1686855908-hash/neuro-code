@@ -360,6 +360,19 @@ class LocalInteractiveTerminalManager:
             raise TerminalError("size must be a TerminalSize")
         output = _TerminalOutputRing(output_capacity)
         resolved_cwd = self._workspace_path_resolver.resolve_existing(self._workspace, cwd)
+        try:
+            # A delegated resolver may return a valid path using a different
+            # platform spelling (for example macOS /var vs /private/var).
+            # Canonicalize it again before building the process request so the
+            # cwd and authorized root share one filesystem identity.
+            # 委托 resolver 可能返回使用不同平台写法的有效路径(例如 macOS 的
+            # /var 与 /private/var).构建进程请求前再次规范化,确保 cwd 与授权根
+            # 使用同一个文件系统身份.
+            resolved_cwd = resolved_cwd.expanduser().resolve(strict=True)
+        except (OSError, RuntimeError) as error:
+            raise TerminalError("terminal working directory cannot be resolved") from error
+        if not (resolved_cwd == self._workspace or resolved_cwd.is_relative_to(self._workspace)):
+            raise TerminalError("terminal working directory is outside the workspace")
         if not resolved_cwd.is_dir():
             raise TerminalError(f"terminal working directory is not a directory: {cwd!r}")
         environment = _terminal_environment(env, self._protected_environment)

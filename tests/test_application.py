@@ -41,6 +41,10 @@ from neuro_code.shared.errors import ConfigurationError, ToolError
 from tests.fakes import EmptyWorkspaceChangeObserver
 
 
+def _canonical_path(path: Path) -> Path:
+    return path.expanduser().resolve(strict=False)
+
+
 class ApplicationProviderFixture:
     provider_name = "fixture"
     model_name = "fixture-model"
@@ -307,7 +311,13 @@ context_window_tokens = 65536
                     binding = await application.create_binding()
                     self.assertEqual(
                         factory_calls,
-                        [(SandboxProfile.OFF, root, state)],
+                        [
+                            (
+                                SandboxProfile.OFF,
+                                _canonical_path(root),
+                                _canonical_path(state),
+                            )
+                        ],
                     )
                     self.assertIs(supervisor.local_process_sandboxes[0], process_sandbox)
                     self.assertIs(

@@ -175,18 +175,23 @@ class WindowsJobProcessTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(api.calls.count(("close", 30)), 1)
         self.assertEqual(api.calls.count(("close", 31)), 1)
 
-    async def test_shell_uses_absolute_comspec_from_child_environment(self) -> None:
+    async def test_shell_uses_absolute_comspec_from_trusted_host_environment(self) -> None:
         api = _FakeWindowsJobProcessApi()
         api.read_chunks = {10: [b"ok", b""]}
 
-        process = WindowsJobProcess.spawn_shell(
-            "echo hello",
-            cwd=Path("C:/workspace"),
-            env={"ComSpec": "C:/Windows/System32/cmd.exe"},
-            job_handle=99,
-            merge_output=True,
-            api=api,
-        )
+        with mock.patch.dict(
+            "neuro_code.infrastructure.sandbox.windows_job_process.os.environ",
+            {"ComSpec": "C:/Windows/System32/cmd.exe"},
+            clear=True,
+        ):
+            process = WindowsJobProcess.spawn_shell(
+                "echo hello",
+                cwd=Path("C:/workspace"),
+                env={"ComSpec": "C:/attacker/cmd.exe"},
+                job_handle=99,
+                merge_output=True,
+                api=api,
+            )
         await process.wait()
 
         assert api.creation is not None

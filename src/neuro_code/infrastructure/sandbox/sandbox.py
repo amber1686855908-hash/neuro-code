@@ -30,13 +30,19 @@ def _trusted_system_executable(name: str, workspace: Path) -> Path:
         raise SandboxError(f"sandbox profile requires the {name!r} system executable")
     path = Path(discovered).resolve()
     try:
+        canonical_workspace = workspace.expanduser().resolve(strict=False)
+    except (OSError, RuntimeError) as error:
+        raise SandboxError(f"cannot resolve sandbox workspace {workspace}: {error}") from error
+    try:
         details = path.stat()
     except OSError as error:
         raise SandboxError(f"cannot inspect sandbox executable {path}: {error}") from error
     if not path.is_file() or not os.access(path, os.X_OK):
         raise SandboxError(f"sandbox executable is not runnable: {path}")
-    if _within(path, workspace):
+    if _within(path, canonical_workspace):
         raise SandboxError(f"refusing workspace-controlled sandbox executable: {path}")
+    if os.name != "posix":
+        raise SandboxError("trusted system executable validation is only implemented on POSIX")
     writable_by_caller = os.access(path, os.W_OK) or any(
         os.access(parent, os.W_OK) for parent in path.parents
     )
