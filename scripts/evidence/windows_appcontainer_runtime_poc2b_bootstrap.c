@@ -656,6 +656,48 @@ static int network_pipe_mode(
     return 0;
 }
 
+static int nul_pipe_mode(const wchar_t *name) {
+    HANDLE pipe = connect_local_pipe(name);
+    HANDLE nul_handle;
+    DWORD error = ERROR_SUCCESS;
+    char facts[2048];
+    char result[256];
+    int length;
+    if (pipe == INVALID_HANDLE_VALUE) return (int)GetLastError();
+    token_facts(facts, sizeof(facts));
+    if (!send_frame(pipe, FRAME_HELLO, facts, (DWORD)strlen(facts))) {
+        CloseHandle(pipe);
+        return 99;
+    }
+    nul_handle = CreateFileW(
+        L"NUL",
+        GENERIC_READ | GENERIC_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        NULL,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL,
+        NULL);
+    if (nul_handle == INVALID_HANDLE_VALUE) {
+        error = GetLastError();
+    } else {
+        CloseHandle(nul_handle);
+    }
+    length = _snprintf_s(
+        result,
+        sizeof(result),
+        _TRUNCATE,
+        "{\"opened\":%s,\"error\":%lu}",
+        nul_handle == INVALID_HANDLE_VALUE ? "false" : "true",
+        error);
+    if (length < 0 || !send_frame(pipe, FRAME_DATA, result, (DWORD)length)) {
+        CloseHandle(pipe);
+        return 100;
+    }
+    FlushFileBuffers(pipe);
+    CloseHandle(pipe);
+    return 0;
+}
+
 static int relay_stdio_mode(const wchar_t *name) {
     HANDLE pipe = connect_local_pipe(name);
     CHILD_PIPES target;
@@ -970,6 +1012,8 @@ int wmain(int argc, wchar_t **argv) {
         return relay_command_mode(argv[2], argv[3]);
     if (wcscmp(argv[1], L"network-pipe") == 0 && argc == 5)
         return network_pipe_mode(argv[2], argv[3], argv[4]);
+    if (wcscmp(argv[1], L"nul-pipe") == 0 && argc == 3)
+        return nul_pipe_mode(argv[2]);
     if (wcscmp(argv[1], L"relay-stdio") == 0 && argc == 3)
         return relay_stdio_mode(argv[2]);
     if (wcscmp(argv[1], L"relay-mcp") == 0 && argc == 3)

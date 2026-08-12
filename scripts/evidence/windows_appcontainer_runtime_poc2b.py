@@ -2676,6 +2676,44 @@ def _network_gate(
         _close_process(api, process)
 
 
+def _nul_device_gate(
+    api: _WinApi,
+    launcher: _Launcher,
+    bootstrap: Path,
+) -> dict[str, object]:
+    pipe: _NamedPipe | None = None
+    process: _CreatedProcess | None = None
+    try:
+        pipe = _create_named_pipe(api, launcher.profile)
+        with _EvidenceJob.create(api) as job:
+            process = launcher.spawn_appcontainer(
+                bootstrap,
+                ["nul-pipe", pipe.client_name],
+                job_handle=job.process_creation_handle,
+            )
+            api.close(process.thread_handle)
+            process.thread_handle = 0
+            _connect_named_pipe(api, pipe, process)
+            facts = _receive_json_frame(api, pipe.handle, _FRAME_HELLO)
+            kind, payload = _receive_frame(api, pipe.handle)
+            exit_code = _wait_exit(api, process)
+            value = cast(dict[str, object], json.loads(payload.decode("utf-8")))
+            return _status(
+                bool(
+                    kind == _FRAME_DATA
+                    and exit_code == 0
+                    and _valid_appcontainer_facts(facts, launcher.profile.sid_text)
+                    and value.get("opened") is True
+                ),
+                {"facts": facts, "nul_device": value, "exit_code": exit_code},
+            )
+    except BaseException as error:
+        return _status(False, {"error_type": type(error).__name__, "error": str(error)})
+    finally:
+        _close_named_pipe(api, pipe)
+        _close_process(api, process)
+
+
 def _standard_user_run(args: argparse.Namespace) -> tuple[dict[str, object], bool]:
     api = _WinApi()
     Path(os.environ["TEMP"]).mkdir(parents=True, exist_ok=True)
@@ -2746,7 +2784,7 @@ def _standard_user_run(args: argparse.Namespace) -> tuple[dict[str, object], boo
                 "/s",
                 "/c",
                 "set /p neuro=&echo STDOUT:!neuro!&echo STDERR:standard 1>&2&"
-                "if defined NEURO_SECRET_SENTINEL echo SECRET_LEAK&exit /b 29",
+                "if defined NEURO_SECRET_SENTINEL (echo SECRET_LEAK)&exit /b 29",
             ],
             input_payload=b"standard-user-input\r\n",
         )
@@ -2855,7 +2893,7 @@ def _create_standard_user_and_run(
     staging: Path,
 ) -> dict[str, object]:
     username = f"neuro_poc2b_{uuid.uuid4().hex[:8]}"
-    password = f"N3uro!{uuid.uuid4().hex}aA"
+    password = f"N3!{uuid.uuid4().hex[:8]}aA"
     public_root = (
         Path(os.environ.get("PUBLIC", r"C:\Users\Public")) / f"NeuroPoc2B-{uuid.uuid4().hex}"
     )
@@ -2872,10 +2910,11 @@ def _create_standard_user_and_run(
         _run_checked(["net", "user", username, password, "/add", "/expires:never"])
         created = True
         _run_checked(["icacls", str(public_root), "/grant", f"{username}:(OI)(CI)(M)"])
+        standard_python = Path(sys.base_prefix) / "python.exe"
         command = ctypes.create_unicode_buffer(
             subprocess.list2cmdline(
                 [
-                    sys.executable,
+                    str(standard_python),
                     str(script),
                     "--standard-user",
                     "--bootstrap",
@@ -2889,13 +2928,15 @@ def _create_standard_user_and_run(
         startup.cb = ctypes.sizeof(startup)
         info = _ProcessInformation()
         standard_temp = standard_profile / "AppData" / "Local" / "Temp"
+        standard_appdata = standard_profile / "AppData" / "Roaming"
+        standard_local_appdata = standard_profile / "AppData" / "Local"
         system_root = Path(os.environ.get("SYSTEMROOT", r"C:\Windows"))
         environment = {
+            "APPDATA": str(standard_appdata),
             "COMSPEC": str(system_root / "System32" / "cmd.exe"),
             "HOME": str(standard_profile),
-            "PATH": os.pathsep.join(
-                [str(Path(sys.executable).parent), str(system_root / "System32")]
-            ),
+            "LOCALAPPDATA": str(standard_local_appdata),
+            "PATH": os.pathsep.join([str(standard_python.parent), str(system_root / "System32")]),
             "PATHEXT": ".COM;.EXE;.BAT;.CMD",
             "NEURO_SECRET_SENTINEL": uuid.uuid4().hex,
             "SYSTEMDRIVE": standard_profile.drive,
@@ -2913,7 +2954,7 @@ def _create_standard_user_and_run(
             ".",
             password,
             _LOGON_WITH_PROFILE,
-            str(sys.executable),
+            str(standard_python),
             command,
             _CREATE_UNICODE_ENVIRONMENT | _CREATE_NO_WINDOW,
             environment_block,
@@ -3259,7 +3300,7 @@ def _main_run(args: argparse.Namespace) -> tuple[dict[str, object], bool]:
                 "/s",
                 "/c",
                 "set /p neuro=&echo CMD_STDOUT:!neuro!&echo CMD_STDERR:diag 1>&2&"
-                "if defined NEURO_SECRET_SENTINEL echo SECRET_LEAK&exit /b 31",
+                "if defined NEURO_SECRET_SENTINEL (echo SECRET_LEAK)&exit /b 31",
             ],
             input_payload=b"cmd-runtime-input\r\n",
         )
@@ -3304,6 +3345,7 @@ def _main_run(args: argparse.Namespace) -> tuple[dict[str, object], bool]:
         gates["bootstrap_helper_boundary"] = helper_boundary
         python = cast(Path, executable_paths["python"])
         gates["python_runtime"] = _python_gate(api, launcher, bootstrap, python, probes)
+        gates["nul_device"] = _nul_device_gate(api, launcher, bootstrap)
         git = executable_paths["git"]
         if git is None:
             gates["git_runtime"] = _status(False, "git NOT_INSTALLED")
@@ -3431,6 +3473,7 @@ def _main_run(args: argparse.Namespace) -> tuple[dict[str, object], bool]:
             "shell_cancellation",
             "bootstrap_helper_boundary",
             "python_runtime",
+            "nul_device",
             "git_runtime",
             "real_mcp_stdio",
             "conpty_real_cmd",
