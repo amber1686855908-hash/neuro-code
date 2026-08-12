@@ -19,6 +19,7 @@ from neuro_code.application.ports.sandbox import (
     LocalProcessEnvironmentPolicy,
     LocalProcessFilesystemPolicy,
     LocalProcessLifecycle,
+    LocalProcessLifecycleCapability,
     LocalProcessNetworkPolicy,
     LocalProcessOutput,
     LocalProcessPurpose,
@@ -467,6 +468,7 @@ class BashTool:
             private_temporary_directory=context.sandbox_profile.enabled,
         )
         lifecycle = LocalProcessLifecycle(
+            required_capability=LocalProcessLifecycleCapability.PROCESS_GROUP_BEST_EFFORT,
             termination_grace_seconds=context.termination_grace_seconds,
         )
         cwd = context.cwd.expanduser().resolve()

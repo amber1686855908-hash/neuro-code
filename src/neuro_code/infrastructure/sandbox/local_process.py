@@ -17,12 +17,14 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from neuro_code.application.ports.sandbox import (
+    LocalProcessLifecycleCapability,
     LocalProcessOutput,
     LocalProcessPurpose,
     LocalProcessSandbox,
     LocalProcessStdioMode,
     OwnedLocalProcess,
     SandboxedProcessRequest,
+    lifecycle_capability_satisfies,
 )
 from neuro_code.domain.terminal.models import TerminalSize
 from neuro_code.infrastructure.sandbox.process_tree import ProcessTree
@@ -47,6 +49,13 @@ class ProcessTreeOwnedLocalProcess(OwnedLocalProcess):
 
     _tree: ProcessTree
     _request: SandboxedProcessRequest
+    _provided_lifecycle_capability: LocalProcessLifecycleCapability
+
+    @property
+    def lifecycle_capability(self) -> LocalProcessLifecycleCapability:
+        """Return the capability declared by the owning sandbox adapter."""
+
+        return self._provided_lifecycle_capability
 
     @property
     def process_id(self) -> int:
@@ -145,12 +154,36 @@ class ProcessTreeLocalProcessSandbox(LocalProcessSandbox):
     def __init__(self, *, terminal_platform: TerminalPlatform | None = None) -> None:
         self._terminal_platform = terminal_platform
 
+    @property
+    def lifecycle_capability(self) -> LocalProcessLifecycleCapability:
+        """Return the actual process boundary this adapter can provide.
+
+        Windows creation is atomically assigned to a Job Object.  Plain POSIX
+        process groups remain best effort because a child can create a new
+        session and leave that group.
+        """
+
+        return (
+            LocalProcessLifecycleCapability.STRONG_DESCENDANT_OWNERSHIP
+            if os.name == "nt"
+            else LocalProcessLifecycleCapability.PROCESS_GROUP_BEST_EFFORT
+        )
+
     async def spawn(self, request: SandboxedProcessRequest) -> OwnedLocalProcess:
         """Create one owned pipe-based child from a validated canonical request.
 
         从经过验证的规范请求创建一个受管的基于管道子进程.
         """
 
+        if not lifecycle_capability_satisfies(
+            self.lifecycle_capability,
+            request.lifecycle.required_capability,
+        ):
+            raise SandboxError(
+                "local process lifecycle capability "
+                f"{self.lifecycle_capability.value!r} does not satisfy required "
+                f"{request.lifecycle.required_capability.value!r}"
+            )
         if request.sandbox_profile.enabled:
             raise SandboxError(
                 "an enabled sandbox profile requires a platform child-sandbox adapter"
@@ -181,7 +214,7 @@ class ProcessTreeLocalProcessSandbox(LocalProcessSandbox):
                 merge_output=merge_output,
                 pipe_stdin=request.stdio_mode is LocalProcessStdioMode.PROTOCOL,
             )
-        return ProcessTreeOwnedLocalProcess(tree, request)
+        return ProcessTreeOwnedLocalProcess(tree, request, self.lifecycle_capability)
 
     def spawn_terminal(
         self,
@@ -203,6 +236,15 @@ class ProcessTreeLocalProcessSandbox(LocalProcessSandbox):
         不再拥有该适配器.
         """
 
+        if not lifecycle_capability_satisfies(
+            self.lifecycle_capability,
+            request.lifecycle.required_capability,
+        ):
+            raise SandboxError(
+                "local process lifecycle capability "
+                f"{self.lifecycle_capability.value!r} does not satisfy required "
+                f"{request.lifecycle.required_capability.value!r}"
+            )
         if request.sandbox_profile.enabled:
             raise SandboxError(
                 "an enabled sandbox profile requires a platform child-sandbox adapter"
@@ -215,7 +257,16 @@ class ProcessTreeLocalProcessSandbox(LocalProcessSandbox):
             raise SandboxError("interactive terminal requests require an argv-safe executable")
         assert request.executable is not None
         platform = self._terminal_platform or _default_terminal_platform()
-        return platform.spawn_exec(
+        if not lifecycle_capability_satisfies(
+            platform.lifecycle_capability,
+            request.lifecycle.required_capability,
+        ):
+            raise SandboxError(
+                "terminal lifecycle capability "
+                f"{platform.lifecycle_capability.value!r} does not satisfy required "
+                f"{request.lifecycle.required_capability.value!r}"
+            )
+        session = platform.spawn_exec(
             request.executable,
             request.arguments,
             cwd=request.cwd,
@@ -225,6 +276,19 @@ class ProcessTreeLocalProcessSandbox(LocalProcessSandbox):
             on_eof=on_eof,
             on_error=on_error,
         )
+        if not lifecycle_capability_satisfies(
+            session.lifecycle_capability,
+            request.lifecycle.required_capability,
+        ):
+            try:
+                session.close()
+            finally:
+                raise SandboxError(
+                    "terminal lifecycle capability "
+                    f"{session.lifecycle_capability.value!r} does not satisfy required "
+                    f"{request.lifecycle.required_capability.value!r}"
+                )
+        return session
 
 
 def _default_terminal_platform() -> TerminalPlatform:

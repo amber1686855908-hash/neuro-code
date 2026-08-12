@@ -13,6 +13,7 @@ from pathlib import Path
 from unittest import mock
 
 from neuro_code.application.ports.sandbox import (
+    LocalProcessLifecycleCapability,
     LocalProcessPurpose,
     LocalProcessSandbox,
     LocalProcessStdioMode,
@@ -49,6 +50,10 @@ class _RecordingLocalProcessSandbox(LocalProcessSandbox):
         self.requests: list[SandboxedProcessRequest] = []
         self._delegate = ProcessTreeLocalProcessSandbox()
 
+    @property
+    def lifecycle_capability(self) -> LocalProcessLifecycleCapability:
+        return self._delegate.lifecycle_capability
+
     async def spawn(self, request: SandboxedProcessRequest) -> OwnedLocalProcess:
         self.requests.append(request)
         return await self._delegate.spawn(request)
@@ -60,6 +65,10 @@ class _EnabledRecordingLocalProcessSandbox(LocalProcessSandbox):
     def __init__(self) -> None:
         self.requests: list[SandboxedProcessRequest] = []
         self._delegate = ProcessTreeLocalProcessSandbox()
+
+    @property
+    def lifecycle_capability(self) -> LocalProcessLifecycleCapability:
+        return self._delegate.lifecycle_capability
 
     async def spawn(self, request: SandboxedProcessRequest) -> OwnedLocalProcess:
         self.requests.append(request)
@@ -86,6 +95,10 @@ class BashToolTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(request.purpose, LocalProcessPurpose.BASH)
             self.assertEqual(request.stdio_mode, LocalProcessStdioMode.CAPTURE)
             self.assertEqual(request.cwd, _canonical_path(root))
+            self.assertIs(
+                request.lifecycle.required_capability,
+                LocalProcessLifecycleCapability.PROCESS_GROUP_BEST_EFFORT,
+            )
 
     async def test_background_bash_uses_a_canonical_sandbox_request(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -107,6 +120,10 @@ class BashToolTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(request.purpose, LocalProcessPurpose.BACKGROUND_BASH)
                 self.assertEqual(request.stdio_mode, LocalProcessStdioMode.MERGED_CAPTURE)
                 self.assertEqual(request.cwd, _canonical_path(root))
+                self.assertIs(
+                    request.lifecycle.required_capability,
+                    LocalProcessLifecycleCapability.PROCESS_GROUP_BEST_EFFORT,
+                )
             finally:
                 await manager.shutdown()
 

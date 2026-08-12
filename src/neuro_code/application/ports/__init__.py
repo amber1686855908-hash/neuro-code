@@ -28,6 +28,7 @@ from neuro_code.application.ports.sandbox import (
     LocalProcessEnvironmentPolicy,
     LocalProcessFilesystemPolicy,
     LocalProcessLifecycle,
+    LocalProcessLifecycleCapability,
     LocalProcessNetworkPolicy,
     LocalProcessPurpose,
     LocalProcessSandbox,
@@ -36,6 +37,7 @@ from neuro_code.application.ports.sandbox import (
     LocalWorkspaceAccessMode,
     OwnedLocalProcess,
     SandboxedProcessRequest,
+    lifecycle_capability_satisfies,
 )
 from neuro_code.application.ports.storage import SessionStore
 from neuro_code.application.ports.terminal import (
@@ -106,6 +108,7 @@ __all__ = [
     "LocalProcessEnvironmentPolicy",
     "LocalProcessFilesystemPolicy",
     "LocalProcessLifecycle",
+    "LocalProcessLifecycleCapability",
     "LocalProcessNetworkPolicy",
     "LocalProcessPurpose",
     "LocalProcessSandbox",
@@ -159,4 +162,5 @@ __all__ = [
     "WorkspaceMutationJournalProjection",
     "WorkspaceMutationTargetProvider",
     "WorkspacePathResolver",
+    "lifecycle_capability_satisfies",
 ]

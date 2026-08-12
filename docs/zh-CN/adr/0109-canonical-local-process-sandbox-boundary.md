@@ -49,6 +49,10 @@ attestation。`LinuxBubblewrapLocalProcessSandbox` 负责权威的、失败关�
 以及启用 profile 的 PTY 请求分别创建独立 child 边界。`ProcessTreeLocalProcessSandbox` 桥接器仍是明确的 `off`
 profile 实现，不被描述为操作系统隔离。没有具备对应 profile 能力的 child launcher 时，启用的请求会 fail closed。
 
+独立的生命周期能力契约见 [ADR 0110](0110-cross-platform-lifecycle-capability-contract.md)。文件系统和网络权限
+不等于后代生命周期所有权。启用的 Linux Bubblewrap 与 Windows Job Object 路径报告
+`STRONG_DESCENDANT_OWNERSHIP`，普通 POSIX ProcessTree 报告 `PROCESS_GROUP_BEST_EFFORT`。
+
 启用的 Linux child 使用独立 PID 命名空间与 Bubblewrap 父进程死亡生命周期，因此 child 创建的
 `setsid()` 后代不能逃离命名空间所有者的终止。POSIX 上的 `off` 只保留原始进程组清理，不提供更强的
 任意后代保证。

@@ -11,6 +11,7 @@ import mcp.types as mcp_types
 
 import neuro_code.infrastructure.mcp.stdio as mcp_stdio
 from neuro_code.application.ports.sandbox import (
+    LocalProcessLifecycleCapability,
     LocalProcessPurpose,
     LocalProcessSandbox,
     LocalProcessStdioMode,
@@ -40,6 +41,10 @@ class _RecordingLocalProcessSandbox(LocalProcessSandbox):
     def __init__(self) -> None:
         self.requests: list[SandboxedProcessRequest] = []
         self._delegate = ProcessTreeLocalProcessSandbox()
+
+    @property
+    def lifecycle_capability(self) -> LocalProcessLifecycleCapability:
+        return self._delegate.lifecycle_capability
 
     async def spawn(self, request: SandboxedProcessRequest) -> OwnedLocalProcess:
         self.requests.append(request)
@@ -175,6 +180,10 @@ class McpStdioToolCollectionTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(request.purpose, LocalProcessPurpose.MCP_STDIO)
             self.assertEqual(request.stdio_mode, LocalProcessStdioMode.PROTOCOL)
             self.assertEqual(request.cwd, _FIXTURE.parent)
+            self.assertIs(
+                request.lifecycle.required_capability,
+                LocalProcessLifecycleCapability.PROCESS_GROUP_BEST_EFFORT,
+            )
         finally:
             await collection.close()
 

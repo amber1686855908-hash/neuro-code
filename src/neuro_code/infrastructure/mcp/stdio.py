@@ -32,6 +32,7 @@ from neuro_code.application.ports.sandbox import (
     LocalProcessEnvironmentPolicy,
     LocalProcessFilesystemPolicy,
     LocalProcessLifecycle,
+    LocalProcessLifecycleCapability,
     LocalProcessNetworkPolicy,
     LocalProcessPurpose,
     LocalProcessSandbox,
@@ -689,6 +690,7 @@ class _McpServerConnection:
             ),
             stdio_mode=LocalProcessStdioMode.PROTOCOL,
             lifecycle=LocalProcessLifecycle(
+                required_capability=LocalProcessLifecycleCapability.PROCESS_GROUP_BEST_EFFORT,
                 termination_grace_seconds=0.5,
                 force_wait_seconds=MCP_CLOSE_TIMEOUT_SECONDS,
             ),

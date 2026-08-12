@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import NoReturn, Protocol, Self, cast
 
+from neuro_code.application.ports.sandbox import LocalProcessLifecycleCapability
 from neuro_code.infrastructure.sandbox.windows_job import WindowsJobObject
 from neuro_code.infrastructure.sandbox.windows_process import (
     windows_environment_block as _environment_block,
@@ -546,6 +547,11 @@ class WindowsPseudoConsoleSession:
         self._process_handle: int | None = process_handle
         self._process_id = process_id
         self._job: WindowsJobObject | None = job
+        self._lifecycle_capability = (
+            LocalProcessLifecycleCapability.STRONG_DESCENDANT_OWNERSHIP
+            if job is not None
+            else LocalProcessLifecycleCapability.PROCESS_GROUP_BEST_EFFORT
+        )
         self._exit_code: int | None = None
         self._closed = False
         self._lifecycle_lock = threading.RLock()
@@ -689,6 +695,12 @@ class WindowsPseudoConsoleSession:
     @property
     def process_id(self) -> int:
         return self._process_id
+
+    @property
+    def lifecycle_capability(self) -> LocalProcessLifecycleCapability:
+        """Return the stable Job-backed capability for this ConPTY session."""
+
+        return self._lifecycle_capability
 
     @property
     def output(self) -> bytes:
