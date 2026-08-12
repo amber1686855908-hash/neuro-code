@@ -560,12 +560,19 @@ class LocalBackgroundTaskManagerTests(unittest.IsolatedAsyncioTestCase):
                 termination_grace_seconds=0.05,
             )
             pid_file = root / "background-child.pid"
+            child_pid_text = ""
             for _ in range(100):
                 if pid_file.exists():
-                    break
+                    # ``Path.write_text`` creates/truncates before writing;
+                    # wait for the complete PID rather than racing the
+                    # parent's two filesystem operations on fast runtimes.
+                    child_pid_text = pid_file.read_text(encoding="utf-8").strip()
+                    if child_pid_text:
+                        break
                 await asyncio.sleep(0.01)
             self.assertTrue(pid_file.exists())
-            child_pid = int(pid_file.read_text(encoding="utf-8"))
+            self.assertTrue(child_pid_text)
+            child_pid = int(child_pid_text)
 
             await manager.shutdown()
             await self._assert_process_stopped(child_pid)
