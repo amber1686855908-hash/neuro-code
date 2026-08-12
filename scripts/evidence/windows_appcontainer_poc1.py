@@ -8,8 +8,8 @@ but it does not wire AppContainer into composition or any runtime workload.
 from __future__ import annotations
 
 import argparse
-import csv
 import contextlib
+import csv
 import ctypes
 import io
 import json
