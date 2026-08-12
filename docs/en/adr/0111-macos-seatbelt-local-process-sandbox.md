@@ -68,6 +68,8 @@ architecture and are not claimed as current lifecycle solutions.
 Dedicated CI executes the real adapter, without skips, on `macos-15` ARM64 and
 `macos-15-intel`, using Python 3.12 and 3.14. It records the macOS version/build,
 architecture, fixed sandbox executable, signature details, and SIP status.
-GitHub-hosted evidence currently reports SIP disabled; physical SIP-enabled
-macOS acceptance remains a release blocker before describing that environment
-as production-validated.
+The production implementation is complete, and GitHub ARM64/Intel integration
+is validated. GitHub-hosted evidence currently reports SIP disabled. Physical
+SIP-enabled macOS acceptance is `DEFERRED_NO_MAC_HARDWARE` because no Mac
+hardware is currently available; this is not a code or merge blocker, and it
+does not claim that physical SIP-enabled acceptance has passed.
