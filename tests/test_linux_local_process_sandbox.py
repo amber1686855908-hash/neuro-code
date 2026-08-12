@@ -124,6 +124,20 @@ class LinuxBubblewrapLocalProcessSandboxTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("controller-secret.invalid", plan)
             self.assertNotIn("NEURO_CODE_HOME", plan)
 
+    def test_runtime_mounts_include_resolved_controller_interpreter_root(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace = (root / "workspace").resolve()
+            state_dir = (root / "controller-state").resolve()
+            workspace.mkdir()
+            state_dir.mkdir()
+            interpreter = Path(sys.executable).resolve()
+            expected_root = interpreter.parent.parent
+            adapter = self._adapter(SandboxProfile.WORKSPACE, workspace, state_dir)
+
+            if interpreter.parent.name == "bin" and expected_root != Path("/"):
+                self.assertIn((expected_root, expected_root), adapter._runtime_mounts)
+
     async def test_read_only_and_strict_children_isolate_network_and_workspace_writes(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

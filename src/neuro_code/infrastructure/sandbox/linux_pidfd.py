@@ -98,9 +98,7 @@ class _LibcLinuxPidfdOps:
         if self._syscall is not None:
             self._syscall.restype = ctypes.c_long
 
-        if self._pidfd_open is None and (
-            self._syscall is None or self._syscall_numbers is None
-        ):
+        if self._pidfd_open is None and (self._syscall is None or self._syscall_numbers is None):
             raise OSError(errno.ENOSYS, "libc does not provide a supported pidfd_open path")
         if self._pidfd_send_signal is None and (
             self._syscall is None or self._syscall_numbers is None
