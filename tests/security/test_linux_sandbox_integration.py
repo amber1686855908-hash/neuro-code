@@ -4,10 +4,10 @@ import asyncio
 import json
 import os
 import shlex
+import shutil
 import sys
 from dataclasses import replace
 from pathlib import Path
-from unittest import mock
 
 import pytest
 
@@ -49,6 +49,16 @@ def _capability_unavailable(reason: str) -> None:
     if os.environ.get(_REQUIRE_INTEGRATION_ENV) == "1":
         pytest.fail(f"required sandbox integration capability is unavailable: {reason}")
     pytest.skip(reason)
+
+
+def _require_bwrap() -> None:
+    """Skip ordinary matrix runs when Bubblewrap is not installed.
+
+    普通矩阵未安装 Bubblewrap 时跳过; dedicated security job 会将缺失能力视为失败.
+    """
+
+    if shutil.which("bwrap") is None:
+        _capability_unavailable("sandbox profile requires the 'bwrap' system executable")
 
 
 def _layout(tmp_path: Path) -> tuple[Path, Path, Path]:
@@ -125,9 +135,8 @@ async def _run_json(
     return json.loads(stdout.decode("utf-8"))
 
 
-async def test_real_workspace_hardlink_would_expose_controller_inode_without_guard(
-    tmp_path: Path,
-) -> None:
+async def test_real_workspace_hardlink_is_rejected_before_child_launch(tmp_path: Path) -> None:
+    _require_bwrap()
     workspace, state_dir, _ = _layout(tmp_path)
     private_file = state_dir / "credentials.json"
     workspace_alias = workspace / "credentials-hardlink"
@@ -135,30 +144,135 @@ async def test_real_workspace_hardlink_would_expose_controller_inode_without_gua
     assert private_file.stat().st_ino == workspace_alias.stat().st_ino
     assert private_file.stat().st_nlink > 1
 
-    # This deliberately disables only the new preflight guard to prove the
-    # underlying bind-mount threat with a real Bubblewrap child. Production
-    # construction below must reject the exact same layout.
-    with mock.patch.object(
-        LinuxBubblewrapLocalProcessSandbox,
-        "_validate_controller_state_hardlinks",
-        return_value=None,
-    ):
-        unguarded = _adapter(SandboxProfile.WORKSPACE, workspace, state_dir)
-    result = await _run_json(
-        unguarded,
-        _request(
-            SandboxProfile.WORKSPACE,
-            workspace,
-            (
-                "import json,pathlib;"
-                f"print(json.dumps(pathlib.Path({str(workspace_alias)!r}).read_text()))"
-            ),
-        ),
-    )
-    assert result == "private-credentials.json"
-
     with pytest.raises(SandboxError, match="hardlink outside its trusted path"):
         LinuxBubblewrapLocalProcessSandbox(SandboxProfile.WORKSPACE, workspace, state_dir)
+
+
+@pytest.mark.parametrize("outside_name", ["host-home", "denied-root"])
+@pytest.mark.parametrize("profile", list(SandboxProfile)[1:])
+async def test_real_external_workspace_aliases_fail_closed(
+    tmp_path: Path,
+    outside_name: str,
+    profile: SandboxProfile,
+) -> None:
+    _require_bwrap()
+    workspace, state_dir, host_home = _layout(tmp_path)
+    outside_root = host_home if outside_name == "host-home" else (tmp_path / outside_name)
+    if outside_name == "denied-root":
+        outside_root.mkdir()
+    outside_file = outside_root / "private.txt"
+    outside_file.write_text("private", encoding="utf-8")
+    os.link(outside_file, workspace / f"{outside_name}-alias.txt")
+
+    with pytest.raises(SandboxError, match="outside the authorized roots"):
+        LinuxBubblewrapLocalProcessSandbox(profile, workspace, state_dir)
+
+
+def _request_with_roots(
+    profile: SandboxProfile,
+    workspace: Path,
+    roots: tuple[LocalWorkspaceAccess, ...],
+    code: str,
+) -> SandboxedProcessRequest:
+    return replace(
+        _request(profile, workspace, code),
+        filesystem_policy=LocalProcessFilesystemPolicy(roots),
+    )
+
+
+@pytest.mark.parametrize("profile", [SandboxProfile.WORKSPACE, SandboxProfile.STRICT])
+async def test_real_mixed_read_only_read_write_alias_is_rejected(
+    tmp_path: Path,
+    profile: SandboxProfile,
+) -> None:
+    workspace, state_dir, _ = _layout(tmp_path)
+    additional_ro = tmp_path / "additional-read-only"
+    additional_ro.mkdir()
+    source = additional_ro / "protected.txt"
+    source.write_text("protected", encoding="utf-8")
+    adapter = _adapter(profile, workspace, state_dir)
+    alias = workspace / "protected-alias.txt"
+    os.link(source, alias)
+
+    request = _request_with_roots(
+        profile,
+        workspace,
+        (
+            LocalWorkspaceAccess(workspace, LocalWorkspaceAccessMode.READ_WRITE),
+            LocalWorkspaceAccess(additional_ro, LocalWorkspaceAccessMode.READ_ONLY),
+        ),
+        "raise SystemExit(99)",
+    )
+    with pytest.raises(SandboxError, match="both READ_ONLY and READ_WRITE"):
+        await adapter.spawn(request)
+
+
+@pytest.mark.parametrize("profile", [SandboxProfile.WORKSPACE, SandboxProfile.STRICT])
+async def test_real_read_write_internal_alias_remains_allowed(
+    tmp_path: Path,
+    profile: SandboxProfile,
+) -> None:
+    workspace, state_dir, _ = _layout(tmp_path)
+    additional_rw = tmp_path / "additional-read-write"
+    additional_rw.mkdir()
+    source = additional_rw / "shared.txt"
+    source.write_text("before", encoding="utf-8")
+    adapter = _adapter(profile, workspace, state_dir)
+    alias = workspace / "shared-alias.txt"
+    os.link(source, alias)
+    code = (
+        "import json;"
+        f"from pathlib import Path; Path({str(alias)!r}).write_text('after');"
+        f"print(json.dumps(Path({str(source)!r}).read_text()))"
+    )
+
+    result = await _run_json(
+        adapter,
+        _request_with_roots(
+            profile,
+            workspace,
+            (
+                LocalWorkspaceAccess(workspace, LocalWorkspaceAccessMode.READ_WRITE),
+                LocalWorkspaceAccess(additional_rw, LocalWorkspaceAccessMode.READ_WRITE),
+            ),
+            code,
+        ),
+    )
+    assert result == "after"
+
+
+async def test_real_read_only_internal_alias_remains_read_only(tmp_path: Path) -> None:
+    workspace, state_dir, _ = _layout(tmp_path)
+    additional_ro = tmp_path / "additional-read-only"
+    additional_ro.mkdir()
+    source = additional_ro / "shared.txt"
+    source.write_text("before", encoding="utf-8")
+    adapter = _adapter(SandboxProfile.READ_ONLY, workspace, state_dir)
+    alias = workspace / "shared-alias.txt"
+    os.link(source, alias)
+    code = (
+        "import json;"
+        f"from pathlib import Path; path=Path({str(alias)!r});"
+        "read=path.read_text();"
+        "\ntry: path.write_text('after')\n"
+        "except OSError: write=False\n"
+        "else: write=True\n"
+        "print(json.dumps({'read': read, 'write': write}))"
+    )
+
+    result = await _run_json(
+        adapter,
+        _request_with_roots(
+            SandboxProfile.READ_ONLY,
+            workspace,
+            (
+                LocalWorkspaceAccess(workspace, LocalWorkspaceAccessMode.READ_ONLY),
+                LocalWorkspaceAccess(additional_ro, LocalWorkspaceAccessMode.READ_ONLY),
+            ),
+            code,
+        ),
+    )
+    assert result == {"read": "before", "write": False}
 
 
 @pytest.mark.parametrize(
