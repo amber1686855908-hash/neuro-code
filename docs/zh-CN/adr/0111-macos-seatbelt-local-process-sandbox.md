@@ -26,6 +26,10 @@ workspace root 与一组 child-private HOME/TMP。Controller state、其他 host
 `read-only` 不授予 workspace 写入，`strict` 则保留 request 的 per-root mode，主 workspace
 仍可写。
 
+授权的 runtime、workspace 与私有根目录获得其自身 subtree 的递归 metadata 权限。它们的
+ancestor 仅获得用于 pathname traversal 的精确 `literal` metadata 权限，包括精确的 `/`；
+任何 ancestor（包括 `/`）都不会获得递归 `subpath` metadata 权限。
+
 在 pipe 或 PTY 创建前，`PosixWorkspaceInodeAudit` 会审计每个授权根目录，拒绝外部
 hardlink alias 以及混合 read-only/read-write alias。Child environment 仅由
 `LocalProcessEnvironmentPolicy` 重建，不会隐式合并 `os.environ`。HOME、TMPDIR、TMP 和

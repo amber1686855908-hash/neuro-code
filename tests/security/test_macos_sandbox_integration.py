@@ -262,6 +262,83 @@ print(json.dumps({{
     assert not Path(str(result["tmp"])).exists()  # noqa: ASYNC240
 
 
+@pytest.mark.parametrize(
+    "profile",
+    [SandboxProfile.WORKSPACE, SandboxProfile.READ_ONLY, SandboxProfile.STRICT],
+)
+async def test_real_metadata_authority_and_symlink_isolation(
+    tmp_path: Path,
+    profile: SandboxProfile,
+) -> None:
+    workspace, state_dir, outside, additional = _layout(tmp_path)
+    state_file = state_dir / "credentials.json"
+    outside_file = outside / "outside.txt"
+    additional_file = additional / "additional.txt"
+    host_sentinel = Path.home() / f".neuro-code-seatbelt-metadata-{os.getpid()}-{profile.value}"
+    host_sentinel.write_text("host-home-metadata-secret", encoding="utf-8")
+    state_link = workspace / "state-file-link"
+    outside_directory_link = workspace / "outside-directory-link"
+    state_link.symlink_to(state_file)
+    outside_directory_link.symlink_to(outside, target_is_directory=True)
+    code = f"""
+import json, os, sys
+from pathlib import Path
+
+def metadata(path):
+    result = {{}}
+    for name, operation in (("stat", os.stat), ("lstat", os.lstat)):
+        try:
+            operation(path)
+        except OSError:
+            result[name] = False
+        else:
+            result[name] = True
+    try:
+        result["exists"] = Path(path).exists()
+    except OSError:
+        result["exists"] = False
+    return result
+
+print(json.dumps({{
+    "workspace": metadata({str(workspace / "readable.txt")!r}),
+    "additional": metadata({str(additional_file)!r}),
+    "private_home": metadata(os.environ["HOME"]),
+    "private_tmp": metadata(os.environ["TMPDIR"]),
+    "runtime": metadata(sys.executable),
+    "state": metadata({str(state_file)!r}),
+    "outside": metadata({str(outside_file)!r}),
+    "host_home": metadata({str(host_sentinel)!r}),
+    "state_link": metadata({str(state_link)!r}),
+    "outside_via_symlink": metadata({str(outside_directory_link / "outside.txt")!r}),
+}}))
+"""
+    roots = (
+        LocalWorkspaceAccess(
+            workspace,
+            LocalWorkspaceAccessMode.READ_ONLY
+            if profile is SandboxProfile.READ_ONLY
+            else LocalWorkspaceAccessMode.READ_WRITE,
+        ),
+        LocalWorkspaceAccess(additional, LocalWorkspaceAccessMode.READ_ONLY),
+    )
+    try:
+        adapter = MacOSSeatbeltLocalProcessSandbox(profile, workspace, state_dir)
+        result = await _run_json(
+            adapter,
+            _request(profile, workspace, code=code, roots=roots),
+        )
+    finally:
+        host_sentinel.unlink(missing_ok=True)
+
+    visible = {"stat": True, "lstat": True, "exists": True}
+    hidden = {"stat": False, "lstat": False, "exists": False}
+    for name in ("workspace", "additional", "private_home", "private_tmp", "runtime"):
+        assert result[name] == visible
+    for name in ("state", "outside", "host_home", "outside_via_symlink"):
+        assert result[name] == hidden
+    assert result["state_link"] == {"stat": False, "lstat": True, "exists": False}
+
+
 @pytest.mark.parametrize("source_name", ["state", "outside", "host-home"])
 async def test_real_external_hardlink_is_rejected_before_child_launch(
     tmp_path: Path,
