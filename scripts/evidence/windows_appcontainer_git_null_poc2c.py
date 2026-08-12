@@ -37,6 +37,26 @@ def _status(passed: bool, detail: object) -> dict[str, object]:
     return {"status": "PASS" if passed else "FAIL", "detail": detail}
 
 
+def _grant_fixture_traversal(pb: ModuleType, fixture: Path, sid: str) -> dict[str, object]:
+    completed = pb._run_checked(["icacls", str(fixture), "/grant", f"*{sid}:(RX)"])
+    return {
+        "path": str(fixture),
+        "rights": "(RX)",
+        "inheritance": "NONE",
+        "purpose": "exact traversal to separately authorized child roots",
+        "output": (completed.stdout + completed.stderr).strip(),
+    }
+
+
+def _cleanup_fixture_traversal(pb: ModuleType, fixture: Path, sid: str) -> dict[str, object]:
+    completed = pb._run_checked(["icacls", str(fixture), "/remove:g", f"*{sid}"])
+    return {
+        "path": str(fixture),
+        "exact_sid": sid,
+        "output": (completed.stdout + completed.stderr).strip(),
+    }
+
+
 def _json_stdout(command: list[str]) -> dict[str, object]:
     completed = subprocess.run(command, capture_output=True, text=True, check=False)
     detail: dict[str, object] = {
@@ -463,6 +483,7 @@ def _standard_user_child(
         )
         result["token_gate"] = _status(token_ok, token)
         profile = pb._Profile(api, f"NeuroCode.Poc2C.Standard.{uuid.uuid4().hex}")
+        result["fixture_traversal_grant"] = _grant_fixture_traversal(pb, fixture, profile.sid_text)
         roots = pb._deduplicate_roots(
             [
                 pb._authority_root(api, helper, "RX", "evidence helper", "USER_INSTALL"),
@@ -515,6 +536,10 @@ def _standard_user_child(
             for root in reversed(roots):
                 with contextlib.suppress(BaseException):
                     cleanup.append(pb._cleanup_root(root, profile.sid_text))
+            with contextlib.suppress(BaseException):
+                result["fixture_traversal_cleanup"] = _cleanup_fixture_traversal(
+                    pb, fixture, profile.sid_text
+                )
             result["profile_delete_hresult"] = profile.close()
         result["authority_cleanup"] = cleanup
         with contextlib.suppress(BaseException):
@@ -698,6 +723,7 @@ def _main_run(args: argparse.Namespace, pb: ModuleType) -> tuple[dict[str, objec
     critical: list[str] = []
     try:
         profile = pb._Profile(api, f"NeuroCode.Poc2C.{uuid.uuid4().hex}")
+        result["fixture_traversal_grant"] = _grant_fixture_traversal(pb, fixture, profile.sid_text)
         roots = pb._deduplicate_roots(
             [
                 pb._authority_root(api, helper, "RX", "evidence helpers", "USER_INSTALL"),
@@ -781,6 +807,10 @@ def _main_run(args: argparse.Namespace, pb: ModuleType) -> tuple[dict[str, objec
             for root in reversed(roots):
                 with contextlib.suppress(BaseException):
                     cleanup.append(pb._cleanup_root(root, profile.sid_text))
+            with contextlib.suppress(BaseException):
+                result["fixture_traversal_cleanup"] = _cleanup_fixture_traversal(
+                    pb, fixture, profile.sid_text
+                )
             result["profile_delete_hresult"] = profile.close()
         result["authority_cleanup"] = cleanup
         result["authority_roots"] = [pb._runtime_root_record(root) for root in roots]
