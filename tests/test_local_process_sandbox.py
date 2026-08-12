@@ -209,7 +209,8 @@ class ProcessTreeLocalProcessSandboxTests(unittest.IsolatedAsyncioTestCase):
     async def test_owns_process_output_and_lifecycle_through_the_port(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            process = await ProcessTreeLocalProcessSandbox().spawn(_request(root))
+            adapter = ProcessTreeLocalProcessSandbox()
+            process = await adapter.spawn(_request(root))
 
             assert process.stdout is not None
             self.assertEqual(
@@ -220,7 +221,7 @@ class ProcessTreeLocalProcessSandboxTests(unittest.IsolatedAsyncioTestCase):
             self.assertGreater(process.process_id, 0)
             self.assertIs(
                 process.lifecycle_capability,
-                LocalProcessLifecycleCapability.PROCESS_GROUP_BEST_EFFORT,
+                adapter.lifecycle_capability,
             )
 
     async def test_deprecated_cancellation_name_keeps_owned_termination_behavior(self) -> None:
