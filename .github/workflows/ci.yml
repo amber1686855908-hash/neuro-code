@@ -101,8 +101,9 @@ jobs:
 
           path = "/tmp/neuro-code-linux-sandbox-${{ matrix.python }}.xml"
           root = ET.parse(path).getroot()
-          skipped = int(root.attrib.get("skipped", "0"))
-          tests = int(root.attrib.get("tests", "0"))
+          suites = root.findall(".//testsuite")
+          tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites)
+          skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites)
           print(f"executed={tests} skipped={skipped}")
           if tests == 0 or skipped:
               raise SystemExit("Linux sandbox security gate did not execute every test")
