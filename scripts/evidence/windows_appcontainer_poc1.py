@@ -542,13 +542,16 @@ class _Launcher:
             command_line = ctypes.create_unicode_buffer(
                 subprocess.list2cmdline([str(application), *arguments])
             )
+            creation_flags = _EXTENDED_STARTUPINFO_PRESENT | _CREATE_UNICODE_ENVIRONMENT
+            if pseudoconsole is None:
+                creation_flags |= _CREATE_NO_WINDOW
             created = self.api.create_process(
                 str(application),
                 command_line,
                 None,
                 None,
                 inherit_handles,
-                _EXTENDED_STARTUPINFO_PRESENT | _CREATE_UNICODE_ENVIRONMENT | _CREATE_NO_WINDOW,
+                creation_flags,
                 None,
                 str(self.cwd),
                 ctypes.byref(startup),
@@ -777,6 +780,95 @@ def _executable_gate(
     }
 
 
+def _pipe_handle_gate(
+    api: _WinApi,
+    launcher: _Launcher,
+    child: Path,
+    report: Path,
+    *,
+    with_job: bool,
+) -> dict[str, object]:
+    report.unlink(missing_ok=True)
+    stdin_read, stdin_write = _make_pipe(api, parent_reads=False)
+    stdout_read, stdout_write = _make_pipe(api, parent_reads=True)
+    stderr_read, stderr_write = _make_pipe(api, parent_reads=True)
+    sentinel_security = _SecurityAttributes(ctypes.sizeof(_SecurityAttributes), None, True)
+    sentinel = int(api.create_event(ctypes.byref(sentinel_security), True, False, None) or 0)
+    process: _CreatedProcess | None = None
+    job = WindowsJobObject.create() if with_job else None
+    try:
+        process = launcher.spawn(
+            child,
+            ["stdio", str(sentinel), str(report)],
+            job_handle=job.process_creation_handle if job is not None else None,
+            handles=(stdin_read, stdout_write, stderr_write),
+        )
+        api.close(process.thread_handle)
+        process.thread_handle = 0
+        api.close(stdin_read)
+        stdin_read = 0
+        api.close(stdout_write)
+        stdout_write = 0
+        api.close(stderr_write)
+        stderr_write = 0
+        _write(api, stdin_write, b"poc1-input\n")
+        api.close(stdin_write)
+        stdin_write = 0
+        exit_code = _wait_exit(api, process)
+        stdout = _read_all(api, stdout_read).decode("utf-8", errors="replace")
+        stderr = _read_all(api, stderr_read).decode("utf-8", errors="replace")
+        diagnostics = _read_json_lines(report)
+        exact_job = (
+            _is_in_job(api, process.process_handle, job.process_creation_handle)
+            if job is not None
+            else None
+        )
+        passed = (
+            exit_code == 0
+            and "STDOUT:poc1-input" in stdout
+            and "STDERR:ok" in stderr
+            and "SENTINEL_VISIBLE:false" in stdout
+            and len(diagnostics) == 1
+            and diagnostics[0].get("sentinel_visible") is False
+            and (exact_job is True if with_job else True)
+        )
+        return _status(
+            passed,
+            detail={
+                "exit_code": exit_code,
+                "stdout": stdout,
+                "stderr": stderr,
+                "child_diagnostics": diagnostics,
+                "exact_job_membership": exact_job,
+            },
+        )
+    except BaseException as error:
+        return _status(
+            False,
+            detail={
+                "error_type": type(error).__name__,
+                "error": str(error),
+                "child_diagnostics": _read_json_lines(report),
+            },
+        )
+    finally:
+        for handle in (
+            stdin_read,
+            stdin_write,
+            stdout_read,
+            stdout_write,
+            stderr_read,
+            stderr_write,
+            sentinel,
+        ):
+            api.close(handle)
+        if process is not None:
+            api.close(process.thread_handle)
+            api.close(process.process_handle)
+        if job is not None:
+            job.close()
+
+
 def _run(args: argparse.Namespace) -> tuple[dict[str, object], bool]:
     api = _WinApi()
     output_report = Path(args.report).resolve()
@@ -931,64 +1023,22 @@ def _run(args: argparse.Namespace) -> tuple[dict[str, object], bool]:
                 api.close(tree_process.thread_handle)
                 api.close(tree_process.process_handle)
 
-        stdin_read, stdin_write = _make_pipe(api, parent_reads=False)
-        stdout_read, stdout_write = _make_pipe(api, parent_reads=True)
-        stderr_read, stderr_write = _make_pipe(api, parent_reads=True)
-        sentinel_security = _SecurityAttributes(ctypes.sizeof(_SecurityAttributes), None, True)
-        sentinel = int(api.create_event(ctypes.byref(sentinel_security), True, False, None) or 0)
-        pipe_process: _CreatedProcess | None = None
-        try:
-            with WindowsJobObject.create() as job:
-                pipe_process = launcher.spawn(
-                    child,
-                    ["stdio", str(sentinel)],
-                    job_handle=job.process_creation_handle,
-                    handles=(stdin_read, stdout_write, stderr_write),
-                )
-                api.close(pipe_process.thread_handle)
-                pipe_process.thread_handle = 0
-                api.close(stdin_read)
-                stdin_read = 0
-                api.close(stdout_write)
-                stdout_write = 0
-                api.close(stderr_write)
-                stderr_write = 0
-                _write(api, stdin_write, b"poc1-input\n")
-                api.close(stdin_write)
-                stdin_write = 0
-                exit_code = _wait_exit(api, pipe_process)
-                stdout = _read_all(api, stdout_read).decode("utf-8", errors="replace")
-                stderr = _read_all(api, stderr_read).decode("utf-8", errors="replace")
-                handle_list_pass = (
-                    exit_code == 0
-                    and "STDOUT:poc1-input" in stdout
-                    and "STDERR:ok" in stderr
-                    and "SENTINEL_VISIBLE:false" in stdout
-                    and _is_in_job(api, pipe_process.process_handle, job.process_creation_handle)
-                )
-                gates["D_handle_list"] = _status(
-                    handle_list_pass,
-                    detail={"exit_code": exit_code, "stdout": stdout, "stderr": stderr},
-                )
-                if not handle_list_pass:
-                    critical_failures.append("D")
-        except BaseException as error:
-            gates["D_handle_list"] = _status(False, detail=str(error))
+        gates["D_handle_list_appcontainer_only_control"] = _pipe_handle_gate(
+            api,
+            launcher,
+            child,
+            authorized / "gate-d-control.jsonl",
+            with_job=False,
+        )
+        gates["D_handle_list"] = _pipe_handle_gate(
+            api,
+            launcher,
+            child,
+            authorized / "gate-d-combined.jsonl",
+            with_job=True,
+        )
+        if cast(dict[str, object], gates["D_handle_list"])["status"] != "PASS":
             critical_failures.append("D")
-        finally:
-            for handle in (
-                stdin_read,
-                stdin_write,
-                stdout_read,
-                stdout_write,
-                stderr_read,
-                stderr_write,
-                sentinel,
-            ):
-                api.close(handle)
-            if pipe_process is not None:
-                api.close(pipe_process.thread_handle)
-                api.close(pipe_process.process_handle)
 
         conpty_input_read, conpty_input_write = _make_pipe(api, parent_reads=False)
         conpty_output_read, conpty_output_write = _make_pipe(api, parent_reads=True)
@@ -1061,7 +1111,21 @@ def _run(args: argparse.Namespace) -> tuple[dict[str, object], bool]:
                 if not conpty_pass:
                     critical_failures.append("E")
         except BaseException as error:
-            gates["E_conpty"] = _status(False, detail=str(error))
+            if pseudoconsole.value:
+                api.close_pseudoconsole(pseudoconsole)
+                pseudoconsole = ctypes.c_void_p()
+            api.close(conpty_output_write)
+            conpty_output_write = 0
+            output = _read_all(api, conpty_output_read).decode("utf-8", errors="replace")
+            gates["E_conpty"] = _status(
+                False,
+                detail={
+                    "error_type": type(error).__name__,
+                    "error": str(error),
+                    "output": output,
+                    "records": _read_json_lines(conpty_report),
+                },
+            )
             critical_failures.append("E")
         finally:
             if pseudoconsole.value:

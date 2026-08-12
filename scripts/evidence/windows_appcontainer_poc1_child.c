@@ -183,21 +183,39 @@ static int tree_mode(const wchar_t *path, int depth) {
     return 0;
 }
 
-static int stdio_mode(const wchar_t *sentinel_text) {
+static int stdio_mode(const wchar_t *sentinel_text, const wchar_t *report) {
     char input[512];
+    char diagnostics[1024];
     DWORD read = 0;
     DWORD written = 0;
     HANDLE sentinel = (HANDLE)(ULONG_PTR)_wcstoui64(sentinel_text, NULL, 0);
+    HANDLE stdin_handle = GetStdHandle(STD_INPUT_HANDLE);
+    HANDLE stdout_handle = GetStdHandle(STD_OUTPUT_HANDLE);
+    HANDLE stderr_handle = GetStdHandle(STD_ERROR_HANDLE);
     DWORD flags = 0;
     BOOL visible = GetHandleInformation(sentinel, &flags);
     DWORD sentinel_error = visible ? 0 : GetLastError();
-    if (!ReadFile(GetStdHandle(STD_INPUT_HANDLE), input, sizeof(input) - 1, &read, NULL)) {
+    _snprintf_s(
+        diagnostics,
+        sizeof(diagnostics),
+        _TRUNCATE,
+        "{\"stdin\":%llu,\"stdout\":%llu,\"stderr\":%llu,"
+        "\"sentinel_visible\":%s,\"sentinel_error\":%lu}",
+        (unsigned long long)(ULONG_PTR)stdin_handle,
+        (unsigned long long)(ULONG_PTR)stdout_handle,
+        (unsigned long long)(ULONG_PTR)stderr_handle,
+        visible ? "true" : "false",
+        sentinel_error);
+    if (!append_line(report, diagnostics)) {
+        return 40;
+    }
+    if (!ReadFile(stdin_handle, input, sizeof(input) - 1, &read, NULL)) {
         return 41;
     }
     input[read] = '\0';
-    WriteFile(GetStdHandle(STD_OUTPUT_HANDLE), "STDOUT:", 7, &written, NULL);
-    WriteFile(GetStdHandle(STD_OUTPUT_HANDLE), input, read, &written, NULL);
-    WriteFile(GetStdHandle(STD_ERROR_HANDLE), "STDERR:ok\n", 10, &written, NULL);
+    WriteFile(stdout_handle, "STDOUT:", 7, &written, NULL);
+    WriteFile(stdout_handle, input, read, &written, NULL);
+    WriteFile(stderr_handle, "STDERR:ok\n", 10, &written, NULL);
     printf("SENTINEL_VISIBLE:%s ERROR:%lu\n", visible ? "true" : "false", sentinel_error);
     fflush(stdout);
     return visible ? 42 : 0;
@@ -346,8 +364,8 @@ int wmain(int argc, wchar_t **argv) {
     if (wcscmp(argv[1], L"tree") == 0 && argc == 4) {
         return tree_mode(argv[2], _wtoi(argv[3]));
     }
-    if (wcscmp(argv[1], L"stdio") == 0 && argc == 3) {
-        return stdio_mode(argv[2]);
+    if (wcscmp(argv[1], L"stdio") == 0 && argc == 4) {
+        return stdio_mode(argv[2], argv[3]);
     }
     if (wcscmp(argv[1], L"conpty") == 0 && argc == 3) {
         return conpty_mode(argv[2]);
