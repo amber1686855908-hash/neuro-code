@@ -1,0 +1,185 @@
+name: Windows AppContainer Git NUL POC2C (evidence only)
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/windows-appcontainer-git-null-poc2c.yml"
+      - "scripts/evidence/git-for-windows-sanitize-stdfds.patch"
+      - "scripts/evidence/windows_appcontainer_git_null_poc2c.py"
+      - "scripts/evidence/windows_git_null_probe.c"
+
+permissions:
+  contents: read
+
+jobs:
+  git-null:
+    name: Git NUL compatibility (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [windows-2025, windows-2022]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v7.0.0
+      - name: Check out pinned POC2B harness without importing its history
+        uses: actions/checkout@v7.0.0
+        with:
+          ref: 7ac1b77e6cc0dc1d51ab7bd47fe4f0ac76d71336
+          path: .poc2b-harness
+      - uses: astral-sh/setup-uv@v8.3.2
+        with:
+          version: "0.11.29"
+          python-version: "3.12"
+          enable-cache: true
+      - run: uv sync --extra dev --locked
+      - name: Resolve runner Git for Windows source correspondence
+        shell: pwsh
+        run: |
+          $versionOutput = & git.exe --version --build-options 2>&1
+          $versionLine = $versionOutput | Select-Object -First 1
+          if ($versionLine -notmatch '^git version (?<version>[0-9.]+\.windows\.[0-9]+)$') {
+            throw "Unexpected Git for Windows version: $versionLine"
+          }
+          $tag = "v$($Matches.version)"
+          $source = Join-Path $env:RUNNER_TEMP "git-for-windows-source"
+          & git.exe clone --depth 1 --branch $tag https://github.com/git-for-windows/git.git $source
+          if ($LASTEXITCODE -ne 0) {
+            throw "Unable to clone exact Git for Windows tag $tag"
+          }
+          $commit = (& git.exe -C $source rev-parse HEAD).Trim()
+          $tagCommit = (& git.exe -C $source rev-list -n 1 $tag).Trim()
+          if ($commit -ne $tagCommit) {
+            throw "Checked-out source $commit does not match $tag at $tagCommit"
+          }
+          $gitPath = (Get-Command git.exe).Source
+          $installedSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $gitPath).Hash
+          $commonInitCall = (& git.exe -C $source grep -n -F "sanitize_stdfds();" -- common-init.c) -join "`n"
+          $sanitizeDefinition = (& git.exe -C $source grep -n -F "void sanitize_stdfds" -- setup.c) -join "`n"
+          $devNullOpen = (& git.exe -C $source grep -n -F 'xopen("/dev/null", O_RDWR)' -- setup.c) -join "`n"
+          $mingwNullMapping = (& git.exe -C $source grep -n -F 'L"/dev/null"' -- compat/mingw.c) -join "`n"
+          if (-not $commonInitCall -or -not $sanitizeDefinition -or `
+              -not $devNullOpen -or -not $mingwNullMapping) {
+            throw "Unable to prove Git common-init, sanitize_stdfds, and MinGW /dev/null mapping"
+          }
+          & git.exe -C $source apply --check `
+            "$env:GITHUB_WORKSPACE\scripts\evidence\git-for-windows-sanitize-stdfds.patch"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Candidate patch does not apply to $tag"
+          }
+          & git.exe -C $source apply `
+            "$env:GITHUB_WORKSPACE\scripts\evidence\git-for-windows-sanitize-stdfds.patch"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Candidate patch failed to apply to $tag"
+          }
+          $sourceProof = [ordered]@{
+            installed_version_output = $versionOutput -join "`n"
+            source_tag = $tag
+            source_commit = $commit
+            source_url = "https://github.com/git-for-windows/git"
+            installed_executable = $gitPath
+            installed_sha256 = $installedSha256
+            common_init_call = $commonInitCall
+            sanitize_definition = $sanitizeDefinition
+            dev_null_open = $devNullOpen
+            mingw_null_mapping = $mingwNullMapping
+            poc2b_harness_head = "7ac1b77e6cc0dc1d51ab7bd47fe4f0ac76d71336"
+          }
+          $sourceProof | ConvertTo-Json -Depth 4 | Set-Content `
+            -Encoding utf8 "$env:RUNNER_TEMP\git-source-proof.json"
+          "POC2C_GIT_SOURCE=$source" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "POC2C_GIT_TAG=$tag" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "POC2C_GIT_COMMIT=$commit" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            base-devel
+            git
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-zlib
+      - name: Build evidence-only patched Git for Windows
+        shell: msys2 {0}
+        run: |
+          set -euxo pipefail
+          source_dir="$(cygpath -u "$POC2C_GIT_SOURCE")"
+          runtime_dir="$(cygpath -u "$RUNNER_TEMP")/patched-git-runtime"
+          make -C "$source_dir" -j2 git.exe \
+            NO_CURL=YesPlease \
+            NO_EXPAT=YesPlease \
+            NO_GETTEXT=YesPlease \
+            NO_ICONV=YesPlease \
+            NO_PERL=YesPlease \
+            NO_PYTHON=YesPlease \
+            NO_TCLTK=YesPlease \
+            2>&1 | tee "$(cygpath -u "$RUNNER_TEMP")/patched-git-build.txt"
+          mkdir -p "$runtime_dir"
+          cp "$source_dir/git.exe" "$runtime_dir/git.exe"
+          ldd "$source_dir/git.exe" | tee "$(cygpath -u "$RUNNER_TEMP")/patched-git-ldd.txt"
+          while read -r dependency; do
+            if test -f "$dependency"; then
+              cp -n "$dependency" "$runtime_dir/"
+            fi
+          done < <(ldd "$source_dir/git.exe" | awk '/=> \/mingw64\// {print $3}')
+          "$runtime_dir/git.exe" --version
+      - name: Compile evidence-only native probes
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $installation = & $vswhere -latest -products * `
+            -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+            -property installationPath
+          if (-not $installation) {
+            throw "Visual C++ toolchain not found"
+          }
+          Import-Module "$installation\Common7\Tools\Microsoft.VisualStudio.DevShell.dll"
+          Enter-VsDevShell `
+            -VsInstallPath $installation `
+            -SkipAutomaticLocation `
+            -DevCmdArguments "-arch=amd64 -host_arch=amd64"
+          cl.exe /nologo /W4 /WX /MT `
+            .poc2b-harness/scripts/evidence/windows_appcontainer_runtime_poc2b_bootstrap.c `
+            /Fe:"${env:RUNNER_TEMP}\runtime-bootstrap.exe" `
+            /link advapi32.lib userenv.lib ws2_32.lib `
+            2>&1 | Tee-Object -FilePath "${env:RUNNER_TEMP}\poc2b-bootstrap-build.txt"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Pinned POC2B bootstrap compilation failed with $LASTEXITCODE"
+          }
+          cl.exe /nologo /W4 /WX /MT /DUNICODE /D_UNICODE `
+            scripts/evidence/windows_git_null_probe.c `
+            /Fe:"${env:RUNNER_TEMP}\git-null-probe.exe" `
+            /link advapi32.lib `
+            2>&1 | Tee-Object -FilePath "${env:RUNNER_TEMP}\git-null-probe-build.txt"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Git/NUL native probe compilation failed with $LASTEXITCODE"
+          }
+      - name: Execute Git/NUL and real standard-user gates
+        shell: pwsh
+        run: |
+          $gitPath = (Get-Command git.exe).Source
+          uv run python scripts/evidence/windows_appcontainer_git_null_poc2c.py `
+            --poc2b ".poc2b-harness/scripts/evidence/windows_appcontainer_runtime_poc2b.py" `
+            --bootstrap "${env:RUNNER_TEMP}\runtime-bootstrap.exe" `
+            --probe "${env:RUNNER_TEMP}\git-null-probe.exe" `
+            --patched-runtime "${env:RUNNER_TEMP}\patched-git-runtime" `
+            --original-git $gitPath `
+            --git-tag $env:POC2C_GIT_TAG `
+            --git-source-commit $env:POC2C_GIT_COMMIT `
+            --patch "scripts/evidence/git-for-windows-sanitize-stdfds.patch" `
+            --report "${env:RUNNER_TEMP}\windows-appcontainer-git-null-poc2c.json"
+      - name: Upload evidence artifacts
+        if: always()
+        uses: actions/upload-artifact@v4.6.2
+        with:
+          name: windows-appcontainer-git-null-poc2c-${{ matrix.runner }}
+          path: |
+            ${{ runner.temp }}/git-source-proof.json
+            ${{ runner.temp }}/patched-git-build.txt
+            ${{ runner.temp }}/patched-git-ldd.txt
+            ${{ runner.temp }}/poc2b-bootstrap-build.txt
+            ${{ runner.temp }}/git-null-probe-build.txt
+            ${{ runner.temp }}/windows-appcontainer-git-null-poc2c.json
+            scripts/evidence/git-for-windows-sanitize-stdfds.patch
+          if-no-files-found: warn
