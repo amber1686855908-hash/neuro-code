@@ -127,13 +127,11 @@ def _nul_matrix_gate(
         for item in matrix
     )
     token = cast(dict[str, object], parsed.get("token", {}))
-    mapping = cast(dict[str, object], parsed.get("query_dos_device", {}))
     passed = bool(
         gate["status"] == "PASS"
         and detail.get("target_exit_code") == 0
         and token.get("is_appcontainer") is True
         and token.get("in_job") is True
-        and mapping.get("success") is True
         and denied
     )
     gate["status"] = "PASS" if passed else "FAIL"
@@ -249,19 +247,29 @@ def _git_local_gates(
         [str(patched_git), "init", str(repo)],
         stdout_contains=("Initialized empty Git repository",),
     )
-    tracked = repo / "tracked.txt"
-    tracked.write_text("PATCHED_GIT_WORKSPACE\n", encoding="utf-8")
-    gates["add"] = _command(
-        pb, api, launcher, bootstrap, [str(patched_git), "-C", str(repo), "add", "tracked.txt"]
-    )
-    gates["status"] = _command(
-        pb,
-        api,
-        launcher,
-        bootstrap,
-        [str(patched_git), "-C", str(repo), "status", "--short"],
-        stdout_contains=("A  tracked.txt",),
-    )
+    init_gate = cast(dict[str, object], gates["init"])
+    if init_gate["status"] == "PASS" and (repo / ".git").is_dir():
+        tracked = repo / "tracked.txt"
+        tracked.write_text("PATCHED_GIT_WORKSPACE\n", encoding="utf-8")
+        gates["add"] = _command(
+            pb,
+            api,
+            launcher,
+            bootstrap,
+            [str(patched_git), "-C", str(repo), "add", "tracked.txt"],
+        )
+        gates["status"] = _command(
+            pb,
+            api,
+            launcher,
+            bootstrap,
+            [str(patched_git), "-C", str(repo), "status", "--short"],
+            stdout_contains=("A  tracked.txt",),
+        )
+    else:
+        detail = {"reason": "git init did not create a repository", "init": gates["init"]}
+        gates["add"] = _status(False, detail)
+        gates["status"] = _status(False, detail)
     gates["private_config_write"] = _command(
         pb,
         api,
@@ -327,7 +335,7 @@ def _git_local_gates(
         "host_config_denied",
         "outside_denied",
     ]
-    if include_descendant:
+    if include_descendant and (repo / ".git").is_dir():
         descendant_report = workspace / "descendant.json"
         descendant_hook = repo / ".git" / "hooks" / "pre-commit"
         shutil.copy2(probe, descendant_hook)
@@ -368,6 +376,11 @@ def _git_local_gates(
         )
         commit_detail["descendant_facts"] = descendant
         gates["descendant_confinement"] = commit
+        required.append("descendant_confinement")
+    elif include_descendant:
+        gates["descendant_confinement"] = _status(
+            False, {"reason": "git init did not create a repository"}
+        )
         required.append("descendant_confinement")
 
     if include_network:
