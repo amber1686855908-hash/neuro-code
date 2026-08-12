@@ -802,7 +802,7 @@ def _run_child(
             process.process_handle, job.process_creation_handle, ctypes.byref(in_job)
         ):
             api.error("IsProcessInJob(child)")
-    exit_code = _wait_process(api, process)
+        exit_code = _wait_process(api, process)
     payload = json.loads(report.read_text(encoding="utf-8")) if report.exists() else None
     if payload is None:
         raise RuntimeError(
