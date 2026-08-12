@@ -319,6 +319,45 @@ class MacOSSeatbeltLocalProcessSandboxTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(pipe_environment["HOME"], str(home))
         self.assertEqual(pipe_environment["TMPDIR"], str(temporary))
 
+    def test_runtime_roots_preserve_lexical_interpreter_symlink_authority(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace = root / "workspace"
+            state = root / "state"
+            cellar = root / "homebrew" / "Cellar" / "python@3.14" / "3.14"
+            opt = root / "homebrew" / "opt" / "python@3.14"
+            virtual_environment = root / "venv"
+            for path in (workspace, state, cellar / "bin", opt.parent, virtual_environment / "bin"):
+                path.mkdir(parents=True, exist_ok=True)
+            canonical_interpreter = cellar / "bin" / "python3.14"
+            canonical_interpreter.touch()
+            opt.symlink_to(cellar, target_is_directory=True)
+            lexical_interpreter = opt / "bin" / "python3.14"
+            virtual_interpreter = virtual_environment / "bin" / "python"
+            virtual_interpreter.symlink_to(lexical_interpreter)
+
+            with (
+                mock.patch.object(sys, "executable", str(virtual_interpreter)),
+                mock.patch.object(sys, "prefix", str(virtual_environment)),
+                mock.patch.object(sys, "base_prefix", str(opt)),
+            ):
+                adapter = self._adapter(SandboxProfile.WORKSPACE, workspace, state)
+
+            self.assertIn(virtual_environment, adapter._runtime_read_roots)
+            self.assertIn(opt, adapter._runtime_read_roots)
+            self.assertIn(cellar, adapter._runtime_read_roots)
+            private_home = root / "private-home"
+            private_tmp = root / "private-tmp"
+            private_home.mkdir()
+            private_tmp.mkdir()
+            policy = adapter.build_policy(
+                self._request(workspace, SandboxProfile.WORKSPACE),
+                private_home=private_home,
+                private_temporary_directory=private_tmp,
+            )
+            self.assertIn(_MacOSSeatbeltPolicyBuilder._subpath_rule("file-read*", opt), policy)
+            self.assertIn(_MacOSSeatbeltPolicyBuilder._subpath_rule("file-read*", cellar), policy)
+
     async def test_pipe_spawn_uses_sandbox_exec_and_cleans_private_directories(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
