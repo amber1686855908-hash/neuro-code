@@ -1532,6 +1532,17 @@ completion metadata is defined by
 event-driven multi-task waits by
 [ADR 0024](adr/0024-event-driven-multi-background-task-wait.md).
 
+The lifecycle capability contract is separate from filesystem and network
+authority. `LocalProcessSandbox` and its owned child/terminal seams report
+`STRONG_DESCENDANT_OWNERSHIP` for enabled Linux Bubblewrap and Windows Job
+Object paths, and `PROCESS_GROUP_BEST_EFFORT` for plain POSIX ProcessTree.
+Ordinary Bash, background Bash, MCP stdio, and PTY requests require the latter
+minimum; a best-effort adapter must fail closed before child creation when a
+workload explicitly requires strong ownership. Future macOS Seatbelt policy
+may enforce filesystem/network/access-control while remaining
+`PROCESS_GROUP_BEST_EFFORT`. See
+[ADR 0110](adr/0110-cross-platform-lifecycle-capability-contract.md).
+
 ## Stage5DC ACP lifecycle alias compatibility
 
 The private subagent lifecycle adapter bounds external alias allocation to four

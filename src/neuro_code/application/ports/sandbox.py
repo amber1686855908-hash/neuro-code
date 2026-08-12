@@ -74,12 +74,55 @@ class LocalWorkspaceAccessMode(StrEnum):
     READ_WRITE = "read-write"
 
 
+class LocalProcessLifecycleCapability(StrEnum):
+    """Descendant-lifecycle strength provided or required by a local child.
+
+    Lifecycle strength is deliberately independent from filesystem and network
+    policy.  A strong owner may satisfy a best-effort requirement, but a
+    process-group owner must never be presented as a strong descendant owner.
+
+    表示本地子进程提供或要求的后代生命周期强度.
+
+    生命周期强度刻意独立于文件系统和网络策略.强所有者可以满足尽力而为要求,
+    但进程组所有者绝不能被描述为强后代所有者.
+    """
+
+    STRONG_DESCENDANT_OWNERSHIP = "strong-descendant-ownership"
+    PROCESS_GROUP_BEST_EFFORT = "process-group-best-effort"
+
+
+_LIFECYCLE_CAPABILITY_STRENGTH = {
+    LocalProcessLifecycleCapability.PROCESS_GROUP_BEST_EFFORT: 0,
+    LocalProcessLifecycleCapability.STRONG_DESCENDANT_OWNERSHIP: 1,
+}
+
+
+def lifecycle_capability_satisfies(
+    provided: LocalProcessLifecycleCapability,
+    required: LocalProcessLifecycleCapability,
+) -> bool:
+    """Return whether ``provided`` meets ``required`` without string ordering.
+
+    唯一的生命周期 capability 满足性判断入口,不依赖 StrEnum 字符串排序.
+    """
+
+    if not isinstance(provided, LocalProcessLifecycleCapability):
+        raise TypeError("provided lifecycle capability must be canonical")
+    if not isinstance(required, LocalProcessLifecycleCapability):
+        raise TypeError("required lifecycle capability must be canonical")
+    return _LIFECYCLE_CAPABILITY_STRENGTH[provided] >= _LIFECYCLE_CAPABILITY_STRENGTH[required]
+
+
 class LocalProcessCancellationPolicy(StrEnum):
     """Cancellation semantics owned by a local process launcher.
 
     表示由本地进程启动器拥有的取消语义.
     """
 
+    TERMINATE_OWNED_SCOPE = "terminate-owned-scope"
+    # Deprecated compatibility member.  The canonical name above is used by
+    # production code and documentation; the termination algorithm is
+    # intentionally unchanged.
     TERMINATE_PROCESS_TREE = "terminate-process-tree"
 
 
@@ -186,22 +229,30 @@ class LocalProcessEnvironmentPolicy:
 class LocalProcessLifecycle:
     """Bounded ownership and cancellation requirements for one child.
 
-    The selected platform adapter determines the enforceable descendant
-    boundary.  Enabled Linux profiles and Windows Job Objects provide strong
-    descendant ownership; the explicit POSIX ``off`` adapter provides only
-    best-effort original-process-group cleanup.
+    ``required_capability`` is the minimum contract requested by the caller.
+    The selected adapter reports its actual capability separately.  Ordinary
+    Neuro Code local workloads require only process-group best effort, while a
+    future workload may explicitly require strong descendant ownership.
 
-    表示一个子进程的有界所有权和取消要求.启用的 Linux profile 与 Windows Job
-    Object 提供强后代所有权;显式 POSIX ``off`` 仅尽力清理原进程组.
+    表示一个子进程的有界所有权和取消要求. ``required_capability`` 是调用方
+    请求的最低 contract;适配器会单独报告实际能力.普通 Neuro Code 本地 workload
+    只要求进程组尽力而为,未来 workload 才应显式要求强后代所有权.
     """
 
     cancellation_policy: LocalProcessCancellationPolicy = (
-        LocalProcessCancellationPolicy.TERMINATE_PROCESS_TREE
+        LocalProcessCancellationPolicy.TERMINATE_OWNED_SCOPE
     )
     termination_grace_seconds: float = 1.0
     force_wait_seconds: float = 5.0
+    # Kept after the pre-existing positional fields so older callers that
+    # construct ``LocalProcessLifecycle`` positionally retain their meaning.
+    required_capability: LocalProcessLifecycleCapability = (
+        LocalProcessLifecycleCapability.PROCESS_GROUP_BEST_EFFORT
+    )
 
     def __post_init__(self) -> None:
+        if not isinstance(self.required_capability, LocalProcessLifecycleCapability):
+            raise TypeError("local process required lifecycle capability must be canonical")
         if not isinstance(self.cancellation_policy, LocalProcessCancellationPolicy):
             raise TypeError("local process cancellation policy must be canonical")
         if (
@@ -395,6 +446,9 @@ class OwnedLocalProcess(Protocol):
     def process_id(self) -> int: ...
 
     @property
+    def lifecycle_capability(self) -> LocalProcessLifecycleCapability: ...
+
+    @property
     def stdout(self) -> LocalProcessOutput | None: ...
 
     @property
@@ -417,6 +471,9 @@ class LocalProcessSandbox(Protocol):
 
     规范地拥有模型可控本地进程创建的端口.
     """
+
+    @property
+    def lifecycle_capability(self) -> LocalProcessLifecycleCapability: ...
 
     async def spawn(self, request: SandboxedProcessRequest) -> OwnedLocalProcess: ...
 

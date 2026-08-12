@@ -8,6 +8,7 @@ from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Protocol
 
+from neuro_code.application.ports.sandbox import LocalProcessLifecycleCapability
 from neuro_code.domain.terminal.models import TerminalOutputChunk, TerminalSignal, TerminalSize
 
 
@@ -60,6 +61,9 @@ class TerminalPlatformSession(Protocol):
     @property
     def process_id(self) -> int: ...
 
+    @property
+    def lifecycle_capability(self) -> LocalProcessLifecycleCapability: ...
+
     def write(self, data: bytes) -> None: ...
 
     def resize(self, size: TerminalSize) -> None: ...
@@ -77,6 +81,9 @@ TerminalErrorHandler = Callable[[BaseException], None]
 
 
 class TerminalPlatform(Protocol):
+    @property
+    def lifecycle_capability(self) -> LocalProcessLifecycleCapability: ...
+
     def spawn_exec(
         self,
         executable: str,

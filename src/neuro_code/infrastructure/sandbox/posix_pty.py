@@ -12,6 +12,7 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Self
 
+from neuro_code.application.ports.sandbox import LocalProcessLifecycleCapability
 from neuro_code.application.ports.terminal import (
     TerminalEofHandler,
     TerminalErrorHandler,
@@ -38,11 +39,17 @@ class PosixPtySession:
         on_error: TerminalErrorHandler,
         pidfd: int | None = None,
         pidfd_ops: LinuxPidfdOps | None = None,
+        lifecycle_capability: LocalProcessLifecycleCapability = (
+            LocalProcessLifecycleCapability.PROCESS_GROUP_BEST_EFFORT
+        ),
     ) -> None:
         self._master_fd: int | None = master_fd
         self._process = process
         self._boundary_pidfd = pidfd
         self._pidfd_ops = pidfd_ops
+        if not isinstance(lifecycle_capability, LocalProcessLifecycleCapability):
+            raise TypeError("PTY lifecycle capability must be canonical")
+        self._lifecycle_capability = lifecycle_capability
         self._size = size
         self._on_output = on_output
         self._on_eof = on_eof
@@ -76,6 +83,9 @@ class PosixPtySession:
         on_eof: TerminalEofHandler,
         on_error: TerminalErrorHandler,
         pidfd_ops: LinuxPidfdOps | None = None,
+        lifecycle_capability: LocalProcessLifecycleCapability = (
+            LocalProcessLifecycleCapability.PROCESS_GROUP_BEST_EFFORT
+        ),
     ) -> Self:
         if os.name != "posix":
             raise OSError("POSIX pseudoterminals are only available on POSIX")
@@ -124,6 +134,7 @@ class PosixPtySession:
                 on_error=on_error,
                 pidfd=boundary_pidfd,
                 pidfd_ops=pidfd_ops,
+                lifecycle_capability=lifecycle_capability,
             )
             master_fd = None
             process = None
@@ -150,6 +161,12 @@ class PosixPtySession:
     @property
     def process_id(self) -> int:
         return self._process.pid
+
+    @property
+    def lifecycle_capability(self) -> LocalProcessLifecycleCapability:
+        """Return the stable capability assigned to this PTY boundary."""
+
+        return self._lifecycle_capability
 
     def write(self, data: bytes) -> None:
         if not isinstance(data, bytes):
@@ -306,8 +323,24 @@ class PosixPtySession:
 
 
 class PosixPtyPlatform:
-    def __init__(self, *, pidfd_ops: LinuxPidfdOps | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        pidfd_ops: LinuxPidfdOps | None = None,
+        lifecycle_capability: LocalProcessLifecycleCapability = (
+            LocalProcessLifecycleCapability.PROCESS_GROUP_BEST_EFFORT
+        ),
+    ) -> None:
         self._pidfd_ops = pidfd_ops
+        if not isinstance(lifecycle_capability, LocalProcessLifecycleCapability):
+            raise TypeError("PTY lifecycle capability must be canonical")
+        self._lifecycle_capability = lifecycle_capability
+
+    @property
+    def lifecycle_capability(self) -> LocalProcessLifecycleCapability:
+        """Return the capability assigned to sessions created by this platform."""
+
+        return self._lifecycle_capability
 
     def spawn_exec(
         self,
@@ -331,6 +364,7 @@ class PosixPtyPlatform:
             on_eof=on_eof,
             on_error=on_error,
             pidfd_ops=self._pidfd_ops,
+            lifecycle_capability=self._lifecycle_capability,
         )
 
 

@@ -8,6 +8,8 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
 
+from neuro_code.application.ports.sandbox import LocalProcessLifecycleCapability
+
 if TYPE_CHECKING:
     from neuro_code.application.ports.sandbox import LocalProcessSandbox, SandboxedProcessRequest
     from neuro_code.application.ports.tools import ToolOutputArtifactStore
@@ -24,6 +26,9 @@ class BackgroundTaskManager(Protocol):
     """Own background process trees visible to one conversation binding.
 
     管理一个会话绑定可见的后台进程树."""
+
+    @property
+    def lifecycle_capability(self) -> LocalProcessLifecycleCapability: ...
 
     async def start_process(
         self,

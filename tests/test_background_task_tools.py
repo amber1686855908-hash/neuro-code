@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest import mock
 
 from neuro_code.application.ports.sandbox import (
+    LocalProcessLifecycleCapability,
     LocalProcessSandbox,
     OwnedLocalProcess,
     SandboxedProcessRequest,
@@ -33,6 +34,10 @@ class _EnabledProcessSandboxFixture(LocalProcessSandbox):
     def __init__(self) -> None:
         self.requests: list[SandboxedProcessRequest] = []
         self._delegate = ProcessTreeLocalProcessSandbox()
+
+    @property
+    def lifecycle_capability(self) -> LocalProcessLifecycleCapability:
+        return self._delegate.lifecycle_capability
 
     async def spawn(self, request: SandboxedProcessRequest) -> OwnedLocalProcess:
         self.requests.append(request)
@@ -96,6 +101,7 @@ class BackgroundTaskToolTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as directory:
             sandbox = _EnabledProcessSandboxFixture()
             manager = LocalBackgroundTaskManager(local_process_sandbox=sandbox)
+            self.assertIs(manager.lifecycle_capability, sandbox.lifecycle_capability)
             context = ToolContext(
                 Path(directory),
                 sandbox_profile=SandboxProfile.WORKSPACE,
@@ -129,6 +135,10 @@ class BackgroundTaskToolTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(await manager.pending_completions(), ())
                 self.assertEqual(len(sandbox.requests), 1)
                 self.assertTrue(sandbox.requests[0].filesystem_policy.private_home)
+                self.assertIs(
+                    sandbox.requests[0].lifecycle.required_capability,
+                    LocalProcessLifecycleCapability.PROCESS_GROUP_BEST_EFFORT,
+                )
                 self.assertIn("missing", output.content)
                 self.assertNotIn("provider-secret", output.content)
             finally:

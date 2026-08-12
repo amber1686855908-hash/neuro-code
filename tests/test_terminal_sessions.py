@@ -14,6 +14,7 @@ from neuro_code.application.permissions.policy import (
     PermissionMode,
 )
 from neuro_code.application.ports.sandbox import (
+    LocalProcessLifecycleCapability,
     LocalProcessSandbox,
     OwnedLocalProcess,
     SandboxedProcessRequest,
@@ -54,6 +55,7 @@ def _normalized_workspace(workspace: Path) -> Path:
 class _FakePlatformSession:
     def __init__(self) -> None:
         self.process_id = 4242
+        self.lifecycle_capability = LocalProcessLifecycleCapability.PROCESS_GROUP_BEST_EFFORT
         self.writes: list[bytes] = []
         self.sizes: list[TerminalSize] = []
         self.signals: list[TerminalSignal] = []
@@ -90,6 +92,8 @@ class _FakePlatformSession:
 
 
 class _FakeTerminalPlatform:
+    lifecycle_capability = LocalProcessLifecycleCapability.PROCESS_GROUP_BEST_EFFORT
+
     def __init__(self, *, events: list[str] | None = None) -> None:
         self.session = _FakePlatformSession()
         self.spawn_calls: list[dict[str, object]] = []
@@ -181,6 +185,10 @@ class _FakeLocalProcessSandbox(LocalProcessSandbox):
         self._reject_enabled = reject_enabled
         self.requests: list[SandboxedProcessRequest] = []
 
+    @property
+    def lifecycle_capability(self) -> LocalProcessLifecycleCapability:
+        return self._platform.lifecycle_capability
+
     async def spawn(self, request: SandboxedProcessRequest) -> OwnedLocalProcess:
         raise AssertionError(f"unexpected pipe spawn: {request.purpose.value}")
 
@@ -262,6 +270,10 @@ class LocalInteractiveTerminalManagerTests(unittest.IsolatedAsyncioTestCase):
                 )
 
                 self.assertEqual(session.process_id, 4242)
+                self.assertIs(
+                    session.lifecycle_capability,
+                    LocalProcessLifecycleCapability.PROCESS_GROUP_BEST_EFFORT,
+                )
                 self.assertEqual(session.size, TerminalSize(90, 25))
                 spawn = platform.spawn_calls[0]
                 spawn_cwd = spawn["cwd"]

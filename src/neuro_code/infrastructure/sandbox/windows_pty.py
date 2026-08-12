@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 
+from neuro_code.application.ports.sandbox import LocalProcessLifecycleCapability
 from neuro_code.application.ports.terminal import (
     TerminalEofHandler,
     TerminalErrorHandler,
@@ -18,13 +19,31 @@ class WindowsConPtySession:
 
     将原生 ConPTY 所有者投影到共享终端平台端口."""
 
-    def __init__(self, session: WindowsPseudoConsoleSession, size: TerminalSize) -> None:
+    def __init__(
+        self,
+        session: WindowsPseudoConsoleSession,
+        size: TerminalSize,
+        lifecycle_capability: LocalProcessLifecycleCapability | None = None,
+    ) -> None:
         self._session = session
         self._size = size
+        if lifecycle_capability is None:
+            lifecycle_capability = getattr(
+                session,
+                "lifecycle_capability",
+                LocalProcessLifecycleCapability.STRONG_DESCENDANT_OWNERSHIP,
+            )
+        if not isinstance(lifecycle_capability, LocalProcessLifecycleCapability):
+            raise TypeError("ConPTY lifecycle capability must be canonical")
+        self._lifecycle_capability = lifecycle_capability
 
     @property
     def process_id(self) -> int:
         return self._session.process_id
+
+    @property
+    def lifecycle_capability(self) -> LocalProcessLifecycleCapability:
+        return self._lifecycle_capability
 
     def write(self, data: bytes) -> None:
         self._session.write(data)
@@ -55,6 +74,10 @@ class WindowsConPtyPlatform:
         if diagnostic_capture_bytes <= 0:
             raise ValueError("diagnostic_capture_bytes must be positive")
         self._diagnostic_capture_bytes = diagnostic_capture_bytes
+
+    @property
+    def lifecycle_capability(self) -> LocalProcessLifecycleCapability:
+        return LocalProcessLifecycleCapability.STRONG_DESCENDANT_OWNERSHIP
 
     def spawn_exec(
         self,

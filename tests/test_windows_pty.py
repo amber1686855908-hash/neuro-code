@@ -4,6 +4,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from neuro_code.application.ports.sandbox import LocalProcessLifecycleCapability
 from neuro_code.domain.terminal import TerminalSignal, TerminalSize
 from neuro_code.infrastructure.sandbox.windows_pty import (
     WindowsConPtyPlatform,
@@ -38,6 +39,12 @@ class _FakeNativeSession:
 
 
 class WindowsConPtyPortAdapterTests(unittest.TestCase):
+    def test_job_backed_platform_reports_strong_descendant_ownership(self) -> None:
+        self.assertIs(
+            WindowsConPtyPlatform().lifecycle_capability,
+            LocalProcessLifecycleCapability.STRONG_DESCENDANT_OWNERSHIP,
+        )
+
     def test_shared_session_operations_project_to_native_conpty(self) -> None:
         native = _FakeNativeSession()
         session = WindowsConPtySession(native, TerminalSize(80, 24))  # type: ignore[arg-type]
