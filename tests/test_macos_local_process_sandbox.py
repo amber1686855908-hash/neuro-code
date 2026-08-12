@@ -356,7 +356,9 @@ class MacOSSeatbeltLocalProcessSandboxTests(unittest.IsolatedAsyncioTestCase):
                 private_temporary_directory=private_tmp,
             )
             self.assertIn(_MacOSSeatbeltPolicyBuilder._subpath_rule("file-read*", opt), policy)
-            self.assertIn(_MacOSSeatbeltPolicyBuilder._subpath_rule("file-read*", cellar), policy)
+            self.assertIn(
+                _MacOSSeatbeltPolicyBuilder._subpath_rule("file-read*", cellar.resolve()), policy
+            )
 
     async def test_pipe_spawn_uses_sandbox_exec_and_cleans_private_directories(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
