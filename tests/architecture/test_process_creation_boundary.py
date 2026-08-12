@@ -8,7 +8,11 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _SOURCE_ROOT = _PROJECT_ROOT / "src" / "neuro_code"
 _SANDBOX_INFRASTRUCTURE = _SOURCE_ROOT / "infrastructure" / "sandbox"
 
-_TRUSTED_HOST_HELPERS: dict[Path, frozenset[str]] = {}
+# This is an intentionally narrow host-platform exception. It copies text to a
+# user-selected desktop clipboard; it is not a model-controlled subprocess launcher.
+_TRUSTED_HOST_HELPERS: dict[Path, frozenset[str]] = {
+    _SOURCE_ROOT / "interfaces" / "tui" / "clipboard.py": frozenset({"subprocess.run"}),
+}
 _FORBIDDEN_CALLS = frozenset(
     {
         "ProcessTree.spawn_exec",

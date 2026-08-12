@@ -18,9 +18,12 @@ bootstrap 组合根使用现有 `SessionStore` 和 `FileToolOutputArtifactStore`
 `NeuroCodeApp`。TUI 只保存工具终态事件中的有界 `output_artifact_id`，不会收到文件系统路径或
 artifact 存储器。
 
-用户展开工具卡片时，TUI 异步请求当前 runner 会话的 artifact。应用服务检查持久化会话事件关联，
-读取器继续执行不透明句柄路径边界、脱敏和读取字节上限。TUI 使用现有显示行数/字符数限制渲染返回内容；
-读取失败时显示通用的本地化不可用提示。artifact ID、路径、参数、原始 metadata 和异常文本都不会渲染。
+用户从有界 Inline Peek 继续进入独立 Tool Inspector 时，TUI 才会异步请求当前 runner 会话的
+artifact；Summary 与 Peek 永远不会请求或渲染 artifact 内容。应用服务检查持久化会话事件
+关联，读取器继续执行不透明句柄路径边界、脱敏和 256 KiB 读取上限。Inspector Output 可滚动，
+并会明确说明读取上限或 artifact 存储截断，绝不暗示截断投影是真正完整的原始输出。读取失败时
+显示通用的本地化不可用提示。artifact ID、路径、任意 metadata 和异常文本都不会渲染；独立
+可选择的 Input 视图会递归脱敏。
 
 读取只在用户展开时发生，并且始终有界；它不改变事件、会话项、Runtime、Provider、权限或 SQLite schema。
 Provider 切换和会话切换复用同一个组合服务，但每次读取仍由应用服务重新执行会话授权检查。
@@ -29,7 +32,8 @@ Provider 切换和会话切换复用同一个组合服务，但每次读取仍�
 
 - 用户可以检查长 Bash 输出，而不把完整输出放进模型可见上下文或会话事件载荷。
 - 缺失、删除、损坏或跨会话 artifact 会安全降级为 UI 提示，不暴露存储细节。
-- TUI 为展开卡片增加一个小的异步 worker；现有卡片布局、折叠逻辑和流式事件流保持不变。
+- TUI 持有一个只在 Inspector 打开后启动的小型异步 worker。ADR 0108 将 disclosure 改为
+  Summary → 单调用 Peek → Inspector；会话授权的应用接缝与流式事件流保持不变。
 - CLI、ACP 和其他入站 artifact 视图仍属于后续独立切片。
 
 ## 被否决的方案

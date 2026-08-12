@@ -78,6 +78,11 @@ expansion is specified by
 [ADR 0030](0030-bounded-interactive-tool-card-details.md); durable full tool
 transcripts and checkpoint-grade rollback remain future vertical slices.
 
+[ADR 0108](0108-editorial-tui-presentation.md) later keeps this per-call state
+and audit boundary but projects consecutive calls through one visible activity
+group. The group, rather than every call widget, owns the default summary and
+detail toggle.
+
 ## Verification
 
 Headless runtime tests cover exact-edit and Bash-created file reports. Workspace
