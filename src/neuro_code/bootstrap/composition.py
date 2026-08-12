@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import asyncio
+import sys
 from collections.abc import Callable, Collection, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -101,7 +102,7 @@ from neuro_code.infrastructure.workspace.changes import (
 from neuro_code.infrastructure.workspace.instructions import FilesystemInstructionDiscovery
 from neuro_code.infrastructure.workspace.paths import FilesystemWorkspaceIdentity, workspaces_match
 from neuro_code.infrastructure.workspace.skills import FilesystemSkillDiscovery
-from neuro_code.shared.errors import ConfigurationError
+from neuro_code.shared.errors import ConfigurationError, SandboxError
 
 if TYPE_CHECKING:
     from neuro_code.configuration.app import AppConfig
@@ -129,17 +130,30 @@ def _default_local_process_sandbox_factory(
 
     为一个会话绑定选择规范本地进程启动器.
 
-    ``off`` preserves the existing owned-process bridge. Every enabled profile
-    instead creates a child-scoped Linux Bubblewrap launcher. The controller is
-    never re-executed inside a sandbox namespace.
+    ``off`` preserves the existing owned-process bridge. Enabled profiles use
+    the platform's fail-closed child adapter on Linux and macOS. The controller
+    is never re-executed inside a sandbox namespace.
 
     ``off`` 保留既有的受管进程桥接器.每个启用的 profile 都创建子进程范围的
-    Linux Bubblewrap 启动器.controller 不会重新执行到沙箱命名空间中.
+    Linux Bubblewrap 或 macOS Seatbelt 启动器.controller 不会重新执行到沙箱中.
     """
 
     if not profile.enabled:
         return ProcessTreeLocalProcessSandbox()
-    return LinuxBubblewrapLocalProcessSandbox(profile, workspace, state_dir)
+    platform = _runtime_platform()
+    if platform.startswith("linux"):
+        return LinuxBubblewrapLocalProcessSandbox(profile, workspace, state_dir)
+    if platform == "darwin":
+        from neuro_code.infrastructure.sandbox.macos_local_process import (
+            MacOSSeatbeltLocalProcessSandbox,
+        )
+
+        return MacOSSeatbeltLocalProcessSandbox(profile, workspace, state_dir)
+    raise SandboxError(f"sandbox profile {profile.value!r} is not enforceable on {platform}")
+
+
+def _runtime_platform() -> str:
+    return sys.platform
 
 
 def _default_session_store_factory(path: Path) -> SessionStore:

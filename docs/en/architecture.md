@@ -1538,10 +1538,11 @@ authority. `LocalProcessSandbox` and its owned child/terminal seams report
 Object paths, and `PROCESS_GROUP_BEST_EFFORT` for plain POSIX ProcessTree.
 Ordinary Bash, background Bash, MCP stdio, and PTY requests require the latter
 minimum; a best-effort adapter must fail closed before child creation when a
-workload explicitly requires strong ownership. Future macOS Seatbelt policy
-may enforce filesystem/network/access-control while remaining
-`PROCESS_GROUP_BEST_EFFORT`. See
-[ADR 0110](adr/0110-cross-platform-lifecycle-capability-contract.md).
+workload explicitly requires strong ownership. Enabled macOS profiles use the
+Seatbelt adapter to enforce filesystem/network/access control while always
+reporting `PROCESS_GROUP_BEST_EFFORT`. See
+[ADR 0110](adr/0110-cross-platform-lifecycle-capability-contract.md) and
+[ADR 0111](adr/0111-macos-seatbelt-local-process-sandbox.md).
 
 ## Stage5DC ACP lifecycle alias compatibility
 

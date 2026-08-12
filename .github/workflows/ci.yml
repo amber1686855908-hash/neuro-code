@@ -109,6 +109,77 @@ jobs:
               raise SystemExit("Linux sandbox security gate did not execute every test")
           PY
 
+  macos-seatbelt-integration:
+    name: macOS Seatbelt (${{ matrix.runner }}, Python ${{ matrix.python }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-15, macos-15-intel]
+        python: ["3.12", "3.14"]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    env:
+      NEURO_CODE_REQUIRE_MACOS_SANDBOX_INTEGRATION: "1"
+    steps:
+      - uses: actions/checkout@v7.0.0
+      - uses: astral-sh/setup-uv@v8.3.2
+        with:
+          version: "0.11.29"
+          python-version: ${{ matrix.python }}
+          enable-cache: true
+      - run: uv sync --extra dev --locked
+      - name: Record macOS Seatbelt runtime facts
+        run: |
+          set -o pipefail
+          test -x /usr/bin/sandbox-exec
+          {
+            sw_vers
+            uname -a
+            uname -m
+            printf 'sandbox-exec='
+            /usr/bin/python3 -c 'from pathlib import Path; print(Path("/usr/bin/sandbox-exec").resolve())'
+            ls -l /usr/bin/sandbox-exec
+            /usr/bin/codesign -dv --verbose=2 /usr/bin/sandbox-exec 2>&1
+            csrutil status || true
+          } | tee "$RUNNER_TEMP/neuro-code-macos-seatbelt-runtime.txt"
+      - name: Prove macOS Seatbelt production adapter boundaries
+        run: >-
+          uv run pytest
+          tests/security/test_macos_sandbox_integration.py
+          -m sandbox_integration
+          -q -rs
+          --junitxml=${{ runner.temp }}/neuro-code-macos-seatbelt-${{ matrix.python }}.xml
+      - name: Require every macOS security test to execute
+        if: always()
+        run: |
+          uv run python - <<'PY'
+          import os
+          import xml.etree.ElementTree as ET
+
+          path = os.path.join(
+              os.environ["RUNNER_TEMP"],
+              "neuro-code-macos-seatbelt-${{ matrix.python }}.xml",
+          )
+          root = ET.parse(path).getroot()
+          suites = root.findall(".//testsuite")
+          if root.tag == "testsuite":
+              suites.append(root)
+          tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites)
+          skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites)
+          print(f"executed={tests} skipped={skipped}")
+          if tests == 0 or skipped:
+              raise SystemExit("macOS Seatbelt security gate did not execute every test")
+          PY
+      - name: Upload macOS Seatbelt integration facts
+        if: always()
+        uses: actions/upload-artifact@v4.6.2
+        with:
+          name: macos-seatbelt-${{ matrix.runner }}-py${{ matrix.python }}
+          path: |
+            ${{ runner.temp }}/neuro-code-macos-seatbelt-runtime.txt
+            ${{ runner.temp }}/neuro-code-macos-seatbelt-${{ matrix.python }}.xml
+          if-no-files-found: error
+
   windows-process-lifecycle:
     runs-on: windows-latest
     timeout-minutes: 10
