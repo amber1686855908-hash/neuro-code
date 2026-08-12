@@ -152,7 +152,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) {
             throw "Pinned POC2B bootstrap compilation failed with $LASTEXITCODE"
           }
-          cl.exe /nologo /W4 /WX /MT /DUNICODE /D_UNICODE `
+          cl.exe /nologo /W4 /WX /MT `
             scripts/evidence/windows_git_null_probe.c `
             /Fe:"${env:RUNNER_TEMP}\git-null-probe.exe" `
             /link advapi32.lib `
