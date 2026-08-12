@@ -506,16 +506,20 @@ class MacOSSeatbeltLocalProcessSandbox(LocalProcessSandbox):
     def _runtime_roots_for_host(self) -> tuple[Path, ...]:
         candidates = [path.resolve() for path in _SYSTEM_READ_ROOTS if path.exists()]
         for candidate in (Path(sys.base_prefix), Path(sys.prefix)):
-            resolved = candidate.expanduser().resolve()
-            if resolved.is_dir() and not _within(resolved, self._workspace):
-                candidates.append(resolved)
+            lexical = _absolute_without_symlink_resolution(candidate)
+            for spelling in (lexical, lexical.resolve()):
+                if spelling.is_dir() and not _within(spelling, self._workspace):
+                    candidates.append(spelling)
         try:
-            interpreter = Path(sys.executable).resolve(strict=True)
-        except OSError:
-            interpreter = Path(sys.executable).resolve()
-        interpreter_root = interpreter.parent.parent
-        if interpreter.parent.name == "bin" and interpreter_root.is_dir():
-            candidates.append(interpreter_root)
+            executable_spellings = _executable_path_spellings(Path(sys.executable))
+        except (OSError, RuntimeError) as error:
+            raise SandboxError(f"cannot resolve controller interpreter runtime: {error}") from error
+        for executable in executable_spellings:
+            interpreter_root = (
+                executable.parent.parent if executable.parent.name == "bin" else executable.parent
+            )
+            if interpreter_root.is_dir() and not _within(interpreter_root, self._workspace):
+                candidates.append(interpreter_root)
         result: list[Path] = []
         for candidate in candidates:
             if any(_within(candidate, existing) for existing in result):
@@ -564,16 +568,46 @@ def _runtime_platform() -> str:
 
 
 def _path_spellings(path: Path) -> tuple[Path, ...]:
+    lexical = _absolute_without_symlink_resolution(path)
     canonical = path.expanduser().resolve(strict=False)
-    spellings = [canonical]
-    try:
-        relative = canonical.relative_to(Path("/private/var"))
-    except ValueError:
-        return tuple(spellings)
-    alias = Path("/var") / relative
-    if alias != canonical:
-        spellings.append(alias)
+    spellings = [lexical]
+    if canonical != lexical:
+        spellings.append(canonical)
+    for spelling in tuple(spellings):
+        try:
+            relative = spelling.relative_to(Path("/private/var"))
+        except ValueError:
+            continue
+        alias = Path("/var") / relative
+        if alias not in spellings:
+            spellings.append(alias)
     return tuple(spellings)
+
+
+def _executable_path_spellings(path: Path) -> tuple[Path, ...]:
+    """Return lexical symlink targets plus the final canonical executable path."""
+
+    current = _absolute_without_symlink_resolution(path)
+    spellings: list[Path] = []
+    seen: set[Path] = set()
+    while current.is_symlink():
+        if current in seen:
+            raise SandboxError(f"controller interpreter symlink cycle: {current}")
+        seen.add(current)
+        spellings.append(current)
+        target = Path(os.readlink(current))
+        current = _absolute_without_symlink_resolution(
+            target if target.is_absolute() else current.parent / target
+        )
+    spellings.append(current)
+    canonical = current.resolve(strict=True)
+    if canonical not in spellings:
+        spellings.append(canonical)
+    return tuple(spellings)
+
+
+def _absolute_without_symlink_resolution(path: Path) -> Path:
+    return Path(os.path.abspath(path.expanduser()))
 
 
 def _paths_overlap(first: Path, second: Path) -> bool:
