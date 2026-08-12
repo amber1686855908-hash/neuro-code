@@ -1375,7 +1375,7 @@ def _acl_authority_gate(
     )
 
 
-def _boundedness_gate(api: _WinApi, fixture: Path) -> dict[str, object]:
+def _boundedness_gate(api: _WinApi, fixture: Path, profile: _Profile) -> dict[str, object]:
     results: dict[str, object] = {}
     for label, count in (("small", 12), ("medium", 320)):
         root = fixture / f"bounded-{label}"
@@ -1384,20 +1384,52 @@ def _boundedness_gate(api: _WinApi, fixture: Path) -> dict[str, object]:
             bucket = root / f"d-{index // 40:02d}"
             bucket.mkdir(exist_ok=True)
             (bucket / f"f-{index:04d}.txt").write_text(str(index), encoding="utf-8")
-        results[label] = _scan_authority(api, [(root, "READ_WRITE")])
+        paths = _all_paths(root)
+        before = {str(path): _sddl(api, path) for path in paths}
+        journal = fixture / f"bounded-{label}.jsonl"
+        grant_start = time.perf_counter()
+        _journaled_grant(api, journal, root, profile.sid_text, "(OI)(CI)(RX)")
+        grant_elapsed = (time.perf_counter() - grant_start) * 1000
+        after = {str(path): _sddl(api, path) for path in paths}
+        changed = [path for path in before if before[path] != after[path]]
+        cleanup_start = time.perf_counter()
+        _remove_sid(root, profile.sid_text)
+        cleanup_elapsed = (time.perf_counter() - cleanup_start) * 1000
+        cleanup_complete = all(not _contains_sid(api, path, profile.sid_text) for path in paths)
+        scan = _scan_authority(api, [(root, "READ_WRITE")])
+        scan.update(
+            {
+                "files": sum(path.is_file() for path in paths),
+                "directories": sum(path.is_dir() for path in paths),
+                "root_acl_api_mutations": 1,
+                "security_descriptors_changed": len(changed),
+                "grant_elapsed_ms": round(grant_elapsed, 3),
+                "cleanup_elapsed_ms": round(cleanup_elapsed, 3),
+                "journal_size_bytes": journal.stat().st_size,
+                "journal_records": len(_journal_records(journal)),
+                "cleanup_complete": cleanup_complete,
+            }
+        )
+        results[label] = scan
     exceeded = False
     try:
         _scan_authority(api, [(fixture / "bounded-medium", "READ_WRITE")], max_objects=10)
     except ValueError as error:
         exceeded = "exceeded" in str(error)
+    cleanup_passed = all(
+        cast(dict[str, object], value)["cleanup_complete"] is True for value in results.values()
+    )
     return _status(
-        exceeded,
+        exceeded and cleanup_passed,
         {
             "trees": results,
-            "acl_objects_mutated_per_authority": 1,
+            "root_acl_api_mutations_per_authority": 1,
             "scan_limit": _MAX_SCAN_OBJECTS,
             "limit_fail_closed": exceeded,
-            "production_cost_classification": "bounded identity scan plus root-only ACL mutation",
+            "production_cost_classification": (
+                "bounded identity scan plus one root ACL API mutation whose inheritance "
+                "propagation changes existing descendant security descriptors"
+            ),
         },
     )
 
@@ -1464,7 +1496,7 @@ def _run(args: argparse.Namespace) -> tuple[dict[str, object], bool]:
         gates["hardlink_same_mode"] = hardlinks["same_mode"]
         gates["hardlink_conflicting_mode"] = hardlinks["conflicting_mode"]
         gates["hardlink_external"] = hardlinks["external"]
-        gates["boundedness"] = _boundedness_gate(api, fixture)
+        gates["boundedness"] = _boundedness_gate(api, fixture, target)
 
         ro, rw, exact_acl, acl_details = _acl_authority_gate(
             api, fixture, target, unrelated, concurrent, child_source
