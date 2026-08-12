@@ -158,6 +158,36 @@ def _nul_matrix_gate(
     return gate
 
 
+def _path_authority_gate(
+    pb: ModuleType,
+    api: Any,
+    launcher: Any,
+    bootstrap: Path,
+    probe: Path,
+    workspace: Path,
+) -> dict[str, object]:
+    gate = _command(
+        pb,
+        api,
+        launcher,
+        bootstrap,
+        [str(probe), "path-authority", str(workspace)],
+    )
+    parsed = _parse_relay_json(gate)
+    detail = cast(dict[str, object], gate["detail"])
+    detail["parsed_result"] = parsed
+    passed = bool(
+        gate["status"] == "PASS"
+        and detail.get("target_exit_code") == 0
+        and parsed.get("cwd_open") is True
+        and parsed.get("cwd_resolved") is True
+        and parsed.get("create_directory") is True
+        and parsed.get("create_file") is True
+    )
+    gate["status"] = "PASS" if passed else "FAIL"
+    return gate
+
+
 def _missing_stdio_regression(probe: Path, patched_git: Path, workspace: Path) -> dict[str, object]:
     cases: list[dict[str, object]] = []
     for descriptor in range(3):
@@ -245,6 +275,7 @@ def _git_local_gates(
     outside_secret: Path,
     controller_secret: Path,
     host_config: Path,
+    host_config_marker: str,
     *,
     include_descendant: bool = True,
     include_network: bool = True,
@@ -305,19 +336,46 @@ def _git_local_gates(
         [str(patched_git), "config", "--global", "--get", "neuro.marker"],
         stdout_contains=("SANDBOX_LOCAL",),
     )
+    host_default_probe = _command(
+        pb,
+        api,
+        launcher,
+        bootstrap,
+        [str(patched_git), "config", "--global", "--get", "neuro.host-marker"],
+        exit_code=None,
+    )
+    host_default_detail = cast(dict[str, object], host_default_probe["detail"])
+    host_default_probe["status"] = (
+        "PASS"
+        if host_default_detail.get("target_exit_code") != 0
+        and host_config_marker not in str(host_default_detail.get("stdout_text", ""))
+        else "FAIL"
+    )
+    gates["host_config_not_loaded"] = host_default_probe
+
     host_probe = _command(
         pb,
         api,
         launcher,
         bootstrap,
-        [str(patched_git), "config", "--file", str(host_config), "--get", "neuro.marker"],
+        [
+            str(patched_git),
+            "config",
+            "--file",
+            str(host_config),
+            "--get",
+            "neuro.host-marker",
+        ],
         exit_code=None,
     )
     host_detail = cast(dict[str, object], host_probe["detail"])
+    host_stderr = str(host_detail.get("stderr_text", ""))
     host_probe["status"] = (
         "PASS"
         if host_detail.get("target_exit_code") != 0
-        and "HOST_CONFIG_SENTINEL" not in str(host_detail.get("stdout_text", ""))
+        and host_config_marker not in str(host_detail.get("stdout_text", ""))
+        and str(host_config) in host_stderr
+        and "Permission denied" in host_stderr
         else "FAIL"
     )
     gates["host_config_denied"] = host_probe
@@ -336,7 +394,14 @@ def _git_local_gates(
             exit_code=None,
         )
         detail = cast(dict[str, object], gate["detail"])
-        gate["status"] = "PASS" if detail.get("target_exit_code") != 0 else "FAIL"
+        stderr = str(detail.get("stderr_text", ""))
+        gate["status"] = (
+            "PASS"
+            if detail.get("target_exit_code") != 0
+            and str(path) in stderr
+            and "Permission denied" in stderr
+            else "FAIL"
+        )
         denied[name] = gate
     gates["outside_denied"] = {
         "status": "PASS"
@@ -352,6 +417,7 @@ def _git_local_gates(
         "status",
         "private_config_write",
         "private_config_read",
+        "host_config_not_loaded",
         "host_config_denied",
         "outside_denied",
     ]
@@ -413,7 +479,17 @@ def _git_local_gates(
             exit_code=None,
         )
         no_detail = cast(dict[str, object], no_network["detail"])
-        no_network["status"] = "PASS" if no_detail.get("target_exit_code") != 0 else "FAIL"
+        no_stderr = str(no_detail.get("stderr_text", ""))
+        no_network["status"] = (
+            "PASS"
+            if no_detail.get("target_exit_code") != 0
+            and "Unable to read current working directory" not in no_stderr
+            and any(
+                marker in no_stderr
+                for marker in ("unable to connect", "Could not resolve", "Permission denied")
+            )
+            else "FAIL"
+        )
         internet = _command(
             pb,
             api,
@@ -467,10 +543,12 @@ def _standard_user_child(
     patched_git = runtime / "git.exe"
     outside_secret = outside / "outside.txt"
     controller_secret = controller / "controller.txt"
-    host_config = outside / ".gitconfig"
+    host_config = Path.home() / ".gitconfig"
+    host_config_marker = f"HOST_CONFIG_SENTINEL_{uuid.uuid4().hex}"
+    original_host_config = host_config.read_bytes() if host_config.exists() else None
     outside_secret.write_text("STANDARD_OUTSIDE_SECRET", encoding="utf-8")
     controller_secret.write_text("STANDARD_CONTROLLER_SECRET", encoding="utf-8")
-    host_config.write_text("[neuro]\n\tmarker = HOST_CONFIG_SENTINEL\n", encoding="utf-8")
+    host_config.write_text(f"[neuro]\n\thost-marker = {host_config_marker}\n", encoding="utf-8")
     profile = None
     roots: list[Any] = []
     cleanup: list[object] = []
@@ -495,6 +573,9 @@ def _standard_user_child(
         result["authority_grants"] = [pb._grant_root(root, profile.sid_text) for root in roots]
         environment = pb._private_environment(private_home, [runtime])
         launcher = pb._Launcher(api, profile, fixture, environment)
+        result["native_path_authority"] = _path_authority_gate(
+            pb, api, launcher, bootstrap, probe, workspace
+        )
         define = _json_stdout([str(probe), "define"])
         result["define_dos_device"] = define
         git_gates = _git_local_gates(
@@ -509,6 +590,7 @@ def _standard_user_child(
             outside_secret,
             controller_secret,
             host_config,
+            host_config_marker,
             include_descendant=False,
             include_network=False,
         )
@@ -517,6 +599,10 @@ def _standard_user_child(
             name
             for name, passed in {
                 "standard_token": token_ok,
+                "native_path_authority": cast(dict[str, object], result["native_path_authority"])[
+                    "status"
+                ]
+                == "PASS",
                 "patched_git": git_gates["overall"] == "PASS",
                 "define_dos_device_control": cast(dict[str, object], define.get("result", {})).get(
                     "created"
@@ -544,6 +630,10 @@ def _standard_user_child(
         result["authority_cleanup"] = cleanup
         with contextlib.suppress(BaseException):
             shutil.rmtree(fixture)
+        if original_host_config is None:
+            host_config.unlink(missing_ok=True)
+        else:
+            host_config.write_bytes(original_host_config)
     result["critical_failures"] = sorted(set(critical))
     result["overall"] = "PASS" if not critical else "FAIL"
     Path(args.report).write_text(
@@ -685,10 +775,12 @@ def _main_run(args: argparse.Namespace, pb: ModuleType) -> tuple[dict[str, objec
     original_root = original_git.parent.parent
     outside_secret = outside / "outside.txt"
     controller_secret = controller / "controller.txt"
-    host_config = outside / ".gitconfig"
+    host_config = Path.home() / ".gitconfig"
+    host_config_marker = f"HOST_CONFIG_SENTINEL_{uuid.uuid4().hex}"
+    original_host_config = host_config.read_bytes() if host_config.exists() else None
     outside_secret.write_text("OUTSIDE_SECRET", encoding="utf-8")
     controller_secret.write_text("CONTROLLER_SECRET", encoding="utf-8")
-    host_config.write_text("[neuro]\n\tmarker = HOST_CONFIG_SENTINEL\n", encoding="utf-8")
+    host_config.write_text(f"[neuro]\n\thost-marker = {host_config_marker}\n", encoding="utf-8")
     result: dict[str, object] = {
         "classification": CLASSIFICATION,
         "poc2b_harness_head": POC2B_HEAD,
@@ -740,6 +832,9 @@ def _main_run(args: argparse.Namespace, pb: ModuleType) -> tuple[dict[str, objec
         result["authority_grants"] = [pb._grant_root(root, profile.sid_text) for root in roots]
         environment = pb._private_environment(private_home, [patched_runtime, original_git.parent])
         launcher = pb._Launcher(api, profile, fixture, environment)
+        result["native_path_authority"] = _path_authority_gate(
+            pb, api, launcher, bootstrap, probe, workspace
+        )
         result["appcontainer_nul"] = _nul_matrix_gate(pb, api, launcher, bootstrap, probe)
         result["original_git"] = _original_git_gate(pb, api, launcher, bootstrap, original_git)
         result["original_git_conpty"] = _conpty_original_git(pb, api, launcher, original_git)
@@ -755,8 +850,15 @@ def _main_run(args: argparse.Namespace, pb: ModuleType) -> tuple[dict[str, objec
             outside_secret,
             controller_secret,
             host_config,
+            host_config_marker,
         )
         result["standard_user"] = _create_standard_user(args, pb, api, fixture)
+        standard_report = cast(
+            dict[str, object], cast(dict[str, object], result["standard_user"]).get("report", {})
+        )
+        standard_native_path = cast(
+            dict[str, object], standard_report.get("native_path_authority", {})
+        )
         controller_matrix = cast(dict[str, object], controller_probe.get("result", {}))
         appcontainer_gate = cast(dict[str, object], result["appcontainer_nul"])
         appcontainer_matrix = cast(
@@ -789,6 +891,10 @@ def _main_run(args: argparse.Namespace, pb: ModuleType) -> tuple[dict[str, objec
         }
         required = {
             "appcontainer_nul_matrix": appcontainer_gate["status"] == "PASS",
+            "native_path_authority": cast(dict[str, object], result["native_path_authority"])[
+                "status"
+            ]
+            == "PASS",
             "original_git_deterministic": cast(dict[str, object], result["original_git"])["status"]
             == "EXPECTED_BLOCKER",
             "original_git_conpty": cast(dict[str, object], result["original_git_conpty"])["status"]
@@ -796,6 +902,7 @@ def _main_run(args: argparse.Namespace, pb: ModuleType) -> tuple[dict[str, objec
             "patched_git": cast(dict[str, object], result["patched_git"])["overall"] == "PASS",
             "missing_stdio": cast(dict[str, object], result["missing_stdio_regression"])["status"]
             == "PASS",
+            "standard_native_path_authority": standard_native_path.get("status") == "PASS",
             "standard_user": cast(dict[str, object], result["standard_user"])["status"] == "PASS",
         }
         critical.extend(name for name, passed in required.items() if not passed)
@@ -818,15 +925,24 @@ def _main_run(args: argparse.Namespace, pb: ModuleType) -> tuple[dict[str, objec
             "root_count": len(roots),
             "object_count": sum(int(root.inventory["object_count"]) for root in roots),
             "file_bytes": sum(int(root.inventory["total_file_bytes"]) for root in roots),
-            "acl_mutations": len(roots),
+            "acl_mutations": len(roots) + int(profile is not None),
         }
         with contextlib.suppress(BaseException):
             shutil.rmtree(fixture)
+        if original_host_config is None:
+            host_config.unlink(missing_ok=True)
+        else:
+            host_config.write_bytes(original_host_config)
     result["documented_nul_capability"] = "NO_DOCUMENTED_NUL_CAPABILITY"
     result["windows11_win32_app_isolation"] = "FUTURE_PREVIEW_CANDIDATE_NOT_TESTED"
     result["critical_failures"] = sorted(set(critical))
     if not critical:
         decision = "GIT_FOR_WINDOWS_UPSTREAM_FIX_REQUIRED"
+    elif any(
+        name in critical
+        for name in ("native_path_authority", "standard_native_path_authority", "HARNESS")
+    ):
+        decision = "WINDOWS_GIT_NUL_INCONCLUSIVE"
     elif "patched_git" in critical:
         decision = "WINDOWS_GIT_RUNTIME_DEEPER_BLOCKER"
     else:

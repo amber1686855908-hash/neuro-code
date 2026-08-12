@@ -297,6 +297,95 @@ static int descendant_mode(const wchar_t *report_path) {
     return 0;
 }
 
+static int path_authority_mode(const wchar_t *workspace) {
+    wchar_t cwd[32768];
+    wchar_t resolved[32768];
+    wchar_t directory[32768];
+    wchar_t file_path[32768];
+    DWORD cwd_length;
+    DWORD resolved_length = 0;
+    DWORD cwd_open_error;
+    DWORD cwd_resolve_error = ERROR_SUCCESS;
+    DWORD directory_error;
+    DWORD file_error;
+    HANDLE cwd_handle;
+    HANDLE file;
+    BOOL directory_created;
+    BOOL file_created;
+
+    cwd_length = GetCurrentDirectoryW(ARRAYSIZE(cwd), cwd);
+    SetLastError(ERROR_SUCCESS);
+    cwd_handle = CreateFileW(
+        cwd,
+        0,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        NULL,
+        OPEN_EXISTING,
+        FILE_FLAG_BACKUP_SEMANTICS,
+        NULL);
+    cwd_open_error = cwd_handle == INVALID_HANDLE_VALUE ? GetLastError() : ERROR_SUCCESS;
+    if (cwd_handle != INVALID_HANDLE_VALUE) {
+        SetLastError(ERROR_SUCCESS);
+        resolved_length = GetFinalPathNameByHandleW(
+            cwd_handle, resolved, ARRAYSIZE(resolved), 0);
+        cwd_resolve_error = resolved_length != 0 ? ERROR_SUCCESS : GetLastError();
+        CloseHandle(cwd_handle);
+    }
+
+    _snwprintf_s(
+        directory,
+        ARRAYSIZE(directory),
+        _TRUNCATE,
+        L"%s\\native-create-directory",
+        workspace);
+    RemoveDirectoryW(directory);
+    SetLastError(ERROR_SUCCESS);
+    directory_created = CreateDirectoryW(directory, NULL);
+    directory_error = directory_created ? ERROR_SUCCESS : GetLastError();
+
+    _snwprintf_s(
+        file_path,
+        ARRAYSIZE(file_path),
+        _TRUNCATE,
+        L"%s\\native-create-file.txt",
+        workspace);
+    DeleteFileW(file_path);
+    SetLastError(ERROR_SUCCESS);
+    file = CreateFileW(
+        file_path,
+        GENERIC_READ | GENERIC_WRITE,
+        0,
+        NULL,
+        CREATE_NEW,
+        FILE_ATTRIBUTE_NORMAL,
+        NULL);
+    file_created = file != INVALID_HANDLE_VALUE;
+    file_error = file_created ? ERROR_SUCCESS : GetLastError();
+    if (file_created) {
+        CloseHandle(file);
+        DeleteFileW(file_path);
+    }
+    if (directory_created) RemoveDirectoryW(directory);
+
+    printf("{\"cwd\":");
+    if (cwd_length != 0 && cwd_length < ARRAYSIZE(cwd)) json_escape_wide(cwd);
+    else fputs("null", stdout);
+    printf(
+        ",\"cwd_open\":%s,\"cwd_open_error\":%lu,"
+        "\"cwd_resolved\":%s,\"cwd_resolve_error\":%lu,"
+        "\"create_directory\":%s,\"create_directory_error\":%lu,"
+        "\"create_file\":%s,\"create_file_error\":%lu}\n",
+        cwd_handle != INVALID_HANDLE_VALUE ? "true" : "false",
+        (unsigned long)cwd_open_error,
+        resolved_length != 0 && resolved_length < ARRAYSIZE(resolved) ? "true" : "false",
+        (unsigned long)cwd_resolve_error,
+        directory_created ? "true" : "false",
+        (unsigned long)directory_error,
+        file_created ? "true" : "false",
+        (unsigned long)file_error);
+    return 0;
+}
+
 static int closed_stdio_mode(
     const wchar_t *descriptor_text,
     const wchar_t *git_path,
@@ -341,6 +430,8 @@ int wmain(int argc, wchar_t **argv) {
         return descendant_mode(report_path);
     if (argc == 3 && wcscmp(argv[1], L"descendant") == 0)
         return descendant_mode(argv[2]);
+    if (argc == 3 && wcscmp(argv[1], L"path-authority") == 0)
+        return path_authority_mode(argv[2]);
     if (argc == 5 && wcscmp(argv[1], L"closed-stdio") == 0)
         return closed_stdio_mode(argv[2], argv[3], argv[4]);
     return 2;
