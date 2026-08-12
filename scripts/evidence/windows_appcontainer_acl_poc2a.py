@@ -802,9 +802,18 @@ def _run_child(
             process.process_handle, job.process_creation_handle, ctypes.byref(in_job)
         ):
             api.error("IsProcessInJob(child)")
-        exit_code = _wait_process(api, process)
+    exit_code = _wait_process(api, process)
     payload = json.loads(report.read_text(encoding="utf-8")) if report.exists() else None
-    return {"exit_code": exit_code, "exact_job_membership": bool(in_job.value), "report": payload}
+    exact_sid = bool(
+        isinstance(payload, dict)
+        and str(payload.get("appcontainer_sid", "")).casefold() == profile.sid_text.casefold()
+    )
+    return {
+        "exit_code": exit_code,
+        "exact_job_membership": bool(in_job.value),
+        "exact_appcontainer_sid": exact_sid,
+        "report": payload,
+    }
 
 
 def _namespace_gate(api: _WinApi, root: Path) -> dict[str, object]:
@@ -958,6 +967,8 @@ def _reparse_gate(
     passed = (
         outside_before == outside_after
         and child_result["exit_code"] == 0
+        and child_result["exact_job_membership"] is True
+        and child_result["exact_appcontainer_sid"] is True
         and cast(dict[str, object], child_result["report"])["outside_readable"] is False
         and root_rejected
     )
@@ -994,6 +1005,8 @@ def _one_shot_gate(
         _remove_sid(cleanup_path, target.sid_text)
     new_cannot_use_stale = (
         child_result["exit_code"] == 0
+        and child_result["exact_job_membership"] is True
+        and child_result["exact_appcontainer_sid"] is True
         and cast(dict[str, object], child_result["report"])["outside_readable"] is False
     )
     names_differ = stale_name != target.name
@@ -1232,6 +1245,8 @@ def _acl_authority_gate(
     rw_report = cast(dict[str, object], rw_result["report"])
     ro_passed = (
         ro_result["exit_code"] == 0
+        and ro_result["exact_job_membership"] is True
+        and ro_result["exact_appcontainer_sid"] is True
         and all(ro_report[key] is True for key in ("read_existing", "read_nested", "read_future"))
         and ro_report["write_dac_denied"] is True
         and all(
@@ -1241,6 +1256,8 @@ def _acl_authority_gate(
     )
     rw_passed = (
         rw_result["exit_code"] == 0
+        and rw_result["exact_job_membership"] is True
+        and rw_result["exact_appcontainer_sid"] is True
         and all(
             rw_report[key] is True
             for key in (

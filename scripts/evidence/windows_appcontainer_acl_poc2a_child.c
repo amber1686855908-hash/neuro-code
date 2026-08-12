@@ -88,6 +88,11 @@ done:
     return result;
 }
 
+static BOOL sid_to_utf8(const wchar_t *sid_text, char *output, int output_size) {
+    return WideCharToMultiByte(CP_UTF8, 0, sid_text, -1, output, output_size,
+                               NULL, NULL) > 0;
+}
+
 static void join_path(wchar_t *out, size_t size, const wchar_t *root, const wchar_t *leaf) {
     _snwprintf_s(out, size, _TRUNCATE, L"%ls\\%ls", root, leaf);
 }
@@ -96,6 +101,7 @@ static int run_ro(const wchar_t *root, const wchar_t *report) {
     wchar_t existing[MAX_PATH * 4], nested[MAX_PATH * 4], created[MAX_PATH * 4];
     wchar_t renamed[MAX_PATH * 4], future[MAX_PATH * 4];
     wchar_t sid[256] = L"";
+    char sid_utf8[256] = "";
     DWORD integrity = 0;
     BOOL is_appcontainer = FALSE, in_job = FALSE;
     DWORD create_error, modify_error, rename_error, delete_error, dacl_error;
@@ -122,17 +128,18 @@ static int run_ro(const wchar_t *root, const wchar_t *report) {
     if (handle == INVALID_HANDLE_VALUE) dacl_error = GetLastError();
     else { dacl_error = ERROR_SUCCESS; CloseHandle(handle); }
     token_facts(sid, _countof(sid), &integrity, &is_appcontainer, &in_job);
+    sid_to_utf8(sid, sid_utf8, (int)sizeof(sid_utf8));
     _snprintf_s(json, sizeof(json), _TRUNCATE,
         "{\"mode\":\"ro\",\"read_existing\":%s,\"read_nested\":%s,"
         "\"read_future\":%s,\"create_error\":%lu,\"modify_error\":%lu,"
         "\"rename_error\":%lu,\"delete_error\":%lu,\"write_dac_denied\":%s,"
         "\"is_appcontainer\":%s,\"integrity_rid\":%lu,\"in_job\":%s,"
-        "\"sid_present\":%s}\n",
+        "\"sid_present\":%s,\"appcontainer_sid\":\"%s\"}\n",
         read_existing ? "true" : "false", read_nested ? "true" : "false",
         read_future ? "true" : "false", create_error, modify_error, rename_error,
         delete_error, is_denied(dacl_error) ? "true" : "false",
         is_appcontainer ? "true" : "false", integrity, in_job ? "true" : "false",
-        sid[0] ? "true" : "false");
+        sid[0] ? "true" : "false", sid_utf8);
     return write_utf8_file(report, json) && read_existing && read_nested && read_future &&
            is_denied(create_error) && is_denied(modify_error) && is_denied(rename_error) &&
            is_denied(delete_error) && is_denied(dacl_error) && is_appcontainer &&
@@ -143,6 +150,7 @@ static int run_rw(const wchar_t *root, const wchar_t *report) {
     wchar_t existing[MAX_PATH * 4], created[MAX_PATH * 4], directory[MAX_PATH * 4];
     wchar_t renamed[MAX_PATH * 4], replacement[MAX_PATH * 4], ads[MAX_PATH * 4];
     wchar_t sid[256] = L"";
+    char sid_utf8[256] = "";
     DWORD integrity = 0;
     BOOL is_appcontainer = FALSE, in_job = FALSE;
     BOOL read_ok, modify_ok, create_ok, dir_ok, rename_ok, replace_ok, delete_ok, ads_ok;
@@ -174,18 +182,19 @@ static int run_rw(const wchar_t *root, const wchar_t *report) {
     if (handle == INVALID_HANDLE_VALUE) label_error = GetLastError();
     else { label_error = ERROR_SUCCESS; CloseHandle(handle); }
     token_facts(sid, _countof(sid), &integrity, &is_appcontainer, &in_job);
+    sid_to_utf8(sid, sid_utf8, (int)sizeof(sid_utf8));
     _snprintf_s(json, sizeof(json), _TRUNCATE,
         "{\"mode\":\"rw\",\"read\":%s,\"modify\":%s,\"create_file\":%s,"
         "\"create_directory\":%s,\"rename\":%s,\"replace\":%s,\"delete\":%s,"
         "\"ads_write\":%s,\"owner_error\":%lu,\"dacl_error\":%lu,"
         "\"label_error\":%lu,\"is_appcontainer\":%s,\"integrity_rid\":%lu,"
-        "\"in_job\":%s,\"sid_present\":%s}\n",
+        "\"in_job\":%s,\"sid_present\":%s,\"appcontainer_sid\":\"%s\"}\n",
         read_ok ? "true" : "false", modify_ok ? "true" : "false",
         create_ok ? "true" : "false", dir_ok ? "true" : "false",
         rename_ok ? "true" : "false", replace_ok ? "true" : "false",
         delete_ok ? "true" : "false", ads_ok ? "true" : "false",
         owner_error, dacl_error, label_error, is_appcontainer ? "true" : "false",
-        integrity, in_job ? "true" : "false", sid[0] ? "true" : "false");
+        integrity, in_job ? "true" : "false", sid[0] ? "true" : "false", sid_utf8);
     return write_utf8_file(report, json) && read_ok && modify_ok && create_ok && dir_ok &&
            rename_ok && replace_ok && delete_ok && ads_ok && is_denied(owner_error) &&
            is_denied(dacl_error) && is_denied(label_error) && is_appcontainer &&
@@ -194,18 +203,22 @@ static int run_rw(const wchar_t *root, const wchar_t *report) {
 
 static int run_link(const wchar_t *path, const wchar_t *report) {
     wchar_t sid[256] = L"";
+    char sid_utf8[256] = "";
     DWORD integrity = 0;
     BOOL is_appcontainer = FALSE, in_job = FALSE;
     BOOL readable = read_exact_file(path, "outside-secret");
     DWORD read_error = readable ? ERROR_SUCCESS : GetLastError();
     char json[1024];
     token_facts(sid, _countof(sid), &integrity, &is_appcontainer, &in_job);
+    sid_to_utf8(sid, sid_utf8, (int)sizeof(sid_utf8));
     _snprintf_s(json, sizeof(json), _TRUNCATE,
         "{\"mode\":\"reparse\",\"outside_readable\":%s,\"last_error\":%lu,"
-        "\"is_appcontainer\":%s,\"integrity_rid\":%lu,\"in_job\":%s}\n",
+        "\"is_appcontainer\":%s,\"integrity_rid\":%lu,\"in_job\":%s,"
+        "\"appcontainer_sid\":\"%s\"}\n",
         readable ? "true" : "false", read_error, is_appcontainer ? "true" : "false",
-        integrity, in_job ? "true" : "false");
-    return write_utf8_file(report, json) && !readable && is_appcontainer && in_job ? 0 : 12;
+        integrity, in_job ? "true" : "false", sid_utf8);
+    return write_utf8_file(report, json) && !readable && is_appcontainer &&
+           integrity == SECURITY_MANDATORY_LOW_RID && in_job ? 0 : 12;
 }
 
 int wmain(int argc, wchar_t **argv) {
