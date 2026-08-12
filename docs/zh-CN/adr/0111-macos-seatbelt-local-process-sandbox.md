@@ -55,5 +55,7 @@ hardened macOS architecture 的候选，不被声称为当前生命周期方案�
 
 专用 CI 使用 Python 3.12 和 3.14，在 `macos-15` ARM64 与 `macos-15-intel` 上无 skip
 执行真实 adapter。它记录 macOS version/build、架构、固定 sandbox executable、签名详情与 SIP
-状态。GitHub-hosted evidence 当前报告 SIP disabled；在将 SIP-enabled 环境描述为已完成生产验证前，
-仍需完成物理 SIP-enabled macOS 验收。
+状态。production implementation 已完成，GitHub ARM64/Intel integration 已验证。
+GitHub-hosted evidence 当前报告 SIP disabled。由于当前没有 Mac 硬件，物理 SIP-enabled macOS
+验收标记为 `DEFERRED_NO_MAC_HARDWARE`；这不是 code 或 merge blocker，也不表示物理 SIP-enabled
+验收已经通过。
