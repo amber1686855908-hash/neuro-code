@@ -868,6 +868,7 @@ def _pipe_handle_gate(
         api.close(stdin_write)
         stdin_write = 0
         exit_code = _wait_exit(api, process)
+        sentinel_signaled = int(api.wait(sentinel, 0)) == _WAIT_OBJECT_0
         stdout = _read_all(api, stdout_read).decode("utf-8", errors="replace")
         stderr = _read_all(api, stderr_read).decode("utf-8", errors="replace")
         diagnostics = _read_json_lines(report)
@@ -880,9 +881,8 @@ def _pipe_handle_gate(
             exit_code == 0
             and "STDOUT:poc1-input" in stdout
             and "STDERR:ok" in stderr
-            and "SENTINEL_VISIBLE:false" in stdout
             and len(diagnostics) == 1
-            and diagnostics[0].get("sentinel_visible") is False
+            and not sentinel_signaled
             and (exact_job is True if with_job else True)
         )
         return _status(
@@ -892,6 +892,7 @@ def _pipe_handle_gate(
                 "stdout": stdout,
                 "stderr": stderr,
                 "child_diagnostics": diagnostics,
+                "sentinel_signaled": sentinel_signaled,
                 "exact_job_membership": exact_job,
             },
         )
@@ -1097,6 +1098,7 @@ def _run(args: argparse.Namespace) -> tuple[dict[str, object], bool]:
         conpty_output_read, conpty_output_write = _make_pipe(api, parent_reads=True)
         pseudoconsole = ctypes.c_void_p()
         conpty_process: _CreatedProcess | None = None
+        conpty_descendant_handles: list[int] = []
         conpty_report = authorized / "gate-e.jsonl"
         conpty_report.unlink(missing_ok=True)
         try:
@@ -1126,6 +1128,31 @@ def _run(args: argparse.Namespace) -> tuple[dict[str, object], bool]:
                 exact_job = _is_in_job(
                     api, conpty_process.process_handle, job.process_creation_handle
                 )
+                deadline = time.monotonic() + 20
+                rows_before_input: list[dict[str, object]] = []
+                while time.monotonic() < deadline:
+                    rows_before_input = _read_json_lines(conpty_report)
+                    if len(rows_before_input) >= 2:
+                        break
+                    time.sleep(0.1)
+                if len(rows_before_input) != 2:
+                    raise RuntimeError(
+                        "expected terminal child and descendant records before input, "
+                        f"got {rows_before_input!r}"
+                    )
+                descendant_exact_job = True
+                for row in rows_before_input:
+                    handle = api.open_process(
+                        _PROCESS_QUERY_LIMITED_INFORMATION | _SYNCHRONIZE,
+                        False,
+                        cast(int, row["pid"]),
+                    )
+                    if not handle:
+                        api.error(f"OpenProcess({row['pid']})")
+                    conpty_descendant_handles.append(int(handle))
+                    descendant_exact_job = descendant_exact_job and _is_in_job(
+                        api, int(handle), job.process_creation_handle
+                    )
                 resize_result = int(api.resize_pseudoconsole(pseudoconsole, _Coord(100, 35)))
                 _write(api, conpty_input_write, b"poc1-conpty\r\n")
                 exit_code = _wait_exit(api, conpty_process, 30000)
@@ -1135,12 +1162,16 @@ def _run(args: argparse.Namespace) -> tuple[dict[str, object], bool]:
                 conpty_output_write = 0
                 output = _read_all(api, conpty_output_read).decode("utf-8", errors="replace")
                 rows = _read_json_lines(conpty_report)
-                confinement = len(rows) == 2 and all(
-                    row.get("token_is_appcontainer") is True
-                    and row.get("in_job") is True
-                    and str(row.get("appcontainer_sid", "")).casefold()
-                    == profile.sid_text.casefold()
-                    for row in rows
+                confinement = (
+                    len(rows) == 2
+                    and all(
+                        row.get("token_is_appcontainer") is True
+                        and row.get("in_job") is True
+                        and str(row.get("appcontainer_sid", "")).casefold()
+                        == profile.sid_text.casefold()
+                        for row in rows
+                    )
+                    and descendant_exact_job
                 )
                 conpty_pass = (
                     exit_code == 0
@@ -1159,6 +1190,7 @@ def _run(args: argparse.Namespace) -> tuple[dict[str, object], bool]:
                         "output": output,
                         "records": rows,
                         "descendant_confinement": confinement,
+                        "descendant_exact_job_membership": descendant_exact_job,
                     },
                 )
                 if not conpty_pass:
@@ -1189,6 +1221,8 @@ def _run(args: argparse.Namespace) -> tuple[dict[str, object], bool]:
                 conpty_output_read,
                 conpty_output_write,
             ):
+                api.close(handle)
+            for handle in conpty_descendant_handles:
                 api.close(handle)
             if conpty_process is not None:
                 api.close(conpty_process.thread_handle)

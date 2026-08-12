@@ -195,17 +195,22 @@ static int stdio_mode(const wchar_t *sentinel_text, const wchar_t *report) {
     DWORD flags = 0;
     BOOL visible = GetHandleInformation(sentinel, &flags);
     DWORD sentinel_error = visible ? 0 : GetLastError();
+    BOOL sentinel_set = SetEvent(sentinel);
+    DWORD sentinel_set_error = sentinel_set ? 0 : GetLastError();
     _snprintf_s(
         diagnostics,
         sizeof(diagnostics),
         _TRUNCATE,
         "{\"stdin\":%llu,\"stdout\":%llu,\"stderr\":%llu,"
-        "\"sentinel_visible\":%s,\"sentinel_error\":%lu}",
+        "\"sentinel_visible\":%s,\"sentinel_error\":%lu,"
+        "\"sentinel_set\":%s,\"sentinel_set_error\":%lu}",
         (unsigned long long)(ULONG_PTR)stdin_handle,
         (unsigned long long)(ULONG_PTR)stdout_handle,
         (unsigned long long)(ULONG_PTR)stderr_handle,
         visible ? "true" : "false",
-        sentinel_error);
+        sentinel_error,
+        sentinel_set ? "true" : "false",
+        sentinel_set_error);
     if (!append_line(report, diagnostics)) {
         return 40;
     }
@@ -216,9 +221,14 @@ static int stdio_mode(const wchar_t *sentinel_text, const wchar_t *report) {
     WriteFile(stdout_handle, "STDOUT:", 7, &written, NULL);
     WriteFile(stdout_handle, input, read, &written, NULL);
     WriteFile(stderr_handle, "STDERR:ok\n", 10, &written, NULL);
-    printf("SENTINEL_VISIBLE:%s ERROR:%lu\n", visible ? "true" : "false", sentinel_error);
+    printf(
+        "SENTINEL_VISIBLE:%s ERROR:%lu SET:%s SET_ERROR:%lu\n",
+        visible ? "true" : "false",
+        sentinel_error,
+        sentinel_set ? "true" : "false",
+        sentinel_set_error);
     fflush(stdout);
-    return visible ? 42 : 0;
+    return 0;
 }
 
 static int conpty_mode(const wchar_t *report) {
@@ -231,13 +241,11 @@ static int conpty_mode(const wchar_t *report) {
     if (!append_line(report, facts)) {
         return 51;
     }
-    _snwprintf_s(arguments, 32768, _TRUNCATE, L"record \"%s\"", report);
+    _snwprintf_s(arguments, 32768, _TRUNCATE, L"tree \"%s\" 2", report);
     if (!spawn_self(arguments, &descendant)) {
         return 52;
     }
     CloseHandle(descendant.hThread);
-    WaitForSingleObject(descendant.hProcess, INFINITE);
-    CloseHandle(descendant.hProcess);
     printf("CONPTY_READY\r\n");
     fflush(stdout);
     if (!ReadFile(GetStdHandle(STD_INPUT_HANDLE), input, sizeof(input) - 1, &read, NULL)) {
@@ -246,6 +254,9 @@ static int conpty_mode(const wchar_t *report) {
     input[read] = '\0';
     printf("CONPTY_ECHO:%s", input);
     fflush(stdout);
+    TerminateProcess(descendant.hProcess, 0);
+    WaitForSingleObject(descendant.hProcess, INFINITE);
+    CloseHandle(descendant.hProcess);
     return 0;
 }
 
