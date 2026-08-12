@@ -2981,7 +2981,8 @@ def _create_standard_user_and_run(
     child_report = public_root / "standard-user-report.json"
     child_stdout = public_root / "standard-user-stdout.txt"
     child_stderr = public_root / "standard-user-stderr.txt"
-    standard_profile = Path(os.environ.get("SYSTEMDRIVE", "C:")) / "Users" / username
+    system_drive = os.environ.get("SYSTEMDRIVE", "C:").rstrip("\\/")
+    standard_profile = Path(f"{system_drive}\\") / "Users" / username
     shutil.copy2(Path(__file__).resolve(), script)
     shutil.copy2(Path(args.bootstrap).resolve(), bootstrap)
     created = False
