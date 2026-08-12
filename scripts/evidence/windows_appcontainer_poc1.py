@@ -8,8 +8,10 @@ but it does not wire AppContainer into composition or any runtime workload.
 from __future__ import annotations
 
 import argparse
+import csv
 import contextlib
 import ctypes
+import io
 import json
 import os
 import platform
@@ -54,6 +56,7 @@ _WIN_CAPABILITY_INTERNET_CLIENT_SID = 85
 _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 _SYNCHRONIZE = 0x00100000
 _LOAD_LIBRARY_SEARCH_SYSTEM32 = 0x00000800
+_SDDL_REVISION_1 = 1
 
 
 class _SecurityAttributes(ctypes.Structure):
@@ -187,6 +190,17 @@ class _WinApi:
             self.advapi32,
             "ConvertSidToStringSidW",
             [ctypes.c_void_p, ctypes.POINTER(ctypes.c_wchar_p)],
+            ctypes.c_int32,
+        )
+        self.convert_sddl = _load_function(
+            self.advapi32,
+            "ConvertStringSecurityDescriptorToSecurityDescriptorW",
+            [
+                ctypes.c_wchar_p,
+                ctypes.c_uint32,
+                ctypes.POINTER(ctypes.c_void_p),
+                ctypes.POINTER(ctypes.c_uint32),
+            ],
             ctypes.c_int32,
         )
         self.create_well_known_sid = _load_function(
@@ -626,17 +640,50 @@ def _single_record(
     return rows[0], process
 
 
-def _make_pipe(api: _WinApi, *, parent_reads: bool) -> tuple[int, int]:
-    security = _SecurityAttributes(ctypes.sizeof(_SecurityAttributes), None, True)
+def _controller_user_sid() -> str:
+    completed = subprocess.run(
+        ["whoami", "/user", "/fo", "csv", "/nh"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    rows = list(csv.reader(io.StringIO(completed.stdout)))
+    if len(rows) != 1 or len(rows[0]) < 2 or not rows[0][1].startswith("S-1-"):
+        raise OSError(f"unable to parse controller SID from whoami: {rows!r}")
+    return rows[0][1]
+
+
+def _make_pipe(
+    api: _WinApi,
+    *,
+    parent_reads: bool,
+    appcontainer_sid: str | None = None,
+) -> tuple[int, int]:
+    descriptor = ctypes.c_void_p()
+    if appcontainer_sid is not None:
+        controller_sid = _controller_user_sid()
+        sddl = f"D:P(A;;GA;;;SY)(A;;GA;;;{controller_sid})(A;;GA;;;{appcontainer_sid})"
+        if not api.convert_sddl(
+            sddl,
+            _SDDL_REVISION_1,
+            ctypes.byref(descriptor),
+            None,
+        ):
+            api.error("ConvertStringSecurityDescriptorToSecurityDescriptorW(pipe)")
+    security = _SecurityAttributes(ctypes.sizeof(_SecurityAttributes), descriptor.value, True)
     read_handle = ctypes.c_void_p()
     write_handle = ctypes.c_void_p()
-    if not api.create_pipe(
-        ctypes.byref(read_handle),
-        ctypes.byref(write_handle),
-        ctypes.byref(security),
-        0,
-    ):
-        api.error("CreatePipe")
+    try:
+        if not api.create_pipe(
+            ctypes.byref(read_handle),
+            ctypes.byref(write_handle),
+            ctypes.byref(security),
+            0,
+        ):
+            api.error("CreatePipe")
+    finally:
+        if descriptor.value:
+            api.local_free(descriptor)
     read_value = int(read_handle.value or 0)
     write_value = int(write_handle.value or 0)
     parent_handle = read_value if parent_reads else write_value
@@ -789,9 +836,15 @@ def _pipe_handle_gate(
     with_job: bool,
 ) -> dict[str, object]:
     report.unlink(missing_ok=True)
-    stdin_read, stdin_write = _make_pipe(api, parent_reads=False)
-    stdout_read, stdout_write = _make_pipe(api, parent_reads=True)
-    stderr_read, stderr_write = _make_pipe(api, parent_reads=True)
+    stdin_read, stdin_write = _make_pipe(
+        api, parent_reads=False, appcontainer_sid=launcher.profile.sid_text
+    )
+    stdout_read, stdout_write = _make_pipe(
+        api, parent_reads=True, appcontainer_sid=launcher.profile.sid_text
+    )
+    stderr_read, stderr_write = _make_pipe(
+        api, parent_reads=True, appcontainer_sid=launcher.profile.sid_text
+    )
     sentinel_security = _SecurityAttributes(ctypes.sizeof(_SecurityAttributes), None, True)
     sentinel = int(api.create_event(ctypes.byref(sentinel_security), True, False, None) or 0)
     process: _CreatedProcess | None = None
