@@ -2884,8 +2884,7 @@ def _standard_user_run(args: argparse.Namespace) -> tuple[dict[str, object], boo
                 "/d",
                 "/s",
                 "/c",
-                f'type "{workspace / "authorized.txt"}" & '
-                f'type "{outside_secret}" & type "{host_marker}"',
+                f"type {workspace / 'authorized.txt'} & type {outside_secret} & type {host_marker}",
             ],
         )
         filesystem_detail = cast(dict[str, object], filesystem["detail"])
