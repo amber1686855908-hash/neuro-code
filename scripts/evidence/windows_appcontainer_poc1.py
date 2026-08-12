@@ -826,6 +826,8 @@ def _executable_gate(
         "status": "STARTED" if exit_code == 0 else "FAILED",
         "application": application,
         "exit_code": exit_code,
+        "exit_code_hex": f"0x{exit_code:08x}",
+        **({"error_type": "PROCESS_EXIT_CODE"} if exit_code != 0 else {}),
     }
 
 
@@ -934,6 +936,8 @@ def _run(args: argparse.Namespace) -> tuple[dict[str, object], bool]:
         "platform": platform.platform(),
         "version": platform.version(),
         "release": platform.release(),
+        "edition": platform.win32_edition(),
+        "win32_version": platform.win32_ver(),
         "architecture": platform.machine(),
         "python": sys.version,
         "github_runner_name": os.environ.get("RUNNER_NAME"),
@@ -1303,6 +1307,48 @@ def _run(args: argparse.Namespace) -> tuple[dict[str, object], bool]:
             cast(dict[str, object], gates["F_localhost_observation"])[
                 "controller_accepted_connection"
             ] = bool(accepted and accepted[0])
+
+        private_ip = socket.gethostbyname(socket.gethostname())
+        private_listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        private_listener.bind((private_ip, 0))
+        private_listener.listen(1)
+        private_listener.settimeout(10)
+        private_port = int(private_listener.getsockname()[1])
+        private_accepted: list[bool] = []
+
+        def accept_private_once() -> None:
+            try:
+                connection, _ = private_listener.accept()
+                connection.close()
+                private_accepted.append(True)
+            except OSError:
+                private_accepted.append(False)
+
+        private_thread = threading.Thread(target=accept_private_once, daemon=True)
+        private_thread.start()
+        try:
+            private_network = network_attempt(
+                "private-lan", private_ip, private_port, internet=True
+            )
+            gates["F_private_lan_observation"] = {
+                "status": "PASS",
+                "classification": "OBSERVATION_ONLY",
+                "target": private_ip,
+                "child": private_network,
+            }
+        except BaseException as error:
+            gates["F_private_lan_observation"] = {
+                "status": "UNRESOLVED",
+                "classification": "OBSERVATION_ONLY",
+                "target": private_ip,
+                "error": str(error),
+            }
+        finally:
+            private_listener.close()
+            private_thread.join(timeout=1)
+            cast(dict[str, object], gates["F_private_lan_observation"])[
+                "controller_accepted_connection"
+            ] = bool(private_accepted and private_accepted[0])
 
         filesystem_report = authorized / "filesystem.jsonl"
         filesystem_report.unlink(missing_ok=True)
