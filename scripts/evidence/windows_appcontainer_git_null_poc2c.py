@@ -494,7 +494,7 @@ def _standard_user_child(
         )
         result["authority_grants"] = [pb._grant_root(root, profile.sid_text) for root in roots]
         environment = pb._private_environment(private_home, [runtime])
-        launcher = pb._Launcher(api, profile, workspace, environment)
+        launcher = pb._Launcher(api, profile, fixture, environment)
         define = _json_stdout([str(probe), "define"])
         result["define_dos_device"] = define
         git_gates = _git_local_gates(
@@ -739,7 +739,7 @@ def _main_run(args: argparse.Namespace, pb: ModuleType) -> tuple[dict[str, objec
         )
         result["authority_grants"] = [pb._grant_root(root, profile.sid_text) for root in roots]
         environment = pb._private_environment(private_home, [patched_runtime, original_git.parent])
-        launcher = pb._Launcher(api, profile, workspace, environment)
+        launcher = pb._Launcher(api, profile, fixture, environment)
         result["appcontainer_nul"] = _nul_matrix_gate(pb, api, launcher, bootstrap, probe)
         result["original_git"] = _original_git_gate(pb, api, launcher, bootstrap, original_git)
         result["original_git_conpty"] = _conpty_original_git(pb, api, launcher, original_git)
