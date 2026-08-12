@@ -345,6 +345,7 @@ def _git_local_gates(
         exit_code=None,
     )
     host_default_detail = cast(dict[str, object], host_default_probe["detail"])
+    host_default_detail["expected_absent_marker"] = host_config_marker
     host_default_probe["status"] = (
         "PASS"
         if host_default_detail.get("target_exit_code") != 0
@@ -369,12 +370,13 @@ def _git_local_gates(
         exit_code=None,
     )
     host_detail = cast(dict[str, object], host_probe["detail"])
+    host_detail["expected_denied_marker"] = host_config_marker
     host_stderr = str(host_detail.get("stderr_text", ""))
     host_probe["status"] = (
         "PASS"
         if host_detail.get("target_exit_code") != 0
         and host_config_marker not in str(host_detail.get("stdout_text", ""))
-        and str(host_config) in host_stderr
+        and host_config.name in host_stderr
         and "Permission denied" in host_stderr
         else "FAIL"
     )
@@ -398,7 +400,7 @@ def _git_local_gates(
         gate["status"] = (
             "PASS"
             if detail.get("target_exit_code") != 0
-            and str(path) in stderr
+            and path.name in stderr
             and "Permission denied" in stderr
             else "FAIL"
         )
@@ -938,13 +940,13 @@ def _main_run(args: argparse.Namespace, pb: ModuleType) -> tuple[dict[str, objec
     result["critical_failures"] = sorted(set(critical))
     if not critical:
         decision = "GIT_FOR_WINDOWS_UPSTREAM_FIX_REQUIRED"
+    elif "patched_git" in critical:
+        decision = "WINDOWS_GIT_RUNTIME_DEEPER_BLOCKER"
     elif any(
         name in critical
         for name in ("native_path_authority", "standard_native_path_authority", "HARNESS")
     ):
         decision = "WINDOWS_GIT_NUL_INCONCLUSIVE"
-    elif "patched_git" in critical:
-        decision = "WINDOWS_GIT_RUNTIME_DEEPER_BLOCKER"
     else:
         decision = "WINDOWS_GIT_NUL_INCONCLUSIVE"
     result["architecture_decision"] = decision
