@@ -428,7 +428,9 @@ def _standard_user_child(
         "token": token,
         "poc2b_harness_head": POC2B_HEAD,
     }
-    fixture = Path(tempfile.mkdtemp(prefix="neuro-code-git-null-poc2c-standard-"))
+    fixture = Path(tempfile.mkdtemp(prefix="neuro-code-git-null-poc2c-standard-")).resolve(
+        strict=True
+    )
     helper = fixture / "trusted-helper"
     runtime = fixture / "patched-git-runtime"
     workspace = fixture / "workspace"
@@ -640,7 +642,7 @@ def _create_standard_user(
 
 def _main_run(args: argparse.Namespace, pb: ModuleType) -> tuple[dict[str, object], bool]:
     api = pb._WinApi()
-    fixture = Path(tempfile.mkdtemp(prefix="neuro-code-git-null-poc2c-"))
+    fixture = Path(tempfile.mkdtemp(prefix="neuro-code-git-null-poc2c-")).resolve(strict=True)
     helper = fixture / "trusted-helper"
     workspace = fixture / "workspace"
     private_home = fixture / "private-home"
