@@ -58,9 +58,10 @@ jobs:
           $commonInitCall = (& git.exe -C $source grep -n -F "sanitize_stdfds();" -- common-init.c) -join "`n"
           $sanitizeDefinition = (& git.exe -C $source grep -n -F "void sanitize_stdfds" -- setup.c) -join "`n"
           $devNullOpen = (& git.exe -C $source grep -n -F 'xopen("/dev/null", O_RDWR)' -- setup.c) -join "`n"
-          $mingwNullMapping = (& git.exe -C $source grep -n -F 'L"/dev/null"' -- compat/mingw.c) -join "`n"
+          $mingwDevNullMatch = (& git.exe -C $source grep -n -F 'strcmp(filename, "/dev/null")' -- compat/mingw.c) -join "`n"
+          $mingwNulTarget = (& git.exe -C $source grep -n -F 'wcscpy(wfilename, L"nul")' -- compat/mingw.c) -join "`n"
           if (-not $commonInitCall -or -not $sanitizeDefinition -or `
-              -not $devNullOpen -or -not $mingwNullMapping) {
+              -not $devNullOpen -or -not $mingwDevNullMatch -or -not $mingwNulTarget) {
             throw "Unable to prove Git common-init, sanitize_stdfds, and MinGW /dev/null mapping"
           }
           & git.exe -C $source apply --check `
@@ -83,7 +84,8 @@ jobs:
             common_init_call = $commonInitCall
             sanitize_definition = $sanitizeDefinition
             dev_null_open = $devNullOpen
-            mingw_null_mapping = $mingwNullMapping
+            mingw_dev_null_match = $mingwDevNullMatch
+            mingw_nul_target = $mingwNulTarget
             poc2b_harness_head = "7ac1b77e6cc0dc1d51ab7bd47fe4f0ac76d71336"
           }
           $sourceProof | ConvertTo-Json -Depth 4 | Set-Content `
