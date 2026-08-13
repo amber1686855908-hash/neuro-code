@@ -28,7 +28,6 @@ from neuro_code.infrastructure.sandbox.windows_sandbox_accounts import (
     _NativeWindowsSandboxAccountApi,
 )
 from neuro_code.infrastructure.sandbox.windows_sandbox_acl import (
-    WindowsManagedAce,
     _AceHeader,
     _NativeWindowsAclApi,
 )
@@ -172,48 +171,6 @@ class WindowsSandboxNativeAcceptanceTests(unittest.TestCase):
                 self.assertEqual(repeated.online_user_sid, offline.online_user_sid)
                 self.assertEqual(repeated.write_restricting_sid, offline.write_restricting_sid)
                 inspected = authority.inspect(request)
-                if inspected.state is not WindowsSandboxSetupState.READY:
-                    # Keep the privileged artifact actionable without ever
-                    # printing passwords or DPAPI plaintext.  Native ACL
-                    # providers can normalize inheritance flags, so expose
-                    # the exact missing managed tuple and the independent
-                    # account/firewall checks before failing the acceptance.
-                    print(f"native_inspect_state={inspected.state.value}")
-                    loaded = _InstallationRecord.decode(store.load() or b"")
-                    plan = authority._plan(request, loaded, store.path)
-                    grouped: dict[Path, list[WindowsManagedAce]] = {}
-                    for entry in plan.entries:
-                        grouped.setdefault(entry.path, []).append(entry)
-                    for path, entries in grouped.items():
-                        try:
-                            raw_entries = acl_api._raw_entries(path)
-                            for entry in entries:
-                                if not any(acl_api._raw_matches(raw, entry) for raw in raw_entries):
-                                    print(
-                                        "native_missing_ace "
-                                        f"path={path} kind={entry.kind.value} sid={entry.sid.value} "
-                                        f"mask={entry.access_mask} inheritance={entry.inheritance}"
-                                    )
-                        except BaseException as error:
-                            print(
-                                f"native_acl_diagnostic_error path={path} error={type(error).__name__}"
-                            )
-                    print(
-                        "native_firewall_rule_exists="
-                        f"{firewall_api.rule_exists(loaded.offline_firewall_rule)}"
-                    )
-                    for identity in loaded.identities:
-                        try:
-                            account_api.validate_user(
-                                identity.username,
-                                identity.password.decode(),
-                                expected_sid=identity.user_sid,
-                            )
-                        except BaseException as error:
-                            print(
-                                f"native_account_diagnostic username={identity.username} "
-                                f"error={type(error).__name__}"
-                            )
                 self.assertEqual(inspected.state, WindowsSandboxSetupState.READY)
 
                 # Existing broad Users access is not enough to bypass the
@@ -243,35 +200,6 @@ class WindowsSandboxNativeAcceptanceTests(unittest.TestCase):
                         if entry.path == sensitive_path and entry.is_deny
                     )
                 ]
-                if not deny_indices:
-                    expected_denies = [
-                        entry
-                        for entry in record.managed_aces
-                        if entry.path == sensitive_path and entry.is_deny
-                    ]
-                    print(
-                        "native_sensitive_expected "
-                        f"count={len(expected_denies)} "
-                        + ";".join(
-                            f"path={entry.path} sid={entry.sid.value} mask={entry.access_mask} inheritance={entry.inheritance}"
-                            for entry in expected_denies
-                        )
-                    )
-                    for index, raw in enumerate(raw_sensitive):
-                        header = _AceHeader.from_buffer_copy(raw)
-                        sid_buffer = ctypes.create_string_buffer(raw[8:])
-                        print(
-                            "native_sensitive_ace "
-                            f"index={index} type={header.AceType} flags={header.AceFlags} "
-                            f"mask={int.from_bytes(raw[4:8], 'little')} "
-                            f"sid={acl_api._sid_string(ctypes.addressof(sid_buffer))}"
-                        )
-                    for entry in expected_denies:
-                        print(
-                            "native_sensitive_match "
-                            f"sid={entry.sid.value} "
-                            f"matches={any(acl_api._raw_matches(raw, entry) for raw in raw_sensitive)}"
-                        )
                 allow_indices = [
                     index
                     for index, raw in enumerate(raw_sensitive)
