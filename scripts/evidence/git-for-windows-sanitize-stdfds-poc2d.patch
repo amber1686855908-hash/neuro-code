@@ -1,0 +1,36 @@
+diff --git a/setup.c b/setup.c
+index fa7a5c1..c0080ba 100644
+--- a/setup.c
++++ b/setup.c
+@@ -2220,10 +2220,29 @@ const char *resolve_gitdir_gently(const char *suspect, int *return_error_code)
+ 	return read_gitfile_gently(suspect, return_error_code);
+ }
+ 
++static int standard_fds_are_valid(void)
++{
++	int fd;
++
++	for (fd = 0; fd <= 2; fd++) {
++		int duplicate = dup(fd);
++
++		if (duplicate < 0)
++			return 0;
++		close(duplicate);
++	}
++	return 1;
++}
++
+ /* if any standard file descriptor is missing open it to /dev/null */
+ void sanitize_stdfds(void)
+ {
+-	int fd = xopen("/dev/null", O_RDWR);
++	int fd;
++
++	if (standard_fds_are_valid())
++		return;
++
++	fd = xopen("/dev/null", O_RDWR);
+ 	while (fd < 2)
+ 		fd = xdup(fd);
+ 	if (fd > 2)
+

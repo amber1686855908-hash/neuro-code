@@ -1,0 +1,40 @@
+diff --git a/compat/mingw.c b/compat/mingw.c
+--- a/compat/mingw.c
++++ b/compat/mingw.c
+@@ -1737,6 +1737,8 @@ char *mingw_getcwd(char *pointer, int len)
+ char *mingw_getcwd(char *pointer, int len)
+ {
+ 	wchar_t cwd[MAX_PATH], wpointer[MAX_PATH];
++	BYTE name_buffer[sizeof(FILE_NAME_INFO) + sizeof(wchar_t) * MAX_PATH];
++	FILE_NAME_INFO *name_info = (FILE_NAME_INFO *)name_buffer;
+ 	DWORD ret = GetCurrentDirectoryW(ARRAY_SIZE(cwd), cwd);
+ 	HANDLE hnd;
+ 
+@@ -1745,9 +1747,27 @@ char *mingw_getcwd(char *pointer, int len)
+ 	}
+ 	hnd = CreateFileW(cwd, 0,
+ 			  FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
+ 			  OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
+ 	if (hnd != INVALID_HANDLE_VALUE) {
+ 		ret = GetFinalPathNameByHandleW(hnd, wpointer, ARRAY_SIZE(wpointer), 0);
++		if (!ret && GetLastError() == ERROR_ACCESS_DENIED &&
++		    isalpha(cwd[0]) && cwd[1] == L':' &&
++		    GetFileInformationByHandleEx(hnd, FileNameInfo, name_info,
++						 sizeof(name_buffer)) &&
++		    name_info->FileNameLength % sizeof(wchar_t) == 0) {
++			size_t name_length =
++				name_info->FileNameLength / sizeof(wchar_t);
++
++			if (name_length + 2 < ARRAY_SIZE(wpointer) &&
++			    name_info->FileName[0] == L'\\') {
++				wpointer[0] = cwd[0];
++				wpointer[1] = L':';
++				memcpy(wpointer + 2, name_info->FileName,
++				       name_info->FileNameLength);
++				wpointer[name_length + 2] = L'\0';
++				ret = name_length + 2;
++			}
++		}
+ 		CloseHandle(hnd);
+ 		if (!ret || ret >= ARRAY_SIZE(wpointer)) {
+ 			ret = GetLongPathNameW(cwd, wpointer, ARRAY_SIZE(wpointer));
