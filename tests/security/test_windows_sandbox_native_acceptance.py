@@ -27,7 +27,11 @@ from neuro_code.infrastructure.sandbox.windows_sandbox_accounts import (
     SANDBOX_ONLINE_USERNAME,
     _NativeWindowsSandboxAccountApi,
 )
-from neuro_code.infrastructure.sandbox.windows_sandbox_acl import _AceHeader, _NativeWindowsAclApi
+from neuro_code.infrastructure.sandbox.windows_sandbox_acl import (
+    WindowsManagedAce,
+    _AceHeader,
+    _NativeWindowsAclApi,
+)
 from neuro_code.infrastructure.sandbox.windows_sandbox_firewall import _NativeWindowsFirewallApi
 from neuro_code.infrastructure.sandbox.windows_sandbox_persistence import (
     WindowsDpapiCredentialStore,
@@ -157,7 +161,50 @@ class WindowsSandboxNativeAcceptanceTests(unittest.TestCase):
                 self.assertEqual(repeated.offline_user_sid, offline.offline_user_sid)
                 self.assertEqual(repeated.online_user_sid, offline.online_user_sid)
                 self.assertEqual(repeated.write_restricting_sid, offline.write_restricting_sid)
-                self.assertEqual(authority.inspect(request).state, WindowsSandboxSetupState.READY)
+                inspected = authority.inspect(request)
+                if inspected.state is not WindowsSandboxSetupState.READY:
+                    # Keep the privileged artifact actionable without ever
+                    # printing passwords or DPAPI plaintext.  Native ACL
+                    # providers can normalize inheritance flags, so expose
+                    # the exact missing managed tuple and the independent
+                    # account/firewall checks before failing the acceptance.
+                    print(f"native_inspect_state={inspected.state.value}")
+                    loaded = _InstallationRecord.decode(store.load() or b"")
+                    plan = authority._plan(request, loaded, store.path)
+                    grouped: dict[Path, list[WindowsManagedAce]] = {}
+                    for entry in plan.entries:
+                        grouped.setdefault(entry.path, []).append(entry)
+                    for path, entries in grouped.items():
+                        try:
+                            raw_entries = acl_api._raw_entries(path)
+                            for entry in entries:
+                                if not any(acl_api._raw_matches(raw, entry) for raw in raw_entries):
+                                    print(
+                                        "native_missing_ace "
+                                        f"path={path} kind={entry.kind.value} sid={entry.sid.value} "
+                                        f"mask={entry.access_mask} inheritance={entry.inheritance}"
+                                    )
+                        except BaseException as error:
+                            print(
+                                f"native_acl_diagnostic_error path={path} error={type(error).__name__}"
+                            )
+                    print(
+                        "native_firewall_rule_exists="
+                        f"{firewall_api.rule_exists(loaded.offline_firewall_rule)}"
+                    )
+                    for identity in loaded.identities:
+                        try:
+                            account_api.validate_user(
+                                identity.username,
+                                identity.password.decode(),
+                                expected_sid=identity.user_sid,
+                            )
+                        except BaseException as error:
+                            print(
+                                f"native_account_diagnostic username={identity.username} "
+                                f"error={type(error).__name__}"
+                            )
+                self.assertEqual(inspected.state, WindowsSandboxSetupState.READY)
 
                 # Existing broad Users access is not enough to bypass the
                 # explicit Neuro deny on sensitive and read-only paths.

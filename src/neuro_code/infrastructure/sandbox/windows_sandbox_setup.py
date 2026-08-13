@@ -520,8 +520,7 @@ class WindowsNativeSandboxSetupAuthority:
             if isinstance(error, WindowsSandboxSetupError):
                 raise
             raise WindowsSandboxSetupError(
-                "Windows sandbox account provisioning failed: "
-                f"{type(error).__name__}: {error}"
+                f"Windows sandbox account provisioning failed: {type(error).__name__}: {error}"
             ) from error
         record = _InstallationRecord.from_facts(
             write_sid=SyntheticWindowsSid.generate(),
@@ -573,7 +572,11 @@ class WindowsNativeSandboxSetupAuthority:
                     identity.username,
                     identity.user_sid,
                     password.encode("utf-8"),
-                    new_facts.created_by_installation,
+                    # The adapter reports current OS facts, not installation
+                    # provenance.  Preserve the persisted ownership decision
+                    # so a repair/repeat setup cannot make cleanup retain a
+                    # user that this installation created.
+                    identity.created_by_installation,
                 )
             identities.append(new_identity)
             facts.append(new_facts)
