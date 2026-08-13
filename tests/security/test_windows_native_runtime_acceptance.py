@@ -86,6 +86,43 @@ def _wait_for_native_process_exit(pid: int, timeout_ms: int = 5_000) -> bool:
         close(handle)
 
 
+def _native_process_facts(pid: int) -> tuple[str, int]:
+    """Return image path and current exit code for startup diagnostics."""
+
+    kernel = ctypes.WinDLL("kernel32.dll", use_last_error=True)
+    open_process = kernel.OpenProcess
+    open_process.argtypes = [ctypes.c_uint32, ctypes.c_int32, ctypes.c_uint32]
+    open_process.restype = ctypes.c_void_p
+    query_image = kernel.QueryFullProcessImageNameW
+    query_image.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.c_wchar_p,
+        ctypes.POINTER(ctypes.c_uint32),
+    ]
+    query_image.restype = ctypes.c_int32
+    get_exit = kernel.GetExitCodeProcess
+    get_exit.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32)]
+    get_exit.restype = ctypes.c_int32
+    close = kernel.CloseHandle
+    close.argtypes = [ctypes.c_void_p]
+    close.restype = ctypes.c_int32
+    handle = open_process(0x1000 | 0x0400, False, pid)  # QUERY_LIMITED_INFORMATION | SYNCHRONIZE
+    if not handle:
+        raise OSError(ctypes.get_last_error(), "OpenProcess(facts) failed")
+    try:
+        image = ctypes.create_unicode_buffer(32_768)
+        length = ctypes.c_uint32(len(image))
+        if not query_image(handle, 0, image, ctypes.byref(length)):
+            raise OSError(ctypes.get_last_error(), "QueryFullProcessImageNameW failed")
+        exit_code = ctypes.c_uint32()
+        if not get_exit(handle, ctypes.byref(exit_code)):
+            raise OSError(ctypes.get_last_error(), "GetExitCodeProcess failed")
+        return image.value, int(exit_code.value)
+    finally:
+        close(handle)
+
+
 async def _read_with_native_timeout(
     process: object,
     *,
@@ -290,6 +327,11 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                     )
                 )
                 print("W3_PHASE whoami-probe-spawned", flush=True)
+                await asyncio.sleep(2)
+                print(
+                    f"W3_PHASE whoami-facts:{_native_process_facts(whoami_probe.process_id)}",
+                    flush=True,
+                )
                 whoami_output = await _read_with_native_timeout(whoami_probe, limit_seconds=10)
                 print(f"W3_PHASE whoami-output:{whoami_output!r}", flush=True)
                 self.assertEqual(await whoami_probe.wait(), 0)
