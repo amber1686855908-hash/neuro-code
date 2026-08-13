@@ -53,13 +53,11 @@ jobs:
 
           $pathSep = (& git.exe -C $source grep -n -F "#define PATH_SEP ';'" -- compat/mingw.h) -join "`n"
           $ceiling = (& git.exe -C $source grep -n -A 31 -F 'canonicalize_ceiling_entry' -- setup.c) -join "`n"
+          $emptyCeiling = (& git.exe -C $source grep -n -F 'turns off canonicalization for all' -- setup.c) -join "`n"
           $split = (& git.exe -C $source grep -n -A 6 -F 'static const char path_sep[] = { PATH_SEP' -- setup.c) -join "`n"
           $across = (& git.exe -C $source grep -n -F 'GIT_DISCOVERY_ACROSS_FILESYSTEM' -- setup.c) -join "`n"
-          if (-not $pathSep -or -not $ceiling -or -not $split -or -not $across) {
+          if (-not $pathSep -or -not $ceiling -or -not $emptyCeiling -or -not $split -or -not $across) {
             throw "Unable to prove Git for Windows discovery source semantics"
-          }
-          if ($ceiling -notmatch 'empty entry' -or $ceiling -notmatch 'turns off canonicalization') {
-            throw "Unable to prove leading-empty ceiling canonicalization behavior"
           }
 
           $nulPatch = Join-Path $env:GITHUB_WORKSPACE `
@@ -92,6 +90,7 @@ jobs:
             path_sep_source = $pathSep
             path_sep = ';'
             ceiling_canonicalization_source = $ceiling
+            empty_ceiling_source = $emptyCeiling
             ceiling_split_source = $split
             across_filesystem_source = $across
             ceiling_boundary_strategy = 'leading empty entry + exact parent of authorized workspace root'
