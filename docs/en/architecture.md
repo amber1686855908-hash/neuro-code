@@ -1513,6 +1513,19 @@ Windows `off` path continues to use the existing Job Object/ConPTY lifecycle.
 Evidence PRs #33--#39 remain unmerged and are recorded in
 [ADR 0112](adr/0112-windows-appcontainer-sandbox-feasibility-decision.md).
 
+The W1 Windows native foundation is recorded in
+[ADR 0113](adr/0113-windows-native-restricted-token-sandbox-architecture.md).
+It adds a platform-neutral filesystem/network security-capability model and an
+in-memory restricted-token/SID boundary. W1 actual filesystem/network
+capabilities are all `UNSUPPORTED` because enabled Windows profiles still fail
+closed. The separate native-backend target is read `LIMITED`, write `STRONG`,
+and network `STRONG`; a strong-read request must not be satisfied by a limited
+provider. Process lifecycle remains the independent
+`LocalProcessLifecycleCapability` contract, with existing Job Object/ConPTY
+paths reporting `STRONG_DESCENDANT_OWNERSHIP`. W1 does not provision users,
+mutate ACLs, use DPAPI, configure a firewall, add a command runner or broker,
+or route enabled Windows profiles.
+
 Enabled Linux startup performs a bounded controller-state hardlink audit before
 mounting any authorized workspace. It fails closed when a private regular file
 has another inode name, preventing a pre-existing workspace hardlink from

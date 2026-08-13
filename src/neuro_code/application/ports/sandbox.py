@@ -113,6 +113,124 @@ def lifecycle_capability_satisfies(
     return _LIFECYCLE_CAPABILITY_STRENGTH[provided] >= _LIFECYCLE_CAPABILITY_STRENGTH[required]
 
 
+class LocalProcessSecurityCapability(StrEnum):
+    """Independent security dimensions provided or required by a local child.
+
+    Security authority is deliberately separate from lifecycle ownership.  The
+    dimensions are named capabilities rather than a single platform label so a
+    backend can expose, for example, strong write isolation while its read
+    isolation remains limited during a compatibility-oriented rollout.
+
+    表示本地子进程提供或要求的独立安全维度.
+
+    安全权限刻意与生命周期所有权分离.这些维度是命名 capability,而不是单一
+    平台标签,因此某个 backend 可以在兼容性 rollout 期间提供 strong write isolation,
+    同时明确表示 read isolation 仍然 limited.
+    """
+
+    READ_ISOLATION = "read-isolation"
+    WRITE_ISOLATION = "write-isolation"
+    NETWORK_ISOLATION = "network-isolation"
+
+
+class LocalProcessSecurityStrength(StrEnum):
+    """Strength of one independent local-process security capability.
+
+    Security authority has three levels.  Process lifecycle ownership remains
+    a separate contract in ``LocalProcessLifecycleCapability``; it is not
+    represented here and has no relationship to this ordering.
+
+    表示一个独立本地进程安全 capability 的强度.
+    """
+
+    STRONG = "strong"
+    LIMITED = "limited"
+    UNSUPPORTED = "unsupported"
+
+
+_SECURITY_STRENGTH = {
+    LocalProcessSecurityStrength.UNSUPPORTED: 0,
+    LocalProcessSecurityStrength.LIMITED: 1,
+    LocalProcessSecurityStrength.STRONG: 2,
+}
+
+
+@dataclass(frozen=True, slots=True)
+class LocalProcessSecurityCapabilities:
+    """Actual or required strengths across the local-process security axes.
+
+    The default value is ``UNSUPPORTED`` so a requirement can name only the
+    axes it needs.  ``security_capability_satisfies`` checks every axis and
+    fails closed when a required strong read contract is supplied by a limited
+    backend.
+
+    表示本地进程安全轴上的实际或要求强度.
+    """
+
+    read_isolation: LocalProcessSecurityStrength = LocalProcessSecurityStrength.UNSUPPORTED
+    write_isolation: LocalProcessSecurityStrength = LocalProcessSecurityStrength.UNSUPPORTED
+    network_isolation: LocalProcessSecurityStrength = LocalProcessSecurityStrength.UNSUPPORTED
+
+    def __post_init__(self) -> None:
+        if not all(
+            isinstance(strength, LocalProcessSecurityStrength)
+            for strength in (
+                self.read_isolation,
+                self.write_isolation,
+                self.network_isolation,
+            )
+        ):
+            raise TypeError("local process security strengths must be canonical")
+
+    def strength_for(
+        self,
+        capability: LocalProcessSecurityCapability,
+    ) -> LocalProcessSecurityStrength:
+        """Return the strength for one named capability axis."""
+
+        if not isinstance(capability, LocalProcessSecurityCapability):
+            raise TypeError("local process security capability must be canonical")
+        return {
+            LocalProcessSecurityCapability.READ_ISOLATION: self.read_isolation,
+            LocalProcessSecurityCapability.WRITE_ISOLATION: self.write_isolation,
+            LocalProcessSecurityCapability.NETWORK_ISOLATION: self.network_isolation,
+        }[capability]
+
+
+def security_capability_satisfies(
+    provided: LocalProcessSecurityCapabilities,
+    required: LocalProcessSecurityCapabilities,
+) -> bool:
+    """Return whether every provided security axis meets its requirement.
+
+    This helper is intentionally explicit and independent from
+    ``lifecycle_capability_satisfies``.  A limited provider can never silently
+    satisfy a strong requirement, and unsupported authority satisfies only an
+    unsupported/no requirement axis.
+    """
+
+    if not isinstance(provided, LocalProcessSecurityCapabilities):
+        raise TypeError("provided local process security capabilities must be canonical")
+    if not isinstance(required, LocalProcessSecurityCapabilities):
+        raise TypeError("required local process security capabilities must be canonical")
+    return all(
+        _SECURITY_STRENGTH[provided_strength] >= _SECURITY_STRENGTH[required_strength]
+        for provided_strength, required_strength in zip(
+            (
+                provided.read_isolation,
+                provided.write_isolation,
+                provided.network_isolation,
+            ),
+            (
+                required.read_isolation,
+                required.write_isolation,
+                required.network_isolation,
+            ),
+            strict=True,
+        )
+    )
+
+
 class LocalProcessCancellationPolicy(StrEnum):
     """Cancellation semantics owned by a local process launcher.
 
