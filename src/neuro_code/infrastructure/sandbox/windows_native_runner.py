@@ -147,6 +147,27 @@ class _ProcessInformation(ctypes.Structure):
     ]
 
 
+class _Guid(ctypes.Structure):
+    _fields_ = [
+        ("Data1", ctypes.c_uint32),
+        ("Data2", ctypes.c_uint16),
+        ("Data3", ctypes.c_uint16),
+        ("Data4", ctypes.c_ubyte * 8),
+    ]
+
+
+# FOLDERID_Profile.  Resolving the known folder from the final token works
+# when CreateProcessWithLogonW was intentionally started without
+# LOGON_WITH_PROFILE; GetUserProfileDirectoryW requires a loaded profile and
+# would otherwise fail before the child boundary is even created.
+_FOLDERID_PROFILE = _Guid(
+    0x5E6C858F,
+    0x0E22,
+    0x4760,
+    (ctypes.c_ubyte * 8)(0x9A, 0xFE, 0xEA, 0x33, 0x17, 0xB6, 0x71, 0x73),
+)
+
+
 @dataclass(frozen=True, slots=True)
 class RunnerLaunch:
     """Controller-side handle for the trusted runner process."""
@@ -1002,12 +1023,24 @@ class _NativeChildApi:
             ctypes.c_uint32,
         )
         advapi32 = cast(object, loader("advapi32.dll", use_last_error=True))
-        userenv = cast(object, loader("userenv.dll", use_last_error=True))
-        self._get_user_profile = _load_function(
-            userenv,
-            "GetUserProfileDirectoryW",
-            [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.POINTER(ctypes.c_uint32)],
+        shell32 = cast(object, loader("shell32.dll", use_last_error=True))
+        ole32 = cast(object, loader("ole32.dll", use_last_error=True))
+        self._get_known_folder_path = _load_function(
+            shell32,
+            "SHGetKnownFolderPath",
+            [
+                ctypes.POINTER(_Guid),
+                ctypes.c_uint32,
+                ctypes.c_void_p,
+                ctypes.POINTER(ctypes.c_wchar_p),
+            ],
             ctypes.c_int32,
+        )
+        self._co_task_mem_free = _load_function(
+            ole32,
+            "CoTaskMemFree",
+            [ctypes.c_void_p],
+            None,
         )
         self._create_process_as_user = _load_function(
             advapi32,
@@ -1186,15 +1219,23 @@ class _NativeChildApi:
         return int(value.value)
 
     def get_user_profile(self, token: int) -> str:
-        required = ctypes.c_uint32()
-        self._get_user_profile(token, None, ctypes.byref(required))
-        if not required.value:
-            self._error("GetUserProfileDirectoryW(size)")
-        buffer = ctypes.create_unicode_buffer(required.value + 1)
-        length = ctypes.c_uint32(len(buffer))
-        if not self._get_user_profile(token, buffer, ctypes.byref(length)):
-            self._error("GetUserProfileDirectoryW")
-        return str(buffer.value)
+        path_pointer = ctypes.c_wchar_p()
+        result = self._get_known_folder_path(
+            ctypes.byref(_FOLDERID_PROFILE),
+            0,
+            token,
+            ctypes.byref(path_pointer),
+        )
+        result_code = cast(int, result)
+        if result_code != 0 or not path_pointer.value:
+            raise OSError(
+                result_code,
+                f"SHGetKnownFolderPath(Profile) failed with Windows error {result_code}",
+            )
+        try:
+            return str(path_pointer.value)
+        finally:
+            self._co_task_mem_free(path_pointer)
 
     @staticmethod
     def get_private_temp_path(profile: str) -> str:
