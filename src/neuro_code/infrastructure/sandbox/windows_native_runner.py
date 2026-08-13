@@ -521,7 +521,6 @@ def launch_runner(
             ctypes.c_uint32,
             ctypes.c_void_p,
             ctypes.c_wchar_p,
-            ctypes.c_void_p,
             ctypes.POINTER(_StartupInfoW),
             ctypes.POINTER(_ProcessInformation),
         ],

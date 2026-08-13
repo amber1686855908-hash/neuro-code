@@ -163,7 +163,7 @@ class WindowsNativeRuntimeContractTests(unittest.IsolatedAsyncioTestCase):
                 setup_authority=authority,
                 runner_launcher=launcher,
             )
-            with self.assertRaises(SandboxError):
+            with mock.patch.object(os, "name", "posix"), self.assertRaises(SandboxError):
                 await adapter.spawn(_request(root))
             launcher.assert_not_called()
             self.assertEqual(authority.requests, [])
