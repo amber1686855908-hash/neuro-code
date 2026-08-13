@@ -125,7 +125,10 @@ class WindowsManagedAce:
         elif self.kind is WindowsManagedAceKind.READ_ONLY_WRITE_DENY:
             expected_mask = WRITE_ONLY_ACCESS_MASK
         elif self.kind is WindowsManagedAceKind.CREDENTIAL_PROTECTION_DENY:
-            expected_mask = READ_ACCESS_MASK
+            # Machine-scope DPAPI is not a user boundary.  Deny the complete
+            # file-state mutation surface (read/write/delete/replace), not
+            # just reads, so an untrusted account cannot swap the envelope.
+            expected_mask = WRITE_ACCESS_MASK
         else:
             expected_mask = READ_ACCESS_MASK
         if self.access_mask != expected_mask:
@@ -172,6 +175,7 @@ def plan_windows_filesystem_authority(
     read_user_sids: tuple[WindowsAccountSid, ...] = (),
     write_user_sids: tuple[WindowsAccountSid, ...] = (),
     credential_path: Path | None = None,
+    private_root: Path | None = None,
 ) -> WindowsFilesystemSetupPlan:
     """Build explicit real-user read policy and synthetic write policy.
 
@@ -193,6 +197,27 @@ def plan_windows_filesystem_authority(
         not isinstance(credential_path, Path) or not credential_path.is_absolute()
     ):
         raise ValueError("credential_path must be an absolute path")
+    if private_root is not None and (
+        not isinstance(private_root, Path) or not private_root.is_absolute()
+    ):
+        raise ValueError("private_root must be an absolute path")
+    canonical_private_root = (
+        private_root.expanduser().resolve(strict=False) if private_root is not None else None
+    )
+    canonical_credential_path = (
+        credential_path.expanduser().resolve(strict=False) if credential_path is not None else None
+    )
+    if (
+        canonical_private_root is not None
+        and canonical_private_root == canonical_private_root.parent
+    ):
+        raise ValueError("private_root must not be a filesystem root")
+    if (
+        canonical_private_root is not None
+        and canonical_credential_path is not None
+        and not (canonical_credential_path.is_relative_to(canonical_private_root))
+    ):
+        raise ValueError("credential_path must be inside private_root")
     entries: list[WindowsManagedAce] = []
     for root in request.read_roots:
         entries.extend(
@@ -245,8 +270,23 @@ def plan_windows_filesystem_authority(
                 credential_path,
                 sid,
                 WindowsManagedAceKind.CREDENTIAL_PROTECTION_DENY,
-                READ_ACCESS_MASK,
+                WRITE_ACCESS_MASK,
                 inheritance=0,
+            )
+            for sid in read_user_sids
+        )
+    if private_root is not None:
+        # The private installation root is a controller/setup boundary.  The
+        # inherited deny protects atomic temporary files and future state
+        # records as well as the current DPAPI envelope.
+        assert canonical_private_root is not None
+        entries.extend(
+            WindowsManagedAce(
+                canonical_private_root,
+                sid,
+                WindowsManagedAceKind.CREDENTIAL_PROTECTION_DENY,
+                WRITE_ACCESS_MASK,
+                inheritance=INHERIT_TO_CHILDREN,
             )
             for sid in read_user_sids
         )
@@ -272,6 +312,9 @@ class InMemoryWindowsAclApi:
 
     def __init__(self) -> None:
         self.entries: dict[Path, set[WindowsManagedAce]] = defaultdict(set)
+        # Keep a separate ordered projection so tests can model an external
+        # ACE reorder without weakening the set-based compatibility surface.
+        self.ordered_entries: dict[Path, list[WindowsManagedAce]] = defaultdict(list)
         self.unmanaged_entries: dict[Path, set[str]] = defaultdict(set)
         self.calls: list[
             tuple[Path, tuple[WindowsManagedAce, ...], tuple[WindowsManagedAce, ...]]
@@ -288,12 +331,31 @@ class InMemoryWindowsAclApi:
         self.calls.append((canonical, desired, remove))
         self.entries[canonical].difference_update(remove)
         self.entries[canonical].update(desired)
+        ordered = list(self.entries[canonical])
+        ordered.sort(key=lambda entry: (0 if entry.is_deny else 1, str(entry)))
+        self.ordered_entries[canonical] = ordered
         if not self.entries[canonical]:
             self.entries.pop(canonical, None)
+            self.ordered_entries.pop(canonical, None)
 
     def matches(self, path: Path, desired: tuple[WindowsManagedAce, ...]) -> bool:
         canonical = path.expanduser().resolve(strict=False)
-        return set(desired).issubset(self.entries.get(canonical, set()))
+        observed = self.entries.get(canonical, set())
+        if not set(desired).issubset(observed):
+            return False
+        ordered = self.ordered_entries.get(canonical, [])
+        if len(ordered) != len(observed):
+            return False
+        if ordered != sorted(ordered, key=lambda entry: (0 if entry.is_deny else 1, str(entry))):
+            return False
+        positions = {entry: index for index, entry in enumerate(ordered)}
+        if any(entry not in positions for entry in desired):
+            return False
+        deny_positions = [positions[entry] for entry in desired if entry.is_deny]
+        allow_positions = [positions[entry] for entry in desired if not entry.is_deny]
+        return (
+            not deny_positions or not allow_positions or max(deny_positions) < min(allow_positions)
+        )
 
 
 class WindowsFilesystemAclAuthority:
@@ -405,6 +467,7 @@ class _NativeWindowsAclApi:  # pragma: no cover - exercised by Windows native CI
     _SET_ACCESS = 2
     _DENY_ACCESS = 3
     _MAXDWORD = 0xFFFFFFFF
+    _INHERITED_ACE = 0x10
 
     def __init__(self) -> None:
         if os.name != "nt":
@@ -595,7 +658,38 @@ class _NativeWindowsAclApi:  # pragma: no cover - exercised by Windows native CI
 
     def matches(self, path: Path, desired: tuple[WindowsManagedAce, ...]) -> bool:
         raw_entries = self._raw_entries(path)
-        return all(any(self._raw_matches(raw, entry) for raw in raw_entries) for entry in desired)
+        positions: dict[WindowsManagedAce, list[int]] = {
+            entry: [index for index, raw in enumerate(raw_entries) if self._raw_matches(raw, entry)]
+            for entry in desired
+        }
+        if any(len(matches) != 1 for matches in positions.values()):
+            return False
+        managed_positions = {entry: matches[0] for entry, matches in positions.items()}
+        explicit_allow_positions = [
+            index
+            for index, raw in enumerate(raw_entries)
+            if _AceHeader.from_buffer_copy(raw).AceType == self._ACCESS_ALLOWED_ACE_TYPE
+            and not (_AceHeader.from_buffer_copy(raw).AceFlags & self._INHERITED_ACE)
+        ]
+        inherited_positions = [
+            index
+            for index, raw in enumerate(raw_entries)
+            if _AceHeader.from_buffer_copy(raw).AceFlags & self._INHERITED_ACE
+        ]
+        for entry, position in managed_positions.items():
+            header = _AceHeader.from_buffer_copy(raw_entries[position])
+            if entry.is_deny:
+                # Explicit managed denies must precede every explicit allow
+                # and every inherited ACE to remain an effective canonical
+                # deny, including when a broad unrelated allow is present.
+                if any(index < position for index in explicit_allow_positions):
+                    return False
+                if any(index < position for index in inherited_positions):
+                    return False
+            elif not (header.AceFlags & self._INHERITED_ACE):
+                if any(index < position for index in inherited_positions):
+                    return False
+        return True
 
     def reconcile(
         self,

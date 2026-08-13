@@ -99,9 +99,21 @@ creation for W3. The authority has these properties:
   owner information. Re-running setup is idempotent, drift is `NEEDS_REPAIR`,
   and cleanup removes only exact managed tuples and installation-created users.
 - Offline owns one outbound block rule scoped to the real Offline account SID.
-  Online removes only that exact managed rule and does not add a global allow
-  rule. The Online account and the controller user are not matched by the
-  Offline rule.
+  Readiness verifies the complete managed tuple: outbound direction, block
+  action, enabled state, expected profile, and the exact Offline SID. Any
+  drift is `NEEDS_REPAIR`; Online removes only that exact managed rule and
+  does not add a global allow rule. The Online account and the controller user
+  are not matched by the Offline rule.
+- The installation root is a private controller/setup root and must be
+  disjoint from every sandbox read or writable root. Its inherited NTFS deny
+  authority protects the DPAPI envelope and future state files from read,
+  write, delete, and replace operations by both sandbox users. The persisted
+  credential record remains the recovery source until ACL, firewall, and
+  installation-created account rollback has completed.
+- Local-account group validation uses well-known built-in group SIDs (with
+  account-name lookup only as a locale-specific transport detail), so a
+  translated `Users` or privileged-group display name cannot change the
+  security decision.
 - Setup, repair, and cleanup are an explicit administrative boundary. An
   ordinary session can inspect the state and run later runtime work without
   continuing to require administrator privileges.

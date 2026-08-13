@@ -59,6 +59,12 @@ def _canonical_unique_paths(paths: Sequence[Path], label: str) -> tuple[Path, ..
     return canonical
 
 
+def _paths_overlap(left: Path, right: Path) -> bool:
+    """Return whether either canonical path contains the other."""
+
+    return left == right or left.is_relative_to(right) or right.is_relative_to(left)
+
+
 @dataclass(frozen=True, slots=True)
 class WindowsSandboxSetupRequest:
     """Explicit filesystem and identity inputs for one setup operation.
@@ -86,6 +92,12 @@ class WindowsSandboxSetupRequest:
             raise ValueError("read_roots must contain at least one root")
         if not set(writable_roots).issubset(read_roots):
             raise ValueError("writable_roots must be a subset of read_roots")
+        # The installation root is controller/setup state, not a sandbox file
+        # authority.  Reject every ancestor/descendant overlap instead of
+        # relying on a credential-file deny ACE to compensate for a writable
+        # or traversable private-state parent.
+        if any(_paths_overlap(installation_root, root) for root in read_roots):
+            raise ValueError("installation_root must be disjoint from sandbox read/write roots")
         for sensitive in sensitive_paths:
             if any(root == sensitive or root.is_relative_to(sensitive) for root in read_roots):
                 raise ValueError(

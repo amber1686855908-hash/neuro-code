@@ -56,30 +56,28 @@ class WindowsAccountSid:
 
 SANDBOX_OFFLINE_USERNAME = "NeuroSandboxOffline"
 SANDBOX_ONLINE_USERNAME = "NeuroSandboxOnline"
-SANDBOX_ACCOUNT_USER_GROUP = "Users"
+SANDBOX_ACCOUNT_USER_GROUP = "Users"  # legacy display-name transport only
 
-_DISALLOWED_GROUPS = frozenset(
+# Built-in group SIDs are stable across Windows locales.  Group display names
+# are retained only as diagnostics; no security decision is based on them.
+BUILTIN_USERS_SID = WindowsAccountSid("S-1-5-32-545")
+BUILTIN_ADMINISTRATORS_SID = WindowsAccountSid("S-1-5-32-544")
+_DISALLOWED_BUILTIN_GROUP_SIDS = frozenset(
     {
-        "administrators",
-        "power users",
-        "backup operators",
-        "remote desktop users",
-        "network configuration operators",
-        "hyper-v administrators",
-        "remote management users",
-        "cryptographic operators",
-        "event log readers",
-        "performance log users",
-        "distributed com users",
-        "iis_iusrs",
+        BUILTIN_ADMINISTRATORS_SID,
+        WindowsAccountSid("S-1-5-32-547"),  # Power Users
+        WindowsAccountSid("S-1-5-32-551"),  # Backup Operators
+        WindowsAccountSid("S-1-5-32-555"),  # Remote Desktop Users
+        WindowsAccountSid("S-1-5-32-556"),  # Network Configuration Operators
+        WindowsAccountSid("S-1-5-32-559"),  # Performance Log Users
+        WindowsAccountSid("S-1-5-32-562"),  # Distributed COM Users
+        WindowsAccountSid("S-1-5-32-568"),  # IIS_IUSRS
+        WindowsAccountSid("S-1-5-32-569"),  # Cryptographic Operators
+        WindowsAccountSid("S-1-5-32-573"),  # Event Log Readers
+        WindowsAccountSid("S-1-5-32-578"),  # Hyper-V Administrators
+        WindowsAccountSid("S-1-5-32-580"),  # Remote Management Users
     }
 )
-
-
-def _local_group_name(group: str) -> str:
-    """Normalize local-group facts returned as ``BUILTIN\\Name`` or ``Name``."""
-
-    return group.rsplit("\\", 1)[-1].casefold()
 
 
 @dataclass(frozen=True, slots=True)
@@ -92,6 +90,7 @@ class WindowsLocalUserFacts:
     enabled: bool
     user_privilege: int
     created_by_installation: bool
+    group_sids: tuple[WindowsAccountSid, ...] = ()
 
     def validate(self, *, expected_username: str) -> None:
         if self.username.casefold() != expected_username.casefold():
@@ -102,11 +101,15 @@ class WindowsLocalUserFacts:
         # privilege levels and every known privileged local-group membership.
         if self.user_privilege != 1:
             raise WindowsSandboxAccountError("Windows sandbox account privilege is not USER")
-        normalized_groups = {_local_group_name(group) for group in self.groups}
-        if SANDBOX_ACCOUNT_USER_GROUP.casefold() not in normalized_groups:
-            raise WindowsSandboxAccountError("Windows sandbox account is not a member of Users")
-        if normalized_groups & _DISALLOWED_GROUPS:
-            raise WindowsSandboxAccountError("Windows sandbox account has privileged group access")
+        group_sids = set(self.group_sids)
+        if BUILTIN_USERS_SID not in group_sids:
+            raise WindowsSandboxAccountError(
+                "Windows sandbox account is not a member of BUILTIN Users"
+            )
+        if group_sids & _DISALLOWED_BUILTIN_GROUP_SIDS:
+            raise WindowsSandboxAccountError(
+                "Windows sandbox account has privileged built-in group access"
+            )
 
 
 class WindowsSandboxAccountApi(Protocol):
@@ -175,7 +178,13 @@ class InMemoryWindowsSandboxAccountApi:
             sid = WindowsAccountSid(f"S-1-5-21-100-200-300-{self._next_rid}")
             self._next_rid += 1
             facts = WindowsLocalUserFacts(
-                username, sid, (SANDBOX_ACCOUNT_USER_GROUP,), True, 1, True
+                username,
+                sid,
+                (SANDBOX_ACCOUNT_USER_GROUP,),
+                True,
+                1,
+                True,
+                (BUILTIN_USERS_SID,),
             )
         else:
             _, facts = existing
@@ -190,6 +199,7 @@ class InMemoryWindowsSandboxAccountApi:
                 True,
                 1,
                 False,
+                facts.group_sids,
             )
         if expected_sid is not None and sid != expected_sid:
             raise WindowsSandboxAccountError("in-memory account SID mismatch")
@@ -374,6 +384,32 @@ class _NativeWindowsSandboxAccountApi:  # pragma: no cover - Windows native CI
             ],
             ctypes.c_int32,
         )
+        self._lookup_account_sid = _native_function(
+            self._advapi,
+            "LookupAccountSidW",
+            [
+                ctypes.c_wchar_p,
+                ctypes.c_void_p,
+                ctypes.c_wchar_p,
+                ctypes.POINTER(ctypes.c_uint32),
+                ctypes.c_wchar_p,
+                ctypes.POINTER(ctypes.c_uint32),
+                ctypes.POINTER(ctypes.c_uint32),
+            ],
+            ctypes.c_int32,
+        )
+        self._convert_string_sid = _native_function(
+            self._advapi,
+            "ConvertStringSidToSidW",
+            [ctypes.c_wchar_p, ctypes.POINTER(ctypes.c_void_p)],
+            ctypes.c_int32,
+        )
+        self._local_free = _native_function(
+            self._kernel,
+            "LocalFree",
+            [ctypes.c_void_p],
+            ctypes.c_void_p,
+        )
         self._logon_user = _native_function(
             self._advapi,
             "LogonUserW",
@@ -420,7 +456,6 @@ class _NativeWindowsSandboxAccountApi:  # pragma: no cover - Windows native CI
             [ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)],
             ctypes.c_int32,
         )
-        local_free = _native_function(self._kernel, "LocalFree", [ctypes.c_void_p], ctypes.c_void_p)
         output = ctypes.c_void_p()
         if (
             not convert(ctypes.cast(sid_buffer, ctypes.c_void_p), ctypes.byref(output))
@@ -430,7 +465,48 @@ class _NativeWindowsSandboxAccountApi:  # pragma: no cover - Windows native CI
         try:
             return WindowsAccountSid(ctypes.wstring_at(output.value))
         finally:
-            local_free(output)
+            self._local_free(output)
+
+    def _account_name_for_sid(self, sid: WindowsAccountSid) -> str:
+        """Resolve a well-known SID to the localised API name for transport."""
+
+        sid_pointer = ctypes.c_void_p()
+        if not self._convert_string_sid(sid.value, ctypes.byref(sid_pointer)):
+            raise self._error("ConvertStringSidToSidW", _windows_last_error())
+        try:
+            name_size = ctypes.c_uint32(0)
+            domain_size = ctypes.c_uint32(0)
+            sid_use = ctypes.c_uint32(0)
+            self._lookup_account_sid(
+                None,
+                sid_pointer,
+                None,
+                ctypes.byref(name_size),
+                None,
+                ctypes.byref(domain_size),
+                ctypes.byref(sid_use),
+            )
+            error = _windows_last_error()
+            if error != self._ERROR_INSUFFICIENT_BUFFER:
+                raise self._error("LookupAccountSidW", error)
+            while True:
+                name_buffer = ctypes.create_unicode_buffer(max(1, name_size.value))
+                domain_buffer = ctypes.create_unicode_buffer(max(1, domain_size.value))
+                if self._lookup_account_sid(
+                    None,
+                    sid_pointer,
+                    name_buffer,
+                    ctypes.byref(name_size),
+                    domain_buffer,
+                    ctypes.byref(domain_size),
+                    ctypes.byref(sid_use),
+                ):
+                    return str(name_buffer.value)
+                error = _windows_last_error()
+                if error != self._ERROR_INSUFFICIENT_BUFFER:
+                    raise self._error("LookupAccountSidW", error)
+        finally:
+            self._local_free(sid_pointer)
 
     def _facts(self, username: str, *, created: bool) -> WindowsLocalUserFacts:
         info_pointer = ctypes.c_void_p()
@@ -457,6 +533,7 @@ class _NativeWindowsSandboxAccountApi:  # pragma: no cover - Windows native CI
                 ),
             )
             groups: list[str] = []
+            group_sids: list[WindowsAccountSid] = []
             try:
                 if (
                     groups_result in (self._NERR_SUCCESS, self._ERROR_MORE_DATA)
@@ -466,6 +543,7 @@ class _NativeWindowsSandboxAccountApi:  # pragma: no cover - Windows native CI
                         groups_pointer, ctypes.POINTER(_LOCALGROUP_USERS_INFO_0 * count.value)
                     ).contents
                     groups = [str(group.lgrui0_name) for group in group_array]
+                    group_sids = [self._sid_for_user(group) for group in groups]
                 elif groups_result != self._NERR_SUCCESS:
                     raise self._error("NetUserGetLocalGroups", groups_result)
                 return WindowsLocalUserFacts(
@@ -475,6 +553,7 @@ class _NativeWindowsSandboxAccountApi:  # pragma: no cover - Windows native CI
                     not bool(info.usri1_flags & (self._UF_ACCOUNTDISABLE | self._UF_LOCKOUT)),
                     int(info.usri1_priv),
                     created,
+                    tuple(group_sids),
                 )
             finally:
                 if groups_pointer.value:
@@ -523,12 +602,16 @@ class _NativeWindowsSandboxAccountApi:  # pragma: no cover - Windows native CI
             )
         if result != self._NERR_SUCCESS:
             raise self._error("NetUserAdd/NetUserSetInfo", result)
+        # Resolve the well-known BUILTIN Users SID to the locale-specific
+        # group name required by the NetAPI transport.  Validation below uses
+        # the SID facts, never this display name.
+        user_group_name = self._account_name_for_sid(BUILTIN_USERS_SID)
         membership = _LOCALGROUP_MEMBERS_INFO_3(username)
         membership_result = cast(
             int,
             self._net_local_group_add_members(
                 None,
-                SANDBOX_ACCOUNT_USER_GROUP,
+                user_group_name,
                 3,
                 ctypes.byref(membership),
                 1,
@@ -611,6 +694,8 @@ class _NativeWindowsSandboxAccountApi:  # pragma: no cover - Windows native CI
 
 
 __all__ = [
+    "BUILTIN_ADMINISTRATORS_SID",
+    "BUILTIN_USERS_SID",
     "SANDBOX_OFFLINE_USERNAME",
     "SANDBOX_ONLINE_USERNAME",
     "InMemoryWindowsSandboxAccountApi",

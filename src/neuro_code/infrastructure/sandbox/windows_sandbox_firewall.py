@@ -13,7 +13,9 @@ Online mode 只删除该 exact managed rule,不添加 global allow rule,也绝�
 
 from __future__ import annotations
 
+import json
 import os
+import re
 import subprocess
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -31,12 +33,16 @@ class WindowsFirewallError(SandboxError):
 
 @dataclass(frozen=True, slots=True)
 class WindowsFirewallRule:
-    """Managed rule metadata without exposing a controller identity."""
+    """Complete managed rule semantics without exposing a controller identity."""
 
     name: str
     identity: WindowsSandboxIdentityKind
     sid: WindowsAccountSid
     outbound_block: bool
+    direction: str = "Outbound"
+    action: str = "Block"
+    enabled: bool = True
+    profile: str = "Any"
 
     def __post_init__(self) -> None:
         if not self.name or "\x00" in self.name or len(self.name) > 240:
@@ -47,6 +53,16 @@ class WindowsFirewallRule:
             raise TypeError("firewall rule SID must be a real account SID")
         if type(self.outbound_block) is not bool:
             raise TypeError("firewall outbound_block must be boolean")
+        if not all(isinstance(value, str) for value in (self.direction, self.action, self.profile)):
+            raise TypeError("firewall rule semantic fields must be strings")
+        if self.direction.casefold() != "outbound":
+            raise ValueError("managed firewall rule must be outbound")
+        if self.action.casefold() != "block":
+            raise ValueError("managed firewall rule must block")
+        if type(self.enabled) is not bool or not self.enabled:
+            raise ValueError("managed firewall rule must be enabled")
+        if self.profile.casefold() != "any":
+            raise ValueError("managed firewall rule must use the Any profile")
 
 
 class WindowsFirewallApi(Protocol):
@@ -75,6 +91,8 @@ class InMemoryWindowsFirewallApi:
         self.rules.pop(rule.name, None)
 
     def rule_exists(self, rule: WindowsFirewallRule) -> bool:
+        # Equality intentionally includes every managed semantic, not just the
+        # stable name and principal.
         return self.rules.get(rule.name) == rule
 
 
@@ -154,13 +172,37 @@ class _NativeWindowsFirewallApi:  # pragma: no cover - exercised by Windows nati
             "-ErrorAction SilentlyContinue; "
             "if ($null -eq $rule) { exit 1 }; "
             "$filter=$rule | Get-NetFirewallSecurityFilter; "
-            "[Console]::Out.Write($filter.LocalUser)"
+            "[pscustomobject]@{ "
+            "Direction=[string]$rule.Direction; "
+            "Action=[string]$rule.Action; "
+            "Enabled=[string]$rule.Enabled; "
+            "Profile=[string]$rule.Profile; "
+            "LocalUser=([string]($filter.LocalUser -join ',')) "
+            "} | ConvertTo-Json -Compress"
         )
         result = self._run(["-Command", script], check=False)
         if result.returncode != 0:
             return False
-        output = result.stdout.casefold()
-        return rule.sid.value.casefold() in output
+        try:
+            observed = json.loads(result.stdout)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return False
+        if not isinstance(observed, dict):
+            return False
+        if str(observed.get("Direction", "")).casefold() != rule.direction.casefold():
+            return False
+        if str(observed.get("Action", "")).casefold() != rule.action.casefold():
+            return False
+        if str(observed.get("Enabled", "")).casefold() not in {
+            "true",
+            "enabled",
+        }:
+            return False
+        if str(observed.get("Profile", "")).casefold() != rule.profile.casefold():
+            return False
+        local_user = str(observed.get("LocalUser", ""))
+        observed_sids = [sid.casefold() for sid in re.findall(r"S-1-(?:\d+-)+\d+", local_user)]
+        return observed_sids == [rule.sid.value.casefold()]
 
 
 def firewall_rule_for_installation(

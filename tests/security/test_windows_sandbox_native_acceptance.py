@@ -28,6 +28,7 @@ from neuro_code.infrastructure.sandbox.windows_sandbox_accounts import (
     _NativeWindowsSandboxAccountApi,
 )
 from neuro_code.infrastructure.sandbox.windows_sandbox_acl import (
+    WindowsManagedAce,
     _AceHeader,
     _NativeWindowsAclApi,
 )
@@ -108,6 +109,49 @@ def _benign_outbound_probe() -> None:
     connection.close()
 
 
+def _reorder_native_acl(
+    api: _NativeWindowsAclApi,
+    path: Path,
+    target: WindowsManagedAce,
+) -> None:  # pragma: no cover - Windows CI
+    """Model an external raw DACL reorder without replacing its descriptor."""
+
+    raw_entries = api._raw_entries(path)
+    target_indices = [
+        index for index, raw in enumerate(raw_entries) if api._raw_matches(raw, target)
+    ]
+    if len(raw_entries) < 2 or len(target_indices) != 1:
+        raise AssertionError("native fixture did not contain the managed ACE to reorder")
+    target_raw = raw_entries[target_indices[0]]
+    reordered = [raw for index, raw in enumerate(raw_entries) if index != target_indices[0]]
+    reordered.append(target_raw)
+    estimated_size = max(256, sum(len(raw) for raw in reordered) + 256)
+    acl_buffer = ctypes.create_string_buffer(estimated_size)
+    if not api._initialize_acl(acl_buffer, estimated_size, api._ACL_REVISION):
+        raise AssertionError("InitializeAcl failed while injecting reorder drift")
+    for raw in reordered:
+        raw_buffer = ctypes.create_string_buffer(raw)
+        if not api._add_ace(
+            acl_buffer,
+            api._ACL_REVISION,
+            api._MAXDWORD,
+            raw_buffer,
+            len(raw),
+        ):
+            raise AssertionError("AddAce failed while injecting reorder drift")
+    result = api._set_named_security_info(
+        str(path),
+        api._SE_FILE_OBJECT,
+        api._DACL_SECURITY_INFORMATION,
+        None,
+        None,
+        ctypes.cast(acl_buffer, ctypes.c_void_p),
+        None,
+    )
+    if result != 0:
+        raise AssertionError(f"SetNamedSecurityInfoW reorder failed: {result}")
+
+
 @unittest.skipUnless(_native_enabled(), "privileged Windows acceptance is CI-only")
 class WindowsSandboxNativeAcceptanceTests(unittest.TestCase):
     def test_real_accounts_acl_dpapi_and_firewall(self) -> None:  # pragma: no cover - Windows CI
@@ -173,6 +217,24 @@ class WindowsSandboxNativeAcceptanceTests(unittest.TestCase):
                 inspected = authority.inspect(request)
                 self.assertEqual(inspected.state, WindowsSandboxSetupState.READY)
 
+                # Native firewall drift must invalidate READY on every
+                # managed semantic, not merely name/SID.  Mutate the exact
+                # rule to an inbound disabled allow on a different profile,
+                # then prove repair restores the complete contract.
+                drift_script = (
+                    f"Set-NetFirewallRule -Name {firewall_api._ps_quote(record.offline_firewall_rule.name)} "
+                    "-Direction Inbound -Action Allow -Enabled False -Profile Domain"
+                )
+                drift_result = firewall_api._run(["-Command", drift_script], check=True)
+                self.assertEqual(drift_result.returncode, 0)
+                self.assertEqual(
+                    authority.inspect(request).state, WindowsSandboxSetupState.NEEDS_REPAIR
+                )
+                self.assertEqual(
+                    authority.repair(request, identity=WindowsSandboxIdentityKind.OFFLINE).state,
+                    WindowsSandboxSetupState.READY,
+                )
+
                 # Existing broad Users access is not enough to bypass the
                 # explicit Neuro deny on sensitive and read-only paths.
                 with _impersonate(offline_record.username, offline_record.password.decode()):
@@ -183,6 +245,12 @@ class WindowsSandboxNativeAcceptanceTests(unittest.TestCase):
                     _assert_denied(lambda: sensitive_file.read_text(encoding="utf-8"))
                     _assert_denied(lambda: os.stat(store.path))
                     _assert_denied(lambda: store.path.read_bytes())
+                    _assert_denied(lambda: store.path.write_bytes(b"must fail"))
+                    replacement = root / "replacement.dpapi"
+                    replacement.write_bytes(b"replacement")
+                    _assert_denied(lambda: os.replace(replacement, store.path))
+                    _assert_denied(lambda: store.path.rename(root / "renamed.dpapi"))
+                    _assert_denied(lambda: store.path.unlink())
 
                 # SetEntriesInAclW must put the managed explicit read deny
                 # before the pre-existing/inherited broad allow on the same
@@ -236,6 +304,38 @@ class WindowsSandboxNativeAcceptanceTests(unittest.TestCase):
                     self.assertEqual(workspace_file.read_text(encoding="utf-8"), "offline write")
                     _assert_denied(lambda: os.stat(store.path))
                     _assert_denied(lambda: store.path.read_bytes())
+                    _assert_denied(lambda: store.path.write_bytes(b"must fail"))
+                    replacement = root / "replacement-online.dpapi"
+                    replacement.write_bytes(b"replacement")
+                    _assert_denied(lambda: os.replace(replacement, store.path))
+                    _assert_denied(lambda: store.path.rename(root / "renamed-online.dpapi"))
+                    _assert_denied(lambda: store.path.unlink())
+
+                # Controller/setup authority retains normal DPAPI state
+                # operations after both sandbox identities are denied.
+                controller_state = store.load()
+                self.assertIsNotNone(controller_state)
+                store.save(controller_state or b"controller-state")
+                self.assertEqual(store.load(), controller_state or b"controller-state")
+
+                # An externally reordered managed sensitive deny is not READY
+                # even though the tuple is still present.  Repair must restore
+                # canonical ordering and preserve its access semantics.
+                sensitive_deny = next(
+                    entry
+                    for entry in record.managed_aces
+                    if entry.path == sensitive_file.resolve(strict=False) and entry.is_deny
+                )
+                _reorder_native_acl(acl_api, sensitive_file, sensitive_deny)
+                self.assertEqual(
+                    authority.inspect(request).state, WindowsSandboxSetupState.NEEDS_REPAIR
+                )
+                self.assertEqual(
+                    authority.repair(request, identity=WindowsSandboxIdentityKind.OFFLINE).state,
+                    WindowsSandboxSetupState.READY,
+                )
+                with _impersonate(offline_record.username, offline_record.password.decode()):
+                    _assert_denied(lambda: sensitive_file.read_text(encoding="utf-8"))
 
                 # Remove one managed ACE and prove native repair restores it.
                 workspace_path = workspace.resolve(strict=False)

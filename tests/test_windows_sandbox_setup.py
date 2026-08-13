@@ -19,6 +19,7 @@ from neuro_code.infrastructure.sandbox.windows_sandbox_accounts import (
     SANDBOX_ONLINE_USERNAME,
     InMemoryWindowsSandboxAccountApi,
     WindowsAccountSid,
+    WindowsLocalUserFacts,
 )
 from neuro_code.infrastructure.sandbox.windows_sandbox_acl import (
     READ_ACCESS_MASK,
@@ -44,6 +45,7 @@ from neuro_code.infrastructure.sandbox.windows_sandbox_persistence import (
 )
 from neuro_code.infrastructure.sandbox.windows_sandbox_setup import (
     WindowsNativeSandboxSetupAuthority,
+    WindowsSandboxSetupError,
     WindowsSandboxSetupPrivilegeError,
 )
 
@@ -72,6 +74,28 @@ class _FakePrivilege:
     def is_administrator(self) -> bool:
         self.calls += 1
         return self.administrator
+
+
+class _FailingFirewall(InMemoryWindowsFirewallApi):
+    def __init__(self) -> None:
+        super().__init__()
+        self.fail_ensure = True
+
+    def ensure_outbound_block(self, rule: WindowsFirewallRule) -> None:
+        if self.fail_ensure:
+            raise RuntimeError("injected firewall setup failure")
+        super().ensure_outbound_block(rule)
+
+
+class _FailingAccountRemovalApi(InMemoryWindowsSandboxAccountApi):
+    def __init__(self) -> None:
+        super().__init__()
+        self.fail_remove = True
+
+    def remove_user(self, facts: WindowsLocalUserFacts) -> None:
+        if self.fail_remove:
+            raise RuntimeError("injected account cleanup failure")
+        super().remove_user(facts)
 
 
 class WindowsDpapiCredentialStoreTests(unittest.TestCase):
@@ -183,6 +207,23 @@ class WindowsSandboxSetupAuthorityTests(unittest.TestCase):
                 )
             with self.assertRaises(ValueError):
                 WindowsSandboxSetupRequest(**{**valid, "writable_roots": (root / "outside",)})
+            with self.assertRaises(ValueError):
+                WindowsSandboxSetupRequest(**{**valid, "installation_root": root / "workspace"})
+            with self.assertRaises(ValueError):
+                WindowsSandboxSetupRequest(
+                    **{
+                        **valid,
+                        "installation_root": root / "workspace" / "private",
+                    }
+                )
+            with self.assertRaises(ValueError):
+                WindowsSandboxSetupRequest(
+                    **{
+                        **valid,
+                        "read_roots": (root / "install" / "workspace",),
+                        "writable_roots": (root / "install" / "workspace",),
+                    }
+                )
 
     def test_managed_ace_contract_rejects_unsafe_tuples(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -270,13 +311,34 @@ class WindowsSandboxSetupAuthorityTests(unittest.TestCase):
             WindowsFirewallRule("rule", WindowsSandboxIdentityKind.OFFLINE, object(), True)  # type: ignore[arg-type]
         with self.assertRaises(TypeError):
             WindowsFirewallRule("rule", WindowsSandboxIdentityKind.OFFLINE, sid, 1)  # type: ignore[arg-type]
+        with self.assertRaises(ValueError):
+            WindowsFirewallRule("rule", WindowsSandboxIdentityKind.OFFLINE, sid, True, "Inbound")
+        with self.assertRaises(ValueError):
+            WindowsFirewallRule(
+                "rule", WindowsSandboxIdentityKind.OFFLINE, sid, True, "Outbound", "Allow"
+            )
+        with self.assertRaises(ValueError):
+            WindowsFirewallRule(
+                "rule", WindowsSandboxIdentityKind.OFFLINE, sid, True, "Outbound", "Block", False
+            )
+        with self.assertRaises(ValueError):
+            WindowsFirewallRule(
+                "rule",
+                WindowsSandboxIdentityKind.OFFLINE,
+                sid,
+                True,
+                "Outbound",
+                "Block",
+                True,
+                "Domain",
+            )
 
     def test_plan_has_write_read_and_sensitive_deny_roles(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             request = self._request(directory)
             request = WindowsSandboxSetupRequest(
                 installation_root=request.installation_root,
-                read_roots=(*request.read_roots, request.installation_root / "readonly"),
+                read_roots=(*request.read_roots, Path(directory) / "readonly"),
                 writable_roots=request.writable_roots,
                 sensitive_read_paths=request.sensitive_read_paths,
             )
@@ -335,6 +397,7 @@ class WindowsSandboxSetupAuthorityTests(unittest.TestCase):
                 read_user_sids=account_sids,
                 write_user_sids=account_sids,
                 credential_path=request.installation_root / "credentials.dpapi",
+                private_root=request.installation_root,
             )
             self.assertTrue(
                 any(
@@ -342,18 +405,17 @@ class WindowsSandboxSetupAuthorityTests(unittest.TestCase):
                     for entry in credential_plan.entries
                 )
             )
-            credential_plan = plan_windows_filesystem_authority(
-                request,
-                SyntheticWindowsSid.from_components((1, 2, 3, 4)),
-                read_user_sids=account_sids,
-                write_user_sids=account_sids,
-                credential_path=request.installation_root / "credentials.dpapi",
-            )
+            credential_denies = [
+                entry
+                for entry in credential_plan.entries
+                if entry.kind is WindowsManagedAceKind.CREDENTIAL_PROTECTION_DENY
+            ]
             self.assertTrue(
-                any(
-                    entry.kind is WindowsManagedAceKind.CREDENTIAL_PROTECTION_DENY
-                    for entry in credential_plan.entries
-                )
+                all(entry.access_mask != READ_ACCESS_MASK for entry in credential_denies)
+            )
+            self.assertIn(
+                request.installation_root,
+                {entry.path for entry in credential_denies},
             )
 
     def test_setup_creates_dedicated_identities_with_one_persistent_write_sid(self) -> None:
@@ -423,6 +485,48 @@ class WindowsSandboxSetupAuthorityTests(unittest.TestCase):
             self.assertEqual(repaired.state, WindowsSandboxSetupState.READY)
             self.assertIn("controller-user-ace", acl.unmanaged_entries[workspace])
 
+    def test_acl_order_drift_is_repaired_without_removing_unmanaged_entries(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            request = self._request(directory)
+            authority, acl, _, _ = self._authority(directory)
+            authority.setup(request, identity=WindowsSandboxIdentityKind.ONLINE)
+            sensitive = request.sensitive_read_paths[0]
+            acl.unmanaged_entries[sensitive].add("controller-user-ace")
+            acl.ordered_entries[sensitive].reverse()
+            self.assertEqual(
+                authority.inspect(request).state, WindowsSandboxSetupState.NEEDS_REPAIR
+            )
+            repaired = authority.repair(request, identity=WindowsSandboxIdentityKind.ONLINE)
+            self.assertEqual(repaired.state, WindowsSandboxSetupState.READY)
+            self.assertIn("controller-user-ace", acl.unmanaged_entries[sensitive])
+
+    def test_firewall_semantic_drift_is_repaired(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            request = self._request(directory)
+            authority, _, firewall, _ = self._authority(directory)
+            authority.setup(request, identity=WindowsSandboxIdentityKind.OFFLINE)
+            rule = next(iter(firewall.rules.values()))
+            drifted = object.__new__(WindowsFirewallRule)
+            object.__setattr__(drifted, "name", rule.name)
+            object.__setattr__(drifted, "identity", rule.identity)
+            object.__setattr__(
+                drifted,
+                "sid",
+                WindowsAccountSid("S-1-5-21-100-200-300-2999"),
+            )
+            object.__setattr__(drifted, "outbound_block", True)
+            object.__setattr__(drifted, "direction", "Inbound")
+            object.__setattr__(drifted, "action", "Allow")
+            object.__setattr__(drifted, "enabled", False)
+            object.__setattr__(drifted, "profile", "Domain")
+            firewall.rules[rule.name] = drifted
+            self.assertEqual(
+                authority.inspect(request).state, WindowsSandboxSetupState.NEEDS_REPAIR
+            )
+            repaired = authority.repair(request, identity=WindowsSandboxIdentityKind.OFFLINE)
+            self.assertEqual(repaired.state, WindowsSandboxSetupState.READY)
+            self.assertEqual(firewall.rules[rule.name], rule)
+
     def test_corrupt_persisted_record_reports_needs_repair(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             request = self._request(directory)
@@ -442,6 +546,23 @@ class WindowsSandboxSetupAuthorityTests(unittest.TestCase):
             self.assertEqual(acl.calls, [])
             self.assertEqual(firewall.calls, [])
 
+    def test_credential_store_outside_private_root_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            request = self._request(directory)
+            authority = WindowsNativeSandboxSetupAuthority(
+                credential_store=WindowsDpapiCredentialStore(
+                    root / "workspace" / "credentials.dpapi",
+                    api=_FakeDpapi(),
+                ),
+                acl_api=InMemoryWindowsAclApi(),
+                firewall_api=InMemoryWindowsFirewallApi(),
+                account_api=InMemoryWindowsSandboxAccountApi(),
+                privilege_api=_FakePrivilege(True),
+            )
+            with self.assertRaises(WindowsSandboxSetupError):
+                authority.setup(request, identity=WindowsSandboxIdentityKind.OFFLINE)
+
     def test_cleanup_removes_only_managed_entries_and_credential_record(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             request = self._request(directory)
@@ -458,6 +579,36 @@ class WindowsSandboxSetupAuthorityTests(unittest.TestCase):
             assert account_api is not None
             self.assertFalse(account_api.user_exists("NeuroSandboxOffline"))
             self.assertFalse(account_api.user_exists("NeuroSandboxOnline"))
+
+    def test_fresh_setup_rollback_keeps_record_until_accounts_are_removed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            request = self._request(directory)
+            acl = InMemoryWindowsAclApi()
+            firewall = _FailingFirewall()
+            accounts = _FailingAccountRemovalApi()
+            store = WindowsDpapiCredentialStore(
+                root / "installation" / "credentials.dpapi",
+                api=_FakeDpapi(),
+            )
+            authority = WindowsNativeSandboxSetupAuthority(
+                credential_store=store,
+                acl_api=acl,
+                firewall_api=firewall,
+                account_api=accounts,
+                privilege_api=_FakePrivilege(True),
+            )
+            with self.assertRaises(WindowsSandboxSetupError):
+                authority.setup(request, identity=WindowsSandboxIdentityKind.OFFLINE)
+            # The account removal failed after ACL/firewall rollback began;
+            # the persisted record must remain as the recovery source.
+            self.assertIsNotNone(store.load())
+            self.assertTrue(accounts.user_exists(SANDBOX_OFFLINE_USERNAME))
+            self.assertTrue(accounts.user_exists(SANDBOX_ONLINE_USERNAME))
+            accounts.fail_remove = False
+            cleaned = authority.cleanup(request)
+            self.assertEqual(cleaned.state, WindowsSandboxSetupState.NEEDS_SETUP)
+            self.assertIsNone(store.load())
 
     def test_setup_privilege_boundary_is_admin_only_for_setup(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

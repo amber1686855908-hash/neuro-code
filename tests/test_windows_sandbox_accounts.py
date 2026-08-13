@@ -3,6 +3,8 @@ from __future__ import annotations
 import unittest
 
 from neuro_code.infrastructure.sandbox.windows_sandbox_accounts import (
+    BUILTIN_ADMINISTRATORS_SID,
+    BUILTIN_USERS_SID,
     SANDBOX_OFFLINE_USERNAME,
     SANDBOX_ONLINE_USERNAME,
     InMemoryWindowsSandboxAccountApi,
@@ -28,7 +30,7 @@ class WindowsSandboxAccountContractTests(unittest.TestCase):
         self.assertTrue(any(character.isdigit() for character in password))
         self.assertTrue(any(not character.isalnum() for character in password))
 
-    def test_local_group_facts_accept_qualified_builtin_names(self) -> None:
+    def test_local_group_facts_use_locale_independent_builtin_sids(self) -> None:
         accounts = InMemoryWindowsSandboxAccountApi()
         facts = accounts.ensure_user(SANDBOX_OFFLINE_USERNAME, "offline-password")
         qualified = type(facts)(
@@ -38,8 +40,30 @@ class WindowsSandboxAccountContractTests(unittest.TestCase):
             facts.enabled,
             facts.user_privilege,
             facts.created_by_installation,
+            (BUILTIN_USERS_SID,),
         )
         qualified.validate(expected_username=SANDBOX_OFFLINE_USERNAME)
+        localized = type(facts)(
+            facts.username,
+            facts.sid,
+            ("Benutzer",),
+            facts.enabled,
+            facts.user_privilege,
+            facts.created_by_installation,
+            (BUILTIN_USERS_SID,),
+        )
+        localized.validate(expected_username=SANDBOX_OFFLINE_USERNAME)
+        privileged = type(facts)(
+            facts.username,
+            facts.sid,
+            ("Administratoren",),
+            facts.enabled,
+            facts.user_privilege,
+            facts.created_by_installation,
+            (BUILTIN_USERS_SID, BUILTIN_ADMINISTRATORS_SID),
+        )
+        with self.assertRaises(WindowsSandboxAccountError):
+            privileged.validate(expected_username=SANDBOX_OFFLINE_USERNAME)
 
     def test_two_users_are_real_account_subjects_and_stable(self) -> None:
         accounts = InMemoryWindowsSandboxAccountApi()

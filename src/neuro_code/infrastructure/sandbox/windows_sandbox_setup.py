@@ -14,6 +14,7 @@ import contextlib
 import json
 import os
 import secrets
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
@@ -226,6 +227,10 @@ class _InstallationRecord:
                 "identity": self.offline_firewall_rule.identity.value,
                 "sid": self.offline_firewall_rule.sid.value,
                 "outbound_block": self.offline_firewall_rule.outbound_block,
+                "direction": self.offline_firewall_rule.direction,
+                "action": self.offline_firewall_rule.action,
+                "enabled": self.offline_firewall_rule.enabled,
+                "profile": self.offline_firewall_rule.profile,
             },
             "active_identity": self.active_identity.value,
         }
@@ -289,6 +294,10 @@ class _InstallationRecord:
                 WindowsSandboxIdentityKind(firewall_payload["identity"]),
                 WindowsAccountSid(firewall_payload["sid"]),
                 bool(firewall_payload["outbound_block"]),
+                str(firewall_payload.get("direction", "Outbound")),
+                str(firewall_payload.get("action", "Block")),
+                bool(firewall_payload.get("enabled", True)),
+                str(firewall_payload.get("profile", "Any")),
             )
             record = cls(
                 int(payload["schema_version"]),
@@ -366,8 +375,16 @@ class WindowsNativeSandboxSetupAuthority:
         return self._acl_authority, firewall, accounts
 
     def _load(self, request: WindowsSandboxSetupRequest) -> _InstallationRecord | None:
+        store = self._store(request)
+        store_path = store.path.expanduser().resolve(strict=False)
+        if store_path == request.installation_root or not store_path.is_relative_to(
+            request.installation_root
+        ):
+            raise WindowsSandboxSetupError(
+                "credential store must remain inside the private installation root"
+            )
         try:
-            encoded = self._store(request).load()
+            encoded = store.load()
         except SandboxError:
             raise WindowsSandboxSetupError("Windows sandbox setup record needs repair") from None
         if encoded is None:
@@ -429,6 +446,7 @@ class WindowsNativeSandboxSetupAuthority:
             read_user_sids=user_sids,
             write_user_sids=user_sids,
             credential_path=credential_path,
+            private_root=request.installation_root,
         )
 
     @staticmethod
@@ -641,14 +659,30 @@ class WindowsNativeSandboxSetupAuthority:
                 firewall.remove_rule(record.offline_firewall_rule)
         except BaseException:
             if fresh:
-                try:
-                    acl_authority.cleanup(plan.entries)
-                    firewall.remove_rule(record.offline_firewall_rule)
-                    store.clear()
-                    for facts in created_facts:
+                rollback_failed = False
+
+                # Keep the persisted installation record until every external
+                # Windows authority has been rolled back.  If any step fails,
+                # the record is the recovery source for a later repair/cleanup.
+                def rollback_accounts() -> None:
+                    for facts in reversed(created_facts):
                         account_api.remove_user(facts)
-                except BaseException:
-                    pass
+
+                rollback_actions: tuple[Callable[[], None], ...] = (
+                    lambda: acl_authority.cleanup(plan.entries),
+                    lambda: firewall.remove_rule(record.offline_firewall_rule),
+                    rollback_accounts,
+                )
+                for rollback in rollback_actions:
+                    try:
+                        rollback()
+                    except BaseException:
+                        rollback_failed = True
+                if not rollback_failed:
+                    try:
+                        store.clear()
+                    except BaseException:
+                        rollback_failed = True
             raise WindowsSandboxSetupError(
                 "Windows sandbox setup failed and was rolled back"
             ) from None
@@ -691,6 +725,7 @@ class WindowsNativeSandboxSetupAuthority:
                         facts.enabled,
                         facts.user_privilege,
                         identity.created_by_installation,
+                        facts.group_sids,
                     )
                     account_api.remove_user(facts)
             self._store(request).clear()
