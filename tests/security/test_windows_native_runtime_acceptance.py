@@ -92,12 +92,24 @@ async def _read_with_native_timeout(
     stream_name: str = "stdout",
     limit_seconds: float = 30.0,
 ) -> bytes:
-    """Bound a native read and terminate the owned scope on a stuck child."""
+    """Read native output in bounded chunks and terminate a stuck child.
+
+    A single ``StreamReader.read()`` waits for EOF.  Keeping that wait in one
+    coroutine makes a child that emitted data but failed to close its stream
+    indistinguishable from a child that never produced output.  Chunked reads
+    preserve binary output while applying the timeout to every native read.
+    """
 
     print(f"W3_PHASE read-start:{stream_name}", flush=True)
     try:
         stream = getattr(process, stream_name)
-        result = await asyncio.wait_for(stream.read(), timeout=limit_seconds)
+        chunks: list[bytes] = []
+        while True:
+            chunk = await asyncio.wait_for(stream.read(65_536), timeout=limit_seconds)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        result = b"".join(chunks)
         print(f"W3_PHASE read-done:{stream_name}:{len(result)}", flush=True)
         return result
     except TimeoutError as error:
