@@ -1449,7 +1449,7 @@ class _NativeChildApi:
             environment = _environment_block(env)
             created = self._create_process_as_user(
                 token,
-                application_name,
+                None,
                 mutable,
                 None,
                 None,
