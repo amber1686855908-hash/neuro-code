@@ -1040,10 +1040,14 @@ class _RunnerChild:
         try:
             self._api.wait_process(self._process_handle)
             code = self._api.get_exit_code(self._process_handle)
+            # Publish process completion before waiting for output relays.  A
+            # relay can remain in a native ReadFile until every duplicated
+            # pipe writer is released; completion must not be hidden behind
+            # that stream-drain path.
+            self._send(RuntimeFrameType.EXIT, {"version": PROTOCOL_VERSION, "returncode": code})
             for thread in self._threads:
                 if thread is not threading.current_thread():
                     thread.join(timeout=2.0)
-            self._send(RuntimeFrameType.EXIT, {"version": PROTOCOL_VERSION, "returncode": code})
         except BaseException as error:
             with contextlib.suppress(BaseException):
                 self._send(
