@@ -1213,7 +1213,12 @@ class _NativeChildApi:
             environment = _environment_block(env)
             created = self._create_process_as_user(
                 token,
-                application_name,
+                # Keep the executable as the first, fully quoted command-line
+                # token.  Passing the same path through both lpApplicationName
+                # and lpCommandLine makes CreateProcessAsUserW perform two
+                # independent parsing paths; the native boundary only needs
+                # one canonical command line here.
+                None,
                 mutable,
                 None,
                 None,
