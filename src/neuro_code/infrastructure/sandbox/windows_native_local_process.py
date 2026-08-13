@@ -412,7 +412,7 @@ class WindowsNativeLocalProcessSandbox(LocalProcessSandbox):
             pipe.write(encode_frame(RuntimeFrameType.SPAWN_REQUEST, encode_json(payload)))
             decoder = RuntimeFrameDecoder()
             while True:
-                data = pipe.read()
+                data = pipe.read_for_runner(launch.process_handle)
                 if not data:
                     decoder.finish()
                     raise SandboxError("trusted Windows runner exited before SpawnReady")

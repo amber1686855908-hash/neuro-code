@@ -292,6 +292,44 @@ class WindowsNamedPipe:
     def read(self) -> bytes:
         return self._api.read(self.handle)
 
+    def read_for_runner(
+        self,
+        runner_handle: int,
+        *,
+        timeout_seconds: float = 30.0,
+    ) -> bytes:
+        """Read one chunk while bounding a stalled trusted runner."""
+
+        if timeout_seconds <= 0:
+            raise ValueError("named-pipe read timeout must be positive")
+        result: list[bytes] = []
+        failure: list[BaseException] = []
+        completed = threading.Event()
+
+        def read() -> None:
+            try:
+                result.append(self.read())
+            except BaseException as error:
+                failure.append(error)
+            finally:
+                completed.set()
+
+        thread = threading.Thread(target=read, name="neuro-code-windows-pipe-read", daemon=True)
+        thread.start()
+        deadline = time.monotonic() + timeout_seconds
+        while not completed.wait(0.05):
+            if self._api.wait_for_single_object(runner_handle, 0) == _WAIT_OBJECT_0:
+                self.close()
+                thread.join(timeout=1.0)
+                raise SandboxError("trusted Windows runner exited during named-pipe read")
+            if time.monotonic() >= deadline:
+                self.close()
+                thread.join(timeout=1.0)
+                raise SandboxError("trusted Windows runner produced no frame before timeout")
+        if failure:
+            raise failure[0]
+        return result[0] if result else b""
+
     def write(self, payload: bytes) -> None:
         with self._write_lock:
             self._api.write(self.handle, payload)
