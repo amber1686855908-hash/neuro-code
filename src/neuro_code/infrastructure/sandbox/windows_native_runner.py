@@ -859,7 +859,7 @@ class _RunnerChild:
             runner_sid = current_user_sid()
             runner_logon_sid = current_logon_sid()
             self._desktop_handle, self._desktop_name = self._api.create_private_desktop(
-                (runner_sid, runner_logon_sid)
+                (runner_sid, runner_logon_sid, write_sid.value)
             )
             executable = payload.get("executable")
             arguments = payload.get("arguments", [])
