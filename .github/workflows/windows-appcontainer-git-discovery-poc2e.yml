@@ -58,7 +58,7 @@ jobs:
           if (-not $pathSep -or -not $ceiling -or -not $split -or -not $across) {
             throw "Unable to prove Git for Windows discovery source semantics"
           }
-          if ($ceiling -notmatch 'empty entry.*turns off canonicalization') {
+          if ($ceiling -notmatch 'empty entry' -or $ceiling -notmatch 'turns off canonicalization') {
             throw "Unable to prove leading-empty ceiling canonicalization behavior"
           }
 
