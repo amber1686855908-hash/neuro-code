@@ -20,6 +20,7 @@ import secrets
 import subprocess
 import sys
 import threading
+import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -66,6 +67,7 @@ _PROC_THREAD_ATTRIBUTE_HANDLE_LIST = 0x00020002
 _PROC_THREAD_ATTRIBUTE_JOB_LIST = 0x0002000D
 _HANDLE_FLAG_INHERIT = 0x00000001
 _WAIT_OBJECT_0 = 0
+_WAIT_TIMEOUT = 0x00000102
 _INFINITE = 0xFFFFFFFF
 _LOGON_WITH_PROFILE = 0x00000001
 _TOKEN_USER = 1
@@ -449,6 +451,55 @@ class WindowsNamedPipeServer:
                 raise OSError(error, "ConnectNamedPipe failed")
         self._pipe = None
         return pipe
+
+    def accept_for_runner(
+        self,
+        runner_handle: int,
+        *,
+        timeout_seconds: float = 30.0,
+    ) -> WindowsNamedPipe:
+        """Accept while detecting a dead or non-connecting trusted runner.
+
+        ``ConnectNamedPipe`` is synchronous. Running it behind a short
+        monitor keeps a runner import/logon failure from hanging the
+        controller forever while retaining the exact named-pipe DACL.
+        """
+
+        if timeout_seconds <= 0:
+            raise ValueError("named-pipe connection timeout must be positive")
+        result: list[WindowsNamedPipe] = []
+        failure: list[BaseException] = []
+        completed = threading.Event()
+
+        def connect() -> None:
+            try:
+                result.append(self.accept())
+            except BaseException as error:
+                failure.append(error)
+            finally:
+                completed.set()
+
+        thread = threading.Thread(
+            target=connect,
+            name="neuro-code-windows-pipe-accept",
+            daemon=True,
+        )
+        thread.start()
+        deadline = time.monotonic() + timeout_seconds
+        while not completed.wait(0.05):
+            if self._api.wait_for_single_object(runner_handle, 0) == _WAIT_OBJECT_0:
+                self.close()
+                thread.join(timeout=1.0)
+                raise SandboxError("trusted Windows runner exited before named-pipe connection")
+            if time.monotonic() >= deadline:
+                self.close()
+                thread.join(timeout=1.0)
+                raise SandboxError("trusted Windows runner did not connect to its named pipe")
+        if failure:
+            raise failure[0]
+        if not result:
+            raise SandboxError("trusted Windows named-pipe accept returned no connection")
+        return result[0]
 
     def close(self) -> None:
         pipe, self._pipe = getattr(self, "_pipe", None), None

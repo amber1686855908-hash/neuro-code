@@ -394,7 +394,7 @@ class WindowsNativeLocalProcessSandbox(LocalProcessSandbox):
                 pipe_name=server.name,
                 environment=self._runner_environment(),
             )
-            pipe = server.accept()
+            pipe = server.accept_for_runner(launch.process_handle)
             server.close()
             payload: dict[str, object] = {
                 "version": PROTOCOL_VERSION,
