@@ -272,6 +272,29 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                 setup_request_factory=lambda _request: setup_request,
             )
             try:
+                print("W3_PHASE whoami-probe-start", flush=True)
+                whoami_probe = await adapter.spawn(
+                    _request(
+                        workspace=workspace,
+                        read_roots=(workspace,),
+                        writable_roots=(workspace,),
+                        profile=SandboxProfile.WORKSPACE,
+                        network=LocalProcessNetworkPolicy.INHERIT,
+                        stdio=LocalProcessStdioMode.CAPTURE,
+                        arguments=(),
+                        executable=str(
+                            Path(os.environ.get("SYSTEMROOT", r"C:\\Windows"))
+                            / "System32"
+                            / "whoami.exe"
+                        ),
+                    )
+                )
+                print("W3_PHASE whoami-probe-spawned", flush=True)
+                whoami_output = await _read_with_native_timeout(whoami_probe, limit_seconds=10)
+                print(f"W3_PHASE whoami-output:{whoami_output!r}", flush=True)
+                self.assertEqual(await whoami_probe.wait(), 0)
+                print("W3_PHASE whoami-probe-done", flush=True)
+
                 print("W3_PHASE stdio-probe-start", flush=True)
                 stdio_marker = workspace / "stdio-marker.txt"
                 stdio_probe_code = (
