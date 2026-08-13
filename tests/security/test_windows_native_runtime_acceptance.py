@@ -309,6 +309,28 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                 setup_request_factory=lambda _request: setup_request,
             )
             try:
+                print("W3_PHASE cmd-exit-probe-start", flush=True)
+                cmd_exit_probe = await adapter.spawn(
+                    _request(
+                        workspace=workspace,
+                        read_roots=(workspace,),
+                        writable_roots=(workspace,),
+                        profile=SandboxProfile.WORKSPACE,
+                        network=LocalProcessNetworkPolicy.INHERIT,
+                        stdio=LocalProcessStdioMode.CAPTURE,
+                        arguments=("/d", "/c", "exit 0"),
+                        executable=os.environ.get("COMSPEC", r"C:\\Windows\\System32\\cmd.exe"),
+                    )
+                )
+                print("W3_PHASE cmd-exit-probe-spawned", flush=True)
+                await asyncio.sleep(2)
+                print(
+                    f"W3_PHASE cmd-exit-facts:{_native_process_facts(cmd_exit_probe.process_id)}",
+                    flush=True,
+                )
+                self.assertEqual(await asyncio.wait_for(cmd_exit_probe.wait(), timeout=10), 0)
+                print("W3_PHASE cmd-exit-probe-done", flush=True)
+
                 print("W3_PHASE whoami-probe-start", flush=True)
                 whoami_probe = await adapter.spawn(
                     _request(
