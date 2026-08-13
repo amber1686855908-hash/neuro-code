@@ -241,7 +241,7 @@ def _trust_exact_repositories(
                 str(config),
                 "--add",
                 "safe.directory",
-                str(repository),
+                str(repository).replace("\\", "/"),
             ]
         )
         for repository in repositories
