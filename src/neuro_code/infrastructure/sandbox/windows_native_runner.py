@@ -1180,8 +1180,23 @@ class _NativeChildApi:
                 None,
             ):
                 self._error("UpdateProcThreadAttribute(handles)")
+            # CreatePipe marks both ends inheritable, but make the contract
+            # explicit immediately before CreateProcessAsUserW.  The handle
+            # list attribute is only honored for inheritable handles; relying
+            # on the CreatePipe security-attributes default is fragile across
+            # Windows runners and leaves the child with detached stdio.
+            for handle in dict.fromkeys(inherited_handles):
+                if not self._set_handle_information(
+                    handle, _HANDLE_FLAG_INHERIT, _HANDLE_FLAG_INHERIT
+                ):
+                    self._error("SetHandleInformation(stdio inherit)")
             startup = _StartupInfoExW()
             startup.StartupInfo.cb = ctypes.sizeof(startup)
+            # A restricted token can otherwise start without a usable window
+            # station/desktop on a fresh local account.  W3 is non-interactive;
+            # the fixed default desktop is only a process-initialization target,
+            # never a PTY or terminal capability.
+            startup.StartupInfo.lpDesktop = r"Winsta0\Default"
             startup.StartupInfo.dwFlags = _STARTF_USESTDHANDLES
             startup.StartupInfo.hStdInput = stdin_handle
             startup.StartupInfo.hStdOutput = stdout_handle
