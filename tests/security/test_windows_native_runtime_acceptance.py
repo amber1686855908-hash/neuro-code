@@ -201,6 +201,7 @@ def _request(
     network: LocalProcessNetworkPolicy,
     stdio: LocalProcessStdioMode,
     arguments: tuple[str, ...],
+    executable: str | None = None,
 ) -> SandboxedProcessRequest:
     mode = (
         LocalWorkspaceAccessMode.READ_WRITE
@@ -209,7 +210,7 @@ def _request(
     )
     roots = tuple(LocalWorkspaceAccess(path, mode) for path in read_roots)
     return SandboxedProcessRequest.exec(
-        sys.executable,
+        executable or sys.executable,
         arguments,
         purpose=(
             LocalProcessPurpose.MCP_STDIO
@@ -271,6 +272,25 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                 setup_request_factory=lambda _request: setup_request,
             )
             try:
+                print("W3_PHASE stdio-probe-start", flush=True)
+                stdio_probe = await adapter.spawn(
+                    _request(
+                        workspace=workspace,
+                        read_roots=(workspace,),
+                        writable_roots=(workspace,),
+                        profile=SandboxProfile.WORKSPACE,
+                        network=LocalProcessNetworkPolicy.INHERIT,
+                        stdio=LocalProcessStdioMode.CAPTURE,
+                        arguments=("/d", "/c", "echo W3_STDIO"),
+                        executable=os.environ.get("COMSPEC", r"C:\\Windows\\System32\\cmd.exe"),
+                    )
+                )
+                print("W3_PHASE stdio-probe-spawned", flush=True)
+                stdio_output = await _read_with_native_timeout(stdio_probe)
+                self.assertIn(b"W3_STDIO", stdio_output)
+                self.assertEqual(await stdio_probe.wait(), 0)
+                print("W3_PHASE stdio-probe-done", flush=True)
+
                 print("W3_PHASE identity-spawn-start", flush=True)
                 identity_request = _request(
                     workspace=workspace,
