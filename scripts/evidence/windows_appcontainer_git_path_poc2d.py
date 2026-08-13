@@ -537,29 +537,40 @@ def _full_git_gates(
     if include_descendant:
         report = repo / "descendant.json"
         hook = repo / ".git" / "hooks" / "pre-commit"
-        shutil.copy2(probe, hook)
-        launcher.environment["NEURO_DESCENDANT_REPORT"] = str(report)
-        for key, value in (
-            ("user.name", "Neuro Evidence"),
-            ("user.email", "evidence@example.invalid"),
-        ):
-            _command(pb, api, launcher, bootstrap, [str(git), "config", key, value])
-        commit = _command(pb, api, launcher, bootstrap, [str(git), "commit", "-m", "evidence"])
-        descendant: dict[str, object] = {}
-        if report.exists():
-            with contextlib.suppress(json.JSONDecodeError):
-                descendant = cast(dict[str, object], json.loads(report.read_text(encoding="utf-8")))
-        detail = cast(dict[str, object], commit["detail"])
-        detail["descendant_facts"] = descendant
-        commit["status"] = (
-            "PASS"
-            if detail.get("target_exit_code") == 0
-            and descendant.get("is_appcontainer") is True
-            and descendant.get("in_job") is True
-            and descendant.get("integrity_rid") == 4096
-            and descendant.get("package_sid") == expected_sid
-            else "FAIL"
-        )
+        if hook.parent.is_dir():
+            shutil.copy2(probe, hook)
+            launcher.environment["NEURO_DESCENDANT_REPORT"] = str(report)
+            for key, value in (
+                ("user.name", "Neuro Evidence"),
+                ("user.email", "evidence@example.invalid"),
+            ):
+                _command(pb, api, launcher, bootstrap, [str(git), "config", key, value])
+            commit = _command(pb, api, launcher, bootstrap, [str(git), "commit", "-m", "evidence"])
+            descendant: dict[str, object] = {}
+            if report.exists():
+                with contextlib.suppress(json.JSONDecodeError):
+                    descendant = cast(
+                        dict[str, object], json.loads(report.read_text(encoding="utf-8"))
+                    )
+            detail = cast(dict[str, object], commit["detail"])
+            detail["descendant_facts"] = descendant
+            commit["status"] = (
+                "PASS"
+                if detail.get("target_exit_code") == 0
+                and descendant.get("is_appcontainer") is True
+                and descendant.get("in_job") is True
+                and descendant.get("integrity_rid") == 4096
+                and descendant.get("package_sid") == expected_sid
+                else "FAIL"
+            )
+        else:
+            commit = _status(
+                False,
+                {
+                    "reason": "git init did not create a repository; descendant hook not launched",
+                    "hook": str(hook),
+                },
+            )
         gates["descendant_confinement"] = commit
         required.append("descendant_confinement")
     gates["overall"] = (
@@ -952,11 +963,14 @@ def _main_run(args: argparse.Namespace, pb: ModuleType) -> tuple[dict[str, objec
                 for name in ("A_OPENED", "B_FILENAMEINFO")
                 if candidate_eligible[name]
                 and cast(dict[str, object], normal_regressions[name])["status"] == "PASS"
-                and cast(dict[str, object], candidate_smokes[name])["status"] == "PASS"
             ),
             None,
         )
         result["candidate_eligibility"] = candidate_eligible
+        result["candidate_selection_basis"] = (
+            "documented API available plus normal Windows regression; "
+            "AppContainer smoke remains an evidence gate"
+        )
         result["selected_candidate"] = selected
         if selected is not None:
             selected_runtime = runtimes[selected]
@@ -1033,7 +1047,7 @@ def _main_run(args: argparse.Namespace, pb: ModuleType) -> tuple[dict[str, objec
             and after_normalized.get("success") is True
         )
         result["parent_only_candidate"] = parent_only
-    except BaseException as error:
+    except Exception as error:
         result["harness_error"] = {"type": type(error).__name__, "message": str(error)}
         critical.append("HARNESS")
     finally:
@@ -1101,7 +1115,7 @@ def main() -> int:
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
-    except BaseException as error:
+    except Exception as error:
         failure = {
             "classification": CLASSIFICATION,
             "architecture_decision": "WINDOWS_GIT_PATH_INCONCLUSIVE",

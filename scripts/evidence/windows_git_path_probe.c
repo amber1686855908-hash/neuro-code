@@ -59,7 +59,7 @@ static void print_token_facts(void) {
     DWORD size = 0;
     DWORD is_appcontainer = 0;
     DWORD integrity = 0;
-    TOKEN_APPCONTAINER_INFORMATION package;
+    TOKEN_APPCONTAINER_INFORMATION *package = NULL;
     TOKEN_MANDATORY_LABEL *label = NULL;
     TOKEN_GROUPS *capabilities = NULL;
     LPWSTR sid = NULL;
@@ -68,12 +68,18 @@ static void print_token_facts(void) {
     BOOL in_job = FALSE;
     DWORD capability_index;
 
-    ZeroMemory(&package, sizeof(package));
     if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) {
         GetTokenInformation(token, TokenIsAppContainer, &is_appcontainer,
                             sizeof(is_appcontainer), &size);
-        size = sizeof(package);
-        GetTokenInformation(token, TokenAppContainerSid, &package, size, &size);
+        size = 0;
+        GetTokenInformation(token, TokenAppContainerSid, NULL, 0, &size);
+        package = (TOKEN_APPCONTAINER_INFORMATION *)HeapAlloc(
+            GetProcessHeap(), HEAP_ZERO_MEMORY, size);
+        if (package != NULL &&
+            !GetTokenInformation(token, TokenAppContainerSid, package, size, &size)) {
+            HeapFree(GetProcessHeap(), 0, package);
+            package = NULL;
+        }
         GetTokenInformation(token, TokenIntegrityLevel, NULL, 0, &size);
         label = (TOKEN_MANDATORY_LABEL *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, size);
         if (label != NULL &&
@@ -81,8 +87,8 @@ static void print_token_facts(void) {
             DWORD count = *GetSidSubAuthorityCount(label->Label.Sid);
             integrity = *GetSidSubAuthority(label->Label.Sid, count - 1);
         }
-        if (package.TokenAppContainer != NULL)
-            ConvertSidToStringSidW(package.TokenAppContainer, &sid);
+        if (package != NULL && package->TokenAppContainer != NULL)
+            ConvertSidToStringSidW(package->TokenAppContainer, &sid);
         size = 0;
         GetTokenInformation(token, TokenCapabilities, NULL, 0, &size);
         capabilities = (TOKEN_GROUPS *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, size);
@@ -117,6 +123,7 @@ static void print_token_facts(void) {
     }
     printf("]}");
     if (all_applications != NULL) LocalFree(all_applications);
+    if (package != NULL) HeapFree(GetProcessHeap(), 0, package);
     if (capabilities != NULL) HeapFree(GetProcessHeap(), 0, capabilities);
     if (sid != NULL) LocalFree(sid);
     if (label != NULL) HeapFree(GetProcessHeap(), 0, label);
@@ -247,17 +254,23 @@ static int descendant_mode(const wchar_t *report_path) {
     DWORD size = 0;
     DWORD is_appcontainer = 0;
     DWORD integrity = 0;
-    TOKEN_APPCONTAINER_INFORMATION package;
+    TOKEN_APPCONTAINER_INFORMATION *package = NULL;
     TOKEN_MANDATORY_LABEL *label = NULL;
     LPWSTR sid = NULL;
     BOOL in_job = FALSE;
 
-    ZeroMemory(&package, sizeof(package));
     if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) {
         GetTokenInformation(token, TokenIsAppContainer, &is_appcontainer,
                             sizeof(is_appcontainer), &size);
-        size = sizeof(package);
-        GetTokenInformation(token, TokenAppContainerSid, &package, size, &size);
+        size = 0;
+        GetTokenInformation(token, TokenAppContainerSid, NULL, 0, &size);
+        package = (TOKEN_APPCONTAINER_INFORMATION *)HeapAlloc(
+            GetProcessHeap(), HEAP_ZERO_MEMORY, size);
+        if (package != NULL &&
+            !GetTokenInformation(token, TokenAppContainerSid, package, size, &size)) {
+            HeapFree(GetProcessHeap(), 0, package);
+            package = NULL;
+        }
         GetTokenInformation(token, TokenIntegrityLevel, NULL, 0, &size);
         label = (TOKEN_MANDATORY_LABEL *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, size);
         if (label != NULL &&
@@ -265,8 +278,8 @@ static int descendant_mode(const wchar_t *report_path) {
             DWORD count = *GetSidSubAuthorityCount(label->Label.Sid);
             integrity = *GetSidSubAuthority(label->Label.Sid, count - 1);
         }
-        if (package.TokenAppContainer != NULL)
-            ConvertSidToStringSidW(package.TokenAppContainer, &sid);
+        if (package != NULL && package->TokenAppContainer != NULL)
+            ConvertSidToStringSidW(package->TokenAppContainer, &sid);
     }
     IsProcessInJob(GetCurrentProcess(), NULL, &in_job);
     length = _snprintf_s(
@@ -285,12 +298,14 @@ static int descendant_mode(const wchar_t *report_path) {
         !WriteFile(file, facts, (DWORD)length, &written, NULL) ||
         written != (DWORD)length) {
         if (file != INVALID_HANDLE_VALUE) CloseHandle(file);
+        if (package != NULL) HeapFree(GetProcessHeap(), 0, package);
         if (sid != NULL) LocalFree(sid);
         if (label != NULL) HeapFree(GetProcessHeap(), 0, label);
         if (token != NULL) CloseHandle(token);
         return 51;
     }
     CloseHandle(file);
+    if (package != NULL) HeapFree(GetProcessHeap(), 0, package);
     if (sid != NULL) LocalFree(sid);
     if (label != NULL) HeapFree(GetProcessHeap(), 0, label);
     if (token != NULL) CloseHandle(token);
