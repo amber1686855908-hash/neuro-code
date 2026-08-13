@@ -82,6 +82,32 @@ _PROFILE_USERNAMES = frozenset({"NeuroSandboxOffline", "NeuroSandboxOnline"})
 _HRESULT_FILE_NOT_FOUND = -2_147_024_894  # 0x80070002
 _HRESULT_PATH_NOT_FOUND = -2_147_024_893  # 0x80070003
 _ERROR_ALREADY_EXISTS = 183
+_DESKTOP_READOBJECTS = 0x0001
+_DESKTOP_CREATEWINDOW = 0x0002
+_DESKTOP_CREATEMENU = 0x0004
+_DESKTOP_HOOKCONTROL = 0x0008
+_DESKTOP_JOURNALRECORD = 0x0010
+_DESKTOP_JOURNALPLAYBACK = 0x0020
+_DESKTOP_ENUMERATE = 0x0040
+_DESKTOP_WRITEOBJECTS = 0x0080
+_DESKTOP_SWITCHDESKTOP = 0x0100
+_DESKTOP_READ_CONTROL = 0x00020000
+_DESKTOP_WRITE_DAC = 0x00040000
+_DESKTOP_WRITE_OWNER = 0x00080000
+_DESKTOP_ALL_ACCESS = (
+    _DESKTOP_READOBJECTS
+    | _DESKTOP_CREATEWINDOW
+    | _DESKTOP_CREATEMENU
+    | _DESKTOP_HOOKCONTROL
+    | _DESKTOP_JOURNALRECORD
+    | _DESKTOP_JOURNALPLAYBACK
+    | _DESKTOP_ENUMERATE
+    | _DESKTOP_WRITEOBJECTS
+    | _DESKTOP_SWITCHDESKTOP
+    | _DESKTOP_READ_CONTROL
+    | _DESKTOP_WRITE_DAC
+    | _DESKTOP_WRITE_OWNER
+)
 
 
 class _CFunction(Protocol):
@@ -717,6 +743,8 @@ class _RunnerChild:
         self._job = WindowsJobObject.create()
         self._process_handle: int | None = None
         self._stdin_handle: int | None = None
+        self._desktop_handle: int | None = None
+        self._desktop_name: str | None = None
         self._ephemeral_home: Path | None = None
         self._output_handles: list[int] = []
         self._threads: list[threading.Thread] = []
@@ -741,6 +769,8 @@ class _RunnerChild:
             # resolving its executable/cwd/imports; this does not add file,
             # network, or administrative authority.
             token.enable_change_notify_privilege()
+            runner_sid = current_user_sid()
+            self._desktop_handle, self._desktop_name = self._api.create_private_desktop(runner_sid)
             executable = payload.get("executable")
             arguments = payload.get("arguments", [])
             shell_command = payload.get("shell_command")
@@ -808,6 +838,7 @@ class _RunnerChild:
                 stderr_handle=stderr_write,
                 inherited_handles=inherited,
                 job_handle=self._job.process_creation_handle,
+                desktop_name=self._desktop_name,
             )
             if created.thread_handle is not None:
                 self._api.close_handle(created.thread_handle)
@@ -868,6 +899,11 @@ class _RunnerChild:
                 with contextlib.suppress(BaseException):
                     self._api.close_handle(handle)
             self._remove_ephemeral_home()
+            if self._desktop_handle is not None:
+                with contextlib.suppress(BaseException):
+                    self._api.close_desktop(self._desktop_handle)
+                self._desktop_handle = None
+                self._desktop_name = None
             raise
         finally:
             token.close()
@@ -925,6 +961,11 @@ class _RunnerChild:
                     self._api.close_handle(stdin_handle)
             with contextlib.suppress(BaseException):
                 self._job.close()
+            desktop_handle, self._desktop_handle = self._desktop_handle, None
+            self._desktop_name = None
+            if desktop_handle is not None:
+                with contextlib.suppress(BaseException):
+                    self._api.close_desktop(desktop_handle)
             self._remove_ephemeral_home()
 
     def handle(self, frame: RuntimeFrame) -> bool:
@@ -1095,6 +1136,26 @@ class _NativeChildApi:
             ],
             ctypes.c_int32,
         )
+        user32 = cast(object, loader("user32.dll", use_last_error=True))
+        self._create_desktop = _load_function(
+            user32,
+            "CreateDesktopW",
+            [
+                ctypes.c_wchar_p,
+                ctypes.c_wchar_p,
+                ctypes.c_void_p,
+                ctypes.c_uint32,
+                ctypes.c_uint32,
+                ctypes.POINTER(_SecurityAttributes),
+            ],
+            ctypes.c_void_p,
+        )
+        self._close_desktop = _load_function(
+            user32,
+            "CloseDesktop",
+            [ctypes.c_void_p],
+            ctypes.c_int32,
+        )
 
     def _error(self, operation: str) -> NoReturn:
         error = cast(int, self._get_last_error())
@@ -1154,6 +1215,7 @@ class _NativeChildApi:
         stderr_handle: int,
         inherited_handles: tuple[int, ...],
         job_handle: int,
+        desktop_name: str,
     ) -> RunnerLaunch:
         required = ctypes.c_size_t()
         self._initialize_attribute_list(None, 2, 0, ctypes.byref(required))
@@ -1198,11 +1260,10 @@ class _NativeChildApi:
                     self._error("SetHandleInformation(stdio inherit)")
             startup = _StartupInfoExW()
             startup.StartupInfo.cb = ctypes.sizeof(startup)
-            # W3 is non-interactive and must not depend on access to the
-            # controller's interactive window station.  Leave lpDesktop null
-            # so Windows selects the account/session default without granting
-            # the child a GUI or PTY surface.
-            startup.StartupInfo.lpDesktop = None
+            # Use only the runner-owned private desktop.  It is not a PTY or
+            # GUI capability; the handle is kept until child exit so account
+            # initialization cannot fall back to the controller desktop.
+            startup.StartupInfo.lpDesktop = desktop_name
             startup.StartupInfo.dwFlags = _STARTF_USESTDHANDLES
             startup.StartupInfo.hStdInput = stdin_handle
             startup.StartupInfo.hStdOutput = stdout_handle
@@ -1240,6 +1301,30 @@ class _NativeChildApi:
             int(process.dwProcessId),
             int(process.hThread),
         )
+
+    def create_private_desktop(self, user_sid: str) -> tuple[int, str]:
+        """Create a private desktop accessible only to the selected account."""
+
+        desktop_name = f"NeuroCodeW3-{secrets.token_hex(16)}"
+        attributes, descriptor = _security_descriptor((user_sid, "S-1-5-18", "S-1-5-32-544"))
+        try:
+            handle = self._create_desktop(
+                desktop_name,
+                None,
+                None,
+                0,
+                _DESKTOP_ALL_ACCESS,
+                ctypes.byref(attributes),
+            )
+        finally:
+            _free_security_descriptor(descriptor)
+        if handle is None or handle == 0 or handle == _INVALID_HANDLE_VALUE:
+            self._error("CreateDesktopW")
+        return int(cast(int, handle)), desktop_name
+
+    def close_desktop(self, handle: int) -> None:
+        if handle and not self._close_desktop(handle):
+            self._error("CloseDesktop")
 
     def read_file(self, handle: int, count: int = 65_536) -> bytes:
         buffer = ctypes.create_string_buffer(count)
