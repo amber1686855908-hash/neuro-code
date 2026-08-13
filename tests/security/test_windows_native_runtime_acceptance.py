@@ -274,6 +274,11 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
             try:
                 print("W3_PHASE stdio-probe-start", flush=True)
                 stdio_marker = workspace / "stdio-marker.txt"
+                stdio_probe_code = (
+                    "import os; "
+                    f"open({str(stdio_marker)!r}, 'w', encoding='ascii').write('marker'); "
+                    "os.write(1, b'W3_STDIO\\n'); os._exit(0)"
+                )
                 stdio_probe = await adapter.spawn(
                     _request(
                         workspace=workspace,
@@ -282,12 +287,7 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                         profile=SandboxProfile.WORKSPACE,
                         network=LocalProcessNetworkPolicy.INHERIT,
                         stdio=LocalProcessStdioMode.CAPTURE,
-                        arguments=(
-                            "/d",
-                            "/c",
-                            f"echo W3_STDIO>{stdio_marker} & echo W3_STDIO",
-                        ),
-                        executable=os.environ.get("COMSPEC", r"C:\\Windows\\System32\\cmd.exe"),
+                        arguments=("-c", stdio_probe_code),
                     )
                 )
                 print("W3_PHASE stdio-probe-spawned", flush=True)
