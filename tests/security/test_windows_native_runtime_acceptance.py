@@ -335,10 +335,15 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                     flush=True,
                 )
                 if cmd_exit_probe.stderr is not None:
-                    print(
-                        f"W3_PHASE runner-debug:{await asyncio.wait_for(cmd_exit_probe.stderr.read(256), timeout=2)}",
-                        flush=True,
-                    )
+                    debug_chunks: list[bytes] = []
+                    for _ in range(4):
+                        try:
+                            debug_chunks.append(
+                                await asyncio.wait_for(cmd_exit_probe.stderr.read(4096), timeout=1)
+                            )
+                        except TimeoutError:
+                            break
+                    print(f"W3_PHASE runner-debug:{debug_chunks!r}", flush=True)
                 self.assertEqual(await asyncio.wait_for(cmd_exit_probe.wait(), timeout=10), 0)
                 print("W3_PHASE cmd-exit-probe-done", flush=True)
 
