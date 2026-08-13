@@ -1314,9 +1314,11 @@ class _NativeChildApi:
         location and keeps HOME/TMP inside the selected W2 account boundary.
         """
 
-        path = Path(profile) / "AppData" / "Local" / "Temp"
+        path = Path(profile)
         try:
-            self.create_private_directory(path, user_sid)
+            for component in ("AppData", "Local", "Temp"):
+                path = path / component
+                self.create_private_directory(path, user_sid)
         except OSError as error:
             raise SandboxError(
                 "Windows sandbox private temporary directory is unavailable"
