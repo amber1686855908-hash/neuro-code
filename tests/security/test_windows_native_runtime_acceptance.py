@@ -109,6 +109,7 @@ async def _read_with_native_timeout(
             if not chunk:
                 break
             chunks.append(chunk)
+            print(f"W3_PHASE read-chunk:{stream_name}:{len(chunk)}", flush=True)
         result = b"".join(chunks)
         print(f"W3_PHASE read-done:{stream_name}:{len(result)}", flush=True)
         return result
@@ -121,6 +122,8 @@ async def _read_with_native_timeout(
 
 
 _TOKEN_PROBE = r"""
+import sys
+print("TOKEN_PROBE_EARLY", flush=True)
 import ctypes
 import json
 import sys
