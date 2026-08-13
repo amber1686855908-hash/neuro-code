@@ -70,6 +70,7 @@ _HANDLE_FLAG_INHERIT = 0x00000001
 _WAIT_OBJECT_0 = 0
 _WAIT_TIMEOUT = 0x00000102
 _INFINITE = 0xFFFFFFFF
+_STILL_ACTIVE = 259
 # Do not ask CreateProcessWithLogonW to synchronously load the account
 # profile.  W3 derives private HOME/TMP from the final token and creates those
 # directories inside the runner; loading a fresh W2 profile here can block the
@@ -1038,18 +1039,17 @@ class _RunnerChild:
     def _wait(self) -> None:
         assert self._process_handle is not None
         try:
-            print("W3_RUNNER_WAIT_ENTER", flush=True)
+            # The runner has no controller console. Keep completion reporting
+            # on the binary pipe instead of relying on detached stdout/stderr.
             self._send(RuntimeFrameType.STDERR, b"W3_RUNNER_WAIT_ENTER\n")
             self._api.wait_process(self._process_handle)
             code = self._api.get_exit_code(self._process_handle)
-            print("W3_RUNNER_WAIT_SIGNALED", flush=True)
             self._send(RuntimeFrameType.STDERR, b"W3_RUNNER_WAIT_SIGNALED\n")
             # Publish process completion before waiting for output relays.  A
             # relay can remain in a native ReadFile until every duplicated
             # pipe writer is released; completion must not be hidden behind
             # that stream-drain path.
             self._send(RuntimeFrameType.EXIT, {"version": PROTOCOL_VERSION, "returncode": code})
-            print("W3_RUNNER_EXIT_SENT", flush=True)
             self._send(RuntimeFrameType.STDERR, b"W3_RUNNER_EXIT_SENT\n")
             for thread in self._threads:
                 if thread is not threading.current_thread():
@@ -1383,12 +1383,7 @@ class _NativeChildApi:
             environment = _environment_block(env)
             created = self._create_process_as_user(
                 token,
-                # Keep the executable as the first, fully quoted command-line
-                # token.  Passing the same path through both lpApplicationName
-                # and lpCommandLine makes CreateProcessAsUserW perform two
-                # independent parsing paths; the native boundary only needs
-                # one canonical command line here.
-                None,
+                application_name,
                 mutable,
                 None,
                 None,
@@ -1464,7 +1459,17 @@ class _NativeChildApi:
             offset += written.value
 
     def wait_process(self, handle: int) -> None:
-        if self._wait(handle, _INFINITE) != _WAIT_OBJECT_0:
+        # Bound each native wait and use GetExitCodeProcess as a completion
+        # fallback. This prevents an unexpected handle state from stranding
+        # the trusted runner without publishing an Exit frame.
+        while True:
+            result = cast(int, self._wait(handle, 100))
+            if result == _WAIT_OBJECT_0:
+                return
+            if result == _WAIT_TIMEOUT:
+                if self.get_exit_code(handle) != _STILL_ACTIVE:
+                    return
+                continue
             self._error("WaitForSingleObject")
 
     def get_exit_code(self, handle: int) -> int:
