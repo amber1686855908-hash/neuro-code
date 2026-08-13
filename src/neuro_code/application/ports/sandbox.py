@@ -131,30 +131,27 @@ class LocalProcessSecurityCapability(StrEnum):
     READ_ISOLATION = "read-isolation"
     WRITE_ISOLATION = "write-isolation"
     NETWORK_ISOLATION = "network-isolation"
-    DESCENDANT_OWNERSHIP = "descendant-ownership"
 
 
 class LocalProcessSecurityStrength(StrEnum):
     """Strength of one independent local-process security capability.
 
-    ``LIMITED`` and ``BEST_EFFORT`` are intentionally distinct labels even
-    though both are weaker than ``STRONG``.  The explicit ordering below is
-    used only by the satisfaction helper; callers never compare enum strings.
+    Security authority has three levels.  Process lifecycle ownership remains
+    a separate contract in ``LocalProcessLifecycleCapability``; it is not
+    represented here and has no relationship to this ordering.
 
     表示一个独立本地进程安全 capability 的强度.
     """
 
     STRONG = "strong"
     LIMITED = "limited"
-    BEST_EFFORT = "best-effort"
     UNSUPPORTED = "unsupported"
 
 
 _SECURITY_STRENGTH = {
     LocalProcessSecurityStrength.UNSUPPORTED: 0,
-    LocalProcessSecurityStrength.BEST_EFFORT: 1,
-    LocalProcessSecurityStrength.LIMITED: 2,
-    LocalProcessSecurityStrength.STRONG: 3,
+    LocalProcessSecurityStrength.LIMITED: 1,
+    LocalProcessSecurityStrength.STRONG: 2,
 }
 
 
@@ -173,7 +170,6 @@ class LocalProcessSecurityCapabilities:
     read_isolation: LocalProcessSecurityStrength = LocalProcessSecurityStrength.UNSUPPORTED
     write_isolation: LocalProcessSecurityStrength = LocalProcessSecurityStrength.UNSUPPORTED
     network_isolation: LocalProcessSecurityStrength = LocalProcessSecurityStrength.UNSUPPORTED
-    descendant_ownership: LocalProcessSecurityStrength = LocalProcessSecurityStrength.UNSUPPORTED
 
     def __post_init__(self) -> None:
         if not all(
@@ -182,7 +178,6 @@ class LocalProcessSecurityCapabilities:
                 self.read_isolation,
                 self.write_isolation,
                 self.network_isolation,
-                self.descendant_ownership,
             )
         ):
             raise TypeError("local process security strengths must be canonical")
@@ -199,7 +194,6 @@ class LocalProcessSecurityCapabilities:
             LocalProcessSecurityCapability.READ_ISOLATION: self.read_isolation,
             LocalProcessSecurityCapability.WRITE_ISOLATION: self.write_isolation,
             LocalProcessSecurityCapability.NETWORK_ISOLATION: self.network_isolation,
-            LocalProcessSecurityCapability.DESCENDANT_OWNERSHIP: self.descendant_ownership,
         }[capability]
 
 
@@ -210,8 +204,9 @@ def security_capability_satisfies(
     """Return whether every provided security axis meets its requirement.
 
     This helper is intentionally explicit and independent from
-    ``lifecycle_capability_satisfies``.  A limited or best-effort provider can
-    never silently satisfy a strong requirement.
+    ``lifecycle_capability_satisfies``.  A limited provider can never silently
+    satisfy a strong requirement, and unsupported authority satisfies only an
+    unsupported/no requirement axis.
     """
 
     if not isinstance(provided, LocalProcessSecurityCapabilities):
@@ -225,13 +220,11 @@ def security_capability_satisfies(
                 provided.read_isolation,
                 provided.write_isolation,
                 provided.network_isolation,
-                provided.descendant_ownership,
             ),
             (
                 required.read_isolation,
                 required.write_isolation,
                 required.network_isolation,
-                required.descendant_ownership,
             ),
             strict=True,
         )

@@ -16,12 +16,10 @@ class LocalProcessSecurityCapabilityTests(unittest.TestCase):
             read_isolation=LocalProcessSecurityStrength.LIMITED,
             write_isolation=LocalProcessSecurityStrength.STRONG,
             network_isolation=LocalProcessSecurityStrength.UNSUPPORTED,
-            descendant_ownership=LocalProcessSecurityStrength.STRONG,
         )
         required = LocalProcessSecurityCapabilities(
             read_isolation=LocalProcessSecurityStrength.LIMITED,
             write_isolation=LocalProcessSecurityStrength.STRONG,
-            descendant_ownership=LocalProcessSecurityStrength.BEST_EFFORT,
         )
 
         self.assertTrue(security_capability_satisfies(provided, required))
@@ -46,6 +44,29 @@ class LocalProcessSecurityCapabilityTests(unittest.TestCase):
         )
         self.assertFalse(security_capability_satisfies(provided, required))
 
+    def test_strength_matrix_is_strong_limited_unsupported_only(self) -> None:
+        strong = LocalProcessSecurityCapabilities(
+            read_isolation=LocalProcessSecurityStrength.STRONG,
+        )
+        limited = LocalProcessSecurityCapabilities(
+            read_isolation=LocalProcessSecurityStrength.LIMITED,
+        )
+        unsupported = LocalProcessSecurityCapabilities()
+        required_strong = LocalProcessSecurityCapabilities(
+            read_isolation=LocalProcessSecurityStrength.STRONG,
+        )
+        required_limited = LocalProcessSecurityCapabilities(
+            read_isolation=LocalProcessSecurityStrength.LIMITED,
+        )
+        required_none = LocalProcessSecurityCapabilities()
+
+        self.assertTrue(security_capability_satisfies(strong, required_strong))
+        self.assertTrue(security_capability_satisfies(strong, required_limited))
+        self.assertFalse(security_capability_satisfies(limited, required_strong))
+        self.assertTrue(security_capability_satisfies(limited, required_limited))
+        self.assertFalse(security_capability_satisfies(unsupported, required_limited))
+        self.assertTrue(security_capability_satisfies(unsupported, required_none))
+
     def test_model_rejects_noncanonical_values(self) -> None:
         with self.assertRaises(TypeError):
             LocalProcessSecurityCapabilities(read_isolation="limited")  # type: ignore[arg-type]
@@ -57,6 +78,14 @@ class LocalProcessSecurityCapabilityTests(unittest.TestCase):
 
     def test_defaults_are_fail_closed(self) -> None:
         capabilities = LocalProcessSecurityCapabilities()
+        self.assertEqual(
+            set(LocalProcessSecurityCapability),
+            {
+                LocalProcessSecurityCapability.READ_ISOLATION,
+                LocalProcessSecurityCapability.WRITE_ISOLATION,
+                LocalProcessSecurityCapability.NETWORK_ISOLATION,
+            },
+        )
         self.assertTrue(
             all(
                 capabilities.strength_for(capability) is LocalProcessSecurityStrength.UNSUPPORTED

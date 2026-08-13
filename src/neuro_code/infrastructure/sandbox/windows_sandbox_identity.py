@@ -100,36 +100,29 @@ class WindowsSandboxIdentity:
         return (self.write_sid,)
 
 
-WINDOWS_NATIVE_SANDBOX_W1_CAPABILITIES = LocalProcessSecurityCapabilities(
-    read_isolation=LocalProcessSecurityStrength.LIMITED,
-    write_isolation=LocalProcessSecurityStrength.STRONG,
-    # Strong network enforcement belongs to W2 firewall setup.  W1 must not
-    # advertise an advisory environment trick as isolation.
-    network_isolation=LocalProcessSecurityStrength.UNSUPPORTED,
-    descendant_ownership=LocalProcessSecurityStrength.STRONG,
-)
+# W1 owns only primitives.  Enabled Windows profiles still fail closed, so no
+# filesystem or network security capability is currently provided at runtime.
+WINDOWS_NATIVE_SANDBOX_ACTUAL_CAPABILITIES = LocalProcessSecurityCapabilities()
 
-# W2 is the explicit target, not a capability currently provided by W1.  The
-# firewall setup layer must prove this value before it is exposed by a runtime
-# adapter.
-WINDOWS_NATIVE_SANDBOX_W2_TARGET_CAPABILITIES = LocalProcessSecurityCapabilities(
+# This is an architecture target, not a runtime provider declaration.  A
+# future profile adapter must prove each axis before exposing this value.
+WINDOWS_NATIVE_SANDBOX_TARGET_CAPABILITIES = LocalProcessSecurityCapabilities(
     read_isolation=LocalProcessSecurityStrength.LIMITED,
     write_isolation=LocalProcessSecurityStrength.STRONG,
     network_isolation=LocalProcessSecurityStrength.STRONG,
-    descendant_ownership=LocalProcessSecurityStrength.STRONG,
 )
 
 
-def windows_native_sandbox_w1_capabilities() -> LocalProcessSecurityCapabilities:
-    """Return the immutable capability declaration for the W1 foundation."""
+def windows_native_sandbox_actual_capabilities() -> LocalProcessSecurityCapabilities:
+    """Return W1's actual provided filesystem/network capability declaration."""
 
-    return WINDOWS_NATIVE_SANDBOX_W1_CAPABILITIES
+    return WINDOWS_NATIVE_SANDBOX_ACTUAL_CAPABILITIES
 
 
 __all__ = [
-    "WINDOWS_NATIVE_SANDBOX_W1_CAPABILITIES",
-    "WINDOWS_NATIVE_SANDBOX_W2_TARGET_CAPABILITIES",
+    "WINDOWS_NATIVE_SANDBOX_ACTUAL_CAPABILITIES",
+    "WINDOWS_NATIVE_SANDBOX_TARGET_CAPABILITIES",
     "SyntheticWindowsSid",
     "WindowsSandboxIdentity",
-    "windows_native_sandbox_w1_capabilities",
+    "windows_native_sandbox_actual_capabilities",
 ]

@@ -13,9 +13,9 @@ production adapter for the current stock Git for Windows workflow. Its
 evidence remains historical and is not replaced by a silent fallback.
 
 The next production direction must preserve the existing child-scoped process
-boundary while making each security authority explicit. Filesystem read
-compatibility, write authority, network policy, and descendant ownership are
-independent dimensions and cannot be represented by one platform label.
+boundary while making each security authority explicit. Filesystem and network
+security authority are one contract; process lifecycle ownership is a separate,
+orthogonal `LocalProcessLifecycleCapability` contract.
 
 ## Decision
 
@@ -25,21 +25,35 @@ canonical local-process port. It has these dimensions:
 - `READ_ISOLATION`
 - `WRITE_ISOLATION`
 - `NETWORK_ISOLATION`
-- `DESCENDANT_OWNERSHIP`
 
-Each dimension reports `STRONG`, `LIMITED`, `BEST_EFFORT`, or `UNSUPPORTED`.
-`security_capability_satisfies()` compares every axis explicitly. A limited
-read provider never satisfies a strong-read requirement; a caller that needs
-strong read isolation must fail closed before creating an OS child.
+Each dimension reports `STRONG`, `LIMITED`, or `UNSUPPORTED`.
+`security_capability_satisfies()` compares the three axes explicitly: strong
+satisfies strong or limited, limited satisfies limited only, and unsupported
+satisfies only unsupported/no requirement. A caller that needs strong read
+isolation must fail closed before creating an OS child when the provider is
+limited or unsupported.
 
-The W1 Windows native target is deliberately narrow:
+W1 establishes primitives and target architecture, but advertises no completed
+Windows filesystem/network capability. Enabled Windows profiles remain fail
+closed, so the actual W1 capability declaration is:
 
-| Dimension | W1 target | Reason |
+| Dimension | W1 actual provided |
+| --- | --- |
+| Read isolation | `UNSUPPORTED` |
+| Write isolation | `UNSUPPORTED` |
+| Network isolation | `UNSUPPORTED` |
+
+The separate native-backend architecture target is:
+
+| Dimension | Target | Reason |
 | --- | --- | --- |
 | Read isolation | `LIMITED` | Developer-tool compatibility remains the read boundary under review. |
 | Write isolation | `STRONG` target | A later setup layer will grant only an explicit restricted SID. |
-| Network isolation | `UNSUPPORTED` | Strong enforcement belongs to W2 firewall policy. |
-| Descendant ownership | `STRONG` | Reuse the existing Job Object lifecycle. |
+| Network isolation | `STRONG` target | Strong enforcement belongs to W2 firewall policy. |
+
+Descendant ownership is not a security axis here. Existing Job Object and
+ConPTY paths continue to provide `STRONG_DESCENDANT_OWNERSHIP` through the
+independent lifecycle contract.
 
 The production W1 token layer provides:
 
@@ -51,7 +65,8 @@ The production W1 token layer provides:
 - restricted-token attestation without exposing token contents; and
 - fail-closed Win32 errors and deterministic source/created-handle cleanup.
 
-W1 does not provision users, persist identities, mutate ACLs, use DPAPI,
+W1 does not advertise completed filesystem/network authority. It does not
+provision users, persist identities, mutate ACLs, use DPAPI,
 configure a firewall, launch a command-runner binary, or add a Git/Python/MCP
 broker. It does not rewrite Job Object or ConPTY code. Existing Linux
 Bubblewrap, macOS Seatbelt, and Windows Job Object/ConPTY guarantees remain
@@ -68,11 +83,12 @@ unsandboxed broker to bypass a missing child authority.
 
 ## Consequences
 
-The capability contract makes partial Windows authority visible without
-weakening other platforms. The token foundation is useful independently of a
-future filesystem setup layer, while the current Windows profile behavior
-continues to fail closed. ADR 0112 remains the historical AppContainer
-feasibility record.
+The capability contract prevents a target declaration from being consumed as
+an actual provider capability and keeps security authority orthogonal to
+lifecycle ownership. The token foundation is useful independently of a future
+filesystem setup layer, while the current Windows profile behavior continues
+to fail closed. ADR 0112 remains the historical AppContainer feasibility
+record.
 
 ## References
 

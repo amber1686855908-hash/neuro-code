@@ -7,8 +7,8 @@ from neuro_code.application.ports.sandbox import (
     LocalProcessSecurityStrength,
 )
 from neuro_code.infrastructure.sandbox.windows_sandbox_identity import (
-    WINDOWS_NATIVE_SANDBOX_W1_CAPABILITIES,
-    WINDOWS_NATIVE_SANDBOX_W2_TARGET_CAPABILITIES,
+    WINDOWS_NATIVE_SANDBOX_ACTUAL_CAPABILITIES,
+    WINDOWS_NATIVE_SANDBOX_TARGET_CAPABILITIES,
     SyntheticWindowsSid,
     WindowsSandboxIdentity,
 )
@@ -44,44 +44,47 @@ class SyntheticWindowsSidTests(unittest.TestCase):
 
 
 class WindowsNativeSandboxCapabilityTests(unittest.TestCase):
-    def test_w1_capability_target_is_explicit(self) -> None:
+    def test_w1_actual_capability_is_fail_closed(self) -> None:
         self.assertIs(
-            WINDOWS_NATIVE_SANDBOX_W1_CAPABILITIES.strength_for(
+            WINDOWS_NATIVE_SANDBOX_ACTUAL_CAPABILITIES.strength_for(
+                LocalProcessSecurityCapability.READ_ISOLATION
+            ),
+            LocalProcessSecurityStrength.UNSUPPORTED,
+        )
+        self.assertIs(
+            WINDOWS_NATIVE_SANDBOX_ACTUAL_CAPABILITIES.strength_for(
+                LocalProcessSecurityCapability.WRITE_ISOLATION
+            ),
+            LocalProcessSecurityStrength.UNSUPPORTED,
+        )
+        self.assertIs(
+            WINDOWS_NATIVE_SANDBOX_ACTUAL_CAPABILITIES.strength_for(
+                LocalProcessSecurityCapability.NETWORK_ISOLATION
+            ),
+            LocalProcessSecurityStrength.UNSUPPORTED,
+        )
+
+    def test_target_capability_is_separate_from_actual_provider(self) -> None:
+        self.assertIs(
+            WINDOWS_NATIVE_SANDBOX_TARGET_CAPABILITIES.strength_for(
                 LocalProcessSecurityCapability.READ_ISOLATION
             ),
             LocalProcessSecurityStrength.LIMITED,
         )
         self.assertIs(
-            WINDOWS_NATIVE_SANDBOX_W1_CAPABILITIES.strength_for(
+            WINDOWS_NATIVE_SANDBOX_TARGET_CAPABILITIES.strength_for(
                 LocalProcessSecurityCapability.WRITE_ISOLATION
             ),
             LocalProcessSecurityStrength.STRONG,
         )
         self.assertIs(
-            WINDOWS_NATIVE_SANDBOX_W1_CAPABILITIES.strength_for(
-                LocalProcessSecurityCapability.NETWORK_ISOLATION
-            ),
-            LocalProcessSecurityStrength.UNSUPPORTED,
-        )
-        self.assertIs(
-            WINDOWS_NATIVE_SANDBOX_W1_CAPABILITIES.strength_for(
-                LocalProcessSecurityCapability.DESCENDANT_OWNERSHIP
-            ),
-            LocalProcessSecurityStrength.STRONG,
-        )
-
-    def test_w2_network_target_is_not_claimed_by_w1(self) -> None:
-        self.assertIs(
-            WINDOWS_NATIVE_SANDBOX_W1_CAPABILITIES.strength_for(
-                LocalProcessSecurityCapability.NETWORK_ISOLATION
-            ),
-            LocalProcessSecurityStrength.UNSUPPORTED,
-        )
-        self.assertIs(
-            WINDOWS_NATIVE_SANDBOX_W2_TARGET_CAPABILITIES.strength_for(
+            WINDOWS_NATIVE_SANDBOX_TARGET_CAPABILITIES.strength_for(
                 LocalProcessSecurityCapability.NETWORK_ISOLATION
             ),
             LocalProcessSecurityStrength.STRONG,
+        )
+        self.assertFalse(
+            WINDOWS_NATIVE_SANDBOX_ACTUAL_CAPABILITIES == WINDOWS_NATIVE_SANDBOX_TARGET_CAPABILITIES
         )
 
 

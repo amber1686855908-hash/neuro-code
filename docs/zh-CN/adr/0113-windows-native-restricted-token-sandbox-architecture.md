@@ -12,8 +12,8 @@ Git for Windows 工作流的 production adapter。其 evidence 仍保留为历�
 被静默 fallback 替代。
 
 下一条 production 路线必须保留现有 child-scoped process boundary，同时明确表达每种
-安全 authority。文件系统读取兼容性、写入权限、网络策略和后代所有权是相互独立的
-维度，不能用一个平台标签代替。
+安全 authority。文件系统与网络 security authority 属于一个 contract；process lifecycle
+ownership 则由独立且正交的 `LocalProcessLifecycleCapability` contract 负责。
 
 ## 决策
 
@@ -23,21 +23,32 @@ W1 在规范 local-process port 中增加平台无关的
 - `READ_ISOLATION`
 - `WRITE_ISOLATION`
 - `NETWORK_ISOLATION`
-- `DESCENDANT_OWNERSHIP`
 
-每个维度报告 `STRONG`、`LIMITED`、`BEST_EFFORT` 或 `UNSUPPORTED`。
-`security_capability_satisfies()` 对每个轴显式比较。limited read provider 永远不能
-满足 strong-read requirement；需要 strong read isolation 的 caller 必须在创建 OS
-child 之前失败关闭。
+每个维度报告 `STRONG`、`LIMITED` 或 `UNSUPPORTED`。
+`security_capability_satisfies()` 对三个轴显式比较：strong 可以满足 strong 或 limited，
+limited 只能满足 limited，unsupported 只能满足 unsupported/无要求。当 provider 为
+limited 或 unsupported 时，需要 strong read isolation 的 caller 必须在创建 OS child
+之前失败关闭。
 
-W1 Windows 原生目标刻意保持狭窄：
+W1 建立 primitives 和 target architecture，但不宣称已完成 Windows 文件系统/网络
+capability。启用的 Windows profile 仍然失败关闭，因此 W1 actual capability 是：
 
-| 维度 | W1 目标 | 原因 |
+| 维度 | W1 actual provided |
+| --- | --- |
+| Read isolation | `UNSUPPORTED` |
+| Write isolation | `UNSUPPORTED` |
+| Network isolation | `UNSUPPORTED` |
+
+独立 native-backend architecture target 是：
+
+| 维度 | Target | 原因 |
 | --- | --- | --- |
 | Read isolation | `LIMITED` | developer-tool 兼容性仍是当前读取边界。 |
 | Write isolation | `STRONG` target | 后续 setup layer 只授予明确的 restricted SID。 |
-| Network isolation | `UNSUPPORTED` | strong enforcement 属于 W2 firewall policy。 |
-| Descendant ownership | `STRONG` | 复用现有 Job Object 生命周期。 |
+| Network isolation | `STRONG` target | strong enforcement 属于 W2 firewall policy。 |
+
+Descendant ownership 不是这里的 security axis。现有 Job Object 和 ConPTY path
+继续通过独立 lifecycle contract 提供 `STRONG_DESCENDANT_OWNERSHIP`。
 
 W1 production token layer 提供：
 
@@ -49,7 +60,7 @@ W1 production token layer 提供：
 - 不暴露 token 内容的 restricted-token attestation；
 - 失败关闭的 Win32 errors 和 source/created-handle 的确定性清理。
 
-W1 不 provisioning user、不持久化 identity、不使用 DPAPI、不修改 ACL、不配置
+W1 不宣称已完成文件系统/网络 authority。它不 provisioning user、不持久化 identity、不使用 DPAPI、不修改 ACL、不配置
 firewall、不启动 command-runner binary，也不增加 Git/Python/MCP broker。不重写 Job
 Object 或 ConPTY 代码。现有 Linux Bubblewrap、macOS Seatbelt 和 Windows Job
 Object/ConPTY guarantee 保持不变。在后续完整 authority composition 接入前，Windows
@@ -64,9 +75,10 @@ network enforcement 所需的 setup authority。它必须复用 W1 capability co
 
 ## 后果
 
-Capability contract 让 Windows 的部分 authority 可见，同时不弱化其他平台。Token
-foundation 可以独立于未来文件系统 setup layer 使用，当前 Windows profile 行为仍然
-失败关闭。ADR 0112 继续作为历史 AppContainer feasibility 记录。
+Capability contract 防止 target declaration 被当作 actual provider capability 使用，并让
+security authority 与 lifecycle ownership 保持正交。Token foundation 可以独立于未来
+文件系统 setup layer 使用，当前 Windows profile 行为仍然失败关闭。ADR 0112 继续作为
+历史 AppContainer feasibility 记录。
 
 ## 参考
 
