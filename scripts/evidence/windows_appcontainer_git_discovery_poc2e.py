@@ -129,9 +129,7 @@ def _path_identity(text: str) -> str:
 
 
 def _short_path(path: Path) -> str | None:
-    kernel32 = ctypes.LibraryLoader(ctypes.WinDLL)(  # type: ignore[attr-defined,operator]
-        "kernel32", use_last_error=True
-    )
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
     function = kernel32.GetShortPathNameW
     function.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_uint32]
     function.restype = ctypes.c_uint32
@@ -1121,7 +1119,7 @@ def _create_standard_user(args: argparse.Namespace, pb: ModuleType, api: Any) ->
     try:
         pb._run_checked(["net", "user", username, password, "/add", "/expires:never"])
         created = True
-        pb._run_checked(["icacls", str(public), "/grant", f"{username}:(OI)(CI)(M)"])
+        pb._run_checked(["icacls", str(public), "/grant", f"{username}:(OI)(CI)(F)", "/T"])
         python = Path(sys.base_prefix) / "python.exe"
         command = ctypes.create_unicode_buffer(
             subprocess.list2cmdline(
