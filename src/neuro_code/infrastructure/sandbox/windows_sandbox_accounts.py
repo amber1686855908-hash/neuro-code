@@ -370,7 +370,6 @@ class _NativeWindowsSandboxAccountApi:  # pragma: no cover - Windows native CI
                 ctypes.POINTER(ctypes.c_uint32),
                 ctypes.c_wchar_p,
                 ctypes.POINTER(ctypes.c_uint32),
-                ctypes.c_void_p,
                 ctypes.POINTER(ctypes.c_uint32),
             ],
             ctypes.c_int32,
