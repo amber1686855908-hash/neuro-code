@@ -1424,7 +1424,13 @@ class _NativeChildApi:
             _free_security_descriptor(descriptor)
         if handle is None or handle == 0 or handle == _INVALID_HANDLE_VALUE:
             self._error("CreateDesktopW")
-        return int(cast(int, handle)), desktop_name
+        # STARTUPINFO.lpDesktop takes a window-station/desktop pair.  A bare
+        # desktop name is resolved against the caller's context and can leave
+        # a restricted child waiting during user32 initialization.  The
+        # runner is launched on the interactive WinSta0 station, matching the
+        # native Windows launch contract used by the existing Job/ConPTY
+        # implementation.
+        return int(cast(int, handle)), rf"Winsta0\{desktop_name}"
 
     def close_desktop(self, handle: int) -> None:
         if handle and not self._close_desktop(handle):
