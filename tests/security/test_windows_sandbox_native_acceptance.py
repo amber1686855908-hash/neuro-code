@@ -233,6 +233,19 @@ class WindowsSandboxNativeAcceptanceTests(unittest.TestCase):
                     )
                 ]
                 if not deny_indices:
+                    expected_denies = [
+                        entry
+                        for entry in record.managed_aces
+                        if entry.path == sensitive_file and entry.is_deny
+                    ]
+                    print(
+                        "native_sensitive_expected "
+                        f"count={len(expected_denies)} "
+                        + ";".join(
+                            f"path={entry.path} sid={entry.sid.value} mask={entry.access_mask} inheritance={entry.inheritance}"
+                            for entry in expected_denies
+                        )
+                    )
                     for index, raw in enumerate(raw_sensitive):
                         header = _AceHeader.from_buffer_copy(raw)
                         sid_buffer = ctypes.create_string_buffer(raw[8:])
@@ -241,6 +254,12 @@ class WindowsSandboxNativeAcceptanceTests(unittest.TestCase):
                             f"index={index} type={header.AceType} flags={header.AceFlags} "
                             f"mask={int.from_bytes(raw[4:8], 'little')} "
                             f"sid={acl_api._sid_string(ctypes.addressof(sid_buffer))}"
+                        )
+                    for entry in expected_denies:
+                        print(
+                            "native_sensitive_match "
+                            f"sid={entry.sid.value} "
+                            f"matches={any(acl_api._raw_matches(raw, entry) for raw in raw_sensitive)}"
                         )
                 allow_indices = [
                     index
