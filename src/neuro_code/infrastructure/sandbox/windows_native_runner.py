@@ -870,9 +870,14 @@ class _RunnerChild:
             # resolving its executable/cwd/imports; this does not add file,
             # network, or administrative authority.
             token.enable_change_notify_privilege()
-            self._desktop_handle, self._desktop_name = self._api.create_private_desktop(
-                (runner_sid, runner_logon_sid, write_sid.value, _WORLD_SID)
-            )
+            # W3 is a non-PTY command boundary.  The runner account may be
+            # attached to a non-interactive window station when launched by
+            # CreateProcessWithLogonW; a desktop created there cannot safely
+            # be addressed as ``Winsta0\\...`` from the final token.  Use the
+            # canonical noninteractive desktop while keeping CREATE_NO_WINDOW
+            # and all token/Job/stdio restrictions intact.  W4 owns any PTY or
+            # interactive desktop contract.
+            self._desktop_name = r"Winsta0\Default"
             executable = payload.get("executable")
             arguments = payload.get("arguments", [])
             shell_command = payload.get("shell_command")
