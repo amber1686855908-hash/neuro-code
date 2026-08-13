@@ -71,6 +71,7 @@ _WAIT_OBJECT_0 = 0
 _WAIT_TIMEOUT = 0x00000102
 _INFINITE = 0xFFFFFFFF
 _STILL_ACTIVE = 259
+_SUSPEND_FAILED = 0xFFFFFFFF
 # Do not ask CreateProcessWithLogonW to synchronously load the account
 # profile.  W3 derives private HOME/TMP from the final token and creates those
 # directories inside the runner; loading a fresh W2 profile here can block the
@@ -870,14 +871,9 @@ class _RunnerChild:
             # resolving its executable/cwd/imports; this does not add file,
             # network, or administrative authority.
             token.enable_change_notify_privilege()
-            # W3 is a non-PTY command boundary.  The runner account may be
-            # attached to a non-interactive window station when launched by
-            # CreateProcessWithLogonW; a desktop created there cannot safely
-            # be addressed as ``Winsta0\\...`` from the final token.  Use the
-            # canonical noninteractive desktop while keeping CREATE_NO_WINDOW
-            # and all token/Job/stdio restrictions intact.  W4 owns any PTY or
-            # interactive desktop contract.
-            self._desktop_name = None
+            self._desktop_handle, self._desktop_name = self._api.create_private_desktop(
+                (runner_sid, runner_logon_sid, write_sid.value, _WORLD_SID)
+            )
             executable = payload.get("executable")
             arguments = payload.get("arguments", [])
             shell_command = payload.get("shell_command")
@@ -1246,6 +1242,12 @@ class _NativeChildApi:
             [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32)],
             ctypes.c_int32,
         )
+        self._resume_thread = _load_function(
+            kernel32,
+            "ResumeThread",
+            [ctypes.c_void_p],
+            ctypes.c_uint32,
+        )
         self._get_process_id = _load_function(
             kernel32,
             "GetProcessId",
@@ -1381,7 +1383,7 @@ class _NativeChildApi:
         stderr_handle: int,
         inherited_handles: tuple[int, ...],
         job_handle: int,
-        desktop_name: str | None,
+        desktop_name: str,
     ) -> RunnerLaunch:
         required = ctypes.c_size_t()
         self._initialize_attribute_list(None, 2, 0, ctypes.byref(required))
@@ -1453,6 +1455,11 @@ class _NativeChildApi:
             )
             if not created:
                 self._error("CreateProcessAsUserW")
+            # CreateProcessAsUserW is expected to return a runnable thread.
+            # Clear a non-zero suspend count defensively; a running thread
+            # returns zero and is unchanged.
+            if cast(int, self._resume_thread(process.hThread)) == _SUSPEND_FAILED:
+                self._error("ResumeThread")
         finally:
             self._delete_attribute_list(attributes)
         if not process.hProcess or not process.hThread or not process.dwProcessId:
