@@ -525,6 +525,7 @@ class _WindowsNativeOwnedLocalProcess(OwnedLocalProcess):
         self._done = asyncio.Event()
         self._stdin_lock = asyncio.Lock()
         self._closed = False
+        self._force_closed = False
         self._decoder = decoder or RuntimeFrameDecoder()
         self._initial_frames = initial_frames
         self._reader = threading.Thread(
@@ -574,10 +575,11 @@ class _WindowsNativeOwnedLocalProcess(OwnedLocalProcess):
                     if frame.kind is RuntimeFrameType.EXIT:
                         return
         except BaseException as error:
-            self._error = error
-            self._call(self._stdout.set_exception, error)
-            if self._stderr is not None:
-                self._call(self._stderr.set_exception, error)
+            if not self._force_closed:
+                self._error = error
+                self._call(self._stdout.set_exception, error)
+                if self._stderr is not None:
+                    self._call(self._stderr.set_exception, error)
         finally:
             self._closed = True
             self._call(self._done.set)
@@ -644,14 +646,15 @@ class _WindowsNativeOwnedLocalProcess(OwnedLocalProcess):
             if grace_seconds is None
             else grace_seconds
         )
-        try:
-            await asyncio.wait_for(
-                run_blocking(self._pipe.write, encode_frame(RuntimeFrameType.TERMINATE)),
-                timeout=max(1.0, timeout),
-            )
-        except (OSError, RuntimeError, TimeoutError) as error:
-            self._force_close(SandboxError("Windows runtime termination IPC failed"))
-            raise SandboxError("Windows runtime termination IPC failed") from error
+        # A synchronous named-pipe write can remain in a native ReadFile/WriteFile
+        # call after the remote runner has stopped servicing the pipe.  Shield
+        # the executor task so its cancellation cannot hold the event loop, then
+        # use the runner's Job Object as the bounded force boundary below.
+        send_task = asyncio.create_task(
+            run_blocking(self._pipe.write, encode_frame(RuntimeFrameType.TERMINATE))
+        )
+        with contextlib.suppress(BaseException):
+            await asyncio.wait_for(asyncio.shield(send_task), timeout=max(0.1, timeout))
         try:
             await asyncio.wait_for(
                 self.wait(), timeout=timeout + self._request.lifecycle.force_wait_seconds
@@ -662,19 +665,20 @@ class _WindowsNativeOwnedLocalProcess(OwnedLocalProcess):
             try:
                 await asyncio.wait_for(self.wait(), timeout=2.0)
             except (TimeoutError, SandboxError) as error:
-                self._force_close(SandboxError("Windows runtime runner did not terminate"))
-                raise SandboxError("Windows runtime runner did not terminate") from error
+                self._force_close(error)
 
-    def _force_close(self, error: BaseException) -> None:
+    def _force_close(self, error: BaseException | None = None) -> None:
         """Bound controller cancellation if a native pipe reader is stuck."""
 
         if self._done.is_set():
             return
+        self._force_closed = True
+        self._returncode = 1
         self._error = error
         self._closed = True
-        self._call(self._stdout.set_exception, error)
+        self._call(self._stdout.feed_eof)
         if self._stderr is not None:
-            self._call(self._stderr.set_exception, error)
+            self._call(self._stderr.feed_eof)
         self._pipe.close()
         self._call(self._done.set)
 
