@@ -70,6 +70,7 @@ _HANDLE_FLAG_INHERIT = 0x00000001
 _WAIT_OBJECT_0 = 0
 _WAIT_TIMEOUT = 0x00000102
 _INFINITE = 0xFFFFFFFF
+_SUSPEND_FAILED = 0xFFFFFFFF
 # Do not ask CreateProcessWithLogonW to synchronously load the account
 # profile.  W3 derives private HOME/TMP from the final token and creates those
 # directories inside the runner; loading a fresh W2 profile here can block the
@@ -1098,6 +1099,12 @@ class _NativeChildApi:
             [ctypes.c_uint32, ctypes.c_wchar_p],
             ctypes.c_uint32,
         )
+        self._resume_thread = _load_function(
+            kernel32,
+            "ResumeThread",
+            [ctypes.c_void_p],
+            ctypes.c_uint32,
+        )
         advapi32 = cast(object, loader("advapi32.dll", use_last_error=True))
         shell32 = cast(object, loader("shell32.dll", use_last_error=True))
         ole32 = cast(object, loader("ole32.dll", use_last_error=True))
@@ -1292,6 +1299,13 @@ class _NativeChildApi:
             )
             if not created:
                 self._error("CreateProcessAsUserW")
+            # Defensive native assertion: CreateProcessAsUserW should return
+            # a runnable primary thread.  If a platform build leaves a
+            # suspend count on it, clear that count before handing the handle
+            # to the runner; a normal thread returns zero and is unchanged.
+            suspend_count = self._resume_thread(process.hThread)
+            if suspend_count == _SUSPEND_FAILED:
+                self._error("ResumeThread")
         finally:
             self._delete_attribute_list(attributes)
         if not process.hProcess or not process.hThread or not process.dwProcessId:
