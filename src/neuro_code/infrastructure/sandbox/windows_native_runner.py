@@ -1212,7 +1212,7 @@ class _NativeChildApi:
                 None,
                 None,
                 True,
-                _EXTENDED_STARTUPINFO_PRESENT | _CREATE_UNICODE_ENVIRONMENT | _CREATE_NO_WINDOW,
+                _EXTENDED_STARTUPINFO_PRESENT | _CREATE_UNICODE_ENVIRONMENT,
                 ctypes.cast(environment, ctypes.c_void_p),
                 str(cwd),
                 ctypes.byref(startup),
