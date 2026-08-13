@@ -66,11 +66,15 @@ jobs:
             'scripts/evidence/git-for-windows-getcwd-filenameinfo-poc2d.patch'
           $nulHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $nulPatch).Hash.ToLowerInvariant()
           $pathHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $pathPatch).Hash.ToLowerInvariant()
-          if ($nulHash -ne 'a3192c74bc0533b0359d317937032729d41c15504cd721d259be29bbdfc837b7') {
-            throw "Fixed sanitize_stdfds patch hash changed: $nulHash"
+          $nulBlob = (& git.exe rev-parse `
+            'HEAD:scripts/evidence/git-for-windows-sanitize-stdfds-poc2d.patch').Trim()
+          $pathBlob = (& git.exe rev-parse `
+            'HEAD:scripts/evidence/git-for-windows-getcwd-filenameinfo-poc2d.patch').Trim()
+          if ($nulBlob -ne 'c87c5fedfab1f4cd445979d8c0e3663086a75ed0') {
+            throw "Fixed sanitize_stdfds Git blob changed: $nulBlob"
           }
-          if ($pathHash -ne 'd6c39ab9d8129ec73cbd53165495a06c495db875cc906cbcd181f89b89fb9f04') {
-            throw "Fixed FileNameInfo patch hash changed: $pathHash"
+          if ($pathBlob -ne 'b5e26b50bd3a7c9478e123a3a53f4160b63d8f22') {
+            throw "Fixed FileNameInfo Git blob changed: $pathBlob"
           }
           foreach ($patch in @($nulPatch, $pathPatch)) {
             & git.exe -C $source apply --check $patch
@@ -96,8 +100,12 @@ jobs:
             ceiling_boundary_strategy = 'leading empty entry + exact parent of authorized workspace root'
             poc2b_harness_head = '7ac1b77e6cc0dc1d51ab7bd47fe4f0ac76d71336'
             poc2d_reference_head = 'ff32981db8f53d82e7692bd2998952df2838af50'
-            sanitize_stdfds_patch_sha256 = $nulHash
-            filenameinfo_patch_sha256 = $pathHash
+            sanitize_stdfds_patch_blob = $nulBlob
+            sanitize_stdfds_patch_canonical_sha256 = 'a3192c74bc0533b0359d317937032729d41c15504cd721d259be29bbdfc837b7'
+            sanitize_stdfds_patch_checkout_sha256 = $nulHash
+            filenameinfo_patch_blob = $pathBlob
+            filenameinfo_patch_canonical_sha256 = 'd6c39ab9d8129ec73cbd53165495a06c495db875cc906cbcd181f89b89fb9f04'
+            filenameinfo_patch_checkout_sha256 = $pathHash
             network_security_testing = $false
           }
           $proof | ConvertTo-Json -Depth 5 | Set-Content -Encoding utf8 `
@@ -105,8 +113,8 @@ jobs:
           "POC2E_GIT_SOURCE=$source" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
           "POC2E_GIT_TAG=$tag" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
           "POC2E_GIT_COMMIT=$commit" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
-          "POC2E_NUL_HASH=$nulHash" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
-          "POC2E_PATH_HASH=$pathHash" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "POC2E_NUL_HASH=a3192c74bc0533b0359d317937032729d41c15504cd721d259be29bbdfc837b7" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "POC2E_PATH_HASH=d6c39ab9d8129ec73cbd53165495a06c495db875cc906cbcd181f89b89fb9f04" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
       - uses: msys2/setup-msys2@v2
         with:
           msystem: MINGW64
