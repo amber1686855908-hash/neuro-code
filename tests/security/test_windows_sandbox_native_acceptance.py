@@ -99,6 +99,16 @@ def _assert_denied(action: object) -> None:
     raise AssertionError("sandbox user unexpectedly retained access")
 
 
+_BENIGN_OUTBOUND_PROBE = ("1.1.1.1", 80)
+
+
+def _benign_outbound_probe() -> None:
+    """Make one fixed TCP connectivity probe; never scan or send a payload."""
+
+    connection = socket.create_connection(_BENIGN_OUTBOUND_PROBE, timeout=5)
+    connection.close()
+
+
 @unittest.skipUnless(_native_enabled(), "privileged Windows acceptance is CI-only")
 class WindowsSandboxNativeAcceptanceTests(unittest.TestCase):
     def test_real_accounts_acl_dpapi_and_firewall(self) -> None:  # pragma: no cover - Windows CI
@@ -275,41 +285,25 @@ class WindowsSandboxNativeAcceptanceTests(unittest.TestCase):
                 self.assertEqual(workspace_file.read_text(encoding="utf-8"), "offline write")
                 sensitive_file.write_text("controller still owns it", encoding="utf-8")
 
-                listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                listener.bind(("127.0.0.1", 0))
-                listener.listen(2)
-                port = listener.getsockname()[1]
-                try:
-                    # The controller is not the firewall subject.
-                    controller = socket.create_connection(("127.0.0.1", port), timeout=3)
-                    controller.close()
-                    # A failed connect is checked explicitly because socket
-                    # errors are not filesystem PermissionErrors.
-                    with (
-                        _impersonate(offline_record.username, offline_record.password.decode()),
-                        self.assertRaises(OSError),
-                    ):
-                        socket.create_connection(("127.0.0.1", port), timeout=3)
-                    with _impersonate(online_record.username, online_record.password.decode()):
-                        online_client = socket.create_connection(("127.0.0.1", port), timeout=3)
-                        online_client.close()
-                finally:
-                    listener.close()
+                # The controller is not the firewall subject.  This is one
+                # fixed, benign non-loopback TCP probe; no scan or payload is
+                # performed.  Windows Firewall intentionally treats loopback
+                # as a separate policy surface.
+                _benign_outbound_probe()
+                # A failed connect is checked explicitly because socket
+                # errors are not filesystem PermissionErrors.
+                with (
+                    _impersonate(offline_record.username, offline_record.password.decode()),
+                    self.assertRaises(OSError),
+                ):
+                    _benign_outbound_probe()
+                with _impersonate(online_record.username, online_record.password.decode()):
+                    _benign_outbound_probe()
 
                 online = authority.setup(request, identity=WindowsSandboxIdentityKind.ONLINE)
                 self.assertEqual(online.state, WindowsSandboxSetupState.READY)
-                online_listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                online_listener.bind(("127.0.0.1", 0))
-                online_listener.listen(1)
-                try:
-                    online_port = online_listener.getsockname()[1]
-                    with _impersonate(online_record.username, online_record.password.decode()):
-                        online_client = socket.create_connection(
-                            ("127.0.0.1", online_port), timeout=3
-                        )
-                        online_client.close()
-                finally:
-                    online_listener.close()
+                with _impersonate(online_record.username, online_record.password.decode()):
+                    _benign_outbound_probe()
                 with _impersonate(online_record.username, online_record.password.decode()):
                     self.assertEqual(workspace_file.read_text(encoding="utf-8"), "offline write")
                     _assert_denied(lambda: os.stat(store.path))
