@@ -1,0 +1,199 @@
+name: Windows AppContainer Git discovery POC2E (evidence only)
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/windows-appcontainer-git-discovery-poc2e.yml"
+      - "scripts/evidence/git-for-windows-sanitize-stdfds-poc2d.patch"
+      - "scripts/evidence/git-for-windows-getcwd-filenameinfo-poc2d.patch"
+      - "scripts/evidence/windows_appcontainer_git_discovery_poc2e.py"
+      - "scripts/evidence/windows_git_discovery_probe.c"
+
+permissions:
+  contents: read
+
+jobs:
+  git-discovery:
+    name: Git discovery boundary (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [windows-2025, windows-2022]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@v7.0.0
+      - name: Check out pinned POC2B harness without importing its history
+        uses: actions/checkout@v7.0.0
+        with:
+          ref: 7ac1b77e6cc0dc1d51ab7bd47fe4f0ac76d71336
+          path: .poc2b-harness
+      - uses: astral-sh/setup-uv@v8.3.2
+        with:
+          version: "0.11.29"
+          python-version: "3.12"
+          enable-cache: true
+      - run: uv sync --extra dev --locked
+      - name: Prove Git discovery semantics and fixed patch provenance
+        shell: pwsh
+        run: |
+          $versionOutput = & git.exe --version --build-options 2>&1
+          $versionLine = $versionOutput | Select-Object -First 1
+          if ($versionLine -notmatch '^git version (?<version>[0-9.]+\.windows\.[0-9]+)$') {
+            throw "Unexpected Git for Windows version: $versionLine"
+          }
+          $tag = "v$($Matches.version)"
+          $source = Join-Path $env:RUNNER_TEMP "git-for-windows-source"
+          & git.exe clone --depth 1 --branch $tag https://github.com/git-for-windows/git.git $source
+          if ($LASTEXITCODE -ne 0) { throw "Unable to clone exact Git tag $tag" }
+          $commit = (& git.exe -C $source rev-parse HEAD).Trim()
+          $tagCommit = (& git.exe -C $source rev-list -n 1 $tag).Trim()
+          if ($commit -ne $tagCommit) { throw "Source/tag mismatch: $commit != $tagCommit" }
+
+          $pathSep = (& git.exe -C $source grep -n -F "#define PATH_SEP ';'" -- compat/mingw.h) -join "`n"
+          $ceiling = (& git.exe -C $source grep -n -A 31 -F 'canonicalize_ceiling_entry' -- setup.c) -join "`n"
+          $split = (& git.exe -C $source grep -n -A 6 -F 'static const char path_sep[] = { PATH_SEP' -- setup.c) -join "`n"
+          $across = (& git.exe -C $source grep -n -F 'GIT_DISCOVERY_ACROSS_FILESYSTEM' -- setup.c) -join "`n"
+          if (-not $pathSep -or -not $ceiling -or -not $split -or -not $across) {
+            throw "Unable to prove Git for Windows discovery source semantics"
+          }
+          if ($ceiling -notmatch 'empty entry.*turns off canonicalization') {
+            throw "Unable to prove leading-empty ceiling canonicalization behavior"
+          }
+
+          $nulPatch = Join-Path $env:GITHUB_WORKSPACE `
+            'scripts/evidence/git-for-windows-sanitize-stdfds-poc2d.patch'
+          $pathPatch = Join-Path $env:GITHUB_WORKSPACE `
+            'scripts/evidence/git-for-windows-getcwd-filenameinfo-poc2d.patch'
+          $nulHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $nulPatch).Hash.ToLowerInvariant()
+          $pathHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $pathPatch).Hash.ToLowerInvariant()
+          if ($nulHash -ne 'a3192c74bc0533b0359d317937032729d41c15504cd721d259be29bbdfc837b7') {
+            throw "Fixed sanitize_stdfds patch hash changed: $nulHash"
+          }
+          if ($pathHash -ne 'd6c39ab9d8129ec73cbd53165495a06c495db875cc906cbcd181f89b89fb9f04') {
+            throw "Fixed FileNameInfo patch hash changed: $pathHash"
+          }
+          foreach ($patch in @($nulPatch, $pathPatch)) {
+            & git.exe -C $source apply --check $patch
+            if ($LASTEXITCODE -ne 0) { throw "Fixed patch does not apply: $patch" }
+            if ($patch -eq $nulPatch) {
+              & git.exe -C $source apply $patch
+              if ($LASTEXITCODE -ne 0) { throw "sanitize_stdfds patch failed to apply" }
+            }
+          }
+
+          $proof = [ordered]@{
+            classification = 'EVIDENCE_ONLY_DO_NOT_MERGE'
+            installed_version_output = $versionOutput -join "`n"
+            source_tag = $tag
+            source_commit = $commit
+            source_url = 'https://github.com/git-for-windows/git'
+            path_sep_source = $pathSep
+            path_sep = ';'
+            ceiling_canonicalization_source = $ceiling
+            ceiling_split_source = $split
+            across_filesystem_source = $across
+            ceiling_boundary_strategy = 'leading empty entry + exact parent of authorized workspace root'
+            poc2b_harness_head = '7ac1b77e6cc0dc1d51ab7bd47fe4f0ac76d71336'
+            poc2d_reference_head = 'ff32981db8f53d82e7692bd2998952df2838af50'
+            sanitize_stdfds_patch_sha256 = $nulHash
+            filenameinfo_patch_sha256 = $pathHash
+            network_security_testing = $false
+          }
+          $proof | ConvertTo-Json -Depth 5 | Set-Content -Encoding utf8 `
+            "$env:RUNNER_TEMP\git-discovery-source-proof.json"
+          "POC2E_GIT_SOURCE=$source" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "POC2E_GIT_TAG=$tag" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "POC2E_GIT_COMMIT=$commit" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "POC2E_NUL_HASH=$nulHash" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "POC2E_PATH_HASH=$pathHash" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            base-devel
+            git
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-openssl
+            mingw-w64-x86_64-pcre2
+            mingw-w64-x86_64-rust
+            mingw-w64-x86_64-zlib
+      - name: Build fixed POC2D-compatible Git runtime
+        shell: msys2 {0}
+        run: |
+          set -euxo pipefail
+          source_dir="$(cygpath -u "$POC2E_GIT_SOURCE")"
+          temp_dir="$(cygpath -u "$RUNNER_TEMP")"
+          workspace_dir="$(cygpath -u "$GITHUB_WORKSPACE")"
+          patch="$workspace_dir/scripts/evidence/git-for-windows-getcwd-filenameinfo-poc2d.patch"
+          git -C "$source_dir" apply "$patch"
+          make -C "$source_dir" -j2 git.exe \
+            NO_CURL=YesPlease \
+            NO_EXPAT=YesPlease \
+            NO_GETTEXT=YesPlease \
+            NO_ICONV=YesPlease \
+            NO_PERL=YesPlease \
+            NO_PYTHON=YesPlease \
+            NO_TCLTK=YesPlease \
+            2>&1 | tee "$temp_dir/git-discovery-build.txt"
+          runtime="$temp_dir/git-discovery-runtime"
+          mkdir -p "$runtime"
+          cp "$source_dir/git.exe" "$runtime/git.exe"
+          ldd "$source_dir/git.exe" | tee "$temp_dir/git-discovery-ldd.txt"
+          while read -r dependency; do
+            if test -f "$dependency"; then cp -n "$dependency" "$runtime/"; fi
+          done < <(ldd "$source_dir/git.exe" | awk '/=> \/mingw64\// {print $3}')
+          "$runtime/git.exe" --version
+      - name: Compile pinned bootstrap and native authority probe with W4 WX
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $installation = & $vswhere -latest -products * `
+            -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+            -property installationPath
+          if (-not $installation) { throw "Visual C++ toolchain not found" }
+          Import-Module "$installation\Common7\Tools\Microsoft.VisualStudio.DevShell.dll"
+          Enter-VsDevShell -VsInstallPath $installation -SkipAutomaticLocation `
+            -DevCmdArguments "-arch=amd64 -host_arch=amd64"
+          cl.exe /nologo /W4 /WX /MT `
+            .poc2b-harness/scripts/evidence/windows_appcontainer_runtime_poc2b_bootstrap.c `
+            /Fe:"${env:RUNNER_TEMP}\runtime-bootstrap.exe" `
+            /link advapi32.lib userenv.lib ws2_32.lib `
+            2>&1 | Tee-Object -FilePath "${env:RUNNER_TEMP}\poc2b-bootstrap-build.txt"
+          if ($LASTEXITCODE -ne 0) { throw "Pinned POC2B bootstrap compilation failed" }
+          cl.exe /nologo /W4 /WX /MT `
+            scripts/evidence/windows_git_discovery_probe.c `
+            /Fe:"${env:RUNNER_TEMP}\git-discovery-probe.exe" `
+            /link advapi32.lib `
+            2>&1 | Tee-Object -FilePath "${env:RUNNER_TEMP}\git-discovery-probe-build.txt"
+          if ($LASTEXITCODE -ne 0) { throw "Git discovery probe compilation failed" }
+      - name: Execute discovery, authority, junction, Git, and standard-user gates
+        shell: pwsh
+        run: |
+          uv run python scripts/evidence/windows_appcontainer_git_discovery_poc2e.py `
+            --poc2b ".poc2b-harness/scripts/evidence/windows_appcontainer_runtime_poc2b.py" `
+            --bootstrap "${env:RUNNER_TEMP}\runtime-bootstrap.exe" `
+            --probe "${env:RUNNER_TEMP}\git-discovery-probe.exe" `
+            --runtime "${env:RUNNER_TEMP}\git-discovery-runtime" `
+            --path-sep ';' `
+            --git-tag $env:POC2E_GIT_TAG `
+            --git-source-commit $env:POC2E_GIT_COMMIT `
+            --nul-patch-sha256 $env:POC2E_NUL_HASH `
+            --path-patch-sha256 $env:POC2E_PATH_HASH `
+            --report "${env:RUNNER_TEMP}\windows-appcontainer-git-discovery-poc2e.json"
+      - name: Upload evidence artifacts
+        if: always()
+        uses: actions/upload-artifact@v4.6.2
+        with:
+          name: windows-appcontainer-git-discovery-poc2e-${{ matrix.runner }}
+          path: |
+            ${{ runner.temp }}/git-discovery-source-proof.json
+            ${{ runner.temp }}/git-discovery-build.txt
+            ${{ runner.temp }}/git-discovery-ldd.txt
+            ${{ runner.temp }}/poc2b-bootstrap-build.txt
+            ${{ runner.temp }}/git-discovery-probe-build.txt
+            ${{ runner.temp }}/windows-appcontainer-git-discovery-poc2e.json
+            scripts/evidence/git-for-windows-*-poc2d.patch
+          if-no-files-found: warn
