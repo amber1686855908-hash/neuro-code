@@ -1038,13 +1038,19 @@ class _RunnerChild:
     def _wait(self) -> None:
         assert self._process_handle is not None
         try:
+            print("W3_RUNNER_WAIT_ENTER", flush=True)
+            self._send(RuntimeFrameType.STDERR, b"W3_RUNNER_WAIT_ENTER\n")
             self._api.wait_process(self._process_handle)
             code = self._api.get_exit_code(self._process_handle)
+            print("W3_RUNNER_WAIT_SIGNALED", flush=True)
+            self._send(RuntimeFrameType.STDERR, b"W3_RUNNER_WAIT_SIGNALED\n")
             # Publish process completion before waiting for output relays.  A
             # relay can remain in a native ReadFile until every duplicated
             # pipe writer is released; completion must not be hidden behind
             # that stream-drain path.
             self._send(RuntimeFrameType.EXIT, {"version": PROTOCOL_VERSION, "returncode": code})
+            print("W3_RUNNER_EXIT_SENT", flush=True)
+            self._send(RuntimeFrameType.STDERR, b"W3_RUNNER_EXIT_SENT\n")
             for thread in self._threads:
                 if thread is not threading.current_thread():
                     thread.join(timeout=2.0)
