@@ -831,6 +831,7 @@ class _RunnerChild:
         self._api = _NativeChildApi()
         self._job = WindowsJobObject.create()
         self._process_handle: int | None = None
+        self._thread_handle: int | None = None
         self._process_id: int | None = None
         self._stdin_handle: int | None = None
         self._desktop_handle: int | None = None
@@ -941,9 +942,6 @@ class _RunnerChild:
                 job_handle=self._job.process_creation_handle,
                 desktop_name=self._desktop_name,
             )
-            if created.thread_handle is not None:
-                self._api.close_handle(created.thread_handle)
-                created = RunnerLaunch(created.process_handle, created.process_id)
             self._api.close_handle(stdin_child)
             handles_to_close.remove(stdin_child)
             self._api.close_handle(stdout_write)
@@ -953,6 +951,7 @@ class _RunnerChild:
                 assert stderr_write is not None
                 handles_to_close.remove(stderr_write)
             self._process_handle = created.process_handle
+            self._thread_handle = created.thread_handle
             self._process_id = created.process_id
             self._stdin_handle = stdin_parent
             if stdin_parent is not None:
@@ -1051,7 +1050,8 @@ class _RunnerChild:
                     "ascii"
                 ),
             )
-            self._api.wait_process(self._process_handle)
+            completion_handle = self._thread_handle or self._process_handle
+            self._api.wait_process(completion_handle)
             code = self._api.get_exit_code(self._process_handle)
             self._send(RuntimeFrameType.STDERR, b"W3_RUNNER_WAIT_SIGNALED\n")
             # Publish process completion before waiting for output relays.  A
@@ -1073,6 +1073,10 @@ class _RunnerChild:
             with contextlib.suppress(BaseException):
                 self._api.close_handle(self._process_handle)
             self._process_handle = None
+            thread_handle, self._thread_handle = self._thread_handle, None
+            if thread_handle is not None:
+                with contextlib.suppress(BaseException):
+                    self._api.close_handle(thread_handle)
             stdin_handle, self._stdin_handle = self._stdin_handle, None
             if stdin_handle is not None:
                 with contextlib.suppress(BaseException):
