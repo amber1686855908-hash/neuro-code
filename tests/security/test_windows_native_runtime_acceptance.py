@@ -86,11 +86,27 @@ def _wait_for_native_process_exit(pid: int, timeout_ms: int = 5_000) -> bool:
         close(handle)
 
 
+async def _read_with_native_timeout(process: object, *, limit_seconds: float = 30.0) -> bytes:
+    """Bound a native read and terminate the owned scope on a stuck child."""
+
+    try:
+        stdout = process.stdout  # type: ignore[attr-defined]
+        return await asyncio.wait_for(stdout.read(), timeout=limit_seconds)
+    except TimeoutError as error:
+        with contextlib.suppress(BaseException):
+            await process.terminate(grace_seconds=0.5)  # type: ignore[attr-defined]
+        raise AssertionError(
+            "Windows W3 child produced no completed output before timeout"
+        ) from error
+
+
 _TOKEN_PROBE = r"""
 import ctypes
 import json
 import sys
 from pathlib import Path
+
+print("TOKEN_PROBE_START", flush=True)
 
 advapi = ctypes.WinDLL("advapi32.dll", use_last_error=True)
 kernel = ctypes.WinDLL("kernel32.dll", use_last_error=True)
@@ -242,7 +258,7 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                     arguments=("-c", _TOKEN_PROBE),
                 )
                 process = await adapter.spawn(identity_request)
-                stdout = await process.stdout.read()  # type: ignore[union-attr]
+                stdout = await _read_with_native_timeout(process)
                 self.assertEqual(await process.wait(), 0)
                 facts = json.loads(stdout.decode("utf-8"))
                 record = authority.identity_records(setup_request)
