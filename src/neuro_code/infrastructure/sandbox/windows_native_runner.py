@@ -1198,11 +1198,11 @@ class _NativeChildApi:
                     self._error("SetHandleInformation(stdio inherit)")
             startup = _StartupInfoExW()
             startup.StartupInfo.cb = ctypes.sizeof(startup)
-            # A restricted token can otherwise start without a usable window
-            # station/desktop on a fresh local account.  W3 is non-interactive;
-            # the fixed default desktop is only a process-initialization target,
-            # never a PTY or terminal capability.
-            startup.StartupInfo.lpDesktop = r"Winsta0\Default"
+            # W3 is non-interactive and must not depend on access to the
+            # controller's interactive window station.  Leave lpDesktop null
+            # so Windows selects the account/session default without granting
+            # the child a GUI or PTY surface.
+            startup.StartupInfo.lpDesktop = None
             startup.StartupInfo.dwFlags = _STARTF_USESTDHANDLES
             startup.StartupInfo.hStdInput = stdin_handle
             startup.StartupInfo.hStdOutput = stdout_handle
