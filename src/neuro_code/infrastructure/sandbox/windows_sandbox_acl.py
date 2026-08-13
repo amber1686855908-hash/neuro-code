@@ -1,15 +1,17 @@
 """Windows sandbox filesystem authority planning and exact ACE reconciliation.
 
-The planner is platform-neutral and deliberately narrow: it grants a dedicated
-synthetic SID access only on explicitly named roots, adds explicit sensitive
-read denies, and removes only ACE tuples that this installation previously
-managed.  Unrelated controller-user ACL entries are never part of the managed
-set.
+The planner is platform-neutral and deliberately narrow: it grants real
+dedicated account SIDs read access, grants those accounts plus the synthetic
+restricted-token SID write access only on explicitly named writable roots,
+adds read-only and sensitive-read denies, and removes only ACE tuples that this
+installation previously managed.  Unrelated controller-user ACL entries are
+never part of the managed set.
 
 Windows 沙箱文件系统 authority 的规划与精确 ACE reconciliation.
 
-planner 平台无关且范围很窄:只在明确 roots 上授予 dedicated synthetic SID 权限,
-为敏感路径加入显式 read deny,并且只删除本 installation 之前管理的 ACE tuple.
+planner 平台无关且范围很窄:真实 dedicated account SID 获得 read 权限,真实 account
+SID 和 synthetic restricted-token SID 仅在明确 writable roots 上获得 write 权限,为
+read-only 和敏感路径加入显式 deny,并且只删除本 installation 之前管理的 ACE tuple.
 controller user 的其他 ACL entry 永远不在 managed set 中.
 """
 
@@ -25,6 +27,7 @@ from pathlib import Path
 from typing import Protocol, cast
 
 from neuro_code.application.ports.windows_sandbox import WindowsSandboxSetupRequest
+from neuro_code.infrastructure.sandbox.windows_sandbox_accounts import WindowsAccountSid
 from neuro_code.infrastructure.sandbox.windows_sandbox_identity import SyntheticWindowsSid
 from neuro_code.shared.errors import SandboxError
 
@@ -55,6 +58,14 @@ WRITE_ACCESS_MASK = (
     | FILE_WRITE_ATTRIBUTES
     | DELETE
 )
+WRITE_ONLY_ACCESS_MASK = (
+    FILE_WRITE_DATA
+    | FILE_APPEND_DATA
+    | FILE_WRITE_EA
+    | FILE_DELETE_CHILD
+    | FILE_WRITE_ATTRIBUTES
+    | DELETE
+)
 INHERIT_TO_CHILDREN = 0x00000003  # OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE
 
 
@@ -67,7 +78,10 @@ class WindowsManagedAceKind(StrEnum):
 
     READ_ALLOW = "read-allow"
     WRITE_ALLOW = "write-allow"
+    RESTRICTING_WRITE_ALLOW = "restricting-write-allow"
+    READ_ONLY_WRITE_DENY = "read-only-write-deny"
     SENSITIVE_READ_DENY = "sensitive-read-deny"
+    CREDENTIAL_PROTECTION_DENY = "credential-protection-deny"
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,7 +89,7 @@ class WindowsManagedAce:
     """One exact, installation-owned ACE tuple."""
 
     path: Path
-    sid: SyntheticWindowsSid
+    sid: WindowsAccountSid | SyntheticWindowsSid
     kind: WindowsManagedAceKind
     access_mask: int
     inheritance: int = INHERIT_TO_CHILDREN
@@ -89,23 +103,51 @@ class WindowsManagedAce:
             raise ValueError("managed ACE path must be resolvable") from error
         if canonical == canonical.parent:
             raise ValueError("managed ACE path must not be a filesystem root")
-        if not isinstance(self.sid, SyntheticWindowsSid):
-            raise TypeError("managed ACE SID must be a canonical synthetic SID")
+        if not isinstance(self.sid, (WindowsAccountSid, SyntheticWindowsSid)):
+            raise TypeError("managed ACE SID must be a canonical account or synthetic SID")
         if not isinstance(self.kind, WindowsManagedAceKind):
             raise TypeError("managed ACE kind must be canonical")
+        if self.kind in (
+            WindowsManagedAceKind.READ_ALLOW,
+            WindowsManagedAceKind.READ_ONLY_WRITE_DENY,
+            WindowsManagedAceKind.SENSITIVE_READ_DENY,
+            WindowsManagedAceKind.CREDENTIAL_PROTECTION_DENY,
+        ) and not isinstance(self.sid, WindowsAccountSid):
+            raise TypeError("read and deny ACEs must target a real account SID")
         if self.kind is WindowsManagedAceKind.WRITE_ALLOW:
+            if not isinstance(self.sid, WindowsAccountSid):
+                raise TypeError("user write ACEs must target a real account SID")
             expected_mask = WRITE_ACCESS_MASK
+        elif self.kind is WindowsManagedAceKind.RESTRICTING_WRITE_ALLOW:
+            if not isinstance(self.sid, SyntheticWindowsSid):
+                raise TypeError("restricting write ACEs must target the synthetic SID")
+            expected_mask = WRITE_ONLY_ACCESS_MASK
+        elif self.kind is WindowsManagedAceKind.READ_ONLY_WRITE_DENY:
+            expected_mask = WRITE_ONLY_ACCESS_MASK
+        elif self.kind is WindowsManagedAceKind.CREDENTIAL_PROTECTION_DENY:
+            expected_mask = READ_ACCESS_MASK
         else:
             expected_mask = READ_ACCESS_MASK
         if self.access_mask != expected_mask:
             raise ValueError("managed ACE access mask does not match its role")
-        if self.inheritance != INHERIT_TO_CHILDREN:
+        if self.kind in (
+            WindowsManagedAceKind.SENSITIVE_READ_DENY,
+            WindowsManagedAceKind.READ_ONLY_WRITE_DENY,
+            WindowsManagedAceKind.CREDENTIAL_PROTECTION_DENY,
+        ):
+            if self.inheritance not in (0, INHERIT_TO_CHILDREN):
+                raise ValueError("sensitive deny inheritance must be exact or cover descendants")
+        elif self.inheritance != INHERIT_TO_CHILDREN:
             raise ValueError("managed ACE inheritance must cover files and child directories")
         object.__setattr__(self, "path", canonical)
 
     @property
     def is_deny(self) -> bool:
-        return self.kind is WindowsManagedAceKind.SENSITIVE_READ_DENY
+        return self.kind in (
+            WindowsManagedAceKind.SENSITIVE_READ_DENY,
+            WindowsManagedAceKind.READ_ONLY_WRITE_DENY,
+            WindowsManagedAceKind.CREDENTIAL_PROTECTION_DENY,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -126,40 +168,80 @@ class WindowsFilesystemSetupPlan:
 def plan_windows_filesystem_authority(
     request: WindowsSandboxSetupRequest,
     write_sid: SyntheticWindowsSid,
+    *,
+    read_user_sids: tuple[WindowsAccountSid, ...] = (),
+    write_user_sids: tuple[WindowsAccountSid, ...] = (),
+    credential_path: Path | None = None,
 ) -> WindowsFilesystemSetupPlan:
-    """Build read/write grants and sensitive-read denies without touching ACLs."""
+    """Build explicit real-user read policy and synthetic write policy.
+
+    Read and sensitive-deny ACEs always target real dedicated local users.
+    ``write_sid`` is the restricted-token SID and is never used as a read or
+    firewall principal.  The real users also receive write access on writable
+    roots because a token's normal user SID remains part of its access check.
+    """
 
     if not isinstance(request, WindowsSandboxSetupRequest):
         raise TypeError("filesystem setup request must be canonical")
     if not isinstance(write_sid, SyntheticWindowsSid):
         raise TypeError("filesystem setup write SID must be canonical")
+    if not read_user_sids or set(read_user_sids) != set(write_user_sids):
+        raise ValueError("read_user_sids and write_user_sids must contain the same real users")
+    if any(not isinstance(sid, WindowsAccountSid) for sid in read_user_sids):
+        raise TypeError("read_user_sids must contain real account SIDs")
+    if credential_path is not None and (
+        not isinstance(credential_path, Path) or not credential_path.is_absolute()
+    ):
+        raise ValueError("credential_path must be an absolute path")
     entries: list[WindowsManagedAce] = []
     for root in request.read_roots:
-        entries.append(
-            WindowsManagedAce(
-                root,
-                write_sid,
-                WindowsManagedAceKind.READ_ALLOW,
-                READ_ACCESS_MASK,
-            )
+        entries.extend(
+            WindowsManagedAce(root, sid, WindowsManagedAceKind.READ_ALLOW, READ_ACCESS_MASK)
+            for sid in read_user_sids
         )
     for root in request.writable_roots:
-        entries.append(
+        entries.extend(
+            [
+                WindowsManagedAce(root, sid, WindowsManagedAceKind.WRITE_ALLOW, WRITE_ACCESS_MASK)
+                for sid in write_user_sids
+            ]
+            + [
+                WindowsManagedAce(
+                    root,
+                    write_sid,
+                    WindowsManagedAceKind.RESTRICTING_WRITE_ALLOW,
+                    WRITE_ONLY_ACCESS_MASK,
+                )
+            ]
+        )
+    read_only_roots = set(request.read_roots) - set(request.writable_roots)
+    for root in read_only_roots:
+        entries.extend(
             WindowsManagedAce(
                 root,
-                write_sid,
-                WindowsManagedAceKind.WRITE_ALLOW,
-                WRITE_ACCESS_MASK,
+                sid,
+                WindowsManagedAceKind.READ_ONLY_WRITE_DENY,
+                WRITE_ONLY_ACCESS_MASK,
             )
+            for sid in read_user_sids
         )
     for sensitive in request.sensitive_read_paths:
-        entries.append(
+        entries.extend(
             WindowsManagedAce(
-                sensitive,
-                write_sid,
-                WindowsManagedAceKind.SENSITIVE_READ_DENY,
-                READ_ACCESS_MASK,
+                sensitive, sid, WindowsManagedAceKind.SENSITIVE_READ_DENY, READ_ACCESS_MASK
             )
+            for sid in read_user_sids
+        )
+    if credential_path is not None:
+        entries.extend(
+            WindowsManagedAce(
+                credential_path,
+                sid,
+                WindowsManagedAceKind.CREDENTIAL_PROTECTION_DENY,
+                READ_ACCESS_MASK,
+                inheritance=0,
+            )
+            for sid in read_user_sids
         )
     return WindowsFilesystemSetupPlan(tuple(entries))
 
@@ -312,7 +394,9 @@ class _NativeWindowsAclApi:  # pragma: no cover - exercised by Windows native CI
     _ACCESS_ALLOWED_ACE_TYPE = 0
     _ACCESS_DENIED_ACE_TYPE = 1
     _TRUSTEE_IS_SID = 0
-    _TRUSTEE_IS_USER = 1
+    _TRUSTEE_IS_UNKNOWN = 0
+    _SET_ACCESS = 2
+    _DENY_ACCESS = 3
     _MAXDWORD = 0xFFFFFFFF
 
     def __init__(self) -> None:
@@ -391,6 +475,17 @@ class _NativeWindowsAclApi:  # pragma: no cover - exercised by Windows native CI
             [ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p],
             ctypes.c_int32,
         )
+        self._set_entries_in_acl = _load_acl_function(
+            advapi32,
+            "SetEntriesInAclW",
+            [
+                ctypes.c_uint32,
+                ctypes.POINTER(_ExplicitAccessW),
+                ctypes.c_void_p,
+                ctypes.POINTER(ctypes.c_void_p),
+            ],
+            ctypes.c_uint32,
+        )
         self._set_named_security_info = _load_acl_function(
             advapi32,
             "SetNamedSecurityInfoW",
@@ -410,7 +505,7 @@ class _NativeWindowsAclApi:  # pragma: no cover - exercised by Windows native CI
         error = cast(int, self._get_last_error()) if code is None else code
         return WindowsAclError(f"{operation} failed with Windows error {error}")
 
-    def _sid_pointer(self, sid: SyntheticWindowsSid) -> int:
+    def _sid_pointer(self, sid: WindowsAccountSid | SyntheticWindowsSid) -> int:
         pointer = ctypes.c_void_p()
         if not self._convert_sid(sid.value, ctypes.byref(pointer)) or not pointer.value:
             raise self._error("ConvertStringSidToSidW")
@@ -504,10 +599,14 @@ class _NativeWindowsAclApi:  # pragma: no cover - exercised by Windows native CI
     ) -> None:
         raw_entries = self._raw_entries(path)
         retained = [
-            raw for raw in raw_entries if not any(self._raw_matches(raw, entry) for entry in remove)
+            raw
+            for raw in raw_entries
+            if not any(self._raw_matches(raw, entry) for entry in (*remove, *desired))
         ]
-        # Build the ACL in one buffer, preserving all unrelated raw ACE bytes.
-        estimated_size = max(256, sum(len(raw) for raw in retained) + 1024 * max(1, len(desired)))
+        # Build a retained ACL in one buffer, preserving all unrelated raw ACE
+        # bytes.  New entries are passed through SetEntriesInAclW below so
+        # Windows performs canonical deny-before-allow ordering.
+        estimated_size = max(256, sum(len(raw) for raw in retained) + 256)
         acl_buffer = ctypes.create_string_buffer(estimated_size)
         if not self._initialize_acl(acl_buffer, estimated_size, self._ACL_REVISION):
             raise self._error("InitializeAcl")
@@ -521,42 +620,63 @@ class _NativeWindowsAclApi:  # pragma: no cover - exercised by Windows native CI
                 len(raw),
             ):
                 raise self._error("AddAce")
-        retained_entries = list(retained)
-        for entry in desired:
-            if any(self._raw_matches(raw, entry) for raw in retained_entries):
-                continue
-            sid_pointer = self._sid_pointer(entry.sid)
-            try:
-                function = self._add_denied_ace if entry.is_deny else self._add_allowed_ace
-                if not function(
-                    acl_buffer,
-                    self._ACL_REVISION,
-                    entry.inheritance,
+        # Re-add every desired managed entry, even if it was already present,
+        # so externally reordered managed ACEs cannot remain before a deny.
+        missing = list(desired)
+        sid_pointers: list[int] = []
+        explicit_array = (_ExplicitAccessW * len(missing))() if missing else None
+        if missing and explicit_array is not None:
+            for index, entry in enumerate(missing):
+                sid_pointer = self._sid_pointer(entry.sid)
+                sid_pointers.append(sid_pointer)
+                explicit_array[index] = _ExplicitAccessW(
                     entry.access_mask,
-                    sid_pointer,
-                ):
-                    raise self._error(
-                        "AddAccessDeniedAceEx" if entry.is_deny else "AddAccessAllowedAceEx"
-                    )
-            finally:
+                    self._DENY_ACCESS if entry.is_deny else self._SET_ACCESS,
+                    entry.inheritance,
+                    _TrusteeW(
+                        None,
+                        0,
+                        self._TRUSTEE_IS_SID,
+                        self._TRUSTEE_IS_UNKNOWN,
+                        sid_pointer,
+                    ),
+                )
+        new_acl = ctypes.c_void_p()
+        try:
+            if missing and explicit_array is not None:
+                result = self._set_entries_in_acl(
+                    len(missing),
+                    explicit_array,
+                    ctypes.cast(acl_buffer, ctypes.c_void_p),
+                    ctypes.byref(new_acl),
+                )
+                if result != 0 or not new_acl.value:
+                    raise self._error("SetEntriesInAclW", cast(int, result))
+            else:
+                new_acl = ctypes.cast(acl_buffer, ctypes.c_void_p)
+            result = self._set_named_security_info(
+                str(path),
+                self._SE_FILE_OBJECT,
+                self._DACL_SECURITY_INFORMATION,
+                None,
+                None,
+                new_acl,
+                None,
+            )
+            if result != 0:
+                raise self._error("SetNamedSecurityInfoW", cast(int, result))
+        finally:
+            for sid_pointer in sid_pointers:
                 self._local_free(sid_pointer)
-        result = self._set_named_security_info(
-            str(path),
-            self._SE_FILE_OBJECT,
-            self._DACL_SECURITY_INFORMATION,
-            None,
-            None,
-            ctypes.cast(acl_buffer, ctypes.c_void_p),
-            None,
-        )
-        if result != 0:
-            raise self._error("SetNamedSecurityInfoW", cast(int, result))
+            if missing and new_acl.value:
+                self._local_free(new_acl)
 
 
 __all__ = [
     "INHERIT_TO_CHILDREN",
     "READ_ACCESS_MASK",
     "WRITE_ACCESS_MASK",
+    "WRITE_ONLY_ACCESS_MASK",
     "InMemoryWindowsAclApi",
     "WindowsAclApi",
     "WindowsAclError",

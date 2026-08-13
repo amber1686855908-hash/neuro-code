@@ -79,20 +79,29 @@ later vertical slice wires a complete authority composition.
 W2 implements an installation-time setup boundary while leaving runtime child
 creation for W3. The authority has these properties:
 
-- Offline and Online are dedicated logical identities. They share one
-  installation-scoped synthetic write SID, while their opaque credentials are
-  kept as separate records.
-- The installation record uses schema version 1 and is persisted as a DPAPI
-  machine-scoped encrypted payload. The envelope contains no plaintext
-  credentials or SID record.
-- Filesystem setup plans explicit read grants, write grants only for writable
-  roots, and sensitive-read deny ACEs. Reconciliation removes only exact ACE
-  tuples recorded as managed by this installation; unrelated controller-user
-  ACEs are preserved. Re-running setup is idempotent, drift is `NEEDS_REPAIR`,
-  and cleanup removes only the managed tuples.
-- Offline owns one outbound block rule scoped to the synthetic SID. Online
-  removes only that exact managed rule and does not add a global allow rule.
-  The real controller user is never used as the firewall subject.
+- Offline and Online are dedicated real local users (`NeuroSandboxOffline` and
+  `NeuroSandboxOnline`). Their resolved account SIDs are stable setup facts and
+  are distinct from the installation-scoped synthetic restricting SID.
+- The synthetic SID is used only as the W1 `WRITE_RESTRICTED` token membership
+  and write-only ACL principal. It is never a read principal and never a
+  firewall identity; real account SIDs carry the read and primary-user write
+  checks.
+- The installation record uses schema version 2 and stores each actual account
+  password inside a DPAPI machine-scoped encrypted payload. Because machine
+  DPAPI alone is not a user boundary, the credential file also receives exact
+  NTFS deny ACEs for both sandbox users; controller/setup access is preserved.
+- Filesystem setup plans read allows for both real users, explicit primary-user
+  write allows for both real users plus a write-only synthetic restricting SID
+  on writable roots,
+  explicit write denies on read-only roots, and sensitive-read denies for both
+  real users. Native reconciliation uses `SetEntriesInAclW`, which canonicalizes
+  explicit denies before allows while preserving unrelated controller ACEs and
+  owner information. Re-running setup is idempotent, drift is `NEEDS_REPAIR`,
+  and cleanup removes only exact managed tuples and installation-created users.
+- Offline owns one outbound block rule scoped to the real Offline account SID.
+  Online removes only that exact managed rule and does not add a global allow
+  rule. The Online account and the controller user are not matched by the
+  Offline rule.
 - Setup, repair, and cleanup are an explicit administrative boundary. An
   ordinary session can inspect the state and run later runtime work without
   continuing to require administrator privileges.

@@ -1525,11 +1525,17 @@ lifecycle remains the independent `LocalProcessLifecycleCapability` contract,
 with existing Job Object/ConPTY paths reporting
 `STRONG_DESCENDANT_OWNERSHIP`.
 
-W2 setup maintains dedicated Offline and Online logical identities, one
-installation-scoped synthetic write SID, DPAPI-protected credential records,
-explicit read/write/sensitive-deny ACL plans, and exact managed-ACE repair and
-cleanup. Offline outbound blocking is scoped to that synthetic SID; Online
-removes only the managed block rule and never targets the controller user.
+W2 setup maintains dedicated real local users `NeuroSandboxOffline` and
+`NeuroSandboxOnline`, their resolved account SIDs, one installation-scoped
+synthetic restricting SID, DPAPI-protected actual account credentials, and
+explicit read/primary-user-write/restricting-write/read-only-deny/sensitive-deny
+ACL plans. The synthetic SID is only a write-only restricted-token principal;
+it is never a read or network identity. Native reconciliation uses `SetEntriesInAclW` so explicit denies are
+canonicalized before allows while unrelated controller ACEs and owner data are
+preserved. The credential file receives exact deny ACEs for both sandbox users.
+Offline outbound blocking is scoped to the real Offline account SID; Online
+removes only the managed block rule and never targets the Online or controller
+user.
 Setup state is `READY`, `NEEDS_SETUP`, `NEEDS_REPAIR`, or `UNSUPPORTED`, and
 setup/repair/cleanup may require administrator authority while runtime work
 does not. W2 does not launch children, connect MCP, add a command runner,

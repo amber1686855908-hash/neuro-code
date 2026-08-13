@@ -14,6 +14,12 @@ from neuro_code.application.ports.windows_sandbox import (
     WindowsSandboxSetupRequest,
     WindowsSandboxSetupState,
 )
+from neuro_code.infrastructure.sandbox.windows_sandbox_accounts import (
+    SANDBOX_OFFLINE_USERNAME,
+    SANDBOX_ONLINE_USERNAME,
+    InMemoryWindowsSandboxAccountApi,
+    WindowsAccountSid,
+)
 from neuro_code.infrastructure.sandbox.windows_sandbox_acl import (
     READ_ACCESS_MASK,
     InMemoryWindowsAclApi,
@@ -140,6 +146,7 @@ class WindowsSandboxSetupAuthorityTests(unittest.TestCase):
             credential_store=store,
             acl_api=acl,
             firewall_api=firewall,
+            account_api=InMemoryWindowsSandboxAccountApi(),
             privilege_api=_FakePrivilege(administrator),
         )
         return authority, acl, firewall, store
@@ -196,18 +203,23 @@ class WindowsSandboxSetupAuthorityTests(unittest.TestCase):
             with self.assertRaises(TypeError):
                 WindowsManagedAce(path, sid, object(), READ_ACCESS_MASK)  # type: ignore[arg-type]
             with self.assertRaises(ValueError):
-                WindowsManagedAce(path, sid, WindowsManagedAceKind.READ_ALLOW, 0)
+                WindowsManagedAce(
+                    path,
+                    WindowsAccountSid("S-1-5-21-100-200-300-2000"),
+                    WindowsManagedAceKind.READ_ALLOW,
+                    0,
+                )
             with self.assertRaises(ValueError):
                 WindowsManagedAce(
                     path,
-                    sid,
+                    WindowsAccountSid("S-1-5-21-100-200-300-2000"),
                     WindowsManagedAceKind.READ_ALLOW,
                     READ_ACCESS_MASK,
                     inheritance=0,
                 )
             deny = WindowsManagedAce(
                 path,
-                sid,
+                WindowsAccountSid("S-1-5-21-100-200-300-2000"),
                 WindowsManagedAceKind.SENSITIVE_READ_DENY,
                 READ_ACCESS_MASK,
             )
@@ -222,13 +234,21 @@ class WindowsSandboxSetupAuthorityTests(unittest.TestCase):
     def test_planner_requires_canonical_request_and_sid(self) -> None:
         with self.assertRaises(TypeError):
             plan_windows_filesystem_authority(
-                object(), SyntheticWindowsSid.from_components((1, 2, 3, 4))
+                object(),
+                SyntheticWindowsSid.from_components((1, 2, 3, 4)),
+                read_user_sids=(WindowsAccountSid("S-1-5-21-100-200-300-2000"),),
+                write_user_sids=(WindowsAccountSid("S-1-5-21-100-200-300-2000"),),
             )  # type: ignore[arg-type]
         with tempfile.TemporaryDirectory() as directory, self.assertRaises(TypeError):
-            plan_windows_filesystem_authority(self._request(directory), object())  # type: ignore[arg-type]
+            plan_windows_filesystem_authority(
+                self._request(directory),
+                object(),
+                read_user_sids=(WindowsAccountSid("S-1-5-21-100-200-300-2000"),),
+                write_user_sids=(WindowsAccountSid("S-1-5-21-100-200-300-2000"),),
+            )  # type: ignore[arg-type]
 
     def test_firewall_rule_contract_is_scoped_and_validated(self) -> None:
-        sid = SyntheticWindowsSid.from_components((1, 2, 3, 4))
+        sid = WindowsAccountSid("S-1-5-21-100-200-300-2000")
         offline = firewall_rule_for_installation(
             "install-1", WindowsSandboxIdentityKind.OFFLINE, sid
         )
@@ -236,6 +256,12 @@ class WindowsSandboxSetupAuthorityTests(unittest.TestCase):
         self.assertEqual(offline.sid, sid)
         with self.assertRaises(ValueError):
             firewall_rule_for_installation("", WindowsSandboxIdentityKind.OFFLINE, sid)
+        with self.assertRaises(TypeError):
+            firewall_rule_for_installation(
+                "install-1",
+                WindowsSandboxIdentityKind.OFFLINE,
+                SyntheticWindowsSid.from_components((1, 2, 3, 4)),
+            )  # type: ignore[arg-type]
         with self.assertRaises(ValueError):
             WindowsFirewallRule("\x00", WindowsSandboxIdentityKind.OFFLINE, sid, True)
         with self.assertRaises(TypeError):
@@ -248,15 +274,79 @@ class WindowsSandboxSetupAuthorityTests(unittest.TestCase):
     def test_plan_has_write_read_and_sensitive_deny_roles(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             request = self._request(directory)
-            sid = SyntheticWindowsSid.from_components((1, 2, 3, 4))
-            plan = plan_windows_filesystem_authority(request, sid)
+            request = WindowsSandboxSetupRequest(
+                installation_root=request.installation_root,
+                read_roots=(*request.read_roots, request.installation_root / "readonly"),
+                writable_roots=request.writable_roots,
+                sensitive_read_paths=request.sensitive_read_paths,
+            )
+            account_sids = (
+                WindowsAccountSid("S-1-5-21-100-200-300-2000"),
+                WindowsAccountSid("S-1-5-21-100-200-300-2001"),
+            )
+            plan = plan_windows_filesystem_authority(
+                request,
+                SyntheticWindowsSid.from_components((1, 2, 3, 4)),
+                read_user_sids=account_sids,
+                write_user_sids=account_sids,
+            )
             self.assertEqual(
                 {entry.kind for entry in plan.entries},
                 {
                     WindowsManagedAceKind.READ_ALLOW,
                     WindowsManagedAceKind.WRITE_ALLOW,
+                    WindowsManagedAceKind.RESTRICTING_WRITE_ALLOW,
+                    WindowsManagedAceKind.READ_ONLY_WRITE_DENY,
                     WindowsManagedAceKind.SENSITIVE_READ_DENY,
                 },
+            )
+            read_entries = [
+                entry
+                for entry in plan.entries
+                if entry.kind
+                in (WindowsManagedAceKind.READ_ALLOW, WindowsManagedAceKind.SENSITIVE_READ_DENY)
+            ]
+            self.assertTrue(all(isinstance(entry.sid, WindowsAccountSid) for entry in read_entries))
+            write_entries = [
+                entry for entry in plan.entries if entry.kind is WindowsManagedAceKind.WRITE_ALLOW
+            ]
+            self.assertTrue(
+                all(isinstance(entry.sid, WindowsAccountSid) for entry in write_entries)
+            )
+            restricting_entries = [
+                entry
+                for entry in plan.entries
+                if entry.kind is WindowsManagedAceKind.RESTRICTING_WRITE_ALLOW
+            ]
+            self.assertTrue(restricting_entries)
+            self.assertTrue(
+                all(isinstance(entry.sid, SyntheticWindowsSid) for entry in restricting_entries)
+            )
+            credential_plan = plan_windows_filesystem_authority(
+                request,
+                SyntheticWindowsSid.from_components((1, 2, 3, 4)),
+                read_user_sids=account_sids,
+                write_user_sids=account_sids,
+                credential_path=request.installation_root / "credentials.dpapi",
+            )
+            self.assertTrue(
+                any(
+                    entry.kind is WindowsManagedAceKind.CREDENTIAL_PROTECTION_DENY
+                    for entry in credential_plan.entries
+                )
+            )
+            credential_plan = plan_windows_filesystem_authority(
+                request,
+                SyntheticWindowsSid.from_components((1, 2, 3, 4)),
+                read_user_sids=account_sids,
+                write_user_sids=account_sids,
+                credential_path=request.installation_root / "credentials.dpapi",
+            )
+            self.assertTrue(
+                any(
+                    entry.kind is WindowsManagedAceKind.CREDENTIAL_PROTECTION_DENY
+                    for entry in credential_plan.entries
+                )
             )
 
     def test_setup_creates_dedicated_identities_with_one_persistent_write_sid(self) -> None:
@@ -273,11 +363,21 @@ class WindowsSandboxSetupAuthorityTests(unittest.TestCase):
                 set(WindowsSandboxIdentityKind),
             )
             self.assertEqual({record.write_sid.value for record in records}, {offline.write_sid})
-            self.assertEqual(len(acl.entries), 2)
+            self.assertEqual(
+                {record.username for record in records},
+                {SANDBOX_OFFLINE_USERNAME, SANDBOX_ONLINE_USERNAME},
+            )
+            self.assertEqual(
+                {record.user_sid.value for record in records},
+                {offline.offline_user_sid, offline.online_user_sid},
+            )
+            self.assertNotIn(offline.write_sid, {offline.offline_user_sid, offline.online_user_sid})
+            self.assertGreaterEqual(len(acl.entries), 2)
             self.assertEqual(len(firewall.rules), 1)
             rule = next(iter(firewall.rules.values()))
-            self.assertEqual(rule.sid.value, offline.write_sid)
+            self.assertEqual(rule.sid.value, offline.offline_user_sid)
             self.assertTrue(rule.outbound_block)
+            self.assertNotEqual(rule.sid.value, offline.write_restricting_sid)
             self.assertIsNotNone(store.load())
 
             online = authority.setup(request, identity=WindowsSandboxIdentityKind.ONLINE)
@@ -347,6 +447,10 @@ class WindowsSandboxSetupAuthorityTests(unittest.TestCase):
             self.assertEqual(firewall.rules, {})
             self.assertIsNone(store.load())
             self.assertIn("real-controller-user", acl.unmanaged_entries[request.read_roots[0]])
+            account_api = authority._account_api
+            assert account_api is not None
+            self.assertFalse(account_api.user_exists("NeuroSandboxOffline"))
+            self.assertFalse(account_api.user_exists("NeuroSandboxOnline"))
 
     def test_setup_privilege_boundary_is_admin_only_for_setup(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

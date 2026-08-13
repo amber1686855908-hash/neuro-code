@@ -1077,12 +1077,17 @@ request 不能由 limited provider 满足。Process lifecycle 继续由独立的
 `LocalProcessLifecycleCapability` contract 负责，现有 Job Object/ConPTY path 报告
 `STRONG_DESCENDANT_OWNERSHIP`。
 
-W2 setup 维护 Offline 和 Online dedicated logical identity、一个
-installation-scoped synthetic write SID、DPAPI 保护的 credential record、显式
-read/write/sensitive-deny ACL plan，以及 exact managed-ACE repair/cleanup。Offline
-outbound block 只按该 synthetic SID 限定；Online 只删除 managed block rule，永远不作用
-于 controller user。setup state 为 `READY`、`NEEDS_SETUP`、`NEEDS_REPAIR` 或
-`UNSUPPORTED`；setup/repair/cleanup 可以需要管理员权限，而 runtime 工作不需要持续提权。
+W2 setup 维护真实 local user `NeuroSandboxOffline` 和 `NeuroSandboxOnline`、各自解析的
+account SID、一个 installation-scoped synthetic restricting SID、DPAPI 保护的实际
+account credential，以及显式 read/primary-user-write/restricting-write/read-only-deny/
+sensitive-deny ACL plan。synthetic SID 只用于 restricted-token 的仅写 principal，不能作为
+read 或 network identity。native
+reconciliation 使用 `SetEntriesInAclW`，将 explicit deny canonicalize 到 allow 之前，同时
+保留无关 controller ACE 和 owner；credential file 另外设置只针对两个 sandbox user 的
+exact deny ACE。Offline outbound block 按真实 Offline account SID 限定；Online 只删除
+managed block rule，永远不作用于 Online 或 controller user。setup state 为 `READY`、
+`NEEDS_SETUP`、`NEEDS_REPAIR` 或 `UNSUPPORTED`；setup/repair/cleanup 可以需要管理员权限，
+而 runtime 工作不需要持续提权。
 W2 不启动 child、不连接 MCP、不增加 command runner、不改 Git/Python integration、不重写
 Job Object/ConPTY，也不改变 actual capability advertisement；runtime 接线留给 W3。
 

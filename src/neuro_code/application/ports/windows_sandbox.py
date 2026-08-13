@@ -20,7 +20,7 @@ from typing import Protocol
 
 
 class WindowsSandboxIdentityKind(StrEnum):
-    """Dedicated logical identities maintained by the installation."""
+    """Dedicated real local users maintained by the installation."""
 
     OFFLINE = "offline"
     ONLINE = "online"
@@ -35,7 +35,9 @@ class WindowsSandboxSetupState(StrEnum):
     UNSUPPORTED = "unsupported"
 
 
-WINDOWS_SANDBOX_SETUP_SCHEMA_VERSION = 1
+# Version 2 records real account SIDs/passwords separately from the synthetic
+# restricted-token SID and carries the credential-file ACL in the managed set.
+WINDOWS_SANDBOX_SETUP_SCHEMA_VERSION = 2
 
 
 def _canonical_setup_path(path: Path, label: str) -> Path:
@@ -109,6 +111,12 @@ class WindowsSandboxSetupSnapshot:
 
     state: WindowsSandboxSetupState
     schema_version: int = WINDOWS_SANDBOX_SETUP_SCHEMA_VERSION
+    offline_user_sid: str | None = None
+    online_user_sid: str | None = None
+    write_restricting_sid: str | None = None
+    # Compatibility projection retained for callers that used the W2 draft
+    # name.  It always contains the synthetic restricting SID, never a user
+    # SID and never a firewall subject.
     write_sid: str | None = None
     identities: tuple[WindowsSandboxIdentityKind, ...] = ()
     managed_ace_count: int = 0

@@ -4,13 +4,15 @@ The file envelope contains only a format marker and an encrypted blob.  The
 plaintext installation record is never written to disk.  DPAPI uses the local
 machine scope so an administrator can perform setup once and an ordinary
 session can later read the installation record without requiring elevation;
-the file's ACL is still managed by the setup authority.
+the setup authority must additionally apply a real NTFS DACL denying both
+sandbox users because machine-scoped DPAPI is not a user isolation boundary.
 
 Windows 沙箱 installation record 的 DPAPI 持久化.
 
 文件 envelope 只包含格式标记和加密 blob,不会把明文 installation record 写入磁盘.
 DPAPI 使用本机 scope,使管理员可以完成一次 setup,普通 session 随后无需提权即可读取;
-文件本身的 ACL 仍由 setup authority 管理.
+machine scope 不是 user isolation boundary, 因此 setup authority 还必须应用真实 NTFS
+DACL, 拒绝两个 sandbox user 读取该文件.
 """
 
 from __future__ import annotations

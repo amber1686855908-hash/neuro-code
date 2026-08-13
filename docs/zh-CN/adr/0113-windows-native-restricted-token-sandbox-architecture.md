@@ -72,17 +72,25 @@ Object/ConPTY guarantee 保持不变。在后续完整 authority composition 接
 W2 实现 installation-time setup boundary，同时把 runtime child creation 留给 W3。该
 authority 具有以下属性：
 
-- Offline 和 Online 是 dedicated logical identity。两者共享一个 installation-scoped
-  synthetic write SID，但各自的 opaque credential 使用独立记录。
-- installation record 使用 schema version 1，并以 DPAPI machine-scoped 加密 payload
-  持久化。envelope 不包含明文 credential 或 SID record。
-- 文件系统 setup 会规划显式 read grant、只对 writable roots 授予 write grant，以及
-  sensitive-read deny ACE。reconciliation 只删除本 installation 记录为 managed 的
-  exact ACE tuple，并保留无关的 controller-user ACE。重复 setup 幂等；漂移报告
-  `NEEDS_REPAIR`；cleanup 只删除 managed tuple。
-- Offline 拥有一个按 synthetic SID 限定的 outbound block rule。Online 只删除该 exact
-  managed rule，不添加 global allow rule。真实 controller user 永远不会成为 firewall
-  subject。
+- Offline 和 Online 是 dedicated real local user：`NeuroSandboxOffline` 和
+  `NeuroSandboxOnline`。两者的真实 account SID 在 setup 时解析并持久化，彼此不同，且
+  与 installation-scoped synthetic restricting SID 分离。
+- synthetic SID 只用于 W1 `WRITE_RESTRICTED` token membership 和仅写 ACL principal，
+  不能作为 read principal 或 firewall identity；read 以及 primary-user write check
+  由真实 account SID 承担。
+- installation record 使用 schema version 2，并将实际 account password 放在 DPAPI
+  machine-scoped 加密 payload 中。machine DPAPI 本身不是 user boundary，因此 credential
+  file 另外设置只针对两个 sandbox user 的 exact NTFS deny ACE，同时保留 controller/setup
+  access。
+- 文件系统 setup 为两个真实 user 规划显式 read allow，在 writable roots 为两个真实 user
+  规划 primary-user write allow、为 synthetic restricting SID 规划仅写 allow，在 read-only roots 规划显式 write deny，
+  并为敏感路径规划两个真实 user 的 read deny。native reconciliation 使用
+  `SetEntriesInAclW`，由 Windows 将 explicit deny canonicalize 到 allow 之前，同时保留
+  无关 controller ACE 和 owner。重复 setup 幂等；漂移报告 `NEEDS_REPAIR`；cleanup 只删除
+  exact managed tuple 和 installation 创建的 user。
+- Offline 拥有一个按真实 Offline account SID 限定的 outbound block rule。Online 只删除该
+  exact managed rule，不添加 global allow rule；Online user 和真实 controller user 都不会
+  匹配 Offline rule。
 - setup、repair 和 cleanup 是显式的管理员 boundary。普通 session 可以检查状态，并在
   后续 runtime 工作中继续运行，不需要持续管理员权限。
 - 状态报告为 `READY`、`NEEDS_SETUP`、`NEEDS_REPAIR` 或 `UNSUPPORTED`。setup 成功不会

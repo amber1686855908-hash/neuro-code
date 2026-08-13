@@ -1,12 +1,12 @@
 """Windows Firewall authority for installation-scoped sandbox profiles.
 
-Offline mode owns one outbound block rule scoped to the synthetic sandbox SID.
+Offline mode owns one outbound block rule scoped to the real Offline account SID.
 Online mode removes only that exact managed rule; it does not add a global
 allow rule and never targets the real controller user.
 
 Windows Firewall authority.
 
-Offline mode 只拥有一个按 synthetic sandbox SID 限定的 outbound block rule.
+Offline mode 只拥有一个按真实 Offline account SID 限定的 outbound block rule.
 Online mode 只删除该 exact managed rule,不添加 global allow rule,也绝不作用于
 真实 controller user.
 """
@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Protocol, cast
 
 from neuro_code.application.ports.windows_sandbox import WindowsSandboxIdentityKind
-from neuro_code.infrastructure.sandbox.windows_sandbox_identity import SyntheticWindowsSid
+from neuro_code.infrastructure.sandbox.windows_sandbox_accounts import WindowsAccountSid
 from neuro_code.shared.errors import SandboxError
 
 
@@ -35,7 +35,7 @@ class WindowsFirewallRule:
 
     name: str
     identity: WindowsSandboxIdentityKind
-    sid: SyntheticWindowsSid
+    sid: WindowsAccountSid
     outbound_block: bool
 
     def __post_init__(self) -> None:
@@ -43,8 +43,8 @@ class WindowsFirewallRule:
             raise ValueError("firewall rule name must be bounded and NUL-free")
         if not isinstance(self.identity, WindowsSandboxIdentityKind):
             raise TypeError("firewall identity must be canonical")
-        if not isinstance(self.sid, SyntheticWindowsSid):
-            raise TypeError("firewall rule SID must be canonical")
+        if not isinstance(self.sid, WindowsAccountSid):
+            raise TypeError("firewall rule SID must be a real account SID")
         if type(self.outbound_block) is not bool:
             raise TypeError("firewall outbound_block must be boolean")
 
@@ -75,11 +75,16 @@ class InMemoryWindowsFirewallApi:
         self.rules.pop(rule.name, None)
 
     def rule_exists(self, rule: WindowsFirewallRule) -> bool:
-        return rule.name in self.rules
+        return self.rules.get(rule.name) == rule
 
 
 class _NativeWindowsFirewallApi:  # pragma: no cover - exercised by Windows native CI
-    """Narrow setup-time netsh adapter; it is never used for child launch."""
+    """Narrow setup-time Windows Firewall adapter; never used for child launch.
+
+    ``New-NetFirewallRule -LocalUser`` is the documented user-SID/WFP policy
+    surface.  A PowerShell process is only the setup transport; no proxy, PATH,
+    or Git-specific behavior is involved.
+    """
 
     def __init__(self, *, runner: object | None = None) -> None:
         if os.name != "nt":
@@ -90,16 +95,30 @@ class _NativeWindowsFirewallApi:  # pragma: no cover - exercised by Windows nati
         )
 
     @property
-    def _netsh(self) -> str:
+    def _powershell(self) -> str:
         system_root = os.environ.get("SYSTEMROOT")
         if not system_root:
             raise WindowsFirewallError("SystemRoot is unavailable for Windows Firewall setup")
-        return str(Path(system_root) / "System32" / "netsh.exe")
+        return str(Path(system_root) / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe")
+
+    @staticmethod
+    def _ps_quote(value: str) -> str:
+        if any(control in value for control in ("\x00", "\r", "\n")):
+            raise WindowsFirewallError("firewall value contains a control character")
+        return "'" + value.replace("'", "''") + "'"
 
     def _run(self, arguments: list[str], *, check: bool) -> subprocess.CompletedProcess[str]:
         try:
             result = self._runner(
-                [self._netsh, "advfirewall", "firewall", *arguments],
+                [
+                    self._powershell,
+                    "-NoLogo",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    *arguments,
+                ],
                 check=check,
                 capture_output=True,
                 text=True,
@@ -115,43 +134,54 @@ class _NativeWindowsFirewallApi:  # pragma: no cover - exercised by Windows nati
     def ensure_outbound_block(self, rule: WindowsFirewallRule) -> None:
         if not rule.outbound_block:
             raise ValueError("ensure_outbound_block requires an outbound block rule")
-        self._run(
-            [
-                "add",
-                "rule",
-                f"name={rule.name}",
-                "dir=out",
-                "action=block",
-                "enable=yes",
-                "profile=any",
-                f"localuser={rule.sid.value}",
-            ],
-            check=True,
+        script = (
+            f"$sid={self._ps_quote(rule.sid.value)}; "
+            f"$name={self._ps_quote(rule.name)}; "
+            "$sddl=('O:LSD:(A;;CC;;;{0})' -f $sid); "
+            "Remove-NetFirewallRule -Name $name -ErrorAction SilentlyContinue; "
+            "New-NetFirewallRule -Name $name -DisplayName $name -Direction Outbound "
+            "-Action Block -Enabled True -Profile Any -Protocol Any -LocalUser $sddl | Out-Null"
         )
+        self._run(["-Command", script], check=True)
 
     def remove_rule(self, rule: WindowsFirewallRule) -> None:
-        self._run(["delete", "rule", f"name={rule.name}"], check=False)
+        script = f"Remove-NetFirewallRule -Name {self._ps_quote(rule.name)} -ErrorAction SilentlyContinue"
+        self._run(["-Command", script], check=False)
 
     def rule_exists(self, rule: WindowsFirewallRule) -> bool:
-        result = self._run(["show", "rule", f"name={rule.name}"], check=False)
-        return result.returncode == 0
+        script = (
+            f"$rule=Get-NetFirewallRule -Name {self._ps_quote(rule.name)} "
+            "-ErrorAction SilentlyContinue; "
+            "if ($null -eq $rule) { exit 1 }; "
+            "$filter=$rule | Get-NetFirewallSecurityFilter; "
+            "[Console]::Out.Write($filter.LocalUser)"
+        )
+        result = self._run(["-Command", script], check=False)
+        if result.returncode != 0:
+            return False
+        output = result.stdout.casefold()
+        return rule.sid.value.casefold() in output
 
 
 def firewall_rule_for_installation(
     installation_id: str,
     identity: WindowsSandboxIdentityKind,
-    write_sid: SyntheticWindowsSid,
+    offline_user_sid: WindowsAccountSid,
 ) -> WindowsFirewallRule:
     """Return a stable, SID-scoped rule name for one installation identity."""
 
     if not installation_id or "\x00" in installation_id:
         raise ValueError("installation_id must be non-empty and NUL-free")
     name = f"NeuroCode Sandbox W2 {installation_id} {identity.value}"
+    if not isinstance(offline_user_sid, WindowsAccountSid):
+        raise TypeError("offline firewall identity must be a real account SID")
+    if identity is not WindowsSandboxIdentityKind.OFFLINE:
+        raise ValueError("the managed outbound block rule is owned by Offline only")
     return WindowsFirewallRule(
         name=name,
         identity=identity,
-        sid=write_sid,
-        outbound_block=identity is WindowsSandboxIdentityKind.OFFLINE,
+        sid=offline_user_sid,
+        outbound_block=True,
     )
 
 
