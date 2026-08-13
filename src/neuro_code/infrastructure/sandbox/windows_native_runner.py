@@ -1056,6 +1056,12 @@ class _RunnerChild:
                 f"W3_RUNNER_INITIAL_CODE:{initial_code}\n".encode("ascii"),
             )
             completion_handle = self._thread_handle or self._process_handle
+            if self._thread_handle is not None:
+                _, completion_thread_id = self._api.handle_ids(self._thread_handle)
+                self._send(
+                    RuntimeFrameType.STDERR,
+                    f"W3_RUNNER_COMPLETION_THREAD:{completion_thread_id}\n".encode("ascii"),
+                )
             self._api.wait_process(completion_handle)
             code = self._api.get_exit_code(self._process_handle)
             self._send(RuntimeFrameType.STDERR, b"W3_RUNNER_WAIT_SIGNALED\n")
