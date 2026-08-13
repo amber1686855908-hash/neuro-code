@@ -86,7 +86,7 @@ def _wait_for_native_process_exit(pid: int, timeout_ms: int = 5_000) -> bool:
         close(handle)
 
 
-def _native_process_facts(pid: int) -> tuple[str, int]:
+def _native_process_facts(pid: int) -> tuple[str, int, int]:
     """Return image path and current exit code for startup diagnostics."""
 
     kernel = ctypes.WinDLL("kernel32.dll", use_last_error=True)
@@ -104,6 +104,9 @@ def _native_process_facts(pid: int) -> tuple[str, int]:
     get_exit = kernel.GetExitCodeProcess
     get_exit.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32)]
     get_exit.restype = ctypes.c_int32
+    wait = kernel.WaitForSingleObject
+    wait.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+    wait.restype = ctypes.c_uint32
     close = kernel.CloseHandle
     close.argtypes = [ctypes.c_void_p]
     close.restype = ctypes.c_int32
@@ -118,7 +121,7 @@ def _native_process_facts(pid: int) -> tuple[str, int]:
         exit_code = ctypes.c_uint32()
         if not get_exit(handle, ctypes.byref(exit_code)):
             raise OSError(ctypes.get_last_error(), "GetExitCodeProcess failed")
-        return image.value, int(exit_code.value)
+        return image.value, int(exit_code.value), int(wait(handle, 0))
     finally:
         close(handle)
 
