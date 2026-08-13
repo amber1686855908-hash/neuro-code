@@ -25,6 +25,7 @@ from neuro_code.shared.errors import SandboxError
 _TOKEN_DUPLICATE = 0x0002
 _TOKEN_QUERY = 0x0008
 _TOKEN_ASSIGN_PRIMARY = 0x0001
+_TOKEN_ADJUST_DEFAULT = 0x0080
 _TOKEN_ADJUST_PRIVILEGES = 0x0020
 _DISABLE_MAX_PRIVILEGE = 0x00000001
 _LUA_TOKEN = 0x00000004
@@ -146,6 +147,8 @@ class _WindowsSecurityTokenApi(Protocol):
 
     def enable_change_notify_privilege(self, token_handle: int) -> None: ...
 
+    def set_default_dacl(self, token_handle: int, sid_texts: tuple[str, ...]) -> None: ...
+
     def close_handle(self, handle: int) -> None: ...
 
 
@@ -194,6 +197,29 @@ class _TokenPrivilegesOne(ctypes.Structure):
         ("PrivilegeCount", ctypes.c_uint32),
         ("Privileges", _LuidAndAttributes),
     ]
+
+
+class _TrusteeW(ctypes.Structure):
+    _fields_ = [
+        ("pMultipleTrustee", ctypes.c_void_p),
+        ("MultipleTrusteeOperation", ctypes.c_uint32),
+        ("TrusteeForm", ctypes.c_uint32),
+        ("TrusteeType", ctypes.c_uint32),
+        ("ptstrName", ctypes.c_void_p),
+    ]
+
+
+class _ExplicitAccessW(ctypes.Structure):
+    _fields_ = [
+        ("grfAccessPermissions", ctypes.c_uint32),
+        ("grfAccessMode", ctypes.c_uint32),
+        ("grfInheritance", ctypes.c_uint32),
+        ("Trustee", _TrusteeW),
+    ]
+
+
+class _TokenDefaultDacl(ctypes.Structure):
+    _fields_ = [("DefaultDacl", ctypes.c_void_p)]
 
 
 class _NativeWindowsSecurityTokenApi:
@@ -288,6 +314,23 @@ class _NativeWindowsSecurityTokenApi:
             ],
             ctypes.c_int32,
         )
+        self._set_entries_in_acl = _load_function(
+            advapi32,
+            "SetEntriesInAclW",
+            [
+                ctypes.c_uint32,
+                ctypes.POINTER(_ExplicitAccessW),
+                ctypes.c_void_p,
+                ctypes.POINTER(ctypes.c_void_p),
+            ],
+            ctypes.c_uint32,
+        )
+        self._set_token_information = _load_function(
+            advapi32,
+            "SetTokenInformation",
+            [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32],
+            ctypes.c_int32,
+        )
 
     def _error(self, operation: str) -> WindowsTokenError:
         return WindowsTokenError(operation, cast(int, self._get_last_error()))
@@ -296,7 +339,11 @@ class _NativeWindowsSecurityTokenApi:
         token_handle = ctypes.c_void_p()
         opened = self._open_process_token(
             self._get_current_process(),
-            _TOKEN_DUPLICATE | _TOKEN_QUERY | _TOKEN_ASSIGN_PRIMARY | _TOKEN_ADJUST_PRIVILEGES,
+            _TOKEN_DUPLICATE
+            | _TOKEN_QUERY
+            | _TOKEN_ASSIGN_PRIMARY
+            | _TOKEN_ADJUST_DEFAULT
+            | _TOKEN_ADJUST_PRIVILEGES,
             ctypes.byref(token_handle),
         )
         if not opened or not token_handle.value:
@@ -464,6 +511,44 @@ class _NativeWindowsSecurityTokenApi:
                 _ERROR_NOT_ALL_ASSIGNED,
             )
 
+    def set_default_dacl(self, token_handle: int, sid_texts: tuple[str, ...]) -> None:
+        """Set a bounded default DACL for objects created by the child."""
+
+        pointers: list[int] = []
+        new_dacl = ctypes.c_void_p()
+        try:
+            pointers.extend(self._convert_sid_text(sid) for sid in sid_texts)
+            if not pointers:
+                raise WindowsTokenError("SetTokenInformation(TokenDefaultDacl) received no SIDs")
+            entries = (_ExplicitAccessW * len(pointers))(
+                *(
+                    _ExplicitAccessW(
+                        0x10000000,  # GENERIC_ALL for child-owned IPC objects.
+                        2,  # GRANT_ACCESS.
+                        0,
+                        _TrusteeW(None, 0, 0, 0, pointer),
+                    )
+                    for pointer in pointers
+                )
+            )
+            result = self._set_entries_in_acl(len(entries), entries, None, ctypes.byref(new_dacl))
+            if result != 0 or not new_dacl.value:
+                raise WindowsTokenError("SetEntriesInAclW(TokenDefaultDacl)", cast(int, result))
+            info = _TokenDefaultDacl(new_dacl.value)
+            if not self._set_token_information(
+                token_handle,
+                6,  # TokenDefaultDacl.
+                ctypes.byref(info),
+                ctypes.sizeof(info),
+            ):
+                raise self._error("SetTokenInformation(TokenDefaultDacl)")
+        finally:
+            if new_dacl.value:
+                self._local_free(new_dacl)
+            for pointer in pointers:
+                with contextlib.suppress(BaseException):
+                    self._free_sid(pointer)
+
     def close_handle(self, handle: int) -> None:
         if not self._close_handle(handle):
             raise self._error("CloseHandle")
@@ -554,6 +639,13 @@ class WindowsRestrictedToken:
             raise WindowsTokenError("enable traversal privilege on closed token")
         self._api.enable_change_notify_privilege(self._handle)
         self._inspection = self._api.inspect_token(self._handle)
+
+    def set_default_dacl(self, sid_texts: tuple[str, ...]) -> None:
+        """Set a bounded default DACL for objects created by this child."""
+
+        if self._handle is None:
+            raise WindowsTokenError("set default DACL on closed token")
+        self._api.set_default_dacl(self._handle, sid_texts)
 
     def close(self) -> None:
         """Close the owned handle exactly once."""

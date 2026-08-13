@@ -25,6 +25,7 @@ class _FakeSecurityTokenApi:
         self.fail_inspect = False
         self.fail_close = False
         self.enabled_change_notify = 0
+        self.default_dacl_sids: tuple[str, ...] | None = None
 
     def open_current_process_token(self) -> int:
         return self.source_handle
@@ -50,6 +51,9 @@ class _FakeSecurityTokenApi:
 
     def enable_change_notify_privilege(self, token_handle: int) -> None:
         self.enabled_change_notify += 1
+
+    def set_default_dacl(self, token_handle: int, sid_texts: tuple[str, ...]) -> None:
+        self.default_dacl_sids = sid_texts
 
     def close_handle(self, handle: int) -> None:
         self.closed.append(handle)
@@ -122,6 +126,16 @@ class WindowsRestrictedTokenTests(unittest.TestCase):
             api.create_calls[-1],
             (api.source_handle, request.flags, (sid,), ("S-1-5-5-0-1", "S-1-1-0")),
         )
+        token.close()
+
+    def test_runtime_can_set_bounded_default_dacl(self) -> None:
+        api = _FakeSecurityTokenApi()
+        token = WindowsRestrictedToken.create_from_current_process(
+            WindowsRestrictedTokenRequest((SyntheticWindowsSid.from_components((11, 22, 33, 44)),)),
+            api=api,
+        )
+        token.set_default_dacl(("S-1-5-5-0-1", "S-1-1-0"))
+        self.assertEqual(api.default_dacl_sids, ("S-1-5-5-0-1", "S-1-1-0"))
         token.close()
 
     def test_inspection_failure_closes_created_and_source_handles(self) -> None:

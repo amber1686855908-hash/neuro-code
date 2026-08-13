@@ -860,6 +860,7 @@ class _RunnerChild:
         handles_to_close: list[int] = []
         created: RunnerLaunch | None = None
         try:
+            token.set_default_dacl((runner_logon_sid, _WORLD_SID, write_sid.value))
             # CreateRestrictedToken(DISABLE_MAX_PRIVILEGE) removes the source
             # account's privileges.  Restore only SeChangeNotifyPrivilege so
             # the final child can traverse ordinary parent directories while
