@@ -77,6 +77,7 @@ _SUSPEND_FAILED = 0xFFFFFFFF
 # controller before the named-pipe protocol starts.
 _LOGON_FLAGS = 0
 _TOKEN_USER = 1
+_TOKEN_LOGON_SID = 28
 _TOKEN_QUERY = 0x0008
 _DACL_SECURITY_INFORMATION = 0x00000004
 _PROFILE_USERNAMES = frozenset({"NeuroSandboxOffline", "NeuroSandboxOnline"})
@@ -140,6 +141,13 @@ class _SecurityAttributes(ctypes.Structure):
         ("nLength", ctypes.c_uint32),
         ("lpSecurityDescriptor", ctypes.c_void_p),
         ("bInheritHandle", ctypes.c_int32),
+    ]
+
+
+class _SidAndAttributes(ctypes.Structure):
+    _fields_ = [
+        ("Sid", ctypes.c_void_p),
+        ("Attributes", ctypes.c_uint32),
     ]
 
 
@@ -511,6 +519,67 @@ def current_user_sid() -> str:
         close_handle(token)
 
 
+def current_logon_sid() -> str:
+    """Return the per-logon SID used by the runner's window objects."""
+
+    if os.name != "nt":
+        raise OSError("current_logon_sid is only available on Windows")
+    loader = getattr(ctypes, "WinDLL", None)
+    if loader is None:  # pragma: no cover - Windows only
+        raise OSError("Win32 API unavailable")
+    advapi32 = cast(object, loader("advapi32.dll", use_last_error=True))
+    kernel32 = cast(object, loader("kernel32.dll", use_last_error=True))
+    get_current_process = _load_function(kernel32, "GetCurrentProcess", [], ctypes.c_void_p)
+    close_handle = _load_function(kernel32, "CloseHandle", [ctypes.c_void_p], ctypes.c_int32)
+    open_token = _load_function(
+        advapi32,
+        "OpenProcessToken",
+        [ctypes.c_void_p, ctypes.c_uint32, ctypes.POINTER(ctypes.c_void_p)],
+        ctypes.c_int32,
+    )
+    get_token_information = _load_function(
+        advapi32,
+        "GetTokenInformation",
+        [
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.POINTER(ctypes.c_uint32),
+        ],
+        ctypes.c_int32,
+    )
+    convert_sid = _load_function(
+        advapi32,
+        "ConvertSidToStringSidW",
+        [ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)],
+        ctypes.c_int32,
+    )
+    token = ctypes.c_void_p()
+    if not open_token(get_current_process(), _TOKEN_QUERY, ctypes.byref(token)) or not token.value:
+        raise OSError(_last_error(), "OpenProcessToken failed")
+    try:
+        required = ctypes.c_uint32()
+        get_token_information(token, _TOKEN_LOGON_SID, None, 0, ctypes.byref(required))
+        if required.value == 0:
+            raise OSError(_last_error(), "GetTokenInformation(TokenLogonSid) failed")
+        buffer = ctypes.create_string_buffer(required.value)
+        if not get_token_information(
+            token, _TOKEN_LOGON_SID, buffer, required, ctypes.byref(required)
+        ):
+            raise OSError(_last_error(), "GetTokenInformation(TokenLogonSid) failed")
+        sid_pointer = _SidAndAttributes.from_buffer_copy(buffer).Sid
+        sid_string = ctypes.c_void_p()
+        if not convert_sid(sid_pointer, ctypes.byref(sid_string)) or not sid_string.value:
+            raise OSError(_last_error(), "ConvertSidToStringSidW failed")
+        try:
+            return ctypes.wstring_at(sid_string.value)
+        finally:
+            _free_security_descriptor(int(sid_string.value))
+    finally:
+        close_handle(token)
+
+
 class WindowsNamedPipeServer:
     """Controller-created, random local named pipe with an exact peer DACL."""
 
@@ -771,7 +840,10 @@ class _RunnerChild:
             # network, or administrative authority.
             token.enable_change_notify_privilege()
             runner_sid = current_user_sid()
-            self._desktop_handle, self._desktop_name = self._api.create_private_desktop(runner_sid)
+            runner_logon_sid = current_logon_sid()
+            self._desktop_handle, self._desktop_name = self._api.create_private_desktop(
+                (runner_sid, runner_logon_sid)
+            )
             executable = payload.get("executable")
             arguments = payload.get("arguments", [])
             shell_command = payload.get("shell_command")
@@ -1316,11 +1388,11 @@ class _NativeChildApi:
             int(process.hThread),
         )
 
-    def create_private_desktop(self, user_sid: str) -> tuple[int, str]:
+    def create_private_desktop(self, sids: tuple[str, ...]) -> tuple[int, str]:
         """Create a private desktop accessible only to the selected account."""
 
         desktop_name = f"NeuroCodeW3-{secrets.token_hex(16)}"
-        attributes, descriptor = _security_descriptor((user_sid, "S-1-5-18", "S-1-5-32-544"))
+        attributes, descriptor = _security_descriptor((*sids, "S-1-5-18", "S-1-5-32-544"))
         try:
             handle = self._create_desktop(
                 desktop_name,
