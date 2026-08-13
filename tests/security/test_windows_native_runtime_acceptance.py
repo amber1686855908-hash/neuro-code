@@ -94,9 +94,12 @@ async def _read_with_native_timeout(
 ) -> bytes:
     """Bound a native read and terminate the owned scope on a stuck child."""
 
+    print(f"W3_PHASE read-start:{stream_name}", flush=True)
     try:
         stream = getattr(process, stream_name)
-        return await asyncio.wait_for(stream.read(), timeout=limit_seconds)
+        result = await asyncio.wait_for(stream.read(), timeout=limit_seconds)
+        print(f"W3_PHASE read-done:{stream_name}:{len(result)}", flush=True)
+        return result
     except TimeoutError as error:
         with contextlib.suppress(BaseException):
             await process.terminate(grace_seconds=0.5)  # type: ignore[attr-defined]
@@ -253,6 +256,7 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                 setup_request_factory=lambda _request: setup_request,
             )
             try:
+                print("W3_PHASE identity-spawn-start", flush=True)
                 identity_request = _request(
                     workspace=workspace,
                     read_roots=(workspace,),
@@ -263,8 +267,10 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                     arguments=("-c", _TOKEN_PROBE),
                 )
                 process = await adapter.spawn(identity_request)
+                print("W3_PHASE identity-spawn-done", flush=True)
                 stdout = await _read_with_native_timeout(process)
                 self.assertEqual(await process.wait(), 0)
+                print("W3_PHASE identity-wait-done", flush=True)
                 facts = json.loads(stdout.decode("utf-8"))
                 record = authority.identity_records(setup_request)
                 online = next(item for item in record if item.kind.value == "online")
@@ -290,6 +296,7 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                     "'outside_write=' + str(denied(lambda: o.write_bytes(b'x'))))"
                 )
                 compile(workspace_probe, "<workspace-probe>", "exec")
+                print("W3_PHASE workspace-spawn-start", flush=True)
                 process = await adapter.spawn(
                     _request(
                         workspace=workspace,
@@ -301,6 +308,7 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                         arguments=("-c", workspace_probe),
                     )
                 )
+                print("W3_PHASE workspace-spawn-done", flush=True)
                 workspace_output = await _read_with_native_timeout(process)
                 self.assertIn(b"workspace-write", workspace_output)
                 self.assertIn(b"sensitive=True", workspace_output)
@@ -310,6 +318,7 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn(b"credential_delete=True", workspace_output)
                 self.assertIn(b"outside_write=True", workspace_output)
                 self.assertEqual(await process.wait(), 0)
+                print("W3_PHASE workspace-wait-done", flush=True)
 
                 read_only_probe = (
                     "from pathlib import Path; "
@@ -327,6 +336,7 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                     setup_authority=authority,
                     setup_request_factory=lambda _request: setup_request,
                 )
+                print("W3_PHASE readonly-spawn-start", flush=True)
                 process = await read_only_adapter.spawn(
                     _request(
                         workspace=readonly,
@@ -338,11 +348,14 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                         arguments=("-c", read_only_probe),
                     )
                 )
+                print("W3_PHASE readonly-spawn-done", flush=True)
                 output = await _read_with_native_timeout(process)
                 self.assertEqual(await process.wait(), 0)
                 self.assertIn(b"READ=readonly", output)
                 self.assertNotIn(b"WRITABLE", output)
+                print("W3_PHASE readonly-wait-done", flush=True)
 
+                print("W3_PHASE offline-identity-spawn-start", flush=True)
                 offline_identity_process = await read_only_adapter.spawn(
                     _request(
                         workspace=readonly,
@@ -354,6 +367,7 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                         arguments=("-c", _TOKEN_PROBE),
                     )
                 )
+                print("W3_PHASE offline-identity-spawn-done", flush=True)
                 offline_facts = json.loads(
                     (await _read_with_native_timeout(offline_identity_process)).decode("utf-8")
                 )
@@ -361,6 +375,7 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                 offline = next(item for item in record if item.kind.value == "offline")
                 self.assertEqual(offline_facts["sid"], offline.user_sid.value)
                 self.assertIn(offline.write_sid.value, offline_facts["restricted_sids"])
+                print("W3_PHASE offline-identity-wait-done", flush=True)
 
                 listener = socket.socket()
                 listener.bind(("127.0.0.1", 0))
@@ -375,6 +390,7 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                 )
                 compile(network_probe, "<network-probe>", "exec")
                 try:
+                    print("W3_PHASE offline-network-spawn-start", flush=True)
                     offline_process = await read_only_adapter.spawn(
                         _request(
                             workspace=readonly,
@@ -386,6 +402,8 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                             arguments=("-c", network_probe),
                         )
                     )
+                    print("W3_PHASE offline-network-spawn-done", flush=True)
+                    print("W3_PHASE online-network-spawn-start", flush=True)
                     online_process = await adapter.spawn(
                         _request(
                             workspace=workspace,
@@ -397,6 +415,7 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                             arguments=("-c", network_probe),
                         )
                     )
+                    print("W3_PHASE online-network-spawn-done", flush=True)
                     offline_output, online_output = await asyncio.gather(
                         _read_with_native_timeout(offline_process),
                         _read_with_native_timeout(online_process),
@@ -410,6 +429,7 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(
                         authority.inspect(setup_request).state, WindowsSandboxSetupState.READY
                     )
+                    print("W3_PHASE network-wait-done", flush=True)
                 finally:
                     listener.close()
 
@@ -418,6 +438,7 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                     "sys.stdout.buffer.write(data); sys.stderr.buffer.write(data[::-1])"
                 )
                 compile(protocol, "<protocol-probe>", "exec")
+                print("W3_PHASE protocol-spawn-start", flush=True)
                 process = await adapter.spawn(
                     _request(
                         workspace=workspace,
@@ -429,6 +450,7 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                         arguments=("-c", protocol),
                     )
                 )
+                print("W3_PHASE protocol-spawn-done", flush=True)
                 payload = (b"\x00\r\n" + bytes(range(256))) * 512
                 await process.write_stdin(payload)
                 await process.close_stdin()
@@ -437,6 +459,7 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(await process.wait(), 0)
                 self.assertEqual(stdout, payload)
                 self.assertEqual(stderr, payload[::-1])
+                print("W3_PHASE protocol-wait-done", flush=True)
 
                 grandchild_marker = workspace / "grandchild.pid"
                 grandchild_code = (
@@ -451,6 +474,7 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                     "print('READY', flush=True); time.sleep(120)"
                 )
                 compile(descendant_probe, "<descendant-probe>", "exec")
+                print("W3_PHASE descendant-spawn-start", flush=True)
                 process = await adapter.spawn(
                     _request(
                         workspace=workspace,
@@ -462,6 +486,7 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                         arguments=("-c", descendant_probe),
                     )
                 )
+                print("W3_PHASE descendant-spawn-done", flush=True)
                 line = await asyncio.wait_for(
                     process.stdout.read(6),  # type: ignore[union-attr]
                     timeout=5,
@@ -474,9 +499,11 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(grandchild_marker.exists())
                 grandchild_pid = int(grandchild_marker.read_text(encoding="ascii"))
                 await process.terminate(grace_seconds=0.5)
+                print("W3_PHASE descendant-terminated", flush=True)
                 self.assertTrue(
                     await asyncio.to_thread(_wait_for_native_process_exit, grandchild_pid)
                 )
+                print("W3_PHASE descendant-wait-done", flush=True)
             finally:
                 with contextlib.suppress(BaseException):
                     authority.cleanup(setup_request)
