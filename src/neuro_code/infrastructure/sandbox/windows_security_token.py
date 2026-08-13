@@ -24,6 +24,7 @@ from neuro_code.shared.errors import SandboxError
 _TOKEN_DUPLICATE = 0x0002
 _TOKEN_QUERY = 0x0008
 _TOKEN_ASSIGN_PRIMARY = 0x0001
+_TOKEN_ADJUST_PRIVILEGES = 0x0020
 _DISABLE_MAX_PRIVILEGE = 0x00000001
 _LUA_TOKEN = 0x00000004
 _WRITE_RESTRICTED = 0x00000008
@@ -32,6 +33,8 @@ _TOKEN_RESTRICTED_SIDS = 11
 _TOKEN_IS_RESTRICTED = 40
 _ERROR_INSUFFICIENT_BUFFER = 122
 _SE_PRIVILEGE_ENABLED = 0x00000002
+_ERROR_NOT_ALL_ASSIGNED = 1300
+_SE_CHANGE_NOTIFY_PRIVILEGE = "SeChangeNotifyPrivilege"
 
 
 class WindowsTokenError(SandboxError):
@@ -138,6 +141,8 @@ class _WindowsSecurityTokenApi(Protocol):
 
     def inspect_token(self, token_handle: int) -> WindowsTokenInspection: ...
 
+    def enable_change_notify_privilege(self, token_handle: int) -> None: ...
+
     def close_handle(self, handle: int) -> None: ...
 
 
@@ -164,6 +169,27 @@ class _SidAndAttributes(ctypes.Structure):
     _fields_ = [
         ("Sid", ctypes.c_void_p),
         ("Attributes", ctypes.c_uint32),
+    ]
+
+
+class _Luid(ctypes.Structure):
+    _fields_ = [
+        ("LowPart", ctypes.c_uint32),
+        ("HighPart", ctypes.c_int32),
+    ]
+
+
+class _LuidAndAttributes(ctypes.Structure):
+    _fields_ = [
+        ("Luid", _Luid),
+        ("Attributes", ctypes.c_uint32),
+    ]
+
+
+class _TokenPrivilegesOne(ctypes.Structure):
+    _fields_ = [
+        ("PrivilegeCount", ctypes.c_uint32),
+        ("Privileges", _LuidAndAttributes),
     ]
 
 
@@ -240,6 +266,25 @@ class _NativeWindowsSecurityTokenApi:
             ],
             ctypes.c_int32,
         )
+        self._lookup_privilege_value = _load_function(
+            advapi32,
+            "LookupPrivilegeValueW",
+            [ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.POINTER(_Luid)],
+            ctypes.c_int32,
+        )
+        self._adjust_token_privileges = _load_function(
+            advapi32,
+            "AdjustTokenPrivileges",
+            [
+                ctypes.c_void_p,
+                ctypes.c_int32,
+                ctypes.POINTER(_TokenPrivilegesOne),
+                ctypes.c_uint32,
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+            ],
+            ctypes.c_int32,
+        )
 
     def _error(self, operation: str) -> WindowsTokenError:
         return WindowsTokenError(operation, cast(int, self._get_last_error()))
@@ -248,7 +293,10 @@ class _NativeWindowsSecurityTokenApi:
         token_handle = ctypes.c_void_p()
         opened = self._open_process_token(
             self._get_current_process(),
-            _TOKEN_DUPLICATE | _TOKEN_QUERY | _TOKEN_ASSIGN_PRIMARY,
+            _TOKEN_DUPLICATE
+            | _TOKEN_QUERY
+            | _TOKEN_ASSIGN_PRIMARY
+            | _TOKEN_ADJUST_PRIVILEGES,
             ctypes.byref(token_handle),
         )
         if not opened or not token_handle.value:
@@ -372,6 +420,39 @@ class _NativeWindowsSecurityTokenApi:
             enabled_privilege_count=enabled_privilege_count,
         )
 
+    def enable_change_notify_privilege(self, token_handle: int) -> None:
+        """Restore only directory traversal for a restricted child token.
+
+        ``DISABLE_MAX_PRIVILEGE`` intentionally removes the source token's
+        privileges.  A process still needs ``SeChangeNotifyPrivilege`` to
+        traverse ordinary parent directories while resolving an executable,
+        cwd, or imported module.  This method does not grant file, network, or
+        administrative authority; it restores the single Windows traversal
+        privilege and fails closed when the token cannot receive it.
+        """
+
+        luid = _Luid()
+        if not self._lookup_privilege_value(None, _SE_CHANGE_NOTIFY_PRIVILEGE, ctypes.byref(luid)):
+            raise self._error("LookupPrivilegeValueW(SeChangeNotifyPrivilege)")
+        privileges = _TokenPrivilegesOne(
+            PrivilegeCount=1,
+            Privileges=_LuidAndAttributes(luid, _SE_PRIVILEGE_ENABLED),
+        )
+        if not self._adjust_token_privileges(
+            token_handle,
+            0,
+            ctypes.byref(privileges),
+            0,
+            None,
+            None,
+        ):
+            raise self._error("AdjustTokenPrivileges(SeChangeNotifyPrivilege)")
+        if cast(int, self._get_last_error()) == _ERROR_NOT_ALL_ASSIGNED:
+            raise WindowsTokenError(
+                "AdjustTokenPrivileges(SeChangeNotifyPrivilege)",
+                _ERROR_NOT_ALL_ASSIGNED,
+            )
+
     def close_handle(self, handle: int) -> None:
         if not self._close_handle(handle):
             raise self._error("CloseHandle")
@@ -452,6 +533,14 @@ class WindowsRestrictedToken:
     @property
     def inspection(self) -> WindowsTokenInspection:
         return self._inspection
+
+    def enable_change_notify_privilege(self) -> None:
+        """Enable only the traversal privilege required by native child startup."""
+
+        if self._handle is None:
+            raise WindowsTokenError("enable traversal privilege on closed token")
+        self._api.enable_change_notify_privilege(self._handle)
+        self._inspection = self._api.inspect_token(self._handle)
 
     def close(self) -> None:
         """Close the owned handle exactly once."""

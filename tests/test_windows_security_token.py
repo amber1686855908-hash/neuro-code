@@ -22,6 +22,7 @@ class _FakeSecurityTokenApi:
         self.fail_create = False
         self.fail_inspect = False
         self.fail_close = False
+        self.enabled_change_notify = 0
 
     def open_current_process_token(self) -> int:
         return self.source_handle
@@ -41,6 +42,9 @@ class _FakeSecurityTokenApi:
         if self.fail_inspect:
             raise WindowsTokenError("GetTokenInformation", 5)
         return self.inspection
+
+    def enable_change_notify_privilege(self, token_handle: int) -> None:
+        self.enabled_change_notify += 1
 
     def close_handle(self, handle: int) -> None:
         self.closed.append(handle)
@@ -86,6 +90,16 @@ class WindowsRestrictedTokenTests(unittest.TestCase):
         token.close()
         token.close()
         self.assertEqual(api.closed, [api.source_handle, api.created_handle])
+
+    def test_runtime_can_restore_only_directory_traversal_privilege(self) -> None:
+        api = _FakeSecurityTokenApi()
+        token = WindowsRestrictedToken.create_from_current_process(
+            WindowsRestrictedTokenRequest((SyntheticWindowsSid.from_components((11, 22, 33, 44)),)),
+            api=api,
+        )
+        token.enable_change_notify_privilege()
+        self.assertEqual(api.enabled_change_notify, 1)
+        token.close()
 
     def test_inspection_failure_closes_created_and_source_handles(self) -> None:
         api = _FakeSecurityTokenApi()

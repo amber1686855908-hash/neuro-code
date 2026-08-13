@@ -735,6 +735,12 @@ class _RunnerChild:
         handles_to_close: list[int] = []
         created: RunnerLaunch | None = None
         try:
+            # CreateRestrictedToken(DISABLE_MAX_PRIVILEGE) removes the source
+            # account's privileges.  Restore only SeChangeNotifyPrivilege so
+            # the final child can traverse ordinary parent directories while
+            # resolving its executable/cwd/imports; this does not add file,
+            # network, or administrative authority.
+            token.enable_change_notify_privilege()
             executable = payload.get("executable")
             arguments = payload.get("arguments", [])
             shell_command = payload.get("shell_command")
