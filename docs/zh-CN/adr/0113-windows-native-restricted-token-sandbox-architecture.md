@@ -2,8 +2,9 @@
 
 ## 状态
 
-作为 W1 foundation 接受。本 ADR 建立类型化 capability 和 restricted-token
-原语；它不启用 Windows 文件系统/网络 profile，也不宣称完整的 Windows 沙箱。
+作为 W1 foundation 和 W2 setup-authority 记录接受。本 ADR 建立类型化 capability、
+restricted-token、installation setup 以及文件系统/防火墙 authority 原语；它不把这些
+原语接入 runtime child creation，也不宣称完整的 Windows 沙箱。
 
 ## 背景
 
@@ -66,12 +67,50 @@ Object 或 ConPTY 代码。现有 Linux Bubblewrap、macOS Seatbelt 和 Windows 
 Object/ConPTY guarantee 保持不变。在后续完整 authority composition 接入前，Windows
 启用 profile 仍然不支持并失败关闭。
 
-## W2 边界
+## W2 setup authority
 
-W2 可以在独立 production evidence 和 CI 基础上增加 write ACL composition 与 strong
-network enforcement 所需的 setup authority。它必须复用 W1 capability contract 和
-现有 Job/ConPTY process boundary，不能把 `LIMITED` read isolation 重新解释为 strong，
-也不能用未沙箱化 broker 绕过 child authority 缺失。
+W2 实现 installation-time setup boundary，同时把 runtime child creation 留给 W3。该
+authority 具有以下属性：
+
+- Offline 和 Online 是 dedicated real local user：`NeuroSandboxOffline` 和
+  `NeuroSandboxOnline`。两者的真实 account SID 在 setup 时解析并持久化，彼此不同，且
+  与 installation-scoped synthetic restricting SID 分离。
+- synthetic SID 只用于 W1 `WRITE_RESTRICTED` token membership 和仅写 ACL principal，
+  不能作为 read principal 或 firewall identity；read 以及 primary-user write check
+  由真实 account SID 承担。
+- installation record 使用 schema version 3，并将实际 account password 放在 DPAPI
+  machine-scoped 加密 payload 中。machine DPAPI 本身不是 user boundary，因此 credential
+  file 另外设置只针对两个 sandbox user 的 exact NTFS deny ACE，同时保留 controller/setup
+  access。
+- 文件系统 setup 为两个真实 user 规划显式 read allow，在 writable roots 为两个真实 user
+  规划 primary-user write allow、为 synthetic restricting SID 规划仅写 allow，在 read-only roots 规划显式 write deny，
+  并为敏感路径规划两个真实 user 的 read deny。native reconciliation 使用
+  `SetEntriesInAclW`，由 Windows 将 explicit deny canonicalize 到 allow 之前，同时保留
+  无关 controller ACE 和 owner。重复 setup 幂等；漂移报告 `NEEDS_REPAIR`；cleanup 只删除
+  exact managed tuple 和 installation 创建的 user。
+- Offline 拥有一个按真实 Offline account SID 限定的持久 outbound block rule。READY 检查完整
+  managed tuple：outbound direction、block action、enabled 状态、预期 profile 以及精确
+  Offline SID。任何 drift 都报告 `NEEDS_REPAIR`；该 rule 在任一 dedicated identity
+  使用期间都保持安装，只有显式 cleanup 才删除，不添加 global allow rule；Online user
+  和真实 controller user 都不会匹配 Offline rule。
+- installation root 是 controller/setup 的 private root，必须与所有 sandbox read root 和
+  writable root 完全不重叠。其继承的 NTFS deny authority 保护 DPAPI envelope 及未来
+  state file，拒绝两个 sandbox user 的 read、write、delete 和 replace。只有 ACL、firewall、
+  installation-created account 全部 rollback 完成后，持久化 credential record 才会作为
+  recovery source 删除。
+- local-account group 校验使用 well-known built-in group SID（account name lookup 只作为
+  本地化 transport 细节），因此翻译后的 `Users` 或 privileged group display name 不会
+  改变 security decision。
+- setup、repair 和 cleanup 是显式的管理员 boundary。普通 session 可以检查状态，并在
+  后续 runtime 工作中继续运行，不需要持续管理员权限。
+- 状态报告为 `READY`、`NEEDS_SETUP`、`NEEDS_REPAIR` 或 `UNSUPPORTED`。setup 成功不会
+  改变 `WINDOWS_NATIVE_SANDBOX_ACTUAL_CAPABILITIES`：在 W3 接通 child boundary 之前，
+  三个 runtime security axis 仍全部为 `UNSUPPORTED`。
+
+W2 不启动 command runner、不创建 runtime child、不桥接 MCP、不改 Git/Python integration、
+不重写 ConPTY 或 Job Object、不使用 AppContainer 或 WSL2，也不为 controller user 配置
+firewall rule。它复用 W1 capability contract 和现有 Job/ConPTY lifecycle boundary，
+也不会把 `LIMITED` read planning 重新解释为 runtime capability。
 
 ## 后果
 

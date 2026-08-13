@@ -1,14 +1,13 @@
 """Restricted-token primitives for the Windows native sandbox foundation.
 
-W1 owns only the token boundary.  It does not provision sandbox users, mutate
-filesystem ACLs, persist identities, configure a firewall, or launch a
-command-runner broker.  Those authorities belong to later, separately audited
-layers.
+This module owns only the token boundary.  W2 setup authority provisions the
+installation record, ACL plan, and firewall rule separately; this token layer
+does not launch a command-runner broker or wire runtime child enforcement.
 
 Windows native sandbox W1 的 restricted-token 原语.
 
-W1 只负责 token 边界,不 provisioning sandbox user、不修改文件系统 ACL、不持久化
-identity、不配置 firewall,也不启动 command-runner broker.这些权限属于后续独立审计层.
+本模块只负责 token 边界.W2 setup authority 独立负责 installation record、ACL plan
+和 firewall rule;本 token layer 不启动 command-runner broker,也不接通 runtime child enforcement.
 """
 
 from __future__ import annotations

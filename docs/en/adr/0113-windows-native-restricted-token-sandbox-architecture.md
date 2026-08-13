@@ -2,9 +2,10 @@
 
 ## Status
 
-Accepted as the W1 foundation. This ADR establishes typed capability and
-restricted-token primitives; it does not enable Windows filesystem/network
-profiles or claim a complete Windows sandbox.
+Accepted as the W1 foundation and W2 setup-authority record. This ADR
+establishes typed capability, restricted-token, installation setup, and
+filesystem/firewall authority primitives; it does not connect them to runtime
+child creation or claim a complete Windows sandbox.
 
 ## Context
 
@@ -73,13 +74,60 @@ Bubblewrap, macOS Seatbelt, and Windows Job Object/ConPTY guarantees remain
 unchanged. Windows enabled profiles remain unsupported and fail closed until a
 later vertical slice wires a complete authority composition.
 
-## W2 boundary
+## W2 setup authority
 
-W2 may add the explicit setup authority needed for write ACL composition and
-strong network enforcement, with its own production evidence and CI. It must
-reuse the W1 capability contract and existing Job/ConPTY process boundary. It
-must not reinterpret `LIMITED` read isolation as strong, and it must not use an
-unsandboxed broker to bypass a missing child authority.
+W2 implements an installation-time setup boundary while leaving runtime child
+creation for W3. The authority has these properties:
+
+- Offline and Online are dedicated real local users (`NeuroSandboxOffline` and
+  `NeuroSandboxOnline`). Their resolved account SIDs are stable setup facts and
+  are distinct from the installation-scoped synthetic restricting SID.
+- The synthetic SID is used only as the W1 `WRITE_RESTRICTED` token membership
+  and write-only ACL principal. It is never a read principal and never a
+  firewall identity; real account SIDs carry the read and primary-user write
+  checks.
+- The installation record uses schema version 3 and stores each actual account
+  password inside a DPAPI machine-scoped encrypted payload. Because machine
+  DPAPI alone is not a user boundary, the credential file also receives exact
+  NTFS deny ACEs for both sandbox users; controller/setup access is preserved.
+- Filesystem setup plans read allows for both real users, explicit primary-user
+  write allows for both real users plus a write-only synthetic restricting SID
+  on writable roots,
+  explicit write denies on read-only roots, and sensitive-read denies for both
+  real users. Native reconciliation uses `SetEntriesInAclW`, which canonicalizes
+  explicit denies before allows while preserving unrelated controller ACEs and
+  owner information. Re-running setup is idempotent, drift is `NEEDS_REPAIR`,
+  and cleanup removes only exact managed tuples and installation-created users.
+- Offline owns one persistent outbound block rule scoped to the real Offline account SID.
+  Readiness verifies the complete managed tuple: outbound direction, block
+  action, enabled state, expected profile, and the exact Offline SID. Any
+  drift is `NEEDS_REPAIR`; the rule remains installed while either dedicated
+  identity is used and is removed only by explicit cleanup. Online identity
+  use therefore cannot change Offline network authority, and neither the
+  Online account nor the controller user is matched by the Offline rule.
+- The installation root is a private controller/setup root and must be
+  disjoint from every sandbox read or writable root. Its inherited NTFS deny
+  authority protects the DPAPI envelope and future state files from read,
+  write, delete, and replace operations by both sandbox users. The persisted
+  credential record remains the recovery source until ACL, firewall, and
+  installation-created account rollback has completed.
+- Local-account group validation uses well-known built-in group SIDs (with
+  account-name lookup only as a locale-specific transport detail), so a
+  translated `Users` or privileged-group display name cannot change the
+  security decision.
+- Setup, repair, and cleanup are an explicit administrative boundary. An
+  ordinary session can inspect the state and run later runtime work without
+  continuing to require administrator privileges.
+- State is reported as `READY`, `NEEDS_SETUP`, `NEEDS_REPAIR`, or
+  `UNSUPPORTED`. Setup success does not change
+  `WINDOWS_NATIVE_SANDBOX_ACTUAL_CAPABILITIES`: all three runtime security
+  axes remain `UNSUPPORTED` until W3 wires the child boundary.
+
+W2 does not launch a command runner, create a runtime child, bridge MCP, alter
+Git/Python integration, rewrite ConPTY or Job Object code, use AppContainer or
+WSL2, or configure a firewall rule for the controller user. It reuses the W1
+capability contract and existing Job/ConPTY lifecycle boundary and does not
+reinterpret `LIMITED` read planning as a runtime capability.
 
 ## Consequences
 

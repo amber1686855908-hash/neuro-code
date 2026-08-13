@@ -202,6 +202,44 @@ jobs:
           tests/test_terminal_smoke.py::test_windows_conpty_reports_resize_and_preserves_nonzero_exit
           -q -rs
 
+  windows-native-sandbox-security:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7.0.0
+      - uses: astral-sh/setup-uv@v8.3.2
+        with:
+          version: "0.11.29"
+          python-version: "3.12"
+          enable-cache: true
+      - run: uv sync --extra dev --locked
+      - name: Prove native W1 token and W2 setup authority contracts
+        run: >-
+          uv run pytest
+          tests/test_windows_security_token.py
+          tests/test_windows_sandbox_accounts.py
+          tests/test_windows_sandbox_setup.py
+          -q -rs
+
+  windows-native-sandbox-native-acceptance:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    env:
+      NEURO_CODE_RUN_NATIVE_WINDOWS_SANDBOX_ACCEPTANCE: "1"
+    steps:
+      - uses: actions/checkout@v7.0.0
+      - uses: astral-sh/setup-uv@v8.3.2
+        with:
+          version: "0.11.29"
+          python-version: "3.12"
+          enable-cache: true
+      - run: uv sync --extra dev --locked
+      - name: Prove real-user ACL, DPAPI DACL and SID-scoped Firewall authority
+        run: >-
+          uv run pytest
+          tests/security/test_windows_sandbox_native_acceptance.py
+          -q -rs
+
   quality:
     runs-on: ubuntu-latest
     steps:

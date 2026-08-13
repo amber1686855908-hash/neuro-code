@@ -854,6 +854,7 @@ def test_canonical_ports_are_the_only_port_modules() -> None:
         "neuro_code.application.ports.ui_preferences",
         "neuro_code.application.ports.workspace",
         "neuro_code.application.ports.workspace_changes",
+        "neuro_code.application.ports.windows_sandbox",
     }
     assert {
         module for module in modules if module.startswith("neuro_code.application.ports")

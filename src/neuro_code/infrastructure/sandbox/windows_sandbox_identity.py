@@ -1,13 +1,18 @@
 """Windows native sandbox identity and capability foundation.
 
-This module deliberately stops before user provisioning, ACL mutation, DPAPI,
-or firewall setup.  It provides only the typed synthetic SID representation
-and the W1 capability declaration consumed by the restricted-token layer.
+This module owns the typed synthetic SID representation and the W1 capability
+declarations consumed by the restricted-token layer.  A synthetic SID is not a
+Windows user and must never be used as a filesystem read principal or firewall
+identity.  Installation persistence, real local users, ACL mutation, and
+firewall setup live in the separate W2 setup authority; this module
+intentionally keeps the runtime actual capability declaration fail closed.
 
 Windows native 沙箱 identity 与 capability foundation.
 
-本模块刻意停在用户 provisioning、ACL 修改、DPAPI 和 firewall setup 之前,只提供
-受限 token 层使用的 typed synthetic SID 表示和 W1 capability 声明.
+本模块负责受限 token 层使用的 typed synthetic SID 表示和 W1 capability 声明.
+synthetic SID 不是 Windows user, 不能作为文件读取 principal 或 firewall identity.
+installation persistence、真实 local user、ACL 修改和 firewall setup 属于独立的 W2
+setup authority; 本模块刻意保持 runtime actual capability 失败关闭.
 """
 
 from __future__ import annotations
@@ -30,12 +35,14 @@ class SyntheticWindowsSid:
     """A validated synthetic Windows SID string.
 
     Windows accepts a valid SID in an ACL even when it is not the SID of a
-    provisioned user.  W1 keeps this value in memory and does not persist or
-    apply ACLs; later setup layers may use the same typed value.
+    provisioned user.  This SID is reserved for the restricted-token
+    ``WRITE_RESTRICTED`` membership and the corresponding write-side ACL
+    entry.  It is not an account, read principal, or network identity.
 
     已验证的 synthetic Windows SID 字符串.即使 SID 不属于已 provisioning 的用户,
-    Windows 仍可在 ACL 中使用有效 SID.W1 只在内存中保存该值,不持久化或应用 ACL;
-    后续 setup layer 可以复用同一 typed value.
+    Windows 仍可在 ACL 中使用有效 SID.该 SID 仅用于 restricted token 的
+    ``WRITE_RESTRICTED`` membership 和对应写 ACL,不能作为账户,读取 principal 或
+    网络 identity.
     """
 
     value: str
