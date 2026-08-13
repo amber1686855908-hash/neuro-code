@@ -374,7 +374,13 @@ class WindowsNativeLocalProcessSandbox(LocalProcessSandbox):
         request: SandboxedProcessRequest,
         identity: WindowsRuntimeIdentity,
         setup_request: WindowsSandboxSetupRequest,
-    ) -> tuple[WindowsNamedPipe, RunnerLaunch, RuntimeFrame, tuple[RuntimeFrame, ...]]:
+    ) -> tuple[
+        WindowsNamedPipe,
+        RunnerLaunch,
+        RuntimeFrame,
+        RuntimeFrameDecoder,
+        tuple[RuntimeFrame, ...],
+    ]:
         controller_sid = current_user_sid()
         server = self._pipe_server_factory(
             peer_sids=(controller_sid, identity.user_sid.value),
@@ -417,7 +423,7 @@ class WindowsNativeLocalProcessSandbox(LocalProcessSandbox):
                         # controller's first pipe read completes.  Preserve
                         # every frame after SpawnReady for the owned-process
                         # reader instead of dropping coalesced data.
-                        return pipe, launch, frame, frames[index + 1 :]
+                        return pipe, launch, frame, decoder, frames[index + 1 :]
                     if frame.kind is RuntimeFrameType.ERROR:
                         raise SandboxError("trusted Windows runner rejected the child request")
         except BaseException:
@@ -439,7 +445,7 @@ class WindowsNativeLocalProcessSandbox(LocalProcessSandbox):
             else WindowsSandboxIdentityKind.ONLINE
         )
         identity = self._identity_provider.resolve(setup_request, kind)
-        pipe, launch, ready, pending_frames = await run_blocking(
+        pipe, launch, ready, decoder, pending_frames = await run_blocking(
             self._start_runner, request, identity, setup_request
         )
         payload = decode_json(ready.payload)
@@ -455,6 +461,7 @@ class WindowsNativeLocalProcessSandbox(LocalProcessSandbox):
             runner=launch,
             pid=pid,
             request=request,
+            decoder=decoder,
             initial_frames=pending_frames,
         )
 
@@ -479,6 +486,7 @@ class _WindowsNativeOwnedLocalProcess(OwnedLocalProcess):
         runner: RunnerLaunch,
         pid: int,
         request: SandboxedProcessRequest,
+        decoder: RuntimeFrameDecoder | None = None,
         initial_frames: tuple[RuntimeFrame, ...] = (),
     ) -> None:
         self._pipe = pipe
@@ -496,6 +504,7 @@ class _WindowsNativeOwnedLocalProcess(OwnedLocalProcess):
         self._done = asyncio.Event()
         self._stdin_lock = asyncio.Lock()
         self._closed = False
+        self._decoder = decoder or RuntimeFrameDecoder()
         self._initial_frames = initial_frames
         self._reader = threading.Thread(
             target=self._read_frames,
@@ -526,7 +535,6 @@ class _WindowsNativeOwnedLocalProcess(OwnedLocalProcess):
         return self._returncode
 
     def _read_frames(self) -> None:
-        decoder = RuntimeFrameDecoder()
         try:
             for frame in self._initial_frames:
                 self._handle_frame(frame)
@@ -536,11 +544,11 @@ class _WindowsNativeOwnedLocalProcess(OwnedLocalProcess):
             while True:
                 data = self._pipe.read()
                 if not data:
-                    decoder.finish()
+                    self._decoder.finish()
                     if self._returncode is None:
                         raise SandboxError("trusted Windows runner disconnected before Exit")
                     break
-                for frame in decoder.feed(data):
+                for frame in self._decoder.feed(data):
                     self._handle_frame(frame)
                     if frame.kind is RuntimeFrameType.EXIT:
                         return

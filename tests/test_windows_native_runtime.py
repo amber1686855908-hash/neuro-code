@@ -130,11 +130,12 @@ class WindowsNativeRuntimeProtocolTests(unittest.TestCase):
 class WindowsNativeRuntimeContractTests(unittest.IsolatedAsyncioTestCase):
     async def test_coalesced_spawn_ready_frames_are_not_dropped(self) -> None:
         class _Pipe:
-            def __init__(self) -> None:
+            def __init__(self, *chunks: bytes) -> None:
                 self.closed = False
+                self._chunks = list(chunks)
 
             def read(self) -> bytes:
-                return b""
+                return self._chunks.pop(0) if self._chunks else b""
 
             def write(self, payload: bytes) -> None:
                 del payload
@@ -145,18 +146,19 @@ class WindowsNativeRuntimeContractTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "workspace"
             root.mkdir()
+            encoded_exit = encode_frame(
+                RuntimeFrameType.EXIT,
+                encode_json({"version": 1, "returncode": 0}),
+            )
+            decoder = RuntimeFrameDecoder()
+            decoder.feed(encoded_exit[:2])
             process = _WindowsNativeOwnedLocalProcess(
-                pipe=_Pipe(),  # type: ignore[arg-type]
+                pipe=_Pipe(encoded_exit[2:]),  # type: ignore[arg-type]
                 runner=RunnerLaunch(process_handle=1, process_id=42),
                 pid=42,
                 request=_request(root),
-                initial_frames=(
-                    RuntimeFrame(RuntimeFrameType.STDOUT, b"fast-child\n"),
-                    RuntimeFrame(
-                        RuntimeFrameType.EXIT,
-                        encode_json({"version": 1, "returncode": 0}),
-                    ),
-                ),
+                decoder=decoder,
+                initial_frames=(RuntimeFrame(RuntimeFrameType.STDOUT, b"fast-child\n"),),
             )
             self.assertEqual(await process.stdout.read(), b"fast-child\n")  # type: ignore[union-attr]
             self.assertEqual(await process.wait(), 0)
