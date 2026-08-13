@@ -1062,7 +1062,23 @@ class _RunnerChild:
                     RuntimeFrameType.STDERR,
                     f"W3_RUNNER_COMPLETION_THREAD:{completion_thread_id}\n".encode("ascii"),
                 )
-            self._api.wait_process(completion_handle)
+            for attempt in range(120):
+                process_status = self._api.wait_status(self._process_handle)
+                completion_status = self._api.wait_status(completion_handle)
+                if attempt in {0, 20, 40, 80}:
+                    self._send(
+                        RuntimeFrameType.STDERR,
+                        f"W3_RUNNER_WAIT_STATUS:{process_status}:{completion_status}:{self._api.get_exit_code(self._process_handle)}\n".encode(
+                            "ascii"
+                        ),
+                    )
+                if process_status == _WAIT_OBJECT_0 or completion_status == _WAIT_OBJECT_0:
+                    break
+                if process_status != _WAIT_TIMEOUT or completion_status != _WAIT_TIMEOUT:
+                    raise SandboxError("Windows runtime process wait failed")
+                time.sleep(0.05)
+            else:
+                raise SandboxError("Windows runtime child did not signal completion")
             code = self._api.get_exit_code(self._process_handle)
             self._send(RuntimeFrameType.STDERR, b"W3_RUNNER_WAIT_SIGNALED\n")
             # Publish process completion before waiting for output relays.  A
@@ -1504,6 +1520,9 @@ class _NativeChildApi:
             if result != _WAIT_TIMEOUT:
                 self._error("WaitForSingleObject")
             time.sleep(0.05)
+
+    def wait_status(self, handle: int) -> int:
+        return cast(int, self._wait(handle, 0))
 
     def get_exit_code(self, handle: int) -> int:
         value = ctypes.c_uint32()
