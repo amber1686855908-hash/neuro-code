@@ -221,7 +221,8 @@ class WindowsSandboxNativeAcceptanceTests(unittest.TestCase):
                 # before the pre-existing/inherited broad allow on the same
                 # sensitive file.  The access probe above proves the semantic
                 # effect; this checks the DACL ordering contract directly.
-                raw_sensitive = acl_api._raw_entries(sensitive_file)
+                sensitive_path = sensitive_file.resolve(strict=False)
+                raw_sensitive = acl_api._raw_entries(sensitive_path)
                 deny_indices = [
                     index
                     for index, raw in enumerate(raw_sensitive)
@@ -229,14 +230,14 @@ class WindowsSandboxNativeAcceptanceTests(unittest.TestCase):
                     and any(
                         acl_api._raw_matches(raw, entry)
                         for entry in record.managed_aces
-                        if entry.path == sensitive_file and entry.is_deny
+                        if entry.path == sensitive_path and entry.is_deny
                     )
                 ]
                 if not deny_indices:
                     expected_denies = [
                         entry
                         for entry in record.managed_aces
-                        if entry.path == sensitive_file and entry.is_deny
+                        if entry.path == sensitive_path and entry.is_deny
                     ]
                     print(
                         "native_sensitive_expected "
