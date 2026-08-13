@@ -334,6 +334,11 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                     f"W3_PHASE cmd-exit-facts:{_native_process_facts(cmd_exit_probe.process_id)}",
                     flush=True,
                 )
+                if cmd_exit_probe.stderr is not None:
+                    print(
+                        f"W3_PHASE runner-debug:{await asyncio.wait_for(cmd_exit_probe.stderr.read(256), timeout=2)}",
+                        flush=True,
+                    )
                 self.assertEqual(await asyncio.wait_for(cmd_exit_probe.wait(), timeout=10), 0)
                 print("W3_PHASE cmd-exit-probe-done", flush=True)
 
