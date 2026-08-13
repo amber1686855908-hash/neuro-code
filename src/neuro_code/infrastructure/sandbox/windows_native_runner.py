@@ -77,6 +77,9 @@ _LOGON_FLAGS = 0
 _TOKEN_USER = 1
 _TOKEN_QUERY = 0x0008
 _DACL_SECURITY_INFORMATION = 0x00000004
+_PROFILE_USERNAMES = frozenset({"NeuroSandboxOffline", "NeuroSandboxOnline"})
+_HRESULT_FILE_NOT_FOUND = -2_147_024_894  # 0x80070002
+_HRESULT_PATH_NOT_FOUND = -2_147_024_893  # 0x80070003
 
 
 class _CFunction(Protocol):
@@ -737,7 +740,8 @@ class _RunnerChild:
             ):
                 raise SandboxError("Windows runtime child environment is invalid")
             environment = dict(environment)
-            private_home = self._api.get_user_profile(token.handle)
+            profile_username = _validated_text(payload.get("profile_username"), "profile username")
+            private_home = self._api.get_user_profile(token.handle, profile_username)
             private_tmp = self._api.get_private_temp_path(private_home)
             # These values are derived from the selected sandbox account, never
             # inherited from the controller.  A model request cannot redirect
@@ -1218,7 +1222,7 @@ class _NativeChildApi:
             self._error("GetExitCodeProcess")
         return int(value.value)
 
-    def get_user_profile(self, token: int) -> str:
+    def get_user_profile(self, token: int, profile_username: str) -> str:
         path_pointer = ctypes.c_wchar_p()
         result = self._get_known_folder_path(
             ctypes.byref(_FOLDERID_PROFILE),
@@ -1227,15 +1231,35 @@ class _NativeChildApi:
             ctypes.byref(path_pointer),
         )
         result_code = cast(int, result)
-        if result_code != 0 or not path_pointer.value:
+        if result_code == 0 and path_pointer.value:
+            try:
+                return str(path_pointer.value)
+            finally:
+                self._co_task_mem_free(path_pointer)
+        if path_pointer.value:
+            self._co_task_mem_free(path_pointer)
+        # A first-run local account has no loaded profile hive yet.  W3 does
+        # not use LOGON_WITH_PROFILE because that can block the controller;
+        # for the two fixed W2 identities the standard profile root is a
+        # deterministic, account-private fallback.  Reject every other name
+        # and any malformed SystemRoot rather than accepting a caller path.
+        if (
+            result_code not in {2, 3, _HRESULT_FILE_NOT_FOUND, _HRESULT_PATH_NOT_FOUND}
+            or profile_username not in _PROFILE_USERNAMES
+        ):
             raise OSError(
                 result_code,
                 f"SHGetKnownFolderPath(Profile) failed with Windows error {result_code}",
             )
+        system_root = Path(os.environ.get("SYSTEMROOT", ""))
+        if not system_root.anchor:
+            raise OSError(result_code, "Windows SystemRoot has no drive anchor")
+        fallback = Path(system_root.anchor) / "Users" / profile_username
         try:
-            return str(path_pointer.value)
-        finally:
-            self._co_task_mem_free(path_pointer)
+            fallback.mkdir(parents=True, exist_ok=True)
+        except OSError as error:
+            raise SandboxError("Windows sandbox profile directory is unavailable") from error
+        return str(fallback)
 
     @staticmethod
     def get_private_temp_path(profile: str) -> str:

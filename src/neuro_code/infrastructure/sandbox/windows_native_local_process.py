@@ -399,6 +399,11 @@ class WindowsNativeLocalProcessSandbox(LocalProcessSandbox):
             payload: dict[str, object] = {
                 "version": PROTOCOL_VERSION,
                 "write_sid": identity.write_sid.value,
+                # The managed local accounts may not have a loaded Windows
+                # profile yet.  The runner uses this fixed W2 identity name
+                # only as a fallback for the standard per-user profile root;
+                # it is never derived from model-controlled request data.
+                "profile_username": identity.username,
                 "cwd": str(request.cwd),
                 "environment": self._child_environment(request.environment_policy),
                 "merge_output": request.stdio_mode is LocalProcessStdioMode.MERGED_CAPTURE,
