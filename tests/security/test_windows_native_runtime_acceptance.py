@@ -110,7 +110,9 @@ def _native_process_facts(pid: int) -> tuple[str, int, int]:
     close = kernel.CloseHandle
     close.argtypes = [ctypes.c_void_p]
     close.restype = ctypes.c_int32
-    handle = open_process(0x1000 | 0x0400, False, pid)  # QUERY_LIMITED_INFORMATION | SYNCHRONIZE
+    handle = open_process(
+        0x1000 | 0x0400 | 0x00100000, False, pid
+    )  # QUERY_LIMITED_INFORMATION | QUERY_INFORMATION | SYNCHRONIZE
     if not handle:
         raise OSError(ctypes.get_last_error(), "OpenProcess(facts) failed")
     try:
