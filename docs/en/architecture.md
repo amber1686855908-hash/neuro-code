@@ -1502,6 +1502,17 @@ unenforced behavior. See
 [ADR 0019](adr/0019-fail-closed-linux-sandbox-profiles.md) and
 [ADR 0020](adr/0020-session-fixed-sandbox-profiles.md).
 
+The W0 Windows AppContainer investigation separates viable primitives from
+production readiness. AppContainer filesystem/ACL, named-pipe, runtime, and
+standard-user primitives were exercised, but the current stock Git for Windows
+runtime still fails its complete non-admin repository workflow while protected
+ancestor ACL expansion is unavailable and unacceptable. The classic stable
+unpackaged AppContainer architecture therefore remains unsupported for enabled
+Windows `workspace`, `read-only`, and `strict` profiles and fails closed; the
+Windows `off` path continues to use the existing Job Object/ConPTY lifecycle.
+Evidence PRs #33--#39 remain unmerged and are recorded in
+[ADR 0112](adr/0112-windows-appcontainer-sandbox-feasibility-decision.md).
+
 Enabled Linux startup performs a bounded controller-state hardlink audit before
 mounting any authorized workspace. It fails closed when a private regular file
 has another inode name, preventing a pre-existing workspace hardlink from

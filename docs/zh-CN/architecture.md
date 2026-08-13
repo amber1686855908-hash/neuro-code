@@ -1059,6 +1059,14 @@ Linux、macOS 和 Windows 都是一等 CI 目标。平台专属代码隔离在�
 [ADR 0019](adr/0019-fail-closed-linux-sandbox-profiles.md) 和
 [ADR 0020](adr/0020-session-fixed-sandbox-profiles.md)。
 
+W0 Windows AppContainer 调查区分了 primitive 可行性与生产就绪状态。AppContainer 文件系统/ACL、
+named-pipe、runtime 与 standard-user primitive 均已实际验证，但在无法且不应扩展受保护 ancestor
+ACL 的前提下，current stock Git for Windows 仍无法完成完整的非管理员 repository 工作流。因此，
+classic stable unpackaged AppContainer 对启用的 Windows `workspace`、`read-only` 和 `strict`
+profile 仍不支持并失败关闭；Windows `off` 路径继续使用现有 Job Object/ConPTY 生命周期。
+Evidence PR #33--#39 保持未合并，并记录于
+[ADR 0112](adr/0112-windows-appcontainer-sandbox-feasibility-decision.md)。
+
 启用的 Linux 启动器会在挂载任何授权工作区前，对 controller 状态目录执行有界硬链接审计。
 私有常规文件存在另一个 inode 名称时失败关闭，防止工作区中既存硬链接重新引入凭据或会话
 状态，同时不扫描整个工作区。专用 Linux CI 必须无 skip 地执行真实 namespace 测试；专用
