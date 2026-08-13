@@ -118,12 +118,13 @@ def _native_process_facts(pid: int) -> tuple[str, int, int]:
     try:
         image = ctypes.create_unicode_buffer(32_768)
         length = ctypes.c_uint32(len(image))
-        if not query_image(handle, 0, image, ctypes.byref(length)):
-            raise OSError(ctypes.get_last_error(), "QueryFullProcessImageNameW failed")
+        image_value = "<unavailable>"
+        if query_image(handle, 0, image, ctypes.byref(length)):
+            image_value = image.value
         exit_code = ctypes.c_uint32()
         if not get_exit(handle, ctypes.byref(exit_code)):
             raise OSError(ctypes.get_last_error(), "GetExitCodeProcess failed")
-        return image.value, int(exit_code.value), int(wait(handle, 0))
+        return image_value, int(exit_code.value), int(wait(handle, 0))
     finally:
         close(handle)
 
