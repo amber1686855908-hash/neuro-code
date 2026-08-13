@@ -944,6 +944,7 @@ class _RunnerChild:
                 job_handle=self._job.process_creation_handle,
                 desktop_name=self._desktop_name,
             )
+            self._resume_count = self._api.resume_count
             self._api.close_handle(stdin_child)
             handles_to_close.remove(stdin_child)
             self._api.close_handle(stdout_write)
@@ -1259,6 +1260,7 @@ class _NativeChildApi:
             [ctypes.c_void_p],
             ctypes.c_uint32,
         )
+        self.resume_count: int | None = None
         self._get_thread_id = _load_function(
             kernel32,
             "GetThreadId",
@@ -1463,8 +1465,8 @@ class _NativeChildApi:
             # CreateProcessAsUserW is expected to return a runnable thread.
             # Clear a non-zero suspend count defensively; a running thread
             # returns zero and is unchanged.
-            self._resume_count = cast(int, self._resume_thread(process.hThread))
-            if self._resume_count == _SUSPEND_FAILED:
+            self.resume_count = cast(int, self._resume_thread(process.hThread))
+            if self.resume_count == _SUSPEND_FAILED:
                 self._error("ResumeThread")
         finally:
             self._delete_attribute_list(attributes)
