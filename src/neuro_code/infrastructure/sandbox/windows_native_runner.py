@@ -69,7 +69,11 @@ _HANDLE_FLAG_INHERIT = 0x00000001
 _WAIT_OBJECT_0 = 0
 _WAIT_TIMEOUT = 0x00000102
 _INFINITE = 0xFFFFFFFF
-_LOGON_WITH_PROFILE = 0x00000001
+# Do not ask CreateProcessWithLogonW to synchronously load the account
+# profile.  W3 derives private HOME/TMP from the final token and creates those
+# directories inside the runner; loading a fresh W2 profile here can block the
+# controller before the named-pipe protocol starts.
+_LOGON_FLAGS = 0
 _TOKEN_USER = 1
 _TOKEN_QUERY = 0x0008
 _DACL_SECURITY_INFORMATION = 0x00000004
@@ -636,7 +640,7 @@ def launch_runner(
         username,
         ".",
         password,
-        _LOGON_WITH_PROFILE,
+        _LOGON_FLAGS,
         executable,
         mutable_command,
         _CREATE_UNICODE_ENVIRONMENT | _CREATE_NO_WINDOW,
