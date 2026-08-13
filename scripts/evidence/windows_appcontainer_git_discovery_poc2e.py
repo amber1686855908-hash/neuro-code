@@ -1270,7 +1270,7 @@ def main() -> int:
         json.dumps(result, indent=2, sort_keys=True, ensure_ascii=False) + "\n",
         encoding="utf-8",
     )
-    print(json.dumps(result, indent=2, sort_keys=True, ensure_ascii=False))
+    print(json.dumps(result, indent=2, sort_keys=True, ensure_ascii=True))
     return 0 if passed else 1
 
 
