@@ -1050,6 +1050,11 @@ class _RunnerChild:
                     "ascii"
                 ),
             )
+            initial_code = self._api.get_exit_code(self._process_handle)
+            self._send(
+                RuntimeFrameType.STDERR,
+                f"W3_RUNNER_INITIAL_CODE:{initial_code}\n".encode("ascii"),
+            )
             completion_handle = self._thread_handle or self._process_handle
             self._api.wait_process(completion_handle)
             code = self._api.get_exit_code(self._process_handle)
