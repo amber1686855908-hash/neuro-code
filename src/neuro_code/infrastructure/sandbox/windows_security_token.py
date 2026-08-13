@@ -293,10 +293,7 @@ class _NativeWindowsSecurityTokenApi:
         token_handle = ctypes.c_void_p()
         opened = self._open_process_token(
             self._get_current_process(),
-            _TOKEN_DUPLICATE
-            | _TOKEN_QUERY
-            | _TOKEN_ASSIGN_PRIMARY
-            | _TOKEN_ADJUST_PRIVILEGES,
+            _TOKEN_DUPLICATE | _TOKEN_QUERY | _TOKEN_ASSIGN_PRIMARY | _TOKEN_ADJUST_PRIVILEGES,
             ctypes.byref(token_handle),
         )
         if not opened or not token_handle.value:
