@@ -86,49 +86,6 @@ def _wait_for_native_process_exit(pid: int, timeout_ms: int = 5_000) -> bool:
         close(handle)
 
 
-def _native_process_facts(pid: int) -> tuple[str, int, int]:
-    """Return image path and current exit code for startup diagnostics."""
-
-    kernel = ctypes.WinDLL("kernel32.dll", use_last_error=True)
-    open_process = kernel.OpenProcess
-    open_process.argtypes = [ctypes.c_uint32, ctypes.c_int32, ctypes.c_uint32]
-    open_process.restype = ctypes.c_void_p
-    query_image = kernel.QueryFullProcessImageNameW
-    query_image.argtypes = [
-        ctypes.c_void_p,
-        ctypes.c_uint32,
-        ctypes.c_wchar_p,
-        ctypes.POINTER(ctypes.c_uint32),
-    ]
-    query_image.restype = ctypes.c_int32
-    get_exit = kernel.GetExitCodeProcess
-    get_exit.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32)]
-    get_exit.restype = ctypes.c_int32
-    wait = kernel.WaitForSingleObject
-    wait.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
-    wait.restype = ctypes.c_uint32
-    close = kernel.CloseHandle
-    close.argtypes = [ctypes.c_void_p]
-    close.restype = ctypes.c_int32
-    handle = open_process(
-        0x1000 | 0x0400 | 0x00100000, False, pid
-    )  # QUERY_LIMITED_INFORMATION | QUERY_INFORMATION | SYNCHRONIZE
-    if not handle:
-        raise OSError(ctypes.get_last_error(), "OpenProcess(facts) failed")
-    try:
-        image = ctypes.create_unicode_buffer(32_768)
-        length = ctypes.c_uint32(len(image))
-        image_value = "<unavailable>"
-        if query_image(handle, 0, image, ctypes.byref(length)):
-            image_value = image.value
-        exit_code = ctypes.c_uint32()
-        if not get_exit(handle, ctypes.byref(exit_code)):
-            raise OSError(ctypes.get_last_error(), "GetExitCodeProcess failed")
-        return image_value, int(exit_code.value), int(wait(handle, 0))
-    finally:
-        close(handle)
-
-
 async def _read_with_native_timeout(
     process: object,
     *,
@@ -143,7 +100,6 @@ async def _read_with_native_timeout(
     preserve binary output while applying the timeout to every native read.
     """
 
-    print(f"W3_PHASE read-start:{stream_name}", flush=True)
     try:
         stream = getattr(process, stream_name)
         chunks: list[bytes] = []
@@ -152,9 +108,7 @@ async def _read_with_native_timeout(
             if not chunk:
                 break
             chunks.append(chunk)
-            print(f"W3_PHASE read-chunk:{stream_name}:{len(chunk)}", flush=True)
         result = b"".join(chunks)
-        print(f"W3_PHASE read-done:{stream_name}:{len(result)}", flush=True)
         return result
     except TimeoutError as error:
         with contextlib.suppress(BaseException):
@@ -165,14 +119,10 @@ async def _read_with_native_timeout(
 
 
 _TOKEN_PROBE = r"""
-import sys
-print("TOKEN_PROBE_EARLY", flush=True)
 import ctypes
 import json
 import sys
 from pathlib import Path
-
-print("TOKEN_PROBE_START", flush=True)
 
 advapi = ctypes.WinDLL("advapi32.dll", use_last_error=True)
 kernel = ctypes.WinDLL("kernel32.dll", use_last_error=True)
@@ -315,39 +265,6 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                 setup_request_factory=lambda _request: setup_request,
             )
             try:
-                print("W3_PHASE cmd-exit-probe-start", flush=True)
-                cmd_exit_probe = await adapter.spawn(
-                    _request(
-                        workspace=workspace,
-                        read_roots=(workspace,),
-                        writable_roots=(workspace,),
-                        profile=SandboxProfile.WORKSPACE,
-                        network=LocalProcessNetworkPolicy.INHERIT,
-                        stdio=LocalProcessStdioMode.CAPTURE,
-                        arguments=("/d", "/c", "exit 0"),
-                        executable=os.environ.get("COMSPEC", r"C:\\Windows\\System32\\cmd.exe"),
-                    )
-                )
-                print("W3_PHASE cmd-exit-probe-spawned", flush=True)
-                await asyncio.sleep(2)
-                print(
-                    f"W3_PHASE cmd-exit-facts:{_native_process_facts(cmd_exit_probe.process_id)}",
-                    flush=True,
-                )
-                if cmd_exit_probe.stderr is not None:
-                    debug_chunks: list[bytes] = []
-                    for _ in range(4):
-                        try:
-                            debug_chunks.append(
-                                await asyncio.wait_for(cmd_exit_probe.stderr.read(4096), timeout=1)
-                            )
-                        except TimeoutError:
-                            break
-                    print(f"W3_PHASE runner-debug:{debug_chunks!r}", flush=True)
-                self.assertEqual(await asyncio.wait_for(cmd_exit_probe.wait(), timeout=10), 0)
-                print("W3_PHASE cmd-exit-probe-done", flush=True)
-
-                print("W3_PHASE whoami-probe-start", flush=True)
                 whoami_probe = await adapter.spawn(
                     _request(
                         workspace=workspace,
@@ -364,18 +281,10 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                         ),
                     )
                 )
-                print("W3_PHASE whoami-probe-spawned", flush=True)
-                await asyncio.sleep(2)
-                print(
-                    f"W3_PHASE whoami-facts:{_native_process_facts(whoami_probe.process_id)}",
-                    flush=True,
-                )
                 whoami_output = await _read_with_native_timeout(whoami_probe, limit_seconds=10)
-                print(f"W3_PHASE whoami-output:{whoami_output!r}", flush=True)
+                self.assertTrue(whoami_output)
                 self.assertEqual(await whoami_probe.wait(), 0)
-                print("W3_PHASE whoami-probe-done", flush=True)
 
-                print("W3_PHASE stdio-probe-start", flush=True)
                 stdio_marker = workspace / "stdio-marker.txt"
                 stdio_probe_code = (
                     "import os; "
@@ -393,18 +302,11 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                         arguments=("-c", stdio_probe_code),
                     )
                 )
-                print("W3_PHASE stdio-probe-spawned", flush=True)
-                await asyncio.sleep(2)
-                print(f"W3_PHASE stdio-marker:{stdio_marker.exists()}", flush=True)
-                print("W3_PHASE stdio-wait-before-read", flush=True)
-                stdio_returncode = await asyncio.wait_for(stdio_probe.wait(), timeout=5)
-                print(f"W3_PHASE stdio-returncode:{stdio_returncode}", flush=True)
+                self.assertEqual(await asyncio.wait_for(stdio_probe.wait(), timeout=5), 0)
                 stdio_output = await _read_with_native_timeout(stdio_probe)
                 self.assertIn(b"W3_STDIO", stdio_output)
                 self.assertEqual(await stdio_probe.wait(), 0)
-                print("W3_PHASE stdio-probe-done", flush=True)
 
-                print("W3_PHASE identity-spawn-start", flush=True)
                 identity_request = _request(
                     workspace=workspace,
                     read_roots=(workspace,),
@@ -415,10 +317,8 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                     arguments=("-c", _TOKEN_PROBE),
                 )
                 process = await adapter.spawn(identity_request)
-                print("W3_PHASE identity-spawn-done", flush=True)
                 stdout = await _read_with_native_timeout(process)
                 self.assertEqual(await process.wait(), 0)
-                print("W3_PHASE identity-wait-done", flush=True)
                 facts = json.loads(stdout.decode("utf-8"))
                 record = authority.identity_records(setup_request)
                 online = next(item for item in record if item.kind.value == "online")
@@ -444,7 +344,6 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                     "'outside_write=' + str(denied(lambda: o.write_bytes(b'x'))))"
                 )
                 compile(workspace_probe, "<workspace-probe>", "exec")
-                print("W3_PHASE workspace-spawn-start", flush=True)
                 process = await adapter.spawn(
                     _request(
                         workspace=workspace,
@@ -456,7 +355,6 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                         arguments=("-c", workspace_probe),
                     )
                 )
-                print("W3_PHASE workspace-spawn-done", flush=True)
                 workspace_output = await _read_with_native_timeout(process)
                 self.assertIn(b"workspace-write", workspace_output)
                 self.assertIn(b"sensitive=True", workspace_output)
@@ -466,7 +364,6 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn(b"credential_delete=True", workspace_output)
                 self.assertIn(b"outside_write=True", workspace_output)
                 self.assertEqual(await process.wait(), 0)
-                print("W3_PHASE workspace-wait-done", flush=True)
 
                 read_only_probe = (
                     "from pathlib import Path; "
@@ -484,7 +381,6 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                     setup_authority=authority,
                     setup_request_factory=lambda _request: setup_request,
                 )
-                print("W3_PHASE readonly-spawn-start", flush=True)
                 process = await read_only_adapter.spawn(
                     _request(
                         workspace=readonly,
@@ -496,14 +392,11 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                         arguments=("-c", read_only_probe),
                     )
                 )
-                print("W3_PHASE readonly-spawn-done", flush=True)
                 output = await _read_with_native_timeout(process)
                 self.assertEqual(await process.wait(), 0)
                 self.assertIn(b"READ=readonly", output)
                 self.assertNotIn(b"WRITABLE", output)
-                print("W3_PHASE readonly-wait-done", flush=True)
 
-                print("W3_PHASE offline-identity-spawn-start", flush=True)
                 offline_identity_process = await read_only_adapter.spawn(
                     _request(
                         workspace=readonly,
@@ -515,7 +408,6 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                         arguments=("-c", _TOKEN_PROBE),
                     )
                 )
-                print("W3_PHASE offline-identity-spawn-done", flush=True)
                 offline_facts = json.loads(
                     (await _read_with_native_timeout(offline_identity_process)).decode("utf-8")
                 )
@@ -523,7 +415,6 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                 offline = next(item for item in record if item.kind.value == "offline")
                 self.assertEqual(offline_facts["sid"], offline.user_sid.value)
                 self.assertIn(offline.write_sid.value, offline_facts["restricted_sids"])
-                print("W3_PHASE offline-identity-wait-done", flush=True)
 
                 listener = socket.socket()
                 listener.bind(("127.0.0.1", 0))
@@ -538,7 +429,6 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                 )
                 compile(network_probe, "<network-probe>", "exec")
                 try:
-                    print("W3_PHASE offline-network-spawn-start", flush=True)
                     offline_process = await read_only_adapter.spawn(
                         _request(
                             workspace=readonly,
@@ -550,8 +440,6 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                             arguments=("-c", network_probe),
                         )
                     )
-                    print("W3_PHASE offline-network-spawn-done", flush=True)
-                    print("W3_PHASE online-network-spawn-start", flush=True)
                     online_process = await adapter.spawn(
                         _request(
                             workspace=workspace,
@@ -563,7 +451,6 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                             arguments=("-c", network_probe),
                         )
                     )
-                    print("W3_PHASE online-network-spawn-done", flush=True)
                     offline_output, online_output = await asyncio.gather(
                         _read_with_native_timeout(offline_process),
                         _read_with_native_timeout(online_process),
@@ -577,7 +464,6 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(
                         authority.inspect(setup_request).state, WindowsSandboxSetupState.READY
                     )
-                    print("W3_PHASE network-wait-done", flush=True)
                 finally:
                     listener.close()
 
@@ -586,7 +472,6 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                     "sys.stdout.buffer.write(data); sys.stderr.buffer.write(data[::-1])"
                 )
                 compile(protocol, "<protocol-probe>", "exec")
-                print("W3_PHASE protocol-spawn-start", flush=True)
                 process = await adapter.spawn(
                     _request(
                         workspace=workspace,
@@ -598,7 +483,6 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                         arguments=("-c", protocol),
                     )
                 )
-                print("W3_PHASE protocol-spawn-done", flush=True)
                 payload = (b"\x00\r\n" + bytes(range(256))) * 512
                 await process.write_stdin(payload)
                 await process.close_stdin()
@@ -607,7 +491,6 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(await process.wait(), 0)
                 self.assertEqual(stdout, payload)
                 self.assertEqual(stderr, payload[::-1])
-                print("W3_PHASE protocol-wait-done", flush=True)
 
                 grandchild_marker = workspace / "grandchild.pid"
                 grandchild_code = (
@@ -622,7 +505,6 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                     "print('READY', flush=True); time.sleep(120)"
                 )
                 compile(descendant_probe, "<descendant-probe>", "exec")
-                print("W3_PHASE descendant-spawn-start", flush=True)
                 process = await adapter.spawn(
                     _request(
                         workspace=workspace,
@@ -634,7 +516,6 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                         arguments=("-c", descendant_probe),
                     )
                 )
-                print("W3_PHASE descendant-spawn-done", flush=True)
                 line = await asyncio.wait_for(
                     process.stdout.read(6),  # type: ignore[union-attr]
                     timeout=5,
@@ -647,11 +528,9 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(grandchild_marker.exists())
                 grandchild_pid = int(grandchild_marker.read_text(encoding="ascii"))
                 await process.terminate(grace_seconds=0.5)
-                print("W3_PHASE descendant-terminated", flush=True)
                 self.assertTrue(
                     await asyncio.to_thread(_wait_for_native_process_exit, grandchild_pid)
                 )
-                print("W3_PHASE descendant-wait-done", flush=True)
             finally:
                 with contextlib.suppress(BaseException):
                     authority.cleanup(setup_request)

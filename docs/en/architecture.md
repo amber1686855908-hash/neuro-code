@@ -1552,9 +1552,11 @@ Offline or Online account; the runner creates the final child with a
 `WRITE_RESTRICTED` token, the installation synthetic write SID, and a
 kill-on-close Job Object. `ISOLATED` selects Offline and `INHERIT` selects
 Online without changing the persistent Offline Firewall rule. The W3 provider
-reports read `LIMITED`, write `STRONG`, and network `STRONG`; `strict` therefore
-fails closed because it requires strong read isolation. PTY/ConPTY remains W4,
-and the existing `off` path is unchanged.
+keeps actual capabilities `UNSUPPORTED` until privileged native acceptance
+proves the complete runtime contract; its architecture target is read
+`LIMITED`, write `STRONG`, and network `STRONG`. `strict` therefore fails
+closed because it requires strong read isolation. PTY/ConPTY remains W4, and
+the existing `off` path is unchanged.
 
 Enabled Linux startup performs a bounded controller-state hardlink audit before
 mounting any authorized workspace. It fails closed when a private regular file

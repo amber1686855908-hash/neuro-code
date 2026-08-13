@@ -1,6 +1,6 @@
 # ADR 0114：Windows 原生非 PTY 沙箱运行时
 
-- 状态：W3 实现提案
+- 状态：W3 实现等待原生验收
 - 日期：2026-08-14
 - 范围：Windows 启用 profile 下的 BASH、后台 Bash 与 MCP stdio
 
@@ -21,9 +21,11 @@ pipe 使用只允许 controller 与选定 sandbox 用户的精确 DACL，并使�
 不会修改 Firewall，也不会执行 setup、repair 或 UAC 提权。setup inspect 不是
 `READY` 时，在创建 child 之前失败关闭。
 
-W3 provider 仅在运行时链路完整接通时表达目标安全轴：read 为 `LIMITED`、write
-为 `STRONG`、network 为 `STRONG`。`STRICT` 要求 strong read isolation，因此在
-未来后端证明更强 contract 前必须失败关闭。交互式 PTY/ConPTY 留给 W4。
+W3 实现会在特权原生验收证明 runner、ACL、network、stdio 与 Job Object 的完整
+contract 之前保持 actual provider 失败关闭。在该门禁通过前，actual read、write
+和 network capability 均保持 `UNSUPPORTED`；架构目标为 read `LIMITED`、write
+`STRONG`、network `STRONG`。`STRICT` 要求 strong read isolation，因此失败关闭。
+交互式 PTY/ConPTY 留给 W4。
 
 ## 后果
 
@@ -34,3 +36,5 @@ W3 provider 仅在运行时链路完整接通时表达目标安全轴：read 为
   controller 凭据和 DPAPI 明文不会传入 child。
 - Native acceptance 必须从最终 restricted child 证明 identity、ACL、network、
   lifecycle、二进制 stdio 与协议行为。
+- 原生验收失败或不可用时，不能把 target capability 当成 actual capability；启用
+  runtime request 必须保持失败关闭。

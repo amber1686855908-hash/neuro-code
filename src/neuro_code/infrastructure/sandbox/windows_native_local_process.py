@@ -60,7 +60,7 @@ from neuro_code.infrastructure.sandbox.windows_native_runtime_protocol import (
 )
 from neuro_code.infrastructure.sandbox.windows_sandbox_accounts import WindowsAccountSid
 from neuro_code.infrastructure.sandbox.windows_sandbox_identity import (
-    WINDOWS_NATIVE_SANDBOX_TARGET_CAPABILITIES,
+    WINDOWS_NATIVE_SANDBOX_ACTUAL_CAPABILITIES,
     SyntheticWindowsSid,
 )
 from neuro_code.infrastructure.sandbox.windows_sandbox_persistence import (
@@ -223,9 +223,15 @@ class WindowsNativeLocalProcessSandbox(LocalProcessSandbox):
 
     @property
     def security_capabilities(self) -> LocalProcessSecurityCapabilities:
-        """Capabilities provided by the fully wired native W3 backend."""
+        """Actual capabilities exposed by the validated native runtime.
 
-        return WINDOWS_NATIVE_SANDBOX_TARGET_CAPABILITIES
+        The implementation remains fail-closed until the privileged native
+        acceptance proves the complete runner, ACL, network, stdio, and Job
+        Object contract.  The target declaration is intentionally kept
+        separate and is never used as runtime authority.
+        """
+
+        return WINDOWS_NATIVE_SANDBOX_ACTUAL_CAPABILITIES
 
     def _setup_request(self, request: SandboxedProcessRequest) -> WindowsSandboxSetupRequest:
         if self._setup_request_factory is not None:

@@ -68,10 +68,7 @@ _PROC_THREAD_ATTRIBUTE_HANDLE_LIST = 0x00020002
 _PROC_THREAD_ATTRIBUTE_JOB_LIST = 0x0002000D
 _HANDLE_FLAG_INHERIT = 0x00000001
 _WAIT_OBJECT_0 = 0
-_WAIT_TIMEOUT = 0x00000102
 _INFINITE = 0xFFFFFFFF
-_STILL_ACTIVE = 259
-_SUSPEND_FAILED = 0xFFFFFFFF
 # Do not ask CreateProcessWithLogonW to synchronously load the account
 # profile.  W3 derives private HOME/TMP from the final token and creates those
 # directories inside the runner; loading a fresh W2 profile here can block the
@@ -832,7 +829,6 @@ class _RunnerChild:
         self._api = _NativeChildApi()
         self._job = WindowsJobObject.create()
         self._process_handle: int | None = None
-        self._thread_handle: int | None = None
         self._process_id: int | None = None
         self._stdin_handle: int | None = None
         self._desktop_handle: int | None = None
@@ -840,7 +836,6 @@ class _RunnerChild:
         self._ephemeral_home: Path | None = None
         self._output_handles: list[int] = []
         self._threads: list[threading.Thread] = []
-        self._resume_count: int | None = None
         try:
             self._create(payload)
         except BaseException:
@@ -944,7 +939,6 @@ class _RunnerChild:
                 job_handle=self._job.process_creation_handle,
                 desktop_name=self._desktop_name,
             )
-            self._resume_count = self._api.resume_count
             self._api.close_handle(stdin_child)
             handles_to_close.remove(stdin_child)
             self._api.close_handle(stdout_write)
@@ -954,7 +948,11 @@ class _RunnerChild:
                 assert stderr_write is not None
                 handles_to_close.remove(stderr_write)
             self._process_handle = created.process_handle
-            self._thread_handle = created.thread_handle
+            # The primary thread is owned by the process after creation; the
+            # runner only needs the process handle for lifecycle ownership.
+            if created.thread_handle is None:
+                raise SandboxError("CreateProcessAsUserW returned no primary thread handle")
+            self._api.close_handle(created.thread_handle)
             self._process_id = created.process_id
             self._stdin_handle = stdin_parent
             if stdin_parent is not None:
@@ -1043,57 +1041,13 @@ class _RunnerChild:
     def _wait(self) -> None:
         assert self._process_handle is not None
         try:
-            # The runner has no controller console. Keep completion reporting
-            # on the binary pipe instead of relying on detached stdout/stderr.
-            self._send(RuntimeFrameType.STDERR, b"W3_RUNNER_WAIT_ENTER\n")
-            process_id, thread_id = self._api.handle_ids(self._process_handle)
-            self._send(
-                RuntimeFrameType.STDERR,
-                f"W3_RUNNER_HANDLE_IDS:{process_id}:{thread_id}:{self._process_id}\n".encode(
-                    "ascii"
-                ),
-            )
-            initial_code = self._api.get_exit_code(self._process_handle)
-            self._send(
-                RuntimeFrameType.STDERR,
-                f"W3_RUNNER_INITIAL_CODE:{initial_code}\n".encode("ascii"),
-            )
-            self._send(
-                RuntimeFrameType.STDERR,
-                f"W3_RUNNER_RESUME_COUNT:{self._resume_count}\n".encode("ascii"),
-            )
-            completion_handle = self._thread_handle or self._process_handle
-            if self._thread_handle is not None:
-                _, completion_thread_id = self._api.handle_ids(self._thread_handle)
-                self._send(
-                    RuntimeFrameType.STDERR,
-                    f"W3_RUNNER_COMPLETION_THREAD:{completion_thread_id}\n".encode("ascii"),
-                )
-            for attempt in range(120):
-                process_status = self._api.wait_status(self._process_handle)
-                completion_status = self._api.wait_status(completion_handle)
-                if attempt in {0, 20, 40, 80}:
-                    self._send(
-                        RuntimeFrameType.STDERR,
-                        f"W3_RUNNER_WAIT_STATUS:{process_status}:{completion_status}:{self._api.get_exit_code(self._process_handle)}\n".encode(
-                            "ascii"
-                        ),
-                    )
-                if process_status == _WAIT_OBJECT_0 or completion_status == _WAIT_OBJECT_0:
-                    break
-                if process_status != _WAIT_TIMEOUT or completion_status != _WAIT_TIMEOUT:
-                    raise SandboxError("Windows runtime process wait failed")
-                time.sleep(0.05)
-            else:
-                raise SandboxError("Windows runtime child did not signal completion")
+            self._api.wait_process(self._process_handle)
             code = self._api.get_exit_code(self._process_handle)
-            self._send(RuntimeFrameType.STDERR, b"W3_RUNNER_WAIT_SIGNALED\n")
             # Publish process completion before waiting for output relays.  A
             # relay can remain in a native ReadFile until every duplicated
             # pipe writer is released; completion must not be hidden behind
             # that stream-drain path.
             self._send(RuntimeFrameType.EXIT, {"version": PROTOCOL_VERSION, "returncode": code})
-            self._send(RuntimeFrameType.STDERR, b"W3_RUNNER_EXIT_SENT\n")
             for thread in self._threads:
                 if thread is not threading.current_thread():
                     thread.join(timeout=2.0)
@@ -1107,10 +1061,6 @@ class _RunnerChild:
             with contextlib.suppress(BaseException):
                 self._api.close_handle(self._process_handle)
             self._process_handle = None
-            thread_handle, self._thread_handle = self._thread_handle, None
-            if thread_handle is not None:
-                with contextlib.suppress(BaseException):
-                    self._api.close_handle(thread_handle)
             stdin_handle, self._stdin_handle = self._stdin_handle, None
             if stdin_handle is not None:
                 with contextlib.suppress(BaseException):
@@ -1247,25 +1197,6 @@ class _NativeChildApi:
             "GetExitCodeProcess",
             [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32)],
             ctypes.c_int32,
-        )
-        self._resume_thread = _load_function(
-            kernel32,
-            "ResumeThread",
-            [ctypes.c_void_p],
-            ctypes.c_uint32,
-        )
-        self._get_process_id = _load_function(
-            kernel32,
-            "GetProcessId",
-            [ctypes.c_void_p],
-            ctypes.c_uint32,
-        )
-        self.resume_count: int | None = None
-        self._get_thread_id = _load_function(
-            kernel32,
-            "GetThreadId",
-            [ctypes.c_void_p],
-            ctypes.c_uint32,
         )
         self._get_temp_path = _load_function(
             kernel32,
@@ -1462,12 +1393,6 @@ class _NativeChildApi:
             )
             if not created:
                 self._error("CreateProcessAsUserW")
-            # CreateProcessAsUserW is expected to return a runnable thread.
-            # Clear a non-zero suspend count defensively; a running thread
-            # returns zero and is unchanged.
-            self.resume_count = cast(int, self._resume_thread(process.hThread))
-            if self.resume_count == _SUSPEND_FAILED:
-                self._error("ResumeThread")
         finally:
             self._delete_attribute_list(attributes)
         if not process.hProcess or not process.hThread or not process.dwProcessId:
@@ -1531,30 +1456,15 @@ class _NativeChildApi:
             offset += written.value
 
     def wait_process(self, handle: int) -> None:
-        # Poll a zero-timeout wait so the runner never blocks in a native call
-        # while still observing the kernel-owned process signal.
-        while True:
-            result = cast(int, self._wait(handle, 0))
-            if result == _WAIT_OBJECT_0:
-                return
-            if result != _WAIT_TIMEOUT:
-                self._error("WaitForSingleObject")
-            time.sleep(0.05)
-
-    def wait_status(self, handle: int) -> int:
-        return cast(int, self._wait(handle, 0))
+        result = cast(int, self._wait(handle, _INFINITE))
+        if result != _WAIT_OBJECT_0:
+            self._error("WaitForSingleObject")
 
     def get_exit_code(self, handle: int) -> int:
         value = ctypes.c_uint32()
         if not self._get_exit(handle, ctypes.byref(value)):
             self._error("GetExitCodeProcess")
         return int(value.value)
-
-    def handle_ids(self, handle: int) -> tuple[int, int]:
-        return (
-            cast(int, self._get_process_id(handle)),
-            cast(int, self._get_thread_id(handle)),
-        )
 
     def create_private_directory(self, path: Path, user_sid: str) -> None:
         attributes, descriptor = _security_descriptor(

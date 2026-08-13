@@ -1098,8 +1098,10 @@ inspect；只有 `READY` 才能创建 child，否则在 child creation 前失败
 Offline 或 Online account 启动可信且独立于 workspace 的 runner；runner 使用
 `WRITE_RESTRICTED` token、installation synthetic write SID 和 kill-on-close Job Object 创建最终
 child。`ISOLATED` 选择 Offline，`INHERIT` 选择 Online，且不会修改持久化 Offline Firewall rule。
-W3 provider 表达 read `LIMITED`、write `STRONG`、network `STRONG`；因此 `strict` 因为要求
-strong read isolation 而失败关闭。PTY/ConPTY 留给 W4，现有 `off` 路径保持不变。
+W3 provider 在特权原生验收证明完整 runtime contract 前保持 actual capability 为
+`UNSUPPORTED`；其架构目标为 read `LIMITED`、write `STRONG`、network `STRONG`。因此
+`strict` 因为要求 strong read isolation 而失败关闭。PTY/ConPTY 留给 W4，现有 `off`
+路径保持不变。
 
 启用的 Linux 启动器会在挂载任何授权工作区前，对 controller 状态目录执行有界硬链接审计。
 私有常规文件存在另一个 inode 名称时失败关闭，防止工作区中既存硬链接重新引入凭据或会话

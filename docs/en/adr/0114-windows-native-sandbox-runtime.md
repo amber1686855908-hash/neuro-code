@@ -1,6 +1,6 @@
 # ADR 0114: Windows native non-PTY sandbox runtime
 
-- Status: Proposed for W3 implementation
+- Status: W3 implementation pending native acceptance
 - Date: 2026-08-14
 - Scope: Windows enabled profiles for BASH, background Bash, and MCP stdio
 
@@ -23,11 +23,13 @@ Online identity.  Runtime never changes Firewall state and never performs
 setup, repair, or UAC elevation.  A setup inspection that is not `READY`
 fails before child creation.
 
-The W3 provider exposes the target security axes only for the fully wired
-runtime: read `LIMITED`, write `STRONG`, and network `STRONG`.  `STRICT`
-requires strong read isolation and therefore fails closed until a future
-backend proves that stronger contract.  Interactive PTY/ConPTY remains a W4
-scope.
+The W3 implementation keeps its actual provider declaration fail-closed until
+the privileged native acceptance proves the complete runner, ACL, network,
+stdio, and Job Object contract.  Until that gate passes, actual read, write,
+and network capabilities remain `UNSUPPORTED`; the architecture target is
+read `LIMITED`, write `STRONG`, and network `STRONG`.  `STRICT` requires strong
+read isolation and therefore fails closed.  Interactive PTY/ConPTY remains a
+W4 scope.
 
 ## Consequences
 
@@ -40,3 +42,5 @@ scope.
   credentials and DPAPI plaintext are never forwarded.
 - Native acceptance must execute the final restricted child and prove identity,
   ACL, network, lifecycle, binary stdio, and protocol behavior.
+- A failed or unavailable native acceptance must never be converted into a
+  target-capability advertisement; enabled runtime requests remain fail-closed.

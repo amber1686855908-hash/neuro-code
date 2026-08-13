@@ -42,7 +42,11 @@ from neuro_code.infrastructure.sandbox.windows_native_runtime_protocol import (
     encode_json,
 )
 from neuro_code.infrastructure.sandbox.windows_sandbox_accounts import WindowsAccountSid
-from neuro_code.infrastructure.sandbox.windows_sandbox_identity import SyntheticWindowsSid
+from neuro_code.infrastructure.sandbox.windows_sandbox_identity import (
+    WINDOWS_NATIVE_SANDBOX_ACTUAL_CAPABILITIES,
+    WINDOWS_NATIVE_SANDBOX_TARGET_CAPABILITIES,
+    SyntheticWindowsSid,
+)
 from neuro_code.shared.errors import SandboxError
 
 
@@ -219,6 +223,23 @@ class WindowsNativeRuntimeContractTests(unittest.IsolatedAsyncioTestCase):
             LocalProcessLifecycle().required_capability,
             LocalProcessLifecycleCapability.PROCESS_GROUP_BEST_EFFORT,
         )
+
+    def test_runtime_keeps_actual_capabilities_fail_closed_until_acceptance(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "workspace"
+            root.mkdir()
+            adapter = WindowsNativeLocalProcessSandbox(
+                SandboxProfile.WORKSPACE,
+                root,
+                Path(directory) / "state",
+                setup_authority=_ReadySetupAuthority(WindowsSandboxSetupState.READY),
+            )
+            self.assertEqual(
+                adapter.security_capabilities, WINDOWS_NATIVE_SANDBOX_ACTUAL_CAPABILITIES
+            )
+            self.assertNotEqual(
+                adapter.security_capabilities, WINDOWS_NATIVE_SANDBOX_TARGET_CAPABILITIES
+            )
 
     def test_enabled_runtime_rejects_pty_and_interactive_requests(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
