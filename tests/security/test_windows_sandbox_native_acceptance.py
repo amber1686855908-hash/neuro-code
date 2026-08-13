@@ -232,6 +232,16 @@ class WindowsSandboxNativeAcceptanceTests(unittest.TestCase):
                         if entry.path == sensitive_file and entry.is_deny
                     )
                 ]
+                if not deny_indices:
+                    for index, raw in enumerate(raw_sensitive):
+                        header = _AceHeader.from_buffer_copy(raw)
+                        sid_buffer = ctypes.create_string_buffer(raw[8:])
+                        print(
+                            "native_sensitive_ace "
+                            f"index={index} type={header.AceType} flags={header.AceFlags} "
+                            f"mask={int.from_bytes(raw[4:8], 'little')} "
+                            f"sid={acl_api._sid_string(ctypes.addressof(sid_buffer))}"
+                        )
                 allow_indices = [
                     index
                     for index, raw in enumerate(raw_sensitive)
