@@ -234,6 +234,8 @@ class WindowsSandboxNativeAcceptanceTests(unittest.TestCase):
                     authority.repair(request, identity=WindowsSandboxIdentityKind.OFFLINE).state,
                     WindowsSandboxSetupState.READY,
                 )
+                replacement = workspace / "replacement.dpapi"
+                replacement.write_bytes(b"replacement")
 
                 # Existing broad Users access is not enough to bypass the
                 # explicit Neuro deny on sensitive and read-only paths.
@@ -246,10 +248,8 @@ class WindowsSandboxNativeAcceptanceTests(unittest.TestCase):
                     _assert_denied(lambda: os.stat(store.path))
                     _assert_denied(lambda: store.path.read_bytes())
                     _assert_denied(lambda: store.path.write_bytes(b"must fail"))
-                    replacement = root / "replacement.dpapi"
-                    replacement.write_bytes(b"replacement")
                     _assert_denied(lambda: os.replace(replacement, store.path))
-                    _assert_denied(lambda: store.path.rename(root / "renamed.dpapi"))
+                    _assert_denied(lambda: store.path.rename(workspace / "renamed.dpapi"))
                     _assert_denied(lambda: store.path.unlink())
 
                 # SetEntriesInAclW must put the managed explicit read deny
@@ -300,15 +300,15 @@ class WindowsSandboxNativeAcceptanceTests(unittest.TestCase):
                 self.assertEqual(online.state, WindowsSandboxSetupState.READY)
                 with _impersonate(online_record.username, online_record.password.decode()):
                     _benign_outbound_probe()
+                replacement_online = workspace / "replacement-online.dpapi"
+                replacement_online.write_bytes(b"replacement")
                 with _impersonate(online_record.username, online_record.password.decode()):
                     self.assertEqual(workspace_file.read_text(encoding="utf-8"), "offline write")
                     _assert_denied(lambda: os.stat(store.path))
                     _assert_denied(lambda: store.path.read_bytes())
                     _assert_denied(lambda: store.path.write_bytes(b"must fail"))
-                    replacement = root / "replacement-online.dpapi"
-                    replacement.write_bytes(b"replacement")
-                    _assert_denied(lambda: os.replace(replacement, store.path))
-                    _assert_denied(lambda: store.path.rename(root / "renamed-online.dpapi"))
+                    _assert_denied(lambda: os.replace(replacement_online, store.path))
+                    _assert_denied(lambda: store.path.rename(workspace / "renamed-online.dpapi"))
                     _assert_denied(lambda: store.path.unlink())
 
                 # Controller/setup authority retains normal DPAPI state
