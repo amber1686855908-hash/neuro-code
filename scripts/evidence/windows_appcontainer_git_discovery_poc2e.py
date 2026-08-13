@@ -227,6 +227,27 @@ def _init_normal(git: Path, repo: Path) -> dict[str, object]:
     return _run([str(git), "init", "."], cwd=repo)
 
 
+def _trust_exact_repositories(
+    git: Path, private_home: Path, repositories: tuple[Path, ...]
+) -> list[dict[str, object]]:
+    private_home.mkdir(parents=True, exist_ok=True)
+    config = private_home / ".gitconfig"
+    return [
+        _run(
+            [
+                str(git),
+                "config",
+                "--file",
+                str(config),
+                "--add",
+                "safe.directory",
+                str(repository),
+            ]
+        )
+        for repository in repositories
+    ]
+
+
 def _discovery_scenarios(
     pb: ModuleType,
     api: Any,
@@ -251,6 +272,7 @@ def _discovery_scenarios(
         "root_repo": _init_normal(git, root_repo),
         "nested_repo": _init_normal(git, nested_repo),
     }
+    safe_directories = _trust_exact_repositories(git, private_home, (root_repo, nested_repo))
     default = _private_environment(pb, private_home, runtime, path_sep=path_sep)
     across_only = _private_environment(pb, private_home, runtime, path_sep=path_sep, across=True)
     ceiling_only = _private_environment(
@@ -279,6 +301,13 @@ def _discovery_scenarios(
         ),
         "ceiling_only": _rev_parse_gate(
             pb, api, profile, bootstrap, git, root_subdir, ceiling_only, root_repo
+        ),
+        "default_no_repo": _no_repo_gate(pb, api, profile, bootstrap, git, no_repo_subdir, default),
+        "across_filesystem_no_repo": _no_repo_gate(
+            pb, api, profile, bootstrap, git, no_repo_subdir, across_only
+        ),
+        "ceiling_no_repo": _no_repo_gate(
+            pb, api, profile, bootstrap, git, no_repo_subdir, ceiling_only
         ),
     }
     scenarios = {
@@ -315,6 +344,7 @@ def _discovery_scenarios(
     )
     return {
         "precreated_by_trusted_controller": precreate,
+        "exact_safe_directory_entries": safe_directories,
         "trusted_environment": {
             "PATH_SEP": path_sep,
             "GIT_CEILING_DIRECTORIES": candidate["GIT_CEILING_DIRECTORIES"],
@@ -747,6 +777,7 @@ def _minimal_parent_diagnostic(
     path_sep: str,
 ) -> dict[str, object]:
     _init_normal(git, workspace)
+    exact_safe_directory = _trust_exact_repositories(git, private_home, (workspace,))
     before = _direct_authority_probe(
         pb,
         api,
@@ -792,6 +823,7 @@ def _minimal_parent_diagnostic(
     )
     return {
         "conditional_on_candidate_a_failure": True,
+        "exact_safe_directory_entry": exact_safe_directory,
         "before": before,
         "grant": grant,
         "after": after,
@@ -899,6 +931,7 @@ def _core_fixture(
     authorized_junction = _junction(authorized_alias, junction_target)
     denied_junction = _junction(denied_alias, outside)
     _init_normal(git, junction_target)
+    junction_safe_directory = _trust_exact_repositories(git, private_home, (junction_target,))
     host_config = Path.home() / ".gitconfig"
     host_marker = f"HOST_{uuid.uuid4().hex}"
     original_config = host_config.read_bytes() if host_config.exists() else None
@@ -922,6 +955,7 @@ def _core_fixture(
         "junction_creation": {
             "authorized": authorized_junction,
             "denied": denied_junction,
+            "exact_safe_directory_entry": junction_safe_directory,
         },
     }
     profile = None
