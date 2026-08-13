@@ -248,6 +248,17 @@ def _trust_exact_repositories(
     ]
 
 
+def _inject_exact_safe_directories(
+    environment: dict[str, str], repositories: tuple[Path, ...]
+) -> dict[str, str]:
+    result = environment.copy()
+    result["GIT_CONFIG_COUNT"] = str(len(repositories))
+    for index, repository in enumerate(repositories):
+        result[f"GIT_CONFIG_KEY_{index}"] = "safe.directory"
+        result[f"GIT_CONFIG_VALUE_{index}"] = str(repository).replace("\\", "/")
+    return result
+
+
 def _discovery_scenarios(
     pb: ModuleType,
     api: Any,
@@ -292,6 +303,11 @@ def _discovery_scenarios(
         across=True,
         ceiling=True,
     )
+    safe_repositories = (root_repo, nested_repo)
+    default = _inject_exact_safe_directories(default, safe_repositories)
+    across_only = _inject_exact_safe_directories(across_only, safe_repositories)
+    ceiling_only = _inject_exact_safe_directories(ceiling_only, safe_repositories)
+    candidate = _inject_exact_safe_directories(candidate, safe_repositories)
     controls = {
         "default": _rev_parse_gate(
             pb, api, profile, bootstrap, git, root_subdir, default, root_repo
@@ -651,6 +667,7 @@ def _git_dir_control(
     path_sep: str,
 ) -> dict[str, object]:
     environment = _private_environment(pb, private_home, runtime, path_sep=path_sep)
+    environment = _inject_exact_safe_directories(environment, (repo,))
     environment["GIT_DIR"] = str(repo / ".git")
     environment["GIT_WORK_TREE"] = str(repo)
     status = _command(pb, api, profile, bootstrap, git, cwd, environment, ["status", "--short"])
@@ -689,6 +706,7 @@ def _junction_gates(
         across=True,
         ceiling=True,
     )
+    environment = _inject_exact_safe_directories(environment, (authorized_target,))
     authorized = _rev_parse_gate(
         pb,
         api,
@@ -813,6 +831,7 @@ def _minimal_parent_diagnostic(
             junction_alias,
         )
         environment = _private_environment(pb, private_home, runtime, path_sep=path_sep)
+        environment = _inject_exact_safe_directories(environment, (workspace,))
         git_after = _rev_parse_gate(
             pb, api, profile, bootstrap, git, workspace, environment, workspace
         )
