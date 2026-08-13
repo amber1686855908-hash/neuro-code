@@ -310,12 +310,13 @@ class WindowsSandboxNativeAcceptanceTests(unittest.TestCase):
                     _assert_denied(lambda: store.path.read_bytes())
 
                 # Remove one managed ACE and prove native repair restores it.
+                workspace_path = workspace.resolve(strict=False)
                 removable = next(
                     entry
                     for entry in record.managed_aces
-                    if entry.path == workspace and entry.kind.value == "read-allow"
+                    if entry.path == workspace_path and entry.kind.value == "read-allow"
                 )
-                acl_api.reconcile(workspace, desired=(), remove=(removable,))
+                acl_api.reconcile(workspace_path, desired=(), remove=(removable,))
                 self.assertEqual(
                     authority.inspect(request).state, WindowsSandboxSetupState.NEEDS_REPAIR
                 )
