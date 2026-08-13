@@ -103,9 +103,9 @@ authority 具有以下属性：
   改变 security decision。
 - setup、repair 和 cleanup 是显式的管理员 boundary。普通 session 可以检查状态，并在
   后续 runtime 工作中继续运行，不需要持续管理员权限。
-- 状态报告为 `READY`、`NEEDS_SETUP`、`NEEDS_REPAIR` 或 `UNSUPPORTED`。setup 成功不会
-  改变 `WINDOWS_NATIVE_SANDBOX_ACTUAL_CAPABILITIES`：在 W3 接通 child boundary 之前，
-  三个 runtime security axis 仍全部为 `UNSUPPORTED`。
+- 状态报告为 `READY`、`NEEDS_SETUP`、`NEEDS_REPAIR` 或 `UNSUPPORTED`。W2 setup 本身不
+  宣布 runtime provider；W3 非 PTY adapter 独立负责最终 child boundary 的 attestation
+  和 capability advertisement。
 
 W2 不启动 command runner、不创建 runtime child、不桥接 MCP、不改 Git/Python integration、
 不重写 ConPTY 或 Job Object、不使用 AppContainer 或 WSL2，也不为 controller user 配置
@@ -115,9 +115,9 @@ firewall rule。它复用 W1 capability contract 和现有 Job/ConPTY lifecycle 
 ## 后果
 
 Capability contract 防止 target declaration 被当作 actual provider capability 使用，并让
-security authority 与 lifecycle ownership 保持正交。Token foundation 可以独立于未来
-文件系统 setup layer 使用，当前 Windows profile 行为仍然失败关闭。ADR 0112 继续作为
-历史 AppContainer feasibility 记录。
+security authority 与 lifecycle ownership 保持正交。W2 仍是 setup authority；W3 是独立的
+非 PTY runtime provider，必须在宣布目标 capability axes 前证明最终 restricted child。
+ADR 0112 继续作为历史 AppContainer feasibility 记录。
 
 ## 参考
 

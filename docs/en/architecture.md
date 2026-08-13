@@ -1496,9 +1496,10 @@ the portable default. The trusted controller is never re-executed inside the
 namespace. Each Bash, background Bash, stdio MCP, or enabled-profile PTY
 request receives its own child boundary with explicit workspace mounts,
 private HOME and temporary directories, and a minimal environment. Read-only
-and strict children additionally use an isolated network namespace. macOS and
-Windows currently reject explicit non-`off` profiles rather than advertising
-unenforced behavior. See
+and strict children additionally use an isolated network namespace. macOS uses
+the child-scoped Seatbelt adapter, while Windows enabled non-PTY requests use
+the W3 native restricted-token runtime described below; unsupported requests
+still fail closed. See
 [ADR 0019](adr/0019-fail-closed-linux-sandbox-profiles.md) and
 [ADR 0020](adr/0020-session-fixed-sandbox-profiles.md).
 
@@ -1540,8 +1541,20 @@ controller user.
 Setup state is `READY`, `NEEDS_SETUP`, `NEEDS_REPAIR`, or `UNSUPPORTED`, and
 setup/repair/cleanup may require administrator authority while runtime work
 does not. W2 does not launch children, connect MCP, add a command runner,
-modify Git/Python integration, rewrite Job Object/ConPTY, or change the actual
-capability advertisement; runtime wiring remains W3.
+modify Git/Python integration, rewrite Job Object/ConPTY, or change the
+foundation's actual capability constant.
+
+W3 adds the Windows non-PTY runtime for Bash, background Bash, and MCP stdio in
+`CAPTURE`, `MERGED_CAPTURE`, and argv-safe `PROTOCOL` modes. Each request is
+preflighted through W2 and fails before child creation unless setup is `READY`.
+The controller starts a trusted workspace-independent runner as the selected
+Offline or Online account; the runner creates the final child with a
+`WRITE_RESTRICTED` token, the installation synthetic write SID, and a
+kill-on-close Job Object. `ISOLATED` selects Offline and `INHERIT` selects
+Online without changing the persistent Offline Firewall rule. The W3 provider
+reports read `LIMITED`, write `STRONG`, and network `STRONG`; `strict` therefore
+fails closed because it requires strong read isolation. PTY/ConPTY remains W4,
+and the existing `off` path is unchanged.
 
 Enabled Linux startup performs a bounded controller-state hardlink audit before
 mounting any authorized workspace. It fails closed when a private regular file
