@@ -228,7 +228,14 @@ def plan_windows_filesystem_authority(
     for sensitive in request.sensitive_read_paths:
         entries.extend(
             WindowsManagedAce(
-                sensitive, sid, WindowsManagedAceKind.SENSITIVE_READ_DENY, READ_ACCESS_MASK
+                sensitive,
+                sid,
+                WindowsManagedAceKind.SENSITIVE_READ_DENY,
+                READ_ACCESS_MASK,
+                # A sensitive path is an exact file/path authority.  Do not
+                # request child inheritance that Windows may normalize away;
+                # recursive protection belongs to an explicitly named root.
+                inheritance=0,
             )
             for sid in read_user_sids
         )

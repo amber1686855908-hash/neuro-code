@@ -307,6 +307,13 @@ class WindowsSandboxSetupAuthorityTests(unittest.TestCase):
                 in (WindowsManagedAceKind.READ_ALLOW, WindowsManagedAceKind.SENSITIVE_READ_DENY)
             ]
             self.assertTrue(all(isinstance(entry.sid, WindowsAccountSid) for entry in read_entries))
+            sensitive_entries = [
+                entry
+                for entry in plan.entries
+                if entry.kind is WindowsManagedAceKind.SENSITIVE_READ_DENY
+            ]
+            self.assertTrue(sensitive_entries)
+            self.assertTrue(all(entry.inheritance == 0 for entry in sensitive_entries))
             write_entries = [
                 entry for entry in plan.entries if entry.kind is WindowsManagedAceKind.WRITE_ALLOW
             ]
