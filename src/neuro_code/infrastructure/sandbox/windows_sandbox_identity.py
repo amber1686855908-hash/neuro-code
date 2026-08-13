@@ -1,13 +1,16 @@
 """Windows native sandbox identity and capability foundation.
 
-This module deliberately stops before user provisioning, ACL mutation, DPAPI,
-or firewall setup.  It provides only the typed synthetic SID representation
-and the W1 capability declaration consumed by the restricted-token layer.
+This module owns the typed synthetic SID representation and the W1 capability
+declarations consumed by the restricted-token layer.  Installation persistence,
+ACL mutation, and firewall setup live in the separate W2 setup authority; this
+module intentionally keeps the runtime actual capability declaration fail
+closed.
 
 Windows native 沙箱 identity 与 capability foundation.
 
-本模块刻意停在用户 provisioning、ACL 修改、DPAPI 和 firewall setup 之前,只提供
-受限 token 层使用的 typed synthetic SID 表示和 W1 capability 声明.
+本模块负责受限 token 层使用的 typed synthetic SID 表示和 W1 capability 声明.
+installation persistence、ACL 修改和 firewall setup 属于独立的 W2 setup authority;
+本模块刻意保持 runtime actual capability 失败关闭.
 """
 
 from __future__ import annotations

@@ -2,9 +2,10 @@
 
 ## Status
 
-Accepted as the W1 foundation. This ADR establishes typed capability and
-restricted-token primitives; it does not enable Windows filesystem/network
-profiles or claim a complete Windows sandbox.
+Accepted as the W1 foundation and W2 setup-authority record. This ADR
+establishes typed capability, restricted-token, installation setup, and
+filesystem/firewall authority primitives; it does not connect them to runtime
+child creation or claim a complete Windows sandbox.
 
 ## Context
 
@@ -73,13 +74,38 @@ Bubblewrap, macOS Seatbelt, and Windows Job Object/ConPTY guarantees remain
 unchanged. Windows enabled profiles remain unsupported and fail closed until a
 later vertical slice wires a complete authority composition.
 
-## W2 boundary
+## W2 setup authority
 
-W2 may add the explicit setup authority needed for write ACL composition and
-strong network enforcement, with its own production evidence and CI. It must
-reuse the W1 capability contract and existing Job/ConPTY process boundary. It
-must not reinterpret `LIMITED` read isolation as strong, and it must not use an
-unsandboxed broker to bypass a missing child authority.
+W2 implements an installation-time setup boundary while leaving runtime child
+creation for W3. The authority has these properties:
+
+- Offline and Online are dedicated logical identities. They share one
+  installation-scoped synthetic write SID, while their opaque credentials are
+  kept as separate records.
+- The installation record uses schema version 1 and is persisted as a DPAPI
+  machine-scoped encrypted payload. The envelope contains no plaintext
+  credentials or SID record.
+- Filesystem setup plans explicit read grants, write grants only for writable
+  roots, and sensitive-read deny ACEs. Reconciliation removes only exact ACE
+  tuples recorded as managed by this installation; unrelated controller-user
+  ACEs are preserved. Re-running setup is idempotent, drift is `NEEDS_REPAIR`,
+  and cleanup removes only the managed tuples.
+- Offline owns one outbound block rule scoped to the synthetic SID. Online
+  removes only that exact managed rule and does not add a global allow rule.
+  The real controller user is never used as the firewall subject.
+- Setup, repair, and cleanup are an explicit administrative boundary. An
+  ordinary session can inspect the state and run later runtime work without
+  continuing to require administrator privileges.
+- State is reported as `READY`, `NEEDS_SETUP`, `NEEDS_REPAIR`, or
+  `UNSUPPORTED`. Setup success does not change
+  `WINDOWS_NATIVE_SANDBOX_ACTUAL_CAPABILITIES`: all three runtime security
+  axes remain `UNSUPPORTED` until W3 wires the child boundary.
+
+W2 does not launch a command runner, create a runtime child, bridge MCP, alter
+Git/Python integration, rewrite ConPTY or Job Object code, use AppContainer or
+WSL2, or configure a firewall rule for the controller user. It reuses the W1
+capability contract and existing Job/ConPTY lifecycle boundary and does not
+reinterpret `LIMITED` read planning as a runtime capability.
 
 ## Consequences
 

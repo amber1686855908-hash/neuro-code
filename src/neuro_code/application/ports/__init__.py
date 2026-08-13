@@ -73,6 +73,15 @@ from neuro_code.application.ports.user_interaction import (
     UserInputResponse,
     UserInteractionPort,
 )
+from neuro_code.application.ports.windows_sandbox import (
+    WINDOWS_SANDBOX_SETUP_SCHEMA_VERSION,
+    WindowsSandboxIdentityKind,
+    WindowsSandboxPrivilegeBoundary,
+    WindowsSandboxSetupAuthority,
+    WindowsSandboxSetupRequest,
+    WindowsSandboxSetupSnapshot,
+    WindowsSandboxSetupState,
+)
 from neuro_code.application.ports.workspace import WorkspaceIdentity, WorkspacePathResolver
 from neuro_code.application.ports.workspace_changes import (
     WorkspaceChangeCheckpoint,
@@ -97,6 +106,7 @@ __all__ = [
     "MAX_TOOL_OUTPUT_ARTIFACT_BYTES",
     "MAX_TOOL_OUTPUT_ARTIFACT_READ_BYTES",
     "TOOL_OUTPUT_ARTIFACT_PRUNE_GRACE_SECONDS",
+    "WINDOWS_SANDBOX_SETUP_SCHEMA_VERSION",
     "BackgroundTaskManager",
     "BackgroundTaskSupervisor",
     "ClientFileSystem",
@@ -151,6 +161,12 @@ __all__ = [
     "UserInputRequest",
     "UserInputResponse",
     "UserInteractionPort",
+    "WindowsSandboxIdentityKind",
+    "WindowsSandboxPrivilegeBoundary",
+    "WindowsSandboxSetupAuthority",
+    "WindowsSandboxSetupRequest",
+    "WindowsSandboxSetupSnapshot",
+    "WindowsSandboxSetupState",
     "WorkspaceChangeCheckpoint",
     "WorkspaceChangeEventPayload",
     "WorkspaceChangeFileEventPayload",

@@ -1067,16 +1067,24 @@ profile 仍不支持并失败关闭；Windows `off` 路径继续使用现有 Job
 Evidence PR #33--#39 保持未合并，并记录于
 [ADR 0112](adr/0112-windows-appcontainer-sandbox-feasibility-decision.md)。
 
-W1 Windows 原生 foundation 记录在
+W1/W2 Windows 原生 foundation 记录在
 [ADR 0113](adr/0113-windows-native-restricted-token-sandbox-architecture.md)。它增加
-平台无关的文件系统/网络 security-capability model 和内存内 restricted-token/SID
-boundary。由于启用的 Windows profile 仍然失败关闭，W1 actual 文件系统/网络
-capability 全部为 `UNSUPPORTED`。独立 native-backend target 是 read `LIMITED`、write
-`STRONG`、network `STRONG`；strong-read request 不能由 limited provider 满足。Process
-lifecycle 继续由独立的 `LocalProcessLifecycleCapability` contract 负责，现有 Job
-Object/ConPTY path 报告 `STRONG_DESCENDANT_OWNERSHIP`。W1 不 provisioning user、不修改
-ACL、不使用 DPAPI、不配置 firewall、不增加 command runner 或 broker，也不路由启用的
-Windows profile。
+平台无关的文件系统/网络 security-capability model、内存内 restricted-token/SID
+boundary 以及仅用于 installation 的 setup authority。由于启用的 Windows profile 仍然
+失败关闭，W1/W2 actual runtime 文件系统/网络 capability 全部为 `UNSUPPORTED`。独立
+native-backend target 是 read `LIMITED`、write `STRONG`、network `STRONG`；strong-read
+request 不能由 limited provider 满足。Process lifecycle 继续由独立的
+`LocalProcessLifecycleCapability` contract 负责，现有 Job Object/ConPTY path 报告
+`STRONG_DESCENDANT_OWNERSHIP`。
+
+W2 setup 维护 Offline 和 Online dedicated logical identity、一个
+installation-scoped synthetic write SID、DPAPI 保护的 credential record、显式
+read/write/sensitive-deny ACL plan，以及 exact managed-ACE repair/cleanup。Offline
+outbound block 只按该 synthetic SID 限定；Online 只删除 managed block rule，永远不作用
+于 controller user。setup state 为 `READY`、`NEEDS_SETUP`、`NEEDS_REPAIR` 或
+`UNSUPPORTED`；setup/repair/cleanup 可以需要管理员权限，而 runtime 工作不需要持续提权。
+W2 不启动 child、不连接 MCP、不增加 command runner、不改 Git/Python integration、不重写
+Job Object/ConPTY，也不改变 actual capability advertisement；runtime 接线留给 W3。
 
 启用的 Linux 启动器会在挂载任何授权工作区前，对 controller 状态目录执行有界硬链接审计。
 私有常规文件存在另一个 inode 名称时失败关闭，防止工作区中既存硬链接重新引入凭据或会话

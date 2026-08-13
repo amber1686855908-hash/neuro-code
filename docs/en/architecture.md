@@ -1513,18 +1513,28 @@ Windows `off` path continues to use the existing Job Object/ConPTY lifecycle.
 Evidence PRs #33--#39 remain unmerged and are recorded in
 [ADR 0112](adr/0112-windows-appcontainer-sandbox-feasibility-decision.md).
 
-The W1 Windows native foundation is recorded in
+The W1/W2 Windows native foundation is recorded in
 [ADR 0113](adr/0113-windows-native-restricted-token-sandbox-architecture.md).
-It adds a platform-neutral filesystem/network security-capability model and an
-in-memory restricted-token/SID boundary. W1 actual filesystem/network
-capabilities are all `UNSUPPORTED` because enabled Windows profiles still fail
-closed. The separate native-backend target is read `LIMITED`, write `STRONG`,
-and network `STRONG`; a strong-read request must not be satisfied by a limited
-provider. Process lifecycle remains the independent
-`LocalProcessLifecycleCapability` contract, with existing Job Object/ConPTY
-paths reporting `STRONG_DESCENDANT_OWNERSHIP`. W1 does not provision users,
-mutate ACLs, use DPAPI, configure a firewall, add a command runner or broker,
-or route enabled Windows profiles.
+It adds a platform-neutral filesystem/network security-capability model, an
+in-memory restricted-token/SID boundary, and an installation-only setup
+authority. W1/W2 actual runtime filesystem/network capabilities remain all
+`UNSUPPORTED` because enabled Windows profiles still fail closed. The separate
+native-backend target is read `LIMITED`, write `STRONG`, and network `STRONG`; a
+strong-read request must not be satisfied by a limited provider. Process
+lifecycle remains the independent `LocalProcessLifecycleCapability` contract,
+with existing Job Object/ConPTY paths reporting
+`STRONG_DESCENDANT_OWNERSHIP`.
+
+W2 setup maintains dedicated Offline and Online logical identities, one
+installation-scoped synthetic write SID, DPAPI-protected credential records,
+explicit read/write/sensitive-deny ACL plans, and exact managed-ACE repair and
+cleanup. Offline outbound blocking is scoped to that synthetic SID; Online
+removes only the managed block rule and never targets the controller user.
+Setup state is `READY`, `NEEDS_SETUP`, `NEEDS_REPAIR`, or `UNSUPPORTED`, and
+setup/repair/cleanup may require administrator authority while runtime work
+does not. W2 does not launch children, connect MCP, add a command runner,
+modify Git/Python integration, rewrite Job Object/ConPTY, or change the actual
+capability advertisement; runtime wiring remains W3.
 
 Enabled Linux startup performs a bounded controller-state hardlink audit before
 mounting any authorized workspace. It fails closed when a private regular file

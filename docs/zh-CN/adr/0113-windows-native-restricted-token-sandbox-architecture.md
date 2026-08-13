@@ -2,8 +2,9 @@
 
 ## 状态
 
-作为 W1 foundation 接受。本 ADR 建立类型化 capability 和 restricted-token
-原语；它不启用 Windows 文件系统/网络 profile，也不宣称完整的 Windows 沙箱。
+作为 W1 foundation 和 W2 setup-authority 记录接受。本 ADR 建立类型化 capability、
+restricted-token、installation setup 以及文件系统/防火墙 authority 原语；它不把这些
+原语接入 runtime child creation，也不宣称完整的 Windows 沙箱。
 
 ## 背景
 
@@ -66,12 +67,32 @@ Object 或 ConPTY 代码。现有 Linux Bubblewrap、macOS Seatbelt 和 Windows 
 Object/ConPTY guarantee 保持不变。在后续完整 authority composition 接入前，Windows
 启用 profile 仍然不支持并失败关闭。
 
-## W2 边界
+## W2 setup authority
 
-W2 可以在独立 production evidence 和 CI 基础上增加 write ACL composition 与 strong
-network enforcement 所需的 setup authority。它必须复用 W1 capability contract 和
-现有 Job/ConPTY process boundary，不能把 `LIMITED` read isolation 重新解释为 strong，
-也不能用未沙箱化 broker 绕过 child authority 缺失。
+W2 实现 installation-time setup boundary，同时把 runtime child creation 留给 W3。该
+authority 具有以下属性：
+
+- Offline 和 Online 是 dedicated logical identity。两者共享一个 installation-scoped
+  synthetic write SID，但各自的 opaque credential 使用独立记录。
+- installation record 使用 schema version 1，并以 DPAPI machine-scoped 加密 payload
+  持久化。envelope 不包含明文 credential 或 SID record。
+- 文件系统 setup 会规划显式 read grant、只对 writable roots 授予 write grant，以及
+  sensitive-read deny ACE。reconciliation 只删除本 installation 记录为 managed 的
+  exact ACE tuple，并保留无关的 controller-user ACE。重复 setup 幂等；漂移报告
+  `NEEDS_REPAIR`；cleanup 只删除 managed tuple。
+- Offline 拥有一个按 synthetic SID 限定的 outbound block rule。Online 只删除该 exact
+  managed rule，不添加 global allow rule。真实 controller user 永远不会成为 firewall
+  subject。
+- setup、repair 和 cleanup 是显式的管理员 boundary。普通 session 可以检查状态，并在
+  后续 runtime 工作中继续运行，不需要持续管理员权限。
+- 状态报告为 `READY`、`NEEDS_SETUP`、`NEEDS_REPAIR` 或 `UNSUPPORTED`。setup 成功不会
+  改变 `WINDOWS_NATIVE_SANDBOX_ACTUAL_CAPABILITIES`：在 W3 接通 child boundary 之前，
+  三个 runtime security axis 仍全部为 `UNSUPPORTED`。
+
+W2 不启动 command runner、不创建 runtime child、不桥接 MCP、不改 Git/Python integration、
+不重写 ConPTY 或 Job Object、不使用 AppContainer 或 WSL2，也不为 controller user 配置
+firewall rule。它复用 W1 capability contract 和现有 Job/ConPTY lifecycle boundary，
+也不会把 `LIMITED` read planning 重新解释为 runtime capability。
 
 ## 后果
 
