@@ -30,13 +30,16 @@ from neuro_code.infrastructure.sandbox.windows_native_local_process import (
     WindowsNativeLocalProcessSandbox,
     WindowsRuntimeIdentity,
     _required_capabilities,
+    _WindowsNativeOwnedLocalProcess,
 )
+from neuro_code.infrastructure.sandbox.windows_native_runner import RunnerLaunch
 from neuro_code.infrastructure.sandbox.windows_native_runtime_protocol import (
     MAX_FRAME_PAYLOAD,
     RuntimeFrame,
     RuntimeFrameDecoder,
     RuntimeFrameType,
     encode_frame,
+    encode_json,
 )
 from neuro_code.infrastructure.sandbox.windows_sandbox_accounts import WindowsAccountSid
 from neuro_code.infrastructure.sandbox.windows_sandbox_identity import SyntheticWindowsSid
@@ -125,6 +128,39 @@ class WindowsNativeRuntimeProtocolTests(unittest.TestCase):
 
 
 class WindowsNativeRuntimeContractTests(unittest.IsolatedAsyncioTestCase):
+    async def test_coalesced_spawn_ready_frames_are_not_dropped(self) -> None:
+        class _Pipe:
+            def __init__(self) -> None:
+                self.closed = False
+
+            def read(self) -> bytes:
+                return b""
+
+            def write(self, payload: bytes) -> None:
+                del payload
+
+            def close(self) -> None:
+                self.closed = True
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "workspace"
+            root.mkdir()
+            process = _WindowsNativeOwnedLocalProcess(
+                pipe=_Pipe(),  # type: ignore[arg-type]
+                runner=RunnerLaunch(process_handle=1, process_id=42),
+                pid=42,
+                request=_request(root),
+                initial_frames=(
+                    RuntimeFrame(RuntimeFrameType.STDOUT, b"fast-child\n"),
+                    RuntimeFrame(
+                        RuntimeFrameType.EXIT,
+                        encode_json({"version": 1, "returncode": 0}),
+                    ),
+                ),
+            )
+            self.assertEqual(await process.stdout.read(), b"fast-child\n")  # type: ignore[union-attr]
+            self.assertEqual(await process.wait(), 0)
+
     def test_composition_routes_enabled_windows_profiles_to_w3(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "workspace"
