@@ -78,7 +78,7 @@ authority 具有以下属性：
 - synthetic SID 只用于 W1 `WRITE_RESTRICTED` token membership 和仅写 ACL principal，
   不能作为 read principal 或 firewall identity；read 以及 primary-user write check
   由真实 account SID 承担。
-- installation record 使用 schema version 2，并将实际 account password 放在 DPAPI
+- installation record 使用 schema version 3，并将实际 account password 放在 DPAPI
   machine-scoped 加密 payload 中。machine DPAPI 本身不是 user boundary，因此 credential
   file 另外设置只针对两个 sandbox user 的 exact NTFS deny ACE，同时保留 controller/setup
   access。
@@ -88,10 +88,11 @@ authority 具有以下属性：
   `SetEntriesInAclW`，由 Windows 将 explicit deny canonicalize 到 allow 之前，同时保留
   无关 controller ACE 和 owner。重复 setup 幂等；漂移报告 `NEEDS_REPAIR`；cleanup 只删除
   exact managed tuple 和 installation 创建的 user。
-- Offline 拥有一个按真实 Offline account SID 限定的 outbound block rule。READY 检查完整
+- Offline 拥有一个按真实 Offline account SID 限定的持久 outbound block rule。READY 检查完整
   managed tuple：outbound direction、block action、enabled 状态、预期 profile 以及精确
-  Offline SID。任何 drift 都报告 `NEEDS_REPAIR`；Online 只删除该 exact managed rule，
-  不添加 global allow rule；Online user 和真实 controller user 都不会匹配 Offline rule。
+  Offline SID。任何 drift 都报告 `NEEDS_REPAIR`；该 rule 在任一 dedicated identity
+  使用期间都保持安装，只有显式 cleanup 才删除，不添加 global allow rule；Online user
+  和真实 controller user 都不会匹配 Offline rule。
 - installation root 是 controller/setup 的 private root，必须与所有 sandbox read root 和
   writable root 完全不重叠。其继承的 NTFS deny authority 保护 DPAPI envelope 及未来
   state file，拒绝两个 sandbox user 的 read、write、delete 和 replace。只有 ACL、firewall、

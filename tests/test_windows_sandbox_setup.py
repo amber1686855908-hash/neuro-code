@@ -422,7 +422,7 @@ class WindowsSandboxSetupAuthorityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             request = self._request(directory)
             authority, acl, firewall, store = self._authority(directory)
-            offline = authority.setup(request, identity=WindowsSandboxIdentityKind.OFFLINE)
+            offline = authority.setup(request)
             self.assertEqual(offline.state, WindowsSandboxSetupState.READY)
             self.assertTrue(offline.offline_firewall_enabled)
             self.assertEqual(len(offline.identities), 2)
@@ -447,33 +447,36 @@ class WindowsSandboxSetupAuthorityTests(unittest.TestCase):
             self.assertEqual(rule.sid.value, offline.offline_user_sid)
             self.assertTrue(rule.outbound_block)
             self.assertNotEqual(rule.sid.value, offline.write_restricting_sid)
-            self.assertIsNotNone(store.load())
+            encoded = store.load()
+            self.assertIsNotNone(encoded)
+            self.assertNotIn(b"active_identity", encoded or b"")
 
-            online = authority.setup(request, identity=WindowsSandboxIdentityKind.ONLINE)
+            online = authority.setup(request)
             self.assertEqual(online.state, WindowsSandboxSetupState.READY)
-            self.assertFalse(online.offline_firewall_enabled)
+            self.assertTrue(online.offline_firewall_enabled)
             self.assertEqual(online.write_sid, offline.write_sid)
-            self.assertEqual(firewall.rules, {})
+            self.assertEqual(len(firewall.rules), 1)
+            self.assertEqual(authority.inspect(request).state, WindowsSandboxSetupState.READY)
 
     def test_setup_is_idempotent_and_inspect_is_ready(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             request = self._request(directory)
             authority, acl, firewall, _ = self._authority(directory)
-            authority.setup(request, identity=WindowsSandboxIdentityKind.ONLINE)
+            authority.setup(request)
             first_entry_count = sum(len(entries) for entries in acl.entries.values())
-            authority.setup(request, identity=WindowsSandboxIdentityKind.ONLINE)
+            authority.setup(request)
             self.assertEqual(
                 sum(len(entries) for entries in acl.entries.values()),
                 first_entry_count,
             )
             self.assertEqual(authority.inspect(request).state, WindowsSandboxSetupState.READY)
-            self.assertEqual(firewall.rules, {})
+            self.assertEqual(len(firewall.rules), 1)
 
     def test_acl_drift_is_repaired_without_removing_unmanaged_entries(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             request = self._request(directory)
             authority, acl, _, _ = self._authority(directory)
-            authority.setup(request, identity=WindowsSandboxIdentityKind.ONLINE)
+            authority.setup(request)
             workspace = request.read_roots[0]
             acl.unmanaged_entries[workspace].add("controller-user-ace")
             removed = next(iter(acl.entries[workspace]))
@@ -481,7 +484,7 @@ class WindowsSandboxSetupAuthorityTests(unittest.TestCase):
             self.assertEqual(
                 authority.inspect(request).state, WindowsSandboxSetupState.NEEDS_REPAIR
             )
-            repaired = authority.repair(request, identity=WindowsSandboxIdentityKind.ONLINE)
+            repaired = authority.repair(request)
             self.assertEqual(repaired.state, WindowsSandboxSetupState.READY)
             self.assertIn("controller-user-ace", acl.unmanaged_entries[workspace])
 
@@ -489,14 +492,14 @@ class WindowsSandboxSetupAuthorityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             request = self._request(directory)
             authority, acl, _, _ = self._authority(directory)
-            authority.setup(request, identity=WindowsSandboxIdentityKind.ONLINE)
+            authority.setup(request)
             sensitive = request.sensitive_read_paths[0]
             acl.unmanaged_entries[sensitive].add("controller-user-ace")
             acl.ordered_entries[sensitive].reverse()
             self.assertEqual(
                 authority.inspect(request).state, WindowsSandboxSetupState.NEEDS_REPAIR
             )
-            repaired = authority.repair(request, identity=WindowsSandboxIdentityKind.ONLINE)
+            repaired = authority.repair(request)
             self.assertEqual(repaired.state, WindowsSandboxSetupState.READY)
             self.assertIn("controller-user-ace", acl.unmanaged_entries[sensitive])
 
@@ -504,7 +507,7 @@ class WindowsSandboxSetupAuthorityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             request = self._request(directory)
             authority, _, firewall, _ = self._authority(directory)
-            authority.setup(request, identity=WindowsSandboxIdentityKind.OFFLINE)
+            authority.setup(request)
             rule = next(iter(firewall.rules.values()))
             drifted = object.__new__(WindowsFirewallRule)
             object.__setattr__(drifted, "name", rule.name)
@@ -523,7 +526,7 @@ class WindowsSandboxSetupAuthorityTests(unittest.TestCase):
             self.assertEqual(
                 authority.inspect(request).state, WindowsSandboxSetupState.NEEDS_REPAIR
             )
-            repaired = authority.repair(request, identity=WindowsSandboxIdentityKind.OFFLINE)
+            repaired = authority.repair(request)
             self.assertEqual(repaired.state, WindowsSandboxSetupState.READY)
             self.assertEqual(firewall.rules[rule.name], rule)
 
@@ -531,7 +534,7 @@ class WindowsSandboxSetupAuthorityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             request = self._request(directory)
             authority, _, _, store = self._authority(directory)
-            authority.setup(request, identity=WindowsSandboxIdentityKind.ONLINE)
+            authority.setup(request)
             store.save(b"not-a-valid-installation-record")
             self.assertEqual(
                 authority.inspect(request).state, WindowsSandboxSetupState.NEEDS_REPAIR
@@ -542,7 +545,7 @@ class WindowsSandboxSetupAuthorityTests(unittest.TestCase):
             request = self._request(directory)
             authority, acl, firewall, _ = self._authority(directory, administrator=False)
             with self.assertRaises(WindowsSandboxSetupPrivilegeError):
-                authority.setup(request, identity=WindowsSandboxIdentityKind.OFFLINE)
+                authority.setup(request)
             self.assertEqual(acl.calls, [])
             self.assertEqual(firewall.calls, [])
 
@@ -561,13 +564,13 @@ class WindowsSandboxSetupAuthorityTests(unittest.TestCase):
                 privilege_api=_FakePrivilege(True),
             )
             with self.assertRaises(WindowsSandboxSetupError):
-                authority.setup(request, identity=WindowsSandboxIdentityKind.OFFLINE)
+                authority.setup(request)
 
     def test_cleanup_removes_only_managed_entries_and_credential_record(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             request = self._request(directory)
             authority, acl, firewall, store = self._authority(directory)
-            authority.setup(request, identity=WindowsSandboxIdentityKind.OFFLINE)
+            authority.setup(request)
             acl.unmanaged_entries[request.read_roots[0]].add("real-controller-user")
             cleaned = authority.cleanup(request)
             self.assertEqual(cleaned.state, WindowsSandboxSetupState.NEEDS_SETUP)
@@ -599,7 +602,7 @@ class WindowsSandboxSetupAuthorityTests(unittest.TestCase):
                 privilege_api=_FakePrivilege(True),
             )
             with self.assertRaises(WindowsSandboxSetupError):
-                authority.setup(request, identity=WindowsSandboxIdentityKind.OFFLINE)
+                authority.setup(request)
             # The account removal failed after ACL/firewall rollback began;
             # the persisted record must remain as the recovery source.
             self.assertIsNotNone(store.load())

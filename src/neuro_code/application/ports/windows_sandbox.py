@@ -35,9 +35,11 @@ class WindowsSandboxSetupState(StrEnum):
     UNSUPPORTED = "unsupported"
 
 
-# Version 2 records real account SIDs/passwords separately from the synthetic
-# restricted-token SID and carries the credential-file ACL in the managed set.
-WINDOWS_SANDBOX_SETUP_SCHEMA_VERSION = 2
+# Version 3 records two simultaneous real account identities and a static
+# installation-scoped Offline Firewall authority.  No mutable "active
+# identity" is persisted: child identity selection is a future runtime
+# concern, while setup owns the policy that protects the Offline account.
+WINDOWS_SANDBOX_SETUP_SCHEMA_VERSION = 3
 
 
 def _canonical_setup_path(path: Path, label: str) -> Path:
@@ -132,6 +134,8 @@ class WindowsSandboxSetupSnapshot:
     write_sid: str | None = None
     identities: tuple[WindowsSandboxIdentityKind, ...] = ()
     managed_ace_count: int = 0
+    # Compatibility/status projection: when READY this reports that the
+    # persistent Offline rule is healthy.  It is not an active identity mode.
     offline_firewall_enabled: bool = False
     privilege_boundary: WindowsSandboxPrivilegeBoundary = WindowsSandboxPrivilegeBoundary()
 
@@ -144,18 +148,8 @@ class WindowsSandboxSetupAuthority(Protocol):
 
     def inspect(self, request: WindowsSandboxSetupRequest) -> WindowsSandboxSetupSnapshot: ...
 
-    def setup(
-        self,
-        request: WindowsSandboxSetupRequest,
-        *,
-        identity: WindowsSandboxIdentityKind,
-    ) -> WindowsSandboxSetupSnapshot: ...
+    def setup(self, request: WindowsSandboxSetupRequest) -> WindowsSandboxSetupSnapshot: ...
 
-    def repair(
-        self,
-        request: WindowsSandboxSetupRequest,
-        *,
-        identity: WindowsSandboxIdentityKind,
-    ) -> WindowsSandboxSetupSnapshot: ...
+    def repair(self, request: WindowsSandboxSetupRequest) -> WindowsSandboxSetupSnapshot: ...
 
     def cleanup(self, request: WindowsSandboxSetupRequest) -> WindowsSandboxSetupSnapshot: ...

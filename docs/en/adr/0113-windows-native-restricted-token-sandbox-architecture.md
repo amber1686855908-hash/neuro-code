@@ -86,7 +86,7 @@ creation for W3. The authority has these properties:
   and write-only ACL principal. It is never a read principal and never a
   firewall identity; real account SIDs carry the read and primary-user write
   checks.
-- The installation record uses schema version 2 and stores each actual account
+- The installation record uses schema version 3 and stores each actual account
   password inside a DPAPI machine-scoped encrypted payload. Because machine
   DPAPI alone is not a user boundary, the credential file also receives exact
   NTFS deny ACEs for both sandbox users; controller/setup access is preserved.
@@ -98,12 +98,13 @@ creation for W3. The authority has these properties:
   explicit denies before allows while preserving unrelated controller ACEs and
   owner information. Re-running setup is idempotent, drift is `NEEDS_REPAIR`,
   and cleanup removes only exact managed tuples and installation-created users.
-- Offline owns one outbound block rule scoped to the real Offline account SID.
+- Offline owns one persistent outbound block rule scoped to the real Offline account SID.
   Readiness verifies the complete managed tuple: outbound direction, block
   action, enabled state, expected profile, and the exact Offline SID. Any
-  drift is `NEEDS_REPAIR`; Online removes only that exact managed rule and
-  does not add a global allow rule. The Online account and the controller user
-  are not matched by the Offline rule.
+  drift is `NEEDS_REPAIR`; the rule remains installed while either dedicated
+  identity is used and is removed only by explicit cleanup. Online identity
+  use therefore cannot change Offline network authority, and neither the
+  Online account nor the controller user is matched by the Offline rule.
 - The installation root is a private controller/setup root and must be
   disjoint from every sandbox read or writable root. Its inherited NTFS deny
   authority protects the DPAPI envelope and future state files from read,

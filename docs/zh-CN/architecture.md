@@ -1084,8 +1084,9 @@ sensitive-deny ACL plan。synthetic SID 只用于 restricted-token 的仅写 pri
 read 或 network identity。native
 reconciliation 使用 `SetEntriesInAclW`，将 explicit deny canonicalize 到 allow 之前，同时
 保留无关 controller ACE 和 owner；credential file 另外设置只针对两个 sandbox user 的
-exact deny ACE。Offline outbound block 按真实 Offline account SID 限定；Online 只删除
-managed block rule，永远不作用于 Online 或 controller user。setup state 为 `READY`、
+exact deny ACE。Offline outbound block 按真实 Offline account SID 限定；managed block
+rule 在任一 dedicated identity 使用期间保持安装，只有显式 cleanup 才删除，且永远不
+作用于 Online 或 controller user。setup state 为 `READY`、
 `NEEDS_SETUP`、`NEEDS_REPAIR` 或 `UNSUPPORTED`；setup/repair/cleanup 可以需要管理员权限，
 而 runtime 工作不需要持续提权。
 W2 不启动 child、不连接 MCP、不增加 command runner、不改 Git/Python integration、不重写

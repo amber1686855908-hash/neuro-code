@@ -1,13 +1,13 @@
 """Windows Firewall authority for installation-scoped sandbox profiles.
 
-Offline mode owns one outbound block rule scoped to the real Offline account SID.
-Online mode removes only that exact managed rule; it does not add a global
-allow rule and never targets the real controller user.
+The installation owns one persistent outbound block rule scoped to the real
+Offline account SID.  Online identity use does not mutate this rule; only
+explicit cleanup removes it.  The rule never targets the real controller user.
 
 Windows Firewall authority.
 
-Offline mode 只拥有一个按真实 Offline account SID 限定的 outbound block rule.
-Online mode 只删除该 exact managed rule,不添加 global allow rule,也绝不作用于
+安装实例只拥有一个按真实 Offline account SID 限定的持久 outbound block rule.
+Online identity 的使用不会修改该规则,只有显式 cleanup 才会删除它,也绝不作用于
 真实 controller user.
 """
 

@@ -18,7 +18,6 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from neuro_code.application.ports.windows_sandbox import (
-    WindowsSandboxIdentityKind,
     WindowsSandboxSetupRequest,
     WindowsSandboxSetupState,
 )
@@ -192,7 +191,7 @@ class WindowsSandboxNativeAcceptanceTests(unittest.TestCase):
             )
             record: _InstallationRecord | None = None
             try:
-                offline = authority.setup(request, identity=WindowsSandboxIdentityKind.OFFLINE)
+                offline = authority.setup(request)
                 self.assertEqual(offline.state, WindowsSandboxSetupState.READY)
                 self.assertIsNotNone(offline.offline_user_sid)
                 self.assertIsNotNone(offline.online_user_sid)
@@ -209,7 +208,7 @@ class WindowsSandboxNativeAcceptanceTests(unittest.TestCase):
 
                 # Repeating the same profile must preserve all three identity
                 # roles and leave the native policy in READY state.
-                repeated = authority.setup(request, identity=WindowsSandboxIdentityKind.OFFLINE)
+                repeated = authority.setup(request)
                 self.assertEqual(repeated.state, WindowsSandboxSetupState.READY)
                 self.assertEqual(repeated.offline_user_sid, offline.offline_user_sid)
                 self.assertEqual(repeated.online_user_sid, offline.online_user_sid)
@@ -231,7 +230,7 @@ class WindowsSandboxNativeAcceptanceTests(unittest.TestCase):
                     authority.inspect(request).state, WindowsSandboxSetupState.NEEDS_REPAIR
                 )
                 self.assertEqual(
-                    authority.repair(request, identity=WindowsSandboxIdentityKind.OFFLINE).state,
+                    authority.repair(request).state,
                     WindowsSandboxSetupState.READY,
                 )
                 replacement = workspace / "replacement.dpapi"
@@ -286,20 +285,29 @@ class WindowsSandboxNativeAcceptanceTests(unittest.TestCase):
                 # performed.  Windows Firewall intentionally treats loopback
                 # as a separate policy surface.
                 _benign_outbound_probe()
-                # A failed connect is checked explicitly because socket
-                # errors are not filesystem PermissionErrors.
-                with (
-                    _impersonate(offline_record.username, offline_record.password.decode()),
-                    self.assertRaises(OSError),
-                ):
-                    _benign_outbound_probe()
-                with _impersonate(online_record.username, online_record.password.decode()):
-                    _benign_outbound_probe()
+                self.assertTrue(firewall_api.rule_exists(record.offline_firewall_rule))
 
-                online = authority.setup(request, identity=WindowsSandboxIdentityKind.ONLINE)
-                self.assertEqual(online.state, WindowsSandboxSetupState.READY)
-                with _impersonate(online_record.username, online_record.password.decode()):
-                    _benign_outbound_probe()
+                # The Offline rule is static installation authority.  Online
+                # identity use never removes it; interleave both identities
+                # repeatedly to catch the old active-identity race without
+                # introducing a W3 child runner.
+                for _ in range(2):
+                    # A failed connect is checked explicitly because socket
+                    # errors are not filesystem PermissionErrors.
+                    with (
+                        _impersonate(offline_record.username, offline_record.password.decode()),
+                        self.assertRaises(OSError),
+                    ):
+                        _benign_outbound_probe()
+                    self.assertTrue(firewall_api.rule_exists(record.offline_firewall_rule))
+                    with _impersonate(online_record.username, online_record.password.decode()):
+                        _benign_outbound_probe()
+                    self.assertTrue(firewall_api.rule_exists(record.offline_firewall_rule))
+                    self.assertEqual(
+                        authority.inspect(request).state,
+                        WindowsSandboxSetupState.READY,
+                    )
+
                 replacement_online = workspace / "replacement-online.dpapi"
                 replacement_online.write_bytes(b"replacement")
                 with _impersonate(online_record.username, online_record.password.decode()):
@@ -331,7 +339,7 @@ class WindowsSandboxNativeAcceptanceTests(unittest.TestCase):
                     authority.inspect(request).state, WindowsSandboxSetupState.NEEDS_REPAIR
                 )
                 self.assertEqual(
-                    authority.repair(request, identity=WindowsSandboxIdentityKind.OFFLINE).state,
+                    authority.repair(request).state,
                     WindowsSandboxSetupState.READY,
                 )
                 with _impersonate(offline_record.username, offline_record.password.decode()):
@@ -349,7 +357,7 @@ class WindowsSandboxNativeAcceptanceTests(unittest.TestCase):
                     authority.inspect(request).state, WindowsSandboxSetupState.NEEDS_REPAIR
                 )
                 self.assertEqual(
-                    authority.repair(request, identity=WindowsSandboxIdentityKind.ONLINE).state,
+                    authority.repair(request).state,
                     WindowsSandboxSetupState.READY,
                 )
             finally:

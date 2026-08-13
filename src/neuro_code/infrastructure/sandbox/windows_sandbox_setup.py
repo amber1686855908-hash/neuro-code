@@ -128,7 +128,6 @@ class _InstallationRecord:
     identities: tuple[_StoredIdentity, ...]
     managed_aces: tuple[WindowsManagedAce, ...]
     offline_firewall_rule: WindowsFirewallRule
-    active_identity: WindowsSandboxIdentityKind
 
     @property
     def offline(self) -> _StoredIdentity:
@@ -178,7 +177,6 @@ class _InstallationRecord:
             firewall_rule_for_installation(
                 installation_id, WindowsSandboxIdentityKind.OFFLINE, offline.sid
             ),
-            WindowsSandboxIdentityKind.ONLINE,
         )
 
     def identity_records(self) -> tuple[WindowsSandboxIdentityRecord, ...]:
@@ -232,7 +230,6 @@ class _InstallationRecord:
                 "enabled": self.offline_firewall_rule.enabled,
                 "profile": self.offline_firewall_rule.profile,
             },
-            "active_identity": self.active_identity.value,
         }
         return json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
@@ -242,6 +239,11 @@ class _InstallationRecord:
             payload = json.loads(encoded.decode("utf-8"))
             if not isinstance(payload, dict):
                 raise ValueError("record must be an object")
+            # Records written by the pre-hardening draft selected a mutable
+            # active identity.  They are intentionally not migrated because
+            # that state could silently change the Firewall authority.
+            if "active_identity" in payload:
+                raise ValueError("record contains obsolete active identity state")
             identities_payload = payload["identities"]
             if not isinstance(identities_payload, list):
                 raise ValueError("identities must be a list")
@@ -306,7 +308,6 @@ class _InstallationRecord:
                 identities,
                 managed_aces,
                 firewall_rule,
-                WindowsSandboxIdentityKind(payload["active_identity"]),
             )
         except (KeyError, TypeError, ValueError, UnicodeError, json.JSONDecodeError) as error:
             raise WindowsSandboxSetupError("Windows sandbox setup record is invalid") from error
@@ -491,11 +492,10 @@ class WindowsNativeSandboxSetupAuthority:
             self._validate_accounts(accounts, record)
             plan = self._plan(request, record, self._store(request).path)
             acl_ready = acl_authority.is_ready(plan)
-            firewall_ready = (
-                firewall.rule_exists(record.offline_firewall_rule)
-                if record.active_identity is WindowsSandboxIdentityKind.OFFLINE
-                else not firewall.rule_exists(record.offline_firewall_rule)
-            )
+            # The Offline outbound block is a persistent installation policy,
+            # not a process-global mode.  READY always requires the complete
+            # managed rule; Online child identity use never removes it.
+            firewall_ready = firewall.rule_exists(record.offline_firewall_rule)
         except (WindowsSandboxSetupError, WindowsSandboxAccountError, OSError):
             return self._snapshot(WindowsSandboxSetupState.NEEDS_REPAIR, record)
         if not acl_ready or not firewall_ready:
@@ -503,7 +503,7 @@ class WindowsNativeSandboxSetupAuthority:
         return self._snapshot(
             WindowsSandboxSetupState.READY,
             record,
-            offline_firewall_enabled=record.active_identity is WindowsSandboxIdentityKind.OFFLINE,
+            offline_firewall_enabled=True,
         )
 
     def _new_record(
@@ -614,7 +614,6 @@ class WindowsNativeSandboxSetupAuthority:
                 tuple(identities),
                 record.managed_aces,
                 updated_rule,
-                record.active_identity,
             ),
             tuple(facts),
         )
@@ -622,11 +621,7 @@ class WindowsNativeSandboxSetupAuthority:
     def setup(
         self,
         request: WindowsSandboxSetupRequest,
-        *,
-        identity: WindowsSandboxIdentityKind,
     ) -> WindowsSandboxSetupSnapshot:
-        if not isinstance(identity, WindowsSandboxIdentityKind):
-            raise TypeError("Windows sandbox identity must be canonical")
         self._require_admin()
         acl_authority, firewall, account_api = self._apis(request)
         record = self._load(request)
@@ -646,17 +641,15 @@ class WindowsNativeSandboxSetupAuthority:
                 record.identities,
                 plan.entries,
                 record.offline_firewall_rule,
-                identity,
             )
             # The file must exist before native GetNamedSecurityInfoW can apply
             # its exact deny ACE.  It is DPAPI encrypted before ACL mutation;
             # the controller's account remains the owner and can decrypt it.
             store.save(updated.encode())
             acl_authority.reconcile(record.managed_aces, plan)
-            if identity is WindowsSandboxIdentityKind.OFFLINE:
-                firewall.ensure_outbound_block(record.offline_firewall_rule)
-            else:
-                firewall.remove_rule(record.offline_firewall_rule)
+            # Always establish the static Offline policy.  Only cleanup is
+            # allowed to remove this managed rule.
+            firewall.ensure_outbound_block(record.offline_firewall_rule)
         except BaseException:
             if fresh:
                 rollback_failed = False
@@ -689,19 +682,17 @@ class WindowsNativeSandboxSetupAuthority:
         return self._snapshot(
             WindowsSandboxSetupState.READY,
             updated,
-            offline_firewall_enabled=identity is WindowsSandboxIdentityKind.OFFLINE,
+            offline_firewall_enabled=True,
         )
 
     def repair(
         self,
         request: WindowsSandboxSetupRequest,
-        *,
-        identity: WindowsSandboxIdentityKind,
     ) -> WindowsSandboxSetupSnapshot:
         record = self._load(request)
         if record is None:
             return self._snapshot(WindowsSandboxSetupState.NEEDS_SETUP, None)
-        return self.setup(request, identity=identity)
+        return self.setup(request)
 
     def cleanup(self, request: WindowsSandboxSetupRequest) -> WindowsSandboxSetupSnapshot:
         self._require_admin()

@@ -1533,9 +1533,10 @@ ACL plans. The synthetic SID is only a write-only restricted-token principal;
 it is never a read or network identity. Native reconciliation uses `SetEntriesInAclW` so explicit denies are
 canonicalized before allows while unrelated controller ACEs and owner data are
 preserved. The credential file receives exact deny ACEs for both sandbox users.
-Offline outbound blocking is scoped to the real Offline account SID; Online
-removes only the managed block rule and never targets the Online or controller
-user.
+Offline outbound blocking is scoped to the real Offline account SID; the
+managed block rule remains installed while either dedicated identity is used
+and only explicit cleanup removes it. It never targets the Online or
+controller user.
 Setup state is `READY`, `NEEDS_SETUP`, `NEEDS_REPAIR`, or `UNSUPPORTED`, and
 setup/repair/cleanup may require administrator authority while runtime work
 does not. W2 does not launch children, connect MCP, add a command runner,
