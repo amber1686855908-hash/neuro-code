@@ -80,6 +80,7 @@ _TOKEN_LOGON_SID = 28
 _TOKEN_QUERY = 0x0008
 _DACL_SECURITY_INFORMATION = 0x00000004
 _PROFILE_USERNAMES = frozenset({"NeuroSandboxOffline", "NeuroSandboxOnline"})
+_WORLD_SID = "S-1-1-0"
 _HRESULT_FILE_NOT_FOUND = -2_147_024_894  # 0x80070002
 _HRESULT_PATH_NOT_FOUND = -2_147_024_893  # 0x80070003
 _ERROR_ALREADY_EXISTS = 183
@@ -846,7 +847,16 @@ class _RunnerChild:
     def _create(self, payload: Mapping[str, object]) -> None:
         write_sid = SyntheticWindowsSid(_validated_text(payload.get("write_sid"), "write SID"))
         token_request = WindowsRestrictedTokenRequest((write_sid,))
-        token = WindowsRestrictedToken.create_from_current_process(token_request)
+        # WRITE_RESTRICTED is evaluated in addition to the normal token SID
+        # check.  Keep the installation SID as the write gate, while retaining
+        # the runner's logon/session SIDs and Everyone as fixed session
+        # identities required for ordinary Windows object initialization.
+        runner_sid = current_user_sid()
+        runner_logon_sid = current_logon_sid()
+        token = WindowsRestrictedToken.create_from_current_process(
+            token_request,
+            additional_restricting_sids=(runner_logon_sid, _WORLD_SID),
+        )
         handles_to_close: list[int] = []
         created: RunnerLaunch | None = None
         try:
@@ -856,10 +866,8 @@ class _RunnerChild:
             # resolving its executable/cwd/imports; this does not add file,
             # network, or administrative authority.
             token.enable_change_notify_privilege()
-            runner_sid = current_user_sid()
-            runner_logon_sid = current_logon_sid()
             self._desktop_handle, self._desktop_name = self._api.create_private_desktop(
-                (runner_sid, runner_logon_sid, write_sid.value)
+                (runner_sid, runner_logon_sid, write_sid.value, _WORLD_SID)
             )
             executable = payload.get("executable")
             arguments = payload.get("arguments", [])

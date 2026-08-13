@@ -17,7 +17,9 @@ class _FakeSecurityTokenApi:
         self.source_handle = 101
         self.created_handle = 202
         self.closed: list[int] = []
-        self.create_calls: list[tuple[int, int, tuple[SyntheticWindowsSid, ...]]] = []
+        self.create_calls: list[
+            tuple[int, int, tuple[SyntheticWindowsSid, ...], tuple[str, ...]]
+        ] = []
         self.inspection = WindowsTokenInspection(restricted_sid_count=1, is_restricted=True)
         self.fail_create = False
         self.fail_inspect = False
@@ -32,8 +34,11 @@ class _FakeSecurityTokenApi:
         existing_handle: int,
         flags: int,
         restricted_sids: tuple[SyntheticWindowsSid, ...],
+        additional_restricting_sids: tuple[str, ...] = (),
     ) -> int:
-        self.create_calls.append((existing_handle, flags, restricted_sids))
+        self.create_calls.append(
+            (existing_handle, flags, restricted_sids, additional_restricting_sids)
+        )
         if self.fail_create:
             raise WindowsTokenError("CreateRestrictedToken", 5)
         return self.created_handle
@@ -86,7 +91,10 @@ class WindowsRestrictedTokenTests(unittest.TestCase):
         self.assertTrue(token.inspection.is_restricted)
         self.assertEqual(token.inspection.enabled_privilege_count, 0)
         self.assertEqual(api.closed, [api.source_handle])
-        self.assertEqual(api.create_calls, [(api.source_handle, request.flags, (sid,))])
+        self.assertEqual(
+            api.create_calls,
+            [(api.source_handle, request.flags, (sid,), ())],
+        )
         token.close()
         token.close()
         self.assertEqual(api.closed, [api.source_handle, api.created_handle])
@@ -99,6 +107,21 @@ class WindowsRestrictedTokenTests(unittest.TestCase):
         )
         token.enable_change_notify_privilege()
         self.assertEqual(api.enabled_change_notify, 1)
+        token.close()
+
+    def test_runtime_can_add_fixed_session_restricting_sids(self) -> None:
+        api = _FakeSecurityTokenApi()
+        sid = SyntheticWindowsSid.from_components((11, 22, 33, 44))
+        request = WindowsRestrictedTokenRequest((sid,))
+        token = WindowsRestrictedToken.create_from_current_process(
+            request,
+            additional_restricting_sids=("S-1-5-5-0-1", "S-1-1-0"),
+            api=api,
+        )
+        self.assertEqual(
+            api.create_calls[-1],
+            (api.source_handle, request.flags, (sid,), ("S-1-5-5-0-1", "S-1-1-0")),
+        )
         token.close()
 
     def test_inspection_failure_closes_created_and_source_handles(self) -> None:

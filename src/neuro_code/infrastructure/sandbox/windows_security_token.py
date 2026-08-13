@@ -15,6 +15,7 @@ from __future__ import annotations
 import contextlib
 import ctypes
 import os
+import re
 from dataclasses import dataclass
 from typing import Protocol, Self, cast
 
@@ -35,6 +36,7 @@ _ERROR_INSUFFICIENT_BUFFER = 122
 _SE_PRIVILEGE_ENABLED = 0x00000002
 _ERROR_NOT_ALL_ASSIGNED = 1300
 _SE_CHANGE_NOTIFY_PRIVILEGE = "SeChangeNotifyPrivilege"
+_SID_TEXT_PATTERN = re.compile(r"^S-1-(?:\d+)(?:-\d+)+$")
 
 
 class WindowsTokenError(SandboxError):
@@ -137,6 +139,7 @@ class _WindowsSecurityTokenApi(Protocol):
         existing_handle: int,
         flags: int,
         restricted_sids: tuple[SyntheticWindowsSid, ...],
+        additional_restricting_sids: tuple[str, ...] = (),
     ) -> int: ...
 
     def inspect_token(self, token_handle: int) -> WindowsTokenInspection: ...
@@ -307,6 +310,15 @@ class _NativeWindowsSecurityTokenApi:
             raise self._error("ConvertStringSidToSidW")
         return int(sid_pointer.value)
 
+    def _convert_sid_text(self, sid: str) -> int:
+        if not isinstance(sid, str) or _SID_TEXT_PATTERN.fullmatch(sid) is None:
+            raise WindowsTokenError("validate additional restricting SID")
+        sid_pointer = ctypes.c_void_p()
+        converted = self._convert_string_sid(sid, ctypes.byref(sid_pointer))
+        if not converted or not sid_pointer.value:
+            raise self._error("ConvertStringSidToSidW(additional restricting SID)")
+        return int(sid_pointer.value)
+
     def _free_sid(self, sid_pointer: int) -> None:
         if self._local_free(sid_pointer):
             raise self._error("LocalFree")
@@ -316,12 +328,14 @@ class _NativeWindowsSecurityTokenApi:
         existing_handle: int,
         flags: int,
         restricted_sids: tuple[SyntheticWindowsSid, ...],
+        additional_restricting_sids: tuple[str, ...] = (),
     ) -> int:
         sid_pointers: list[int] = []
         created_handle: int | None = None
         operation_failure: BaseException | None = None
         try:
             sid_pointers.extend(self._convert_sid(sid) for sid in restricted_sids)
+            sid_pointers.extend(self._convert_sid_text(sid) for sid in additional_restricting_sids)
             sid_array_type = _SidAndAttributes * len(sid_pointers)
             sid_array = sid_array_type(*(_SidAndAttributes(pointer, 0) for pointer in sid_pointers))
             new_token = ctypes.c_void_p()
@@ -477,6 +491,7 @@ class WindowsRestrictedToken:
         cls,
         request: WindowsRestrictedTokenRequest,
         *,
+        additional_restricting_sids: tuple[str, ...] = (),
         api: _WindowsSecurityTokenApi | None = None,
     ) -> Self:
         """Create and attest a restricted token, closing the source token."""
@@ -494,6 +509,7 @@ class WindowsRestrictedToken:
                 source_handle,
                 request.flags,
                 request.restricted_sids,
+                additional_restricting_sids,
             )
             if created_handle <= 0:
                 raise WindowsTokenError("CreateRestrictedToken returned an invalid handle")
