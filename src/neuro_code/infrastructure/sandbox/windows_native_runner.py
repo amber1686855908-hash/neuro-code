@@ -1459,18 +1459,15 @@ class _NativeChildApi:
             offset += written.value
 
     def wait_process(self, handle: int) -> None:
-        # Bound each native wait and use GetExitCodeProcess as a completion
-        # fallback. This prevents an unexpected handle state from stranding
-        # the trusted runner without publishing an Exit frame.
+        # Poll the owned process handle rather than relying on an unbounded
+        # wait call.  The handle is returned by CreateProcessAsUserW and its
+        # exit code is the authoritative completion fact; bounded polling
+        # keeps the runner responsive to cancellation and avoids stranding the
+        # protocol if a platform shim reports an unexpected wait state.
         while True:
-            result = cast(int, self._wait(handle, 100))
-            if result == _WAIT_OBJECT_0:
+            if self.get_exit_code(handle) != _STILL_ACTIVE:
                 return
-            if result == _WAIT_TIMEOUT:
-                if self.get_exit_code(handle) != _STILL_ACTIVE:
-                    return
-                continue
-            self._error("WaitForSingleObject")
+            time.sleep(0.05)
 
     def get_exit_code(self, handle: int) -> int:
         value = ctypes.c_uint32()
