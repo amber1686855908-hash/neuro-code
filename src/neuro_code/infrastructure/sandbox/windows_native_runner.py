@@ -831,6 +831,7 @@ class _RunnerChild:
         self._api = _NativeChildApi()
         self._job = WindowsJobObject.create()
         self._process_handle: int | None = None
+        self._process_id: int | None = None
         self._stdin_handle: int | None = None
         self._desktop_handle: int | None = None
         self._desktop_name: str | None = None
@@ -952,6 +953,7 @@ class _RunnerChild:
                 assert stderr_write is not None
                 handles_to_close.remove(stderr_write)
             self._process_handle = created.process_handle
+            self._process_id = created.process_id
             self._stdin_handle = stdin_parent
             if stdin_parent is not None:
                 handles_to_close.remove(stdin_parent)
@@ -1042,6 +1044,13 @@ class _RunnerChild:
             # The runner has no controller console. Keep completion reporting
             # on the binary pipe instead of relying on detached stdout/stderr.
             self._send(RuntimeFrameType.STDERR, b"W3_RUNNER_WAIT_ENTER\n")
+            process_id, thread_id = self._api.handle_ids(self._process_handle)
+            self._send(
+                RuntimeFrameType.STDERR,
+                f"W3_RUNNER_HANDLE_IDS:{process_id}:{thread_id}:{self._process_id}\n".encode(
+                    "ascii"
+                ),
+            )
             self._api.wait_process(self._process_handle)
             code = self._api.get_exit_code(self._process_handle)
             self._send(RuntimeFrameType.STDERR, b"W3_RUNNER_WAIT_SIGNALED\n")
@@ -1200,6 +1209,18 @@ class _NativeChildApi:
             "GetExitCodeProcess",
             [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32)],
             ctypes.c_int32,
+        )
+        self._get_process_id = _load_function(
+            kernel32,
+            "GetProcessId",
+            [ctypes.c_void_p],
+            ctypes.c_uint32,
+        )
+        self._get_thread_id = _load_function(
+            kernel32,
+            "GetThreadId",
+            [ctypes.c_void_p],
+            ctypes.c_uint32,
         )
         self._get_temp_path = _load_function(
             kernel32,
@@ -1474,6 +1495,12 @@ class _NativeChildApi:
         if not self._get_exit(handle, ctypes.byref(value)):
             self._error("GetExitCodeProcess")
         return int(value.value)
+
+    def handle_ids(self, handle: int) -> tuple[int, int]:
+        return (
+            cast(int, self._get_process_id(handle)),
+            cast(int, self._get_thread_id(handle)),
+        )
 
     def create_private_directory(self, path: Path, user_sid: str) -> None:
         attributes, descriptor = _security_descriptor(
