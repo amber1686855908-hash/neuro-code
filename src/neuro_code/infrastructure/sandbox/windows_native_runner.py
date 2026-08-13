@@ -17,6 +17,7 @@ import contextlib
 import ctypes
 import os
 import secrets
+import shutil
 import subprocess
 import sys
 import threading
@@ -80,6 +81,7 @@ _DACL_SECURITY_INFORMATION = 0x00000004
 _PROFILE_USERNAMES = frozenset({"NeuroSandboxOffline", "NeuroSandboxOnline"})
 _HRESULT_FILE_NOT_FOUND = -2_147_024_894  # 0x80070002
 _HRESULT_PATH_NOT_FOUND = -2_147_024_893  # 0x80070003
+_ERROR_ALREADY_EXISTS = 183
 
 
 class _CFunction(Protocol):
@@ -376,7 +378,9 @@ class WindowsNamedPipe:
         self.close()
 
 
-def _security_descriptor(sids: Sequence[str]) -> tuple[_SecurityAttributes, int]:
+def _security_descriptor(
+    sids: Sequence[str], *, inherit_to_children: bool = False
+) -> tuple[_SecurityAttributes, int]:
     """Build an exact, non-inheritable named-pipe DACL for the two peers."""
 
     if not sids or any(not sid or ";" in sid for sid in sids):
@@ -396,7 +400,8 @@ def _security_descriptor(sids: Sequence[str]) -> tuple[_SecurityAttributes, int]
         ],
         ctypes.c_int32,
     )
-    sddl = "D:P" + "".join(f"(A;;GA;;;{sid})" for sid in dict.fromkeys(sids))
+    ace = "(A;OICI;GA;;;{sid})" if inherit_to_children else "(A;;GA;;;{sid})"
+    sddl = "D:P" + "".join(ace.format(sid=sid) for sid in dict.fromkeys(sids))
     descriptor = ctypes.c_void_p()
     descriptor_size = ctypes.c_uint32()
     if not convert(sddl, 1, ctypes.byref(descriptor), ctypes.byref(descriptor_size)):
@@ -712,6 +717,7 @@ class _RunnerChild:
         self._job = WindowsJobObject.create()
         self._process_handle: int | None = None
         self._stdin_handle: int | None = None
+        self._ephemeral_home: Path | None = None
         self._output_handles: list[int] = []
         self._threads: list[threading.Thread] = []
         try:
@@ -741,8 +747,13 @@ class _RunnerChild:
                 raise SandboxError("Windows runtime child environment is invalid")
             environment = dict(environment)
             profile_username = _validated_text(payload.get("profile_username"), "profile username")
-            private_home = self._api.get_user_profile(token.handle, profile_username)
-            private_tmp = self._api.get_private_temp_path(private_home)
+            private_home, ephemeral_home = self._api.get_user_profile(
+                token.handle, profile_username
+            )
+            if ephemeral_home:
+                self._ephemeral_home = Path(private_home)
+            runner_sid = current_user_sid()
+            private_tmp = self._api.get_private_temp_path(private_home, runner_sid)
             # These values are derived from the selected sandbox account, never
             # inherited from the controller.  A model request cannot redirect
             # an enabled child into controller HOME/TMP.
@@ -850,9 +861,16 @@ class _RunnerChild:
                 seen.add(handle)
                 with contextlib.suppress(BaseException):
                     self._api.close_handle(handle)
+            self._remove_ephemeral_home()
             raise
         finally:
             token.close()
+
+    def _remove_ephemeral_home(self) -> None:
+        home, self._ephemeral_home = self._ephemeral_home, None
+        if home is not None:
+            with contextlib.suppress(BaseException):
+                shutil.rmtree(home)
 
     def _send(self, kind: RuntimeFrameType, value: object = b"") -> None:
         payload = value if isinstance(value, bytes) else encode_json(value)
@@ -901,6 +919,7 @@ class _RunnerChild:
                     self._api.close_handle(stdin_handle)
             with contextlib.suppress(BaseException):
                 self._job.close()
+            self._remove_ephemeral_home()
 
     def handle(self, frame: RuntimeFrame) -> bool:
         if frame.kind is RuntimeFrameType.STDIN:
@@ -960,6 +979,12 @@ class _NativeChildApi:
                 ctypes.c_void_p,
             ],
             ctypes.c_void_p,
+        )
+        self._create_directory = _load_function(
+            kernel32,
+            "CreateDirectoryW",
+            [ctypes.c_wchar_p, ctypes.POINTER(_SecurityAttributes)],
+            ctypes.c_int32,
         )
         self._initialize_attribute_list = _load_function(
             kernel32,
@@ -1222,7 +1247,21 @@ class _NativeChildApi:
             self._error("GetExitCodeProcess")
         return int(value.value)
 
-    def get_user_profile(self, token: int, profile_username: str) -> str:
+    def create_private_directory(self, path: Path, user_sid: str) -> None:
+        attributes, descriptor = _security_descriptor(
+            (user_sid, "S-1-5-18", "S-1-5-32-544"),
+            inherit_to_children=True,
+        )
+        try:
+            created = self._create_directory(str(path), ctypes.byref(attributes))
+            if not created:
+                error = cast(int, self._get_last_error())
+                if error != _ERROR_ALREADY_EXISTS:
+                    raise OSError(error, f"CreateDirectoryW failed with Windows error {error}")
+        finally:
+            _free_security_descriptor(descriptor)
+
+    def get_user_profile(self, token: int, profile_username: str) -> tuple[str, bool]:
         path_pointer = ctypes.c_wchar_p()
         result = self._get_known_folder_path(
             ctypes.byref(_FOLDERID_PROFILE),
@@ -1233,7 +1272,7 @@ class _NativeChildApi:
         result_code = cast(int, result)
         if result_code == 0 and path_pointer.value:
             try:
-                return str(path_pointer.value)
+                return str(path_pointer.value), False
             finally:
                 self._co_task_mem_free(path_pointer)
         if path_pointer.value:
@@ -1254,15 +1293,19 @@ class _NativeChildApi:
         system_root = Path(os.environ.get("SYSTEMROOT", ""))
         if not system_root.anchor:
             raise OSError(result_code, "Windows SystemRoot has no drive anchor")
-        fallback = Path(system_root.anchor) / "Users" / profile_username
+        fallback = (
+            Path(system_root.anchor)
+            / "Windows"
+            / "Temp"
+            / f"neuro-code-home-{profile_username}-{secrets.token_hex(16)}"
+        )
         try:
-            fallback.mkdir(parents=True, exist_ok=True)
+            self.create_private_directory(fallback, current_user_sid())
         except OSError as error:
-            raise SandboxError("Windows sandbox profile directory is unavailable") from error
-        return str(fallback)
+            raise SandboxError("Windows sandbox private HOME is unavailable") from error
+        return str(fallback), True
 
-    @staticmethod
-    def get_private_temp_path(profile: str) -> str:
+    def get_private_temp_path(self, profile: str, user_sid: str) -> str:
         """Return a temp directory owned by the selected sandbox profile.
 
         ``GetTempPathW`` would fall back to a machine-wide directory when the
@@ -1273,7 +1316,7 @@ class _NativeChildApi:
 
         path = Path(profile) / "AppData" / "Local" / "Temp"
         try:
-            path.mkdir(parents=True, exist_ok=True)
+            self.create_private_directory(path, user_sid)
         except OSError as error:
             raise SandboxError(
                 "Windows sandbox private temporary directory is unavailable"
