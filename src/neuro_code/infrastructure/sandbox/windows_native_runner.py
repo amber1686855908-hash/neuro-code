@@ -877,7 +877,7 @@ class _RunnerChild:
             # canonical noninteractive desktop while keeping CREATE_NO_WINDOW
             # and all token/Job/stdio restrictions intact.  W4 owns any PTY or
             # interactive desktop contract.
-            self._desktop_name = r"Winsta0\Default"
+            self._desktop_name = None
             executable = payload.get("executable")
             arguments = payload.get("arguments", [])
             shell_command = payload.get("shell_command")
@@ -1381,7 +1381,7 @@ class _NativeChildApi:
         stderr_handle: int,
         inherited_handles: tuple[int, ...],
         job_handle: int,
-        desktop_name: str,
+        desktop_name: str | None,
     ) -> RunnerLaunch:
         required = ctypes.c_size_t()
         self._initialize_attribute_list(None, 2, 0, ctypes.byref(required))
