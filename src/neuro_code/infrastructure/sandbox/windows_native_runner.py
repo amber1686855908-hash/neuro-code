@@ -151,6 +151,21 @@ class _SidAndAttributes(ctypes.Structure):
     ]
 
 
+class _TokenGroupsOne(ctypes.Structure):
+    """Header plus the first entry returned for ``TokenLogonSid``.
+
+    ``GetTokenInformation(TokenLogonSid)`` returns a ``TOKEN_GROUPS``
+    structure, not a bare ``SID_AND_ATTRIBUTES`` value.  Keeping the header
+    in the ctypes layout is important on 64-bit Windows because the first SID
+    pointer is aligned after the DWORD group count.
+    """
+
+    _fields_ = [
+        ("GroupCount", ctypes.c_uint32),
+        ("Groups", _SidAndAttributes * 1),
+    ]
+
+
 class _StartupInfoW(ctypes.Structure):
     _fields_ = [
         ("cb", ctypes.c_uint32),
@@ -568,7 +583,10 @@ def current_logon_sid() -> str:
             token, _TOKEN_LOGON_SID, buffer, required, ctypes.byref(required)
         ):
             raise OSError(_last_error(), "GetTokenInformation(TokenLogonSid) failed")
-        sid_pointer = _SidAndAttributes.from_buffer_copy(buffer).Sid
+        groups = _TokenGroupsOne.from_buffer(buffer)
+        if groups.GroupCount < 1 or not groups.Groups[0].Sid:
+            raise OSError(_last_error(), "GetTokenInformation(TokenLogonSid) returned no SID")
+        sid_pointer = groups.Groups[0].Sid
         sid_string = ctypes.c_void_p()
         if not convert_sid(sid_pointer, ctypes.byref(sid_string)) or not sid_string.value:
             raise OSError(_last_error(), "ConvertSidToStringSidW failed")
