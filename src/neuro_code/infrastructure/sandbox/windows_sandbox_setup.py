@@ -510,14 +510,19 @@ class WindowsNativeSandboxSetupAuthority:
                         "new sandbox account was not installation-created"
                     )
                 created.append((kind, facts, password))
-        except BaseException:
+        except BaseException as error:
             # If provisioning the second account fails, do not leave the first
             # newly-created account behind.  Adopted pre-existing accounts are
             # explicitly preserved by their created_by_installation fact.
             for _, facts, _ in reversed(created):
                 with contextlib.suppress(BaseException):
                     account_api.remove_user(facts)
-            raise WindowsSandboxSetupError("Windows sandbox account provisioning failed") from None
+            if isinstance(error, WindowsSandboxSetupError):
+                raise
+            raise WindowsSandboxSetupError(
+                "Windows sandbox account provisioning failed: "
+                f"{type(error).__name__}: {error}"
+            ) from error
         record = _InstallationRecord.from_facts(
             write_sid=SyntheticWindowsSid.generate(),
             facts=tuple(created),
