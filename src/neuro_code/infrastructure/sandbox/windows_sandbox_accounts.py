@@ -298,6 +298,7 @@ class _NativeWindowsSandboxAccountApi:  # pragma: no cover - Windows native CI
     _UF_ACCOUNTDISABLE = 0x0002
     _UF_LOCKOUT = 0x0010
     _ERROR_MORE_DATA = 234
+    _ERROR_INSUFFICIENT_BUFFER = 122
     _MAX_PREFERRED_LENGTH = 0xFFFFFFFF
     _LOGON32_LOGON_INTERACTIVE = 2
     _LOGON32_PROVIDER_DEFAULT = 0
@@ -395,32 +396,25 @@ class _NativeWindowsSandboxAccountApi:  # pragma: no cover - Windows native CI
         return WindowsSandboxAccountError(f"{operation} failed with Windows error {code}")
 
     def _sid_for_user(self, username: str) -> WindowsAccountSid:
-        sid_size = ctypes.c_uint32(0)
-        domain_size = ctypes.c_uint32(0)
+        sid_size = ctypes.c_uint32(68)
+        domain_size = ctypes.c_uint32(256)
         sid_use = ctypes.c_uint32(0)
-        self._lookup_account_name(
-            None,
-            username,
-            None,
-            ctypes.byref(sid_size),
-            None,
-            ctypes.byref(domain_size),
-            None,
-            ctypes.byref(sid_use),
-        )
         sid_buffer = ctypes.create_string_buffer(sid_size.value)
-        domain_buffer = ctypes.create_unicode_buffer(max(1, domain_size.value))
-        if not self._lookup_account_name(
+        domain_buffer = ctypes.create_unicode_buffer(domain_size.value)
+        while not self._lookup_account_name(
             None,
             username,
-            sid_buffer,
+            ctypes.cast(sid_buffer, ctypes.c_void_p),
             ctypes.byref(sid_size),
-            domain_buffer,
+            ctypes.cast(domain_buffer, ctypes.c_wchar_p),
             ctypes.byref(domain_size),
-            None,
             ctypes.byref(sid_use),
         ):
-            raise self._error("LookupAccountNameW", _windows_last_error())
+            error = _windows_last_error()
+            if error != self._ERROR_INSUFFICIENT_BUFFER:
+                raise self._error("LookupAccountNameW", error)
+            sid_buffer = ctypes.create_string_buffer(max(1, sid_size.value))
+            domain_buffer = ctypes.create_unicode_buffer(max(1, domain_size.value))
         convert = _native_function(
             self._advapi,
             "ConvertSidToStringSidW",
@@ -429,7 +423,10 @@ class _NativeWindowsSandboxAccountApi:  # pragma: no cover - Windows native CI
         )
         local_free = _native_function(self._kernel, "LocalFree", [ctypes.c_void_p], ctypes.c_void_p)
         output = ctypes.c_void_p()
-        if not convert(sid_buffer, ctypes.byref(output)) or not output.value:
+        if (
+            not convert(ctypes.cast(sid_buffer, ctypes.c_void_p), ctypes.byref(output))
+            or not output.value
+        ):
             raise self._error("ConvertSidToStringSidW", _windows_last_error())
         try:
             return WindowsAccountSid(ctypes.wstring_at(output.value))
