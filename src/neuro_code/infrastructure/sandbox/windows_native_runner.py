@@ -840,6 +840,7 @@ class _RunnerChild:
         self._ephemeral_home: Path | None = None
         self._output_handles: list[int] = []
         self._threads: list[threading.Thread] = []
+        self._resume_count: int | None = None
         try:
             self._create(payload)
         except BaseException:
@@ -1055,6 +1056,10 @@ class _RunnerChild:
             self._send(
                 RuntimeFrameType.STDERR,
                 f"W3_RUNNER_INITIAL_CODE:{initial_code}\n".encode("ascii"),
+            )
+            self._send(
+                RuntimeFrameType.STDERR,
+                f"W3_RUNNER_RESUME_COUNT:{self._resume_count}\n".encode("ascii"),
             )
             completion_handle = self._thread_handle or self._process_handle
             if self._thread_handle is not None:
@@ -1458,7 +1463,8 @@ class _NativeChildApi:
             # CreateProcessAsUserW is expected to return a runnable thread.
             # Clear a non-zero suspend count defensively; a running thread
             # returns zero and is unchanged.
-            if cast(int, self._resume_thread(process.hThread)) == _SUSPEND_FAILED:
+            self._resume_count = cast(int, self._resume_thread(process.hThread))
+            if self._resume_count == _SUSPEND_FAILED:
                 self._error("ResumeThread")
         finally:
             self._delete_attribute_list(attributes)
