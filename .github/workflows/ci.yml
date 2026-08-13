@@ -257,7 +257,7 @@ jobs:
         run: >-
           uv run pytest
           tests/security/test_windows_native_runtime_acceptance.py
-          -q -rs
+          -q -rs -s
           --junitxml=${{ runner.temp }}/neuro-code-windows-native-runtime.xml
       - name: Require W3 native acceptance execution
         shell: pwsh
