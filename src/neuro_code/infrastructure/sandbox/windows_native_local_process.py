@@ -644,14 +644,39 @@ class _WindowsNativeOwnedLocalProcess(OwnedLocalProcess):
             if grace_seconds is None
             else grace_seconds
         )
-        await run_blocking(self._pipe.write, encode_frame(RuntimeFrameType.TERMINATE))
+        try:
+            await asyncio.wait_for(
+                run_blocking(self._pipe.write, encode_frame(RuntimeFrameType.TERMINATE)),
+                timeout=max(1.0, timeout),
+            )
+        except (OSError, RuntimeError, TimeoutError) as error:
+            self._force_close(SandboxError("Windows runtime termination IPC failed"))
+            raise SandboxError("Windows runtime termination IPC failed") from error
         try:
             await asyncio.wait_for(
                 self.wait(), timeout=timeout + self._request.lifecycle.force_wait_seconds
             )
         except (TimeoutError, SandboxError):
             _terminate_runner_process(self._runner.process_handle)
-            await self.wait()
+            self._pipe.close()
+            try:
+                await asyncio.wait_for(self.wait(), timeout=2.0)
+            except (TimeoutError, SandboxError) as error:
+                self._force_close(SandboxError("Windows runtime runner did not terminate"))
+                raise SandboxError("Windows runtime runner did not terminate") from error
+
+    def _force_close(self, error: BaseException) -> None:
+        """Bound controller cancellation if a native pipe reader is stuck."""
+
+        if self._done.is_set():
+            return
+        self._error = error
+        self._closed = True
+        self._call(self._stdout.set_exception, error)
+        if self._stderr is not None:
+            self._call(self._stderr.set_exception, error)
+        self._pipe.close()
+        self._call(self._done.set)
 
 
 def _terminate_runner_process(handle: int) -> None:
