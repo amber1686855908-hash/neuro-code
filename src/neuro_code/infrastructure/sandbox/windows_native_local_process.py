@@ -425,7 +425,23 @@ class WindowsNativeLocalProcessSandbox(LocalProcessSandbox):
                         # reader instead of dropping coalesced data.
                         return pipe, launch, frame, decoder, frames[index + 1 :]
                     if frame.kind is RuntimeFrameType.ERROR:
-                        raise SandboxError("trusted Windows runner rejected the child request")
+                        # The runner deliberately sends only a bounded, safe
+                        # operation/error diagnostic.  Preserve it here so a
+                        # native acceptance failure identifies the rejected
+                        # Win32 boundary instead of collapsing into a generic
+                        # protocol error.  Credentials, command arguments,
+                        # token contents, and paths are never included by the
+                        # runner's error payload.
+                        detail = ""
+                        with contextlib.suppress(BaseException):
+                            error_payload = decode_json(frame.payload)
+                            if isinstance(error_payload, dict):
+                                message = error_payload.get("message")
+                                if isinstance(message, str) and message:
+                                    detail = f": {message[:512]}"
+                        raise SandboxError(
+                            f"trusted Windows runner rejected the child request{detail}"
+                        )
         except BaseException:
             server.close()
             if pipe is not None:
