@@ -86,12 +86,17 @@ def _wait_for_native_process_exit(pid: int, timeout_ms: int = 5_000) -> bool:
         close(handle)
 
 
-async def _read_with_native_timeout(process: object, *, limit_seconds: float = 30.0) -> bytes:
+async def _read_with_native_timeout(
+    process: object,
+    *,
+    stream_name: str = "stdout",
+    limit_seconds: float = 30.0,
+) -> bytes:
     """Bound a native read and terminate the owned scope on a stuck child."""
 
     try:
-        stdout = process.stdout  # type: ignore[attr-defined]
-        return await asyncio.wait_for(stdout.read(), timeout=limit_seconds)
+        stream = getattr(process, stream_name)
+        return await asyncio.wait_for(stream.read(), timeout=limit_seconds)
     except TimeoutError as error:
         with contextlib.suppress(BaseException):
             await process.terminate(grace_seconds=0.5)  # type: ignore[attr-defined]
@@ -296,7 +301,7 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                         arguments=("-c", workspace_probe),
                     )
                 )
-                workspace_output = await process.stdout.read()  # type: ignore[union-attr]
+                workspace_output = await _read_with_native_timeout(process)
                 self.assertIn(b"workspace-write", workspace_output)
                 self.assertIn(b"sensitive=True", workspace_output)
                 self.assertIn(b"installation_read=True", workspace_output)
@@ -333,7 +338,7 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                         arguments=("-c", read_only_probe),
                     )
                 )
-                output = await process.stdout.read()  # type: ignore[union-attr]
+                output = await _read_with_native_timeout(process)
                 self.assertEqual(await process.wait(), 0)
                 self.assertIn(b"READ=readonly", output)
                 self.assertNotIn(b"WRITABLE", output)
@@ -350,7 +355,7 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                     )
                 )
                 offline_facts = json.loads(
-                    (await offline_identity_process.stdout.read()).decode("utf-8")  # type: ignore[union-attr]
+                    (await _read_with_native_timeout(offline_identity_process)).decode("utf-8")
                 )
                 self.assertEqual(await offline_identity_process.wait(), 0)
                 offline = next(item for item in record if item.kind.value == "offline")
@@ -393,8 +398,8 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                         )
                     )
                     offline_output, online_output = await asyncio.gather(
-                        offline_process.stdout.read(),  # type: ignore[union-attr]
-                        online_process.stdout.read(),  # type: ignore[union-attr]
+                        _read_with_native_timeout(offline_process),
+                        _read_with_native_timeout(online_process),
                     )
                     self.assertEqual(await offline_process.wait(), 0)
                     self.assertEqual(await online_process.wait(), 0)
@@ -427,8 +432,8 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                 payload = (b"\x00\r\n" + bytes(range(256))) * 512
                 await process.write_stdin(payload)
                 await process.close_stdin()
-                stdout = await process.stdout.read()  # type: ignore[union-attr]
-                stderr = await process.stderr.read()  # type: ignore[union-attr]
+                stdout = await _read_with_native_timeout(process)
+                stderr = await _read_with_native_timeout(process, stream_name="stderr")
                 self.assertEqual(await process.wait(), 0)
                 self.assertEqual(stdout, payload)
                 self.assertEqual(stderr, payload[::-1])
