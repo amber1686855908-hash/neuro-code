@@ -154,7 +154,7 @@ def _compile_winsock_probe() -> Path:  # pragma: no cover - Windows CI
     command = f'call "{vcvars}" && cl /nologo /W4 /WX /MT /O2 /Fe:"{output}" "{source}" Ws2_32.lib'
     try:
         build = subprocess.run(
-            ["cmd.exe", "/d", "/s", "/c", command],
+            ["cmd.exe", "/d", "/c", command],
             check=False,
             capture_output=True,
             text=True,
