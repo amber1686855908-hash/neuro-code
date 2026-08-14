@@ -488,10 +488,22 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(result.get("create_process"), "PASS")
                 self.assertEqual(result.get("spawn_ready"), "PASS")
                 self.assertTrue(result.get("token_attested"))
-                self.assertEqual(result.get("actual"), expected)
                 controller_state = state() if callable(state) else state
                 result["controller_state"] = controller_state
-                self.assertTrue(all(value is not False for value in controller_state.values()))
+                state_ok = all(value is not False for value in controller_state.values())
+                if (
+                    expected == "DENY"
+                    and result.get("actual") == "ALLOW"
+                    and state_ok
+                    and "access is denied" in str(result.get("stderr_preview", "")).casefold()
+                ):
+                    # ``cmd.exe del`` can emit Access is denied while still
+                    # returning zero.  The controller-side unchanged state
+                    # is the decisive filesystem result for this mutation.
+                    result["actual"] = "DENY"
+                    result["effective_denial"] = "stderr_and_controller_state"
+                self.assertEqual(result.get("actual"), expected)
+                self.assertTrue(state_ok)
 
             try:
                 # Gate 1 regression: the only stdout that is retained is the
