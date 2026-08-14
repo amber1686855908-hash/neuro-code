@@ -554,7 +554,11 @@ class WindowsNativeLocalProcessSandbox(LocalProcessSandbox):
         def accept(label: str, server: WindowsNamedPipeServer) -> None:
             try:
                 results[label] = server.accept_for_runner(runner_handle)
+                _native_acceptance_stage(f"{label}_accept_returned")
             except BaseException as error:
+                _native_acceptance_stage(
+                    f"{label}_accept_error:{type(error).__name__}:{str(error)[:160]}"
+                )
                 failures.append(error)
             finally:
                 completed.set()
