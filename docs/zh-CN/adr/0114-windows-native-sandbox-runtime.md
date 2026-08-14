@@ -12,6 +12,11 @@ Windows runtime 将 controller 保持在沙箱边界之外。每个非 PTY child
 `CreateRestrictedToken(WRITE_RESTRICTED)` 应用持久化 synthetic write SID，
 再以 `CreateProcessAsUserW` 在 kill-on-close Job Object 内创建最终 child。
 
+最终 token 的 restricting SID set 只包含 installation synthetic write SID；Everyone、
+logon、sandbox-user 与 controller SID 只作为 object ACL principal。
+`DISABLE_MAX_PRIVILEGE` 必须保留 `SeChangeNotifyPrivilege`；W3 会检查该事实，绝不
+通过 `AdjustTokenPrivileges` 重新授予。
+
 controller 与 runner 通过随机、由 controller 创建的 named pipe 通信。named
 pipe 使用只允许 controller 与选定 sandbox 用户的精确 DACL，并使用带版本和长度
 前缀的二进制 frame。stdout 与 stderr 保持分离；协议 payload 不按文本解码，runner
@@ -34,7 +39,8 @@ read isolation，因此失败关闭。交互式 PTY/ConPTY 留给 W4。
   生命周期 authority。
 - 最终 child 使用显式环境，并由选定 sandbox account 推导 private profile 与临时路径；
   controller 凭据和 DPAPI 明文不会传入 child。
-- Native acceptance 必须从最终 restricted child 证明 identity、ACL、network、
-  lifecycle、二进制 stdio 与协议行为。
+- Native acceptance 必须从最终 restricted child 证明 identity、exact restricted SID、
+  保留的 traversal privilege、授权 write 与仅有 broad primary-user write 的对抗行为、
+  ACL、network、lifecycle、二进制 stdio 与协议行为。
 - 原生验收失败时阻断 W3 production admission，而不是在 runtime 改变 capability
   语义。

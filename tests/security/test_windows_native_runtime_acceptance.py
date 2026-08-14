@@ -38,10 +38,17 @@ from neuro_code.domain.sandbox.models import SandboxProfile
 from neuro_code.infrastructure.sandbox.windows_native_local_process import (
     WindowsNativeLocalProcessSandbox,
 )
+from neuro_code.infrastructure.sandbox.windows_native_runner import current_user_sid
 from neuro_code.infrastructure.sandbox.windows_sandbox_accounts import (
     _NativeWindowsSandboxAccountApi,
 )
-from neuro_code.infrastructure.sandbox.windows_sandbox_acl import _NativeWindowsAclApi
+from neuro_code.infrastructure.sandbox.windows_sandbox_acl import (
+    READ_ACCESS_MASK,
+    WRITE_ACCESS_MASK,
+    WindowsManagedAce,
+    WindowsManagedAceKind,
+    _NativeWindowsAclApi,
+)
 from neuro_code.infrastructure.sandbox.windows_sandbox_firewall import _NativeWindowsFirewallApi
 from neuro_code.infrastructure.sandbox.windows_sandbox_persistence import (
     WindowsDpapiCredentialStore,
@@ -121,8 +128,6 @@ async def _read_with_native_timeout(
 _TOKEN_PROBE = r"""
 import ctypes
 import json
-import sys
-from pathlib import Path
 
 advapi = ctypes.WinDLL("advapi32.dll", use_last_error=True)
 kernel = ctypes.WinDLL("kernel32.dll", use_last_error=True)
@@ -132,6 +137,18 @@ class SidAndAttributes(ctypes.Structure):
 
 class TokenUser(ctypes.Structure):
     _fields_ = [("User", SidAndAttributes)]
+
+class TokenGroupsOne(ctypes.Structure):
+    _fields_ = [("GroupCount", ctypes.c_uint32), ("Groups", SidAndAttributes * 1)]
+
+class Luid(ctypes.Structure):
+    _fields_ = [("LowPart", ctypes.c_uint32), ("HighPart", ctypes.c_int32)]
+
+class LuidAndAttributes(ctypes.Structure):
+    _fields_ = [("Luid", Luid), ("Attributes", ctypes.c_uint32)]
+
+class TokenPrivilegesOne(ctypes.Structure):
+    _fields_ = [("PrivilegeCount", ctypes.c_uint32), ("Privileges", LuidAndAttributes * 1)]
 
 get_current_process = kernel.GetCurrentProcess
 get_current_process.restype = ctypes.c_void_p
@@ -144,6 +161,9 @@ get_info.restype = ctypes.c_int32
 sid_to_string = advapi.ConvertSidToStringSidW
 sid_to_string.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)]
 sid_to_string.restype = ctypes.c_int32
+lookup_privilege = advapi.LookupPrivilegeValueW
+lookup_privilege.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.POINTER(Luid)]
+lookup_privilege.restype = ctypes.c_int32
 local_free = kernel.LocalFree
 local_free.argtypes = [ctypes.c_void_p]
 local_free.restype = ctypes.c_void_p
@@ -163,24 +183,59 @@ def info(kind):
         raise OSError(ctypes.get_last_error(), "GetTokenInformation")
     return data
 
-user = TokenUser.from_buffer_copy(info(1))
-sid_buffer = ctypes.c_void_p()
-if not sid_to_string(user.User.Sid, ctypes.byref(sid_buffer)):
-    raise OSError(ctypes.get_last_error(), "ConvertSidToStringSidW")
-sid = ctypes.wstring_at(sid_buffer.value)
-local_free(sid_buffer)
+def sid_text(pointer):
+    text = ctypes.c_void_p()
+    if not sid_to_string(pointer, ctypes.byref(text)):
+        raise OSError(ctypes.get_last_error(), "ConvertSidToStringSidW")
+    try:
+        return ctypes.wstring_at(text.value)
+    finally:
+        local_free(text)
+
+def sid_entries(data):
+    count = int.from_bytes(data[:4], "little")
+    offset = TokenGroupsOne.Groups.offset
+    size = ctypes.sizeof(SidAndAttributes)
+    return [SidAndAttributes.from_buffer(data, offset + index * size) for index in range(count)]
+
+user_info = info(1)
+user = TokenUser.from_buffer(user_info)
+sid = sid_text(user.User.Sid)
 restricted = bool(int.from_bytes(info(40)[:4], "little"))
 restricted_info = info(11)
 restricted_count = int.from_bytes(restricted_info[:4], "little")
-restricted_sids = []
-for index in range(restricted_count):
-    entry = SidAndAttributes.from_buffer_copy(restricted_info, 4 + index * ctypes.sizeof(SidAndAttributes))
-    text = ctypes.c_void_p()
-    if not sid_to_string(entry.Sid, ctypes.byref(text)):
-        raise OSError(ctypes.get_last_error(), "ConvertSidToStringSidW")
-    restricted_sids.append(ctypes.wstring_at(text.value))
-    local_free(text)
-print(json.dumps({"sid": sid, "restricted": restricted, "restricted_count": restricted_count, "restricted_sids": restricted_sids}))
+restricted_sids = [sid_text(entry.Sid) for entry in sid_entries(restricted_info)]
+groups_info = info(2)
+logon_sids = [
+    sid_text(entry.Sid)
+    for entry in sid_entries(groups_info)
+    if entry.Attributes & 0xC0000000 == 0xC0000000
+]
+change_notify_luid = Luid()
+if not lookup_privilege(None, "SeChangeNotifyPrivilege", ctypes.byref(change_notify_luid)):
+    raise OSError(ctypes.get_last_error(), "LookupPrivilegeValueW")
+privileges_info = info(3)
+privilege_count = int.from_bytes(privileges_info[:4], "little")
+privilege_offset = TokenPrivilegesOne.Privileges.offset
+privilege_size = ctypes.sizeof(LuidAndAttributes)
+privileges = [
+    LuidAndAttributes.from_buffer(privileges_info, privilege_offset + index * privilege_size)
+    for index in range(privilege_count)
+]
+change_notify_enabled = any(
+    item.Luid.LowPart == change_notify_luid.LowPart
+    and item.Luid.HighPart == change_notify_luid.HighPart
+    and bool(item.Attributes & 0x2)
+    for item in privileges
+)
+print(json.dumps({
+    "sid": sid,
+    "restricted": restricted,
+    "restricted_count": restricted_count,
+    "restricted_sids": restricted_sids,
+    "logon_sids": logon_sids,
+    "change_notify_enabled": change_notify_enabled,
+}))
 close(token)
 """
 
@@ -235,10 +290,12 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
             installation = root / "installation"
             state = root / "runtime-state"
             outside = root / "outside.txt"
+            outside_broad_write = root / "outside-broad-write"
             workspace.mkdir()
             readonly.mkdir()
             installation.mkdir()
             state.mkdir()
+            outside_broad_write.mkdir()
             outside.write_text("controller-owned", encoding="utf-8")
             sensitive = workspace / "controller-state.json"
             sensitive.write_text("controller secret", encoding="utf-8")
@@ -249,14 +306,33 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                 sensitive_read_paths=(sensitive,),
             )
             store = WindowsDpapiCredentialStore(installation / "credentials.dpapi")
+            acl_api = _NativeWindowsAclApi()
             authority = WindowsNativeSandboxSetupAuthority(
                 credential_store=store,
-                acl_api=_NativeWindowsAclApi(),
+                acl_api=acl_api,
                 firewall_api=_NativeWindowsFirewallApi(),
                 account_api=account_api,
                 privilege_api=privilege_api,
             )
             self.assertEqual(authority.setup(setup_request).state, WindowsSandboxSetupState.READY)
+            record = authority.identity_records(setup_request)
+            online = next(item for item in record if item.kind.value == "online")
+            broad_write_aces = (
+                WindowsManagedAce(
+                    outside_broad_write,
+                    online.user_sid,
+                    WindowsManagedAceKind.READ_ALLOW,
+                    READ_ACCESS_MASK,
+                ),
+                WindowsManagedAce(
+                    outside_broad_write,
+                    online.user_sid,
+                    WindowsManagedAceKind.WRITE_ALLOW,
+                    WRITE_ACCESS_MASK,
+                ),
+            )
+            acl_api.reconcile(outside_broad_write, desired=broad_write_aces, remove=())
+            self.assertTrue(acl_api.matches(outside_broad_write, broad_write_aces))
             adapter = WindowsNativeLocalProcessSandbox(
                 SandboxProfile.WORKSPACE,
                 workspace,
@@ -320,12 +396,16 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                 stdout = await _read_with_native_timeout(process)
                 self.assertEqual(await process.wait(), 0)
                 facts = json.loads(stdout.decode("utf-8"))
-                record = authority.identity_records(setup_request)
-                online = next(item for item in record if item.kind.value == "online")
                 self.assertEqual(facts["sid"], online.user_sid.value)
                 self.assertTrue(facts["restricted"])
-                self.assertGreaterEqual(facts["restricted_count"], 1)
-                self.assertIn(online.write_sid.value, facts["restricted_sids"])
+                self.assertEqual(facts["restricted_count"], 1)
+                self.assertEqual(set(facts["restricted_sids"]), {online.write_sid.value})
+                self.assertNotIn("S-1-1-0", facts["restricted_sids"])
+                self.assertNotIn(online.user_sid.value, facts["restricted_sids"])
+                self.assertNotIn(current_user_sid(), facts["restricted_sids"])
+                self.assertTrue(facts["logon_sids"])
+                self.assertTrue(set(facts["logon_sids"]).isdisjoint(facts["restricted_sids"]))
+                self.assertTrue(facts["change_notify_enabled"])
 
                 workspace_probe = (
                     "from pathlib import Path\n"
@@ -333,6 +413,7 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                     f"p=Path({str(workspace / 'runtime.txt')!r}); p.write_bytes(b'workspace-write')\n"
                     f"s=Path({str(sensitive)!r}); i=Path({str(installation)!r}); c=Path({str(installation / 'credentials.dpapi')!r})\n"
                     f"o=Path({str(outside)!r})\n"
+                    f"b=Path({str(outside_broad_write / 'created.txt')!r})\n"
                     "def denied(action):\n"
                     "    try: action(); return False\n"
                     "    except (PermissionError, OSError): return True\n"
@@ -341,7 +422,8 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                     "'credential_read=' + str(denied(lambda: c.read_bytes())), "
                     "'credential_write=' + str(denied(lambda: c.write_bytes(b'x'))), "
                     "'credential_delete=' + str(denied(lambda: c.unlink())), "
-                    "'outside_write=' + str(denied(lambda: o.write_bytes(b'x'))))"
+                    "'outside_write=' + str(denied(lambda: o.write_bytes(b'x'))), "
+                    "'broad_write_outside=' + str(denied(lambda: b.write_bytes(b'x'))))"
                 )
                 compile(workspace_probe, "<workspace-probe>", "exec")
                 process = await adapter.spawn(
@@ -363,6 +445,7 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn(b"credential_write=True", workspace_output)
                 self.assertIn(b"credential_delete=True", workspace_output)
                 self.assertIn(b"outside_write=True", workspace_output)
+                self.assertIn(b"broad_write_outside=True", workspace_output)
                 self.assertEqual(await process.wait(), 0)
 
                 read_only_probe = (
@@ -414,7 +497,8 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(await offline_identity_process.wait(), 0)
                 offline = next(item for item in record if item.kind.value == "offline")
                 self.assertEqual(offline_facts["sid"], offline.user_sid.value)
-                self.assertIn(offline.write_sid.value, offline_facts["restricted_sids"])
+                self.assertEqual(set(offline_facts["restricted_sids"]), {offline.write_sid.value})
+                self.assertTrue(offline_facts["change_notify_enabled"])
 
                 listener = socket.socket()
                 listener.bind(("127.0.0.1", 0))

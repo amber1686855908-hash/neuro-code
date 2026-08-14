@@ -1549,8 +1549,11 @@ W3 adds the Windows non-PTY runtime for Bash, background Bash, and MCP stdio in
 preflighted through W2 and fails before child creation unless setup is `READY`.
 The controller starts a trusted workspace-independent runner as the selected
 Offline or Online account; the runner creates the final child with a
-`WRITE_RESTRICTED` token, the installation synthetic write SID, and a
-kill-on-close Job Object. `ISOLATED` selects Offline and `INHERIT` selects
+`WRITE_RESTRICTED` token whose restricting set is exactly the installation
+synthetic write SID, plus a kill-on-close Job Object. Everyone, logon,
+sandbox-user, and controller SIDs remain object-ACL principals only. The runner
+attests that `DISABLE_MAX_PRIVILEGE` preserved `SeChangeNotifyPrivilege` and
+does not call `AdjustTokenPrivileges`. `ISOLATED` selects Offline and `INHERIT` selects
 Online without changing the persistent Offline Firewall rule. The fully wired
 W3 runtime declares a candidate provider contract of read `LIMITED`, write
 `STRONG`, and network `STRONG`, certified by privileged native acceptance and

@@ -17,14 +17,19 @@ class _FakeSecurityTokenApi:
         self.source_handle = 101
         self.created_handle = 202
         self.closed: list[int] = []
-        self.create_calls: list[
-            tuple[int, int, tuple[SyntheticWindowsSid, ...], tuple[str, ...]]
-        ] = []
-        self.inspection = WindowsTokenInspection(restricted_sid_count=1, is_restricted=True)
+        self.create_calls: list[tuple[int, int, tuple[SyntheticWindowsSid, ...]]] = []
+        sid = SyntheticWindowsSid.from_components((11, 22, 33, 44))
+        self.inspection = WindowsTokenInspection(
+            restricted_sid_count=1,
+            is_restricted=True,
+            privilege_count=1,
+            enabled_privilege_count=1,
+            restricted_sids=(sid.value,),
+            change_notify_privilege_enabled=True,
+        )
         self.fail_create = False
         self.fail_inspect = False
         self.fail_close = False
-        self.enabled_change_notify = 0
         self.default_dacl_sids: tuple[str, ...] | None = None
 
     def open_current_process_token(self) -> int:
@@ -35,11 +40,8 @@ class _FakeSecurityTokenApi:
         existing_handle: int,
         flags: int,
         restricted_sids: tuple[SyntheticWindowsSid, ...],
-        additional_restricting_sids: tuple[str, ...] = (),
     ) -> int:
-        self.create_calls.append(
-            (existing_handle, flags, restricted_sids, additional_restricting_sids)
-        )
+        self.create_calls.append((existing_handle, flags, restricted_sids))
         if self.fail_create:
             raise WindowsTokenError("CreateRestrictedToken", 5)
         return self.created_handle
@@ -48,9 +50,6 @@ class _FakeSecurityTokenApi:
         if self.fail_inspect:
             raise WindowsTokenError("GetTokenInformation", 5)
         return self.inspection
-
-    def enable_change_notify_privilege(self, token_handle: int) -> None:
-        self.enabled_change_notify += 1
 
     def set_default_dacl(self, token_handle: int, sid_texts: tuple[str, ...]) -> None:
         self.default_dacl_sids = sid_texts
@@ -92,41 +91,17 @@ class WindowsRestrictedTokenTests(unittest.TestCase):
         token = WindowsRestrictedToken.create_from_current_process(request, api=api)
         self.assertEqual(token.handle, api.created_handle)
         self.assertEqual(token.inspection.restricted_sid_count, 1)
+        self.assertEqual(token.inspection.restricted_sids, (sid.value,))
         self.assertTrue(token.inspection.is_restricted)
-        self.assertEqual(token.inspection.enabled_privilege_count, 0)
+        self.assertTrue(token.inspection.change_notify_privilege_enabled)
         self.assertEqual(api.closed, [api.source_handle])
         self.assertEqual(
             api.create_calls,
-            [(api.source_handle, request.flags, (sid,), ())],
+            [(api.source_handle, request.flags, (sid,))],
         )
         token.close()
         token.close()
         self.assertEqual(api.closed, [api.source_handle, api.created_handle])
-
-    def test_runtime_can_restore_only_directory_traversal_privilege(self) -> None:
-        api = _FakeSecurityTokenApi()
-        token = WindowsRestrictedToken.create_from_current_process(
-            WindowsRestrictedTokenRequest((SyntheticWindowsSid.from_components((11, 22, 33, 44)),)),
-            api=api,
-        )
-        token.enable_change_notify_privilege()
-        self.assertEqual(api.enabled_change_notify, 1)
-        token.close()
-
-    def test_runtime_can_add_fixed_session_restricting_sids(self) -> None:
-        api = _FakeSecurityTokenApi()
-        sid = SyntheticWindowsSid.from_components((11, 22, 33, 44))
-        request = WindowsRestrictedTokenRequest((sid,))
-        token = WindowsRestrictedToken.create_from_current_process(
-            request,
-            additional_restricting_sids=("S-1-5-5-0-1", "S-1-1-0"),
-            api=api,
-        )
-        self.assertEqual(
-            api.create_calls[-1],
-            (api.source_handle, request.flags, (sid,), ("S-1-5-5-0-1", "S-1-1-0")),
-        )
-        token.close()
 
     def test_runtime_can_set_bounded_default_dacl(self) -> None:
         api = _FakeSecurityTokenApi()
@@ -179,7 +154,8 @@ class WindowsRestrictedTokenTests(unittest.TestCase):
         )
         with WindowsRestrictedToken.create_from_current_process(request) as token:
             self.assertTrue(token.inspection.is_restricted)
-            self.assertGreaterEqual(token.inspection.restricted_sid_count, 1)
+            self.assertEqual(token.inspection.restricted_sids, (request.restricted_sids[0].value,))
+            self.assertTrue(token.inspection.change_notify_privilege_enabled)
             self.assertLessEqual(token.inspection.enabled_privilege_count, 1)
 
 

@@ -13,6 +13,12 @@ its own process token, applies the persisted synthetic write SID through the
 W1 `CreateRestrictedToken(WRITE_RESTRICTED)` primitive, and creates the final
 child with `CreateProcessAsUserW` inside a kill-on-close Job Object.
 
+The final token's restricting SID set contains exactly the installation
+synthetic write SID. Everyone, logon, sandbox-user, and controller SIDs remain
+object-ACL principals only. `DISABLE_MAX_PRIVILEGE` must preserve
+`SeChangeNotifyPrivilege`; W3 inspects that fact and never re-grants it with
+`AdjustTokenPrivileges`.
+
 Controller and runner communicate through a random controller-owned named
 pipe with an exact controller/selected-user DACL and versioned length-prefixed
 binary frames.  Stdout and stderr remain separate; protocol payloads are not
@@ -41,6 +47,8 @@ PTY/ConPTY remains a W4 scope.
   and temporary paths derived from the selected sandbox account; controller
   credentials and DPAPI plaintext are never forwarded.
 - Native acceptance must execute the final restricted child and prove identity,
-  ACL, network, lifecycle, binary stdio, and protocol behavior.
+  exact restricted SIDs, preserved traversal privilege, authorized and
+  broad-primary-user-only write behavior, ACL, network, lifecycle, binary
+  stdio, and protocol behavior.
 - A failed native acceptance blocks W3 production admission rather than
   changing capability semantics at runtime.

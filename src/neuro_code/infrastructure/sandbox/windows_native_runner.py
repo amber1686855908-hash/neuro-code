@@ -848,25 +848,24 @@ class _RunnerChild:
         write_sid = SyntheticWindowsSid(_validated_text(payload.get("write_sid"), "write SID"))
         token_request = WindowsRestrictedTokenRequest((write_sid,))
         # WRITE_RESTRICTED is evaluated in addition to the normal token SID
-        # check.  Keep the installation SID as the write gate, while retaining
-        # the runner's logon/session SIDs and Everyone as fixed session
-        # identities required for ordinary Windows object initialization.
+        # check.  The installation-scoped synthetic SID is therefore the sole
+        # restricting SID and the sole second-half write authority.  Session,
+        # account, and Everyone SIDs belong only on object ACLs below.
         runner_sid = current_user_sid()
         runner_logon_sid = current_logon_sid()
-        token = WindowsRestrictedToken.create_from_current_process(
-            token_request,
-            additional_restricting_sids=(runner_logon_sid, _WORLD_SID),
-        )
+        token = WindowsRestrictedToken.create_from_current_process(token_request)
         handles_to_close: list[int] = []
         created: RunnerLaunch | None = None
         try:
+            if token.inspection.restricted_sids != (write_sid.value,):
+                raise SandboxError(
+                    "Windows restricted token does not contain the exact write SID authority"
+                )
+            if not token.inspection.change_notify_privilege_enabled:
+                raise SandboxError(
+                    "Windows restricted token did not preserve SeChangeNotifyPrivilege"
+                )
             token.set_default_dacl((runner_logon_sid, _WORLD_SID, write_sid.value))
-            # CreateRestrictedToken(DISABLE_MAX_PRIVILEGE) removes the source
-            # account's privileges.  Restore only SeChangeNotifyPrivilege so
-            # the final child can traverse ordinary parent directories while
-            # resolving its executable/cwd/imports; this does not add file,
-            # network, or administrative authority.
-            token.enable_change_notify_privilege()
             self._desktop_handle, self._desktop_name = self._api.create_private_desktop(
                 (runner_sid, runner_logon_sid, write_sid.value, _WORLD_SID)
             )
