@@ -289,6 +289,15 @@ class _InstallationRecord:
                 "action": self.offline_firewall_rule.action,
                 "enabled": self.offline_firewall_rule.enabled,
                 "profile": self.offline_firewall_rule.profile,
+                "protocol": self.offline_firewall_rule.protocol,
+                "local_port": self.offline_firewall_rule.local_port,
+                "remote_port": self.offline_firewall_rule.remote_port,
+                "local_address": self.offline_firewall_rule.local_address,
+                "remote_address": self.offline_firewall_rule.remote_address,
+                "program": self.offline_firewall_rule.program,
+                "service": self.offline_firewall_rule.service,
+                "interface_alias": self.offline_firewall_rule.interface_alias,
+                "interface_type": self.offline_firewall_rule.interface_type,
             },
         }
         return json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -360,6 +369,15 @@ class _InstallationRecord:
                 str(firewall_payload.get("action", "Block")),
                 bool(firewall_payload.get("enabled", True)),
                 str(firewall_payload.get("profile", "Any")),
+                str(firewall_payload.get("protocol", "Any")),
+                str(firewall_payload.get("local_port", "Any")),
+                str(firewall_payload.get("remote_port", "Any")),
+                str(firewall_payload.get("local_address", "Any")),
+                str(firewall_payload.get("remote_address", "Any")),
+                str(firewall_payload.get("program", "Any")),
+                str(firewall_payload.get("service", "Any")),
+                str(firewall_payload.get("interface_alias", "Any")),
+                str(firewall_payload.get("interface_type", "Any")),
             )
             record = cls(
                 int(payload["schema_version"]),

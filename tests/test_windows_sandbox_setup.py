@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import tempfile
@@ -349,6 +350,67 @@ class WindowsSandboxSetupAuthorityTests(unittest.TestCase):
                 True,
                 "Domain",
             )
+
+    @staticmethod
+    def _native_firewall_payload() -> dict[str, object]:
+        return {
+            "Direction": "Outbound",
+            "Action": "Block",
+            "Enabled": "True",
+            "Profile": "Any",
+            "LocalUser": "S-1-5-21-100-200-300-2000",
+            "Protocol": ["Any"],
+            "LocalPort": ["Any"],
+            "RemotePort": ["Any"],
+            "LocalAddress": ["Any"],
+            "RemoteAddress": ["Any"],
+            "Program": ["Any"],
+            "Service": ["Any"],
+            "InterfaceAlias": ["Any"],
+            "InterfaceType": ["Any"],
+        }
+
+    def _native_firewall_api_for_payload(
+        self, payload: dict[str, object]
+    ) -> _NativeWindowsFirewallApi:
+        api = object.__new__(_NativeWindowsFirewallApi)
+        api._run = mock.Mock(  # type: ignore[method-assign]
+            return_value=subprocess.CompletedProcess(
+                args=["powershell"],
+                returncode=0,
+                stdout=json.dumps(payload),
+                stderr="",
+            )
+        )
+        return api
+
+    def _native_firewall_rule_for_test(self) -> WindowsFirewallRule:
+        return firewall_rule_for_installation(
+            "install-1",
+            WindowsSandboxIdentityKind.OFFLINE,
+            WindowsAccountSid("S-1-5-21-100-200-300-2000"),
+        )
+
+    def test_native_firewall_ready_requires_all_broad_filters(self) -> None:
+        rule = self._native_firewall_rule_for_test()
+        api = self._native_firewall_api_for_payload(self._native_firewall_payload())
+        self.assertTrue(api.rule_exists(rule))
+        run_mock = api._run  # type: ignore[attr-defined]
+        command = run_mock.call_args.args[0][-1]
+        self.assertIn("Get-NetFirewallPortFilter", command)
+        self.assertIn("Get-NetFirewallAddressFilter", command)
+        self.assertIn("Get-NetFirewallApplicationFilter", command)
+        self.assertIn("Get-NetFirewallServiceFilter", command)
+        self.assertIn("Get-NetFirewallInterfaceFilter", command)
+
+    def test_native_firewall_protocol_and_address_drift_fail_closed(self) -> None:
+        rule = self._native_firewall_rule_for_test()
+        protocol_drift = self._native_firewall_payload()
+        protocol_drift["Protocol"] = ["TCP"]
+        self.assertFalse(self._native_firewall_api_for_payload(protocol_drift).rule_exists(rule))
+        address_drift = self._native_firewall_payload()
+        address_drift["RemoteAddress"] = ["1.1.1.1"]
+        self.assertFalse(self._native_firewall_api_for_payload(address_drift).rule_exists(rule))
 
     def test_plan_has_write_read_and_sensitive_deny_roles(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -13,6 +13,7 @@ import contextlib
 import ctypes
 import json
 import os
+import socket
 import unittest
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -26,6 +27,7 @@ from neuro_code.application.ports.sandbox import (
     LocalProcessLifecycle,
     LocalProcessNetworkPolicy,
     LocalProcessPurpose,
+    LocalProcessSecurityStrength,
     LocalProcessStdioMode,
     LocalWorkspaceAccess,
     LocalWorkspaceAccessMode,
@@ -57,13 +59,17 @@ from neuro_code.infrastructure.sandbox.windows_sandbox_acl import (
     _AceHeader,
     _NativeWindowsAclApi,
 )
-from neuro_code.infrastructure.sandbox.windows_sandbox_firewall import _NativeWindowsFirewallApi
+from neuro_code.infrastructure.sandbox.windows_sandbox_firewall import (
+    WindowsFirewallRule,
+    _NativeWindowsFirewallApi,
+)
 from neuro_code.infrastructure.sandbox.windows_sandbox_identity import SyntheticWindowsSid
 from neuro_code.infrastructure.sandbox.windows_sandbox_persistence import (
     WindowsDpapiCredentialStore,
 )
 from neuro_code.infrastructure.sandbox.windows_sandbox_setup import (
     WindowsNativeSandboxSetupAuthority,
+    _InstallationRecord,
     _NativeWindowsSetupPrivilegeApi,
 )
 
@@ -71,8 +77,29 @@ _SENTINEL = "GATE2_NON_SECRET_SENTINEL"
 _APPENDED = "GATE2_APPEND_SENTINEL"
 _OVERWRITTEN = "GATE2_OVERWRITE_SENTINEL"
 _NUL_CANARY_COMMAND = ("echo", "GATE2_NUL_CANARY>NUL")
+_BENIGN_OUTBOUND_PROBE = ("1.1.1.1", 80)
 ProbeState = Callable[[], dict[str, object]]
 Command = tuple[str, ...]
+
+
+class _RecordingFirewallApi:
+    """Native delegating firewall adapter used only by Gate 3 evidence."""
+
+    def __init__(self, delegate: _NativeWindowsFirewallApi) -> None:
+        self.delegate = delegate
+        self.calls: list[str] = []
+
+    def ensure_outbound_block(self, rule: WindowsFirewallRule) -> None:
+        self.calls.append("ENSURE")
+        self.delegate.ensure_outbound_block(rule)
+
+    def remove_rule(self, rule: WindowsFirewallRule) -> None:
+        self.calls.append("REMOVE")
+        self.delegate.remove_rule(rule)
+
+    def rule_exists(self, rule: WindowsFirewallRule) -> bool:
+        self.calls.append("INSPECT")
+        return self.delegate.rule_exists(rule)
 
 
 @dataclass(frozen=True, slots=True)
@@ -353,17 +380,28 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                 label: str,
                 identity: str,
                 network: LocalProcessNetworkPolicy,
-                command: str | Command,
-                expected: str,
+                command: str | Command | None = None,
+                direct_executable: str | None = None,
+                direct_arguments: tuple[str, ...] | None = None,
+                expected: str = "UNSPECIFIED",
                 capture_stdout: bool = False,
                 expected_stdout: str | None = None,
+                record_stdout_nonempty: bool = False,
             ) -> dict[str, object]:
-                command_args = (command,) if isinstance(command, str) else command
+                if direct_arguments is not None:
+                    child_executable = direct_executable or executable
+                    child_arguments = direct_arguments
+                else:
+                    if command is None:
+                        raise AssertionError("command or direct arguments are required")
+                    command_args = (command,) if isinstance(command, str) else command
+                    child_executable = executable
+                    child_arguments = ("/d", "/s", "/c", *command_args)
                 request = _request(
                     workspace=workspace,
                     network=network,
-                    executable=executable,
-                    arguments=("/d", "/s", "/c", *command_args),
+                    executable=child_executable,
+                    arguments=child_arguments,
                 )
                 adapter = WindowsNativeLocalProcessSandbox(
                     SandboxProfile.WORKSPACE,
@@ -439,6 +477,8 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                         result["exit_code"] = process.returncode
                         result["actual"] = "ALLOW" if process.returncode == 0 else "DENY"
                     stdout_text = captured_stdout.decode("utf-8", errors="replace")
+                    if record_stdout_nonempty:
+                        result["stdout_nonempty"] = bool(captured_stdout)
                     if capture_stdout:
                         result["stdout_preview"] = stdout_text.strip()[:256]
                     if expected_stdout is not None:
@@ -860,6 +900,354 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                                 "offline_real_write_deny": offline_write_deny,
                             },
                             "token_attestation": "active_before_every_spawn_ready",
+                        },
+                        sort_keys=True,
+                    ),
+                    flush=True,
+                )
+            finally:
+                with contextlib.suppress(BaseException):
+                    authority.cleanup(setup_request)
+
+    async def test_gate3_network_isolation(self) -> None:  # pragma: no cover - Windows CI
+        """Prove static Offline Firewall authority around real final children."""
+
+        privilege_api = _NativeWindowsSetupPrivilegeApi()
+        self.assertTrue(privilege_api.is_administrator(), "W2 setup acceptance requires elevation")
+
+        def controller_probe() -> None:
+            with socket.create_connection(_BENIGN_OUTBOUND_PROBE, timeout=5):
+                return
+
+        try:
+            controller_probe()
+        except OSError as error:
+            print(
+                "W3_GATE3_BLOCKER="
+                + json.dumps(
+                    {
+                        "classification": "NETWORK_PROBE_ENVIRONMENT_UNAVAILABLE",
+                        "error_type": type(error).__name__,
+                    },
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
+            self.fail("NETWORK_PROBE_ENVIRONMENT_UNAVAILABLE")
+
+        system_root = os.environ.get("SYSTEMROOT")
+        if not system_root:
+            self.fail("NETWORK_PROBE_EXECUTABLE_UNAVAILABLE")
+        curl = Path(system_root) / "System32" / "curl.exe"
+        if not curl.is_file():
+            print("W3_GATE3_BLOCKER=NETWORK_PROBE_EXECUTABLE_UNAVAILABLE", flush=True)
+            self.fail("NETWORK_PROBE_EXECUTABLE_UNAVAILABLE")
+
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace = root / "workspace"
+            installation = root / "installation"
+            runtime_state = root / "runtime-state"
+            workspace.mkdir()
+            installation.mkdir()
+            runtime_state.mkdir()
+            sensitive = workspace / "sensitive.txt"
+            sensitive.write_text(_SENTINEL, encoding="utf-8")
+            setup_request = WindowsSandboxSetupRequest(
+                installation_root=installation,
+                read_roots=(workspace,),
+                writable_roots=(workspace,),
+                sensitive_read_paths=(sensitive,),
+            )
+            real_firewall = _NativeWindowsFirewallApi()
+            recording_firewall = _RecordingFirewallApi(real_firewall)
+            account_api = _NativeWindowsSandboxAccountApi()
+            authority = WindowsNativeSandboxSetupAuthority(
+                credential_store=WindowsDpapiCredentialStore(installation / "credentials.dpapi"),
+                acl_api=_NativeWindowsAclApi(),
+                firewall_api=recording_firewall,
+                account_api=account_api,
+                privilege_api=privilege_api,
+            )
+            setup_snapshot = authority.setup(setup_request)
+            self.assertEqual(setup_snapshot.state, WindowsSandboxSetupState.READY)
+            encoded = authority._store(setup_request).load()  # type: ignore[attr-defined]
+            self.assertIsNotNone(encoded)
+            record = _InstallationRecord.decode(cast(bytes, encoded))
+
+            firewall_observations: list[dict[str, object]] = []
+
+            def assert_firewall_ready(label: str) -> None:
+                inspected = authority.inspect(setup_request)
+                native_exact = real_firewall.rule_exists(record.offline_firewall_rule)
+                firewall_observations.append(
+                    {
+                        "label": label,
+                        "authority": inspected.state.value,
+                        "exact": native_exact,
+                    }
+                )
+                self.assertEqual(inspected.state, WindowsSandboxSetupState.READY)
+                self.assertTrue(native_exact)
+
+            recording_firewall.calls.clear()
+            executable = str(curl)
+            curl_arguments = (
+                "--head",
+                "--silent",
+                "--show-error",
+                "--connect-timeout",
+                "5",
+                "--max-time",
+                "8",
+                "http://1.1.1.1/",
+            )
+
+            async def run_network_child(
+                *,
+                label: str,
+                identity: str,
+                network: LocalProcessNetworkPolicy,
+            ) -> dict[str, object]:
+                request = _request(
+                    workspace=workspace,
+                    network=network,
+                    executable=executable,
+                    arguments=curl_arguments,
+                )
+                adapter = WindowsNativeLocalProcessSandbox(
+                    SandboxProfile.WORKSPACE,
+                    workspace,
+                    runtime_state,
+                    setup_authority=authority,
+                    setup_request_factory=lambda _request: setup_request,
+                    _diagnostic_desktop_mode=_WindowsNativeDesktopMode.PRIVATE_DESKTOP,
+                    _diagnostic_create_no_window=True,
+                )
+                result: dict[str, object] = {
+                    "operation": label,
+                    "identity": identity,
+                    "create_process": "UNKNOWN",
+                    "spawn_ready": "FAIL",
+                    "token_attested": False,
+                    "actual": "ERROR",
+                    "exit_code": None,
+                    "stdout_nonempty": False,
+                }
+                process: OwnedLocalProcess | None = None
+                combined: asyncio.Future[Any] | None = None
+                stdout = b""
+                stderr = b""
+                try:
+                    process = await adapter.spawn(request)
+                    result["create_process"] = "PASS"
+                    result["spawn_ready"] = "PASS"
+                    combined = asyncio.gather(
+                        asyncio.create_task(_drain_stream(process.stdout)),
+                        asyncio.create_task(_drain_stream(process.stderr)),
+                        asyncio.create_task(process.wait()),
+                        return_exceptions=True,
+                    )
+                    values = cast(
+                        object,
+                        await asyncio.wait_for(asyncio.shield(combined), timeout=10),
+                    )
+                    if isinstance(values, list) and len(values) == 3:
+                        if isinstance(values[0], bytes):
+                            stdout = values[0]
+                        if isinstance(values[1], bytes):
+                            stderr = values[1]
+                        if isinstance(values[2], int):
+                            result["exit_code"] = values[2]
+                            result["actual"] = "ALLOW" if values[2] == 0 else "DENY"
+                except TimeoutError:
+                    result["actual"] = "TIMEOUT"
+                except BaseException as error:
+                    result["error_class"] = type(error).__name__
+                finally:
+                    if process is not None and process.returncode is None:
+                        with contextlib.suppress(BaseException):
+                            await process.terminate(grace_seconds=0.5)
+                    if combined is not None and not combined.done():
+                        with contextlib.suppress(BaseException):
+                            values = cast(object, await asyncio.wait_for(combined, timeout=2))
+                            if isinstance(values, list) and len(values) == 3:
+                                if isinstance(values[0], bytes):
+                                    stdout = values[0]
+                                if isinstance(values[1], bytes):
+                                    stderr = values[1]
+                                if isinstance(values[2], int):
+                                    result["exit_code"] = values[2]
+                                    result["actual"] = "ALLOW" if values[2] == 0 else "DENY"
+                    if process is not None and process.returncode is not None:
+                        result["exit_code"] = process.returncode
+                        result["actual"] = "ALLOW" if process.returncode == 0 else "DENY"
+                    result["stdout_nonempty"] = bool(stdout)
+                    result["stderr_preview"] = stderr.decode("utf-8", errors="replace")[:512]
+                    diagnostic = (
+                        cast(Any, process).diagnostic_snapshot() if process is not None else None
+                    )
+                    if isinstance(diagnostic, dict):
+                        attestation = diagnostic.get("security_attestation")
+                        expected_sid = online_sid if identity == "ONLINE" else offline_sid
+                        result["token_attested"] = bool(
+                            isinstance(attestation, dict)
+                            and attestation.get("user_sid") == expected_sid
+                            and attestation.get("is_restricted") is True
+                            and tuple(attestation.get("restricted_sids", ())) == (write_sid.value,)
+                            and attestation.get("change_notify_privilege_enabled") is True
+                            and attestation.get("unexpected_enabled_privilege_count") == 0
+                        )
+                        runner = diagnostic.get("runner")
+                        if isinstance(runner, dict):
+                            result["runner_exit"] = runner.get("exit_code")
+                    print(
+                        "W3_GATE3_NETWORK_PROBE=" + json.dumps(result, sort_keys=True),
+                        flush=True,
+                    )
+                return result
+
+            online_sid = cast(str, setup_snapshot.online_user_sid)
+            offline_sid = cast(str, setup_snapshot.offline_user_sid)
+            write_sid = SyntheticWindowsSid(cast(str, setup_snapshot.write_restricting_sid))
+
+            try:
+                # Firewall exactness is checked before and after every child;
+                # runtime setup inspection is the only permitted call path.
+                assert_firewall_ready("before_offline_1")
+                offline_1 = await run_network_child(
+                    label="OFFLINE_1",
+                    identity="OFFLINE",
+                    network=LocalProcessNetworkPolicy.ISOLATED,
+                )
+                self.assertEqual(offline_1.get("create_process"), "PASS")
+                self.assertEqual(offline_1.get("spawn_ready"), "PASS")
+                self.assertTrue(offline_1.get("token_attested"))
+                self.assertEqual(offline_1.get("actual"), "DENY")
+                self.assertNotEqual(offline_1.get("exit_code"), 0)
+                assert_firewall_ready("after_offline_1")
+
+                online_1 = await run_network_child(
+                    label="ONLINE_1",
+                    identity="ONLINE",
+                    network=LocalProcessNetworkPolicy.INHERIT,
+                )
+                self.assertEqual(online_1.get("create_process"), "PASS")
+                self.assertEqual(online_1.get("spawn_ready"), "PASS")
+                self.assertTrue(online_1.get("token_attested"))
+                self.assertEqual(online_1.get("actual"), "ALLOW")
+                self.assertEqual(online_1.get("exit_code"), 0)
+                self.assertTrue(online_1.get("stdout_nonempty"))
+                assert_firewall_ready("after_online_1")
+
+                offline_2 = await run_network_child(
+                    label="OFFLINE_2",
+                    identity="OFFLINE",
+                    network=LocalProcessNetworkPolicy.ISOLATED,
+                )
+                self.assertEqual(offline_2.get("create_process"), "PASS")
+                self.assertEqual(offline_2.get("spawn_ready"), "PASS")
+                self.assertTrue(offline_2.get("token_attested"))
+                self.assertEqual(offline_2.get("actual"), "DENY")
+                self.assertNotEqual(offline_2.get("exit_code"), 0)
+                assert_firewall_ready("after_offline_2")
+
+                # Two identities share one static setup.  Poll the real native
+                # rule while both final children are alive so a hidden rule
+                # toggle/removal cannot explain the observed results.
+                recording_firewall.calls.clear()
+                monitor_stop = asyncio.Event()
+                monitor_observations: list[bool] = []
+
+                async def monitor_firewall() -> None:
+                    while not monitor_stop.is_set():
+                        monitor_observations.append(
+                            await asyncio.to_thread(
+                                real_firewall.rule_exists,
+                                record.offline_firewall_rule,
+                            )
+                        )
+                        await asyncio.sleep(0.05)
+
+                monitor = asyncio.create_task(monitor_firewall())
+                try:
+                    concurrent_online, concurrent_offline = await asyncio.gather(
+                        run_network_child(
+                            label="CONCURRENT_ONLINE",
+                            identity="ONLINE",
+                            network=LocalProcessNetworkPolicy.INHERIT,
+                        ),
+                        run_network_child(
+                            label="CONCURRENT_OFFLINE",
+                            identity="OFFLINE",
+                            network=LocalProcessNetworkPolicy.ISOLATED,
+                        ),
+                    )
+                finally:
+                    monitor_stop.set()
+                    with contextlib.suppress(BaseException):
+                        await monitor
+                self.assertTrue(monitor_observations)
+                self.assertTrue(all(monitor_observations))
+                self.assertTrue(concurrent_online.get("token_attested"))
+                self.assertEqual(concurrent_online.get("actual"), "ALLOW")
+                self.assertEqual(concurrent_online.get("exit_code"), 0)
+                self.assertTrue(concurrent_online.get("stdout_nonempty"))
+                self.assertTrue(concurrent_offline.get("token_attested"))
+                self.assertEqual(concurrent_offline.get("actual"), "DENY")
+                self.assertNotEqual(concurrent_offline.get("exit_code"), 0)
+                mutation_calls = [
+                    call for call in recording_firewall.calls if call in {"ENSURE", "REMOVE"}
+                ]
+                self.assertEqual(mutation_calls, [])
+
+                try:
+                    controller_probe()
+                except OSError as error:
+                    self.fail(
+                        f"NETWORK_PROBE_ENVIRONMENT_UNAVAILABLE_POSTFLIGHT:{type(error).__name__}"
+                    )
+                assert_firewall_ready("controller_postflight")
+
+                # Gate 3 evidence is only promoted after the complete network
+                # sequence and static-rule invariant have passed.
+                adapter = WindowsNativeLocalProcessSandbox(
+                    SandboxProfile.WORKSPACE,
+                    workspace,
+                    runtime_state,
+                    setup_authority=authority,
+                    setup_request_factory=lambda _request: setup_request,
+                    _diagnostic_desktop_mode=_WindowsNativeDesktopMode.PRIVATE_DESKTOP,
+                    _diagnostic_create_no_window=True,
+                )
+                self.assertEqual(
+                    adapter.security_capabilities.read_isolation,
+                    LocalProcessSecurityStrength.LIMITED,
+                )
+                self.assertEqual(
+                    adapter.security_capabilities.write_isolation,
+                    LocalProcessSecurityStrength.STRONG,
+                )
+                self.assertEqual(
+                    adapter.security_capabilities.network_isolation,
+                    LocalProcessSecurityStrength.STRONG,
+                )
+                print(
+                    "W3_GATE3_RESULTS="
+                    + json.dumps(
+                        {
+                            "firewall": firewall_observations,
+                            "runtime_firewall_mutations": mutation_calls,
+                            "controller_preflight": "PASS",
+                            "controller_postflight": "PASS",
+                            "online_offline_concurrent_rule_observations": len(
+                                monitor_observations
+                            ),
+                            "capabilities": {
+                                "read": LocalProcessSecurityStrength.LIMITED.value,
+                                "write": LocalProcessSecurityStrength.STRONG.value,
+                                "network": LocalProcessSecurityStrength.STRONG.value,
+                            },
                         },
                         sort_keys=True,
                     ),
