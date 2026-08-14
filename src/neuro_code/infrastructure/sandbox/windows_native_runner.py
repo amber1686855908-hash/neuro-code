@@ -44,6 +44,8 @@ from neuro_code.infrastructure.sandbox.windows_sandbox_identity import Synthetic
 from neuro_code.infrastructure.sandbox.windows_security_token import (
     WindowsRestrictedToken,
     WindowsRestrictedTokenRequest,
+    WindowsTokenInspection,
+    inspect_windows_process_token,
 )
 from neuro_code.shared.errors import SandboxError
 
@@ -1127,6 +1129,7 @@ class _RunnerChild:
         self._ephemeral_home: Path | None = None
         self._output_handles: list[int] = []
         self._threads: list[threading.Thread] = []
+        self._token_attestation: WindowsTokenInspection | None = None
         try:
             self._create(payload)
         except BaseException:
@@ -1195,7 +1198,6 @@ class _RunnerChild:
             )
             if ephemeral_home:
                 self._ephemeral_home = Path(private_home)
-            runner_sid = current_user_sid()
             private_tmp = self._api.get_private_temp_path(private_home, runner_sid)
             # These values are derived from the selected sandbox account, never
             # inherited from the controller.  A model request cannot redirect
@@ -1271,9 +1273,43 @@ class _RunnerChild:
             ]
             for handle in self._output_handles:
                 handles_to_close.remove(handle)
+            # Attest the actual final child process, not the runner token or a
+            # Python-side helper.  This is the last security gate before the
+            # controller may observe SpawnReady; any failure tears down the
+            # Job-owned child in the enclosing fail-closed path.
+            child_attestation = inspect_windows_process_token(created.process_handle)
+            if child_attestation.user_sid != runner_sid:
+                raise SandboxError("Windows final child TokenUser does not match selected identity")
+            if not child_attestation.is_restricted:
+                raise SandboxError("Windows final child token is not restricted")
+            if child_attestation.restricted_sids != (write_sid.value,):
+                raise SandboxError(
+                    "Windows final child token does not contain the exact write SID authority"
+                )
+            if not child_attestation.change_notify_privilege_enabled:
+                raise SandboxError(
+                    "Windows final child token did not preserve SeChangeNotifyPrivilege"
+                )
+            if child_attestation.unexpected_enabled_privilege_count != 0:
+                raise SandboxError("Windows final child token has unexpected enabled privileges")
+            self._token_attestation = child_attestation
             self._send(
                 RuntimeFrameType.SPAWN_READY,
-                {"version": PROTOCOL_VERSION, "pid": created.process_id},
+                {
+                    "version": PROTOCOL_VERSION,
+                    "pid": created.process_id,
+                    "security": {
+                        "user_sid": child_attestation.user_sid,
+                        "is_restricted": child_attestation.is_restricted,
+                        "restricted_sids": list(child_attestation.restricted_sids),
+                        "change_notify_privilege_enabled": (
+                            child_attestation.change_notify_privilege_enabled
+                        ),
+                        "unexpected_enabled_privilege_count": (
+                            child_attestation.unexpected_enabled_privilege_count
+                        ),
+                    },
+                },
             )
             self._threads.append(
                 threading.Thread(

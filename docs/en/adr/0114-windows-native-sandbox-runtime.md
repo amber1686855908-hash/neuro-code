@@ -44,6 +44,16 @@ foundation actual-capability declaration remains `UNSUPPORTED`.  `STRICT`
 requires strong read isolation and therefore fails closed.  Interactive
 PTY/ConPTY remains a W4 scope.
 
+Gate 1 does not depend on Python startup.  The basic Win32 child is attested
+from the actual process handle returned by `CreateProcessAsUserW`, before
+`SpawnReady`; the controller checks `TokenUser`, `IsTokenRestricted`, the exact
+singleton restricting SID, `SeChangeNotifyPrivilege`, and the absence of
+unexpected enabled privileges.  A focused Windows Server 2025 run showed the
+current venv interpreter, its `-I -S -B` form, and the base interpreter all
+failing before user code ran.  The cause is intentionally unresolved and is a
+W5 developer-tool compatibility blocker, not a reason to weaken the token,
+ACL, environment, desktop, Job, or provenance boundary.
+
 ## Consequences
 
 - W2 remains the sole authority for accounts, DPAPI state, ACLs, and the

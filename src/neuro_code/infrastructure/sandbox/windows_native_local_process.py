@@ -11,6 +11,7 @@ import asyncio
 import contextlib
 import json
 import os
+import re
 import sys
 import threading
 import time
@@ -105,10 +106,45 @@ _SUPPORTED_STDIO = frozenset(
     }
 )
 _RUNNER_ENVIRONMENT = frozenset({"SystemRoot", "SystemDrive", "PATH", "PATHEXT"})
+_WINDOWS_SID_TEXT = re.compile(r"^S-1-(?:\d+)(?:-\d+)+$")
 
 
 def _runtime_is_windows() -> bool:
     return os.name == "nt"
+
+
+def _validated_child_token_attestation(value: object) -> dict[str, object]:
+    """Validate bounded controller-only facts from the runner's SpawnReady."""
+
+    if not isinstance(value, dict):
+        raise SandboxError("Windows runner omitted final-child token attestation")
+    user_sid = value.get("user_sid")
+    restricted_sids = value.get("restricted_sids")
+    is_restricted = value.get("is_restricted")
+    change_notify = value.get("change_notify_privilege_enabled")
+    unexpected = value.get("unexpected_enabled_privilege_count")
+    if not isinstance(user_sid, str) or _WINDOWS_SID_TEXT.fullmatch(user_sid) is None:
+        raise SandboxError("Windows runner returned an invalid final-child TokenUser")
+    if (
+        not isinstance(restricted_sids, list)
+        or len(restricted_sids) > 64
+        or any(
+            not isinstance(sid, str) or _WINDOWS_SID_TEXT.fullmatch(sid) is None
+            for sid in restricted_sids
+        )
+    ):
+        raise SandboxError("Windows runner returned invalid final-child restricting SIDs")
+    if type(is_restricted) is not bool or type(change_notify) is not bool:
+        raise SandboxError("Windows runner returned invalid final-child token flags")
+    if type(unexpected) is not int or unexpected < 0 or unexpected > 64:
+        raise SandboxError("Windows runner returned invalid final-child privilege facts")
+    return {
+        "user_sid": user_sid,
+        "is_restricted": is_restricted,
+        "restricted_sids": tuple(restricted_sids),
+        "change_notify_privilege_enabled": change_notify,
+        "unexpected_enabled_privilege_count": unexpected,
+    }
 
 
 def _native_acceptance_stage(label: str) -> None:
@@ -688,6 +724,7 @@ class WindowsNativeLocalProcessSandbox(LocalProcessSandbox):
             transport.control.close()
             transport.events.close()
             raise SandboxError("trusted Windows runner returned an invalid child PID")
+        security_attestation = _validated_child_token_attestation(payload.get("security"))
         return _WindowsNativeOwnedLocalProcess(
             transport=transport,
             runner=launch,
@@ -695,6 +732,7 @@ class WindowsNativeLocalProcessSandbox(LocalProcessSandbox):
             request=request,
             decoder=decoder,
             initial_frames=pending_frames,
+            security_attestation=security_attestation,
         )
 
     def spawn_terminal(
@@ -720,6 +758,7 @@ class _WindowsNativeOwnedLocalProcess(OwnedLocalProcess):
         request: SandboxedProcessRequest,
         decoder: RuntimeFrameDecoder | None = None,
         initial_frames: tuple[RuntimeFrame, ...] = (),
+        security_attestation: dict[str, object] | None = None,
     ) -> None:
         self._control = transport.control
         self._events = transport.events
@@ -742,6 +781,7 @@ class _WindowsNativeOwnedLocalProcess(OwnedLocalProcess):
         self._cleanup_error: str | None = None
         self._decoder = decoder or RuntimeFrameDecoder()
         self._initial_frames = initial_frames
+        self._security_attestation = dict(security_attestation or {})
         self._reader = threading.Thread(
             target=self._read_frames,
             name=f"neuro-code-windows-runtime-{pid}",
@@ -846,6 +886,7 @@ class _WindowsNativeOwnedLocalProcess(OwnedLocalProcess):
                 exited_state="RUNNER_EXITED",
             ),
             "child": observe_process_id(self._process_id),
+            "security_attestation": dict(self._security_attestation),
         }
 
     def diagnostic_snapshot(self) -> dict[str, object] | None:
@@ -866,6 +907,7 @@ class _WindowsNativeOwnedLocalProcess(OwnedLocalProcess):
             "pipe": "EVENT_PIPE_BROKEN" if self._closed and self._returncode is None else None,
             "runner": runner,
             "child": observe_process_id(self._process_id),
+            "security_attestation": dict(self._security_attestation),
             "cleanup_error": self._cleanup_error,
         }
 
@@ -887,6 +929,7 @@ class _WindowsNativeOwnedLocalProcess(OwnedLocalProcess):
                     "pipe": None,
                     "child": child_diagnostic,
                     "termination_observation": termination_observation,
+                    "security_attestation": dict(self._security_attestation),
                 }
             self._call(self._stdout.feed_eof)
             if self._stderr is not None:
@@ -899,6 +942,7 @@ class _WindowsNativeOwnedLocalProcess(OwnedLocalProcess):
                 "pipe": "EVENT_PIPE_BROKEN",
                 "runner": {"state": "RUNNER_EXITED"},
                 "child": payload.get("child"),
+                "security_attestation": dict(self._security_attestation),
             }
             message = payload.get("message")
             detail = message[:512] if isinstance(message, str) and message else "runtime error"

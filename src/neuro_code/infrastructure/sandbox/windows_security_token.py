@@ -29,13 +29,15 @@ _TOKEN_ADJUST_DEFAULT = 0x0080
 _DISABLE_MAX_PRIVILEGE = 0x00000001
 _LUA_TOKEN = 0x00000004
 _WRITE_RESTRICTED = 0x00000008
+_TOKEN_USER = 1
 _TOKEN_PRIVILEGES = 3
 _TOKEN_RESTRICTED_SIDS = 11
-_TOKEN_IS_RESTRICTED = 40
 _ERROR_INSUFFICIENT_BUFFER = 122
 _SE_PRIVILEGE_ENABLED = 0x00000002
 _SE_CHANGE_NOTIFY_PRIVILEGE = "SeChangeNotifyPrivilege"
 _SID_TEXT_PATTERN = re.compile(r"^S-1-(?:\d+)(?:-\d+)+$")
+_MAX_TOKEN_SIDS = 64
+_MAX_TOKEN_PRIVILEGES = 64
 
 
 class WindowsTokenError(SandboxError):
@@ -108,16 +110,20 @@ class WindowsTokenInspection:
 
     restricted_sid_count: int
     is_restricted: bool
+    user_sid: str = ""
     privilege_count: int = 0
     enabled_privilege_count: int = 0
     restricted_sids: tuple[str, ...] = ()
     change_notify_privilege_enabled: bool = False
+    unexpected_enabled_privilege_count: int = 0
 
     def __post_init__(self) -> None:
         if type(self.restricted_sid_count) is not int or self.restricted_sid_count < 0:
             raise ValueError("restricted_sid_count must be a non-negative integer")
         if type(self.is_restricted) is not bool:
             raise TypeError("is_restricted must be bool")
+        if self.user_sid and _SID_TEXT_PATTERN.fullmatch(self.user_sid) is None:
+            raise ValueError("user_sid must be a canonical SID string")
         if type(self.privilege_count) is not int or self.privilege_count < 0:
             raise ValueError("privilege_count must be a non-negative integer")
         if type(self.enabled_privilege_count) is not int or self.enabled_privilege_count < 0:
@@ -133,6 +139,13 @@ class WindowsTokenInspection:
             raise ValueError("restricted_sid_count must match restricted_sids")
         if type(self.change_notify_privilege_enabled) is not bool:
             raise TypeError("change_notify_privilege_enabled must be bool")
+        if (
+            type(self.unexpected_enabled_privilege_count) is not int
+            or self.unexpected_enabled_privilege_count < 0
+        ):
+            raise ValueError("unexpected_enabled_privilege_count must be non-negative")
+        if self.unexpected_enabled_privilege_count > self.enabled_privilege_count:
+            raise ValueError("unexpected enabled privileges cannot exceed enabled privilege count")
 
     @property
     def has_restricted_sids(self) -> bool:
@@ -143,6 +156,8 @@ class _WindowsSecurityTokenApi(Protocol):
     """Small injectable surface around Win32 token operations."""
 
     def open_current_process_token(self) -> int: ...
+
+    def open_process_token(self, process_handle: int) -> int: ...
 
     def create_restricted_token(
         self,
@@ -203,6 +218,10 @@ class _TokenGroupsOne(ctypes.Structure):
         ("GroupCount", ctypes.c_uint32),
         ("Groups", _SidAndAttributes * 1),
     ]
+
+
+class _TokenUserOne(ctypes.Structure):
+    _fields_ = [("User", _SidAndAttributes)]
 
 
 class _TokenPrivilegesOne(ctypes.Structure):
@@ -272,6 +291,12 @@ class _NativeWindowsSecurityTokenApi:
             advapi32,
             "OpenProcessToken",
             [ctypes.c_void_p, ctypes.c_uint32, ctypes.POINTER(ctypes.c_void_p)],
+            ctypes.c_int32,
+        )
+        self._is_token_restricted = _load_function(
+            advapi32,
+            "IsTokenRestricted",
+            [ctypes.c_void_p],
             ctypes.c_int32,
         )
         self._create_restricted_token = _load_function(
@@ -350,6 +375,21 @@ class _NativeWindowsSecurityTokenApi:
         )
         if not opened or not token_handle.value:
             raise self._error("OpenProcessToken")
+        return int(token_handle.value)
+
+    def open_process_token(self, process_handle: int) -> int:
+        """Open an actual child process token with query-only authority."""
+
+        if not isinstance(process_handle, int) or process_handle <= 0:
+            raise WindowsTokenError("OpenProcessToken(actual child hProcess)")
+        token_handle = ctypes.c_void_p()
+        opened = self._open_process_token(
+            process_handle,
+            _TOKEN_QUERY,
+            ctypes.byref(token_handle),
+        )
+        if not opened or not token_handle.value:
+            raise self._error("OpenProcessToken(actual child hProcess)")
         return int(token_handle.value)
 
     def _convert_sid(self, sid: SyntheticWindowsSid) -> int:
@@ -451,24 +491,32 @@ class _NativeWindowsSecurityTokenApi:
     def _query_token_information(self, token_handle: int, information_class: int) -> bytes:
         return self._query_token_information_buffer(token_handle, information_class).raw
 
-    def _sid_to_text(self, sid_pointer: int) -> str:
+    def _sid_to_text(self, sid_pointer: int, *, context: str) -> str:
         if not sid_pointer:
-            raise WindowsTokenError("parse TokenRestrictedSids")
+            raise WindowsTokenError(f"parse {context}")
         text_pointer = ctypes.c_void_p()
         if not self._convert_sid_to_string(sid_pointer, ctypes.byref(text_pointer)):
-            raise self._error("ConvertSidToStringSidW(TokenRestrictedSids)")
+            raise self._error(f"ConvertSidToStringSidW({context})")
         if not text_pointer.value:
             raise WindowsTokenError("ConvertSidToStringSidW returned no SID")
         try:
             value = ctypes.wstring_at(text_pointer.value)
         finally:
             if self._local_free(text_pointer):
-                raise self._error("LocalFree(TokenRestrictedSids)")
+                raise self._error(f"LocalFree({context})")
         if _SID_TEXT_PATTERN.fullmatch(value) is None:
-            raise WindowsTokenError("parse TokenRestrictedSids")
+            raise WindowsTokenError(f"parse {context}")
         return value
 
     def inspect_token(self, token_handle: int) -> WindowsTokenInspection:
+        user_buffer = self._query_token_information_buffer(token_handle, _TOKEN_USER)
+        user_raw = user_buffer.raw
+        user_offset = _TokenUserOne.User.offset
+        if len(user_raw) < user_offset + ctypes.sizeof(_SidAndAttributes):
+            raise WindowsTokenError("parse TokenUser")
+        user_sid_pointer = int(_SidAndAttributes.from_buffer(user_buffer, user_offset).Sid or 0)
+        user_sid = self._sid_to_text(user_sid_pointer, context="TokenUser")
+
         restricted_buffer = self._query_token_information_buffer(
             token_handle, _TOKEN_RESTRICTED_SIDS
         )
@@ -476,6 +524,8 @@ class _NativeWindowsSecurityTokenApi:
         if len(restricted_raw) < ctypes.sizeof(ctypes.c_uint32):
             raise WindowsTokenError("parse TokenRestrictedSids")
         restricted_sid_count = int.from_bytes(restricted_raw[:4], "little", signed=False)
+        if restricted_sid_count > _MAX_TOKEN_SIDS:
+            raise WindowsTokenError("parse TokenRestrictedSids")
         groups_offset = _TokenGroupsOne.Groups.offset
         group_size = ctypes.sizeof(_SidAndAttributes)
         if len(restricted_raw) < groups_offset + restricted_sid_count * group_size:
@@ -487,18 +537,19 @@ class _NativeWindowsSecurityTokenApi:
                         restricted_buffer, groups_offset + index * group_size
                     ).Sid
                     or 0
-                )
+                ),
+                context="TokenRestrictedSids",
             )
             for index in range(restricted_sid_count)
         )
 
-        is_restricted = self._query_token_information(token_handle, _TOKEN_IS_RESTRICTED)
-        if len(is_restricted) < ctypes.sizeof(ctypes.c_int32):
-            raise WindowsTokenError("parse TokenIsRestricted")
+        is_restricted = self._is_token_restricted(token_handle)
         privileges = self._query_token_information(token_handle, _TOKEN_PRIVILEGES)
         if len(privileges) < ctypes.sizeof(ctypes.c_uint32):
             raise WindowsTokenError("parse TokenPrivileges")
         privilege_count = int.from_bytes(privileges[:4], "little", signed=False)
+        if privilege_count > _MAX_TOKEN_PRIVILEGES:
+            raise WindowsTokenError("parse TokenPrivileges")
         privileges_offset = _TokenPrivilegesOne.Privileges.offset
         entry_size = ctypes.sizeof(_LuidAndAttributes)
         if len(privileges) < privileges_offset + privilege_count * entry_size:
@@ -516,22 +567,30 @@ class _NativeWindowsSecurityTokenApi:
                 entry_size,
             )
         )
-        enabled_privilege_count = sum(
-            bool(entry.Attributes & _SE_PRIVILEGE_ENABLED) for entry in entries
-        )
-        change_notify_privilege_enabled = any(
-            entry.Luid.LowPart == change_notify_luid.LowPart
-            and entry.Luid.HighPart == change_notify_luid.HighPart
-            and bool(entry.Attributes & _SE_PRIVILEGE_ENABLED)
-            for entry in entries
-        )
+        enabled_privilege_count = 0
+        unexpected_enabled_privilege_count = 0
+        change_notify_privilege_enabled = False
+        for entry in entries:
+            if not bool(entry.Attributes & _SE_PRIVILEGE_ENABLED):
+                continue
+            enabled_privilege_count += 1
+            is_change_notify = (
+                entry.Luid.LowPart == change_notify_luid.LowPart
+                and entry.Luid.HighPart == change_notify_luid.HighPart
+            )
+            if is_change_notify:
+                change_notify_privilege_enabled = True
+            else:
+                unexpected_enabled_privilege_count += 1
         return WindowsTokenInspection(
             restricted_sid_count=restricted_sid_count,
-            is_restricted=bool(int.from_bytes(is_restricted[:4], "little", signed=False)),
+            is_restricted=bool(is_restricted),
+            user_sid=user_sid,
             privilege_count=privilege_count,
             enabled_privilege_count=enabled_privilege_count,
             restricted_sids=restricted_sids,
             change_notify_privilege_enabled=change_notify_privilege_enabled,
+            unexpected_enabled_privilege_count=unexpected_enabled_privilege_count,
         )
 
     def set_default_dacl(self, token_handle: int, sid_texts: tuple[str, ...]) -> None:
@@ -575,6 +634,49 @@ class _NativeWindowsSecurityTokenApi:
     def close_handle(self, handle: int) -> None:
         if not self._close_handle(handle):
             raise self._error("CloseHandle")
+
+
+def inspect_windows_token(
+    token_handle: int,
+    *,
+    api: _WindowsSecurityTokenApi | None = None,
+) -> WindowsTokenInspection:
+    """Inspect one already-open token through the shared W1 parser."""
+
+    token_api = _NativeWindowsSecurityTokenApi() if api is None else api
+    return token_api.inspect_token(token_handle)
+
+
+def inspect_windows_process_token(
+    process_handle: int,
+    *,
+    api: _WindowsSecurityTokenApi | None = None,
+) -> WindowsTokenInspection:
+    """Open and inspect an actual process token, then close the query handle."""
+
+    token_api = _NativeWindowsSecurityTokenApi() if api is None else api
+    token_handle: int | None = None
+    inspection: WindowsTokenInspection | None = None
+    failure: BaseException | None = None
+    try:
+        token_handle = token_api.open_process_token(process_handle)
+        if token_handle <= 0:
+            token_handle = None
+            raise WindowsTokenError("OpenProcessToken(actual child hProcess)")
+        inspection = inspect_windows_token(token_handle, api=token_api)
+    except BaseException as error:
+        failure = error
+    if token_handle is not None:
+        try:
+            token_api.close_handle(token_handle)
+        except BaseException as error:
+            if failure is None:
+                failure = error
+    if failure is not None:
+        raise failure
+    if inspection is None:  # pragma: no cover - defensive
+        raise WindowsTokenError("OpenProcessToken(actual child hProcess) produced no inspection")
+    return inspection
 
 
 class WindowsRestrictedToken:
@@ -683,4 +785,6 @@ __all__ = [
     "WindowsRestrictedTokenRequest",
     "WindowsTokenError",
     "WindowsTokenInspection",
+    "inspect_windows_process_token",
+    "inspect_windows_token",
 ]

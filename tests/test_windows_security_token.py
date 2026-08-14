@@ -9,6 +9,7 @@ from neuro_code.infrastructure.sandbox.windows_security_token import (
     WindowsRestrictedTokenRequest,
     WindowsTokenError,
     WindowsTokenInspection,
+    inspect_windows_process_token,
 )
 
 
@@ -16,12 +17,14 @@ class _FakeSecurityTokenApi:
     def __init__(self) -> None:
         self.source_handle = 101
         self.created_handle = 202
+        self.child_token_handle = 303
         self.closed: list[int] = []
         self.create_calls: list[tuple[int, int, tuple[SyntheticWindowsSid, ...]]] = []
         sid = SyntheticWindowsSid.from_components((11, 22, 33, 44))
         self.inspection = WindowsTokenInspection(
             restricted_sid_count=1,
             is_restricted=True,
+            user_sid="S-1-5-21-10-20-30-40",
             privilege_count=1,
             enabled_privilege_count=1,
             restricted_sids=(sid.value,),
@@ -34,6 +37,11 @@ class _FakeSecurityTokenApi:
 
     def open_current_process_token(self) -> int:
         return self.source_handle
+
+    def open_process_token(self, process_handle: int) -> int:
+        if process_handle != 404:
+            raise WindowsTokenError("OpenProcessToken(actual child hProcess)", 6)
+        return self.child_token_handle
 
     def create_restricted_token(
         self,
@@ -146,6 +154,19 @@ class WindowsRestrictedTokenTests(unittest.TestCase):
             token.close()
         with self.assertRaises(WindowsTokenError):
             _ = token.handle
+
+    def test_actual_process_inspection_uses_query_handle_and_closes_it(self) -> None:
+        api = _FakeSecurityTokenApi()
+        inspection = inspect_windows_process_token(404, api=api)
+        self.assertEqual(inspection.user_sid, "S-1-5-21-10-20-30-40")
+        self.assertEqual(api.closed, [api.child_token_handle])
+
+    def test_actual_process_open_failure_is_preserved(self) -> None:
+        api = _FakeSecurityTokenApi()
+        with self.assertRaisesRegex(WindowsTokenError, "actual child hProcess") as raised:
+            inspect_windows_process_token(405, api=api)
+        self.assertEqual(raised.exception.error_code, 6)
+        self.assertEqual(api.closed, [])
 
     @unittest.skipUnless(os.name == "nt", "native restricted-token attestation requires Windows")
     def test_native_restricted_token_has_restricted_sid(self) -> None:

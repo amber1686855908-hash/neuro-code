@@ -37,6 +37,14 @@ acceptance 与 required PR gate 认证，而不是依赖 CI 环境的 runtime by
 foundation actual-capability declaration 仍为 `UNSUPPORTED`。`STRICT` 要求 strong
 read isolation，因此失败关闭。交互式 PTY/ConPTY 留给 W4。
 
+Gate 1 不依赖 Python 启动。实际 `CreateProcessAsUserW` 返回的 process handle
+会在发送 `SpawnReady` 之前完成 attestation；controller 检查 `TokenUser`、
+`IsTokenRestricted`、精确 singleton restricting SID、`SeChangeNotifyPrivilege`，
+以及不存在意外的 enabled privilege。一次聚焦的 Windows Server 2025 运行显示，
+当前 venv interpreter、其 `-I -S -B` 形式和 base interpreter 都在用户代码运行前失败。
+根因有意保留为未确定的 W5 developer-tool compatibility blocker；不得因此放宽
+token、ACL、environment、desktop、Job 或 provenance 边界。
+
 ## 后果
 
 - W2 仍是账户、DPAPI state、ACL 与持久化 Offline Firewall rule 的唯一 authority。
