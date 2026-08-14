@@ -582,7 +582,17 @@ def _security_descriptor(
             mask = access_masks.get(sid)
             if mask is None:
                 raise ValueError("named-pipe access mask is missing a peer SID")
-            ace = f"(A;;0x{mask:X};;;{sid})"
+            # Use SDDL's file-generic rights tokens instead of spelling the
+            # generic mapping as a raw mask.  This keeps the client
+            # CreateFileW(GENERIC_READ/WRITE) access check aligned with the
+            # pipe's directional access mode on all supported Windows builds.
+            if mask == _FILE_GENERIC_READ:
+                rights = "FR"
+            elif mask == _FILE_GENERIC_WRITE:
+                rights = "FW"
+            else:
+                rights = f"0x{mask:X}"
+            ace = f"(A;;{rights};;;{sid})"
         entries.append(ace.format(sid=sid))
     sddl = "D:P" + "".join(entries)
     descriptor = ctypes.c_void_p()
