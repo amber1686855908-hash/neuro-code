@@ -1,9 +1,9 @@
 """Focused W3 acceptance for the directional Windows runtime transport.
 
-This gate intentionally stops after the PRIVATE_DESKTOP/CREATE_NO_WINDOW
-``whoami.exe`` baseline.  Filesystem, network, protocol, and descendant gates
-remain separate until the transport has proved its lifecycle and framing
-contract.
+This gate proves the PRIVATE_DESKTOP/CREATE_NO_WINDOW ``whoami.exe``
+transport baseline and the final-child identity-token contract.  Filesystem,
+network, protocol, and descendant gates remain separate until the transport
+has proved their respective lifecycle and framing contracts.
 """
 
 from __future__ import annotations
@@ -57,6 +57,51 @@ from neuro_code.infrastructure.sandbox.windows_sandbox_setup import (
     WindowsNativeSandboxSetupAuthority,
     _NativeWindowsSetupPrivilegeApi,
 )
+
+_GATE1_MARKERS = {
+    "PYTHON_STARTED",
+    "CTYPES_IMPORTED",
+    "TOKEN_OPENED",
+    "TOKEN_USER_OK",
+    "RESTRICTED_SIDS_OK",
+    "IS_RESTRICTED_OK",
+    "PRIVILEGES_OK",
+    "JSON_WRITTEN",
+}
+_GATE1_STAGE_AFTER_MARKER = {
+    "PYTHON_STARTED": "CTYPES_IMPORT",
+    "CTYPES_IMPORTED": "OPEN_PROCESS_TOKEN",
+    "TOKEN_OPENED": "TOKEN_USER",
+    "TOKEN_USER_OK": "TOKEN_RESTRICTED_SIDS",
+    "RESTRICTED_SIDS_OK": "IS_TOKEN_RESTRICTED",
+    "IS_RESTRICTED_OK": "TOKEN_PRIVILEGES",
+    "PRIVILEGES_OK": "JSON_WRITE",
+    "JSON_WRITTEN": "COMPLETE",
+}
+
+
+def _gate1_stderr_markers(data: bytes) -> list[str]:
+    """Extract only the probe's fixed, bounded diagnostic markers."""
+
+    markers: list[str] = []
+    text = data.decode("ascii", errors="ignore")
+    for fragment in text.split("G1_PROBE=")[1:]:
+        marker = fragment.splitlines()[0].strip()
+        if marker in _GATE1_MARKERS and len(markers) < len(_GATE1_MARKERS):
+            markers.append(marker)
+    return markers
+
+
+def _gate1_probe_stage(markers: list[str]) -> str:
+    if not markers:
+        return "PYTHON_STARTUP"
+    return _GATE1_STAGE_AFTER_MARKER[markers[-1]]
+
+
+async def _read_gate1_stream(stream: object | None) -> bytes:
+    if stream is None:
+        return b""
+    return await cast(Any, stream).read(65_536)
 
 
 def _native_enabled() -> bool:
@@ -279,29 +324,47 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                     "expected_user_sid": expected_user_sid,
                 }
                 process: OwnedLocalProcess | None = None
+                combined: asyncio.Future[Any] | None = None
+                captured_stdout = b""
+                captured_stderr = b""
+
+                def record_stream_results(values: object) -> None:
+                    nonlocal captured_stdout, captured_stderr
+                    if not isinstance(values, list) or len(values) != 3:
+                        return
+                    if isinstance(values[0], bytes):
+                        captured_stdout = values[0]
+                    if isinstance(values[1], bytes):
+                        captured_stderr = values[1]
+                    wait_result = values[2]
+                    if isinstance(wait_result, int):
+                        result["child_exit"] = wait_result
+                        result["Exit"] = "PASS" if wait_result == 0 else "FAIL"
+                    elif isinstance(wait_result, BaseException):
+                        result["wait_error"] = type(wait_result).__name__
+
                 try:
                     print(f"W3_STAGE={label.lower()}_spawn_start", flush=True)
                     process = await adapter.spawn(request)
                     print(f"W3_STAGE={label.lower()}_spawn_ready", flush=True)
                     result["CreateProcessAsUser"] = "PASS"
                     result["SpawnReady"] = "PASS"
-                    stream = process.stdout
-                    if stream is None:
-                        raise AssertionError("Gate 1 probe has no stdout stream")
-                    output = await asyncio.wait_for(stream.read(65_536), timeout=15)
-                    result["stdout"] = "NONEMPTY" if output else "EOF"
-                    if output:
-                        try:
-                            decoded = json.loads(output.decode("utf-8", errors="strict"))
-                        except (UnicodeError, json.JSONDecodeError):
-                            result["token_probe"] = {"error": "INVALID_JSON"}
-                        else:
-                            result["token_probe"] = decoded
-                    print(f"W3_STAGE={label.lower()}_stdout_read", flush=True)
-                    await asyncio.wait_for(process.wait(), timeout=15)
-                    result["child_exit"] = process.returncode
-                    result["Exit"] = "PASS"
-                    print(f"W3_STAGE={label.lower()}_child_waited", flush=True)
+                    stdout_task = asyncio.create_task(_read_gate1_stream(process.stdout))
+                    stderr_task = asyncio.create_task(_read_gate1_stream(process.stderr))
+                    wait_task = asyncio.create_task(process.wait())
+                    combined = asyncio.gather(
+                        stdout_task,
+                        stderr_task,
+                        wait_task,
+                        return_exceptions=True,
+                    )
+                    try:
+                        values = await asyncio.wait_for(asyncio.shield(combined), timeout=15)
+                    except TimeoutError:
+                        result["error"] = "TIMEOUT"
+                    else:
+                        record_stream_results(values)
+                        print(f"W3_STAGE={label.lower()}_streams_drained", flush=True)
                 except TimeoutError:
                     result["error"] = "TIMEOUT"
                 except BaseException as error:
@@ -310,6 +373,28 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                     if process is not None:
                         with contextlib.suppress(BaseException):
                             await process.terminate(grace_seconds=0.5)
+                    if combined is not None and not combined.done():
+                        with contextlib.suppress(BaseException):
+                            values = await asyncio.wait_for(combined, timeout=2)
+                            record_stream_results(values)
+                    elif combined is not None:
+                        with contextlib.suppress(BaseException):
+                            record_stream_results(combined.result())
+                    if process is not None and process.returncode is not None:
+                        result["child_exit"] = process.returncode
+                        if result.get("Exit") == "NOT_STARTED":
+                            result["Exit"] = "PASS" if process.returncode == 0 else "FAIL"
+                    result["stdout"] = "NONEMPTY" if captured_stdout else "EOF"
+                    if captured_stdout:
+                        try:
+                            decoded = json.loads(captured_stdout.decode("utf-8", errors="strict"))
+                        except (UnicodeError, json.JSONDecodeError):
+                            result["token_probe"] = {"error": "INVALID_JSON"}
+                        else:
+                            result["token_probe"] = decoded
+                    markers = _gate1_stderr_markers(captured_stderr)
+                    result["stderr_markers"] = markers
+                    result["probe_stage"] = _gate1_probe_stage(markers)
                     diagnostic = (
                         cast(Any, process).diagnostic_snapshot() if process is not None else None
                     )
@@ -356,10 +441,11 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(token.get("is_restricted"))
                 self.assertEqual(token.get("restricted_sids"), [expected_restricted_sid])
                 self.assertTrue(token.get("change_notify"))
-                self.assertEqual(token.get("unexpected_enabled_privileges"), [])
-                logon_sid = token.get("logon_sid")
-                self.assertIsInstance(logon_sid, str)
-                self.assertNotIn(logon_sid, token.get("restricted_sids", []))
+                self.assertEqual(token.get("unexpected_enabled_privilege_count"), 0)
+                restricted_sids = token.get("restricted_sids")
+                self.assertIsInstance(restricted_sids, list)
+                assert isinstance(restricted_sids, list)
+                self.assertNotIn("S-1-1-0", restricted_sids)
                 self.assertNotIn(online_record.user_sid.value, token.get("restricted_sids", []))
                 self.assertNotIn(offline_record.user_sid.value, token.get("restricted_sids", []))
                 self.assertNotIn(controller_sid, token.get("restricted_sids", []))

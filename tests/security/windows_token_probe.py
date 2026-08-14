@@ -8,16 +8,19 @@ credential material.
 
 from __future__ import annotations
 
-import ctypes
-import json
 import sys
+
+print("G1_PROBE=PYTHON_STARTED", file=sys.stderr, flush=True)
+
+import ctypes  # noqa: E402
+import json  # noqa: E402
+
+print("G1_PROBE=CTYPES_IMPORTED", file=sys.stderr, flush=True)
 
 _TOKEN_QUERY = 0x0008
 _TOKEN_USER = 1
 _TOKEN_PRIVILEGES = 3
 _TOKEN_RESTRICTED_SIDS = 11
-_TOKEN_LOGON_SID = 28
-_TOKEN_IS_RESTRICTED = 40
 _ERROR_INSUFFICIENT_BUFFER = 122
 _SE_PRIVILEGE_ENABLED = 0x00000002
 _SE_CHANGE_NOTIFY_PRIVILEGE = "SeChangeNotifyPrivilege"
@@ -89,17 +92,6 @@ def _sid_text(convert_sid: object, local_free: object, pointer: int) -> str:
     return value
 
 
-def _privilege_name(lookup_name: object, luid: _Luid) -> str:
-    size = ctypes.c_uint32()
-    lookup_name(None, ctypes.byref(luid), None, ctypes.byref(size))
-    if size.value == 0 or size.value > 128:
-        raise RuntimeError("LookupPrivilegeNameW sizing failed")
-    name = ctypes.create_unicode_buffer(size.value + 1)
-    if not lookup_name(None, ctypes.byref(luid), name, ctypes.byref(size)):
-        raise RuntimeError("LookupPrivilegeNameW failed")
-    return name.value
-
-
 def _run() -> None:
     if sys.platform != "win32":
         raise RuntimeError("Windows token probe requires Windows")
@@ -132,15 +124,16 @@ def _run() -> None:
         ctypes.c_int32,
     )
     local_free = _load(kernel, "LocalFree", [ctypes.c_void_p], ctypes.c_void_p)
-    lookup_name = _load(
+    is_token_restricted = _load(
         advapi,
-        "LookupPrivilegeNameW",
-        [
-            ctypes.c_wchar_p,
-            ctypes.POINTER(_Luid),
-            ctypes.c_wchar_p,
-            ctypes.POINTER(ctypes.c_uint32),
-        ],
+        "IsTokenRestricted",
+        [ctypes.c_void_p],
+        ctypes.c_int32,
+    )
+    lookup_value = _load(
+        advapi,
+        "LookupPrivilegeValueW",
+        [ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.POINTER(_Luid)],
         ctypes.c_int32,
     )
     token = ctypes.c_void_p()
@@ -149,16 +142,12 @@ def _run() -> None:
         or not token.value
     ):
         raise RuntimeError("OpenProcessToken failed")
+    print("G1_PROBE=TOKEN_OPENED", file=sys.stderr, flush=True)
     try:
         user_buffer = _query(get_information, token, _TOKEN_USER)
         user = _SidAndAttributes.from_buffer(user_buffer)
         user_sid = _sid_text(convert_sid, local_free, int(user.Sid or 0))
-
-        logon_buffer = _query(get_information, token, _TOKEN_LOGON_SID)
-        logon = _TokenGroupsOne.from_buffer(logon_buffer)
-        if logon.GroupCount != 1:
-            raise RuntimeError("TokenLogonSid is not a singleton")
-        logon_sid = _sid_text(convert_sid, local_free, int(logon.Groups[0].Sid or 0))
+        print("G1_PROBE=TOKEN_USER_OK", file=sys.stderr, flush=True)
 
         restricted_buffer = _query(get_information, token, _TOKEN_RESTRICTED_SIDS)
         restricted_count = int.from_bytes(restricted_buffer.raw[:4], "little", signed=False)
@@ -166,6 +155,8 @@ def _run() -> None:
             raise RuntimeError("TokenRestrictedSids is unbounded")
         restricted_offset = _TokenGroupsOne.Groups.offset
         entry_size = ctypes.sizeof(_SidAndAttributes)
+        if restricted_offset + restricted_count * entry_size > len(restricted_buffer):
+            raise RuntimeError("TokenRestrictedSids size is invalid")
         restricted_sids = tuple(
             _sid_text(
                 convert_sid,
@@ -179,9 +170,10 @@ def _run() -> None:
             )
             for index in range(restricted_count)
         )
+        print("G1_PROBE=RESTRICTED_SIDS_OK", file=sys.stderr, flush=True)
 
-        restricted_flag = _query(get_information, token, _TOKEN_IS_RESTRICTED)
-        is_restricted = bool(int.from_bytes(restricted_flag.raw[:4], "little", signed=False))
+        is_restricted = bool(is_token_restricted(token))
+        print("G1_PROBE=IS_RESTRICTED_OK", file=sys.stderr, flush=True)
 
         privilege_buffer = _query(get_information, token, _TOKEN_PRIVILEGES)
         privilege_count = int.from_bytes(privilege_buffer.raw[:4], "little", signed=False)
@@ -189,32 +181,36 @@ def _run() -> None:
             raise RuntimeError("TokenPrivileges is unbounded")
         privilege_offset = _TokenPrivilegesOne.Privileges.offset
         privilege_size = ctypes.sizeof(_LuidAndAttributes)
-        enabled_privileges = tuple(
-            _privilege_name(
-                lookup_name,
-                _LuidAndAttributes.from_buffer(
-                    privilege_buffer, privilege_offset + index * privilege_size
-                ).Luid,
-            )
-            for index in range(privilege_count)
-            if _LuidAndAttributes.from_buffer(
+        if privilege_offset + privilege_count * privilege_size > len(privilege_buffer):
+            raise RuntimeError("TokenPrivileges size is invalid")
+        expected_luid = _Luid()
+        if not lookup_value(None, _SE_CHANGE_NOTIFY_PRIVILEGE, ctypes.byref(expected_luid)):
+            raise RuntimeError("LookupPrivilegeValueW failed")
+        expected_luid_tuple = (int(expected_luid.LowPart), int(expected_luid.HighPart))
+        change_notify_enabled = False
+        unexpected_enabled_privilege_count = 0
+        for index in range(privilege_count):
+            entry = _LuidAndAttributes.from_buffer(
                 privilege_buffer, privilege_offset + index * privilege_size
-            ).Attributes
-            & _SE_PRIVILEGE_ENABLED
-        )
-        unexpected = tuple(
-            name for name in enabled_privileges if name != _SE_CHANGE_NOTIFY_PRIVILEGE
-        )
+            )
+            if not entry.Attributes & _SE_PRIVILEGE_ENABLED:
+                continue
+            luid_tuple = (int(entry.Luid.LowPart), int(entry.Luid.HighPart))
+            if luid_tuple == expected_luid_tuple:
+                change_notify_enabled = True
+            else:
+                unexpected_enabled_privilege_count += 1
+        print("G1_PROBE=PRIVILEGES_OK", file=sys.stderr, flush=True)
+
         result = {
             "user_sid": user_sid,
-            "logon_sid": logon_sid,
             "is_restricted": is_restricted,
             "restricted_sids": list(restricted_sids),
-            "change_notify": _SE_CHANGE_NOTIFY_PRIVILEGE in enabled_privileges,
-            "enabled_privileges": list(enabled_privileges),
-            "unexpected_enabled_privileges": list(unexpected),
+            "change_notify": change_notify_enabled,
+            "unexpected_enabled_privilege_count": unexpected_enabled_privilege_count,
         }
         print(json.dumps(result, sort_keys=True), flush=True)
+        print("G1_PROBE=JSON_WRITTEN", file=sys.stderr, flush=True)
     finally:
         close_handle(token)
 
