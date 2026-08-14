@@ -293,6 +293,12 @@ class _NativePipeApi:
             ],
             ctypes.c_void_p,
         )
+        self.wait_named_pipe = _load_function(
+            kernel32,
+            "WaitNamedPipeW",
+            [ctypes.c_wchar_p, ctypes.c_uint32],
+            ctypes.c_int32,
+        )
         self.read_file = _load_function(
             kernel32,
             "ReadFile",
@@ -868,6 +874,9 @@ class WindowsNamedPipeClient(WindowsNamedPipe):
     @classmethod
     def _connect(cls, name: str, *, direction: _WindowsNamedPipeDirection) -> WindowsNamedPipe:
         api = _NativePipeApi()
+        if not api.wait_named_pipe(name, 5_000):
+            error = api.last_error()
+            raise OSError(error, f"WaitNamedPipeW failed with Windows error {error}")
         desired_access = (
             _GENERIC_READ if direction is _WindowsNamedPipeDirection.INBOUND else _GENERIC_WRITE
         )
