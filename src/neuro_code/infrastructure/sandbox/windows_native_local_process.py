@@ -107,6 +107,10 @@ _SUPPORTED_STDIO = frozenset(
 _RUNNER_ENVIRONMENT = frozenset({"SystemRoot", "SystemDrive", "PATH", "PATHEXT"})
 
 
+def _runtime_is_windows() -> bool:
+    return os.name == "nt"
+
+
 def _native_acceptance_stage(label: str) -> None:
     """Emit bounded setup/transport stages only in the focused native gate."""
 
@@ -126,6 +130,75 @@ class WindowsRuntimeIdentity:
     password: str
     user_sid: WindowsAccountSid
     write_sid: SyntheticWindowsSid
+
+
+@dataclass(frozen=True, slots=True)
+class WindowsTrustedRunnerProvenance:
+    """Resolved trusted runner code facts checked before child creation.
+
+    Python ``-I`` and the explicit runner environment remove import-path and
+    user-site injection, but they do not establish where the package code was
+    loaded from.  This contract keeps the interpreter, runner module, and
+    Neuro Code package/dependency root outside every model-writable authority.
+    """
+
+    interpreter: Path
+    package_root: Path
+    runner_module: Path
+    dependency_root: Path
+
+    @staticmethod
+    def _canonical(path: Path) -> Path:
+        if not isinstance(path, Path) or not path.is_absolute():
+            raise SandboxError("trusted runner provenance path is not absolute")
+        try:
+            resolved = path.expanduser().resolve(strict=False)
+        except (OSError, RuntimeError) as error:
+            raise SandboxError("trusted runner provenance path cannot be resolved") from error
+        # Windows path comparisons are case-insensitive.  Normalize before
+        # using Path.relative_to so C:\Repo and c:\repo cannot evade the
+        # component-aware containment check.
+        return Path(os.path.normcase(os.path.normpath(os.fspath(resolved))))
+
+    @classmethod
+    def resolve(cls) -> WindowsTrustedRunnerProvenance:
+        runner_module = cls._canonical(Path(__file__).with_name("windows_native_runner.py"))
+        package_root = cls._canonical(runner_module.parents[2])
+        interpreter = cls._canonical(Path(sys.executable))
+        dependency_root = package_root
+        candidates = (interpreter, package_root, runner_module, dependency_root)
+        if any(not candidate.exists() for candidate in candidates):
+            raise SandboxError("trusted runner provenance is unavailable")
+        if not runner_module.is_file() or not interpreter.is_file():
+            raise SandboxError("trusted runner provenance is not backed by files")
+        return cls(
+            interpreter=interpreter,
+            package_root=package_root,
+            runner_module=runner_module,
+            dependency_root=dependency_root,
+        )
+
+    @property
+    def trusted_paths(self) -> tuple[Path, ...]:
+        return (self.interpreter, self.package_root, self.runner_module, self.dependency_root)
+
+    def assert_disjoint(self, writable_roots: tuple[Path, ...]) -> None:
+        canonical_roots = tuple(self._canonical(root) for root in writable_roots)
+        for trusted in self.trusted_paths:
+            for writable in canonical_roots:
+                try:
+                    trusted.relative_to(writable)
+                    overlaps = True
+                except ValueError:
+                    try:
+                        writable.relative_to(trusted)
+                        overlaps = True
+                    except ValueError:
+                        overlaps = False
+                if overlaps:
+                    raise SandboxError(
+                        "trusted runner provenance overlaps model-writable authority"
+                    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -311,7 +384,7 @@ class WindowsNativeLocalProcessSandbox(LocalProcessSandbox):
             raise SandboxError("Windows runtime cwd is outside the prepared read authority")
 
     def _validate(self, request: SandboxedProcessRequest) -> WindowsSandboxSetupRequest:
-        if os.name != "nt":
+        if not _runtime_is_windows():
             raise SandboxError("Windows native sandbox is only available on Windows")
         if request.sandbox_profile is not self._profile:
             raise SandboxError("Windows native sandbox profile does not match the session")
@@ -344,6 +417,12 @@ class WindowsNativeLocalProcessSandbox(LocalProcessSandbox):
             raise SandboxError("Windows setup state must remain outside the sandbox workspace")
         self._validate_setup_scope(request, setup_request)
         try:
+            WindowsTrustedRunnerProvenance.resolve().assert_disjoint(setup_request.writable_roots)
+        except SandboxError:
+            raise
+        except BaseException as error:
+            raise SandboxError("trusted runner provenance is unavailable") from error
+        try:
             snapshot = self._setup_authority.inspect(setup_request)
         except BaseException as error:
             raise SandboxError("Windows sandbox setup inspection failed closed") from error
@@ -351,16 +430,6 @@ class WindowsNativeLocalProcessSandbox(LocalProcessSandbox):
             raise SandboxError(
                 "Windows sandbox setup is not READY; runtime never performs setup or UAC"
             )
-        trusted_paths = (Path(__file__).resolve(), Path(sys.executable).resolve())
-        if any(
-            not path.is_file()
-            or any(
-                path == root.path or path.is_relative_to(root.path)
-                for root in request.filesystem_policy.workspace_roots
-            )
-            for path in trusted_paths
-        ):
-            raise SandboxError("trusted Windows runner must remain outside model workspaces")
         return setup_request
 
     @staticmethod

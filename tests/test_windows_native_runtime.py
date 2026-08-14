@@ -32,10 +32,14 @@ from neuro_code.infrastructure.sandbox.windows_native_local_process import (
     WindowsNativeLocalProcessSandbox,
     WindowsRuntimeControllerTransport,
     WindowsRuntimeIdentity,
+    WindowsTrustedRunnerProvenance,
     _required_capabilities,
     _WindowsNativeOwnedLocalProcess,
 )
 from neuro_code.infrastructure.sandbox.windows_native_runner import (
+    _FILE_CREATE_PIPE_INSTANCE,
+    _PIPE_CONTROL_READ_ACCESS,
+    _PIPE_EVENT_WRITE_ACCESS,
     RunnerLaunch,
     WindowsNamedPipeReader,
     WindowsNamedPipeWriter,
@@ -184,6 +188,12 @@ class _FakeDirectionalPipeApi:
 
 
 class WindowsNativeDirectionalTransportTests(unittest.TestCase):
+    def test_pipe_client_masks_are_specific_and_cannot_create_instances(self) -> None:
+        self.assertNotEqual(_PIPE_CONTROL_READ_ACCESS, 0)
+        self.assertNotEqual(_PIPE_EVENT_WRITE_ACCESS, 0)
+        self.assertEqual(_PIPE_CONTROL_READ_ACCESS & _FILE_CREATE_PIPE_INSTANCE, 0)
+        self.assertEqual(_PIPE_EVENT_WRITE_ACCESS & _FILE_CREATE_PIPE_INSTANCE, 0)
+
     def test_control_and_event_are_distinct_one_way_endpoints(self) -> None:
         api = _FakeDirectionalPipeApi()
         control = WindowsNamedPipeWriter(101, api=api)  # type: ignore[arg-type]
@@ -241,6 +251,61 @@ class WindowsNativeDirectionalTransportTests(unittest.TestCase):
 
 
 class WindowsNativeRuntimeContractTests(unittest.IsolatedAsyncioTestCase):
+    def test_trusted_runner_provenance_accepts_external_workspace(self) -> None:
+        provenance = WindowsTrustedRunnerProvenance.resolve()
+        with tempfile.TemporaryDirectory() as directory:
+            writable = Path(directory) / "workspace"
+            writable.mkdir()
+            provenance.assert_disjoint((writable,))
+
+    def test_trusted_runner_provenance_rejects_package_and_ancestor_overlap(self) -> None:
+        provenance = WindowsTrustedRunnerProvenance.resolve()
+        with self.assertRaisesRegex(
+            SandboxError, "trusted runner provenance overlaps model-writable authority"
+        ):
+            provenance.assert_disjoint((provenance.package_root,))
+        with self.assertRaisesRegex(
+            SandboxError, "trusted runner provenance overlaps model-writable authority"
+        ):
+            provenance.assert_disjoint((provenance.package_root.parent,))
+
+    def test_editable_checkout_fails_before_runner_launch(self) -> None:
+        repository = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as directory:
+            installation = Path(directory) / "installation"
+            installation.mkdir()
+            setup_request = WindowsSandboxSetupRequest(
+                installation_root=installation,
+                read_roots=(repository,),
+                writable_roots=(repository,),
+                sensitive_read_paths=(),
+            )
+            launcher = mock.Mock()
+            adapter = WindowsNativeLocalProcessSandbox(
+                SandboxProfile.WORKSPACE,
+                repository,
+                Path(directory) / "state",
+                setup_authority=_ReadySetupAuthority(WindowsSandboxSetupState.READY),
+                setup_request_factory=lambda _request: setup_request,
+                runner_launcher=launcher,
+            )
+            provenance = WindowsTrustedRunnerProvenance.resolve()
+            with (
+                mock.patch(
+                    "neuro_code.infrastructure.sandbox.windows_native_local_process._runtime_is_windows",
+                    return_value=True,
+                ),
+                mock.patch.object(
+                    WindowsTrustedRunnerProvenance, "resolve", return_value=provenance
+                ),
+                self.assertRaisesRegex(
+                    SandboxError,
+                    "trusted runner provenance overlaps model-writable authority",
+                ),
+            ):
+                adapter._validate(_request(repository))
+            launcher.assert_not_called()
+
     async def test_coalesced_spawn_ready_frames_are_not_dropped(self) -> None:
         class _Pipe:
             def __init__(self, *chunks: bytes) -> None:

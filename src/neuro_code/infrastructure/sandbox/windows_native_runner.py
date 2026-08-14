@@ -115,9 +115,33 @@ _DESKTOP_ALL_ACCESS = (
     | _DESKTOP_WRITE_DAC
     | _DESKTOP_WRITE_OWNER
 )
-_FILE_GENERIC_READ = 0x00120089
-_FILE_GENERIC_WRITE = 0x00120116
+_FILE_READ_DATA = 0x00000001
+_FILE_WRITE_DATA = 0x00000002
+_FILE_APPEND_DATA = 0x00000004
+_FILE_READ_EA = 0x00000008
+_FILE_WRITE_EA = 0x00000010
 _FILE_READ_ATTRIBUTES = 0x00000080
+_FILE_WRITE_ATTRIBUTES = 0x00000100
+_READ_CONTROL = 0x00020000
+_SYNCHRONIZE = 0x00100000
+_FILE_CREATE_PIPE_INSTANCE = _FILE_APPEND_DATA
+
+# Named-pipe client rights are deliberately expressed as specific rights.
+# ``FILE_GENERIC_WRITE`` includes FILE_APPEND_DATA, whose bit is also
+# FILE_CREATE_PIPE_INSTANCE for named pipes.  The event writer therefore
+# keeps the proven generic-write components except that authority, while the
+# control reader mirrors the specific generic-read components.
+_PIPE_CONTROL_READ_ACCESS = (
+    _FILE_READ_DATA | _FILE_READ_EA | _FILE_READ_ATTRIBUTES | _READ_CONTROL | _SYNCHRONIZE
+)
+_PIPE_EVENT_WRITE_ACCESS = (
+    _FILE_WRITE_DATA
+    | _FILE_WRITE_EA
+    | _FILE_WRITE_ATTRIBUTES
+    | _FILE_READ_ATTRIBUTES
+    | _READ_CONTROL
+    | _SYNCHRONIZE
+)
 
 
 class _CFunction(Protocol):
@@ -589,21 +613,11 @@ def _security_descriptor(
             mask = access_masks.get(sid)
             if mask is None:
                 raise ValueError("named-pipe access mask is missing a peer SID")
-            # Use SDDL's generic rights tokens instead of spelling the
-            # generic mapping as a raw mask.  This keeps the client
-            # CreateFileW(GENERIC_READ/WRITE) access check aligned with the
-            # pipe's directional access mode on all supported Windows builds.
-            if mask == _FILE_GENERIC_READ:
-                rights = "GR"
-            elif mask == _FILE_GENERIC_WRITE:
-                rights = "GW"
-            elif mask == (_FILE_GENERIC_WRITE | _FILE_READ_ATTRIBUTES):
-                # A write-only named-pipe client needs read-attributes access
-                # for the connection handshake on supported Windows builds;
-                # this is not read/write data authority.
-                rights = f"0x{mask:X}"
-            else:
-                rights = f"0x{mask:X}"
+            # Keep the ACE in the same specific-rights vocabulary as the
+            # CreateFileW request.  In particular, never spell this as GW:
+            # FILE_GENERIC_WRITE contains FILE_APPEND_DATA, which is the
+            # FILE_CREATE_PIPE_INSTANCE bit for named pipes.
+            rights = f"0x{mask:X}"
             ace = f"(A;;{rights};;;{sid})"
         entries.append(ace.format(sid=sid))
     sddl = "D:P" + "".join(entries)
@@ -776,9 +790,9 @@ class WindowsNamedPipeServer:
             else _PIPE_ACCESS_INBOUND
         )
         controller_mask, runner_mask = (
-            (_FILE_GENERIC_WRITE, _FILE_GENERIC_READ)
+            (_PIPE_EVENT_WRITE_ACCESS, _PIPE_CONTROL_READ_ACCESS)
             if direction is _WindowsNamedPipeDirection.OUTBOUND
-            else (_FILE_GENERIC_READ, _FILE_GENERIC_WRITE | _FILE_READ_ATTRIBUTES)
+            else (_PIPE_CONTROL_READ_ACCESS, _PIPE_EVENT_WRITE_ACCESS)
         )
         attributes, descriptor = _security_descriptor(
             (controller_sid, runner_sid),
@@ -891,7 +905,9 @@ class WindowsNamedPipeClient(WindowsNamedPipe):
             error = api.last_error()
             raise OSError(error, f"WaitNamedPipeW failed with Windows error {error}")
         desired_access = (
-            _GENERIC_READ if direction is _WindowsNamedPipeDirection.INBOUND else _GENERIC_WRITE
+            _PIPE_CONTROL_READ_ACCESS
+            if direction is _WindowsNamedPipeDirection.INBOUND
+            else _PIPE_EVENT_WRITE_ACCESS
         )
         handle = api.create_file(
             name,
