@@ -1696,7 +1696,6 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                 wait_task: asyncio.Task[int] | None = None
                 try:
                     process = await adapter.spawn(request)
-                    diagnostic = cast(Any, process).diagnostic_snapshot()
                     stdout_task = asyncio.create_task(_read_all_bounded(process.stdout))
                     stderr_task = asyncio.create_task(_read_all_bounded(process.stderr))
                     wait_task = asyncio.create_task(process.wait())
@@ -1709,8 +1708,13 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                         timeout=30,
                     )
                     self.assertEqual(exit_code, expected_exit)
+                    diagnostic = cast(Any, process).diagnostic_snapshot()
                     if not isinstance(diagnostic, dict):
                         diagnostic = {}
+                    runner = diagnostic.get("runner")
+                    self.assertIsInstance(runner, dict)
+                    self.assertEqual(runner.get("state"), "RUNNER_EXITED")
+                    self.assertEqual(runner.get("exit_code"), 0)
                     attestation = diagnostic.get("security_attestation")
                     token_attested = bool(
                         isinstance(attestation, dict)
