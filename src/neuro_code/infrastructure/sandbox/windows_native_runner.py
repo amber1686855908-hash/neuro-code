@@ -851,9 +851,16 @@ class WindowsNamedPipeServer:
         deadline = time.monotonic() + timeout_seconds
         while not completed.wait(0.05):
             if self._api.wait_for_single_object(runner_handle, 0) == _WAIT_OBJECT_0:
+                state = self._api.observe_process(
+                    runner_handle,
+                    active_state="RUNNER_STILL_ACTIVE",
+                    exited_state="RUNNER_EXITED",
+                )
                 self.close()
                 thread.join(timeout=1.0)
-                raise SandboxError("trusted Windows runner exited before named-pipe connection")
+                raise SandboxError(
+                    "trusted Windows runner exited before named-pipe connection " + repr(state)
+                )
             if time.monotonic() >= deadline:
                 self.close()
                 thread.join(timeout=1.0)
@@ -1933,8 +1940,8 @@ def _runner_main(control_pipe_name: str, event_pipe_name: str) -> int:
     event_pipe: WindowsNamedPipeWriter | None = None
     child: _RunnerChild | None = None
     try:
-        event_pipe = WindowsNamedPipeClient.connect_writer(event_pipe_name)
         control_pipe = WindowsNamedPipeClient.connect_reader(control_pipe_name)
+        event_pipe = WindowsNamedPipeClient.connect_writer(event_pipe_name)
         decoder = RuntimeFrameDecoder()
         while True:
             data = control_pipe.read()
@@ -1973,7 +1980,16 @@ def _runner_main(control_pipe_name: str, event_pipe_name: str) -> int:
                         encode_json(diagnostic),
                     )
                 )
-        return 1
+        # Preserve a bounded, non-zero diagnostic in the trusted runner's
+        # process exit code.  The controller can inspect this when a pipe
+        # connection fails before the event channel exists; no paths,
+        # credentials, or request data are encoded here.
+        win_error = getattr(error, "winerror", None)
+        if not isinstance(win_error, int) or win_error <= 0:
+            win_error = getattr(error, "errno", None)
+        if not isinstance(win_error, int) or win_error <= 0:
+            win_error = 1
+        return 0xE0000000 | (win_error & 0xFFFF)
     finally:
         if child is not None:
             with contextlib.suppress(BaseException):
