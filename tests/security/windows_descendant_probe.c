@@ -4,7 +4,9 @@
  * The leader is the final CreateProcessAsUserW child.  It creates this same
  * executable as a grandchild with bInheritHandles=FALSE and with no standard
  * handles in STARTUPINFO.  The grandchild therefore proves that its lifetime
- * is not coupled to the controller's stdout/stderr/stdin relay handles.
+ * is not coupled to the controller's stdout/stderr/stdin relay pipes.  Windows
+ * may still expose default non-pipe standard handles in a child; only an
+ * inherited FILE_TYPE_PIPE handle can be one of the runner's relay handles.
  * It remains in the inherited Windows Job Object for a bounded interval,
  * writes fixed workspace markers, and exits naturally.
  */
@@ -93,13 +95,12 @@ static int write_pid(const wchar_t *root) {
                        (DWORD)(sizeof(digits) - 1 - cursor));
 }
 
-static int standard_handle_is_valid(DWORD which) {
+static int standard_pipe_handle_is_valid(DWORD which) {
     HANDLE handle = GetStdHandle(which);
-    DWORD flags = 0;
     if (handle == NULL || handle == INVALID_HANDLE_VALUE) {
         return 0;
     }
-    return GetHandleInformation(handle, &flags) != 0;
+    return GetFileType(handle) == FILE_TYPE_PIPE;
 }
 
 static int marker_exists(const wchar_t *root, const wchar_t *name) {
@@ -126,14 +127,15 @@ static int wait_for_markers(const wchar_t *root) {
 }
 
 static int run_grandchild(const wchar_t *root) {
-    int has_stdio = standard_handle_is_valid(STD_INPUT_HANDLE) ||
-                    standard_handle_is_valid(STD_OUTPUT_HANDLE) ||
-                    standard_handle_is_valid(STD_ERROR_HANDLE);
+    int has_runner_pipes =
+        standard_pipe_handle_is_valid(STD_INPUT_HANDLE) ||
+        standard_pipe_handle_is_valid(STD_OUTPUT_HANDLE) ||
+        standard_pipe_handle_is_valid(STD_ERROR_HANDLE);
     if (!write_marker(root, L"grandchild-started", "grandchild-started\n") ||
         !write_pid(root)) {
         return 31;
     }
-    if (has_stdio) {
+    if (has_runner_pipes) {
         if (!write_marker(root, L"grandchild-stdio-inherited",
                           "grandchild-stdio-inherited\n")) {
             return 32;

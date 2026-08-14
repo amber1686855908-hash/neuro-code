@@ -2035,7 +2035,7 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                     await asyncio.sleep(0.02)
 
                 stdio_free = stdio_free_marker.is_file() and not stdio_inherited_marker.is_file()
-                stdio_inherited = stdio_inherited_marker.is_file()
+                runner_pipe_inherited = stdio_inherited_marker.is_file()
                 if not stdio_free:
                     classification = "DESCENDANT_WAIT_COUPLED_TO_STDIO"
                 elif (
@@ -2141,7 +2141,7 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                     "leader_exit_observed": leader_marker.is_file(),
                     "leader_exit_code": leader_code,
                     "grandchild_started": started_marker.is_file(),
-                    "grandchild_stdio_inherited": stdio_inherited,
+                    "grandchild_runner_pipe_inherited": runner_pipe_inherited,
                     "grandchild_stdio_free": stdio_free,
                     "grandchild_pid_active_window": pid_observation.get("state") == "ACTIVE"
                     or wait_pending_window,
