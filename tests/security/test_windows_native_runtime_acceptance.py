@@ -218,6 +218,51 @@ def _compile_stdio_probe() -> Path:  # pragma: no cover - Windows CI
     return _compile_msvc_probe(_stdio_probe_source(), "windows_stdio_probe")
 
 
+def _descendant_probe_source() -> Path:
+    source = Path(__file__).with_name("windows_descendant_probe.c").resolve(strict=False)
+    if not source.is_file():
+        raise _NativeProbeBuildError("descendant probe source is unavailable")
+    return source
+
+
+def _compile_descendant_probe() -> Path:  # pragma: no cover - Windows CI
+    """Build the acceptance-only Job Object descendant probe."""
+
+    return _compile_msvc_probe(_descendant_probe_source(), "windows_descendant_probe")
+
+
+def _observe_windows_pid(pid: int) -> dict[str, object]:  # pragma: no cover - Windows CI
+    """Observe one trusted PID without tasklist/PID enumeration."""
+
+    if os.name != "nt":
+        return {"state": "NON_WINDOWS"}
+    loader = getattr(ctypes, "WinDLL", None)
+    if loader is None:
+        return {"state": "WIN32_UNAVAILABLE"}
+    kernel32 = cast(Any, loader)("kernel32.dll", use_last_error=True)
+    kernel32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+    kernel32.OpenProcess.restype = ctypes.c_void_p
+    kernel32.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+    kernel32.WaitForSingleObject.restype = ctypes.c_uint32
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    kernel32.CloseHandle.restype = ctypes.c_int
+    handle = kernel32.OpenProcess(0x00100000 | 0x00001000, 0, pid)
+    if not handle:
+        get_last_error = cast(Any, getattr(ctypes, "get_last_error", lambda: 0))
+        return {"state": "OPEN_FAILED", "error": int(get_last_error())}
+    try:
+        wait_result = int(kernel32.WaitForSingleObject(handle, 0))
+    finally:
+        kernel32.CloseHandle(handle)
+    if wait_result == 0x00000000:
+        state = "EXITED"
+    elif wait_result == 0x00000102:
+        state = "ACTIVE"
+    else:
+        state = "WAIT_FAILED"
+    return {"state": state, "wait_result": wait_result}
+
+
 def _stdio_payload(length: int, variant: int) -> bytes:
     if length < len(_STDIO_SPECIAL):
         raise ValueError("stdio payload length is too small")
@@ -1214,7 +1259,7 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
             )
             setup_snapshot = authority.setup(setup_request)
             self.assertEqual(setup_snapshot.state, WindowsSandboxSetupState.READY)
-            encoded = authority._store(setup_request).load()  # type: ignore[attr-defined]
+            encoded = authority._store(setup_request).load()
             self.assertIsNotNone(encoded)
             record = _InstallationRecord.decode(cast(bytes, encoded))
 
@@ -1717,8 +1762,9 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                     diagnostic["stderr_is_none"] = stderr_is_none
                     runner = diagnostic.get("runner")
                     self.assertIsInstance(runner, dict)
-                    self.assertEqual(runner.get("state"), "RUNNER_EXITED")
-                    self.assertEqual(runner.get("exit_code"), 0)
+                    runner_facts = cast(dict[str, object], runner)
+                    self.assertEqual(runner_facts.get("state"), "RUNNER_EXITED")
+                    self.assertEqual(runner_facts.get("exit_code"), 0)
                     attestation = diagnostic.get("security_attestation")
                     token_attested = bool(
                         isinstance(attestation, dict)
@@ -1872,6 +1918,255 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                     flush=True,
                 )
             finally:
+                with contextlib.suppress(BaseException):
+                    authority.cleanup(setup_request)
+
+    async def test_gate5a_descendant_normal_wait_ownership(
+        self,
+    ) -> None:  # pragma: no cover - Windows CI
+        """Prove Job-owned descendants keep normal wait pending after leader exit."""
+
+        privilege_api = _NativeWindowsSetupPrivilegeApi()
+        self.assertTrue(privilege_api.is_administrator(), "W2 setup acceptance requires elevation")
+        try:
+            compiled_probe = await asyncio.to_thread(_compile_descendant_probe)
+        except _NativeProbeBuildError as error:
+            print(
+                "W3_GATE5A_BLOCKER="
+                + json.dumps(
+                    {
+                        "classification": "NATIVE_DESCENDANT_PROBE_BUILD_UNAVAILABLE",
+                        "error_type": type(error).__name__,
+                        "detail": str(error)[:512],
+                    },
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
+            self.fail("NATIVE_DESCENDANT_PROBE_BUILD_UNAVAILABLE")
+        self.addCleanup(shutil.rmtree, compiled_probe.parent, ignore_errors=True)
+
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace = root / "workspace"
+            installation = root / "installation"
+            runtime_state = root / "runtime-state"
+            workspace.mkdir()
+            installation.mkdir()
+            runtime_state.mkdir()
+            probe = workspace / "w3-windows-descendant-probe.exe"
+            shutil.copy2(compiled_probe, probe)
+            setup_request = WindowsSandboxSetupRequest(
+                installation_root=installation,
+                read_roots=(workspace,),
+                writable_roots=(workspace,),
+                sensitive_read_paths=(),
+            )
+            authority = WindowsNativeSandboxSetupAuthority(
+                credential_store=WindowsDpapiCredentialStore(installation / "credentials.dpapi"),
+                acl_api=_NativeWindowsAclApi(),
+                firewall_api=_NativeWindowsFirewallApi(),
+                account_api=_NativeWindowsSandboxAccountApi(),
+                privilege_api=privilege_api,
+            )
+            setup_snapshot = authority.setup(setup_request)
+            self.assertEqual(setup_snapshot.state, WindowsSandboxSetupState.READY)
+            online_sid = cast(str, setup_snapshot.online_user_sid)
+            write_sid = SyntheticWindowsSid(cast(str, setup_snapshot.write_restricting_sid))
+            request = _request(
+                workspace=workspace,
+                network=LocalProcessNetworkPolicy.INHERIT,
+                executable=str(probe),
+                arguments=("parent-exit-child-holds", str(workspace)),
+                purpose=LocalProcessPurpose.BASH,
+                stdio_mode=LocalProcessStdioMode.CAPTURE,
+            )
+            adapter = WindowsNativeLocalProcessSandbox(
+                SandboxProfile.WORKSPACE,
+                workspace,
+                runtime_state,
+                setup_authority=authority,
+                setup_request_factory=lambda _request: setup_request,
+                _diagnostic_desktop_mode=_WindowsNativeDesktopMode.PRIVATE_DESKTOP,
+                _diagnostic_create_no_window=True,
+            )
+            process: OwnedLocalProcess | None = None
+            stdout_task: asyncio.Task[bytes] | None = None
+            stderr_task: asyncio.Task[bytes] | None = None
+            wait_task: asyncio.Task[int] | None = None
+            classification: str | None = None
+            pid = 0
+            pid_observation: dict[str, object] = {"state": "NOT_OBSERVED"}
+            try:
+                process = await adapter.spawn(request)
+                initial_diagnostic = cast(Any, process).diagnostic_snapshot()
+                if not isinstance(initial_diagnostic, dict):
+                    initial_diagnostic = {}
+                attestation = initial_diagnostic.get("security_attestation")
+                token_attested = bool(
+                    isinstance(attestation, dict)
+                    and attestation.get("user_sid") == online_sid
+                    and attestation.get("is_restricted") is True
+                    and tuple(attestation.get("restricted_sids", ())) == (write_sid.value,)
+                    and attestation.get("change_notify_privilege_enabled") is True
+                    and attestation.get("unexpected_enabled_privilege_count") == 0
+                )
+                self.assertTrue(token_attested)
+                stdout_task = asyncio.create_task(_read_all_bounded(process.stdout))
+                stderr_task = asyncio.create_task(_read_all_bounded(process.stderr))
+                wait_task = asyncio.create_task(process.wait())
+
+                started_marker = workspace / "grandchild-started"
+                pid_file = workspace / "grandchild.pid"
+                stdio_free_marker = workspace / "grandchild-stdio-free"
+                stdio_inherited_marker = workspace / "grandchild-stdio-inherited"
+                leader_marker = workspace / "leader-exiting"
+                finished_marker = workspace / "grandchild-finished"
+
+                deadline = asyncio.get_running_loop().time() + 8.0
+                while asyncio.get_running_loop().time() < deadline:
+                    if (
+                        started_marker.is_file()
+                        and pid_file.is_file()
+                        and (stdio_free_marker.is_file() or stdio_inherited_marker.is_file())
+                        and leader_marker.is_file()
+                    ):
+                        break
+                    await asyncio.sleep(0.02)
+
+                stdio_free = stdio_free_marker.is_file() and not stdio_inherited_marker.is_file()
+                stdio_inherited = stdio_inherited_marker.is_file()
+                if not stdio_free:
+                    classification = "DESCENDANT_WAIT_COUPLED_TO_STDIO"
+                elif (
+                    not started_marker.is_file()
+                    or not leader_marker.is_file()
+                    or not pid_file.is_file()
+                ):
+                    classification = "DESCENDANT_LEADER_EXIT_TRANSPORT_FAILURE"
+                else:
+                    try:
+                        pid_text = pid_file.read_text(encoding="ascii").strip()
+                        pid = int(pid_text)
+                    except (OSError, UnicodeError, ValueError):
+                        classification = "DESCENDANT_LEADER_EXIT_TRANSPORT_FAILURE"
+                    if pid <= 0:
+                        classification = "DESCENDANT_LEADER_EXIT_TRANSPORT_FAILURE"
+
+                leader_code: int | None = None
+                if classification is None:
+                    for _ in range(150):
+                        if process.returncode is not None or wait_task.done():
+                            break
+                        await asyncio.sleep(0.02)
+                    leader_code = process.returncode
+                    if leader_code is None and wait_task.done():
+                        with contextlib.suppress(BaseException):
+                            leader_code = wait_task.result()
+                    if leader_code != 23:
+                        classification = "DESCENDANT_LEADER_EXIT_TRANSPORT_FAILURE"
+
+                if classification is None:
+                    pid_observation = _observe_windows_pid(pid)
+                    if pid_observation.get("state") != "ACTIVE":
+                        classification = "DESCENDANT_KILLED_ON_LEADER_EXIT"
+                    elif wait_task.done():
+                        classification = "WAIT_RETURNED_WITH_ACTIVE_DESCENDANT"
+
+                wait_pending_window = classification is None and not wait_task.done()
+                if classification is None:
+                    finish_deadline = asyncio.get_running_loop().time() + 8.0
+                    while (
+                        not finished_marker.is_file()
+                        and asyncio.get_running_loop().time() < finish_deadline
+                    ):
+                        if wait_task.done():
+                            pid_observation = _observe_windows_pid(pid)
+                            classification = (
+                                "WAIT_RETURNED_WITH_ACTIVE_DESCENDANT"
+                                if pid_observation.get("state") == "ACTIVE"
+                                else "DESCENDANT_KILLED_ON_LEADER_EXIT"
+                            )
+                            break
+                        await asyncio.sleep(0.02)
+
+                if classification is None and not finished_marker.is_file():
+                    classification = "DESCENDANT_LEADER_EXIT_TRANSPORT_FAILURE"
+
+                if classification is None:
+                    exit_deadline = asyncio.get_running_loop().time() + 3.0
+                    while asyncio.get_running_loop().time() < exit_deadline:
+                        pid_observation = _observe_windows_pid(pid)
+                        if pid_observation.get("state") == "EXITED":
+                            break
+                        await asyncio.sleep(0.02)
+                    if pid_observation.get("state") != "EXITED":
+                        classification = "DESCENDANT_LEADER_EXIT_TRANSPORT_FAILURE"
+
+                exit_code: int | None = None
+                if classification is None:
+                    try:
+                        exit_code = await asyncio.wait_for(asyncio.shield(wait_task), timeout=5.0)
+                    except BaseException:
+                        classification = "DESCENDANT_LEADER_EXIT_TRANSPORT_FAILURE"
+                    if exit_code != 23:
+                        classification = "DESCENDANT_LEADER_EXIT_TRANSPORT_FAILURE"
+
+                stdout = b""
+                stderr = b""
+                if classification is None:
+                    try:
+                        stdout, stderr = await asyncio.wait_for(
+                            asyncio.gather(stdout_task, stderr_task), timeout=5.0
+                        )
+                    except BaseException:
+                        classification = "DESCENDANT_LEADER_EXIT_TRANSPORT_FAILURE"
+
+                final_diagnostic = cast(Any, process).diagnostic_snapshot()
+                if not isinstance(final_diagnostic, dict):
+                    final_diagnostic = {}
+                runner = final_diagnostic.get("runner")
+                runner_exit = isinstance(runner, dict) and runner.get("state") == "RUNNER_EXITED"
+                runner_code = runner.get("exit_code") if isinstance(runner, dict) else None
+                forced_termination = final_diagnostic.get("termination_observation") is not None
+                if classification is None and (
+                    not runner_exit or runner_code != 0 or forced_termination or stdout or stderr
+                ):
+                    classification = "DESCENDANT_LEADER_EXIT_TRANSPORT_FAILURE"
+
+                facts = {
+                    "create_process_as_user": "PASS",
+                    "spawn_ready": "PASS",
+                    "token_attestation": token_attested,
+                    "leader_exit_observed": leader_marker.is_file(),
+                    "leader_exit_code": leader_code,
+                    "grandchild_started": started_marker.is_file(),
+                    "grandchild_stdio_inherited": stdio_inherited,
+                    "grandchild_stdio_free": stdio_free,
+                    "grandchild_pid_active_window": pid_observation.get("state") == "ACTIVE"
+                    or wait_pending_window,
+                    "wait_pending_while_descendant_active": wait_pending_window,
+                    "grandchild_finished": finished_marker.is_file(),
+                    "grandchild_pid_state_after_finish": pid_observation.get("state"),
+                    "runner_exit": runner_code,
+                    "forced_job_termination": forced_termination,
+                    "stdout_bytes": len(stdout),
+                    "stderr_bytes": len(stderr),
+                    "job_close_after_natural_descendant": classification is None,
+                    "classification": classification or "PASS",
+                }
+                print("W3_GATE5A_RESULTS=" + json.dumps(facts, sort_keys=True), flush=True)
+                if classification is not None:
+                    self.fail(classification)
+            finally:
+                if process is not None and process.returncode is None:
+                    with contextlib.suppress(BaseException):
+                        await process.terminate(grace_seconds=0.5)
+                for task in (stdout_task, stderr_task, wait_task):
+                    if task is not None and not task.done():
+                        task.cancel()
+                        with contextlib.suppress(BaseException):
+                            await task
                 with contextlib.suppress(BaseException):
                     authority.cleanup(setup_request)
 
