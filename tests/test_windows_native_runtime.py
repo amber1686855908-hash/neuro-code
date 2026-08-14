@@ -43,7 +43,6 @@ from neuro_code.infrastructure.sandbox.windows_native_runtime_protocol import (
 )
 from neuro_code.infrastructure.sandbox.windows_sandbox_accounts import WindowsAccountSid
 from neuro_code.infrastructure.sandbox.windows_sandbox_identity import (
-    WINDOWS_NATIVE_SANDBOX_ACTUAL_CAPABILITIES,
     WINDOWS_NATIVE_SANDBOX_TARGET_CAPABILITIES,
     SyntheticWindowsSid,
 )
@@ -224,7 +223,7 @@ class WindowsNativeRuntimeContractTests(unittest.IsolatedAsyncioTestCase):
             LocalProcessLifecycleCapability.PROCESS_GROUP_BEST_EFFORT,
         )
 
-    def test_runtime_keeps_actual_capabilities_fail_closed_until_acceptance(self) -> None:
+    def test_runtime_advertises_candidate_capabilities_for_native_acceptance(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "workspace"
             root.mkdir()
@@ -235,9 +234,6 @@ class WindowsNativeRuntimeContractTests(unittest.IsolatedAsyncioTestCase):
                 setup_authority=_ReadySetupAuthority(WindowsSandboxSetupState.READY),
             )
             self.assertEqual(
-                adapter.security_capabilities, WINDOWS_NATIVE_SANDBOX_ACTUAL_CAPABILITIES
-            )
-            self.assertNotEqual(
                 adapter.security_capabilities, WINDOWS_NATIVE_SANDBOX_TARGET_CAPABILITIES
             )
 

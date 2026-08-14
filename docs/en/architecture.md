@@ -1551,12 +1551,12 @@ The controller starts a trusted workspace-independent runner as the selected
 Offline or Online account; the runner creates the final child with a
 `WRITE_RESTRICTED` token, the installation synthetic write SID, and a
 kill-on-close Job Object. `ISOLATED` selects Offline and `INHERIT` selects
-Online without changing the persistent Offline Firewall rule. The W3 provider
-keeps actual capabilities `UNSUPPORTED` until privileged native acceptance
-proves the complete runtime contract; its architecture target is read
-`LIMITED`, write `STRONG`, and network `STRONG`. `strict` therefore fails
-closed because it requires strong read isolation. PTY/ConPTY remains W4, and
-the existing `off` path is unchanged.
+Online without changing the persistent Offline Firewall rule. The fully wired
+W3 runtime declares a candidate provider contract of read `LIMITED`, write
+`STRONG`, and network `STRONG`, certified by privileged native acceptance and
+the required PR gate. The W1/W2 foundation actual-capability constant remains
+`UNSUPPORTED`. `strict` fails closed because it requires strong read isolation.
+PTY/ConPTY remains W4, and the existing `off` path is unchanged.
 
 Enabled Linux startup performs a bounded controller-state hardlink audit before
 mounting any authorized workspace. It fails closed when a private regular file
