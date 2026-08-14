@@ -24,11 +24,27 @@ from typing import Protocol, cast
 
 from neuro_code.application.ports.windows_sandbox import WindowsSandboxIdentityKind
 from neuro_code.infrastructure.sandbox.windows_sandbox_accounts import WindowsAccountSid
+from neuro_code.infrastructure.sandbox.windows_sandbox_diagnostics import (
+    WindowsSandboxOperationDiagnostic,
+    diagnostic_for_exception,
+)
 from neuro_code.shared.errors import SandboxError
 
 
 class WindowsFirewallError(SandboxError):
     """A Windows Firewall authority operation failed closed."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        safe_diagnostic: WindowsSandboxOperationDiagnostic | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.safe_diagnostic = safe_diagnostic or WindowsSandboxOperationDiagnostic(
+            None,
+            type(self).__name__,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -125,7 +141,13 @@ class _NativeWindowsFirewallApi:  # pragma: no cover - exercised by Windows nati
             raise WindowsFirewallError("firewall value contains a control character")
         return "'" + value.replace("'", "''") + "'"
 
-    def _run(self, arguments: list[str], *, check: bool) -> subprocess.CompletedProcess[str]:
+    def _run(
+        self,
+        arguments: list[str],
+        *,
+        check: bool,
+        operation: str | None = None,
+    ) -> subprocess.CompletedProcess[str]:
         try:
             result = self._runner(
                 [
@@ -144,9 +166,18 @@ class _NativeWindowsFirewallApi:  # pragma: no cover - exercised by Windows nati
                 shell=False,
             )
         except (OSError, subprocess.SubprocessError) as error:
-            raise WindowsFirewallError("Windows Firewall setup command failed") from error
+            raise WindowsFirewallError(
+                "Windows Firewall setup command failed",
+                safe_diagnostic=diagnostic_for_exception(error, operation=operation),
+            ) from error
         if not isinstance(result, subprocess.CompletedProcess):
-            raise WindowsFirewallError("Windows Firewall setup command returned an invalid result")
+            raise WindowsFirewallError(
+                "Windows Firewall setup command returned an invalid result",
+                safe_diagnostic=WindowsSandboxOperationDiagnostic(
+                    operation,
+                    "InvalidCompletedProcess",
+                ),
+            )
         return result
 
     def ensure_outbound_block(self, rule: WindowsFirewallRule) -> None:
@@ -160,11 +191,11 @@ class _NativeWindowsFirewallApi:  # pragma: no cover - exercised by Windows nati
             "New-NetFirewallRule -Name $name -DisplayName $name -Direction Outbound "
             "-Action Block -Enabled True -Profile Any -Protocol Any -LocalUser $sddl | Out-Null"
         )
-        self._run(["-Command", script], check=True)
+        self._run(["-Command", script], check=True, operation="ENSURE")
 
     def remove_rule(self, rule: WindowsFirewallRule) -> None:
         script = f"Remove-NetFirewallRule -Name {self._ps_quote(rule.name)} -ErrorAction SilentlyContinue"
-        self._run(["-Command", script], check=False)
+        self._run(["-Command", script], check=False, operation="REMOVE")
 
     def rule_exists(self, rule: WindowsFirewallRule) -> bool:
         script = (
@@ -180,7 +211,7 @@ class _NativeWindowsFirewallApi:  # pragma: no cover - exercised by Windows nati
             "LocalUser=([string]($filter.LocalUser -join ',')) "
             "} | ConvertTo-Json -Compress"
         )
-        result = self._run(["-Command", script], check=False)
+        result = self._run(["-Command", script], check=False, operation="INSPECT")
         if result.returncode != 0:
             return False
         try:

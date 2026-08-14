@@ -28,6 +28,9 @@ from typing import Protocol, cast
 
 from neuro_code.application.ports.windows_sandbox import WindowsSandboxSetupRequest
 from neuro_code.infrastructure.sandbox.windows_sandbox_accounts import WindowsAccountSid
+from neuro_code.infrastructure.sandbox.windows_sandbox_diagnostics import (
+    WindowsSandboxOperationDiagnostic,
+)
 from neuro_code.infrastructure.sandbox.windows_sandbox_identity import SyntheticWindowsSid
 from neuro_code.shared.errors import SandboxError
 
@@ -71,6 +74,18 @@ INHERIT_TO_CHILDREN = 0x00000003  # OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE
 
 class WindowsAclError(SandboxError):
     """A filesystem ACL authority operation failed closed."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        safe_diagnostic: WindowsSandboxOperationDiagnostic | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.safe_diagnostic = safe_diagnostic or WindowsSandboxOperationDiagnostic(
+            None,
+            type(self).__name__,
+        )
 
 
 class WindowsManagedAceKind(StrEnum):
@@ -573,7 +588,14 @@ class _NativeWindowsAclApi:  # pragma: no cover - exercised by Windows native CI
 
     def _error(self, operation: str, code: int | None = None) -> WindowsAclError:
         error = cast(int, self._get_last_error()) if code is None else code
-        return WindowsAclError(f"{operation} failed with Windows error {error}")
+        return WindowsAclError(
+            f"{operation} failed with Windows error {error}",
+            safe_diagnostic=WindowsSandboxOperationDiagnostic(
+                operation,
+                "Win32Error",
+                winerror=error,
+            ),
+        )
 
     def _sid_pointer(self, sid: WindowsAccountSid | SyntheticWindowsSid) -> int:
         pointer = ctypes.c_void_p()

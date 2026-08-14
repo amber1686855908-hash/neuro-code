@@ -16,6 +16,7 @@ import os
 import secrets
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from enum import StrEnum
 from pathlib import Path
 from typing import Protocol
 
@@ -45,6 +46,10 @@ from neuro_code.infrastructure.sandbox.windows_sandbox_acl import (
     _NativeWindowsAclApi,
     plan_windows_filesystem_authority,
 )
+from neuro_code.infrastructure.sandbox.windows_sandbox_diagnostics import (
+    WindowsSandboxOperationDiagnostic,
+    diagnostic_for_exception,
+)
 from neuro_code.infrastructure.sandbox.windows_sandbox_firewall import (
     WindowsFirewallApi,
     WindowsFirewallRule,
@@ -58,8 +63,63 @@ from neuro_code.infrastructure.sandbox.windows_sandbox_persistence import (
 from neuro_code.shared.errors import SandboxError
 
 
+class WindowsSandboxSetupStage(StrEnum):
+    """Typed setup and rollback seams exposed by the W3 acceptance gate."""
+
+    STORE_SAVE = "STORE_SAVE"
+    ACL_RECONCILE = "ACL_RECONCILE"
+    FIREWALL_ENSURE = "FIREWALL_ENSURE"
+    ROLLBACK_ACL = "ROLLBACK_ACL"
+    ROLLBACK_FIREWALL = "ROLLBACK_FIREWALL"
+    ROLLBACK_ACCOUNTS = "ROLLBACK_ACCOUNTS"
+    ROLLBACK_STORE_CLEAR = "ROLLBACK_STORE_CLEAR"
+
+
 class WindowsSandboxSetupError(SandboxError):
-    """A W2 setup authority operation failed closed."""
+    """A W2 setup authority operation failed closed with safe diagnostics."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        stage: WindowsSandboxSetupStage | None = None,
+        cause: BaseException | None = None,
+        safe_diagnostic: WindowsSandboxOperationDiagnostic | None = None,
+        rollback_complete: bool = True,
+        rollback_failures: tuple[WindowsSandboxSetupStage, ...] = (),
+    ) -> None:
+        super().__init__(message)
+        diagnostic = safe_diagnostic or (
+            diagnostic_for_exception(cause) if cause is not None else None
+        )
+        if diagnostic is None:
+            diagnostic = WindowsSandboxOperationDiagnostic(None, type(self).__name__)
+        self.stage = stage
+        self.cause_type = diagnostic.cause_type
+        self.winerror = diagnostic.winerror
+        self.errno = diagnostic.errno
+        self.returncode = diagnostic.returncode
+        self.timed_out = diagnostic.timed_out
+        self.rollback_complete = rollback_complete
+        self.rollback_failures = rollback_failures
+        # This is intentionally a safe projection; no exception message is
+        # copied into the structured acceptance output.
+        self.safe_diagnostic = diagnostic
+
+    def diagnostic_payload(self) -> dict[str, object]:
+        """Return the bounded, machine-readable acceptance diagnostic."""
+
+        return {
+            "stage": self.stage.value if self.stage is not None else None,
+            "cause_type": self.cause_type,
+            "winerror": self.winerror,
+            "errno": self.errno,
+            "returncode": self.returncode,
+            "timed_out": self.timed_out,
+            "rollback_complete": self.rollback_complete,
+            "operation": self.safe_diagnostic.operation,
+            "rollback_failures": [stage.value for stage in self.rollback_failures],
+        }
 
 
 class WindowsSandboxSetupPrivilegeError(WindowsSandboxSetupError):
@@ -633,52 +693,89 @@ class WindowsNativeSandboxSetupAuthority:
             record, _ = self._repair_missing_accounts(account_api, record)
         store = self._store(request)
         plan = self._plan(request, record, store.path)
-        try:
-            updated = _InstallationRecord(
-                record.schema_version,
-                record.installation_id,
-                record.write_sid,
-                record.identities,
-                plan.entries,
-                record.offline_firewall_rule,
-            )
-            # The file must exist before native GetNamedSecurityInfoW can apply
-            # its exact deny ACE.  It is DPAPI encrypted before ACL mutation;
-            # the controller's account remains the owner and can decrypt it.
-            store.save(updated.encode())
-            acl_authority.reconcile(record.managed_aces, plan)
-            # Always establish the static Offline policy.  Only cleanup is
-            # allowed to remove this managed rule.
-            firewall.ensure_outbound_block(record.offline_firewall_rule)
-        except BaseException:
-            if fresh:
-                rollback_failed = False
+        updated = _InstallationRecord(
+            record.schema_version,
+            record.installation_id,
+            record.write_sid,
+            record.identities,
+            plan.entries,
+            record.offline_firewall_rule,
+        )
 
-                # Keep the persisted installation record until every external
-                # Windows authority has been rolled back.  If any step fails,
-                # the record is the recovery source for a later repair/cleanup.
-                def rollback_accounts() -> None:
-                    for facts in reversed(created_facts):
-                        account_api.remove_user(facts)
+        # Keep the first failing seam explicit.  Rollback is intentionally
+        # separate so a cleanup error can never replace the primary cause.
+        operation_steps: tuple[tuple[WindowsSandboxSetupStage, Callable[[], None]], ...] = (
+            (
+                WindowsSandboxSetupStage.STORE_SAVE,
+                lambda: store.save(updated.encode()),
+            ),
+            (
+                WindowsSandboxSetupStage.ACL_RECONCILE,
+                lambda: acl_authority.reconcile(record.managed_aces, plan),
+            ),
+            (
+                WindowsSandboxSetupStage.FIREWALL_ENSURE,
+                lambda: firewall.ensure_outbound_block(record.offline_firewall_rule),
+            ),
+        )
+        primary_stage: WindowsSandboxSetupStage | None = None
+        primary_error: BaseException | None = None
+        for stage, operation in operation_steps:
+            try:
+                operation()
+            except BaseException as error:
+                primary_stage = stage
+                primary_error = error
+                break
 
-                rollback_actions: tuple[Callable[[], None], ...] = (
+        if primary_error is not None and primary_stage is not None:
+            rollback_failures: list[WindowsSandboxSetupStage] = []
+
+            # Keep the persisted installation record until every external
+            # Windows authority has been rolled back.  If any step fails, the
+            # record remains the recovery source for a later repair/cleanup.
+            def rollback_accounts() -> None:
+                for facts in reversed(created_facts):
+                    account_api.remove_user(facts)
+
+            rollback_actions: tuple[tuple[WindowsSandboxSetupStage, Callable[[], None]], ...] = (
+                (
+                    WindowsSandboxSetupStage.ROLLBACK_ACL,
                     lambda: acl_authority.cleanup(plan.entries),
+                ),
+                (
+                    WindowsSandboxSetupStage.ROLLBACK_FIREWALL,
                     lambda: firewall.remove_rule(record.offline_firewall_rule),
-                    rollback_accounts,
-                )
-                for rollback in rollback_actions:
+                ),
+                (WindowsSandboxSetupStage.ROLLBACK_ACCOUNTS, rollback_accounts),
+            )
+            if fresh:
+                for rollback_stage, rollback in rollback_actions:
                     try:
                         rollback()
                     except BaseException:
-                        rollback_failed = True
-                if not rollback_failed:
+                        rollback_failures.append(rollback_stage)
+                if not rollback_failures:
                     try:
                         store.clear()
                     except BaseException:
-                        rollback_failed = True
+                        rollback_failures.append(WindowsSandboxSetupStage.ROLLBACK_STORE_CLEAR)
+
+            rollback_complete = not rollback_failures
+            diagnostic = diagnostic_for_exception(primary_error)
+            message = (
+                "Windows sandbox setup failed; rollback completed"
+                if rollback_complete
+                else "Windows sandbox setup failed; rollback incomplete"
+            )
             raise WindowsSandboxSetupError(
-                "Windows sandbox setup failed and was rolled back"
-            ) from None
+                message,
+                stage=primary_stage,
+                cause=primary_error,
+                safe_diagnostic=diagnostic,
+                rollback_complete=rollback_complete,
+                rollback_failures=tuple(rollback_failures),
+            ) from primary_error
         return self._snapshot(
             WindowsSandboxSetupState.READY,
             updated,
@@ -740,5 +837,6 @@ __all__ = [
     "WindowsSandboxIdentityRecord",
     "WindowsSandboxSetupError",
     "WindowsSandboxSetupPrivilegeError",
+    "WindowsSandboxSetupStage",
     "WindowsSetupPrivilegeApi",
 ]

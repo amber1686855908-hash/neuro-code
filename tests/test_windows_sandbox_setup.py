@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import os
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from neuro_code.application.ports.sandbox import (
     LocalProcessSecurityCapability,
@@ -31,7 +33,9 @@ from neuro_code.infrastructure.sandbox.windows_sandbox_acl import (
 )
 from neuro_code.infrastructure.sandbox.windows_sandbox_firewall import (
     InMemoryWindowsFirewallApi,
+    WindowsFirewallError,
     WindowsFirewallRule,
+    _NativeWindowsFirewallApi,
     firewall_rule_for_installation,
 )
 from neuro_code.infrastructure.sandbox.windows_sandbox_identity import (
@@ -47,6 +51,7 @@ from neuro_code.infrastructure.sandbox.windows_sandbox_setup import (
     WindowsNativeSandboxSetupAuthority,
     WindowsSandboxSetupError,
     WindowsSandboxSetupPrivilegeError,
+    WindowsSandboxSetupStage,
 )
 
 
@@ -85,6 +90,18 @@ class _FailingFirewall(InMemoryWindowsFirewallApi):
         if self.fail_ensure:
             raise RuntimeError("injected firewall setup failure")
         super().ensure_outbound_block(rule)
+
+
+class _FailingAcl(InMemoryWindowsAclApi):
+    def __init__(self) -> None:
+        super().__init__()
+        self.fail_reconcile = True
+
+    def reconcile(self, path, *, desired, remove):  # type: ignore[no-untyped-def]
+        if self.fail_reconcile:
+            self.fail_reconcile = False
+            raise PermissionError(13, "injected ACL failure")
+        super().reconcile(path, desired=desired, remove=remove)
 
 
 class _FailingAccountRemovalApi(InMemoryWindowsSandboxAccountApi):
@@ -530,6 +547,62 @@ class WindowsSandboxSetupAuthorityTests(unittest.TestCase):
             self.assertEqual(repaired.state, WindowsSandboxSetupState.READY)
             self.assertEqual(firewall.rules[rule.name], rule)
 
+    def test_setup_failure_keeps_primary_firewall_stage_and_safe_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            request = self._request(directory)
+            authority, _, _, _ = self._authority(directory)
+            authority._firewall_api = _FailingFirewall()
+            with self.assertRaises(WindowsSandboxSetupError) as raised:
+                authority.setup(request)
+            error = raised.exception
+            self.assertIs(error.stage, WindowsSandboxSetupStage.FIREWALL_ENSURE)
+            self.assertEqual(error.cause_type, "RuntimeError")
+            self.assertIsNone(error.winerror)
+            self.assertIsNone(error.returncode)
+            self.assertFalse(error.timed_out)
+            self.assertTrue(error.rollback_complete)
+            payload = error.diagnostic_payload()
+            self.assertNotIn("injected firewall setup failure", repr(payload))
+            self.assertEqual(payload["stage"], "FIREWALL_ENSURE")
+            self.assertEqual(payload["rollback_failures"], [])
+
+    def test_setup_failure_keeps_primary_acl_stage_and_errno(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            request = self._request(directory)
+            authority, _, _, _ = self._authority(directory)
+            authority._acl_api = _FailingAcl()
+            authority._acl_authority = None
+            with self.assertRaises(WindowsSandboxSetupError) as raised:
+                authority.setup(request)
+            error = raised.exception
+            self.assertIs(error.stage, WindowsSandboxSetupStage.ACL_RECONCILE)
+            self.assertEqual(error.cause_type, "PermissionError")
+            self.assertEqual(error.errno, 13)
+            self.assertTrue(error.rollback_complete)
+
+    def test_firewall_timeout_keeps_operation_and_timeout_fact(self) -> None:
+        api = object.__new__(_NativeWindowsFirewallApi)
+
+        def timeout_runner(*args: object, **kwargs: object) -> object:
+            del args, kwargs
+            raise subprocess.TimeoutExpired("powershell", 30)
+
+        api._runner = timeout_runner  # type: ignore[assignment]
+        with (
+            mock.patch.object(
+                _NativeWindowsFirewallApi,
+                "_powershell",
+                new_callable=mock.PropertyMock,
+                return_value="powershell.exe",
+            ),
+            self.assertRaises(WindowsFirewallError) as raised,
+        ):
+            api._run(["-Command", "redacted"], check=True, operation="ENSURE")
+        diagnostic = raised.exception.safe_diagnostic
+        self.assertEqual(diagnostic.operation, "ENSURE")
+        self.assertTrue(diagnostic.timed_out)
+        self.assertIsNone(diagnostic.returncode)
+
     def test_corrupt_persisted_record_reports_needs_repair(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             request = self._request(directory)
@@ -601,8 +674,15 @@ class WindowsSandboxSetupAuthorityTests(unittest.TestCase):
                 account_api=accounts,
                 privilege_api=_FakePrivilege(True),
             )
-            with self.assertRaises(WindowsSandboxSetupError):
+            with self.assertRaises(WindowsSandboxSetupError) as raised:
                 authority.setup(request)
+            error = raised.exception
+            self.assertIs(error.stage, WindowsSandboxSetupStage.FIREWALL_ENSURE)
+            self.assertFalse(error.rollback_complete)
+            self.assertIn(
+                WindowsSandboxSetupStage.ROLLBACK_ACCOUNTS,
+                error.rollback_failures,
+            )
             # The account removal failed after ACL/firewall rollback began;
             # the persisted record must remain as the recovery source.
             self.assertIsNotNone(store.load())
