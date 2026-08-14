@@ -81,18 +81,37 @@ _OVERWRITTEN = "GATE2_OVERWRITE_SENTINEL"
 _NUL_CANARY_COMMAND = ("echo", "GATE2_NUL_CANARY>NUL")
 _BENIGN_OUTBOUND_PROBE = ("1.1.1.1", 80)
 _WINSOCK_MARKER = "W3_WINSOCK="
+_STDIO_CAPTURE_STDOUT_LENGTH = 131329
+_STDIO_CAPTURE_STDERR_LENGTH = 131331
+_STDIO_MERGED_LENGTHS = (32771, 32773, 32779, 32783)
+_STDIO_MERGED_VARIANTS = (10, 11, 12, 13)
+_STDIO_PROTOCOL_LARGE_LENGTH = 96 * 1024 + 257
+_STDIO_SPECIAL = bytes(
+    (0x00, 0x0D, 0x0A, 0x0D, 0x0A, 0xE2, 0x82, 0xAC, 0xF0, 0x9F, 0x98, 0x80, 0xFF)
+)
+_STDIO_CAPTURE_STDOUT_TRAILER = b"G4_CAPTURE_STDOUT_TRAILER\x00\x0d\x0a\xff"
+_STDIO_CAPTURE_STDERR_TRAILER = b"G4_CAPTURE_STDERR_TRAILER\x00\x0a\x0d\xff"
+_STDIO_MERGED_TRAILERS = (
+    b"G4_MERGED_A\x00\x0d\x0a",
+    b"G4_MERGED_B\x00\x0a\x0d",
+    b"G4_MERGED_C\xff\x0d\x0a",
+    b"G4_MERGED_D\xe2\x82\xac\x0a",
+)
+_STDIO_PROTOCOL_DIAGNOSTIC = b"G4_PROTOCOL_DIAGNOSTIC\x00\x0d\x0a"
+_STDIO_NONZERO_STDOUT = b"G4_NONZERO_STDOUT\x00\x0d\x0a\xff"
+_STDIO_NONZERO_STDERR = b"G4_NONZERO_STDERR\x00\x0a\x0d\xff"
 ProbeState = Callable[[], dict[str, object]]
 Command = tuple[str, ...]
 
 
-class _WinsockProbeBuildError(RuntimeError):
-    """The trusted Windows controller could not build the acceptance probe."""
+class _NativeProbeBuildError(RuntimeError):
+    """The trusted Windows controller could not build an acceptance probe."""
 
 
 def _winsock_probe_source() -> Path:
     source = Path(__file__).with_name("windows_winsock_probe.c").resolve(strict=False)
     if not source.is_file():
-        raise _WinsockProbeBuildError("Winsock probe source is unavailable")
+        raise _NativeProbeBuildError("Winsock probe source is unavailable")
     return source
 
 
@@ -109,11 +128,11 @@ def _find_vswhere() -> Path:
     for candidate in candidates:
         if candidate.is_file():
             return candidate
-    raise _WinsockProbeBuildError("vswhere.exe is unavailable")
+    raise _NativeProbeBuildError("vswhere.exe is unavailable")
 
 
-def _compile_winsock_probe() -> Path:  # pragma: no cover - Windows CI
-    """Build the acceptance-only probe with the runner's selected MSVC toolchain."""
+def _compile_msvc_probe(source: Path, output_stem: str) -> Path:  # pragma: no cover - Windows CI
+    """Build one acceptance-only native probe with the runner's selected MSVC toolchain."""
 
     vswhere = _find_vswhere()
     try:
@@ -135,22 +154,21 @@ def _compile_winsock_probe() -> Path:  # pragma: no cover - Windows CI
             shell=False,
         )
     except (OSError, subprocess.SubprocessError) as error:
-        raise _WinsockProbeBuildError("vswhere discovery failed") from error
+        raise _NativeProbeBuildError("vswhere discovery failed") from error
     if discovery.returncode != 0:
-        raise _WinsockProbeBuildError("vswhere did not find an MSVC installation")
+        raise _NativeProbeBuildError("vswhere did not find an MSVC installation")
     installation_path = next(
         (Path(line.strip()) for line in discovery.stdout.splitlines() if line.strip()),
         None,
     )
     if installation_path is None:
-        raise _WinsockProbeBuildError("vswhere returned no installation path")
+        raise _NativeProbeBuildError("vswhere returned no installation path")
     vcvars = installation_path / "VC" / "Auxiliary" / "Build" / "vcvars64.bat"
     if not vcvars.is_file():
-        raise _WinsockProbeBuildError("vcvars64.bat is unavailable")
-    source = _winsock_probe_source()
+        raise _NativeProbeBuildError("vcvars64.bat is unavailable")
     runner_temp = Path(os.environ.get("RUNNER_TEMP", gettempdir()))
-    build_directory = Path(mkdtemp(prefix="neuro-code-w3-winsock-", dir=runner_temp))
-    output = build_directory / "windows_winsock_probe.exe"
+    build_directory = Path(mkdtemp(prefix=f"neuro-code-{output_stem}-", dir=runner_temp))
+    output = build_directory / f"{output_stem}.exe"
     build_script = build_directory / "build_probe.cmd"
     build_script.write_text(
         "@echo off\r\n"
@@ -171,14 +189,46 @@ def _compile_winsock_probe() -> Path:  # pragma: no cover - Windows CI
         )
     except (OSError, subprocess.SubprocessError) as error:
         shutil.rmtree(build_directory, ignore_errors=True)
-        raise _WinsockProbeBuildError("MSVC probe build failed") from error
+        raise _NativeProbeBuildError("MSVC probe build failed") from error
     if build.returncode != 0 or not output.is_file():
         diagnostic = (build.stderr or build.stdout or "").strip().replace("\x00", "")[:512]
         shutil.rmtree(build_directory, ignore_errors=True)
-        raise _WinsockProbeBuildError(
+        raise _NativeProbeBuildError(
             f"MSVC probe build failed (returncode={build.returncode}): {diagnostic}"
         )
     return output
+
+
+def _compile_winsock_probe() -> Path:  # pragma: no cover - Windows CI
+    """Build the acceptance-only Winsock probe."""
+
+    return _compile_msvc_probe(_winsock_probe_source(), "windows_winsock_probe")
+
+
+def _stdio_probe_source() -> Path:
+    source = Path(__file__).with_name("windows_stdio_probe.c").resolve(strict=False)
+    if not source.is_file():
+        raise _NativeProbeBuildError("stdio probe source is unavailable")
+    return source
+
+
+def _compile_stdio_probe() -> Path:  # pragma: no cover - Windows CI
+    """Build the acceptance-only raw Win32 stdio probe."""
+
+    return _compile_msvc_probe(_stdio_probe_source(), "windows_stdio_probe")
+
+
+def _stdio_payload(length: int, variant: int) -> bytes:
+    if length < len(_STDIO_SPECIAL):
+        raise ValueError("stdio payload length is too small")
+    body = bytes(
+        ((index * 37 + variant * 53 + 17) & 0xFF) for index in range(len(_STDIO_SPECIAL), length)
+    )
+    return _STDIO_SPECIAL + body
+
+
+def _encode_stdio_frame(payload: bytes) -> bytes:
+    return len(payload).to_bytes(4, "little") + payload
 
 
 def _parse_winsock_result(value: object) -> dict[str, object]:
@@ -242,6 +292,24 @@ async def _drain_stream(stream: object | None) -> bytes:
     return value if isinstance(value, bytes) else b""
 
 
+async def _read_all_bounded(stream: object | None, *, maximum: int = 1 << 20) -> bytes:
+    """Read one runtime stream to EOF without allowing unbounded buffering."""
+
+    if stream is None:
+        return b""
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        value = await cast(Any, stream).read(65_536)
+        if not isinstance(value, bytes) or not value:
+            break
+        total += len(value)
+        if total > maximum:
+            raise AssertionError("OUTPUT_BOUND_EXCEEDED")
+        chunks.append(value)
+    return b"".join(chunks)
+
+
 def _native_enabled() -> bool:
     return (
         os.name == "nt"
@@ -272,11 +340,13 @@ def _request(
     network: LocalProcessNetworkPolicy,
     executable: str,
     arguments: tuple[str, ...],
+    purpose: LocalProcessPurpose = LocalProcessPurpose.BASH,
+    stdio_mode: LocalProcessStdioMode = LocalProcessStdioMode.CAPTURE,
 ) -> SandboxedProcessRequest:
     return SandboxedProcessRequest.exec(
         executable,
         arguments,
-        purpose=LocalProcessPurpose.BASH,
+        purpose=purpose,
         cwd=workspace,
         sandbox_profile=SandboxProfile.WORKSPACE,
         filesystem_policy=LocalProcessFilesystemPolicy(
@@ -289,7 +359,7 @@ def _request(
         ),
         network_policy=network,
         environment_policy=LocalProcessEnvironmentPolicy({}),
-        stdio_mode=LocalProcessStdioMode.CAPTURE,
+        stdio_mode=stdio_mode,
         lifecycle=LocalProcessLifecycle(),
     )
 
@@ -1040,7 +1110,7 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
 
         try:
             compiled_probe = await asyncio.to_thread(_compile_winsock_probe)
-        except _WinsockProbeBuildError as error:
+        except _NativeProbeBuildError as error:
             print(
                 "W3_GATE3_BLOCKER="
                 + json.dumps(
@@ -1509,6 +1579,284 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                                 "write": LocalProcessSecurityStrength.STRONG.value,
                                 "network": LocalProcessSecurityStrength.STRONG.value,
                             },
+                        },
+                        sort_keys=True,
+                    ),
+                    flush=True,
+                )
+            finally:
+                with contextlib.suppress(BaseException):
+                    authority.cleanup(setup_request)
+
+    async def test_gate4_binary_stdio_protocol(self) -> None:  # pragma: no cover - Windows CI
+        """Prove bounded, binary-transparent capture and MCP-style stdio."""
+
+        privilege_api = _NativeWindowsSetupPrivilegeApi()
+        self.assertTrue(privilege_api.is_administrator(), "W2 setup acceptance requires elevation")
+        try:
+            compiled_probe = await asyncio.to_thread(_compile_stdio_probe)
+        except _NativeProbeBuildError as error:
+            print(
+                "W3_GATE4_BLOCKER="
+                + json.dumps(
+                    {
+                        "classification": "NATIVE_STDIO_PROBE_BUILD_UNAVAILABLE",
+                        "error_type": type(error).__name__,
+                        "detail": str(error)[:512],
+                    },
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
+            self.fail("NATIVE_STDIO_PROBE_BUILD_UNAVAILABLE")
+        self.addCleanup(shutil.rmtree, compiled_probe.parent, ignore_errors=True)
+
+        stdout_expected = _stdio_payload(_STDIO_CAPTURE_STDOUT_LENGTH, 3) + (
+            _STDIO_CAPTURE_STDOUT_TRAILER
+        )
+        stderr_expected = _stdio_payload(_STDIO_CAPTURE_STDERR_LENGTH, 7) + (
+            _STDIO_CAPTURE_STDERR_TRAILER
+        )
+        merged_expected = b"".join(
+            _stdio_payload(length, variant) + trailer
+            for length, variant, trailer in zip(
+                _STDIO_MERGED_LENGTHS,
+                _STDIO_MERGED_VARIANTS,
+                _STDIO_MERGED_TRAILERS,
+                strict=True,
+            )
+        )
+        protocol_first = _stdio_payload(_STDIO_PROTOCOL_LARGE_LENGTH, 17)
+        protocol_second = bytes(
+            (0x00, 0x0D, 0x0A, 0x0D, 0x0A, 0xE2, 0x82, 0xAC, 0xF0, 0x9F, 0x98, 0x80, 0xFF)
+        )
+        protocol_input = _encode_stdio_frame(protocol_first) + _encode_stdio_frame(protocol_second)
+        self.assertGreater(len(protocol_input), 65 * 1024)
+        self.assertNotIn(_STDIO_PROTOCOL_DIAGNOSTIC, protocol_input)
+
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace = root / "workspace"
+            installation = root / "installation"
+            runtime_state = root / "runtime-state"
+            workspace.mkdir()
+            installation.mkdir()
+            runtime_state.mkdir()
+            probe = workspace / "w3-windows-stdio-probe.exe"
+            shutil.copy2(compiled_probe, probe)
+            setup_request = WindowsSandboxSetupRequest(
+                installation_root=installation,
+                read_roots=(workspace,),
+                writable_roots=(workspace,),
+                sensitive_read_paths=(),
+            )
+            authority = WindowsNativeSandboxSetupAuthority(
+                credential_store=WindowsDpapiCredentialStore(installation / "credentials.dpapi"),
+                acl_api=_NativeWindowsAclApi(),
+                firewall_api=_NativeWindowsFirewallApi(),
+                account_api=_NativeWindowsSandboxAccountApi(),
+                privilege_api=privilege_api,
+            )
+            setup_snapshot = authority.setup(setup_request)
+            self.assertEqual(setup_snapshot.state, WindowsSandboxSetupState.READY)
+            online_sid = cast(str, setup_snapshot.online_user_sid)
+            write_sid = SyntheticWindowsSid(cast(str, setup_snapshot.write_restricting_sid))
+
+            async def run_stdio_child(
+                *,
+                mode: LocalProcessStdioMode,
+                argument: str,
+                stdin_payload: bytes = b"",
+                expected_exit: int = 0,
+            ) -> tuple[bytes, bytes, int, bool, dict[str, object]]:
+                request = _request(
+                    workspace=workspace,
+                    network=LocalProcessNetworkPolicy.INHERIT,
+                    executable=str(probe),
+                    arguments=(argument,),
+                    purpose=(
+                        LocalProcessPurpose.MCP_STDIO
+                        if mode is LocalProcessStdioMode.PROTOCOL
+                        else LocalProcessPurpose.BASH
+                    ),
+                    stdio_mode=mode,
+                )
+                adapter = WindowsNativeLocalProcessSandbox(
+                    SandboxProfile.WORKSPACE,
+                    workspace,
+                    runtime_state,
+                    setup_authority=authority,
+                    setup_request_factory=lambda _request: setup_request,
+                    _diagnostic_desktop_mode=_WindowsNativeDesktopMode.PRIVATE_DESKTOP,
+                    _diagnostic_create_no_window=True,
+                )
+                process: OwnedLocalProcess | None = None
+                stdout_task: asyncio.Task[bytes] | None = None
+                stderr_task: asyncio.Task[bytes] | None = None
+                wait_task: asyncio.Task[int] | None = None
+                try:
+                    process = await adapter.spawn(request)
+                    diagnostic = cast(Any, process).diagnostic_snapshot()
+                    stdout_task = asyncio.create_task(_read_all_bounded(process.stdout))
+                    stderr_task = asyncio.create_task(_read_all_bounded(process.stderr))
+                    wait_task = asyncio.create_task(process.wait())
+                    if stdin_payload:
+                        await process.write_stdin(stdin_payload)
+                    if mode is LocalProcessStdioMode.PROTOCOL:
+                        await process.close_stdin()
+                    stdout, stderr, exit_code = await asyncio.wait_for(
+                        asyncio.gather(stdout_task, stderr_task, wait_task),
+                        timeout=30,
+                    )
+                    self.assertEqual(exit_code, expected_exit)
+                    if not isinstance(diagnostic, dict):
+                        diagnostic = {}
+                    attestation = diagnostic.get("security_attestation")
+                    token_attested = bool(
+                        isinstance(attestation, dict)
+                        and attestation.get("user_sid") == online_sid
+                        and attestation.get("is_restricted") is True
+                        and tuple(attestation.get("restricted_sids", ())) == (write_sid.value,)
+                        and attestation.get("change_notify_privilege_enabled") is True
+                        and attestation.get("unexpected_enabled_privilege_count") == 0
+                    )
+                    self.assertTrue(token_attested)
+                    return stdout, stderr, exit_code, token_attested, diagnostic
+                finally:
+                    if process is not None and process.returncode is None:
+                        with contextlib.suppress(BaseException):
+                            await process.terminate(grace_seconds=0.5)
+                    for task in (stdout_task, stderr_task, wait_task):
+                        if task is not None and not task.done():
+                            task.cancel()
+                            with contextlib.suppress(BaseException):
+                                await task
+
+            try:
+                (
+                    capture_stdout,
+                    capture_stderr,
+                    capture_exit,
+                    capture_token,
+                    capture_diag,
+                ) = await run_stdio_child(mode=LocalProcessStdioMode.CAPTURE, argument="capture")
+                self.assertEqual(capture_stdout, stdout_expected)
+                self.assertEqual(capture_stderr, stderr_expected)
+                self.assertEqual(capture_exit, 0)
+                self.assertTrue(capture_token)
+                self.assertTrue(capture_stdout.endswith(_STDIO_CAPTURE_STDOUT_TRAILER))
+                self.assertTrue(capture_stderr.endswith(_STDIO_CAPTURE_STDERR_TRAILER))
+
+                (
+                    merged_stdout,
+                    merged_stderr,
+                    merged_exit,
+                    merged_token,
+                    merged_diag,
+                ) = await run_stdio_child(
+                    mode=LocalProcessStdioMode.MERGED_CAPTURE, argument="merged"
+                )
+                self.assertEqual(merged_stdout, merged_expected)
+                self.assertEqual(merged_stderr, b"")
+                self.assertEqual(merged_exit, 0)
+                self.assertTrue(merged_token)
+
+                (
+                    protocol_stdout,
+                    protocol_stderr,
+                    protocol_exit,
+                    protocol_token,
+                    protocol_diag,
+                ) = await run_stdio_child(
+                    mode=LocalProcessStdioMode.PROTOCOL,
+                    argument="protocol",
+                    stdin_payload=protocol_input,
+                )
+                self.assertEqual(protocol_stdout, protocol_input)
+                self.assertEqual(protocol_stderr, _STDIO_PROTOCOL_DIAGNOSTIC)
+                self.assertEqual(protocol_exit, 0)
+                self.assertTrue(protocol_token)
+                self.assertNotIn(_STDIO_PROTOCOL_DIAGNOSTIC, protocol_stdout)
+
+                (
+                    nonzero_stdout,
+                    nonzero_stderr,
+                    nonzero_exit,
+                    nonzero_token,
+                    nonzero_diag,
+                ) = await run_stdio_child(
+                    mode=LocalProcessStdioMode.CAPTURE,
+                    argument="nonzero",
+                    expected_exit=7,
+                )
+                self.assertEqual(nonzero_stdout, _STDIO_NONZERO_STDOUT)
+                self.assertEqual(nonzero_stderr, _STDIO_NONZERO_STDERR)
+                self.assertEqual(nonzero_exit, 7)
+                self.assertTrue(nonzero_token)
+
+                self.assertEqual(len(capture_stdout), len(stdout_expected))
+                self.assertEqual(len(capture_stderr), len(stderr_expected))
+                self.assertEqual(len(merged_stdout), len(merged_expected))
+                self.assertEqual(len(protocol_input), len(protocol_stdout))
+                print(
+                    "W3_GATE4_RESULTS="
+                    + json.dumps(
+                        {
+                            "capture": {
+                                "stdout_expected_bytes": len(stdout_expected),
+                                "stdout_actual_bytes": len(capture_stdout),
+                                "stdout_exact": capture_stdout == stdout_expected,
+                                "stderr_expected_bytes": len(stderr_expected),
+                                "stderr_actual_bytes": len(capture_stderr),
+                                "stderr_exact": capture_stderr == stderr_expected,
+                                "exit": capture_exit,
+                                "tail_preserved": capture_stdout.endswith(
+                                    _STDIO_CAPTURE_STDOUT_TRAILER
+                                )
+                                and capture_stderr.endswith(_STDIO_CAPTURE_STDERR_TRAILER),
+                            },
+                            "merged_capture": {
+                                "expected_bytes": len(merged_expected),
+                                "actual_bytes": len(merged_stdout),
+                                "exact": merged_stdout == merged_expected,
+                                "stderr_none": merged_stderr == b"",
+                                "order_exact": merged_stdout == merged_expected,
+                                "exit": merged_exit,
+                            },
+                            "protocol": {
+                                "stdin_bytes": len(protocol_input),
+                                "largest_write_stdin_bytes": len(protocol_input),
+                                "frames": 2,
+                                "stdout_exact": protocol_stdout == protocol_input,
+                                "stderr_exact": protocol_stderr == _STDIO_PROTOCOL_DIAGNOSTIC,
+                                "stdout_contamination": _STDIO_PROTOCOL_DIAGNOSTIC
+                                in protocol_stdout,
+                                "close_stdin_eof": protocol_exit == 0,
+                            },
+                            "nonzero": {
+                                "stdout_exact": nonzero_stdout == _STDIO_NONZERO_STDOUT,
+                                "stderr_exact": nonzero_stderr == _STDIO_NONZERO_STDERR,
+                                "exit": nonzero_exit,
+                            },
+                            "output_after_exit": False,
+                            "token_attestation": all(
+                                (
+                                    capture_token,
+                                    merged_token,
+                                    protocol_token,
+                                    nonzero_token,
+                                )
+                            ),
+                            "diagnostic_runner_states": [
+                                diagnostic.get("runner")
+                                for diagnostic in (
+                                    capture_diag,
+                                    merged_diag,
+                                    protocol_diag,
+                                    nonzero_diag,
+                                )
+                                if isinstance(diagnostic, dict)
+                            ],
                         },
                         sort_keys=True,
                     ),
