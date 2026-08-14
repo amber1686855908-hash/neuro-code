@@ -151,15 +151,23 @@ def _compile_winsock_probe() -> Path:  # pragma: no cover - Windows CI
     runner_temp = Path(os.environ.get("RUNNER_TEMP", gettempdir()))
     build_directory = Path(mkdtemp(prefix="neuro-code-w3-winsock-", dir=runner_temp))
     output = build_directory / "windows_winsock_probe.exe"
-    command = f'call "{vcvars}" && cl /nologo /W4 /WX /MT /O2 /Fe:"{output}" "{source}" Ws2_32.lib'
+    build_script = build_directory / "build_probe.cmd"
+    build_script.write_text(
+        "@echo off\r\n"
+        f'call "{vcvars}"\r\n'
+        "if errorlevel 1 exit /b 1\r\n"
+        f'cl /nologo /W4 /WX /MT /O2 /Fe:"{output}" "{source}" Ws2_32.lib\r\n',
+        encoding="ascii",
+    )
     try:
         build = subprocess.run(
-            ["cmd.exe", "/d", "/c", command],
+            ["cmd.exe", "/d", "/c", build_script.name],
             check=False,
             capture_output=True,
             text=True,
             timeout=120,
             shell=False,
+            cwd=str(build_directory),
         )
     except (OSError, subprocess.SubprocessError) as error:
         shutil.rmtree(build_directory, ignore_errors=True)
