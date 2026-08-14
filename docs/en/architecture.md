@@ -1550,7 +1550,13 @@ preflighted through W2 and fails before child creation unless setup is `READY`.
 The controller starts a trusted workspace-independent runner as the selected
 Offline or Online account; the runner creates the final child with a
 `WRITE_RESTRICTED` token whose restricting set is exactly the installation
-synthetic write SID, plus a kill-on-close Job Object. Everyone, logon,
+synthetic write SID, plus a kill-on-close Job Object. Controller and runner
+use separate controller-to-runner control and runner-to-controller event
+named pipes with specific rights that exclude `FILE_CREATE_PIPE_INSTANCE`.
+Python `-I` and the explicit environment are necessary but not sufficient
+provenance controls: before `CreateProcessWithLogonW`, the resolved
+interpreter, runner module, Neuro Code package root, and dependency root must
+be outside every model-writable root. Everyone, logon,
 sandbox-user, and controller SIDs remain object-ACL principals only. The runner
 attests that `DISABLE_MAX_PRIVILEGE` preserved `SeChangeNotifyPrivilege` and
 does not call `AdjustTokenPrivileges`. `ISOLATED` selects Offline and `INHERIT` selects

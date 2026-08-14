@@ -17,10 +17,15 @@ logon、sandbox-user 与 controller SID 只作为 object ACL principal。
 `DISABLE_MAX_PRIVILEGE` 必须保留 `SeChangeNotifyPrivilege`；W3 会检查该事实，绝不
 通过 `AdjustTokenPrivileges` 重新授予。
 
-controller 与 runner 通过随机、由 controller 创建的 named pipe 通信。named
-pipe 使用只允许 controller 与选定 sandbox 用户的精确 DACL，并使用带版本和长度
-前缀的二进制 frame。stdout 与 stderr 保持分离；协议 payload 不按文本解码，runner
-诊断不会进入 MCP stdout。
+controller 与 runner 通过两个随机、由 controller 创建的单向同步 named pipe
+通信：controller 写入、runner 读取的 control pipe，以及 runner 写入、controller
+读取的 event pipe。每个 pipe 都使用只允许 controller 与选定 sandbox 用户的精确
+DACL，并使用排除 `FILE_CREATE_PIPE_INSTANCE` 的 specific client rights，以及带
+版本和长度前缀的二进制 frame。stdout 与 stderr 保持分离；协议 payload 不按文本
+解码，runner 诊断不会进入 MCP stdout。runner 使用 Python `-I` 和显式环境启动，
+但这两项本身不能证明 provenance：在 `CreateProcessWithLogonW` 之前，resolved
+interpreter、runner module、Neuro Code package root 与 dependency root 必须与所有
+模型可写 root 保持不相交。
 
 `ISOLATED` 选择持久化 Offline identity，`INHERIT` 选择 Online identity。runtime
 不会修改 Firewall，也不会执行 setup、repair 或 UAC 提权。setup inspect 不是

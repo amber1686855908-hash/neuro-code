@@ -1097,7 +1097,11 @@ W3 为 Windows Bash、后台 Bash 和 MCP stdio 的非 PTY runtime 增加
 inspect；只有 `READY` 才能创建 child，否则在 child creation 前失败关闭。controller 使用选定的
 Offline 或 Online account 启动可信且独立于 workspace 的 runner；runner 使用
 restricting set 仅为 installation synthetic write SID 的 `WRITE_RESTRICTED` token 和
-kill-on-close Job Object 创建最终 child。Everyone、logon、sandbox-user 与 controller SID
+kill-on-close Job Object 创建最终 child。controller 与 runner 使用分离的
+controller→runner control pipe 和 runner→controller event pipe，specific rights
+排除 `FILE_CREATE_PIPE_INSTANCE`。Python `-I` 与显式环境是必要条件但并非 provenance
+证明：在 `CreateProcessWithLogonW` 之前，resolved interpreter、runner module、Neuro Code
+package root 与 dependency root 必须位于所有模型可写 root 之外。Everyone、logon、sandbox-user 与 controller SID
 只作为 object ACL principal。runner 检查 `DISABLE_MAX_PRIVILEGE` 已保留
 `SeChangeNotifyPrivilege`，且不会调用 `AdjustTokenPrivileges`。`ISOLATED` 选择 Offline，
 `INHERIT` 选择 Online，且不会修改持久化 Offline Firewall rule。

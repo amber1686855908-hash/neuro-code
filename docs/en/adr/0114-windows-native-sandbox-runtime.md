@@ -19,10 +19,17 @@ object-ACL principals only. `DISABLE_MAX_PRIVILEGE` must preserve
 `SeChangeNotifyPrivilege`; W3 inspects that fact and never re-grants it with
 `AdjustTokenPrivileges`.
 
-Controller and runner communicate through a random controller-owned named
-pipe with an exact controller/selected-user DACL and versioned length-prefixed
-binary frames.  Stdout and stderr remain separate; protocol payloads are not
-decoded as text and runner diagnostics never enter MCP stdout.
+Controller and runner communicate through two random controller-owned,
+directional synchronous named pipes: a controller-writer/runner-reader
+control pipe and a runner-writer/controller-reader event pipe. Each pipe has
+an exact controller/selected-user DACL, specific client rights that exclude
+`FILE_CREATE_PIPE_INSTANCE`, and versioned length-prefixed binary frames.
+Stdout and stderr remain separate; protocol payloads are not decoded as text
+and runner diagnostics never enter MCP stdout. The runner is launched with
+Python `-I` and an explicit environment, but those measures are not a
+provenance proof by themselves: before `CreateProcessWithLogonW`, the
+resolved interpreter, runner module, Neuro Code package root, and dependency
+root must be disjoint from every model-writable root.
 
 `ISOLATED` selects the persistent Offline identity and `INHERIT` selects the
 Online identity.  Runtime never changes Firewall state and never performs
