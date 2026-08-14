@@ -70,6 +70,7 @@ from neuro_code.infrastructure.sandbox.windows_sandbox_setup import (
 _SENTINEL = "GATE2_NON_SECRET_SENTINEL"
 _APPENDED = "GATE2_APPEND_SENTINEL"
 _OVERWRITTEN = "GATE2_OVERWRITE_SENTINEL"
+_NUL_CANARY_COMMAND = "echo GATE2_NUL_CANARY>NUL"
 ProbeState = Callable[[], dict[str, object]]
 
 
@@ -107,15 +108,15 @@ def _cmd_write(path: Path, text: str, *, append: bool = False) -> str:
 
 
 def _cmd_read(path: Path) -> str:
-    return f"type {_quoted(path)} > NUL"
+    return f"type {_quoted(path)}"
 
 
 def _cmd_move(source: Path, destination: Path) -> str:
-    return f"move /Y {_quoted(source)} {_quoted(destination)} > NUL"
+    return f"move /Y {_quoted(source)} {_quoted(destination)}"
 
 
 def _cmd_delete(path: Path) -> str:
-    return f"del /F /Q {_quoted(path)} > NUL"
+    return f"del /F /Q {_quoted(path)}"
 
 
 def _request(
@@ -186,6 +187,78 @@ def _inspect_acl_entries(api: _NativeWindowsAclApi, path: Path) -> tuple[_AclEnt
             )
         )
     return tuple(entries)
+
+
+def _inspect_dacl_protection(api: _NativeWindowsAclApi, path: Path) -> dict[str, object]:
+    """Return only the DACL protection bit for a bounded acceptance record."""
+
+    owner = ctypes.c_void_p()
+    group = ctypes.c_void_p()
+    dacl = ctypes.c_void_p()
+    sacl = ctypes.c_void_p()
+    descriptor = ctypes.c_void_p()
+    result = cast(Any, api._get_named_security_info)(
+        str(path),
+        api._SE_FILE_OBJECT,
+        api._DACL_SECURITY_INFORMATION,
+        ctypes.byref(owner),
+        ctypes.byref(group),
+        ctypes.byref(dacl),
+        ctypes.byref(sacl),
+        ctypes.byref(descriptor),
+    )
+    if result != 0 or not descriptor.value:
+        return {"inspection_error": "GetNamedSecurityInfoW"}
+    try:
+        loader = getattr(ctypes, "WinDLL", None)
+        if loader is None:
+            return {"inspection_error": "Win32 ctypes unavailable"}
+        advapi32 = loader("advapi32.dll", use_last_error=True)
+        get_control = advapi32.GetSecurityDescriptorControl
+        get_control.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_uint16),
+            ctypes.POINTER(ctypes.c_uint32),
+        ]
+        get_control.restype = ctypes.c_int32
+        control = ctypes.c_uint16()
+        revision = ctypes.c_uint32()
+        if not get_control(descriptor, ctypes.byref(control), ctypes.byref(revision)):
+            return {"inspection_error": "GetSecurityDescriptorControl"}
+        return {"dacl_protected": bool(control.value & 0x1000)}
+    finally:
+        api._local_free(descriptor)
+
+
+def _acl_summary(
+    api: _NativeWindowsAclApi,
+    path: Path,
+    *,
+    online_sid: str,
+    offline_sid: str,
+    synthetic_sid: str,
+) -> dict[str, object]:
+    entries = _inspect_acl_entries(api, path)
+    target_sids = {online_sid, offline_sid, synthetic_sid}
+
+    def project(entry: _AclEntryProjection) -> dict[str, object]:
+        return {
+            "type": "deny" if entry.is_deny else "allow",
+            "mask": entry.access_mask,
+            "inherited": bool(entry.inheritance & api._INHERITED_ACE),
+        }
+
+    def for_sid(sid: str) -> list[dict[str, object]]:
+        return [project(entry) for entry in entries if entry.sid == sid]
+
+    unrelated = [project(entry) for entry in entries if entry.sid not in target_sids]
+    return {
+        "dacl_protected": _inspect_dacl_protection(api, path),
+        "online_real_sid": for_sid(online_sid),
+        "offline_real_sid": for_sid(offline_sid),
+        "synthetic_sid": for_sid(synthetic_sid),
+        "unrelated": unrelated[:32],
+    }
 
 
 def _projection_has_write_allow(entries: tuple[_AclEntryProjection, ...], sid: str) -> bool:
@@ -286,6 +359,7 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                 command: str,
                 expected: str,
                 capture_stdout: bool = False,
+                expected_stdout: str | None = None,
             ) -> dict[str, object]:
                 request = _request(
                     workspace=workspace,
@@ -366,10 +440,13 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                     if process is not None and process.returncode is not None:
                         result["exit_code"] = process.returncode
                         result["actual"] = "ALLOW" if process.returncode == 0 else "DENY"
+                    stdout_text = captured_stdout.decode("utf-8", errors="replace")
                     if capture_stdout:
-                        result["stdout_preview"] = captured_stdout.decode(
-                            "utf-8", errors="replace"
-                        ).strip()[:256]
+                        result["stdout_preview"] = stdout_text.strip()[:256]
+                    if expected_stdout is not None:
+                        result["stdout_matches_expected"] = (
+                            stdout_text.rstrip("\r\n") == expected_stdout
+                        )
                     result["stderr_preview"] = captured_stderr.decode("utf-8", errors="replace")[
                         :512
                     ]
@@ -451,9 +528,11 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                     gate1.append(probe)
                 print("W3_GATE1_REGRESSION=PASS", flush=True)
 
-                # Gate 2A: both primary user and synthetic restricting SID
-                # must authorize every workspace write operation.
+                # Gate 2A starts with a pure read.  ``type file`` deliberately
+                # leaves stdout on the inherited pipe; redirecting to NUL
+                # would combine READ authority with an unrelated device write.
                 workspace_results: list[dict[str, object]] = []
+                nul_probe: dict[str, object] | None = None
                 for identity, network in (
                     ("ONLINE", LocalProcessNetworkPolicy.INHERIT),
                     ("OFFLINE", LocalProcessNetworkPolicy.ISOLATED),
@@ -461,13 +540,88 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                     prefix = identity.casefold()
                     source = workspace / f"{prefix}-gate2-a.txt"
                     destination = workspace / f"{prefix}-gate2-b.txt"
+                    read_probe = await run_child(
+                        label="WORKSPACE_READ_NO_REDIRECT",
+                        identity=identity,
+                        network=network,
+                        command=_cmd_read(readable),
+                        expected="ALLOW",
+                        expected_stdout=_SENTINEL,
+                    )
+                    if read_probe.get("actual") != "ALLOW":
+                        try:
+                            require_probe(
+                                read_probe,
+                                expected="ALLOW",
+                                state=_state_probe(readable, expected_content=_SENTINEL),
+                            )
+                        except AssertionError:
+                            try:
+                                inspection: dict[str, object] = {
+                                    "workspace_root": _acl_summary(
+                                        acl_api,
+                                        workspace,
+                                        online_sid=online_sid,
+                                        offline_sid=offline_sid,
+                                        synthetic_sid=write_sid.value,
+                                    ),
+                                    "readable_file": _acl_summary(
+                                        acl_api,
+                                        readable,
+                                        online_sid=online_sid,
+                                        offline_sid=offline_sid,
+                                        synthetic_sid=write_sid.value,
+                                    ),
+                                }
+                            except BaseException as inspection_error:
+                                inspection = {"inspection_error": type(inspection_error).__name__}
+                            print(
+                                "W3_WORKSPACE_ACL_INSPECTION="
+                                + json.dumps(inspection, sort_keys=True),
+                                flush=True,
+                            )
+                            raise
+                    require_probe(
+                        read_probe,
+                        expected="ALLOW",
+                        state=_state_probe(readable, expected_content=_SENTINEL),
+                    )
+                    self.assertTrue(read_probe.get("stdout_matches_expected"))
+                    workspace_results.append(read_probe)
+
+                    if identity == "ONLINE":
+                        nul_probe = await run_child(
+                            label="NUL_WRITE",
+                            identity=identity,
+                            network=network,
+                            command=_NUL_CANARY_COMMAND,
+                            expected="UNSPECIFIED",
+                        )
+                        self.assertEqual(nul_probe.get("create_process"), "PASS")
+                        self.assertEqual(nul_probe.get("spawn_ready"), "PASS")
+                        self.assertTrue(nul_probe.get("token_attested"))
+                        self.assertIn(nul_probe.get("actual"), {"ALLOW", "DENY"})
+                        print(
+                            "W3_NUL_PROBE="
+                            + json.dumps(
+                                {
+                                    "actual": nul_probe.get("actual"),
+                                    "exit_code": nul_probe.get("exit_code"),
+                                    "stderr_preview": nul_probe.get("stderr_preview", ""),
+                                    "classification": (
+                                        "NUL_WRITE_RESTRICTED_COMPATIBILITY"
+                                        if nul_probe.get("actual") == "DENY"
+                                        else "ALLOW"
+                                    ),
+                                },
+                                sort_keys=True,
+                            ),
+                            flush=True,
+                        )
+
+                    # Remaining operations keep stdout/stderr on the already
+                    # inherited pipes and test only workspace mutation.
                     workspace_operations: tuple[tuple[str, str, str, ProbeState], ...] = (
-                        (
-                            "WORKSPACE_READ",
-                            _cmd_read(readable),
-                            "ALLOW",
-                            _state_probe(readable, expected_content=_SENTINEL),
-                        ),
                         (
                             "WORKSPACE_CREATE",
                             _cmd_write(source, _SENTINEL),
@@ -686,6 +840,7 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                         {
                             "gate1": gate1,
                             "workspace": workspace_results,
+                            "nul": nul_probe,
                             "readonly": readonly_results,
                             "outside_acl": {
                                 "online_real_write_allow": online_write_ace,
