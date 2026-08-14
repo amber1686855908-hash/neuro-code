@@ -106,6 +106,16 @@ _SUPPORTED_STDIO = frozenset(
 _RUNNER_ENVIRONMENT = frozenset({"SystemRoot", "SystemDrive", "PATH", "PATHEXT"})
 
 
+def _native_acceptance_stage(label: str) -> None:
+    """Emit bounded setup/transport stages only in the focused native gate."""
+
+    if (
+        os.name == "nt"
+        and os.environ.get("NEURO_CODE_RUN_NATIVE_WINDOWS_SANDBOX_ACCEPTANCE") == "1"
+    ):
+        print(f"W3_STAGE={label}", flush=True)
+
+
 @dataclass(frozen=True, slots=True)
 class WindowsRuntimeIdentity:
     """The minimum W2 facts needed to launch one child; password is transient."""
@@ -409,6 +419,7 @@ class WindowsNativeLocalProcessSandbox(LocalProcessSandbox):
         RuntimeFrameDecoder,
         tuple[RuntimeFrame, ...],
     ]:
+        _native_acceptance_stage("identity_resolve_start")
         controller_sid = current_user_sid()
         control_server = self._pipe_server_factory(
             peer_sids=(controller_sid, identity.user_sid.value),
@@ -418,6 +429,7 @@ class WindowsNativeLocalProcessSandbox(LocalProcessSandbox):
             peer_sids=(controller_sid, identity.user_sid.value),
             direction=_WindowsNamedPipeDirection.INBOUND,
         )
+        _native_acceptance_stage("pipe_servers_ready")
         launch: RunnerLaunch | None = None
         control: WindowsNamedPipeWriter | None = None
         events: WindowsNamedPipeReader | None = None
@@ -429,8 +441,11 @@ class WindowsNativeLocalProcessSandbox(LocalProcessSandbox):
                 event_pipe_name=event_server.name,
                 environment=self._runner_environment(),
             )
+            _native_acceptance_stage("runner_launched")
             control_endpoint = control_server.accept_for_runner(launch.process_handle)
+            _native_acceptance_stage("control_connected")
             event_endpoint = event_server.accept_for_runner(launch.process_handle)
+            _native_acceptance_stage("event_connected")
             if not isinstance(control_endpoint, WindowsNamedPipeWriter):
                 raise SandboxError("Windows control pipe did not provide a writer endpoint")
             if not isinstance(event_endpoint, WindowsNamedPipeReader):
@@ -462,9 +477,11 @@ class WindowsNativeLocalProcessSandbox(LocalProcessSandbox):
                 payload["executable"] = request.executable
                 payload["arguments"] = list(request.arguments)
             control.write(encode_frame(RuntimeFrameType.SPAWN_REQUEST, encode_json(payload)))
+            _native_acceptance_stage("spawn_request_sent")
             decoder = RuntimeFrameDecoder()
             while True:
                 data = events.read_for_runner(launch.process_handle)
+                _native_acceptance_stage("event_read")
                 if not data:
                     decoder.finish()
                     raise SandboxError("trusted Windows runner exited before SpawnReady")
@@ -523,9 +540,11 @@ class WindowsNativeLocalProcessSandbox(LocalProcessSandbox):
             else WindowsSandboxIdentityKind.ONLINE
         )
         identity = self._identity_provider.resolve(setup_request, kind)
+        _native_acceptance_stage("identity_resolved")
         transport, launch, ready, decoder, pending_frames = await run_blocking(
             self._start_runner, request, identity, setup_request
         )
+        _native_acceptance_stage("start_runner_returned")
         payload = decode_json(ready.payload)
         if not isinstance(payload, dict) or payload.get("version") != PROTOCOL_VERSION:
             transport.control.close()
