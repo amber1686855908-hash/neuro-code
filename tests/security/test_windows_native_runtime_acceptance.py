@@ -2053,18 +2053,20 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                     if pid <= 0:
                         classification = "DESCENDANT_LEADER_EXIT_TRANSPORT_FAILURE"
 
+                leader_pid_observation: dict[str, object] = {"state": "NOT_OBSERVED"}
                 leader_code: int | None = None
                 if classification is None:
                     for _ in range(150):
-                        if process.returncode is not None or wait_task.done():
+                        leader_pid_observation = _observe_windows_pid(process.process_id)
+                        if leader_pid_observation.get("state") == "EXITED":
+                            break
+                        if wait_task.done():
                             break
                         await asyncio.sleep(0.02)
-                    leader_code = process.returncode
-                    if leader_code is None and wait_task.done():
-                        with contextlib.suppress(BaseException):
-                            leader_code = wait_task.result()
-                    if leader_code != 23:
+                    if leader_pid_observation.get("state") != "EXITED":
                         classification = "DESCENDANT_LEADER_EXIT_TRANSPORT_FAILURE"
+                    elif process.returncode is not None:
+                        leader_code = process.returncode
 
                 if classification is None:
                     pid_observation = _observe_windows_pid(pid)
@@ -2080,6 +2082,8 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                         not finished_marker.is_file()
                         and asyncio.get_running_loop().time() < finish_deadline
                     ):
+                        if finished_marker.is_file():
+                            break
                         if wait_task.done():
                             pid_observation = _observe_windows_pid(pid)
                             classification = (
@@ -2111,6 +2115,8 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                         classification = "DESCENDANT_LEADER_EXIT_TRANSPORT_FAILURE"
                     if exit_code != 23:
                         classification = "DESCENDANT_LEADER_EXIT_TRANSPORT_FAILURE"
+                    else:
+                        leader_code = exit_code
 
                 stdout = b""
                 stderr = b""
@@ -2139,6 +2145,7 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                     "spawn_ready": "PASS",
                     "token_attestation": token_attested,
                     "leader_exit_observed": leader_marker.is_file(),
+                    "leader_pid_state_before_scope_wait": leader_pid_observation.get("state"),
                     "leader_exit_code": leader_code,
                     "grandchild_started": started_marker.is_file(),
                     "grandchild_runner_pipe_inherited": runner_pipe_inherited,

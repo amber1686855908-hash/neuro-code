@@ -1419,6 +1419,13 @@ class _RunnerChild:
             self._api.wait_process(self._process_handle)
             code = self._api.get_exit_code(self._process_handle)
             self._last_exit_code = code
+            # A direct child exit is not the end of the Job-owned scope.  A
+            # descendant may still be running without holding any relay
+            # handle, so keep the independent wait thread alive until the Job
+            # reports no active processes.  The control thread remains free to
+            # receive TERMINATE/EOF while this bounded-frequency poll runs.
+            while self._job.active_processes:
+                time.sleep(0.02)
             # Drain both output relays before publishing Exit.  The event pipe
             # is one-way, so the controller can keep reading while these
             # synchronous relay writes complete; Exit is therefore the final
