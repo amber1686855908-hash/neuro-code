@@ -10,10 +10,12 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import ctypes
 import json
 import os
 import unittest
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any, cast
@@ -50,9 +52,9 @@ from neuro_code.infrastructure.sandbox.windows_sandbox_accounts import (
 from neuro_code.infrastructure.sandbox.windows_sandbox_acl import (
     WRITE_ACCESS_MASK,
     WRITE_ONLY_ACCESS_MASK,
-    WindowsAclEntryProjection,
     WindowsManagedAce,
     WindowsManagedAceKind,
+    _AceHeader,
     _NativeWindowsAclApi,
 )
 from neuro_code.infrastructure.sandbox.windows_sandbox_firewall import _NativeWindowsFirewallApi
@@ -69,6 +71,16 @@ _SENTINEL = "GATE2_NON_SECRET_SENTINEL"
 _APPENDED = "GATE2_APPEND_SENTINEL"
 _OVERWRITTEN = "GATE2_OVERWRITE_SENTINEL"
 ProbeState = Callable[[], dict[str, object]]
+
+
+@dataclass(frozen=True, slots=True)
+class _AclEntryProjection:
+    """Test-only non-secret projection used to inspect the native DACL."""
+
+    sid: str
+    access_mask: int
+    is_deny: bool
+    inheritance: int
 
 
 async def _drain_stream(stream: object | None) -> bytes:
@@ -158,7 +170,25 @@ def _deleted_probe(path: Path) -> ProbeState:
     return lambda: {"deleted": not path.exists()}
 
 
-def _projection_has_write_allow(entries: tuple[WindowsAclEntryProjection, ...], sid: str) -> bool:
+def _inspect_acl_entries(api: _NativeWindowsAclApi, path: Path) -> tuple[_AclEntryProjection, ...]:
+    entries: list[_AclEntryProjection] = []
+    for raw in api._raw_entries(path):
+        header = _AceHeader.from_buffer_copy(raw)
+        if header.AceType not in (api._ACCESS_ALLOWED_ACE_TYPE, api._ACCESS_DENIED_ACE_TYPE):
+            continue
+        sid_buffer = ctypes.create_string_buffer(raw[8:])
+        entries.append(
+            _AclEntryProjection(
+                sid=api._sid_string(ctypes.addressof(sid_buffer)),
+                access_mask=int.from_bytes(raw[4:8], "little", signed=False),
+                is_deny=header.AceType == api._ACCESS_DENIED_ACE_TYPE,
+                inheritance=int(header.AceFlags),
+            )
+        )
+    return tuple(entries)
+
+
+def _projection_has_write_allow(entries: tuple[_AclEntryProjection, ...], sid: str) -> bool:
     return any(
         entry.sid == sid
         and not entry.is_deny
@@ -168,7 +198,7 @@ def _projection_has_write_allow(entries: tuple[WindowsAclEntryProjection, ...], 
 
 
 def _projection_has_synthetic_write_allow(
-    entries: tuple[WindowsAclEntryProjection, ...], sid: str
+    entries: tuple[_AclEntryProjection, ...], sid: str
 ) -> bool:
     return any(
         entry.sid == sid
@@ -178,7 +208,7 @@ def _projection_has_synthetic_write_allow(
     )
 
 
-def _projection_has_deny(entries: tuple[WindowsAclEntryProjection, ...], sid: str) -> bool:
+def _projection_has_deny(entries: tuple[_AclEntryProjection, ...], sid: str) -> bool:
     return any(entry.sid == sid and entry.is_deny for entry in entries)
 
 
@@ -494,7 +524,7 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                     ),
                 )
                 acl_api.reconcile(outside, desired=outside_entries, remove=())
-                outside_projection = acl_api.inspect_entries(outside)
+                outside_projection = _inspect_acl_entries(acl_api, outside)
                 online_write_ace = _projection_has_write_allow(outside_projection, online_sid)
                 offline_write_ace = _projection_has_write_allow(outside_projection, offline_sid)
                 synthetic_write_ace = _projection_has_synthetic_write_allow(

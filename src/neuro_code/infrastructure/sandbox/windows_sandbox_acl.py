@@ -169,31 +169,6 @@ class WindowsManagedAce:
 
 
 @dataclass(frozen=True, slots=True)
-class WindowsAclEntryProjection:
-    """Bounded, non-secret projection of one standard DACL ACE.
-
-    The projection is intentionally read-only and contains only the SID,
-    access mask, allow/deny type, and ACE flags needed by setup acceptance.
-    It is not a second policy model and is never used to grant authority.
-    """
-
-    sid: str
-    access_mask: int
-    is_deny: bool
-    inheritance: int
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.sid, str) or not self.sid.startswith("S-1-"):
-            raise ValueError("ACL projection SID must be canonical text")
-        if type(self.access_mask) is not int or self.access_mask < 0:
-            raise ValueError("ACL projection access mask must be non-negative")
-        if type(self.is_deny) is not bool:
-            raise TypeError("ACL projection is_deny must be bool")
-        if type(self.inheritance) is not int or self.inheritance < 0 or self.inheritance > 0xFF:
-            raise ValueError("ACL projection inheritance must be an ACE flag byte")
-
-
-@dataclass(frozen=True, slots=True)
 class WindowsFilesystemSetupPlan:
     """Desired managed ACE set for one setup request."""
 
@@ -508,7 +483,6 @@ class _NativeWindowsAclApi:  # pragma: no cover - exercised by Windows native CI
     _DENY_ACCESS = 3
     _MAXDWORD = 0xFFFFFFFF
     _INHERITED_ACE = 0x10
-    _MAX_ACE_COUNT = 4096
 
     def __init__(self) -> None:
         if os.name != "nt":
@@ -700,38 +674,9 @@ class _NativeWindowsAclApi:  # pragma: no cover - exercised by Windows native CI
         offset = 0
         while offset < len(raw):
             header = _AceHeader.from_buffer_copy(raw[offset:])
-            if header.AceSize < ctypes.sizeof(_AceHeader) or offset + header.AceSize > len(raw):
-                raise self._error("parse ACL ACE")
             entries.append(raw[offset : offset + header.AceSize])
             offset += header.AceSize
         return entries
-
-    def inspect_entries(self, path: Path) -> tuple[WindowsAclEntryProjection, ...]:
-        """Return a bounded projection of standard allow/deny DACL entries."""
-
-        raw_entries = self._raw_entries(path)
-        if len(raw_entries) > self._MAX_ACE_COUNT:
-            raise self._error("inspect ACL ACE count")
-        projections: list[WindowsAclEntryProjection] = []
-        for raw in raw_entries:
-            header = _AceHeader.from_buffer_copy(raw)
-            if header.AceType not in (
-                self._ACCESS_ALLOWED_ACE_TYPE,
-                self._ACCESS_DENIED_ACE_TYPE,
-            ):
-                continue
-            if len(raw) < 8:
-                raise self._error("parse ACL ACE")
-            sid_buffer = ctypes.create_string_buffer(raw[8:])
-            projections.append(
-                WindowsAclEntryProjection(
-                    sid=self._sid_string(ctypes.addressof(sid_buffer)),
-                    access_mask=int.from_bytes(raw[4:8], "little", signed=False),
-                    is_deny=header.AceType == self._ACCESS_DENIED_ACE_TYPE,
-                    inheritance=int(header.AceFlags),
-                )
-            )
-        return tuple(projections)
 
     def matches(self, path: Path, desired: tuple[WindowsManagedAce, ...]) -> bool:
         raw_entries = self._raw_entries(path)
@@ -857,7 +802,6 @@ __all__ = [
     "WRITE_ONLY_ACCESS_MASK",
     "InMemoryWindowsAclApi",
     "WindowsAclApi",
-    "WindowsAclEntryProjection",
     "WindowsAclError",
     "WindowsFilesystemAclAuthority",
     "WindowsFilesystemSetupPlan",
