@@ -1924,8 +1924,8 @@ def _runner_main(control_pipe_name: str, event_pipe_name: str) -> int:
     event_pipe: WindowsNamedPipeWriter | None = None
     child: _RunnerChild | None = None
     try:
-        control_pipe = WindowsNamedPipeClient.connect_reader(control_pipe_name)
         event_pipe = WindowsNamedPipeClient.connect_writer(event_pipe_name)
+        control_pipe = WindowsNamedPipeClient.connect_reader(control_pipe_name)
         decoder = RuntimeFrameDecoder()
         while True:
             data = control_pipe.read()
