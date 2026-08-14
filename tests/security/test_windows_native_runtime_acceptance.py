@@ -1696,6 +1696,9 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                 wait_task: asyncio.Task[int] | None = None
                 try:
                     process = await adapter.spawn(request)
+                    stderr_is_none = process.stderr is None
+                    if mode is LocalProcessStdioMode.MERGED_CAPTURE:
+                        self.assertTrue(stderr_is_none)
                     stdout_task = asyncio.create_task(_read_all_bounded(process.stdout))
                     stderr_task = asyncio.create_task(_read_all_bounded(process.stderr))
                     wait_task = asyncio.create_task(process.wait())
@@ -1711,6 +1714,7 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                     diagnostic = cast(Any, process).diagnostic_snapshot()
                     if not isinstance(diagnostic, dict):
                         diagnostic = {}
+                    diagnostic["stderr_is_none"] = stderr_is_none
                     runner = diagnostic.get("runner")
                     self.assertIsInstance(runner, dict)
                     self.assertEqual(runner.get("state"), "RUNNER_EXITED")
@@ -1823,7 +1827,8 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                                 "expected_bytes": len(merged_expected),
                                 "actual_bytes": len(merged_stdout),
                                 "exact": merged_stdout == merged_expected,
-                                "stderr_none": merged_stderr == b"",
+                                "stderr_none": merged_diag.get("stderr_is_none") is True
+                                and merged_stderr == b"",
                                 "order_exact": merged_stdout == merged_expected,
                                 "exit": merged_exit,
                             },
