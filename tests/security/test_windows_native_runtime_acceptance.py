@@ -231,36 +231,64 @@ def _compile_descendant_probe() -> Path:  # pragma: no cover - Windows CI
     return _compile_msvc_probe(_descendant_probe_source(), "windows_descendant_probe")
 
 
+class _WindowsPidHandle:
+    """Trusted controller observation handle for one known PID."""
+
+    def __init__(self, pid: int) -> None:  # pragma: no cover - Windows CI
+        self._handle: object | None = None
+        self._close: Callable[[object], object] | None = None
+        self._wait: Callable[[object, int], object] | None = None
+        self._open_error: int | None = None
+        if os.name != "nt":
+            self._open_error = 0
+            return
+        loader = getattr(ctypes, "WinDLL", None)
+        if loader is None:
+            self._open_error = 0
+            return
+        kernel32 = cast(Any, loader)("kernel32.dll", use_last_error=True)
+        open_process = kernel32.OpenProcess
+        open_process.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+        open_process.restype = ctypes.c_void_p
+        wait = kernel32.WaitForSingleObject
+        wait.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+        wait.restype = ctypes.c_uint32
+        close = kernel32.CloseHandle
+        close.argtypes = [ctypes.c_void_p]
+        close.restype = ctypes.c_int
+        self._wait = cast(Callable[[object, int], object], wait)
+        self._close = cast(Callable[[object], object], close)
+        self._handle = open_process(0x00100000 | 0x00001000, 0, pid)
+        if not self._handle:
+            get_last_error = cast(Any, getattr(ctypes, "get_last_error", lambda: 0))
+            self._open_error = int(get_last_error())
+            self._handle = None
+
+    def observe(self) -> dict[str, object]:  # pragma: no cover - Windows CI
+        if self._handle is None or self._wait is None:
+            return {"state": "OPEN_FAILED", "error": self._open_error or 0}
+        wait_result = int(self._wait(self._handle, 0))
+        if wait_result == 0x00000000:
+            return {"state": "EXITED"}
+        if wait_result == 0x00000102:
+            return {"state": "ACTIVE"}
+        return {"state": "WAIT_FAILED", "wait_result": wait_result}
+
+    def close(self) -> None:  # pragma: no cover - Windows CI
+        if self._handle is not None and self._close is not None:
+            with contextlib.suppress(BaseException):
+                self._close(self._handle)
+            self._handle = None
+
+
 def _observe_windows_pid(pid: int) -> dict[str, object]:  # pragma: no cover - Windows CI
     """Observe one trusted PID without tasklist/PID enumeration."""
 
-    if os.name != "nt":
-        return {"state": "NON_WINDOWS"}
-    loader = getattr(ctypes, "WinDLL", None)
-    if loader is None:
-        return {"state": "WIN32_UNAVAILABLE"}
-    kernel32 = cast(Any, loader)("kernel32.dll", use_last_error=True)
-    kernel32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
-    kernel32.OpenProcess.restype = ctypes.c_void_p
-    kernel32.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
-    kernel32.WaitForSingleObject.restype = ctypes.c_uint32
-    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
-    kernel32.CloseHandle.restype = ctypes.c_int
-    handle = kernel32.OpenProcess(0x00100000 | 0x00001000, 0, pid)
-    if not handle:
-        get_last_error = cast(Any, getattr(ctypes, "get_last_error", lambda: 0))
-        return {"state": "OPEN_FAILED", "error": int(get_last_error())}
+    observer = _WindowsPidHandle(pid)
     try:
-        wait_result = int(kernel32.WaitForSingleObject(handle, 0))
+        return observer.observe()
     finally:
-        kernel32.CloseHandle(handle)
-    if wait_result == 0x00000000:
-        state = "EXITED"
-    elif wait_result == 0x00000102:
-        state = "ACTIVE"
-    else:
-        state = "WAIT_FAILED"
-    return {"state": state, "wait_result": wait_result}
+        observer.close()
 
 
 def _stdio_payload(length: int, variant: int) -> bytes:
@@ -1997,6 +2025,8 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
             classification: str | None = None
             pid = 0
             pid_observation: dict[str, object] = {"state": "NOT_OBSERVED"}
+            leader_observer: _WindowsPidHandle | None = None
+            grandchild_observer: _WindowsPidHandle | None = None
             try:
                 process = await adapter.spawn(request)
                 initial_diagnostic = cast(Any, process).diagnostic_snapshot()
@@ -2056,8 +2086,10 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                 leader_pid_observation: dict[str, object] = {"state": "NOT_OBSERVED"}
                 leader_code: int | None = None
                 if classification is None:
+                    leader_observer = _WindowsPidHandle(process.process_id)
+                    grandchild_observer = _WindowsPidHandle(pid)
                     for _ in range(150):
-                        leader_pid_observation = _observe_windows_pid(process.process_id)
+                        leader_pid_observation = leader_observer.observe()
                         if leader_pid_observation.get("state") == "EXITED":
                             break
                         if wait_task.done():
@@ -2069,7 +2101,8 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                         leader_code = process.returncode
 
                 if classification is None:
-                    pid_observation = _observe_windows_pid(pid)
+                    assert grandchild_observer is not None
+                    pid_observation = grandchild_observer.observe()
                     if pid_observation.get("state") != "ACTIVE":
                         classification = "DESCENDANT_KILLED_ON_LEADER_EXIT"
                     elif wait_task.done():
@@ -2085,7 +2118,8 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                         if finished_marker.is_file():
                             break
                         if wait_task.done():
-                            pid_observation = _observe_windows_pid(pid)
+                            assert grandchild_observer is not None
+                            pid_observation = grandchild_observer.observe()
                             classification = (
                                 "WAIT_RETURNED_WITH_ACTIVE_DESCENDANT"
                                 if pid_observation.get("state") == "ACTIVE"
@@ -2100,7 +2134,8 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                 if classification is None:
                     exit_deadline = asyncio.get_running_loop().time() + 3.0
                     while asyncio.get_running_loop().time() < exit_deadline:
-                        pid_observation = _observe_windows_pid(pid)
+                        assert grandchild_observer is not None
+                        pid_observation = grandchild_observer.observe()
                         if pid_observation.get("state") == "EXITED":
                             break
                         await asyncio.sleep(0.02)
@@ -2174,6 +2209,10 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                         task.cancel()
                         with contextlib.suppress(BaseException):
                             await task
+                if leader_observer is not None:
+                    leader_observer.close()
+                if grandchild_observer is not None:
+                    grandchild_observer.close()
                 with contextlib.suppress(BaseException):
                     authority.cleanup(setup_request)
 
