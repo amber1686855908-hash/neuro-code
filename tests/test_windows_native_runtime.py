@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import os
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -28,18 +30,25 @@ from neuro_code.bootstrap.composition import _default_local_process_sandbox_fact
 from neuro_code.domain.sandbox.models import SandboxProfile
 from neuro_code.infrastructure.sandbox.windows_native_local_process import (
     WindowsNativeLocalProcessSandbox,
+    WindowsRuntimeControllerTransport,
     WindowsRuntimeIdentity,
     _required_capabilities,
     _WindowsNativeOwnedLocalProcess,
 )
-from neuro_code.infrastructure.sandbox.windows_native_runner import RunnerLaunch
+from neuro_code.infrastructure.sandbox.windows_native_runner import (
+    RunnerLaunch,
+    WindowsNamedPipeReader,
+    WindowsNamedPipeWriter,
+)
 from neuro_code.infrastructure.sandbox.windows_native_runtime_protocol import (
     MAX_FRAME_PAYLOAD,
+    RuntimeChannel,
     RuntimeFrame,
     RuntimeFrameDecoder,
     RuntimeFrameType,
     encode_frame,
     encode_json,
+    validate_channel_frame,
 )
 from neuro_code.infrastructure.sandbox.windows_sandbox_accounts import WindowsAccountSid
 from neuro_code.infrastructure.sandbox.windows_sandbox_identity import (
@@ -129,6 +138,107 @@ class WindowsNativeRuntimeProtocolTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             encode_frame(RuntimeFrameType.STDOUT, b"x" * (MAX_FRAME_PAYLOAD + 1))
 
+    def test_directional_channels_reject_cross_direction_frames(self) -> None:
+        for kind in (
+            RuntimeFrameType.STDOUT,
+            RuntimeFrameType.STDERR,
+            RuntimeFrameType.EXIT,
+            RuntimeFrameType.ERROR,
+        ):
+            with self.assertRaises(SandboxError):
+                validate_channel_frame(RuntimeChannel.CONTROL, kind)
+        for kind in (
+            RuntimeFrameType.SPAWN_REQUEST,
+            RuntimeFrameType.STDIN,
+            RuntimeFrameType.CLOSE_STDIN,
+            RuntimeFrameType.TERMINATE,
+        ):
+            with self.assertRaises(SandboxError):
+                validate_channel_frame(RuntimeChannel.EVENT, kind)
+
+    def test_large_stdin_frame_is_binary_safe(self) -> None:
+        payload = b"\x00\xff" * 40_000
+        decoder = RuntimeFrameDecoder()
+        frames = decoder.feed(encode_frame(RuntimeFrameType.STDIN, payload))
+        self.assertEqual(frames, (RuntimeFrame(RuntimeFrameType.STDIN, payload),))
+
+
+class _FakeDirectionalPipeApi:
+    def __init__(self) -> None:
+        self.writes: list[bytes] = []
+        self.read_release = threading.Event()
+        self.closed: list[int] = []
+        self.last_read_error = None
+
+    def read(self, handle: int) -> bytes:
+        del handle
+        self.read_release.wait(timeout=2)
+        return b""
+
+    def write(self, handle: int, payload: bytes) -> None:
+        del handle
+        self.writes.append(payload)
+
+    def close(self, handle: int) -> None:
+        self.closed.append(handle)
+
+
+class WindowsNativeDirectionalTransportTests(unittest.TestCase):
+    def test_control_and_event_are_distinct_one_way_endpoints(self) -> None:
+        api = _FakeDirectionalPipeApi()
+        control = WindowsNamedPipeWriter(101, api=api)  # type: ignore[arg-type]
+        events = WindowsNamedPipeReader(202, api=api)  # type: ignore[arg-type]
+        self.assertNotEqual(control.handle, events.handle)
+        self.assertTrue(hasattr(control, "write"))
+        self.assertFalse(hasattr(control, "read"))
+        self.assertTrue(hasattr(events, "read"))
+        self.assertFalse(hasattr(events, "write"))
+
+    def test_concurrent_event_writes_are_serialized_as_complete_frames(self) -> None:
+        api = _FakeDirectionalPipeApi()
+        events = WindowsNamedPipeWriter(202, api=api)  # type: ignore[arg-type]
+        frames_to_write = [
+            (
+                (RuntimeFrameType.STDOUT, RuntimeFrameType.STDERR, RuntimeFrameType.EXIT)[
+                    index % 3
+                ],
+                b"event-" + bytes([index]) * 70_000,
+            )
+            for index in range(8)
+        ]
+        threads = [
+            threading.Thread(
+                target=events.write,
+                args=(encode_frame(kind, payload),),
+            )
+            for kind, payload in frames_to_write
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=2)
+        decoder = RuntimeFrameDecoder()
+        frames = decoder.feed(b"".join(api.writes))
+        self.assertEqual(len(frames), len(frames_to_write))
+        self.assertEqual(
+            {(frame.kind, frame.payload) for frame in frames},
+            set(frames_to_write),
+        )
+
+    def test_blocking_control_read_does_not_prevent_event_write(self) -> None:
+        api = _FakeDirectionalPipeApi()
+        control = WindowsNamedPipeReader(101, api=api)  # type: ignore[arg-type]
+        events = WindowsNamedPipeWriter(202, api=api)  # type: ignore[arg-type]
+        reader = threading.Thread(target=control.read, daemon=True)
+        reader.start()
+        started = time.monotonic()
+        events.write(encode_frame(RuntimeFrameType.EXIT, b"done"))
+        elapsed = time.monotonic() - started
+        api.read_release.set()
+        reader.join(timeout=2)
+        self.assertLess(elapsed, 0.5)
+        self.assertEqual(len(api.writes), 1)
+
 
 class WindowsNativeRuntimeContractTests(unittest.IsolatedAsyncioTestCase):
     async def test_coalesced_spawn_ready_frames_are_not_dropped(self) -> None:
@@ -156,7 +266,10 @@ class WindowsNativeRuntimeContractTests(unittest.IsolatedAsyncioTestCase):
             decoder = RuntimeFrameDecoder()
             decoder.feed(encoded_exit[:2])
             process = _WindowsNativeOwnedLocalProcess(
-                pipe=_Pipe(encoded_exit[2:]),  # type: ignore[arg-type]
+                transport=WindowsRuntimeControllerTransport(
+                    control=_Pipe(),  # type: ignore[arg-type]
+                    events=_Pipe(encoded_exit[2:]),  # type: ignore[arg-type]
+                ),
                 runner=RunnerLaunch(process_handle=1, process_id=42),
                 pid=42,
                 request=_request(root),

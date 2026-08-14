@@ -23,7 +23,7 @@ import subprocess
 import sys
 import threading
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import NoReturn, Protocol, cast
@@ -31,12 +31,14 @@ from typing import NoReturn, Protocol, cast
 from neuro_code.infrastructure.sandbox.windows_job import WindowsJobObject
 from neuro_code.infrastructure.sandbox.windows_native_runtime_protocol import (
     PROTOCOL_VERSION,
+    RuntimeChannel,
     RuntimeFrame,
     RuntimeFrameDecoder,
     RuntimeFrameType,
     decode_json,
     encode_frame,
     encode_json,
+    validate_channel_frame,
 )
 from neuro_code.infrastructure.sandbox.windows_sandbox_identity import SyntheticWindowsSid
 from neuro_code.infrastructure.sandbox.windows_security_token import (
@@ -51,7 +53,8 @@ _FILE_SHARE_READ = 0x00000001
 _FILE_SHARE_WRITE = 0x00000002
 _OPEN_EXISTING = 3
 _CREATE_ALWAYS = 2
-_PIPE_ACCESS_DUPLEX = 0x00000003
+_PIPE_ACCESS_INBOUND = 0x00000001
+_PIPE_ACCESS_OUTBOUND = 0x00000002
 _PIPE_TYPE_BYTE = 0x00000000
 _PIPE_READMODE_BYTE = 0x00000000
 _PIPE_WAIT = 0x00000000
@@ -112,6 +115,8 @@ _DESKTOP_ALL_ACCESS = (
     | _DESKTOP_WRITE_DAC
     | _DESKTOP_WRITE_OWNER
 )
+_FILE_GENERIC_READ = 0x00120089
+_FILE_GENERIC_WRITE = 0x00120116
 
 
 class _CFunction(Protocol):
@@ -380,6 +385,27 @@ class _NativePipeApi:
             return {"state": "WAIT_FAILED", "wait_error": self.last_error()}
         return {"state": exited_state, "exit_code": int(exit_code.value)}
 
+    def wait_process(
+        self,
+        handle: int,
+        *,
+        timeout_seconds: float,
+        active_state: str,
+        exited_state: str,
+    ) -> dict[str, object]:
+        """Wait for a trusted process and report its bounded final state."""
+
+        timeout_ms = min(0xFFFFFFFF, max(0, int(timeout_seconds * 1000)))
+        result = self.wait_for_single_object(handle, timeout_ms)
+        if result == _WAIT_TIMEOUT:
+            return {"state": active_state}
+        if result != _WAIT_OBJECT_0:
+            return {"state": "WAIT_FAILED", "wait_error": cast(int, result)}
+        exit_code = ctypes.c_uint32()
+        if not self.get_exit_code_process(handle, ctypes.byref(exit_code)):
+            return {"state": "WAIT_FAILED", "wait_error": self.last_error()}
+        return {"state": exited_state, "exit_code": int(exit_code.value)}
+
     def write(self, handle: int, payload: bytes) -> None:
         offset = 0
         while offset < len(payload):
@@ -394,21 +420,44 @@ class _NativePipeApi:
             offset += written.value
 
 
+class _WindowsNamedPipeDirection(enum.StrEnum):
+    """Access direction owned by one endpoint of the runtime transport."""
+
+    INBOUND = "inbound"
+    OUTBOUND = "outbound"
+
+
 class WindowsNamedPipe:
-    """Connected synchronous byte stream used by the framing layer."""
+    """Common lifetime operations for one-direction synchronous pipe handle."""
 
     def __init__(self, handle: int, *, api: _NativePipeApi | None = None) -> None:
         if handle <= 0:
             raise ValueError("pipe handle must be positive")
         self._api = _NativePipeApi() if api is None else api
         self._handle: int | None = handle
-        self._write_lock = threading.Lock()
 
     @property
     def handle(self) -> int:
         if self._handle is None:
             raise RuntimeError("pipe is closed")
         return self._handle
+
+    def close(self) -> None:
+        handle, self._handle = self._handle, None
+        if handle is not None:
+            with contextlib.suppress(BaseException):
+                self._api.close(handle)
+
+    def __enter__(self) -> WindowsNamedPipe:
+        _ = self.handle
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self.close()
+
+
+class WindowsNamedPipeReader(WindowsNamedPipe):
+    """Controller/runner endpoint that can only receive event/control bytes."""
 
     def read(self) -> bytes:
         return self._api.read(self.handle)
@@ -426,6 +475,25 @@ class WindowsNamedPipe:
     ) -> dict[str, object]:
         return self._api.observe_process(
             handle,
+            active_state=active_state,
+            exited_state=exited_state,
+        )
+
+    def wait_process(
+        self,
+        handle: int,
+        *,
+        timeout_seconds: float,
+        active_state: str,
+        exited_state: str,
+    ) -> dict[str, object]:
+        """Wait for the trusted runner after the controller closes control."""
+
+        if timeout_seconds < 0:
+            raise ValueError("process wait timeout must not be negative")
+        return self._api.wait_process(
+            handle,
+            timeout_seconds=timeout_seconds,
             active_state=active_state,
             exited_state=exited_state,
         )
@@ -468,26 +536,24 @@ class WindowsNamedPipe:
             raise failure[0]
         return result[0] if result else b""
 
+
+class WindowsNamedPipeWriter(WindowsNamedPipe):
+    """Controller/runner endpoint that can only send complete frames."""
+
+    def __init__(self, handle: int, *, api: _NativePipeApi | None = None) -> None:
+        super().__init__(handle, api=api)
+        self._write_lock = threading.Lock()
+
     def write(self, payload: bytes) -> None:
         with self._write_lock:
             self._api.write(self.handle, payload)
 
-    def close(self) -> None:
-        handle, self._handle = self._handle, None
-        if handle is not None:
-            with contextlib.suppress(BaseException):
-                self._api.close(handle)
-
-    def __enter__(self) -> WindowsNamedPipe:
-        _ = self.handle
-        return self
-
-    def __exit__(self, *_exc: object) -> None:
-        self.close()
-
 
 def _security_descriptor(
-    sids: Sequence[str], *, inherit_to_children: bool = False
+    sids: Sequence[str],
+    *,
+    inherit_to_children: bool = False,
+    access_masks: Mapping[str, int] | None = None,
 ) -> tuple[_SecurityAttributes, int]:
     """Build an exact, non-inheritable named-pipe DACL for the two peers."""
 
@@ -508,8 +574,17 @@ def _security_descriptor(
         ],
         ctypes.c_int32,
     )
-    ace = "(A;OICI;GA;;;{sid})" if inherit_to_children else "(A;;GA;;;{sid})"
-    sddl = "D:P" + "".join(ace.format(sid=sid) for sid in dict.fromkeys(sids))
+    entries = []
+    for sid in dict.fromkeys(sids):
+        if access_masks is None:
+            ace = "(A;OICI;GA;;;{sid})" if inherit_to_children else "(A;;GA;;;{sid})"
+        else:
+            mask = access_masks.get(sid)
+            if mask is None:
+                raise ValueError("named-pipe access mask is missing a peer SID")
+            ace = f"(A;;0x{mask:X};;;{sid})"
+        entries.append(ace.format(sid=sid))
+    sddl = "D:P" + "".join(entries)
     descriptor = ctypes.c_void_p()
     descriptor_size = ctypes.c_uint32()
     if not convert(sddl, 1, ctypes.byref(descriptor), ctypes.byref(descriptor_size)):
@@ -659,15 +734,39 @@ def current_logon_sid() -> str:
 class WindowsNamedPipeServer:
     """Controller-created, random local named pipe with an exact peer DACL."""
 
-    def __init__(self, *, peer_sids: Sequence[str]) -> None:
+    def __init__(
+        self,
+        *,
+        peer_sids: Sequence[str],
+        direction: _WindowsNamedPipeDirection,
+    ) -> None:
+        if not isinstance(direction, _WindowsNamedPipeDirection):
+            raise ValueError("named-pipe direction is invalid")
+        peers = tuple(peer_sids)
+        if len(peers) != 2:
+            raise ValueError("named-pipe server requires controller and runner SIDs")
+        controller_sid, runner_sid = peers
         self.name = rf"\\.\pipe\neuro-code-{secrets.token_urlsafe(32)}"
         self._api = _NativePipeApi()
-        attributes, descriptor = _security_descriptor(peer_sids)
+        server_access = (
+            _PIPE_ACCESS_OUTBOUND
+            if direction is _WindowsNamedPipeDirection.OUTBOUND
+            else _PIPE_ACCESS_INBOUND
+        )
+        controller_mask, runner_mask = (
+            (_FILE_GENERIC_WRITE, _FILE_GENERIC_READ)
+            if direction is _WindowsNamedPipeDirection.OUTBOUND
+            else (_FILE_GENERIC_READ, _FILE_GENERIC_WRITE)
+        )
+        attributes, descriptor = _security_descriptor(
+            (controller_sid, runner_sid),
+            access_masks={controller_sid: controller_mask, runner_sid: runner_mask},
+        )
         self._descriptor = descriptor
         try:
             handle = self._api.create_named_pipe(
                 self.name,
-                _PIPE_ACCESS_DUPLEX,
+                server_access,
                 _PIPE_TYPE_BYTE | _PIPE_READMODE_BYTE | _PIPE_WAIT | _PIPE_REJECT_REMOTE_CLIENTS,
                 1,
                 65_536,
@@ -679,11 +778,12 @@ class WindowsNamedPipeServer:
             _free_security_descriptor(descriptor)
         if handle is None or handle == 0 or handle == _INVALID_HANDLE_VALUE:
             raise OSError(self._api.last_error(), "CreateNamedPipeW failed")
+        self._direction = direction
         self._pipe: WindowsNamedPipe | None = WindowsNamedPipe(
             int(cast(int, handle)), api=self._api
         )
 
-    def accept(self) -> WindowsNamedPipe:
+    def accept(self) -> WindowsNamedPipeReader | WindowsNamedPipeWriter:
         pipe = self._pipe
         if pipe is None:
             raise RuntimeError("named-pipe server is closed")
@@ -692,15 +792,19 @@ class WindowsNamedPipeServer:
             if error != _ERROR_PIPE_CONNECTED:
                 self.close()
                 raise OSError(error, "ConnectNamedPipe failed")
+        handle, api = pipe.handle, pipe._api
+        pipe._handle = None
         self._pipe = None
-        return pipe
+        if self._direction is _WindowsNamedPipeDirection.INBOUND:
+            return WindowsNamedPipeReader(handle, api=api)
+        return WindowsNamedPipeWriter(handle, api=api)
 
     def accept_for_runner(
         self,
         runner_handle: int,
         *,
         timeout_seconds: float = 30.0,
-    ) -> WindowsNamedPipe:
+    ) -> WindowsNamedPipeReader | WindowsNamedPipeWriter:
         """Accept while detecting a dead or non-connecting trusted runner.
 
         ``ConnectNamedPipe`` is synchronous. Running it behind a short
@@ -710,7 +814,7 @@ class WindowsNamedPipeServer:
 
         if timeout_seconds <= 0:
             raise ValueError("named-pipe connection timeout must be positive")
-        result: list[WindowsNamedPipe] = []
+        result: list[WindowsNamedPipeReader | WindowsNamedPipeWriter] = []
         failure: list[BaseException] = []
         completed = threading.Event()
 
@@ -752,11 +856,14 @@ class WindowsNamedPipeServer:
 
 class WindowsNamedPipeClient(WindowsNamedPipe):
     @classmethod
-    def connect(cls, name: str) -> WindowsNamedPipeClient:
+    def _connect(cls, name: str, *, direction: _WindowsNamedPipeDirection) -> WindowsNamedPipe:
         api = _NativePipeApi()
+        desired_access = (
+            _GENERIC_READ if direction is _WindowsNamedPipeDirection.INBOUND else _GENERIC_WRITE
+        )
         handle = api.create_file(
             name,
-            _GENERIC_READ | _GENERIC_WRITE,
+            desired_access,
             0,
             None,
             _OPEN_EXISTING,
@@ -765,7 +872,21 @@ class WindowsNamedPipeClient(WindowsNamedPipe):
         )
         if handle is None or handle == 0 or handle == _INVALID_HANDLE_VALUE:
             raise OSError(api.last_error(), "CreateFileW(named pipe) failed")
-        return cls(int(cast(int, handle)), api=api)
+        if direction is _WindowsNamedPipeDirection.INBOUND:
+            return WindowsNamedPipeReader(int(cast(int, handle)), api=api)
+        return WindowsNamedPipeWriter(int(cast(int, handle)), api=api)
+
+    @classmethod
+    def connect_reader(cls, name: str) -> WindowsNamedPipeReader:
+        endpoint = cls._connect(name, direction=_WindowsNamedPipeDirection.INBOUND)
+        assert isinstance(endpoint, WindowsNamedPipeReader)
+        return endpoint
+
+    @classmethod
+    def connect_writer(cls, name: str) -> WindowsNamedPipeWriter:
+        endpoint = cls._connect(name, direction=_WindowsNamedPipeDirection.OUTBOUND)
+        assert isinstance(endpoint, WindowsNamedPipeWriter)
+        return endpoint
 
 
 def _environment_block(environment: Mapping[str, str]) -> ctypes.Array[ctypes.c_wchar]:
@@ -789,7 +910,8 @@ def launch_runner(
     *,
     username: str,
     password: str,
-    pipe_name: str,
+    control_pipe_name: str,
+    event_pipe_name: str,
     environment: Mapping[str, str],
 ) -> RunnerLaunch:
     """Launch this trusted module under a selected dedicated local account."""
@@ -827,8 +949,10 @@ def launch_runner(
             "-I",
             "-m",
             "neuro_code.infrastructure.sandbox.windows_native_runner",
-            "--pipe",
-            pipe_name,
+            "--control-pipe",
+            control_pipe_name,
+            "--event-pipe",
+            event_pipe_name,
         ]
     )
     mutable_command = ctypes.create_unicode_buffer(command)
@@ -931,9 +1055,18 @@ def _validated_text(value: object, label: str) -> str:
 class _RunnerChild:
     """Native restricted child and its relay threads, owned by one runner."""
 
-    def __init__(self, pipe: WindowsNamedPipe, payload: Mapping[str, object]) -> None:
-        self.pipe = pipe
+    def __init__(
+        self,
+        event_pipe: WindowsNamedPipeWriter,
+        payload: Mapping[str, object],
+        *,
+        abort_control: Callable[[], None],
+    ) -> None:
+        self.event_pipe = event_pipe
+        self._abort_control = abort_control
         self._write_lock = threading.Lock()
+        self._event_failed = threading.Event()
+        self._exit_sent = threading.Event()
         self._api = _NativeChildApi()
         self._job = WindowsJobObject.create()
         self._process_handle: int | None = None
@@ -1145,9 +1278,18 @@ class _RunnerChild:
                 shutil.rmtree(home)
 
     def _send(self, kind: RuntimeFrameType, value: object = b"") -> None:
+        validate_channel_frame(RuntimeChannel.EVENT, kind)
         payload = value if isinstance(value, bytes) else encode_json(value)
-        with self._write_lock:
-            self.pipe.write(encode_frame(kind, payload))
+        try:
+            with self._write_lock:
+                self.event_pipe.write(encode_frame(kind, payload))
+        except BaseException:
+            self._event_failed.set()
+            with contextlib.suppress(BaseException):
+                self._job.terminate()
+            with contextlib.suppress(BaseException):
+                self._abort_control()
+            raise
 
     def observe(self) -> dict[str, object]:
         """Capture only final-child lifecycle facts safe for diagnostics."""
@@ -1193,10 +1335,32 @@ class _RunnerChild:
             self._api.wait_process(self._process_handle)
             code = self._api.get_exit_code(self._process_handle)
             self._last_exit_code = code
-            # Publish process completion before waiting for output relays.  A
-            # relay can remain in a native ReadFile until every duplicated
-            # pipe writer is released; completion must not be hidden behind
-            # that stream-drain path.
+            # Drain both output relays before publishing Exit.  The event pipe
+            # is one-way, so the controller can keep reading while these
+            # synchronous relay writes complete; Exit is therefore the final
+            # event frame and the controller can close the event reader safely.
+            for thread in self._threads:
+                if thread is not threading.current_thread():
+                    thread.join(timeout=2.0)
+            remaining = [
+                thread
+                for thread in self._threads
+                if thread is not threading.current_thread() and thread.is_alive()
+            ]
+            if remaining:
+                # A child exit should close every inherited stdout/stderr
+                # writer.  If a relay is nevertheless still blocked, close
+                # our read handles to unblock it rather than publishing Exit
+                # while another thread could still write an event frame.
+                for handle in self._output_handles:
+                    with contextlib.suppress(BaseException):
+                        self._api.close_handle(handle)
+                for thread in remaining:
+                    thread.join(timeout=1.0)
+                if any(thread.is_alive() for thread in remaining):
+                    raise SandboxError("Windows runtime output relay did not quiesce before Exit")
+            if self._event_failed.is_set():
+                raise SandboxError("Windows runtime event pipe failed before Exit")
             self._send(
                 RuntimeFrameType.EXIT,
                 {
@@ -1206,9 +1370,7 @@ class _RunnerChild:
                     "termination_observation": self._termination_observation,
                 },
             )
-            for thread in self._threads:
-                if thread is not threading.current_thread():
-                    thread.join(timeout=2.0)
+            self._exit_sent.set()
         except BaseException as error:
             with contextlib.suppress(BaseException):
                 self._send(
@@ -1247,7 +1409,23 @@ class _RunnerChild:
             self._termination_observation = self.observe()
             self._job.terminate()
             return True
+        if frame.kind in {
+            RuntimeFrameType.SPAWN_READY,
+            RuntimeFrameType.STDOUT,
+            RuntimeFrameType.STDERR,
+            RuntimeFrameType.EXIT,
+            RuntimeFrameType.ERROR,
+        }:
+            raise SandboxError("Windows runtime event frame arrived on control pipe")
         return False
+
+    @property
+    def exit_sent(self) -> bool:
+        return self._exit_sent.is_set()
+
+    def fail_closed(self) -> None:
+        with contextlib.suppress(BaseException):
+            self._job.terminate()
 
 
 class _NativeChildApi:
@@ -1731,55 +1909,68 @@ class _NativeChildApi:
             self._error("CloseHandle")
 
 
-def _runner_main(pipe_name: str) -> int:
-    pipe = WindowsNamedPipeClient.connect(pipe_name)
-    decoder = RuntimeFrameDecoder()
+def _runner_main(control_pipe_name: str, event_pipe_name: str) -> int:
+    control_pipe: WindowsNamedPipeReader | None = None
+    event_pipe: WindowsNamedPipeWriter | None = None
     child: _RunnerChild | None = None
     try:
+        control_pipe = WindowsNamedPipeClient.connect_reader(control_pipe_name)
+        event_pipe = WindowsNamedPipeClient.connect_writer(event_pipe_name)
+        decoder = RuntimeFrameDecoder()
         while True:
-            data = pipe.read()
+            data = control_pipe.read()
             if not data:
                 decoder.finish()
+                if child is not None and child.exit_sent:
+                    return 0
+                if child is not None:
+                    child.fail_closed()
                 return 1
             for frame in decoder.feed(data):
+                validate_channel_frame(RuntimeChannel.CONTROL, frame.kind)
                 if child is None:
                     if frame.kind is not RuntimeFrameType.SPAWN_REQUEST:
                         raise SandboxError("Windows runtime first frame must be SpawnRequest")
                     payload = decode_json(frame.payload)
                     if not isinstance(payload, dict) or payload.get("version") != PROTOCOL_VERSION:
                         raise SandboxError("Windows runtime SpawnRequest version is invalid")
-                    child = _RunnerChild(pipe, payload)
+                    child = _RunnerChild(event_pipe, payload, abort_control=control_pipe.close)
                 elif not child.handle(frame):
-                    if frame.kind is RuntimeFrameType.EXIT:
-                        return 0
                     raise SandboxError("Windows runtime frame is not valid for the runner state")
     except BaseException as error:
         with contextlib.suppress(BaseException):
-            diagnostic: dict[str, object] = {
-                "version": PROTOCOL_VERSION,
-                "message": str(error)[:512],
-            }
             if child is not None:
-                diagnostic["child"] = child.observe()
-            pipe.write(
-                encode_frame(
-                    RuntimeFrameType.ERROR,
-                    encode_json(diagnostic),
+                child.fail_closed()
+            if event_pipe is not None:
+                diagnostic: dict[str, object] = {
+                    "version": PROTOCOL_VERSION,
+                    "message": str(error)[:512],
+                }
+                if child is not None:
+                    diagnostic["child"] = child.observe()
+                event_pipe.write(
+                    encode_frame(
+                        RuntimeFrameType.ERROR,
+                        encode_json(diagnostic),
+                    )
                 )
-            )
         return 1
     finally:
         if child is not None:
             with contextlib.suppress(BaseException):
                 child._job.close()
-        pipe.close()
+        if control_pipe is not None:
+            control_pipe.close()
+        if event_pipe is not None:
+            event_pipe.close()
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument("--pipe", required=True)
+    parser.add_argument("--control-pipe", required=True)
+    parser.add_argument("--event-pipe", required=True)
     arguments = parser.parse_args(argv)
-    return _runner_main(arguments.pipe)
+    return _runner_main(arguments.control_pipe, arguments.event_pipe)
 
 
 if __name__ == "__main__":  # pragma: no cover - exercised by Windows acceptance
@@ -1790,7 +1981,9 @@ __all__ = [
     "RunnerLaunch",
     "WindowsNamedPipe",
     "WindowsNamedPipeClient",
+    "WindowsNamedPipeReader",
     "WindowsNamedPipeServer",
+    "WindowsNamedPipeWriter",
     "close_runner_process",
     "current_user_sid",
     "launch_runner",

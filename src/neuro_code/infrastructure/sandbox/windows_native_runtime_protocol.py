@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import struct
 from dataclasses import dataclass
-from enum import IntEnum
+from enum import IntEnum, StrEnum
 from typing import Final
 
 from neuro_code.shared.errors import SandboxError
@@ -32,6 +32,42 @@ class RuntimeFrameType(IntEnum):
     TERMINATE = 7
     EXIT = 8
     ERROR = 9
+
+
+class RuntimeChannel(StrEnum):
+    """One-way protocol channel used by the trusted runtime."""
+
+    CONTROL = "control"
+    EVENT = "event"
+
+
+_CONTROL_FRAME_TYPES = frozenset(
+    {
+        RuntimeFrameType.SPAWN_REQUEST,
+        RuntimeFrameType.STDIN,
+        RuntimeFrameType.CLOSE_STDIN,
+        RuntimeFrameType.TERMINATE,
+    }
+)
+_EVENT_FRAME_TYPES = frozenset(
+    {
+        RuntimeFrameType.SPAWN_READY,
+        RuntimeFrameType.STDOUT,
+        RuntimeFrameType.STDERR,
+        RuntimeFrameType.EXIT,
+        RuntimeFrameType.ERROR,
+    }
+)
+
+
+def validate_channel_frame(channel: RuntimeChannel, kind: RuntimeFrameType) -> None:
+    """Reject a frame that crosses the directional runtime boundary."""
+
+    if not isinstance(channel, RuntimeChannel) or not isinstance(kind, RuntimeFrameType):
+        raise TypeError("runtime channel and frame kind must be canonical")
+    allowed = _CONTROL_FRAME_TYPES if channel is RuntimeChannel.CONTROL else _EVENT_FRAME_TYPES
+    if kind not in allowed:
+        raise SandboxError(f"runtime frame {kind.name} is invalid on {channel.value} channel")
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,10 +145,12 @@ def decode_json(payload: bytes) -> object:
 __all__ = [
     "MAX_FRAME_PAYLOAD",
     "PROTOCOL_VERSION",
+    "RuntimeChannel",
     "RuntimeFrame",
     "RuntimeFrameDecoder",
     "RuntimeFrameType",
     "decode_json",
     "encode_frame",
     "encode_json",
+    "validate_channel_frame",
 ]

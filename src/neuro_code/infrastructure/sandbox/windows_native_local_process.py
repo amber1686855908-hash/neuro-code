@@ -44,8 +44,10 @@ from neuro_code.application.ports.windows_sandbox import (
 from neuro_code.domain.sandbox.models import SandboxProfile
 from neuro_code.infrastructure.sandbox.windows_native_runner import (
     RunnerLaunch,
-    WindowsNamedPipe,
+    WindowsNamedPipeReader,
     WindowsNamedPipeServer,
+    WindowsNamedPipeWriter,
+    _WindowsNamedPipeDirection,
     _WindowsNativeDesktopMode,
     close_runner_process,
     current_user_sid,
@@ -54,12 +56,14 @@ from neuro_code.infrastructure.sandbox.windows_native_runner import (
 )
 from neuro_code.infrastructure.sandbox.windows_native_runtime_protocol import (
     PROTOCOL_VERSION,
+    RuntimeChannel,
     RuntimeFrame,
     RuntimeFrameDecoder,
     RuntimeFrameType,
     decode_json,
     encode_frame,
     encode_json,
+    validate_channel_frame,
 )
 from neuro_code.infrastructure.sandbox.windows_sandbox_accounts import WindowsAccountSid
 from neuro_code.infrastructure.sandbox.windows_sandbox_identity import (
@@ -111,6 +115,14 @@ class WindowsRuntimeIdentity:
     password: str
     user_sid: WindowsAccountSid
     write_sid: SyntheticWindowsSid
+
+
+@dataclass(frozen=True, slots=True)
+class WindowsRuntimeControllerTransport:
+    """One-way controller-owned endpoints for one trusted runner."""
+
+    control: WindowsNamedPipeWriter
+    events: WindowsNamedPipeReader
 
 
 class WindowsRuntimeIdentityProvider(Protocol):
@@ -391,27 +403,41 @@ class WindowsNativeLocalProcessSandbox(LocalProcessSandbox):
         identity: WindowsRuntimeIdentity,
         setup_request: WindowsSandboxSetupRequest,
     ) -> tuple[
-        WindowsNamedPipe,
+        WindowsRuntimeControllerTransport,
         RunnerLaunch,
         RuntimeFrame,
         RuntimeFrameDecoder,
         tuple[RuntimeFrame, ...],
     ]:
         controller_sid = current_user_sid()
-        server = self._pipe_server_factory(
+        control_server = self._pipe_server_factory(
             peer_sids=(controller_sid, identity.user_sid.value),
+            direction=_WindowsNamedPipeDirection.OUTBOUND,
+        )
+        event_server = self._pipe_server_factory(
+            peer_sids=(controller_sid, identity.user_sid.value),
+            direction=_WindowsNamedPipeDirection.INBOUND,
         )
         launch: RunnerLaunch | None = None
-        pipe: WindowsNamedPipe | None = None
+        control: WindowsNamedPipeWriter | None = None
+        events: WindowsNamedPipeReader | None = None
         try:
             launch = self._runner_launcher(
                 username=identity.username,
                 password=identity.password,
-                pipe_name=server.name,
+                control_pipe_name=control_server.name,
+                event_pipe_name=event_server.name,
                 environment=self._runner_environment(),
             )
-            pipe = server.accept_for_runner(launch.process_handle)
-            server.close()
+            control_endpoint = control_server.accept_for_runner(launch.process_handle)
+            event_endpoint = event_server.accept_for_runner(launch.process_handle)
+            if not isinstance(control_endpoint, WindowsNamedPipeWriter):
+                raise SandboxError("Windows control pipe did not provide a writer endpoint")
+            if not isinstance(event_endpoint, WindowsNamedPipeReader):
+                raise SandboxError("Windows event pipe did not provide a reader endpoint")
+            control, events = control_endpoint, event_endpoint
+            control_server.close()
+            event_server.close()
             payload: dict[str, object] = {
                 "version": PROTOCOL_VERSION,
                 "write_sid": identity.write_sid.value,
@@ -435,21 +461,28 @@ class WindowsNativeLocalProcessSandbox(LocalProcessSandbox):
             else:
                 payload["executable"] = request.executable
                 payload["arguments"] = list(request.arguments)
-            pipe.write(encode_frame(RuntimeFrameType.SPAWN_REQUEST, encode_json(payload)))
+            control.write(encode_frame(RuntimeFrameType.SPAWN_REQUEST, encode_json(payload)))
             decoder = RuntimeFrameDecoder()
             while True:
-                data = pipe.read_for_runner(launch.process_handle)
+                data = events.read_for_runner(launch.process_handle)
                 if not data:
                     decoder.finish()
                     raise SandboxError("trusted Windows runner exited before SpawnReady")
                 frames = decoder.feed(data)
                 for index, frame in enumerate(frames):
+                    validate_channel_frame(RuntimeChannel.EVENT, frame.kind)
                     if frame.kind is RuntimeFrameType.SPAWN_READY:
                         # A fast child can produce stdout and Exit before the
                         # controller's first pipe read completes.  Preserve
                         # every frame after SpawnReady for the owned-process
                         # reader instead of dropping coalesced data.
-                        return pipe, launch, frame, decoder, frames[index + 1 :]
+                        return (
+                            WindowsRuntimeControllerTransport(control=control, events=events),
+                            launch,
+                            frame,
+                            decoder,
+                            frames[index + 1 :],
+                        )
                     if frame.kind is RuntimeFrameType.ERROR:
                         # The runner deliberately sends only a bounded, safe
                         # operation/error diagnostic.  Preserve it here so a
@@ -469,9 +502,12 @@ class WindowsNativeLocalProcessSandbox(LocalProcessSandbox):
                             f"trusted Windows runner rejected the child request{detail}"
                         )
         except BaseException:
-            server.close()
-            if pipe is not None:
-                pipe.close()
+            control_server.close()
+            event_server.close()
+            if control is not None:
+                control.close()
+            if events is not None:
+                events.close()
             if launch is not None:
                 with contextlib.suppress(BaseException):
                     _terminate_runner_process(launch.process_handle)
@@ -487,19 +523,21 @@ class WindowsNativeLocalProcessSandbox(LocalProcessSandbox):
             else WindowsSandboxIdentityKind.ONLINE
         )
         identity = self._identity_provider.resolve(setup_request, kind)
-        pipe, launch, ready, decoder, pending_frames = await run_blocking(
+        transport, launch, ready, decoder, pending_frames = await run_blocking(
             self._start_runner, request, identity, setup_request
         )
         payload = decode_json(ready.payload)
         if not isinstance(payload, dict) or payload.get("version") != PROTOCOL_VERSION:
-            pipe.close()
+            transport.control.close()
+            transport.events.close()
             raise SandboxError("trusted Windows runner returned an invalid SpawnReady frame")
         pid = payload.get("pid")
         if not isinstance(pid, int) or pid <= 0:
-            pipe.close()
+            transport.control.close()
+            transport.events.close()
             raise SandboxError("trusted Windows runner returned an invalid child PID")
         return _WindowsNativeOwnedLocalProcess(
-            pipe=pipe,
+            transport=transport,
             runner=launch,
             pid=pid,
             request=request,
@@ -524,14 +562,15 @@ class _WindowsNativeOwnedLocalProcess(OwnedLocalProcess):
     def __init__(
         self,
         *,
-        pipe: WindowsNamedPipe,
+        transport: WindowsRuntimeControllerTransport,
         runner: RunnerLaunch,
         pid: int,
         request: SandboxedProcessRequest,
         decoder: RuntimeFrameDecoder | None = None,
         initial_frames: tuple[RuntimeFrame, ...] = (),
     ) -> None:
-        self._pipe = pipe
+        self._control = transport.control
+        self._events = transport.events
         self._runner = runner
         self._request = request
         self._loop = asyncio.get_running_loop()
@@ -587,7 +626,7 @@ class _WindowsNativeOwnedLocalProcess(OwnedLocalProcess):
                     return
             self._initial_frames = ()
             while True:
-                data = self._pipe.read()
+                data = self._events.read()
                 if not data:
                     if self._returncode is None:
                         self._diagnostic = self._pipe_eof_diagnostic()
@@ -611,16 +650,45 @@ class _WindowsNativeOwnedLocalProcess(OwnedLocalProcess):
                     self._call(self._stderr.set_exception, error)
         finally:
             self._closed = True
-            self._call(self._done.set)
-            self._pipe.close()
+            # Exit is an event from runner to controller.  Closing control
+            # first is what releases the runner's blocking control ReadFile;
+            # only after its bounded final wait do we close the event reader.
+            self._control.close()
+            runner_final: dict[str, object] | None = None
+            if os.name == "nt":
+                wait_runner = getattr(self._events, "wait_process", None)
+                if callable(wait_runner):
+                    with contextlib.suppress(BaseException):
+                        runner_final = wait_runner(
+                            self._runner.process_handle,
+                            timeout_seconds=2.0,
+                            active_state="RUNNER_STILL_ACTIVE",
+                            exited_state="RUNNER_EXITED",
+                        )
+                        if runner_final.get("state") == "RUNNER_STILL_ACTIVE":
+                            _terminate_runner_process(self._runner.process_handle)
+                            runner_final = wait_runner(
+                                self._runner.process_handle,
+                                timeout_seconds=1.0,
+                                active_state="RUNNER_STILL_ACTIVE",
+                                exited_state="RUNNER_EXITED",
+                            )
+            if runner_final is not None:
+                diagnostic = dict(self._diagnostic or {})
+                diagnostic["runner"] = runner_final
+                diagnostic["control_pipe"] = "CLOSED_AFTER_EXIT"
+                diagnostic["event_pipe"] = "CLOSED_AFTER_RUNNER_EXIT"
+                self._diagnostic = diagnostic
+            self._events.close()
             with contextlib.suppress(BaseException):
                 close_runner_process(self._runner.process_handle)
+            self._call(self._done.set)
 
     def _pipe_eof_diagnostic(self) -> dict[str, object]:
         return {
-            "pipe": "PIPE_BROKEN",
-            "pipe_error": self._pipe.last_read_error,
-            "runner": self._pipe.observe_process(
+            "pipe": "EVENT_PIPE_BROKEN",
+            "pipe_error": self._events.last_read_error,
+            "runner": self._events.observe_process(
                 self._runner.process_handle,
                 active_state="RUNNER_STILL_ACTIVE",
                 exited_state="RUNNER_EXITED",
@@ -635,7 +703,7 @@ class _WindowsNativeOwnedLocalProcess(OwnedLocalProcess):
             return dict(self._diagnostic)
         runner: dict[str, object] | None = None
         with contextlib.suppress(BaseException):
-            runner = self._pipe.observe_process(
+            runner = self._events.observe_process(
                 self._runner.process_handle,
                 active_state="RUNNER_STILL_ACTIVE",
                 exited_state="RUNNER_EXITED",
@@ -643,7 +711,7 @@ class _WindowsNativeOwnedLocalProcess(OwnedLocalProcess):
         if runner is None:
             runner = {"state": "WAIT_FAILED", "wait_error": "HANDLE_CLOSED"}
         return {
-            "pipe": "PIPE_BROKEN" if self._closed and self._returncode is None else None,
+            "pipe": "EVENT_PIPE_BROKEN" if self._closed and self._returncode is None else None,
             "runner": runner,
             "child": observe_process_id(self._process_id),
             "cleanup_error": self._cleanup_error,
@@ -676,7 +744,7 @@ class _WindowsNativeOwnedLocalProcess(OwnedLocalProcess):
             if not isinstance(payload, dict):
                 raise SandboxError("trusted Windows runner reported a runtime error")
             self._diagnostic = {
-                "pipe": "PIPE_BROKEN",
+                "pipe": "EVENT_PIPE_BROKEN",
                 "runner": {"state": "RUNNER_EXITED"},
                 "child": payload.get("child"),
             }
@@ -697,7 +765,7 @@ class _WindowsNativeOwnedLocalProcess(OwnedLocalProcess):
             if self._closed:
                 raise RuntimeError("Windows runtime process is closed")
             await run_blocking(
-                self._pipe.write,
+                self._control.write,
                 encode_frame(RuntimeFrameType.STDIN, data),
             )
 
@@ -706,7 +774,7 @@ class _WindowsNativeOwnedLocalProcess(OwnedLocalProcess):
             if self._closed:
                 return
             await run_blocking(
-                self._pipe.write,
+                self._control.write,
                 encode_frame(RuntimeFrameType.CLOSE_STDIN),
             )
 
@@ -731,7 +799,7 @@ class _WindowsNativeOwnedLocalProcess(OwnedLocalProcess):
         # the executor task so its cancellation cannot hold the event loop, then
         # use the runner's Job Object as the bounded force boundary below.
         send_task = asyncio.create_task(
-            run_blocking(self._pipe.write, encode_frame(RuntimeFrameType.TERMINATE))
+            run_blocking(self._control.write, encode_frame(RuntimeFrameType.TERMINATE))
         )
         try:
             await asyncio.wait_for(asyncio.shield(send_task), timeout=max(0.1, timeout))
@@ -746,7 +814,8 @@ class _WindowsNativeOwnedLocalProcess(OwnedLocalProcess):
         except (TimeoutError, SandboxError):
             self._diagnostic = self.diagnostic_snapshot()
             _terminate_runner_process(self._runner.process_handle)
-            self._pipe.close()
+            self._events.close()
+            self._control.close()
             try:
                 await asyncio.wait_for(self.wait(), timeout=2.0)
             except (TimeoutError, SandboxError) as error:
@@ -777,7 +846,8 @@ class _WindowsNativeOwnedLocalProcess(OwnedLocalProcess):
         self._call(self._stdout.feed_eof)
         if self._stderr is not None:
             self._call(self._stderr.feed_eof)
-        self._pipe.close()
+        self._events.close()
+        self._control.close()
         self._call(self._done.set)
 
 
@@ -797,6 +867,7 @@ def _terminate_runner_process(handle: int) -> None:
 __all__ = [
     "DpapiWindowsRuntimeIdentityProvider",
     "WindowsNativeLocalProcessSandbox",
+    "WindowsRuntimeControllerTransport",
     "WindowsRuntimeIdentity",
     "WindowsRuntimeIdentityProvider",
 ]
