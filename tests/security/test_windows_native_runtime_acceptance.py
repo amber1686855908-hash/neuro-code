@@ -12,6 +12,8 @@ import asyncio
 import contextlib
 import json
 import os
+import shutil
+import sys
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -30,6 +32,7 @@ from neuro_code.application.ports.sandbox import (
     SandboxedProcessRequest,
 )
 from neuro_code.application.ports.windows_sandbox import (
+    WindowsSandboxIdentityKind,
     WindowsSandboxSetupRequest,
     WindowsSandboxSetupState,
 )
@@ -37,7 +40,10 @@ from neuro_code.domain.sandbox.models import SandboxProfile
 from neuro_code.infrastructure.sandbox.windows_native_local_process import (
     WindowsNativeLocalProcessSandbox,
 )
-from neuro_code.infrastructure.sandbox.windows_native_runner import _WindowsNativeDesktopMode
+from neuro_code.infrastructure.sandbox.windows_native_runner import (
+    _WindowsNativeDesktopMode,
+    current_user_sid,
+)
 from neuro_code.infrastructure.sandbox.windows_sandbox_accounts import (
     SANDBOX_ONLINE_USERNAME,
     _NativeWindowsSandboxAccountApi,
@@ -223,6 +229,143 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                 self.fail(
                     "W3_IPC_DIRECTIONAL_TRANSPORT_BLOCKED " + json.dumps([probe], sort_keys=True)
                 )
+
+            # Gate 1 runs only after the whoami transport baseline has passed.
+            # The probe is copied into the disposable workspace and therefore
+            # executes as the actual CreateProcessAsUserW final child, not as
+            # the trusted runner that created its restricted token.
+            probe_source = Path(__file__).with_name("windows_token_probe.py")
+            token_probe_path = workspace / "windows_token_probe.py"
+            shutil.copyfile(probe_source, token_probe_path)
+            records = {record.kind: record for record in authority.identity_records(setup_request)}
+            online_record = records[WindowsSandboxIdentityKind.ONLINE]
+            offline_record = records[WindowsSandboxIdentityKind.OFFLINE]
+            controller_sid = current_user_sid()
+            expected_restricted_sid = online_record.write_sid.value
+            self.assertEqual(expected_restricted_sid, offline_record.write_sid.value)
+            self.assertNotEqual(online_record.user_sid.value, controller_sid)
+            self.assertNotEqual(offline_record.user_sid.value, controller_sid)
+
+            async def run_gate1_probe(
+                *,
+                label: str,
+                network: LocalProcessNetworkPolicy,
+                expected_user_sid: str,
+            ) -> dict[str, object]:
+                request = _request(
+                    workspace=workspace,
+                    profile=SandboxProfile.WORKSPACE,
+                    network=network,
+                    stdio=LocalProcessStdioMode.CAPTURE,
+                    arguments=("-I", str(token_probe_path)),
+                    executable=sys.executable,
+                )
+                adapter = WindowsNativeLocalProcessSandbox(
+                    SandboxProfile.WORKSPACE,
+                    workspace,
+                    state,
+                    setup_authority=authority,
+                    setup_request_factory=lambda _request: setup_request,
+                    _diagnostic_desktop_mode=_WindowsNativeDesktopMode.PRIVATE_DESKTOP,
+                    _diagnostic_create_no_window=True,
+                )
+                result: dict[str, object] = {
+                    "probe": label,
+                    "CreateProcessAsUser": "UNKNOWN",
+                    "SpawnReady": "FAIL",
+                    "stdout": "NOT_STARTED",
+                    "child_exit": "NOT_STARTED",
+                    "Exit": "NOT_STARTED",
+                    "expected_user_sid": expected_user_sid,
+                }
+                process: OwnedLocalProcess | None = None
+                try:
+                    print(f"W3_STAGE={label.lower()}_spawn_start", flush=True)
+                    process = await adapter.spawn(request)
+                    print(f"W3_STAGE={label.lower()}_spawn_ready", flush=True)
+                    result["CreateProcessAsUser"] = "PASS"
+                    result["SpawnReady"] = "PASS"
+                    stream = process.stdout
+                    if stream is None:
+                        raise AssertionError("Gate 1 probe has no stdout stream")
+                    output = await asyncio.wait_for(stream.read(65_536), timeout=15)
+                    result["stdout"] = "NONEMPTY" if output else "EOF"
+                    if output:
+                        try:
+                            decoded = json.loads(output.decode("utf-8", errors="strict"))
+                        except (UnicodeError, json.JSONDecodeError):
+                            result["token_probe"] = {"error": "INVALID_JSON"}
+                        else:
+                            result["token_probe"] = decoded
+                    print(f"W3_STAGE={label.lower()}_stdout_read", flush=True)
+                    await asyncio.wait_for(process.wait(), timeout=15)
+                    result["child_exit"] = process.returncode
+                    result["Exit"] = "PASS"
+                    print(f"W3_STAGE={label.lower()}_child_waited", flush=True)
+                except TimeoutError:
+                    result["error"] = "TIMEOUT"
+                except BaseException as error:
+                    result["error"] = type(error).__name__
+                finally:
+                    if process is not None:
+                        with contextlib.suppress(BaseException):
+                            await process.terminate(grace_seconds=0.5)
+                    diagnostic = (
+                        cast(Any, process).diagnostic_snapshot() if process is not None else None
+                    )
+                    result["diagnostic_after_cleanup"] = diagnostic
+                    if isinstance(diagnostic, dict):
+                        result["runner_final"] = diagnostic.get("runner")
+                        result["control_close"] = diagnostic.get("control_pipe")
+                        result["event_close"] = diagnostic.get("event_pipe")
+                    print(f"W3_STAGE={label.lower()}_probe_finished", flush=True)
+                return result
+
+            online_probe = await run_gate1_probe(
+                label="GATE1_ONLINE",
+                network=LocalProcessNetworkPolicy.INHERIT,
+                expected_user_sid=online_record.user_sid.value,
+            )
+            offline_probe = await run_gate1_probe(
+                label="GATE1_OFFLINE",
+                network=LocalProcessNetworkPolicy.ISOLATED,
+                expected_user_sid=offline_record.user_sid.value,
+            )
+            gate1_results = [online_probe, offline_probe]
+            print(f"W3_GATE1_RESULTS={json.dumps(gate1_results, sort_keys=True)}", flush=True)
+
+            def assert_gate1_result(
+                result: dict[str, object],
+                *,
+                expected_user_sid: str,
+            ) -> None:
+                self.assertEqual(result.get("CreateProcessAsUser"), "PASS")
+                self.assertEqual(result.get("SpawnReady"), "PASS")
+                self.assertEqual(result.get("stdout"), "NONEMPTY")
+                self.assertEqual(result.get("child_exit"), 0)
+                self.assertEqual(result.get("Exit"), "PASS")
+                runner_final = result.get("runner_final")
+                self.assertIsInstance(runner_final, dict)
+                self.assertEqual(runner_final.get("state"), "RUNNER_EXITED")
+                self.assertEqual(runner_final.get("exit_code"), 0)
+                token = result.get("token_probe")
+                self.assertIsInstance(token, dict)
+                assert isinstance(token, dict)
+                self.assertEqual(token.get("user_sid"), expected_user_sid)
+                self.assertNotEqual(token.get("user_sid"), controller_sid)
+                self.assertTrue(token.get("is_restricted"))
+                self.assertEqual(token.get("restricted_sids"), [expected_restricted_sid])
+                self.assertTrue(token.get("change_notify"))
+                self.assertEqual(token.get("unexpected_enabled_privileges"), [])
+                logon_sid = token.get("logon_sid")
+                self.assertIsInstance(logon_sid, str)
+                self.assertNotIn(logon_sid, token.get("restricted_sids", []))
+                self.assertNotIn(online_record.user_sid.value, token.get("restricted_sids", []))
+                self.assertNotIn(offline_record.user_sid.value, token.get("restricted_sids", []))
+                self.assertNotIn(controller_sid, token.get("restricted_sids", []))
+
+            assert_gate1_result(online_probe, expected_user_sid=online_record.user_sid.value)
+            assert_gate1_result(offline_probe, expected_user_sid=offline_record.user_sid.value)
             try:
                 self.assertEqual(
                     authority.inspect(setup_request).state,
