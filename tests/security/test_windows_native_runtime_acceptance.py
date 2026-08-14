@@ -13,12 +13,14 @@ import contextlib
 import ctypes
 import json
 import os
+import shutil
 import socket
+import subprocess
 import unittest
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from tempfile import TemporaryDirectory
+from tempfile import TemporaryDirectory, gettempdir, mkdtemp
 from typing import Any, cast
 
 from neuro_code.application.ports.sandbox import (
@@ -78,8 +80,118 @@ _APPENDED = "GATE2_APPEND_SENTINEL"
 _OVERWRITTEN = "GATE2_OVERWRITE_SENTINEL"
 _NUL_CANARY_COMMAND = ("echo", "GATE2_NUL_CANARY>NUL")
 _BENIGN_OUTBOUND_PROBE = ("1.1.1.1", 80)
+_WINSOCK_MARKER = "W3_WINSOCK="
 ProbeState = Callable[[], dict[str, object]]
 Command = tuple[str, ...]
+
+
+class _WinsockProbeBuildError(RuntimeError):
+    """The trusted Windows controller could not build the acceptance probe."""
+
+
+def _winsock_probe_source() -> Path:
+    source = Path(__file__).with_name("windows_winsock_probe.c").resolve(strict=False)
+    if not source.is_file():
+        raise _WinsockProbeBuildError("Winsock probe source is unavailable")
+    return source
+
+
+def _find_vswhere() -> Path:
+    candidates: list[Path] = []
+    discovered = shutil.which("vswhere.exe")
+    if discovered:
+        candidates.append(Path(discovered))
+    program_files_x86 = os.environ.get("PROGRAMFILES(X86)")
+    if program_files_x86:
+        candidates.append(
+            Path(program_files_x86) / "Microsoft Visual Studio" / "Installer" / "vswhere.exe"
+        )
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    raise _WinsockProbeBuildError("vswhere.exe is unavailable")
+
+
+def _compile_winsock_probe() -> Path:  # pragma: no cover - Windows CI
+    """Build the acceptance-only probe with the runner's selected MSVC toolchain."""
+
+    vswhere = _find_vswhere()
+    try:
+        discovery = subprocess.run(
+            [
+                str(vswhere),
+                "-latest",
+                "-products",
+                "*",
+                "-requires",
+                "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+                "-property",
+                "installationPath",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            shell=False,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise _WinsockProbeBuildError("vswhere discovery failed") from error
+    if discovery.returncode != 0:
+        raise _WinsockProbeBuildError("vswhere did not find an MSVC installation")
+    installation_path = next(
+        (Path(line.strip()) for line in discovery.stdout.splitlines() if line.strip()),
+        None,
+    )
+    if installation_path is None:
+        raise _WinsockProbeBuildError("vswhere returned no installation path")
+    vcvars = installation_path / "VC" / "Auxiliary" / "Build" / "vcvars64.bat"
+    if not vcvars.is_file():
+        raise _WinsockProbeBuildError("vcvars64.bat is unavailable")
+    source = _winsock_probe_source()
+    runner_temp = Path(os.environ.get("RUNNER_TEMP", gettempdir()))
+    build_directory = Path(mkdtemp(prefix="neuro-code-w3-winsock-", dir=runner_temp))
+    output = build_directory / "windows_winsock_probe.exe"
+    command = f'call "{vcvars}" && cl /nologo /W4 /WX /MT /O2 /Fe:"{output}" "{source}" Ws2_32.lib'
+    try:
+        build = subprocess.run(
+            ["cmd.exe", "/d", "/s", "/c", command],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=120,
+            shell=False,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        shutil.rmtree(build_directory, ignore_errors=True)
+        raise _WinsockProbeBuildError("MSVC probe build failed") from error
+    if build.returncode != 0 or not output.is_file():
+        shutil.rmtree(build_directory, ignore_errors=True)
+        raise _WinsockProbeBuildError("MSVC probe build failed")
+    return output
+
+
+def _parse_winsock_result(value: object) -> dict[str, object]:
+    preview = value if isinstance(value, str) else ""
+    marker_line = next(
+        (line.strip() for line in preview.splitlines() if line.strip().startswith(_WINSOCK_MARKER)),
+        "",
+    )
+    if not marker_line:
+        raise AssertionError("Winsock probe omitted W3_WINSOCK marker")
+    try:
+        payload = json.loads(marker_line[len(_WINSOCK_MARKER) :])
+    except (TypeError, ValueError, json.JSONDecodeError) as error:
+        raise AssertionError("Winsock probe emitted invalid JSON") from error
+    if not isinstance(payload, dict):
+        raise AssertionError("Winsock probe JSON is not an object")
+    stage = payload.get("stage")
+    connected = payload.get("connected")
+    wsa_error = payload.get("wsa_error")
+    if stage not in {"WSA_STARTUP", "SOCKET", "CONNECT"}:
+        raise AssertionError("Winsock probe emitted an invalid stage")
+    if type(connected) is not bool or type(wsa_error) is not int or wsa_error < 0:
+        raise AssertionError("Winsock probe emitted invalid bounded facts")
+    return {"stage": stage, "connected": connected, "wsa_error": wsa_error}
 
 
 class _RecordingFirewallApi:
@@ -915,12 +1027,29 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
         privilege_api = _NativeWindowsSetupPrivilegeApi()
         self.assertTrue(privilege_api.is_administrator(), "W2 setup acceptance requires elevation")
 
-        def controller_probe() -> None:
+        try:
+            compiled_probe = await asyncio.to_thread(_compile_winsock_probe)
+        except _WinsockProbeBuildError as error:
+            print(
+                "W3_GATE3_BLOCKER="
+                + json.dumps(
+                    {
+                        "classification": "NATIVE_WINSOCK_PROBE_BUILD_UNAVAILABLE",
+                        "error_type": type(error).__name__,
+                    },
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
+            self.fail("NATIVE_WINSOCK_PROBE_BUILD_UNAVAILABLE")
+        self.addCleanup(shutil.rmtree, compiled_probe.parent, ignore_errors=True)
+
+        def controller_python_probe() -> None:
             with socket.create_connection(_BENIGN_OUTBOUND_PROBE, timeout=5):
                 return
 
         try:
-            controller_probe()
+            await asyncio.to_thread(controller_python_probe)
         except OSError as error:
             print(
                 "W3_GATE3_BLOCKER="
@@ -935,13 +1064,43 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
             )
             self.fail("NETWORK_PROBE_ENVIRONMENT_UNAVAILABLE")
 
-        system_root = os.environ.get("SYSTEMROOT")
-        if not system_root:
-            self.fail("NETWORK_PROBE_EXECUTABLE_UNAVAILABLE")
-        curl = Path(system_root) / "System32" / "curl.exe"
-        if not curl.is_file():
-            print("W3_GATE3_BLOCKER=NETWORK_PROBE_EXECUTABLE_UNAVAILABLE", flush=True)
-            self.fail("NETWORK_PROBE_EXECUTABLE_UNAVAILABLE")
+        try:
+            controller_winsock = await asyncio.to_thread(
+                subprocess.run,
+                [str(compiled_probe)],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=8,
+                shell=False,
+            )
+            controller_winsock_result = _parse_winsock_result(controller_winsock.stdout)
+        except (OSError, subprocess.SubprocessError, AssertionError) as error:
+            print(
+                "W3_GATE3_BLOCKER="
+                + json.dumps(
+                    {
+                        "classification": "NETWORK_PROBE_ENVIRONMENT_UNAVAILABLE",
+                        "error_type": type(error).__name__,
+                    },
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
+            self.fail("NETWORK_PROBE_ENVIRONMENT_UNAVAILABLE")
+        if controller_winsock.returncode != 0 or not controller_winsock_result["connected"]:
+            print(
+                "W3_GATE3_BLOCKER="
+                + json.dumps(
+                    {
+                        "classification": "NETWORK_PROBE_ENVIRONMENT_UNAVAILABLE",
+                        "controller_winsock": controller_winsock_result,
+                    },
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
+            self.fail("NETWORK_PROBE_ENVIRONMENT_UNAVAILABLE")
 
         with TemporaryDirectory() as directory:
             root = Path(directory)
@@ -951,6 +1110,8 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
             workspace.mkdir()
             installation.mkdir()
             runtime_state.mkdir()
+            probe = workspace / "w3-winsock-probe.exe"
+            shutil.copy2(compiled_probe, probe)
             sensitive = workspace / "sensitive.txt"
             sensitive.write_text(_SENTINEL, encoding="utf-8")
             setup_request = WindowsSandboxSetupRequest(
@@ -991,17 +1152,8 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(native_exact)
 
             recording_firewall.calls.clear()
-            executable = str(curl)
-            curl_arguments = (
-                "--head",
-                "--silent",
-                "--show-error",
-                "--connect-timeout",
-                "5",
-                "--max-time",
-                "8",
-                "http://1.1.1.1/",
-            )
+            executable = str(probe)
+            winsock_arguments: tuple[str, ...] = ()
 
             async def run_network_child(
                 *,
@@ -1013,7 +1165,7 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                     workspace=workspace,
                     network=network,
                     executable=executable,
-                    arguments=curl_arguments,
+                    arguments=winsock_arguments,
                 )
                 adapter = WindowsNativeLocalProcessSandbox(
                     SandboxProfile.WORKSPACE,
@@ -1083,6 +1235,7 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                         result["exit_code"] = process.returncode
                         result["actual"] = "ALLOW" if process.returncode == 0 else "DENY"
                     result["stdout_nonempty"] = bool(stdout)
+                    result["stdout_preview"] = stdout.decode("utf-8", errors="replace")[:256]
                     result["stderr_preview"] = stderr.decode("utf-8", errors="replace")[:512]
                     diagnostic = (
                         cast(Any, process).diagnostic_snapshot() if process is not None else None
@@ -1107,6 +1260,18 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                     )
                 return result
 
+            def winsock_result(result: dict[str, object]) -> dict[str, object]:
+                parsed = _parse_winsock_result(result.get("stdout_preview"))
+                result["winsock"] = parsed
+                return parsed
+
+            def online_failure_classification(parsed: dict[str, object]) -> str:
+                return {
+                    "WSA_STARTUP": "ONLINE_WINSOCK_STARTUP_BLOCKED",
+                    "SOCKET": "ONLINE_WINSOCK_SOCKET_BLOCKED",
+                    "CONNECT": "ONLINE_WINSOCK_CONNECT_BLOCKED",
+                }.get(str(parsed.get("stage")), "ONLINE_WINSOCK_PROBE_PROTOCOL_FAILURE")
+
             online_sid = cast(str, setup_snapshot.online_user_sid)
             offline_sid = cast(str, setup_snapshot.offline_user_sid)
             write_sid = SyntheticWindowsSid(cast(str, setup_snapshot.write_restricting_sid))
@@ -1114,42 +1279,97 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
             try:
                 # Firewall exactness is checked before and after every child;
                 # runtime setup inspection is the only permitted call path.
-                assert_firewall_ready("before_offline_1")
-                offline_1 = await run_network_child(
-                    label="OFFLINE_1",
-                    identity="OFFLINE",
-                    network=LocalProcessNetworkPolicy.ISOLATED,
-                )
-                self.assertEqual(offline_1.get("create_process"), "PASS")
-                self.assertEqual(offline_1.get("spawn_ready"), "PASS")
-                self.assertTrue(offline_1.get("token_attested"))
-                self.assertEqual(offline_1.get("actual"), "DENY")
-                self.assertNotEqual(offline_1.get("exit_code"), 0)
-                assert_firewall_ready("after_offline_1")
-
+                assert_firewall_ready("before_online_1")
                 online_1 = await run_network_child(
                     label="ONLINE_1",
                     identity="ONLINE",
                     network=LocalProcessNetworkPolicy.INHERIT,
                 )
+                online_1_winsock = winsock_result(online_1)
                 self.assertEqual(online_1.get("create_process"), "PASS")
                 self.assertEqual(online_1.get("spawn_ready"), "PASS")
                 self.assertTrue(online_1.get("token_attested"))
-                self.assertEqual(online_1.get("actual"), "ALLOW")
-                self.assertEqual(online_1.get("exit_code"), 0)
+                if (
+                    online_1.get("actual") != "ALLOW"
+                    or online_1.get("exit_code") != 0
+                    or online_1_winsock.get("stage") != "CONNECT"
+                    or online_1_winsock.get("connected") is not True
+                    or online_1_winsock.get("wsa_error") != 0
+                ):
+                    classification = online_failure_classification(online_1_winsock)
+                    print(
+                        "W3_GATE3_BLOCKER="
+                        + json.dumps(
+                            {
+                                "classification": classification,
+                                "online": online_1_winsock,
+                            },
+                            sort_keys=True,
+                        ),
+                        flush=True,
+                    )
+                    self.fail(classification)
                 self.assertTrue(online_1.get("stdout_nonempty"))
                 assert_firewall_ready("after_online_1")
+
+                offline_1 = await run_network_child(
+                    label="OFFLINE_1",
+                    identity="OFFLINE",
+                    network=LocalProcessNetworkPolicy.ISOLATED,
+                )
+                offline_1_winsock = winsock_result(offline_1)
+                self.assertEqual(offline_1.get("create_process"), "PASS")
+                self.assertEqual(offline_1.get("spawn_ready"), "PASS")
+                self.assertTrue(offline_1.get("token_attested"))
+                if (
+                    offline_1.get("actual") != "DENY"
+                    or offline_1.get("exit_code") == 0
+                    or offline_1_winsock.get("stage") != "CONNECT"
+                    or offline_1_winsock.get("connected") is not False
+                ):
+                    print(
+                        "W3_GATE3_BLOCKER="
+                        + json.dumps(
+                            {
+                                "classification": "OFFLINE_NETWORK_STACK_COMPATIBILITY",
+                                "offline": offline_1_winsock,
+                            },
+                            sort_keys=True,
+                        ),
+                        flush=True,
+                    )
+                    self.fail("OFFLINE_NETWORK_STACK_COMPATIBILITY")
+                assert_firewall_ready("after_offline_1")
+
+                online_2 = await run_network_child(
+                    label="ONLINE_2",
+                    identity="ONLINE",
+                    network=LocalProcessNetworkPolicy.INHERIT,
+                )
+                online_2_winsock = winsock_result(online_2)
+                self.assertEqual(online_2.get("create_process"), "PASS")
+                self.assertEqual(online_2.get("spawn_ready"), "PASS")
+                self.assertTrue(online_2.get("token_attested"))
+                self.assertEqual(online_2.get("actual"), "ALLOW")
+                self.assertEqual(online_2.get("exit_code"), 0)
+                self.assertEqual(online_2_winsock.get("stage"), "CONNECT")
+                self.assertTrue(online_2_winsock.get("connected"))
+                self.assertEqual(online_2_winsock.get("wsa_error"), 0)
+                assert_firewall_ready("after_online_2")
 
                 offline_2 = await run_network_child(
                     label="OFFLINE_2",
                     identity="OFFLINE",
                     network=LocalProcessNetworkPolicy.ISOLATED,
                 )
+                offline_2_winsock = winsock_result(offline_2)
                 self.assertEqual(offline_2.get("create_process"), "PASS")
                 self.assertEqual(offline_2.get("spawn_ready"), "PASS")
                 self.assertTrue(offline_2.get("token_attested"))
                 self.assertEqual(offline_2.get("actual"), "DENY")
                 self.assertNotEqual(offline_2.get("exit_code"), 0)
+                self.assertEqual(offline_2_winsock.get("stage"), "CONNECT")
+                self.assertFalse(offline_2_winsock.get("connected"))
                 assert_firewall_ready("after_offline_2")
 
                 # Two identities share one static setup.  Poll the real native
@@ -1193,20 +1413,40 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(concurrent_online.get("actual"), "ALLOW")
                 self.assertEqual(concurrent_online.get("exit_code"), 0)
                 self.assertTrue(concurrent_online.get("stdout_nonempty"))
+                concurrent_online_winsock = winsock_result(concurrent_online)
+                self.assertEqual(concurrent_online_winsock.get("stage"), "CONNECT")
+                self.assertTrue(concurrent_online_winsock.get("connected"))
                 self.assertTrue(concurrent_offline.get("token_attested"))
                 self.assertEqual(concurrent_offline.get("actual"), "DENY")
                 self.assertNotEqual(concurrent_offline.get("exit_code"), 0)
+                concurrent_offline_winsock = winsock_result(concurrent_offline)
+                self.assertEqual(concurrent_offline_winsock.get("stage"), "CONNECT")
+                self.assertFalse(concurrent_offline_winsock.get("connected"))
                 mutation_calls = [
                     call for call in recording_firewall.calls if call in {"ENSURE", "REMOVE"}
                 ]
                 self.assertEqual(mutation_calls, [])
 
                 try:
-                    controller_probe()
-                except OSError as error:
+                    await asyncio.to_thread(controller_python_probe)
+                    controller_postflight_winsock = await asyncio.to_thread(
+                        subprocess.run,
+                        [str(compiled_probe)],
+                        check=False,
+                        capture_output=True,
+                        text=True,
+                        timeout=8,
+                        shell=False,
+                    )
+                    controller_postflight_result = _parse_winsock_result(
+                        controller_postflight_winsock.stdout
+                    )
+                except (OSError, subprocess.SubprocessError, AssertionError) as error:
                     self.fail(
                         f"NETWORK_PROBE_ENVIRONMENT_UNAVAILABLE_POSTFLIGHT:{type(error).__name__}"
                     )
+                self.assertEqual(controller_postflight_winsock.returncode, 0)
+                self.assertTrue(controller_postflight_result["connected"])
                 assert_firewall_ready("controller_postflight")
 
                 # Gate 3 evidence is only promoted after the complete network
@@ -1239,7 +1479,16 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                             "firewall": firewall_observations,
                             "runtime_firewall_mutations": mutation_calls,
                             "controller_preflight": "PASS",
+                            "controller_winsock": controller_winsock_result,
                             "controller_postflight": "PASS",
+                            "controller_postflight_winsock": controller_postflight_result,
+                            "online_1": online_1_winsock,
+                            "offline_1": offline_1_winsock,
+                            "online_2": online_2_winsock,
+                            "offline_2": offline_2_winsock,
+                            "concurrent_online": concurrent_online_winsock,
+                            "concurrent_offline": concurrent_offline_winsock,
+                            "curl_w5_classification": "CURL_RESTRICTED_RUNTIME_COMPATIBILITY",
                             "online_offline_concurrent_rule_observations": len(
                                 monitor_observations
                             ),
