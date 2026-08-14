@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import ctypes
+import enum
 import os
 import secrets
 import shutil
@@ -68,6 +69,8 @@ _PROC_THREAD_ATTRIBUTE_HANDLE_LIST = 0x00020002
 _PROC_THREAD_ATTRIBUTE_JOB_LIST = 0x0002000D
 _HANDLE_FLAG_INHERIT = 0x00000001
 _WAIT_OBJECT_0 = 0
+_WAIT_TIMEOUT = 258
+_STILL_ACTIVE = 259
 _INFINITE = 0xFFFFFFFF
 # Do not ask CreateProcessWithLogonW to synchronously load the account
 # profile.  W3 derives private HOME/TMP from the final token and creates those
@@ -231,6 +234,13 @@ class RunnerLaunch:
     thread_handle: int | None = None
 
 
+class _WindowsNativeDesktopMode(enum.StrEnum):
+    """Trusted-runner-only desktop selection used by native diagnostics."""
+
+    PRIVATE_DESKTOP = "private"
+    INHERIT_DESKTOP = "inherit"
+
+
 class _NativePipeApi:
     """Synchronous Win32 byte-pipe calls shared by controller and runner."""
 
@@ -320,6 +330,13 @@ class _NativePipeApi:
             [ctypes.c_void_p, ctypes.c_uint32],
             ctypes.c_uint32,
         )
+        self.get_exit_code_process = _load_function(
+            kernel32,
+            "GetExitCodeProcess",
+            [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32)],
+            ctypes.c_int32,
+        )
+        self._last_read_error: int | None = None
 
     def last_error(self) -> int:
         return cast(int, self._get_last_error())
@@ -333,10 +350,35 @@ class _NativePipeApi:
         returned = ctypes.c_uint32()
         if not self.read_file(handle, buffer, count, ctypes.byref(returned), None):
             error = self.last_error()
+            self._last_read_error = error
             if error in {_ERROR_BROKEN_PIPE, _ERROR_NO_DATA}:
                 return b""
             raise OSError(error, f"ReadFile failed with Windows error {error}")
+        self._last_read_error = None
         return buffer.raw[: returned.value]
+
+    @property
+    def last_read_error(self) -> int | None:
+        return self._last_read_error
+
+    def observe_process(
+        self,
+        handle: int,
+        *,
+        active_state: str,
+        exited_state: str,
+    ) -> dict[str, object]:
+        """Return bounded Win32 process state without exposing process data."""
+
+        result = self.wait_for_single_object(handle, 0)
+        if result == _WAIT_TIMEOUT:
+            return {"state": active_state}
+        if result != _WAIT_OBJECT_0:
+            return {"state": "WAIT_FAILED", "wait_error": cast(int, result)}
+        exit_code = ctypes.c_uint32()
+        if not self.get_exit_code_process(handle, ctypes.byref(exit_code)):
+            return {"state": "WAIT_FAILED", "wait_error": self.last_error()}
+        return {"state": exited_state, "exit_code": int(exit_code.value)}
 
     def write(self, handle: int, payload: bytes) -> None:
         offset = 0
@@ -370,6 +412,23 @@ class WindowsNamedPipe:
 
     def read(self) -> bytes:
         return self._api.read(self.handle)
+
+    @property
+    def last_read_error(self) -> int | None:
+        return self._api.last_read_error
+
+    def observe_process(
+        self,
+        handle: int,
+        *,
+        active_state: str,
+        exited_state: str,
+    ) -> dict[str, object]:
+        return self._api.observe_process(
+            handle,
+            active_state=active_state,
+            exited_state=exited_state,
+        )
 
     def read_for_runner(
         self,
@@ -814,6 +873,55 @@ def close_runner_process(handle: int) -> None:
         raise OSError(_last_error(), "CloseHandle(runner) failed")
 
 
+def observe_process_id(pid: int) -> dict[str, object]:
+    """Observe a child PID for diagnostics without opening a control handle."""
+
+    if os.name != "nt":
+        return {"state": "WAIT_FAILED", "wait_error": "NOT_WINDOWS"}
+    loader = getattr(ctypes, "WinDLL", None)
+    if loader is None:  # pragma: no cover - Windows only
+        return {"state": "WAIT_FAILED", "wait_error": "WIN32_UNAVAILABLE"}
+    kernel32 = cast(object, loader("kernel32.dll", use_last_error=True))
+    open_process = _load_function(
+        kernel32,
+        "OpenProcess",
+        [ctypes.c_uint32, ctypes.c_int32, ctypes.c_uint32],
+        ctypes.c_void_p,
+    )
+    wait = _load_function(
+        kernel32,
+        "WaitForSingleObject",
+        [ctypes.c_void_p, ctypes.c_uint32],
+        ctypes.c_uint32,
+    )
+    get_exit = _load_function(
+        kernel32,
+        "GetExitCodeProcess",
+        [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32)],
+        ctypes.c_int32,
+    )
+    close = _load_function(kernel32, "CloseHandle", [ctypes.c_void_p], ctypes.c_int32)
+    handle = open_process(0x00100000 | 0x1000, False, pid)
+    if not handle:
+        error = _last_error()
+        if error in {2, 87}:  # ERROR_FILE_NOT_FOUND / ERROR_INVALID_PARAMETER
+            return {"state": "FINAL_CHILD_EXITED", "open_error": error}
+        return {"state": "WAIT_FAILED", "wait_error": error}
+    try:
+        result = wait(handle, 0)
+        if result == _WAIT_TIMEOUT:
+            return {"state": "FINAL_CHILD_STILL_ACTIVE"}
+        if result != _WAIT_OBJECT_0:
+            return {"state": "WAIT_FAILED", "wait_error": cast(int, result)}
+        exit_code = ctypes.c_uint32()
+        if not get_exit(handle, ctypes.byref(exit_code)):
+            return {"state": "WAIT_FAILED", "wait_error": _last_error()}
+        return {"state": "FINAL_CHILD_EXITED", "exit_code": int(exit_code.value)}
+    finally:
+        with contextlib.suppress(BaseException):
+            close(handle)
+
+
 def _validated_text(value: object, label: str) -> str:
     if not isinstance(value, str) or not value or "\x00" in value:
         raise SandboxError(f"Windows runtime {label} is invalid")
@@ -830,6 +938,8 @@ class _RunnerChild:
         self._job = WindowsJobObject.create()
         self._process_handle: int | None = None
         self._process_id: int | None = None
+        self._last_exit_code: int | None = None
+        self._termination_observation: dict[str, object] | None = None
         self._stdin_handle: int | None = None
         self._desktop_handle: int | None = None
         self._desktop_name: str | None = None
@@ -866,9 +976,27 @@ class _RunnerChild:
                     "Windows restricted token did not preserve SeChangeNotifyPrivilege"
                 )
             token.set_default_dacl((runner_logon_sid, _WORLD_SID, write_sid.value))
-            self._desktop_handle, self._desktop_name = self._api.create_private_desktop(
-                (runner_sid, runner_logon_sid, write_sid.value, _WORLD_SID)
+            desktop_value = payload.get(
+                "desktop_mode", _WindowsNativeDesktopMode.PRIVATE_DESKTOP.value
             )
+            if not isinstance(desktop_value, str):
+                raise SandboxError("Windows runtime desktop mode is invalid")
+            try:
+                desktop_mode = _WindowsNativeDesktopMode(desktop_value)
+            except (TypeError, ValueError) as error:
+                raise SandboxError("Windows runtime desktop mode is invalid") from error
+            if desktop_mode is _WindowsNativeDesktopMode.PRIVATE_DESKTOP:
+                self._desktop_handle, self._desktop_name = self._api.create_private_desktop(
+                    (runner_sid, runner_logon_sid, write_sid.value, _WORLD_SID)
+                )
+            else:
+                # The inherited/default desktop is a diagnostic-only launch
+                # mode.  It changes no token, ACL, filesystem, or network
+                # authority and is never selected by SandboxedProcessRequest.
+                self._desktop_handle, self._desktop_name = None, None
+            create_no_window = payload.get("create_no_window", True)
+            if not isinstance(create_no_window, bool):
+                raise SandboxError("Windows runtime console mode is invalid")
             executable = payload.get("executable")
             arguments = payload.get("arguments", [])
             shell_command = payload.get("shell_command")
@@ -937,6 +1065,7 @@ class _RunnerChild:
                 inherited_handles=inherited,
                 job_handle=self._job.process_creation_handle,
                 desktop_name=self._desktop_name,
+                create_no_window=create_no_window,
             )
             self._api.close_handle(stdin_child)
             handles_to_close.remove(stdin_child)
@@ -1020,6 +1149,27 @@ class _RunnerChild:
         with self._write_lock:
             self.pipe.write(encode_frame(kind, payload))
 
+    def observe(self) -> dict[str, object]:
+        """Capture only final-child lifecycle facts safe for diagnostics."""
+
+        handle = self._process_handle
+        if handle is None:
+            if self._last_exit_code is None:
+                return {"state": "WAIT_FAILED", "wait_error": "HANDLE_CLOSED"}
+            return {"state": "FINAL_CHILD_EXITED", "exit_code": self._last_exit_code}
+        return self._api.observe_process(
+            handle,
+            active_state="FINAL_CHILD_STILL_ACTIVE",
+            exited_state="FINAL_CHILD_EXITED",
+        )
+
+    def _error_payload(self, error: BaseException) -> dict[str, object]:
+        return {
+            "version": PROTOCOL_VERSION,
+            "message": str(error)[:512],
+            "child": self.observe(),
+        }
+
     def _relay(self, handle: int, kind: RuntimeFrameType) -> None:
         try:
             while True:
@@ -1031,7 +1181,7 @@ class _RunnerChild:
             with contextlib.suppress(BaseException):
                 self._send(
                     RuntimeFrameType.ERROR,
-                    {"version": PROTOCOL_VERSION, "message": str(error)[:512]},
+                    self._error_payload(error),
                 )
         finally:
             with contextlib.suppress(BaseException):
@@ -1042,11 +1192,20 @@ class _RunnerChild:
         try:
             self._api.wait_process(self._process_handle)
             code = self._api.get_exit_code(self._process_handle)
+            self._last_exit_code = code
             # Publish process completion before waiting for output relays.  A
             # relay can remain in a native ReadFile until every duplicated
             # pipe writer is released; completion must not be hidden behind
             # that stream-drain path.
-            self._send(RuntimeFrameType.EXIT, {"version": PROTOCOL_VERSION, "returncode": code})
+            self._send(
+                RuntimeFrameType.EXIT,
+                {
+                    "version": PROTOCOL_VERSION,
+                    "returncode": code,
+                    "child": self.observe(),
+                    "termination_observation": self._termination_observation,
+                },
+            )
             for thread in self._threads:
                 if thread is not threading.current_thread():
                     thread.join(timeout=2.0)
@@ -1054,7 +1213,7 @@ class _RunnerChild:
             with contextlib.suppress(BaseException):
                 self._send(
                     RuntimeFrameType.ERROR,
-                    {"version": PROTOCOL_VERSION, "message": str(error)[:512]},
+                    self._error_payload(error),
                 )
         finally:
             with contextlib.suppress(BaseException):
@@ -1085,6 +1244,7 @@ class _RunnerChild:
                 self._stdin_handle = None
             return True
         if frame.kind is RuntimeFrameType.TERMINATE:
+            self._termination_observation = self.observe()
             self._job.terminate()
             return True
         return False
@@ -1320,7 +1480,8 @@ class _NativeChildApi:
         stderr_handle: int,
         inherited_handles: tuple[int, ...],
         job_handle: int,
-        desktop_name: str,
+        desktop_name: str | None,
+        create_no_window: bool,
     ) -> RunnerLaunch:
         required = ctypes.c_size_t()
         self._initialize_attribute_list(None, 2, 0, ctypes.byref(required))
@@ -1365,9 +1526,9 @@ class _NativeChildApi:
                     self._error("SetHandleInformation(stdio inherit)")
             startup = _StartupInfoExW()
             startup.StartupInfo.cb = ctypes.sizeof(startup)
-            # Use only the runner-owned private desktop.  It is not a PTY or
-            # GUI capability; the handle is kept until child exit so account
-            # initialization cannot fall back to the controller desktop.
+            # The desktop is selected by trusted runner composition.  The
+            # inherited/default value is used only by the native diagnostic
+            # probes; model-controlled requests cannot select it.
             startup.StartupInfo.lpDesktop = desktop_name
             startup.StartupInfo.dwFlags = _STARTF_USESTDHANDLES
             startup.StartupInfo.hStdInput = stdin_handle
@@ -1377,6 +1538,9 @@ class _NativeChildApi:
             process = _ProcessInformation()
             mutable = ctypes.create_unicode_buffer(command_line)
             environment = _environment_block(env)
+            creation_flags = _EXTENDED_STARTUPINFO_PRESENT | _CREATE_UNICODE_ENVIRONMENT
+            if create_no_window:
+                creation_flags |= _CREATE_NO_WINDOW
             created = self._create_process_as_user(
                 token,
                 None,
@@ -1384,7 +1548,7 @@ class _NativeChildApi:
                 None,
                 None,
                 True,
-                _EXTENDED_STARTUPINFO_PRESENT | _CREATE_UNICODE_ENVIRONMENT | _CREATE_NO_WINDOW,
+                creation_flags,
                 ctypes.cast(environment, ctypes.c_void_p),
                 str(cwd),
                 ctypes.byref(startup),
@@ -1401,6 +1565,25 @@ class _NativeChildApi:
             int(process.dwProcessId),
             int(process.hThread),
         )
+
+    def observe_process(
+        self,
+        handle: int,
+        *,
+        active_state: str,
+        exited_state: str,
+    ) -> dict[str, object]:
+        """Capture a process wait/exit result without reading child data."""
+
+        result = self._wait(handle, 0)
+        if result == _WAIT_TIMEOUT:
+            return {"state": active_state}
+        if result != _WAIT_OBJECT_0:
+            return {"state": "WAIT_FAILED", "wait_error": cast(int, result)}
+        exit_code = ctypes.c_uint32()
+        if not self._get_exit(handle, ctypes.byref(exit_code)):
+            return {"state": "WAIT_FAILED", "wait_error": cast(int, self._get_last_error())}
+        return {"state": exited_state, "exit_code": int(exit_code.value)}
 
     def create_private_desktop(self, sids: tuple[str, ...]) -> tuple[int, str]:
         """Create a private desktop accessible only to the selected account."""
@@ -1572,10 +1755,16 @@ def _runner_main(pipe_name: str) -> int:
                     raise SandboxError("Windows runtime frame is not valid for the runner state")
     except BaseException as error:
         with contextlib.suppress(BaseException):
+            diagnostic: dict[str, object] = {
+                "version": PROTOCOL_VERSION,
+                "message": str(error)[:512],
+            }
+            if child is not None:
+                diagnostic["child"] = child.observe()
             pipe.write(
                 encode_frame(
                     RuntimeFrameType.ERROR,
-                    encode_json({"version": PROTOCOL_VERSION, "message": str(error)[:512]}),
+                    encode_json(diagnostic),
                 )
             )
         return 1
@@ -1605,4 +1794,5 @@ __all__ = [
     "close_runner_process",
     "current_user_sid",
     "launch_runner",
+    "observe_process_id",
 ]

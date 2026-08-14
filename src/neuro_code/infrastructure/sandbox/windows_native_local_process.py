@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import os
 import sys
 import threading
@@ -45,9 +46,11 @@ from neuro_code.infrastructure.sandbox.windows_native_runner import (
     RunnerLaunch,
     WindowsNamedPipe,
     WindowsNamedPipeServer,
+    _WindowsNativeDesktopMode,
     close_runner_process,
     current_user_sid,
     launch_runner,
+    observe_process_id,
 )
 from neuro_code.infrastructure.sandbox.windows_native_runtime_protocol import (
     PROTOCOL_VERSION,
@@ -201,6 +204,8 @@ class WindowsNativeLocalProcessSandbox(LocalProcessSandbox):
         | None = None,
         runner_launcher: Callable[..., RunnerLaunch] = launch_runner,
         pipe_server_factory: Callable[..., WindowsNamedPipeServer] = WindowsNamedPipeServer,
+        _diagnostic_desktop_mode: _WindowsNativeDesktopMode = _WindowsNativeDesktopMode.PRIVATE_DESKTOP,
+        _diagnostic_create_no_window: bool = True,
     ) -> None:
         if not isinstance(profile, SandboxProfile) or not profile.enabled:
             raise ValueError("Windows native adapter requires an enabled sandbox profile")
@@ -216,6 +221,12 @@ class WindowsNativeLocalProcessSandbox(LocalProcessSandbox):
         self._setup_request_factory = setup_request_factory
         self._runner_launcher = runner_launcher
         self._pipe_server_factory = pipe_server_factory
+        if not isinstance(_diagnostic_desktop_mode, _WindowsNativeDesktopMode):
+            raise ValueError("Windows native diagnostic desktop mode is invalid")
+        if not isinstance(_diagnostic_create_no_window, bool):
+            raise ValueError("Windows native diagnostic console mode is invalid")
+        self._diagnostic_desktop_mode = _diagnostic_desktop_mode
+        self._diagnostic_create_no_window = _diagnostic_create_no_window
 
     @property
     def lifecycle_capability(self) -> LocalProcessLifecycleCapability:
@@ -413,6 +424,11 @@ class WindowsNativeLocalProcessSandbox(LocalProcessSandbox):
                 "environment": self._child_environment(request.environment_policy),
                 "merge_output": request.stdio_mode is LocalProcessStdioMode.MERGED_CAPTURE,
                 "pipe_stdin": request.stdio_mode is LocalProcessStdioMode.PROTOCOL,
+                # These fields are trusted adapter composition knobs for the
+                # native acceptance probes only.  They are not part of the
+                # model-facing request or any public sandbox configuration.
+                "desktop_mode": self._diagnostic_desktop_mode.value,
+                "create_no_window": self._diagnostic_create_no_window,
             }
             if request.uses_shell:
                 payload["shell_command"] = request.shell_command
@@ -531,6 +547,8 @@ class _WindowsNativeOwnedLocalProcess(OwnedLocalProcess):
         self._stdin_lock = asyncio.Lock()
         self._closed = False
         self._force_closed = False
+        self._diagnostic: dict[str, object] | None = None
+        self._cleanup_error: str | None = None
         self._decoder = decoder or RuntimeFrameDecoder()
         self._initial_frames = initial_frames
         self._reader = threading.Thread(
@@ -571,9 +589,15 @@ class _WindowsNativeOwnedLocalProcess(OwnedLocalProcess):
             while True:
                 data = self._pipe.read()
                 if not data:
-                    self._decoder.finish()
                     if self._returncode is None:
-                        raise SandboxError("trusted Windows runner disconnected before Exit")
+                        self._diagnostic = self._pipe_eof_diagnostic()
+                        with contextlib.suppress(BaseException):
+                            self._decoder.finish()
+                        raise SandboxError(
+                            "trusted Windows runner disconnected before Exit "
+                            + json.dumps(self._diagnostic, sort_keys=True)
+                        )
+                    self._decoder.finish()
                     break
                 for frame in self._decoder.feed(data):
                     self._handle_frame(frame)
@@ -592,6 +616,39 @@ class _WindowsNativeOwnedLocalProcess(OwnedLocalProcess):
             with contextlib.suppress(BaseException):
                 close_runner_process(self._runner.process_handle)
 
+    def _pipe_eof_diagnostic(self) -> dict[str, object]:
+        return {
+            "pipe": "PIPE_BROKEN",
+            "pipe_error": self._pipe.last_read_error,
+            "runner": self._pipe.observe_process(
+                self._runner.process_handle,
+                active_state="RUNNER_STILL_ACTIVE",
+                exited_state="RUNNER_EXITED",
+            ),
+            "child": observe_process_id(self._process_id),
+        }
+
+    def diagnostic_snapshot(self) -> dict[str, object] | None:
+        """Return the last safe native lifecycle diagnostic, if available."""
+
+        if self._diagnostic is not None:
+            return dict(self._diagnostic)
+        runner: dict[str, object] | None = None
+        with contextlib.suppress(BaseException):
+            runner = self._pipe.observe_process(
+                self._runner.process_handle,
+                active_state="RUNNER_STILL_ACTIVE",
+                exited_state="RUNNER_EXITED",
+            )
+        if runner is None:
+            runner = {"state": "WAIT_FAILED", "wait_error": "HANDLE_CLOSED"}
+        return {
+            "pipe": "PIPE_BROKEN" if self._closed and self._returncode is None else None,
+            "runner": runner,
+            "child": observe_process_id(self._process_id),
+            "cleanup_error": self._cleanup_error,
+        }
+
     def _handle_frame(self, frame: RuntimeFrame) -> None:
         if frame.kind is RuntimeFrameType.STDOUT:
             self._call(self._stdout.feed_data, frame.payload)
@@ -603,11 +660,29 @@ class _WindowsNativeOwnedLocalProcess(OwnedLocalProcess):
             if not isinstance(payload, dict) or not isinstance(payload.get("returncode"), int):
                 raise SandboxError("Windows runtime Exit frame is invalid")
             self._returncode = int(payload["returncode"])
+            child_diagnostic = payload.get("child")
+            termination_observation = payload.get("termination_observation")
+            if isinstance(child_diagnostic, dict) or isinstance(termination_observation, dict):
+                self._diagnostic = {
+                    "pipe": None,
+                    "child": child_diagnostic,
+                    "termination_observation": termination_observation,
+                }
             self._call(self._stdout.feed_eof)
             if self._stderr is not None:
                 self._call(self._stderr.feed_eof)
         elif frame.kind is RuntimeFrameType.ERROR:
-            raise SandboxError("trusted Windows runner reported a runtime error")
+            payload = decode_json(frame.payload)
+            if not isinstance(payload, dict):
+                raise SandboxError("trusted Windows runner reported a runtime error")
+            self._diagnostic = {
+                "pipe": "PIPE_BROKEN",
+                "runner": {"state": "RUNNER_EXITED"},
+                "child": payload.get("child"),
+            }
+            message = payload.get("message")
+            detail = message[:512] if isinstance(message, str) and message else "runtime error"
+            raise SandboxError(f"trusted Windows runner reported a runtime error: {detail}")
 
     def _call(self, callback: Callable[..., object], *args: object) -> None:
         with contextlib.suppress(RuntimeError):
@@ -658,19 +733,37 @@ class _WindowsNativeOwnedLocalProcess(OwnedLocalProcess):
         send_task = asyncio.create_task(
             run_blocking(self._pipe.write, encode_frame(RuntimeFrameType.TERMINATE))
         )
-        with contextlib.suppress(BaseException):
+        try:
             await asyncio.wait_for(asyncio.shield(send_task), timeout=max(0.1, timeout))
+        except BaseException:
+            pass
+        finally:
+            self._consume_send_task(send_task)
         try:
             await asyncio.wait_for(
                 self.wait(), timeout=timeout + self._request.lifecycle.force_wait_seconds
             )
         except (TimeoutError, SandboxError):
+            self._diagnostic = self.diagnostic_snapshot()
             _terminate_runner_process(self._runner.process_handle)
             self._pipe.close()
             try:
                 await asyncio.wait_for(self.wait(), timeout=2.0)
             except (TimeoutError, SandboxError) as error:
                 self._force_close(error)
+
+    def _consume_send_task(self, task: asyncio.Task[object]) -> None:
+        if not task.done():
+            task.add_done_callback(self._consume_send_task)
+            return
+        try:
+            task.result()
+        except BaseException as error:
+            self._cleanup_error = str(error)[:256]
+            if self._diagnostic is not None:
+                self._diagnostic["cleanup_error"] = self._cleanup_error
+        else:
+            self._cleanup_error = None
 
     def _force_close(self, error: BaseException | None = None) -> None:
         """Bound controller cancellation if a native pipe reader is stuck."""

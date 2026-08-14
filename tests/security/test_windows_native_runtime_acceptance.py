@@ -18,6 +18,7 @@ import sys
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from typing import Any, cast
 
 from neuro_code.application.ports.sandbox import (
     LocalProcessEnvironmentPolicy,
@@ -28,6 +29,7 @@ from neuro_code.application.ports.sandbox import (
     LocalProcessStdioMode,
     LocalWorkspaceAccess,
     LocalWorkspaceAccessMode,
+    OwnedLocalProcess,
     SandboxedProcessRequest,
 )
 from neuro_code.application.ports.windows_sandbox import (
@@ -38,7 +40,10 @@ from neuro_code.domain.sandbox.models import SandboxProfile
 from neuro_code.infrastructure.sandbox.windows_native_local_process import (
     WindowsNativeLocalProcessSandbox,
 )
-from neuro_code.infrastructure.sandbox.windows_native_runner import current_user_sid
+from neuro_code.infrastructure.sandbox.windows_native_runner import (
+    _WindowsNativeDesktopMode,
+    current_user_sid,
+)
 from neuro_code.infrastructure.sandbox.windows_sandbox_accounts import (
     _NativeWindowsSandboxAccountApi,
 )
@@ -341,25 +346,121 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                 setup_request_factory=lambda _request: setup_request,
             )
             try:
-                whoami_probe = await adapter.spawn(
-                    _request(
-                        workspace=workspace,
-                        read_roots=(workspace,),
-                        writable_roots=(workspace,),
-                        profile=SandboxProfile.WORKSPACE,
-                        network=LocalProcessNetworkPolicy.INHERIT,
-                        stdio=LocalProcessStdioMode.CAPTURE,
-                        arguments=(),
-                        executable=str(
-                            Path(os.environ.get("SYSTEMROOT", r"C:\\Windows"))
-                            / "System32"
-                            / "whoami.exe"
-                        ),
-                    )
+                whoami_request = _request(
+                    workspace=workspace,
+                    read_roots=(workspace,),
+                    writable_roots=(workspace,),
+                    profile=SandboxProfile.WORKSPACE,
+                    network=LocalProcessNetworkPolicy.INHERIT,
+                    stdio=LocalProcessStdioMode.CAPTURE,
+                    arguments=(),
+                    executable=str(
+                        Path(os.environ.get("SYSTEMROOT", r"C:\\Windows"))
+                        / "System32"
+                        / "whoami.exe"
+                    ),
                 )
-                whoami_output = await _read_with_native_timeout(whoami_probe, limit_seconds=10)
-                self.assertTrue(whoami_output)
-                self.assertEqual(await whoami_probe.wait(), 0)
+
+                async def run_runtime_probe(
+                    label: str,
+                    *,
+                    desktop_mode: _WindowsNativeDesktopMode,
+                    create_no_window: bool = True,
+                ) -> dict[str, object]:
+                    probe_adapter = WindowsNativeLocalProcessSandbox(
+                        SandboxProfile.WORKSPACE,
+                        workspace,
+                        state,
+                        setup_authority=authority,
+                        setup_request_factory=lambda _request: setup_request,
+                        _diagnostic_desktop_mode=desktop_mode,
+                        _diagnostic_create_no_window=create_no_window,
+                    )
+                    result: dict[str, object] = {
+                        "probe": label,
+                        "CreateProcessAsUser": "UNKNOWN",
+                        "SpawnReady": "FAIL",
+                        "stdout": "NOT_STARTED",
+                        "Exit": "NOT_STARTED",
+                    }
+                    process: OwnedLocalProcess | None = None
+                    try:
+                        process = await probe_adapter.spawn(whoami_request)
+                        result["CreateProcessAsUser"] = "PASS"
+                        result["SpawnReady"] = "PASS"
+                        stream = process.stdout
+                        if stream is None:
+                            raise AssertionError("W3 probe has no stdout stream")
+                        try:
+                            output = await asyncio.wait_for(stream.read(65_536), timeout=10)
+                            result["stdout"] = "NONEMPTY" if output else "EOF"
+                        except TimeoutError:
+                            result["stdout"] = "TIMEOUT"
+                        except BaseException as error:
+                            result["stdout"] = f"ERROR:{type(error).__name__}"
+                        diagnostic = cast(Any, process).diagnostic_snapshot()
+                        if isinstance(diagnostic, dict):
+                            result["diagnostic_before_cleanup"] = diagnostic
+                        if result["stdout"] != "TIMEOUT":
+                            try:
+                                await asyncio.wait_for(process.wait(), timeout=10)
+                                result["Exit"] = "PASS"
+                            except TimeoutError:
+                                result["Exit"] = "TIMEOUT"
+                            except BaseException as error:
+                                result["Exit"] = f"ERROR:{type(error).__name__}"
+                        else:
+                            result["Exit"] = "TIMEOUT"
+                    except BaseException as error:
+                        result["error"] = str(error)[:512]
+                    finally:
+                        if process is not None:
+                            with contextlib.suppress(BaseException):
+                                await process.terminate(grace_seconds=0.5)
+                        result["diagnostic_after_cleanup"] = (
+                            cast(Any, process).diagnostic_snapshot()
+                            if process is not None
+                            else None
+                        )
+                    return result
+
+                probe_a = await run_runtime_probe(
+                    "A_PRIVATE_DESKTOP",
+                    desktop_mode=_WindowsNativeDesktopMode.PRIVATE_DESKTOP,
+                )
+                probe_results = [probe_a]
+                a_completed = probe_a.get("stdout") == "NONEMPTY" and probe_a.get("Exit") == "PASS"
+                if not a_completed:
+                    probe_b = await run_runtime_probe(
+                        "B_INHERIT_DESKTOP",
+                        desktop_mode=_WindowsNativeDesktopMode.INHERIT_DESKTOP,
+                    )
+                    probe_results.append(probe_b)
+                    b_completed = (
+                        probe_b.get("stdout") == "NONEMPTY" and probe_b.get("Exit") == "PASS"
+                    )
+                    if b_completed:
+                        print("W3_CHILD_RUNTIME_CLASSIFICATION=WINDOW_STATION_DESKTOP")
+                        print(f"W3_PROBE_RESULTS={json.dumps(probe_results, sort_keys=True)}")
+                        return
+                    probe_c = await run_runtime_probe(
+                        "C_INHERIT_DESKTOP_NO_WINDOW_FALSE",
+                        desktop_mode=_WindowsNativeDesktopMode.INHERIT_DESKTOP,
+                        create_no_window=False,
+                    )
+                    probe_results.append(probe_c)
+                    c_completed = (
+                        probe_c.get("stdout") == "NONEMPTY" and probe_c.get("Exit") == "PASS"
+                    )
+                    print(f"W3_PROBE_RESULTS={json.dumps(probe_results, sort_keys=True)}")
+                    if c_completed:
+                        print("W3_CHILD_RUNTIME_CLASSIFICATION=CONSOLE_CREATION_MODE")
+                        return
+                    self.fail(
+                        "W3_CHILD_RUNTIME_STILL_AMBIGUOUS "
+                        + json.dumps(probe_results, sort_keys=True)
+                    )
+                print(f"W3_PROBE_RESULTS={json.dumps(probe_results, sort_keys=True)}")
 
                 stdio_marker = workspace / "stdio-marker.txt"
                 stdio_probe_code = (
