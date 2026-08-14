@@ -596,6 +596,11 @@ def _security_descriptor(
                 rights = "GR"
             elif mask == _FILE_GENERIC_WRITE:
                 rights = "GW"
+            elif mask == (_FILE_GENERIC_READ | _FILE_GENERIC_WRITE):
+                # Diagnostic fallback used only while proving the inbound
+                # client handshake; the final transport must narrow this
+                # back to write-only rights.
+                rights = "GA"
             else:
                 rights = f"0x{mask:X}"
             ace = f"(A;;{rights};;;{sid})"
@@ -772,7 +777,7 @@ class WindowsNamedPipeServer:
         controller_mask, runner_mask = (
             (_FILE_GENERIC_WRITE, _FILE_GENERIC_READ)
             if direction is _WindowsNamedPipeDirection.OUTBOUND
-            else (_FILE_GENERIC_READ, _FILE_GENERIC_WRITE)
+            else (_FILE_GENERIC_READ, _FILE_GENERIC_READ | _FILE_GENERIC_WRITE)
         )
         attributes, descriptor = _security_descriptor(
             (controller_sid, runner_sid),
