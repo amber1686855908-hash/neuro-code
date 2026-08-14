@@ -13,6 +13,7 @@ import json
 import os
 import sys
 import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -442,9 +443,12 @@ class WindowsNativeLocalProcessSandbox(LocalProcessSandbox):
                 environment=self._runner_environment(),
             )
             _native_acceptance_stage("runner_launched")
-            control_endpoint = control_server.accept_for_runner(launch.process_handle)
+            control_endpoint, event_endpoint = self._accept_runner_pipes(
+                control_server,
+                event_server,
+                launch.process_handle,
+            )
             _native_acceptance_stage("control_connected")
-            event_endpoint = event_server.accept_for_runner(launch.process_handle)
             _native_acceptance_stage("event_connected")
             if not isinstance(control_endpoint, WindowsNamedPipeWriter):
                 raise SandboxError("Windows control pipe did not provide a writer endpoint")
@@ -531,6 +535,62 @@ class WindowsNativeLocalProcessSandbox(LocalProcessSandbox):
                 with contextlib.suppress(BaseException):
                     close_runner_process(launch.process_handle)
             raise
+
+    @staticmethod
+    def _accept_runner_pipes(
+        control_server: WindowsNamedPipeServer,
+        event_server: WindowsNamedPipeServer,
+        runner_handle: int,
+    ) -> tuple[
+        WindowsNamedPipeReader | WindowsNamedPipeWriter,
+        WindowsNamedPipeReader | WindowsNamedPipeWriter,
+    ]:
+        """Accept both synchronous pipe clients without handshake ordering."""
+
+        results: dict[str, WindowsNamedPipeReader | WindowsNamedPipeWriter] = {}
+        failures: list[BaseException] = []
+        completed = threading.Event()
+
+        def accept(label: str, server: WindowsNamedPipeServer) -> None:
+            try:
+                results[label] = server.accept_for_runner(runner_handle)
+            except BaseException as error:
+                failures.append(error)
+            finally:
+                completed.set()
+
+        threads = [
+            threading.Thread(
+                target=accept,
+                args=("control", control_server),
+                name="neuro-code-windows-control-accept",
+                daemon=True,
+            ),
+            threading.Thread(
+                target=accept,
+                args=("event", event_server),
+                name="neuro-code-windows-event-accept",
+                daemon=True,
+            ),
+        ]
+        for thread in threads:
+            thread.start()
+        deadline = time.monotonic() + 35.0
+        while len(results) < 2 and not failures:
+            if time.monotonic() >= deadline:
+                control_server.close()
+                event_server.close()
+                raise SandboxError("trusted Windows runner did not connect to both named pipes")
+            completed.wait(0.05)
+        if failures:
+            control_server.close()
+            event_server.close()
+            raise failures[0]
+        control_endpoint = results.get("control")
+        event_endpoint = results.get("event")
+        if control_endpoint is None or event_endpoint is None:
+            raise SandboxError("trusted Windows named-pipe accept returned incomplete endpoints")
+        return control_endpoint, event_endpoint
 
     async def spawn(self, request: SandboxedProcessRequest) -> OwnedLocalProcess:
         setup_request = self._validate(request)
