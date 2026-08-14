@@ -70,8 +70,9 @@ from neuro_code.infrastructure.sandbox.windows_sandbox_setup import (
 _SENTINEL = "GATE2_NON_SECRET_SENTINEL"
 _APPENDED = "GATE2_APPEND_SENTINEL"
 _OVERWRITTEN = "GATE2_OVERWRITE_SENTINEL"
-_NUL_CANARY_COMMAND = "echo GATE2_NUL_CANARY>NUL"
+_NUL_CANARY_COMMAND = ("echo", "GATE2_NUL_CANARY>NUL")
 ProbeState = Callable[[], dict[str, object]]
+Command = tuple[str, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -98,25 +99,21 @@ def _native_enabled() -> bool:
     )
 
 
-def _quoted(path: Path) -> str:
-    return '"' + str(path).replace('"', '""') + '"'
-
-
-def _cmd_write(path: Path, text: str, *, append: bool = False) -> str:
+def _cmd_write(path: Path, text: str, *, append: bool = False) -> Command:
     operator = ">>" if append else ">"
-    return f"echo {text}{operator}{_quoted(path)}"
+    return ("echo", f"{text}{operator}", str(path))
 
 
-def _cmd_read(path: Path) -> str:
-    return f"type {_quoted(path)}"
+def _cmd_read(path: Path) -> Command:
+    return ("type", str(path))
 
 
-def _cmd_move(source: Path, destination: Path) -> str:
-    return f"move /Y {_quoted(source)} {_quoted(destination)}"
+def _cmd_move(source: Path, destination: Path) -> Command:
+    return ("move", "/Y", str(source), str(destination))
 
 
-def _cmd_delete(path: Path) -> str:
-    return f"del /F /Q {_quoted(path)}"
+def _cmd_delete(path: Path) -> Command:
+    return ("del", "/F", "/Q", str(path))
 
 
 def _request(
@@ -356,16 +353,17 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                 label: str,
                 identity: str,
                 network: LocalProcessNetworkPolicy,
-                command: str,
+                command: str | Command,
                 expected: str,
                 capture_stdout: bool = False,
                 expected_stdout: str | None = None,
             ) -> dict[str, object]:
+                command_args = (command,) if isinstance(command, str) else command
                 request = _request(
                     workspace=workspace,
                     network=network,
                     executable=executable,
-                    arguments=("/d", "/s", "/c", command),
+                    arguments=("/d", "/s", "/c", *command_args),
                 )
                 adapter = WindowsNativeLocalProcessSandbox(
                     SandboxProfile.WORKSPACE,
@@ -621,7 +619,7 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
 
                     # Remaining operations keep stdout/stderr on the already
                     # inherited pipes and test only workspace mutation.
-                    workspace_operations: tuple[tuple[str, str, str, ProbeState], ...] = (
+                    workspace_operations: tuple[tuple[str, Command, str, ProbeState], ...] = (
                         (
                             "WORKSPACE_CREATE",
                             _cmd_write(source, _SENTINEL),
@@ -731,7 +729,7 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                     ("OFFLINE", LocalProcessNetworkPolicy.ISOLATED),
                 ):
                     create_path = readonly_root / f"{identity.casefold()}-create.txt"
-                    readonly_operations: tuple[tuple[str, str, str, ProbeState], ...] = (
+                    readonly_operations: tuple[tuple[str, Command, str, ProbeState], ...] = (
                         (
                             "READ_ONLY_READ",
                             _cmd_read(readonly_file),
