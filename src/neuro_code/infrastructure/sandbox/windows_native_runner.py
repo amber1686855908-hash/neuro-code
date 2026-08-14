@@ -117,6 +117,7 @@ _DESKTOP_ALL_ACCESS = (
 )
 _FILE_GENERIC_READ = 0x00120089
 _FILE_GENERIC_WRITE = 0x00120116
+_FILE_READ_ATTRIBUTES = 0x00000080
 
 
 class _CFunction(Protocol):
@@ -596,11 +597,11 @@ def _security_descriptor(
                 rights = "GR"
             elif mask == _FILE_GENERIC_WRITE:
                 rights = "GW"
-            elif mask == (_FILE_GENERIC_READ | _FILE_GENERIC_WRITE):
-                # Diagnostic fallback used only while proving the inbound
-                # client handshake; the final transport must narrow this
-                # back to write-only rights.
-                rights = "GA"
+            elif mask == (_FILE_GENERIC_WRITE | _FILE_READ_ATTRIBUTES):
+                # A write-only named-pipe client needs read-attributes access
+                # for the connection handshake on supported Windows builds;
+                # this is not read/write data authority.
+                rights = f"0x{mask:X}"
             else:
                 rights = f"0x{mask:X}"
             ace = f"(A;;{rights};;;{sid})"
@@ -777,7 +778,7 @@ class WindowsNamedPipeServer:
         controller_mask, runner_mask = (
             (_FILE_GENERIC_WRITE, _FILE_GENERIC_READ)
             if direction is _WindowsNamedPipeDirection.OUTBOUND
-            else (_FILE_GENERIC_READ, _FILE_GENERIC_READ | _FILE_GENERIC_WRITE)
+            else (_FILE_GENERIC_READ, _FILE_GENERIC_WRITE | _FILE_READ_ATTRIBUTES)
         )
         attributes, descriptor = _security_descriptor(
             (controller_sid, runner_sid),
