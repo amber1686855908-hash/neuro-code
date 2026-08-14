@@ -165,8 +165,11 @@ def _compile_winsock_probe() -> Path:  # pragma: no cover - Windows CI
         shutil.rmtree(build_directory, ignore_errors=True)
         raise _WinsockProbeBuildError("MSVC probe build failed") from error
     if build.returncode != 0 or not output.is_file():
+        diagnostic = (build.stderr or build.stdout or "").strip().replace("\x00", "")[:512]
         shutil.rmtree(build_directory, ignore_errors=True)
-        raise _WinsockProbeBuildError("MSVC probe build failed")
+        raise _WinsockProbeBuildError(
+            f"MSVC probe build failed (returncode={build.returncode}): {diagnostic}"
+        )
     return output
 
 
@@ -1036,6 +1039,7 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                     {
                         "classification": "NATIVE_WINSOCK_PROBE_BUILD_UNAVAILABLE",
                         "error_type": type(error).__name__,
+                        "detail": str(error)[:512],
                     },
                     sort_keys=True,
                 ),
