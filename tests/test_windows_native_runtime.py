@@ -34,6 +34,7 @@ from neuro_code.infrastructure.sandbox.windows_native_local_process import (
     WindowsRuntimeIdentity,
     WindowsTrustedRunnerProvenance,
     _required_capabilities,
+    _validated_child_token_attestation,
     _WindowsNativeOwnedLocalProcess,
 )
 from neuro_code.infrastructure.sandbox.windows_native_runner import (
@@ -56,7 +57,7 @@ from neuro_code.infrastructure.sandbox.windows_native_runtime_protocol import (
 )
 from neuro_code.infrastructure.sandbox.windows_sandbox_accounts import WindowsAccountSid
 from neuro_code.infrastructure.sandbox.windows_sandbox_identity import (
-    WINDOWS_NATIVE_SANDBOX_TARGET_CAPABILITIES,
+    WINDOWS_NATIVE_SANDBOX_W3_CAPABILITIES,
     SyntheticWindowsSid,
 )
 from neuro_code.shared.errors import SandboxError
@@ -401,6 +402,18 @@ class WindowsNativeRuntimeContractTests(unittest.IsolatedAsyncioTestCase):
             LocalProcessLifecycleCapability.PROCESS_GROUP_BEST_EFFORT,
         )
 
+    def test_spawn_ready_attestation_requires_exact_synthetic_write_sid(self) -> None:
+        expected = SyntheticWindowsSid.from_components((1, 2, 3, 4))
+        payload = {
+            "user_sid": "S-1-5-21-10-20-30-40",
+            "restricted_sids": ["S-1-1-0"],
+            "is_restricted": True,
+            "change_notify_privilege_enabled": True,
+            "unexpected_enabled_privilege_count": 0,
+        }
+        with self.assertRaisesRegex(SandboxError, "unexpected restricting SID set"):
+            _validated_child_token_attestation(payload, expected_write_sid=expected)
+
     def test_runtime_advertises_candidate_capabilities_for_native_acceptance(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "workspace"
@@ -411,9 +424,7 @@ class WindowsNativeRuntimeContractTests(unittest.IsolatedAsyncioTestCase):
                 Path(directory) / "state",
                 setup_authority=_ReadySetupAuthority(WindowsSandboxSetupState.READY),
             )
-            self.assertEqual(
-                adapter.security_capabilities, WINDOWS_NATIVE_SANDBOX_TARGET_CAPABILITIES
-            )
+            self.assertEqual(adapter.security_capabilities, WINDOWS_NATIVE_SANDBOX_W3_CAPABILITIES)
 
     def test_enabled_runtime_rejects_pty_and_interactive_requests(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

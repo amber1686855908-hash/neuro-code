@@ -69,7 +69,7 @@ from neuro_code.infrastructure.sandbox.windows_native_runtime_protocol import (
 )
 from neuro_code.infrastructure.sandbox.windows_sandbox_accounts import WindowsAccountSid
 from neuro_code.infrastructure.sandbox.windows_sandbox_identity import (
-    WINDOWS_NATIVE_SANDBOX_TARGET_CAPABILITIES,
+    WINDOWS_NATIVE_SANDBOX_W3_CAPABILITIES,
     SyntheticWindowsSid,
 )
 from neuro_code.infrastructure.sandbox.windows_sandbox_persistence import (
@@ -113,8 +113,10 @@ def _runtime_is_windows() -> bool:
     return os.name == "nt"
 
 
-def _validated_child_token_attestation(value: object) -> dict[str, object]:
-    """Validate bounded controller-only facts from the runner's SpawnReady."""
+def _validated_child_token_attestation(
+    value: object, *, expected_write_sid: SyntheticWindowsSid
+) -> dict[str, object]:
+    """Validate SpawnReady facts, including the exact restricting SID identity."""
 
     if not isinstance(value, dict):
         raise SandboxError("Windows runner omitted final-child token attestation")
@@ -134,6 +136,8 @@ def _validated_child_token_attestation(value: object) -> dict[str, object]:
         )
     ):
         raise SandboxError("Windows runner returned invalid final-child restricting SIDs")
+    if tuple(restricted_sids) != (expected_write_sid.value,):
+        raise SandboxError("Windows runner returned an unexpected restricting SID set")
     if type(is_restricted) is not bool or type(change_notify) is not bool:
         raise SandboxError("Windows runner returned invalid final-child token flags")
     if type(unexpected) is not int or unexpected < 0 or unexpected > 64:
@@ -366,14 +370,14 @@ class WindowsNativeLocalProcessSandbox(LocalProcessSandbox):
 
     @property
     def security_capabilities(self) -> LocalProcessSecurityCapabilities:
-        """Candidate capabilities provided by the fully wired W3 runtime.
+        """Capabilities provided by the concrete W3 runtime provider.
 
-        Privileged native acceptance and the required PR gate certify this
-        provider contract.  W1/W2's foundation capability declaration remains
-        fail-closed and is not used to admit W3 runtime requests.
+        Native acceptance and the required PR gate certify this provider
+        contract.  W1/W2's foundation actual declaration remains fail-closed;
+        the architecture target is not used to admit runtime requests.
         """
 
-        return WINDOWS_NATIVE_SANDBOX_TARGET_CAPABILITIES
+        return WINDOWS_NATIVE_SANDBOX_W3_CAPABILITIES
 
     def _setup_request(self, request: SandboxedProcessRequest) -> WindowsSandboxSetupRequest:
         if self._setup_request_factory is not None:
@@ -724,7 +728,9 @@ class WindowsNativeLocalProcessSandbox(LocalProcessSandbox):
             transport.control.close()
             transport.events.close()
             raise SandboxError("trusted Windows runner returned an invalid child PID")
-        security_attestation = _validated_child_token_attestation(payload.get("security"))
+        security_attestation = _validated_child_token_attestation(
+            payload.get("security"), expected_write_sid=identity.write_sid
+        )
         return _WindowsNativeOwnedLocalProcess(
             transport=transport,
             runner=launch,

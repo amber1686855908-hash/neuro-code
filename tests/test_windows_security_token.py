@@ -85,6 +85,15 @@ class WindowsRestrictedTokenRequestTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             WindowsRestrictedTokenRequest(())
 
+    def test_write_restricted_rejects_multiple_restricting_sids(self) -> None:
+        with self.assertRaises(ValueError):
+            WindowsRestrictedTokenRequest(
+                (
+                    SyntheticWindowsSid.from_components((1, 2, 3, 4)),
+                    SyntheticWindowsSid.from_components((5, 6, 7, 8)),
+                )
+            )
+
     def test_non_write_token_can_have_no_restricted_sids(self) -> None:
         request = WindowsRestrictedTokenRequest((), write_restricted=False)
         self.assertEqual(request.flags, 0x1 | 0x4)

@@ -640,6 +640,7 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
             write_sid = SyntheticWindowsSid(cast(str, snapshot.write_restricting_sid))
             online_account = WindowsAccountSid(online_sid)
             offline_account = WindowsAccountSid(offline_sid)
+            everyone_account = WindowsAccountSid("S-1-1-0")
 
             async def run_child(
                 *,
@@ -977,8 +978,15 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                         require_probe(probe, expected=expected, state=state)
                         workspace_results.append(probe)
 
-                # Gate 2B: explicitly grant ordinary real-user write access to
-                # an unrelated directory, but do not grant the synthetic SID.
+                workspace_projection = _inspect_acl_entries(acl_api, workspace)
+                self.assertTrue(
+                    _projection_has_synthetic_write_allow(workspace_projection, write_sid.value)
+                )
+
+                # Gate 2B: explicitly grant broad real-user and Everyone write
+                # access to an unrelated directory, but do not grant the
+                # synthetic SID.  The restricted SID must remain the second
+                # access-check write gate.
                 outside_entries = (
                     WindowsManagedAce(
                         outside,
@@ -992,11 +1000,18 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                         WindowsManagedAceKind.WRITE_ALLOW,
                         WRITE_ACCESS_MASK,
                     ),
+                    WindowsManagedAce(
+                        outside,
+                        everyone_account,
+                        WindowsManagedAceKind.WRITE_ALLOW,
+                        WRITE_ACCESS_MASK,
+                    ),
                 )
                 acl_api.reconcile(outside, desired=outside_entries, remove=())
                 outside_projection = _inspect_acl_entries(acl_api, outside)
                 online_write_ace = _projection_has_write_allow(outside_projection, online_sid)
                 offline_write_ace = _projection_has_write_allow(outside_projection, offline_sid)
+                everyone_write_ace = _projection_has_write_allow(outside_projection, "S-1-1-0")
                 synthetic_write_ace = _projection_has_synthetic_write_allow(
                     outside_projection, write_sid.value
                 )
@@ -1004,6 +1019,7 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                 offline_write_deny = _projection_has_deny(outside_projection, offline_sid)
                 self.assertTrue(online_write_ace)
                 self.assertTrue(offline_write_ace)
+                self.assertTrue(everyone_write_ace)
                 self.assertFalse(synthetic_write_ace)
                 self.assertFalse(online_write_deny)
                 self.assertFalse(offline_write_deny)
@@ -1030,6 +1046,7 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                         {
                             "online_real_write_allow": online_write_ace,
                             "offline_real_write_allow": offline_write_ace,
+                            "everyone_write_allow": everyone_write_ace,
                             "synthetic_write_allow": synthetic_write_ace,
                             "online_real_write_deny": online_write_deny,
                             "offline_real_write_deny": offline_write_deny,

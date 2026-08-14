@@ -63,11 +63,11 @@ class WindowsRestrictedTokenRequest:
 
     The default flags disable maximum privilege, request a LUA-style token, and
     apply ``WRITE_RESTRICTED``.  W1 supplies no disabled privileges or disabled
-    SIDs; the restricted SID list is the only new write authority.
+    SIDs; the one synthetic restricted SID is the only new write authority.
 
     一个受验证的 write-restricted token 创建请求.默认 flags 会禁用最大权限、请求 LUA
     token 并启用 ``WRITE_RESTRICTED``.W1 不传入 disabled privileges 或 disabled SIDs;
-    restricted SID list 是唯一新增的写入 authority.
+    one synthetic restricted SID 是唯一新增的写入 authority.
     """
 
     restricted_sids: tuple[SyntheticWindowsSid, ...]
@@ -80,8 +80,8 @@ class WindowsRestrictedTokenRequest:
             not isinstance(sid, SyntheticWindowsSid) for sid in self.restricted_sids
         ):
             raise TypeError("restricted_sids must be a tuple of canonical synthetic SIDs")
-        if self.write_restricted and not self.restricted_sids:
-            raise ValueError("WRITE_RESTRICTED requires at least one restricted SID")
+        if self.write_restricted and len(self.restricted_sids) != 1:
+            raise ValueError("WRITE_RESTRICTED requires exactly one synthetic write SID")
         for value, name in (
             (self.disable_max_privilege, "disable_max_privilege"),
             (self.lua_token, "lua_token"),

@@ -1159,6 +1159,10 @@ class _RunnerChild:
                 raise SandboxError(
                     "Windows restricted token did not preserve SeChangeNotifyPrivilege"
                 )
+            # These SIDs are object-DACL principals for runner-created IPC and
+            # desktop objects.  They are deliberately not added to the
+            # restricted-token SID set; only ``write_sid`` is a
+            # WRITE_RESTRICTED authority.
             token.set_default_dacl((runner_logon_sid, _WORLD_SID, write_sid.value))
             desktop_value = payload.get(
                 "desktop_mode", _WindowsNativeDesktopMode.PRIVATE_DESKTOP.value

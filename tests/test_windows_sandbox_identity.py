@@ -9,6 +9,7 @@ from neuro_code.application.ports.sandbox import (
 from neuro_code.infrastructure.sandbox.windows_sandbox_identity import (
     WINDOWS_NATIVE_SANDBOX_ACTUAL_CAPABILITIES,
     WINDOWS_NATIVE_SANDBOX_TARGET_CAPABILITIES,
+    WINDOWS_NATIVE_SANDBOX_W3_CAPABILITIES,
     SyntheticWindowsSid,
     WindowsSandboxIdentity,
 )
@@ -85,6 +86,16 @@ class WindowsNativeSandboxCapabilityTests(unittest.TestCase):
         )
         self.assertFalse(
             WINDOWS_NATIVE_SANDBOX_ACTUAL_CAPABILITIES == WINDOWS_NATIVE_SANDBOX_TARGET_CAPABILITIES
+        )
+
+    def test_w3_provider_capability_is_explicit_and_matches_target_strength(self) -> None:
+        self.assertEqual(
+            WINDOWS_NATIVE_SANDBOX_W3_CAPABILITIES,
+            WINDOWS_NATIVE_SANDBOX_TARGET_CAPABILITIES,
+        )
+        self.assertNotEqual(
+            WINDOWS_NATIVE_SANDBOX_W3_CAPABILITIES,
+            WINDOWS_NATIVE_SANDBOX_ACTUAL_CAPABILITIES,
         )
 
 
