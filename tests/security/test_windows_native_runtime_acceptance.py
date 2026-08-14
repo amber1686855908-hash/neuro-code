@@ -117,7 +117,9 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                 account_api=account_api,
                 privilege_api=privilege_api,
             )
+            print("W3_STAGE=setup_start", flush=True)
             self.assertEqual(authority.setup(setup_request).state, WindowsSandboxSetupState.READY)
+            print("W3_STAGE=setup_ready", flush=True)
             executable = str(
                 Path(os.environ.get("SYSTEMROOT", r"C:\Windows")) / "System32" / "whoami.exe"
             )
@@ -150,7 +152,9 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                 }
                 process: OwnedLocalProcess | None = None
                 try:
+                    print("W3_STAGE=spawn_start", flush=True)
                     process = await adapter.spawn(whoami_request)
+                    print("W3_STAGE=spawn_ready", flush=True)
                     result["CreateProcessAsUser"] = "PASS"
                     result["SpawnReady"] = "PASS"
                     stream = process.stdout
@@ -164,6 +168,7 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                             SANDBOX_ONLINE_USERNAME.casefold() in output_text.casefold()
                         )
                         result["stdout_preview"] = output_text[:256]
+                        print("W3_STAGE=stdout_read", flush=True)
                     except TimeoutError:
                         result["stdout"] = "TIMEOUT"
                     except BaseException as error:
@@ -173,6 +178,7 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                             await asyncio.wait_for(process.wait(), timeout=10)
                             result["child_exit"] = process.returncode
                             result["Exit"] = "PASS"
+                            print("W3_STAGE=child_waited", flush=True)
                         except TimeoutError:
                             result["child_exit"] = "TIMEOUT"
                             result["Exit"] = "TIMEOUT"
@@ -197,6 +203,7 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                         result["runner_final"] = runner
                         result["control_close"] = diagnostic.get("control_pipe")
                         result["event_close"] = diagnostic.get("event_pipe")
+                    print("W3_STAGE=probe_finished", flush=True)
                 return result
 
             probe = await run_probe()
