@@ -253,12 +253,12 @@ class WindowsNativePtyAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                     )
                 self.assertTrue(ready)
                 self.assertTrue(await wait_for(b"W4_SIZE=80x25\n"))
-                await asyncio.to_thread(session.write, b"w4-input-token\n")
+                await asyncio.to_thread(session.write, b"w4-input-token\r")
                 self.assertTrue(await wait_for(b"W4_INPUT=w4-input-token\n"))
                 await asyncio.to_thread(session.resize, TerminalSize(120, 40))
-                await asyncio.to_thread(session.write, b"w4-size\n")
+                await asyncio.to_thread(session.write, b"w4-size\r")
                 self.assertTrue(await wait_for(b"W4_SIZE=120x40\n"))
-                await asyncio.to_thread(session.write, b"w4-exit\n")
+                await asyncio.to_thread(session.write, b"w4-exit\r")
                 self.assertTrue(await wait_for(b"W4_FINAL\n"))
                 deadline = asyncio.get_running_loop().time() + 8.0
                 while (  # noqa: ASYNC110
