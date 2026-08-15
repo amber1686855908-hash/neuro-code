@@ -1,7 +1,7 @@
 """Focused W4 Gate 3 acceptance for PTY lifecycle ownership.
 
-The tests deliberately reuse the W3 native descendant probe and fixture.  The
-only new boundary here is the private W4 ConPTY candidate; lifecycle authority
+The tests deliberately reuse the W3 native descendant probe and fixture. The
+only new boundary here is the W4 ConPTY production route; lifecycle authority
 remains the runner-owned kill-on-close Job Object.
 """
 
@@ -100,7 +100,7 @@ async def _spawn_pty_descendant(
     callbacks: _PtyCallbacks,
 ) -> Any:
     return await asyncio.to_thread(
-        fixture.adapter._spawn_terminal_candidate,
+        fixture.adapter.spawn_terminal,
         _pty_descendant_request(fixture, mode),
         size=TerminalSize(80, 25),
         on_output=callbacks.on_output,
@@ -221,7 +221,7 @@ def _controller_loss_pty_helper_source(
                     _diagnostic_create_no_window=False,
                 )
                 process = await asyncio.to_thread(
-                    adapter._spawn_terminal_candidate,
+                    adapter.spawn_terminal,
                     request,
                     size=TerminalSize(80, 25),
                     on_output=lambda _data: None,

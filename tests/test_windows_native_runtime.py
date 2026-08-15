@@ -739,7 +739,7 @@ class WindowsNativeRuntimeContractTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(SandboxError, "unexpected restricting SID set"):
             _validated_child_token_attestation(payload, expected_write_sid=expected)
 
-    def test_runtime_advertises_candidate_capabilities_for_native_acceptance(self) -> None:
+    def test_runtime_advertises_w3_capabilities_for_native_acceptance(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "workspace"
             root.mkdir()
@@ -772,7 +772,7 @@ class WindowsNativeRuntimeContractTests(unittest.IsolatedAsyncioTestCase):
                         )
                     )
 
-    def test_public_spawn_terminal_remains_fail_closed_during_w4_gate1(self) -> None:
+    def test_public_spawn_terminal_uses_the_single_production_implementation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "workspace"
             root.mkdir()
@@ -781,8 +781,9 @@ class WindowsNativeRuntimeContractTests(unittest.IsolatedAsyncioTestCase):
                 root,
                 Path(directory) / "state",
             )
-            with self.assertRaisesRegex(SandboxError, "W3 does not provide"):
-                adapter.spawn_terminal(
+            session = object()
+            with mock.patch.object(adapter, "_spawn_terminal", return_value=session) as spawn:
+                result = adapter.spawn_terminal(
                     _request(
                         root,
                         purpose=LocalProcessPurpose.INTERACTIVE_TERMINAL,
@@ -793,25 +794,70 @@ class WindowsNativeRuntimeContractTests(unittest.IsolatedAsyncioTestCase):
                     on_eof=lambda: None,
                     on_error=lambda _error: None,
                 )
+            self.assertIs(result, session)
+            spawn.assert_called_once()
 
-    def test_setup_not_ready_fails_before_identity_or_runner(self) -> None:
+    def test_public_strict_spawn_terminal_fails_closed_before_runner(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "workspace"
             root.mkdir()
-            provider = _IdentityProvider()
             launcher = mock.Mock()
             adapter = WindowsNativeLocalProcessSandbox(
-                SandboxProfile.WORKSPACE,
+                SandboxProfile.STRICT,
                 root,
                 Path(directory) / "state",
-                setup_authority=_ReadySetupAuthority(WindowsSandboxSetupState.NEEDS_REPAIR),
-                identity_provider=provider,
+                setup_authority=_ReadySetupAuthority(WindowsSandboxSetupState.READY),
                 runner_launcher=launcher,
             )
             with mock.patch.object(os, "name", "nt"), self.assertRaises(SandboxError):
-                adapter._validate(_request(root))
-            self.assertEqual(provider.kinds, [])
+                adapter.spawn_terminal(
+                    _request(
+                        root,
+                        profile=SandboxProfile.STRICT,
+                        purpose=LocalProcessPurpose.INTERACTIVE_TERMINAL,
+                        stdio=LocalProcessStdioMode.PTY,
+                        network=LocalProcessNetworkPolicy.ISOLATED,
+                    ),
+                    size=TerminalSize(80, 25),
+                    on_output=lambda _data: None,
+                    on_eof=lambda: None,
+                    on_error=lambda _error: None,
+                )
             launcher.assert_not_called()
+
+    def test_setup_not_ready_fails_before_identity_or_runner(self) -> None:
+        for state in (
+            WindowsSandboxSetupState.NEEDS_SETUP,
+            WindowsSandboxSetupState.NEEDS_REPAIR,
+            WindowsSandboxSetupState.UNSUPPORTED,
+        ):
+            with self.subTest(state=state), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory) / "workspace"
+                root.mkdir()
+                provider = _IdentityProvider()
+                launcher = mock.Mock()
+                adapter = WindowsNativeLocalProcessSandbox(
+                    SandboxProfile.WORKSPACE,
+                    root,
+                    Path(directory) / "state",
+                    setup_authority=_ReadySetupAuthority(state),
+                    identity_provider=provider,
+                    runner_launcher=launcher,
+                )
+                with mock.patch.object(os, "name", "nt"), self.assertRaises(SandboxError):
+                    adapter.spawn_terminal(
+                        _request(
+                            root,
+                            purpose=LocalProcessPurpose.INTERACTIVE_TERMINAL,
+                            stdio=LocalProcessStdioMode.PTY,
+                        ),
+                        size=TerminalSize(80, 25),
+                        on_output=lambda _data: None,
+                        on_eof=lambda: None,
+                        on_error=lambda _error: None,
+                    )
+                self.assertEqual(provider.kinds, [])
+                launcher.assert_not_called()
 
     def test_strict_fails_closed_because_read_is_limited(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

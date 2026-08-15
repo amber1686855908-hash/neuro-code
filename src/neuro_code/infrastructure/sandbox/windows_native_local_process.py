@@ -1,4 +1,4 @@
-"""Windows non-PTY native sandbox runtime adapter (W3).
+"""Windows native sandbox runtime adapter for W3 workloads and W4 PTY sessions.
 
 The adapter owns only runtime orchestration.  W2 remains the authority for
 setup/repair and persistent state.  A spawn is rejected unless W2 reports
@@ -327,7 +327,7 @@ def _default_setup_request(
 
 
 class WindowsNativeLocalProcessSandbox(LocalProcessSandbox):
-    """Windows enabled-profile adapter for non-PTY canonical workloads."""
+    """Windows enabled-profile adapter for canonical process and PTY workloads."""
 
     def __init__(
         self,
@@ -765,13 +765,26 @@ class WindowsNativeLocalProcessSandbox(LocalProcessSandbox):
         on_eof: TerminalEofHandler,
         on_error: TerminalErrorHandler,
     ) -> TerminalPlatformSession:
-        del request, size, on_output, on_eof, on_error
-        raise SandboxError("Windows W3 does not provide a sandboxed interactive terminal; use W4")
+        """Create the canonical Windows enabled-profile ConPTY session.
 
-    def _validate_terminal_candidate(
+        The same validated implementation is used by the focused native
+        acceptance gates and by the application terminal manager.  Runtime
+        setup is deliberately inspection-only: a non-READY W2 state fails
+        closed before identity resolution or final-child creation.
+        """
+
+        return self._spawn_terminal(
+            request,
+            size=size,
+            on_output=on_output,
+            on_eof=on_eof,
+            on_error=on_error,
+        )
+
+    def _validate_terminal_request(
         self, request: SandboxedProcessRequest
     ) -> WindowsSandboxSetupRequest:
-        """Validate the private Gate 1 W4 candidate without changing public routing."""
+        """Validate one production Windows ConPTY request before launch."""
 
         if not _runtime_is_windows():
             raise SandboxError("Windows native sandbox is only available on Windows")
@@ -819,7 +832,7 @@ class WindowsNativeLocalProcessSandbox(LocalProcessSandbox):
             raise SandboxError("Windows sandbox setup is not READY; W4 never performs setup")
         return setup_request
 
-    def _spawn_terminal_candidate(
+    def _spawn_terminal(
         self,
         request: SandboxedProcessRequest,
         *,
@@ -828,11 +841,11 @@ class WindowsNativeLocalProcessSandbox(LocalProcessSandbox):
         on_eof: TerminalEofHandler,
         on_error: TerminalErrorHandler,
     ) -> TerminalPlatformSession:
-        """Start the focused W4 Gate 1 candidate; public PTY remains fail closed."""
+        """Start one validated production Windows ConPTY session."""
 
         if not isinstance(size, TerminalSize):
             raise TypeError("size must be a TerminalSize")
-        setup_request = self._validate_terminal_candidate(request)
+        setup_request = self._validate_terminal_request(request)
         kind = (
             WindowsSandboxIdentityKind.OFFLINE
             if request.network_policy is LocalProcessNetworkPolicy.ISOLATED
@@ -875,7 +888,7 @@ class WindowsNativeLocalProcessSandbox(LocalProcessSandbox):
 
 
 class _WindowsNativePtySession:
-    """Controller-side projection of the private W4 PTY candidate."""
+    """Controller-side projection of a Windows W4 PTY session."""
 
     def __init__(
         self,

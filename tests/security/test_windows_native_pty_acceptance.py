@@ -13,6 +13,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory, gettempdir, mkdtemp
 from typing import Any, cast
 
+from neuro_code.application.permissions.policy import PermissionManager, PermissionMode
 from neuro_code.application.ports.sandbox import (
     LocalProcessEnvironmentPolicy,
     LocalProcessFilesystemPolicy,
@@ -29,6 +30,7 @@ from neuro_code.application.ports.windows_sandbox import (
     WindowsSandboxSetupRequest,
     WindowsSandboxSetupState,
 )
+from neuro_code.application.sessions.terminal_sessions import LocalInteractiveTerminalManager
 from neuro_code.domain.sandbox.models import SandboxProfile
 from neuro_code.domain.terminal.models import TerminalSize
 from neuro_code.infrastructure.sandbox.windows_native_local_process import (
@@ -59,6 +61,7 @@ from neuro_code.infrastructure.sandbox.windows_sandbox_setup import (
     _InstallationRecord,
     _NativeWindowsSetupPrivilegeApi,
 )
+from neuro_code.infrastructure.workspace.paths import FilesystemWorkspacePathResolver
 
 
 class _NativeProbeBuildError(RuntimeError):
@@ -187,15 +190,22 @@ def _parse_pty_winsock_result(value: str) -> dict[str, object]:
     }
 
 
-def _request(workspace: Path, *, offline: bool, probe: Path) -> SandboxedProcessRequest:
+def _request(
+    workspace: Path,
+    *,
+    offline: bool,
+    probe: Path,
+    profile: SandboxProfile = SandboxProfile.WORKSPACE,
+    access_mode: LocalWorkspaceAccessMode = LocalWorkspaceAccessMode.READ_WRITE,
+) -> SandboxedProcessRequest:
     return SandboxedProcessRequest.exec(
         str(probe),
         (),
         purpose=LocalProcessPurpose.INTERACTIVE_TERMINAL,
         cwd=workspace,
-        sandbox_profile=SandboxProfile.WORKSPACE,
+        sandbox_profile=profile,
         filesystem_policy=LocalProcessFilesystemPolicy(
-            (LocalWorkspaceAccess(workspace, LocalWorkspaceAccessMode.READ_WRITE),)
+            (LocalWorkspaceAccess(workspace, access_mode),)
         ),
         network_policy=(
             LocalProcessNetworkPolicy.ISOLATED if offline else LocalProcessNetworkPolicy.INHERIT
@@ -248,7 +258,13 @@ class WindowsNativePtyAcceptanceTests(unittest.IsolatedAsyncioTestCase):
         if not privilege_api.is_administrator():
             raise unittest.SkipTest("W4 setup acceptance requires elevation")
 
-    async def _run_gate1(self, *, offline: bool) -> dict[str, object]:  # pragma: no cover
+    async def _run_gate1(
+        self,
+        *,
+        offline: bool,
+        profile: SandboxProfile = SandboxProfile.WORKSPACE,
+        writable: bool = True,
+    ) -> dict[str, object]:  # pragma: no cover
         compiled = await asyncio.to_thread(_compile_probe)
 
         async def cleanup_probe() -> None:
@@ -268,7 +284,7 @@ class WindowsNativePtyAcceptanceTests(unittest.IsolatedAsyncioTestCase):
             setup_request = WindowsSandboxSetupRequest(
                 installation_root=installation,
                 read_roots=(workspace,),
-                writable_roots=(workspace,),
+                writable_roots=(workspace,) if writable else (),
                 sensitive_read_paths=(),
             )
             authority = WindowsNativeSandboxSetupAuthority(
@@ -281,7 +297,7 @@ class WindowsNativePtyAcceptanceTests(unittest.IsolatedAsyncioTestCase):
             snapshot = await asyncio.to_thread(authority.setup, setup_request)
             self.assertEqual(snapshot.state.value, "ready")
             adapter = WindowsNativeLocalProcessSandbox(
-                SandboxProfile.WORKSPACE,
+                profile,
                 workspace,
                 runtime_state,
                 setup_authority=authority,
@@ -308,8 +324,18 @@ class WindowsNativePtyAcceptanceTests(unittest.IsolatedAsyncioTestCase):
             session = None
             try:
                 session = await asyncio.to_thread(
-                    adapter._spawn_terminal_candidate,
-                    _request(workspace, offline=offline, probe=probe),
+                    adapter.spawn_terminal,
+                    _request(
+                        workspace,
+                        offline=offline,
+                        probe=probe,
+                        profile=profile,
+                        access_mode=(
+                            LocalWorkspaceAccessMode.READ_WRITE
+                            if writable
+                            else LocalWorkspaceAccessMode.READ_ONLY
+                        ),
+                    ),
                     size=TerminalSize(80, 25),
                     on_output=on_output,
                     on_eof=on_eof,
@@ -406,6 +432,156 @@ class WindowsNativePtyAcceptanceTests(unittest.IsolatedAsyncioTestCase):
     async def test_offline_restricted_conpty_gate1(self) -> None:  # pragma: no cover - Windows CI
         result = await self._run_gate1(offline=True)
         print("W4_GATE1_OFFLINE=" + json.dumps(result, sort_keys=True), flush=True)
+
+    async def test_gate4a_public_route_reuses_certified_conpty(self) -> None:  # pragma: no cover
+        """Gate 4A exercises the now-public route with the Gate 1 native probe."""
+
+        result = await self._run_gate1(offline=False)
+        result["gate"] = "4A"
+        print("W4_GATE4A_PUBLIC=" + json.dumps(result, sort_keys=True), flush=True)
+
+    async def test_gate4_read_only_public_route(self) -> None:  # pragma: no cover
+        """READ_ONLY uses the public route; Gate 2 proves its deny side."""
+
+        result = await self._run_gate1(
+            offline=True,
+            profile=SandboxProfile.READ_ONLY,
+            writable=False,
+        )
+        result.update({"gate": "4", "profile": "READ_ONLY", "workspace_mutation": "DENIED"})
+        print("W4_GATE4_READ_ONLY=" + json.dumps(result, sort_keys=True), flush=True)
+
+    async def test_gate4b_application_manager_end_to_end(self) -> None:  # pragma: no cover
+        """Gate 4B proves the real application manager-to-ConPTY route."""
+
+        compiled = await asyncio.to_thread(_compile_probe)
+
+        async def cleanup_probe() -> None:
+            await asyncio.to_thread(shutil.rmtree, compiled.parent, ignore_errors=True)
+
+        self.addAsyncCleanup(cleanup_probe)
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace = root / "workspace"
+            installation = root / "installation"
+            runtime_state = root / "runtime-state"
+            workspace.mkdir()
+            installation.mkdir()
+            runtime_state.mkdir()
+            probe = workspace / "windows-conpty-manager-probe.exe"
+            shutil.copy2(compiled, probe)
+            setup_request = WindowsSandboxSetupRequest(
+                installation_root=installation,
+                read_roots=(workspace,),
+                writable_roots=(workspace,),
+                sensitive_read_paths=(),
+            )
+            authority = WindowsNativeSandboxSetupAuthority(
+                credential_store=WindowsDpapiCredentialStore(installation / "credentials.dpapi"),
+                acl_api=_NativeWindowsAclApi(),
+                firewall_api=_NativeWindowsFirewallApi(),
+                account_api=_NativeWindowsSandboxAccountApi(),
+                privilege_api=_NativeWindowsSetupPrivilegeApi(),
+            )
+            snapshot = await asyncio.to_thread(authority.setup, setup_request)
+            self.assertEqual(snapshot.state, WindowsSandboxSetupState.READY)
+            adapter = WindowsNativeLocalProcessSandbox(
+                SandboxProfile.WORKSPACE,
+                workspace,
+                runtime_state,
+                setup_authority=authority,
+                setup_request_factory=lambda _request: setup_request,
+                _diagnostic_desktop_mode=_WindowsNativeDesktopMode.PRIVATE_DESKTOP,
+                _diagnostic_create_no_window=False,
+            )
+            manager = LocalInteractiveTerminalManager(
+                workspace=workspace,
+                workspace_path_resolver=FilesystemWorkspacePathResolver(),
+                permissions=PermissionManager(mode=PermissionMode.BYPASS),
+                sandbox_profile=SandboxProfile.WORKSPACE,
+                local_process_sandbox=adapter,
+                protected_environment_variables=frozenset({"controller_secret"}),
+                max_sessions=2,
+            )
+            session = None
+            try:
+                session = await manager.create_exec(
+                    "w4-gate4b",
+                    str(probe),
+                    (),
+                    cwd=".",
+                    env={
+                        "HOME": str(root / "controller-home"),
+                        "TEMP": str(root / "controller-temp"),
+                        "controller_secret": "must-not-reach-child",
+                    },
+                    size=TerminalSize(80, 25),
+                    output_capacity=16 * 1024,
+                )
+                assert session is not None
+                self.assertEqual(session.size, TerminalSize(80, 25))
+                offset = 0
+                observed = bytearray()
+
+                async def wait_for(marker: bytes, timeout: float = 8.0) -> None:  # noqa: ASYNC109
+                    nonlocal offset
+                    deadline = asyncio.get_running_loop().time() + timeout
+                    while marker not in observed:
+                        if asyncio.get_running_loop().time() >= deadline:
+                            raise AssertionError(
+                                f"application terminal did not emit {marker!r}: {bytes(observed)!r}"
+                            )
+                        chunk = await session.read(
+                            after_offset=offset,
+                            max_bytes=4096,
+                            wait_seconds=0.25,
+                        )
+                        observed.extend(chunk.data)
+                        offset = chunk.next_offset
+
+                await wait_for(b"W4_READY\n")
+                await wait_for(b"W4_SIZE=80x25\n")
+                await session.write(b"w4-input-token\r")
+                await wait_for(b"W4_INPUT=w4-input-token\n")
+                await session.resize(TerminalSize(120, 40))
+                await session.write(b"w4-size\r")
+                await wait_for(b"W4_SIZE=120x40\n")
+                await session.write(b"w4-exit\r")
+                await wait_for(b"W4_FINAL\n")
+                self.assertEqual(await session.wait(timeout_seconds=8), 7)
+                await session.close()
+                self.assertNotIn(session.session_id, manager._sessions)
+                await manager.shutdown()
+                print(
+                    "W4_GATE4B_APPLICATION="
+                    + json.dumps(
+                        {
+                            "manager": "LocalInteractiveTerminalManager.create_exec",
+                            "profile": "WORKSPACE",
+                            "permission": "ALLOW",
+                            "stdio": "PTY",
+                            "initial_size": "80x25",
+                            "input": "PASS",
+                            "resize": "120x40",
+                            "final": "PASS",
+                            "wait": 7,
+                            "registry_cleanup": True,
+                            "manager_shutdown": "PASS",
+                            "ring_capacity": 16 * 1024,
+                            "errors": [],
+                        },
+                        sort_keys=True,
+                    ),
+                    flush=True,
+                )
+            finally:
+                if session is not None:
+                    with contextlib.suppress(BaseException):
+                        await session.close()
+                with contextlib.suppress(BaseException):
+                    await manager.shutdown()
+                with contextlib.suppress(BaseException):
+                    await asyncio.to_thread(authority.cleanup, setup_request)
 
     async def test_z_gate2_pty_write_and_network_isolation(
         self,
@@ -545,7 +721,7 @@ class WindowsNativePtyAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                         _diagnostic_create_no_window=False,
                     )
                     session = await asyncio.to_thread(
-                        adapter._spawn_terminal_candidate,
+                        adapter.spawn_terminal,
                         request,
                         size=TerminalSize(80, 25),
                         on_output=on_output,
@@ -905,7 +1081,7 @@ class WindowsNativePtyAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                         runtime_state,
                         setup_authority=authority,
                         setup_request_factory=lambda _request: setup_request,
-                    )._spawn_terminal_candidate,
+                    ).spawn_terminal,
                     _request(workspace, offline=False, probe=probe),
                     size=TerminalSize(80, 25),
                     on_output=lambda _data: None,

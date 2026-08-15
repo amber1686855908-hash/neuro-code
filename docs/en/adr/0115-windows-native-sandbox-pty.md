@@ -1,6 +1,6 @@
 # ADR 0115: Windows native sandbox ConPTY vertical slice
 
-- Status: W4 implementation in progress; Gate 1 hardened, Gate 2 PTY write/network isolation, and Gate 3 PTY lifecycle ownership accepted
+- Status: Accepted; W4 production Windows ConPTY routing certified by focused native acceptance and full CI
 - Date: 2026-08-15
 
 ## Context
@@ -21,15 +21,15 @@ the final `CreateProcessAsUserW` call. PTY output is one raw byte stream and
 resize is a directional control frame. The child does not inherit controller,
 runner, or protocol handles; ConPTY supplies its console streams.
 
-The public enabled-profile `spawn_terminal()` route remains fail closed while
-the Gate 1 evidence is collected. The private candidate path is used only by
-the focused native acceptance. W3 non-PTY behavior and its capability contract
+The enabled-profile `spawn_terminal()` route is now the canonical production
+boundary and is the same route exercised by focused native acceptance. W3
+non-PTY behavior and its capability contract
 are unchanged: READ LIMITED, WRITE STRONG, NETWORK STRONG, and strong
 descendant ownership. STRICT continues to fail closed because it requires
 strong read isolation.
 
-Gate 3 reuses the W3 native descendant probe under the private ConPTY
-candidate. In 3A, the direct leader exits with code 23 while its stdio-free
+Gate 3 reuses the W3 native descendant probe through the production ConPTY
+route. In 3A, the direct leader exits with code 23 while its stdio-free
 grandchild remains active; `poll_exit()` stays pending until the grandchild
 naturally writes its finished marker and the runner-owned Job becomes empty.
 In 3B, `session.close()` sends the canonical TERMINATE frame and the runner's
@@ -66,14 +66,27 @@ Online Winsock connects, Offline Winsock is denied with `WSAEACCES` (10013),
 and the managed Offline firewall rule is inspected as READY before and after
 each run without runtime mutation. Every PTY SpawnReady attestation contains
 the exact singleton synthetic restricting SID and no unexpected enabled
-privileges. The private candidate therefore evidences READ LIMITED, WRITE
+privileges. The certified production route therefore evidences READ LIMITED, WRITE
 STRONG, and NETWORK STRONG; STRICT still fails closed because it requires
 strong read isolation.
 
-The public enabled-profile `spawn_terminal()` route remains fail closed; Gate 2
-acceptance does not expose it. W5 has not started, and Python, Git, Node, NUL,
-curl, application terminal routing, and developer-tool compatibility are not
-certified by this ADR.
+Gate 4 proves the real application route: the terminal manager builds the
+normal `SandboxedProcessRequest` and calls the public
+`LocalProcessSandbox.spawn_terminal()` port. For an enabled Windows profile,
+the production chain is:
+
+`LocalInteractiveTerminalManager` → `LocalProcessSandbox.spawn_terminal()` →
+`WindowsNativeLocalProcessSandbox` → W2 identity → trusted runner → restricted
+token → `CreatePseudoConsole` → `PSEUDOCONSOLE` + `JOB_LIST` →
+`CreateProcessAsUserW` → restricted final child.
+
+WORKSPACE and READ_ONLY are admitted only when W2 reports `READY`; STRICT
+continues to fail closed because READ LIMITED cannot satisfy its STRONG read
+requirement. Runtime never performs setup, repair, UAC, ACL, or Firewall
+mutation. SandboxProfile.OFF remains on the ordinary Windows ConPTY route.
+
+W5 has not started. Python, Git, Node, NUL, curl, and developer-tool
+compatibility remain future workload certification, not claims of this ADR.
 
 ## Consequences
 
@@ -82,8 +95,10 @@ certified by this ADR.
 - The runner keeps draining the PTY output channel before publishing `EXIT`.
 - `ClosePseudoConsole` is performed only after the Job-owned scope is empty;
   no second lifecycle or Job authority is introduced.
-- Gate 1, Gate 2, and Gate 3 evidence are required before exposing a future
-  production terminal route. This ADR does not certify that public route yet.
+- Gate 1, Gate 2, Gate 3, shared-runner hardening, and Gate 4 application
+  routing are the acceptance evidence for this production route. The route is
+  certified on the tested Windows CI matrix; W5 workload compatibility remains
+  explicitly out of scope.
 
 ## References
 
