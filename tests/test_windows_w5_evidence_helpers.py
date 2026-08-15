@@ -217,6 +217,7 @@ def test_gate15_probe_attachment_uses_complete_marker_stream_and_discards_raw_by
     attached = _attach_probe_result(cell)
     assert "_captured_stdout" not in attached
     assert attached["probe_start"] == "STARTED_AND_FINISHED"
+    assert attached["probe_result_available"] is True
     assert attached["probe"] == {
         "started": True,
         "finished": True,

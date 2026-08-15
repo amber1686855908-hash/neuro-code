@@ -255,6 +255,8 @@ class _Gate1DirectProcess:
         startup.hStdOutput = ctypes.c_void_p(stdout_write)
         startup.hStdError = ctypes.c_void_p(stderr_write)
         result: dict[str, object] = {
+            "execution_path": "DIRECT/CreateProcessWithLogonW",
+            "resolved_executable": str(executable),
             "spawn_result": "NOT_STARTED",
             "logon_flags": "LOGON_WITH_PROFILE" if logon_flags else "NONE",
             "exit_code": None,
@@ -462,6 +464,7 @@ def _attach_probe_result(cell: dict[str, object]) -> dict[str, object]:
         cell["probe_start"] = "STARTED_WITHOUT_FINISH"
     else:
         cell["probe_start"] = "STARTED_AND_FINISHED"
+    cell["probe_result_available"] = bool(probe["started"] and probe["finished"])
     return cell
 
 
