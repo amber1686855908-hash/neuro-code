@@ -124,6 +124,31 @@ class WindowsSandboxAccountContractTests(unittest.TestCase):
             first.sid,
         )
 
+    def test_account_input_and_lookup_fail_closed(self) -> None:
+        accounts = InMemoryWindowsSandboxAccountApi()
+        for username, password in (
+            ("", "pw"),
+            ("bad\\name", "pw"),
+            ("bad\x00name", "pw"),
+            ("user", ""),
+        ):
+            with self.assertRaises(WindowsSandboxAccountError):
+                accounts.ensure_user(username, password)
+        offline = accounts.ensure_user(SANDBOX_OFFLINE_USERNAME, "offline-password")
+        with self.assertRaises(WindowsSandboxAccountError):
+            accounts.validate_user(
+                SANDBOX_OFFLINE_USERNAME,
+                "offline-password",
+                expected_sid=WindowsAccountSid("S-1-5-21-100-200-300-9999"),
+            )
+        with self.assertRaises(WindowsSandboxAccountError):
+            accounts.lookup_user(
+                SANDBOX_ONLINE_USERNAME,
+                expected_sid=offline.sid,
+            )
+        with self.assertRaises(ValueError):
+            generate_windows_account_password(19)
+
 
 if __name__ == "__main__":
     unittest.main()

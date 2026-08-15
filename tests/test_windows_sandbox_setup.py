@@ -32,6 +32,11 @@ from neuro_code.infrastructure.sandbox.windows_sandbox_acl import (
     WindowsManagedAceKind,
     plan_windows_filesystem_authority,
 )
+from neuro_code.infrastructure.sandbox.windows_sandbox_diagnostics import (
+    WindowsSandboxOperationDiagnostic,
+    diagnostic_for_exception,
+    diagnostic_kwargs,
+)
 from neuro_code.infrastructure.sandbox.windows_sandbox_firewall import (
     InMemoryWindowsFirewallApi,
     WindowsFirewallError,
@@ -136,6 +141,69 @@ class WindowsDpapiCredentialStoreTests(unittest.TestCase):
             with self.assertRaises(WindowsDpapiError):
                 store.load()
 
+    def test_invalid_envelope_shapes_and_blob_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "credentials.dpapi"
+            store = WindowsDpapiCredentialStore(path, api=_FakeDpapi())
+            for payload in (
+                {"format": "wrong", "blob": ""},
+                {"format": "neuro-code-windows-sandbox-dpapi-v1"},
+                {"format": "neuro-code-windows-sandbox-dpapi-v1", "blob": 1},
+                {"format": "neuro-code-windows-sandbox-dpapi-v1", "blob": "%%%"},
+            ):
+                path.write_text(json.dumps(payload), encoding="utf-8")
+                with self.assertRaises(WindowsDpapiError):
+                    store.load()
+
+    def test_store_rejects_empty_payload_and_wraps_dpapi_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "credentials.dpapi"
+            store = WindowsDpapiCredentialStore(path, api=_FakeDpapi())
+            with self.assertRaises(ValueError):
+                store.save(b"")
+            path.write_text(
+                json.dumps(
+                    {
+                        "format": "neuro-code-windows-sandbox-dpapi-v1",
+                        "blob": "bm90LXByb3RlY3RlZA==",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaises(WindowsDpapiError):
+                store.load()
+
+    def test_store_clear_reports_os_failure_without_leaking_path(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "credentials.dpapi"
+            store = WindowsDpapiCredentialStore(path, api=_FakeDpapi())
+            with (
+                mock.patch.object(Path, "unlink", side_effect=PermissionError(13, "secret-path")),
+                self.assertRaises(WindowsDpapiError) as raised,
+            ):
+                store.clear()
+            self.assertNotIn("secret-path", str(raised.exception))
+            self.assertEqual(raised.exception.safe_diagnostic.operation, "STORE_CLEAR")
+
+    def test_store_atomic_replace_failure_is_wrapped_and_temporary_file_removed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "credentials.dpapi"
+            store = WindowsDpapiCredentialStore(path, api=_FakeDpapi())
+            with (
+                mock.patch(
+                    "neuro_code.infrastructure.sandbox.windows_sandbox_persistence.os.replace",
+                    side_effect=OSError(28, "disk full"),
+                ),
+                self.assertRaises(WindowsDpapiError) as raised,
+            ):
+                store.save(b"secret")
+            self.assertEqual(raised.exception.safe_diagnostic.operation, "ATOMIC_WRITE")
+            self.assertEqual(list(path.parent.glob(f".{path.name}.*")), [])
+
+    def test_store_requires_absolute_path(self) -> None:
+        with self.assertRaises(ValueError):
+            WindowsDpapiCredentialStore(Path("relative"), api=_FakeDpapi())
+
     def test_clear_is_idempotent(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = WindowsDpapiCredentialStore(
@@ -146,6 +214,21 @@ class WindowsDpapiCredentialStoreTests(unittest.TestCase):
             store.clear()
             store.clear()
             self.assertIsNone(store.load())
+
+    def test_diagnostics_keep_only_bounded_numeric_facts(self) -> None:
+        error = PermissionError(13, "controller-secret-path")
+        diagnostic = diagnostic_for_exception(error, operation="ACL")
+        self.assertEqual(diagnostic.as_dict()["operation"], "ACL")
+        self.assertEqual(diagnostic.errno, 13)
+        self.assertNotIn("controller-secret-path", repr(diagnostic.as_dict()))
+        existing = WindowsSandboxOperationDiagnostic("ORIGINAL", "RuntimeError", returncode=4)
+        wrapped = RuntimeError("secret payload")
+        wrapped.safe_diagnostic = existing  # type: ignore[attr-defined]
+        self.assertIs(diagnostic_for_exception(wrapped), existing)
+        self.assertEqual(diagnostic_for_exception(wrapped, operation="RETRY").operation, "RETRY")
+        self.assertEqual(diagnostic_kwargs(error, operation="ACL")["safe_diagnostic"], diagnostic)
+        timeout = diagnostic_for_exception(subprocess.TimeoutExpired("powershell", 1))
+        self.assertTrue(timeout.timed_out)
 
     @unittest.skipUnless(os.name == "nt", "native DPAPI requires Windows")
     def test_native_dpapi_round_trip(self) -> None:
@@ -305,6 +388,46 @@ class WindowsSandboxSetupAuthorityTests(unittest.TestCase):
                 read_user_sids=(WindowsAccountSid("S-1-5-21-100-200-300-2000"),),
                 write_user_sids=(WindowsAccountSid("S-1-5-21-100-200-300-2000"),),
             )  # type: ignore[arg-type]
+
+    def test_planner_rejects_ambiguous_real_users_and_private_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            request = self._request(directory)
+            write_sid = SyntheticWindowsSid.from_components((1, 2, 3, 4))
+            user = WindowsAccountSid("S-1-5-21-100-200-300-2000")
+            other = WindowsAccountSid("S-1-5-21-100-200-300-2001")
+            with self.assertRaises(ValueError):
+                plan_windows_filesystem_authority(request, write_sid)
+            with self.assertRaises(ValueError):
+                plan_windows_filesystem_authority(
+                    request,
+                    write_sid,
+                    read_user_sids=(user,),
+                    write_user_sids=(other,),
+                )
+            with self.assertRaises(TypeError):
+                bad_sid = object()
+                plan_windows_filesystem_authority(
+                    request,
+                    write_sid,
+                    read_user_sids=(bad_sid,),  # type: ignore[arg-type]
+                    write_user_sids=(bad_sid,),  # type: ignore[arg-type]
+                )
+            with self.assertRaises(ValueError):
+                plan_windows_filesystem_authority(
+                    request,
+                    write_sid,
+                    read_user_sids=(user,),
+                    write_user_sids=(user,),
+                    credential_path=Path("relative"),
+                )
+            with self.assertRaises(ValueError):
+                plan_windows_filesystem_authority(
+                    request,
+                    write_sid,
+                    read_user_sids=(user,),
+                    write_user_sids=(user,),
+                    private_root=Path("relative"),
+                )
 
     def test_firewall_rule_contract_is_scoped_and_validated(self) -> None:
         sid = WindowsAccountSid("S-1-5-21-100-200-300-2000")
@@ -550,6 +673,52 @@ class WindowsSandboxSetupAuthorityTests(unittest.TestCase):
             )
             self.assertEqual(authority.inspect(request).state, WindowsSandboxSetupState.READY)
             self.assertEqual(len(firewall.rules), 1)
+
+    def test_setup_repairs_missing_account_and_rotated_password_in_place(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            request = self._request(directory)
+            authority, _, _, _ = self._authority(directory)
+            authority.setup(request)
+            account_api = authority._account_api
+            assert isinstance(account_api, InMemoryWindowsSandboxAccountApi)
+            offline = account_api.lookup_user(
+                SANDBOX_OFFLINE_USERNAME,
+                expected_sid=WindowsAccountSid("S-1-5-21-100-200-300-2000"),
+            )
+            account_api.remove_user(offline)
+            repaired = authority.setup(request)
+            self.assertEqual(repaired.state, WindowsSandboxSetupState.READY)
+            recreated = account_api.lookup_user(
+                SANDBOX_OFFLINE_USERNAME,
+                expected_sid=WindowsAccountSid(repaired.offline_user_sid),
+            )
+            self.assertTrue(recreated.created_by_installation)
+
+            online = account_api.lookup_user(
+                SANDBOX_ONLINE_USERNAME,
+                expected_sid=WindowsAccountSid(repaired.online_user_sid),
+            )
+            account_api.users[online.username.casefold()] = ("rotated", online)
+            rotated = authority.setup(request)
+            self.assertEqual(rotated.state, WindowsSandboxSetupState.READY)
+            repaired_password = account_api.users[online.username.casefold()][0]
+            self.assertNotEqual(repaired_password, "rotated")
+            self.assertEqual(
+                account_api.validate_user(
+                    SANDBOX_ONLINE_USERNAME,
+                    repaired_password,
+                    expected_sid=WindowsAccountSid(rotated.online_user_sid),
+                ).sid,
+                WindowsAccountSid(rotated.online_user_sid),
+            )
+
+    def test_repair_and_identity_records_fail_closed_before_setup(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            request = self._request(directory)
+            authority, _, _, _ = self._authority(directory)
+            self.assertEqual(authority.repair(request).state, WindowsSandboxSetupState.NEEDS_SETUP)
+            with self.assertRaises(WindowsSandboxSetupError):
+                authority.identity_records(request)
 
     def test_acl_drift_is_repaired_without_removing_unmanaged_entries(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

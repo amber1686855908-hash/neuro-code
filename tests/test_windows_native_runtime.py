@@ -51,6 +51,7 @@ from neuro_code.infrastructure.sandbox.windows_native_runtime_protocol import (
     RuntimeFrame,
     RuntimeFrameDecoder,
     RuntimeFrameType,
+    decode_json,
     encode_frame,
     encode_json,
     validate_channel_frame,
@@ -167,6 +168,37 @@ class WindowsNativeRuntimeProtocolTests(unittest.TestCase):
         frames = decoder.feed(encode_frame(RuntimeFrameType.STDIN, payload))
         self.assertEqual(frames, (RuntimeFrame(RuntimeFrameType.STDIN, payload),))
 
+    def test_protocol_rejects_noncanonical_types_and_invalid_frames(self) -> None:
+        with self.assertRaises(TypeError):
+            encode_frame(1)  # type: ignore[arg-type]
+        with self.assertRaises(TypeError):
+            encode_frame(RuntimeFrameType.STDOUT, bytearray(b"not-bytes"))  # type: ignore[arg-type]
+        with self.assertRaises(TypeError):
+            RuntimeFrameDecoder().feed(bytearray(b"frame"))  # type: ignore[arg-type]
+        with self.assertRaises(TypeError):
+            validate_channel_frame("control", RuntimeFrameType.STDIN)  # type: ignore[arg-type]
+
+        too_large = (MAX_FRAME_PAYLOAD + 1).to_bytes(4, "little") + bytes([RuntimeFrameType.STDOUT])
+        with self.assertRaises(SandboxError):
+            RuntimeFrameDecoder().feed(too_large)
+        invalid_kind = (0).to_bytes(4, "little") + b"\xff"
+        with self.assertRaises(SandboxError):
+            RuntimeFrameDecoder().feed(invalid_kind)
+        decoder = RuntimeFrameDecoder()
+        decoder.feed(encode_frame(RuntimeFrameType.STDOUT, b"partial")[:-1])
+        with self.assertRaises(SandboxError):
+            decoder.finish()
+
+    def test_protocol_json_is_utf8_bounded_and_fail_closed(self) -> None:
+        value = {"message": "中文", "count": 2}
+        self.assertEqual(decode_json(encode_json(value)), value)
+        with self.assertRaises(SandboxError):
+            decode_json(b"{not-json")
+        with self.assertRaises(SandboxError):
+            decode_json(b"\xff")
+        with self.assertRaises(SandboxError):
+            encode_json({"not": object()})
+
 
 class _FakeDirectionalPipeApi:
     def __init__(self) -> None:
@@ -186,6 +218,28 @@ class _FakeDirectionalPipeApi:
 
     def close(self, handle: int) -> None:
         self.closed.append(handle)
+
+
+class _StatePipe:
+    def __init__(self, *chunks: bytes) -> None:
+        self._chunks = list(chunks)
+        self.writes: list[bytes] = []
+        self.closed = False
+        self.last_read_error = None
+
+    def read(self) -> bytes:
+        if not self._chunks:
+            time.sleep(0.01)
+        return self._chunks.pop(0) if self._chunks else b""
+
+    def write(self, payload: bytes) -> None:
+        self.writes.append(payload)
+
+    def close(self) -> None:
+        self.closed = True
+
+    def observe_process(self, *_args: object, **_kwargs: object) -> dict[str, object]:
+        return {"state": "RUNNER_EXITED"}
 
 
 class WindowsNativeDirectionalTransportTests(unittest.TestCase):
@@ -252,6 +306,95 @@ class WindowsNativeDirectionalTransportTests(unittest.TestCase):
 
 
 class WindowsNativeRuntimeContractTests(unittest.IsolatedAsyncioTestCase):
+    async def test_event_eof_before_exit_is_a_bounded_error(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "workspace"
+            root.mkdir()
+            process = _WindowsNativeOwnedLocalProcess(
+                transport=WindowsRuntimeControllerTransport(
+                    control=_StatePipe(),  # type: ignore[arg-type]
+                    events=_StatePipe(),  # type: ignore[arg-type]
+                ),
+                runner=RunnerLaunch(process_handle=1, process_id=42),
+                pid=42,
+                request=_request(root),
+            )
+            with self.assertRaisesRegex(SandboxError, "disconnected before Exit"):
+                await process.wait()
+            diagnostic = process.diagnostic_snapshot()
+            self.assertIsNotNone(diagnostic)
+            self.assertEqual(diagnostic["pipe"], "EVENT_PIPE_BROKEN")  # type: ignore[index]
+
+    async def test_exit_preserves_nonzero_code_and_error_diagnostic_is_bounded(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "workspace"
+            root.mkdir()
+            payload = encode_json(
+                {
+                    "version": 1,
+                    "returncode": 23,
+                    "child": {"state": "EXITED", "exit_code": 23},
+                }
+            )
+            process = _WindowsNativeOwnedLocalProcess(
+                transport=WindowsRuntimeControllerTransport(
+                    control=_StatePipe(),  # type: ignore[arg-type]
+                    events=_StatePipe(),  # type: ignore[arg-type]
+                ),
+                runner=RunnerLaunch(process_handle=1, process_id=42),
+                pid=42,
+                request=_request(root),
+                initial_frames=(RuntimeFrame(RuntimeFrameType.EXIT, payload),),
+            )
+            self.assertEqual(await process.wait(), 23)
+            self.assertEqual(process.returncode, 23)
+            diagnostic = process.diagnostic_snapshot()
+            self.assertIsNotNone(diagnostic)
+            self.assertEqual(diagnostic["child"]["exit_code"], 23)  # type: ignore[index]
+
+            error_process = _WindowsNativeOwnedLocalProcess(
+                transport=WindowsRuntimeControllerTransport(
+                    control=_StatePipe(),  # type: ignore[arg-type]
+                    events=_StatePipe(),  # type: ignore[arg-type]
+                ),
+                runner=RunnerLaunch(process_handle=1, process_id=42),
+                pid=42,
+                request=_request(root),
+                security_attestation={"user_sid": "S-1-5-21-safe"},
+                initial_frames=(
+                    RuntimeFrame(
+                        RuntimeFrameType.ERROR,
+                        encode_json({"message": "credential=secret" * 100}),
+                    ),
+                ),
+            )
+            with self.assertRaisesRegex(SandboxError, "credential=secret"):
+                await error_process.wait()
+            self.assertNotIn("credential=secret", repr(error_process.diagnostic_snapshot()))
+
+    async def test_stdin_rejects_after_exit_and_close_is_idempotent(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "workspace"
+            root.mkdir()
+            control = _StatePipe()
+            process = _WindowsNativeOwnedLocalProcess(
+                transport=WindowsRuntimeControllerTransport(
+                    control=control,  # type: ignore[arg-type]
+                    events=_StatePipe(),  # type: ignore[arg-type]
+                ),
+                runner=RunnerLaunch(process_handle=1, process_id=42),
+                pid=42,
+                request=_request(root),
+                initial_frames=(
+                    RuntimeFrame(RuntimeFrameType.EXIT, encode_json({"returncode": 0})),
+                ),
+            )
+            self.assertEqual(await process.wait(), 0)
+            with self.assertRaisesRegex(RuntimeError, "process is closed"):
+                await process.write_stdin(b"must-not-send")
+            await process.close_stdin()
+            self.assertEqual(control.writes, [])
+
     def test_trusted_runner_provenance_accepts_external_workspace(self) -> None:
         provenance = WindowsTrustedRunnerProvenance.resolve()
         with tempfile.TemporaryDirectory() as directory:

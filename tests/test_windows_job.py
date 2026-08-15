@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ctypes
 import unittest
 from unittest import mock
 
@@ -7,6 +8,7 @@ from neuro_code.infrastructure.sandbox.windows_job import (
     WindowsJobObject,
     _BasicAccountingInformation,
     _ExtendedLimitInformation,
+    _NativeWindowsJobApi,
 )
 
 
@@ -59,6 +61,53 @@ class _FakeWindowsJobApi:
 
 
 class WindowsJobObjectTests(unittest.TestCase):
+    def test_native_api_facade_maps_kernel32_results(self) -> None:
+        api = object.__new__(_NativeWindowsJobApi)
+        calls: list[tuple[str, object]] = []
+
+        def create(*args: object) -> int:
+            calls.append(("create", args))
+            return 701
+
+        def configure(*args: object) -> int:
+            calls.append(("configure", args))
+            return 1
+
+        def query(*args: object) -> int:
+            calls.append(("query", args))
+            pointer = ctypes.cast(args[2], ctypes.POINTER(_BasicAccountingInformation))
+            information = pointer.contents
+            information.ActiveProcesses = 3
+            return 1
+
+        def terminate(*args: object) -> int:
+            calls.append(("terminate", args))
+            return 1
+
+        def close(*args: object) -> int:
+            calls.append(("close", args))
+            return 1
+
+        api._create_job_object = create  # type: ignore[assignment]
+        api._set_information_job_object = configure  # type: ignore[assignment]
+        api._query_information_job_object = query  # type: ignore[assignment]
+        api._terminate_job_object = terminate  # type: ignore[assignment]
+        api._close_handle = close  # type: ignore[assignment]
+        api._get_last_error = lambda: 91  # type: ignore[assignment]
+
+        self.assertEqual(api.create_job_object(), 701)
+        limits = _ExtendedLimitInformation()
+        self.assertTrue(api.set_information_job_object(701, 9, limits))
+        accounting = _BasicAccountingInformation()
+        self.assertTrue(api.query_information_job_object(701, 1, accounting))
+        self.assertEqual(accounting.ActiveProcesses, 3)
+        self.assertTrue(api.terminate_job_object(701, 23))
+        self.assertTrue(api.close_handle(701))
+        self.assertEqual(api.get_last_error(), 91)
+        self.assertEqual(
+            [name for name, _ in calls], ["create", "configure", "query", "terminate", "close"]
+        )
+
     def test_non_windows_default_creation_fails_cleanly(self) -> None:
         with (
             mock.patch("neuro_code.infrastructure.sandbox.windows_job.os.name", "posix"),
@@ -190,6 +239,12 @@ class WindowsJobObjectTests(unittest.TestCase):
 
         with self.assertRaisesRegex(RuntimeError, "is closed"):
             _ = job.active_processes
+
+    def test_context_manager_closes_job_after_validating_handle(self) -> None:
+        api = _FakeWindowsJobApi()
+        with WindowsJobObject.create(api=api) as job:
+            self.assertEqual(job.process_creation_handle, 101)
+        self.assertEqual(api.calls.count(("close", 101)), 1)
 
     def test_numeric_arguments_are_validated_before_win32_calls(self) -> None:
         api = _FakeWindowsJobApi()
