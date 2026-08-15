@@ -16,6 +16,8 @@ import os
 import shutil
 import socket
 import subprocess
+import sys
+import textwrap
 import unittest
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -43,6 +45,7 @@ from neuro_code.application.ports.windows_sandbox import (
 from neuro_code.domain.sandbox.models import SandboxProfile
 from neuro_code.infrastructure.sandbox.windows_native_local_process import (
     WindowsNativeLocalProcessSandbox,
+    _terminate_runner_process,
 )
 from neuro_code.infrastructure.sandbox.windows_native_runner import (
     _WindowsNativeDesktopMode,
@@ -74,6 +77,7 @@ from neuro_code.infrastructure.sandbox.windows_sandbox_setup import (
     _InstallationRecord,
     _NativeWindowsSetupPrivilegeApi,
 )
+from neuro_code.shared.errors import SandboxError
 
 _SENTINEL = "GATE2_NON_SECRET_SENTINEL"
 _APPENDED = "GATE2_APPEND_SENTINEL"
@@ -434,6 +438,268 @@ def _request(
         environment_policy=LocalProcessEnvironmentPolicy({}),
         stdio_mode=stdio_mode,
         lifecycle=LocalProcessLifecycle(),
+    )
+
+
+@dataclass(slots=True)
+class _DescendantFixture:
+    """Disposable native fixture shared by the Gate 5 lifecycle probes."""
+
+    root: Path
+    workspace: Path
+    installation: Path
+    runtime_state: Path
+    probe: Path
+    setup_request: WindowsSandboxSetupRequest
+    authority: WindowsNativeSandboxSetupAuthority
+    adapter: WindowsNativeLocalProcessSandbox
+    online_sid: str
+    write_sid: SyntheticWindowsSid
+
+
+def _make_descendant_fixture(root: Path, compiled_probe: Path) -> _DescendantFixture:
+    workspace = root / "workspace"
+    installation = root / "installation"
+    runtime_state = root / "runtime-state"
+    workspace.mkdir()
+    installation.mkdir()
+    runtime_state.mkdir()
+    probe = workspace / "w3-windows-descendant-probe.exe"
+    shutil.copy2(compiled_probe, probe)
+    setup_request = WindowsSandboxSetupRequest(
+        installation_root=installation,
+        read_roots=(workspace,),
+        writable_roots=(workspace,),
+        sensitive_read_paths=(),
+    )
+    privilege_api = _NativeWindowsSetupPrivilegeApi()
+    authority = WindowsNativeSandboxSetupAuthority(
+        credential_store=WindowsDpapiCredentialStore(installation / "credentials.dpapi"),
+        acl_api=_NativeWindowsAclApi(),
+        firewall_api=_NativeWindowsFirewallApi(),
+        account_api=_NativeWindowsSandboxAccountApi(),
+        privilege_api=privilege_api,
+    )
+    snapshot = authority.setup(setup_request)
+    if snapshot.state is not WindowsSandboxSetupState.READY:
+        raise AssertionError("W3 descendant fixture setup did not reach READY")
+    online_sid = snapshot.online_user_sid
+    write_sid = snapshot.write_restricting_sid
+    if not isinstance(online_sid, str) or not isinstance(write_sid, str):
+        raise AssertionError("W3 descendant fixture omitted setup identities")
+    adapter = WindowsNativeLocalProcessSandbox(
+        SandboxProfile.WORKSPACE,
+        workspace,
+        runtime_state,
+        setup_authority=authority,
+        setup_request_factory=lambda _request: setup_request,
+        _diagnostic_desktop_mode=_WindowsNativeDesktopMode.PRIVATE_DESKTOP,
+        _diagnostic_create_no_window=True,
+    )
+    return _DescendantFixture(
+        root,
+        workspace,
+        installation,
+        runtime_state,
+        probe,
+        setup_request,
+        authority,
+        adapter,
+        online_sid,
+        SyntheticWindowsSid(write_sid),
+    )
+
+
+def _descendant_request(fixture: _DescendantFixture, mode: str) -> SandboxedProcessRequest:
+    return _request(
+        workspace=fixture.workspace,
+        network=LocalProcessNetworkPolicy.INHERIT,
+        executable=str(fixture.probe),
+        arguments=(mode, str(fixture.workspace)),
+        purpose=LocalProcessPurpose.BASH,
+        stdio_mode=LocalProcessStdioMode.CAPTURE,
+    )
+
+
+async def _wait_for_descendant_markers(
+    fixture: _DescendantFixture, *, holding: bool
+) -> tuple[Path, Path, Path, Path, Path]:
+    started_marker = fixture.workspace / "grandchild-started"
+    pid_file = fixture.workspace / "grandchild.pid"
+    stdio_free_marker = fixture.workspace / "grandchild-stdio-free"
+    stdio_inherited_marker = fixture.workspace / "grandchild-stdio-inherited"
+    leader_marker = fixture.workspace / ("leader-holding" if holding else "leader-exiting")
+    deadline = asyncio.get_running_loop().time() + 8.0
+    while asyncio.get_running_loop().time() < deadline:
+        if (
+            started_marker.is_file()
+            and pid_file.is_file()
+            and (stdio_free_marker.is_file() or stdio_inherited_marker.is_file())
+            and leader_marker.is_file()
+        ):
+            return (
+                started_marker,
+                pid_file,
+                stdio_free_marker,
+                stdio_inherited_marker,
+                leader_marker,
+            )
+        await asyncio.sleep(0.02)
+    return (
+        started_marker,
+        pid_file,
+        stdio_free_marker,
+        stdio_inherited_marker,
+        leader_marker,
+    )
+
+
+async def _wait_pid_exit(
+    observer: _WindowsPidHandle,
+    timeout: float = 8.0,  # noqa: ASYNC109
+) -> dict[str, object]:
+    deadline = asyncio.get_running_loop().time() + timeout
+    state = observer.observe()
+    while state.get("state") == "ACTIVE" and asyncio.get_running_loop().time() < deadline:
+        await asyncio.sleep(0.02)
+        state = observer.observe()
+    return state
+
+
+def _read_descendant_pid(path: Path) -> int:
+    try:
+        value = int(path.read_text(encoding="ascii").strip())
+    except (OSError, UnicodeError, ValueError) as error:
+        raise AssertionError("descendant PID marker is invalid") from error
+    if value <= 0:
+        raise AssertionError("descendant PID marker is invalid")
+    return value
+
+
+def _token_attestation_is_exact(process: OwnedLocalProcess, write_sid: SyntheticWindowsSid) -> bool:
+    diagnostic = cast(Any, process).diagnostic_snapshot()
+    if not isinstance(diagnostic, dict):
+        return False
+    attestation = diagnostic.get("security_attestation")
+    return bool(
+        isinstance(attestation, dict)
+        and attestation.get("is_restricted") is True
+        and tuple(attestation.get("restricted_sids", ())) == (write_sid.value,)
+        and attestation.get("change_notify_privilege_enabled") is True
+        and attestation.get("unexpected_enabled_privilege_count") == 0
+    )
+
+
+def _controller_loss_helper_source() -> str:
+    """Return the disposable controller helper used only by Gate 5C."""
+
+    return textwrap.dedent(
+        r"""
+        from __future__ import annotations
+
+        import asyncio
+        import json
+        import sys
+        from pathlib import Path
+
+        sys.path.insert(0, sys.argv[1])
+
+        from neuro_code.application.ports.sandbox import (
+            LocalProcessEnvironmentPolicy,
+            LocalProcessFilesystemPolicy,
+            LocalProcessLifecycle,
+            LocalProcessNetworkPolicy,
+            LocalProcessPurpose,
+            LocalProcessStdioMode,
+            LocalWorkspaceAccess,
+            LocalWorkspaceAccessMode,
+            SandboxedProcessRequest,
+        )
+        from neuro_code.application.ports.windows_sandbox import WindowsSandboxSetupRequest
+        from neuro_code.domain.sandbox.models import SandboxProfile
+        from neuro_code.infrastructure.sandbox.windows_native_local_process import (
+            WindowsNativeLocalProcessSandbox,
+        )
+
+        async def main() -> int:
+            repo_root, workspace_text, installation_text, runtime_text, probe_text, ready_text = sys.argv[1:]
+            workspace = Path(workspace_text)
+            installation = Path(installation_text)
+            runtime_state = Path(runtime_text)
+            probe = Path(probe_text)
+            ready = Path(ready_text)
+            setup_request = WindowsSandboxSetupRequest(
+                installation_root=installation,
+                read_roots=(workspace,),
+                writable_roots=(workspace,),
+                sensitive_read_paths=(),
+            )
+            request = SandboxedProcessRequest.exec(
+                str(probe),
+                ("leader-holds-grandchild-holds", str(workspace)),
+                purpose=LocalProcessPurpose.BASH,
+                cwd=workspace,
+                sandbox_profile=SandboxProfile.WORKSPACE,
+                filesystem_policy=LocalProcessFilesystemPolicy(
+                    (LocalWorkspaceAccess(workspace, LocalWorkspaceAccessMode.READ_WRITE),)
+                ),
+                network_policy=LocalProcessNetworkPolicy.INHERIT,
+                environment_policy=LocalProcessEnvironmentPolicy({}),
+                stdio_mode=LocalProcessStdioMode.CAPTURE,
+                lifecycle=LocalProcessLifecycle(),
+            )
+            process = None
+            try:
+                adapter = WindowsNativeLocalProcessSandbox(
+                    SandboxProfile.WORKSPACE,
+                    workspace,
+                    runtime_state,
+                    setup_request_factory=lambda _request: setup_request,
+                )
+                process = await adapter.spawn(request)
+                runner = getattr(process, "_runner", None)
+                runner_pid = getattr(runner, "process_id", 0)
+                deadline = asyncio.get_running_loop().time() + 8.0
+                pid_file = workspace / "grandchild.pid"
+                while asyncio.get_running_loop().time() < deadline:
+                    if (
+                        (workspace / "grandchild-started").is_file()
+                        and (workspace / "grandchild-stdio-free").is_file()
+                        and (workspace / "leader-holding").is_file()
+                        and pid_file.is_file()
+                    ):
+                        break
+                    await asyncio.sleep(0.02)
+                if not pid_file.is_file() or not (workspace / "leader-holding").is_file():
+                    raise RuntimeError("controller helper did not observe descendant readiness")
+                ready.write_text(
+                    json.dumps(
+                        {
+                            "spawn_ready": True,
+                            "runner_pid": int(runner_pid),
+                            "leader_pid": int(process.process_id),
+                            "grandchild_pid": int(pid_file.read_text(encoding="ascii").strip()),
+                        },
+                        sort_keys=True,
+                    ),
+                    encoding="ascii",
+                )
+                await process.wait()
+                return 0
+            except BaseException as error:
+                ready.with_name("controller-error.json").write_text(
+                    json.dumps({"error": type(error).__name__}), encoding="ascii"
+                )
+                return 23
+            finally:
+                if process is not None and process.returncode is None:
+                    try:
+                        await process.terminate(grace_seconds=0.5)
+                    except BaseException:
+                        pass
+
+        raise SystemExit(asyncio.run(main()))
+        """
     )
 
 
@@ -1191,6 +1457,429 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 with contextlib.suppress(BaseException):
                     authority.cleanup(setup_request)
+
+    async def test_gate5b_explicit_termination_owns_descendants(
+        self,
+    ) -> None:  # pragma: no cover - Windows CI
+        """Prove public terminate() kills the complete Job-owned scope."""
+
+        privilege_api = _NativeWindowsSetupPrivilegeApi()
+        self.assertTrue(privilege_api.is_administrator(), "W2 setup acceptance requires elevation")
+        try:
+            compiled_probe = await asyncio.to_thread(_compile_descendant_probe)
+        except _NativeProbeBuildError as error:
+            self.fail(f"NATIVE_DESCENDANT_PROBE_BUILD_UNAVAILABLE: {type(error).__name__}")
+        self.addCleanup(shutil.rmtree, compiled_probe.parent, ignore_errors=True)
+
+        with TemporaryDirectory() as directory:
+            fixture = _make_descendant_fixture(Path(directory), compiled_probe)
+            process: OwnedLocalProcess | None = None
+            wait_task: asyncio.Task[int] | None = None
+            stdout_task: asyncio.Task[bytes] | None = None
+            stderr_task: asyncio.Task[bytes] | None = None
+            leader_observer: _WindowsPidHandle | None = None
+            grandchild_observer: _WindowsPidHandle | None = None
+            classification: str | None = None
+            termination_error: str | None = None
+            terminate_duration = 0.0
+            leader_pre: dict[str, object] = {"state": "NOT_OBSERVED"}
+            grandchild_pre: dict[str, object] = {"state": "NOT_OBSERVED"}
+            leader_post: dict[str, object] = {"state": "NOT_OBSERVED"}
+            grandchild_post: dict[str, object] = {"state": "NOT_OBSERVED"}
+            runner_exit: int | None = None
+            termination_observation: object = None
+            returncode: int | None = None
+            try:
+                process = await fixture.adapter.spawn(
+                    _descendant_request(fixture, "leader-holds-grandchild-holds")
+                )
+                token_attested = _token_attestation_is_exact(process, fixture.write_sid)
+                self.assertTrue(token_attested)
+                stdout_task = asyncio.create_task(_read_all_bounded(process.stdout))
+                stderr_task = asyncio.create_task(_read_all_bounded(process.stderr))
+                wait_task = asyncio.create_task(process.wait())
+                (
+                    started,
+                    pid_file,
+                    stdio_free_marker,
+                    stdio_inherited_marker,
+                    leader_marker,
+                ) = await _wait_for_descendant_markers(fixture, holding=True)
+                stdio_free = stdio_free_marker.is_file() and not stdio_inherited_marker.is_file()
+                if not stdio_free:
+                    classification = "DESCENDANT_WAIT_COUPLED_TO_STDIO"
+                elif not started.is_file() or not leader_marker.is_file():
+                    classification = "DESCENDANT_LEADER_EXIT_TRANSPORT_FAILURE"
+                else:
+                    grandchild_pid = _read_descendant_pid(pid_file)
+                    leader_observer = _WindowsPidHandle(process.process_id)
+                    grandchild_observer = _WindowsPidHandle(grandchild_pid)
+                    leader_pre = leader_observer.observe()
+                    grandchild_pre = grandchild_observer.observe()
+                    if (
+                        leader_pre.get("state") != "ACTIVE"
+                        or grandchild_pre.get("state") != "ACTIVE"
+                    ):
+                        classification = "DESCENDANT_SCOPE_NOT_ACTIVE_BEFORE_TERMINATE"
+                wait_pending = wait_task is not None and not wait_task.done()
+                if classification is None and not wait_pending:
+                    classification = "WAIT_COMPLETED_BEFORE_EXPLICIT_TERMINATION"
+
+                started_at = asyncio.get_running_loop().time()
+                if classification is None and process is not None:
+                    try:
+                        await asyncio.wait_for(process.terminate(grace_seconds=0.5), timeout=8.0)
+                    except BaseException as error:
+                        termination_error = type(error).__name__
+                        classification = "EXPLICIT_TERMINATION_TIMEOUT"
+                terminate_duration = asyncio.get_running_loop().time() - started_at
+
+                if leader_observer is not None:
+                    leader_post = await _wait_pid_exit(leader_observer)
+                if grandchild_observer is not None:
+                    grandchild_post = await _wait_pid_exit(grandchild_observer)
+                if wait_task is not None and wait_task.done():
+                    with contextlib.suppress(BaseException):
+                        returncode = wait_task.result()
+                elif wait_task is not None and classification is None:
+                    classification = "EXPLICIT_TERMINATION_TIMEOUT"
+
+                diagnostic = cast(Any, process).diagnostic_snapshot() if process is not None else {}
+                if not isinstance(diagnostic, dict):
+                    diagnostic = {}
+                runner = diagnostic.get("runner")
+                if isinstance(runner, dict):
+                    value = runner.get("exit_code")
+                    runner_exit = value if isinstance(value, int) else None
+                termination_observation = diagnostic.get("termination_observation")
+                natural_finished = (fixture.workspace / "grandchild-finished").is_file()
+                orphan_count = sum(
+                    state.get("state") != "EXITED" for state in (leader_post, grandchild_post)
+                )
+                if classification is None and (
+                    leader_post.get("state") != "EXITED" or grandchild_post.get("state") != "EXITED"
+                ):
+                    classification = "DESCENDANT_SURVIVED_EXPLICIT_TERMINATION"
+                elif classification is None and natural_finished:
+                    classification = "DESCENDANT_NATURAL_COMPLETION_DURING_TERMINATION"
+                elif classification is None and not isinstance(termination_observation, dict):
+                    classification = "TERMINATION_OBSERVATION_MISSING"
+                elif classification is None and runner_exit != 0:
+                    classification = "TERMINATION_RUNNER_EXIT_FAILURE"
+                facts = {
+                    "create_process_as_user": "PASS",
+                    "spawn_ready": "PASS",
+                    "token_attestation": token_attested,
+                    "leader_pre_terminate_state": leader_pre.get("state"),
+                    "grandchild_pre_terminate_state": grandchild_pre.get("state"),
+                    "wait_pending_at_terminate": wait_pending,
+                    "terminate_duration_ms": round(terminate_duration * 1000, 2),
+                    "leader_post_state": leader_post.get("state"),
+                    "grandchild_post_state": grandchild_post.get("state"),
+                    "orphan_count": orphan_count,
+                    "runner_exit": runner_exit,
+                    "termination_observation": termination_observation,
+                    "termination_error": termination_error,
+                    "natural_finished": natural_finished,
+                    "returncode": returncode,
+                    "classification": classification or "PASS",
+                }
+                print("W3_GATE5B_RESULTS=" + json.dumps(facts, sort_keys=True), flush=True)
+                if classification is not None:
+                    self.fail(classification)
+            finally:
+                if process is not None and process.returncode is None:
+                    with contextlib.suppress(BaseException):
+                        await process.terminate(grace_seconds=0.5)
+                for task in (stdout_task, stderr_task, wait_task):
+                    if task is not None and not task.done():
+                        task.cancel()
+                        with contextlib.suppress(BaseException):
+                            await task
+                if leader_observer is not None:
+                    leader_observer.close()
+                if grandchild_observer is not None:
+                    grandchild_observer.close()
+                with contextlib.suppress(BaseException):
+                    fixture.authority.cleanup(fixture.setup_request)
+
+    async def test_gate5c_controller_loss_fails_closed(
+        self,
+    ) -> None:  # pragma: no cover - Windows CI
+        """Prove abrupt controller loss closes the owned Job scope."""
+
+        privilege_api = _NativeWindowsSetupPrivilegeApi()
+        self.assertTrue(privilege_api.is_administrator(), "W2 setup acceptance requires elevation")
+        try:
+            compiled_probe = await asyncio.to_thread(_compile_descendant_probe)
+        except _NativeProbeBuildError as error:
+            self.fail(f"NATIVE_DESCENDANT_PROBE_BUILD_UNAVAILABLE: {type(error).__name__}")
+        self.addCleanup(shutil.rmtree, compiled_probe.parent, ignore_errors=True)
+
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            fixture = _make_descendant_fixture(root, compiled_probe)
+            helper_script = root / "controller_loss_helper.py"
+            helper_script.write_text(_controller_loss_helper_source(), encoding="utf-8")
+            ready_path = root / "controller-ready.json"
+            error_path = root / "controller-error.json"
+            repo_root = Path(__file__).resolve().parents[2]  # noqa: ASYNC240
+            helper = subprocess.Popen(  # noqa: ASYNC220
+                [
+                    sys.executable,
+                    str(helper_script),
+                    str(repo_root),
+                    str(fixture.workspace),
+                    str(fixture.installation),
+                    str(fixture.runtime_state),
+                    str(fixture.probe),
+                    str(ready_path),
+                ],
+                cwd=str(repo_root),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                close_fds=True,
+            )
+            helper_observer = _WindowsPidHandle(helper.pid)
+            runner_observer: _WindowsPidHandle | None = None
+            leader_observer: _WindowsPidHandle | None = None
+            grandchild_observer: _WindowsPidHandle | None = None
+            classification: str | None = None
+            ready: dict[str, object] = {}
+            helper_exit: int | None = None
+            try:
+                deadline = asyncio.get_running_loop().time() + 15.0
+                while (  # noqa: ASYNC110
+                    not ready_path.is_file()
+                    and not error_path.is_file()
+                    and helper.poll() is None
+                    and asyncio.get_running_loop().time() < deadline
+                ):
+                    await asyncio.sleep(0.02)
+                if error_path.is_file() or not ready_path.is_file():
+                    classification = "CONTROLLER_LOSS_HELPER_STARTUP_FAILURE"
+                else:
+                    try:
+                        value = json.loads(ready_path.read_text(encoding="ascii"))
+                        if isinstance(value, dict):
+                            ready = value
+                    except (OSError, UnicodeError, ValueError, json.JSONDecodeError):
+                        classification = "CONTROLLER_LOSS_HELPER_STARTUP_FAILURE"
+                pids = (
+                    ready.get("runner_pid"),
+                    ready.get("leader_pid"),
+                    ready.get("grandchild_pid"),
+                )
+                if classification is None and (
+                    ready.get("spawn_ready") is not True
+                    or any(type(pid) is not int or pid <= 0 for pid in pids)
+                ):
+                    classification = "CONTROLLER_LOSS_HELPER_STARTUP_FAILURE"
+                if classification is None:
+                    runner_observer = _WindowsPidHandle(cast(int, pids[0]))
+                    leader_observer = _WindowsPidHandle(cast(int, pids[1]))
+                    grandchild_observer = _WindowsPidHandle(cast(int, pids[2]))
+                    pre_states = (
+                        runner_observer.observe(),
+                        leader_observer.observe(),
+                        grandchild_observer.observe(),
+                    )
+                    if any(state.get("state") != "ACTIVE" for state in pre_states):
+                        classification = "CONTROLLER_LOSS_SCOPE_NOT_ACTIVE"
+                forced_controller_exit = False
+                if classification is None:
+                    helper.kill()
+                    forced_controller_exit = True
+                    try:
+                        helper_exit = await asyncio.to_thread(helper.wait, 10.0)
+                    except BaseException:
+                        classification = "CONTROLLER_LOSS_HELPER_DID_NOT_EXIT"
+                if runner_observer is not None:
+                    runner_post = await _wait_pid_exit(runner_observer)
+                else:
+                    runner_post = {"state": "NOT_OBSERVED"}
+                if leader_observer is not None:
+                    leader_post = await _wait_pid_exit(leader_observer)
+                else:
+                    leader_post = {"state": "NOT_OBSERVED"}
+                if grandchild_observer is not None:
+                    grandchild_post = await _wait_pid_exit(grandchild_observer)
+                else:
+                    grandchild_post = {"state": "NOT_OBSERVED"}
+                natural_finished = (fixture.workspace / "grandchild-finished").is_file()
+                orphan_count = sum(
+                    state.get("state") != "EXITED"
+                    for state in (runner_post, leader_post, grandchild_post)
+                )
+                if classification is None and orphan_count:
+                    classification = "CONTROLLER_LOSS_LEFT_DESCENDANT_SCOPE"
+                elif classification is None and natural_finished:
+                    classification = "CONTROLLER_LOSS_NATURAL_COMPLETION"
+                facts = {
+                    "controller_helper_pre_state": "ACTIVE",
+                    "forced_controller_exit": forced_controller_exit,
+                    "controller_helper_exit": helper_exit,
+                    "runner_post_state": runner_post.get("state"),
+                    "leader_post_state": leader_post.get("state"),
+                    "grandchild_post_state": grandchild_post.get("state"),
+                    "orphan_count": orphan_count,
+                    "natural_finished": natural_finished,
+                    "classification": classification or "PASS",
+                }
+                print("W3_GATE5C_RESULTS=" + json.dumps(facts, sort_keys=True), flush=True)
+                if classification is not None:
+                    self.fail(classification)
+            finally:
+                if helper.poll() is None:
+                    with contextlib.suppress(BaseException):
+                        helper.kill()
+                    with contextlib.suppress(BaseException):
+                        await asyncio.to_thread(helper.wait, 5.0)
+                helper_observer.close()
+                if runner_observer is not None:
+                    runner_observer.close()
+                if leader_observer is not None:
+                    leader_observer.close()
+                if grandchild_observer is not None:
+                    grandchild_observer.close()
+                with contextlib.suppress(BaseException):
+                    fixture.authority.cleanup(fixture.setup_request)
+
+    async def test_gate5d_runner_crash_uses_job_kill_on_close(
+        self,
+    ) -> None:  # pragma: no cover - Windows CI
+        """Prove runner death closes the Job and kills every descendant."""
+
+        privilege_api = _NativeWindowsSetupPrivilegeApi()
+        self.assertTrue(privilege_api.is_administrator(), "W2 setup acceptance requires elevation")
+        try:
+            compiled_probe = await asyncio.to_thread(_compile_descendant_probe)
+        except _NativeProbeBuildError as error:
+            self.fail(f"NATIVE_DESCENDANT_PROBE_BUILD_UNAVAILABLE: {type(error).__name__}")
+        self.addCleanup(shutil.rmtree, compiled_probe.parent, ignore_errors=True)
+
+        with TemporaryDirectory() as directory:
+            fixture = _make_descendant_fixture(Path(directory), compiled_probe)
+            process: OwnedLocalProcess | None = None
+            wait_task: asyncio.Task[int] | None = None
+            runner_observer: _WindowsPidHandle | None = None
+            leader_observer: _WindowsPidHandle | None = None
+            grandchild_observer: _WindowsPidHandle | None = None
+            classification: str | None = None
+            controller_result: dict[str, object] = {"state": "NOT_OBSERVED"}
+            runner_pre: dict[str, object] = {"state": "NOT_OBSERVED"}
+            runner_post: dict[str, object] = {"state": "NOT_OBSERVED"}
+            leader_pre: dict[str, object] = {"state": "NOT_OBSERVED"}
+            grandchild_pre: dict[str, object] = {"state": "NOT_OBSERVED"}
+            leader_post: dict[str, object] = {"state": "NOT_OBSERVED"}
+            grandchild_post: dict[str, object] = {"state": "NOT_OBSERVED"}
+            try:
+                process = await fixture.adapter.spawn(
+                    _descendant_request(fixture, "leader-holds-grandchild-holds")
+                )
+                token_attested = _token_attestation_is_exact(process, fixture.write_sid)
+                self.assertTrue(token_attested)
+                wait_task = asyncio.create_task(process.wait())
+                (
+                    started,
+                    pid_file,
+                    stdio_free_marker,
+                    stdio_inherited_marker,
+                    leader_marker,
+                ) = await _wait_for_descendant_markers(fixture, holding=True)
+                stdio_free = stdio_free_marker.is_file() and not stdio_inherited_marker.is_file()
+                if not stdio_free:
+                    classification = "DESCENDANT_WAIT_COUPLED_TO_STDIO"
+                elif not started.is_file() or not leader_marker.is_file():
+                    classification = "DESCENDANT_LEADER_EXIT_TRANSPORT_FAILURE"
+                else:
+                    grandchild_pid = _read_descendant_pid(pid_file)
+                    runner = getattr(process, "_runner", None)
+                    runner_pid = getattr(runner, "process_id", 0)
+                    if not isinstance(runner_pid, int) or runner_pid <= 0:
+                        classification = "RUNNER_NOT_ACTIVE_BEFORE_FAULT"
+                    else:
+                        runner_observer = _WindowsPidHandle(runner_pid)
+                        leader_observer = _WindowsPidHandle(process.process_id)
+                        grandchild_observer = _WindowsPidHandle(grandchild_pid)
+                        runner_pre = runner_observer.observe()
+                        leader_pre = leader_observer.observe()
+                        grandchild_pre = grandchild_observer.observe()
+                        if any(
+                            state.get("state") != "ACTIVE"
+                            for state in (runner_pre, leader_pre, grandchild_pre)
+                        ):
+                            classification = "RUNNER_NOT_ACTIVE_BEFORE_FAULT"
+                if classification is None and process is not None:
+                    runner = getattr(process, "_runner", None)
+                    handle = getattr(runner, "process_handle", 0)
+                    if not isinstance(handle, int) or handle <= 0:
+                        classification = "RUNNER_NOT_ACTIVE_BEFORE_FAULT"
+                    else:
+                        _terminate_runner_process(handle)
+                if runner_observer is not None:
+                    runner_post = await _wait_pid_exit(runner_observer)
+                if leader_observer is not None:
+                    leader_post = await _wait_pid_exit(leader_observer)
+                if grandchild_observer is not None:
+                    grandchild_post = await _wait_pid_exit(grandchild_observer)
+                if wait_task is not None:
+                    try:
+                        await asyncio.wait_for(asyncio.shield(wait_task), timeout=8.0)
+                        controller_result = {"state": "NORMAL_RETURN"}
+                    except SandboxError as error:
+                        controller_result = {"state": "SANDBOX_ERROR", "type": type(error).__name__}
+                    except TimeoutError:
+                        controller_result = {"state": "WAIT_TIMEOUT"}
+                    except BaseException as error:
+                        controller_result = {"state": "ERROR", "type": type(error).__name__}
+                natural_finished = (fixture.workspace / "grandchild-finished").is_file()
+                orphan_count = sum(
+                    state.get("state") != "EXITED"
+                    for state in (runner_post, leader_post, grandchild_post)
+                )
+                if classification is None and orphan_count:
+                    classification = "JOB_KILL_ON_CLOSE_VIOLATION"
+                elif classification is None and natural_finished:
+                    classification = "RUNNER_KILL_ALLOWED_NATURAL_FINISH"
+                elif classification is None and controller_result.get("state") != "SANDBOX_ERROR":
+                    classification = "RUNNER_KILL_CONTROLLER_RESULT_UNEXPECTED"
+                kill_on_close_proven = (
+                    runner_post.get("state") == "EXITED"
+                    and leader_post.get("state") == "EXITED"
+                    and grandchild_post.get("state") == "EXITED"
+                    and not natural_finished
+                )
+                facts = {
+                    "runner_pre_state": runner_pre.get("state"),
+                    "forced_runner_exit": True,
+                    "runner_post_state": runner_post.get("state"),
+                    "leader_pre_state": leader_pre.get("state"),
+                    "grandchild_pre_state": grandchild_pre.get("state"),
+                    "leader_post_state": leader_post.get("state"),
+                    "grandchild_post_state": grandchild_post.get("state"),
+                    "orphan_count": orphan_count,
+                    "controller_result": controller_result,
+                    "natural_finished": natural_finished,
+                    "kill_on_close_proven": kill_on_close_proven,
+                    "classification": classification or "PASS",
+                }
+                print("W3_GATE5D_RESULTS=" + json.dumps(facts, sort_keys=True), flush=True)
+                if classification is not None:
+                    self.fail(classification)
+            finally:
+                if wait_task is not None and not wait_task.done():
+                    wait_task.cancel()
+                    with contextlib.suppress(BaseException):
+                        await wait_task
+                if runner_observer is not None:
+                    runner_observer.close()
+                if leader_observer is not None:
+                    leader_observer.close()
+                if grandchild_observer is not None:
+                    grandchild_observer.close()
+                with contextlib.suppress(BaseException):
+                    fixture.authority.cleanup(fixture.setup_request)
 
     async def test_gate3_network_isolation(self) -> None:  # pragma: no cover - Windows CI
         """Prove static Offline Firewall authority around real final children."""

@@ -1,5 +1,5 @@
 /*
- * Acceptance-only Win32 probe for W3 Gate 5A.
+ * Acceptance-only Win32 probe for W3 Gate 5A and Gate 5B/5C/5D.
  *
  * The leader is the final CreateProcessAsUserW child.  It creates this same
  * executable as a grandchild with bInheritHandles=FALSE and with no standard
@@ -126,7 +126,7 @@ static int wait_for_markers(const wchar_t *root) {
     return 0;
 }
 
-static int run_grandchild(const wchar_t *root) {
+static int run_grandchild(const wchar_t *root, int hold) {
     int has_runner_pipes =
         standard_pipe_handle_is_valid(STD_INPUT_HANDLE) ||
         standard_pipe_handle_is_valid(STD_OUTPUT_HANDLE) ||
@@ -144,14 +144,17 @@ static int run_grandchild(const wchar_t *root) {
                              "grandchild-stdio-free\n")) {
         return 33;
     }
-    Sleep(2500);
+    /* Gate 5A completes naturally; Gate 5B/5C/5D must remain alive until the
+     * controller or runner kills the Job.  The hold is deliberately bounded
+     * so a faulty acceptance run cannot leave a child forever. */
+    Sleep(hold ? 30000 : 2500);
     if (!write_marker(root, L"grandchild-finished", "grandchild-finished\n")) {
         return 34;
     }
     return 0;
 }
 
-static int run_leader(const wchar_t *root) {
+static int run_leader(const wchar_t *root, int hold) {
     wchar_t module[32768];
     wchar_t command_line[32768];
     size_t command_length = 0;
@@ -171,7 +174,8 @@ static int run_leader(const wchar_t *root) {
         !append_wide(command_line, sizeof(command_line) / sizeof(command_line[0]),
                      &command_length, module) ||
         !append_wide(command_line, sizeof(command_line) / sizeof(command_line[0]),
-                     &command_length, L"\" grandchild \"") ||
+                     &command_length,
+                     hold ? L"\" grandchild-holds \"" : L"\" grandchild \"") ||
         !append_wide(command_line, sizeof(command_line) / sizeof(command_line[0]),
                      &command_length, root) ||
         !append_wide(command_line, sizeof(command_line) / sizeof(command_line[0]),
@@ -192,6 +196,13 @@ static int run_leader(const wchar_t *root) {
     if (!wait_for_markers(root)) {
         return 44;
     }
+    if (hold) {
+        if (!write_marker(root, L"leader-holding", "leader-holding\n")) {
+            return 46;
+        }
+        Sleep(30000);
+        return 23;
+    }
     if (!write_marker(root, L"leader-exiting", "leader-exiting\n")) {
         return 45;
     }
@@ -200,10 +211,16 @@ static int run_leader(const wchar_t *root) {
 
 int wmain(int argc, wchar_t **argv) {
     if (argc == 3 && wcscmp(argv[1], L"grandchild") == 0) {
-        return run_grandchild(argv[2]);
+        return run_grandchild(argv[2], 0);
+    }
+    if (argc == 3 && wcscmp(argv[1], L"grandchild-holds") == 0) {
+        return run_grandchild(argv[2], 1);
     }
     if (argc == 3 && wcscmp(argv[1], L"parent-exit-child-holds") == 0) {
-        return run_leader(argv[2]);
+        return run_leader(argv[2], 0);
+    }
+    if (argc == 3 && wcscmp(argv[1], L"leader-holds-grandchild-holds") == 0) {
+        return run_leader(argv[2], 1);
     }
     return 64;
 }
