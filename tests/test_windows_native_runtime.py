@@ -28,6 +28,7 @@ from neuro_code.application.ports.windows_sandbox import (
 )
 from neuro_code.bootstrap.composition import _default_local_process_sandbox_factory
 from neuro_code.domain.sandbox.models import SandboxProfile
+from neuro_code.domain.terminal.models import TerminalSize
 from neuro_code.infrastructure.sandbox.windows_native_local_process import (
     WindowsNativeLocalProcessSandbox,
     WindowsRuntimeControllerTransport,
@@ -36,6 +37,7 @@ from neuro_code.infrastructure.sandbox.windows_native_local_process import (
     _required_capabilities,
     _validated_child_token_attestation,
     _WindowsNativeOwnedLocalProcess,
+    _WindowsNativePtySession,
 )
 from neuro_code.infrastructure.sandbox.windows_native_runner import (
     _FILE_CREATE_PIPE_INSTANCE,
@@ -44,6 +46,9 @@ from neuro_code.infrastructure.sandbox.windows_native_runner import (
     RunnerLaunch,
     WindowsNamedPipeReader,
     WindowsNamedPipeWriter,
+    _handle_control_eof,
+    _RunnerChild,
+    _valid_console_size,
 )
 from neuro_code.infrastructure.sandbox.windows_native_runtime_protocol import (
     MAX_FRAME_PAYLOAD,
@@ -150,6 +155,7 @@ class WindowsNativeRuntimeProtocolTests(unittest.TestCase):
             RuntimeFrameType.STDERR,
             RuntimeFrameType.EXIT,
             RuntimeFrameType.ERROR,
+            RuntimeFrameType.PTY_OUTPUT,
         ):
             with self.assertRaises(SandboxError):
                 validate_channel_frame(RuntimeChannel.CONTROL, kind)
@@ -158,9 +164,104 @@ class WindowsNativeRuntimeProtocolTests(unittest.TestCase):
             RuntimeFrameType.STDIN,
             RuntimeFrameType.CLOSE_STDIN,
             RuntimeFrameType.TERMINATE,
+            RuntimeFrameType.RESIZE,
         ):
             with self.assertRaises(SandboxError):
                 validate_channel_frame(RuntimeChannel.EVENT, kind)
+
+    def test_pty_frames_keep_directional_binary_contract(self) -> None:
+        resize = encode_json({"version": 1, "columns": 120, "rows": 40})
+        self.assertEqual(
+            RuntimeFrameDecoder().feed(encode_frame(RuntimeFrameType.RESIZE, resize)),
+            (RuntimeFrame(RuntimeFrameType.RESIZE, resize),),
+        )
+        self.assertEqual(
+            RuntimeFrameDecoder().feed(encode_frame(RuntimeFrameType.PTY_OUTPUT, b"raw\x00bytes")),
+            (RuntimeFrame(RuntimeFrameType.PTY_OUTPUT, b"raw\x00bytes"),),
+        )
+
+    def test_pty_dimensions_are_bounded_and_reject_zero_or_bool(self) -> None:
+        self.assertTrue(_valid_console_size(80, 25))
+        self.assertTrue(_valid_console_size(32_767, 32_767))
+        self.assertFalse(_valid_console_size(0, 25))
+        self.assertFalse(_valid_console_size(80, 32_768))
+        self.assertFalse(_valid_console_size(True, 25))
+
+    def test_pty_output_is_raw_and_exit_is_final_event(self) -> None:
+        output: list[bytes] = []
+        eof = []
+        errors: list[BaseException] = []
+        session = _WindowsNativePtySession(
+            transport=WindowsRuntimeControllerTransport(
+                control=_StatePipe(),  # type: ignore[arg-type]
+                events=_StatePipe(),  # type: ignore[arg-type]
+            ),
+            runner=RunnerLaunch(process_handle=1, process_id=42),
+            pid=42,
+            size=TerminalSize(80, 25),
+            on_output=output.append,
+            on_eof=lambda: eof.append(True),
+            on_error=errors.append,
+            decoder=RuntimeFrameDecoder(),
+            initial_frames=(
+                RuntimeFrame(RuntimeFrameType.PTY_OUTPUT, b"raw\x00bytes"),
+                RuntimeFrame(
+                    RuntimeFrameType.EXIT,
+                    encode_json(
+                        {
+                            "returncode": 7,
+                            "termination_observation": {
+                                "state": "FINAL_CHILD_STILL_ACTIVE",
+                                "unsafe": "must-not-leak",
+                            },
+                        }
+                    ),
+                ),
+                RuntimeFrame(RuntimeFrameType.PTY_OUTPUT, b"after-exit"),
+            ),
+            security_attestation={},
+        )
+        self.assertTrue(session._done.wait(2.0))
+        self.assertEqual(output, [b"raw\x00bytes"])
+        self.assertEqual(eof, [True])
+        self.assertEqual(errors, [])
+        self.assertEqual(session.poll_exit(), 7)
+        self.assertEqual(session.diagnostic_snapshot()["runner_state"], "NOT_OBSERVED")
+        self.assertFalse(session.diagnostic_snapshot()["runner_forced_termination"])
+        self.assertFalse(session.diagnostic_snapshot()["controller_forced_runner_termination"])
+        self.assertEqual(
+            session.diagnostic_snapshot()["termination_observation"],
+            {"state": "FINAL_CHILD_STILL_ACTIVE"},
+        )
+        session.close()
+        session.close()
+
+    def test_pty_event_failure_calls_error_once_and_close_is_idempotent(self) -> None:
+        eof: list[bool] = []
+        errors: list[BaseException] = []
+        session = _WindowsNativePtySession(
+            transport=WindowsRuntimeControllerTransport(
+                control=_StatePipe(),  # type: ignore[arg-type]
+                events=_StatePipe(),  # type: ignore[arg-type]
+            ),
+            runner=RunnerLaunch(process_handle=1, process_id=43),
+            pid=43,
+            size=TerminalSize(80, 25),
+            on_output=lambda _data: None,
+            on_eof=lambda: eof.append(True),
+            on_error=errors.append,
+            decoder=RuntimeFrameDecoder(),
+            initial_frames=(),
+            security_attestation={},
+        )
+        self.assertTrue(session._done.wait(2.0))
+        self.assertEqual(eof, [])
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], SandboxError)
+        self.assertIsNone(session.poll_exit())
+        self.assertFalse(session.diagnostic_snapshot()["controller_forced_runner_termination"])
+        session.close()
+        session.close()
 
     def test_large_stdin_frame_is_binary_safe(self) -> None:
         payload = b"\x00\xff" * 40_000
@@ -240,6 +341,87 @@ class _StatePipe:
 
     def observe_process(self, *_args: object, **_kwargs: object) -> dict[str, object]:
         return {"state": "RUNNER_EXITED"}
+
+
+class _FakeRunnerChildForControlEof:
+    def __init__(self, *, exit_sent: bool, owned_scope_quiesced: bool) -> None:
+        self.exit_sent = exit_sent
+        self.owned_scope_quiesced = owned_scope_quiesced
+        self.event_failed = False
+        self.fail_closed_calls = 0
+
+    def wait_for_exit_sent(self, _timeout_seconds: float) -> bool:
+        raise AssertionError("control EOF must not use a time-based grace period")
+
+    def fail_closed(self) -> None:
+        self.fail_closed_calls += 1
+
+
+class _FakeJobActiveProcessState:
+    def __init__(self, active_processes: int) -> None:
+        self.active_processes = active_processes
+
+
+class WindowsRunnerControlEofStateTests(unittest.TestCase):
+    def test_final_exit_sent_makes_eof_harmless(self) -> None:
+        child = _FakeRunnerChildForControlEof(
+            exit_sent=True,
+            owned_scope_quiesced=False,
+        )
+
+        self.assertTrue(_handle_control_eof(child))  # type: ignore[arg-type]
+        self.assertEqual(child.fail_closed_calls, 0)
+
+    def test_quiesced_owned_scope_makes_eof_harmless(self) -> None:
+        child = _FakeRunnerChildForControlEof(
+            exit_sent=False,
+            owned_scope_quiesced=True,
+        )
+
+        self.assertTrue(_handle_control_eof(child))  # type: ignore[arg-type]
+        self.assertEqual(child.fail_closed_calls, 0)
+
+    def test_active_owned_scope_fails_closed_without_waiting(self) -> None:
+        child = _FakeRunnerChildForControlEof(
+            exit_sent=False,
+            owned_scope_quiesced=False,
+        )
+
+        self.assertFalse(_handle_control_eof(child))  # type: ignore[arg-type]
+        self.assertEqual(child.fail_closed_calls, 1)
+
+    def test_direct_child_exit_does_not_prove_scope_quiescence(self) -> None:
+        # The leader has exited, but an owned descendant remains active.  The
+        # actual runner property must keep the quiesced event unset until the
+        # Job reports zero ActiveProcesses.
+        child = object.__new__(_RunnerChild)
+        child._direct_child_exited = threading.Event()
+        child._direct_child_exited.set()
+        child._owned_scope_quiesced = threading.Event()
+        child._job = _FakeJobActiveProcessState(1)  # type: ignore[assignment]
+
+        self.assertFalse(child.owned_scope_quiesced)
+        self.assertFalse(child._owned_scope_quiesced.is_set())
+
+    def test_job_empty_sets_scope_quiesced_event(self) -> None:
+        child = object.__new__(_RunnerChild)
+        child._direct_child_exited = threading.Event()
+        child._direct_child_exited.set()
+        child._owned_scope_quiesced = threading.Event()
+        child._job = _FakeJobActiveProcessState(0)  # type: ignore[assignment]
+
+        self.assertTrue(child.owned_scope_quiesced)
+        self.assertTrue(child._owned_scope_quiesced.is_set())
+
+    def test_event_failure_is_not_hidden_by_quiesced_scope(self) -> None:
+        child = _FakeRunnerChildForControlEof(
+            exit_sent=False,
+            owned_scope_quiesced=True,
+        )
+        child.event_failed = True
+
+        self.assertFalse(_handle_control_eof(child))  # type: ignore[arg-type]
+        self.assertEqual(child.fail_closed_calls, 1)
 
 
 class WindowsNativeDirectionalTransportTests(unittest.TestCase):
@@ -557,7 +739,7 @@ class WindowsNativeRuntimeContractTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(SandboxError, "unexpected restricting SID set"):
             _validated_child_token_attestation(payload, expected_write_sid=expected)
 
-    def test_runtime_advertises_candidate_capabilities_for_native_acceptance(self) -> None:
+    def test_runtime_advertises_w3_capabilities_for_native_acceptance(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "workspace"
             root.mkdir()
@@ -590,24 +772,92 @@ class WindowsNativeRuntimeContractTests(unittest.IsolatedAsyncioTestCase):
                         )
                     )
 
-    def test_setup_not_ready_fails_before_identity_or_runner(self) -> None:
+    def test_public_spawn_terminal_uses_the_single_production_implementation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "workspace"
             root.mkdir()
-            provider = _IdentityProvider()
-            launcher = mock.Mock()
             adapter = WindowsNativeLocalProcessSandbox(
                 SandboxProfile.WORKSPACE,
                 root,
                 Path(directory) / "state",
-                setup_authority=_ReadySetupAuthority(WindowsSandboxSetupState.NEEDS_REPAIR),
-                identity_provider=provider,
+            )
+            session = object()
+            with mock.patch.object(adapter, "_spawn_terminal", return_value=session) as spawn:
+                result = adapter.spawn_terminal(
+                    _request(
+                        root,
+                        purpose=LocalProcessPurpose.INTERACTIVE_TERMINAL,
+                        stdio=LocalProcessStdioMode.PTY,
+                    ),
+                    size=TerminalSize(80, 25),
+                    on_output=lambda _data: None,
+                    on_eof=lambda: None,
+                    on_error=lambda _error: None,
+                )
+            self.assertIs(result, session)
+            spawn.assert_called_once()
+
+    def test_public_strict_spawn_terminal_fails_closed_before_runner(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "workspace"
+            root.mkdir()
+            launcher = mock.Mock()
+            adapter = WindowsNativeLocalProcessSandbox(
+                SandboxProfile.STRICT,
+                root,
+                Path(directory) / "state",
+                setup_authority=_ReadySetupAuthority(WindowsSandboxSetupState.READY),
                 runner_launcher=launcher,
             )
             with mock.patch.object(os, "name", "nt"), self.assertRaises(SandboxError):
-                adapter._validate(_request(root))
-            self.assertEqual(provider.kinds, [])
+                adapter.spawn_terminal(
+                    _request(
+                        root,
+                        profile=SandboxProfile.STRICT,
+                        purpose=LocalProcessPurpose.INTERACTIVE_TERMINAL,
+                        stdio=LocalProcessStdioMode.PTY,
+                        network=LocalProcessNetworkPolicy.ISOLATED,
+                    ),
+                    size=TerminalSize(80, 25),
+                    on_output=lambda _data: None,
+                    on_eof=lambda: None,
+                    on_error=lambda _error: None,
+                )
             launcher.assert_not_called()
+
+    def test_setup_not_ready_fails_before_identity_or_runner(self) -> None:
+        for state in (
+            WindowsSandboxSetupState.NEEDS_SETUP,
+            WindowsSandboxSetupState.NEEDS_REPAIR,
+            WindowsSandboxSetupState.UNSUPPORTED,
+        ):
+            with self.subTest(state=state), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory) / "workspace"
+                root.mkdir()
+                provider = _IdentityProvider()
+                launcher = mock.Mock()
+                adapter = WindowsNativeLocalProcessSandbox(
+                    SandboxProfile.WORKSPACE,
+                    root,
+                    Path(directory) / "state",
+                    setup_authority=_ReadySetupAuthority(state),
+                    identity_provider=provider,
+                    runner_launcher=launcher,
+                )
+                with mock.patch.object(os, "name", "nt"), self.assertRaises(SandboxError):
+                    adapter.spawn_terminal(
+                        _request(
+                            root,
+                            purpose=LocalProcessPurpose.INTERACTIVE_TERMINAL,
+                            stdio=LocalProcessStdioMode.PTY,
+                        ),
+                        size=TerminalSize(80, 25),
+                        on_output=lambda _data: None,
+                        on_eof=lambda: None,
+                        on_error=lambda _error: None,
+                    )
+                self.assertEqual(provider.kinds, [])
+                launcher.assert_not_called()
 
     def test_strict_fails_closed_because_read_is_limited(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

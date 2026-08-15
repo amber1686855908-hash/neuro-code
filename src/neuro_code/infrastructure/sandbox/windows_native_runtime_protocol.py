@@ -32,6 +32,8 @@ class RuntimeFrameType(IntEnum):
     TERMINATE = 7
     EXIT = 8
     ERROR = 9
+    PTY_OUTPUT = 10
+    RESIZE = 11
 
 
 class RuntimeChannel(StrEnum):
@@ -47,6 +49,7 @@ _CONTROL_FRAME_TYPES = frozenset(
         RuntimeFrameType.STDIN,
         RuntimeFrameType.CLOSE_STDIN,
         RuntimeFrameType.TERMINATE,
+        RuntimeFrameType.RESIZE,
     }
 )
 _EVENT_FRAME_TYPES = frozenset(
@@ -56,6 +59,7 @@ _EVENT_FRAME_TYPES = frozenset(
         RuntimeFrameType.STDERR,
         RuntimeFrameType.EXIT,
         RuntimeFrameType.ERROR,
+        RuntimeFrameType.PTY_OUTPUT,
     }
 )
 

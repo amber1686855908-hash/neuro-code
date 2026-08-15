@@ -272,6 +272,112 @@ jobs:
             throw "Windows W3 native acceptance did not execute every test"
           }
 
+  windows-native-sandbox-pty:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    env:
+      NEURO_CODE_RUN_NATIVE_WINDOWS_SANDBOX_ACCEPTANCE: "1"
+    steps:
+      - uses: actions/checkout@v7.0.0
+      - uses: astral-sh/setup-uv@v8.3.2
+        with:
+          version: "0.11.29"
+          python-version: "3.12"
+          enable-cache: true
+      - run: uv sync --extra dev --locked
+      - name: Prove W4 Gate 1 restricted ConPTY evidence
+        run: >-
+          uv run pytest
+          tests/security/test_windows_native_pty_acceptance.py
+          -k "gate1 or malformed_resize"
+          -q -rs -s
+          --junitxml=${{ runner.temp }}/neuro-code-windows-native-pty-gate1.xml
+      - name: Require W4 Gate 1 execution
+        shell: pwsh
+        env:
+          W4_JUNIT: ${{ runner.temp }}/neuro-code-windows-native-pty-gate1.xml
+        run: |
+          [xml]$report = Get-Content $env:W4_JUNIT
+          $cases = @($report.testsuites.testsuite.testcase)
+          $skipped = @($cases | Where-Object { $_.skipped }).Count
+          Write-Host "executed=$($cases.Count) skipped=$skipped"
+          if ($cases.Count -ne 3 -or $skipped -ne 0) {
+            throw "Windows W4 Gate 1 did not execute every focused test"
+          }
+      - name: Prove W4 Gate 2 PTY write and network isolation
+        run: >-
+          uv run pytest
+          tests/security/test_windows_native_pty_acceptance.py::WindowsNativePtyAcceptanceTests::test_z_gate2_pty_write_and_network_isolation
+          -q -rs -s
+          --junitxml=${{ runner.temp }}/neuro-code-windows-native-pty-gate2.xml
+      - name: Require W4 Gate 2 execution
+        shell: pwsh
+        env:
+          W4_JUNIT: ${{ runner.temp }}/neuro-code-windows-native-pty-gate2.xml
+        run: |
+          [xml]$report = Get-Content $env:W4_JUNIT
+          $cases = @($report.testsuites.testsuite.testcase)
+          $skipped = @($cases | Where-Object { $_.skipped }).Count
+          Write-Host "executed=$($cases.Count) skipped=$skipped"
+          if ($cases.Count -ne 1 -or $skipped -ne 0) {
+            throw "Windows W4 Gate 2 did not execute"
+          }
+      - name: Prove W4 Gate 3 PTY lifecycle ownership
+        run: >-
+          uv run pytest
+          tests/security/test_windows_native_pty_lifecycle_acceptance.py
+          -q -rs -s
+          --junitxml=${{ runner.temp }}/neuro-code-windows-native-pty-gate3.xml
+      - name: Require W4 Gate 3 execution
+        shell: pwsh
+        env:
+          W4_JUNIT: ${{ runner.temp }}/neuro-code-windows-native-pty-gate3.xml
+        run: |
+          [xml]$report = Get-Content $env:W4_JUNIT
+          $cases = @($report.testsuites.testsuite.testcase)
+          $skipped = @($cases | Where-Object { $_.skipped }).Count
+          Write-Host "executed=$($cases.Count) skipped=$skipped"
+          if ($cases.Count -ne 4 -or $skipped -ne 0) {
+            throw "Windows W4 Gate 3 did not execute every focused test"
+          }
+      - name: Prove W4 Gate 3 controller-loss has no time grace
+        run: >-
+          uv run pytest
+          tests/security/test_windows_native_pty_controller_loss_acceptance.py
+          -q -rs -s
+          --junitxml=${{ runner.temp }}/neuro-code-windows-native-pty-gate3-no-grace.xml
+      - name: Require W4 Gate 3 no-grace execution
+        shell: pwsh
+        env:
+          W4_JUNIT: ${{ runner.temp }}/neuro-code-windows-native-pty-gate3-no-grace.xml
+        run: |
+          [xml]$report = Get-Content $env:W4_JUNIT
+          $cases = @($report.testsuites.testsuite.testcase)
+          $skipped = @($cases | Where-Object { $_.skipped }).Count
+          Write-Host "executed=$($cases.Count) skipped=$skipped"
+          if ($cases.Count -ne 1 -or $skipped -ne 0) {
+            throw "Windows W4 Gate 3 no-grace acceptance did not execute"
+          }
+      - name: Prove W4 Gate 4 public and application routing
+        run: >-
+          uv run pytest
+          tests/security/test_windows_native_pty_acceptance.py
+          -k "gate4"
+          -q -rs -s
+          --junitxml=${{ runner.temp }}/neuro-code-windows-native-pty-gate4.xml
+      - name: Require W4 Gate 4 execution
+        shell: pwsh
+        env:
+          W4_JUNIT: ${{ runner.temp }}/neuro-code-windows-native-pty-gate4.xml
+        run: |
+          [xml]$report = Get-Content $env:W4_JUNIT
+          $cases = @($report.testsuites.testsuite.testcase)
+          $skipped = @($cases | Where-Object { $_.skipped }).Count
+          Write-Host "executed=$($cases.Count) skipped=$skipped"
+          if ($cases.Count -ne 3 -or $skipped -ne 0) {
+            throw "Windows W4 Gate 4 did not execute every focused test"
+          }
+
   quality:
     runs-on: ubuntu-latest
     steps:
