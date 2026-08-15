@@ -226,12 +226,13 @@ class WindowsNativePtyAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                 )
 
                 async def wait_for(marker: bytes, timeout: float = 8.0) -> bool:  # noqa: ASYNC109
+                    needle = marker.rstrip(b"\n")
                     deadline = asyncio.get_running_loop().time() + timeout
-                    while marker not in output and asyncio.get_running_loop().time() < deadline:
+                    while needle not in output and asyncio.get_running_loop().time() < deadline:
                         with contextlib.suppress(TimeoutError):
                             await asyncio.wait_for(output_changed.wait(), timeout=0.25)
                         output_changed.clear()
-                    return marker in output
+                    return needle in output
 
                 ready = await wait_for(b"W4_READY\n")
                 if not ready:
