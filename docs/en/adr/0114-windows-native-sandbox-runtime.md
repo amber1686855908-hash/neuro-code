@@ -1,6 +1,6 @@
 # ADR 0114: Windows native non-PTY sandbox runtime
 
-- Status: W3 implementation; focused native acceptance complete; full CI pending
+- Status: Accepted; W3 merged after focused native acceptance and full CI
 - Date: 2026-08-14
 - Scope: Windows enabled profiles for BASH, background Bash, and MCP stdio
 
@@ -93,4 +93,4 @@ seven tests executed, zero skipped. The evidence covers:
 Restricted Python startup, restricted NUL write, and restricted curl behavior
 remain W5 compatibility seams, not security-isolation failures. Git, Python,
 Node, and general developer workloads are not compatibility-certified by W3.
-Full PR CI is the final merge-readiness certification step for this PR.
+Full PR CI passed and completed this PR's merge-readiness certification.
