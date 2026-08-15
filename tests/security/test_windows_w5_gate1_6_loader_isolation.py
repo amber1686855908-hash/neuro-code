@@ -315,17 +315,23 @@ def _static_classification(definition: _ProbeDefinition, matrix: dict[str, objec
 
 
 def _production_source_diff() -> tuple[str, ...]:
-    result = subprocess.run(
-        ["git", "diff", "--name-only", f"{_BASE}...HEAD", "--", "src/neuro_code"],
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=30,
-        shell=False,
-    )
-    if result.returncode != 0:
-        raise _Gate16ProbeBuildError("could not inspect production source diff")
-    return tuple(line.strip() for line in result.stdout.splitlines() if line.strip())
+    for revision in (f"{_BASE}...HEAD", "HEAD^1"):
+        command = (
+            ["git", "diff", "--name-only", revision, "--", "src/neuro_code"]
+            if "..." in revision
+            else ["git", "diff", "--name-only", revision, "HEAD", "--", "src/neuro_code"]
+        )
+        result = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            shell=False,
+        )
+        if result.returncode == 0:
+            return tuple(line.strip() for line in result.stdout.splitlines() if line.strip())
+    raise _Gate16ProbeBuildError("could not inspect production source diff")
 
 
 def _write_artifact(path: str | None, payload: dict[str, object]) -> None:
