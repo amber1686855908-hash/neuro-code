@@ -240,6 +240,8 @@ class WindowsNativePtyAcceptanceTests(unittest.IsolatedAsyncioTestCase):
 
     @classmethod
     def setUpClass(cls) -> None:  # pragma: no cover - Windows CI
+        if os.environ.get("NEURO_CODE_RUN_NATIVE_WINDOWS_SANDBOX_ACCEPTANCE") != "1":
+            raise unittest.SkipTest("W4 native acceptance is CI-only")
         if os.name != "nt":
             raise unittest.SkipTest("W4 native acceptance requires Windows")
         privilege_api = _NativeWindowsSetupPrivilegeApi()
