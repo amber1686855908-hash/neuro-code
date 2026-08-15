@@ -233,7 +233,24 @@ class WindowsNativePtyAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                         output_changed.clear()
                     return marker in output
 
-                self.assertTrue(await wait_for(b"W4_READY\n"))
+                ready = await wait_for(b"W4_READY\n")
+                if not ready:
+                    print(
+                        "W4_GATE1_BLOCKER="
+                        + json.dumps(
+                            {
+                                "classification": "PTY_CHILD_OUTPUT_STARTUP_BLOCKER",
+                                "mode": "offline" if offline else "online",
+                                "child_exit": session.poll_exit(),
+                                "output_bytes": len(output),
+                                "output_preview": bytes(output[:128]).hex(),
+                                "error_types": [type(error).__name__ for error in errors],
+                            },
+                            sort_keys=True,
+                        ),
+                        flush=True,
+                    )
+                self.assertTrue(ready)
                 self.assertTrue(await wait_for(b"W4_SIZE=80x25\n"))
                 await asyncio.to_thread(session.write, b"w4-input-token\n")
                 self.assertTrue(await wait_for(b"W4_INPUT=w4-input-token\n"))
