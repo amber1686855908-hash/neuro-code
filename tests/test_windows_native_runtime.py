@@ -213,6 +213,8 @@ class WindowsNativeRuntimeProtocolTests(unittest.TestCase):
         self.assertEqual(eof, [True])
         self.assertEqual(errors, [])
         self.assertEqual(session.poll_exit(), 7)
+        self.assertEqual(session.diagnostic_snapshot()["runner_state"], "NOT_OBSERVED")
+        self.assertFalse(session.diagnostic_snapshot()["runner_forced_termination"])
 
     def test_large_stdin_frame_is_binary_safe(self) -> None:
         payload = b"\x00\xff" * 40_000

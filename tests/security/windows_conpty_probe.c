@@ -50,6 +50,37 @@ static int write_size(void) {
     return write_text("\n");
 }
 
+static int valid_handle(HANDLE handle) {
+    return handle != NULL && handle != INVALID_HANDLE_VALUE;
+}
+
+static int supports_console_api(HANDLE handle) {
+    DWORD mode = 0;
+    return valid_handle(handle) && GetConsoleMode(handle, &mode);
+}
+
+static int write_handle_observation(void) {
+    HANDLE input = input_handle();
+    HANDLE output = output_handle();
+    HANDLE error = GetStdHandle(STD_ERROR_HANDLE);
+    if (!valid_handle(input) || !valid_handle(output) || !valid_handle(error)) {
+        return 0;
+    }
+    if (!write_text("W4_HANDLES=CONPTY;stdin-valid=1;stdout-valid=1;stderr-valid=1;")) {
+        return 0;
+    }
+    if (!write_text(supports_console_api(input) ? "stdin-console=1;" : "stdin-console=0;")) {
+        return 0;
+    }
+    if (!write_text(supports_console_api(output) ? "stdout-console=1;" : "stdout-console=0;")) {
+        return 0;
+    }
+    if (!write_text(supports_console_api(error) ? "stderr-console=1\n" : "stderr-console=0\n")) {
+        return 0;
+    }
+    return 1;
+}
+
 static int read_line(char *buffer, DWORD capacity) {
     DWORD used = 0;
     while (used + 1U < capacity) {
@@ -74,7 +105,7 @@ int main(void) {
         mode &= ~(ENABLE_ECHO_INPUT | ENABLE_LINE_INPUT);
         (void)SetConsoleMode(input_handle(), mode);
     }
-    if (!write_text("W4_READY\n") || !write_size()) {
+    if (!write_handle_observation() || !write_text("W4_READY\n") || !write_size()) {
         return 91;
     }
 

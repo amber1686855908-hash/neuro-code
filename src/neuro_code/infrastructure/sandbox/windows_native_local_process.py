@@ -907,6 +907,7 @@ class _WindowsNativePtySession:
         self._done = threading.Event()
         self._closed = False
         self._eof_sent = False
+        self._diagnostic: dict[str, object] | None = None
         self._write_lock = threading.Lock()
         self._reader = threading.Thread(
             target=self._read_frames,
@@ -955,20 +956,65 @@ class _WindowsNativePtySession:
             self._closed = True
             self._control.close()
             wait_runner = getattr(self._events, "wait_process", None)
+            runner_result: dict[str, object] = {"state": "NOT_OBSERVED"}
+            runner_wait_error: str | None = None
+            runner_forced_termination = False
             if callable(wait_runner) and os.name == "nt":
-                with contextlib.suppress(BaseException):
+                try:
                     result = wait_runner(
                         self._runner.process_handle,
                         timeout_seconds=2.0,
                         active_state="RUNNER_STILL_ACTIVE",
                         exited_state="RUNNER_EXITED",
                     )
+                    if isinstance(result, dict):
+                        runner_result = {
+                            key: value
+                            for key, value in result.items()
+                            if key in {"state", "exit_code", "wait_error"}
+                        }
                     if result.get("state") == "RUNNER_STILL_ACTIVE":
+                        runner_forced_termination = True
                         _terminate_runner_process(self._runner.process_handle)
+                        result = wait_runner(
+                            self._runner.process_handle,
+                            timeout_seconds=1.0,
+                            active_state="RUNNER_STILL_ACTIVE",
+                            exited_state="RUNNER_EXITED",
+                        )
+                        if isinstance(result, dict):
+                            runner_result = {
+                                key: value
+                                for key, value in result.items()
+                                if key in {"state", "exit_code", "wait_error"}
+                            }
+                except BaseException as error:
+                    runner_wait_error = type(error).__name__
+                    runner_result = {"state": "WAIT_FAILED"}
+            self._diagnostic = {
+                "runner": runner_result,
+                "runner_state": runner_result.get("state"),
+                "runner_exit_code": runner_result.get("exit_code"),
+                "runner_forced_termination": runner_forced_termination,
+                "runner_wait_error": runner_wait_error,
+                "security_attestation": dict(self._security_attestation),
+            }
             self._events.close()
             with contextlib.suppress(BaseException):
                 close_runner_process(self._runner.process_handle)
             self._done.set()
+
+    def diagnostic_snapshot(self) -> dict[str, object]:
+        """Return bounded PTY lifecycle evidence for focused native acceptance."""
+
+        diagnostic = dict(self._diagnostic or {})
+        diagnostic.setdefault("runner_state", None)
+        diagnostic.setdefault("runner_exit_code", None)
+        diagnostic.setdefault("runner_forced_termination", False)
+        diagnostic.setdefault("runner_wait_error", None)
+        diagnostic["child_exit_code"] = self._returncode
+        diagnostic["security_attestation"] = dict(self._security_attestation)
+        return diagnostic
 
     def _handle_frame(self, frame: RuntimeFrame) -> None:
         if frame.kind is RuntimeFrameType.PTY_OUTPUT:
@@ -1045,6 +1091,11 @@ class _WindowsNativePtySession:
                 self._control.close()
                 self._events.close()
                 self._done.wait(2.0)
+        else:
+            # The reader marks the session closed before it performs the
+            # bounded runner wait.  Give that cleanup a chance to publish the
+            # natural-exit diagnostic before returning to an acceptance caller.
+            self._done.wait(3.0)
         self._reader.join(timeout=1.0)
 
 

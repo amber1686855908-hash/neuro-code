@@ -25,7 +25,10 @@ from neuro_code.application.ports.sandbox import (
     LocalWorkspaceAccessMode,
     SandboxedProcessRequest,
 )
-from neuro_code.application.ports.windows_sandbox import WindowsSandboxSetupRequest
+from neuro_code.application.ports.windows_sandbox import (
+    WindowsSandboxSetupRequest,
+    WindowsSandboxSetupState,
+)
 from neuro_code.domain.sandbox.models import SandboxProfile
 from neuro_code.domain.terminal.models import TerminalSize
 from neuro_code.infrastructure.sandbox.windows_native_local_process import (
@@ -38,15 +41,22 @@ from neuro_code.infrastructure.sandbox.windows_native_runtime_protocol import (
     encode_json,
 )
 from neuro_code.infrastructure.sandbox.windows_sandbox_accounts import (
+    WindowsAccountSid,
     _NativeWindowsSandboxAccountApi,
 )
-from neuro_code.infrastructure.sandbox.windows_sandbox_acl import _NativeWindowsAclApi
+from neuro_code.infrastructure.sandbox.windows_sandbox_acl import (
+    WRITE_ACCESS_MASK,
+    WindowsManagedAce,
+    WindowsManagedAceKind,
+    _NativeWindowsAclApi,
+)
 from neuro_code.infrastructure.sandbox.windows_sandbox_firewall import _NativeWindowsFirewallApi
 from neuro_code.infrastructure.sandbox.windows_sandbox_persistence import (
     WindowsDpapiCredentialStore,
 )
 from neuro_code.infrastructure.sandbox.windows_sandbox_setup import (
     WindowsNativeSandboxSetupAuthority,
+    _InstallationRecord,
     _NativeWindowsSetupPrivilegeApi,
 )
 
@@ -55,10 +65,14 @@ class _NativeProbeBuildError(RuntimeError):
     pass
 
 
-def _compile_probe() -> Path:  # pragma: no cover - Windows CI
-    source = Path(__file__).with_name("windows_conpty_probe.c").resolve(strict=False)
+def _compile_msvc_probe(
+    source: Path,
+    stem: str,
+    *,
+    libraries: tuple[str, ...] = (),
+) -> Path:  # pragma: no cover - Windows CI
     if not source.is_file():
-        raise _NativeProbeBuildError("ConPTY probe source is unavailable")
+        raise _NativeProbeBuildError(f"{stem} probe source is unavailable")
     vswhere = shutil.which("vswhere.exe")
     if vswhere is None:
         program_files_x86 = os.environ.get("PROGRAMFILES(X86)")
@@ -99,14 +113,16 @@ def _compile_probe() -> Path:  # pragma: no cover - Windows CI
     if not vcvars.is_file():
         raise _NativeProbeBuildError("vcvars64.bat is unavailable")
     runner_temp = Path(os.environ.get("RUNNER_TEMP", gettempdir()))
-    build_dir = Path(mkdtemp(prefix="neuro-code-w4-", dir=runner_temp))
-    output = build_dir / "windows_conpty_probe.exe"
+    build_dir = Path(mkdtemp(prefix=f"neuro-code-{stem}-", dir=runner_temp))
+    output = build_dir / f"{stem}.exe"
     command = build_dir / "build_probe.cmd"
     command.write_text(
         "@echo off\r\n"
         f'call "{vcvars}"\r\n'
         "if errorlevel 1 exit /b 1\r\n"
-        f'cl /nologo /W4 /WX /MT /O2 /Fe:"{output}" "{source}"\r\n',
+        f'cl /nologo /W4 /WX /MT /O2 /Fe:"{output}" "{source}"'
+        + (" " + " ".join(libraries) if libraries else "")
+        + "\r\n",
         encoding="ascii",
     )
     build = subprocess.run(
@@ -125,10 +141,83 @@ def _compile_probe() -> Path:  # pragma: no cover - Windows CI
     return output
 
 
+def _compile_probe() -> Path:  # pragma: no cover - Windows CI
+    return _compile_msvc_probe(
+        Path(__file__).with_name("windows_conpty_probe.c").resolve(strict=False),
+        "windows_conpty_probe",
+    )
+
+
+def _compile_security_probe() -> Path:  # pragma: no cover - Windows CI
+    return _compile_msvc_probe(
+        Path(__file__).with_name("windows_conpty_security_probe.c").resolve(strict=False),
+        "windows_conpty_security_probe",
+    )
+
+
+def _compile_winsock_probe() -> Path:  # pragma: no cover - Windows CI
+    return _compile_msvc_probe(
+        Path(__file__).with_name("windows_winsock_probe.c").resolve(strict=False),
+        "windows_winsock_probe",
+        libraries=("Ws2_32.lib",),
+    )
+
+
+def _parse_pty_winsock_result(value: str) -> dict[str, object]:
+    """Parse the existing Winsock probe through ConPTY line decoration."""
+
+    marker = "W3_WINSOCK="
+    position = value.find(marker)
+    if position < 0:
+        raise AssertionError("Winsock probe omitted W3_WINSOCK marker")
+    line = value[position + len(marker) :].splitlines()[0].strip()
+    payload = json.loads(line)
+    if not isinstance(payload, dict):
+        raise AssertionError("Winsock probe JSON is not an object")
+    if payload.get("stage") not in {"WSA_STARTUP", "SOCKET", "CONNECT"}:
+        raise AssertionError("Winsock probe emitted an invalid stage")
+    if type(payload.get("connected")) is not bool:
+        raise AssertionError("Winsock probe emitted invalid connected fact")
+    if type(payload.get("wsa_error")) is not int or payload["wsa_error"] < 0:
+        raise AssertionError("Winsock probe emitted invalid WSA error")
+    return {
+        "stage": payload["stage"],
+        "connected": payload["connected"],
+        "wsa_error": payload["wsa_error"],
+    }
+
+
 def _request(workspace: Path, *, offline: bool, probe: Path) -> SandboxedProcessRequest:
     return SandboxedProcessRequest.exec(
         str(probe),
         (),
+        purpose=LocalProcessPurpose.INTERACTIVE_TERMINAL,
+        cwd=workspace,
+        sandbox_profile=SandboxProfile.WORKSPACE,
+        filesystem_policy=LocalProcessFilesystemPolicy(
+            (LocalWorkspaceAccess(workspace, LocalWorkspaceAccessMode.READ_WRITE),)
+        ),
+        network_policy=(
+            LocalProcessNetworkPolicy.ISOLATED if offline else LocalProcessNetworkPolicy.INHERIT
+        ),
+        environment_policy=LocalProcessEnvironmentPolicy({}),
+        stdio_mode=LocalProcessStdioMode.PTY,
+        lifecycle=LocalProcessLifecycle(
+            required_capability=LocalProcessLifecycleCapability.STRONG_DESCENDANT_OWNERSHIP
+        ),
+    )
+
+
+def _pty_security_request(
+    workspace: Path,
+    *,
+    offline: bool,
+    probe: Path,
+    arguments: tuple[str, ...],
+) -> SandboxedProcessRequest:
+    return SandboxedProcessRequest.exec(
+        str(probe),
+        arguments,
         purpose=LocalProcessPurpose.INTERACTIVE_TERMINAL,
         cwd=workspace,
         sandbox_profile=SandboxProfile.WORKSPACE,
@@ -252,6 +341,13 @@ class WindowsNativePtyAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                         flush=True,
                     )
                 self.assertTrue(ready)
+                self.assertTrue(await wait_for(b"W4_HANDLES=CONPTY;"))
+                handle_observation = bytes(output).split(b"W4_HANDLES=", 1)[1].split(b"\n", 1)[0]
+                self.assertIn(b"stdin-valid=1", handle_observation)
+                self.assertIn(b"stdout-valid=1", handle_observation)
+                self.assertIn(b"stderr-valid=1", handle_observation)
+                self.assertIn(b"stdin-console=1", handle_observation)
+                self.assertIn(b"stdout-console=1", handle_observation)
                 self.assertTrue(await wait_for(b"W4_SIZE=80x25\n"))
                 await asyncio.to_thread(session.write, b"w4-input-token\r")
                 self.assertTrue(await wait_for(b"W4_INPUT=w4-input-token\n"))
@@ -267,6 +363,11 @@ class WindowsNativePtyAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                     await asyncio.sleep(0.02)
                 self.assertEqual(session.poll_exit(), 7)
                 self.assertEqual(errors, [])
+                await asyncio.to_thread(session.close)
+                diagnostic = cast(Any, session).diagnostic_snapshot()
+                self.assertEqual(diagnostic.get("runner_state"), "RUNNER_EXITED")
+                self.assertEqual(diagnostic.get("runner_exit_code"), 0)
+                self.assertFalse(diagnostic.get("runner_forced_termination"))
                 return {
                     "mode": "offline" if offline else "online",
                     "create_process_with_logon": "PASS",
@@ -282,6 +383,13 @@ class WindowsNativePtyAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                     "exit_code": session.poll_exit(),
                     "lifecycle": session.lifecycle_capability.value,
                     "runner": "PASS",
+                    "runner_state": diagnostic.get("runner_state"),
+                    "runner_exit_code": diagnostic.get("runner_exit_code"),
+                    "runner_forced_termination": diagnostic.get("runner_forced_termination"),
+                    "stdio_contract": "CONPTY",
+                    "bInheritHandles": False,
+                    "HANDLE_LIST": "absent",
+                    "conpty_std_handles": handle_observation.decode("ascii", errors="replace"),
                 }
             finally:
                 if session is not None:
@@ -296,6 +404,427 @@ class WindowsNativePtyAcceptanceTests(unittest.IsolatedAsyncioTestCase):
     async def test_offline_restricted_conpty_gate1(self) -> None:  # pragma: no cover - Windows CI
         result = await self._run_gate1(offline=True)
         print("W4_GATE1_OFFLINE=" + json.dumps(result, sort_keys=True), flush=True)
+
+    async def test_z_gate2_pty_write_and_network_isolation(
+        self,
+    ) -> None:  # pragma: no cover - Windows CI
+        """Re-certify W3 write/network authority through the restricted PTY child."""
+
+        privilege_api = _NativeWindowsSetupPrivilegeApi()
+        self.assertTrue(privilege_api.is_administrator(), "W2 setup acceptance requires elevation")
+        security_probe = await asyncio.to_thread(_compile_security_probe)
+        winsock_probe = await asyncio.to_thread(_compile_winsock_probe)
+        self.addAsyncCleanup(
+            lambda: asyncio.to_thread(shutil.rmtree, security_probe.parent, ignore_errors=True)
+        )
+        self.addAsyncCleanup(
+            lambda: asyncio.to_thread(shutil.rmtree, winsock_probe.parent, ignore_errors=True)
+        )
+
+        class RecordingFirewall:
+            def __init__(self) -> None:
+                self.delegate = _NativeWindowsFirewallApi()
+                self.calls: list[str] = []
+
+            def ensure_outbound_block(self, rule: object) -> None:
+                self.calls.append("ENSURE")
+                self.delegate.ensure_outbound_block(rule)  # type: ignore[arg-type]
+
+            def remove_rule(self, rule: object) -> None:
+                self.calls.append("REMOVE")
+                self.delegate.remove_rule(rule)  # type: ignore[arg-type]
+
+            def rule_exists(self, rule: object) -> bool:
+                self.calls.append("INSPECT")
+                return self.delegate.rule_exists(rule)  # type: ignore[arg-type]
+
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace = root / "workspace"
+            readonly_root = root / "readonly"
+            installation = root / "installation"
+            outside = root / "outside-broad-write"
+            runtime_state = root / "runtime-state"
+            for path in (workspace, readonly_root, installation, outside, runtime_state):
+                path.mkdir()
+            security_executable = workspace / "windows-conpty-security-probe.exe"
+            winsock_executable = workspace / "windows-winsock-probe.exe"
+            shutil.copy2(security_probe, security_executable)
+            shutil.copy2(winsock_probe, winsock_executable)
+            readonly_file = readonly_root / "readonly.txt"
+            private_file = installation / "private.txt"
+            readonly_file.write_text("W4_READONLY_SENTINEL", encoding="utf-8")
+            private_file.write_text("W4_PRIVATE_SENTINEL", encoding="utf-8")
+            setup_request = WindowsSandboxSetupRequest(
+                installation_root=installation,
+                read_roots=(workspace, readonly_root),
+                writable_roots=(workspace,),
+                sensitive_read_paths=(),
+            )
+            acl_api = _NativeWindowsAclApi()
+            firewall = RecordingFirewall()
+            authority = WindowsNativeSandboxSetupAuthority(
+                credential_store=WindowsDpapiCredentialStore(installation / "credentials.dpapi"),
+                acl_api=acl_api,
+                firewall_api=firewall,
+                account_api=_NativeWindowsSandboxAccountApi(),
+                privilege_api=privilege_api,
+            )
+            snapshot = await asyncio.to_thread(authority.setup, setup_request)
+            self.assertEqual(snapshot.state, WindowsSandboxSetupState.READY)
+            online_sid = cast(str, snapshot.online_user_sid)
+            offline_sid = cast(str, snapshot.offline_user_sid)
+            write_sid = cast(str, snapshot.write_restricting_sid)
+            encoded = authority._store(setup_request).load()
+            self.assertIsNotNone(encoded)
+            record = _InstallationRecord.decode(cast(bytes, encoded))
+            plan = authority._plan(setup_request, record, authority._store(setup_request).path)
+            grouped_plan: dict[Path, list[object]] = {}
+            for entry in plan.entries:
+                grouped_plan.setdefault(entry.path, []).append(entry)
+
+            def acl_ready_projection() -> tuple[tuple[str, bool], ...]:
+                return tuple(
+                    (str(path), acl_api.matches(path, tuple(entries)))
+                    for path, entries in sorted(grouped_plan.items(), key=lambda item: str(item[0]))
+                )
+
+            acl_before = acl_ready_projection()
+            self.assertTrue(all(ready for _, ready in acl_before))
+            real_firewall = firewall.delegate
+
+            def firewall_checkpoint(label: str) -> None:
+                inspected = authority.inspect(setup_request)
+                self.assertEqual(inspected.state, WindowsSandboxSetupState.READY)
+                self.assertTrue(real_firewall.rule_exists(record.offline_firewall_rule))
+                print(
+                    "W4_GATE2_FIREWALL="
+                    + json.dumps({"label": label, "state": inspected.state.value}, sort_keys=True),
+                    flush=True,
+                )
+
+            async def run_pty(
+                *,
+                identity: str,
+                offline: bool,
+                probe: Path,
+                arguments: tuple[str, ...],
+                label: str,
+            ) -> dict[str, object]:
+                output = bytearray()
+                errors: list[BaseException] = []
+                changed = asyncio.Event()
+                loop = asyncio.get_running_loop()
+                session: Any | None = None
+
+                def on_output(data: bytes) -> None:
+                    output.extend(data[: max(0, (1 << 20) - len(output))])
+                    loop.call_soon_threadsafe(changed.set)
+
+                try:
+                    request = _pty_security_request(
+                        workspace,
+                        offline=offline,
+                        probe=probe,
+                        arguments=arguments,
+                    )
+                    adapter = WindowsNativeLocalProcessSandbox(
+                        SandboxProfile.WORKSPACE,
+                        workspace,
+                        runtime_state,
+                        setup_authority=authority,
+                        setup_request_factory=lambda _request: setup_request,
+                        _diagnostic_desktop_mode=_WindowsNativeDesktopMode.PRIVATE_DESKTOP,
+                        _diagnostic_create_no_window=False,
+                    )
+                    session = await asyncio.to_thread(
+                        adapter._spawn_terminal_candidate,
+                        request,
+                        size=TerminalSize(80, 25),
+                        on_output=on_output,
+                        on_eof=lambda: changed.set(),
+                        on_error=errors.append,
+                    )
+                    deadline = asyncio.get_running_loop().time() + 15.0
+                    while (
+                        session.poll_exit() is None and asyncio.get_running_loop().time() < deadline
+                    ):
+                        with contextlib.suppress(TimeoutError):
+                            await asyncio.wait_for(changed.wait(), timeout=0.25)
+                        changed.clear()
+                    if session.poll_exit() is None:
+                        self.fail(f"{label}: PTY child did not exit")
+                    await asyncio.to_thread(session.close)
+                    diagnostic = session.diagnostic_snapshot()
+                    self.assertEqual(diagnostic.get("runner_state"), "RUNNER_EXITED")
+                    self.assertEqual(diagnostic.get("runner_exit_code"), 0)
+                    self.assertFalse(diagnostic.get("runner_forced_termination"))
+                    self.assertEqual(errors, [])
+                    attestation = diagnostic.get("security_attestation")
+                    expected_sid = online_sid if identity == "ONLINE" else offline_sid
+                    self.assertIsInstance(attestation, dict)
+                    self.assertEqual(attestation.get("user_sid"), expected_sid)
+                    self.assertIs(attestation.get("is_restricted"), True)
+                    self.assertEqual(tuple(attestation.get("restricted_sids", ())), (write_sid,))
+                    self.assertIs(attestation.get("change_notify_privilege_enabled"), True)
+                    self.assertEqual(attestation.get("unexpected_enabled_privilege_count"), 0)
+                    result = {
+                        "label": label,
+                        "identity": identity,
+                        "exit_code": session.poll_exit(),
+                        "actual": "ALLOW" if session.poll_exit() == 0 else "DENY",
+                        "token_user": expected_sid,
+                        "token_attested": True,
+                        "runner_state": diagnostic.get("runner_state"),
+                        "runner_exit_code": diagnostic.get("runner_exit_code"),
+                        "runner_forced_termination": diagnostic.get("runner_forced_termination"),
+                        "stdout_preview": bytes(output[:256]).decode("utf-8", errors="replace"),
+                    }
+                    return result
+                finally:
+                    if session is not None and session.poll_exit() is None:
+                        with contextlib.suppress(BaseException):
+                            await asyncio.to_thread(session.close)
+
+            def require_state(path: Path, *, exists: bool, content: str | None = None) -> None:
+                self.assertEqual(path.exists(), exists)
+                if content is not None:
+                    self.assertEqual(path.read_text(encoding="utf-8"), content)
+
+            try:
+                # Broad normal-user and Everyone write ACEs deliberately omit
+                # the synthetic restricting SID.  The final PTY child must
+                # still fail the WRITE_RESTRICTED second access check.
+                outside_entries = (
+                    WindowsManagedAce(
+                        outside,
+                        WindowsAccountSid(online_sid),
+                        WindowsManagedAceKind.WRITE_ALLOW,
+                        WRITE_ACCESS_MASK,
+                    ),
+                    WindowsManagedAce(
+                        outside,
+                        WindowsAccountSid(offline_sid),
+                        WindowsManagedAceKind.WRITE_ALLOW,
+                        WRITE_ACCESS_MASK,
+                    ),
+                    WindowsManagedAce(
+                        outside,
+                        WindowsAccountSid("S-1-1-0"),
+                        WindowsManagedAceKind.WRITE_ALLOW,
+                        WRITE_ACCESS_MASK,
+                    ),
+                )
+                acl_api.reconcile(outside, desired=outside_entries, remove=())
+                self.assertTrue(acl_api.matches(outside, outside_entries))
+                firewall.calls.clear()
+                firewall_checkpoint("before_filesystem")
+
+                workspace_results: list[dict[str, object]] = []
+                for identity, offline in (("ONLINE", False), ("OFFLINE", True)):
+                    prefix = identity.casefold()
+                    source = workspace / f"{prefix}-write.txt"
+                    renamed = workspace / f"{prefix}-renamed.txt"
+                    result = await run_pty(
+                        identity=identity,
+                        offline=offline,
+                        probe=security_executable,
+                        arguments=("write", str(source)),
+                        label="WORKSPACE_CREATE",
+                    )
+                    self.assertEqual(result["actual"], "ALLOW")
+                    require_state(source, exists=True)
+                    workspace_results.append(result)
+                    result = await run_pty(
+                        identity=identity,
+                        offline=offline,
+                        probe=security_executable,
+                        arguments=("append", str(source)),
+                        label="WORKSPACE_APPEND",
+                    )
+                    self.assertEqual(result["actual"], "ALLOW")
+                    require_state(source, exists=True)
+                    workspace_results.append(result)
+                    result = await run_pty(
+                        identity=identity,
+                        offline=offline,
+                        probe=security_executable,
+                        arguments=("rename", str(source), str(renamed)),
+                        label="WORKSPACE_RENAME",
+                    )
+                    self.assertEqual(result["actual"], "ALLOW")
+                    require_state(source, exists=False)
+                    require_state(renamed, exists=True)
+                    workspace_results.append(result)
+                    result = await run_pty(
+                        identity=identity,
+                        offline=offline,
+                        probe=security_executable,
+                        arguments=("delete", str(renamed)),
+                        label="WORKSPACE_DELETE",
+                    )
+                    self.assertEqual(result["actual"], "ALLOW")
+                    require_state(renamed, exists=False)
+                    workspace_results.append(result)
+
+                    outside_target = outside / f"{prefix}-blocked.txt"
+                    result = await run_pty(
+                        identity=identity,
+                        offline=offline,
+                        probe=security_executable,
+                        arguments=("write", str(outside_target)),
+                        label="OUTSIDE_BROAD_WRITE",
+                    )
+                    self.assertEqual(result["actual"], "DENY")
+                    require_state(outside_target, exists=False)
+                    workspace_results.append(result)
+
+                    readonly_new = readonly_root / f"{prefix}-new.txt"
+                    readonly_renamed = readonly_root / f"{prefix}-renamed.txt"
+                    result = await run_pty(
+                        identity=identity,
+                        offline=offline,
+                        probe=security_executable,
+                        arguments=("read", str(readonly_file)),
+                        label="READ_ONLY_READ",
+                    )
+                    self.assertEqual(result["actual"], "ALLOW")
+                    require_state(readonly_file, exists=True, content="W4_READONLY_SENTINEL")
+                    workspace_results.append(result)
+                    for arguments, label in (
+                        (("write", str(readonly_new)), "READ_ONLY_CREATE"),
+                        (("append", str(readonly_file)), "READ_ONLY_APPEND"),
+                        (
+                            ("rename", str(readonly_file), str(readonly_renamed)),
+                            "READ_ONLY_RENAME",
+                        ),
+                        (("delete", str(readonly_file)), "READ_ONLY_DELETE"),
+                    ):
+                        result = await run_pty(
+                            identity=identity,
+                            offline=offline,
+                            probe=security_executable,
+                            arguments=arguments,
+                            label=label,
+                        )
+                        self.assertEqual(result["actual"], "DENY")
+                        require_state(readonly_file, exists=True, content="W4_READONLY_SENTINEL")
+                        require_state(readonly_new, exists=False)
+                        require_state(readonly_renamed, exists=False)
+                        workspace_results.append(result)
+
+                    for target, label in (
+                        (private_file, "INSTALLATION_WRITE"),
+                        (authority._store(setup_request).path, "CREDENTIAL_WRITE"),
+                    ):
+                        before = target.read_bytes() if target.exists() else None
+                        result = await run_pty(
+                            identity=identity,
+                            offline=offline,
+                            probe=security_executable,
+                            arguments=("write", str(target)),
+                            label=label,
+                        )
+                        self.assertEqual(result["actual"], "DENY")
+                        self.assertEqual(target.read_bytes() if target.exists() else None, before)
+                        workspace_results.append(result)
+                        result = await run_pty(
+                            identity=identity,
+                            offline=offline,
+                            probe=security_executable,
+                            arguments=("delete", str(target)),
+                            label=label.replace("WRITE", "DELETE"),
+                        )
+                        self.assertEqual(result["actual"], "DENY")
+                        self.assertTrue(target.exists())
+                        workspace_results.append(result)
+
+                firewall_checkpoint("after_filesystem")
+                self.assertEqual(
+                    [call for call in firewall.calls if call in {"ENSURE", "REMOVE"}], []
+                )
+                acl_after_filesystem = acl_ready_projection()
+                self.assertEqual(acl_after_filesystem, acl_before)
+
+                controller = await asyncio.to_thread(
+                    subprocess.run,
+                    [str(winsock_probe)],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=8,
+                    shell=False,
+                )
+                controller_result = _parse_pty_winsock_result(controller.stdout)
+                self.assertEqual(controller.returncode, 0)
+                self.assertEqual(controller_result["stage"], "CONNECT")
+                self.assertTrue(controller_result["connected"])
+                self.assertEqual(controller_result["wsa_error"], 0)
+                network_results: list[dict[str, object]] = []
+                for label, identity, offline in (
+                    ("ONLINE_1", "ONLINE", False),
+                    ("OFFLINE_1", "OFFLINE", True),
+                    ("ONLINE_2", "ONLINE", False),
+                    ("OFFLINE_2", "OFFLINE", True),
+                ):
+                    firewall_checkpoint(f"before_{label.casefold()}")
+                    result = await run_pty(
+                        identity=identity,
+                        offline=offline,
+                        probe=winsock_executable,
+                        arguments=(),
+                        label=label,
+                    )
+                    parsed = _parse_pty_winsock_result(str(result["stdout_preview"]))
+                    result["winsock"] = parsed
+                    self.assertEqual(parsed["stage"], "CONNECT")
+                    if offline:
+                        self.assertFalse(parsed["connected"])
+                        self.assertEqual(parsed["wsa_error"], 10013)
+                        self.assertNotEqual(result["exit_code"], 0)
+                    else:
+                        self.assertTrue(parsed["connected"])
+                        self.assertEqual(parsed["wsa_error"], 0)
+                        self.assertEqual(result["exit_code"], 0)
+                    firewall_checkpoint(f"after_{label.casefold()}")
+                    network_results.append(result)
+                self.assertEqual(
+                    [call for call in firewall.calls if call in {"ENSURE", "REMOVE"}], []
+                )
+                acl_after_network = acl_ready_projection()
+                self.assertEqual(acl_after_network, acl_before)
+
+                print(
+                    "W4_GATE2_RESULTS="
+                    + json.dumps(
+                        {
+                            "workspace_operations": workspace_results,
+                            "outside_real_user_write_ace": True,
+                            "outside_everyone_write_ace": True,
+                            "outside_synthetic_write_ace": False,
+                            "outside_deny_ace": False,
+                            "read_only_mutations": "DENIED",
+                            "installation_and_credential_mutations": "DENIED",
+                            "acl_ready_before_after": True,
+                            "controller_preflight": controller_result,
+                            "network": network_results,
+                            "firewall_ready_checkpoints": "PASS",
+                            "runtime_firewall_mutations": 0,
+                            "token_restricting_sid": "exact-singleton",
+                            "capabilities": {
+                                "read": "limited",
+                                "write": "strong",
+                                "network": "strong",
+                                "strict": "fail-closed-read-strong",
+                            },
+                        },
+                        sort_keys=True,
+                    ),
+                    flush=True,
+                )
+            finally:
+                with contextlib.suppress(BaseException):
+                    await asyncio.to_thread(authority.cleanup, setup_request)
 
     async def test_malformed_resize_fails_closed(self) -> None:  # pragma: no cover - Windows CI
         compiled = await asyncio.to_thread(_compile_probe)
