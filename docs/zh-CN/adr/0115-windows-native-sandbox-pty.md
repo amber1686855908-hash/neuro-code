@@ -1,6 +1,6 @@
 # ADR 0115：Windows 原生沙箱 ConPTY 纵向切片
 
-- 状态：W4 实施中；Gate 1 已加固，Gate 2 PTY 写入/网络隔离已接受
+- 状态：W4 实施中；Gate 1 已加固，Gate 2 PTY 写入/网络隔离与 Gate 3 PTY 生命周期 ownership 已接受
 - 日期：2026-08-15
 
 ## 背景
@@ -40,6 +40,18 @@ synthetic write SID 的外部目录仍被拒绝；只读 root 和 installation/c
 启用的 privilege。私有 candidate 因而证明 READ LIMITED、WRITE STRONG、NETWORK STRONG；
 STRICT 仍因要求 strong read isolation 而 fail closed。
 
+Gate 3 在私有 ConPTY candidate 下复用 W3 原生 descendant probe。3A 中，直接
+leader 以 exit code 23 退出，而不依赖 stdio 的 grandchild 仍保持 active；在
+grandchild 自然写出 finished marker 且 runner 所有的 Job 变为空之前，
+`poll_exit()` 持续为 pending。3B 中，`session.close()` 发送规范 TERMINATE
+frame，由 runner 的 Job 终止两个仍存活的 descendant，且不需要 controller 侧
+强制终止 runner；有界 termination observation 记录请求时 final child 仍为
+active。3C 中，controller helper 突然退出会使 runner fail closed 并终止完整
+Job scope。3D 中，强制结束受信任 runner 证明 KILL_ON_JOB_CLOSE：两个
+descendant 均退出且没有自然完成 marker，controller 收到一次有界 error，而不
+会伪造干净 EOF。四个场景均保持 HPCON/relay 有界 teardown，且没有 orphan
+process。
+
 启用 profile 的公开 `spawn_terminal()` 路由仍保持 fail closed；Gate 2 acceptance 不会
 暴露该路由。W5 尚未开始，本 ADR 不认证 Python、Git、Node、NUL、curl、应用层 terminal
 路由或 developer-tool compatibility。
@@ -50,8 +62,8 @@ STRICT 仍因要求 strong read isolation 而 fail closed。
 - runner 在发送 `EXIT` 前持续排空 PTY output channel。
 - 只有 Job-owned scope 为空后才执行 `ClosePseudoConsole`；不引入第二套 lifecycle 或
   Job authority。
-- 未来 production terminal route 必须先通过 Gate 1 和 Gate 2 evidence。本 ADR 尚未认证该
-  公开 route。
+- 未来 production terminal route 必须先通过 Gate 1、Gate 2 和 Gate 3 evidence。本 ADR
+  尚未认证该公开 route。
 
 ## 参考
 

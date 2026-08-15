@@ -1,6 +1,6 @@
 # ADR 0115: Windows native sandbox ConPTY vertical slice
 
-- Status: W4 implementation in progress; Gate 1 hardened and Gate 2 PTY write/network isolation accepted
+- Status: W4 implementation in progress; Gate 1 hardened, Gate 2 PTY write/network isolation, and Gate 3 PTY lifecycle ownership accepted
 - Date: 2026-08-15
 
 ## Context
@@ -27,6 +27,20 @@ the focused native acceptance. W3 non-PTY behavior and its capability contract
 are unchanged: READ LIMITED, WRITE STRONG, NETWORK STRONG, and strong
 descendant ownership. STRICT continues to fail closed because it requires
 strong read isolation.
+
+Gate 3 reuses the W3 native descendant probe under the private ConPTY
+candidate. In 3A, the direct leader exits with code 23 while its stdio-free
+grandchild remains active; `poll_exit()` stays pending until the grandchild
+naturally writes its finished marker and the runner-owned Job becomes empty.
+In 3B, `session.close()` sends the canonical TERMINATE frame and the runner's
+Job terminates both live descendants without controller-side runner fallback;
+the bounded termination observation records the final child as active at the
+request point. In 3C, abrupt controller-helper loss causes the runner to
+fail closed and terminate the complete Job scope. In 3D, killing the trusted
+runner proves KILL_ON_JOB_CLOSE: both descendants exit without a natural
+completion marker, and the controller receives one bounded error rather than
+a fabricated clean EOF. All four scenarios preserve bounded HPCON/relay
+teardown and report no orphan processes.
 
 The Gate 1 probe is a disposable native C executable. It verifies actual
 console dimensions, input, merged PTY output, final output drain, exit code,
@@ -61,8 +75,8 @@ certified by this ADR.
 - The runner keeps draining the PTY output channel before publishing `EXIT`.
 - `ClosePseudoConsole` is performed only after the Job-owned scope is empty;
   no second lifecycle or Job authority is introduced.
-- Gate 1 and Gate 2 evidence are required before exposing a future production
-  terminal route. This ADR does not certify that public route yet.
+- Gate 1, Gate 2, and Gate 3 evidence are required before exposing a future
+  production terminal route. This ADR does not certify that public route yet.
 
 ## References
 
