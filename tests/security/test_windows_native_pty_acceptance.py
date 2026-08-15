@@ -416,12 +416,15 @@ class WindowsNativePtyAcceptanceTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(privilege_api.is_administrator(), "W2 setup acceptance requires elevation")
         security_probe = await asyncio.to_thread(_compile_security_probe)
         winsock_probe = await asyncio.to_thread(_compile_winsock_probe)
-        self.addAsyncCleanup(
-            lambda: asyncio.to_thread(shutil.rmtree, security_probe.parent, ignore_errors=True)
-        )
-        self.addAsyncCleanup(
-            lambda: asyncio.to_thread(shutil.rmtree, winsock_probe.parent, ignore_errors=True)
-        )
+
+        async def cleanup_security_probe() -> None:
+            await asyncio.to_thread(shutil.rmtree, security_probe.parent, ignore_errors=True)
+
+        async def cleanup_winsock_probe() -> None:
+            await asyncio.to_thread(shutil.rmtree, winsock_probe.parent, ignore_errors=True)
+
+        self.addAsyncCleanup(cleanup_security_probe)
+        self.addAsyncCleanup(cleanup_winsock_probe)
 
         class RecordingFirewall:
             def __init__(self) -> None:
