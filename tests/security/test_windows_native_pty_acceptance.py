@@ -564,6 +564,11 @@ class WindowsNativePtyAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                         with contextlib.suppress(TimeoutError):
                             await asyncio.wait_for(changed.wait(), timeout=0.25)
                         changed.clear()
+                        # A PTY can deliver a stream of small output chunks;
+                        # when the event is already set, wait() may complete
+                        # synchronously.  Yield explicitly so the bounded
+                        # deadline and cancellation callbacks cannot starve.
+                        await asyncio.sleep(0)
                     if session.poll_exit() is None:
                         print(
                             "W4_GATE2_RUN_TIMEOUT="
