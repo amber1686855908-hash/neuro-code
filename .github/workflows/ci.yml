@@ -434,34 +434,34 @@ jobs:
           python-version: "3.12"
           enable-cache: true
       - run: uv sync --extra dev --locked
-      - name: Collect W5 Gate 1 restricted-runtime causal matrix
+      - name: Collect W5 Gate 1.5 restricted-runtime causal matrix
         env:
-          NEURO_CODE_W5_GATE1_EVIDENCE_JSON: ${{ runner.temp }}/neuro-code-w5-gate1-runtime-root-cause.json
+          NEURO_CODE_W5_GATE15_EVIDENCE_JSON: ${{ runner.temp }}/neuro-code-w5-gate1-5-runtime-root-cause.json
         run: >-
           uv run pytest
           tests/security/test_windows_w5_gate1_runtime_root_cause.py
           -q -rs -s
-          --junitxml=${{ runner.temp }}/neuro-code-w5-gate1-runtime-root-cause.xml
-      - name: Require W5 Gate 1 execution
+          --junitxml=${{ runner.temp }}/neuro-code-w5-gate1-5-runtime-root-cause.xml
+      - name: Require W5 Gate 1.5 execution
         shell: pwsh
         env:
-          W5_GATE1_JUNIT: ${{ runner.temp }}/neuro-code-w5-gate1-runtime-root-cause.xml
+          W5_GATE15_JUNIT: ${{ runner.temp }}/neuro-code-w5-gate1-5-runtime-root-cause.xml
         run: |
-          [xml]$report = Get-Content $env:W5_GATE1_JUNIT
+          [xml]$report = Get-Content $env:W5_GATE15_JUNIT
           $cases = @($report.testsuites.testsuite.testcase)
           $skipped = @($cases | Where-Object { $_.skipped }).Count
           Write-Host "executed=$($cases.Count) skipped=$skipped"
           if ($cases.Count -ne 1 -or $skipped -ne 0) {
-            throw "Windows W5 Gate 1 did not execute exactly once without skip"
+            throw "Windows W5 Gate 1.5 did not execute exactly once without skip"
           }
-      - name: Upload W5 Gate 1 evidence
+      - name: Upload W5 Gate 1.5 evidence
         if: always()
         uses: actions/upload-artifact@v4.6.2
         with:
-          name: windows-w5-gate1-runtime-root-cause
+          name: windows-w5-gate1-5-runtime-root-cause
           path: |
-            ${{ runner.temp }}/neuro-code-w5-gate1-runtime-root-cause.xml
-            ${{ runner.temp }}/neuro-code-w5-gate1-runtime-root-cause.json
+            ${{ runner.temp }}/neuro-code-w5-gate1-5-runtime-root-cause.xml
+            ${{ runner.temp }}/neuro-code-w5-gate1-5-runtime-root-cause.json
           if-no-files-found: error
 
   quality:

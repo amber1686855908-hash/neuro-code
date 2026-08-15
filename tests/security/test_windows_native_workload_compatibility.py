@@ -722,7 +722,7 @@ def _build_workloads(
     *,
     workspace: Path,
     repo: Path,
-    nul_probe: Path,
+    nul_probe: Path | None,
     cmd: Path | None,
     powershell: Path | None,
     pwsh: Path | None,
@@ -833,18 +833,21 @@ def _build_workloads(
             ("--version",),
             ("curl ",),
         ),
-        _Workload(
-            "NUL_DIRECT_WIN32",
-            "CreateFileW-read-write-modes",
-            nul_probe,
-            (),
-            (
-                r'"read":\{"create":"pass"',
-                r'"write":\{"create":"pass"',
-                r'"read_write":\{"create":"pass"',
-            ),
-        ),
     ]
+    if nul_probe is not None:
+        workloads.append(
+            _Workload(
+                "NUL_DIRECT_WIN32",
+                "CreateFileW-read-write-modes",
+                nul_probe,
+                (),
+                (
+                    r'"read":\{"create":"pass"',
+                    r'"write":\{"create":"pass"',
+                    r'"read_write":\{"create":"pass"',
+                ),
+            )
+        )
     npm_arguments: _Command
     if npm is not None:
         if npm.suffix.casefold() in {".cmd", ".bat"} and cmd is not None:

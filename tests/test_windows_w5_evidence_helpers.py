@@ -82,22 +82,118 @@ def test_nul_mode_projection_tolerates_pty_wrapping() -> None:
     }
 
 
-def test_gate1_probe_projection_is_bounded_to_fixed_markers() -> None:
+def test_gate15_probe_projection_separates_profile_and_runtime_facts() -> None:
     assert _probe_result(
-        "W5_GATE1_PROBE_STARTED\nW5_GATE1_PROFILE=AVAILABLE\n"
-        "W5_GATE1_PROBE_FINISHED\nsecret=discarded\n"
+        "W5_GATE15_PROBE_STARTED\n"
+        "W5_GATE15_TOKEN=PASS\n"
+        "W5_GATE15_TOKEN_ERROR=0\n"
+        "W5_GATE15_PROFILE_DIRECTORY=AVAILABLE\n"
+        "W5_GATE15_PROFILE_DIRECTORY_ERROR=0\n"
+        "W5_GATE15_TOKEN_USER=PASS\n"
+        "W5_GATE15_TOKEN_USER_ERROR=0\n"
+        "W5_GATE15_HKU_SID_STATUS=0\n"
+        "W5_GATE15_HKU_SID=LOADED\n"
+        "W5_GATE15_CURRENT_USER_STATUS=0\n"
+        "W5_GATE15_CURRENT_USER=OPEN\n"
+        "W5_GATE15_BCRYPT_LIBRARY=LOADED\n"
+        "W5_GATE15_BCRYPT_LIBRARY_ERROR=0\n"
+        "W5_GATE15_BCRYPT_MODULE_PATH=AVAILABLE\n"
+        "W5_GATE15_BCRYPT_MODULE_PATH_ERROR=0\n"
+        "W5_GATE15_BCRYPT_GEN_RANDOM_STATUS=0x00000000\n"
+        "W5_GATE15_NCRYPT_OPEN_STATUS=0x00000000\n"
+        "W5_GATE15_NUL_READ_CREATE=PASS\n"
+        "W5_GATE15_NUL_READ_CREATE_ERROR=0\n"
+        "W5_GATE15_NUL_READ_WRITE=NOT_ATTEMPTED\n"
+        "W5_GATE15_NUL_READ_WRITE_ERROR=0\n"
+        "W5_GATE15_PROBE_FINISHED\nsecret=discarded\n"
     ) == {
         "started": True,
         "finished": True,
-        "profile": "AVAILABLE",
         "token": "PASS",
+        "token_error": 0,
+        "profile_directory_available": True,
+        "profile_directory_error": 0,
+        "token_user": "PASS",
+        "token_user_error": 0,
+        "registry_hive_loaded": True,
+        "registry_hive_status": 0,
+        "current_user_open": True,
+        "current_user_status": 0,
+        "bcrypt_library": "LOADED",
+        "bcrypt_library_error": 0,
+        "bcrypt_module_path": "AVAILABLE",
+        "bcrypt_module_path_error": 0,
+        "bcrypt_gen_random_status": 0,
+        "ncrypt_open_status": 0,
+        "nul": {
+            "read": {
+                "create": "PASS",
+                "create_error": 0,
+                "write": "NOT_ATTEMPTED",
+                "write_error": 0,
+            },
+            "write": {
+                "create": "UNKNOWN",
+                "create_error": None,
+                "write": "UNKNOWN",
+                "write_error": None,
+            },
+            "read_write": {
+                "create": "UNKNOWN",
+                "create_error": None,
+                "write": "UNKNOWN",
+                "write_error": None,
+            },
+        },
     }
 
 
-def test_gate1_probe_projection_distinguishes_unavailable_profile() -> None:
-    assert _probe_result("W5_GATE1_PROBE_STARTED\nW5_GATE1_PROFILE=UNAVAILABLE\n") == {
+def test_gate15_probe_projection_distinguishes_directory_and_hive() -> None:
+    assert _probe_result(
+        "W5_GATE15_PROBE_STARTED\n"
+        "W5_GATE15_PROFILE_DIRECTORY=AVAILABLE\n"
+        "W5_GATE15_PROFILE_DIRECTORY_ERROR=0\n"
+        "W5_GATE15_HKU_SID_STATUS=2\n"
+        "W5_GATE15_HKU_SID=NOT_LOADED\n"
+        "W5_GATE15_CURRENT_USER_STATUS=5\n"
+        "W5_GATE15_CURRENT_USER=FAILED\n"
+    ) == {
         "started": True,
         "finished": False,
-        "profile": "UNAVAILABLE",
-        "token": "PASS",
+        "token": "UNKNOWN",
+        "token_error": None,
+        "profile_directory_available": True,
+        "profile_directory_error": 0,
+        "token_user": "UNKNOWN",
+        "token_user_error": None,
+        "registry_hive_loaded": False,
+        "registry_hive_status": 2,
+        "current_user_open": False,
+        "current_user_status": 5,
+        "bcrypt_library": "UNKNOWN",
+        "bcrypt_library_error": None,
+        "bcrypt_module_path": "UNKNOWN",
+        "bcrypt_module_path_error": None,
+        "bcrypt_gen_random_status": None,
+        "ncrypt_open_status": None,
+        "nul": {
+            "read": {
+                "create": "UNKNOWN",
+                "create_error": None,
+                "write": "UNKNOWN",
+                "write_error": None,
+            },
+            "write": {
+                "create": "UNKNOWN",
+                "create_error": None,
+                "write": "UNKNOWN",
+                "write_error": None,
+            },
+            "read_write": {
+                "create": "UNKNOWN",
+                "create_error": None,
+                "write": "UNKNOWN",
+                "write_error": None,
+            },
+        },
     }

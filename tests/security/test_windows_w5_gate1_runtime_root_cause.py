@@ -1,4 +1,4 @@
-"""W5 Gate 1 evidence for the shared Windows restricted-runtime seam.
+"""W5 Gate 1.5 evidence for the shared Windows restricted-runtime seam.
 
 This module deliberately contains no compatibility workaround and never edits
 the production sandbox.  It compares the same fixed native probe and a small
@@ -6,6 +6,9 @@ set of Gate 0 workload canaries across the host, the two W2 profile-loading
 modes, and the real W3 restricted-child route.  The profile-enabled W3 row is
 an in-memory evidence experiment: the production ``_LOGON_FLAGS`` value is
 restored before the test exits.
+
+The native probe separates profile-directory resolution from registry-hive
+loading and records bounded bcrypt, CNG-provider, and NUL access facts.
 """
 
 from __future__ import annotations
@@ -91,7 +94,6 @@ _PROBE_WORKLOADS = frozenset(
         "PYTHON_BASE_MINIMAL_NO_SITE",
         "GIT_VERSION",
         "CURL_VERSION",
-        "NUL_DIRECT_WIN32",
     }
 )
 
@@ -372,20 +374,70 @@ def _native_enabled() -> bool:
 
 
 def _probe_result(output: str) -> dict[str, object]:
-    """Parse only fixed probe markers; never retain arbitrary output."""
+    """Parse only fixed Gate 1.5 markers; never retain arbitrary output."""
 
     text = _strip_terminal(output)
+    lines = text.splitlines()
+
+    def marker(name: str, default: str = "UNKNOWN") -> str:
+        prefix = f"W5_GATE15_{name}="
+        for line in lines:
+            if line.startswith(prefix):
+                return line[len(prefix) :].strip()
+        return default
+
+    def status(name: str) -> int | None:
+        value = marker(name, "")
+        try:
+            return int(value, 0)
+        except ValueError:
+            return None
+
+    def nul(name: str) -> dict[str, object]:
+        return {
+            "create": marker(f"NUL_{name}_CREATE"),
+            "create_error": status(f"NUL_{name}_CREATE_ERROR"),
+            "write": marker(f"NUL_{name}_WRITE"),
+            "write_error": status(f"NUL_{name}_WRITE_ERROR"),
+        }
+
+    hku_status = status("HKU_SID_STATUS")
+    current_user_status = status("CURRENT_USER_STATUS")
+    profile_directory_marker = marker("PROFILE_DIRECTORY")
     return {
-        "started": "W5_GATE1_PROBE_STARTED" in text,
-        "finished": "W5_GATE1_PROBE_FINISHED" in text,
-        "profile": (
-            "AVAILABLE"
-            if "W5_GATE1_PROFILE=AVAILABLE" in text
-            else "UNAVAILABLE"
-            if "W5_GATE1_PROFILE=UNAVAILABLE" in text
-            else "UNKNOWN"
+        "started": "W5_GATE15_PROBE_STARTED" in text,
+        "finished": "W5_GATE15_PROBE_FINISHED" in text,
+        "token": marker("TOKEN"),
+        "token_error": status("TOKEN_ERROR"),
+        "profile_directory_available": (
+            True
+            if profile_directory_marker == "AVAILABLE"
+            else False
+            if profile_directory_marker == "UNAVAILABLE"
+            else None
         ),
-        "token": "ERROR" if "W5_GATE1_TOKEN=ERROR" in text else "PASS",
+        "profile_directory_error": status("PROFILE_DIRECTORY_ERROR"),
+        "token_user": marker("TOKEN_USER"),
+        "token_user_error": status("TOKEN_USER_ERROR"),
+        "registry_hive_loaded": (
+            True if hku_status == 0 else False if hku_status is not None else None
+        ),
+        "registry_hive_status": hku_status,
+        "current_user_open": (
+            True if current_user_status == 0 else False if current_user_status is not None else None
+        ),
+        "current_user_status": current_user_status,
+        "bcrypt_library": marker("BCRYPT_LIBRARY"),
+        "bcrypt_library_error": status("BCRYPT_LIBRARY_ERROR"),
+        "bcrypt_module_path": marker("BCRYPT_MODULE_PATH"),
+        "bcrypt_module_path_error": status("BCRYPT_MODULE_PATH_ERROR"),
+        "bcrypt_gen_random_status": status("BCRYPT_GEN_RANDOM_STATUS"),
+        "ncrypt_open_status": status("NCRYPT_OPEN_STATUS"),
+        "nul": {
+            "read": nul("READ"),
+            "write": nul("WRITE"),
+            "read_write": nul("READ_WRITE"),
+        },
     }
 
 
@@ -440,13 +492,13 @@ async def _cleanup_probe_directory(path: Path) -> None:
     await asyncio.to_thread(shutil.rmtree, path, ignore_errors=True)
 
 
-class WindowsW5Gate1RuntimeRootCauseTests(unittest.IsolatedAsyncioTestCase):
-    """Run Gate 1 exactly once on the elevated Windows evidence runner."""
+class WindowsW5Gate15RuntimeRootCauseTests(unittest.IsolatedAsyncioTestCase):
+    """Run Gate 1.5 exactly once on the elevated Windows evidence runner."""
 
     @unittest.skipUnless(
-        _native_enabled(), "Windows W5 Gate 1 evidence requires the enabled CI gate"
+        _native_enabled(), "Windows W5 Gate 1.5 evidence requires the enabled CI gate"
     )
-    async def test_gate1_runtime_root_cause_matrix(self) -> None:  # pragma: no cover - Windows CI
+    async def test_gate15_runtime_root_cause_matrix(self) -> None:  # pragma: no cover - Windows CI
         privilege_api = _NativeWindowsSetupPrivilegeApi()
         self.assertTrue(privilege_api.is_administrator(), "W5 setup requires Windows elevation")
         compile_probe = cast(
@@ -464,13 +516,6 @@ class WindowsW5Gate1RuntimeRootCauseTests(unittest.IsolatedAsyncioTestCase):
             "windows_w5_gate1_probe",
         )
         self.addAsyncCleanup(_cleanup_probe_directory, probe.parent)
-        nul_probe = await asyncio.to_thread(
-            __import__(
-                "tests.security.test_windows_native_workload_compatibility",
-                fromlist=["_compile_nul_probe"],
-            )._compile_nul_probe
-        )
-        self.addAsyncCleanup(_cleanup_probe_directory, nul_probe.parent)
         paths = _tool_paths()
         paths["python_base"] = __import__(
             "tests.security.test_windows_native_workload_compatibility",
@@ -619,7 +664,7 @@ class WindowsW5Gate1RuntimeRootCauseTests(unittest.IsolatedAsyncioTestCase):
                 workloads = _build_workloads(
                     workspace=workspace,
                     repo=repo,
-                    nul_probe=nul_probe,
+                    nul_probe=None,
                     cmd=paths["cmd"],
                     powershell=paths["powershell"],
                     pwsh=paths["pwsh"],
@@ -679,7 +724,7 @@ class WindowsW5Gate1RuntimeRootCauseTests(unittest.IsolatedAsyncioTestCase):
                     matrix.append(row)
 
                 artifact = {
-                    "gate": "W5_GATE1",
+                    "gate": "W5_GATE1_5",
                     "base": "00879b9b71f637804ff6e40c82451d86f2bd6165",
                     "authorities": [
                         "HOST",
@@ -702,15 +747,15 @@ class WindowsW5Gate1RuntimeRootCauseTests(unittest.IsolatedAsyncioTestCase):
                     },
                     "tool_provenance": _provenance(paths, workspace),
                 }
-                artifact_path = os.environ.get("NEURO_CODE_W5_GATE1_EVIDENCE_JSON")
+                artifact_path = os.environ.get("NEURO_CODE_W5_GATE15_EVIDENCE_JSON")
                 if artifact_path:
                     await asyncio.to_thread(
                         Path(artifact_path).write_text,
                         json.dumps(artifact, sort_keys=True, indent=2),
                         encoding="utf-8",
                     )
-                print("W5_GATE1_PROBE=" + json.dumps(probe_matrix, sort_keys=True), flush=True)
-                print("W5_GATE1_MATRIX=" + json.dumps(matrix, sort_keys=True), flush=True)
+                print("W5_GATE1_5_PROBE=" + json.dumps(probe_matrix, sort_keys=True), flush=True)
+                print("W5_GATE1_5_MATRIX=" + json.dumps(matrix, sort_keys=True), flush=True)
             finally:
                 await asyncio.to_thread(authority.cleanup, setup_request)
                 # Prevent an evidence failure from leaking the in-memory
