@@ -315,11 +315,38 @@ def _static_classification(definition: _ProbeDefinition, matrix: dict[str, objec
 
 
 def _production_source_diff() -> tuple[str, ...]:
-    for revision in (f"{_BASE}...HEAD", "HEAD^1"):
+    """Return production paths changed from the fixed evidence baseline.
+
+    ``actions/checkout`` uses a shallow checkout for pull-request jobs.  The
+    merge ref therefore need not retain either parent, even though its tree is
+    the content under test.  Fetch only the known baseline commit when that
+    object is absent; this keeps the assertion tied to the exact evidence
+    baseline without weakening it to a working-tree/status check.
+    """
+
+    revisions = (
+        ("three-dot", [_BASE, "HEAD"]),
+        ("two-dot", [_BASE, "HEAD"]),
+        ("parent", ["HEAD^1", "HEAD"]),
+    )
+    fetch = subprocess.run(
+        ["git", "fetch", "--no-tags", "--depth=1", "origin", _BASE],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        shell=False,
+    )
+    # A fetch is expected to be a no-op when the commit is already present.
+    # Keep the result for diagnostics only; the diff attempts below remain the
+    # authority and can still use a parent-only checkout if the remote is not
+    # available in an offline local run.
+    fetch_diagnostic = (fetch.stderr or fetch.stdout or "").strip()[:256]
+    for kind, refs in revisions:
         command = (
-            ["git", "diff", "--name-only", revision, "--", "src/neuro_code"]
-            if "..." in revision
-            else ["git", "diff", "--name-only", revision, "HEAD", "--", "src/neuro_code"]
+            ["git", "diff", "--name-only", f"{refs[0]}...{refs[1]}", "--", "src/neuro_code"]
+            if kind == "three-dot"
+            else ["git", "diff", "--name-only", *refs, "--", "src/neuro_code"]
         )
         result = subprocess.run(
             command,
@@ -331,7 +358,8 @@ def _production_source_diff() -> tuple[str, ...]:
         )
         if result.returncode == 0:
             return tuple(line.strip() for line in result.stdout.splitlines() if line.strip())
-    raise _Gate16ProbeBuildError("could not inspect production source diff")
+    detail = f"; fetch={fetch_diagnostic}" if fetch_diagnostic else ""
+    raise _Gate16ProbeBuildError(f"could not inspect production source diff{detail}")
 
 
 def _write_artifact(path: str | None, payload: dict[str, object]) -> None:
