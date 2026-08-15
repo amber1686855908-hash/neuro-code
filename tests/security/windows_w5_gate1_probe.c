@@ -100,7 +100,7 @@ static void emit_nul_probe(const char *name, DWORD access) {
 static void emit_profile_facts(HANDLE token) {
     wchar_t profile[32768];
     DWORD profile_length = (DWORD)(sizeof(profile) / sizeof(profile[0]));
-    HANDLE current_user = NULL;
+    HKEY current_user = NULL;
     HKEY hku_key = NULL;
     PTOKEN_USER token_user = NULL;
     LPWSTR sid_string = NULL;
