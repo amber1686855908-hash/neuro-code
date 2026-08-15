@@ -82,6 +82,7 @@ class _Workload:
     exit_only: bool = False
     note: str = ""
     cwd: Path | None = None
+    resolved_launcher: Path | None = None
 
 
 def _native_enabled() -> bool:
@@ -238,11 +239,33 @@ def _output_matches(spec: _Workload, stdout: bytes, stderr: bytes) -> bool:
     )
 
 
+def _reported_error_code(stdout: bytes, stderr: bytes) -> int | None:
+    text = (stdout + b"\n" + stderr).decode("utf-8", errors="replace").replace("\x00", "")
+    matches = re.findall(
+        r"(create_error|write_error|hresult)\s*[=:]?\s*((?:0x)?[0-9a-f]+)",
+        text,
+        flags=re.IGNORECASE,
+    )
+    for label, value in matches:
+        try:
+            parsed = int(value, 16 if label.casefold() == "hresult" else 10)
+        except ValueError:
+            continue
+        if parsed:
+            return parsed
+    return None
+
+
 def _completed_classification(spec: _Workload, exit_code: int, stdout: bytes, stderr: bytes) -> str:
     if exit_code == 0:
         return "PASS" if _output_matches(spec, stdout, stderr) else "OUTPUT_MISMATCH"
     if "NUL" in spec.name:
-        evidence = (stdout + b"\n" + stderr).decode("utf-8", errors="replace").casefold()
+        evidence = (
+            (stdout + b"\n" + stderr)
+            .decode("utf-8", errors="replace")
+            .replace("\x00", "")
+            .casefold()
+        )
         if (
             exit_code in {2, 3}
             or "access is denied" in evidence
@@ -250,11 +273,13 @@ def _completed_classification(spec: _Workload, exit_code: int, stdout: bytes, st
             or '"write":"fail"' in evidence
         ):
             return "DEVICE_ACCESS_DENIED"
-    evidence = (stdout + b"\n" + stderr).decode("utf-8", errors="replace").casefold()
-    if spec.name == "GIT_REPO_DISCOVERY" and exit_code != 0:
-        return "REPOSITORY_DISCOVERY_FAILURE"
+    evidence = (
+        (stdout + b"\n" + stderr).decode("utf-8", errors="replace").replace("\x00", "").casefold()
+    )
     if spec.name.startswith("GIT") and "could not open '/dev/null'" in evidence:
         return "DEVICE_ACCESS_DENIED"
+    if spec.name == "GIT_REPO_DISCOVERY" and exit_code != 0:
+        return "REPOSITORY_DISCOVERY_FAILURE"
     if spec.name.startswith("PYTHON") and spec.name != "PYTHON_VERSION":
         return "RUNTIME_INITIALIZATION_FAILURE"
     if "starting the clr failed" in evidence or "hresult 80070005" in evidence:
@@ -268,6 +293,7 @@ def _cell_base(
     return {
         "execution_path": path,
         "resolved_executable": str(spec.executable) if spec.executable else None,
+        "resolved_launcher": str(spec.resolved_launcher) if spec.resolved_launcher else None,
         "argv": _command_for(spec),
         "identity": identity,
         "profile": profile,
@@ -337,6 +363,7 @@ def _host_run(spec: _Workload, workspace: Path) -> dict[str, object]:
         result["exit_code"] = process.returncode
         result["stdout_preview"] = _preview(stdout)
         result["stderr_preview"] = _preview(stderr)
+        result["win32_error"] = _reported_error_code(stdout, stderr)
         if not result["timeout"]:
             result["classification"] = _completed_classification(
                 spec, process.returncode, stdout, stderr
@@ -490,6 +517,8 @@ async def _w3_run(
                     stderr = tasks[1].result()
         result["stdout_preview"] = _preview(stdout)
         result["stderr_preview"] = _preview(stderr)
+        if result["win32_error"] is None:
+            result["win32_error"] = _reported_error_code(stdout, stderr)
         if result["classification"] == "INCONCLUSIVE" and not result["timeout"]:
             observed_exit = result.get("exit_code")
             if isinstance(observed_exit, int):
@@ -571,6 +600,8 @@ async def _w4_run(
             result["token_attestation"] = _security_attestation_status(diagnostic)
         stdout = bytes(output)
         result["stdout_preview"] = _preview(stdout)
+        if result["win32_error"] is None:
+            result["win32_error"] = _reported_error_code(stdout, b"")
         if result["classification"] == "INCONCLUSIVE" and not result["timeout"]:
             exit_code = result.get("exit_code")
             if isinstance(exit_code, int):
@@ -725,6 +756,7 @@ def _build_workloads(
             npm_arguments,
             (r"\d+\.\d+",),
             note=(f"resolved launcher: {npm}" if npm is not None else "npm launcher not installed"),
+            resolved_launcher=npm,
         ),
     )
     return workloads
