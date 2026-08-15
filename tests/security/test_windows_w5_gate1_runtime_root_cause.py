@@ -604,14 +604,14 @@ class WindowsW5Gate1RuntimeRootCauseTests(unittest.IsolatedAsyncioTestCase):
                     )
                 finally:
                     windows_native_runner._LOGON_FLAGS = original_flags
-                for authority in (
+                for authority_name in (
                     "HOST",
                     "W2_RESTRICTED_NO_PROFILE",
                     "W2_RESTRICTED_WITH_PROFILE",
                 ):
-                    cell = probe_matrix.get(authority)
+                    cell = probe_matrix.get(authority_name)
                     if isinstance(cell, dict):
-                        probe_matrix[authority] = {
+                        probe_matrix[authority_name] = {
                             **cell,
                             "probe": _probe_result(str(cell.get("stdout_preview", ""))),
                         }
