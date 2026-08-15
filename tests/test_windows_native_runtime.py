@@ -203,7 +203,18 @@ class WindowsNativeRuntimeProtocolTests(unittest.TestCase):
             decoder=RuntimeFrameDecoder(),
             initial_frames=(
                 RuntimeFrame(RuntimeFrameType.PTY_OUTPUT, b"raw\x00bytes"),
-                RuntimeFrame(RuntimeFrameType.EXIT, encode_json({"returncode": 7})),
+                RuntimeFrame(
+                    RuntimeFrameType.EXIT,
+                    encode_json(
+                        {
+                            "returncode": 7,
+                            "termination_observation": {
+                                "state": "FINAL_CHILD_STILL_ACTIVE",
+                                "unsafe": "must-not-leak",
+                            },
+                        }
+                    ),
+                ),
                 RuntimeFrame(RuntimeFrameType.PTY_OUTPUT, b"after-exit"),
             ),
             security_attestation={},
@@ -215,6 +226,40 @@ class WindowsNativeRuntimeProtocolTests(unittest.TestCase):
         self.assertEqual(session.poll_exit(), 7)
         self.assertEqual(session.diagnostic_snapshot()["runner_state"], "NOT_OBSERVED")
         self.assertFalse(session.diagnostic_snapshot()["runner_forced_termination"])
+        self.assertFalse(session.diagnostic_snapshot()["controller_forced_runner_termination"])
+        self.assertEqual(
+            session.diagnostic_snapshot()["termination_observation"],
+            {"state": "FINAL_CHILD_STILL_ACTIVE"},
+        )
+        session.close()
+        session.close()
+
+    def test_pty_event_failure_calls_error_once_and_close_is_idempotent(self) -> None:
+        eof: list[bool] = []
+        errors: list[BaseException] = []
+        session = _WindowsNativePtySession(
+            transport=WindowsRuntimeControllerTransport(
+                control=_StatePipe(),  # type: ignore[arg-type]
+                events=_StatePipe(),  # type: ignore[arg-type]
+            ),
+            runner=RunnerLaunch(process_handle=1, process_id=43),
+            pid=43,
+            size=TerminalSize(80, 25),
+            on_output=lambda _data: None,
+            on_eof=lambda: eof.append(True),
+            on_error=errors.append,
+            decoder=RuntimeFrameDecoder(),
+            initial_frames=(),
+            security_attestation={},
+        )
+        self.assertTrue(session._done.wait(2.0))
+        self.assertEqual(eof, [])
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], SandboxError)
+        self.assertIsNone(session.poll_exit())
+        self.assertFalse(session.diagnostic_snapshot()["controller_forced_runner_termination"])
+        session.close()
+        session.close()
 
     def test_large_stdin_frame_is_binary_safe(self) -> None:
         payload = b"\x00\xff" * 40_000

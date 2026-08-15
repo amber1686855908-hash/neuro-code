@@ -322,6 +322,24 @@ jobs:
           if ($cases.Count -ne 1 -or $skipped -ne 0) {
             throw "Windows W4 Gate 2 did not execute"
           }
+      - name: Prove W4 Gate 3 PTY lifecycle ownership
+        run: >-
+          uv run pytest
+          tests/security/test_windows_native_pty_lifecycle_acceptance.py
+          -q -rs -s
+          --junitxml=${{ runner.temp }}/neuro-code-windows-native-pty-gate3.xml
+      - name: Require W4 Gate 3 execution
+        shell: pwsh
+        env:
+          W4_JUNIT: ${{ runner.temp }}/neuro-code-windows-native-pty-gate3.xml
+        run: |
+          [xml]$report = Get-Content $env:W4_JUNIT
+          $cases = @($report.testsuites.testsuite.testcase)
+          $skipped = @($cases | Where-Object { $_.skipped }).Count
+          Write-Host "executed=$($cases.Count) skipped=$skipped"
+          if ($cases.Count -ne 4 -or $skipped -ne 0) {
+            throw "Windows W4 Gate 3 did not execute every focused test"
+          }
 
   quality:
     runs-on: ubuntu-latest

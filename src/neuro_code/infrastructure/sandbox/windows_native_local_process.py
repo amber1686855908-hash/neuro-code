@@ -908,6 +908,8 @@ class _WindowsNativePtySession:
         self._closed = False
         self._eof_sent = False
         self._diagnostic: dict[str, object] | None = None
+        self._termination_observation: dict[str, object] | None = None
+        self._controller_forced_runner_termination = False
         self._write_lock = threading.Lock()
         self._reader = threading.Thread(
             target=self._read_frames,
@@ -996,7 +998,11 @@ class _WindowsNativePtySession:
                 "runner_state": runner_result.get("state"),
                 "runner_exit_code": runner_result.get("exit_code"),
                 "runner_forced_termination": runner_forced_termination,
+                "controller_forced_runner_termination": (
+                    self._controller_forced_runner_termination
+                ),
                 "runner_wait_error": runner_wait_error,
+                "termination_observation": self._termination_observation,
                 "security_attestation": dict(self._security_attestation),
             }
             self._events.close()
@@ -1011,7 +1017,9 @@ class _WindowsNativePtySession:
         diagnostic.setdefault("runner_state", None)
         diagnostic.setdefault("runner_exit_code", None)
         diagnostic.setdefault("runner_forced_termination", False)
+        diagnostic.setdefault("controller_forced_runner_termination", False)
         diagnostic.setdefault("runner_wait_error", None)
+        diagnostic.setdefault("termination_observation", self._termination_observation)
         diagnostic["child_exit_code"] = self._returncode
         diagnostic["security_attestation"] = dict(self._security_attestation)
         return diagnostic
@@ -1025,6 +1033,16 @@ class _WindowsNativePtySession:
             if not isinstance(payload, dict) or not isinstance(payload.get("returncode"), int):
                 raise SandboxError("Windows PTY Exit frame is invalid")
             self._returncode = int(payload["returncode"])
+            termination_observation = payload.get("termination_observation")
+            if isinstance(termination_observation, dict):
+                bounded: dict[str, object] = {}
+                for key in ("state", "exit_code", "wait_error"):
+                    value = termination_observation.get(key)
+                    if (key == "state" and isinstance(value, str) and len(value) <= 64) or (
+                        key in {"exit_code", "wait_error"} and isinstance(value, int)
+                    ):
+                        bounded[key] = value
+                self._termination_observation = bounded or None
             if not self._eof_sent:
                 self._eof_sent = True
                 self._on_eof()
@@ -1087,6 +1105,7 @@ class _WindowsNativePtySession:
             with contextlib.suppress(BaseException):
                 self.send_signal(TerminalSignal.TERMINATE)
             if not self._done.wait(5.0):
+                self._controller_forced_runner_termination = True
                 _terminate_runner_process(self._runner.process_handle)
                 self._control.close()
                 self._events.close()
