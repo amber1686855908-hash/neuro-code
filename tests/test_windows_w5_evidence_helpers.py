@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 from tests.security.test_windows_native_workload_compatibility import _nul_mode_results
-from tests.security.test_windows_w5_gate1_runtime_root_cause import _probe_result
+from tests.security.test_windows_w5_gate1_runtime_root_cause import (
+    _attach_probe_result,
+    _probe_result,
+)
 from tests.security.windows_token_attestation import token_attestation_is_exact
 
 
@@ -179,6 +182,63 @@ def test_gate15_probe_projection_distinguishes_directory_and_hive() -> None:
         "nul": {
             "read": {
                 "create": "UNKNOWN",
+                "create_error": None,
+                "write": "UNKNOWN",
+                "write_error": None,
+            },
+            "write": {
+                "create": "UNKNOWN",
+                "create_error": None,
+                "write": "UNKNOWN",
+                "write_error": None,
+            },
+            "read_write": {
+                "create": "UNKNOWN",
+                "create_error": None,
+                "write": "UNKNOWN",
+                "write_error": None,
+            },
+        },
+    }
+
+
+def test_gate15_probe_attachment_uses_complete_marker_stream_and_discards_raw_bytes() -> None:
+    cell = {
+        "spawn_result": "PASS",
+        "stdout_preview": "W5_GATE15_PROBE_STARTED\n",
+        "_captured_stdout": (
+            b"W5_GATE15_PROBE_STARTED\n"
+            b"W5_GATE15_BCRYPT_GEN_RANDOM_STATUS=0x00000000\n"
+            b"W5_GATE15_NCRYPT_OPEN_STATUS=0x00000000\n"
+            b"W5_GATE15_NUL_READ_CREATE=PASS\n"
+            b"W5_GATE15_PROBE_FINISHED\n"
+        ),
+    }
+    attached = _attach_probe_result(cell)
+    assert "_captured_stdout" not in attached
+    assert attached["probe_start"] == "STARTED_AND_FINISHED"
+    assert attached["probe"] == {
+        "started": True,
+        "finished": True,
+        "token": "UNKNOWN",
+        "token_error": None,
+        "profile_directory_available": None,
+        "profile_directory_error": None,
+        "token_user": "UNKNOWN",
+        "token_user_error": None,
+        "registry_hive_loaded": None,
+        "registry_hive_status": None,
+        "current_user_open": None,
+        "current_user_status": None,
+        "bcrypt_library": "UNKNOWN",
+        "bcrypt_library_error": None,
+        "bcrypt_module_path": "UNKNOWN",
+        "bcrypt_module_path_error": None,
+        "bcrypt_gen_random_status": 0,
+        "ncrypt_open_status": 0,
+        "nul": {
+            "read": {
+                "create": "PASS",
                 "create_error": None,
                 "write": "UNKNOWN",
                 "write_error": None,

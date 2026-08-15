@@ -359,7 +359,9 @@ def _workload_cwd(spec: _Workload, workspace: Path) -> Path:
     return cwd
 
 
-def _host_run(spec: _Workload, workspace: Path) -> dict[str, object]:
+def _host_run(
+    spec: _Workload, workspace: Path, *, retain_output: bool = False
+) -> dict[str, object]:
     result = _cell_base(spec, path="HOST/OFF", identity="HOST", profile="OFF", stdio="CAPTURE")
     if spec.executable is None:
         return _not_installed(
@@ -385,6 +387,8 @@ def _host_run(spec: _Workload, workspace: Path) -> dict[str, object]:
             result["classification"] = "TIMEOUT"
             result["note"] = "host control exceeded bounded timeout"
         result["exit_code"] = process.returncode
+        if retain_output:
+            result["_captured_stdout"] = stdout
         result["stdout_preview"] = _preview(stdout)
         result["stderr_preview"] = _preview(stderr)
         result["nul_modes"] = _nul_mode_results(stdout, stderr)
@@ -506,6 +510,7 @@ async def _w3_run(
     adapter: WindowsNativeLocalProcessSandbox,
     expected_user_sid: str,
     expected_write_sid: str,
+    retain_output: bool = False,
 ) -> dict[str, object]:
     if spec.executable is None:
         return _not_installed(
@@ -589,6 +594,8 @@ async def _w3_run(
                 with contextlib.suppress(BaseException):
                     stderr = tasks[1].result()
         result["stdout_preview"] = _preview(stdout)
+        if retain_output:
+            result["_captured_stdout"] = stdout
         result["nul_modes"] = _nul_mode_results(stdout, b"")
         result["stderr_preview"] = _preview(stderr)
         if result["win32_error"] is None:

@@ -239,6 +239,7 @@ class _Gate1DirectProcess:
         cwd: Path,
         environment: dict[str, str],
         logon_flags: int,
+        retain_output: bool = False,
     ) -> dict[str, object]:  # pragma: no cover - Windows CI
         stdout_read, stdout_write = self._new_pipe()
         stderr_read, stderr_write = self._new_pipe()
@@ -345,6 +346,8 @@ class _Gate1DirectProcess:
                 reader.join(timeout=2.0)
             self._close_handle(stdout_read)
             self._close_handle(stderr_read)
+            if retain_output:
+                result["_captured_stdout"] = bytes(stdout)
             result["stdout_preview"] = _preview(bytes(stdout))
             result["stderr_preview"] = _preview(bytes(stderr))
             if result["win32_error"] is None:
@@ -439,6 +442,27 @@ def _probe_result(output: str) -> dict[str, object]:
             "read_write": nul("READ_WRITE"),
         },
     }
+
+
+def _attach_probe_result(cell: dict[str, object]) -> dict[str, object]:
+    """Parse the complete fixed-marker stream without retaining raw output."""
+
+    captured = cell.pop("_captured_stdout", None)
+    if isinstance(captured, bytes):
+        output = captured.decode("utf-8", errors="replace")
+    else:
+        output = str(cell.get("stdout_preview", ""))
+    probe = _probe_result(output)
+    cell["probe"] = probe
+    if cell.get("spawn_result") not in {"PASS", "NOT_APPLICABLE"}:
+        cell["probe_start"] = "PROCESS_CREATION_FAILED"
+    elif not bool(probe["started"]):
+        cell["probe_start"] = "NOT_OBSERVED"
+    elif not bool(probe["finished"]):
+        cell["probe_start"] = "STARTED_WITHOUT_FINISH"
+    else:
+        cell["probe_start"] = "STARTED_AND_FINISHED"
+    return cell
 
 
 def _environment_for(request: SandboxedProcessRequest) -> dict[str, str]:
@@ -590,7 +614,7 @@ class WindowsW5Gate15RuntimeRootCauseTests(unittest.IsolatedAsyncioTestCase):
                 probe_request = _request(probe_spec, workspace)
                 environment = _environment_for(probe_request)
                 probe_matrix: dict[str, object] = {
-                    "HOST": _host_run(probe_spec, workspace),
+                    "HOST": _host_run(probe_spec, workspace, retain_output=True),
                     "W2_UNRESTRICTED_NO_PROFILE": harness.run(
                         username=online.username,
                         password=online.password.decode("utf-8"),
@@ -599,6 +623,7 @@ class WindowsW5Gate15RuntimeRootCauseTests(unittest.IsolatedAsyncioTestCase):
                         cwd=workspace,
                         environment=environment,
                         logon_flags=0,
+                        retain_output=True,
                     ),
                     "W2_UNRESTRICTED_WITH_PROFILE": harness.run(
                         username=online.username,
@@ -608,26 +633,7 @@ class WindowsW5Gate15RuntimeRootCauseTests(unittest.IsolatedAsyncioTestCase):
                         cwd=workspace,
                         environment=environment,
                         logon_flags=_LOGON_WITH_PROFILE,
-                    ),
-                }
-                probe_matrix["W2_UNRESTRICTED_NO_PROFILE"] = {
-                    **cast(dict[str, object], probe_matrix["W2_UNRESTRICTED_NO_PROFILE"]),
-                    "probe": _probe_result(
-                        str(
-                            cast(dict[str, object], probe_matrix["W2_UNRESTRICTED_NO_PROFILE"]).get(
-                                "stdout_preview", ""
-                            )
-                        )
-                    ),
-                }
-                probe_matrix["W2_UNRESTRICTED_WITH_PROFILE"] = {
-                    **cast(dict[str, object], probe_matrix["W2_UNRESTRICTED_WITH_PROFILE"]),
-                    "probe": _probe_result(
-                        str(
-                            cast(
-                                dict[str, object], probe_matrix["W2_UNRESTRICTED_WITH_PROFILE"]
-                            ).get("stdout_preview", "")
-                        )
+                        retain_output=True,
                     ),
                 }
                 probe_matrix["W2_RESTRICTED_NO_PROFILE"] = await _w3_run(
@@ -636,6 +642,7 @@ class WindowsW5Gate15RuntimeRootCauseTests(unittest.IsolatedAsyncioTestCase):
                     adapter=adapter,
                     expected_user_sid=expected_online_sid,
                     expected_write_sid=expected_write_sid,
+                    retain_output=True,
                 )
                 original_flags = windows_native_runner._LOGON_FLAGS
                 try:
@@ -646,20 +653,20 @@ class WindowsW5Gate15RuntimeRootCauseTests(unittest.IsolatedAsyncioTestCase):
                         adapter=adapter,
                         expected_user_sid=expected_online_sid,
                         expected_write_sid=expected_write_sid,
+                        retain_output=True,
                     )
                 finally:
                     windows_native_runner._LOGON_FLAGS = original_flags
                 for authority_name in (
                     "HOST",
+                    "W2_UNRESTRICTED_NO_PROFILE",
+                    "W2_UNRESTRICTED_WITH_PROFILE",
                     "W2_RESTRICTED_NO_PROFILE",
                     "W2_RESTRICTED_WITH_PROFILE",
                 ):
                     cell = probe_matrix.get(authority_name)
                     if isinstance(cell, dict):
-                        probe_matrix[authority_name] = {
-                            **cell,
-                            "probe": _probe_result(str(cell.get("stdout_preview", ""))),
-                        }
+                        probe_matrix[authority_name] = _attach_probe_result(cell)
 
                 workloads = _build_workloads(
                     workspace=workspace,
