@@ -1,6 +1,6 @@
 # ADR 0114：Windows 原生非 PTY 沙箱运行时
 
-- 状态：W3 实现完成；focused 原生验收完成；full CI 待最终认证
+- 状态：已接受；W3 已在 focused 原生验收与 full CI 通过后合并
 - 日期：2026-08-14
 - 范围：Windows 启用 profile 下的 BASH、后台 Bash 与 MCP stdio
 
@@ -77,4 +77,4 @@ token、ACL、environment、desktop、Job 或 provenance 边界。
 
 受限 Python 启动、受限 NUL 写入和受限 curl 行为仍记录为 W5 compatibility seam，
 不是 security-isolation failure。W3 不认证 Git、Python、Node 或一般 developer workload
-的兼容性。Full PR CI 是本 PR 的最终 merge-readiness 认证步骤。
+的兼容性。Full PR CI 已通过并完成本 PR 的 merge-readiness 认证。
