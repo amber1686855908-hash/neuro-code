@@ -340,6 +340,24 @@ jobs:
           if ($cases.Count -ne 4 -or $skipped -ne 0) {
             throw "Windows W4 Gate 3 did not execute every focused test"
           }
+      - name: Prove W4 Gate 3 controller-loss has no time grace
+        run: >-
+          uv run pytest
+          tests/security/test_windows_native_pty_controller_loss_acceptance.py
+          -q -rs -s
+          --junitxml=${{ runner.temp }}/neuro-code-windows-native-pty-gate3-no-grace.xml
+      - name: Require W4 Gate 3 no-grace execution
+        shell: pwsh
+        env:
+          W4_JUNIT: ${{ runner.temp }}/neuro-code-windows-native-pty-gate3-no-grace.xml
+        run: |
+          [xml]$report = Get-Content $env:W4_JUNIT
+          $cases = @($report.testsuites.testsuite.testcase)
+          $skipped = @($cases | Where-Object { $_.skipped }).Count
+          Write-Host "executed=$($cases.Count) skipped=$skipped"
+          if ($cases.Count -ne 1 -or $skipped -ne 0) {
+            throw "Windows W4 Gate 3 no-grace acceptance did not execute"
+          }
 
   quality:
     runs-on: ubuntu-latest

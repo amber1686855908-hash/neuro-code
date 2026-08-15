@@ -42,6 +42,13 @@ completion marker, and the controller receives one bounded error rather than
 a fabricated clean EOF. All four scenarios preserve bounded HPCON/relay
 teardown and report no orphan processes.
 
+Controller-loss classification is state-based. The runner treats control EOF
+as harmless only after the final `EXIT` was sent or after
+`owned_scope_quiesced` was established by direct-child exit plus
+`Job ActiveProcesses == 0`. EOF while the owned Job is active calls
+`fail_closed()` immediately; no time-based EXIT grace is used for this
+security decision.
+
 The Gate 1 probe is a disposable native C executable. It verifies actual
 console dimensions, input, merged PTY output, final output drain, exit code,
 restricted-token attestation, and bounded malformed-resize cleanup for both W2

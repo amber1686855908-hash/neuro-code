@@ -46,6 +46,8 @@ from neuro_code.infrastructure.sandbox.windows_native_runner import (
     RunnerLaunch,
     WindowsNamedPipeReader,
     WindowsNamedPipeWriter,
+    _handle_control_eof,
+    _RunnerChild,
     _valid_console_size,
 )
 from neuro_code.infrastructure.sandbox.windows_native_runtime_protocol import (
@@ -339,6 +341,87 @@ class _StatePipe:
 
     def observe_process(self, *_args: object, **_kwargs: object) -> dict[str, object]:
         return {"state": "RUNNER_EXITED"}
+
+
+class _FakeRunnerChildForControlEof:
+    def __init__(self, *, exit_sent: bool, owned_scope_quiesced: bool) -> None:
+        self.exit_sent = exit_sent
+        self.owned_scope_quiesced = owned_scope_quiesced
+        self.event_failed = False
+        self.fail_closed_calls = 0
+
+    def wait_for_exit_sent(self, _timeout_seconds: float) -> bool:
+        raise AssertionError("control EOF must not use a time-based grace period")
+
+    def fail_closed(self) -> None:
+        self.fail_closed_calls += 1
+
+
+class _FakeJobActiveProcessState:
+    def __init__(self, active_processes: int) -> None:
+        self.active_processes = active_processes
+
+
+class WindowsRunnerControlEofStateTests(unittest.TestCase):
+    def test_final_exit_sent_makes_eof_harmless(self) -> None:
+        child = _FakeRunnerChildForControlEof(
+            exit_sent=True,
+            owned_scope_quiesced=False,
+        )
+
+        self.assertTrue(_handle_control_eof(child))  # type: ignore[arg-type]
+        self.assertEqual(child.fail_closed_calls, 0)
+
+    def test_quiesced_owned_scope_makes_eof_harmless(self) -> None:
+        child = _FakeRunnerChildForControlEof(
+            exit_sent=False,
+            owned_scope_quiesced=True,
+        )
+
+        self.assertTrue(_handle_control_eof(child))  # type: ignore[arg-type]
+        self.assertEqual(child.fail_closed_calls, 0)
+
+    def test_active_owned_scope_fails_closed_without_waiting(self) -> None:
+        child = _FakeRunnerChildForControlEof(
+            exit_sent=False,
+            owned_scope_quiesced=False,
+        )
+
+        self.assertFalse(_handle_control_eof(child))  # type: ignore[arg-type]
+        self.assertEqual(child.fail_closed_calls, 1)
+
+    def test_direct_child_exit_does_not_prove_scope_quiescence(self) -> None:
+        # The leader has exited, but an owned descendant remains active.  The
+        # actual runner property must keep the quiesced event unset until the
+        # Job reports zero ActiveProcesses.
+        child = object.__new__(_RunnerChild)
+        child._direct_child_exited = threading.Event()
+        child._direct_child_exited.set()
+        child._owned_scope_quiesced = threading.Event()
+        child._job = _FakeJobActiveProcessState(1)  # type: ignore[assignment]
+
+        self.assertFalse(child.owned_scope_quiesced)
+        self.assertFalse(child._owned_scope_quiesced.is_set())
+
+    def test_job_empty_sets_scope_quiesced_event(self) -> None:
+        child = object.__new__(_RunnerChild)
+        child._direct_child_exited = threading.Event()
+        child._direct_child_exited.set()
+        child._owned_scope_quiesced = threading.Event()
+        child._job = _FakeJobActiveProcessState(0)  # type: ignore[assignment]
+
+        self.assertTrue(child.owned_scope_quiesced)
+        self.assertTrue(child._owned_scope_quiesced.is_set())
+
+    def test_event_failure_is_not_hidden_by_quiesced_scope(self) -> None:
+        child = _FakeRunnerChildForControlEof(
+            exit_sent=False,
+            owned_scope_quiesced=True,
+        )
+        child.event_failed = True
+
+        self.assertFalse(_handle_control_eof(child))  # type: ignore[arg-type]
+        self.assertEqual(child.fail_closed_calls, 1)
 
 
 class WindowsNativeDirectionalTransportTests(unittest.TestCase):

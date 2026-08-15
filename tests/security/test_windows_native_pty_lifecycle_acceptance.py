@@ -124,8 +124,16 @@ async def _wait_for_callback_or_exit(
         await asyncio.sleep(0.02)
 
 
-def _controller_loss_pty_helper_source() -> str:
+def _controller_loss_pty_helper_source(
+    probe_mode: str = "leader-holds-grandchild-holds",
+) -> str:
     """Return the sacrificial trusted controller helper used by Gate 3C."""
+
+    if probe_mode not in {
+        "leader-holds-grandchild-holds",
+        "leader-holds-grandchild-watches-controller-loss",
+    }:
+        raise ValueError("unsupported controller-loss probe mode")
 
     return textwrap.dedent(
         r"""
@@ -182,7 +190,7 @@ def _controller_loss_pty_helper_source() -> str:
             )
             request = SandboxedProcessRequest.exec(
                 str(probe),
-                ("leader-holds-grandchild-holds", str(workspace)),
+                ("W4_CONTROLLER_LOSS_MODE", str(workspace)),
                 purpose=LocalProcessPurpose.INTERACTIVE_TERMINAL,
                 cwd=workspace,
                 sandbox_profile=SandboxProfile.WORKSPACE,
@@ -269,7 +277,7 @@ def _controller_loss_pty_helper_source() -> str:
 
         raise SystemExit(asyncio.run(main()))
         """
-    )
+    ).replace("W4_CONTROLLER_LOSS_MODE", probe_mode)
 
 
 @unittest.skipUnless(_native_enabled(), "privileged Windows W4 acceptance is CI-only")

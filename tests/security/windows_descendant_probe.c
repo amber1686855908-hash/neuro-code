@@ -8,7 +8,9 @@
  * may still expose default non-pipe standard handles in a child; only an
  * inherited FILE_TYPE_PIPE handle can be one of the runner's relay handles.
  * It remains in the inherited Windows Job Object for a bounded interval,
- * writes fixed workspace markers, and exits naturally.
+ * writes fixed workspace markers, and exits naturally.  The controller-loss
+ * mode additionally watches for a parent-written trigger and records whether
+ * the grandchild survived after the controller had already exited.
  */
 
 #define UNICODE
@@ -126,7 +128,8 @@ static int wait_for_markers(const wchar_t *root) {
     return 0;
 }
 
-static int run_grandchild(const wchar_t *root, int hold) {
+static int run_grandchild(const wchar_t *root, int hold,
+                          int watch_controller_loss) {
     int has_runner_pipes =
         standard_pipe_handle_is_valid(STD_INPUT_HANDLE) ||
         standard_pipe_handle_is_valid(STD_OUTPUT_HANDLE) ||
@@ -144,6 +147,23 @@ static int run_grandchild(const wchar_t *root, int hold) {
                              "grandchild-stdio-free\n")) {
         return 33;
     }
+    if (watch_controller_loss) {
+        DWORD elapsed = 0;
+        while (elapsed < 30000) {
+            if (marker_exists(root, L"controller-loss-trigger")) {
+                if (!write_marker(root, L"grandchild-survived-controller-loss",
+                                  "grandchild-survived-controller-loss\n")) {
+                    return 35;
+                }
+                /* Keep the child alive long enough for the controller to
+                 * observe the marker before normal Job cleanup. */
+                Sleep(5000);
+                break;
+            }
+            Sleep(20);
+            elapsed += 20;
+        }
+    }
     /* Gate 5A completes naturally; Gate 5B/5C/5D must remain alive until the
      * controller or runner kills the Job.  The hold is deliberately bounded
      * so a faulty acceptance run cannot leave a child forever. */
@@ -154,7 +174,8 @@ static int run_grandchild(const wchar_t *root, int hold) {
     return 0;
 }
 
-static int run_leader(const wchar_t *root, int hold) {
+static int run_leader(const wchar_t *root, int hold,
+                      int watch_controller_loss) {
     wchar_t module[32768];
     wchar_t command_line[32768];
     size_t command_length = 0;
@@ -175,7 +196,9 @@ static int run_leader(const wchar_t *root, int hold) {
                      &command_length, module) ||
         !append_wide(command_line, sizeof(command_line) / sizeof(command_line[0]),
                      &command_length,
-                     hold ? L"\" grandchild-holds \"" : L"\" grandchild \"") ||
+                     watch_controller_loss
+                         ? L"\" grandchild-watches-controller-loss \""
+                         : hold ? L"\" grandchild-holds \"" : L"\" grandchild \"") ||
         !append_wide(command_line, sizeof(command_line) / sizeof(command_line[0]),
                      &command_length, root) ||
         !append_wide(command_line, sizeof(command_line) / sizeof(command_line[0]),
@@ -211,16 +234,23 @@ static int run_leader(const wchar_t *root, int hold) {
 
 int wmain(int argc, wchar_t **argv) {
     if (argc == 3 && wcscmp(argv[1], L"grandchild") == 0) {
-        return run_grandchild(argv[2], 0);
+        return run_grandchild(argv[2], 0, 0);
     }
     if (argc == 3 && wcscmp(argv[1], L"grandchild-holds") == 0) {
-        return run_grandchild(argv[2], 1);
+        return run_grandchild(argv[2], 1, 0);
+    }
+    if (argc == 3 && wcscmp(argv[1], L"grandchild-watches-controller-loss") == 0) {
+        return run_grandchild(argv[2], 0, 1);
     }
     if (argc == 3 && wcscmp(argv[1], L"parent-exit-child-holds") == 0) {
-        return run_leader(argv[2], 0);
+        return run_leader(argv[2], 0, 0);
     }
     if (argc == 3 && wcscmp(argv[1], L"leader-holds-grandchild-holds") == 0) {
-        return run_leader(argv[2], 1);
+        return run_leader(argv[2], 1, 0);
+    }
+    if (argc == 3 &&
+        wcscmp(argv[1], L"leader-holds-grandchild-watches-controller-loss") == 0) {
+        return run_leader(argv[2], 1, 1);
     }
     return 64;
 }

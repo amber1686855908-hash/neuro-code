@@ -1134,6 +1134,8 @@ class _RunnerChild:
         self._write_lock = threading.Lock()
         self._event_failed = threading.Event()
         self._exit_sent = threading.Event()
+        self._direct_child_exited = threading.Event()
+        self._owned_scope_quiesced = threading.Event()
         self._api = _NativeChildApi()
         self._job = WindowsJobObject.create()
         self._process_handle: int | None = None
@@ -1503,6 +1505,7 @@ class _RunnerChild:
             self._api.wait_process(self._process_handle)
             code = self._api.get_exit_code(self._process_handle)
             self._last_exit_code = code
+            self._direct_child_exited.set()
             # A direct child exit is not the end of the Job-owned scope.  A
             # descendant may still be running without holding any relay
             # handle, so keep the independent wait thread alive until the Job
@@ -1510,6 +1513,10 @@ class _RunnerChild:
             # receive TERMINATE/EOF while this bounded-frequency poll runs.
             while self._job.active_processes:
                 time.sleep(0.02)
+            # This is the only state transition that certifies the owned
+            # scope is empty.  A direct-child exit alone is deliberately not
+            # enough: a detached descendant may still be alive in the Job.
+            self._owned_scope_quiesced.set()
             if self._pseudo_console_handle is not None:
                 pseudo_console_handle = self._pseudo_console_handle
                 self._pseudo_console_handle = None
@@ -1627,23 +1634,55 @@ class _RunnerChild:
     def exit_sent(self) -> bool:
         return self._exit_sent.is_set()
 
-    def wait_for_exit_sent(self, timeout_seconds: float) -> bool:
-        """Close-control grace period for the final EXIT write race.
+    @property
+    def event_failed(self) -> bool:
+        return self._event_failed.is_set()
 
-        The controller closes the control channel immediately after consuming
-        the final event frame.  ``_wait`` marks that frame as sent just after
-        the pipe write returns, so the runner can observe control EOF in the
-        small interval between those two operations.  Waiting here is only a
-        bounded protocol-ordering grace period; it is not a child or Job
-        lifetime timeout.  A controller that disappears before EXIT still
-        fails closed after the bound.
+    @property
+    def owned_scope_quiesced(self) -> bool:
+        """Return whether the direct child and its Job-owned descendants are done.
+
+        The event is set by ``_wait`` only after the Job reports zero active
+        processes.  When control EOF races that event, re-check the live Job
+        count rather than sleeping for a protocol grace period.  A failed
+        query remains non-quiesced so the caller fails closed.
         """
 
-        return self._exit_sent.wait(timeout_seconds)
+        if self._owned_scope_quiesced.is_set():
+            return True
+        if not self._direct_child_exited.is_set():
+            return False
+        try:
+            if self._job.active_processes == 0:
+                self._owned_scope_quiesced.set()
+                return True
+        except BaseException:
+            return False
+        return False
 
     def fail_closed(self) -> None:
         with contextlib.suppress(BaseException):
             self._job.terminate()
+
+
+def _control_eof_is_harmless(child: _RunnerChild) -> bool:
+    """Classify control EOF from actual runner state, never elapsed time."""
+
+    try:
+        if child.event_failed:
+            return False
+        return child.exit_sent or child.owned_scope_quiesced
+    except BaseException:
+        return False
+
+
+def _handle_control_eof(child: _RunnerChild) -> bool:
+    """Apply the state-based EOF contract and report clean runner shutdown."""
+
+    if _control_eof_is_harmless(child):
+        return True
+    child.fail_closed()
+    return False
 
 
 class _NativeChildApi:
@@ -2217,16 +2256,13 @@ def _runner_main(control_pipe_name: str, event_pipe_name: str) -> int:
             data = control_pipe.read()
             if not data:
                 decoder.finish()
-                if child is not None:
-                    # The controller closes control immediately after it
-                    # consumes the final EXIT event.  _RunnerChild sets
-                    # exit_sent just after the event write returns, so allow
-                    # that bounded protocol-ordering race to settle.  This
-                    # is not a child-lifetime timeout: a controller that
-                    # disappears before EXIT still fails closed.
-                    if child.exit_sent or child.wait_for_exit_sent(1.0):
-                        return 0
-                    child.fail_closed()
+                if child is not None and _handle_control_eof(child):
+                    # EOF is harmless only after the final event is known to
+                    # be sent or the complete Job-owned scope is quiesced.
+                    # An active Job fails closed immediately; there is no
+                    # time-based protocol grace that could hide controller
+                    # loss.
+                    return 0
                 return 1
             for frame in decoder.feed(data):
                 validate_channel_frame(RuntimeChannel.CONTROL, frame.kind)

@@ -52,6 +52,11 @@ descendant 均退出且没有自然完成 marker，controller 收到一次有界
 会伪造干净 EOF。四个场景均保持 HPCON/relay 有界 teardown，且没有 orphan
 process。
 
+Controller-loss 的判定基于状态。只有在最终 `EXIT` 已发送，或 direct child
+已退出且 `Job ActiveProcesses == 0`、从而建立 `owned_scope_quiesced` 后，runner
+才将 control EOF 视为无害。owned Job 仍活动时，EOF 会立即调用
+`fail_closed()`；该安全判定不使用基于时间的 EXIT 宽限。
+
 启用 profile 的公开 `spawn_terminal()` 路由仍保持 fail closed；Gate 2 acceptance 不会
 暴露该路由。W5 尚未开始，本 ADR 不认证 Python、Git、Node、NUL、curl、应用层 terminal
 路由或 developer-tool compatibility。
