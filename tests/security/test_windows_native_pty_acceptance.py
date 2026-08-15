@@ -525,8 +525,9 @@ class WindowsNativePtyAcceptanceTests(unittest.IsolatedAsyncioTestCase):
 
                 async def wait_for(marker: bytes, timeout: float = 8.0) -> None:  # noqa: ASYNC109
                     nonlocal offset
+                    needle = marker.rstrip(b"\r\n")
                     deadline = asyncio.get_running_loop().time() + timeout
-                    while marker not in observed:
+                    while needle not in observed:
                         if asyncio.get_running_loop().time() >= deadline:
                             raise AssertionError(
                                 f"application terminal did not emit {marker!r}: {bytes(observed)!r}"
