@@ -515,13 +515,10 @@ class WindowsNativePtyAcceptanceTests(unittest.IsolatedAsyncioTestCase):
             ) -> dict[str, object]:
                 output = bytearray()
                 errors: list[BaseException] = []
-                changed = asyncio.Event()
-                loop = asyncio.get_running_loop()
                 session: Any | None = None
 
                 def on_output(data: bytes) -> None:
                     output.extend(data[: max(0, (1 << 20) - len(output))])
-                    loop.call_soon_threadsafe(changed.set)
 
                 try:
                     print(
@@ -549,7 +546,7 @@ class WindowsNativePtyAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                         request,
                         size=TerminalSize(80, 25),
                         on_output=on_output,
-                        on_eof=lambda: changed.set(),
+                        on_eof=lambda: None,
                         on_error=errors.append,
                     )
                     print(
@@ -558,17 +555,16 @@ class WindowsNativePtyAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                         flush=True,
                     )
                     deadline = asyncio.get_running_loop().time() + 15.0
+                    tick = asyncio.Event()
                     while (
                         session.poll_exit() is None and asyncio.get_running_loop().time() < deadline
                     ):
+                        # Gate 2 intentionally uses a timer-only wait.  PTY
+                        # output is evidence, not a wake-up source; letting a
+                        # noisy pseudo-console enqueue callbacks could starve
+                        # this bounded child-exit deadline.
                         with contextlib.suppress(TimeoutError):
-                            await asyncio.wait_for(changed.wait(), timeout=0.25)
-                        changed.clear()
-                        # A PTY can deliver a stream of small output chunks;
-                        # when the event is already set, wait() may complete
-                        # synchronously.  Yield explicitly so the bounded
-                        # deadline and cancellation callbacks cannot starve.
-                        await asyncio.sleep(0)
+                            await asyncio.wait_for(tick.wait(), timeout=0.1)
                     if session.poll_exit() is None:
                         print(
                             "W4_GATE2_RUN_TIMEOUT="
