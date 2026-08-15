@@ -524,6 +524,11 @@ class WindowsNativePtyAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                     loop.call_soon_threadsafe(changed.set)
 
                 try:
+                    print(
+                        "W4_GATE2_RUN_START="
+                        + json.dumps({"label": label, "identity": identity}, sort_keys=True),
+                        flush=True,
+                    )
                     request = _pty_security_request(
                         workspace,
                         offline=offline,
@@ -547,6 +552,11 @@ class WindowsNativePtyAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                         on_eof=lambda: changed.set(),
                         on_error=errors.append,
                     )
+                    print(
+                        "W4_GATE2_RUN_SPAWNED="
+                        + json.dumps({"label": label, "pid": session.process_id}, sort_keys=True),
+                        flush=True,
+                    )
                     deadline = asyncio.get_running_loop().time() + 15.0
                     while (
                         session.poll_exit() is None and asyncio.get_running_loop().time() < deadline
@@ -555,8 +565,28 @@ class WindowsNativePtyAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                             await asyncio.wait_for(changed.wait(), timeout=0.25)
                         changed.clear()
                     if session.poll_exit() is None:
+                        print(
+                            "W4_GATE2_RUN_TIMEOUT="
+                            + json.dumps(
+                                {
+                                    "label": label,
+                                    "pid": session.process_id,
+                                    "output_bytes": len(output),
+                                    "errors": [type(error).__name__ for error in errors],
+                                },
+                                sort_keys=True,
+                            ),
+                            flush=True,
+                        )
                         self.fail(f"{label}: PTY child did not exit")
                     await asyncio.to_thread(session.close)
+                    print(
+                        "W4_GATE2_RUN_EXIT="
+                        + json.dumps(
+                            {"label": label, "exit_code": session.poll_exit()}, sort_keys=True
+                        ),
+                        flush=True,
+                    )
                     diagnostic = session.diagnostic_snapshot()
                     self.assertEqual(diagnostic.get("runner_state"), "RUNNER_EXITED")
                     self.assertEqual(diagnostic.get("runner_exit_code"), 0)
