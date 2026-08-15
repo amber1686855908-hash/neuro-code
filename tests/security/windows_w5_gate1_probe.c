@@ -2,6 +2,7 @@
 #include <userenv.h>
 
 #pragma comment(lib, "userenv.lib")
+#pragma comment(lib, "Advapi32.lib")
 
 static void emit_ascii(const char *text) {
     DWORD written = 0;
