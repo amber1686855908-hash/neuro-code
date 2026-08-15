@@ -28,6 +28,7 @@ from neuro_code.application.ports.windows_sandbox import (
 )
 from neuro_code.bootstrap.composition import _default_local_process_sandbox_factory
 from neuro_code.domain.sandbox.models import SandboxProfile
+from neuro_code.domain.terminal.models import TerminalSize
 from neuro_code.infrastructure.sandbox.windows_native_local_process import (
     WindowsNativeLocalProcessSandbox,
     WindowsRuntimeControllerTransport,
@@ -36,6 +37,7 @@ from neuro_code.infrastructure.sandbox.windows_native_local_process import (
     _required_capabilities,
     _validated_child_token_attestation,
     _WindowsNativeOwnedLocalProcess,
+    _WindowsNativePtySession,
 )
 from neuro_code.infrastructure.sandbox.windows_native_runner import (
     _FILE_CREATE_PIPE_INSTANCE,
@@ -44,6 +46,7 @@ from neuro_code.infrastructure.sandbox.windows_native_runner import (
     RunnerLaunch,
     WindowsNamedPipeReader,
     WindowsNamedPipeWriter,
+    _valid_console_size,
 )
 from neuro_code.infrastructure.sandbox.windows_native_runtime_protocol import (
     MAX_FRAME_PAYLOAD,
@@ -150,6 +153,7 @@ class WindowsNativeRuntimeProtocolTests(unittest.TestCase):
             RuntimeFrameType.STDERR,
             RuntimeFrameType.EXIT,
             RuntimeFrameType.ERROR,
+            RuntimeFrameType.PTY_OUTPUT,
         ):
             with self.assertRaises(SandboxError):
                 validate_channel_frame(RuntimeChannel.CONTROL, kind)
@@ -158,9 +162,57 @@ class WindowsNativeRuntimeProtocolTests(unittest.TestCase):
             RuntimeFrameType.STDIN,
             RuntimeFrameType.CLOSE_STDIN,
             RuntimeFrameType.TERMINATE,
+            RuntimeFrameType.RESIZE,
         ):
             with self.assertRaises(SandboxError):
                 validate_channel_frame(RuntimeChannel.EVENT, kind)
+
+    def test_pty_frames_keep_directional_binary_contract(self) -> None:
+        resize = encode_json({"version": 1, "columns": 120, "rows": 40})
+        self.assertEqual(
+            RuntimeFrameDecoder().feed(encode_frame(RuntimeFrameType.RESIZE, resize)),
+            (RuntimeFrame(RuntimeFrameType.RESIZE, resize),),
+        )
+        self.assertEqual(
+            RuntimeFrameDecoder().feed(encode_frame(RuntimeFrameType.PTY_OUTPUT, b"raw\x00bytes")),
+            (RuntimeFrame(RuntimeFrameType.PTY_OUTPUT, b"raw\x00bytes"),),
+        )
+
+    def test_pty_dimensions_are_bounded_and_reject_zero_or_bool(self) -> None:
+        self.assertTrue(_valid_console_size(80, 25))
+        self.assertTrue(_valid_console_size(32_767, 32_767))
+        self.assertFalse(_valid_console_size(0, 25))
+        self.assertFalse(_valid_console_size(80, 32_768))
+        self.assertFalse(_valid_console_size(True, 25))
+
+    def test_pty_output_is_raw_and_exit_is_final_event(self) -> None:
+        output: list[bytes] = []
+        eof = []
+        errors: list[BaseException] = []
+        session = _WindowsNativePtySession(
+            transport=WindowsRuntimeControllerTransport(
+                control=_StatePipe(),  # type: ignore[arg-type]
+                events=_StatePipe(),  # type: ignore[arg-type]
+            ),
+            runner=RunnerLaunch(process_handle=1, process_id=42),
+            pid=42,
+            size=TerminalSize(80, 25),
+            on_output=output.append,
+            on_eof=lambda: eof.append(True),
+            on_error=errors.append,
+            decoder=RuntimeFrameDecoder(),
+            initial_frames=(
+                RuntimeFrame(RuntimeFrameType.PTY_OUTPUT, b"raw\x00bytes"),
+                RuntimeFrame(RuntimeFrameType.EXIT, encode_json({"returncode": 7})),
+                RuntimeFrame(RuntimeFrameType.PTY_OUTPUT, b"after-exit"),
+            ),
+            security_attestation={},
+        )
+        self.assertTrue(session._done.wait(2.0))
+        self.assertEqual(output, [b"raw\x00bytes"])
+        self.assertEqual(eof, [True])
+        self.assertEqual(errors, [])
+        self.assertEqual(session.poll_exit(), 7)
 
     def test_large_stdin_frame_is_binary_safe(self) -> None:
         payload = b"\x00\xff" * 40_000
@@ -589,6 +641,28 @@ class WindowsNativeRuntimeContractTests(unittest.IsolatedAsyncioTestCase):
                             purpose=LocalProcessPurpose.INTERACTIVE_TERMINAL,
                         )
                     )
+
+    def test_public_spawn_terminal_remains_fail_closed_during_w4_gate1(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "workspace"
+            root.mkdir()
+            adapter = WindowsNativeLocalProcessSandbox(
+                SandboxProfile.WORKSPACE,
+                root,
+                Path(directory) / "state",
+            )
+            with self.assertRaisesRegex(SandboxError, "W3 does not provide"):
+                adapter.spawn_terminal(
+                    _request(
+                        root,
+                        purpose=LocalProcessPurpose.INTERACTIVE_TERMINAL,
+                        stdio=LocalProcessStdioMode.PTY,
+                    ),
+                    size=TerminalSize(80, 25),
+                    on_output=lambda _data: None,
+                    on_eof=lambda: None,
+                    on_error=lambda _error: None,
+                )
 
     def test_setup_not_ready_fails_before_identity_or_runner(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

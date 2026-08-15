@@ -72,6 +72,7 @@ _EXTENDED_STARTUPINFO_PRESENT = 0x00080000
 _STARTF_USESTDHANDLES = 0x00000100
 _PROC_THREAD_ATTRIBUTE_HANDLE_LIST = 0x00020002
 _PROC_THREAD_ATTRIBUTE_JOB_LIST = 0x0002000D
+_PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE = 0x00020016
 _HANDLE_FLAG_INHERIT = 0x00000001
 _WAIT_OBJECT_0 = 0
 _WAIT_TIMEOUT = 258
@@ -144,6 +145,11 @@ _PIPE_EVENT_WRITE_ACCESS = (
     | _READ_CONTROL
     | _SYNCHRONIZE
 )
+_COORD_MAX = (1 << 15) - 1
+
+
+class _Coord(ctypes.Structure):
+    _fields_ = [("X", ctypes.c_int16), ("Y", ctypes.c_int16)]
 
 
 class _CFunction(Protocol):
@@ -1102,6 +1108,17 @@ def _validated_text(value: object, label: str) -> str:
     return value
 
 
+def _valid_console_size(columns: object, rows: object) -> bool:
+    return (
+        isinstance(columns, int)
+        and not isinstance(columns, bool)
+        and isinstance(rows, int)
+        and not isinstance(rows, bool)
+        and 1 <= columns <= _COORD_MAX
+        and 1 <= rows <= _COORD_MAX
+    )
+
+
 class _RunnerChild:
     """Native restricted child and its relay threads, owned by one runner."""
 
@@ -1130,6 +1147,8 @@ class _RunnerChild:
         self._output_handles: list[int] = []
         self._threads: list[threading.Thread] = []
         self._token_attestation: WindowsTokenInspection | None = None
+        self._pty_mode = False
+        self._pseudo_console_handle: int | None = None
         try:
             self._create(payload)
         except BaseException:
@@ -1185,6 +1204,18 @@ class _RunnerChild:
             create_no_window = payload.get("create_no_window", True)
             if not isinstance(create_no_window, bool):
                 raise SandboxError("Windows runtime console mode is invalid")
+            stdio_mode = payload.get("stdio_mode", "")
+            if stdio_mode not in {"capture", "merged-capture", "protocol", "pty"}:
+                raise SandboxError("Windows runtime stdio mode is invalid")
+            self._pty_mode = stdio_mode == "pty"
+            if self._pty_mode and payload.get("terminal_mode") != "pty":
+                raise SandboxError("Windows runtime PTY mode is invalid")
+            if self._pty_mode and create_no_window:
+                raise SandboxError("Windows runtime PTY cannot use CREATE_NO_WINDOW")
+            initial_columns = payload.get("columns")
+            initial_rows = payload.get("rows")
+            if self._pty_mode and not _valid_console_size(initial_columns, initial_rows):
+                raise SandboxError("Windows runtime PTY dimensions are invalid")
             executable = payload.get("executable")
             arguments = payload.get("arguments", [])
             shell_command = payload.get("shell_command")
@@ -1225,43 +1256,82 @@ class _RunnerChild:
                 command_line = subprocess.list2cmdline([application_name, *arguments])
             merge_output = bool(payload.get("merge_output", False))
             pipe_stdin = bool(payload.get("pipe_stdin", False))
-            stdout_read, stdout_write = self._api.create_output_pipe()
-            handles_to_close.extend((stdout_read, stdout_write))
-            if merge_output:
-                stderr_read, stderr_write = None, stdout_write
+            if self._pty_mode:
+                if shell_command is not None or merge_output or pipe_stdin:
+                    raise SandboxError("Windows runtime PTY request has incompatible stdio")
+                input_read, input_write = self._api.create_input_pipe()
+                output_read, output_write = self._api.create_output_pipe()
+                handles_to_close.extend((input_read, input_write, output_read, output_write))
+                columns = cast(int, initial_columns)
+                rows = cast(int, initial_rows)
+                self._pseudo_console_handle = self._api.create_pseudo_console(
+                    columns,
+                    rows,
+                    input_read,
+                    output_write,
+                )
+                created = self._api.create_process_as_user(
+                    token.handle,
+                    application_name=application_name,
+                    command_line=command_line,
+                    cwd=cwd,
+                    env=environment,
+                    stdin_handle=0,
+                    stdout_handle=0,
+                    stderr_handle=0,
+                    inherited_handles=(),
+                    job_handle=self._job.process_creation_handle,
+                    desktop_name=self._desktop_name,
+                    create_no_window=False,
+                    pseudo_console_handle=self._pseudo_console_handle,
+                )
+                # The host-side pipe endpoints remain owned by the runner;
+                # the child-side endpoints were supplied to CreatePseudoConsole
+                # and must be closed after the process is created.
+                for handle in (input_read, output_write):
+                    self._api.close_handle(handle)
+                    handles_to_close.remove(handle)
+                stdin_child, stdin_parent = input_read, input_write
+                stdout_read, stdout_write = output_read, output_write
+                stderr_read, stderr_write = None, None
             else:
-                stderr_read, stderr_write = self._api.create_output_pipe()
-                handles_to_close.extend((stderr_read, stderr_write))
-            if pipe_stdin:
-                stdin_child, stdin_parent = self._api.create_input_pipe()
-            else:
-                stdin_child, stdin_parent = self._api.open_null_input(), None
-            handles_to_close.append(stdin_child)
-            if stdin_parent is not None:
-                handles_to_close.append(stdin_parent)
-            inherited = tuple(dict.fromkeys((stdin_child, stdout_write, stderr_write)))
-            created = self._api.create_process_as_user(
-                token.handle,
-                application_name=application_name,
-                command_line=command_line,
-                cwd=cwd,
-                env=environment,
-                stdin_handle=stdin_child,
-                stdout_handle=stdout_write,
-                stderr_handle=stderr_write,
-                inherited_handles=inherited,
-                job_handle=self._job.process_creation_handle,
-                desktop_name=self._desktop_name,
-                create_no_window=create_no_window,
-            )
-            self._api.close_handle(stdin_child)
-            handles_to_close.remove(stdin_child)
-            self._api.close_handle(stdout_write)
-            handles_to_close.remove(stdout_write)
-            if not merge_output:
-                self._api.close_handle(stderr_write)
-                assert stderr_write is not None
-                handles_to_close.remove(stderr_write)
+                stdout_read, stdout_write = self._api.create_output_pipe()
+                handles_to_close.extend((stdout_read, stdout_write))
+                if merge_output:
+                    stderr_read, stderr_write = None, stdout_write
+                else:
+                    stderr_read, stderr_write = self._api.create_output_pipe()
+                    handles_to_close.extend((stderr_read, stderr_write))
+                if pipe_stdin:
+                    stdin_child, stdin_parent = self._api.create_input_pipe()
+                else:
+                    stdin_child, stdin_parent = self._api.open_null_input(), None
+                handles_to_close.append(stdin_child)
+                if stdin_parent is not None:
+                    handles_to_close.append(stdin_parent)
+                inherited = tuple(dict.fromkeys((stdin_child, stdout_write, stderr_write)))
+                created = self._api.create_process_as_user(
+                    token.handle,
+                    application_name=application_name,
+                    command_line=command_line,
+                    cwd=cwd,
+                    env=environment,
+                    stdin_handle=stdin_child,
+                    stdout_handle=stdout_write,
+                    stderr_handle=stderr_write,
+                    inherited_handles=inherited,
+                    job_handle=self._job.process_creation_handle,
+                    desktop_name=self._desktop_name,
+                    create_no_window=create_no_window,
+                )
+                self._api.close_handle(stdin_child)
+                handles_to_close.remove(stdin_child)
+                self._api.close_handle(stdout_write)
+                handles_to_close.remove(stdout_write)
+                if not merge_output:
+                    self._api.close_handle(stderr_write)
+                    assert stderr_write is not None
+                    handles_to_close.remove(stderr_write)
             self._process_handle = created.process_handle
             # The primary thread is owned by the process after creation; the
             # runner only needs the process handle for lifecycle ownership.
@@ -1317,7 +1387,12 @@ class _RunnerChild:
             )
             self._threads.append(
                 threading.Thread(
-                    target=self._relay, args=(stdout_read, RuntimeFrameType.STDOUT), daemon=True
+                    target=self._relay,
+                    args=(
+                        stdout_read,
+                        RuntimeFrameType.PTY_OUTPUT if self._pty_mode else RuntimeFrameType.STDOUT,
+                    ),
+                    daemon=True,
                 )
             )
             if stderr_read is not None:
@@ -1342,6 +1417,11 @@ class _RunnerChild:
                 owned_handles.append(self._stdin_handle)
             self._output_handles.clear()
             self._stdin_handle = None
+            remaining_pseudo_console_handle = self._pseudo_console_handle
+            self._pseudo_console_handle = None
+            if remaining_pseudo_console_handle is not None:
+                with contextlib.suppress(BaseException):
+                    self._api.close_pseudo_console(remaining_pseudo_console_handle)
             seen: set[int] = set()
             for handle in (*handles_to_close, *owned_handles):
                 if handle in seen:
@@ -1430,6 +1510,13 @@ class _RunnerChild:
             # receive TERMINATE/EOF while this bounded-frequency poll runs.
             while self._job.active_processes:
                 time.sleep(0.02)
+            if self._pseudo_console_handle is not None:
+                pseudo_console_handle = self._pseudo_console_handle
+                self._pseudo_console_handle = None
+                # ClosePseudoConsole may emit final output.  The PTY relay is
+                # already draining the host output pipe and is joined only
+                # after this call, so final bytes cannot race the Exit frame.
+                self._api.close_pseudo_console(pseudo_console_handle)
             # Drain both output relays before publishing Exit.  The event pipe
             # is one-way, so the controller can keep reading while these
             # synchronous relay writes complete; Exit is therefore the final
@@ -1482,6 +1569,11 @@ class _RunnerChild:
                     self._api.close_handle(stdin_handle)
             with contextlib.suppress(BaseException):
                 self._job.close()
+            remaining_pseudo_console_handle = self._pseudo_console_handle
+            self._pseudo_console_handle = None
+            if remaining_pseudo_console_handle is not None:
+                with contextlib.suppress(BaseException):
+                    self._api.close_pseudo_console(remaining_pseudo_console_handle)
             desktop_handle, self._desktop_handle = self._desktop_handle, None
             self._desktop_name = None
             if desktop_handle is not None:
@@ -1494,6 +1586,22 @@ class _RunnerChild:
             if self._stdin_handle is None:
                 raise SandboxError("Windows runtime stdin is not available")
             self._api.write_all(self._stdin_handle, frame.payload)
+            return True
+        if frame.kind is RuntimeFrameType.RESIZE:
+            if not self._pty_mode or self._pseudo_console_handle is None:
+                raise SandboxError("Windows runtime resize is not available")
+            payload = decode_json(frame.payload)
+            if (
+                not isinstance(payload, dict)
+                or payload.get("version") != PROTOCOL_VERSION
+                or not _valid_console_size(payload.get("columns"), payload.get("rows"))
+            ):
+                raise SandboxError("Windows runtime resize dimensions are invalid")
+            self._api.resize_pseudo_console(
+                self._pseudo_console_handle,
+                int(payload["columns"]),
+                int(payload["rows"]),
+            )
             return True
         if frame.kind is RuntimeFrameType.CLOSE_STDIN:
             if self._stdin_handle is not None:
@@ -1510,6 +1618,7 @@ class _RunnerChild:
             RuntimeFrameType.STDERR,
             RuntimeFrameType.EXIT,
             RuntimeFrameType.ERROR,
+            RuntimeFrameType.PTY_OUTPUT,
         }:
             raise SandboxError("Windows runtime event frame arrived on control pipe")
         return False
@@ -1544,6 +1653,24 @@ class _NativeChildApi:
                 ctypes.c_uint32,
             ],
             ctypes.c_int32,
+        )
+        self._create_pseudo_console = _load_function(
+            kernel32,
+            "CreatePseudoConsole",
+            [_Coord, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32, ctypes.c_void_p],
+            ctypes.c_int32,
+        )
+        self._resize_pseudo_console = _load_function(
+            kernel32,
+            "ResizePseudoConsole",
+            [ctypes.c_void_p, _Coord],
+            ctypes.c_int32,
+        )
+        self._close_pseudo_console = _load_function(
+            kernel32,
+            "ClosePseudoConsole",
+            [ctypes.c_void_p],
+            None,
         )
         self._set_handle_information = _load_function(
             kernel32,
@@ -1712,6 +1839,42 @@ class _NativeChildApi:
     def create_input_pipe(self) -> tuple[int, int]:
         return self._pipe(parent_is_read=False)
 
+    def create_pseudo_console(
+        self,
+        columns: int,
+        rows: int,
+        input_read_handle: int,
+        output_write_handle: int,
+    ) -> int:
+        if not _valid_console_size(columns, rows):
+            raise ValueError("Windows PTY dimensions are invalid")
+        handle = ctypes.c_void_p()
+        result = cast(
+            int,
+            self._create_pseudo_console(
+                _Coord(columns, rows),
+                input_read_handle,
+                output_write_handle,
+                0,
+                ctypes.byref(handle),
+            ),
+        )
+        if result != 0:
+            raise OSError(result, f"CreatePseudoConsole failed with HRESULT {result}")
+        if handle.value is None:
+            raise OSError("CreatePseudoConsole returned an invalid handle")
+        return int(handle.value)
+
+    def resize_pseudo_console(self, handle: int, columns: int, rows: int) -> None:
+        if not _valid_console_size(columns, rows):
+            raise ValueError("Windows PTY dimensions are invalid")
+        result = cast(int, self._resize_pseudo_console(handle, _Coord(columns, rows)))
+        if result != 0:
+            raise OSError(result, f"ResizePseudoConsole failed with HRESULT {result}")
+
+    def close_pseudo_console(self, handle: int) -> None:
+        self._close_pseudo_console(handle)
+
     def _pipe(self, *, parent_is_read: bool) -> tuple[int, int]:
         attrs = self._attrs()
         read, write = ctypes.c_void_p(), ctypes.c_void_p()
@@ -1755,18 +1918,35 @@ class _NativeChildApi:
         job_handle: int,
         desktop_name: str | None,
         create_no_window: bool,
+        pseudo_console_handle: int | None = None,
     ) -> RunnerLaunch:
+        pty_mode = pseudo_console_handle is not None
+        if pty_mode and inherited_handles:
+            raise ValueError("PTY process creation cannot inherit arbitrary handles")
+        attribute_count = 2
         required = ctypes.c_size_t()
-        self._initialize_attribute_list(None, 2, 0, ctypes.byref(required))
+        self._initialize_attribute_list(None, attribute_count, 0, ctypes.byref(required))
         if not required.value:
             self._error("InitializeProcThreadAttributeList(size)")
         storage = ctypes.create_string_buffer(required.value)
         attributes = ctypes.cast(storage, ctypes.c_void_p)
-        if not self._initialize_attribute_list(attributes, 2, 0, ctypes.byref(required)):
+        if not self._initialize_attribute_list(
+            attributes, attribute_count, 0, ctypes.byref(required)
+        ):
             self._error("InitializeProcThreadAttributeList")
         job_values = (ctypes.c_void_p * 1)(job_handle)
         handle_values = (ctypes.c_void_p * len(inherited_handles))(*inherited_handles)
         try:
+            if pty_mode and not self._update_attribute(
+                attributes,
+                0,
+                _PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
+                pseudo_console_handle,
+                ctypes.sizeof(ctypes.c_void_p),
+                None,
+                None,
+            ):
+                self._error("UpdateProcThreadAttribute(pseudoconsole)")
             if not self._update_attribute(
                 attributes,
                 0,
@@ -1777,7 +1957,7 @@ class _NativeChildApi:
                 None,
             ):
                 self._error("UpdateProcThreadAttribute(job)")
-            if not self._update_attribute(
+            if not pty_mode and not self._update_attribute(
                 attributes,
                 0,
                 _PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
@@ -1792,21 +1972,28 @@ class _NativeChildApi:
             # list attribute is only honored for inheritable handles; relying
             # on the CreatePipe security-attributes default is fragile across
             # Windows runners and leaves the child with detached stdio.
-            for handle in dict.fromkeys(inherited_handles):
-                if not self._set_handle_information(
-                    handle, _HANDLE_FLAG_INHERIT, _HANDLE_FLAG_INHERIT
-                ):
-                    self._error("SetHandleInformation(stdio inherit)")
+            if not pty_mode:
+                for handle in dict.fromkeys(inherited_handles):
+                    if not self._set_handle_information(
+                        handle, _HANDLE_FLAG_INHERIT, _HANDLE_FLAG_INHERIT
+                    ):
+                        self._error("SetHandleInformation(stdio inherit)")
             startup = _StartupInfoExW()
             startup.StartupInfo.cb = ctypes.sizeof(startup)
             # The desktop is selected by trusted runner composition.  The
             # inherited/default value is used only by the native diagnostic
             # probes; model-controlled requests cannot select it.
             startup.StartupInfo.lpDesktop = desktop_name
-            startup.StartupInfo.dwFlags = _STARTF_USESTDHANDLES
-            startup.StartupInfo.hStdInput = stdin_handle
-            startup.StartupInfo.hStdOutput = stdout_handle
-            startup.StartupInfo.hStdError = stderr_handle
+            if pty_mode:
+                startup.StartupInfo.dwFlags = 0
+                startup.StartupInfo.hStdInput = None
+                startup.StartupInfo.hStdOutput = None
+                startup.StartupInfo.hStdError = None
+            else:
+                startup.StartupInfo.dwFlags = _STARTF_USESTDHANDLES
+                startup.StartupInfo.hStdInput = stdin_handle
+                startup.StartupInfo.hStdOutput = stdout_handle
+                startup.StartupInfo.hStdError = stderr_handle
             startup.lpAttributeList = attributes.value
             process = _ProcessInformation()
             mutable = ctypes.create_unicode_buffer(command_line)
@@ -1820,7 +2007,7 @@ class _NativeChildApi:
                 mutable,
                 None,
                 None,
-                True,
+                not pty_mode,
                 creation_flags,
                 ctypes.cast(environment, ctypes.c_void_p),
                 str(cwd),

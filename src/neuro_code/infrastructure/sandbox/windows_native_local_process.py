@@ -44,6 +44,7 @@ from neuro_code.application.ports.windows_sandbox import (
     WindowsSandboxSetupState,
 )
 from neuro_code.domain.sandbox.models import SandboxProfile
+from neuro_code.domain.terminal.models import TerminalSignal, TerminalSize
 from neuro_code.infrastructure.sandbox.windows_native_runner import (
     RunnerLaunch,
     WindowsNamedPipeReader,
@@ -522,6 +523,8 @@ class WindowsNativeLocalProcessSandbox(LocalProcessSandbox):
         request: SandboxedProcessRequest,
         identity: WindowsRuntimeIdentity,
         setup_request: WindowsSandboxSetupRequest,
+        *,
+        pty_size: TerminalSize | None = None,
     ) -> tuple[
         WindowsRuntimeControllerTransport,
         RunnerLaunch,
@@ -578,12 +581,24 @@ class WindowsNativeLocalProcessSandbox(LocalProcessSandbox):
                 "environment": self._child_environment(request.environment_policy),
                 "merge_output": request.stdio_mode is LocalProcessStdioMode.MERGED_CAPTURE,
                 "pipe_stdin": request.stdio_mode is LocalProcessStdioMode.PROTOCOL,
+                "stdio_mode": request.stdio_mode.value,
                 # These fields are trusted adapter composition knobs for the
                 # native acceptance probes only.  They are not part of the
                 # model-facing request or any public sandbox configuration.
                 "desktop_mode": self._diagnostic_desktop_mode.value,
                 "create_no_window": self._diagnostic_create_no_window,
             }
+            if pty_size is not None:
+                if request.stdio_mode is not LocalProcessStdioMode.PTY:
+                    raise SandboxError("Windows PTY candidate requires PTY stdio")
+                payload.update(
+                    {
+                        "terminal_mode": "pty",
+                        "columns": pty_size.columns,
+                        "rows": pty_size.rows,
+                        "create_no_window": False,
+                    }
+                )
             if request.uses_shell:
                 payload["shell_command"] = request.shell_command
             else:
@@ -752,6 +767,285 @@ class WindowsNativeLocalProcessSandbox(LocalProcessSandbox):
     ) -> TerminalPlatformSession:
         del request, size, on_output, on_eof, on_error
         raise SandboxError("Windows W3 does not provide a sandboxed interactive terminal; use W4")
+
+    def _validate_terminal_candidate(
+        self, request: SandboxedProcessRequest
+    ) -> WindowsSandboxSetupRequest:
+        """Validate the private Gate 1 W4 candidate without changing public routing."""
+
+        if not _runtime_is_windows():
+            raise SandboxError("Windows native sandbox is only available on Windows")
+        if request.sandbox_profile is not self._profile:
+            raise SandboxError("Windows native sandbox profile does not match the session")
+        if request.purpose is not LocalProcessPurpose.INTERACTIVE_TERMINAL:
+            raise SandboxError("Windows W4 requires interactive-terminal purpose")
+        if request.stdio_mode is not LocalProcessStdioMode.PTY:
+            raise SandboxError("Windows W4 requires PTY stdio")
+        if request.uses_shell:
+            raise SandboxError("Windows W4 requires an argv-safe executable")
+        if not lifecycle_capability_satisfies(
+            self.lifecycle_capability, request.lifecycle.required_capability
+        ):
+            raise SandboxError("Windows W4 cannot satisfy the requested lifecycle")
+        if not security_capability_satisfies(
+            self.security_capabilities, _required_capabilities(self._profile)
+        ):
+            raise SandboxError("Windows W4 security capabilities are insufficient")
+        if (
+            not request.filesystem_policy.private_home
+            or not request.filesystem_policy.private_temporary_directory
+        ):
+            raise SandboxError(
+                "Windows enabled profiles require private HOME and temporary storage"
+            )
+        setup_request = self._setup_request(request)
+        if (
+            setup_request.installation_root == self._workspace
+            or setup_request.installation_root.is_relative_to(self._workspace)
+        ):
+            raise SandboxError("Windows setup state must remain outside the sandbox workspace")
+        self._validate_setup_scope(request, setup_request)
+        try:
+            WindowsTrustedRunnerProvenance.resolve().assert_disjoint(setup_request.writable_roots)
+        except SandboxError:
+            raise
+        except BaseException as error:
+            raise SandboxError("trusted runner provenance is unavailable") from error
+        try:
+            snapshot = self._setup_authority.inspect(setup_request)
+        except BaseException as error:
+            raise SandboxError("Windows sandbox setup inspection failed closed") from error
+        if snapshot.state is not WindowsSandboxSetupState.READY:
+            raise SandboxError("Windows sandbox setup is not READY; W4 never performs setup")
+        return setup_request
+
+    def _spawn_terminal_candidate(
+        self,
+        request: SandboxedProcessRequest,
+        *,
+        size: TerminalSize,
+        on_output: TerminalOutputHandler,
+        on_eof: TerminalEofHandler,
+        on_error: TerminalErrorHandler,
+    ) -> TerminalPlatformSession:
+        """Start the focused W4 Gate 1 candidate; public PTY remains fail closed."""
+
+        if not isinstance(size, TerminalSize):
+            raise TypeError("size must be a TerminalSize")
+        setup_request = self._validate_terminal_candidate(request)
+        kind = (
+            WindowsSandboxIdentityKind.OFFLINE
+            if request.network_policy is LocalProcessNetworkPolicy.ISOLATED
+            else WindowsSandboxIdentityKind.ONLINE
+        )
+        identity = self._identity_provider.resolve(setup_request, kind)
+        transport, launch, ready, decoder, pending_frames = self._start_runner(
+            request,
+            identity,
+            setup_request,
+            pty_size=size,
+        )
+        payload = decode_json(ready.payload)
+        if not isinstance(payload, dict) or payload.get("version") != PROTOCOL_VERSION:
+            transport.control.close()
+            transport.events.close()
+            close_runner_process(launch.process_handle)
+            raise SandboxError("trusted Windows runner returned an invalid SpawnReady frame")
+        pid = payload.get("pid")
+        if not isinstance(pid, int) or pid <= 0:
+            transport.control.close()
+            transport.events.close()
+            close_runner_process(launch.process_handle)
+            raise SandboxError("trusted Windows runner returned an invalid child PID")
+        security_attestation = _validated_child_token_attestation(
+            payload.get("security"), expected_write_sid=identity.write_sid
+        )
+        return _WindowsNativePtySession(
+            transport=transport,
+            runner=launch,
+            pid=pid,
+            size=size,
+            on_output=on_output,
+            on_eof=on_eof,
+            on_error=on_error,
+            decoder=decoder,
+            initial_frames=pending_frames,
+            security_attestation=security_attestation,
+        )
+
+
+class _WindowsNativePtySession:
+    """Controller-side projection of the private W4 PTY candidate."""
+
+    def __init__(
+        self,
+        *,
+        transport: WindowsRuntimeControllerTransport,
+        runner: RunnerLaunch,
+        pid: int,
+        size: TerminalSize,
+        on_output: TerminalOutputHandler,
+        on_eof: TerminalEofHandler,
+        on_error: TerminalErrorHandler,
+        decoder: RuntimeFrameDecoder,
+        initial_frames: tuple[RuntimeFrame, ...],
+        security_attestation: dict[str, object],
+    ) -> None:
+        self._control = transport.control
+        self._events = transport.events
+        self._runner = runner
+        self._pid = pid
+        self._size = size
+        self._on_output = on_output
+        self._on_eof = on_eof
+        self._on_error = on_error
+        self._decoder = decoder
+        self._initial_frames = initial_frames
+        self._security_attestation = dict(security_attestation)
+        self._returncode: int | None = None
+        self._error: BaseException | None = None
+        self._done = threading.Event()
+        self._closed = False
+        self._eof_sent = False
+        self._write_lock = threading.Lock()
+        self._reader = threading.Thread(
+            target=self._read_frames,
+            name=f"neuro-code-windows-pty-{pid}",
+            daemon=True,
+        )
+        self._reader.start()
+
+    @property
+    def process_id(self) -> int:
+        return self._pid
+
+    @property
+    def lifecycle_capability(self) -> LocalProcessLifecycleCapability:
+        return LocalProcessLifecycleCapability.STRONG_DESCENDANT_OWNERSHIP
+
+    @property
+    def size(self) -> TerminalSize:
+        return self._size
+
+    def _read_frames(self) -> None:
+        try:
+            for frame in self._initial_frames:
+                self._handle_frame(frame)
+                if frame.kind is RuntimeFrameType.EXIT:
+                    return
+            self._initial_frames = ()
+            while True:
+                data = self._events.read()
+                if not data:
+                    self._decoder.finish()
+                    if self._returncode is None:
+                        raise SandboxError("trusted Windows PTY runner disconnected before Exit")
+                    return
+                for frame in self._decoder.feed(data):
+                    validate_channel_frame(RuntimeChannel.EVENT, frame.kind)
+                    self._handle_frame(frame)
+                    if frame.kind is RuntimeFrameType.EXIT:
+                        return
+        except BaseException as error:
+            self._error = error
+            if not self._closed:
+                with contextlib.suppress(BaseException):
+                    self._on_error(error)
+        finally:
+            self._closed = True
+            self._control.close()
+            wait_runner = getattr(self._events, "wait_process", None)
+            if callable(wait_runner) and os.name == "nt":
+                with contextlib.suppress(BaseException):
+                    result = wait_runner(
+                        self._runner.process_handle,
+                        timeout_seconds=2.0,
+                        active_state="RUNNER_STILL_ACTIVE",
+                        exited_state="RUNNER_EXITED",
+                    )
+                    if result.get("state") == "RUNNER_STILL_ACTIVE":
+                        _terminate_runner_process(self._runner.process_handle)
+            self._events.close()
+            with contextlib.suppress(BaseException):
+                close_runner_process(self._runner.process_handle)
+            self._done.set()
+
+    def _handle_frame(self, frame: RuntimeFrame) -> None:
+        if frame.kind is RuntimeFrameType.PTY_OUTPUT:
+            self._on_output(frame.payload)
+            return
+        if frame.kind is RuntimeFrameType.EXIT:
+            payload = decode_json(frame.payload)
+            if not isinstance(payload, dict) or not isinstance(payload.get("returncode"), int):
+                raise SandboxError("Windows PTY Exit frame is invalid")
+            self._returncode = int(payload["returncode"])
+            if not self._eof_sent:
+                self._eof_sent = True
+                self._on_eof()
+            return
+        if frame.kind is RuntimeFrameType.ERROR:
+            payload = decode_json(frame.payload)
+            if not isinstance(payload, dict):
+                raise SandboxError("trusted Windows PTY runner reported an invalid error")
+            message = payload.get("message")
+            detail = message[:512] if isinstance(message, str) and message else "runtime error"
+            raise SandboxError(f"trusted Windows PTY runner reported a runtime error: {detail}")
+        raise SandboxError("Windows PTY event frame is invalid")
+
+    def write(self, data: bytes) -> None:
+        if not isinstance(data, bytes):
+            raise TypeError("terminal input data must be bytes")
+        if not data:
+            return
+        with self._write_lock:
+            if self._closed:
+                raise RuntimeError("Windows PTY session is closed")
+            self._control.write(encode_frame(RuntimeFrameType.STDIN, data))
+
+    def resize(self, size: TerminalSize) -> None:
+        if not isinstance(size, TerminalSize):
+            raise TypeError("size must be a TerminalSize")
+        with self._write_lock:
+            if self._closed:
+                raise RuntimeError("Windows PTY session is closed")
+            self._control.write(
+                encode_frame(
+                    RuntimeFrameType.RESIZE,
+                    encode_json(
+                        {
+                            "version": PROTOCOL_VERSION,
+                            "columns": size.columns,
+                            "rows": size.rows,
+                        }
+                    ),
+                )
+            )
+            self._size = size
+
+    def send_signal(self, signal: TerminalSignal) -> None:
+        if not isinstance(signal, TerminalSignal):
+            raise TypeError("signal must be a TerminalSignal")
+        if signal is TerminalSignal.INTERRUPT:
+            self.write(b"\x03")
+            return
+        with self._write_lock:
+            if self._closed:
+                return
+            self._control.write(encode_frame(RuntimeFrameType.TERMINATE))
+
+    def poll_exit(self) -> int | None:
+        return self._returncode
+
+    def close(self) -> None:
+        if not self._closed:
+            with contextlib.suppress(BaseException):
+                self.send_signal(TerminalSignal.TERMINATE)
+            if not self._done.wait(5.0):
+                _terminate_runner_process(self._runner.process_handle)
+                self._control.close()
+                self._events.close()
+                self._done.wait(2.0)
+        self._reader.join(timeout=1.0)
 
 
 class _WindowsNativeOwnedLocalProcess(OwnedLocalProcess):
@@ -923,6 +1217,8 @@ class _WindowsNativeOwnedLocalProcess(OwnedLocalProcess):
         elif frame.kind is RuntimeFrameType.STDERR:
             if self._stderr is not None:
                 self._call(self._stderr.feed_data, frame.payload)
+        elif frame.kind is RuntimeFrameType.PTY_OUTPUT:
+            raise SandboxError("Windows W3 process received a PTY output frame")
         elif frame.kind is RuntimeFrameType.EXIT:
             payload = decode_json(frame.payload)
             if not isinstance(payload, dict) or not isinstance(payload.get("returncode"), int):
