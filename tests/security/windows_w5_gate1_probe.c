@@ -1,4 +1,5 @@
 #include <windows.h>
+#include <userenv.h>
 
 #pragma comment(lib, "userenv.lib")
 
