@@ -165,6 +165,7 @@ def _compile_nul_probe() -> Path:  # pragma: no cover - Windows CI
         "if errorlevel 1 exit /b 1\r\n"
         f'cl /nologo /W4 /WX /MT /O2 /Fe:"{output}" "{source}"\r\n',
         encoding="ascii",
+        newline="",
     )
     build = subprocess.run(
         ["cmd.exe", "/d", "/c", script.name],
@@ -223,6 +224,14 @@ def _output_matches(spec: _Workload, stdout: bytes, stderr: bytes) -> bool:
     folded = combined.casefold()
     if spec.require_empty_output and combined.strip():
         return False
+    if spec.name == "GIT_REPO_DISCOVERY":
+        lines = [line.strip() for line in combined.splitlines() if line.strip()]
+        if not lines or spec.cwd is None:
+            return False
+        try:
+            return _canonical(Path(lines[0])) == _canonical(spec.cwd)
+        except (OSError, RuntimeError, ValueError):
+            return False
     return not spec.expected_patterns or all(
         re.search(pattern, folded, flags=re.IGNORECASE | re.DOTALL)
         for pattern in spec.expected_patterns
@@ -241,6 +250,15 @@ def _completed_classification(spec: _Workload, exit_code: int, stdout: bytes, st
             or '"write":"fail"' in evidence
         ):
             return "DEVICE_ACCESS_DENIED"
+    evidence = (stdout + b"\n" + stderr).decode("utf-8", errors="replace").casefold()
+    if spec.name == "GIT_REPO_DISCOVERY" and exit_code != 0:
+        return "REPOSITORY_DISCOVERY_FAILURE"
+    if spec.name.startswith("GIT") and "could not open '/dev/null'" in evidence:
+        return "DEVICE_ACCESS_DENIED"
+    if spec.name.startswith("PYTHON") and spec.name != "PYTHON_VERSION":
+        return "RUNTIME_INITIALIZATION_FAILURE"
+    if "starting the clr failed" in evidence or "hresult 80070005" in evidence:
+        return "RUNTIME_INITIALIZATION_FAILURE"
     return "NONZERO_EXIT"
 
 
@@ -659,7 +677,7 @@ def _build_workloads(
             "workspace-repository",
             git,
             ("rev-parse", "--show-toplevel"),
-            (re.escape(str(repo).replace("\\", "/").casefold()),),
+            (),
             cwd=repo,
         ),
         _Workload(
@@ -691,7 +709,7 @@ def _build_workloads(
     if npm is not None:
         if npm.suffix.casefold() in {".cmd", ".bat"} and cmd is not None:
             npm_executable = cmd
-            npm_arguments = ("/d", "/s", "/c", f'"{npm}" --version')
+            npm_arguments = ("/d", "/c", "call", str(npm), "--version")
         else:
             npm_executable = npm
             npm_arguments = ("--version",)
@@ -762,7 +780,7 @@ def _provenance(paths: dict[str, Path | None], workspace: Path) -> dict[str, obj
             cmd = paths.get("cmd")
             if path.suffix.casefold() in {".cmd", ".bat"} and cmd is not None:
                 version = _version_command(
-                    cmd, ("/d", "/s", "/c", f'"{path}" --version'), workspace
+                    cmd, ("/d", "/c", "call", str(path), "--version"), workspace
                 )
             else:
                 version = _version_command(path, ("--version",), workspace)
@@ -898,6 +916,20 @@ class WindowsNativeWorkloadCompatibilityTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.to_thread(authority.cleanup, setup_request)
 
 
+def _path_classifications(row: dict[str, object]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for path in ("HOST", "W3", "W4"):
+        cell = row.get(path)
+        if isinstance(cell, dict):
+            result[path] = cell.get("classification")
+    return result
+
+
+def _shared_transport_classification(row: dict[str, object]) -> bool:
+    classes = _path_classifications(row)
+    return classes.get("W3") == classes.get("W4")
+
+
 def _correlate(matrix: list[dict[str, object]]) -> dict[str, object]:
     shared: list[str] = []
     w3_only: list[str] = []
@@ -942,4 +974,36 @@ def _correlate(matrix: list[dict[str, object]]) -> dict[str, object]:
         "curl_rows": [
             row["workload"] for row in matrix if str(row.get("workload", "")).startswith("CURL")
         ],
+        "nul_correlation": {
+            "rows": [row["workload"] for row in matrix if "NUL" in str(row.get("workload"))],
+            "shared_w3_w4": [
+                row["workload"]
+                for row in matrix
+                if "NUL" in str(row.get("workload")) and _shared_transport_classification(row)
+            ],
+        },
+        "python_layer_results": {
+            row["workload"]: _path_classifications(row)
+            for row in matrix
+            if str(row.get("workload", "")).startswith("PYTHON")
+        },
+        "git_failure_stage": {
+            row["workload"]: _path_classifications(row)
+            for row in matrix
+            if str(row.get("workload", "")).startswith("GIT")
+        },
+        "node_npm_failure_stage": {
+            row["workload"]: _path_classifications(row)
+            for row in matrix
+            if str(row.get("workload")) in {"NODE_VERSION", "NODE_EXEC", "NPM_VERSION"}
+        },
+        "curl_failure_stage": {
+            row["workload"]: _path_classifications(row)
+            for row in matrix
+            if str(row.get("workload", "")).startswith("CURL")
+        },
+        "prior_current_curl_reproduction": {
+            "status": "NOT_FOUND",
+            "note": "No exact prior restricted-curl command exists in current W3 evidence.",
+        },
     }
