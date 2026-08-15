@@ -242,7 +242,7 @@ def _output_matches(spec: _Workload, stdout: bytes, stderr: bytes) -> bool:
 def _reported_error_code(stdout: bytes, stderr: bytes) -> int | None:
     text = (stdout + b"\n" + stderr).decode("utf-8", errors="replace").replace("\x00", "")
     matches = re.findall(
-        r"(create_error|write_error|hresult)\s*[=:]?\s*((?:0x)?[0-9a-f]+)",
+        r"(create_error|write_error|hresult)[^0-9a-f]{0,12}((?:0x)?[0-9a-f]+)",
         text,
         flags=re.IGNORECASE,
     )

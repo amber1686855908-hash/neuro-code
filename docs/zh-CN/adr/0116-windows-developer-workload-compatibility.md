@@ -68,9 +68,66 @@ HOST 通过而 W3、W4 均失败时，记录为共享 restricted-runtime 候选�
 W4 失败则保留为 transport-specific 证据。这些只是下一阶段的假设，不是修复或
 因果结论。
 
+## Gate 0 证据记录
+
+focused CI run [31896141324](https://github.com/amber1686855908-hash/neuro-code/actions/runs/31896141324)
+的 23 个 job 全部成功。`windows-native-sandbox-compatibility` job 执行了一个
+矩阵测试，0 skip，并上传了有界 JSON 与 JUnit artifact。矩阵运行于 Windows
+Server 2025 hosted `windows-latest`、Python 3.12.10、`WORKSPACE` 和 Online
+identity。
+
+controller 记录的工具来源：
+
+| 工具 | 已解析路径与版本 |
+| --- | --- |
+| `cmd.exe` | `C:\Windows\System32\cmd.exe`；Windows 10.0.26100.33158 |
+| `powershell.exe` | `C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe`；5.1.26100.33158 |
+| `pwsh.exe` | `C:\Program Files\PowerShell\7\pwsh.exe`；7.6.4 |
+| `python.exe` | `D:\a\neuro-code\neuro-code\.venv\Scripts\python.exe`；3.12.10 |
+| `git.exe` | `C:\Program Files\Git\bin\git.exe`；2.55.0.windows.3 |
+| `node.exe` | `C:\Program Files\nodejs\node.exe`；v22.23.2 |
+| `npm.cmd` | `C:\Program Files\nodejs\npm.cmd`；10.9.8 |
+| `curl.exe` | `C:\Windows\System32\curl.exe`；8.16.0 Schannel |
+
+下表记录 `HOST / W3 / W4` 的 `classification` 与退出码；`T` 表示达到有界
+timeout。所有已安装的 W3/W4 单元格都先达到 `SpawnReady`，并在观察工作负载
+结果前保留通过的 token attestation。
+
+| 工作负载 / variant | HOST | W3 非 PTY | W4 PTY |
+| --- | --- | --- | --- |
+| `CMD_BASIC` / default | PASS / 0 | PASS / 0 | PASS / 0 |
+| `CMD_NUL_REDIRECT` / default | PASS / 0 | DEVICE_ACCESS_DENIED / 1 | DEVICE_ACCESS_DENIED / 1 |
+| `POWERSHELL_BASIC` / Windows PowerShell | PASS / 0 | RUNTIME_INITIALIZATION_FAILURE / 4294901760 | RUNTIME_INITIALIZATION_FAILURE / 4294901760 |
+| `PWSH_BASIC` / pwsh | PASS / 0 | TIMEOUT / 1 / T | TIMEOUT / T |
+| `PYTHON_VERSION` / default | PASS / 0 | TIMEOUT / 1 / T | TIMEOUT / T |
+| `PYTHON_MINIMAL_NO_SITE` / `-I -S` | PASS / 0 | TIMEOUT / 1 / T | TIMEOUT / T |
+| `PYTHON_ISOLATED` / `-I` | PASS / 0 | TIMEOUT / 1 / T | TIMEOUT / T |
+| `PYTHON_NORMAL` / normal | PASS / 0 | TIMEOUT / 1 / T | TIMEOUT / T |
+| `GIT_VERSION` / default | PASS / 0 | DEVICE_ACCESS_DENIED / 128 | DEVICE_ACCESS_DENIED / 128 |
+| `GIT_REPO_DISCOVERY` / disposable repo | PASS / 0 | DEVICE_ACCESS_DENIED / 128 | DEVICE_ACCESS_DENIED / 128 |
+| `GIT_STATUS` / porcelain v1 | PASS / 0 | DEVICE_ACCESS_DENIED / 128 | DEVICE_ACCESS_DENIED / 128 |
+| `NODE_VERSION` / default | PASS / 0 | PASS / 0 | PASS / 0 |
+| `NODE_EXEC` / `-e` | PASS / 0 | PASS / 0 | PASS / 0 |
+| `NPM_VERSION` / resolved `npm.cmd` | PASS / 0 | PASS / 0 | PASS / 0 |
+| `CURL_VERSION` / `--version` | PASS / 0 | TIMEOUT / 1 / T | TIMEOUT / T |
+| `NUL_DIRECT_WIN32` / `CreateFileW` + `WriteFile` | PASS / 0 | DEVICE_ACCESS_DENIED / 2（Win32 5） | DEVICE_ACCESS_DENIED / 2（Win32 5） |
+
+artifact 保留的重要有界错误事实：Windows PowerShell 在 CLR 启动时报告
+`HRESULT 80070005`（Win32 `2147942405`）；Git 报告
+`fatal: could not open '/dev/null' for reading and writing: Permission denied`；
+直接 NUL probe 报告 `CreateFileW` error 5；`pwsh` PTY 输出包含有界的
+`BCrypt.dll` 初始化失败（`0x8007045A`）。Python 的任何启动变体都没有产生
+用户 marker。curl 行只测启动；当前 W3 evidence 没有精确的既有 restricted-curl
+命令，因此没有运行替代网络命令。
+
+关联分析显示 `CMD_NUL_REDIRECT`、Windows PowerShell、`pwsh`、全部四个 Python
+行、三个 Git 行、curl 启动和 `NUL_DIRECT_WIN32` 均为 W3/W4 共享失败；没有
+W3-only、W4-only 或 HOST 失败。Node 与 npm 在两种 transport 中均通过。NUL
+拒绝同时出现在 shell redirection 与直接 Win32 device access，但本 Gate 不对
+Git 或其他工作负载宣称因果关系。
+
 ## 下一决策边界
 
-审阅 focused CI artifact 后，按受影响工作负载数量、W3/W4 是否共享、对开发工作流
-的影响以及是否无需削弱冻结的安全 contract 来排序最高影响兼容性候选。Gate 0 不
-实现该候选，W5 Gate 1 尚未开始。
-
+下一阶段首先调查共享的 restricted startup/device compatibility seam：它影响
+Python、curl、Git、NUL 和 PowerShell 家族，且对 W3/W4 都有影响；但在任何改动
+之前仍必须分离其中的子原因。Gate 0 不实现修复，W5 Gate 1 尚未开始。

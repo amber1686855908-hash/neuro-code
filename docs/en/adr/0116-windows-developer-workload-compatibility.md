@@ -76,11 +76,71 @@ shared restricted-runtime candidate; a W3-only or W4-only failure is retained
 as transport-specific evidence.  These are hypotheses for the next W5 step,
 not fixes or causal claims.
 
+## Gate 0 evidence record
+
+Focused CI run [31896141324](https://github.com/amber1686855908-hash/neuro-code/actions/runs/31896141324)
+completed all 23 jobs successfully.  Its `windows-native-sandbox-compatibility`
+job executed one matrix test with zero skips and uploaded the bounded JSON and
+JUnit artifacts.  The matrix used Windows Server 2025 hosted `windows-latest`,
+Python 3.12.10, `WORKSPACE`, and the Online identity.
+
+Tool provenance recorded by the controller:
+
+| Tool | Resolved path and version |
+| --- | --- |
+| `cmd.exe` | `C:\Windows\System32\cmd.exe`; Windows 10.0.26100.33158 |
+| `powershell.exe` | `C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe`; 5.1.26100.33158 |
+| `pwsh.exe` | `C:\Program Files\PowerShell\7\pwsh.exe`; 7.6.4 |
+| `python.exe` | `D:\a\neuro-code\neuro-code\.venv\Scripts\python.exe`; 3.12.10 |
+| `git.exe` | `C:\Program Files\Git\bin\git.exe`; 2.55.0.windows.3 |
+| `node.exe` | `C:\Program Files\nodejs\node.exe`; v22.23.2 |
+| `npm.cmd` | `C:\Program Files\nodejs\npm.cmd`; 10.9.8 |
+| `curl.exe` | `C:\Windows\System32\curl.exe`; 8.16.0 Schannel |
+
+The table records `classification` and exit code for `HOST / W3 / W4`; `T`
+means the bounded timeout was reached.  Every installed W3/W4 cell reached
+`SpawnReady` and retained a passing token attestation before the workload
+result was observed.
+
+| Workload / variant | HOST | W3 non-PTY | W4 PTY |
+| --- | --- | --- | --- |
+| `CMD_BASIC` / default | PASS / 0 | PASS / 0 | PASS / 0 |
+| `CMD_NUL_REDIRECT` / default | PASS / 0 | DEVICE_ACCESS_DENIED / 1 | DEVICE_ACCESS_DENIED / 1 |
+| `POWERSHELL_BASIC` / Windows PowerShell | PASS / 0 | RUNTIME_INITIALIZATION_FAILURE / 4294901760 | RUNTIME_INITIALIZATION_FAILURE / 4294901760 |
+| `PWSH_BASIC` / pwsh | PASS / 0 | TIMEOUT / 1 / T | TIMEOUT / T |
+| `PYTHON_VERSION` / default | PASS / 0 | TIMEOUT / 1 / T | TIMEOUT / T |
+| `PYTHON_MINIMAL_NO_SITE` / `-I -S` | PASS / 0 | TIMEOUT / 1 / T | TIMEOUT / T |
+| `PYTHON_ISOLATED` / `-I` | PASS / 0 | TIMEOUT / 1 / T | TIMEOUT / T |
+| `PYTHON_NORMAL` / normal | PASS / 0 | TIMEOUT / 1 / T | TIMEOUT / T |
+| `GIT_VERSION` / default | PASS / 0 | DEVICE_ACCESS_DENIED / 128 | DEVICE_ACCESS_DENIED / 128 |
+| `GIT_REPO_DISCOVERY` / disposable repo | PASS / 0 | DEVICE_ACCESS_DENIED / 128 | DEVICE_ACCESS_DENIED / 128 |
+| `GIT_STATUS` / porcelain v1 | PASS / 0 | DEVICE_ACCESS_DENIED / 128 | DEVICE_ACCESS_DENIED / 128 |
+| `NODE_VERSION` / default | PASS / 0 | PASS / 0 | PASS / 0 |
+| `NODE_EXEC` / `-e` | PASS / 0 | PASS / 0 | PASS / 0 |
+| `NPM_VERSION` / resolved `npm.cmd` | PASS / 0 | PASS / 0 | PASS / 0 |
+| `CURL_VERSION` / `--version` | PASS / 0 | TIMEOUT / 1 / T | TIMEOUT / T |
+| `NUL_DIRECT_WIN32` / `CreateFileW` + `WriteFile` | PASS / 0 | DEVICE_ACCESS_DENIED / 2 (Win32 5) | DEVICE_ACCESS_DENIED / 2 (Win32 5) |
+
+Important bounded error facts are retained in the artifact: Windows PowerShell
+reported `HRESULT 80070005` (Win32 `2147942405`) while starting the CLR;
+Git reported `fatal: could not open '/dev/null' for reading and writing:
+Permission denied`; the direct NUL probe reported `CreateFileW` error 5;
+`pwsh` PTY output included a bounded `BCrypt.dll` initialization failure
+(`0x8007045A`).  Python produced no user marker in any startup variant.  The
+curl row is startup-only; no exact prior restricted-curl command was found in
+the current W3 evidence and no replacement network command was run.
+
+Correlation is shared W3/W4 for `CMD_NUL_REDIRECT`, Windows PowerShell,
+`pwsh`, all four Python rows, all three Git rows, curl startup, and
+`NUL_DIRECT_WIN32`.  There were no W3-only or W4-only rows and no HOST
+failures.  Node and npm passed through both transports.  NUL denial is
+correlated across shell redirection and direct Win32 device access, but this
+Gate does not claim causation for Git or any other workload.
+
 ## Next decision boundary
 
-After the focused CI artifact is reviewed, the highest-impact compatibility
-candidate will be ranked by affected workloads, W3/W4 sharing, developer
-workflow impact, and whether it can be addressed without weakening the frozen
-security contract.  Gate 0 does not implement that candidate.  W5 Gate 1 has
-not started.
-
+The first candidate for a later W5 fix investigation is the shared restricted
+startup/device-compatibility seam affecting Python, curl, Git, NUL, and the
+PowerShell family.  It has the broadest W3/W4 impact, but its sub-causes must
+be separated before any change.  Gate 0 does not implement a fix, and W5 Gate
+1 has not started.
