@@ -65,3 +65,17 @@ def test_nul_mode_projection_preserves_each_access_shape() -> None:
             "write_error": 0,
         },
     }
+
+
+def test_nul_mode_projection_tolerates_pty_wrapping() -> None:
+    output = (
+        b'\x1b[?25lW5_NUL_DIRECT={"read":{"create":"PASS"},'
+        b'"write":{"create":"FAIL","create_error":5},'
+        b'"read_write":{"create":"FAIL","create_error":5}}'
+        b"\x1b[?25h\r\n"
+    )
+    assert _nul_mode_results(output, b"\x1b[2K") == {
+        "read": {"create": "PASS"},
+        "write": {"create": "FAIL", "create_error": 5},
+        "read_write": {"create": "FAIL", "create_error": 5},
+    }

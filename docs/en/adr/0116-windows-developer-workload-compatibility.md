@@ -100,7 +100,7 @@ Tool provenance recorded by the controller:
 | `powershell.exe` | `C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe`; 5.1.26100.33158 |
 | `pwsh.exe` | `C:\Program Files\PowerShell\7\pwsh.exe`; 7.6.4 |
 | `python.exe` | `D:\a\neuro-code\neuro-code\.venv\Scripts\python.exe`; 3.12.10 |
-| base `python.exe` | discovered from the venv's verified `sys._base_executable`; path and version are recorded in the JSON artifact |
+| base `python.exe` | discovered from the venv's verified `sys._base_executable`; the artifact records `C:\\hostedtoolcache\\windows\\Python\\3.12.10\\x64\\python.exe` / Python 3.12.10 |
 | `git.exe` | `C:\Program Files\Git\bin\git.exe`; 2.55.0.windows.3 |
 | `node.exe` | `C:\Program Files\nodejs\node.exe`; v22.23.2 |
 | `npm.cmd` | `C:\Program Files\nodejs\npm.cmd`; 10.9.8 |
@@ -121,6 +121,8 @@ result was observed.
 | `PYTHON_MINIMAL_NO_SITE` / `-I -S` | PASS / 0 | TIMEOUT / 1 / T | TIMEOUT / T |
 | `PYTHON_ISOLATED` / `-I` | PASS / 0 | TIMEOUT / 1 / T | TIMEOUT / T |
 | `PYTHON_NORMAL` / normal | PASS / 0 | TIMEOUT / 1 / T | TIMEOUT / T |
+| `PYTHON_BASE_VERSION` / verified base interpreter | PASS / 0 | TIMEOUT / 1 / T | TIMEOUT / T |
+| `PYTHON_BASE_MINIMAL_NO_SITE` / base `-I -S` | PASS / 0 | TIMEOUT / 1 / T | TIMEOUT / T |
 | `GIT_VERSION` / default | PASS / 0 | DEVICE_ACCESS_DENIED / 128 | DEVICE_ACCESS_DENIED / 128 |
 | `GIT_REPO_DISCOVERY` / disposable repo | PASS / 0 | DEVICE_ACCESS_DENIED / 128 | DEVICE_ACCESS_DENIED / 128 |
 | `GIT_STATUS` / porcelain v1 | PASS / 0 | DEVICE_ACCESS_DENIED / 128 | DEVICE_ACCESS_DENIED / 128 |
@@ -130,6 +132,18 @@ result was observed.
 | `CURL_VERSION` / `--version` | PASS / 0 | TIMEOUT / 1 / T | TIMEOUT / T |
 | `NUL_DIRECT_WIN32` / `CreateFileW` + `WriteFile` | PASS / 0 | DEVICE_ACCESS_DENIED / 2 (Win32 5) | DEVICE_ACCESS_DENIED / 2 (Win32 5) |
 
+The venv and verified base interpreter both report Python 3.12.10 on the host,
+but they are distinct executables; all six Python rows time out in both W3 and
+W4. The base rows therefore do not establish a venv-only startup cause.
+
+The access-mode-specific NUL evidence is retained separately in the artifact:
+
+| NUL access mode | HOST | W3 non-PTY | W4 PTY |
+| --- | --- | --- | --- |
+| `NUL_READ` (`GENERIC_READ`) | Create PASS / error 0; write not attempted | Create PASS / error 0; write not attempted | Create PASS / error 0; write not attempted |
+| `NUL_WRITE` (`GENERIC_WRITE`) | Create PASS / error 0; `WriteFile` PASS | Create FAIL / error 5; `WriteFile` not attempted | Create FAIL / error 5; `WriteFile` not attempted |
+| `NUL_READ_WRITE` (both) | Create PASS / error 0; `WriteFile` PASS | Create FAIL / error 5; `WriteFile` not attempted | Create FAIL / error 5; `WriteFile` not attempted |
+
 Important bounded error facts are retained in the artifact: Windows PowerShell
 reported `HRESULT 80070005` (Win32 `2147942405`) while starting the CLR;
 Git reported `fatal: could not open '/dev/null' for reading and writing:
@@ -137,7 +151,12 @@ Permission denied`; the direct NUL probe reported `CreateFileW` error 5;
 `pwsh` PTY output included a bounded `BCrypt.dll` initialization failure
 (`0x8007045A`).  Python produced no user marker in any startup variant.  The
 curl row is startup-only; no exact prior restricted-curl command was found in
-the current W3 evidence and no replacement network command was run.
+the current W3 evidence and no replacement network command was run. For every
+timeout row, W3 used canonical process termination followed by a bounded
+two-second pipe drain, and W4 used canonical terminal-session close followed by
+its bounded close/drain; the runner reported exit 0 and the artifact recorded
+no forced-runner fallback. This is cleanup evidence only; it does not measure
+or claim an `orphan_count` value.
 
 The interpretation separates at least two evidence clusters.  Cluster A is
 device/NUL evidence: `CMD_NUL_REDIRECT`, the access-mode-specific

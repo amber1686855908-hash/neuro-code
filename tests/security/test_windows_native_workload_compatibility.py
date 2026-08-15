@@ -262,13 +262,17 @@ def _reported_error_code(stdout: bytes, stderr: bytes) -> int | None:
 
 
 def _nul_mode_results(stdout: bytes, stderr: bytes) -> dict[str, object] | None:
-    text = (stdout + b"\n" + stderr).decode("utf-8", errors="replace").replace("\x00", "")
-    match = re.search(r"W5_NUL_DIRECT=(\{.*\})", text)
-    if match is None:
+    text = _strip_terminal((stdout + b"\n" + stderr).decode("utf-8", errors="replace")).replace(
+        "\x00", ""
+    )
+    marker = "W5_NUL_DIRECT="
+    marker_start = text.find(marker)
+    if marker_start < 0:
         return None
+    payload = text[marker_start + len(marker) :].lstrip()
     try:
-        value = json.loads(match.group(1))
-    except json.JSONDecodeError:
+        value, _ = json.JSONDecoder().raw_decode(payload)
+    except (json.JSONDecodeError, TypeError):
         return None
     return value if isinstance(value, dict) else None
 
@@ -934,6 +938,7 @@ def _provenance(paths: dict[str, Path | None], workspace: Path) -> dict[str, obj
             "$PSVersionTable.PSVersion.ToString()",
         ),
         "python": ("--version",),
+        "python_base": ("--version",),
         "git": ("--version",),
         "node": ("--version",),
         "curl": ("--version",),

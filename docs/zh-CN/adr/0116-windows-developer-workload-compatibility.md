@@ -90,7 +90,7 @@ controller 记录的工具来源：
 | `powershell.exe` | `C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe`；5.1.26100.33158 |
 | `pwsh.exe` | `C:\Program Files\PowerShell\7\pwsh.exe`；7.6.4 |
 | `python.exe` | `D:\a\neuro-code\neuro-code\.venv\Scripts\python.exe`；3.12.10 |
-| base `python.exe` | 从 venv 已验证的 `sys._base_executable` 发现；路径与版本记录在 JSON artifact |
+| base `python.exe` | 从 venv 已验证的 `sys._base_executable` 发现；artifact 记录为 `C:\\hostedtoolcache\\windows\\Python\\3.12.10\\x64\\python.exe` / Python 3.12.10 |
 | `git.exe` | `C:\Program Files\Git\bin\git.exe`；2.55.0.windows.3 |
 | `node.exe` | `C:\Program Files\nodejs\node.exe`；v22.23.2 |
 | `npm.cmd` | `C:\Program Files\nodejs\npm.cmd`；10.9.8 |
@@ -110,6 +110,8 @@ timeout。所有已安装的 W3/W4 单元格都先达到 `SpawnReady`，并在�
 | `PYTHON_MINIMAL_NO_SITE` / `-I -S` | PASS / 0 | TIMEOUT / 1 / T | TIMEOUT / T |
 | `PYTHON_ISOLATED` / `-I` | PASS / 0 | TIMEOUT / 1 / T | TIMEOUT / T |
 | `PYTHON_NORMAL` / normal | PASS / 0 | TIMEOUT / 1 / T | TIMEOUT / T |
+| `PYTHON_BASE_VERSION` / 已验证 base interpreter | PASS / 0 | TIMEOUT / 1 / T | TIMEOUT / T |
+| `PYTHON_BASE_MINIMAL_NO_SITE` / base `-I -S` | PASS / 0 | TIMEOUT / 1 / T | TIMEOUT / T |
 | `GIT_VERSION` / default | PASS / 0 | DEVICE_ACCESS_DENIED / 128 | DEVICE_ACCESS_DENIED / 128 |
 | `GIT_REPO_DISCOVERY` / disposable repo | PASS / 0 | DEVICE_ACCESS_DENIED / 128 | DEVICE_ACCESS_DENIED / 128 |
 | `GIT_STATUS` / porcelain v1 | PASS / 0 | DEVICE_ACCESS_DENIED / 128 | DEVICE_ACCESS_DENIED / 128 |
@@ -119,13 +121,29 @@ timeout。所有已安装的 W3/W4 单元格都先达到 `SpawnReady`，并在�
 | `CURL_VERSION` / `--version` | PASS / 0 | TIMEOUT / 1 / T | TIMEOUT / T |
 | `NUL_DIRECT_WIN32` / `CreateFileW` + `WriteFile` | PASS / 0 | DEVICE_ACCESS_DENIED / 2（Win32 5） | DEVICE_ACCESS_DENIED / 2（Win32 5） |
 
+venv 与已验证的 base interpreter 在 HOST 上都报告 Python 3.12.10，但二者是
+不同的 executable；六个 Python 行在 W3 与 W4 均 timeout。因此 base 行不能证明
+问题只存在于 venv 启动。
+
+按 access mode 分开的 NUL 证据也保留在 artifact 中：
+
+| NUL access mode | HOST | W3 非 PTY | W4 PTY |
+| --- | --- | --- | --- |
+| `NUL_READ`（`GENERIC_READ`） | Create PASS / error 0；未尝试写入 | Create PASS / error 0；未尝试写入 | Create PASS / error 0；未尝试写入 |
+| `NUL_WRITE`（`GENERIC_WRITE`） | Create PASS / error 0；`WriteFile` PASS | Create FAIL / error 5；未尝试 `WriteFile` | Create FAIL / error 5；未尝试 `WriteFile` |
+| `NUL_READ_WRITE`（两者） | Create PASS / error 0；`WriteFile` PASS | Create FAIL / error 5；未尝试 `WriteFile` | Create FAIL / error 5；未尝试 `WriteFile` |
+
 artifact 保留的重要有界错误事实：Windows PowerShell 在 CLR 启动时报告
 `HRESULT 80070005`（Win32 `2147942405`）；Git 报告
 `fatal: could not open '/dev/null' for reading and writing: Permission denied`；
 直接 NUL probe 报告 `CreateFileW` error 5；`pwsh` PTY 输出包含有界的
 `BCrypt.dll` 初始化失败（`0x8007045A`）。Python 的任何启动变体都没有产生
 用户 marker。curl 行只测启动；当前 W3 evidence 没有精确的既有 restricted-curl
-命令，因此没有运行替代网络命令。
+命令，因此没有运行替代网络命令。所有 timeout 行的 W3 都通过 canonical
+process termination 后进行有界两秒 pipe drain，W4 都通过 canonical
+terminal-session close 后进行有界 close/drain；runner 报告 exit 0，artifact
+没有记录 forced-runner fallback。这只是 cleanup 证据，不测量也不声称
+`orphan_count`。
 
 解释至少分为两个证据 cluster。Cluster A 是 device/NUL 证据：
 `CMD_NUL_REDIRECT`、按 access mode 分开的 `NUL_DIRECT_WIN32` probe，以及
