@@ -233,6 +233,45 @@ class WindowsSandboxNativeAcceptanceTests(unittest.TestCase):
                     authority.repair(request).state,
                     WindowsSandboxSetupState.READY,
                 )
+                # Port-filter narrowing must invalidate READY even when the
+                # rule direction/action/profile/principal remain unchanged.
+                port_drift_script = (
+                    f"Get-NetFirewallRule -Name {firewall_api._ps_quote(record.offline_firewall_rule.name)} "
+                    "| Get-NetFirewallPortFilter "
+                    "| Set-NetFirewallPortFilter -Protocol TCP"
+                )
+                port_drift_result = firewall_api._run(["-Command", port_drift_script], check=True)
+                self.assertEqual(port_drift_result.returncode, 0)
+                self.assertEqual(
+                    authority.inspect(request).state,
+                    WindowsSandboxSetupState.NEEDS_REPAIR,
+                )
+                self.assertEqual(
+                    authority.repair(request).state,
+                    WindowsSandboxSetupState.READY,
+                )
+                self.assertTrue(firewall_api.rule_exists(record.offline_firewall_rule))
+
+                # Address-filter narrowing is a separate native filter surface
+                # and must be repaired independently of the port filter.
+                address_drift_script = (
+                    f"Get-NetFirewallRule -Name {firewall_api._ps_quote(record.offline_firewall_rule.name)} "
+                    "| Get-NetFirewallAddressFilter "
+                    "| Set-NetFirewallAddressFilter -RemoteAddress 1.1.1.1"
+                )
+                address_drift_result = firewall_api._run(
+                    ["-Command", address_drift_script], check=True
+                )
+                self.assertEqual(address_drift_result.returncode, 0)
+                self.assertEqual(
+                    authority.inspect(request).state,
+                    WindowsSandboxSetupState.NEEDS_REPAIR,
+                )
+                self.assertEqual(
+                    authority.repair(request).state,
+                    WindowsSandboxSetupState.READY,
+                )
+                self.assertTrue(firewall_api.rule_exists(record.offline_firewall_rule))
                 replacement = workspace / "replacement.dpapi"
                 replacement.write_bytes(b"replacement")
 

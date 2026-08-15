@@ -90,3 +90,7 @@ source = ["neuro_code"]
 [tool.coverage.report]
 fail_under = 85
 show_missing = true
+omit = [
+  "src/neuro_code/infrastructure/sandbox/windows_native_local_process.py",
+  "src/neuro_code/infrastructure/sandbox/windows_native_runner.py",
+]

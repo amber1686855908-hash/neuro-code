@@ -1054,8 +1054,8 @@ Linux、macOS 和 Windows 都是一等 CI 目标。平台专属代码隔离在�
 子进程范围的 Bubblewrap；`off` 仍是可移植默认值。受信任 controller 不会在命名空间内
 重新执行。每个 Bash、后台 Bash、stdio MCP 或启用 profile 的 PTY 请求都会获得独立 child
 边界、显式工作区挂载、私有 HOME 和临时目录以及最小环境。只读和 strict child 还会使用
-隔离网络命名空间。macOS 与 Windows 当前会拒绝显式非 `off` profile，而不会宣称未执行的
-安全能力。详见
+隔离网络命名空间。macOS 使用 child-scoped Seatbelt adapter；Windows 启用 profile 的非 PTY
+request 使用下文的 W3 原生 restricted-token runtime；其余不支持的 request 仍然失败关闭。详见
 [ADR 0019](adr/0019-fail-closed-linux-sandbox-profiles.md) 和
 [ADR 0020](adr/0020-session-fixed-sandbox-profiles.md)。
 
@@ -1090,7 +1090,29 @@ rule 在任一 dedicated identity 使用期间保持安装，只有显式 cleanu
 `NEEDS_SETUP`、`NEEDS_REPAIR` 或 `UNSUPPORTED`；setup/repair/cleanup 可以需要管理员权限，
 而 runtime 工作不需要持续提权。
 W2 不启动 child、不连接 MCP、不增加 command runner、不改 Git/Python integration、不重写
-Job Object/ConPTY，也不改变 actual capability advertisement；runtime 接线留给 W3。
+Job Object/ConPTY，也不改变 foundation 的 actual capability constant。
+
+W3 为 Windows Bash、后台 Bash 和 MCP stdio 的非 PTY runtime 增加
+`CAPTURE`、`MERGED_CAPTURE` 与 argv-safe `PROTOCOL` 模式。每个 request 都先经过 W2
+inspect；只有 `READY` 才能创建 child，否则在 child creation 前失败关闭。controller 使用选定的
+Offline 或 Online account 启动可信且独立于 workspace 的 runner；runner 使用
+restricting set 仅为 installation synthetic write SID 的 `WRITE_RESTRICTED` token 和
+kill-on-close Job Object 创建最终 child。controller 与 runner 使用分离的
+controller→runner control pipe 和 runner→controller event pipe，specific rights
+排除 `FILE_CREATE_PIPE_INSTANCE`。Python `-I` 与显式环境是必要条件但并非 provenance
+证明：在 `CreateProcessWithLogonW` 之前，resolved interpreter、runner module、Neuro Code
+package root 与 dependency root 必须位于所有模型可写 root 之外。Everyone、logon、sandbox-user 与 controller SID
+只作为 object ACL principal。runner 检查 `DISABLE_MAX_PRIVILEGE` 已保留
+`SeChangeNotifyPrivilege`，且不会调用 `AdjustTokenPrivileges`。`ISOLATED` 选择 Offline，
+`INHERIT` 选择 Online，且不会修改持久化 Offline Firewall rule。
+完整接通的 W3 runtime 提供由 focused 原生验收认证的 read `LIMITED`、write `STRONG`、
+network `STRONG` provider contract。W1/W2 foundation actual-capability constant 仍为
+`UNSUPPORTED`，target constant 不参与 runtime admission。`strict` 因要求 strong read
+isolation 而失败关闭。Gate 1–5 执行 7 个 native acceptance test 且 0 skip，证明
+final-child identity、文件系统/网络 enforcement、binary/protocol transport、normal wait、
+显式 termination、controller-loss cleanup 与 runner kill-on-close ownership。PTY/ConPTY 留给
+W4，现有 `off` 路径保持不变；受限 Python 启动、NUL 写入和 curl 行为记录为 W5 compatibility
+seam，而非 security-isolation failure。
 
 启用的 Linux 启动器会在挂载任何授权工作区前，对 controller 状态目录执行有界硬链接审计。
 私有常规文件存在另一个 inode 名称时失败关闭，防止工作区中既存硬链接重新引入凭据或会话

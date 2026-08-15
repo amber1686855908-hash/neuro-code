@@ -1496,9 +1496,10 @@ the portable default. The trusted controller is never re-executed inside the
 namespace. Each Bash, background Bash, stdio MCP, or enabled-profile PTY
 request receives its own child boundary with explicit workspace mounts,
 private HOME and temporary directories, and a minimal environment. Read-only
-and strict children additionally use an isolated network namespace. macOS and
-Windows currently reject explicit non-`off` profiles rather than advertising
-unenforced behavior. See
+and strict children additionally use an isolated network namespace. macOS uses
+the child-scoped Seatbelt adapter, while Windows enabled non-PTY requests use
+the W3 native restricted-token runtime described below; unsupported requests
+still fail closed. See
 [ADR 0019](adr/0019-fail-closed-linux-sandbox-profiles.md) and
 [ADR 0020](adr/0020-session-fixed-sandbox-profiles.md).
 
@@ -1540,8 +1541,37 @@ controller user.
 Setup state is `READY`, `NEEDS_SETUP`, `NEEDS_REPAIR`, or `UNSUPPORTED`, and
 setup/repair/cleanup may require administrator authority while runtime work
 does not. W2 does not launch children, connect MCP, add a command runner,
-modify Git/Python integration, rewrite Job Object/ConPTY, or change the actual
-capability advertisement; runtime wiring remains W3.
+modify Git/Python integration, rewrite Job Object/ConPTY, or change the
+foundation's actual capability constant.
+
+W3 adds the Windows non-PTY runtime for Bash, background Bash, and MCP stdio in
+`CAPTURE`, `MERGED_CAPTURE`, and argv-safe `PROTOCOL` modes. Each request is
+preflighted through W2 and fails before child creation unless setup is `READY`.
+The controller starts a trusted workspace-independent runner as the selected
+Offline or Online account; the runner creates the final child with a
+`WRITE_RESTRICTED` token whose restricting set is exactly the installation
+synthetic write SID, plus a kill-on-close Job Object. Controller and runner
+use separate controller-to-runner control and runner-to-controller event
+named pipes with specific rights that exclude `FILE_CREATE_PIPE_INSTANCE`.
+Python `-I` and the explicit environment are necessary but not sufficient
+provenance controls: before `CreateProcessWithLogonW`, the resolved
+interpreter, runner module, Neuro Code package root, and dependency root must
+be outside every model-writable root. Everyone, logon,
+sandbox-user, and controller SIDs remain object-ACL principals only. The runner
+attests that `DISABLE_MAX_PRIVILEGE` preserved `SeChangeNotifyPrivilege` and
+does not call `AdjustTokenPrivileges`. `ISOLATED` selects Offline and `INHERIT` selects
+Online without changing the persistent Offline Firewall rule. The fully wired
+W3 runtime declares the focused-acceptance-certified provider contract of read
+`LIMITED`, write `STRONG`, and network `STRONG`. The W1/W2 foundation
+actual-capability constant remains `UNSUPPORTED`, and the target constant is
+not used for runtime admission. `strict` fails closed because it requires
+strong read isolation. Gates 1–5 execute seven native acceptance tests with
+zero skips and prove final-child identity, filesystem/network enforcement,
+binary/protocol transport, normal wait, explicit termination, controller-loss
+cleanup, and runner kill-on-close ownership. PTY/ConPTY remains W4, and the
+existing `off` path is unchanged. Restricted Python startup, NUL write, and
+curl behavior remain W5 compatibility seams rather than security-isolation
+failures.
 
 Enabled Linux startup performs a bounded controller-state hardlink audit before
 mounting any authorized workspace. It fails closed when a private regular file

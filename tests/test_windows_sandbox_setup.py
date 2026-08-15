@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import json
 import os
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from neuro_code.application.ports.sandbox import (
     LocalProcessSecurityCapability,
@@ -29,9 +32,16 @@ from neuro_code.infrastructure.sandbox.windows_sandbox_acl import (
     WindowsManagedAceKind,
     plan_windows_filesystem_authority,
 )
+from neuro_code.infrastructure.sandbox.windows_sandbox_diagnostics import (
+    WindowsSandboxOperationDiagnostic,
+    diagnostic_for_exception,
+    diagnostic_kwargs,
+)
 from neuro_code.infrastructure.sandbox.windows_sandbox_firewall import (
     InMemoryWindowsFirewallApi,
+    WindowsFirewallError,
     WindowsFirewallRule,
+    _NativeWindowsFirewallApi,
     firewall_rule_for_installation,
 )
 from neuro_code.infrastructure.sandbox.windows_sandbox_identity import (
@@ -47,6 +57,7 @@ from neuro_code.infrastructure.sandbox.windows_sandbox_setup import (
     WindowsNativeSandboxSetupAuthority,
     WindowsSandboxSetupError,
     WindowsSandboxSetupPrivilegeError,
+    WindowsSandboxSetupStage,
 )
 
 
@@ -87,6 +98,18 @@ class _FailingFirewall(InMemoryWindowsFirewallApi):
         super().ensure_outbound_block(rule)
 
 
+class _FailingAcl(InMemoryWindowsAclApi):
+    def __init__(self) -> None:
+        super().__init__()
+        self.fail_reconcile = True
+
+    def reconcile(self, path, *, desired, remove):  # type: ignore[no-untyped-def]
+        if self.fail_reconcile:
+            self.fail_reconcile = False
+            raise PermissionError(13, "injected ACL failure")
+        super().reconcile(path, desired=desired, remove=remove)
+
+
 class _FailingAccountRemovalApi(InMemoryWindowsSandboxAccountApi):
     def __init__(self) -> None:
         super().__init__()
@@ -118,6 +141,69 @@ class WindowsDpapiCredentialStoreTests(unittest.TestCase):
             with self.assertRaises(WindowsDpapiError):
                 store.load()
 
+    def test_invalid_envelope_shapes_and_blob_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "credentials.dpapi"
+            store = WindowsDpapiCredentialStore(path, api=_FakeDpapi())
+            for payload in (
+                {"format": "wrong", "blob": ""},
+                {"format": "neuro-code-windows-sandbox-dpapi-v1"},
+                {"format": "neuro-code-windows-sandbox-dpapi-v1", "blob": 1},
+                {"format": "neuro-code-windows-sandbox-dpapi-v1", "blob": "%%%"},
+            ):
+                path.write_text(json.dumps(payload), encoding="utf-8")
+                with self.assertRaises(WindowsDpapiError):
+                    store.load()
+
+    def test_store_rejects_empty_payload_and_wraps_dpapi_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "credentials.dpapi"
+            store = WindowsDpapiCredentialStore(path, api=_FakeDpapi())
+            with self.assertRaises(ValueError):
+                store.save(b"")
+            path.write_text(
+                json.dumps(
+                    {
+                        "format": "neuro-code-windows-sandbox-dpapi-v1",
+                        "blob": "bm90LXByb3RlY3RlZA==",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaises(WindowsDpapiError):
+                store.load()
+
+    def test_store_clear_reports_os_failure_without_leaking_path(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "credentials.dpapi"
+            store = WindowsDpapiCredentialStore(path, api=_FakeDpapi())
+            with (
+                mock.patch.object(Path, "unlink", side_effect=PermissionError(13, "secret-path")),
+                self.assertRaises(WindowsDpapiError) as raised,
+            ):
+                store.clear()
+            self.assertNotIn("secret-path", str(raised.exception))
+            self.assertEqual(raised.exception.safe_diagnostic.operation, "STORE_CLEAR")
+
+    def test_store_atomic_replace_failure_is_wrapped_and_temporary_file_removed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "credentials.dpapi"
+            store = WindowsDpapiCredentialStore(path, api=_FakeDpapi())
+            with (
+                mock.patch(
+                    "neuro_code.infrastructure.sandbox.windows_sandbox_persistence.os.replace",
+                    side_effect=OSError(28, "disk full"),
+                ),
+                self.assertRaises(WindowsDpapiError) as raised,
+            ):
+                store.save(b"secret")
+            self.assertEqual(raised.exception.safe_diagnostic.operation, "ATOMIC_WRITE")
+            self.assertEqual(list(path.parent.glob(f".{path.name}.*")), [])
+
+    def test_store_requires_absolute_path(self) -> None:
+        with self.assertRaises(ValueError):
+            WindowsDpapiCredentialStore(Path("relative"), api=_FakeDpapi())
+
     def test_clear_is_idempotent(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = WindowsDpapiCredentialStore(
@@ -128,6 +214,21 @@ class WindowsDpapiCredentialStoreTests(unittest.TestCase):
             store.clear()
             store.clear()
             self.assertIsNone(store.load())
+
+    def test_diagnostics_keep_only_bounded_numeric_facts(self) -> None:
+        error = PermissionError(13, "controller-secret-path")
+        diagnostic = diagnostic_for_exception(error, operation="ACL")
+        self.assertEqual(diagnostic.as_dict()["operation"], "ACL")
+        self.assertEqual(diagnostic.errno, 13)
+        self.assertNotIn("controller-secret-path", repr(diagnostic.as_dict()))
+        existing = WindowsSandboxOperationDiagnostic("ORIGINAL", "RuntimeError", returncode=4)
+        wrapped = RuntimeError("secret payload")
+        wrapped.safe_diagnostic = existing  # type: ignore[attr-defined]
+        self.assertIs(diagnostic_for_exception(wrapped), existing)
+        self.assertEqual(diagnostic_for_exception(wrapped, operation="RETRY").operation, "RETRY")
+        self.assertEqual(diagnostic_kwargs(error, operation="ACL")["safe_diagnostic"], diagnostic)
+        timeout = diagnostic_for_exception(subprocess.TimeoutExpired("powershell", 1))
+        self.assertTrue(timeout.timed_out)
 
     @unittest.skipUnless(os.name == "nt", "native DPAPI requires Windows")
     def test_native_dpapi_round_trip(self) -> None:
@@ -288,6 +389,46 @@ class WindowsSandboxSetupAuthorityTests(unittest.TestCase):
                 write_user_sids=(WindowsAccountSid("S-1-5-21-100-200-300-2000"),),
             )  # type: ignore[arg-type]
 
+    def test_planner_rejects_ambiguous_real_users_and_private_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            request = self._request(directory)
+            write_sid = SyntheticWindowsSid.from_components((1, 2, 3, 4))
+            user = WindowsAccountSid("S-1-5-21-100-200-300-2000")
+            other = WindowsAccountSid("S-1-5-21-100-200-300-2001")
+            with self.assertRaises(ValueError):
+                plan_windows_filesystem_authority(request, write_sid)
+            with self.assertRaises(ValueError):
+                plan_windows_filesystem_authority(
+                    request,
+                    write_sid,
+                    read_user_sids=(user,),
+                    write_user_sids=(other,),
+                )
+            with self.assertRaises(TypeError):
+                bad_sid = object()
+                plan_windows_filesystem_authority(
+                    request,
+                    write_sid,
+                    read_user_sids=(bad_sid,),  # type: ignore[arg-type]
+                    write_user_sids=(bad_sid,),  # type: ignore[arg-type]
+                )
+            with self.assertRaises(ValueError):
+                plan_windows_filesystem_authority(
+                    request,
+                    write_sid,
+                    read_user_sids=(user,),
+                    write_user_sids=(user,),
+                    credential_path=Path("relative"),
+                )
+            with self.assertRaises(ValueError):
+                plan_windows_filesystem_authority(
+                    request,
+                    write_sid,
+                    read_user_sids=(user,),
+                    write_user_sids=(user,),
+                    private_root=Path("relative"),
+                )
+
     def test_firewall_rule_contract_is_scoped_and_validated(self) -> None:
         sid = WindowsAccountSid("S-1-5-21-100-200-300-2000")
         offline = firewall_rule_for_installation(
@@ -332,6 +473,67 @@ class WindowsSandboxSetupAuthorityTests(unittest.TestCase):
                 True,
                 "Domain",
             )
+
+    @staticmethod
+    def _native_firewall_payload() -> dict[str, object]:
+        return {
+            "Direction": "Outbound",
+            "Action": "Block",
+            "Enabled": "True",
+            "Profile": "Any",
+            "LocalUser": "S-1-5-21-100-200-300-2000",
+            "Protocol": ["Any"],
+            "LocalPort": ["Any"],
+            "RemotePort": ["Any"],
+            "LocalAddress": ["Any"],
+            "RemoteAddress": ["Any"],
+            "Program": ["Any"],
+            "Service": ["Any"],
+            "InterfaceAlias": ["Any"],
+            "InterfaceType": ["Any"],
+        }
+
+    def _native_firewall_api_for_payload(
+        self, payload: dict[str, object]
+    ) -> _NativeWindowsFirewallApi:
+        api = object.__new__(_NativeWindowsFirewallApi)
+        api._run = mock.Mock(  # type: ignore[method-assign]
+            return_value=subprocess.CompletedProcess(
+                args=["powershell"],
+                returncode=0,
+                stdout=json.dumps(payload),
+                stderr="",
+            )
+        )
+        return api
+
+    def _native_firewall_rule_for_test(self) -> WindowsFirewallRule:
+        return firewall_rule_for_installation(
+            "install-1",
+            WindowsSandboxIdentityKind.OFFLINE,
+            WindowsAccountSid("S-1-5-21-100-200-300-2000"),
+        )
+
+    def test_native_firewall_ready_requires_all_broad_filters(self) -> None:
+        rule = self._native_firewall_rule_for_test()
+        api = self._native_firewall_api_for_payload(self._native_firewall_payload())
+        self.assertTrue(api.rule_exists(rule))
+        run_mock = api._run  # type: ignore[attr-defined]
+        command = run_mock.call_args.args[0][-1]
+        self.assertIn("Get-NetFirewallPortFilter", command)
+        self.assertIn("Get-NetFirewallAddressFilter", command)
+        self.assertIn("Get-NetFirewallApplicationFilter", command)
+        self.assertIn("Get-NetFirewallServiceFilter", command)
+        self.assertIn("Get-NetFirewallInterfaceFilter", command)
+
+    def test_native_firewall_protocol_and_address_drift_fail_closed(self) -> None:
+        rule = self._native_firewall_rule_for_test()
+        protocol_drift = self._native_firewall_payload()
+        protocol_drift["Protocol"] = ["TCP"]
+        self.assertFalse(self._native_firewall_api_for_payload(protocol_drift).rule_exists(rule))
+        address_drift = self._native_firewall_payload()
+        address_drift["RemoteAddress"] = ["1.1.1.1"]
+        self.assertFalse(self._native_firewall_api_for_payload(address_drift).rule_exists(rule))
 
     def test_plan_has_write_read_and_sensitive_deny_roles(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -472,6 +674,52 @@ class WindowsSandboxSetupAuthorityTests(unittest.TestCase):
             self.assertEqual(authority.inspect(request).state, WindowsSandboxSetupState.READY)
             self.assertEqual(len(firewall.rules), 1)
 
+    def test_setup_repairs_missing_account_and_rotated_password_in_place(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            request = self._request(directory)
+            authority, _, _, _ = self._authority(directory)
+            authority.setup(request)
+            account_api = authority._account_api
+            assert isinstance(account_api, InMemoryWindowsSandboxAccountApi)
+            offline = account_api.lookup_user(
+                SANDBOX_OFFLINE_USERNAME,
+                expected_sid=WindowsAccountSid("S-1-5-21-100-200-300-2000"),
+            )
+            account_api.remove_user(offline)
+            repaired = authority.setup(request)
+            self.assertEqual(repaired.state, WindowsSandboxSetupState.READY)
+            recreated = account_api.lookup_user(
+                SANDBOX_OFFLINE_USERNAME,
+                expected_sid=WindowsAccountSid(repaired.offline_user_sid),
+            )
+            self.assertTrue(recreated.created_by_installation)
+
+            online = account_api.lookup_user(
+                SANDBOX_ONLINE_USERNAME,
+                expected_sid=WindowsAccountSid(repaired.online_user_sid),
+            )
+            account_api.users[online.username.casefold()] = ("rotated", online)
+            rotated = authority.setup(request)
+            self.assertEqual(rotated.state, WindowsSandboxSetupState.READY)
+            repaired_password = account_api.users[online.username.casefold()][0]
+            self.assertNotEqual(repaired_password, "rotated")
+            self.assertEqual(
+                account_api.validate_user(
+                    SANDBOX_ONLINE_USERNAME,
+                    repaired_password,
+                    expected_sid=WindowsAccountSid(rotated.online_user_sid),
+                ).sid,
+                WindowsAccountSid(rotated.online_user_sid),
+            )
+
+    def test_repair_and_identity_records_fail_closed_before_setup(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            request = self._request(directory)
+            authority, _, _, _ = self._authority(directory)
+            self.assertEqual(authority.repair(request).state, WindowsSandboxSetupState.NEEDS_SETUP)
+            with self.assertRaises(WindowsSandboxSetupError):
+                authority.identity_records(request)
+
     def test_acl_drift_is_repaired_without_removing_unmanaged_entries(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             request = self._request(directory)
@@ -529,6 +777,62 @@ class WindowsSandboxSetupAuthorityTests(unittest.TestCase):
             repaired = authority.repair(request)
             self.assertEqual(repaired.state, WindowsSandboxSetupState.READY)
             self.assertEqual(firewall.rules[rule.name], rule)
+
+    def test_setup_failure_keeps_primary_firewall_stage_and_safe_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            request = self._request(directory)
+            authority, _, _, _ = self._authority(directory)
+            authority._firewall_api = _FailingFirewall()
+            with self.assertRaises(WindowsSandboxSetupError) as raised:
+                authority.setup(request)
+            error = raised.exception
+            self.assertIs(error.stage, WindowsSandboxSetupStage.FIREWALL_ENSURE)
+            self.assertEqual(error.cause_type, "RuntimeError")
+            self.assertIsNone(error.winerror)
+            self.assertIsNone(error.returncode)
+            self.assertFalse(error.timed_out)
+            self.assertTrue(error.rollback_complete)
+            payload = error.diagnostic_payload()
+            self.assertNotIn("injected firewall setup failure", repr(payload))
+            self.assertEqual(payload["stage"], "FIREWALL_ENSURE")
+            self.assertEqual(payload["rollback_failures"], [])
+
+    def test_setup_failure_keeps_primary_acl_stage_and_errno(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            request = self._request(directory)
+            authority, _, _, _ = self._authority(directory)
+            authority._acl_api = _FailingAcl()
+            authority._acl_authority = None
+            with self.assertRaises(WindowsSandboxSetupError) as raised:
+                authority.setup(request)
+            error = raised.exception
+            self.assertIs(error.stage, WindowsSandboxSetupStage.ACL_RECONCILE)
+            self.assertEqual(error.cause_type, "PermissionError")
+            self.assertEqual(error.errno, 13)
+            self.assertTrue(error.rollback_complete)
+
+    def test_firewall_timeout_keeps_operation_and_timeout_fact(self) -> None:
+        api = object.__new__(_NativeWindowsFirewallApi)
+
+        def timeout_runner(*args: object, **kwargs: object) -> object:
+            del args, kwargs
+            raise subprocess.TimeoutExpired("powershell", 30)
+
+        api._runner = timeout_runner  # type: ignore[assignment]
+        with (
+            mock.patch.object(
+                _NativeWindowsFirewallApi,
+                "_powershell",
+                new_callable=mock.PropertyMock,
+                return_value="powershell.exe",
+            ),
+            self.assertRaises(WindowsFirewallError) as raised,
+        ):
+            api._run(["-Command", "redacted"], check=True, operation="ENSURE")
+        diagnostic = raised.exception.safe_diagnostic
+        self.assertEqual(diagnostic.operation, "ENSURE")
+        self.assertTrue(diagnostic.timed_out)
+        self.assertIsNone(diagnostic.returncode)
 
     def test_corrupt_persisted_record_reports_needs_repair(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -601,8 +905,15 @@ class WindowsSandboxSetupAuthorityTests(unittest.TestCase):
                 account_api=accounts,
                 privilege_api=_FakePrivilege(True),
             )
-            with self.assertRaises(WindowsSandboxSetupError):
+            with self.assertRaises(WindowsSandboxSetupError) as raised:
                 authority.setup(request)
+            error = raised.exception
+            self.assertIs(error.stage, WindowsSandboxSetupStage.FIREWALL_ENSURE)
+            self.assertFalse(error.rollback_complete)
+            self.assertIn(
+                WindowsSandboxSetupStage.ROLLBACK_ACCOUNTS,
+                error.rollback_failures,
+            )
             # The account removal failed after ACL/firewall rollback began;
             # the persisted record must remain as the recovery source.
             self.assertIsNotNone(store.load())

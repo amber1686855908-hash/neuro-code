@@ -93,6 +93,9 @@ from neuro_code.infrastructure.persistence.sqlite_session import SqliteSessionSt
 from neuro_code.infrastructure.providers import create_routed_provider
 from neuro_code.infrastructure.sandbox.linux_local_process import LinuxBubblewrapLocalProcessSandbox
 from neuro_code.infrastructure.sandbox.local_process import ProcessTreeLocalProcessSandbox
+from neuro_code.infrastructure.sandbox.windows_native_local_process import (
+    WindowsNativeLocalProcessSandbox,
+)
 from neuro_code.infrastructure.tools.registry import default_tool_registry
 from neuro_code.infrastructure.tools.workspace_diff import WorkspaceMutationJournal
 from neuro_code.infrastructure.workspace.changes import (
@@ -131,11 +134,13 @@ def _default_local_process_sandbox_factory(
     为一个会话绑定选择规范本地进程启动器.
 
     ``off`` preserves the existing owned-process bridge. Enabled profiles use
-    the platform's fail-closed child adapter on Linux and macOS. The controller
-    is never re-executed inside a sandbox namespace.
+    the platform's child adapter on Linux, macOS, or Windows W3; unsupported
+    platform/profile combinations fail closed. The controller is never
+    re-executed inside a sandbox namespace.
 
-    ``off`` 保留既有的受管进程桥接器.每个启用的 profile 都创建子进程范围的
-    Linux Bubblewrap 或 macOS Seatbelt 启动器.controller 不会重新执行到沙箱中.
+    ``off`` 保留既有的受管进程桥接器.每个启用的 profile 都通过 Linux Bubblewrap、
+    macOS Seatbelt 或 Windows W3 child adapter 创建边界;不支持的平台/profile
+    组合失败关闭.controller 不会重新执行到沙箱中.
     """
 
     if not profile.enabled:
@@ -149,6 +154,8 @@ def _default_local_process_sandbox_factory(
         )
 
         return MacOSSeatbeltLocalProcessSandbox(profile, workspace, state_dir)
+    if platform.startswith("win"):
+        return WindowsNativeLocalProcessSandbox(profile, workspace, state_dir)
     raise SandboxError(f"sandbox profile {profile.value!r} is not enforceable on {platform}")
 
 

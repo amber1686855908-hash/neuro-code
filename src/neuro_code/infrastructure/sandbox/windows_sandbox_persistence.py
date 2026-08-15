@@ -26,6 +26,10 @@ import tempfile
 from pathlib import Path
 from typing import Protocol, cast
 
+from neuro_code.infrastructure.sandbox.windows_sandbox_diagnostics import (
+    WindowsSandboxOperationDiagnostic,
+    diagnostic_for_exception,
+)
 from neuro_code.shared.errors import SandboxError
 
 _DPAPI_UI_FORBIDDEN = 0x00000001
@@ -35,6 +39,18 @@ _ENVELOPE_FORMAT = "neuro-code-windows-sandbox-dpapi-v1"
 
 class WindowsDpapiError(SandboxError):
     """A DPAPI or encrypted-record persistence failure."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        safe_diagnostic: WindowsSandboxOperationDiagnostic | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.safe_diagnostic = safe_diagnostic or WindowsSandboxOperationDiagnostic(
+            None,
+            type(self).__name__,
+        )
 
 
 class WindowsDpapiApi(Protocol):
@@ -117,9 +133,20 @@ class _NativeWindowsDpapiApi:  # pragma: no cover - exercised by Windows native 
             ctypes.c_int32,
         )
 
-    def _error(self, operation: str) -> WindowsDpapiError:
+    def _error(
+        self,
+        operation: str,
+        *,
+        diagnostic_operation: str | None = None,
+    ) -> WindowsDpapiError:
+        error = cast(int, self._get_last_error())
         return WindowsDpapiError(
-            f"{operation} failed with Windows error {cast(int, self._get_last_error())}"
+            f"{operation} failed with Windows error {error}",
+            safe_diagnostic=WindowsSandboxOperationDiagnostic(
+                diagnostic_operation or operation,
+                "Win32Error",
+                winerror=error,
+            ),
         )
 
     @staticmethod
@@ -154,12 +181,22 @@ class _NativeWindowsDpapiApi:  # pragma: no cover - exercised by Windows native 
                 ctypes.byref(output_blob),
             )
         if not succeeded or not output_blob.pbData:
-            raise self._error(operation)
+            raise self._error(
+                operation,
+                diagnostic_operation=(
+                    "DPAPI_PROTECT" if operation == "CryptProtectData" else "DPAPI_UNPROTECT"
+                ),
+            )
         try:
             return ctypes.string_at(output_blob.pbData, output_blob.cbData)
         finally:
             if self._local_free(output_blob.pbData):
-                raise self._error("LocalFree(DPAPI blob)")
+                raise self._error(
+                    "LocalFree(DPAPI blob)",
+                    diagnostic_operation=(
+                        "DPAPI_PROTECT" if operation == "CryptProtectData" else "DPAPI_UNPROTECT"
+                    ),
+                )
 
     def protect(self, plaintext: bytes) -> bytes:
         return self._run("CryptProtectData", self._protect, plaintext)
@@ -215,7 +252,8 @@ class WindowsDpapiCredentialStore:
                 raise
         except OSError as error:
             raise WindowsDpapiError(
-                "unable to atomically persist DPAPI credential record"
+                "unable to atomically persist DPAPI credential record",
+                safe_diagnostic=diagnostic_for_exception(error, operation="ATOMIC_WRITE"),
             ) from error
 
     def load(self) -> bytes | None:
@@ -224,7 +262,10 @@ class WindowsDpapiCredentialStore:
         except FileNotFoundError:
             return None
         except (OSError, UnicodeError, json.JSONDecodeError) as error:
-            raise WindowsDpapiError("DPAPI credential record is unreadable") from error
+            raise WindowsDpapiError(
+                "DPAPI credential record is unreadable",
+                safe_diagnostic=diagnostic_for_exception(error, operation="ATOMIC_READ"),
+            ) from error
         if not isinstance(envelope, dict) or envelope.get("format") != _ENVELOPE_FORMAT:
             raise WindowsDpapiError("DPAPI credential record format is unsupported")
         encoded = envelope.get("blob")
@@ -244,7 +285,10 @@ class WindowsDpapiCredentialStore:
         except FileNotFoundError:
             return
         except OSError as error:
-            raise WindowsDpapiError("unable to remove DPAPI credential record") from error
+            raise WindowsDpapiError(
+                "unable to remove DPAPI credential record",
+                safe_diagnostic=diagnostic_for_exception(error, operation="STORE_CLEAR"),
+            ) from error
 
 
 __all__ = ["WindowsDpapiApi", "WindowsDpapiCredentialStore", "WindowsDpapiError"]

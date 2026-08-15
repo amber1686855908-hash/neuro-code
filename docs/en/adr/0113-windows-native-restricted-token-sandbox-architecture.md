@@ -119,9 +119,9 @@ creation for W3. The authority has these properties:
   ordinary session can inspect the state and run later runtime work without
   continuing to require administrator privileges.
 - State is reported as `READY`, `NEEDS_SETUP`, `NEEDS_REPAIR`, or
-  `UNSUPPORTED`. Setup success does not change
-  `WINDOWS_NATIVE_SANDBOX_ACTUAL_CAPABILITIES`: all three runtime security
-  axes remain `UNSUPPORTED` until W3 wires the child boundary.
+  `UNSUPPORTED`. W2 setup by itself does not advertise a runtime provider;
+  the W3 non-PTY adapter owns the separate child-boundary attestation and
+  capability advertisement.
 
 W2 does not launch a command runner, create a runtime child, bridge MCP, alter
 Git/Python integration, rewrite ConPTY or Job Object code, use AppContainer or
@@ -133,10 +133,10 @@ reinterpret `LIMITED` read planning as a runtime capability.
 
 The capability contract prevents a target declaration from being consumed as
 an actual provider capability and keeps security authority orthogonal to
-lifecycle ownership. The token foundation is useful independently of a future
-filesystem setup layer, while the current Windows profile behavior continues
-to fail closed. ADR 0112 remains the historical AppContainer feasibility
-record.
+lifecycle ownership. W2 remains a setup authority; W3 is the separate non-PTY
+runtime provider, with its final restricted-child contract proven by the
+focused evidence recorded in ADR 0114. ADR 0112 remains the historical
+AppContainer feasibility record.
 
 ## References
 

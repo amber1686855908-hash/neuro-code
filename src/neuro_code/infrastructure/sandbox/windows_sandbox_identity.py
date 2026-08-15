@@ -107,13 +107,23 @@ class WindowsSandboxIdentity:
         return (self.write_sid,)
 
 
-# W1 owns only primitives.  Enabled Windows profiles still fail closed, so no
-# filesystem or network security capability is currently provided at runtime.
+# W1/W2 own only primitives and setup authority.  Their canonical actual
+# declaration remains fail-closed until a concrete runtime provider is
+# certified; this value must not be used to admit a W3 process.
 WINDOWS_NATIVE_SANDBOX_ACTUAL_CAPABILITIES = LocalProcessSecurityCapabilities()
 
-# This is an architecture target, not a runtime provider declaration.  A
-# future profile adapter must prove each axis before exposing this value.
+# Architecture target for the eventual Windows native backend.  It is not a
+# runtime provider declaration and must not be used by W1/W2 callers.
 WINDOWS_NATIVE_SANDBOX_TARGET_CAPABILITIES = LocalProcessSecurityCapabilities(
+    read_isolation=LocalProcessSecurityStrength.LIMITED,
+    write_isolation=LocalProcessSecurityStrength.STRONG,
+    network_isolation=LocalProcessSecurityStrength.STRONG,
+)
+
+# W3's concrete runtime provider declaration.  Native acceptance validates
+# this provider by exercising the real child boundary; it is deliberately
+# separate from the W1/W2 actual declaration and the architecture target.
+WINDOWS_NATIVE_SANDBOX_W3_CAPABILITIES = LocalProcessSecurityCapabilities(
     read_isolation=LocalProcessSecurityStrength.LIMITED,
     write_isolation=LocalProcessSecurityStrength.STRONG,
     network_isolation=LocalProcessSecurityStrength.STRONG,
@@ -121,15 +131,23 @@ WINDOWS_NATIVE_SANDBOX_TARGET_CAPABILITIES = LocalProcessSecurityCapabilities(
 
 
 def windows_native_sandbox_actual_capabilities() -> LocalProcessSecurityCapabilities:
-    """Return W1's actual provided filesystem/network capability declaration."""
+    """Return W1/W2's fail-closed actual capability declaration."""
 
     return WINDOWS_NATIVE_SANDBOX_ACTUAL_CAPABILITIES
+
+
+def windows_native_sandbox_w3_capabilities() -> LocalProcessSecurityCapabilities:
+    """Return the concrete W3 provider declaration under native acceptance."""
+
+    return WINDOWS_NATIVE_SANDBOX_W3_CAPABILITIES
 
 
 __all__ = [
     "WINDOWS_NATIVE_SANDBOX_ACTUAL_CAPABILITIES",
     "WINDOWS_NATIVE_SANDBOX_TARGET_CAPABILITIES",
+    "WINDOWS_NATIVE_SANDBOX_W3_CAPABILITIES",
     "SyntheticWindowsSid",
     "WindowsSandboxIdentity",
     "windows_native_sandbox_actual_capabilities",
+    "windows_native_sandbox_w3_capabilities",
 ]
