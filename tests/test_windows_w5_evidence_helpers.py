@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from tests.security.test_windows_native_workload_compatibility import _nul_mode_results
+from tests.security.test_windows_w5_gate1_runtime_root_cause import _probe_result
 from tests.security.windows_token_attestation import token_attestation_is_exact
 
 
@@ -78,4 +79,25 @@ def test_nul_mode_projection_tolerates_pty_wrapping() -> None:
         "read": {"create": "PASS"},
         "write": {"create": "FAIL", "create_error": 5},
         "read_write": {"create": "FAIL", "create_error": 5},
+    }
+
+
+def test_gate1_probe_projection_is_bounded_to_fixed_markers() -> None:
+    assert _probe_result(
+        "W5_GATE1_PROBE_STARTED\nW5_GATE1_PROFILE=AVAILABLE\n"
+        "W5_GATE1_PROBE_FINISHED\nsecret=discarded\n"
+    ) == {
+        "started": True,
+        "finished": True,
+        "profile": "AVAILABLE",
+        "token": "PASS",
+    }
+
+
+def test_gate1_probe_projection_distinguishes_unavailable_profile() -> None:
+    assert _probe_result("W5_GATE1_PROBE_STARTED\nW5_GATE1_PROFILE=UNAVAILABLE\n") == {
+        "started": True,
+        "finished": False,
+        "profile": "UNAVAILABLE",
+        "token": "PASS",
     }
