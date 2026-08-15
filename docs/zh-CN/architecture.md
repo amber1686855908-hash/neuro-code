@@ -1105,10 +1105,14 @@ package root 与 dependency root 必须位于所有模型可写 root 之外。Ev
 只作为 object ACL principal。runner 检查 `DISABLE_MAX_PRIVILEGE` 已保留
 `SeChangeNotifyPrivilege`，且不会调用 `AdjustTokenPrivileges`。`ISOLATED` 选择 Offline，
 `INHERIT` 选择 Online，且不会修改持久化 Offline Firewall rule。
-完整接通的 W3 runtime 声明 read `LIMITED`、write `STRONG`、network `STRONG` 的
-candidate provider contract，并由特权原生验收与 required PR gate 认证。W1/W2
-foundation actual-capability constant 仍为 `UNSUPPORTED`。`strict` 因要求 strong read
-isolation 而失败关闭。PTY/ConPTY 留给 W4，现有 `off` 路径保持不变。
+完整接通的 W3 runtime 提供由 focused 原生验收认证的 read `LIMITED`、write `STRONG`、
+network `STRONG` provider contract。W1/W2 foundation actual-capability constant 仍为
+`UNSUPPORTED`，target constant 不参与 runtime admission。`strict` 因要求 strong read
+isolation 而失败关闭。Gate 1–5 执行 7 个 native acceptance test 且 0 skip，证明
+final-child identity、文件系统/网络 enforcement、binary/protocol transport、normal wait、
+显式 termination、controller-loss cleanup 与 runner kill-on-close ownership。PTY/ConPTY 留给
+W4，现有 `off` 路径保持不变；受限 Python 启动、NUL 写入和 curl 行为记录为 W5 compatibility
+seam，而非 security-isolation failure。
 
 启用的 Linux 启动器会在挂载任何授权工作区前，对 controller 状态目录执行有界硬链接审计。
 私有常规文件存在另一个 inode 名称时失败关闭，防止工作区中既存硬链接重新引入凭据或会话

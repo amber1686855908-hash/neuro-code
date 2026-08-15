@@ -1,6 +1,6 @@
 # ADR 0114：Windows 原生非 PTY 沙箱运行时
 
-- 状态：W3 实现正在进行 focused 原生验收
+- 状态：W3 实现完成；focused 原生验收完成；full CI 待最终认证
 - 日期：2026-08-14
 - 范围：Windows 启用 profile 下的 BASH、后台 Bash 与 MCP stdio
 
@@ -31,10 +31,10 @@ interpreter、runner module、Neuro Code package root 与 dependency root 必须
 不会修改 Firewall，也不会执行 setup、repair 或 UAC 提权。setup inspect 不是
 `READY` 时，在创建 child 之前失败关闭。
 
-完整接通的 W3 runtime 会声明 read `LIMITED`、write `STRONG`、network `STRONG`
-的 candidate provider contract，使特权原生验收能够执行真实边界。该声明由 native
-acceptance 与 required PR gate 认证，而不是依赖 CI 环境的 runtime bypass。W1/W2
-foundation actual-capability declaration 仍为 `UNSUPPORTED`。`STRICT` 要求 strong
+完整接通的 W3 runtime 提供 read `LIMITED`、write `STRONG`、network `STRONG` 的
+concrete provider contract；focused 原生验收已经认证该声明，而不是依赖 CI 环境的
+runtime bypass。W1/W2 foundation actual-capability declaration 仍为
+`UNSUPPORTED`，target declaration 不参与 runtime admission。`STRICT` 要求 strong
 read isolation，因此失败关闭。交互式 PTY/ConPTY 留给 W4。
 
 Gate 1 不依赖 Python 启动。实际 `CreateProcessAsUserW` 返回的 process handle
@@ -57,3 +57,24 @@ token、ACL、environment、desktop、Job 或 provenance 边界。
   ACL、network、lifecycle、二进制 stdio 与协议行为。
 - 原生验收失败时阻断 W3 production admission，而不是在 runtime 改变 capability
   语义。
+
+## Focused 原生验收证据
+
+当前 W3 provider 已完成完整 focused Windows runtime acceptance：执行 7 个测试，0 个 skip。
+证据覆盖：
+
+- Gate 1：Online/Offline final child 在 `SpawnReady` 前完成 identity/token attestation。
+- Gate 2：workspace allow、read-only 与 sensitive-read deny、installation state deny，
+  以及 real-user/Everyone WRITE 但没有 synthetic SID 的对抗 fixture；实际 restricted
+  child 仍被拒绝写入。
+- Gate 3：Online 重复/并发 Winsock 连接、Offline `WSAEACCES` deny、controller 前后置检查，
+  以及未变化的精确持久 Firewall rule。
+- Gate 4：二进制 stdout/stderr capture、merged 顺序、protocol framing、EOF、非零退出码和
+  `Exit` 后无输出。
+- Gate 5A：stdio-free descendant 的 normal wait 与自然完成；Gate 5B：公开
+  `terminate()` 终止整个 Job；Gate 5C：controller 丢失后失败关闭整个 scope；Gate 5D：
+  runner 退出证明 `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`。
+
+受限 Python 启动、受限 NUL 写入和受限 curl 行为仍记录为 W5 compatibility seam，
+不是 security-isolation failure。W3 不认证 Git、Python、Node 或一般 developer workload
+的兼容性。Full PR CI 是本 PR 的最终 merge-readiness 认证步骤。

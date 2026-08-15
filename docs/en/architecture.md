@@ -1561,11 +1561,17 @@ sandbox-user, and controller SIDs remain object-ACL principals only. The runner
 attests that `DISABLE_MAX_PRIVILEGE` preserved `SeChangeNotifyPrivilege` and
 does not call `AdjustTokenPrivileges`. `ISOLATED` selects Offline and `INHERIT` selects
 Online without changing the persistent Offline Firewall rule. The fully wired
-W3 runtime declares a candidate provider contract of read `LIMITED`, write
-`STRONG`, and network `STRONG`, certified by privileged native acceptance and
-the required PR gate. The W1/W2 foundation actual-capability constant remains
-`UNSUPPORTED`. `strict` fails closed because it requires strong read isolation.
-PTY/ConPTY remains W4, and the existing `off` path is unchanged.
+W3 runtime declares the focused-acceptance-certified provider contract of read
+`LIMITED`, write `STRONG`, and network `STRONG`. The W1/W2 foundation
+actual-capability constant remains `UNSUPPORTED`, and the target constant is
+not used for runtime admission. `strict` fails closed because it requires
+strong read isolation. Gates 1–5 execute seven native acceptance tests with
+zero skips and prove final-child identity, filesystem/network enforcement,
+binary/protocol transport, normal wait, explicit termination, controller-loss
+cleanup, and runner kill-on-close ownership. PTY/ConPTY remains W4, and the
+existing `off` path is unchanged. Restricted Python startup, NUL write, and
+curl behavior remain W5 compatibility seams rather than security-isolation
+failures.
 
 Enabled Linux startup performs a bounded controller-state hardlink audit before
 mounting any authorized workspace. It fails closed when a private regular file

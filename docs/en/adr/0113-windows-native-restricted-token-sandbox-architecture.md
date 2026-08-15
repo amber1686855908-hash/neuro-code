@@ -133,10 +133,10 @@ reinterpret `LIMITED` read planning as a runtime capability.
 
 The capability contract prevents a target declaration from being consumed as
 an actual provider capability and keeps security authority orthogonal to
-lifecycle ownership. W2 remains a setup authority; W3 is the separate
-non-PTY runtime provider and must prove the final restricted child before it
-advertises its target axes. ADR 0112 remains the historical AppContainer
-feasibility record.
+lifecycle ownership. W2 remains a setup authority; W3 is the separate non-PTY
+runtime provider, with its final restricted-child contract proven by the
+focused evidence recorded in ADR 0114. ADR 0112 remains the historical
+AppContainer feasibility record.
 
 ## References
 

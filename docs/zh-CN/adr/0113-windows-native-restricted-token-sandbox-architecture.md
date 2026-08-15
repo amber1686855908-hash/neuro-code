@@ -116,8 +116,8 @@ firewall rule。它复用 W1 capability contract 和现有 Job/ConPTY lifecycle 
 
 Capability contract 防止 target declaration 被当作 actual provider capability 使用，并让
 security authority 与 lifecycle ownership 保持正交。W2 仍是 setup authority；W3 是独立的
-非 PTY runtime provider，必须在宣布目标 capability axes 前证明最终 restricted child。
-ADR 0112 继续作为历史 AppContainer feasibility 记录。
+非 PTY runtime provider，其 final restricted-child contract 已由 ADR 0114 记录的 focused
+证据证明。ADR 0112 继续作为历史 AppContainer feasibility 记录。
 
 ## 参考
 
