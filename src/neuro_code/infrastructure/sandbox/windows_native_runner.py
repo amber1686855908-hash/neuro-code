@@ -1627,6 +1627,20 @@ class _RunnerChild:
     def exit_sent(self) -> bool:
         return self._exit_sent.is_set()
 
+    def wait_for_exit_sent(self, timeout_seconds: float) -> bool:
+        """Close-control grace period for the final EXIT write race.
+
+        The controller closes the control channel immediately after consuming
+        the final event frame.  ``_wait`` marks that frame as sent just after
+        the pipe write returns, so the runner can observe control EOF in the
+        small interval between those two operations.  Waiting here is only a
+        bounded protocol-ordering grace period; it is not a child or Job
+        lifetime timeout.  A controller that disappears before EXIT still
+        fails closed after the bound.
+        """
+
+        return self._exit_sent.wait(timeout_seconds)
+
     def fail_closed(self) -> None:
         with contextlib.suppress(BaseException):
             self._job.terminate()
@@ -2203,9 +2217,15 @@ def _runner_main(control_pipe_name: str, event_pipe_name: str) -> int:
             data = control_pipe.read()
             if not data:
                 decoder.finish()
-                if child is not None and child.exit_sent:
-                    return 0
                 if child is not None:
+                    # The controller closes control immediately after it
+                    # consumes the final EXIT event.  _RunnerChild sets
+                    # exit_sent just after the event write returns, so allow
+                    # that bounded protocol-ordering race to settle.  This
+                    # is not a child-lifetime timeout: a controller that
+                    # disappears before EXIT still fails closed.
+                    if child.exit_sent or child.wait_for_exit_sent(1.0):
+                        return 0
                     child.fail_closed()
                 return 1
             for frame in decoder.feed(data):
