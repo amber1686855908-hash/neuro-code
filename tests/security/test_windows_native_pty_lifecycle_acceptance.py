@@ -287,9 +287,11 @@ class WindowsNativePtyLifecycleAcceptanceTests(unittest.IsolatedAsyncioTestCase)
         """A direct leader exit does not complete the Job-owned PTY scope."""
 
         compiled_probe = await asyncio.to_thread(_compile_descendant_probe)
-        self.addAsyncCleanup(
-            lambda: asyncio.to_thread(shutil.rmtree, compiled_probe.parent, ignore_errors=True)
-        )
+
+        async def cleanup_probe() -> None:
+            await asyncio.to_thread(shutil.rmtree, compiled_probe.parent, ignore_errors=True)
+
+        self.addAsyncCleanup(cleanup_probe)
         with TemporaryDirectory() as directory:
             fixture = _make_descendant_fixture(Path(directory), compiled_probe)
             callbacks = _PtyCallbacks()
@@ -303,6 +305,8 @@ class WindowsNativePtyLifecycleAcceptanceTests(unittest.IsolatedAsyncioTestCase)
             grandchild_post: dict[str, object] = {"state": "NOT_OBSERVED"}
             runner_post: dict[str, object] = {"state": "NOT_OBSERVED"}
             session_poll_while_active: int | None = None
+            eof_while_active = False
+            error_while_active = False
             try:
                 session = await _spawn_pty_descendant(fixture, "parent-exit-child-holds", callbacks)
                 self.assertTrue(_token_attestation_is_exact(session, fixture.write_sid))
@@ -339,13 +343,15 @@ class WindowsNativePtyLifecycleAcceptanceTests(unittest.IsolatedAsyncioTestCase)
                     leader_state = leader_observer.observe()
                     grandchild_state = grandchild_observer.observe()
                     session_poll_while_active = session.poll_exit()
+                    eof_while_active = callbacks.eof_count != 0
+                    error_while_active = bool(callbacks.errors)
                     if classification is None and leader_state.get("state") != "EXITED":
                         classification = "DESCENDANT_LEADER_EXIT_TRANSPORT_FAILURE"
                     elif classification is None and grandchild_state.get("state") != "ACTIVE":
                         classification = "DESCENDANT_KILLED_ON_LEADER_EXIT"
                     elif classification is None and session_poll_while_active is not None:
                         classification = "WAIT_RETURNED_WITH_ACTIVE_DESCENDANT"
-                    elif classification is None and (callbacks.eof_count != 0 or callbacks.errors):
+                    elif classification is None and (eof_while_active or error_while_active):
                         classification = "DESCENDANT_LEADER_EXIT_TRANSPORT_FAILURE"
 
                     finish_deadline = asyncio.get_running_loop().time() + 6.0
@@ -412,8 +418,8 @@ class WindowsNativePtyLifecycleAcceptanceTests(unittest.IsolatedAsyncioTestCase)
                     "leader_state_while_grandchild_active": leader_state.get("state"),
                     "grandchild_state_after_leader_exit": grandchild_state.get("state"),
                     "session_poll_exit_while_grandchild_active": session_poll_while_active,
-                    "eof_while_grandchild_active": callbacks.eof_count != 0,
-                    "error_while_grandchild_active": bool(callbacks.errors),
+                    "eof_while_grandchild_active": eof_while_active,
+                    "error_while_grandchild_active": error_while_active,
                     "grandchild_natural_finish": fixture.workspace.joinpath(
                         "grandchild-finished"
                     ).is_file(),
@@ -445,9 +451,11 @@ class WindowsNativePtyLifecycleAcceptanceTests(unittest.IsolatedAsyncioTestCase)
         """A normal PTY close terminates the complete runner-owned Job scope."""
 
         compiled_probe = await asyncio.to_thread(_compile_descendant_probe)
-        self.addAsyncCleanup(
-            lambda: asyncio.to_thread(shutil.rmtree, compiled_probe.parent, ignore_errors=True)
-        )
+
+        async def cleanup_probe() -> None:
+            await asyncio.to_thread(shutil.rmtree, compiled_probe.parent, ignore_errors=True)
+
+        self.addAsyncCleanup(cleanup_probe)
         with TemporaryDirectory() as directory:
             fixture = _make_descendant_fixture(Path(directory), compiled_probe)
             callbacks = _PtyCallbacks()
@@ -578,9 +586,11 @@ class WindowsNativePtyLifecycleAcceptanceTests(unittest.IsolatedAsyncioTestCase)
         """A controller process loss causes the runner to fail closed."""
 
         compiled_probe = await asyncio.to_thread(_compile_descendant_probe)
-        self.addAsyncCleanup(
-            lambda: asyncio.to_thread(shutil.rmtree, compiled_probe.parent, ignore_errors=True)
-        )
+
+        async def cleanup_probe() -> None:
+            await asyncio.to_thread(shutil.rmtree, compiled_probe.parent, ignore_errors=True)
+
+        self.addAsyncCleanup(cleanup_probe)
         with TemporaryDirectory() as directory:
             root = Path(directory)
             workspace = root / "workspace"
@@ -729,9 +739,11 @@ class WindowsNativePtyLifecycleAcceptanceTests(unittest.IsolatedAsyncioTestCase)
         """Runner death closes its Job and does not masquerade as clean EOF."""
 
         compiled_probe = await asyncio.to_thread(_compile_descendant_probe)
-        self.addAsyncCleanup(
-            lambda: asyncio.to_thread(shutil.rmtree, compiled_probe.parent, ignore_errors=True)
-        )
+
+        async def cleanup_probe() -> None:
+            await asyncio.to_thread(shutil.rmtree, compiled_probe.parent, ignore_errors=True)
+
+        self.addAsyncCleanup(cleanup_probe)
         with TemporaryDirectory() as directory:
             fixture = _make_descendant_fixture(Path(directory), compiled_probe)
             callbacks = _PtyCallbacks()
