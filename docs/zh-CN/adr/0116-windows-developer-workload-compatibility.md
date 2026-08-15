@@ -41,13 +41,19 @@ identity。缺失工具记录为 `NOT_INSTALLED`；观察到的工作负载失�
 HOME/TEMP、identity、Job、named-pipe 与 ConPTY 边界均不变。不得为使某个
 工作负载通过而添加 SID、privilege、fallback 或扩大 authority。
 
+对于启用的 W3/W4 单元格，只有当诊断事实同时满足选定的 Online W2 identity、
+`IsTokenRestricted=true`、精确单例 synthetic write SID、启用的
+`SeChangeNotifyPrivilege` 以及 unexpected enabled privilege 数量为 0 时，
+才会输出 `token_attestation=PASS`。
+
 ## 矩阵工作负载
 
 数据驱动的验收模块只覆盖确定性的启动和本地文件系统操作：
 
 - `CMD_BASIC` 以及独立的 `CMD_NUL_REDIRECT` 退出码判据；
 - 已安装时的 Windows PowerShell 与 `pwsh`；
-- Python version、`-I -S`、`-I` 和 normal 启动行；
+- venv Python version、`-I -S`、`-I` 和 normal 启动行，以及经过验证的 base
+  interpreter version 与 `-I -S` 启动行；
 - Git version、在授权 workspace 内 disposable repository 中的 repository
   discovery、`status --porcelain=v1`；
 - Node version/`-e` 执行和实际解析到的 npm launcher；
@@ -70,11 +76,11 @@ W4 失败则保留为 transport-specific 证据。这些只是下一阶段的假
 
 ## Gate 0 证据记录
 
-focused CI run [31896141324](https://github.com/amber1686855908-hash/neuro-code/actions/runs/31896141324)
-的 23 个 job 全部成功。`windows-native-sandbox-compatibility` job 执行了一个
-矩阵测试，0 skip，并上传了有界 JSON 与 JUnit artifact。矩阵运行于 Windows
-Server 2025 hosted `windows-latest`、Python 3.12.10、`WORKSPACE` 和 Online
-identity。
+PR body 是最新 exact-head CI run 与 artifact 的 canonical pointer。本 ADR
+有意不硬编码易变化的当前 run ID；历史 run ID 只有在明确标注其测试的 exact
+commit 时才保留。`windows-native-sandbox-compatibility` job 必须执行一个
+矩阵测试、0 skip，并上传有界 JSON 与 JUnit artifact。矩阵运行于 Windows
+Server 2025 hosted `windows-latest`、`WORKSPACE` 和 Online identity。
 
 controller 记录的工具来源：
 
@@ -84,6 +90,7 @@ controller 记录的工具来源：
 | `powershell.exe` | `C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe`；5.1.26100.33158 |
 | `pwsh.exe` | `C:\Program Files\PowerShell\7\pwsh.exe`；7.6.4 |
 | `python.exe` | `D:\a\neuro-code\neuro-code\.venv\Scripts\python.exe`；3.12.10 |
+| base `python.exe` | 从 venv 已验证的 `sys._base_executable` 发现；路径与版本记录在 JSON artifact |
 | `git.exe` | `C:\Program Files\Git\bin\git.exe`；2.55.0.windows.3 |
 | `node.exe` | `C:\Program Files\nodejs\node.exe`；v22.23.2 |
 | `npm.cmd` | `C:\Program Files\nodejs\npm.cmd`；10.9.8 |
@@ -120,14 +127,20 @@ artifact 保留的重要有界错误事实：Windows PowerShell 在 CLR 启动�
 用户 marker。curl 行只测启动；当前 W3 evidence 没有精确的既有 restricted-curl
 命令，因此没有运行替代网络命令。
 
-关联分析显示 `CMD_NUL_REDIRECT`、Windows PowerShell、`pwsh`、全部四个 Python
-行、三个 Git 行、curl 启动和 `NUL_DIRECT_WIN32` 均为 W3/W4 共享失败；没有
-W3-only、W4-only 或 HOST 失败。Node 与 npm 在两种 transport 中均通过。NUL
-拒绝同时出现在 shell redirection 与直接 Win32 device access，但本 Gate 不对
-Git 或其他工作负载宣称因果关系。
+解释至少分为两个证据 cluster。Cluster A 是 device/NUL 证据：
+`CMD_NUL_REDIRECT`、按 access mode 分开的 `NUL_DIRECT_WIN32` probe，以及
+Git 的 `/dev/null` 启动失败。Cluster B 是 runtime initialization：Windows
+PowerShell 的 `HRESULT 0x80070005`、pwsh 的 `BCrypt.dll`/`0x8007045A` 输出、
+Python 启动 timeout 和 curl 启动 timeout。Node 与 npm 在两种 transport 中
+均通过。W3/W4 共享模式是事实，但 cluster 之间的关系仍未证明；没有新证据
+时，不把 Python 等同于 BCrypt、不把 curl 等同于 BCrypt，也不把 PowerShell
+等同于 NUL。
 
 ## 下一决策边界
 
-下一阶段首先调查共享的 restricted startup/device compatibility seam：它影响
-Python、curl、Git、NUL 和 PowerShell 家族，且对 W3/W4 都有影响；但在任何改动
-之前仍必须分离其中的子原因。Gate 0 不实现修复，W5 Gate 1 尚未开始。
+下一阶段首先调查影响多个 W3/W4 工作负载的 restricted startup/device
+compatibility seam；在任何改动之前仍必须分离其中的子原因。Gate 0 不授权
+CNG/Bcrypt、token、SID、privilege、ACL、Firewall 或 fallback 变更，也不实现
+修复，W5 Gate 1 尚未开始。兼容性 timeout 行记录 canonical termination、runner
+状态和有界 drain 事实；当没有测量 `orphan_count` 时，不声称观察到
+`orphan_count=0`。

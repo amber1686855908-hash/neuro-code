@@ -23,6 +23,11 @@ from pathlib import Path
 from tempfile import TemporaryDirectory, gettempdir, mkdtemp
 from typing import Any, cast
 
+from tests.security.windows_token_attestation import (
+    token_attestation_is_exact,
+    token_attestation_projection,
+)
+
 from neuro_code.application.permissions.policy import PermissionManager, PermissionMode
 from neuro_code.application.ports.sandbox import (
     LocalProcessEnvironmentPolicy,
@@ -256,6 +261,18 @@ def _reported_error_code(stdout: bytes, stderr: bytes) -> int | None:
     return None
 
 
+def _nul_mode_results(stdout: bytes, stderr: bytes) -> dict[str, object] | None:
+    text = (stdout + b"\n" + stderr).decode("utf-8", errors="replace").replace("\x00", "")
+    match = re.search(r"W5_NUL_DIRECT=(\{.*\})", text)
+    if match is None:
+        return None
+    try:
+        value = json.loads(match.group(1))
+    except json.JSONDecodeError:
+        return None
+    return value if isinstance(value, dict) else None
+
+
 def _completed_classification(spec: _Workload, exit_code: int, stdout: bytes, stderr: bytes) -> str:
     if exit_code == 0:
         return "PASS" if _output_matches(spec, stdout, stderr) else "OUTPUT_MISMATCH"
@@ -270,6 +287,7 @@ def _completed_classification(spec: _Workload, exit_code: int, stdout: bytes, st
             exit_code in {2, 3}
             or "access is denied" in evidence
             or '"create_file":"fail"' in evidence
+            or '"create":"fail"' in evidence
             or '"write":"fail"' in evidence
         ):
             return "DEVICE_ACCESS_DENIED"
@@ -309,6 +327,8 @@ def _cell_base(
         "runner_exit": "NOT_APPLICABLE",
         "forced_termination": False,
         "orphan_count": None,
+        "timeout_cleanup": "NOT_APPLICABLE",
+        "timeout_drain": "NOT_APPLICABLE",
         "classification": "INCONCLUSIVE",
         "note": spec.note,
     }
@@ -363,6 +383,7 @@ def _host_run(spec: _Workload, workspace: Path) -> dict[str, object]:
         result["exit_code"] = process.returncode
         result["stdout_preview"] = _preview(stdout)
         result["stderr_preview"] = _preview(stderr)
+        result["nul_modes"] = _nul_mode_results(stdout, stderr)
         result["win32_error"] = _reported_error_code(stdout, stderr)
         if not result["timeout"]:
             result["classification"] = _completed_classification(
@@ -401,20 +422,42 @@ def _write_json_artifact(path: str, payload: dict[str, object]) -> None:
     )
 
 
-def _security_attestation_status(diagnostic: object) -> str:
+def _security_attestation_status_for(
+    diagnostic: object,
+    *,
+    expected_user_sid: str | None,
+    expected_write_sid: str | None,
+) -> str:
     if not isinstance(diagnostic, dict):
         return "UNKNOWN"
-    value = diagnostic.get("security_attestation")
-    if not isinstance(value, dict):
+    if expected_user_sid is None or expected_write_sid is None:
         return "UNKNOWN"
-    if (
-        value.get("is_restricted") is True
-        and value.get("change_notify_privilege_enabled") is True
-        and value.get("unexpected_enabled_privilege_count") == 0
-        and tuple(value.get("restricted_sids", ()))
+    if token_attestation_is_exact(
+        diagnostic,
+        expected_user_sid=expected_user_sid,
+        expected_write_sid=expected_write_sid,
     ):
         return "PASS"
     return "FAIL"
+
+
+def _security_attestation_projection(diagnostic: object) -> dict[str, Any] | None:
+    return token_attestation_projection(diagnostic)
+
+
+def _record_security_attestation(
+    result: dict[str, object],
+    diagnostic: object,
+    *,
+    expected_user_sid: str,
+    expected_write_sid: str,
+) -> None:
+    result["token_attestation"] = _security_attestation_status_for(
+        diagnostic,
+        expected_user_sid=expected_user_sid,
+        expected_write_sid=expected_write_sid,
+    )
+    result["security_attestation"] = _security_attestation_projection(diagnostic)
 
 
 def _runner_projection(diagnostic: object) -> object:
@@ -457,6 +500,8 @@ async def _w3_run(
     *,
     workspace: Path,
     adapter: WindowsNativeLocalProcessSandbox,
+    expected_user_sid: str,
+    expected_write_sid: str,
 ) -> dict[str, object]:
     if spec.executable is None:
         return _not_installed(
@@ -474,28 +519,52 @@ async def _w3_run(
         result["spawn_result"] = "PASS"
         result["spawn_ready"] = "PASS"
         diagnostic = process.diagnostic_snapshot()
-        result["token_attestation"] = _security_attestation_status(diagnostic)
+        _record_security_attestation(
+            result,
+            diagnostic,
+            expected_user_sid=expected_user_sid,
+            expected_write_sid=expected_write_sid,
+        )
         tasks = (
             asyncio.create_task(_read_output(process.stdout)),
             asyncio.create_task(_read_output(process.stderr)),
             asyncio.create_task(process.wait()),
         )
-        try:
-            values = await asyncio.wait_for(asyncio.gather(*tasks), timeout=_TIMEOUT_SECONDS)
-            stdout, stderr, exit_code = values
-            result["exit_code"] = exit_code
-        except TimeoutError:
+        done, _ = await asyncio.wait(tasks, timeout=_TIMEOUT_SECONDS)
+        if len(done) == len(tasks):
+            with contextlib.suppress(BaseException):
+                stdout = tasks[0].result()
+            with contextlib.suppress(BaseException):
+                stderr = tasks[1].result()
+            with contextlib.suppress(BaseException):
+                result["exit_code"] = tasks[2].result()
+        else:
             result["timeout"] = True
             result["classification"] = "TIMEOUT"
+            result["timeout_cleanup"] = "canonical_process_terminate"
             await process.terminate(grace_seconds=0.5)
-            with contextlib.suppress(BaseException):
-                result["exit_code"] = await asyncio.wait_for(process.wait(), timeout=5)
+            result["timeout_drain"] = "bounded_2s_pipe_drain"
+            drained, _ = await asyncio.wait(tasks, timeout=2.0)
+            if tasks[0] in drained:
+                with contextlib.suppress(BaseException):
+                    stdout = tasks[0].result()
+            if tasks[1] in drained:
+                with contextlib.suppress(BaseException):
+                    stderr = tasks[1].result()
+            if tasks[2] in drained:
+                with contextlib.suppress(BaseException):
+                    result["exit_code"] = tasks[2].result()
         diagnostic = process.diagnostic_snapshot()
         result["runner_exit"] = _runner_projection(diagnostic)
         result["forced_termination"] = bool(
             isinstance(diagnostic, dict) and diagnostic.get("runner_forced_termination", False)
         )
-        result["token_attestation"] = _security_attestation_status(diagnostic)
+        _record_security_attestation(
+            result,
+            diagnostic,
+            expected_user_sid=expected_user_sid,
+            expected_write_sid=expected_write_sid,
+        )
     except BaseException as error:
         result["classification"] = _classify_exception(error)
         result["note"] = str(error)[:512]
@@ -516,6 +585,7 @@ async def _w3_run(
                 with contextlib.suppress(BaseException):
                     stderr = tasks[1].result()
         result["stdout_preview"] = _preview(stdout)
+        result["nul_modes"] = _nul_mode_results(stdout, b"")
         result["stderr_preview"] = _preview(stderr)
         if result["win32_error"] is None:
             result["win32_error"] = _reported_error_code(stdout, stderr)
@@ -533,6 +603,8 @@ async def _w4_run(
     *,
     workspace: Path,
     manager: LocalInteractiveTerminalManager,
+    expected_user_sid: str,
+    expected_write_sid: str,
 ) -> dict[str, object]:
     if spec.executable is None:
         return _not_installed(
@@ -578,10 +650,17 @@ async def _w4_run(
         result["forced_termination"] = bool(
             isinstance(diagnostic, dict) and diagnostic.get("runner_forced_termination", False)
         )
-        result["token_attestation"] = _security_attestation_status(diagnostic)
+        _record_security_attestation(
+            result,
+            diagnostic,
+            expected_user_sid=expected_user_sid,
+            expected_write_sid=expected_write_sid,
+        )
     except TimeoutError as error:
         result["timeout"] = True
         result["classification"] = "TIMEOUT"
+        result["timeout_cleanup"] = "canonical_terminal_session_close"
+        result["timeout_drain"] = "bounded_session_close"
         result["note"] = str(error)[:512]
     except BaseException as error:
         result["classification"] = _classify_exception(error)
@@ -597,11 +676,17 @@ async def _w4_run(
             result["forced_termination"] = bool(
                 isinstance(diagnostic, dict) and diagnostic.get("runner_forced_termination", False)
             )
-            result["token_attestation"] = _security_attestation_status(diagnostic)
+            _record_security_attestation(
+                result,
+                diagnostic,
+                expected_user_sid=expected_user_sid,
+                expected_write_sid=expected_write_sid,
+            )
         stdout = bytes(output)
         result["stdout_preview"] = _preview(stdout)
         if result["win32_error"] is None:
             result["win32_error"] = _reported_error_code(stdout, b"")
+        result["nul_modes"] = _nul_mode_results(stdout, b"")
         if result["classification"] == "INCONCLUSIVE" and not result["timeout"]:
             exit_code = result.get("exit_code")
             if isinstance(exit_code, int):
@@ -638,6 +723,7 @@ def _build_workloads(
     powershell: Path | None,
     pwsh: Path | None,
     python: Path | None,
+    python_base: Path | None,
     git: Path | None,
     node: Path | None,
     npm: Path | None,
@@ -702,6 +788,21 @@ def _build_workloads(
             ("-c", "import sys; print('W5_PYTHON_NORMAL_OK'); print(sys.executable)"),
             ("w5_python_normal_ok",),
         ),
+        _Workload(
+            "PYTHON_BASE_VERSION", "base-interpreter", python_base, ("--version",), ("python ",)
+        ),
+        _Workload(
+            "PYTHON_BASE_MINIMAL_NO_SITE",
+            "base-interpreter -I-S",
+            python_base,
+            (
+                "-I",
+                "-S",
+                "-c",
+                "import sys; print('W5_PYTHON_BASE_MINIMAL_OK'); print(sys.executable)",
+            ),
+            ("w5_python_base_minimal_ok",),
+        ),
         _Workload("GIT_VERSION", "default", git, ("--version",), ("git version ",)),
         _Workload(
             "GIT_REPO_DISCOVERY",
@@ -730,10 +831,14 @@ def _build_workloads(
         ),
         _Workload(
             "NUL_DIRECT_WIN32",
-            "CreateFileW-WriteFile",
+            "CreateFileW-read-write-modes",
             nul_probe,
             (),
-            (r'"create_file":"pass"', r'"write":"pass"'),
+            (
+                r'"read":\{"create":"pass"',
+                r'"write":\{"create":"pass"',
+                r'"read_write":\{"create":"pass"',
+            ),
         ),
     ]
     npm_arguments: _Command
@@ -748,7 +853,7 @@ def _build_workloads(
         npm_executable = None
         npm_arguments = ()
     workloads.insert(
-        13,
+        next(index for index, workload in enumerate(workloads) if workload.name == "CURL_VERSION"),
         _Workload(
             "NPM_VERSION",
             "resolved-launcher",
@@ -778,6 +883,37 @@ def _tool_paths() -> dict[str, Path | None]:
         "npm": _find_tool("npm.cmd", "npm.exe", "npm"),
         "curl": _find_tool("curl.exe", "curl"),
     }
+
+
+def _discover_base_python(python: Path | None) -> Path | None:
+    """Resolve and verify the base interpreter behind the active venv."""
+
+    if python is None:
+        return None
+    candidates: list[Path] = []
+    current_base = getattr(sys, "_base_executable", None)
+    if isinstance(current_base, str) and current_base:
+        candidates.append(Path(current_base))
+    with contextlib.suppress(OSError, subprocess.SubprocessError):
+        completed = subprocess.run(
+            [str(python), "-I", "-S", "-c", "import sys; print(sys._base_executable)"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            shell=False,
+        )
+        candidates.extend(
+            Path(line.strip()) for line in completed.stdout.splitlines() if line.strip()
+        )
+    venv_path = _canonical(python)
+    for candidate in candidates:
+        if not candidate.is_absolute():
+            continue
+        resolved = _canonical(candidate)
+        if resolved.is_file() and resolved != venv_path:
+            return resolved
+    return None
 
 
 def _provenance(paths: dict[str, Path | None], workspace: Path) -> dict[str, object]:
@@ -832,6 +968,7 @@ class WindowsNativeWorkloadCompatibilityTests(unittest.IsolatedAsyncioTestCase):
         nul_probe = await asyncio.to_thread(_compile_nul_probe)
         self.addAsyncCleanup(_remove_directory, nul_probe.parent)
         paths = _tool_paths()
+        paths["python_base"] = _discover_base_python(paths["python"])
 
         with TemporaryDirectory() as directory:
             root = Path(directory)
@@ -870,6 +1007,10 @@ class WindowsNativeWorkloadCompatibilityTests(unittest.IsolatedAsyncioTestCase):
             )
             snapshot = await asyncio.to_thread(authority.setup, setup_request)
             self.assertEqual(snapshot.state, WindowsSandboxSetupState.READY)
+            self.assertIsInstance(snapshot.online_user_sid, str)
+            self.assertIsInstance(snapshot.write_restricting_sid, str)
+            expected_online_sid = cast(str, snapshot.online_user_sid)
+            expected_write_sid = cast(str, snapshot.write_restricting_sid)
             adapter = WindowsNativeLocalProcessSandbox(
                 SandboxProfile.WORKSPACE,
                 workspace,
@@ -899,6 +1040,7 @@ class WindowsNativeWorkloadCompatibilityTests(unittest.IsolatedAsyncioTestCase):
                     powershell=paths["powershell"],
                     pwsh=paths["pwsh"],
                     python=paths["python"],
+                    python_base=paths["python_base"],
                     git=paths["git"],
                     node=paths["node"],
                     npm=paths["npm"],
@@ -907,8 +1049,20 @@ class WindowsNativeWorkloadCompatibilityTests(unittest.IsolatedAsyncioTestCase):
                 matrix: list[dict[str, object]] = []
                 for workload in workloads:
                     host = await asyncio.to_thread(_host_run, workload, workspace)
-                    w3 = await _w3_run(workload, workspace=workspace, adapter=adapter)
-                    w4 = await _w4_run(workload, workspace=workspace, manager=manager)
+                    w3 = await _w3_run(
+                        workload,
+                        workspace=workspace,
+                        adapter=adapter,
+                        expected_user_sid=expected_online_sid,
+                        expected_write_sid=expected_write_sid,
+                    )
+                    w4 = await _w4_run(
+                        workload,
+                        workspace=workspace,
+                        manager=manager,
+                        expected_user_sid=expected_online_sid,
+                        expected_write_sid=expected_write_sid,
+                    )
                     matrix.append(
                         {
                             "workload": workload.name,
@@ -940,6 +1094,8 @@ class WindowsNativeWorkloadCompatibilityTests(unittest.IsolatedAsyncioTestCase):
                                 "lifecycle": "STRONG_DESCENDANT_OWNERSHIP",
                                 "profile": "WORKSPACE",
                                 "strict": "FAIL_CLOSED",
+                                "expected_online_user_sid": expected_online_sid,
+                                "expected_write_restricting_sid": expected_write_sid,
                             },
                         },
                     )

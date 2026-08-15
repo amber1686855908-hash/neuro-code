@@ -25,6 +25,10 @@ from pathlib import Path
 from tempfile import TemporaryDirectory, gettempdir, mkdtemp
 from typing import Any, cast
 
+from tests.security.windows_token_attestation import (
+    token_attestation_is_exact as _token_attestation_matches_exact,
+)
+
 from neuro_code.application.ports.sandbox import (
     LocalProcessEnvironmentPolicy,
     LocalProcessFilesystemPolicy,
@@ -578,15 +582,10 @@ def _read_descendant_pid(path: Path) -> int:
 
 def _token_attestation_is_exact(process: OwnedLocalProcess, write_sid: SyntheticWindowsSid) -> bool:
     diagnostic = cast(Any, process).diagnostic_snapshot()
-    if not isinstance(diagnostic, dict):
-        return False
-    attestation = diagnostic.get("security_attestation")
-    return bool(
-        isinstance(attestation, dict)
-        and attestation.get("is_restricted") is True
-        and tuple(attestation.get("restricted_sids", ())) == (write_sid.value,)
-        and attestation.get("change_notify_privilege_enabled") is True
-        and attestation.get("unexpected_enabled_privilege_count") == 0
+    return _token_attestation_matches_exact(
+        diagnostic,
+        expected_user_sid=None,
+        expected_write_sid=write_sid.value,
     )
 
 
