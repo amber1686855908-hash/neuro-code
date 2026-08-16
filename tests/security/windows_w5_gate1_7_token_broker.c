@@ -26,10 +26,13 @@
 #define PROC_THREAD_ATTRIBUTE_HANDLE_LIST_VALUE 0x00020002
 #define WAIT_OBJECT_0_RESULT 0x00000000
 #define WAIT_TIMEOUT_RESULT 0x00000102
+#define TOKEN_LOGON_SID_INFORMATION 28
 #ifdef NEURO_GATE18
 #define CREATE_SUSPENDED_FLAG 0x00000004
 #define JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS 9
 #define JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE_VALUE 0x00002000
+#define CHILD_WAIT_TIMEOUT_MS 10000
+#elif defined(NEURO_GATE19)
 #define CHILD_WAIT_TIMEOUT_MS 10000
 #else
 #define CHILD_WAIT_TIMEOUT_MS 20000
@@ -37,6 +40,8 @@
 
 #ifdef NEURO_GATE18
 #define GATE_MARKER(name) "W5_GATE18_" name
+#elif defined(NEURO_GATE19)
+#define GATE_MARKER(name) "W5_GATE19_" name
 #else
 #define GATE_MARKER(name) "W5_GATE17_" name
 #endif
@@ -138,6 +143,7 @@ static BOOL inspect_token_privileges(HANDLE token) {
     TOKEN_PRIVILEGES *privileges = NULL;
     LUID change_notify;
     DWORD index;
+    DWORD unexpected_enabled = 0;
     const char *change_notify_state = "ABSENT";
     if (GetTokenInformation(
         token,
@@ -163,15 +169,19 @@ static BOOL inspect_token_privileges(HANDLE token) {
         return FALSE;
     }
     for (index = 0; index < privileges->PrivilegeCount; ++index) {
-        if (privileges->Privileges[index].Luid.LowPart == change_notify.LowPart &&
-            privileges->Privileges[index].Luid.HighPart == change_notify.HighPart) {
+        BOOL is_change_notify =
+            privileges->Privileges[index].Luid.LowPart == change_notify.LowPart &&
+            privileges->Privileges[index].Luid.HighPart == change_notify.HighPart;
+        if (is_change_notify) {
             change_notify_state = (privileges->Privileges[index].Attributes & 0x00000002)
                 ? "ENABLED"
                 : "DISABLED";
-            break;
+        } else if ((privileges->Privileges[index].Attributes & 0x00000002) != 0) {
+            ++unexpected_enabled;
         }
     }
     emit_u32(GATE_MARKER("TOKEN_PRIVILEGE_COUNT="), privileges->PrivilegeCount);
+    emit_u32(GATE_MARKER("UNEXPECTED_ENABLED_PRIVILEGES="), unexpected_enabled);
     emit_ascii(GATE_MARKER("SE_CHANGE_NOTIFY="));
     emit_ascii(change_notify_state);
     emit_ascii("\n");
@@ -180,6 +190,101 @@ static BOOL inspect_token_privileges(HANDLE token) {
     return TRUE;
 }
 
+#ifdef NEURO_GATE19
+static BOOL get_current_logon_sid_text(
+    HANDLE token,
+    wchar_t *sid_text,
+    DWORD sid_capacity
+) {
+    DWORD required = 0;
+    TOKEN_GROUPS *groups = NULL;
+    LPWSTR converted = NULL;
+    BOOL result = FALSE;
+    if (GetTokenInformation(
+        token,
+        TOKEN_LOGON_SID_INFORMATION,
+        NULL,
+        0,
+        &required
+    ) || GetLastError() != ERROR_INSUFFICIENT_BUFFER || required < sizeof(DWORD)) {
+        return FALSE;
+    }
+    groups = (TOKEN_GROUPS *)malloc(required);
+    if (groups == NULL || !GetTokenInformation(
+        token,
+        TOKEN_LOGON_SID_INFORMATION,
+        groups,
+        required,
+        &required
+    ) || groups->GroupCount < 1 || groups->Groups[0].Sid == NULL ||
+        !ConvertSidToStringSidW(groups->Groups[0].Sid, &converted) || converted == NULL) {
+        if (groups != NULL) {
+            free(groups);
+        }
+        return FALSE;
+    }
+    if (wcsncpy_s(sid_text, sid_capacity, converted, _TRUNCATE) == 0) {
+        result = TRUE;
+    }
+    LocalFree(converted);
+    free(groups);
+    return result;
+}
+
+static BOOL set_broker_default_dacl(
+    HANDLE token,
+    const wchar_t *write_sid_text,
+    const wchar_t *logon_sid_text
+) {
+    PSECURITY_DESCRIPTOR descriptor = NULL;
+    PACL dacl = NULL;
+    BOOL dacl_present = FALSE;
+    BOOL dacl_defaulted = FALSE;
+    TOKEN_DEFAULT_DACL token_dacl;
+    wchar_t sddl[512];
+    BOOL converted;
+    BOOL result;
+    int written = _snwprintf_s(
+        sddl,
+        sizeof(sddl) / sizeof(sddl[0]),
+        _TRUNCATE,
+        L"D:(A;;GA;;;WD)(A;;GA;;;%ls)(A;;GA;;;%ls)",
+        logon_sid_text,
+        write_sid_text
+    );
+    if (written < 0) {
+        return FALSE;
+    }
+    converted = ConvertStringSecurityDescriptorToSecurityDescriptorW(
+        sddl,
+        SDDL_REVISION_1,
+        &descriptor,
+        NULL
+    );
+    if (!converted || descriptor == NULL) {
+        return FALSE;
+    }
+    result = GetSecurityDescriptorDacl(
+        descriptor,
+        &dacl_present,
+        &dacl,
+        &dacl_defaulted
+    );
+    if (!result || !dacl_present || dacl == NULL) {
+        (void)LocalFree(descriptor);
+        return FALSE;
+    }
+    token_dacl.DefaultDacl = dacl;
+    result = SetTokenInformation(
+        token,
+        TokenDefaultDacl,
+        &token_dacl,
+        sizeof(token_dacl)
+    );
+    (void)LocalFree(descriptor);
+    return result;
+}
+#else
 static BOOL set_broker_default_dacl(HANDLE token, const wchar_t *sid_text) {
     PSECURITY_DESCRIPTOR descriptor = NULL;
     PACL dacl = NULL;
@@ -230,6 +335,7 @@ static BOOL set_broker_default_dacl(HANDLE token, const wchar_t *sid_text) {
     (void)LocalFree(descriptor);
     return result;
 }
+#endif
 
 #ifdef NEURO_GATE18
 static BOOL write_child_pid_marker(const wchar_t *path, DWORD pid) {
@@ -418,12 +524,33 @@ static int launch_child(
         emit_ascii(GATE_MARKER("CHILD_PID_MARKER=PASS\n"));
     }
 #endif
+#ifdef NEURO_GATE19
+    emit_u32(GATE_MARKER("CHILD_PID="), GetProcessId(process.hProcess));
+    emit_ascii(
+        GATE_MARKER("CHILD_INITIAL_ACTIVE=")
+    );
+    emit_ascii(
+        WaitForSingleObject(process.hProcess, 0) == WAIT_TIMEOUT_RESULT
+            ? "PASS\n"
+            : "EXITED\n"
+    );
+    emit_ascii(GATE_MARKER("CHILD_ACTIVE=PASS\n"));
+#endif
     emit_ascii(GATE_MARKER("CHILD_CREATE=PASS\n"));
     (void)CloseHandle(process.hThread);
     wait_result = WaitForSingleObject(process.hProcess, CHILD_WAIT_TIMEOUT_MS);
     if (wait_result == WAIT_TIMEOUT_RESULT) {
         emit_ascii(GATE_MARKER("CHILD_WAIT=TIMEOUT\n"));
-        (void)TerminateProcess(process.hProcess, 0xC000013A);
+        emit_ascii(GATE_MARKER("CHILD_CLEANUP=TERMINATE\n"));
+        {
+#ifdef NEURO_GATE19
+            BOOL terminated = TerminateProcess(process.hProcess, 0xC000013A);
+            emit_ascii(GATE_MARKER("CHILD_CLEANUP_RESULT="));
+            emit_ascii(terminated ? "PASS\n" : "FAIL\n");
+#else
+            (void)TerminateProcess(process.hProcess, 0xC000013A);
+#endif
+        }
 #ifdef NEURO_GATE18
         if (cleanup_job != NULL) {
             (void)TerminateJobObject(cleanup_job, 0xC000013A);
@@ -451,6 +578,9 @@ static int launch_child(
         return 44;
     }
     emit_u32(GATE_MARKER("CHILD_EXIT="), exit_code);
+#ifdef NEURO_GATE19
+    emit_ascii(GATE_MARKER("CHILD_CLEANUP=NONE\n"));
+#endif
     (void)CloseHandle(process.hProcess);
 #ifdef NEURO_GATE18
     if (cleanup_job != NULL) {
@@ -476,6 +606,9 @@ int wmain(int argc, wchar_t **argv) {
     SID_AND_ATTRIBUTES restricted_sid;
     DWORD expected_count;
     int child_result;
+#ifdef NEURO_GATE19
+    wchar_t logon_sid_text[128];
+#endif
 
     if (
 #ifdef NEURO_GATE18
@@ -542,6 +675,22 @@ int wmain(int argc, wchar_t **argv) {
         return 33;
     }
     emit_ascii(GATE_MARKER("TOKEN_CREATE=PASS\n"));
+#ifdef NEURO_GATE19
+    if (!get_current_logon_sid_text(source_token, logon_sid_text, sizeof(logon_sid_text) / sizeof(logon_sid_text[0])) ||
+        !set_broker_default_dacl(child_token, sid_text, logon_sid_text)) {
+        emit_ascii(GATE_MARKER("TOKEN_DACL=FAIL\n"));
+        emit_u32(GATE_MARKER("TOKEN_DACL_ERROR="), GetLastError());
+        if (child_token != source_token) {
+            (void)CloseHandle(child_token);
+        }
+        (void)CloseHandle(source_token);
+        if (expected_sid != NULL) {
+            (void)LocalFree(expected_sid);
+        }
+        return 34;
+    }
+    emit_ascii(GATE_MARKER("DACL_PRINCIPALS=LOGON,WORLD,SYNTHETIC_WRITE\n"));
+#else
     if (!set_broker_default_dacl(child_token, has_sid ? sid_text : L"")) {
         emit_ascii(GATE_MARKER("TOKEN_DACL=FAIL\n"));
         emit_u32(GATE_MARKER("TOKEN_DACL_ERROR="), GetLastError());
@@ -554,6 +703,7 @@ int wmain(int argc, wchar_t **argv) {
         }
         return 34;
     }
+#endif
     emit_ascii(GATE_MARKER("TOKEN_DACL=PASS\n"));
     emit_bool(GATE_MARKER("TOKEN_RESTRICTED="), IsTokenRestricted(child_token));
     if (!inspect_restricted_sids(child_token, expected_sid, expected_count)) {
