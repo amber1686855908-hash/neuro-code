@@ -242,7 +242,10 @@ def _int_marker(markers: dict[str, str], key: str) -> int | None:
 
 def _probe_projection(name: str, markers: dict[str, str]) -> dict[str, object]:
     prefix = f"W5_GATE16_{name}_"
-    child = {key: value for key, value in markers.items() if key.startswith(prefix)}
+    prefixes = (prefix,)
+    if name == "P3":
+        prefixes = (*prefixes, "W5_GATE16_BCRYPT_", "W5_GATE16_NCRYPT_", "W5_GATE16_BEFORE_")
+    child = {key: value for key, value in markers.items() if key.startswith(prefixes)}
     started = f"W5_GATE16_{name}_STARTED" in child
     finished = f"W5_GATE16_{name}_FINISHED" in child
     return {
@@ -326,11 +329,15 @@ def _full_production_equivalent(results: dict[str, dict[str, object]]) -> bool:
         probe = cast(dict[str, object], result["probe"])
         broker = cast(dict[str, object], result["broker"])
         markers = cast(dict[str, str], probe["markers"])
+        bcrypt_load = "W5_GATE16_BCRYPT_LOAD" if name == "P3" else "W5_GATE16_P4_BCRYPT_LOAD"
+        bcrypt_error = (
+            "W5_GATE16_BCRYPT_LOAD_ERROR" if name == "P3" else "W5_GATE16_P4_BCRYPT_LOAD_ERROR"
+        )
         if (
             probe.get("finished") is not True
             or broker.get("child_exit") != expected_probe_exit[name]
-            or markers.get(f"W5_GATE16_{name}_BCRYPT_LOAD") != "FAIL"
-            or markers.get(f"W5_GATE16_{name}_BCRYPT_LOAD_ERROR") != "1114"
+            or markers.get(bcrypt_load) != "FAIL"
+            or markers.get(bcrypt_error) != "1114"
         ):
             return False
     return True
