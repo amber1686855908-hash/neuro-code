@@ -26,6 +26,11 @@
 #define PROC_THREAD_ATTRIBUTE_HANDLE_LIST_VALUE 0x00020002
 #define WAIT_OBJECT_0_RESULT 0x00000000
 #define WAIT_TIMEOUT_RESULT 0x00000102
+#ifdef NEURO_GATE18
+#define CREATE_SUSPENDED_FLAG 0x00000004
+#define JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS 9
+#define JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE_VALUE 0x00002000
+#endif
 
 #ifdef NEURO_GATE18
 #define GATE_MARKER(name) "W5_GATE18_" name
@@ -239,6 +244,9 @@ static int launch_child(
     DWORD exit_code = 0;
     BOOL attribute_list_ready = FALSE;
     BOOL created = FALSE;
+#ifdef NEURO_GATE18
+    HANDLE cleanup_job = NULL;
+#endif
     int written = _snwprintf_s(
         command_line,
         sizeof(command_line) / sizeof(command_line[0]),
@@ -322,7 +330,11 @@ static int launch_child(
         NULL,
         TRUE,
         CREATE_UNICODE_ENVIRONMENT_FLAG | CREATE_NO_WINDOW_FLAG |
-            EXTENDED_STARTUPINFO_PRESENT_FLAG,
+            EXTENDED_STARTUPINFO_PRESENT_FLAG
+#ifdef NEURO_GATE18
+            | CREATE_SUSPENDED_FLAG
+#endif
+            ,
         NULL,
         cwd,
         &startup_ex.StartupInfo,
@@ -339,14 +351,53 @@ static int launch_child(
         emit_u32(GATE_MARKER("CHILD_CREATE_ERROR="), GetLastError());
         return 42;
     }
+#ifdef NEURO_GATE18
+    cleanup_job = CreateJobObjectW(NULL, NULL);
+    if (cleanup_job != NULL) {
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION job_limits;
+        ZeroMemory(&job_limits, sizeof(job_limits));
+        job_limits.BasicLimitInformation.LimitFlags =
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE_VALUE;
+        if (!SetInformationJobObject(
+            cleanup_job,
+            JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS,
+            &job_limits,
+            sizeof(job_limits)
+        ) || !AssignProcessToJobObject(cleanup_job, process.hProcess)) {
+            (void)CloseHandle(cleanup_job);
+            cleanup_job = NULL;
+        }
+    }
+    if (ResumeThread(process.hThread) == (DWORD)-1) {
+        emit_ascii(GATE_MARKER("CHILD_CREATE=FAIL\n"));
+        emit_u32(GATE_MARKER("CHILD_CREATE_ERROR="), GetLastError());
+        (void)TerminateProcess(process.hProcess, 0xC000013A);
+        (void)WaitForSingleObject(process.hProcess, 2000);
+        (void)CloseHandle(process.hProcess);
+        if (cleanup_job != NULL) {
+            (void)CloseHandle(cleanup_job);
+        }
+        return 42;
+    }
+#endif
     emit_ascii(GATE_MARKER("CHILD_CREATE=PASS\n"));
     (void)CloseHandle(process.hThread);
     wait_result = WaitForSingleObject(process.hProcess, 20000);
     if (wait_result == WAIT_TIMEOUT_RESULT) {
         emit_ascii(GATE_MARKER("CHILD_WAIT=TIMEOUT\n"));
         (void)TerminateProcess(process.hProcess, 0xC000013A);
+#ifdef NEURO_GATE18
+        if (cleanup_job != NULL) {
+            (void)TerminateJobObject(cleanup_job, 0xC000013A);
+        }
+#endif
         (void)WaitForSingleObject(process.hProcess, 2000);
         (void)CloseHandle(process.hProcess);
+#ifdef NEURO_GATE18
+        if (cleanup_job != NULL) {
+            (void)CloseHandle(cleanup_job);
+        }
+#endif
         return 43;
     }
     if (wait_result != WAIT_OBJECT_0_RESULT ||
@@ -354,10 +405,20 @@ static int launch_child(
         emit_ascii(GATE_MARKER("CHILD_WAIT=FAIL\n"));
         emit_u32(GATE_MARKER("CHILD_WAIT_ERROR="), GetLastError());
         (void)CloseHandle(process.hProcess);
+#ifdef NEURO_GATE18
+        if (cleanup_job != NULL) {
+            (void)CloseHandle(cleanup_job);
+        }
+#endif
         return 44;
     }
     emit_u32(GATE_MARKER("CHILD_EXIT="), exit_code);
     (void)CloseHandle(process.hProcess);
+#ifdef NEURO_GATE18
+    if (cleanup_job != NULL) {
+        (void)CloseHandle(cleanup_job);
+    }
+#endif
     return (int)exit_code;
 }
 
