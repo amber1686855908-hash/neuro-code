@@ -752,6 +752,13 @@ static int launch_child(
         !GetExitCodeProcess(process.hProcess, &exit_code)) {
         emit_ascii(GATE_MARKER("CHILD_WAIT=FAIL\n"));
         emit_u32(GATE_MARKER("CHILD_WAIT_ERROR="), GetLastError());
+        emit_ascii(GATE_MARKER("CHILD_CLEANUP=TERMINATE\n"));
+        {
+            BOOL terminated = TerminateProcess(process.hProcess, 0xC000013A);
+            emit_ascii(GATE_MARKER("CHILD_CLEANUP_RESULT="));
+            emit_ascii(terminated ? "PASS\n" : "FAIL\n");
+        }
+        (void)WaitForSingleObject(process.hProcess, 2000);
         (void)CloseHandle(process.hProcess);
 #ifdef NEURO_GATE18
         if (cleanup_job != NULL) {
