@@ -680,6 +680,11 @@ class WindowsW5Gate110WriteRestrictedCodeTests(unittest.IsolatedAsyncioTestCase)
                         "nul_modes": _nul_mode_results(output, stderr),
                         "broker": _token_projection(raw, broker_markers),
                     }
+                    # Persist the raw fixed-marker projection before any
+                    # assertion so a harness/child-startup failure remains
+                    # auditable in the uploaded artifact.
+                    artifact["workloads"] = workload_matrix | {requested_name: workload_cells}
+                    persist()
                     broker_result = cast(dict[str, object], workload_cells[variant]["broker"])
                     self.assertEqual(broker_result["started"], True)
                     self.assertEqual(broker_result["token_inspection"], "PASS")
@@ -701,8 +706,7 @@ class WindowsW5Gate110WriteRestrictedCodeTests(unittest.IsolatedAsyncioTestCase)
                         workload_cells[variant]["broker_completion"] = "CHILD_WAIT_REPORTED"
                     else:
                         workload_cells[variant]["broker_completion"] = "BROKER_FINISHED"
-                    # Persist after every cell so a later evidence assertion
-                    # cannot erase the already-observed workload matrix.
+                    # Persist the lifecycle classification as well.
                     artifact["workloads"] = workload_matrix | {requested_name: workload_cells}
                     persist()
                 workload_matrix[requested_name] = workload_cells
