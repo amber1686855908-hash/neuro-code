@@ -84,6 +84,11 @@ _OPEN_EXISTING = 3
 _FILE_ATTRIBUTE_NORMAL = 0x00000080
 _WAIT_OBJECT_0 = 0
 _WAIT_TIMEOUT = 258
+_WAIT_FAILED = 0xFFFFFFFF
+_SYNCHRONIZE = 0x00100000
+_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+_ERROR_FILE_NOT_FOUND = 2
+_ERROR_INVALID_PARAMETER = 87
 _INFINITE = 0xFFFFFFFF
 _MAX_PREVIEW_BYTES = 512
 _PROBE_WORKLOADS = frozenset(
@@ -437,6 +442,13 @@ class _Gate1DirectProcess:
         if completed.returncode == 0:
             return True
 
+        # A timeout callback can race with the controller's own bounded
+        # termination.  A non-zero taskkill result is therefore successful
+        # only when the exact PID is independently observed to be gone; an
+        # active or unobservable PID remains a hard cleanup failure.
+        if self.process_is_gone(process_id):
+            return True
+
         # taskkill can race with a short-lived parent and return a non-zero
         # status even though the exact process is still present.  Fall back to
         # a handle-based termination of that PID; this remains scoped to the
@@ -453,6 +465,24 @@ class _Gate1DirectProcess:
             terminated = bool(self._terminate(process, 0xC000013A))
             self._wait(process, 2_000)
             return terminated
+        finally:
+            self._close_handle(int(cast(int, process)))
+
+    def process_is_gone(self, process_id: int) -> bool:  # pragma: no cover - Windows CI
+        """Confirm that an exact PID no longer has a running process object."""
+
+        if process_id <= 0:
+            return False
+        process = self._open_process(
+            _SYNCHRONIZE | _PROCESS_QUERY_LIMITED_INFORMATION,
+            0,
+            ctypes.c_uint32(process_id),
+        )
+        if not process:
+            return self._last_error() in (_ERROR_FILE_NOT_FOUND, _ERROR_INVALID_PARAMETER)
+        try:
+            wait_result = int(self._wait(process, 0))
+            return wait_result == _WAIT_OBJECT_0
         finally:
             self._close_handle(int(cast(int, process)))
 
