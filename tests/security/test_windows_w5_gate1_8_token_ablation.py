@@ -444,6 +444,8 @@ class WindowsW5Gate18TokenAblationTests(unittest.IsolatedAsyncioTestCase):
                             timeout=45.0,
                             on_timeout=cleanup_stuck_child,
                         )
+                        if raw.get("timeout") is True and not timeout_cleanup["attempted"]:
+                            cleanup_stuck_child()
                         cell = _projection(
                             raw,
                             variant=variant,
