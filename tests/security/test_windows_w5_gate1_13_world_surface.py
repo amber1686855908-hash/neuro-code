@@ -328,7 +328,10 @@ class _AccessCheckOracle:
         result = self._get_named(
             str(path),
             1,
-            0x00000004,
+            # AccessCheck validates the complete descriptor, not only the
+            # DACL.  Request owner + group alongside DACL so the returned
+            # self-relative descriptor is structurally complete.
+            0x00000001 | 0x00000002 | 0x00000004,
             ctypes.byref(owner),
             ctypes.byref(group),
             ctypes.byref(dacl),
