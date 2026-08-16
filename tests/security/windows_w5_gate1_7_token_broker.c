@@ -750,11 +750,6 @@ static int launch_child(
             Sleep(1000);
             waited_ms += 1000;
         }
-        if (wait_result == WAIT_TIMEOUT_RESULT &&
-            GetExitCodeProcess(process.hProcess, &observed_exit) &&
-            observed_exit != STILL_ACTIVE) {
-            wait_result = WAIT_OBJECT_0_RESULT;
-        }
     }
     emit_u32(GATE_MARKER("CHILD_WAIT_RESULT="), wait_result);
     if (wait_result == WAIT_TIMEOUT_RESULT) {
