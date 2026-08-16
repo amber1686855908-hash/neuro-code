@@ -252,6 +252,10 @@ def _token_projection(raw: dict[str, object], markers: dict[str, str]) -> dict[s
         "wrc_canonical_match": markers.get(f"{_MARKER_PREFIX}WRC_CANONICAL_MATCH"),
         "wrc_create": markers.get(f"{_MARKER_PREFIX}WRC_CREATE"),
         "child_create": markers.get(f"{_MARKER_PREFIX}CHILD_CREATE"),
+        "child_launch_enter": markers.get(f"{_MARKER_PREFIX}CHILD_LAUNCH_ENTER"),
+        "child_launch_return": markers.get(f"{_MARKER_PREFIX}CHILD_LAUNCH_RETURN"),
+        "child_wait_enter": markers.get(f"{_MARKER_PREFIX}CHILD_WAIT_ENTER"),
+        "child_wait_result": _marker_int(markers, f"{_MARKER_PREFIX}CHILD_WAIT_RESULT"),
         "child_wait": markers.get(f"{_MARKER_PREFIX}CHILD_WAIT"),
         "child_exit": _marker_int(markers, f"{_MARKER_PREFIX}CHILD_EXIT"),
         "child_cleanup": markers.get(f"{_MARKER_PREFIX}CHILD_CLEANUP"),
@@ -576,6 +580,7 @@ class WindowsW5Gate110WriteRestrictedCodeTests(unittest.IsolatedAsyncioTestCase)
                 )
 
                 active_controller: dict[str, int] = {}
+                partial_stdout = bytearray()
 
                 def on_spawn(process_handle: int) -> None:
                     active_controller["handle"] = process_handle
@@ -585,7 +590,11 @@ class WindowsW5Gate110WriteRestrictedCodeTests(unittest.IsolatedAsyncioTestCase)
                     if process_handle is not None:
                         harness.terminate_process(process_handle)
 
-                return await asyncio.to_thread(
+                def on_output(stream: str, chunk: bytes) -> None:
+                    if stream == "stdout" and len(partial_stdout) < 65_536:
+                        partial_stdout.extend(chunk[: 65_536 - len(partial_stdout)])
+
+                raw = await asyncio.to_thread(
                     _run_harness_bounded,
                     harness,
                     username=online.username,
@@ -598,7 +607,11 @@ class WindowsW5Gate110WriteRestrictedCodeTests(unittest.IsolatedAsyncioTestCase)
                     timeout=limit_seconds,
                     on_timeout=on_timeout,
                     on_spawn=on_spawn,
+                    on_output=on_output,
                 )
+                if "_captured_stdout" not in raw and partial_stdout:
+                    raw["_captured_stdout"] = bytes(partial_stdout)
+                return raw
 
             variant_results: dict[str, object] = {}
             for variant, _flags, expected_count in _VARIANTS:

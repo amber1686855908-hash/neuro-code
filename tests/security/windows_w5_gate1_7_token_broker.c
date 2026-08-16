@@ -644,6 +644,7 @@ static int launch_child(
     }
     attribute_list_ready = TRUE;
     startup_ex.lpAttributeList = attributes;
+    emit_ascii(GATE_MARKER("CHILD_LAUNCH_ENTER\n"));
     created = CreateProcessAsUserW(
         token,
         child_path,
@@ -673,6 +674,7 @@ static int launch_child(
         emit_u32(GATE_MARKER("CHILD_CREATE_ERROR="), GetLastError());
         return 42;
     }
+    emit_ascii(GATE_MARKER("CHILD_LAUNCH_RETURN=PASS\n"));
 #ifdef NEURO_GATE18
     cleanup_job = CreateJobObjectW(NULL, NULL);
     if (cleanup_job != NULL) {
@@ -721,7 +723,9 @@ static int launch_child(
 #endif
     emit_ascii(GATE_MARKER("CHILD_CREATE=PASS\n"));
     (void)CloseHandle(process.hThread);
+    emit_ascii(GATE_MARKER("CHILD_WAIT_ENTER\n"));
     wait_result = WaitForSingleObject(process.hProcess, CHILD_WAIT_TIMEOUT_MS);
+    emit_u32(GATE_MARKER("CHILD_WAIT_RESULT="), wait_result);
     if (wait_result == WAIT_TIMEOUT_RESULT) {
         emit_ascii(GATE_MARKER("CHILD_WAIT=TIMEOUT\n"));
         emit_ascii(GATE_MARKER("CHILD_CLEANUP=TERMINATE\n"));

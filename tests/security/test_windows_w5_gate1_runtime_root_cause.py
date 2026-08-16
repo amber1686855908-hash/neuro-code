@@ -242,6 +242,7 @@ class _Gate1DirectProcess:
         logon_flags: int,
         retain_output: bool = False,
         on_spawn: Callable[[int], None] | None = None,
+        on_output: Callable[[str, bytes], None] | None = None,
     ) -> dict[str, object]:  # pragma: no cover - Windows CI
         stdout_read, stdout_write = self._new_pipe()
         stderr_read, stderr_write = self._new_pipe()
@@ -287,9 +288,11 @@ class _Gate1DirectProcess:
                 if not ok or returned.value == 0:
                     return
                 if len(target) < _MAX_OUTPUT_BYTES:
-                    target.extend(
-                        bytes(buffer.raw[: returned.value])[: _MAX_OUTPUT_BYTES - len(target)]
-                    )
+                    chunk = bytes(buffer.raw[: returned.value])[: _MAX_OUTPUT_BYTES - len(target)]
+                    target.extend(chunk)
+                    if on_output is not None:
+                        with contextlib.suppress(Exception):
+                            on_output("stdout" if target is stdout else "stderr", chunk)
 
         try:
             created = self._create(
