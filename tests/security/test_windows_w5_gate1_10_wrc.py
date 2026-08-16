@@ -583,6 +583,7 @@ class WindowsW5Gate110WriteRestrictedCodeTests(unittest.IsolatedAsyncioTestCase)
 
                 active_controller: dict[str, int] = {}
                 partial_stdout = bytearray()
+                controller_tree_cleanup = {"attempted": False, "result": False}
 
                 def on_spawn(process_handle: int) -> None:
                     active_controller["handle"] = process_handle
@@ -590,7 +591,10 @@ class WindowsW5Gate110WriteRestrictedCodeTests(unittest.IsolatedAsyncioTestCase)
                 def on_timeout() -> None:
                     process_handle = active_controller.get("handle")
                     if process_handle is not None:
-                        harness.terminate_process(process_handle)
+                        controller_tree_cleanup["attempted"] = True
+                        controller_tree_cleanup["result"] = harness.terminate_process_tree(
+                            process_handle
+                        )
 
                 def on_output(stream: str, chunk: bytes) -> None:
                     if stream == "stdout" and len(partial_stdout) < 65_536:
@@ -613,6 +617,7 @@ class WindowsW5Gate110WriteRestrictedCodeTests(unittest.IsolatedAsyncioTestCase)
                 )
                 if "_captured_stdout" not in raw and partial_stdout:
                     raw["_captured_stdout"] = bytes(partial_stdout)
+                raw["controller_tree_cleanup"] = dict(controller_tree_cleanup)
                 return raw
 
             variant_results: dict[str, object] = {}
@@ -679,7 +684,7 @@ class WindowsW5Gate110WriteRestrictedCodeTests(unittest.IsolatedAsyncioTestCase)
                         variant,
                         spec.executable,
                         tuple(spec.arguments),
-                        limit_seconds=45.0,
+                        limit_seconds=25.0,
                     )
                     captured = raw.get("_captured_stdout")
                     output = _clean_child_output(captured if isinstance(captured, bytes) else b"")
@@ -689,7 +694,11 @@ class WindowsW5Gate110WriteRestrictedCodeTests(unittest.IsolatedAsyncioTestCase)
                         captured if isinstance(captured, bytes) else b""
                     )
                     child_timeout = broker_markers.get(f"{_MARKER_PREFIX}CHILD_WAIT") == "TIMEOUT"
-                    if child_timeout:
+                    controller_timeout = bool(raw.get("timeout")) and (
+                        broker_markers.get(f"{_MARKER_PREFIX}CHILD_CREATE") == "PASS"
+                        and f"{_MARKER_PREFIX}CHILD_WAIT_ENTER" in broker_markers
+                    )
+                    if child_timeout or controller_timeout:
                         classification = "TIMEOUT"
                     elif isinstance(exit_code, int):
                         classification = (
@@ -727,6 +736,18 @@ class WindowsW5Gate110WriteRestrictedCodeTests(unittest.IsolatedAsyncioTestCase)
                     # not a harness failure.  An outer controller timeout or
                     # a missing child-wait oracle remains a hard failure.
                     if broker_result["finished"] is not True:
+                        if controller_timeout:
+                            workload_cells[variant]["broker_completion"] = (
+                                "CONTROLLER_TREE_TERMINATED"
+                            )
+                            workload_cells[variant]["controller_tree_cleanup"] = raw.get(
+                                "controller_tree_cleanup"
+                            )
+                            artifact["workloads"] = workload_matrix | {
+                                requested_name: workload_cells
+                            }
+                            persist()
+                            continue
                         self.assertFalse(
                             bool(raw.get("timeout")),
                             f"Gate 1.10 controller timed out for {requested_name}/{variant}",

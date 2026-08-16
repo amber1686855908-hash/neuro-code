@@ -158,6 +158,9 @@ class _Gate1DirectProcess:
         self._get_exit_code = self._kernel32.GetExitCodeProcess
         self._get_exit_code.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32)]
         self._get_exit_code.restype = ctypes.c_int32
+        self._get_process_id = self._kernel32.GetProcessId
+        self._get_process_id.argtypes = [ctypes.c_void_p]
+        self._get_process_id.restype = ctypes.c_uint32
         self._close = self._kernel32.CloseHandle
         self._close.argtypes = [ctypes.c_void_p]
         self._close.restype = ctypes.c_int32
@@ -394,6 +397,24 @@ class _Gate1DirectProcess:
 
         self._terminate(ctypes.c_void_p(process_handle), 0xC000013A)
         self._wait(ctypes.c_void_p(process_handle), 2_000)
+
+    def terminate_process_tree(self, process_handle: int) -> bool:  # pragma: no cover
+        """Bounded cleanup for one evidence controller and its descendants."""
+
+        process_id = int(self._get_process_id(ctypes.c_void_p(process_handle)))
+        if process_id == 0:
+            return False
+        try:
+            completed = subprocess.run(
+                ["taskkill.exe", "/PID", str(process_id), "/T", "/F"],
+                check=False,
+                capture_output=True,
+                timeout=5,
+                shell=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return False
+        return completed.returncode == 0
 
 
 def _native_enabled() -> bool:
