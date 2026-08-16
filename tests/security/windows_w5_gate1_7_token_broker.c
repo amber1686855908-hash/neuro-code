@@ -19,7 +19,10 @@
 #define WRITE_RESTRICTED_FLAG 0x00000008
 #define CREATE_UNICODE_ENVIRONMENT_FLAG 0x00000400
 #define CREATE_NO_WINDOW_FLAG 0x08000000
+#define EXTENDED_STARTUPINFO_PRESENT_FLAG 0x00080000
 #define STARTF_USESTDHANDLES_FLAG 0x00000100
+#define HANDLE_FLAG_INHERIT_VALUE 0x00000001
+#define PROC_THREAD_ATTRIBUTE_HANDLE_LIST_VALUE 0x00020002
 #define WAIT_OBJECT_0_RESULT 0x00000000
 #define WAIT_TIMEOUT_RESULT 0x00000102
 
@@ -112,10 +115,16 @@ static int launch_child(
     const wchar_t *cwd
 ) {
     STARTUPINFOW startup;
+    STARTUPINFOEXW startup_ex;
     PROCESS_INFORMATION process;
     wchar_t command_line[32768];
+    HANDLE inherited_handles[3];
+    SIZE_T attribute_bytes = 0;
+    LPPROC_THREAD_ATTRIBUTE_LIST attributes = NULL;
     DWORD wait_result;
     DWORD exit_code = 0;
+    BOOL attribute_list_ready = FALSE;
+    BOOL created = FALSE;
     int written = _snwprintf_s(
         command_line,
         sizeof(command_line) / sizeof(command_line[0]),
@@ -128,26 +137,90 @@ static int launch_child(
         emit_u32("W5_GATE17_CHILD_CREATE_ERROR=", ERROR_INSUFFICIENT_BUFFER);
         return 41;
     }
-    ZeroMemory(&startup, sizeof(startup));
+    ZeroMemory(&startup_ex, sizeof(startup_ex));
     ZeroMemory(&process, sizeof(process));
+    startup = startup_ex.StartupInfo;
     startup.cb = sizeof(startup);
     startup.dwFlags = STARTF_USESTDHANDLES_FLAG;
     startup.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
     startup.hStdOutput = GetStdHandle(STD_OUTPUT_HANDLE);
     startup.hStdError = GetStdHandle(STD_ERROR_HANDLE);
-    if (!CreateProcessAsUserW(
+    startup_ex.StartupInfo = startup;
+    inherited_handles[0] = startup.hStdInput;
+    inherited_handles[1] = startup.hStdOutput;
+    inherited_handles[2] = startup.hStdError;
+    if (!SetHandleInformation(
+        inherited_handles[0],
+        HANDLE_FLAG_INHERIT_VALUE,
+        HANDLE_FLAG_INHERIT_VALUE
+    ) || !SetHandleInformation(
+        inherited_handles[1],
+        HANDLE_FLAG_INHERIT_VALUE,
+        HANDLE_FLAG_INHERIT_VALUE
+    ) || !SetHandleInformation(
+        inherited_handles[2],
+        HANDLE_FLAG_INHERIT_VALUE,
+        HANDLE_FLAG_INHERIT_VALUE
+    )) {
+        emit_ascii("W5_GATE17_CHILD_CREATE=FAIL\n");
+        emit_u32("W5_GATE17_CHILD_CREATE_ERROR=", GetLastError());
+        return 42;
+    }
+    (void)InitializeProcThreadAttributeList(NULL, 1, 0, &attribute_bytes);
+    if (attribute_bytes == 0) {
+        emit_ascii("W5_GATE17_CHILD_CREATE=FAIL\n");
+        emit_u32("W5_GATE17_CHILD_CREATE_ERROR=", GetLastError());
+        return 42;
+    }
+    attributes = (LPPROC_THREAD_ATTRIBUTE_LIST)HeapAlloc(
+        GetProcessHeap(),
+        0,
+        attribute_bytes
+    );
+    if (attributes == NULL || !InitializeProcThreadAttributeList(
+        attributes,
+        1,
+        0,
+        &attribute_bytes
+    ) || !UpdateProcThreadAttribute(
+        attributes,
+        0,
+        PROC_THREAD_ATTRIBUTE_HANDLE_LIST_VALUE,
+        inherited_handles,
+        sizeof(inherited_handles),
+        NULL,
+        NULL
+    )) {
+        emit_ascii("W5_GATE17_CHILD_CREATE=FAIL\n");
+        emit_u32("W5_GATE17_CHILD_CREATE_ERROR=", GetLastError());
+        if (attributes != NULL) {
+            HeapFree(GetProcessHeap(), 0, attributes);
+        }
+        return 42;
+    }
+    attribute_list_ready = TRUE;
+    startup_ex.lpAttributeList = attributes;
+    created = CreateProcessAsUserW(
         token,
         child_path,
         command_line,
         NULL,
         NULL,
         TRUE,
-        CREATE_UNICODE_ENVIRONMENT_FLAG | CREATE_NO_WINDOW_FLAG,
+        CREATE_UNICODE_ENVIRONMENT_FLAG | CREATE_NO_WINDOW_FLAG |
+            EXTENDED_STARTUPINFO_PRESENT_FLAG,
         NULL,
         cwd,
-        &startup,
+        &startup_ex.StartupInfo,
         &process
-    )) {
+    );
+    if (attribute_list_ready) {
+        DeleteProcThreadAttributeList(attributes);
+    }
+    if (attributes != NULL) {
+        HeapFree(GetProcessHeap(), 0, attributes);
+    }
+    if (!created) {
         emit_ascii("W5_GATE17_CHILD_CREATE=FAIL\n");
         emit_u32("W5_GATE17_CHILD_CREATE_ERROR=", GetLastError());
         return 42;
