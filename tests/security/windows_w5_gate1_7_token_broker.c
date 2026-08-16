@@ -792,7 +792,9 @@ int wmain(int argc, wchar_t **argv) {
 #endif
     HANDLE source_token = NULL;
     HANDLE child_token = NULL;
+#ifndef NEURO_GATE110
     SID_AND_ATTRIBUTES restricted_sid;
+#endif
     DWORD expected_count;
     int child_result;
 #if defined(NEURO_GATE19) || defined(NEURO_GATE110)
