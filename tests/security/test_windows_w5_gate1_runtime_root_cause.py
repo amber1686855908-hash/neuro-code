@@ -329,14 +329,25 @@ class _Gate1DirectProcess:
             elif wait_result != _WAIT_OBJECT_0:
                 result["classification"] = "WAIT_FAILED"
                 result["win32_error"] = wait_result
+                # A failed wait is not proof that the child is gone.  Keep
+                # this evidence-only controller bounded and avoid leaving a
+                # workload process holding the disposable fixture open.
+                self._terminate(ctypes.c_void_p(process_handle), 0xC000013A)
+                self._wait(ctypes.c_void_p(process_handle), 2_000)
             else:
                 exit_code = ctypes.c_uint32()
                 if not self._get_exit_code(
                     ctypes.c_void_p(process_handle), ctypes.byref(exit_code)
                 ):
-                    raise OSError(self._last_error(), "GetExitCodeProcess failed")
+                    error = self._last_error()
+                    self._terminate(ctypes.c_void_p(process_handle), 0xC000013A)
+                    self._wait(ctypes.c_void_p(process_handle), 2_000)
+                    self._close_handle(process_handle)
+                    process_handle = 0
+                    raise OSError(error, "GetExitCodeProcess failed")
                 result["exit_code"] = int(exit_code.value)
             self._close_handle(process_handle)
+            process_handle = 0
         except (OSError, subprocess.SubprocessError) as error:
             result["classification"] = _classify_exception(error)
             result["win32_error"] = _error_code(error)

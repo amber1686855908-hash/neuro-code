@@ -227,6 +227,11 @@ def _probe_projection(name: str, markers: dict[str, str]) -> dict[str, object]:
 
 def _token_projection(raw: dict[str, object], markers: dict[str, str]) -> dict[str, object]:
     return {
+        "execution_spawn_result": raw.get("spawn_result"),
+        "execution_classification": raw.get("classification"),
+        "execution_exit_code": raw.get("exit_code"),
+        "execution_timeout": raw.get("timeout"),
+        "execution_win32_error": raw.get("win32_error"),
         "started": f"{_MARKER_PREFIX}BROKER_STARTED" in markers,
         "finished": f"{_MARKER_PREFIX}BROKER_FINISHED" in markers,
         "token_create": markers.get(f"{_MARKER_PREFIX}TOKEN_CREATE"),
