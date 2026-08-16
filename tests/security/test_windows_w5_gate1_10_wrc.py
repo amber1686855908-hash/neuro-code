@@ -13,7 +13,6 @@ import contextlib
 import json
 import os
 import shutil
-import subprocess
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory, mkdtemp
@@ -23,15 +22,8 @@ from tests.security.test_windows_native_runtime_acceptance import (
     _compile_msvc_probe,
 )
 from tests.security.test_windows_native_workload_compatibility import (
-    _build_workloads,
-    _completed_classification,
-    _discover_base_python,
-    _nul_mode_results,
-    _output_matches,
     _preview,
-    _provenance,
     _request,
-    _tool_paths,
     _Workload,
 )
 from tests.security.test_windows_w5_gate1_6_loader_isolation import (
@@ -89,24 +81,6 @@ _NATIVE_PROBES = {
     "P0": "windows_w5_gate1_6_p0.c",
     "P3": "windows_w5_gate1_6_p3_dynamic.c",
     "P4": "windows_w5_gate1_7_p4_bcrypt_dynamic.c",
-}
-_WORKLOAD_ALIASES = {
-    "CMD_BASIC": "CMD_BASIC",
-    "CMD_NUL_REDIRECT": "CMD_NUL_REDIRECT",
-    "NUL_DIRECT_WIN32": "NUL_DIRECT_WIN32",
-    "POWERSHELL_BASIC": "POWERSHELL_BASIC",
-    "PWSH_BASIC": "PWSH_BASIC",
-    "PYTHON_BASE_VERSION": "PYTHON_BASE_VERSION",
-    "PYTHON_BASE_MINIMAL_NO_SITE": "PYTHON_BASE_MINIMAL_NO_SITE",
-    "PYTHON_VENV_VERSION": "PYTHON_VERSION",
-    "PYTHON_VENV_MINIMAL_NO_SITE": "PYTHON_MINIMAL_NO_SITE",
-    "GIT_VERSION": "GIT_VERSION",
-    "GIT_REPO_DISCOVERY": "GIT_REPO_DISCOVERY",
-    "GIT_STATUS": "GIT_STATUS",
-    "NODE_VERSION": "NODE_VERSION",
-    "NODE_EXEC": "NODE_EXEC",
-    "NPM_VERSION": "NPM_VERSION",
-    "CURL_VERSION": "CURL_VERSION",
 }
 
 
@@ -269,13 +243,6 @@ def _token_projection(raw: dict[str, object], markers: dict[str, str]) -> dict[s
     }
 
 
-def _clean_child_output(data: bytes) -> bytes:
-    lines = data.decode("utf-8", errors="replace").replace("\r", "").splitlines()
-    return (
-        "\n".join(line for line in lines if not line.startswith(_MARKER_PREFIX)) + "\n"
-    ).encode()
-
-
 def _cell(
     raw: dict[str, object], *, variant: str, expected_count: int, probe: str
 ) -> dict[str, object]:
@@ -328,16 +295,6 @@ def _state(path: Path) -> dict[str, object]:
     }
 
 
-def _compatibility_classification(synthetic: str, candidate: str) -> str:
-    if synthetic == candidate:
-        return "UNCHANGED_PASS" if synthetic == "PASS" else "UNCHANGED_FAILURE"
-    if synthetic != "PASS" and candidate == "PASS":
-        return "RECOVERED"
-    if synthetic == "PASS" and candidate != "PASS":
-        return "REGRESSED"
-    return "INCONCLUSIVE"
-
-
 class WindowsW5Gate110WriteRestrictedCodeTests(unittest.IsolatedAsyncioTestCase):
     """Measure WRC compatibility and its exact second-pass authority."""
 
@@ -364,8 +321,6 @@ class WindowsW5Gate110WriteRestrictedCodeTests(unittest.IsolatedAsyncioTestCase)
             )
             self.addAsyncCleanup(_remove_directory, native_probes[name].parent)
 
-        paths = _tool_paths()
-        paths["python_base"] = _discover_base_python(paths["python"])
         artifact_path = os.environ.get("NEURO_CODE_W5_GATE1_10_EVIDENCE_JSON")
         artifact: dict[str, object] = {
             "gate": "W5_GATE1_10",
@@ -389,7 +344,7 @@ class WindowsW5Gate110WriteRestrictedCodeTests(unittest.IsolatedAsyncioTestCase)
                 "identical": True,
             },
             "variants": {},
-            "workload_aliases": _WORKLOAD_ALIASES,
+            "workload_evidence_scope": "WITHDRAWN_FROM_GATE1_10_PRODUCTION_INTERPRETATION",
             "status": "RUNNING",
         }
 
@@ -406,29 +361,9 @@ class WindowsW5Gate110WriteRestrictedCodeTests(unittest.IsolatedAsyncioTestCase)
             installation = root / "installation"
             outside = root / "outside"
             outside_wrc = root / "outside-wrc"
-            repo = workspace / "compat-repo"
-            for path in (workspace, readonly, installation, outside, outside_wrc, repo):
+            for path in (workspace, readonly, installation, outside, outside_wrc):
                 path.mkdir(parents=True)
             persist()
-
-            nul_probe = await asyncio.to_thread(
-                __import__(
-                    "tests.security.test_windows_native_workload_compatibility",
-                    fromlist=["_compile_nul_probe"],
-                )._compile_nul_probe
-            )
-            self.addAsyncCleanup(_remove_directory, nul_probe.parent)
-            copied_nul = workspace / "windows-nul-probe.exe"
-            shutil.copy2(nul_probe, copied_nul)
-            if paths["git"] is not None:
-                await asyncio.to_thread(
-                    subprocess.run,
-                    [str(paths["git"]), "init", "-q", str(repo)],
-                    check=False,
-                    capture_output=True,
-                    timeout=15,
-                    shell=False,
-                )
 
             sensitive = installation / "sensitive-state.bin"
             sensitive.write_bytes(b"W5_GATE110_SENSITIVE\n")
@@ -583,7 +518,6 @@ class WindowsW5Gate110WriteRestrictedCodeTests(unittest.IsolatedAsyncioTestCase)
                     "GATE110_BROKER", variant.casefold(), broker_destination, arguments
                 )
 
-                active_controller: dict[str, int] = {}
                 partial_stdout = bytearray()
                 controller_tree_cleanup = {
                     "attempted": False,
@@ -591,10 +525,14 @@ class WindowsW5Gate110WriteRestrictedCodeTests(unittest.IsolatedAsyncioTestCase)
                     "child_attempted": False,
                     "child_result": False,
                     "child_pid": None,
+                    "controller_pid": None,
                 }
 
                 def on_spawn(process_handle: int) -> None:
-                    active_controller["handle"] = process_handle
+                    # The callback receives a borrowed handle owned by
+                    # _Gate1DirectProcess.  Snapshot only its PID; never
+                    # retain or close the handle from the timeout path.
+                    controller_tree_cleanup["controller_pid"] = harness.process_id(process_handle)
 
                 def on_timeout() -> None:
                     # The broker emits the exact CreateProcessAsUserW child
@@ -611,11 +549,11 @@ class WindowsW5Gate110WriteRestrictedCodeTests(unittest.IsolatedAsyncioTestCase)
                         controller_tree_cleanup["child_result"] = harness.terminate_process_id_tree(
                             child_pid
                         )
-                    process_handle = active_controller.get("handle")
-                    if process_handle is not None:
+                    controller_pid = controller_tree_cleanup.get("controller_pid")
+                    if isinstance(controller_pid, int) and controller_pid > 0:
                         controller_tree_cleanup["attempted"] = True
-                        controller_tree_cleanup["result"] = harness.terminate_process_tree(
-                            process_handle
+                        controller_tree_cleanup["result"] = harness.terminate_process_id_tree(
+                            controller_pid
                         )
 
                 def on_output(stream: str, chunk: bytes) -> None:
@@ -640,6 +578,7 @@ class WindowsW5Gate110WriteRestrictedCodeTests(unittest.IsolatedAsyncioTestCase)
                 if "_captured_stdout" not in raw and partial_stdout:
                     raw["_captured_stdout"] = bytes(partial_stdout)
                 raw["controller_tree_cleanup"] = dict(controller_tree_cleanup)
+                self.assertFalse(raw.get("worker_alive", False))
                 return raw
 
             variant_results: dict[str, object] = {}
@@ -675,129 +614,18 @@ class WindowsW5Gate110WriteRestrictedCodeTests(unittest.IsolatedAsyncioTestCase)
                 artifact["variants"] = variant_results
                 persist()
 
-            provenance = _provenance(paths, workspace)
-            workloads = _build_workloads(
-                workspace=workspace,
-                repo=repo,
-                nul_probe=copied_nul,
-                cmd=paths["cmd"],
-                powershell=paths["powershell"],
-                pwsh=paths["pwsh"],
-                python=paths["python"],
-                python_base=paths["python_base"],
-                git=paths["git"],
-                node=paths["node"],
-                npm=paths["npm"],
-                curl=paths["curl"],
-            )
-            workload_by_name = {workload.name: workload for workload in workloads}
-            workload_matrix: dict[str, object] = {}
-            for requested_name, source_name in _WORKLOAD_ALIASES.items():
-                spec = workload_by_name[source_name]
-                workload_cells: dict[str, dict[str, object]] = {}
-                for variant, _flags, _count in _VARIANTS:
-                    if spec.executable is None:
-                        workload_cells[variant] = {
-                            "classification": "NOT_INSTALLED",
-                            "resolved_executable": None,
-                        }
-                        continue
-                    raw = await run_broker(
-                        variant,
-                        spec.executable,
-                        tuple(spec.arguments),
-                        limit_seconds=25.0,
-                    )
-                    captured = raw.get("_captured_stdout")
-                    output = _clean_child_output(captured if isinstance(captured, bytes) else b"")
-                    stderr = str(raw.get("stderr_preview", "")).encode()
-                    exit_code = raw.get("exit_code")
-                    broker_markers = _parse_markers(
-                        captured if isinstance(captured, bytes) else b""
-                    )
-                    child_timeout = broker_markers.get(f"{_MARKER_PREFIX}CHILD_WAIT") == "TIMEOUT"
-                    controller_timeout = bool(raw.get("timeout")) and (
-                        broker_markers.get(f"{_MARKER_PREFIX}CHILD_CREATE") == "PASS"
-                        and f"{_MARKER_PREFIX}CHILD_WAIT_ENTER" in broker_markers
-                    )
-                    if child_timeout or controller_timeout:
-                        classification = "TIMEOUT"
-                    elif isinstance(exit_code, int):
-                        classification = (
-                            "PASS"
-                            if exit_code == 0 and _output_matches(spec, output, stderr)
-                            else _completed_classification(spec, exit_code, output, stderr)
-                        )
-                    else:
-                        classification = "INCONCLUSIVE"
-                    workload_cells[variant] = {
-                        "resolved_executable": str(spec.executable),
-                        "resolved_launcher": str(spec.resolved_launcher)
-                        if spec.resolved_launcher
-                        else None,
-                        "argv": [str(spec.executable), *spec.arguments],
-                        "classification": classification,
-                        "exit_code": exit_code,
-                        "timeout": child_timeout,
-                        "stdout_preview": _preview(output),
-                        "stderr_preview": stderr.decode("utf-8", errors="replace")[:512],
-                        "nul_modes": _nul_mode_results(output, stderr),
-                        "broker": _token_projection(raw, broker_markers),
-                    }
-                    # Persist the raw fixed-marker projection before any
-                    # assertion so a harness/child-startup failure remains
-                    # auditable in the uploaded artifact.
-                    artifact["workloads"] = workload_matrix | {requested_name: workload_cells}
-                    persist()
-                    broker_result = cast(dict[str, object], workload_cells[variant]["broker"])
-                    self.assertEqual(broker_result["started"], True)
-                    self.assertEqual(broker_result["token_inspection"], "PASS")
-                    # A workload may be one of the intentionally observed
-                    # startup/compatibility timeouts.  The broker reports
-                    # that bounded child wait separately; that is evidence,
-                    # not a harness failure.  An outer controller timeout or
-                    # a missing child-wait oracle remains a hard failure.
-                    if broker_result["finished"] is not True:
-                        if controller_timeout:
-                            workload_cells[variant]["broker_completion"] = (
-                                "CONTROLLER_TREE_TERMINATED"
-                            )
-                            workload_cells[variant]["controller_tree_cleanup"] = raw.get(
-                                "controller_tree_cleanup"
-                            )
-                            artifact["workloads"] = workload_matrix | {
-                                requested_name: workload_cells
-                            }
-                            persist()
-                            continue
-                        self.assertFalse(
-                            bool(raw.get("timeout")),
-                            f"Gate 1.10 controller timed out for {requested_name}/{variant}",
-                        )
-                        self.assertIn(
-                            broker_result["child_wait"],
-                            ("TIMEOUT", "FAIL"),
-                            f"missing bounded child-wait oracle for {requested_name}/{variant}",
-                        )
-                        workload_cells[variant]["broker_completion"] = "CHILD_WAIT_REPORTED"
-                    else:
-                        workload_cells[variant]["broker_completion"] = "BROKER_FINISHED"
-                    # Persist the lifecycle classification as well.
-                    artifact["workloads"] = workload_matrix | {requested_name: workload_cells}
-                    persist()
-                workload_matrix[requested_name] = workload_cells
-                synthetic_result = workload_cells["PROD_SYN"].get("classification", "INCONCLUSIVE")
-                candidate_result = workload_cells["PROD_SYN_WRC"].get(
-                    "classification", "INCONCLUSIVE"
-                )
-                workload_matrix[requested_name] = {
-                    **workload_cells,
-                    "impact": _compatibility_classification(
-                        str(synthetic_result), str(candidate_result)
-                    ),
-                }
-                artifact["workloads"] = workload_matrix
-                persist()
+            # The direct broker is retained for native-token and security
+            # authority probes only.  Its developer-workload loop was
+            # withdrawn from compatibility interpretation: it is not the
+            # production W3 route and can exercise a different timeout/handle
+            # ownership path.  Gate 1.10.5 records the explicit production
+            # versus broker comparison separately.
+            artifact["workloads"] = {
+                "evidence_scope": "BROKER_RELATIVE_ONLY",
+                "production_equivalent": False,
+                "withdrawn": True,
+            }
+            persist()
 
             async def run_write(label: str, target: Path) -> dict[str, object]:
                 # Keep a private, in-memory copy for fixture restoration.
@@ -849,7 +677,6 @@ class WindowsW5Gate110WriteRestrictedCodeTests(unittest.IsolatedAsyncioTestCase)
                     "CREDENTIAL_PROTECTION": await run_write("CREDENTIAL_PROTECTION", store.path),
                 },
             )
-            artifact["provenance"] = provenance
             artifact["security"] = security
             artifact["status"] = "COMPLETED"
             artifact["production_source_diff"] = _production_source_diff()

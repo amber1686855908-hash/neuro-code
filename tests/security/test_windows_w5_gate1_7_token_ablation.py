@@ -103,6 +103,7 @@ def _run_harness_bounded(
     """Bound one native controller call without letting a ctypes call hang pytest."""
 
     results: queue.Queue[dict[str, object]] = queue.Queue(maxsize=1)
+    worker_done = threading.Event()
 
     def invoke() -> None:
         try:
@@ -126,29 +127,45 @@ def _run_harness_bounded(
                 "timeout": False,
                 "exit_code": None,
             }
-        try:
+        finally:
+            worker_done.set()
+        with contextlib.suppress(queue.Full):
             results.put_nowait(result)
-        except queue.Full:  # pragma: no cover - defensive
-            return
 
-    worker = threading.Thread(target=invoke, daemon=True)
+    worker = threading.Thread(target=invoke, daemon=True, name="W5-HarnessWorker")
     worker.start()
     try:
-        return results.get(timeout=timeout)
+        result = results.get(timeout=timeout)
+        worker.join(timeout=1.0)
+        result["worker_terminal"] = not worker.is_alive()
+        result["worker_alive"] = worker.is_alive()
+        return result
     except queue.Empty:
         if on_timeout is not None:
             with contextlib.suppress(Exception):
                 on_timeout()
             try:
-                return results.get(timeout=10.0)
+                result = results.get(timeout=10.0)
+                worker.join(timeout=1.0)
+                result["worker_terminal"] = not worker.is_alive()
+                result["worker_alive"] = worker.is_alive()
+                return result
             except queue.Empty:
                 pass
+        # A timeout callback is allowed to be best-effort, but returning while
+        # the worker can still touch the controller would make ownership
+        # ambiguous and can trigger late handle/Popen destructor warnings.
+        # Expose that state as a hard evidence failure for callers instead of
+        # pretending the bounded call completed.
+        worker_alive = worker.is_alive()
         return {
             "execution_path": "DIRECT/CreateProcessWithLogonW",
             "spawn_result": "HARNESS_TIMEOUT",
             "classification": "HARNESS_CALL_TIMEOUT",
             "timeout": True,
             "exit_code": None,
+            "worker_terminal": not worker_alive and worker_done.is_set(),
+            "worker_alive": worker_alive,
         }
 
 

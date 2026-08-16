@@ -401,6 +401,13 @@ class _Gate1DirectProcess:
         self._terminate(ctypes.c_void_p(process_handle), 0xC000013A)
         self._wait(ctypes.c_void_p(process_handle), 2_000)
 
+    def process_id(self, process_handle: int) -> int:  # pragma: no cover - Windows CI
+        """Read a borrowed process handle without retaining or closing it."""
+
+        if process_handle <= 0:
+            return 0
+        return int(self._get_process_id(ctypes.c_void_p(process_handle)))
+
     def terminate_process_tree(self, process_handle: int) -> bool:  # pragma: no cover
         """Bounded cleanup for one evidence controller and its descendants."""
 
@@ -418,10 +425,12 @@ class _Gate1DirectProcess:
             completed = subprocess.run(
                 ["taskkill.exe", "/PID", str(process_id), "/T", "/F"],
                 check=False,
+                stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 timeout=5,
                 shell=False,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
         except (OSError, subprocess.SubprocessError):
             return False
