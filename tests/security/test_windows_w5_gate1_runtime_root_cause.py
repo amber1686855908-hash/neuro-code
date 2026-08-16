@@ -418,7 +418,8 @@ class _Gate1DirectProcess:
             completed = subprocess.run(
                 ["taskkill.exe", "/PID", str(process_id), "/T", "/F"],
                 check=False,
-                capture_output=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
                 timeout=5,
                 shell=False,
             )
