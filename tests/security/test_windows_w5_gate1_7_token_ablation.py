@@ -137,6 +137,7 @@ def _run_harness_bounded(
     try:
         result = results.get(timeout=timeout)
         worker.join(timeout=1.0)
+        result["harness_call_timeout"] = False
         result["worker_terminal"] = not worker.is_alive()
         result["worker_alive"] = worker.is_alive()
         return result
@@ -147,6 +148,7 @@ def _run_harness_bounded(
             try:
                 result = results.get(timeout=10.0)
                 worker.join(timeout=1.0)
+                result["harness_call_timeout"] = True
                 result["worker_terminal"] = not worker.is_alive()
                 result["worker_alive"] = worker.is_alive()
                 return result
@@ -163,6 +165,7 @@ def _run_harness_bounded(
             "spawn_result": "HARNESS_TIMEOUT",
             "classification": "HARNESS_CALL_TIMEOUT",
             "timeout": True,
+            "harness_call_timeout": True,
             "exit_code": None,
             "worker_terminal": not worker_alive and worker_done.is_set(),
             "worker_alive": worker_alive,

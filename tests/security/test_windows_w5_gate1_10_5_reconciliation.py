@@ -105,11 +105,17 @@ def _broker_classification(spec: _Workload, raw: dict[str, object]) -> dict[str,
     stderr = str(raw.get("stderr_preview", "")).encode()
     exit_code = raw.get("exit_code")
     child_timeout = markers.get(f"{_MARKER_PREFIX}CHILD_WAIT") == "TIMEOUT"
+    # ``timeout`` is the direct harness' wait result.  It may mean that the
+    # broker's own child exceeded its bounded native wait; that is not the
+    # same as the Python worker call timing out.  Keep both facts separate so
+    # cleanup assertions cannot turn an inner workload timeout into a false
+    # controller-ownership failure.
     controller_timeout = bool(raw.get("timeout")) and (
         markers.get(f"{_MARKER_PREFIX}CHILD_CREATE") == "PASS"
         and f"{_MARKER_PREFIX}CHILD_WAIT_ENTER" in markers
     )
-    if child_timeout or controller_timeout:
+    harness_call_timeout = bool(raw.get("harness_call_timeout"))
+    if child_timeout or controller_timeout or harness_call_timeout:
         classification = "TIMEOUT"
     elif isinstance(exit_code, int):
         classification = (
@@ -130,6 +136,7 @@ def _broker_classification(spec: _Workload, raw: dict[str, object]) -> dict[str,
         "exit_code": exit_code,
         "timeout": child_timeout,
         "controller_timeout": controller_timeout,
+        "harness_call_timeout": harness_call_timeout,
         "stdout_preview": _preview(output),
         "stderr_preview": _preview(stderr),
         "nul_modes": _nul_mode_results(output, stderr),
@@ -362,7 +369,7 @@ class WindowsW5Gate1105ReconciliationTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(broker["started"], True)
                 self.assertEqual(broker["token_inspection"], "PASS")
                 self.assertEqual(broker["restricted_sid_count"], 1)
-                if result["controller_timeout"]:
+                if result["harness_call_timeout"]:
                     self.assertTrue(cleanup["attempted"])
                     self.assertTrue(cleanup["result"])
                 return result
