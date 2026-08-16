@@ -23,11 +23,6 @@
 #define WAIT_OBJECT_0_RESULT 0x00000000
 #define WAIT_TIMEOUT_RESULT 0x00000102
 
-typedef struct _GATE17_SID_AND_ATTRIBUTES {
-    PSID Sid;
-    DWORD Attributes;
-} GATE17_SID_AND_ATTRIBUTES;
-
 static void emit_ascii(const char *text) {
     DWORD written = 0;
     HANDLE output = GetStdHandle(STD_OUTPUT_HANDLE);
@@ -189,7 +184,7 @@ int wmain(int argc, wchar_t **argv) {
     PSID expected_sid = NULL;
     HANDLE source_token = NULL;
     HANDLE child_token = NULL;
-    GATE17_SID_AND_ATTRIBUTES restricted_sid;
+    SID_AND_ATTRIBUTES restricted_sid;
     DWORD expected_count;
     int child_result;
 
