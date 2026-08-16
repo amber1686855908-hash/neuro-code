@@ -254,6 +254,7 @@ def _token_projection(raw: dict[str, object], markers: dict[str, str]) -> dict[s
         "child_create": markers.get(f"{_MARKER_PREFIX}CHILD_CREATE"),
         "child_launch_enter": markers.get(f"{_MARKER_PREFIX}CHILD_LAUNCH_ENTER"),
         "child_launch_return": markers.get(f"{_MARKER_PREFIX}CHILD_LAUNCH_RETURN"),
+        "child_pid": _marker_int(markers, f"{_MARKER_PREFIX}CHILD_PID"),
         "child_wait_enter": markers.get(f"{_MARKER_PREFIX}CHILD_WAIT_ENTER"),
         "child_wait_budget": _marker_int(markers, f"{_MARKER_PREFIX}CHILD_WAIT_BUDGET"),
         "child_wait_tick": _marker_int(markers, f"{_MARKER_PREFIX}CHILD_WAIT_TICK"),
@@ -583,12 +584,32 @@ class WindowsW5Gate110WriteRestrictedCodeTests(unittest.IsolatedAsyncioTestCase)
 
                 active_controller: dict[str, int] = {}
                 partial_stdout = bytearray()
-                controller_tree_cleanup = {"attempted": False, "result": False}
+                controller_tree_cleanup = {
+                    "attempted": False,
+                    "result": False,
+                    "child_attempted": False,
+                    "child_result": False,
+                    "child_pid": None,
+                }
 
                 def on_spawn(process_handle: int) -> None:
                     active_controller["handle"] = process_handle
 
                 def on_timeout() -> None:
+                    # The broker emits the exact CreateProcessAsUserW child
+                    # PID before entering its bounded wait.  Kill that tree
+                    # first, then the W2 controller itself.  This avoids the
+                    # common race where the controller exits/loses its tree
+                    # relationship while a runtime descendant still holds a
+                    # workspace handle.
+                    markers = _parse_markers(bytes(partial_stdout))
+                    child_pid = _marker_int(markers, f"{_MARKER_PREFIX}CHILD_PID")
+                    controller_tree_cleanup["child_pid"] = child_pid
+                    if child_pid is not None:
+                        controller_tree_cleanup["child_attempted"] = True
+                        controller_tree_cleanup["child_result"] = harness.terminate_process_id_tree(
+                            child_pid
+                        )
                     process_handle = active_controller.get("handle")
                     if process_handle is not None:
                         controller_tree_cleanup["attempted"] = True

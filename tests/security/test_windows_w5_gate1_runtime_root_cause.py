@@ -161,6 +161,9 @@ class _Gate1DirectProcess:
         self._get_process_id = self._kernel32.GetProcessId
         self._get_process_id.argtypes = [ctypes.c_void_p]
         self._get_process_id.restype = ctypes.c_uint32
+        self._open_process = self._kernel32.OpenProcess
+        self._open_process.argtypes = [ctypes.c_uint32, ctypes.c_int32, ctypes.c_uint32]
+        self._open_process.restype = ctypes.c_void_p
         self._close = self._kernel32.CloseHandle
         self._close.argtypes = [ctypes.c_void_p]
         self._close.restype = ctypes.c_int32
@@ -404,6 +407,13 @@ class _Gate1DirectProcess:
         process_id = int(self._get_process_id(ctypes.c_void_p(process_handle)))
         if process_id == 0:
             return False
+        return self.terminate_process_id_tree(process_id)
+
+    def terminate_process_id_tree(self, process_id: int) -> bool:  # pragma: no cover
+        """Terminate one exact PID tree without matching an image name."""
+
+        if process_id <= 0:
+            return False
         try:
             completed = subprocess.run(
                 ["taskkill.exe", "/PID", str(process_id), "/T", "/F"],
@@ -414,7 +424,27 @@ class _Gate1DirectProcess:
             )
         except (OSError, subprocess.SubprocessError):
             return False
-        return completed.returncode == 0
+        if completed.returncode == 0:
+            return True
+
+        # taskkill can race with a short-lived parent and return a non-zero
+        # status even though the exact process is still present.  Fall back to
+        # a handle-based termination of that PID; this remains scoped to the
+        # controller/child PID supplied by the evidence harness and never
+        # matches a process by executable name.
+        process = self._open_process(
+            0x0001 | 0x00100000 | 0x1000,
+            0,
+            ctypes.c_uint32(process_id),
+        )
+        if not process:
+            return False
+        try:
+            terminated = bool(self._terminate(process, 0xC000013A))
+            self._wait(process, 2_000)
+            return terminated
+        finally:
+            self._close_handle(int(cast(int, process)))
 
 
 def _native_enabled() -> bool:

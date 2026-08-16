@@ -677,6 +677,13 @@ static int launch_child(
         return 42;
     }
     emit_ascii(GATE_MARKER("CHILD_LAUNCH_RETURN=PASS\n"));
+    /*
+     * Keep the child PID in the bounded evidence stream.  Gate 1.10 may
+     * intentionally time out a runtime that never reaches user code; the
+     * trusted controller then needs an exact PID to tear down that child
+     * tree without relying on image-name matching or a broad taskkill.
+     */
+    emit_u32(GATE_MARKER("CHILD_PID="), GetProcessId(process.hProcess));
 #ifdef NEURO_GATE18
     cleanup_job = CreateJobObjectW(NULL, NULL);
     if (cleanup_job != NULL) {
