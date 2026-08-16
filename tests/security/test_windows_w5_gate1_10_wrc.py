@@ -9,6 +9,7 @@ not changed by this experiment.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import shutil
@@ -799,21 +800,34 @@ class WindowsW5Gate110WriteRestrictedCodeTests(unittest.IsolatedAsyncioTestCase)
                 persist()
 
             async def run_write(label: str, target: Path) -> dict[str, object]:
+                # Keep a private, in-memory copy for fixture restoration.
+                # ``_state`` intentionally stores only a bounded preview so
+                # credential material is never written to the artifact; using
+                # that preview as the restore payload would truncate the
+                # DPAPI envelope and make the final setup cleanup fail.
+                try:
+                    original_bytes = await asyncio.to_thread(target.read_bytes)
+                except FileNotFoundError:
+                    original_bytes = None
+
+                async def restore() -> None:
+                    if original_bytes is None:
+                        with contextlib.suppress(FileNotFoundError):
+                            await asyncio.to_thread(target.unlink)
+                    else:
+                        await asyncio.to_thread(target.write_bytes, original_bytes)
+
                 before = _state(target)
                 raw = await run_broker("PROD_SYN", write_destination, (str(target),))
                 syn = _write_result(raw)
                 after_syn = _state(target)
-                await asyncio.to_thread(
-                    target.write_bytes, cast(str, before.get("content", "")).encode("ascii")
-                )
+                await restore()
                 before_wrc = _state(target)
                 raw_wrc = await run_broker("PROD_SYN_WRC", write_destination, (str(target),))
                 wrc_result = _write_result(raw_wrc)
                 after_wrc = _state(target)
                 # Reset the fixture so the next oracle observes the same bytes.
-                await asyncio.to_thread(
-                    target.write_bytes, cast(str, before.get("content", "")).encode("ascii")
-                )
+                await restore()
                 return {
                     "label": label,
                     "PROD_SYN": {**syn, "before": before, "after": after_syn},
