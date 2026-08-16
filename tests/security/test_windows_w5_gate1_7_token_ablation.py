@@ -303,7 +303,7 @@ class WindowsW5Gate17TokenAblationTests(unittest.IsolatedAsyncioTestCase):
                 _compile_msvc_probe,
                 source,
                 f"windows_w5_gate17_{name.lower()}",
-                libraries=("Advapi32.lib",),
+                libraries=("Advapi32.lib", "Userenv.lib"),
             )
             probe_paths[name] = probe
             self.addAsyncCleanup(_cleanup_directory, probe.parent)
