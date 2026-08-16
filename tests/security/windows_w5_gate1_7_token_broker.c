@@ -23,9 +23,6 @@
 #define STARTF_USESTDHANDLES_FLAG 0x00000100
 #define HANDLE_FLAG_INHERIT_VALUE 0x00000001
 #define PROC_THREAD_ATTRIBUTE_HANDLE_LIST_VALUE 0x00020002
-#define PROC_THREAD_ATTRIBUTE_JOB_LIST_VALUE 0x0002000D
-#define JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS 9
-#define JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE_VALUE 0x00002000
 #define WAIT_OBJECT_0_RESULT 0x00000000
 #define WAIT_TIMEOUT_RESULT 0x00000102
 
@@ -122,16 +119,12 @@ static int launch_child(
     PROCESS_INFORMATION process;
     wchar_t command_line[32768];
     HANDLE inherited_handles[3];
-    HANDLE job_handle = NULL;
-    HANDLE job_handles[1];
     SIZE_T attribute_bytes = 0;
     LPPROC_THREAD_ATTRIBUTE_LIST attributes = NULL;
-    JOBOBJECT_EXTENDED_LIMIT_INFORMATION job_limits;
     DWORD wait_result;
     DWORD exit_code = 0;
     BOOL attribute_list_ready = FALSE;
     BOOL created = FALSE;
-    BOOL job_ready = FALSE;
     int written = _snwprintf_s(
         command_line,
         sizeof(command_line) / sizeof(command_line[0]),
@@ -173,33 +166,10 @@ static int launch_child(
         emit_u32("W5_GATE17_CHILD_CREATE_ERROR=", GetLastError());
         return 42;
     }
-    job_handle = CreateJobObjectW(NULL, NULL);
-    if (job_handle == NULL) {
-        emit_ascii("W5_GATE17_CHILD_CREATE=FAIL\n");
-        emit_u32("W5_GATE17_CHILD_CREATE_ERROR=", GetLastError());
-        return 42;
-    }
-    ZeroMemory(&job_limits, sizeof(job_limits));
-    job_limits.BasicLimitInformation.LimitFlags =
-        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE_VALUE;
-    if (!SetInformationJobObject(
-        job_handle,
-        JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS,
-        &job_limits,
-        sizeof(job_limits)
-    )) {
-        emit_ascii("W5_GATE17_CHILD_CREATE=FAIL\n");
-        emit_u32("W5_GATE17_CHILD_CREATE_ERROR=", GetLastError());
-        (void)CloseHandle(job_handle);
-        return 42;
-    }
-    job_ready = TRUE;
-    job_handles[0] = job_handle;
-    (void)InitializeProcThreadAttributeList(NULL, 2, 0, &attribute_bytes);
+    (void)InitializeProcThreadAttributeList(NULL, 1, 0, &attribute_bytes);
     if (attribute_bytes == 0) {
         emit_ascii("W5_GATE17_CHILD_CREATE=FAIL\n");
         emit_u32("W5_GATE17_CHILD_CREATE_ERROR=", GetLastError());
-        (void)CloseHandle(job_handle);
         return 42;
     }
     attributes = (LPPROC_THREAD_ATTRIBUTE_LIST)HeapAlloc(
@@ -226,23 +196,6 @@ static int launch_child(
         if (attributes != NULL) {
             HeapFree(GetProcessHeap(), 0, attributes);
         }
-        (void)CloseHandle(job_handle);
-        return 42;
-    }
-    if (!UpdateProcThreadAttribute(
-        attributes,
-        0,
-        PROC_THREAD_ATTRIBUTE_JOB_LIST_VALUE,
-        job_handles,
-        sizeof(job_handles),
-        NULL,
-        NULL
-    )) {
-        emit_ascii("W5_GATE17_CHILD_CREATE=FAIL\n");
-        emit_u32("W5_GATE17_CHILD_CREATE_ERROR=", GetLastError());
-        DeleteProcThreadAttributeList(attributes);
-        HeapFree(GetProcessHeap(), 0, attributes);
-        (void)CloseHandle(job_handle);
         return 42;
     }
     attribute_list_ready = TRUE;
@@ -270,9 +223,6 @@ static int launch_child(
     if (!created) {
         emit_ascii("W5_GATE17_CHILD_CREATE=FAIL\n");
         emit_u32("W5_GATE17_CHILD_CREATE_ERROR=", GetLastError());
-        if (job_ready) {
-            (void)CloseHandle(job_handle);
-        }
         return 42;
     }
     emit_ascii("W5_GATE17_CHILD_CREATE=PASS\n");
@@ -281,10 +231,8 @@ static int launch_child(
     if (wait_result == WAIT_TIMEOUT_RESULT) {
         emit_ascii("W5_GATE17_CHILD_WAIT=TIMEOUT\n");
         (void)TerminateProcess(process.hProcess, 0xC000013A);
-        (void)TerminateJobObject(job_handle, 0xC000013A);
         (void)WaitForSingleObject(process.hProcess, 2000);
         (void)CloseHandle(process.hProcess);
-        (void)CloseHandle(job_handle);
         return 43;
     }
     if (wait_result != WAIT_OBJECT_0_RESULT ||
@@ -292,12 +240,10 @@ static int launch_child(
         emit_ascii("W5_GATE17_CHILD_WAIT=FAIL\n");
         emit_u32("W5_GATE17_CHILD_WAIT_ERROR=", GetLastError());
         (void)CloseHandle(process.hProcess);
-        (void)CloseHandle(job_handle);
         return 44;
     }
     emit_u32("W5_GATE17_CHILD_EXIT=", exit_code);
     (void)CloseHandle(process.hProcess);
-    (void)CloseHandle(job_handle);
     return (int)exit_code;
 }
 
