@@ -574,6 +574,17 @@ class WindowsW5Gate110WriteRestrictedCodeTests(unittest.IsolatedAsyncioTestCase)
                 spec = _Workload(
                     "GATE110_BROKER", variant.casefold(), broker_destination, arguments
                 )
+
+                active_controller: dict[str, int] = {}
+
+                def on_spawn(process_handle: int) -> None:
+                    active_controller["handle"] = process_handle
+
+                def on_timeout() -> None:
+                    process_handle = active_controller.get("handle")
+                    if process_handle is not None:
+                        harness.terminate_process(process_handle)
+
                 return await asyncio.to_thread(
                     _run_harness_bounded,
                     harness,
@@ -585,6 +596,8 @@ class WindowsW5Gate110WriteRestrictedCodeTests(unittest.IsolatedAsyncioTestCase)
                     environment=_environment_for(_request(spec, workspace)),
                     logon_flags=0,
                     timeout=limit_seconds,
+                    on_timeout=on_timeout,
+                    on_spawn=on_spawn,
                 )
 
             variant_results: dict[str, object] = {}

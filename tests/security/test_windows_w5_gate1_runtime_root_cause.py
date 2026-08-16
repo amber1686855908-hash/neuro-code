@@ -14,6 +14,7 @@ loading and records bounded bcrypt, CNG-provider, and NUL access facts.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import ctypes
 import json
 import os
@@ -240,6 +241,7 @@ class _Gate1DirectProcess:
         environment: dict[str, str],
         logon_flags: int,
         retain_output: bool = False,
+        on_spawn: Callable[[int], None] | None = None,
     ) -> dict[str, object]:  # pragma: no cover - Windows CI
         stdout_read, stdout_write = self._new_pipe()
         stderr_read, stderr_write = self._new_pipe()
@@ -307,6 +309,9 @@ class _Gate1DirectProcess:
                 raise OSError(self._last_error(), "CreateProcessWithLogonW failed")
             result["spawn_result"] = "PASS"
             process_handle = int(cast(int, process_info.hProcess))
+            if on_spawn is not None:
+                with contextlib.suppress(Exception):
+                    on_spawn(process_handle)
             self._close_handle(int(cast(int, process_info.hThread)))
             self._close_handle(stdin_handle)
             self._close_handle(stdout_write)
@@ -380,6 +385,12 @@ class _Gate1DirectProcess:
                         bytes(stderr),
                     )
         return result
+
+    def terminate_process(self, process_handle: int) -> None:  # pragma: no cover - Windows CI
+        """Terminate a still-running evidence controller process on timeout."""
+
+        self._terminate(ctypes.c_void_p(process_handle), 0xC000013A)
+        self._wait(ctypes.c_void_p(process_handle), 2_000)
 
 
 def _native_enabled() -> bool:

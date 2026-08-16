@@ -97,6 +97,7 @@ def _run_harness_bounded(
     logon_flags: int,
     timeout: float = 30.0,
     on_timeout: Callable[[], None] | None = None,
+    on_spawn: Callable[[int], None] | None = None,
 ) -> dict[str, object]:  # pragma: no cover - Windows CI
     """Bound one native controller call without letting a ctypes call hang pytest."""
 
@@ -113,6 +114,7 @@ def _run_harness_bounded(
                 environment=environment,
                 logon_flags=logon_flags,
                 retain_output=True,
+                on_spawn=on_spawn,
             )
         except Exception as error:  # pragma: no cover - Windows CI
             result = {
