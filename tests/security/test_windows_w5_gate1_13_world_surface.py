@@ -355,8 +355,8 @@ class _AccessCheckOracle:
             granted = ctypes.c_uint32()
             access_status = ctypes.c_int32()
             ok = self._access_check(
-                descriptor,
-                token,
+                descriptor.value,
+                token.value,
                 _MAXIMUM_ALLOWED,
                 ctypes.byref(mapping),
                 privilege_set,
