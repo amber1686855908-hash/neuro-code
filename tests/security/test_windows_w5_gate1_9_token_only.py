@@ -144,9 +144,8 @@ def _compile_praw() -> tuple[Path, dict[str, object]]:  # pragma: no cover - Win
     result = _run_vcvars_command(
         vcvars,
         (
-            f"cl /nologo /W4 /WX /O2 /GS- /NODEFAULTLIB "
-            f'/ENTRY:gate19_raw_entry /SUBSYSTEM:CONSOLE /Fe:"{output}" '
-            f'"{source}" Kernel32.lib'
+            f'cl /nologo /W4 /WX /O2 /GS- /Fe:"{output}" "{source}" Kernel32.lib '
+            f"/link /NODEFAULTLIB /ENTRY:gate19_raw_entry /SUBSYSTEM:CONSOLE"
         ),
         cwd=build_directory,
         timeout=120,
