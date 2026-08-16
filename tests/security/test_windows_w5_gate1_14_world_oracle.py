@@ -593,6 +593,10 @@ def _capture_procmon_variant(
                     procmon.wait(timeout=10)
                 except (OSError, subprocess.SubprocessError):
                     record["procmon_process_left"] = True
+        if procmon is not None:
+            for stream in (procmon.stdout, procmon.stderr):
+                if stream is not None:
+                    stream.close()
     child = cast(dict[str, object] | None, record.get("p4"))
     broker_projection = cast(dict[str, object] | None, child.get("broker") if child else None)
     child_pid = broker_projection.get("child_pid") if broker_projection else None
