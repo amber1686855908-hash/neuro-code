@@ -726,16 +726,24 @@ static int launch_child(
     emit_ascii(GATE_MARKER("CHILD_WAIT_ENTER\n"));
     {
         DWORD waited_ms = 0;
-        for (;;) {
-            wait_result = WaitForSingleObject(process.hProcess, 1000);
-            if (wait_result != WAIT_TIMEOUT_RESULT ||
-                waited_ms + 1000 >= CHILD_WAIT_TIMEOUT_MS) {
-                if (wait_result == WAIT_TIMEOUT_RESULT) {
-                    wait_result = WAIT_TIMEOUT_RESULT;
-                }
+        DWORD observed_exit = STILL_ACTIVE;
+        wait_result = WAIT_TIMEOUT_RESULT;
+        while (waited_ms < CHILD_WAIT_TIMEOUT_MS) {
+            if (!GetExitCodeProcess(process.hProcess, &observed_exit)) {
+                wait_result = WAIT_FAILED;
                 break;
             }
+            if (observed_exit != STILL_ACTIVE) {
+                wait_result = WAIT_OBJECT_0_RESULT;
+                break;
+            }
+            Sleep(1000);
             waited_ms += 1000;
+        }
+        if (wait_result == WAIT_TIMEOUT_RESULT &&
+            GetExitCodeProcess(process.hProcess, &observed_exit) &&
+            observed_exit != STILL_ACTIVE) {
+            wait_result = WAIT_OBJECT_0_RESULT;
         }
     }
     emit_u32(GATE_MARKER("CHILD_WAIT_RESULT="), wait_result);
