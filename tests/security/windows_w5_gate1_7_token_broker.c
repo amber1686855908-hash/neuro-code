@@ -27,11 +27,15 @@
 #define WAIT_OBJECT_0_RESULT 0x00000000
 #define WAIT_TIMEOUT_RESULT 0x00000102
 #define TOKEN_LOGON_SID_INFORMATION 28
+#define TOKEN_DEFAULT_DACL_INFORMATION 6
+#define SECURITY_MAX_SID_SIZE_VALUE 68
 #ifdef NEURO_GATE18
 #define CREATE_SUSPENDED_FLAG 0x00000004
 #define JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS 9
 #define JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE_VALUE 0x00002000
 #define CHILD_WAIT_TIMEOUT_MS 10000
+#elif defined(NEURO_GATE110)
+#define CHILD_WAIT_TIMEOUT_MS 15000
 #elif defined(NEURO_GATE19)
 #define CHILD_WAIT_TIMEOUT_MS 10000
 #else
@@ -40,6 +44,8 @@
 
 #ifdef NEURO_GATE18
 #define GATE_MARKER(name) "W5_GATE18_" name
+#elif defined(NEURO_GATE110)
+#define GATE_MARKER(name) "W5_GATE110_" name
 #elif defined(NEURO_GATE19)
 #define GATE_MARKER(name) "W5_GATE19_" name
 #else
@@ -98,6 +104,14 @@ static BOOL variant_flags(const wchar_t *variant, DWORD *flags, BOOL *has_sid) {
     } else if (wcscmp(variant, L"DLWR") == 0) {
         *flags = DISABLE_MAX_PRIVILEGE_FLAG | LUA_TOKEN_FLAG | WRITE_RESTRICTED_FLAG;
         *has_sid = TRUE;
+#ifdef NEURO_GATE110
+    } else if (wcscmp(variant, L"PROD_SYN") == 0) {
+        *flags = DISABLE_MAX_PRIVILEGE_FLAG | LUA_TOKEN_FLAG | WRITE_RESTRICTED_FLAG;
+        *has_sid = TRUE;
+    } else if (wcscmp(variant, L"PROD_SYN_WRC") == 0) {
+        *flags = DISABLE_MAX_PRIVILEGE_FLAG | LUA_TOKEN_FLAG | WRITE_RESTRICTED_FLAG;
+        *has_sid = TRUE;
+#endif
     } else {
         return FALSE;
     }
@@ -137,6 +151,92 @@ static BOOL inspect_restricted_sids(HANDLE token, PSID expected_sid, DWORD expec
     free(groups);
     return TRUE;
 }
+
+#ifdef NEURO_GATE110
+static BOOL inspect_restricted_sids_gate110(
+    HANDLE token,
+    PSID *expected_sids,
+    DWORD expected_count
+) {
+    DWORD required = 0;
+    TOKEN_GROUPS *groups = NULL;
+    BOOL matched = TRUE;
+    DWORD index;
+    if (GetTokenInformation(
+        token,
+        TOKEN_RESTRICTED_SIDS_INFORMATION,
+        NULL,
+        0,
+        &required
+    ) || GetLastError() != ERROR_INSUFFICIENT_BUFFER || required < sizeof(DWORD)) {
+        return FALSE;
+    }
+    groups = (TOKEN_GROUPS *)malloc(required);
+    if (groups == NULL) {
+        return FALSE;
+    }
+    if (!GetTokenInformation(
+        token,
+        TOKEN_RESTRICTED_SIDS_INFORMATION,
+        groups,
+        required,
+        &required
+    )) {
+        free(groups);
+        return FALSE;
+    }
+    if (groups->GroupCount != expected_count) {
+        matched = FALSE;
+    }
+    for (index = 0; matched && index < expected_count; ++index) {
+        BOOL found = FALSE;
+        DWORD candidate;
+        for (candidate = 0; candidate < groups->GroupCount; ++candidate) {
+            if (EqualSid(groups->Groups[candidate].Sid, expected_sids[index])) {
+                found = TRUE;
+                break;
+            }
+        }
+        if (!found) {
+            matched = FALSE;
+        }
+    }
+    emit_u32(GATE_MARKER("RESTRICTED_SID_COUNT="), groups->GroupCount);
+    emit_bool(GATE_MARKER("RESTRICTED_SID_MATCH="), matched);
+    free(groups);
+    return TRUE;
+}
+
+static BOOL emit_write_restricted_code_sid(PSID *sid_out) {
+    BYTE sid_buffer[SECURITY_MAX_SID_SIZE_VALUE];
+    DWORD sid_size = sizeof(sid_buffer);
+    LPWSTR sid_text = NULL;
+    if (!CreateWellKnownSid(
+        WinWriteRestrictedCodeSid,
+        NULL,
+        sid_buffer,
+        &sid_size
+    ) || !ConvertSidToStringSidW((PSID)sid_buffer, &sid_text) || sid_text == NULL) {
+        emit_ascii(GATE_MARKER("WRC_CREATE=FAIL\n"));
+        emit_u32(GATE_MARKER("WRC_CREATE_ERROR="), GetLastError());
+        return FALSE;
+    }
+    emit_ascii(GATE_MARKER("WRC_TYPE=WinWriteRestrictedCodeSid\n"));
+    emit_ascii(GATE_MARKER("WRC_SID="));
+    emit_ascii("S-1-5-33\n");
+    emit_bool(GATE_MARKER("WRC_CANONICAL_MATCH="), wcscmp(sid_text, L"S-1-5-33") == 0);
+    *sid_out = (PSID)malloc(sid_size);
+    if (*sid_out == NULL) {
+        LocalFree(sid_text);
+        emit_ascii(GATE_MARKER("WRC_CREATE=FAIL\n"));
+        return FALSE;
+    }
+    CopyMemory(*sid_out, sid_buffer, sid_size);
+    LocalFree(sid_text);
+    emit_ascii(GATE_MARKER("WRC_CREATE=PASS\n"));
+    return TRUE;
+}
+#endif
 
 static BOOL inspect_token_privileges(HANDLE token) {
     DWORD required = 0;
@@ -190,7 +290,7 @@ static BOOL inspect_token_privileges(HANDLE token) {
     return TRUE;
 }
 
-#ifdef NEURO_GATE19
+#if defined(NEURO_GATE19) || defined(NEURO_GATE110)
 static BOOL get_current_logon_sid_text(
     HANDLE token,
     wchar_t *sid_text,
@@ -363,10 +463,78 @@ static BOOL write_child_pid_marker(const wchar_t *path, DWORD pid) {
 }
 #endif
 
+static BOOL append_command_line_argument(
+    wchar_t *command_line,
+    size_t capacity,
+    size_t *position,
+    const wchar_t *argument
+) {
+    size_t length = wcslen(argument);
+    size_t index;
+    size_t backslashes = 0;
+    BOOL quote = length == 0 || wcspbrk(argument, L" \t\"") != NULL;
+    if (*position != 0) {
+        if (*position + 1 >= capacity) {
+            return FALSE;
+        }
+        command_line[(*position)++] = L' ';
+    }
+    if (!quote) {
+        if (*position + length >= capacity) {
+            return FALSE;
+        }
+        CopyMemory(command_line + *position, argument, (length + 1) * sizeof(wchar_t));
+        *position += length;
+        return TRUE;
+    }
+    if (*position + 1 >= capacity) {
+        return FALSE;
+    }
+    command_line[(*position)++] = L'"';
+    for (index = 0; index < length; ++index) {
+        wchar_t current = argument[index];
+        if (current == L'\\') {
+            ++backslashes;
+            continue;
+        }
+        if (current == L'"') {
+            size_t count = backslashes * 2 + 1;
+            if (*position + count + 1 >= capacity) {
+                return FALSE;
+            }
+            while (count-- != 0) {
+                command_line[(*position)++] = L'\\';
+            }
+            command_line[(*position)++] = L'"';
+            backslashes = 0;
+            continue;
+        }
+        if (*position + backslashes + 1 >= capacity) {
+            return FALSE;
+        }
+        while (backslashes-- != 0) {
+            command_line[(*position)++] = L'\\';
+        }
+        command_line[(*position)++] = current;
+    }
+    if (*position + backslashes * 2 + 2 > capacity) {
+        return FALSE;
+    }
+    while (backslashes-- != 0) {
+        command_line[(*position)++] = L'\\';
+        command_line[(*position)++] = L'\\';
+    }
+    command_line[(*position)++] = L'"';
+    command_line[*position] = L'\0';
+    return TRUE;
+}
+
 static int launch_child(
     HANDLE token,
     const wchar_t *child_path,
-    const wchar_t *cwd
+    const wchar_t *cwd,
+    int child_argc,
+    wchar_t **child_argv
 #ifdef NEURO_GATE18
     ,
     const wchar_t *pid_marker_path
@@ -381,22 +549,34 @@ static int launch_child(
     LPPROC_THREAD_ATTRIBUTE_LIST attributes = NULL;
     DWORD wait_result;
     DWORD exit_code = 0;
+    int argument_index;
     BOOL attribute_list_ready = FALSE;
     BOOL created = FALSE;
 #ifdef NEURO_GATE18
     HANDLE cleanup_job = NULL;
 #endif
-    int written = _snwprintf_s(
+    size_t command_position = 0;
+    if (!append_command_line_argument(
         command_line,
         sizeof(command_line) / sizeof(command_line[0]),
-        _TRUNCATE,
-        L"\"%ls\"",
+        &command_position,
         child_path
-    );
-    if (written < 0) {
+    )) {
         emit_ascii(GATE_MARKER("CHILD_CREATE=FAIL\n"));
         emit_u32(GATE_MARKER("CHILD_CREATE_ERROR="), ERROR_INSUFFICIENT_BUFFER);
         return 41;
+    }
+    for (argument_index = 0; argument_index < child_argc; ++argument_index) {
+        if (!append_command_line_argument(
+            command_line,
+            sizeof(command_line) / sizeof(command_line[0]),
+            &command_position,
+            child_argv[argument_index]
+        )) {
+            emit_ascii(GATE_MARKER("CHILD_CREATE=FAIL\n"));
+            emit_u32(GATE_MARKER("CHILD_CREATE_ERROR="), ERROR_INSUFFICIENT_BUFFER);
+            return 41;
+        }
     }
     ZeroMemory(&startup_ex, sizeof(startup_ex));
     ZeroMemory(&process, sizeof(process));
@@ -595,24 +775,35 @@ int wmain(int argc, wchar_t **argv) {
     const wchar_t *sid_text;
     const wchar_t *child_path;
     const wchar_t *cwd;
+#ifdef NEURO_GATE110
+    int child_argc;
+    wchar_t **child_argv;
+#endif
 #ifdef NEURO_GATE18
     const wchar_t *pid_marker_path;
 #endif
     DWORD flags = 0;
     BOOL has_sid = FALSE;
     PSID expected_sid = NULL;
+#ifdef NEURO_GATE110
+    PSID write_restricted_sid = NULL;
+    PSID expected_sids[2];
+    SID_AND_ATTRIBUTES restricted_sids[2];
+#endif
     HANDLE source_token = NULL;
     HANDLE child_token = NULL;
     SID_AND_ATTRIBUTES restricted_sid;
     DWORD expected_count;
     int child_result;
-#ifdef NEURO_GATE19
+#if defined(NEURO_GATE19) || defined(NEURO_GATE110)
     wchar_t logon_sid_text[128];
 #endif
 
     if (
 #ifdef NEURO_GATE18
         argc < 6 ||
+#elif defined(NEURO_GATE110)
+        argc < 5 ||
 #else
         argc < 5 ||
 #endif
@@ -625,10 +816,18 @@ int wmain(int argc, wchar_t **argv) {
     sid_text = argv[2];
     child_path = argv[3];
     cwd = argv[4];
+#ifdef NEURO_GATE110
+    child_argc = argc - 5;
+    child_argv = &argv[5];
+#endif
 #ifdef NEURO_GATE18
     pid_marker_path = argv[5];
 #endif
+#ifdef NEURO_GATE110
+    expected_count = wcscmp(variant, L"PROD_SYN_WRC") == 0 ? 2 : 1;
+#else
     expected_count = has_sid ? 1 : 0;
+#endif
     emit_ascii(GATE_MARKER("BROKER_STARTED\n"));
     emit_u32(GATE_MARKER("FLAGS="), flags);
 
@@ -637,8 +836,23 @@ int wmain(int argc, wchar_t **argv) {
         emit_u32(GATE_MARKER("TOKEN_CREATE_ERROR="), GetLastError());
         return 31;
     }
+#ifdef NEURO_GATE110
+    if (!emit_write_restricted_code_sid(&write_restricted_sid)) {
+        if (expected_sid != NULL) {
+            (void)LocalFree(expected_sid);
+        }
+        return 31;
+    }
+    expected_sids[0] = expected_sid;
+    expected_sids[1] = write_restricted_sid;
+    restricted_sids[0].Sid = expected_sid;
+    restricted_sids[0].Attributes = 0;
+    restricted_sids[1].Sid = write_restricted_sid;
+    restricted_sids[1].Attributes = 0;
+#else
     restricted_sid.Sid = expected_sid;
     restricted_sid.Attributes = 0;
+#endif
     if (!OpenProcessToken(
         GetCurrentProcess(),
         TOKEN_DUPLICATE_ACCESS | TOKEN_QUERY_ACCESS | TOKEN_ASSIGN_PRIMARY_ACCESS |
@@ -655,6 +869,19 @@ int wmain(int argc, wchar_t **argv) {
 
     if (wcscmp(variant, L"U") == 0) {
         child_token = source_token;
+#ifdef NEURO_GATE110
+    } else if (!CreateRestrictedToken(
+        source_token,
+        flags,
+        0,
+        NULL,
+        0,
+        NULL,
+        expected_count,
+        restricted_sids,
+        &child_token
+    )) {
+#else
     } else if (!CreateRestrictedToken(
         source_token,
         flags,
@@ -666,16 +893,22 @@ int wmain(int argc, wchar_t **argv) {
         has_sid ? &restricted_sid : NULL,
         &child_token
     )) {
+#endif
         emit_ascii(GATE_MARKER("TOKEN_CREATE=FAIL\n"));
         emit_u32(GATE_MARKER("TOKEN_CREATE_ERROR="), GetLastError());
         (void)CloseHandle(source_token);
         if (expected_sid != NULL) {
             (void)LocalFree(expected_sid);
         }
+#ifdef NEURO_GATE110
+        if (write_restricted_sid != NULL) {
+            free(write_restricted_sid);
+        }
+#endif
         return 33;
     }
     emit_ascii(GATE_MARKER("TOKEN_CREATE=PASS\n"));
-#ifdef NEURO_GATE19
+#if defined(NEURO_GATE19) || defined(NEURO_GATE110)
     if (!get_current_logon_sid_text(source_token, logon_sid_text, sizeof(logon_sid_text) / sizeof(logon_sid_text[0])) ||
         !set_broker_default_dacl(child_token, sid_text, logon_sid_text)) {
         emit_ascii(GATE_MARKER("TOKEN_DACL=FAIL\n"));
@@ -687,6 +920,11 @@ int wmain(int argc, wchar_t **argv) {
         if (expected_sid != NULL) {
             (void)LocalFree(expected_sid);
         }
+#ifdef NEURO_GATE110
+        if (write_restricted_sid != NULL) {
+            free(write_restricted_sid);
+        }
+#endif
         return 34;
     }
     emit_ascii(GATE_MARKER("DACL_PRINCIPALS=LOGON,WORLD,SYNTHETIC_WRITE\n"));
@@ -706,7 +944,11 @@ int wmain(int argc, wchar_t **argv) {
 #endif
     emit_ascii(GATE_MARKER("TOKEN_DACL=PASS\n"));
     emit_bool(GATE_MARKER("TOKEN_RESTRICTED="), IsTokenRestricted(child_token));
+#ifdef NEURO_GATE110
+    if (!inspect_restricted_sids_gate110(child_token, expected_sids, expected_count)) {
+#else
     if (!inspect_restricted_sids(child_token, expected_sid, expected_count)) {
+#endif
         emit_ascii(GATE_MARKER("TOKEN_INSPECTION=FAIL\n"));
         if (child_token != source_token) {
             (void)CloseHandle(child_token);
@@ -715,6 +957,11 @@ int wmain(int argc, wchar_t **argv) {
         if (expected_sid != NULL) {
             (void)LocalFree(expected_sid);
         }
+#ifdef NEURO_GATE110
+        if (write_restricted_sid != NULL) {
+            free(write_restricted_sid);
+        }
+#endif
         return 34;
     }
     emit_ascii(GATE_MARKER("TOKEN_INSPECTION=PASS\n"));
@@ -727,12 +974,24 @@ int wmain(int argc, wchar_t **argv) {
         if (expected_sid != NULL) {
             (void)LocalFree(expected_sid);
         }
+#ifdef NEURO_GATE110
+        if (write_restricted_sid != NULL) {
+            free(write_restricted_sid);
+        }
+#endif
         return 34;
     }
     child_result = launch_child(
         child_token,
         child_path,
-        cwd
+        cwd,
+#ifdef NEURO_GATE110
+        child_argc,
+        child_argv
+#else
+        0,
+        NULL
+#endif
 #ifdef NEURO_GATE18
         ,
         pid_marker_path
@@ -745,6 +1004,11 @@ int wmain(int argc, wchar_t **argv) {
     if (expected_sid != NULL) {
         (void)LocalFree(expected_sid);
     }
+#ifdef NEURO_GATE110
+    if (write_restricted_sid != NULL) {
+        free(write_restricted_sid);
+    }
+#endif
     emit_ascii(GATE_MARKER("BROKER_FINISHED\n"));
     return child_result;
 }
