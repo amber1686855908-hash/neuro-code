@@ -9,6 +9,7 @@
 #include <wchar.h>
 
 #define TOKEN_USER_INFORMATION 1
+#define TOKEN_PRIVILEGES_INFORMATION 3
 #define TOKEN_RESTRICTED_SIDS_INFORMATION 11
 #define TOKEN_DUPLICATE_ACCESS 0x0002
 #define TOKEN_QUERY_ACCESS 0x0008
@@ -25,6 +26,12 @@
 #define PROC_THREAD_ATTRIBUTE_HANDLE_LIST_VALUE 0x00020002
 #define WAIT_OBJECT_0_RESULT 0x00000000
 #define WAIT_TIMEOUT_RESULT 0x00000102
+
+#ifdef NEURO_GATE18
+#define GATE_MARKER(name) "W5_GATE18_" name
+#else
+#define GATE_MARKER(name) "W5_GATE17_" name
+#endif
 
 static void emit_ascii(const char *text) {
     DWORD written = 0;
@@ -69,6 +76,15 @@ static BOOL variant_flags(const wchar_t *variant, DWORD *flags, BOOL *has_sid) {
     } else if (wcscmp(variant, L"DLW") == 0) {
         *flags = DISABLE_MAX_PRIVILEGE_FLAG | LUA_TOKEN_FLAG | WRITE_RESTRICTED_FLAG;
         *has_sid = TRUE;
+    } else if (wcscmp(variant, L"DLR") == 0) {
+        *flags = DISABLE_MAX_PRIVILEGE_FLAG | LUA_TOKEN_FLAG;
+        *has_sid = TRUE;
+    } else if (wcscmp(variant, L"DLW0") == 0) {
+        *flags = DISABLE_MAX_PRIVILEGE_FLAG | LUA_TOKEN_FLAG | WRITE_RESTRICTED_FLAG;
+        *has_sid = FALSE;
+    } else if (wcscmp(variant, L"DLWR") == 0) {
+        *flags = DISABLE_MAX_PRIVILEGE_FLAG | LUA_TOKEN_FLAG | WRITE_RESTRICTED_FLAG;
+        *has_sid = TRUE;
     } else {
         return FALSE;
     }
@@ -103,9 +119,56 @@ static BOOL inspect_restricted_sids(HANDLE token, PSID expected_sid, DWORD expec
     if (expected_count == 1 && groups->GroupCount == 1) {
         matched = expected_sid != NULL && EqualSid(groups->Groups[0].Sid, expected_sid);
     }
-    emit_u32("W5_GATE17_RESTRICTED_SID_COUNT=", groups->GroupCount);
-    emit_bool("W5_GATE17_RESTRICTED_SID_MATCH=", matched);
+    emit_u32(GATE_MARKER("RESTRICTED_SID_COUNT="), groups->GroupCount);
+    emit_bool(GATE_MARKER("RESTRICTED_SID_MATCH="), matched);
     free(groups);
+    return TRUE;
+}
+
+static BOOL inspect_token_privileges(HANDLE token) {
+    DWORD required = 0;
+    TOKEN_PRIVILEGES *privileges = NULL;
+    LUID change_notify;
+    DWORD index;
+    const char *change_notify_state = "ABSENT";
+    if (GetTokenInformation(
+        token,
+        TOKEN_PRIVILEGES_INFORMATION,
+        NULL,
+        0,
+        &required
+    ) || GetLastError() != ERROR_INSUFFICIENT_BUFFER || required < sizeof(DWORD)) {
+        return FALSE;
+    }
+    privileges = (TOKEN_PRIVILEGES *)malloc(required);
+    if (privileges == NULL) {
+        return FALSE;
+    }
+    if (!GetTokenInformation(
+        token,
+        TOKEN_PRIVILEGES_INFORMATION,
+        privileges,
+        required,
+        &required
+    ) || !LookupPrivilegeValueW(NULL, L"SeChangeNotifyPrivilege", &change_notify)) {
+        free(privileges);
+        return FALSE;
+    }
+    for (index = 0; index < privileges->PrivilegeCount; ++index) {
+        if (privileges->Privileges[index].Luid.LowPart == change_notify.LowPart &&
+            privileges->Privileges[index].Luid.HighPart == change_notify.HighPart) {
+            change_notify_state = (privileges->Privileges[index].Attributes & 0x00000002)
+                ? "ENABLED"
+                : "DISABLED";
+            break;
+        }
+    }
+    emit_u32(GATE_MARKER("TOKEN_PRIVILEGE_COUNT="), privileges->PrivilegeCount);
+    emit_ascii(GATE_MARKER("SE_CHANGE_NOTIFY="));
+    emit_ascii(change_notify_state);
+    emit_ascii("\n");
+    emit_ascii(GATE_MARKER("TOKEN_PRIVILEGES=PASS\n"));
+    free(privileges);
     return TRUE;
 }
 
@@ -184,8 +247,8 @@ static int launch_child(
         child_path
     );
     if (written < 0) {
-        emit_ascii("W5_GATE17_CHILD_CREATE=FAIL\n");
-        emit_u32("W5_GATE17_CHILD_CREATE_ERROR=", ERROR_INSUFFICIENT_BUFFER);
+        emit_ascii(GATE_MARKER("CHILD_CREATE=FAIL\n"));
+        emit_u32(GATE_MARKER("CHILD_CREATE_ERROR="), ERROR_INSUFFICIENT_BUFFER);
         return 41;
     }
     ZeroMemory(&startup_ex, sizeof(startup_ex));
@@ -213,14 +276,14 @@ static int launch_child(
         HANDLE_FLAG_INHERIT_VALUE,
         HANDLE_FLAG_INHERIT_VALUE
     )) {
-        emit_ascii("W5_GATE17_CHILD_CREATE=FAIL\n");
-        emit_u32("W5_GATE17_CHILD_CREATE_ERROR=", GetLastError());
+        emit_ascii(GATE_MARKER("CHILD_CREATE=FAIL\n"));
+        emit_u32(GATE_MARKER("CHILD_CREATE_ERROR="), GetLastError());
         return 42;
     }
     (void)InitializeProcThreadAttributeList(NULL, 1, 0, &attribute_bytes);
     if (attribute_bytes == 0) {
-        emit_ascii("W5_GATE17_CHILD_CREATE=FAIL\n");
-        emit_u32("W5_GATE17_CHILD_CREATE_ERROR=", GetLastError());
+        emit_ascii(GATE_MARKER("CHILD_CREATE=FAIL\n"));
+        emit_u32(GATE_MARKER("CHILD_CREATE_ERROR="), GetLastError());
         return 42;
     }
     attributes = (LPPROC_THREAD_ATTRIBUTE_LIST)HeapAlloc(
@@ -242,8 +305,8 @@ static int launch_child(
         NULL,
         NULL
     )) {
-        emit_ascii("W5_GATE17_CHILD_CREATE=FAIL\n");
-        emit_u32("W5_GATE17_CHILD_CREATE_ERROR=", GetLastError());
+        emit_ascii(GATE_MARKER("CHILD_CREATE=FAIL\n"));
+        emit_u32(GATE_MARKER("CHILD_CREATE_ERROR="), GetLastError());
         if (attributes != NULL) {
             HeapFree(GetProcessHeap(), 0, attributes);
         }
@@ -272,15 +335,15 @@ static int launch_child(
         HeapFree(GetProcessHeap(), 0, attributes);
     }
     if (!created) {
-        emit_ascii("W5_GATE17_CHILD_CREATE=FAIL\n");
-        emit_u32("W5_GATE17_CHILD_CREATE_ERROR=", GetLastError());
+        emit_ascii(GATE_MARKER("CHILD_CREATE=FAIL\n"));
+        emit_u32(GATE_MARKER("CHILD_CREATE_ERROR="), GetLastError());
         return 42;
     }
-    emit_ascii("W5_GATE17_CHILD_CREATE=PASS\n");
+    emit_ascii(GATE_MARKER("CHILD_CREATE=PASS\n"));
     (void)CloseHandle(process.hThread);
     wait_result = WaitForSingleObject(process.hProcess, 20000);
     if (wait_result == WAIT_TIMEOUT_RESULT) {
-        emit_ascii("W5_GATE17_CHILD_WAIT=TIMEOUT\n");
+        emit_ascii(GATE_MARKER("CHILD_WAIT=TIMEOUT\n"));
         (void)TerminateProcess(process.hProcess, 0xC000013A);
         (void)WaitForSingleObject(process.hProcess, 2000);
         (void)CloseHandle(process.hProcess);
@@ -288,12 +351,12 @@ static int launch_child(
     }
     if (wait_result != WAIT_OBJECT_0_RESULT ||
         !GetExitCodeProcess(process.hProcess, &exit_code)) {
-        emit_ascii("W5_GATE17_CHILD_WAIT=FAIL\n");
-        emit_u32("W5_GATE17_CHILD_WAIT_ERROR=", GetLastError());
+        emit_ascii(GATE_MARKER("CHILD_WAIT=FAIL\n"));
+        emit_u32(GATE_MARKER("CHILD_WAIT_ERROR="), GetLastError());
         (void)CloseHandle(process.hProcess);
         return 44;
     }
-    emit_u32("W5_GATE17_CHILD_EXIT=", exit_code);
+    emit_u32(GATE_MARKER("CHILD_EXIT="), exit_code);
     (void)CloseHandle(process.hProcess);
     return (int)exit_code;
 }
@@ -313,7 +376,7 @@ int wmain(int argc, wchar_t **argv) {
     int child_result;
 
     if (argc < 5 || !variant_flags(argv[1], &flags, &has_sid)) {
-        emit_ascii("W5_GATE17_BROKER=INVALID_ARGUMENTS\n");
+        emit_ascii(GATE_MARKER("BROKER=INVALID_ARGUMENTS\n"));
         return 30;
     }
     variant = argv[1];
@@ -321,12 +384,12 @@ int wmain(int argc, wchar_t **argv) {
     child_path = argv[3];
     cwd = argv[4];
     expected_count = has_sid ? 1 : 0;
-    emit_ascii("W5_GATE17_BROKER_STARTED\n");
-    emit_u32("W5_GATE17_FLAGS=", flags);
+    emit_ascii(GATE_MARKER("BROKER_STARTED\n"));
+    emit_u32(GATE_MARKER("FLAGS="), flags);
 
     if (has_sid && !ConvertStringSidToSidW(sid_text, &expected_sid)) {
-        emit_ascii("W5_GATE17_TOKEN_CREATE=FAIL\n");
-        emit_u32("W5_GATE17_TOKEN_CREATE_ERROR=", GetLastError());
+        emit_ascii(GATE_MARKER("TOKEN_CREATE=FAIL\n"));
+        emit_u32(GATE_MARKER("TOKEN_CREATE_ERROR="), GetLastError());
         return 31;
     }
     restricted_sid.Sid = expected_sid;
@@ -337,8 +400,8 @@ int wmain(int argc, wchar_t **argv) {
             TOKEN_ADJUST_DEFAULT_ACCESS,
         &source_token
     )) {
-        emit_ascii("W5_GATE17_TOKEN_CREATE=FAIL\n");
-        emit_u32("W5_GATE17_TOKEN_CREATE_ERROR=", GetLastError());
+        emit_ascii(GATE_MARKER("TOKEN_CREATE=FAIL\n"));
+        emit_u32(GATE_MARKER("TOKEN_CREATE_ERROR="), GetLastError());
         if (expected_sid != NULL) {
             (void)LocalFree(expected_sid);
         }
@@ -358,18 +421,18 @@ int wmain(int argc, wchar_t **argv) {
         has_sid ? &restricted_sid : NULL,
         &child_token
     )) {
-        emit_ascii("W5_GATE17_TOKEN_CREATE=FAIL\n");
-        emit_u32("W5_GATE17_TOKEN_CREATE_ERROR=", GetLastError());
+        emit_ascii(GATE_MARKER("TOKEN_CREATE=FAIL\n"));
+        emit_u32(GATE_MARKER("TOKEN_CREATE_ERROR="), GetLastError());
         (void)CloseHandle(source_token);
         if (expected_sid != NULL) {
             (void)LocalFree(expected_sid);
         }
         return 33;
     }
-    emit_ascii("W5_GATE17_TOKEN_CREATE=PASS\n");
+    emit_ascii(GATE_MARKER("TOKEN_CREATE=PASS\n"));
     if (!set_broker_default_dacl(child_token, has_sid ? sid_text : L"")) {
-        emit_ascii("W5_GATE17_TOKEN_DACL=FAIL\n");
-        emit_u32("W5_GATE17_TOKEN_DACL_ERROR=", GetLastError());
+        emit_ascii(GATE_MARKER("TOKEN_DACL=FAIL\n"));
+        emit_u32(GATE_MARKER("TOKEN_DACL_ERROR="), GetLastError());
         if (child_token != source_token) {
             (void)CloseHandle(child_token);
         }
@@ -379,10 +442,10 @@ int wmain(int argc, wchar_t **argv) {
         }
         return 34;
     }
-    emit_ascii("W5_GATE17_TOKEN_DACL=PASS\n");
-    emit_bool("W5_GATE17_TOKEN_RESTRICTED=", IsTokenRestricted(child_token));
+    emit_ascii(GATE_MARKER("TOKEN_DACL=PASS\n"));
+    emit_bool(GATE_MARKER("TOKEN_RESTRICTED="), IsTokenRestricted(child_token));
     if (!inspect_restricted_sids(child_token, expected_sid, expected_count)) {
-        emit_ascii("W5_GATE17_TOKEN_INSPECTION=FAIL\n");
+        emit_ascii(GATE_MARKER("TOKEN_INSPECTION=FAIL\n"));
         if (child_token != source_token) {
             (void)CloseHandle(child_token);
         }
@@ -392,7 +455,18 @@ int wmain(int argc, wchar_t **argv) {
         }
         return 34;
     }
-    emit_ascii("W5_GATE17_TOKEN_INSPECTION=PASS\n");
+    emit_ascii(GATE_MARKER("TOKEN_INSPECTION=PASS\n"));
+    if (!inspect_token_privileges(child_token)) {
+        emit_ascii(GATE_MARKER("TOKEN_PRIVILEGES=FAIL\n"));
+        if (child_token != source_token) {
+            (void)CloseHandle(child_token);
+        }
+        (void)CloseHandle(source_token);
+        if (expected_sid != NULL) {
+            (void)LocalFree(expected_sid);
+        }
+        return 34;
+    }
     child_result = launch_child(child_token, child_path, cwd);
     if (child_token != source_token) {
         (void)CloseHandle(child_token);
@@ -401,6 +475,6 @@ int wmain(int argc, wchar_t **argv) {
     if (expected_sid != NULL) {
         (void)LocalFree(expected_sid);
     }
-    emit_ascii("W5_GATE17_BROKER_FINISHED\n");
+    emit_ascii(GATE_MARKER("BROKER_FINISHED\n"));
     return child_result;
 }
