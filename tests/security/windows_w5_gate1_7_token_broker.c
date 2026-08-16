@@ -502,7 +502,8 @@ static BOOL append_command_line_argument(
             if (*position + count + 1 >= capacity) {
                 return FALSE;
             }
-            while (count-- != 0) {
+            while (count > 0) {
+                --count;
                 command_line[(*position)++] = L'\\';
             }
             command_line[(*position)++] = L'"';
@@ -512,7 +513,8 @@ static BOOL append_command_line_argument(
         if (*position + backslashes + 1 >= capacity) {
             return FALSE;
         }
-        while (backslashes-- != 0) {
+        while (backslashes > 0) {
+            --backslashes;
             command_line[(*position)++] = L'\\';
         }
         command_line[(*position)++] = current;
@@ -520,7 +522,8 @@ static BOOL append_command_line_argument(
     if (*position + backslashes * 2 + 2 > capacity) {
         return FALSE;
     }
-    while (backslashes-- != 0) {
+    while (backslashes > 0) {
+        --backslashes;
         command_line[(*position)++] = L'\\';
         command_line[(*position)++] = L'\\';
     }
