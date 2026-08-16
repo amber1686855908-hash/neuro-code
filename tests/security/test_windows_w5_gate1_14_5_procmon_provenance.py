@@ -185,7 +185,13 @@ def _powershell_diagnostics(path: Path) -> dict[str, object]:  # pragma: no cove
     env["NEURO_CODE_PROCMON"] = str(path)
     env["NEURO_CODE_POWERSHELL"] = executable
     script = r"""
-$s = Get-AuthenticodeSignature -LiteralPath $env:NEURO_CODE_PROCMON
+$s = $null
+$signatureError = $null
+try {
+  $s = Get-AuthenticodeSignature -LiteralPath $env:NEURO_CODE_PROCMON
+} catch {
+  $signatureError = [string]$_.Exception.Message
+}
 $i = Get-Item -LiteralPath $env:NEURO_CODE_PROCMON
 $os = Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue
 function Cert($c) {
@@ -201,12 +207,12 @@ function Cert($c) {
   PSEdition=[string]$PSVersionTable.PSEdition
   OSVersion=[Environment]::OSVersion.VersionString
   OSProductVersion=if ($os) {[string]$os.Version} else {$null}
-  Status=[string]$s.Status
-  StatusMessage=[string]$s.StatusMessage
-  SignatureType=[string]$s.SignatureType
-  IsOSBinary=$s.IsOSBinary
-  SignerCertificate=Cert $s.SignerCertificate
-  TimeStamperCertificate=Cert $s.TimeStamperCertificate
+  Status=if ($s) {[string]$s.Status} else {"UNAVAILABLE"}
+  StatusMessage=if ($s) {[string]$s.StatusMessage} else {$signatureError}
+  SignatureType=if ($s) {[string]$s.SignatureType} else {$null}
+  IsOSBinary=if ($s) {$s.IsOSBinary} else {$null}
+  SignerCertificate=if ($s) {Cert $s.SignerCertificate} else {$null}
+  TimeStamperCertificate=if ($s) {Cert $s.TimeStamperCertificate} else {$null}
   FileVersion=[string]$i.VersionInfo.FileVersion
   ProductName=[string]$i.VersionInfo.ProductName
   CompanyName=[string]$i.VersionInfo.CompanyName
@@ -599,7 +605,10 @@ def _acquire_procmon(directory: Path) -> tuple[Path | None, dict[str, object]]: 
     )
     file_version = str(metadata.get("file_version") or "")
     product_name = str(metadata.get("product_name") or "")
-    version_metadata_coherent = bool(file_version and "process monitor" in product_name.casefold())
+    version_metadata_coherent = bool(
+        file_version
+        and ("process monitor" in product_name.casefold() or "procmon" in product_name.casefold())
+    )
     architecture_coherent = runner_is_x64 and machine_name == "x64"
     provenance_verified = (
         official_endpoint
@@ -625,8 +634,11 @@ def _acquire_procmon(directory: Path) -> tuple[Path | None, dict[str, object]]: 
             if provenance_verified
             else "PROCMON_PROVENANCE_NOT_VERIFIED"
         ),
-        "powershell_diverged": bool(
-            powershell_status not in ("", "valid") and any(independent_results)
+        "powershell_diverged": bool(any(independent_results) and not powershell_valid),
+        "powershell_divergence_classification": (
+            "POWERSHELL_AUTHENTICODE_PATH_DIVERGED"
+            if any(independent_results) and not powershell_valid
+            else None
         ),
     }
     return (
