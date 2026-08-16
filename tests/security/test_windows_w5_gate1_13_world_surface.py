@@ -58,6 +58,7 @@ from neuro_code.infrastructure.sandbox.windows_sandbox_acl import (
     WRITE_ONLY_ACCESS_MASK,
     WindowsManagedAce,
     WindowsManagedAceKind,
+    _AceHeader,
     _NativeWindowsAclApi,
 )
 from neuro_code.infrastructure.sandbox.windows_sandbox_firewall import (
@@ -550,6 +551,44 @@ def _object_fingerprint(path: Path) -> tuple[int, int]:
     return int(observed.st_size), int(observed.st_mtime_ns)
 
 
+def _acl_summary(
+    api: _NativeWindowsAclApi,
+    path: Path,
+    known_sids: dict[str, str],
+) -> list[dict[str, object]]:  # pragma: no cover - Windows CI
+    """Return a bounded, redacted ACE summary for AccessCheck diagnostics."""
+
+    summary: list[dict[str, object]] = []
+    try:
+        raw_entries = api._raw_entries(path)
+    except OSError as error:
+        return [{"summary_error": type(error).__name__}]
+    for raw in raw_entries[:32]:
+        header = _AceHeader.from_buffer_copy(raw)
+        item: dict[str, object] = {
+            "ace_type": int(header.AceType),
+            "ace_flags": int(header.AceFlags),
+            "ace_size": int(header.AceSize),
+        }
+        if len(raw) >= 8:
+            item["mask"] = int.from_bytes(raw[4:8], "little")
+        if len(raw) > 8 and header.AceType in (0, 1):
+            sid_buffer = ctypes.create_string_buffer(raw[8:])
+            sid_pointer = ctypes.addressof(sid_buffer)
+            try:
+                sid_text = api._sid_string(sid_pointer)
+            except Exception as error:  # pragma: no cover - defensive native diagnostic
+                item["sid_valid"] = False
+                item["sid_error"] = type(error).__name__
+            else:
+                item["sid_valid"] = True
+                item["sid_role"] = known_sids.get(sid_text, "OTHER")
+        summary.append(item)
+    if len(raw_entries) > len(summary):
+        summary.append({"truncated_ace_count": len(raw_entries) - len(summary)})
+    return summary
+
+
 def _trace_tool_facts() -> dict[str, object]:  # pragma: no cover - Windows CI
     candidates = [
         shutil.which("procmon.exe"),
@@ -873,6 +912,15 @@ class WindowsW5Gate113WorldSurfaceTests(unittest.IsolatedAsyncioTestCase):
                         }[name],
                     )
                     for name, path in fixtures.items()
+                }
+                known_sids = {
+                    online.user_sid.value: "ONLINE_USER",
+                    write_sid.value: "SYNTHETIC_WRITE",
+                    _WORLD.value: "WORLD",
+                    _BUILTIN_USERS.value: "BUILTIN_USERS",
+                }
+                artifact["fixture_reconciliation"]["dacl_summary"] = {
+                    name: _acl_summary(acl_api, path, known_sids) for name, path in fixtures.items()
                 }
                 persist()
                 self.assertEqual(
