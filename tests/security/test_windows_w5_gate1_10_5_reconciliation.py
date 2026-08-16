@@ -264,7 +264,10 @@ class WindowsW5Gate1105ReconciliationTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNotNone(encoded)
             record = _InstallationRecord.decode(encoded or b"")
             online = record.online
-            expected_user_sid = cast(str, online.user_sid)
+            # The installation record stores a typed WindowsAccountSid.  The
+            # W3 attestation contract compares its canonical SID text, so do
+            # not rely on a typing-only cast here.
+            expected_user_sid = online.user_sid.value
             expected_write_sid = record.write_sid.value
             adapter = WindowsNativeLocalProcessSandbox(
                 SandboxProfile.WORKSPACE,
