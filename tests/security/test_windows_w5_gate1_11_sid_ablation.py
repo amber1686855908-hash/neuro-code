@@ -216,6 +216,7 @@ def _projection(raw: dict[str, object], variant: str, probe: str) -> dict[str, o
         ),
         "token_privileges": markers.get("W5_GATE111_TOKEN_PRIVILEGES"),
         "logon_sid_group_match": markers.get("W5_GATE111_LOGON_SID_GROUP_MATCH"),
+        "token_user_sid": markers.get("W5_GATE111_TOKEN_USER_SID"),
         "logon_sid": markers.get("W5_GATE111_LOGON_SID"),
         "world_sid": markers.get("W5_GATE111_WORLD_SID"),
         "child_create": markers.get("W5_GATE111_CHILD_CREATE"),

@@ -769,6 +769,52 @@ jobs:
             ${{ runner.temp }}/neuro-code-w5-gate1-11-sid-ablation.json
           if-no-files-found: error
 
+  windows-native-w5-gate1-12:
+    runs-on: windows-latest
+    timeout-minutes: 70
+    env:
+      NEURO_CODE_RUN_NATIVE_WINDOWS_SANDBOX_ACCEPTANCE: "1"
+    steps:
+      - uses: actions/checkout@v7.0.0
+      - uses: astral-sh/setup-uv@v8.3.2
+        with:
+          version: "0.11.29"
+          python-version: "3.12"
+          enable-cache: true
+      - run: uv sync --extra dev --locked
+      - name: Collect W5 Gate 1.12 TokenUser restricting-SID evidence
+        env:
+          NEURO_CODE_W5_GATE112_EVIDENCE_JSON: ${{ runner.temp }}/neuro-code-w5-gate1-12-token-user.json
+        run: >-
+          uv run pytest
+          tests/security/test_windows_w5_gate1_12_token_user_ablation.py
+          -q -rs -s
+          -W error::pytest.PytestUnraisableExceptionWarning
+          -W error::pytest.PytestUnhandledThreadExceptionWarning
+          -W error::ResourceWarning
+          --junitxml=${{ runner.temp }}/neuro-code-w5-gate1-12-token-user.xml
+      - name: Require W5 Gate 1.12 execution
+        shell: pwsh
+        env:
+          W5_GATE112_JUNIT: ${{ runner.temp }}/neuro-code-w5-gate1-12-token-user.xml
+        run: |
+          [xml]$report = Get-Content $env:W5_GATE112_JUNIT
+          $cases = @($report.testsuites.testsuite.testcase)
+          $skipped = @($cases | Where-Object { $_.skipped }).Count
+          Write-Host "executed=$($cases.Count) skipped=$skipped"
+          if ($cases.Count -ne 1 -or $skipped -ne 0) {
+            throw "Windows W5 Gate 1.12 must execute exactly one non-skipped test"
+          }
+      - name: Upload W5 Gate 1.12 evidence
+        if: always()
+        uses: actions/upload-artifact@v4.6.2
+        with:
+          name: windows-w5-gate1-12-token-user
+          path: |
+            ${{ runner.temp }}/neuro-code-w5-gate1-12-token-user.xml
+            ${{ runner.temp }}/neuro-code-w5-gate1-12-token-user.json
+          if-no-files-found: error
+
   quality:
     runs-on: ubuntu-latest
     steps:

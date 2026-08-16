@@ -237,6 +237,42 @@ static BOOL token_user_matches(HANDLE first, HANDLE second) {
     return result;
 }
 
+static BOOL resolve_token_user_sid(HANDLE token, PSID *sid_out) {
+    DWORD required = 0;
+    TOKEN_USER *user = NULL;
+    DWORD sid_size;
+    if (GetTokenInformation(
+        token,
+        TOKEN_USER_INFORMATION,
+        NULL,
+        0,
+        &required
+    ) || GetLastError() != ERROR_INSUFFICIENT_BUFFER || required < sizeof(TOKEN_USER)) {
+        return FALSE;
+    }
+    user = (TOKEN_USER *)malloc(required);
+    if (user == NULL || !GetTokenInformation(
+        token,
+        TOKEN_USER_INFORMATION,
+        user,
+        required,
+        &required
+    ) || user->User.Sid == NULL || !IsValidSid(user->User.Sid)) {
+        free(user);
+        return FALSE;
+    }
+    sid_size = GetLengthSid(user->User.Sid);
+    *sid_out = malloc(sid_size);
+    if (*sid_out == NULL || !CopySid(sid_size, *sid_out, user->User.Sid)) {
+        free(*sid_out);
+        *sid_out = NULL;
+        free(user);
+        return FALSE;
+    }
+    free(user);
+    return TRUE;
+}
+
 static BOOL inspect_restricted_sids(
     HANDLE token,
     PSID *expected,
@@ -532,10 +568,12 @@ static int launch_child(
 static BOOL parse_variant(
     const wchar_t *variant,
     DWORD *count,
+    BOOL *with_user,
     BOOL *with_logon,
     BOOL *with_world
 ) {
     *count = 1;
+    *with_user = FALSE;
     *with_logon = FALSE;
     *with_world = FALSE;
     if (wcscmp(variant, L"SYN") == 0) {
@@ -543,6 +581,17 @@ static BOOL parse_variant(
     }
     if (wcscmp(variant, L"SYN_LOGON") == 0) {
         *count = 2;
+        *with_logon = TRUE;
+        return TRUE;
+    }
+    if (wcscmp(variant, L"SYN_USER") == 0) {
+        *count = 2;
+        *with_user = TRUE;
+        return TRUE;
+    }
+    if (wcscmp(variant, L"SYN_USER_LOGON") == 0) {
+        *count = 3;
+        *with_user = TRUE;
         *with_logon = TRUE;
         return TRUE;
     }
@@ -565,13 +614,15 @@ int wmain(int argc, wchar_t **argv) {
     const wchar_t *child_path;
     const wchar_t *cwd;
     DWORD restricted_count;
+    BOOL with_user;
     BOOL with_logon;
     BOOL with_world;
     PSID synthetic = NULL;
+    PSID user = NULL;
     PSID logon = NULL;
     PSID world = NULL;
-    PSID expected[3];
-    SID_AND_ATTRIBUTES restricted[3];
+    PSID expected[4];
+    SID_AND_ATTRIBUTES restricted[4];
     HANDLE source_token = NULL;
     HANDLE child_token = NULL;
     DWORD flags = DISABLE_MAX_PRIVILEGE_FLAG | LUA_TOKEN_FLAG | WRITE_RESTRICTED_FLAG;
@@ -580,7 +631,13 @@ int wmain(int argc, wchar_t **argv) {
     LPWSTR converted_synthetic = NULL;
     int child_result;
     int index;
-    if (argc < 5 || !parse_variant(argv[1], &restricted_count, &with_logon, &with_world)) {
+    if (argc < 5 || !parse_variant(
+        argv[1],
+        &restricted_count,
+        &with_user,
+        &with_logon,
+        &with_world
+    )) {
         emit_ascii("W5_GATE111_BROKER_INVALID_ARGUMENTS\n");
         return 30;
     }
@@ -610,7 +667,8 @@ int wmain(int argc, wchar_t **argv) {
         LocalFree(synthetic);
         return 32;
     }
-    if (!resolve_logon_sid_from_groups(source_token, &logon) || !create_world_sid(&world) ||
+    if (!resolve_token_user_sid(source_token, &user) ||
+        !resolve_logon_sid_from_groups(source_token, &logon) || !create_world_sid(&world) ||
         !ConvertSidToStringSidW(logon, &converted_synthetic) || converted_synthetic == NULL ||
         wcsncpy_s(logon_text, MAX_SID_TEXT, converted_synthetic, _TRUNCATE) != 0) {
         emit_ascii("W5_GATE111_LOGON_SID_GROUP_MATCH=FAIL\n");
@@ -619,18 +677,26 @@ int wmain(int argc, wchar_t **argv) {
         }
         CloseHandle(source_token);
         LocalFree(synthetic);
+        free(user);
         free(logon);
         free(world);
         return 33;
     }
     LocalFree(converted_synthetic);
     emit_ascii("W5_GATE111_LOGON_SID_GROUP_MATCH=PASS\n");
+    emit_sid("W5_GATE111_TOKEN_USER_SID=", user);
     emit_sid("W5_GATE111_LOGON_SID=", logon);
     emit_sid("W5_GATE111_WORLD_SID=", world);
     expected[0] = synthetic;
     restricted[0].Sid = synthetic;
     restricted[0].Attributes = 0;
     index = 1;
+    if (with_user) {
+        expected[index] = user;
+        restricted[index].Sid = user;
+        restricted[index].Attributes = 0;
+        ++index;
+    }
     if (with_logon) {
         expected[index] = logon;
         restricted[index].Sid = logon;
@@ -657,6 +723,7 @@ int wmain(int argc, wchar_t **argv) {
         emit_ascii("W5_GATE111_TOKEN_CREATE=FAIL\n");
         CloseHandle(source_token);
         LocalFree(synthetic);
+        free(user);
         free(logon);
         free(world);
         return 34;
@@ -667,6 +734,7 @@ int wmain(int argc, wchar_t **argv) {
         CloseHandle(child_token);
         CloseHandle(source_token);
         LocalFree(synthetic);
+        free(user);
         free(logon);
         free(world);
         return 35;
@@ -681,6 +749,7 @@ int wmain(int argc, wchar_t **argv) {
         CloseHandle(child_token);
         CloseHandle(source_token);
         LocalFree(synthetic);
+        free(user);
         free(logon);
         free(world);
         return 36;
@@ -691,6 +760,7 @@ int wmain(int argc, wchar_t **argv) {
         CloseHandle(child_token);
         CloseHandle(source_token);
         LocalFree(synthetic);
+        free(user);
         free(logon);
         free(world);
         return 37;
@@ -700,6 +770,7 @@ int wmain(int argc, wchar_t **argv) {
     CloseHandle(child_token);
     CloseHandle(source_token);
     LocalFree(synthetic);
+    free(user);
     free(logon);
     free(world);
     emit_ascii("W5_GATE111_BROKER_FINISHED\n");
