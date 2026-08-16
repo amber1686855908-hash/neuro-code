@@ -728,7 +728,9 @@ static int launch_child(
         DWORD waited_ms = 0;
         DWORD observed_exit = STILL_ACTIVE;
         wait_result = WAIT_TIMEOUT_RESULT;
+        emit_u32(GATE_MARKER("CHILD_WAIT_BUDGET="), CHILD_WAIT_TIMEOUT_MS);
         while (waited_ms < CHILD_WAIT_TIMEOUT_MS) {
+            emit_u32(GATE_MARKER("CHILD_WAIT_TICK="), waited_ms);
             if (!GetExitCodeProcess(process.hProcess, &observed_exit)) {
                 wait_result = WAIT_FAILED;
                 break;
