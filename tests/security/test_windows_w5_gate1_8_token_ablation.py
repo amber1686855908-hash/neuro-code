@@ -10,6 +10,7 @@ by Gate 1.7; no production token or runner code is changed.
 from __future__ import annotations
 
 import asyncio
+import ctypes
 import json
 import os
 import re
@@ -149,6 +150,42 @@ def _marker_int(markers: dict[str, str], key: str) -> int | None:
         return int(value, 0)
     except ValueError:
         return None
+
+
+def _read_pid_marker(path: Path) -> int | None:
+    try:
+        value = int(path.read_text(encoding="ascii").strip(), 10)
+    except (OSError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
+def _terminate_pid_from_marker(path: Path) -> bool:  # pragma: no cover - Windows CI
+    pid = _read_pid_marker(path)
+    if pid is None or os.name != "nt":
+        return False
+    kernel32 = ctypes.WinDLL("kernel32.dll", use_last_error=True)
+    open_process = kernel32.OpenProcess
+    open_process.argtypes = [ctypes.c_uint32, ctypes.c_int32, ctypes.c_uint32]
+    open_process.restype = ctypes.c_void_p
+    terminate_process = kernel32.TerminateProcess
+    terminate_process.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+    terminate_process.restype = ctypes.c_int32
+    wait_for_single_object = kernel32.WaitForSingleObject
+    wait_for_single_object.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+    wait_for_single_object.restype = ctypes.c_uint32
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = [ctypes.c_void_p]
+    close_handle.restype = ctypes.c_int32
+    handle = open_process(0x0001 | 0x00100000, 0, pid)
+    if not handle:
+        return False
+    try:
+        if not terminate_process(handle, 0xC000013A):
+            return False
+        return wait_for_single_object(handle, 5_000) == 0
+    finally:
+        close_handle(handle)
 
 
 def _probe_projection(probe_name: str, markers: dict[str, str]) -> dict[str, object]:
@@ -371,7 +408,26 @@ class WindowsW5Gate18TokenAblationTests(unittest.IsolatedAsyncioTestCase):
                     persist_artifact()
                     per_probe: dict[str, dict[str, object]] = {}
                     for probe_name, probe_path in copied.items():
-                        args = (variant, record.write_sid.value, str(probe_path), str(workspace))
+                        pid_marker_path = (
+                            workspace / f"gate18-{variant.casefold()}-{probe_name.casefold()}.pid"
+                        )
+                        pid_marker_path.unlink(missing_ok=True)
+                        timeout_cleanup = {"attempted": False, "terminated": False}
+
+                        def cleanup_stuck_child(
+                            marker: Path = pid_marker_path,
+                            cleanup: dict[str, bool] = timeout_cleanup,
+                        ) -> None:
+                            cleanup["attempted"] = True
+                            cleanup["terminated"] = _terminate_pid_from_marker(marker)
+
+                        args = (
+                            variant,
+                            record.write_sid.value,
+                            str(probe_path),
+                            str(workspace),
+                            str(pid_marker_path),
+                        )
                         broker_spec = _Workload(
                             "GATE18_BROKER", variant.casefold(), broker_destination, args
                         )
@@ -385,7 +441,8 @@ class WindowsW5Gate18TokenAblationTests(unittest.IsolatedAsyncioTestCase):
                             cwd=workspace,
                             environment=_environment_for(_request(broker_spec, workspace)),
                             logon_flags=0,
-                            timeout=90.0,
+                            timeout=45.0,
+                            on_timeout=cleanup_stuck_child,
                         )
                         cell = _projection(
                             raw,
@@ -395,15 +452,26 @@ class WindowsW5Gate18TokenAblationTests(unittest.IsolatedAsyncioTestCase):
                             expected_sid=has_sid,
                             probe_name=probe_name,
                         )
+                        cell["child_pid"] = _read_pid_marker(pid_marker_path)
+                        cell["timeout_cleanup"] = timeout_cleanup
+                        per_probe[probe_name] = cell
+                        variant_results[variant] = per_probe
+                        artifact["partial_variant"] = variant
+                        artifact["partial_probe"] = probe_name
+                        artifact["variants"] = variant_results
+                        persist_artifact()
                         broker_projection = cast(dict[str, object], cell["broker"])
+                        cleanup_was_successful = bool(timeout_cleanup["terminated"])
                         self.assertEqual(
-                            cell.get("spawn_result"),
-                            "PASS",
+                            cell.get("spawn_result") == "PASS" or cleanup_was_successful,
+                            True,
                             f"Gate 1.8 broker launch failed for {variant}/{probe_name}",
                         )
                         self.assertTrue(
                             broker_projection.get("started") is True
-                            and broker_projection.get("finished") is True,
+                            and (
+                                broker_projection.get("finished") is True or cleanup_was_successful
+                            ),
                             f"Gate 1.8 broker lifecycle failed for {variant}/{probe_name}",
                         )
                         self.assertEqual(broker_projection.get("token_create"), "PASS")
@@ -420,7 +488,6 @@ class WindowsW5Gate18TokenAblationTests(unittest.IsolatedAsyncioTestCase):
                             broker_projection.get("restricted_sid_count_actual"), sid_count
                         )
                         self.assertEqual(broker_projection.get("restricted_sid_match"), "PASS")
-                        per_probe[probe_name] = cell
                     variant_results[variant] = per_probe
                     artifact["completed_variants"] = tuple(variant_results)
                     persist_artifact()

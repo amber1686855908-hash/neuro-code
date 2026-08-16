@@ -228,10 +228,40 @@ static BOOL set_broker_default_dacl(HANDLE token, const wchar_t *sid_text) {
     return result;
 }
 
+#ifdef NEURO_GATE18
+static BOOL write_child_pid_marker(const wchar_t *path, DWORD pid) {
+    HANDLE marker = CreateFileW(
+        path,
+        GENERIC_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        NULL,
+        CREATE_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL,
+        NULL
+    );
+    char text[32];
+    DWORD written = 0;
+    int length;
+    BOOL result;
+    if (marker == INVALID_HANDLE_VALUE) {
+        return FALSE;
+    }
+    length = snprintf(text, sizeof(text), "%lu\n", (unsigned long)pid);
+    result = length > 0 && WriteFile(marker, text, (DWORD)length, &written, NULL) &&
+        written == (DWORD)length;
+    (void)CloseHandle(marker);
+    return result;
+}
+#endif
+
 static int launch_child(
     HANDLE token,
     const wchar_t *child_path,
     const wchar_t *cwd
+#ifdef NEURO_GATE18
+    ,
+    const wchar_t *pid_marker_path
+#endif
 ) {
     STARTUPINFOW startup;
     STARTUPINFOEXW startup_ex;
@@ -379,6 +409,11 @@ static int launch_child(
         }
         return 42;
     }
+    if (!write_child_pid_marker(pid_marker_path, GetProcessId(process.hProcess))) {
+        emit_ascii(GATE_MARKER("CHILD_PID_MARKER=FAIL\n"));
+    } else {
+        emit_ascii(GATE_MARKER("CHILD_PID_MARKER=PASS\n"));
+    }
 #endif
     emit_ascii(GATE_MARKER("CHILD_CREATE=PASS\n"));
     (void)CloseHandle(process.hThread);
@@ -427,6 +462,9 @@ int wmain(int argc, wchar_t **argv) {
     const wchar_t *sid_text;
     const wchar_t *child_path;
     const wchar_t *cwd;
+#ifdef NEURO_GATE18
+    const wchar_t *pid_marker_path;
+#endif
     DWORD flags = 0;
     BOOL has_sid = FALSE;
     PSID expected_sid = NULL;
@@ -436,7 +474,14 @@ int wmain(int argc, wchar_t **argv) {
     DWORD expected_count;
     int child_result;
 
-    if (argc < 5 || !variant_flags(argv[1], &flags, &has_sid)) {
+    if (
+#ifdef NEURO_GATE18
+        argc < 6 ||
+#else
+        argc < 5 ||
+#endif
+        !variant_flags(argv[1], &flags, &has_sid)
+    ) {
         emit_ascii(GATE_MARKER("BROKER=INVALID_ARGUMENTS\n"));
         return 30;
     }
@@ -444,6 +489,9 @@ int wmain(int argc, wchar_t **argv) {
     sid_text = argv[2];
     child_path = argv[3];
     cwd = argv[4];
+#ifdef NEURO_GATE18
+    pid_marker_path = argv[5];
+#endif
     expected_count = has_sid ? 1 : 0;
     emit_ascii(GATE_MARKER("BROKER_STARTED\n"));
     emit_u32(GATE_MARKER("FLAGS="), flags);
@@ -528,7 +576,15 @@ int wmain(int argc, wchar_t **argv) {
         }
         return 34;
     }
-    child_result = launch_child(child_token, child_path, cwd);
+    child_result = launch_child(
+        child_token,
+        child_path,
+        cwd
+#ifdef NEURO_GATE18
+        ,
+        pid_marker_path
+#endif
+    );
     if (child_token != source_token) {
         (void)CloseHandle(child_token);
     }

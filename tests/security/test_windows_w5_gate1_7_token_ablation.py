@@ -10,6 +10,7 @@ code is changed.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import queue
@@ -18,6 +19,7 @@ import shutil
 import subprocess
 import threading
 import unittest
+from collections.abc import Callable
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import cast
@@ -94,6 +96,7 @@ def _run_harness_bounded(
     environment: dict[str, str],
     logon_flags: int,
     timeout: float = 30.0,
+    on_timeout: Callable[[], None] | None = None,
 ) -> dict[str, object]:  # pragma: no cover - Windows CI
     """Bound one native controller call without letting a ctypes call hang pytest."""
 
@@ -129,6 +132,13 @@ def _run_harness_bounded(
     try:
         return results.get(timeout=timeout)
     except queue.Empty:
+        if on_timeout is not None:
+            with contextlib.suppress(Exception):
+                on_timeout()
+            try:
+                return results.get(timeout=10.0)
+            except queue.Empty:
+                pass
         return {
             "execution_path": "DIRECT/CreateProcessWithLogonW",
             "spawn_result": "HARNESS_TIMEOUT",
