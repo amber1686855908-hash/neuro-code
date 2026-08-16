@@ -385,6 +385,7 @@ class WindowsW5Gate18TokenAblationTests(unittest.IsolatedAsyncioTestCase):
                             cwd=workspace,
                             environment=_environment_for(_request(broker_spec, workspace)),
                             logon_flags=0,
+                            timeout=90.0,
                         )
                         cell = _projection(
                             raw,
