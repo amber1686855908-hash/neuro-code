@@ -160,8 +160,18 @@ def _probe_projection(name: str, markers: dict[str, str]) -> dict[str, object]:
                 if key.startswith(("W5_GATE16_BCRYPT_", "W5_GATE16_NCRYPT_", "W5_GATE16_BEFORE_"))
             }
         )
-    load_key = f"W5_GATE16_{name}_BCRYPT_LOAD"
-    status_key = f"W5_GATE16_{name}_BCRYPT_STATUS"
+    # P3 is the shared Gate 1.6 dynamic probe and deliberately emits the
+    # unqualified BCRYPT markers; P4 is the dedicated probe and includes its
+    # probe name.  Keep the evidence parser aligned with the native output so
+    # the recovery classification is based on the actual oracle.
+    if name == "P3":
+        load_key = "W5_GATE16_BCRYPT_LOAD"
+        load_error_key = "W5_GATE16_BCRYPT_LOAD_ERROR"
+        status_key = "W5_GATE16_BCRYPT_STATUS"
+    else:
+        load_key = f"W5_GATE16_{name}_BCRYPT_LOAD"
+        load_error_key = f"W5_GATE16_{name}_BCRYPT_LOAD_ERROR"
+        status_key = f"W5_GATE16_{name}_BCRYPT_STATUS"
     return {
         "started": f"W5_GATE16_{name}_STARTED" in markers,
         "finished": f"W5_GATE16_{name}_FINISHED" in markers,
@@ -173,7 +183,7 @@ def _probe_projection(name: str, markers: dict[str, str]) -> dict[str, object]:
         "allowed_exit_codes": (0,) if name == "P0" else (0, 23) if name == "P3" else (0, 24),
         "bcrypt": {
             "load": child.get(load_key),
-            "load_error": _int_marker(child, f"W5_GATE16_{name}_BCRYPT_LOAD_ERROR"),
+            "load_error": _int_marker(child, load_error_key),
             "gen_random_status": child.get(status_key),
             "recovered": child.get(load_key) == "PASS" and _int_marker(child, status_key) == 0,
         }
