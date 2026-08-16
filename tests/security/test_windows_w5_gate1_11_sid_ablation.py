@@ -144,7 +144,7 @@ def _probe_projection(name: str, markers: dict[str, str]) -> dict[str, object]:
             "started": "W5_GATE111_PRAW_ENTRY" in markers,
             "finished": "W5_GATE111_PRAW_ENTRY" in markers,
             "first_marker": "W5_GATE111_PRAW_ENTRY" if "W5_GATE111_PRAW_ENTRY" in markers else None,
-            "exit_expected": 0,
+            "allowed_exit_codes": (0,),
             "bcrypt": None,
             "markers": {
                 key: value for key, value in markers.items() if key.startswith("W5_GATE111_")
@@ -166,7 +166,11 @@ def _probe_projection(name: str, markers: dict[str, str]) -> dict[str, object]:
         "started": f"W5_GATE16_{name}_STARTED" in markers,
         "finished": f"W5_GATE16_{name}_FINISHED" in markers,
         "first_marker": next((key for key in markers if key.startswith(prefix)), None),
-        "exit_expected": 0 if name == "P0" else 23 if name == "P3" else 24,
+        # P3/P4 deliberately report a non-zero code when one of their
+        # post-load crypto calls fails.  A candidate that repairs BCrypt may
+        # therefore legitimately change that code to zero; the ablation must
+        # observe, rather than hard-code, the historical failure code.
+        "allowed_exit_codes": (0,) if name == "P0" else (0, 23) if name == "P3" else (0, 24),
         "bcrypt": {
             "load": child.get(load_key),
             "load_error": _int_marker(child, f"W5_GATE16_{name}_BCRYPT_LOAD_ERROR"),
@@ -183,6 +187,40 @@ def _projection(raw: dict[str, object], variant: str, probe: str) -> dict[str, o
     captured = raw.get("_captured_stdout")
     output = captured if isinstance(captured, bytes) else b""
     markers = _parse_markers(output)
+    broker_projection = {
+        "started": "W5_GATE111_BROKER_STARTED" in markers,
+        "finished": "W5_GATE111_BROKER_FINISHED" in markers,
+        "flags": _int_marker(markers, "W5_GATE111_FLAGS"),
+        "token_create": markers.get("W5_GATE111_TOKEN_CREATE"),
+        "token_dacl": markers.get("W5_GATE111_TOKEN_DACL"),
+        "dacl_principals": markers.get("W5_GATE111_DACL_PRINCIPALS"),
+        "dacl_semantic_match": markers.get("W5_GATE111_DACL_SEMANTIC_MATCH"),
+        "is_token_restricted": markers.get("W5_GATE111_TOKEN_RESTRICTED"),
+        "token_user_match": markers.get("W5_GATE111_TOKEN_USER_MATCH"),
+        "token_inspection": markers.get("W5_GATE111_TOKEN_INSPECTION"),
+        "restricted_sid_count": _int_marker(markers, "W5_GATE111_RESTRICTED_SID_COUNT"),
+        "restricted_sid_match": markers.get("W5_GATE111_RESTRICTED_SID_MATCH"),
+        "se_change_notify": markers.get("W5_GATE111_SE_CHANGE_NOTIFY"),
+        "unexpected_enabled_privileges": _int_marker(
+            markers, "W5_GATE111_UNEXPECTED_ENABLED_PRIVILEGES"
+        ),
+        "token_privileges": markers.get("W5_GATE111_TOKEN_PRIVILEGES"),
+        "logon_sid_group_match": markers.get("W5_GATE111_LOGON_SID_GROUP_MATCH"),
+        "logon_sid": markers.get("W5_GATE111_LOGON_SID"),
+        "world_sid": markers.get("W5_GATE111_WORLD_SID"),
+        "child_create": markers.get("W5_GATE111_CHILD_CREATE"),
+        "child_pid": _int_marker(markers, "W5_GATE111_CHILD_PID"),
+        "child_exit": _int_marker(markers, "W5_GATE111_CHILD_EXIT"),
+    }
+    probe_result = _probe_projection(probe, markers)
+    child_exit = broker_projection["child_exit"]
+    allowed_exit_codes = cast(tuple[int, ...], probe_result["allowed_exit_codes"])
+    normal_exit = child_exit in allowed_exit_codes
+    probe_result["exit"] = child_exit
+    probe_result["normal_exit"] = normal_exit
+    bcrypt = probe_result.get("bcrypt")
+    if isinstance(bcrypt, dict):
+        bcrypt["recovered"] = bool(bcrypt["recovered"] and normal_exit)
     return {
         "variant": variant,
         "probe": probe,
@@ -190,32 +228,8 @@ def _projection(raw: dict[str, object], variant: str, probe: str) -> dict[str, o
         "classification": raw.get("classification"),
         "exit_code": raw.get("exit_code"),
         "timeout": raw.get("timeout"),
-        "broker": {
-            "started": "W5_GATE111_BROKER_STARTED" in markers,
-            "finished": "W5_GATE111_BROKER_FINISHED" in markers,
-            "flags": _int_marker(markers, "W5_GATE111_FLAGS"),
-            "token_create": markers.get("W5_GATE111_TOKEN_CREATE"),
-            "token_dacl": markers.get("W5_GATE111_TOKEN_DACL"),
-            "dacl_principals": markers.get("W5_GATE111_DACL_PRINCIPALS"),
-            "dacl_semantic_match": markers.get("W5_GATE111_DACL_SEMANTIC_MATCH"),
-            "is_token_restricted": markers.get("W5_GATE111_TOKEN_RESTRICTED"),
-            "token_user_match": markers.get("W5_GATE111_TOKEN_USER_MATCH"),
-            "token_inspection": markers.get("W5_GATE111_TOKEN_INSPECTION"),
-            "restricted_sid_count": _int_marker(markers, "W5_GATE111_RESTRICTED_SID_COUNT"),
-            "restricted_sid_match": markers.get("W5_GATE111_RESTRICTED_SID_MATCH"),
-            "se_change_notify": markers.get("W5_GATE111_SE_CHANGE_NOTIFY"),
-            "unexpected_enabled_privileges": _int_marker(
-                markers, "W5_GATE111_UNEXPECTED_ENABLED_PRIVILEGES"
-            ),
-            "token_privileges": markers.get("W5_GATE111_TOKEN_PRIVILEGES"),
-            "logon_sid_group_match": markers.get("W5_GATE111_LOGON_SID_GROUP_MATCH"),
-            "logon_sid": markers.get("W5_GATE111_LOGON_SID"),
-            "world_sid": markers.get("W5_GATE111_WORLD_SID"),
-            "child_create": markers.get("W5_GATE111_CHILD_CREATE"),
-            "child_pid": _int_marker(markers, "W5_GATE111_CHILD_PID"),
-            "child_exit": _int_marker(markers, "W5_GATE111_CHILD_EXIT"),
-        },
-        "probe_result": _probe_projection(probe, markers),
+        "broker": broker_projection,
+        "probe_result": probe_result,
         "stdout_preview": _preview(output),
         "stderr_preview": raw.get("stderr_preview", ""),
         "harness_call_timeout": raw.get("harness_call_timeout"),
@@ -586,8 +600,10 @@ class WindowsW5Gate111RestrictingSidTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(probe_projection["finished"], True)
                     self.assertEqual(broker_projection["child_create"], "PASS")
                     self.assertEqual(
-                        broker_projection["child_exit"], probe_projection["exit_expected"]
+                        broker_projection["child_exit"],
+                        probe_projection["exit"],
                     )
+                    self.assertTrue(probe_projection["normal_exit"])
                 artifact["variants"] = variant_results
                 persist()
 
