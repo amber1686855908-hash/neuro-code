@@ -820,6 +820,61 @@ class WindowsW5Gate113WorldSurfaceTests(unittest.IsolatedAsyncioTestCase):
                     "SYN": world_result[_SYN],
                     "SYN_WORLD": world_result[_SYN_WORLD],
                 }
+                # Persist the oracle cells before assertions so a native
+                # AccessCheck mismatch remains auditable instead of being
+                # reduced to a bare pytest failure.  The ordinary-token
+                # comparison also distinguishes a fixture ACL/SID issue
+                # from a restricted-token second-pass issue.
+                artifact["fixture_reconciliation"]["ordinary_access_check"] = {
+                    name: oracle.check_unrestricted(path) for name, path in fixtures.items()
+                }
+                artifact["fixture_reconciliation"]["acl_ready"] = {
+                    name: acl_api.matches(
+                        path,
+                        {
+                            "OUTSIDE_SYNTHETIC_WITH_NORMAL_PASS": (
+                                WindowsManagedAce(
+                                    path,
+                                    online.user_sid,
+                                    WindowsManagedAceKind.WRITE_ALLOW,
+                                    WRITE_ACCESS_MASK,
+                                ),
+                                WindowsManagedAce(
+                                    path,
+                                    write_sid,
+                                    WindowsManagedAceKind.RESTRICTING_WRITE_ALLOW,
+                                    WRITE_ONLY_ACCESS_MASK,
+                                ),
+                            ),
+                            "OUTSIDE_SYNTHETIC_WITHOUT_NORMAL_PASS": (
+                                WindowsManagedAce(
+                                    path,
+                                    write_sid,
+                                    WindowsManagedAceKind.RESTRICTING_WRITE_ALLOW,
+                                    WRITE_ONLY_ACCESS_MASK,
+                                ),
+                            ),
+                            "OUTSIDE_WORLD_ONLY": (
+                                WindowsManagedAce(
+                                    path,
+                                    _WORLD,
+                                    WindowsManagedAceKind.WRITE_ALLOW,
+                                    WRITE_ACCESS_MASK,
+                                ),
+                            ),
+                            "OUTSIDE_NO_SECOND_PASS": (
+                                WindowsManagedAce(
+                                    path,
+                                    _BUILTIN_USERS,
+                                    WindowsManagedAceKind.WRITE_ALLOW,
+                                    WRITE_ACCESS_MASK,
+                                ),
+                            ),
+                        }[name],
+                    )
+                    for name, path in fixtures.items()
+                }
+                persist()
                 self.assertEqual(
                     fixture_results["OUTSIDE_SYNTHETIC_WITH_NORMAL_PASS"][_SYN]["write_allowed"],
                     True,
