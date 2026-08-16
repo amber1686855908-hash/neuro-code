@@ -140,7 +140,7 @@ static int launch_child(
     ZeroMemory(&startup_ex, sizeof(startup_ex));
     ZeroMemory(&process, sizeof(process));
     startup = startup_ex.StartupInfo;
-    startup.cb = sizeof(startup);
+    startup.cb = sizeof(startup_ex);
     startup.dwFlags = STARTF_USESTDHANDLES_FLAG;
     startup.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
     startup.hStdOutput = GetStdHandle(STD_OUTPUT_HANDLE);
