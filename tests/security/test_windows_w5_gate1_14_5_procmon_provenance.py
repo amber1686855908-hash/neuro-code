@@ -880,6 +880,12 @@ class WindowsW5Gate1145ProcmonTests(unittest.IsolatedAsyncioTestCase):
                         write_sid.value,
                         trace_directory,
                     )
+                    trace_syn["truncated"] = (
+                        int(trace_syn.get("event_count_after_pid_filter", 0)) >= _MAX_EVENTS
+                    )
+                    trace_world["truncated"] = (
+                        int(trace_world.get("event_count_after_pid_filter", 0)) >= _MAX_EVENTS
+                    )
                     syn_events = cast(list[dict[str, object]], trace_syn.get("filtered_events", []))
                     world_events = cast(
                         list[dict[str, object]], trace_world.get("filtered_events", [])
