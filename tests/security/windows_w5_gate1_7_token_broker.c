@@ -109,6 +109,57 @@ static BOOL inspect_restricted_sids(HANDLE token, PSID expected_sid, DWORD expec
     return TRUE;
 }
 
+static BOOL set_broker_default_dacl(HANDLE token, const wchar_t *sid_text) {
+    PSECURITY_DESCRIPTOR descriptor = NULL;
+    PACL dacl = NULL;
+    BOOL dacl_present = FALSE;
+    BOOL dacl_defaulted = FALSE;
+    TOKEN_DEFAULT_DACL token_dacl;
+    wchar_t sddl[256];
+    BOOL converted;
+    BOOL result;
+    int written = _snwprintf_s(
+        sddl,
+        sizeof(sddl) / sizeof(sddl[0]),
+        _TRUNCATE,
+        sid_text[0] == L'\0'
+            ? L"D:(A;;GA;;;WD)"
+            : L"D:(A;;GA;;;WD)(A;;GA;;;%ls)",
+        sid_text
+    );
+    if (written < 0) {
+        return FALSE;
+    }
+    converted = ConvertStringSecurityDescriptorToSecurityDescriptorW(
+        sddl,
+        SDDL_REVISION_1,
+        &descriptor,
+        NULL
+    );
+    if (!converted || descriptor == NULL) {
+        return FALSE;
+    }
+    result = GetSecurityDescriptorDacl(
+        descriptor,
+        &dacl_present,
+        &dacl,
+        &dacl_defaulted
+    );
+    if (!result || !dacl_present || dacl == NULL) {
+        (void)LocalFree(descriptor);
+        return FALSE;
+    }
+    token_dacl.DefaultDacl = dacl;
+    result = SetTokenInformation(
+        token,
+        TokenDefaultDacl,
+        &token_dacl,
+        sizeof(token_dacl)
+    );
+    (void)LocalFree(descriptor);
+    return result;
+}
+
 static int launch_child(
     HANDLE token,
     const wchar_t *child_path,
@@ -316,6 +367,19 @@ int wmain(int argc, wchar_t **argv) {
         return 33;
     }
     emit_ascii("W5_GATE17_TOKEN_CREATE=PASS\n");
+    if (!set_broker_default_dacl(child_token, has_sid ? sid_text : L"")) {
+        emit_ascii("W5_GATE17_TOKEN_DACL=FAIL\n");
+        emit_u32("W5_GATE17_TOKEN_DACL_ERROR=", GetLastError());
+        if (child_token != source_token) {
+            (void)CloseHandle(child_token);
+        }
+        (void)CloseHandle(source_token);
+        if (expected_sid != NULL) {
+            (void)LocalFree(expected_sid);
+        }
+        return 34;
+    }
+    emit_ascii("W5_GATE17_TOKEN_DACL=PASS\n");
     emit_bool("W5_GATE17_TOKEN_RESTRICTED=", IsTokenRestricted(child_token));
     if (!inspect_restricted_sids(child_token, expected_sid, expected_count)) {
         emit_ascii("W5_GATE17_TOKEN_INSPECTION=FAIL\n");
