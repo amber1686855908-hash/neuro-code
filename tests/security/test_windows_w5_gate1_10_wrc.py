@@ -255,6 +255,8 @@ def _token_projection(raw: dict[str, object], markers: dict[str, str]) -> dict[s
         "child_launch_enter": markers.get(f"{_MARKER_PREFIX}CHILD_LAUNCH_ENTER"),
         "child_launch_return": markers.get(f"{_MARKER_PREFIX}CHILD_LAUNCH_RETURN"),
         "child_wait_enter": markers.get(f"{_MARKER_PREFIX}CHILD_WAIT_ENTER"),
+        "child_wait_budget": _marker_int(markers, f"{_MARKER_PREFIX}CHILD_WAIT_BUDGET"),
+        "child_wait_tick": _marker_int(markers, f"{_MARKER_PREFIX}CHILD_WAIT_TICK"),
         "child_wait_result": _marker_int(markers, f"{_MARKER_PREFIX}CHILD_WAIT_RESULT"),
         "child_wait": markers.get(f"{_MARKER_PREFIX}CHILD_WAIT"),
         "child_exit": _marker_int(markers, f"{_MARKER_PREFIX}CHILD_EXIT"),

@@ -551,6 +551,8 @@ static int launch_child(
     SIZE_T attribute_bytes = 0;
     LPPROC_THREAD_ATTRIBUTE_LIST attributes = NULL;
     DWORD wait_result;
+    DWORD cleanup_wait_ms;
+    DWORD cleanup_exit_code;
     DWORD exit_code = 0;
     int argument_index;
     BOOL attribute_list_ready = FALSE;
@@ -696,7 +698,13 @@ static int launch_child(
         emit_ascii(GATE_MARKER("CHILD_CREATE=FAIL\n"));
         emit_u32(GATE_MARKER("CHILD_CREATE_ERROR="), GetLastError());
         (void)TerminateProcess(process.hProcess, 0xC000013A);
-        (void)WaitForSingleObject(process.hProcess, 2000);
+        for (cleanup_wait_ms = 0; cleanup_wait_ms < 2000; cleanup_wait_ms += 100) {
+            if (!GetExitCodeProcess(process.hProcess, &cleanup_exit_code) ||
+                cleanup_exit_code != STILL_ACTIVE) {
+                break;
+            }
+            Sleep(100);
+        }
         (void)CloseHandle(process.hProcess);
         if (cleanup_job != NULL) {
             (void)CloseHandle(cleanup_job);
@@ -766,7 +774,13 @@ static int launch_child(
             (void)TerminateJobObject(cleanup_job, 0xC000013A);
         }
 #endif
-        (void)WaitForSingleObject(process.hProcess, 2000);
+        for (cleanup_wait_ms = 0; cleanup_wait_ms < 2000; cleanup_wait_ms += 100) {
+            if (!GetExitCodeProcess(process.hProcess, &cleanup_exit_code) ||
+                cleanup_exit_code != STILL_ACTIVE) {
+                break;
+            }
+            Sleep(100);
+        }
         (void)CloseHandle(process.hProcess);
 #ifdef NEURO_GATE18
         if (cleanup_job != NULL) {
@@ -785,7 +799,13 @@ static int launch_child(
             emit_ascii(GATE_MARKER("CHILD_CLEANUP_RESULT="));
             emit_ascii(terminated ? "PASS\n" : "FAIL\n");
         }
-        (void)WaitForSingleObject(process.hProcess, 2000);
+        for (cleanup_wait_ms = 0; cleanup_wait_ms < 2000; cleanup_wait_ms += 100) {
+            if (!GetExitCodeProcess(process.hProcess, &cleanup_exit_code) ||
+                cleanup_exit_code != STILL_ACTIVE) {
+                break;
+            }
+            Sleep(100);
+        }
         (void)CloseHandle(process.hProcess);
 #ifdef NEURO_GATE18
         if (cleanup_job != NULL) {
