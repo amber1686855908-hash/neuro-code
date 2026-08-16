@@ -12,9 +12,11 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import queue
 import re
 import shutil
 import subprocess
+import threading
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -79,6 +81,61 @@ _VARIANTS = (
 
 class _Gate17BuildError(RuntimeError):
     """The trusted controller could not build the evidence broker."""
+
+
+def _run_harness_bounded(
+    harness: _Gate1DirectProcess,
+    *,
+    username: str,
+    password: str,
+    executable: Path,
+    arguments: tuple[str, ...],
+    cwd: Path,
+    environment: dict[str, str],
+    logon_flags: int,
+    timeout: float = 30.0,
+) -> dict[str, object]:  # pragma: no cover - Windows CI
+    """Bound one native controller call without letting a ctypes call hang pytest."""
+
+    results: queue.Queue[dict[str, object]] = queue.Queue(maxsize=1)
+
+    def invoke() -> None:
+        try:
+            result = harness.run(
+                username=username,
+                password=password,
+                executable=executable,
+                arguments=arguments,
+                cwd=cwd,
+                environment=environment,
+                logon_flags=logon_flags,
+                retain_output=True,
+            )
+        except Exception as error:  # pragma: no cover - Windows CI
+            result = {
+                "execution_path": "DIRECT/CreateProcessWithLogonW",
+                "spawn_result": "HARNESS_EXCEPTION",
+                "classification": type(error).__name__,
+                "timeout": False,
+                "exit_code": None,
+            }
+        try:
+            results.put_nowait(result)
+        except queue.Full:  # pragma: no cover - defensive
+            return
+
+    worker = threading.Thread(target=invoke, daemon=True)
+    worker.start()
+    try:
+        return results.get(timeout=timeout)
+    except queue.Empty:
+        return {
+            "execution_path": "DIRECT/CreateProcessWithLogonW",
+            "spawn_result": "HARNESS_TIMEOUT",
+            "classification": "HARNESS_CALL_TIMEOUT",
+            "timeout": True,
+            "exit_code": None,
+        }
 
 
 def _run_vcvars_command(
@@ -322,7 +379,19 @@ class WindowsW5Gate17TokenAblationTests(unittest.IsolatedAsyncioTestCase):
                 "production_restricted_sid_count": 1,
                 "sid_value": "installation synthetic write SID (redacted)",
             },
+            "status": "RUNNING",
         }
+        variant_results: dict[str, dict[str, object]] = {}
+        artifact["variants"] = variant_results
+
+        def persist_artifact() -> None:
+            if artifact_path:
+                Path(artifact_path).write_text(
+                    json.dumps(artifact, sort_keys=True, indent=2),
+                    encoding="utf-8",
+                )
+
+        persist_artifact()
         with TemporaryDirectory() as directory:
             root = Path(directory)
             workspace = root / "workspace"
@@ -355,15 +424,18 @@ class WindowsW5Gate17TokenAblationTests(unittest.IsolatedAsyncioTestCase):
             )
             snapshot = await asyncio.to_thread(authority.setup, setup_request)
             self.assertEqual(snapshot.state, WindowsSandboxSetupState.READY)
+            artifact["setup_ready"] = True
+            persist_artifact()
             encoded = store.load()
             self.assertIsNotNone(encoded)
             record = _InstallationRecord.decode(encoded or b"")
             online = record.online
             password = online.password.decode("utf-8")
             harness = _Gate1DirectProcess()
-            variant_results: dict[str, dict[str, object]] = {}
             try:
                 for variant, flags, sid_count in _VARIANTS:
+                    artifact["current_variant"] = variant
+                    persist_artifact()
                     per_probe: dict[str, object] = {}
                     for probe_name, probe_path in copied.items():
                         args = (variant, record.write_sid.value, str(probe_path), str(workspace))
@@ -374,7 +446,8 @@ class WindowsW5Gate17TokenAblationTests(unittest.IsolatedAsyncioTestCase):
                             args,
                         )
                         raw = await asyncio.to_thread(
-                            harness.run,
+                            _run_harness_bounded,
+                            harness,
                             username=online.username,
                             password=password,
                             executable=broker_destination,
@@ -382,7 +455,6 @@ class WindowsW5Gate17TokenAblationTests(unittest.IsolatedAsyncioTestCase):
                             cwd=workspace,
                             environment=_environment_for(_request(broker_spec, workspace)),
                             logon_flags=0,
-                            retain_output=True,
                         )
                         per_probe[probe_name] = _run_projection(
                             raw,
@@ -392,18 +464,16 @@ class WindowsW5Gate17TokenAblationTests(unittest.IsolatedAsyncioTestCase):
                             probe_name=probe_name,
                         )
                     variant_results[variant] = per_probe
+                    artifact["completed_variants"] = tuple(variant_results)
+                    persist_artifact()
                 artifact["variants"] = variant_results
                 artifact["copied_into_authorized_workspace"] = True
                 production_results = cast(dict[str, dict[str, object]], variant_results["DLW"])
                 artifact["full_production_equivalent"] = _full_production_equivalent(
                     production_results
                 )
-                if artifact_path:
-                    await asyncio.to_thread(
-                        Path(artifact_path).write_text,
-                        json.dumps(artifact, sort_keys=True, indent=2),
-                        encoding="utf-8",
-                    )
+                artifact["status"] = "COMPLETED"
+                persist_artifact()
                 self.assertTrue(
                     artifact["full_production_equivalent"],
                     "TOKEN_ABLATION_HARNESS_NOT_EQUIVALENT",
