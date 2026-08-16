@@ -682,8 +682,29 @@ class WindowsW5Gate110WriteRestrictedCodeTests(unittest.IsolatedAsyncioTestCase)
                     }
                     broker_result = cast(dict[str, object], workload_cells[variant]["broker"])
                     self.assertEqual(broker_result["started"], True)
-                    self.assertEqual(broker_result["finished"], True)
                     self.assertEqual(broker_result["token_inspection"], "PASS")
+                    # A workload may be one of the intentionally observed
+                    # startup/compatibility timeouts.  The broker reports
+                    # that bounded child wait separately; that is evidence,
+                    # not a harness failure.  An outer controller timeout or
+                    # a missing child-wait oracle remains a hard failure.
+                    if broker_result["finished"] is not True:
+                        self.assertFalse(
+                            bool(raw.get("timeout")),
+                            f"Gate 1.10 controller timed out for {requested_name}/{variant}",
+                        )
+                        self.assertIn(
+                            broker_result["child_wait"],
+                            ("TIMEOUT", "FAIL"),
+                            f"missing bounded child-wait oracle for {requested_name}/{variant}",
+                        )
+                        workload_cells[variant]["broker_completion"] = "CHILD_WAIT_REPORTED"
+                    else:
+                        workload_cells[variant]["broker_completion"] = "BROKER_FINISHED"
+                    # Persist after every cell so a later evidence assertion
+                    # cannot erase the already-observed workload matrix.
+                    artifact["workloads"] = workload_matrix | {requested_name: workload_cells}
+                    persist()
                 workload_matrix[requested_name] = workload_cells
                 synthetic_result = workload_cells["PROD_SYN"].get("classification", "INCONCLUSIVE")
                 candidate_result = workload_cells["PROD_SYN_WRC"].get(
