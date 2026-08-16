@@ -320,6 +320,7 @@ def _full_production_equivalent(results: dict[str, dict[str, object]]) -> bool:
     p0_broker = cast(dict[str, object], p0["broker"])
     if p0_probe.get("finished") is not True or p0_broker.get("child_exit") != 0:
         return False
+    expected_probe_exit = {"P3": 23, "P4": 24}
     for name in ("P3", "P4"):
         result = results[name]
         probe = cast(dict[str, object], result["probe"])
@@ -327,7 +328,7 @@ def _full_production_equivalent(results: dict[str, dict[str, object]]) -> bool:
         markers = cast(dict[str, str], probe["markers"])
         if (
             probe.get("finished") is not True
-            or broker.get("child_exit") != 23
+            or broker.get("child_exit") != expected_probe_exit[name]
             or markers.get(f"W5_GATE16_{name}_BCRYPT_LOAD") != "FAIL"
             or markers.get(f"W5_GATE16_{name}_BCRYPT_LOAD_ERROR") != "1114"
         ):
