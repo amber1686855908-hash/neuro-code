@@ -30,6 +30,9 @@
 #define CREATE_SUSPENDED_FLAG 0x00000004
 #define JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS 9
 #define JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE_VALUE 0x00002000
+#define CHILD_WAIT_TIMEOUT_MS 10000
+#else
+#define CHILD_WAIT_TIMEOUT_MS 20000
 #endif
 
 #ifdef NEURO_GATE18
@@ -417,7 +420,7 @@ static int launch_child(
 #endif
     emit_ascii(GATE_MARKER("CHILD_CREATE=PASS\n"));
     (void)CloseHandle(process.hThread);
-    wait_result = WaitForSingleObject(process.hProcess, 20000);
+    wait_result = WaitForSingleObject(process.hProcess, CHILD_WAIT_TIMEOUT_MS);
     if (wait_result == WAIT_TIMEOUT_RESULT) {
         emit_ascii(GATE_MARKER("CHILD_WAIT=TIMEOUT\n"));
         (void)TerminateProcess(process.hProcess, 0xC000013A);
