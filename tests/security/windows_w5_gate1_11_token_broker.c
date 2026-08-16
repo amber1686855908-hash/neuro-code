@@ -509,6 +509,7 @@ static int launch_child(
     }
     emit_ascii("W5_GATE111_CHILD_LAUNCH_RETURN=PASS\n");
     emit_u32("W5_GATE111_CHILD_PID=", GetProcessId(process.hProcess));
+    emit_ascii("W5_GATE111_CHILD_CREATE=PASS\n");
     CloseHandle(process.hThread);
     while (waited < CHILD_WAIT_BUDGET_MS) {
         if (!GetExitCodeProcess(process.hProcess, &observed) || observed != STILL_ACTIVE) {
