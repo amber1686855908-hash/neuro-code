@@ -300,7 +300,10 @@ class WindowsW5Gate17TokenAblationTests(unittest.IsolatedAsyncioTestCase):
         for name, source_name in _PROBE_SOURCES.items():
             source = _source_path(source_name)
             probe = await asyncio.to_thread(
-                _compile_msvc_probe, source, f"windows_w5_gate17_{name.lower()}"
+                _compile_msvc_probe,
+                source,
+                f"windows_w5_gate17_{name.lower()}",
+                libraries=("Advapi32.lib",),
             )
             probe_paths[name] = probe
             self.addAsyncCleanup(_cleanup_directory, probe.parent)

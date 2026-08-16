@@ -139,7 +139,12 @@ def _find_vswhere() -> Path:
     raise _NativeProbeBuildError("vswhere.exe is unavailable")
 
 
-def _compile_msvc_probe(source: Path, output_stem: str) -> Path:  # pragma: no cover - Windows CI
+def _compile_msvc_probe(
+    source: Path,
+    output_stem: str,
+    *,
+    libraries: tuple[str, ...] = ("Ws2_32.lib",),
+) -> Path:  # pragma: no cover - Windows CI
     """Build one acceptance-only native probe with the runner's selected MSVC toolchain."""
 
     vswhere = _find_vswhere()
@@ -182,7 +187,7 @@ def _compile_msvc_probe(source: Path, output_stem: str) -> Path:  # pragma: no c
         "@echo off\r\n"
         f'call "{vcvars}"\r\n'
         "if errorlevel 1 exit /b 1\r\n"
-        f'cl /nologo /W4 /WX /MT /O2 /Fe:"{output}" "{source}" Ws2_32.lib\r\n',
+        f'cl /nologo /W4 /WX /MT /O2 /Fe:"{output}" "{source}" {" ".join(libraries)}\r\n',
         encoding="ascii",
     )
     try:
