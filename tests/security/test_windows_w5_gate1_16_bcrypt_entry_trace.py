@@ -747,10 +747,13 @@ class _CdbSession:
         stream = self.process.stdout
         if stream is None:
             return
-        for line in stream:
-            self._all = (self._all + line)[-64 * 1024 :]
+        while True:
+            chunk = stream.read(1)
+            if chunk == "":
+                return
+            self._all = (self._all + chunk)[-64 * 1024 :]
             with contextlib.suppress(queue.Full):
-                self._lines.put_nowait(line)
+                self._lines.put_nowait(chunk)
 
     def send(self, command: str) -> None:
         if self.process.stdin is None:
@@ -1110,6 +1113,9 @@ class WindowsW5Gate116BcryptEntryTraceTests(unittest.IsolatedAsyncioTestCase):
                     }
                 except (OSError, RuntimeError, TimeoutError, subprocess.SubprocessError) as error:
                     debug_metadata["error"] = type(error).__name__
+                    if cdb_session is not None:
+                        debug_metadata["cdb_returncode"] = cdb_session.process.poll()
+                        debug_metadata["cdb_output_preview"] = cdb_session.output[-4096:]
                     run.terminate()
                     result = await asyncio.to_thread(run.wait, 15.0)
                     return {
