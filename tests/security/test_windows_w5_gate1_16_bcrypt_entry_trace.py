@@ -740,6 +740,7 @@ class _CdbSession:
         )
         self._lines: queue.Queue[str] = queue.Queue()
         self._all = ""
+        self._closed = False
         self._reader = threading.Thread(target=self._read, daemon=True, name="W5-Gate116-CDB")
         self._reader.start()
 
@@ -783,6 +784,8 @@ class _CdbSession:
                 return "".join(collected)[-32 * 1024 :]
 
     def detach(self) -> None:
+        if self._closed:
+            return
         if self.process.poll() is None:
             with contextlib.suppress(Exception):
                 self.send("qd")
@@ -793,6 +796,17 @@ class _CdbSession:
                     self.process.terminate()
                 with contextlib.suppress(Exception):
                     self.process.wait(timeout=5)
+        # Popen's text streams own the Windows pipe handles.  Close them only
+        # after CDB has exited and its reader had a chance to observe EOF; the
+        # evidence harness runs with warnings-as-errors, so leaving these
+        # wrappers for garbage collection would turn an otherwise successful
+        # native trace into a failed test.
+        self._reader.join(timeout=2)
+        for stream in (self.process.stdin, self.process.stdout, self.process.stderr):
+            if stream is not None:
+                with contextlib.suppress(Exception):
+                    stream.close()
+        self._closed = True
 
     @property
     def output(self) -> str:
