@@ -395,12 +395,16 @@ static BOOL parse_variant(
     DWORD *expected_count,
     BOOL *with_rc,
     BOOL *with_wr,
-    BOOL *with_world
+    BOOL *with_world,
+    BOOL *with_aap,
+    BOOL *with_arap
 ) {
     *expected_count = 1;
     *with_rc = FALSE;
     *with_wr = FALSE;
     *with_world = FALSE;
+    *with_aap = FALSE;
+    *with_arap = FALSE;
     if (wcscmp(variant, L"SYN") == 0) {
         return TRUE;
     }
@@ -423,6 +427,22 @@ static BOOL parse_variant(
     if (wcscmp(variant, L"SYN_WORLD") == 0) {
         *expected_count = 2;
         *with_world = TRUE;
+        return TRUE;
+    }
+    if (wcscmp(variant, L"SYN_AAP") == 0) {
+        *expected_count = 2;
+        *with_aap = TRUE;
+        return TRUE;
+    }
+    if (wcscmp(variant, L"SYN_ARAP") == 0) {
+        *expected_count = 2;
+        *with_arap = TRUE;
+        return TRUE;
+    }
+    if (wcscmp(variant, L"SYN_AAP_ARAP") == 0) {
+        *expected_count = 3;
+        *with_aap = TRUE;
+        *with_arap = TRUE;
         return TRUE;
     }
     return FALSE;
@@ -560,11 +580,15 @@ int wmain(int argc, wchar_t **argv) {
     BOOL with_rc;
     BOOL with_wr;
     BOOL with_world;
+    BOOL with_aap;
+    BOOL with_arap;
     DWORD flags = DISABLE_MAX_PRIVILEGE_FLAG | LUA_TOKEN_FLAG | WRITE_RESTRICTED_FLAG;
     PSID synthetic = NULL;
     PSID restricted_code = NULL;
     PSID write_restricted_code = NULL;
     PSID world = NULL;
+    PSID all_app_packages = NULL;
+    PSID all_restricted_app_packages = NULL;
     PSID expected[MAX_RESTRICTING_SIDS];
     SID_AND_ATTRIBUTES restricted[MAX_RESTRICTING_SIDS];
     PSID logon = NULL;
@@ -577,7 +601,9 @@ int wmain(int argc, wchar_t **argv) {
         &expected_count,
         &with_rc,
         &with_wr,
-        &with_world
+        &with_world,
+        &with_aap,
+        &with_arap
     )) {
         emit_ascii("W5_GATE120_BROKER=INVALID_ARGUMENTS\n");
         return 30;
@@ -600,13 +626,17 @@ int wmain(int argc, wchar_t **argv) {
     if (!ConvertStringSidToSidW(synthetic_text, &synthetic) || synthetic == NULL ||
         !create_well_known(WinRestrictedCodeSid, &restricted_code) ||
         !create_well_known(WinWriteRestrictedCodeSid, &write_restricted_code) ||
-        !create_well_known(WinWorldSid, &world)) {
+        !create_well_known(WinWorldSid, &world) ||
+        !ConvertStringSidToSidW(L"S-1-15-2-1", &all_app_packages) ||
+        !ConvertStringSidToSidW(L"S-1-15-2-2", &all_restricted_app_packages)) {
         emit_ascii("W5_GATE120_TOKEN_CREATE=FAIL\n");
         goto cleanup;
     }
     emit_sid("W5_GATE120_RC_SID=", restricted_code);
     emit_sid("W5_GATE120_WR_SID=", write_restricted_code);
     emit_sid("W5_GATE120_WORLD_SID=", world);
+    emit_sid("W5_GATE120_AAP_SID=", all_app_packages);
+    emit_sid("W5_GATE120_ARAP_SID=", all_restricted_app_packages);
     if (!OpenProcessToken(
         GetCurrentProcess(),
         TOKEN_DUPLICATE_ACCESS | TOKEN_QUERY_ACCESS | TOKEN_ASSIGN_PRIMARY_ACCESS |
@@ -635,6 +665,18 @@ int wmain(int argc, wchar_t **argv) {
     if (with_world) {
         expected[index] = world;
         restricted[index].Sid = world;
+        restricted[index].Attributes = 0;
+        ++index;
+    }
+    if (with_aap) {
+        expected[index] = all_app_packages;
+        restricted[index].Sid = all_app_packages;
+        restricted[index].Attributes = 0;
+        ++index;
+    }
+    if (with_arap) {
+        expected[index] = all_restricted_app_packages;
+        restricted[index].Sid = all_restricted_app_packages;
         restricted[index].Attributes = 0;
         ++index;
     }
@@ -692,6 +734,12 @@ result:
     free(restricted_code);
     free(write_restricted_code);
     free(world);
+    if (all_app_packages != NULL) {
+        LocalFree(all_app_packages);
+    }
+    if (all_restricted_app_packages != NULL) {
+        LocalFree(all_restricted_app_packages);
+    }
     free(logon);
     return child_result;
 }

@@ -351,6 +351,130 @@ static int run_security(const wchar_t *object_text) {
     return 0;
 }
 
+static int run_accesscheck(const wchar_t *object_text, ACCESS_MASK desired_access) {
+    HANDLE handle = NULL;
+    HANDLE primary = NULL;
+    HANDLE impersonation = NULL;
+    GATE120_NTSTATUS status = 0;
+    GATE120_IO_STATUS_BLOCK io_status;
+    HMODULE ntdll;
+    gate120_nt_query_security_object_fn query_security;
+    PSECURITY_DESCRIPTOR descriptor = NULL;
+    DWORD required = 0;
+    BYTE privilege_buffer[1024];
+    DWORD privilege_size = sizeof(privilege_buffer);
+    GENERIC_MAPPING mapping = {0, 0, 0, 0};
+    DWORD granted = 0;
+    BOOL allowed = FALSE;
+
+    emit_ascii("W5_GATE120_ACCESSCHECK_STARTED=OBSERVED\n");
+    emit_hex32("W5_GATE120_ACCESSCHECK_REQUEST=", (ULONG)desired_access);
+    if (!open_target(
+        object_text,
+        GATE120_SYNCHRONIZE | GATE120_READ_CONTROL,
+        &handle,
+        &status,
+        &io_status
+    )) {
+        emit_ascii("W5_GATE120_ACCESSCHECK_API=UNAVAILABLE\n");
+        emit_ascii("W5_GATE120_ACCESSCHECK_FINISHED=OBSERVED\n");
+        return 0;
+    }
+    emit_hex32("W5_GATE120_ACCESSCHECK_OPEN_STATUS=", (ULONG)status);
+    emit_hex32("W5_GATE120_ACCESSCHECK_IO_STATUS=", (ULONG)io_status.Status);
+    if ((ULONG)status != GATE120_STATUS_SUCCESS || handle == NULL ||
+        handle == INVALID_HANDLE_VALUE) {
+        emit_ascii("W5_GATE120_ACCESSCHECK_API=NOT_ATTEMPTED\n");
+        emit_bool("W5_GATE120_ACCESSCHECK_HANDLE_CLOSE=", CloseHandle(handle));
+        emit_ascii("W5_GATE120_ACCESSCHECK_FINISHED=OBSERVED\n");
+        return 0;
+    }
+
+    ntdll = GetModuleHandleW(L"ntdll.dll");
+    query_security = ntdll == NULL
+        ? NULL
+        : (gate120_nt_query_security_object_fn)GetProcAddress(ntdll, "NtQuerySecurityObject");
+    if (query_security == NULL) {
+        emit_ascii("W5_GATE120_ACCESSCHECK_API=UNAVAILABLE\n");
+        emit_bool("W5_GATE120_ACCESSCHECK_HANDLE_CLOSE=", CloseHandle(handle));
+        emit_ascii("W5_GATE120_ACCESSCHECK_FINISHED=OBSERVED\n");
+        return 0;
+    }
+    status = query_security(
+        handle,
+        GATE120_SECURITY_OWNER | GATE120_SECURITY_GROUP | GATE120_SECURITY_DACL,
+        NULL,
+        0,
+        &required
+    );
+    emit_hex32("W5_GATE120_ACCESSCHECK_QUERY_SIZE_STATUS=", (ULONG)status);
+    if (required == 0 || required > GATE120_MAX_BUFFER) {
+        emit_ascii("W5_GATE120_ACCESSCHECK_API=QUERY_UNAVAILABLE\n");
+        emit_bool("W5_GATE120_ACCESSCHECK_HANDLE_CLOSE=", CloseHandle(handle));
+        emit_ascii("W5_GATE120_ACCESSCHECK_FINISHED=OBSERVED\n");
+        return 0;
+    }
+    descriptor = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, required);
+    if (descriptor == NULL) {
+        emit_ascii("W5_GATE120_ACCESSCHECK_API=OUT_OF_MEMORY\n");
+        emit_bool("W5_GATE120_ACCESSCHECK_HANDLE_CLOSE=", CloseHandle(handle));
+        emit_ascii("W5_GATE120_ACCESSCHECK_FINISHED=OBSERVED\n");
+        return 0;
+    }
+    status = query_security(
+        handle,
+        GATE120_SECURITY_OWNER | GATE120_SECURITY_GROUP | GATE120_SECURITY_DACL,
+        descriptor,
+        required,
+        &required
+    );
+    emit_hex32("W5_GATE120_ACCESSCHECK_QUERY_STATUS=", (ULONG)status);
+    if ((ULONG)status != GATE120_STATUS_SUCCESS ||
+        !OpenProcessToken(GetCurrentProcess(), TOKEN_DUPLICATE | TOKEN_QUERY, &primary) ||
+        !DuplicateTokenEx(
+            primary,
+            TOKEN_QUERY | TOKEN_DUPLICATE,
+            NULL,
+            SecurityImpersonation,
+            TokenImpersonation,
+            &impersonation
+        )) {
+        emit_ascii("W5_GATE120_ACCESSCHECK_API=TOKEN_UNAVAILABLE\n");
+        if (primary != NULL) {
+            CloseHandle(primary);
+        }
+        HeapFree(GetProcessHeap(), 0, descriptor);
+        emit_bool("W5_GATE120_ACCESSCHECK_HANDLE_CLOSE=", CloseHandle(handle));
+        emit_ascii("W5_GATE120_ACCESSCHECK_FINISHED=OBSERVED\n");
+        return 0;
+    }
+
+    if (!AccessCheck(
+        descriptor,
+        impersonation,
+        desired_access,
+        &mapping,
+        (PPRIVILEGE_SET)privilege_buffer,
+        &privilege_size,
+        &granted,
+        &allowed
+    )) {
+        emit_ascii("W5_GATE120_ACCESSCHECK_API=FAIL\n");
+        emit_u32("W5_GATE120_ACCESSCHECK_ERROR=", GetLastError());
+    } else {
+        emit_ascii("W5_GATE120_ACCESSCHECK_API=PASS\n");
+        emit_ascii("W5_GATE120_ACCESSCHECK_RESULT=");
+        emit_ascii(allowed ? "ALLOW\n" : "DENY\n");
+        emit_hex32("W5_GATE120_ACCESSCHECK_GRANTED=", granted);
+    }
+    CloseHandle(impersonation);
+    CloseHandle(primary);
+    HeapFree(GetProcessHeap(), 0, descriptor);
+    emit_bool("W5_GATE120_ACCESSCHECK_HANDLE_CLOSE=", CloseHandle(handle));
+    emit_ascii("W5_GATE120_ACCESSCHECK_FINISHED=OBSERVED\n");
+    return 0;
+}
+
 static unsigned long long parse_u64(const wchar_t *text) {
     return _wcstoui64(text, NULL, 0);
 }
@@ -367,6 +491,8 @@ int wmain(int argc, wchar_t **argv) {
         (void)run_ntopen(argv[2], (ACCESS_MASK)parse_u64(argv[3]));
     } else if (wcscmp(argv[1], L"security") == 0) {
         (void)run_security(argv[2]);
+    } else if (wcscmp(argv[1], L"accesscheck") == 0 && argc >= 4) {
+        (void)run_accesscheck(argv[2], (ACCESS_MASK)parse_u64(argv[3]));
     } else {
         emit_ascii("W5_GATE120_ARGUMENTS=FAIL\n");
     }
