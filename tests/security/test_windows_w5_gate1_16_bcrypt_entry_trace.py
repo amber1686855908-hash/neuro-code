@@ -17,6 +17,7 @@ import ctypes
 import hashlib
 import json
 import os
+import platform
 import queue
 import re
 import shutil
@@ -802,10 +803,26 @@ def _discover_cdb() -> dict[str, object]:  # pragma: no cover - Windows CI
             root = Path(raw_root) / "Windows Kits" / "10" / "Debuggers"
             candidates.extend(root.glob("*/cdb.exe"))
             candidates.append(root / "cdb.exe")
-    unique = sorted({path.resolve() for path in candidates if path.is_file()}, key=str)
+    unique = {path.resolve() for path in candidates if path.is_file()}
+    host_machine = platform.machine().casefold()
+    preferred_architecture = {
+        "amd64": "x64",
+        "x86_64": "x64",
+        "arm64": "ARM64",
+        "aarch64": "ARM64",
+        "x86": "x86",
+        "i386": "x86",
+    }.get(host_machine)
+
+    def candidate_key(path: Path) -> tuple[int, str]:
+        architecture = _pe_machine(path)[0]
+        preferred = 0 if architecture == preferred_architecture else 1
+        return preferred, str(path)
+
+    ordered = sorted(unique, key=candidate_key)
     inspected: list[dict[str, object]] = []
     signtool = _discover_signtool()
-    for candidate in unique:
+    for candidate in ordered:
         trust = _winverifytrust(candidate)
         diagnostics = _powershell_diagnostics(candidate)
         diagnostic = cast(dict[str, object], diagnostics.get("diagnostic", {}))
