@@ -97,7 +97,7 @@ def _qwords(text: str) -> list[int]:
         match = _QWORD_LINE_RE.match(line)
         if match is None:
             continue
-        words = re.findall(r"(?i)(?<![a-z0-9])([0-9a-f`]{8,16})(?![a-z0-9])", match.group(2))
+        words = re.findall(r"(?i)(?<![a-z0-9])([0-9a-f`]{8,17})(?![a-z0-9])", match.group(2))
         for word in words:
             try:
                 result.append(int(word.replace("`", ""), 16))
