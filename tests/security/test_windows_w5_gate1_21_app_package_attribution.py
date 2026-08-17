@@ -432,7 +432,11 @@ class WindowsW5Gate121AppPackageAttributionTests(unittest.IsolatedAsyncioTestCas
                 expected = _expected_sids(variant, synthetic.value)
                 self.assertEqual(projection["spawn_result"], "PASS")
                 self.assertTrue(broker_data["started"])
-                self.assertTrue(broker_data["finished"])
+                if not broker_data["finished"]:
+                    self.fail(
+                        "Gate 1.21 broker did not finish: "
+                        f"variant={variant} data={broker_data} projection={projection}"
+                    )
                 self.assertEqual(broker_data["flags"], 0xD)
                 self.assertEqual(broker_data["restricted_sid_count"], len(expected))
                 self.assertEqual(broker_data["restricted_sid_match"], "PASS")
