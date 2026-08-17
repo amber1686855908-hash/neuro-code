@@ -26,7 +26,6 @@
 #include <wchar.h>
 
 #pragma comment(lib, "Advapi32.lib")
-#pragma comment(lib, "Aclapi.lib")
 #pragma comment(lib, "Userenv.lib")
 
 #define G2A_ATTRIBUTE_SECURITY_CAPABILITIES 0x00020009
