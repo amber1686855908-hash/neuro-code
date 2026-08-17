@@ -121,6 +121,10 @@ def _parse_du(text: str) -> str | None:
 
     chunks: list[str] = []
     for line in text.replace("\r", "").splitlines():
+        # As with ``dq``, CDB prefixes the first ``du`` line with the
+        # command prompt.  Remove it before applying the bounded address
+        # grammar so a one-line UNICODE_STRING is not discarded.
+        line = re.sub(r"^\s*\d+:\d+>\s*", "", line)
         match = _DU_LINE_RE.match(line)
         if match is None:
             continue
