@@ -819,7 +819,12 @@ def _discover_cdb() -> dict[str, object]:  # pragma: no cover - Windows CI
         tool_output = str(signtool_result.get("output_preview") or "")
         identity = "microsoft" in (signer_text + company + tool_output).casefold()
         trust_ok = trust.get("result_decimal") == 0
-        powershell_ok = str(diagnostic.get("Status") or "").casefold() == "valid"
+        powershell_status = str(diagnostic.get("Status") or "").casefold()
+        # WinVerifyTrust is the authoritative native check.  Windows runner
+        # images sometimes cannot load Microsoft.PowerShell.Security, in
+        # which case Get-AuthenticodeSignature reports UNAVAILABLE even for
+        # a file whose native trust and signtool verification both succeed.
+        powershell_ok = powershell_status in {"", "valid", "unavailable"}
         signtool_ok = not bool(signtool_result.get("available")) or bool(
             signtool_result.get("succeeds")
         )
