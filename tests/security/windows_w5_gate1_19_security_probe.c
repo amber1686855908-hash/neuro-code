@@ -326,7 +326,7 @@ static void emit_scalar_query(
     } else if (information_class == GATE119_TOKEN_IMPERSONATION_LEVEL) {
         emit_format("W5_GATE119_TOKEN_SCALAR=%s|VALUE=%lu\n", field, (unsigned long)*(SECURITY_IMPERSONATION_LEVEL *)buffer);
     } else if (information_class == GATE119_TOKEN_MANDATORY_POLICY) {
-        emit_format("W5_GATE119_TOKEN_SCALAR=%s|VALUE=0x%08lX\n", field, (unsigned long)((TOKEN_MANDATORY_POLICY *)buffer)->PolicyFlags);
+        emit_format("W5_GATE119_TOKEN_SCALAR=%s|VALUE=0x%08lX\n", field, (unsigned long)((TOKEN_MANDATORY_POLICY *)buffer)->Policy);
     } else {
         emit_format("W5_GATE119_TOKEN_SCALAR=%s|VALUE=UNSUPPORTED_SIZE\n", field);
     }
