@@ -112,6 +112,12 @@ typedef struct _G2A_PROFILE {
     BOOL Created;
 } G2A_PROFILE;
 
+typedef enum _G2A_ATTRIBUTE_STAGE {
+    G2A_ATTRIBUTE_STAGE_SECURITY = 1,
+    G2A_ATTRIBUTE_STAGE_JOB = 2,
+    G2A_ATTRIBUTE_STAGE_IO = 3
+} G2A_ATTRIBUTE_STAGE;
+
 static void g2a_emit(const char *text) {
     DWORD written = 0;
     HANDLE output = GetStdHandle(STD_OUTPUT_HANDLE);
@@ -526,9 +532,14 @@ static int g2a_descendant(const wchar_t *path) {
     return 0;
 }
 
-static void g2a_child_common(const wchar_t *fixture_root, HANDLE input, BOOL pty) {
+static void g2a_child_common(const wchar_t *fixture_root, HANDLE input, BOOL pty, BOOL minimal) {
     char line[128];
     g2a_emit("G2A_CHILD_STARTED\n");
+    if (minimal) {
+        g2a_emit("G2A_CHILD_MINIMAL=TRUE\n");
+        g2a_emit("G2A_CHILD_FINISHED\n");
+        return;
+    }
     g2a_attest_token();
     g2a_ntopen();
     g2a_cng();
@@ -544,15 +555,15 @@ static void g2a_child_common(const wchar_t *fixture_root, HANDLE input, BOOL pty
     g2a_emit("G2A_CHILD_FINISHED\n");
 }
 
-static int g2a_child_pipe(const wchar_t *fixture_root) {
+static int g2a_child_pipe(const wchar_t *fixture_root, BOOL minimal) {
     HANDLE input = GetStdHandle(STD_INPUT_HANDLE);
-    g2a_child_common(fixture_root, input, FALSE);
+    g2a_child_common(fixture_root, input, FALSE, minimal);
     return 0;
 }
 
-static int g2a_child_pty(const wchar_t *fixture_root) {
+static int g2a_child_pty(const wchar_t *fixture_root, BOOL minimal) {
     HANDLE input = GetStdHandle(STD_INPUT_HANDLE);
-    g2a_child_common(fixture_root, input, TRUE);
+    g2a_child_common(fixture_root, input, TRUE, minimal);
     return 0;
 }
 
@@ -709,6 +720,140 @@ static BOOL g2a_noninherit(HANDLE handle) {
     return SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0);
 }
 
+static void g2a_emit_environment_path(const char *label, const wchar_t *value) {
+    DWORD attributes;
+    if (value == NULL || value[0] == L'\0') {
+        g2a_emitf("G2A_ENV_%s_EXISTS=UNKNOWN\n", label);
+        return;
+    }
+    attributes = GetFileAttributesW(value);
+    if (attributes == INVALID_FILE_ATTRIBUTES) {
+        g2a_emitf("G2A_ENV_%s_EXISTS=NO\n", label);
+    } else {
+        g2a_emitf("G2A_ENV_%s_EXISTS=YES\n", label);
+    }
+}
+
+static void g2a_emit_environment_value(
+    const char *label,
+    const wchar_t *value,
+    BOOL path
+) {
+    BOOL present = value != NULL && value[0] != L'\0';
+    g2a_emitf("G2A_ENV_%s=%s\n", label, present ? "PRESENT" : "ABSENT");
+    if (path) {
+        g2a_emit_environment_path(label, value);
+    }
+}
+
+static const wchar_t *g2a_environment_block_value(
+    const wchar_t *block,
+    const wchar_t *name
+) {
+    size_t name_length;
+    const wchar_t *cursor;
+    if (block == NULL || name == NULL) {
+        return NULL;
+    }
+    name_length = wcslen(name);
+    cursor = block;
+    while (*cursor != L'\0') {
+        if (wcsncmp(cursor, name, name_length) == 0 && cursor[name_length] == L'=') {
+            return cursor + name_length + 1;
+        }
+        cursor += wcslen(cursor) + 1;
+    }
+    return NULL;
+}
+
+static void g2a_emit_environment_facts_from_block(const wchar_t *block) {
+    const wchar_t *value;
+    value = g2a_environment_block_value(block, L"USERNAME");
+    g2a_emit_environment_value("USERNAME", value, FALSE);
+    value = g2a_environment_block_value(block, L"USERDOMAIN");
+    g2a_emit_environment_value("USERDOMAIN", value, FALSE);
+    value = g2a_environment_block_value(block, L"USERPROFILE");
+    g2a_emit_environment_value("USERPROFILE", value, TRUE);
+    value = g2a_environment_block_value(block, L"LOCALAPPDATA");
+    g2a_emit_environment_value("LOCALAPPDATA", value, TRUE);
+    value = g2a_environment_block_value(block, L"APPDATA");
+    g2a_emit_environment_value("APPDATA", value, FALSE);
+    value = g2a_environment_block_value(block, L"TEMP");
+    g2a_emit_environment_value("TEMP", value, TRUE);
+    value = g2a_environment_block_value(block, L"TMP");
+    g2a_emit_environment_value("TMP", value, FALSE);
+    value = g2a_environment_block_value(block, L"PATH");
+    g2a_emit_environment_value("PATH", value, FALSE);
+}
+
+static void g2a_emit_environment_facts_from_process(void) {
+    const wchar_t *names[] = {
+        L"USERNAME", L"USERDOMAIN", L"USERPROFILE", L"LOCALAPPDATA",
+        L"APPDATA", L"TEMP", L"TMP", L"PATH"
+    };
+    const char *labels[] = {
+        "USERNAME", "USERDOMAIN", "USERPROFILE", "LOCALAPPDATA",
+        "APPDATA", "TEMP", "TMP", "PATH"
+    };
+    const BOOL paths[] = {FALSE, FALSE, TRUE, TRUE, FALSE, TRUE, FALSE, FALSE};
+    DWORD index;
+    WCHAR value[32768];
+    for (index = 0; index < sizeof(names) / sizeof(names[0]); ++index) {
+        DWORD length = GetEnvironmentVariableW(names[index], value, sizeof(value) / sizeof(value[0]));
+        if (length == 0 || length >= sizeof(value) / sizeof(value[0])) {
+            g2a_emit_environment_value(labels[index], NULL, paths[index]);
+        } else {
+            g2a_emit_environment_value(labels[index], value, paths[index]);
+        }
+    }
+}
+
+static BOOL g2a_prepare_environment(
+    HANDLE token,
+    BOOL use_user_environment,
+    LPVOID *environment
+) {
+    *environment = NULL;
+    if (!use_user_environment) {
+        g2a_emit("G2A_ENV_VARIANT=NULL\n");
+        g2a_emit("G2A_ENV_CREATE=NOT_USED\n");
+        g2a_emit_environment_facts_from_process();
+        return TRUE;
+    }
+    g2a_emit("G2A_ENV_VARIANT=USER_BLOCK\n");
+    if (!CreateEnvironmentBlock(environment, token, FALSE)) {
+        g2a_u32("G2A_ENV_CREATE_ERROR=", GetLastError());
+        g2a_emit("G2A_ENV_CREATE=FAIL\n");
+        return FALSE;
+    }
+    g2a_emit("G2A_ENV_CREATE=PASS\n");
+    g2a_emit_environment_facts_from_block((const wchar_t *)*environment);
+    return TRUE;
+}
+
+static void g2a_destroy_environment(LPVOID environment) {
+    if (environment == NULL) {
+        g2a_emit("G2A_ENV_DESTROY=NOT_USED\n");
+    } else {
+        g2a_bool("G2A_ENV_DESTROY=", DestroyEnvironmentBlock(environment));
+    }
+}
+
+static void g2a_emit_attribute_contract(
+    BOOL pty,
+    G2A_ATTRIBUTE_STAGE stage
+) {
+    if (stage == G2A_ATTRIBUTE_STAGE_SECURITY) {
+        g2a_emit("G2A_ATTRIBUTES=SECURITY_CAPABILITIES\n");
+    } else if (stage == G2A_ATTRIBUTE_STAGE_JOB) {
+        g2a_emit("G2A_ATTRIBUTES=SECURITY_CAPABILITIES,JOB_LIST\n");
+    } else if (pty) {
+        g2a_emit("G2A_ATTRIBUTES=SECURITY_CAPABILITIES,JOB_LIST,PSEUDOCONSOLE\n");
+    } else {
+        g2a_emit("G2A_ATTRIBUTES=SECURITY_CAPABILITIES,JOB_LIST,HANDLE_LIST\n");
+    }
+}
+
 static BOOL g2a_update_common_attributes(
     LPPROC_THREAD_ATTRIBUTE_LIST attributes,
     HANDLE job,
@@ -716,7 +861,8 @@ static BOOL g2a_update_common_attributes(
     HANDLE *handles,
     DWORD handle_count,
     HANDLE pseudo_console,
-    BOOL pty
+    BOOL pty,
+    G2A_ATTRIBUTE_STAGE stage
 ) {
     SECURITY_CAPABILITIES capabilities;
     ZeroMemory(&capabilities, sizeof(capabilities));
@@ -729,13 +875,16 @@ static BOOL g2a_update_common_attributes(
         g2a_u32("G2A_ATTRIBUTE_SECURITY_CAPABILITIES_ERROR=", GetLastError());
         return FALSE;
     }
-    {
+    if (stage >= G2A_ATTRIBUTE_STAGE_JOB) {
         HANDLE jobs[1] = {job};
         if (!UpdateProcThreadAttribute(attributes, 0, G2A_ATTRIBUTE_JOB_LIST,
             jobs, sizeof(jobs), NULL, NULL)) {
             g2a_u32("G2A_ATTRIBUTE_JOB_LIST_ERROR=", GetLastError());
             return FALSE;
         }
+    }
+    if (stage < G2A_ATTRIBUTE_STAGE_IO) {
+        return TRUE;
     }
     if (pty) {
         if (!UpdateProcThreadAttribute(attributes, 0, G2A_ATTRIBUTE_PSEUDOCONSOLE,
@@ -762,7 +911,10 @@ static BOOL g2a_create_child(
     HANDLE output_write,
     HANDLE error_write,
     HANDLE pseudo_console,
-    PROCESS_INFORMATION *process
+    PROCESS_INFORMATION *process,
+    BOOL use_user_environment,
+    G2A_ATTRIBUTE_STAGE stage,
+    BOOL minimal_child
 ) {
     SIZE_T bytes = 0;
     LPPROC_THREAD_ATTRIBUTE_LIST attributes = NULL;
@@ -771,20 +923,28 @@ static BOOL g2a_create_child(
     WCHAR command[32768];
     int count;
     BOOL created = FALSE;
+    LPVOID environment = NULL;
+    DWORD attribute_count = (DWORD)stage;
     count = swprintf_s(command, sizeof(command) / sizeof(command[0]),
-        L"\"%s\" child-%s \"%s\"", self, mode, fixture_root);
+        L"\"%s\" child-%s%s \"%s\"", self, mode,
+        minimal_child ? L"-minimal" : L"", fixture_root);
     if (count <= 0) {
         g2a_emit("G2A_CHILD_CREATE=FAIL\n");
         return FALSE;
     }
-    (void)InitializeProcThreadAttributeList(NULL, 3, 0, &bytes);
+    g2a_emit_attribute_contract(pty, stage);
+    g2a_emitf("G2A_INHERIT_HANDLES=%s\n", !pty ? "TRUE" : "FALSE");
+    g2a_emit("G2A_CREATION_FLAGS=CREATE_UNICODE_ENVIRONMENT,CREATE_NO_WINDOW,EXTENDED_STARTUPINFO_PRESENT\n");
+    (void)InitializeProcThreadAttributeList(NULL, attribute_count, 0, &bytes);
     if (bytes == 0) {
+        g2a_u32("G2A_ATTRIBUTE_LIST_ERROR=", GetLastError());
         g2a_u32("G2A_CHILD_CREATE_ERROR=", GetLastError());
         return FALSE;
     }
     attributes = (LPPROC_THREAD_ATTRIBUTE_LIST)HeapAlloc(GetProcessHeap(), 0, bytes);
-    if (attributes == NULL || !InitializeProcThreadAttributeList(attributes, 3, 0, &bytes) ||
-        !g2a_update_common_attributes(attributes, job, profile->Sid, handles, 3, pseudo_console, pty)) {
+    if (attributes == NULL || !InitializeProcThreadAttributeList(attributes, attribute_count, 0, &bytes) ||
+        !g2a_update_common_attributes(attributes, job, profile->Sid, handles, 3, pseudo_console, pty, stage)) {
+        g2a_u32("G2A_ATTRIBUTE_LIST_ERROR=", GetLastError());
         g2a_u32("G2A_CHILD_CREATE_ERROR=", GetLastError());
         if (attributes != NULL) HeapFree(GetProcessHeap(), 0, attributes);
         return FALSE;
@@ -807,12 +967,23 @@ static BOOL g2a_create_child(
         if (!token_ok) {
             g2a_u32("G2A_SOURCE_TOKEN_ERROR=", GetLastError());
         } else {
+            if (!g2a_prepare_environment(token, use_user_environment, &environment)) {
+                g2a_emit("G2A_CHILD_CREATE=FAIL\n");
+                g2a_u32("G2A_CHILD_CREATE_ERROR=", GetLastError());
+                CloseHandle(token);
+                DeleteProcThreadAttributeList(attributes);
+                HeapFree(GetProcessHeap(), 0, attributes);
+                return FALSE;
+            }
+            g2a_emit("G2A_CREATEPROCESS_CALL=ABOUT_TO_CALL\n");
             created = CreateProcessAsUserW(token, self, command, NULL, NULL, !pty,
                 G2A_CREATE_UNICODE_ENVIRONMENT | G2A_CREATE_NO_WINDOW | G2A_EXTENDED_STARTUPINFO_PRESENT,
-                NULL, fixture_root, &startup.StartupInfo, process);
+                environment, fixture_root, &startup.StartupInfo, process);
             if (!created) {
+                g2a_u32("G2A_CREATEPROCESS_ERROR=", GetLastError());
                 g2a_u32("G2A_CHILD_CREATE_ERROR=", GetLastError());
             }
+            g2a_destroy_environment(environment);
             CloseHandle(token);
         }
     }
@@ -826,6 +997,24 @@ static BOOL g2a_create_child(
 }
 
 static void g2a_capture_descendant_pid(const char *text);
+
+static void g2a_parse_variant(
+    const wchar_t *mode,
+    BOOL *pty,
+    BOOL *use_user_environment,
+    G2A_ATTRIBUTE_STAGE *stage
+) {
+    *pty = wcsncmp(mode, L"pty", 3) == 0;
+    *use_user_environment =
+        wcsstr(mode, L"-env-user") != NULL || wcsstr(mode, L"-user-") != NULL;
+    if (wcsstr(mode, L"-a0") != NULL) {
+        *stage = G2A_ATTRIBUTE_STAGE_SECURITY;
+    } else if (wcsstr(mode, L"-a1") != NULL) {
+        *stage = G2A_ATTRIBUTE_STAGE_JOB;
+    } else {
+        *stage = G2A_ATTRIBUTE_STAGE_IO;
+    }
+}
 
 static void g2a_forward_pipe(HANDLE read_handle) {
     char buffer[G2A_PIPE_BUFFER];
@@ -885,9 +1074,12 @@ static int g2a_controller(const wchar_t *mode, const wchar_t *workspace, const w
     PROCESS_INFORMATION process;
     HANDLE descendant_handle = NULL;
     WCHAR self[MAX_PATH * 4];
-    BOOL pty = wcscmp(mode, L"pty") == 0;
+    BOOL pty = FALSE;
+    BOOL use_user_environment = FALSE;
+    G2A_ATTRIBUTE_STAGE stage = G2A_ATTRIBUTE_STAGE_IO;
     DWORD wait_result;
     int result = 0;
+    g2a_parse_variant(mode, &pty, &use_user_environment, &stage);
     ZeroMemory(&profile, sizeof(profile));
     ZeroMemory(&process, sizeof(process));
     if (!g2a_profile_create(&profile)) {
@@ -932,11 +1124,11 @@ static int g2a_controller(const wchar_t *mode, const wchar_t *workspace, const w
             }
         }
         g2a_emit("G2A_PTY_CREATE=PASS\n");
-        if (!g2a_create_child(self, L"pty", fixture_root, &profile, job, TRUE, NULL, NULL, NULL, pseudo_console, &process)) {
+        if (!g2a_create_child(self, L"pty", fixture_root, &profile, job, TRUE, NULL, NULL, NULL, pseudo_console, &process,
+            use_user_environment, stage, stage < G2A_ATTRIBUTE_STAGE_JOB)) {
             result = 25;
             goto cleanup;
         }
-        g2a_emit("G2A_ATTRIBUTES=SECURITY_CAPABILITIES,JOB_LIST,PSEUDOCONSOLE\n");
         if (pty_input_write != NULL) {
             const char input[] = "g2a-input\n";
             DWORD written = 0;
@@ -954,11 +1146,11 @@ static int g2a_controller(const wchar_t *mode, const wchar_t *workspace, const w
         (void)g2a_noninherit(error_read);
         g2a_emit("G2A_PIPE_CREATE=PASS\n");
         if (!g2a_create_child(self, L"pipe", fixture_root, &profile, job, FALSE,
-            input_read, output_write, error_write, NULL, &process)) {
+            input_read, output_write, error_write, NULL, &process, use_user_environment, stage,
+            stage < G2A_ATTRIBUTE_STAGE_JOB)) {
             result = 27;
             goto cleanup;
         }
-        g2a_emit("G2A_ATTRIBUTES=SECURITY_CAPABILITIES,JOB_LIST,HANDLE_LIST\n");
         {
             const char input[] = "g2a-input\n";
             DWORD written = 0;
@@ -1034,14 +1226,22 @@ int wmain(int argc, wchar_t **argv) {
         return g2a_descendant(NULL);
     }
     if (argc >= 3 && wcscmp(argv[1], L"child-pipe") == 0) {
-        g2a_child_pipe(argv[2]);
+        g2a_child_pipe(argv[2], FALSE);
+        return 0;
+    }
+    if (argc >= 3 && wcscmp(argv[1], L"child-pipe-minimal") == 0) {
+        g2a_child_pipe(argv[2], TRUE);
         return 0;
     }
     if (argc >= 3 && wcscmp(argv[1], L"child-pty") == 0) {
-        g2a_child_pty(argv[2]);
+        g2a_child_pty(argv[2], FALSE);
         return 0;
     }
-    if (argc >= 4 && (wcscmp(argv[1], L"pipe") == 0 || wcscmp(argv[1], L"pty") == 0)) {
+    if (argc >= 3 && wcscmp(argv[1], L"child-pty-minimal") == 0) {
+        g2a_child_pty(argv[2], TRUE);
+        return 0;
+    }
+    if (argc >= 4 && (wcsncmp(argv[1], L"pipe", 4) == 0 || wcsncmp(argv[1], L"pty", 3) == 0)) {
         return g2a_controller(argv[1], argv[2], argv[3]);
     }
     g2a_emit("G2A_INVALID_ARGUMENTS\n");

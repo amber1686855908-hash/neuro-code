@@ -147,6 +147,33 @@ def _projection(raw: dict[str, object], mode: str) -> dict[str, object]:
         "profile_delete": _last(markers, "G2A_PROFILE_DELETE"),
         "profile_delete_hresult": _last(markers, "G2A_PROFILE_DELETE_HRESULT"),
         "app_container_sid": app_sid,
+        "environment_variant": _last(markers, "G2A_ENV_VARIANT"),
+        "environment_create": _last(markers, "G2A_ENV_CREATE"),
+        "environment_create_error": _int_value(_last(markers, "G2A_ENV_CREATE_ERROR")),
+        "environment_destroy": _last(markers, "G2A_ENV_DESTROY"),
+        "environment": {
+            key: _last(markers, f"G2A_ENV_{key}")
+            for key in (
+                "USERNAME",
+                "USERDOMAIN",
+                "USERPROFILE",
+                "LOCALAPPDATA",
+                "APPDATA",
+                "TEMP",
+                "TMP",
+                "PATH",
+            )
+        },
+        "environment_paths": {
+            key: _last(markers, f"G2A_ENV_{key}_EXISTS")
+            for key in ("USERPROFILE", "LOCALAPPDATA", "TEMP")
+        },
+        "createprocess_error": _int_value(_last(markers, "G2A_CREATEPROCESS_ERROR")),
+        "child_create_error": _int_value(_last(markers, "G2A_CHILD_CREATE_ERROR")),
+        "attribute_list_error": _int_value(_last(markers, "G2A_ATTRIBUTE_LIST_ERROR")),
+        "createprocess_call": _last(markers, "G2A_CREATEPROCESS_CALL"),
+        "child_create": _last(markers, "G2A_CHILD_CREATE"),
+        "inherit_handles": _last(markers, "G2A_INHERIT_HANDLES"),
         "token_is_app_container": _last(markers, "G2A_TOKEN_IS_APP_CONTAINER"),
         "token_app_container_sid": token_sid,
         "token_user": _last(markers, "G2A_TOKEN_USER"),
