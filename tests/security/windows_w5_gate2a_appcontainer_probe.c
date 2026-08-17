@@ -27,6 +27,7 @@
 
 #pragma comment(lib, "Advapi32.lib")
 #pragma comment(lib, "Userenv.lib")
+#pragma warning(disable: 4191)
 
 #define G2A_ATTRIBUTE_SECURITY_CAPABILITIES 0x00020009
 #define G2A_ATTRIBUTE_HANDLE_LIST 0x00020002
