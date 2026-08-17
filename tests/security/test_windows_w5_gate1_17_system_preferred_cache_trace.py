@@ -180,7 +180,7 @@ def _structured_trace(text: str) -> list[dict[str, object]]:
     in_trace = False
     for line in text.replace("\r", "").splitlines():
         lowered = line.casefold()
-        if lowered.startswith("tracing "):
+        if "tracing " in lowered:
             in_trace = True
             continue
         if not in_trace:
@@ -492,11 +492,9 @@ class WindowsW5Gate117SystemPreferredCacheTests(unittest.IsolatedAsyncioTestCase
                             lambda text: "breakpoint" in text.casefold(), 20.0
                         )
                         debug["entrypoint_breakpoint_hit"] = "breakpoint" in entry_output.casefold()
-                        debug["entrypoint_registers"] = _registers(
-                            session.command(
-                                "r rip rsp rax rcx rdx r8 r9 efl", "W5_GATE117_ENTRY_REG", 5.0
-                            )
-                        )
+                        entry_register_output = session.command("r", "W5_GATE117_ENTRY_REG", 5.0)
+                        debug["entrypoint_register_output"] = entry_register_output[-4096:]
+                        debug["entrypoint_registers"] = _registers(entry_register_output)
                         debug["entrypoint_stack"] = session.command(
                             "k 8", "W5_GATE117_ENTRY_STACK", 5.0
                         )[-4096:]
@@ -516,11 +514,11 @@ class WindowsW5Gate117SystemPreferredCacheTests(unittest.IsolatedAsyncioTestCase
                             lambda text: "breakpoint" in text.casefold(), 25.0
                         )
                         debug["cache_breakpoint_hit"] = "breakpoint" in cache_hit.casefold()
-                        debug["cache_entry_registers"] = _registers(
-                            session.command(
-                                "r rip rsp rax rcx rdx r8 r9 efl", "W5_GATE117_CACHE_ENTRY_REG", 5.0
-                            )
+                        cache_entry_register_output = session.command(
+                            "r", "W5_GATE117_CACHE_ENTRY_REG", 5.0
                         )
+                        debug["cache_entry_register_output"] = cache_entry_register_output[-4096:]
+                        debug["cache_entry_registers"] = _registers(cache_entry_register_output)
                         debug["cache_entry_stack"] = session.command(
                             "k 8", "W5_GATE117_CACHE_ENTRY_STACK", 5.0
                         )[-4096:]
@@ -547,13 +545,11 @@ class WindowsW5Gate117SystemPreferredCacheTests(unittest.IsolatedAsyncioTestCase
                             debug["trace_output"] = trace_output
                             debug["structured_trace"] = _structured_trace(trace_output)
                             debug["raw_called_function_returns"] = _raw_returns(trace_output)
-                            debug["cache_exit_registers"] = _registers(
-                                session.command(
-                                    "r rip rsp rax rcx rdx r8 r9 efl",
-                                    "W5_GATE117_CACHE_EXIT_REG",
-                                    5.0,
-                                )
+                            cache_exit_register_output = session.command(
+                                "r", "W5_GATE117_CACHE_EXIT_REG", 5.0
                             )
+                            debug["cache_exit_register_output"] = cache_exit_register_output[-4096:]
+                            debug["cache_exit_registers"] = _registers(cache_exit_register_output)
                             debug["cache_exit_disassembly"] = session.command(
                                 "u @rip L8", "W5_GATE117_CACHE_EXIT_U", 5.0
                             )[-4096:]
