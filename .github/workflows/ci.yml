@@ -999,6 +999,52 @@ jobs:
             ${{ runner.temp }}/neuro-code-w5-gate1-15-dll-etw.json
           if-no-files-found: error
 
+  windows-native-w5-gate1-16:
+    runs-on: windows-latest
+    timeout-minutes: 100
+    env:
+      NEURO_CODE_RUN_NATIVE_WINDOWS_SANDBOX_ACCEPTANCE: "1"
+    steps:
+      - uses: actions/checkout@v7.0.0
+      - uses: astral-sh/setup-uv@v8.3.2
+        with:
+          version: "0.11.29"
+          python-version: "3.12"
+          enable-cache: true
+      - run: uv sync --extra dev --locked
+      - name: Trace bcrypt image-entry initialization with Microsoft debugger
+        env:
+          NEURO_CODE_W5_GATE116_EVIDENCE_JSON: ${{ runner.temp }}/neuro-code-w5-gate1-16-bcrypt-entry.json
+        run: >-
+          uv run pytest
+          tests/security/test_windows_w5_gate1_16_bcrypt_entry_trace.py
+          -q -rs -s
+          -W error::pytest.PytestUnraisableExceptionWarning
+          -W error::pytest.PytestUnhandledThreadExceptionWarning
+          -W error::ResourceWarning
+          --junitxml=${{ runner.temp }}/neuro-code-w5-gate1-16-bcrypt-entry.xml
+      - name: Require W5 Gate 1.16 execution
+        shell: pwsh
+        env:
+          W5_GATE116_JUNIT: ${{ runner.temp }}/neuro-code-w5-gate1-16-bcrypt-entry.xml
+        run: |
+          [xml]$report = Get-Content $env:W5_GATE116_JUNIT
+          $cases = @($report.testsuites.testsuite.testcase)
+          $skipped = @($cases | Where-Object { $_.skipped }).Count
+          Write-Host "executed=$($cases.Count) skipped=$skipped"
+          if ($cases.Count -ne 1 -or $skipped -ne 0) {
+            throw "Windows W5 Gate 1.16 must execute exactly one non-skipped test"
+          }
+      - name: Upload W5 Gate 1.16 evidence
+        if: always()
+        uses: actions/upload-artifact@v4.6.2
+        with:
+          name: windows-w5-gate1-16-bcrypt-entry
+          path: |
+            ${{ runner.temp }}/neuro-code-w5-gate1-16-bcrypt-entry.xml
+            ${{ runner.temp }}/neuro-code-w5-gate1-16-bcrypt-entry.json
+          if-no-files-found: error
+
   quality:
     runs-on: ubuntu-latest
     steps:
