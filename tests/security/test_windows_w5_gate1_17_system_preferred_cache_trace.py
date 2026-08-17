@@ -169,6 +169,67 @@ def _disassembly_summary(text: str, target: str) -> dict[str, object]:
     }
 
 
+def _caller_branch_from_return(raw_rax: str | None, disassembly: str) -> dict[str, object]:
+    """Relate the raw cache return to the first caller conditional branch."""
+
+    result: dict[str, object] = {
+        "raw_rax": raw_rax,
+        "test_instruction": None,
+        "branch_instruction": None,
+        "taken": None,
+        "interpretation": "RAW_REGISTER_ONLY",
+    }
+    if raw_rax is None:
+        return result
+    try:
+        value = int(raw_rax.replace("0x", ""), 16) & 0xFFFFFFFF
+    except ValueError:
+        return result
+    lines = _disassembly_lines(disassembly)
+    test_index: int | None = None
+    for index, line in enumerate(lines):
+        body = str(line["text"])
+        if re.search(r"(?i)\btest\s+eax,eax\b", body):
+            test_index = index
+            result["test_instruction"] = body[:512]
+            break
+    if test_index is None:
+        return result
+    for line in lines[test_index + 1 : test_index + 4]:
+        body = str(line["text"])
+        match = re.search(r"(?i)\b(j[a-z]+)\b", body)
+        if match is None:
+            continue
+        condition = match.group(1).casefold()
+        result["branch_instruction"] = body[:512]
+        nonzero = value != 0
+        if condition in {"jne", "jnz"}:
+            result["taken"] = nonzero
+        elif condition == "js":
+            result["taken"] = bool(value & 0x80000000)
+        elif condition == "jns":
+            result["taken"] = not bool(value & 0x80000000)
+        elif condition in {"je", "jz"}:
+            result["taken"] = not nonzero
+        result["interpretation"] = "EAX_ZERO_TEST_ONLY"
+        return result
+    return result
+
+
+def _preferred_focus_target(difference: dict[str, object]) -> str | None:
+    syn = difference.get("syn")
+    world = difference.get("syn_world")
+    syn_text = syn if isinstance(syn, str) else None
+    world_text = world if isinstance(world, str) else None
+
+    def compiler_cookie(value: str | None) -> bool:
+        return bool(value and value.casefold().endswith("!_security_check_cookie"))
+
+    if compiler_cookie(syn_text) and not compiler_cookie(world_text):
+        return world_text
+    return syn_text or world_text
+
+
 def _structured_trace(text: str) -> list[dict[str, object]]:
     """Parse only the execution block emitted by CDB ``wt``.
 
@@ -510,10 +571,24 @@ class WindowsW5Gate117SystemPreferredCacheTests(unittest.IsolatedAsyncioTestCase
                             5.0,
                         )
                         session.send("g")
-                        cache_hit = session.wait_for(
-                            lambda text: "breakpoint" in text.casefold(), 25.0
-                        )
-                        debug["cache_breakpoint_hit"] = "breakpoint" in cache_hit.casefold()
+                        try:
+                            cache_hit = session.wait_for(
+                                lambda text: "breakpoint" in text.casefold(), 25.0
+                            )
+                            debug["cache_breakpoint_hit"] = "breakpoint" in cache_hit.casefold()
+                        except TimeoutError:
+                            if not focused_target:
+                                raise
+                            debug["cache_breakpoint_hit"] = False
+                            debug["focused_target_not_observed"] = True
+                            session.detach()
+                            result = await asyncio.to_thread(run.wait, 80.0)
+                            return {
+                                "cell": _gate116._safe_result(result),
+                                "debug": debug,
+                                "p4_pid": run.p4_pid,
+                                "broker_pid": run.broker_pid,
+                            }
                         cache_entry_register_output = session.command(
                             "r", "W5_GATE117_CACHE_ENTRY_REG", 5.0
                         )
@@ -531,8 +606,13 @@ class WindowsW5Gate117SystemPreferredCacheTests(unittest.IsolatedAsyncioTestCase
                                 focused_return = session.wait_for(
                                     lambda text: bool(_gate116._PROMPT_RE.search(text)), 20.0
                                 )
-                                debug["focused_target_return"] = _registers(focused_return)
-                                debug["focused_target_return_output"] = focused_return[-4096:]
+                                focused_register_output = session.command(
+                                    "r", "W5_GATE117_FOCUSED_RETURN_REG", 5.0
+                                )
+                                debug["focused_target_return"] = _registers(focused_register_output)
+                                debug["focused_target_return_output"] = (
+                                    focused_return + focused_register_output
+                                )[-4096:]
                                 session.send("g")
                             except (OSError, RuntimeError, TimeoutError) as error:
                                 debug["focused_target_return_error"] = type(error).__name__
@@ -554,7 +634,13 @@ class WindowsW5Gate117SystemPreferredCacheTests(unittest.IsolatedAsyncioTestCase
                                 "u @rip L8", "W5_GATE117_CACHE_EXIT_U", 5.0
                             )[-4096:]
                             debug["caller_rip"] = debug["cache_exit_registers"].get("rip")
-                            debug["caller_branch_taken"] = "NOT_DETERMINED"
+                            debug["caller_branch"] = _caller_branch_from_return(
+                                debug["cache_exit_registers"].get("rax"),
+                                debug["cache_exit_disassembly"],
+                            )
+                            debug["caller_branch_taken"] = cast(
+                                dict[str, object], debug["caller_branch"]
+                            ).get("taken")
                         session.send("g")
                     session.detach()
                     result = await asyncio.to_thread(run.wait, 80.0)
@@ -670,6 +756,7 @@ class WindowsW5Gate117SystemPreferredCacheTests(unittest.IsolatedAsyncioTestCase
                     "cache_exit_registers": debug.get("cache_exit_registers", {}),
                     "caller_rip": debug.get("caller_rip"),
                     "caller_branch_taken": debug.get("caller_branch_taken"),
+                    "caller_branch": debug.get("caller_branch"),
                     "caller_disassembly": debug.get("cache_exit_disassembly"),
                     "load": cast(
                         dict[str, object], cast(dict[str, object], debug_cells[variant])["cell"]
@@ -717,8 +804,8 @@ class WindowsW5Gate117SystemPreferredCacheTests(unittest.IsolatedAsyncioTestCase
                 difference = None
             artifact["earliest_inner_differential"] = difference
 
-            if difference and isinstance(difference.get("syn"), str):
-                target = str(difference["syn"])
+            target = _preferred_focus_target(difference) if difference else None
+            if target:
                 focused: dict[str, object] = {
                     "performed": True,
                     "target": target,
