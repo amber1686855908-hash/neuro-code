@@ -100,7 +100,7 @@ _TOKEN_QUERY = 0x0008
 _TOKEN_USER_INFORMATION = 1
 _TOKEN_RESTRICTED_SIDS_INFORMATION = 11
 _MARKER_RE = re.compile(r"^W5_GATE116_[A-Z0-9_]+(?:=.*)?$")
-_PROMPT_RE = re.compile(r"(?m)^\d+:\d+> ?$")
+_PROMPT_RE = re.compile(r"(?m)(?:^|[^\w])\d+:\d+>\s*$")
 _MODULE_LOAD_RE = re.compile(r"(?im)\b(?:modload|load)\s*:.*\\bcrypt\.dll\b")
 _MODULE_LINE_RE = re.compile(r"(?im)^\s*([0-9a-f`]+)\s+([0-9a-f`]+)\s+.*\bbcrypt(?:\.dll)?\b")
 _TRACE_TOKEN_RE = re.compile(
