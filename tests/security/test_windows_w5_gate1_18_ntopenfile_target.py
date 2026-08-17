@@ -94,6 +94,12 @@ def _qwords(text: str) -> list[int]:
 
     result: list[int] = []
     for line in text.replace("\r", "").splitlines():
+        # CDB prefixes the first data row after a command with its prompt
+        # (for example ``0:000> 000000...``).  Strip that prompt before
+        # applying the bounded address/qword grammar; otherwise the first
+        # stack word is silently discarded and the six-argument NtOpenFile
+        # capture is misclassified as unavailable.
+        line = re.sub(r"^\s*\d+:\d+>\s*", "", line)
         match = _QWORD_LINE_RE.match(line)
         if match is None:
             continue
