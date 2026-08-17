@@ -26,10 +26,8 @@ typedef struct _GATE118_OBJECT_ATTRIBUTES {
 } GATE118_OBJECT_ATTRIBUTES;
 
 typedef struct _GATE118_IO_STATUS_BLOCK {
-    union {
-        GATE118_NTSTATUS Status;
-        PVOID Pointer;
-    } DUMMYUNIONNAME;
+    GATE118_NTSTATUS Status;
+    ULONG Reserved;
     ULONG_PTR Information;
 } GATE118_IO_STATUS_BLOCK;
 
@@ -128,7 +126,7 @@ int wmain(int argc, wchar_t **argv) {
     );
     emit_u32("W5_GATE118_DIRECT_NTOPEN_STATUS=", (ULONG)status);
     emit_u64("W5_GATE118_DIRECT_FILE_HANDLE=", (ULONG_PTR)file_handle);
-    emit_u32("W5_GATE118_DIRECT_IO_STATUS=", (ULONG)io_status.DUMMYUNIONNAME.Status);
+    emit_u32("W5_GATE118_DIRECT_IO_STATUS=", (ULONG)io_status.Status);
     emit_u64("W5_GATE118_DIRECT_IO_INFORMATION=", io_status.Information);
     if ((ULONG)status == 0 && file_handle != NULL && file_handle != INVALID_HANDLE_VALUE) {
         emit_ascii(CloseHandle(file_handle)
