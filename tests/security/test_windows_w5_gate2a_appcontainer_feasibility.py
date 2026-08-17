@@ -315,7 +315,7 @@ class WindowsW5Gate2AAppContainerTests(unittest.IsolatedAsyncioTestCase):
             results["pipe"] = await run_mode("pipe")
             results["pty"] = await run_mode("pty")
             classification = _classify(results["pipe"], results["pty"])
-            production_diff = list(_production_source_diff())
+            production_diff = _production_source_diff()
             artifact: dict[str, object] = {
                 "gate": "W5_GATE2A",
                 "old_head": _HEAD,
