@@ -438,7 +438,13 @@ static BOOL open_target(
     GATE119_UNICODE_STRING object_name;
     GATE119_OBJECT_ATTRIBUTES object_attributes;
     if (ntdll == NULL || handle == NULL || status == NULL || io_status == NULL ||
-        !build_object_attributes(object_text, (ULONG)sizeof(GATE119_OBJECT_ATTRIBUTES), 0, &object_name, &object_attributes)) {
+        !build_object_attributes(
+            object_text,
+            (ULONG)sizeof(GATE119_OBJECT_ATTRIBUTES),
+            object_attributes_value,
+            &object_name,
+            &object_attributes
+        )) {
         return FALSE;
     }
     nt_open_file = (gate119_nt_open_file_fn)GetProcAddress(ntdll, "NtOpenFile");
