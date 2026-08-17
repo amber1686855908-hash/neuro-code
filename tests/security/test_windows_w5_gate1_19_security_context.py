@@ -120,7 +120,7 @@ def _token_projection(data: bytes) -> dict[str, object]:
     fields: dict[str, dict[str, object]] = {}
     for value in _marker_values(lines, "W5_GATE119_TOKEN_FIELD"):
         item = _parts(value)
-        field = item.get("FIELD")
+        field = item.get("FIELD") or value.split("|", 1)[0]
         if field:
             fields[field] = {
                 "supported": item.get("SUPPORTED") == "1",
@@ -129,13 +129,13 @@ def _token_projection(data: bytes) -> dict[str, object]:
     sid_fields: dict[str, str | None] = {}
     for value in _marker_values(lines, "W5_GATE119_TOKEN_SID"):
         item = _parts(value)
-        field = item.get("FIELD")
+        field = item.get("FIELD") or value.split("|", 1)[0]
         if field:
             sid_fields[field] = item.get("SID")
     groups: dict[str, list[dict[str, object]]] = {}
     for value in _marker_values(lines, "W5_GATE119_TOKEN_GROUP"):
         item = _parts(value)
-        field = item.get("FIELD")
+        field = item.get("FIELD") or value.split("|", 1)[0]
         sid = item.get("SID")
         if field and sid:
             groups.setdefault(field, []).append(
