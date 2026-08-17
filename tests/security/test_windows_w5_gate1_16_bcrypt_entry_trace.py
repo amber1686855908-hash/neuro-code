@@ -1095,7 +1095,8 @@ class WindowsW5Gate116BcryptEntryTraceTests(unittest.IsolatedAsyncioTestCase):
                                     debug_metadata["focused_breakpoint_hit"] = False
                             cdb_session.send(".echo W5_GATE116_WT_BEGIN")
                             cdb_session.wait_for(lambda text: "W5_GATE116_WT_BEGIN" in text, 5.0)
-                            cdb_session.send("wt -l 2 -m bcrypt.dll")
+                            debug_metadata["trace_command"] = "wt -l 2"
+                            cdb_session.send("wt -l 2")
                             trace_output = cdb_session.wait_for(
                                 lambda text: bool(_PROMPT_RE.search(text)), 25.0
                             )
@@ -1110,6 +1111,10 @@ class WindowsW5Gate116BcryptEntryTraceTests(unittest.IsolatedAsyncioTestCase):
                             debug_metadata["trace_output"] = trace_output[-32 * 1024 :]
                             debug_metadata["trace_sequence"] = _normalize_trace(trace_output)
                         cdb_session.send("g")
+                        # Detach while the process is still under debugger
+                        # control so a failed/unsupported trace command
+                        # cannot leave the final child stopped at a breakpoint.
+                        cdb_session.detach()
                     else:
                         debug_metadata["post_attach_token_attestation"] = _attest_process_token(
                             run.p4_pid,
