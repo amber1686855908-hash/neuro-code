@@ -183,6 +183,7 @@ def _broker_projection(raw: dict[str, object], variant: str) -> dict[str, object
         "finished": "W5_GATE120_BROKER_FINISHED" in markers,
         "flags": _marker_int(markers, "W5_GATE120_FLAGS"),
         "token_create": markers.get("W5_GATE120_TOKEN_CREATE"),
+        "token_create_error": _marker_int(markers, "W5_GATE120_TOKEN_CREATE_ERROR"),
         "token_dacl": markers.get("W5_GATE120_TOKEN_DACL"),
         "token_restricted": markers.get("W5_GATE120_TOKEN_RESTRICTED"),
         "token_inspection": markers.get("W5_GATE120_TOKEN_INSPECTION"),

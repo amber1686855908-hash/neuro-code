@@ -680,7 +680,12 @@ int wmain(int argc, wchar_t **argv) {
         restricted[index].Attributes = 0;
         ++index;
     }
-    if (index != expected_count || !CreateRestrictedToken(
+    if (index != expected_count) {
+        emit_ascii("W5_GATE120_TOKEN_CREATE=FAIL\n");
+        emit_u32("W5_GATE120_TOKEN_CREATE_ERROR=", ERROR_INVALID_PARAMETER);
+        goto cleanup;
+    }
+    if (!CreateRestrictedToken(
         source_token,
         flags,
         0,
@@ -692,6 +697,7 @@ int wmain(int argc, wchar_t **argv) {
         &child_token
     )) {
         emit_ascii("W5_GATE120_TOKEN_CREATE=FAIL\n");
+        emit_u32("W5_GATE120_TOKEN_CREATE_ERROR=", GetLastError());
         goto cleanup;
     }
     emit_ascii("W5_GATE120_TOKEN_CREATE=PASS\n");

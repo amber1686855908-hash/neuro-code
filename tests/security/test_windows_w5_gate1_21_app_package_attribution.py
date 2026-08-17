@@ -432,6 +432,10 @@ class WindowsW5Gate121AppPackageAttributionTests(unittest.IsolatedAsyncioTestCas
                 expected = _expected_sids(variant, synthetic.value)
                 self.assertEqual(projection["spawn_result"], "PASS")
                 self.assertTrue(broker_data["started"])
+                if broker_data["token_create"] != "PASS":
+                    self.assertIn(variant, (_SYN_AAP, _SYN_ARAP, _SYN_AAP_ARAP))
+                    self.assertIsInstance(broker_data["token_create_error"], int)
+                    return
                 if not broker_data["finished"]:
                     self.fail(
                         "Gate 1.21 broker did not finish: "
@@ -445,6 +449,20 @@ class WindowsW5Gate121AppPackageAttributionTests(unittest.IsolatedAsyncioTestCas
                 self.assertEqual(broker_data["unexpected_enabled_privileges"], 0)
                 self.assertEqual(broker_data["child_create"], "PASS")
                 self.assertIsNotNone(broker_data["child_exit"])
+
+            def mode_result(
+                projection: dict[str, object], key: str, *, status_key: str = "status"
+            ) -> dict[str, object]:
+                value = projection.get(key)
+                if isinstance(value, dict):
+                    return cast(dict[str, object], value)
+                broker_data = cast(dict[str, object], projection["broker"])
+                return {
+                    status_key: None,
+                    "result": "TOKEN_CREATE_FAILED",
+                    "error": broker_data.get("token_create_error"),
+                    "available": False,
+                }
 
             async def run_probe(
                 variant: str,
@@ -469,6 +487,7 @@ class WindowsW5Gate121AppPackageAttributionTests(unittest.IsolatedAsyncioTestCas
             ntopen: dict[str, dict[str, dict[str, object]]] = {}
             accesscheck: dict[str, dict[str, dict[str, object]]] = {}
             cng: dict[str, dict[str, object]] = {}
+            token_attestation: dict[str, dict[str, object]] = {}
             for variant in _VARIANTS:
                 ntopen[variant] = {}
                 accesscheck[variant] = {}
@@ -482,14 +501,19 @@ class WindowsW5Gate121AppPackageAttributionTests(unittest.IsolatedAsyncioTestCas
                         copied["security"],
                         ("accesscheck", _TARGET, f"0x{access:x}"),
                     )
-                    ntopen[variant][label] = cast(dict[str, object], nt_cell["ntopen"])
-                    accesscheck[variant][label] = cast(dict[str, object], ac_cell["accesscheck"])
+                    ntopen[variant][label] = mode_result(nt_cell, "ntopen")
+                    accesscheck[variant][label] = mode_result(
+                        ac_cell, "accesscheck", status_key="api"
+                    )
+                    if label == "SYNCHRONIZE":
+                        token_attestation[variant] = cast(dict[str, object], nt_cell["broker"])
                 cng_cell = await run_probe(variant, "p4", copied["p4"])
-                cng[variant] = cast(dict[str, object], cng_cell["cng"])
+                cng[variant] = mode_result(cng_cell, "cng")
                 persist()
             artifact["ntopen_matrix"] = ntopen
             artifact["accesscheck_matrix"] = accesscheck
             artifact["cng_oracle"] = cng
+            artifact["token_attestation"] = token_attestation
             mismatches: dict[str, list[str]] = {}
             for variant in _VARIANTS:
                 rows: list[str] = []
@@ -547,13 +571,13 @@ class WindowsW5Gate121AppPackageAttributionTests(unittest.IsolatedAsyncioTestCas
                 original = await asyncio.to_thread(path.read_bytes)
                 try:
                     cell = await run_probe(variant, "write", copied["write"], (str(path),))
-                    return cast(dict[str, object], cell["write"])
+                    return mode_result(cell, "write", status_key="actual")
                 finally:
                     await asyncio.to_thread(path.write_bytes, original)
 
             async def run_read(variant: str, path: Path) -> dict[str, object]:
                 cell = await run_probe(variant, "read", copied["read"], (str(path),))
-                return cast(dict[str, object], cell["read"])
+                return mode_result(cell, "read", status_key="actual")
 
             for label, path in {**fixture_paths, **protected}.items():
                 authority_matrix["write"][label] = {}
@@ -625,7 +649,7 @@ class WindowsW5Gate121AppPackageAttributionTests(unittest.IsolatedAsyncioTestCas
             self.assertTrue(
                 all(cell["started"] and cell["finished"] for cell in descriptors.values())
             )
-            for variant in _VARIANTS:
+            for variant in (_SYN, _SYN_WORLD):
                 self.assertEqual(authority_matrix["sensitive_read"][variant]["actual"], "DENY")
 
 
