@@ -71,6 +71,8 @@ _DU_LINE_RE = re.compile(r"^\s*([0-9a-f`]+)\s+(.*)$", re.I)
 
 
 def _hex_int(value: object) -> int | None:
+    if isinstance(value, int):
+        return value
     if not isinstance(value, str):
         return None
     try:
