@@ -1093,12 +1093,19 @@ class WindowsW5Gate116BcryptEntryTraceTests(unittest.IsolatedAsyncioTestCase):
                                     cdb_session.send("g")
                                 except (OSError, RuntimeError, TimeoutError):
                                     debug_metadata["focused_breakpoint_hit"] = False
-                            cdb_session.send(
-                                ".echo W5_GATE116_WT_BEGIN; wt -l 2 -m bcrypt.dll; "
-                                ".echo W5_GATE116_WT_DONE; r rax"
-                            )
+                            cdb_session.send(".echo W5_GATE116_WT_BEGIN")
+                            cdb_session.wait_for(lambda text: "W5_GATE116_WT_BEGIN" in text, 5.0)
+                            cdb_session.send("wt -l 2 -m bcrypt.dll")
                             trace_output = cdb_session.wait_for(
-                                lambda text: "W5_GATE116_WT_DONE" in text, 25.0
+                                lambda text: bool(_PROMPT_RE.search(text)), 25.0
+                            )
+                            cdb_session.send(".echo W5_GATE116_WT_DONE")
+                            trace_output += cdb_session.wait_for(
+                                lambda text: "W5_GATE116_WT_DONE" in text, 5.0
+                            )
+                            cdb_session.send("r rax")
+                            trace_output += cdb_session.wait_for(
+                                lambda text: bool(_PROMPT_RE.search(text)), 5.0
                             )
                             debug_metadata["trace_output"] = trace_output[-32 * 1024 :]
                             debug_metadata["trace_sequence"] = _normalize_trace(trace_output)
