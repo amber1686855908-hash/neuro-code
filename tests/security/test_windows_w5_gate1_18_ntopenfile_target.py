@@ -736,6 +736,7 @@ class WindowsW5Gate118NtOpenFileTests(unittest.IsolatedAsyncioTestCase):
                     session.command("sxe ld:bcrypt.dll", "W5_GATE118_SXE_READY", 5.0)
                     session.send(".echo W5_GATE118_DEBUGGER_READY")
                     session.wait_for(lambda text: "W5_GATE118_DEBUGGER_READY" in text, 5.0)
+                    debug_data["release_after_attach"] = run.release()
                     session.send("g")
                     module_load = session.wait_for(
                         lambda text: bool(_gate116._MODULE_LOAD_RE.search(text)), 20.0
@@ -774,7 +775,6 @@ class WindowsW5Gate118NtOpenFileTests(unittest.IsolatedAsyncioTestCase):
                                 run.p4_pid,
                                 expected_synthetic_sid=write_sid.value,
                             ),
-                            "release_after_attach": run.release(),
                         }
                     )
                     io_symbol = cast(dict[str, object], symbols["bcrypt!_IoOpenDevice"])
