@@ -422,8 +422,10 @@ def _capture_ntopen(
     io_entry = session.wait_for(lambda text: "breakpoint" in text.casefold(), 25.0)
     io_stack = session.command("k 8", f"W5_GATE118_IOOPEN_STACK_{variant}", 5.0)
     stack_lower = io_stack.casefold()
-    if "bcrypt!ioopendevice" not in stack_lower or "bcrypt!iocallkerneldriver" not in stack_lower:
-        raise RuntimeError("_IoOpenDevice caller stack was not causal")
+    if "bcrypt!_ioopendevice" not in stack_lower or "bcrypt!iocallkerneldriver" not in stack_lower:
+        raise RuntimeError(
+            "_IoOpenDevice caller stack was not causal: " + io_stack[-1024:].replace("\n", " ")
+        )
     # Use an explicitly bounded instruction window.  ``uf`` can follow a
     # private helper's exception/unwind metadata for an unbounded amount of
     # output on some debugger builds; the call-site contract only needs this
