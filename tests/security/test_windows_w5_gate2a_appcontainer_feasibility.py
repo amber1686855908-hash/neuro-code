@@ -26,6 +26,7 @@ from tests.security.test_windows_w5_gate1_7_token_ablation import (
     _run_harness_bounded,
 )
 from tests.security.test_windows_w5_gate1_runtime_root_cause import (
+    _LOGON_WITH_PROFILE,
     _Gate1DirectProcess,
     _native_enabled,
 )
@@ -307,7 +308,7 @@ class WindowsW5Gate2AAppContainerTests(unittest.IsolatedAsyncioTestCase):
                     arguments=(mode, str(workspace), str(fixtures)),
                     cwd=workspace,
                     environment=environment,
-                    logon_flags=0,
+                    logon_flags=_LOGON_WITH_PROFILE,
                     timeout=120.0,
                 )
                 return _projection(raw, mode)
@@ -322,7 +323,7 @@ class WindowsW5Gate2AAppContainerTests(unittest.IsolatedAsyncioTestCase):
                 "main": _MAIN,
                 "status": "COMPLETED",
                 "production_source_diff": production_diff,
-                "controller_identity": "W2_ONLINE_via_CreateProcessWithLogonW",
+                "controller_identity": "W2_ONLINE_WITH_PROFILE_via_CreateProcessWithLogonW",
                 "profile_scope": "disposable_per_mode",
                 "pipe": results["pipe"],
                 "pty": results["pty"],

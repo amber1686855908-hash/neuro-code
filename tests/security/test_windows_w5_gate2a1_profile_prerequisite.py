@@ -70,6 +70,9 @@ def _parse_markers(data: bytes) -> dict[str, str]:
     text = data.decode("utf-8", errors="replace").replace("\x1b", "")
     markers: dict[str, str] = {}
     for line in text.replace("\r", "").splitlines():
+        if line in {"W5_GATE21_PROBE_STARTED", "W5_GATE21_PROBE_FINISHED"}:
+            markers[line.removeprefix("W5_GATE21_")] = "OBSERVED"
+            continue
         match = _MARKER.fullmatch(line)
         if match is not None:
             markers[match.group(1)] = match.group(2)[:512]
