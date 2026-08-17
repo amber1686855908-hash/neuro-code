@@ -1425,7 +1425,13 @@ int wmain(int argc, wchar_t **argv) {
         g2a_child_pty(argv[2], TRUE);
         return 0;
     }
-    if (argc >= 4 && (wcsncmp(argv[1], L"pipe", 4) == 0 || wcsncmp(argv[1], L"pty", 3) == 0)) {
+    if (argc >= 4 && (
+        wcsncmp(argv[1], L"pipe", 4) == 0 ||
+        wcsncmp(argv[1], L"pty", 3) == 0 ||
+        wcsncmp(argv[1], L"cd-", 3) == 0 ||
+        wcsncmp(argv[1], L"api-", 4) == 0 ||
+        wcsncmp(argv[1], L"layer-", 6) == 0
+    )) {
         return g2a_controller(argv[1], argv[2], argv[3]);
     }
     g2a_emit("G2A_INVALID_ARGUMENTS\n");
