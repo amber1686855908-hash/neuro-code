@@ -424,10 +424,14 @@ def _capture_ntopen(
     stack_lower = io_stack.casefold()
     if "bcrypt!ioopendevice" not in stack_lower or "bcrypt!iocallkerneldriver" not in stack_lower:
         raise RuntimeError("_IoOpenDevice caller stack was not causal")
+    # Use an explicitly bounded instruction window.  ``uf`` can follow a
+    # private helper's exception/unwind metadata for an unbounded amount of
+    # output on some debugger builds; the call-site contract only needs this
+    # bounded function window.
     disassembly = session.command(
-        "uf bcrypt!_IoOpenDevice",
-        f"W5_GATE118_UF_IOOPEN_{variant}",
-        8.0,
+        f"u 0x{io_open_address:x} L80",
+        f"W5_GATE118_U_IOOPEN_{variant}",
+        10.0,
     )
     summary = _gate117._disassembly_summary(disassembly, "NtOpenFile")
     call_sites = cast(list[dict[str, object]], summary.get("call_sites", []))
@@ -802,6 +806,7 @@ class WindowsW5Gate118NtOpenFileTests(unittest.IsolatedAsyncioTestCase):
                     }
                 except (OSError, RuntimeError, TimeoutError, subprocess.SubprocessError) as error:
                     debug_data["error"] = type(error).__name__
+                    debug_data["error_detail"] = str(error)[:256]
                     if session is not None:
                         debug_data["cdb_output_preview"] = session.output[-4096:]
                     run.terminate()
