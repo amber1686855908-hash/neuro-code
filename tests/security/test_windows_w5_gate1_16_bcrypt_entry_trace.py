@@ -761,6 +761,12 @@ class _CdbSession:
         self.process.stdin.write(command + "\n")
         self.process.stdin.flush()
 
+    def command(self, command: str, marker: str, timeout: float) -> str:
+        """Run one non-continuing command and wait for a unique echo marker."""
+
+        self.send(f"{command}; .echo {marker}")
+        return self.wait_for(lambda text: marker in text, timeout)
+
     def wait_for(self, predicate: Callable[[str], bool], timeout: float) -> str:
         collected: list[str] = []
         deadline = time.monotonic() + timeout
@@ -1017,8 +1023,7 @@ class WindowsW5Gate116BcryptEntryTraceTests(unittest.IsolatedAsyncioTestCase):
                         initial = cdb_session.wait_for(
                             lambda text: bool(_PROMPT_RE.search(text)), 15.0
                         )
-                        cdb_session.send("sxe ld:bcrypt.dll")
-                        cdb_session.wait_for(lambda text: bool(_PROMPT_RE.search(text)), 5.0)
+                        cdb_session.command("sxe ld:bcrypt.dll", "W5_GATE116_SXE_READY", 5.0)
                         cdb_session.send(".echo W5_GATE116_DEBUGGER_READY")
                         cdb_session.wait_for(lambda text: "W5_GATE116_DEBUGGER_READY" in text, 5.0)
                         cdb_session.send("g")
@@ -1034,9 +1039,8 @@ class WindowsW5Gate116BcryptEntryTraceTests(unittest.IsolatedAsyncioTestCase):
                         module_load = cdb_session.wait_for(
                             lambda text: bool(_MODULE_LOAD_RE.search(text)), 20.0
                         )
-                        cdb_session.send("lm m bcrypt")
-                        module_listing = cdb_session.wait_for(
-                            lambda text: bool(_PROMPT_RE.search(text)), 5.0
+                        module_listing = cdb_session.command(
+                            "lm m bcrypt", "W5_GATE116_LM_DONE", 5.0
                         )
                         match = _MODULE_LINE_RE.search(module_listing)
                         module_base = int(match.group(1).replace("`", ""), 16) if match else None
@@ -1060,8 +1064,9 @@ class WindowsW5Gate116BcryptEntryTraceTests(unittest.IsolatedAsyncioTestCase):
                             }
                         )
                         if entry_va is not None:
-                            cdb_session.send(f"bp /1 0x{entry_va:x}")
-                            cdb_session.wait_for(lambda text: bool(_PROMPT_RE.search(text)), 5.0)
+                            cdb_session.command(
+                                f"bp /1 0x{entry_va:x}", "W5_GATE116_ENTRY_BP_SET", 5.0
+                            )
                             cdb_session.send("g")
                             breakpoint_output = cdb_session.wait_for(
                                 lambda text: "breakpoint" in text.casefold(), 20.0
@@ -1072,9 +1077,10 @@ class WindowsW5Gate116BcryptEntryTraceTests(unittest.IsolatedAsyncioTestCase):
                             if focused_target and "!" in focused_target:
                                 debug_metadata["focused_target"] = focused_target
                                 try:
-                                    cdb_session.send(f"bp /1 {focused_target}")
-                                    cdb_session.wait_for(
-                                        lambda text: bool(_PROMPT_RE.search(text)), 5.0
+                                    cdb_session.command(
+                                        f"bp /1 {focused_target}",
+                                        "W5_GATE116_FOCUSED_BP_SET",
+                                        5.0,
                                     )
                                     cdb_session.send("g")
                                     focused_output = cdb_session.wait_for(
