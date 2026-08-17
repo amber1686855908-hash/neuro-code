@@ -168,7 +168,7 @@ def _token_projection(data: bytes) -> dict[str, object]:
     scalars: dict[str, object] = {}
     for value in _marker_values(lines, "W5_GATE119_TOKEN_SCALAR"):
         item = _parts(value)
-        field = item.get("FIELD")
+        field = item.get("FIELD") or value.split("|", 1)[0]
         if field:
             scalars[field] = _int_value(item.get("VALUE"))
             if scalars[field] is None:
