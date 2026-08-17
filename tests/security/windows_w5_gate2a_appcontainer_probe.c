@@ -743,13 +743,30 @@ static void g2a_emit_wide(const char *prefix, const wchar_t *value) {
     g2a_emitf("%s%s\n", prefix, converted);
 }
 
+static void g2a_emit_path_full(const char *label, const wchar_t *value) {
+    char converted[4096];
+    int length;
+    if (value == NULL) {
+        g2a_emitf("G2A_PATH_%s_FULL=NULL\n", label);
+        return;
+    }
+    length = WideCharToMultiByte(
+        CP_UTF8, 0, value, -1, converted, (int)sizeof(converted), NULL, NULL
+    );
+    if (length <= 0) {
+        g2a_emitf("G2A_PATH_%s_FULL=UNAVAILABLE\n", label);
+        return;
+    }
+    converted[sizeof(converted) - 1] = '\0';
+    g2a_emitf("G2A_PATH_%s_FULL=%s\n", label, converted);
+}
+
 static void g2a_path_fact(const char *label, const wchar_t *path, BOOL executable) {
     WCHAR full[MAX_PATH * 4];
     DWORD attributes;
     DWORD length;
     HANDLE readable;
     DWORD error;
-    char prefix[128];
     if (path == NULL || path[0] == L'\0') {
         g2a_emitf("G2A_PATH_%s_FULL=NULL\n", label);
         g2a_emitf("G2A_PATH_%s_EXISTS=UNKNOWN\n", label);
@@ -765,8 +782,7 @@ static void g2a_path_fact(const char *label, const wchar_t *path, BOOL executabl
         g2a_u32("G2A_PATH_FULL_ERROR=", GetLastError());
         return;
     }
-    (void)snprintf_s(prefix, sizeof(prefix), _TRUNCATE, "G2A_PATH_%s_FULL=", label);
-    g2a_emit_wide(prefix, full);
+    g2a_emit_path_full(label, full);
     attributes = GetFileAttributesW(full);
     if (attributes == INVALID_FILE_ATTRIBUTES) {
         g2a_emitf("G2A_PATH_%s_EXISTS=NO\n", label);
