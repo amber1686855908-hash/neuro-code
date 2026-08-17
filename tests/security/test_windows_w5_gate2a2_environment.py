@@ -205,7 +205,8 @@ class WindowsW5Gate2A2EnvironmentTests(unittest.IsolatedAsyncioTestCase):
                 "launch_contract": {
                     "application": "copied probe in authorized workspace",
                     "command": "probe pipe/pty child mode",
-                    "current_directory": "authorized workspace",
+                    "current_directory": "fixture_root",
+                    "lp_current_directory": "fixture_root",
                     "security_capabilities": "AppContainer SID; NULL capabilities; count 0",
                     "pipe_attributes": "SECURITY_CAPABILITIES,JOB_LIST,HANDLE_LIST",
                     "pty_attributes": "SECURITY_CAPABILITIES,JOB_LIST,PSEUDOCONSOLE",

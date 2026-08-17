@@ -136,6 +136,11 @@ def _projection(raw: dict[str, object], mode: str) -> dict[str, object]:
         access: _status(markers, f"G2A_NTOPEN_{access}")
         for access in ("0x100000", "0x100001", "0x100002", "0x100003")
     }
+    path_facts = {
+        key.removeprefix("G2A_PATH_"): values[-1]
+        for key, values in markers.items()
+        if key.startswith("G2A_PATH_") and values
+    }
     return {
         "mode": mode,
         "spawn_result": raw.get("spawn_result"),
@@ -168,6 +173,15 @@ def _projection(raw: dict[str, object], mode: str) -> dict[str, object]:
             key: _last(markers, f"G2A_ENV_{key}_EXISTS")
             for key in ("USERPROFILE", "LOCALAPPDATA", "TEMP")
         },
+        "process_api": _last(markers, "G2A_PROCESS_API"),
+        "lp_application_name": _last(markers, "G2A_LP_APPLICATION_NAME"),
+        "command_executable": _last(markers, "G2A_COMMAND_EXECUTABLE"),
+        "command_line": _last(markers, "G2A_COMMAND_LINE"),
+        "lp_current_directory": _last(markers, "G2A_LP_CURRENT_DIRECTORY"),
+        "current_directory_variant": _last(markers, "G2A_CURRENT_DIRECTORY_VARIANT"),
+        "controller_current_directory": _last(markers, "G2A_CONTROLLER_CURRENT_DIRECTORY"),
+        "path_attestation": _last(markers, "G2A_PATH_ATTESTATION"),
+        "path_facts": path_facts,
         "createprocess_error": _int_value(_last(markers, "G2A_CREATEPROCESS_ERROR")),
         "child_create_error": _int_value(_last(markers, "G2A_CHILD_CREATE_ERROR")),
         "attribute_list_error": _int_value(_last(markers, "G2A_ATTRIBUTE_LIST_ERROR")),
