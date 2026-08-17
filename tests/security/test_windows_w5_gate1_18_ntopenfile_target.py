@@ -209,7 +209,10 @@ def _parse_object_attributes(session: Any, pointer: int) -> dict[str, object]:
         raise RuntimeError("OBJECT_ATTRIBUTES memory unavailable")
     object_name_pointer = _pointer(words[2])
     if object_name_pointer is None:
-        raise RuntimeError("OBJECT_ATTRIBUTES.ObjectName unavailable")
+        raise RuntimeError(
+            "OBJECT_ATTRIBUTES.ObjectName unavailable: "
+            f"pointer=0x{pointer:x} words={[f'0x{word:x}' for word in words[:6]]}"
+        )
     object_name = _parse_object_name(session, object_name_pointer)
     return {
         "length": words[0] & 0xFFFFFFFF,
