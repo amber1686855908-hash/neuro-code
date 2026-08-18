@@ -19,8 +19,11 @@ int main(void) {
         return 2;
     }
 
+    #pragma warning(push)
+    #pragma warning(disable : 4191)
     bcrypt_gen_random_fn gen_random =
         (bcrypt_gen_random_fn)(void *)GetProcAddress(bcrypt, "BCryptGenRandom");
+    #pragma warning(pop)
     if (gen_random == NULL) {
         printf("W5_BCRYPT_SYMBOL_FAILED=%lu\n", (unsigned long)GetLastError());
         FreeLibrary(bcrypt);
