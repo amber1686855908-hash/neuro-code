@@ -12,8 +12,11 @@ Windows runtime 将 controller 保持在沙箱边界之外。每个非 PTY child
 `CreateRestrictedToken(WRITE_RESTRICTED)` 应用持久化 synthetic write SID，
 再以 `CreateProcessAsUserW` 在 kill-on-close Job Object 内创建最终 child。
 
-最终 token 的 restricting SID set 只包含 installation synthetic write SID；Everyone、
-logon、sandbox-user 与 controller SID 只作为 object ACL principal。
+最终 token 的 restricting SID set 是精确且有序的 production set：installation
+synthetic write SID、选定 sandbox-user SID、runner logon SID 与 World
+（`S-1-1-0`）。只有 synthetic SID 是受管理的 filesystem capability principal；其余
+identity entry 只提供 runtime 所需的 object authority，不构成额外 filesystem
+capability。controller SID 仍只作为 object ACL principal。
 `DISABLE_MAX_PRIVILEGE` 必须保留 `SeChangeNotifyPrivilege`；W3 会检查该事实，绝不
 通过 `AdjustTokenPrivileges` 重新授予。
 
@@ -74,7 +77,7 @@ PowerShell、Git、Node/npm、curl、NUL 和动态 BCrypt 启动。
   `terminate()` 终止整个 Job；Gate 5C：controller 丢失后失败关闭整个 scope；Gate 5D：
   runner 退出证明 `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`。
 
-已接受的 W5 workload artifact（run `32192058214`）记录 20 行 HOST/W3/W4 PASS，
+已接受的 W5 workload artifact（run `32193614626`）记录 20 行 HOST/W3/W4 PASS，
 包括 Python child process、Git repository 操作、NUL 读写模式、curl 启动和动态
 `BCryptGenRandom`。这是有界的本地工作负载证据；未来工具和网络场景仍需独立 fixture。
 Full CI 与 focused 原生验收继续构成生产 runtime 的 merge-readiness 证据。

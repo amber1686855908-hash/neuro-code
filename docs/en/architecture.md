@@ -1570,7 +1570,7 @@ zero skips and prove final-child identity, filesystem/network enforcement,
 binary/protocol transport, normal wait, explicit termination, controller-loss
 cleanup, and runner kill-on-close ownership. PTY/ConPTY remains W4, and the
 existing `off` path is unchanged. The accepted W5 workload matrix (run
-`32192058214`) passes Python and child Python, PowerShell, Git, Node/npm, curl,
+`32193614626`) passes Python and child Python, PowerShell, Git, Node/npm, curl,
 NUL read/write modes, and dynamic BCrypt startup through both W3 and W4; future
 developer tools still require their own bounded evidence rows.
 

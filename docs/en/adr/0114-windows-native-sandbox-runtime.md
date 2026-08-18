@@ -13,9 +13,12 @@ its own process token, applies the persisted synthetic write SID through the
 W1 `CreateRestrictedToken(WRITE_RESTRICTED)` primitive, and creates the final
 child with `CreateProcessAsUserW` inside a kill-on-close Job Object.
 
-The final token's restricting SID set contains exactly the installation
-synthetic write SID. Everyone, logon, sandbox-user, and controller SIDs remain
-object-ACL principals only. `DISABLE_MAX_PRIVILEGE` must preserve
+The final token's restricting SID set is the exact ordered production set:
+installation synthetic write SID, the selected sandbox-user SID, the runner
+logon SID, and World (`S-1-1-0`). Only the synthetic SID is the managed
+filesystem capability principal; the identity entries provide the runtime's
+required object authority and are not additional filesystem capabilities.
+Controller SIDs remain object-ACL principals only. `DISABLE_MAX_PRIVILEGE` must preserve
 `SeChangeNotifyPrivilege`; W3 inspects that fact and never re-grants it with
 `AdjustTokenPrivileges`.
 
@@ -89,7 +92,7 @@ seven tests executed, zero skipped. The evidence covers:
   controller loss closes the scope fail-closed; Gate 5D: runner death proves
   `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`.
 
-The accepted W5 workload artifact (run `32192058214`) records 20 HOST/W3/W4
+The accepted W5 workload artifact (run `32193614626`) records 20 HOST/W3/W4
 rows with PASS results, including Python child processes, Git repository
 operations, NUL read/write modes, curl startup, and dynamic `BCryptGenRandom`.
 This is bounded local workload evidence; future tools and network scenarios

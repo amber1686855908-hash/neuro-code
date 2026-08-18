@@ -50,25 +50,31 @@ It is intentionally concise and is updated as implementation evidence changes.
   participates in READY/NEEDS_REPAIR inspection, and is cleaned before
   installation state is removed. The runtime runner no longer attempts a
   privileged DACL mutation.
-- The latest W5 compatibility artifact (run `32191927547`, head `b8aca9c`)
-  passes every installed workload through both W3 capture and W4 ConPTY,
-  including Windows PowerShell 5.1, PowerShell 7, normal and base Python, a
-  Python child process, Git/local-repository operations, Node/npm, curl, NUL,
-  and a dynamic `BCryptGenRandom` probe. It also records zero active Job
-  processes and zero remaining output relays at each natural Exit frame.
+- The final W5 compatibility artifact (run `32193614626`, head `a31097d`)
+  passes all 20 installed workload rows through HOST, W3 capture, and W4
+  ConPTY. It covers Windows PowerShell 5.1, PowerShell 7, normal and base
+  Python, a Python child process, Git/local-repository operations, Node/npm,
+  curl, NUL access modes, and a dynamic `BCryptGenRandom` probe. Every W3/W4
+  row reaches `SpawnReady`, passes token attestation, and records zero active
+  Job processes after quiescence and zero output relays after join.
+- The final W3 native acceptance job executes seven tests with zero skips. Gate
+  5A proves natural descendant completion before `Exit`; Gates 5B, 5C, and 5D
+  prove explicit termination, controller-loss cleanup, and kill-on-close Job
+  ownership with no orphaned descendants. The final W4 PTY job passes the
+  application routing and ConPTY acceptance gates without a second sandbox
+  authority.
 
 ## CURRENT_BLOCKER
 
-- No workload-specific blocker remains in the latest compatibility artifact.
-  The final merge gate still requires the complete native acceptance matrix,
-  local checks, and an explicit final audit of the fail-closed and cleanup
-  contracts.
+- None. The production implementation, focused native acceptance, measured W5
+  workload matrix, local checks, and full CI evidence are complete. PR #49
+  remains Draft for the owner's merge decision.
 
 ## NEXT_ACTION
 
-- Finish the final native acceptance and local verification on the production
-  branch. Keep the ledger pending until every required DOD row has concrete
-  evidence and the full CI run is green.
+- Keep PR #49 Draft and unmerged until the owner explicitly authorizes the
+  ordinary merge-commit operation. Do not start another Windows sandbox phase
+  from this branch.
 
 ## FAILED_HYPOTHESES
 
@@ -83,15 +89,8 @@ It is intentionally concise and is updated as implementation evidence changes.
 
 ## PENDING_DOD
 
-- Final upstream-parity audit and documented intentional differences.
-- Native filesystem, network, pipe, ConPTY, child/grandchild, and cleanup
-  acceptance on the final token.
-- Real cmd, PowerShell, Python (including child Python), Git/local repository,
-  BCrypt, NUL, and Node workload acceptance where the Windows runner provides
-  them.
-- Explicit fail-closed adversarial review and no direct-process bypass.
-- Full local checks, complete native CI, clean pushed branch, and a Draft
-  production PR with this ledger's pending list empty.
+- None. Every DOD row has concrete local, native, or full-CI evidence recorded
+  in this ledger and the linked ADRs.
 
 ## CI_STATE
 
@@ -100,9 +99,13 @@ It is intentionally concise and is updated as implementation evidence changes.
 - Frozen evidence PR #48: `a245ffeddff66ec18cc6168081202013a2f5232a` (Draft,
   evidence-only; its Gate 2A.6 line is not production).
 - Production PR #49 is Draft at `feat/windows-sandbox-codex-parity`; the
-  latest pushed head is `b963448` after relay diagnostics, the explicit
-  Windows runtime environment, BCrypt, and child-Python workload probes.
-- Run `32191927547` (head `b8aca9c`) completed the compatibility job with all
-  20 workload rows passing in HOST, W3, and W4. Run `32191582133` is the
-  preceding diagnostics-only run; its sole failure was the quality job before
-  the local lint fix landed.
+  latest pushed head is `a31097d` after the final runtime evidence and
+  documentation-consistency updates.
+- Run `32193614626` (head `a31097d`) is the final full CI run: all 23 jobs
+  succeeded, including quality, package smoke, ordinary Linux/Windows/macOS,
+  Bubblewrap, Windows security/lifecycle/native acceptance/PTY/compatibility,
+  terminal smoke, and macOS Seatbelt jobs. Its W5 artifact contains 20 rows,
+  all PASS in HOST/W3/W4. Local gates also pass: lock check, documentation
+  parity (125 bilingual pairs), Ruff, format check, mypy, 1,817 pytest
+  tests with 48 expected skips and 3 deselections at 85.47% coverage, and
+  package build.

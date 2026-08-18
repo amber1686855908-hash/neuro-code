@@ -65,7 +65,8 @@ denied; read-only and installation/controller state mutations remain denied.
 Online Winsock connects, Offline Winsock is denied with `WSAEACCES` (10013),
 and the managed Offline firewall rule is inspected as READY before and after
 each run without runtime mutation. Every PTY SpawnReady attestation contains
-the exact singleton synthetic restricting SID and no unexpected enabled
+the exact ordered production restricting-SID set (synthetic capability SID,
+sandbox-user SID, runner logon SID, and World) and no unexpected enabled
 privileges. The certified production route therefore evidences READ LIMITED, WRITE
 STRONG, and NETWORK STRONG; STRICT still fails closed because it requires
 strong read isolation.
@@ -86,7 +87,7 @@ requirement. Runtime never performs setup, repair, UAC, ACL, or Firewall
 mutation. SandboxProfile.OFF remains on the ordinary Windows ConPTY route.
 
 The W5 workload matrix is now accepted as bounded compatibility evidence. Run
-`32192058214` records 20 HOST/W3/W4 rows passing, including Python and child
+`32193614626` records 20 HOST/W3/W4 rows passing, including Python and child
 Python, Git repository operations, Node/npm, curl, NUL access modes, and a
 dynamic BCrypt probe. This evidence does not add a second PTY authority or
 weaken the W4 token, ConPTY, or Job contracts; future tools still require their

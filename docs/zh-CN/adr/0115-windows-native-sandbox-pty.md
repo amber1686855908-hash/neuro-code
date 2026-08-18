@@ -36,7 +36,8 @@ create/append/rename/delete 成功；一个具有普通用户和 Everyone write 
 synthetic write SID 的外部目录仍被拒绝；只读 root 和 installation/controller state 的
 变更仍被拒绝。Online Winsock 可以连接，Offline Winsock 以 `WSAEACCES`（10013）拒绝；
 每次运行前后都将 managed Offline firewall rule 检查为 READY，runtime 不执行 mutation。
-每个 PTY SpawnReady attestation 都包含唯一精确的 synthetic restricting SID，且没有额外
+每个 PTY SpawnReady attestation 都包含精确且有序的 production restricting-SID set
+（synthetic capability SID、sandbox-user SID、runner logon SID 与 World），且没有额外
 启用的 privilege。已认证的生产路由因此证明 READ LIMITED、WRITE STRONG、NETWORK STRONG；
 STRICT 仍因要求 strong read isolation 而 fail closed。
 
@@ -70,7 +71,7 @@ WORKSPACE 与 READ_ONLY 只有在 W2 报告 `READY` 时才允许继续；STRICT 
 无法满足 STRONG read requirement 而 fail closed。runtime 永远不会执行 setup、repair、UAC、
 ACL 或 Firewall mutation。`SandboxProfile.OFF` 继续使用普通 Windows ConPTY 路由。
 
-W5 workload matrix 已作为有界兼容性证据接受。Run `32192058214` 记录 20 行
+W5 workload matrix 已作为有界兼容性证据接受。Run `32193614626` 记录 20 行
 HOST/W3/W4 PASS，包括 Python 与 child Python、Git repository 操作、Node/npm、curl、
 NUL access mode 以及动态 BCrypt probe。该证据不新增第二套 PTY authority，也不放宽
 W4 token、ConPTY 或 Job contract；未来工具仍需各自的 fixture。
