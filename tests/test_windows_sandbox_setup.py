@@ -648,6 +648,9 @@ class WindowsSandboxSetupAuthorityTests(unittest.TestCase):
                     for entry in entries
                 )
             )
+            inheritance_by_path = {entry.path: entry.inheritance for entry in entries}
+            self.assertEqual(inheritance_by_path[outside.resolve(strict=False)], 0x00000003)
+            self.assertEqual(inheritance_by_path[outside_file.resolve(strict=False)], 0)
 
     def test_boundary_deny_reinspection_keeps_known_files_and_ignores_new_files(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -681,6 +684,9 @@ class WindowsSandboxSetupAuthorityTests(unittest.TestCase):
             self.assertNotIn(
                 transient_file.resolve(strict=False), {entry.path for entry in reinspected}
             )
+            inheritance_by_path = {entry.path: entry.inheritance for entry in reinspected}
+            self.assertEqual(inheritance_by_path[known_file.resolve(strict=False)], 0)
+            self.assertEqual(inheritance_by_path[new_directory.resolve(strict=False)], 0x00000003)
 
     def test_setup_creates_dedicated_identities_with_one_persistent_write_sid(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

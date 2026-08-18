@@ -160,6 +160,12 @@ class WindowsManagedAce:
         ):
             if self.inheritance not in (0, INHERIT_TO_CHILDREN):
                 raise ValueError("sensitive deny inheritance must be exact or cover descendants")
+        elif self.kind is WindowsManagedAceKind.RESTRICTING_WRITE_DENY:
+            # A deny on an existing sibling file is an exact-file boundary;
+            # Windows may normalize directory inheritance flags away on files.
+            # Directory boundaries retain inheritance for future descendants.
+            if self.inheritance not in (0, INHERIT_TO_CHILDREN):
+                raise ValueError("restricting deny inheritance must be exact or cover descendants")
         elif self.inheritance != INHERIT_TO_CHILDREN:
             raise ValueError("managed ACE inheritance must cover files and child directories")
         object.__setattr__(self, "path", canonical)
@@ -246,6 +252,7 @@ def plan_restricting_boundary_denies(
             write_sid,
             WindowsManagedAceKind.RESTRICTING_WRITE_DENY,
             WRITE_ONLY_ACCESS_MASK,
+            inheritance=INHERIT_TO_CHILDREN if path.is_dir() else 0,
         )
         for path in sorted(candidates, key=str)
     )
