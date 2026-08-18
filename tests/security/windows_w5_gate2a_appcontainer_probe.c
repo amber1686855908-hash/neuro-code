@@ -78,6 +78,7 @@ typedef char g2a_pseudoconsole_attribute_encoding_check[
 #define G2A_FILE_WRITE_EA 0x00000010UL
 #define G2A_FILE_READ_ATTRIBUTES 0x00000080UL
 #define G2A_FILE_WRITE_ATTRIBUTES 0x00000100UL
+#define G2A_FILE_TRAVERSE 0x00000020UL
 #define G2A_READ_CONTROL 0x00020000UL
 #define G2A_SYNCHRONIZE 0x00100000UL
 #define G2A_FILE_GENERIC_READ (STANDARD_RIGHTS_READ | G2A_FILE_READ_DATA | G2A_FILE_READ_ATTRIBUTES | G2A_FILE_READ_EA | G2A_SYNCHRONIZE)
@@ -857,6 +858,33 @@ static BOOL g2a_grant_sid(const wchar_t *path, PSID sid, DWORD mask) {
     return result == ERROR_SUCCESS;
 }
 
+/*
+ * An AppContainer must be able to traverse the disposable parent directory
+ * before an ACL on the authorized workspace or executable can be observed.
+ * The earlier probe granted the AppContainer SID on the leaf paths only, so
+ * GetFileAttributesW/CreateFileW reported ERROR_PATH_NOT_FOUND from inside
+ * the child.  Grant only the traversal/read-attribute surface on this
+ * test-owned parent; do not modify any host/system directory.
+ */
+static BOOL g2a_grant_parent_traverse(const wchar_t *path, PSID sid) {
+    wchar_t parent[MAX_PATH * 4];
+    wchar_t *separator;
+    if (path == NULL || sid == NULL || wcslen(path) >= sizeof(parent) / sizeof(parent[0])) {
+        return FALSE;
+    }
+    wcscpy_s(parent, sizeof(parent) / sizeof(parent[0]), path);
+    separator = wcsrchr(parent, L'\\');
+    if (separator == NULL || separator == parent) {
+        return FALSE;
+    }
+    *separator = L'\0';
+    return g2a_grant_sid(
+        parent,
+        sid,
+        G2A_FILE_TRAVERSE | G2A_FILE_READ_ATTRIBUTES | G2A_FILE_READ_EA | G2A_SYNCHRONIZE
+    );
+}
+
 static BOOL g2a_prepare_fixtures(const wchar_t *root, PSID app_sid) {
     const wchar_t *names[] = {
         L"authorized_workspace.txt", L"outside_user_only.txt", L"appcontainer_sid_only.txt",
@@ -1408,7 +1436,16 @@ static BOOL g2a_create_child(
     }
     ZeroMemory(&startup, sizeof(startup));
     startup.StartupInfo.cb = sizeof(startup);
-    if (!pty && !no_transport) {
+    if (pty) {
+        /* Match the canonical ConPTY launch contract: the pseudoconsole owns
+         * the actual terminal streams, while the child receives the standard
+         * handle placeholders expected by the console host. */
+        startup.StartupInfo.dwFlags = G2A_STARTF_USESTDHANDLES;
+        startup.StartupInfo.hStdInput = INVALID_HANDLE_VALUE;
+        startup.StartupInfo.hStdOutput = INVALID_HANDLE_VALUE;
+        startup.StartupInfo.hStdError = INVALID_HANDLE_VALUE;
+        g2a_emit("G2A_PTY_STD_HANDLES=INVALID_PLACEHOLDERS\n");
+    } else if (!no_transport) {
         startup.StartupInfo.dwFlags = G2A_STARTF_USESTDHANDLES;
         startup.StartupInfo.hStdInput = input_read;
         startup.StartupInfo.hStdOutput = output_write;
@@ -1692,6 +1729,10 @@ static int g2a_controller(const wchar_t *mode, const wchar_t *workspace, const w
         g2a_profile_cleanup(&profile);
         return 21;
     }
+    g2a_emitf(
+        "G2A_PARENT_AUTHORITY=%s\n",
+        g2a_grant_parent_traverse(workspace, profile.Sid) ? "PASS" : "FAIL"
+    );
     (void)g2a_grant_sid(workspace, profile.Sid, G2A_FILE_ALL_TEMP);
     (void)g2a_grant_sid(self, profile.Sid, G2A_FILE_GENERIC_READ | FILE_EXECUTE);
     if (!g2a_prepare_fixtures(fixture_root, profile.Sid)) {

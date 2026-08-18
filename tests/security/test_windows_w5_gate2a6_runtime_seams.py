@@ -91,6 +91,7 @@ def _descendant_projection(run: dict[str, object], mode: str) -> dict[str, objec
             "self_exists": _marker(projected, "G2A_DESCENDANT_SELF_EXISTS"),
             "self_readable": _marker(projected, "G2A_DESCENDANT_SELF_READABLE"),
             "workspace_exists": _marker(projected, "G2A_DESCENDANT_WORKSPACE_EXISTS"),
+            "parent_authority": _marker(projected, "G2A_PARENT_AUTHORITY"),
             "environment_present": _marker(projected, "G2A_DESCENDANT_ENV_PRESENT"),
             "local_timeout": _marker(projected, "G2A_LOCAL_TIMEOUT"),
             "last_milestone": _marker(projected, "G2A_LAST_MILESTONE"),
@@ -124,6 +125,29 @@ def _descendant_classification(
         if app_pass.get("APP_ORIGINAL"):
             return "W5_GATE2A6_DESCENDANT_PASS"
         return "W5_GATE2A6_DESCENDANT_LAUNCH_CONTRACT_CAUSAL"
+    # ERROR_ACCESS_DENIED is not enough by itself.  Require every AppContainer
+    # cell to have a usable executable, workspace, and disposable-parent ACL so
+    # a path-resolution failure cannot be mistaken for a child-process policy
+    # failure.  With those inputs proven, the successful JOB_ONLY control plus
+    # four identical AppContainer denials is the direct child-creation
+    # restriction evidence allowed by Gate 2A.6, even when the mitigation
+    # policy's NoChildProcessCreation bit is false.
+    app_inputs_valid = all(
+        run.get("parent_authority") == "PASS"
+        and run.get("self_path_available") == "PASS"
+        and run.get("self_exists") == "PASS"
+        and run.get("self_readable") == "PASS"
+        and run.get("workspace_exists") == "PASS"
+        and run.get("descendant_policy_available") == "PASS"
+        for run in app_runs.values()
+    )
+    if app_inputs_valid and all(
+        run.get("descendant_create") != "PASS"
+        and run.get("descendant_create_error") == 5
+        and run.get("no_child_process_creation") == "FAIL"
+        for run in app_runs.values()
+    ):
+        return "W5_GATE2A6_APPCONTAINER_CHILD_PROCESS_POLICY_BLOCKED"
     if all(run.get("no_child_process_creation") == "PASS" for run in app_runs.values()) and all(
         run.get("descendant_policy_available") == "PASS" for run in app_runs.values()
     ):
@@ -325,6 +349,11 @@ class WindowsW5Gate2A6RuntimeSeamTests(unittest.IsolatedAsyncioTestCase):
                 pty_input is not None and pty_lf is not None and _pty_input_pass(pty_lf)
             ):
                 pty_classification = "W5_GATE2A6_PTY_CR_INPUT_CAUSAL"
+            elif pty_input is not None and _pty_min_output_pass(pty_min):
+                # Output-only proves the ConPTY creation/relay seam.  A
+                # failed input canary is a separate transport result and must
+                # not be silently reported as a complete PTY pass.
+                pty_classification = "W5_GATE2A6_PTY_TRANSPORT_STILL_BLOCKED"
 
             pipe_full_pass = _full_transport_pass(pipe_full, "PIPE")
             pty_full_pass = pty_full is not None and _full_transport_pass(pty_full, "PTY")
@@ -380,6 +409,11 @@ class WindowsW5Gate2A6RuntimeSeamTests(unittest.IsolatedAsyncioTestCase):
                             "audit_no_child_process_creation": run.get(
                                 "audit_no_child_process_creation"
                             ),
+                            "parent_authority": run.get("parent_authority"),
+                            "self_path_available": run.get("self_path_available"),
+                            "self_exists": run.get("self_exists"),
+                            "self_readable": run.get("self_readable"),
+                            "workspace_exists": run.get("workspace_exists"),
                         }
                         for name, run in app_runs.items()
                     },
