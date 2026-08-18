@@ -1379,7 +1379,11 @@ static BOOL g2a_create_child(
     g2a_emit_wide("G2A_COMMAND_LINE=", command);
     g2a_emit_wide("G2A_LP_CURRENT_DIRECTORY=", current_directory);
     g2a_emitf("G2A_INHERIT_HANDLES=%s\n", (!pty && !no_transport) ? "TRUE" : "FALSE");
-    g2a_emit("G2A_CREATION_FLAGS=CREATE_UNICODE_ENVIRONMENT,CREATE_NO_WINDOW,EXTENDED_STARTUPINFO_PRESENT\n");
+    if (pty) {
+        g2a_emit("G2A_CREATION_FLAGS=CREATE_UNICODE_ENVIRONMENT,EXTENDED_STARTUPINFO_PRESENT\n");
+    } else {
+        g2a_emit("G2A_CREATION_FLAGS=CREATE_UNICODE_ENVIRONMENT,CREATE_NO_WINDOW,EXTENDED_STARTUPINFO_PRESENT\n");
+    }
     (void)InitializeProcThreadAttributeList(NULL, attribute_count, 0, &bytes);
     if (bytes == 0) {
         g2a_u32("G2A_ATTRIBUTE_LIST_ERROR=", GetLastError());
@@ -1438,35 +1442,40 @@ static BOOL g2a_create_child(
                 return FALSE;
             }
             g2a_emit("G2A_CREATEPROCESS_CALL=ABOUT_TO_CALL\n");
-            if (process_api == G2A_PROCESS_API_CURRENT) {
-                created = CreateProcessW(
-                    self,
-                    command,
-                    NULL,
-                    NULL,
-                    !pty && !no_transport,
-                    G2A_CREATE_UNICODE_ENVIRONMENT | G2A_CREATE_NO_WINDOW |
-                        G2A_EXTENDED_STARTUPINFO_PRESENT,
-                    environment,
-                    current_directory,
-                    &startup.StartupInfo,
-                    process
-                );
-            } else {
-                created = CreateProcessAsUserW(
-                    token,
-                    self,
-                    command,
-                    NULL,
-                    NULL,
-                    !pty && !no_transport,
-                    G2A_CREATE_UNICODE_ENVIRONMENT | G2A_CREATE_NO_WINDOW |
-                        G2A_EXTENDED_STARTUPINFO_PRESENT,
-                    environment,
-                    current_directory,
-                    &startup.StartupInfo,
-                    process
-                );
+            {
+                DWORD creation_flags = G2A_CREATE_UNICODE_ENVIRONMENT |
+                    G2A_EXTENDED_STARTUPINFO_PRESENT;
+                if (!pty) {
+                    creation_flags |= G2A_CREATE_NO_WINDOW;
+                }
+                if (process_api == G2A_PROCESS_API_CURRENT) {
+                    created = CreateProcessW(
+                        self,
+                        command,
+                        NULL,
+                        NULL,
+                        !pty && !no_transport,
+                        creation_flags,
+                        environment,
+                        current_directory,
+                        &startup.StartupInfo,
+                        process
+                    );
+                } else {
+                    created = CreateProcessAsUserW(
+                        token,
+                        self,
+                        command,
+                        NULL,
+                        NULL,
+                        !pty && !no_transport,
+                        creation_flags,
+                        environment,
+                        current_directory,
+                        &startup.StartupInfo,
+                        process
+                    );
+                }
             }
             if (!created) {
                 g2a_u32("G2A_CREATEPROCESS_ERROR=", GetLastError());
