@@ -1226,15 +1226,6 @@ class _RunnerChild:
             # runner-created IPC and desktop objects.  The capability SID is
             # still the only managed write principal on workspace roots.
             token.set_default_dacl((runner_logon_sid, _WORLD_SID, write_sid.value))
-            allow_null_device = payload.get("allow_null_device", False)
-            if not isinstance(allow_null_device, bool):
-                raise SandboxError("Windows runtime NUL authority flag is invalid")
-            if allow_null_device:
-                # ``WRITE_RESTRICTED`` performs a second access check for
-                # device writes.  Grant only the installation capability SID
-                # on the existing NUL DACL; any failure is fail-closed before
-                # the developer child is created.
-                self._api.allow_null_device(write_sid.value)
             desktop_value = payload.get(
                 "desktop_mode", _WindowsNativeDesktopMode.PRIVATE_DESKTOP.value
             )

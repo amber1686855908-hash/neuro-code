@@ -43,6 +43,13 @@ It is intentionally concise and is updated as implementation evidence changes.
   and add only newly-created sibling directories. This keeps inherited
   protection for future descendants without treating controller helper/marker
   files created after setup as ACL drift.
+- The first capability-scoped NUL attempt exposed that a normal W2 runner
+  cannot open the process-global device with ``WRITE_DAC``. The NUL grant is
+  now owned by the existing elevated setup authority: it preserves unrelated
+  device ACEs, adds/removes only the installation synthetic write SID,
+  participates in READY/NEEDS_REPAIR inspection, and is cleaned before
+  installation state is removed. The runtime runner no longer attempts a
+  privileged DACL mutation.
 
 ## CURRENT_BLOCKER
 
@@ -53,14 +60,15 @@ It is intentionally concise and is updated as implementation evidence changes.
   environment hypothesis were both disproved. The first `cmd.exe` wrapper
   diagnostic was invalid because C-runtime quoting made PowerShell print its
   script text; an exact UTF-16LE `-EncodedCommand` wrapper also timed out.
-  Upstream parity audit then identified the missing per-capability `\\.\\NUL`
-  device ACL grant used before final child creation. That narrow grant is now
-  implemented and its native artifact is pending.
+  Upstream parity audit identified the missing per-capability `\\.\\NUL`
+  device ACL grant used before final child creation. The first implementation
+  attempted it inside the normal W2 runner and was rejected with Win32 error 5;
+  the grant is now moved to elevated setup and its native artifact is pending.
 
 ## NEXT_ACTION
 
-- Inspect the next Windows compatibility artifact after the capability-scoped
-  NUL grant. If Git, PowerShell, Python, and curl now leave their startup
+- Inspect the next Windows compatibility artifact after the setup-owned NUL
+  grant. If Git, PowerShell, Python, and curl now leave their startup
   timeout cluster, continue with the remaining native workload and lifecycle
   acceptance. If not, use the bounded artifact to isolate the next smallest
   upstream parity difference; do not weaken the token contract.
@@ -94,9 +102,8 @@ It is intentionally concise and is updated as implementation evidence changes.
 - Production branch: `feat/windows-sandbox-codex-parity`.
 - Frozen evidence PR #48: `a245ffeddff66ec18cc6168081202013a2f5232a` (Draft,
   evidence-only; its Gate 2A.6 line is not production).
-- Production PR #49 is Draft at `feat/windows-sandbox-codex-parity`; current
-  head is `50521c4` after environment, desktop-diagnostic, and hidden-error
-  dialog fixes. Run `32185023683` (head `e7ffbcc`) passed runtime and
-  compatibility job colors but its artifact still recorded PowerShell
-  `TIMEOUT`; run `32185500327` (head `18287a3`) and the current run for
-  `50521c4` are pending.
+- Production PR #49 is Draft at `feat/windows-sandbox-codex-parity`; the
+  latest pushed head is `23b3b3b` after environment, desktop-diagnostic,
+  hidden-error dialog, exact PowerShell wrapper, and setup-owned NUL changes.
+  Run `32188203385` recorded the pre-fix `CreateFileW(NUL security)` error 5;
+  its quality/platform jobs were still running when this entry was written.
