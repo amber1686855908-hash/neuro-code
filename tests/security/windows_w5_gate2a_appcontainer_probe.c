@@ -1703,6 +1703,7 @@ static int g2a_controller(const wchar_t *mode, const wchar_t *workspace, const w
     PROCESS_INFORMATION process;
     HANDLE descendant_handle = NULL;
     WCHAR self[MAX_PATH * 4];
+    WCHAR owned_self[MAX_PATH * 4];
     BOOL pty = FALSE;
     G2A_TRANSPORT transport = G2A_TRANSPORT_PIPE;
     BOOL use_user_environment = FALSE;
@@ -1735,6 +1736,21 @@ static int g2a_controller(const wchar_t *mode, const wchar_t *workspace, const w
         g2a_profile_cleanup(&profile);
         return 21;
     }
+    /* The trusted controller copies the probe into the workspace before the
+     * W2 user starts it.  Make a second copy while running as that W2 user so
+     * the AppContainer child executable is owned by the same identity and its
+     * SID-specific ACL can be applied without broad host principals. */
+    if (workspace == NULL ||
+        swprintf_s(owned_self, sizeof(owned_self) / sizeof(owned_self[0]),
+            L"%s\\g2a_owned_probe.exe", workspace) < 0 ||
+        !CopyFileW(self, owned_self, FALSE)) {
+        g2a_u32("G2A_SELF_COPY_ERROR=", GetLastError());
+        g2a_emit("G2A_SELF_COPY=FAIL\n");
+        g2a_profile_cleanup(&profile);
+        return 21;
+    }
+    wcscpy_s(self, sizeof(self) / sizeof(self[0]), owned_self);
+    g2a_emit("G2A_SELF_COPY=PASS\n");
     g2a_emitf(
         "G2A_PARENT_AUTHORITY=%s\n",
         g2a_grant_parent_traverse(workspace, profile.Sid) ? "PASS" : "FAIL"
