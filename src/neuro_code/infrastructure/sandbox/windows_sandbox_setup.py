@@ -518,6 +518,8 @@ class WindowsNativeSandboxSetupAuthority:
         request: WindowsSandboxSetupRequest,
         record: _InstallationRecord,
         credential_path: Path,
+        *,
+        include_new_boundary_files: bool = False,
     ) -> WindowsFilesystemSetupPlan:
         user_sids = tuple(identity.user_sid for identity in record.identities)
         base = plan_windows_filesystem_authority(
@@ -528,7 +530,18 @@ class WindowsNativeSandboxSetupAuthority:
             credential_path=credential_path,
             private_root=request.installation_root,
         )
-        boundary_denies = plan_restricting_boundary_denies(request, record.write_sid)
+        existing_boundary_paths = tuple(
+            entry.path
+            for entry in record.managed_aces
+            if entry.kind is WindowsManagedAceKind.RESTRICTING_WRITE_DENY
+        )
+        boundary_denies = plan_restricting_boundary_denies(
+            request,
+            record.write_sid,
+            existing_boundary_paths=(
+                None if include_new_boundary_files else existing_boundary_paths
+            ),
+        )
         return WindowsFilesystemSetupPlan((*base.entries, *boundary_denies))
 
     @staticmethod
@@ -713,7 +726,12 @@ class WindowsNativeSandboxSetupAuthority:
         else:
             record, _ = self._repair_missing_accounts(account_api, record)
         store = self._store(request)
-        plan = self._plan(request, record, store.path)
+        plan = self._plan(
+            request,
+            record,
+            store.path,
+            include_new_boundary_files=fresh,
+        )
         updated = _InstallationRecord(
             record.schema_version,
             record.installation_id,

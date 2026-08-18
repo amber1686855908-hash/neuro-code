@@ -177,14 +177,23 @@ class WindowsManagedAce:
 def plan_restricting_boundary_denies(
     request: WindowsSandboxSetupRequest,
     write_sid: SyntheticWindowsSid,
+    *,
+    existing_boundary_paths: Iterable[Path] | None = None,
 ) -> tuple[WindowsManagedAce, ...]:
-    """Plan explicit capability denies for existing sibling boundary paths.
+    """Plan explicit capability denies for sibling boundary paths.
 
     A compatibility restricted token includes identity SIDs that are needed by
     ordinary Windows runtime objects.  A broad ``Everyone`` write ACE would
     otherwise satisfy the restricted-side check.  These explicit, persisted
     synthetic-SID denies preserve the capability boundary without changing
     unrelated principals or authorized roots.
+
+    A fresh setup records every existing sibling path, including files.  On a
+    later inspection the persisted file paths remain authoritative, while
+    newly-created sibling directories are added because their inherited deny
+    protects future descendants.  Newly-created sibling files are deliberately
+    not treated as setup drift: controller-side helper/marker files commonly
+    appear after setup and must not make a READY installation fail closed.
     """
 
     if not isinstance(request, WindowsSandboxSetupRequest):
@@ -193,6 +202,26 @@ def plan_restricting_boundary_denies(
         raise TypeError("filesystem setup write SID must be canonical")
     authorized = set(request.read_roots) | set(request.writable_roots)
     candidates: set[Path] = set()
+    known_paths = None if existing_boundary_paths is None else set(existing_boundary_paths)
+
+    def add_candidate(candidate: Path) -> None:
+        try:
+            canonical = candidate.expanduser().resolve(strict=False)
+        except (OSError, RuntimeError) as error:
+            raise SandboxError("cannot canonicalize Windows sandbox boundary sibling") from error
+        if canonical == request.installation_root or canonical in authorized:
+            return
+        if any(root.is_relative_to(canonical) for root in request.read_roots):
+            return
+        if canonical.is_file() or canonical.is_dir():
+            candidates.add(canonical)
+
+    if known_paths is not None:
+        for path in known_paths:
+            if not isinstance(path, Path):
+                raise TypeError("existing boundary paths must be pathlib.Path values")
+            add_candidate(path)
+
     for root in request.read_roots:
         try:
             children = tuple(root.parent.iterdir())
@@ -205,12 +234,12 @@ def plan_restricting_boundary_denies(
                 raise SandboxError(
                     "cannot canonicalize Windows sandbox boundary sibling"
                 ) from error
-            if canonical == request.installation_root or canonical in authorized:
-                continue
-            if any(root.is_relative_to(canonical) for root in request.read_roots):
-                continue
-            if canonical.is_file() or canonical.is_dir():
-                candidates.add(canonical)
+            # New directories are stable boundary roots: their inherited deny
+            # also protects files created underneath them after setup.  New
+            # files are transient controller artifacts and are considered only
+            # on a fresh setup (known_paths is None).
+            if known_paths is None or canonical.is_dir():
+                add_candidate(canonical)
     return tuple(
         WindowsManagedAce(
             path,

@@ -38,18 +38,25 @@ It is intentionally concise and is updated as implementation evidence changes.
   plan now persists explicit synthetic capability-deny ACEs for existing
   sibling boundary paths; authorized roots and unrelated principals remain
   outside that deny set.
+- Boundary-deny planning now preserves fresh-setup protection for existing
+  sibling files, while later READY inspections retain persisted file denies
+  and add only newly-created sibling directories. This keeps inherited
+  protection for future descendants without treating controller helper/marker
+  files created after setup as ACL drift.
 
 ## CURRENT_BLOCKER
 
-- The boundary-deny hardening has not yet been validated by native Windows
-  filesystem and PTY acceptance; the previous run failed only on the
-  outside-broad-write assertions before this fix.
+- The boundary-deny reinspection fix is locally validated but not yet proven
+  by a replacement native Windows runtime/PTY run. The latest remote run
+  `32172674664` failed only in controller-loss helper startup after the
+  boundary-deny change; filesystem, token, lifecycle, native acceptance, and
+  compatibility jobs passed.
 
 ## NEXT_ACTION
 
-- Run focused Windows filesystem and PTY acceptance with the persisted
-  boundary-deny plan, then inspect any remaining native failures before
-  expanding to full real-workload and cleanup coverage.
+- Commit and push the stable boundary-deny reinspection fix, run focused
+  Windows runtime and PTY acceptance, then inspect any remaining native
+  failures before expanding to full real-workload and cleanup coverage.
 
 ## FAILED_HYPOTHESES
 
@@ -79,5 +86,9 @@ It is intentionally concise and is updated as implementation evidence changes.
 - Frozen evidence PR #48: `1dbb6ef9ef0c3d788b861f814396c19812ace51e`, CI
   `32168581270` (49/49 success).
 - Production PR #49 is Draft at `feat/windows-sandbox-codex-parity`; latest
-  pushed token-model commit is `26cc140`, and boundary-deny hardening is
-  currently uncommitted.
+  pushed commits are `26cc140` (token model), `827059e` (boundary-deny
+  hardening), and `fc3cd20` (Windows short-path assertion normalization).
+  CI run `32172674664` has 2 focused failures
+  (`windows-native-sandbox-runtime` and `windows-native-sandbox-pty`), both
+  `CONTROLLER_LOSS_HELPER_STARTUP_FAILURE`; the replacement is pending after
+  the reinspection fix.

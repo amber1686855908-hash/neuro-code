@@ -626,14 +626,19 @@ class WindowsSandboxSetupAuthorityTests(unittest.TestCase):
             root = Path(directory)
             request = self._request(directory)
             outside = root / "outside"
+            outside_file = root / "outside-file.txt"
             outside.mkdir()
+            outside_file.write_text("fixture", encoding="utf-8")
             entries = plan_restricting_boundary_denies(
                 request,
                 SyntheticWindowsSid.from_components((1, 2, 3, 4)),
             )
             self.assertEqual(
                 tuple(entry.path for entry in entries),
-                (outside.resolve(strict=False),),
+                (
+                    outside.resolve(strict=False),
+                    outside_file.resolve(strict=False),
+                ),
             )
             self.assertTrue(
                 all(
@@ -642,6 +647,39 @@ class WindowsSandboxSetupAuthorityTests(unittest.TestCase):
                     and entry.is_deny
                     for entry in entries
                 )
+            )
+
+    def test_boundary_deny_reinspection_keeps_known_files_and_ignores_new_files(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            request = self._request(directory)
+            outside = root / "outside"
+            known_file = root / "known-file.txt"
+            transient_file = root / "transient-helper.py"
+            new_directory = root / "new-outside"
+            outside.mkdir()
+            known_file.write_text("fixture", encoding="utf-8")
+            initial = plan_restricting_boundary_denies(
+                request,
+                SyntheticWindowsSid.from_components((1, 2, 3, 4)),
+            )
+            transient_file.write_text("marker", encoding="utf-8")
+            new_directory.mkdir()
+            reinspected = plan_restricting_boundary_denies(
+                request,
+                SyntheticWindowsSid.from_components((1, 2, 3, 4)),
+                existing_boundary_paths=tuple(entry.path for entry in initial),
+            )
+            self.assertEqual(
+                {entry.path for entry in reinspected},
+                {
+                    outside.resolve(strict=False),
+                    known_file.resolve(strict=False),
+                    new_directory.resolve(strict=False),
+                },
+            )
+            self.assertNotIn(
+                transient_file.resolve(strict=False), {entry.path for entry in reinspected}
             )
 
     def test_setup_creates_dedicated_identities_with_one_persistent_write_sid(self) -> None:
