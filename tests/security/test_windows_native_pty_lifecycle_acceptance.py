@@ -209,8 +209,10 @@ def _controller_loss_pty_helper_source(
                 privilege_api=_NativeWindowsSetupPrivilegeApi(),
             )
             process = None
+            phase = "AUTHORITY_SETUP"
             try:
                 authority.setup(setup_request)
+                phase = "ADAPTER_CONSTRUCTION"
                 adapter = WindowsNativeLocalProcessSandbox(
                     SandboxProfile.WORKSPACE,
                     workspace,
@@ -220,6 +222,7 @@ def _controller_loss_pty_helper_source(
                     _diagnostic_desktop_mode=_WindowsNativeDesktopMode.PRIVATE_DESKTOP,
                     _diagnostic_create_no_window=False,
                 )
+                phase = "PTY_SPAWN"
                 process = await asyncio.to_thread(
                     adapter.spawn_terminal,
                     request,
@@ -228,6 +231,7 @@ def _controller_loss_pty_helper_source(
                     on_eof=lambda: None,
                     on_error=lambda _error: None,
                 )
+                phase = "DESCENDANT_READINESS"
                 runner = getattr(process, "_runner", None)
                 runner_pid = int(getattr(runner, "process_id", 0))
                 pid_file = workspace / "grandchild.pid"
@@ -264,7 +268,7 @@ def _controller_loss_pty_helper_source(
             except BaseException as error:
                 # Keep controller-loss startup failures diagnosable without
                 # exposing paths, credentials, handles, or exception text.
-                payload = {"error": type(error).__name__}
+                payload = {"error": type(error).__name__, "phase": phase}
                 diagnostic_payload = getattr(error, "diagnostic_payload", None)
                 if callable(diagnostic_payload):
                     try:
