@@ -1031,7 +1031,7 @@ class WindowsNativePtyAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                             "network": network_results,
                             "firewall_ready_checkpoints": "PASS",
                             "runtime_firewall_mutations": 0,
-                            "token_restricting_sid": "exact-singleton",
+                            "token_restricting_sid": "exact-ordered-set",
                             "capabilities": {
                                 "read": "limited",
                                 "write": "strong",
