@@ -1120,7 +1120,11 @@ class WindowsNativeWorkloadCompatibilityTests(unittest.IsolatedAsyncioTestCase):
                                 + subprocess.list2cmdline(
                                     [
                                         str(powershell),
-                                        *powershell_spec.arguments,
+                                        "-NoLogo",
+                                        "-NoProfile",
+                                        "-NonInteractive",
+                                        "-Command",
+                                        "Write-Output W5_POWERSHELL_OK",
                                     ]
                                 ),
                             ),
