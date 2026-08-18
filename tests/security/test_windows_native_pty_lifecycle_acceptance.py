@@ -262,8 +262,19 @@ def _controller_loss_pty_helper_source(
                 await asyncio.Event().wait()
                 return 0
             except BaseException as error:
+                # Keep controller-loss startup failures diagnosable without
+                # exposing paths, credentials, handles, or exception text.
+                payload = {"error": type(error).__name__}
+                diagnostic_payload = getattr(error, "diagnostic_payload", None)
+                if callable(diagnostic_payload):
+                    try:
+                        value = diagnostic_payload()
+                    except BaseException:
+                        value = None
+                    if isinstance(value, dict):
+                        payload["diagnostic"] = value
                 ready.with_name("controller-error.json").write_text(
-                    json.dumps({"error": type(error).__name__}), encoding="ascii"
+                    json.dumps(payload, sort_keys=True), encoding="ascii"
                 )
                 return 23
             finally:
@@ -635,6 +646,7 @@ class WindowsNativePtyLifecycleAcceptanceTests(unittest.IsolatedAsyncioTestCase)
             grandchild_observer: _WindowsPidHandle | None = None
             classification: str | None = None
             ready: dict[str, object] = {}
+            helper_error: dict[str, object] = {}
             helper_exit: int | None = None
             runner_post: dict[str, object] = {"state": "NOT_OBSERVED"}
             leader_post: dict[str, object] = {"state": "NOT_OBSERVED"}
@@ -648,7 +660,15 @@ class WindowsNativePtyLifecycleAcceptanceTests(unittest.IsolatedAsyncioTestCase)
                     and asyncio.get_running_loop().time() < deadline
                 ):
                     await asyncio.sleep(0.02)
-                if error_path.is_file() or not ready_path.is_file():
+                if error_path.is_file():
+                    try:
+                        value = json.loads(error_path.read_text(encoding="ascii"))
+                        if isinstance(value, dict):
+                            helper_error = value
+                    except (OSError, UnicodeError, ValueError, json.JSONDecodeError):
+                        pass
+                    classification = "CONTROLLER_LOSS_HELPER_STARTUP_FAILURE"
+                elif not ready_path.is_file():
                     classification = "CONTROLLER_LOSS_HELPER_STARTUP_FAILURE"
                 else:
                     try:
@@ -705,6 +725,7 @@ class WindowsNativePtyLifecycleAcceptanceTests(unittest.IsolatedAsyncioTestCase)
                     "grandchild_pre_state": "ACTIVE",
                     "forced_controller_death": forced_controller_death,
                     "controller_helper_exit": helper_exit,
+                    "helper_error": helper_error,
                     "runner_post_state": runner_post.get("state"),
                     "runner_exit_code": runner_post.get("exit_code"),
                     "leader_post_state": leader_post.get("state"),
