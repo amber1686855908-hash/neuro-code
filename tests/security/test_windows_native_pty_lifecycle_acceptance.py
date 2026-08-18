@@ -232,6 +232,8 @@ def _controller_loss_pty_helper_source(
                     _diagnostic_desktop_mode=_WindowsNativeDesktopMode.PRIVATE_DESKTOP,
                     _diagnostic_create_no_window=False,
                 )
+                phase = "PTY_VALIDATE"
+                adapter._validate_terminal_request(request)
                 phase = "PTY_SPAWN"
                 process = await asyncio.to_thread(
                     adapter.spawn_terminal,
