@@ -125,7 +125,15 @@ _WINDOWS_CHILD_CORE_ENVIRONMENT = frozenset(
         "PROGRAMFILES",
         "PROGRAMFILES(X86)",
         "PROGRAMW6432",
+        "COMMONPROGRAMFILES",
+        "COMMONPROGRAMFILES(X86)",
+        "COMMONPROGRAMW6432",
         "PROGRAMDATA",
+        "ALLUSERSPROFILE",
+        "PUBLIC",
+        "OS",
+        "PSMODULEPATH",
+        "PSHOME",
         "LOCALAPPDATA",
         "APPDATA",
         "POWERSHELL",
@@ -202,18 +210,11 @@ def _bounded_lifecycle_diagnostic(value: object) -> dict[str, object] | None:
     result: dict[str, object] = {}
     for key, item in value.items():
         if (
-            (
-                key.startswith("job_active_processes_")
-                or key.startswith("relay_threads_")
-            )
+            key.startswith(("job_active_processes_", "relay_threads_"))
             and isinstance(item, int)
             and 0 <= item <= 1_000_000
-        ):
-            result[key] = item
-        elif (
-            key == "job_active_processes_query_error"
-            and isinstance(item, str)
-            and len(item) <= 64
+        ) or (
+            key == "job_active_processes_query_error" and isinstance(item, str) and len(item) <= 64
         ):
             result[key] = item
     return result or None
@@ -604,7 +605,27 @@ class WindowsNativeLocalProcessSandbox(LocalProcessSandbox):
             values.setdefault("PROGRAMFILES", f"{system_drive}\\Program Files")
             values.setdefault("PROGRAMW6432", values["PROGRAMFILES"])
             values.setdefault("PROGRAMFILES(X86)", f"{system_drive}\\Program Files (x86)")
+            values.setdefault("COMMONPROGRAMFILES", f"{values['PROGRAMFILES']}\\Common Files")
+            values.setdefault("COMMONPROGRAMW6432", values["COMMONPROGRAMFILES"])
+            values.setdefault(
+                "COMMONPROGRAMFILES(X86)",
+                f"{values['PROGRAMFILES(X86)']}\\Common Files",
+            )
             values.setdefault("PROGRAMDATA", f"{system_drive}\\ProgramData")
+            values.setdefault("ALLUSERSPROFILE", values["PROGRAMDATA"])
+            values.setdefault("PUBLIC", f"{system_drive}\\Users\\Public")
+            values.setdefault("OS", "Windows_NT")
+            windir = values["WINDIR"].rstrip("\\/")
+            values.setdefault(
+                "PSMODULEPATH",
+                ";".join(
+                    (
+                        f"{values['PROGRAMFILES']}\\WindowsPowerShell\\Modules",
+                        f"{windir}\\System32\\WindowsPowerShell\\v1.0\\Modules",
+                    )
+                ),
+            )
+            values.setdefault("PSHOME", f"{windir}\\System32\\WindowsPowerShell\\v1.0")
         values["PYTHONNOUSERSITE"] = "1"
         return values
 

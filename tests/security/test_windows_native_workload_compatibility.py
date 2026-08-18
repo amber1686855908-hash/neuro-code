@@ -192,6 +192,69 @@ def _compile_nul_probe() -> Path:  # pragma: no cover - Windows CI
     return output
 
 
+def _compile_bcrypt_probe() -> Path:  # pragma: no cover - Windows CI
+    source = Path(__file__).with_name("windows_bcrypt_probe.c").resolve(strict=False)
+    if not source.is_file():
+        raise _NativeProbeBuildError("BCrypt probe source is unavailable")
+    discovery = subprocess.run(
+        [
+            str(_find_vswhere()),
+            "-latest",
+            "-products",
+            "*",
+            "-requires",
+            "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+            "-property",
+            "installationPath",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        shell=False,
+    )
+    if discovery.returncode != 0:
+        raise _NativeProbeBuildError("vswhere did not find an MSVC installation")
+    installation = next(
+        (Path(line.strip()) for line in discovery.stdout.splitlines() if line.strip()),
+        None,
+    )
+    if installation is None:
+        raise _NativeProbeBuildError("vswhere returned no installation path")
+    vcvars = installation / "VC" / "Auxiliary" / "Build" / "vcvars64.bat"
+    if not vcvars.is_file():
+        raise _NativeProbeBuildError("vcvars64.bat is unavailable")
+    build_directory = Path(
+        mkdtemp(prefix="neuro-code-w5-bcrypt-", dir=os.environ.get("RUNNER_TEMP", gettempdir()))
+    )
+    output = build_directory / "windows_bcrypt_probe.exe"
+    script = build_directory / "build_probe.cmd"
+    script.write_text(
+        "@echo off\r\n"
+        f'call "{vcvars}"\r\n'
+        "if errorlevel 1 exit /b 1\r\n"
+        f'cl /nologo /W4 /WX /MT /O2 /Fe:"{output}" "{source}"\r\n',
+        encoding="ascii",
+        newline="",
+    )
+    build = subprocess.run(
+        ["cmd.exe", "/d", "/c", script.name],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=120,
+        shell=False,
+        cwd=str(build_directory),
+    )
+    if build.returncode != 0 or not output.is_file():
+        detail = (build.stderr or build.stdout or "").strip().replace("\x00", "")[:512]
+        shutil.rmtree(build_directory, ignore_errors=True)
+        raise _NativeProbeBuildError(
+            f"MSVC BCrypt probe build failed (returncode={build.returncode}): {detail}"
+        )
+    return output
+
+
 def _strip_terminal(text: str) -> str:
     return _ANSI_RE.sub("", text).replace("\r", "")
 
@@ -763,6 +826,7 @@ def _build_workloads(
     workspace: Path,
     repo: Path,
     nul_probe: Path,
+    bcrypt_probe: Path,
     cmd: Path | None,
     powershell: Path | None,
     pwsh: Path | None,
@@ -833,6 +897,22 @@ def _build_workloads(
             ("w5_python_normal_ok",),
         ),
         _Workload(
+            "PYTHON_CHILD_PROCESS",
+            "subprocess-child",
+            python,
+            (
+                "-c",
+                (
+                    "import subprocess,sys; "
+                    "child=subprocess.run([sys.executable,'-c',\"print('W5_PYTHON_CHILD_OK')\"],"
+                    "check=False,capture_output=True,text=True); "
+                    "print(child.stdout,end=''); raise SystemExit(child.returncode)"
+                ),
+            ),
+            ("w5_python_child_ok",),
+            note="Python launches a child Python in the same Job-owned scope",
+        ),
+        _Workload(
             "PYTHON_BASE_VERSION", "base-interpreter", python_base, ("--version",), ("python ",)
         ),
         _Workload(
@@ -883,6 +963,14 @@ def _build_workloads(
                 r'"write":\{"create":"pass"',
                 r'"read_write":\{"create":"pass"',
             ),
+        ),
+        _Workload(
+            "BCRYPT_CNG_RUNTIME",
+            "BCryptGenRandom",
+            bcrypt_probe,
+            (),
+            (r"w5_bcrypt_ok",),
+            note="dynamic bcrypt.dll load and BCryptGenRandom on the final child token",
         ),
     ]
     npm_arguments: _Command
@@ -1012,6 +1100,8 @@ class WindowsNativeWorkloadCompatibilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(privilege_api.is_administrator(), "W5 setup requires Windows elevation")
         nul_probe = await asyncio.to_thread(_compile_nul_probe)
         self.addAsyncCleanup(_remove_directory, nul_probe.parent)
+        bcrypt_probe = await asyncio.to_thread(_compile_bcrypt_probe)
+        self.addAsyncCleanup(_remove_directory, bcrypt_probe.parent)
         paths = _tool_paths()
         paths["python_base"] = _discover_base_python(paths["python"])
 
@@ -1037,6 +1127,8 @@ class WindowsNativeWorkloadCompatibilityTests(unittest.IsolatedAsyncioTestCase):
             )
             copied_probe = workspace / "windows-nul-probe.exe"
             shutil.copy2(nul_probe, copied_probe)
+            copied_bcrypt_probe = workspace / "windows-bcrypt-probe.exe"
+            shutil.copy2(bcrypt_probe, copied_bcrypt_probe)
             setup_request = WindowsSandboxSetupRequest(
                 installation_root=installation,
                 read_roots=(workspace,),
@@ -1083,6 +1175,7 @@ class WindowsNativeWorkloadCompatibilityTests(unittest.IsolatedAsyncioTestCase):
                     workspace=workspace,
                     repo=repo,
                     nul_probe=copied_probe,
+                    bcrypt_probe=copied_bcrypt_probe,
                     cmd=paths["cmd"],
                     powershell=paths["powershell"],
                     pwsh=paths["pwsh"],
