@@ -184,6 +184,7 @@ def _controller_loss_pty_helper_source(
             probe = Path(probe_text)
             ready = Path(ready_text)
             stage_path = ready.with_name("controller-stage.txt")
+            inspect_path = ready.with_name("controller-inspect.json")
             from neuro_code.infrastructure.sandbox import windows_native_local_process as _local_process_module
 
             def _record_native_stage(value: str) -> None:
@@ -234,6 +235,35 @@ def _controller_loss_pty_helper_source(
                     _diagnostic_create_no_window=False,
                 )
                 phase = "PTY_VALIDATE"
+                snapshot = authority.inspect(setup_request)
+                if snapshot.state.value != "READY":
+                    details: dict[str, object] = {
+                        "snapshot_state": snapshot.state.value,
+                    }
+                    try:
+                        acl_authority, firewall, accounts = authority._apis(setup_request)
+                        record = authority._load(setup_request)
+                        if record is not None:
+                            plan = authority._plan(
+                                setup_request,
+                                record,
+                                authority._store(setup_request).path,
+                            )
+                            details.update(
+                                {
+                                    "acl_ready": acl_authority.is_ready(plan),
+                                    "firewall_ready": firewall.rule_exists(
+                                        record.offline_firewall_rule
+                                    ),
+                                    "record_aces": len(record.managed_aces),
+                                    "plan_aces": len(plan.entries),
+                                    "record_paths": len({entry.path for entry in record.managed_aces}),
+                                    "plan_paths": len(set(plan.paths)),
+                                }
+                            )
+                    except BaseException as diagnostic_error:
+                        details["diagnostic_error"] = type(diagnostic_error).__name__
+                    inspect_path.write_text(json.dumps(details, sort_keys=True), encoding="ascii")
                 adapter._validate_terminal_request(request)
                 phase = "PTY_SPAWN"
                 process = await asyncio.to_thread(
@@ -292,6 +322,12 @@ def _controller_loss_pty_helper_source(
                     payload["native_stage"] = stage_path.read_text(encoding="ascii")[:160]
                 except (OSError, UnicodeError):
                     pass
+                try:
+                    value = json.loads(inspect_path.read_text(encoding="ascii"))
+                except (OSError, UnicodeError, ValueError, json.JSONDecodeError):
+                    value = None
+                if isinstance(value, dict):
+                    payload["inspect"] = value
                 diagnostic_payload = getattr(error, "diagnostic_payload", None)
                 if callable(diagnostic_payload):
                     try:
