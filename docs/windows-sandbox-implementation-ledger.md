@@ -32,18 +32,24 @@ It is intentionally concise and is updated as implementation evidence changes.
   validates the complete ordered set, and existing object DACLs retain only
   the capability SID as the managed workspace write principal. Focused
   non-Windows token and attestation tests pass.
+- The first native run passed token/CNG/workload, security, lifecycle, and
+  native acceptance jobs. Its filesystem and PTY jobs exposed the World-SID
+  authority surface on an outside directory with a broad write ACE. The setup
+  plan now persists explicit synthetic capability-deny ACEs for existing
+  sibling boundary paths; authorized roots and unrelated principals remain
+  outside that deny set.
 
 ## CURRENT_BLOCKER
 
-- The updated token model has not yet been validated by the native Windows
-  workload matrix; focused local tests pass, but CNG, filesystem, and process
-  workload evidence is still pending.
+- The boundary-deny hardening has not yet been validated by native Windows
+  filesystem and PTY acceptance; the previous run failed only on the
+  outside-broad-write assertions before this fix.
 
 ## NEXT_ACTION
 
-- Commit and push the token-model seam, open the Draft production PR, and run
-  the focused Windows native runtime/workload acceptance before expanding to
-  filesystem and lifecycle adversarial cases.
+- Run focused Windows filesystem and PTY acceptance with the persisted
+  boundary-deny plan, then inspect any remaining native failures before
+  expanding to full real-workload and cleanup coverage.
 
 ## FAILED_HYPOTHESES
 
@@ -53,6 +59,8 @@ It is intentionally concise and is updated as implementation evidence changes.
   attribution evidence showed token creation failure for those variants.
 - The synthetic-only restricted SID is not sufficient for the final Windows
   runtime: CNG/KsecDD evidence disproved that model.
+- A compatibility World SID without an explicit synthetic deny lets a broad
+  outside ``Everyone`` write ACE pass the restricted-side check.
 
 ## PENDING_DOD
 
@@ -70,5 +78,6 @@ It is intentionally concise and is updated as implementation evidence changes.
 - Production branch: `feat/windows-sandbox-codex-parity`.
 - Frozen evidence PR #48: `1dbb6ef9ef0c3d788b861f814396c19812ace51e`, CI
   `32168581270` (49/49 success).
-- Current production edits are uncommitted on
-  `feat/windows-sandbox-codex-parity`; no production PR has been opened yet.
+- Production PR #49 is Draft at `feat/windows-sandbox-codex-parity`; latest
+  pushed token-model commit is `26cc140`, and boundary-deny hardening is
+  currently uncommitted.

@@ -94,6 +94,7 @@ class WindowsManagedAceKind(StrEnum):
     READ_ALLOW = "read-allow"
     WRITE_ALLOW = "write-allow"
     RESTRICTING_WRITE_ALLOW = "restricting-write-allow"
+    RESTRICTING_WRITE_DENY = "restricting-write-deny"
     READ_ONLY_WRITE_DENY = "read-only-write-deny"
     SENSITIVE_READ_DENY = "sensitive-read-deny"
     CREDENTIAL_PROTECTION_DENY = "credential-protection-deny"
@@ -137,6 +138,10 @@ class WindowsManagedAce:
             if not isinstance(self.sid, SyntheticWindowsSid):
                 raise TypeError("restricting write ACEs must target the synthetic SID")
             expected_mask = WRITE_ONLY_ACCESS_MASK
+        elif self.kind is WindowsManagedAceKind.RESTRICTING_WRITE_DENY:
+            if not isinstance(self.sid, SyntheticWindowsSid):
+                raise TypeError("restricting deny ACEs must target the synthetic SID")
+            expected_mask = WRITE_ONLY_ACCESS_MASK
         elif self.kind is WindowsManagedAceKind.READ_ONLY_WRITE_DENY:
             expected_mask = WRITE_ONLY_ACCESS_MASK
         elif self.kind is WindowsManagedAceKind.CREDENTIAL_PROTECTION_DENY:
@@ -165,7 +170,56 @@ class WindowsManagedAce:
             WindowsManagedAceKind.SENSITIVE_READ_DENY,
             WindowsManagedAceKind.READ_ONLY_WRITE_DENY,
             WindowsManagedAceKind.CREDENTIAL_PROTECTION_DENY,
+            WindowsManagedAceKind.RESTRICTING_WRITE_DENY,
         )
+
+
+def plan_restricting_boundary_denies(
+    request: WindowsSandboxSetupRequest,
+    write_sid: SyntheticWindowsSid,
+) -> tuple[WindowsManagedAce, ...]:
+    """Plan explicit capability denies for existing sibling boundary paths.
+
+    A compatibility restricted token includes identity SIDs that are needed by
+    ordinary Windows runtime objects.  A broad ``Everyone`` write ACE would
+    otherwise satisfy the restricted-side check.  These explicit, persisted
+    synthetic-SID denies preserve the capability boundary without changing
+    unrelated principals or authorized roots.
+    """
+
+    if not isinstance(request, WindowsSandboxSetupRequest):
+        raise TypeError("filesystem setup request must be canonical")
+    if not isinstance(write_sid, SyntheticWindowsSid):
+        raise TypeError("filesystem setup write SID must be canonical")
+    authorized = set(request.read_roots) | set(request.writable_roots)
+    candidates: set[Path] = set()
+    for root in request.read_roots:
+        try:
+            children = tuple(root.parent.iterdir())
+        except OSError as error:
+            raise SandboxError("cannot audit Windows sandbox boundary siblings") from error
+        for child in children:
+            try:
+                canonical = child.expanduser().resolve(strict=False)
+            except (OSError, RuntimeError) as error:
+                raise SandboxError(
+                    "cannot canonicalize Windows sandbox boundary sibling"
+                ) from error
+            if canonical == request.installation_root or canonical in authorized:
+                continue
+            if any(root.is_relative_to(canonical) for root in request.read_roots):
+                continue
+            if canonical.is_file() or canonical.is_dir():
+                candidates.add(canonical)
+    return tuple(
+        WindowsManagedAce(
+            path,
+            write_sid,
+            WindowsManagedAceKind.RESTRICTING_WRITE_DENY,
+            WRITE_ONLY_ACCESS_MASK,
+        )
+        for path in sorted(candidates, key=str)
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -808,5 +862,6 @@ __all__ = [
     "WindowsManagedAce",
     "WindowsManagedAceKind",
     "_NativeWindowsAclApi",
+    "plan_restricting_boundary_denies",
     "plan_windows_filesystem_authority",
 ]

@@ -44,6 +44,7 @@ from neuro_code.infrastructure.sandbox.windows_sandbox_acl import (
     WindowsManagedAce,
     WindowsManagedAceKind,
     _NativeWindowsAclApi,
+    plan_restricting_boundary_denies,
     plan_windows_filesystem_authority,
 )
 from neuro_code.infrastructure.sandbox.windows_sandbox_diagnostics import (
@@ -519,7 +520,7 @@ class WindowsNativeSandboxSetupAuthority:
         credential_path: Path,
     ) -> WindowsFilesystemSetupPlan:
         user_sids = tuple(identity.user_sid for identity in record.identities)
-        return plan_windows_filesystem_authority(
+        base = plan_windows_filesystem_authority(
             request,
             record.write_sid,
             read_user_sids=user_sids,
@@ -527,6 +528,8 @@ class WindowsNativeSandboxSetupAuthority:
             credential_path=credential_path,
             private_root=request.installation_root,
         )
+        boundary_denies = plan_restricting_boundary_denies(request, record.write_sid)
+        return WindowsFilesystemSetupPlan((*base.entries, *boundary_denies))
 
     @staticmethod
     def _account_password(identity: _StoredIdentity) -> str:

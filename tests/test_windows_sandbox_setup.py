@@ -30,6 +30,7 @@ from neuro_code.infrastructure.sandbox.windows_sandbox_acl import (
     WindowsFilesystemSetupPlan,
     WindowsManagedAce,
     WindowsManagedAceKind,
+    plan_restricting_boundary_denies,
     plan_windows_filesystem_authority,
 )
 from neuro_code.infrastructure.sandbox.windows_sandbox_diagnostics import (
@@ -618,6 +619,26 @@ class WindowsSandboxSetupAuthorityTests(unittest.TestCase):
             self.assertIn(
                 request.installation_root,
                 {entry.path for entry in credential_denies},
+            )
+
+    def test_boundary_deny_plan_protects_existing_siblings_without_authorized_roots(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            request = self._request(directory)
+            outside = root / "outside"
+            outside.mkdir()
+            entries = plan_restricting_boundary_denies(
+                request,
+                SyntheticWindowsSid.from_components((1, 2, 3, 4)),
+            )
+            self.assertEqual(tuple(entry.path for entry in entries), (outside,))
+            self.assertTrue(
+                all(
+                    entry.kind is WindowsManagedAceKind.RESTRICTING_WRITE_DENY
+                    and isinstance(entry.sid, SyntheticWindowsSid)
+                    and entry.is_deny
+                    for entry in entries
+                )
             )
 
     def test_setup_creates_dedicated_identities_with_one_persistent_write_sid(self) -> None:
