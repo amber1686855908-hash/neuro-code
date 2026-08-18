@@ -1116,6 +1116,23 @@ class _WindowsNativePtySession:
                 raise SandboxError("Windows PTY Exit frame is invalid")
             self._returncode = int(payload["returncode"])
             termination_observation = payload.get("termination_observation")
+            lifecycle = payload.get("lifecycle")
+            bounded_lifecycle: dict[str, object] | None = None
+            if isinstance(lifecycle, dict):
+                bounded_lifecycle = {
+                    key: value
+                    for key, value in lifecycle.items()
+                    if (
+                        key.startswith("job_active_processes_")
+                        and isinstance(value, int)
+                        and 0 <= value <= 1_000_000
+                    )
+                    or (
+                        key == "job_active_processes_query_error"
+                        and isinstance(value, str)
+                        and len(value) <= 64
+                    )
+                }
             if isinstance(termination_observation, dict):
                 bounded: dict[str, object] = {}
                 for key in ("state", "exit_code", "wait_error"):
@@ -1125,6 +1142,11 @@ class _WindowsNativePtySession:
                     ):
                         bounded[key] = value
                 self._termination_observation = bounded or None
+            if bounded_lifecycle:
+                self._termination_observation = {
+                    **(self._termination_observation or {}),
+                    "lifecycle": bounded_lifecycle,
+                }
             if not self._eof_sent:
                 self._eof_sent = True
                 self._on_eof()
@@ -1378,11 +1400,33 @@ class _WindowsNativeOwnedLocalProcess(OwnedLocalProcess):
             self._returncode = int(payload["returncode"])
             child_diagnostic = payload.get("child")
             termination_observation = payload.get("termination_observation")
-            if isinstance(child_diagnostic, dict) or isinstance(termination_observation, dict):
+            lifecycle = payload.get("lifecycle")
+            bounded_lifecycle: dict[str, object] | None = None
+            if isinstance(lifecycle, dict):
+                bounded_lifecycle = {
+                    key: value
+                    for key, value in lifecycle.items()
+                    if (
+                        key.startswith("job_active_processes_")
+                        and isinstance(value, int)
+                        and 0 <= value <= 1_000_000
+                    )
+                    or (
+                        key == "job_active_processes_query_error"
+                        and isinstance(value, str)
+                        and len(value) <= 64
+                    )
+                }
+            if (
+                isinstance(child_diagnostic, dict)
+                or isinstance(termination_observation, dict)
+                or bounded_lifecycle
+            ):
                 self._diagnostic = {
                     "pipe": None,
                     "child": child_diagnostic,
                     "termination_observation": termination_observation,
+                    "lifecycle": bounded_lifecycle,
                     "security_attestation": dict(self._security_attestation),
                 }
             self._call(self._stdout.feed_eof)

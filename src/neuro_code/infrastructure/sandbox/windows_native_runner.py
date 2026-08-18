@@ -1174,6 +1174,7 @@ class _RunnerChild:
         self._process_id: int | None = None
         self._last_exit_code: int | None = None
         self._termination_observation: dict[str, object] | None = None
+        self._lifecycle_diagnostics: dict[str, object] = {}
         self._stdin_handle: int | None = None
         self._desktop_handle: int | None = None
         self._desktop_name: str | None = None
@@ -1546,6 +1547,7 @@ class _RunnerChild:
             "version": PROTOCOL_VERSION,
             "message": str(error)[:512],
             "child": self.observe(),
+            "lifecycle": dict(self._lifecycle_diagnostics),
         }
 
     def _relay(self, handle: int, kind: RuntimeFrameType) -> None:
@@ -1572,13 +1574,34 @@ class _RunnerChild:
             code = self._api.get_exit_code(self._process_handle)
             self._last_exit_code = code
             self._direct_child_exited.set()
+            try:
+                self._lifecycle_diagnostics["job_active_processes_at_direct_exit"] = (
+                    self._job.active_processes
+                )
+            except BaseException as error:
+                self._lifecycle_diagnostics["job_active_processes_query_error"] = type(
+                    error
+                ).__name__
             # A direct child exit is not the end of the Job-owned scope.  A
             # descendant may still be running without holding any relay
             # handle, so keep the independent wait thread alive until the Job
             # reports no active processes.  The control thread remains free to
             # receive TERMINATE/EOF while this bounded-frequency poll runs.
-            while self._job.active_processes:
+            while True:
+                try:
+                    active_processes = self._job.active_processes
+                except BaseException as error:
+                    self._lifecycle_diagnostics["job_active_processes_query_error"] = type(
+                        error
+                    ).__name__
+                    raise
+                if active_processes == 0:
+                    break
+                self._lifecycle_diagnostics["job_active_processes_before_quiesce"] = (
+                    active_processes
+                )
                 time.sleep(0.02)
+            self._lifecycle_diagnostics["job_active_processes_after_quiesce"] = 0
             # This is the only state transition that certifies the owned
             # scope is empty.  A direct-child exit alone is deliberately not
             # enough: a detached descendant may still be alive in the Job.
@@ -1623,6 +1646,7 @@ class _RunnerChild:
                     "returncode": code,
                     "child": self.observe(),
                     "termination_observation": self._termination_observation,
+                    "lifecycle": dict(self._lifecycle_diagnostics),
                 },
             )
             self._exit_sent.set()
@@ -1682,7 +1706,10 @@ class _RunnerChild:
                 self._stdin_handle = None
             return True
         if frame.kind is RuntimeFrameType.TERMINATE:
-            self._termination_observation = self.observe()
+            self._termination_observation = {
+                **self.observe(),
+                "lifecycle": dict(self._lifecycle_diagnostics),
+            }
             self._job.terminate()
             return True
         if frame.kind in {
