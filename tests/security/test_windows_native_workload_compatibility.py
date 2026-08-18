@@ -10,6 +10,7 @@ silently lost.
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import json
 import os
@@ -1108,6 +1109,9 @@ class WindowsNativeWorkloadCompatibilityTests(unittest.IsolatedAsyncioTestCase):
                     )
                     cmd = paths.get("cmd")
                     if cmd is not None:
+                        encoded_command = base64.b64encode(
+                            "Write-Output W5_POWERSHELL_OK".encode("utf-16le")
+                        ).decode("ascii")
                         powershell_via_cmd = _Workload(
                             "POWERSHELL_VIA_CMD",
                             "cmd-wrapper",
@@ -1116,15 +1120,14 @@ class WindowsNativeWorkloadCompatibilityTests(unittest.IsolatedAsyncioTestCase):
                                 "/d",
                                 "/s",
                                 "/c",
-                                "call "
-                                + subprocess.list2cmdline(
+                                subprocess.list2cmdline(
                                     [
                                         str(powershell),
                                         "-NoLogo",
                                         "-NoProfile",
                                         "-NonInteractive",
-                                        "-Command",
-                                        "Write-Output W5_POWERSHELL_OK",
+                                        "-EncodedCommand",
+                                        encoded_command,
                                     ]
                                 ),
                             ),
