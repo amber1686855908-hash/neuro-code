@@ -249,6 +249,15 @@ def _controller_loss_pty_helper_source(
                                 record,
                                 authority._store(setup_request).path,
                             )
+                            path_readiness: list[dict[str, object]] = []
+                            for path, entries in authority._acl_authority._group(plan.entries).items():
+                                path_readiness.append(
+                                    {
+                                        "name": path.name,
+                                        "ready": acl_authority._api.matches(path, entries),
+                                        "kinds": sorted(entry.kind.value for entry in entries),
+                                    }
+                                )
                             details.update(
                                 {
                                     "acl_ready": acl_authority.is_ready(plan),
@@ -259,6 +268,7 @@ def _controller_loss_pty_helper_source(
                                     "plan_aces": len(plan.entries),
                                     "record_paths": len({entry.path for entry in record.managed_aces}),
                                     "plan_paths": len(set(plan.paths)),
+                                    "path_readiness": sorted(path_readiness, key=lambda item: str(item["name"])),
                                 }
                             )
                     except BaseException as diagnostic_error:
