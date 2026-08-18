@@ -6,12 +6,12 @@ It is intentionally concise and is updated as implementation evidence changes.
 ## UPSTREAM_BASELINE
 
 - OpenAI Codex repository: `https://github.com/openai/codex`
-- Pinned default-branch commit: `8193c56a595f66eb0f77f18d7434765eb0179d20`
+- Pinned default-branch commit: `22b860e80b06dff3c5e86160e5dc3199b7816693`
 - Primary reference: `codex-rs/windows-sandbox-rs/`
 - Relevant upstream sources inspected: `token.rs`, `proc_thread_attr.rs`,
   `process.rs`, `spawn_prep.rs`, `setup.rs`, `identity.rs`, `wfp.rs`,
   `wfp_setup.rs`, `elevated/runner_client.rs`, and the unified-exec Windows
-  backends.
+  backends, plus `desktop.rs` and `bin/command_runner/win.rs`.
 - Upstream is Apache-2.0. This implementation adapts observable Win32
   semantics to Neuro Code's Python boundaries; no upstream source is copied
   into production.
@@ -46,17 +46,20 @@ It is intentionally concise and is updated as implementation evidence changes.
 
 ## CURRENT_BLOCKER
 
-- The boundary-deny reinspection fix is locally validated but not yet proven
-  by a replacement native Windows runtime/PTY run. The latest remote run
-  `32172674664` failed only in controller-loss helper startup after the
-  boundary-deny change; filesystem, token, lifecycle, native acceptance, and
-  compatibility jobs passed.
+- Windows PowerShell 5.1 still does not produce output under the final
+  restricted child: direct W3 and W4 runs reach `SpawnReady` and token
+  attestation, then remain active until the bounded workload timeout. The
+  upstream-equivalent explicit `Winsta0\\Default` diagnostic and the minimal
+  environment hypothesis were both disproved; a non-interactive
+  `SetErrorMode` guard is now pushed and its native artifact is pending.
 
 ## NEXT_ACTION
 
-- Commit and push the stable boundary-deny reinspection fix, run focused
-  Windows runtime and PTY acceptance, then inspect any remaining native
-  failures before expanding to full real-workload and cleanup coverage.
+- Inspect the next Windows compatibility artifact after the `SetErrorMode`
+  change and the `cmd.exe`-wrapper diagnostic. If PowerShell now exits, use
+  its bounded error evidence to fix the smallest production startup/authority
+  mismatch; otherwise compare the direct and wrapper process paths before
+  touching the token contract.
 
 ## FAILED_HYPOTHESES
 
@@ -71,24 +74,25 @@ It is intentionally concise and is updated as implementation evidence changes.
 
 ## PENDING_DOD
 
-- Upstream-parity token and default-DACL implementation.
-- Filesystem, network, pipe, ConPTY, child/grandchild, and cleanup acceptance
-  on the final token.
-- Real cmd, PowerShell, Python, Git, and Node workload acceptance where the
-  Windows runner provides them.
-- Fail-closed adversarial review, local checks, full native CI, pushed branch,
-  and a Draft production PR.
+- Final upstream-parity audit and documented intentional differences.
+- Native filesystem, network, pipe, ConPTY, child/grandchild, and cleanup
+  acceptance on the final token.
+- Real cmd, PowerShell, Python (including child Python), Git/local repository,
+  BCrypt, NUL, and Node workload acceptance where the Windows runner provides
+  them.
+- Explicit fail-closed adversarial review and no direct-process bypass.
+- Full local checks, complete native CI, clean pushed branch, and a Draft
+  production PR with this ledger's pending list empty.
 
 ## CI_STATE
 
 - Production base: `origin/main` at `00879b9b71f637804ff6e40c82451d86f2bd6165`.
 - Production branch: `feat/windows-sandbox-codex-parity`.
-- Frozen evidence PR #48: `1dbb6ef9ef0c3d788b861f814396c19812ace51e`, CI
-  `32168581270` (49/49 success).
-- Production PR #49 is Draft at `feat/windows-sandbox-codex-parity`; latest
-  pushed commits are `26cc140` (token model), `827059e` (boundary-deny
-  hardening), and `fc3cd20` (Windows short-path assertion normalization).
-  CI run `32172674664` has 2 focused failures
-  (`windows-native-sandbox-runtime` and `windows-native-sandbox-pty`), both
-  `CONTROLLER_LOSS_HELPER_STARTUP_FAILURE`; the replacement is pending after
-  the reinspection fix.
+- Frozen evidence PR #48: `a245ffeddff66ec18cc6168081202013a2f5232a` (Draft,
+  evidence-only; its Gate 2A.6 line is not production).
+- Production PR #49 is Draft at `feat/windows-sandbox-codex-parity`; current
+  head is `50521c4` after environment, desktop-diagnostic, and hidden-error
+  dialog fixes. Run `32185023683` (head `e7ffbcc`) passed runtime and
+  compatibility job colors but its artifact still recorded PowerShell
+  `TIMEOUT`; run `32185500327` (head `18287a3`) and the current run for
+  `50521c4` are pending.
