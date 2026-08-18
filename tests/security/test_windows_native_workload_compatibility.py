@@ -1116,7 +1116,8 @@ class WindowsNativeWorkloadCompatibilityTests(unittest.IsolatedAsyncioTestCase):
                                 "/d",
                                 "/s",
                                 "/c",
-                                subprocess.list2cmdline(
+                                "call "
+                                + subprocess.list2cmdline(
                                     [
                                         str(powershell),
                                         *powershell_spec.arguments,
