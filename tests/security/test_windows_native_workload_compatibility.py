@@ -330,6 +330,7 @@ def _cell_base(
         "stderr_preview": "",
         "win32_error": None,
         "runner_exit": "NOT_APPLICABLE",
+        "lifecycle": None,
         "forced_termination": False,
         "orphan_count": None,
         "timeout_cleanup": "NOT_APPLICABLE",
@@ -474,6 +475,39 @@ def _runner_projection(diagnostic: object) -> object:
     return diagnostic.get("runner_state", "UNKNOWN")
 
 
+def _lifecycle_projection(diagnostic: object) -> dict[str, object] | None:
+    """Keep only bounded Job-scope facts from the native diagnostic."""
+
+    if not isinstance(diagnostic, dict):
+        return None
+
+    def project(value: object) -> dict[str, object] | None:
+        if not isinstance(value, dict):
+            return None
+        result: dict[str, object] = {}
+        for key in (
+            "job_active_processes_at_direct_exit",
+            "job_active_processes_before_quiesce",
+            "job_active_processes_after_quiesce",
+        ):
+            item = value.get(key)
+            if isinstance(item, int) and 0 <= item <= 1_000_000:
+                result[key] = item
+        error = value.get("job_active_processes_query_error")
+        if isinstance(error, str) and len(error) <= 64:
+            result["job_active_processes_query_error"] = error
+        return result or None
+
+    lifecycle = project(diagnostic.get("lifecycle"))
+    termination = diagnostic.get("termination_observation")
+    termination_lifecycle = (
+        project(termination.get("lifecycle")) if isinstance(termination, dict) else None
+    )
+    if termination_lifecycle:
+        lifecycle = {**(lifecycle or {}), **termination_lifecycle}
+    return lifecycle
+
+
 def _request(spec: _Workload, workspace: Path) -> SandboxedProcessRequest:
     if spec.executable is None:
         raise ValueError("cannot create a request for an unavailable workload")
@@ -561,6 +595,7 @@ async def _w3_run(
                     result["exit_code"] = tasks[2].result()
         diagnostic = process.diagnostic_snapshot()
         result["runner_exit"] = _runner_projection(diagnostic)
+        result["lifecycle"] = _lifecycle_projection(diagnostic)
         result["forced_termination"] = bool(
             isinstance(diagnostic, dict) and diagnostic.get("runner_forced_termination", False)
         )
@@ -678,6 +713,7 @@ async def _w4_run(
             platform = getattr(session, "_platform_session", None)
             diagnostic = platform.diagnostic_snapshot() if platform is not None else None
             result["runner_exit"] = _runner_projection(diagnostic)
+            result["lifecycle"] = _lifecycle_projection(diagnostic)
             result["forced_termination"] = bool(
                 isinstance(diagnostic, dict) and diagnostic.get("runner_forced_termination", False)
             )
