@@ -45,18 +45,22 @@
 #ifndef PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE
 #define PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE 0x00020016
 #endif
-#if PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES != 0x00020009
-#error "Unexpected PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES encoding"
-#endif
-#if PROC_THREAD_ATTRIBUTE_HANDLE_LIST != 0x00020002
-#error "Unexpected PROC_THREAD_ATTRIBUTE_HANDLE_LIST encoding"
-#endif
-#if PROC_THREAD_ATTRIBUTE_JOB_LIST != 0x0002000D
-#error "Unexpected PROC_THREAD_ATTRIBUTE_JOB_LIST encoding"
-#endif
-#if PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE != 0x00020016
-#error "Unexpected PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE encoding"
-#endif
+/* The SDK definitions use ProcThreadAttributeValue(), which contains a cast
+ * and therefore cannot be evaluated by the preprocessor's #if expression.
+ * Keep the equality checks in C so the compiler still rejects an SDK whose
+ * encodings drift from the documented values. */
+typedef char g2a_security_attribute_encoding_check[
+    (PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES == 0x00020009) ? 1 : -1
+];
+typedef char g2a_handle_list_attribute_encoding_check[
+    (PROC_THREAD_ATTRIBUTE_HANDLE_LIST == 0x00020002) ? 1 : -1
+];
+typedef char g2a_job_list_attribute_encoding_check[
+    (PROC_THREAD_ATTRIBUTE_JOB_LIST == 0x0002000D) ? 1 : -1
+];
+typedef char g2a_pseudoconsole_attribute_encoding_check[
+    (PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE == 0x00020016) ? 1 : -1
+];
 #define G2A_ATTRIBUTE_SECURITY_CAPABILITIES PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES
 #define G2A_ATTRIBUTE_HANDLE_LIST PROC_THREAD_ATTRIBUTE_HANDLE_LIST
 #define G2A_ATTRIBUTE_JOB_LIST PROC_THREAD_ATTRIBUTE_JOB_LIST
