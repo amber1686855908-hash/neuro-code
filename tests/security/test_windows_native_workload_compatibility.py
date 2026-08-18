@@ -1143,6 +1143,27 @@ class WindowsNativeWorkloadCompatibilityTests(unittest.IsolatedAsyncioTestCase):
                         + json.dumps(diagnostics["powershell_inherited_desktop"], sort_keys=True),
                         flush=True,
                     )
+                    no_window_adapter = WindowsNativeLocalProcessSandbox(
+                        SandboxProfile.WORKSPACE,
+                        workspace,
+                        runtime_state,
+                        setup_authority=authority,
+                        setup_request_factory=lambda _request: setup_request,
+                        _diagnostic_desktop_mode=_WindowsNativeDesktopMode.PRIVATE_DESKTOP,
+                        _diagnostic_create_no_window=True,
+                    )
+                    diagnostics["powershell_create_no_window"] = await _w3_run(
+                        powershell_spec,
+                        workspace=workspace,
+                        adapter=no_window_adapter,
+                        expected_user_sid=expected_online_sid,
+                        expected_write_sid=expected_write_sid,
+                    )
+                    print(
+                        "W5_POWERSHELL_CREATE_NO_WINDOW="
+                        + json.dumps(diagnostics["powershell_create_no_window"], sort_keys=True),
+                        flush=True,
+                    )
                     cmd = paths.get("cmd")
                     if cmd is not None:
                         encoded_command = base64.b64encode(
