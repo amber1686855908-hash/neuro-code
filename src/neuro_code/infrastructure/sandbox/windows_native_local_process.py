@@ -652,6 +652,10 @@ class WindowsNativeLocalProcessSandbox(LocalProcessSandbox):
                 # model-facing request or any public sandbox configuration.
                 "desktop_mode": self._diagnostic_desktop_mode.value,
                 "create_no_window": self._diagnostic_create_no_window,
+                # The upstream Windows boundary grants the installation
+                # capability SID on the NUL device only for writable roots.
+                # Read-only requests must not gain a device write authority.
+                "allow_null_device": bool(setup_request.writable_roots),
             }
             if pty_size is not None:
                 if request.stdio_mode is not LocalProcessStdioMode.PTY:

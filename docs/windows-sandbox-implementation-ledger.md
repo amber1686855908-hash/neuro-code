@@ -50,16 +50,20 @@ It is intentionally concise and is updated as implementation evidence changes.
   restricted child: direct W3 and W4 runs reach `SpawnReady` and token
   attestation, then remain active until the bounded workload timeout. The
   upstream-equivalent explicit `Winsta0\\Default` diagnostic and the minimal
-  environment hypothesis were both disproved; a non-interactive
-  `SetErrorMode` guard is now pushed and its native artifact is pending.
+  environment hypothesis were both disproved. The first `cmd.exe` wrapper
+  diagnostic was invalid because C-runtime quoting made PowerShell print its
+  script text; an exact UTF-16LE `-EncodedCommand` wrapper also timed out.
+  Upstream parity audit then identified the missing per-capability `\\.\\NUL`
+  device ACL grant used before final child creation. That narrow grant is now
+  implemented and its native artifact is pending.
 
 ## NEXT_ACTION
 
-- Inspect the next Windows compatibility artifact after the `SetErrorMode`
-  change and the `cmd.exe`-wrapper diagnostic. If PowerShell now exits, use
-  its bounded error evidence to fix the smallest production startup/authority
-  mismatch; otherwise compare the direct and wrapper process paths before
-  touching the token contract.
+- Inspect the next Windows compatibility artifact after the capability-scoped
+  NUL grant. If Git, PowerShell, Python, and curl now leave their startup
+  timeout cluster, continue with the remaining native workload and lifecycle
+  acceptance. If not, use the bounded artifact to isolate the next smallest
+  upstream parity difference; do not weaken the token contract.
 
 ## FAILED_HYPOTHESES
 

@@ -81,6 +81,16 @@ _INFINITE = 0xFFFFFFFF
 _SEM_FAILCRITICALERRORS = 0x0001
 _SEM_NOGPFAULTERRORBOX = 0x0002
 _SEM_NOOPENFILEERRORBOX = 0x8000
+_READ_CONTROL = 0x00020000
+_WRITE_DAC = 0x00040000
+_SE_KERNEL_OBJECT = 6
+_SET_ACCESS = 2
+_TRUSTEE_IS_SID = 0
+_TRUSTEE_IS_UNKNOWN = 0
+_FILE_GENERIC_READ = 0x00120089
+_FILE_GENERIC_WRITE = 0x00120116
+_FILE_GENERIC_EXECUTE = 0x001200A0
+_FILE_GENERIC_READ_WRITE_EXECUTE = _FILE_GENERIC_READ | _FILE_GENERIC_WRITE | _FILE_GENERIC_EXECUTE
 # Do not ask CreateProcessWithLogonW to synchronously load the account
 # profile.  W3 derives private HOME/TMP from the final token and creates those
 # directories inside the runner; loading a fresh W2 profile here can block the
@@ -242,6 +252,25 @@ class _ProcessInformation(ctypes.Structure):
         ("hThread", ctypes.c_void_p),
         ("dwProcessId", ctypes.c_uint32),
         ("dwThreadId", ctypes.c_uint32),
+    ]
+
+
+class _TrusteeW(ctypes.Structure):
+    _fields_ = [
+        ("pMultipleTrustee", ctypes.c_void_p),
+        ("MultipleTrusteeOperation", ctypes.c_uint32),
+        ("TrusteeForm", ctypes.c_uint32),
+        ("TrusteeType", ctypes.c_uint32),
+        ("ptstrName", ctypes.c_void_p),
+    ]
+
+
+class _ExplicitAccessW(ctypes.Structure):
+    _fields_ = [
+        ("grfAccessPermissions", ctypes.c_uint32),
+        ("grfAccessMode", ctypes.c_uint32),
+        ("grfInheritance", ctypes.c_uint32),
+        ("Trustee", _TrusteeW),
     ]
 
 
@@ -1197,6 +1226,15 @@ class _RunnerChild:
             # runner-created IPC and desktop objects.  The capability SID is
             # still the only managed write principal on workspace roots.
             token.set_default_dacl((runner_logon_sid, _WORLD_SID, write_sid.value))
+            allow_null_device = payload.get("allow_null_device", False)
+            if not isinstance(allow_null_device, bool):
+                raise SandboxError("Windows runtime NUL authority flag is invalid")
+            if allow_null_device:
+                # ``WRITE_RESTRICTED`` performs a second access check for
+                # device writes.  Grant only the installation capability SID
+                # on the existing NUL DACL; any failure is fail-closed before
+                # the developer child is created.
+                self._api.allow_null_device(write_sid.value)
             desktop_value = payload.get(
                 "desktop_mode", _WindowsNativeDesktopMode.PRIVATE_DESKTOP.value
             )
@@ -1827,6 +1865,7 @@ class _NativeChildApi:
         self._close_handle = _load_function(
             kernel32, "CloseHandle", [ctypes.c_void_p], ctypes.c_int32
         )
+        self._local_free = _load_function(kernel32, "LocalFree", [ctypes.c_void_p], ctypes.c_void_p)
         self._read_file = _load_function(
             kernel32,
             "ReadFile",
@@ -1903,6 +1942,52 @@ class _NativeChildApi:
                 ctypes.c_void_p,
             ],
             ctypes.c_int32,
+        )
+        self._convert_string_sid = _load_function(
+            advapi32,
+            "ConvertStringSidToSidW",
+            [ctypes.c_wchar_p, ctypes.POINTER(ctypes.c_void_p)],
+            ctypes.c_int32,
+        )
+        self._get_security_info = _load_function(
+            advapi32,
+            "GetSecurityInfo",
+            [
+                ctypes.c_void_p,
+                ctypes.c_uint32,
+                ctypes.c_uint32,
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.POINTER(ctypes.c_void_p),
+                ctypes.c_void_p,
+                ctypes.POINTER(ctypes.c_void_p),
+            ],
+            ctypes.c_uint32,
+        )
+        self._set_entries_in_acl = _load_function(
+            advapi32,
+            "SetEntriesInAclW",
+            [
+                ctypes.c_uint32,
+                ctypes.POINTER(_ExplicitAccessW),
+                ctypes.c_void_p,
+                ctypes.POINTER(ctypes.c_void_p),
+            ],
+            ctypes.c_uint32,
+        )
+        self._set_security_info = _load_function(
+            advapi32,
+            "SetSecurityInfo",
+            [
+                ctypes.c_void_p,
+                ctypes.c_uint32,
+                ctypes.c_uint32,
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+            ],
+            ctypes.c_uint32,
         )
         user32 = cast(object, loader("user32.dll", use_last_error=True))
         self._create_desktop = _load_function(
@@ -2005,6 +2090,92 @@ class _NativeChildApi:
         if value is None or value == 0 or value == _INVALID_HANDLE_VALUE:
             self._error("CreateFileW(NUL)")
         return int(cast(int, value))
+
+    def allow_null_device(self, sid_text: str) -> None:
+        r"""Grant one installation capability SID access to ``\\.\NUL``.
+
+        Windows' ``WRITE_RESTRICTED`` second access check applies to device
+        objects as well as ordinary files.  The capability SID is therefore
+        added to the existing NUL DACL using the same narrow SET_ACCESS
+        operation as the upstream Windows sandbox.  No inherited or broad
+        principal is added, and every Win32 failure aborts child creation.
+        """
+
+        if not isinstance(sid_text, str) or not sid_text or "\x00" in sid_text:
+            raise ValueError("Windows NUL capability SID is invalid")
+        sid_pointer = ctypes.c_void_p()
+        if not self._convert_string_sid(sid_text, ctypes.byref(sid_pointer)):
+            self._error("ConvertStringSidToSidW(NUL capability)")
+        device: int | None = None
+        security_descriptor = ctypes.c_void_p()
+        old_dacl = ctypes.c_void_p()
+        new_dacl = ctypes.c_void_p()
+        try:
+            value = self._create_file(
+                r"\\.\NUL",
+                _READ_CONTROL | _WRITE_DAC,
+                _FILE_SHARE_READ | _FILE_SHARE_WRITE,
+                None,
+                _OPEN_EXISTING,
+                0x80,
+                None,
+            )
+            if value is None or value == 0 or value == _INVALID_HANDLE_VALUE:
+                self._error("CreateFileW(NUL security)")
+            device = int(cast(int, value))
+            result = self._get_security_info(
+                device,
+                _SE_KERNEL_OBJECT,
+                _DACL_SECURITY_INFORMATION,
+                None,
+                None,
+                ctypes.byref(old_dacl),
+                None,
+                ctypes.byref(security_descriptor),
+            )
+            if result != 0:
+                raise OSError(cast(int, result), "GetSecurityInfo(NUL) failed")
+            trustee = _TrusteeW(
+                None,
+                0,
+                _TRUSTEE_IS_SID,
+                _TRUSTEE_IS_UNKNOWN,
+                sid_pointer.value,
+            )
+            explicit = _ExplicitAccessW(
+                _FILE_GENERIC_READ_WRITE_EXECUTE,
+                _SET_ACCESS,
+                0,
+                trustee,
+            )
+            result = self._set_entries_in_acl(
+                1,
+                ctypes.byref(explicit),
+                old_dacl,
+                ctypes.byref(new_dacl),
+            )
+            if result != 0 or not new_dacl.value:
+                raise OSError(cast(int, result), "SetEntriesInAclW(NUL) failed")
+            result = self._set_security_info(
+                device,
+                _SE_KERNEL_OBJECT,
+                _DACL_SECURITY_INFORMATION,
+                None,
+                None,
+                new_dacl,
+                None,
+            )
+            if result != 0:
+                raise OSError(cast(int, result), "SetSecurityInfo(NUL) failed")
+        finally:
+            if new_dacl.value:
+                self._local_free(new_dacl)
+            if security_descriptor.value:
+                self._local_free(security_descriptor)
+            if sid_pointer.value:
+                self._local_free(sid_pointer)
+            if device is not None:
+                self.close_handle(device)
 
     def create_process_as_user(
         self,
