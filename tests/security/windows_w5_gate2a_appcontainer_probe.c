@@ -1140,7 +1140,7 @@ static BOOL g2a_update_attribute(
     LPPROC_THREAD_ATTRIBUTE_LIST attributes,
     DWORD_PTR attribute,
     const char *name,
-    const void *value,
+    void *value,
     SIZE_T value_size
 ) {
     BOOL ok = UpdateProcThreadAttribute(
