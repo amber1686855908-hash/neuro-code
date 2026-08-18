@@ -1079,6 +1079,33 @@ class WindowsNativeWorkloadCompatibilityTests(unittest.IsolatedAsyncioTestCase):
                             "W4": w4,
                         }
                     )
+                diagnostics: dict[str, object] = {}
+                powershell = paths.get("powershell")
+                if powershell is not None:
+                    powershell_spec = next(
+                        workload for workload in workloads if workload.name == "POWERSHELL_BASIC"
+                    )
+                    inherited_desktop_adapter = WindowsNativeLocalProcessSandbox(
+                        SandboxProfile.WORKSPACE,
+                        workspace,
+                        runtime_state,
+                        setup_authority=authority,
+                        setup_request_factory=lambda _request: setup_request,
+                        _diagnostic_desktop_mode=_WindowsNativeDesktopMode.INHERIT_DESKTOP,
+                        _diagnostic_create_no_window=False,
+                    )
+                    diagnostics["powershell_inherited_desktop"] = await _w3_run(
+                        powershell_spec,
+                        workspace=workspace,
+                        adapter=inherited_desktop_adapter,
+                        expected_user_sid=expected_online_sid,
+                        expected_write_sid=expected_write_sid,
+                    )
+                    print(
+                        "W5_POWERSHELL_INHERITED_DESKTOP="
+                        + json.dumps(diagnostics["powershell_inherited_desktop"], sort_keys=True),
+                        flush=True,
+                    )
                 print("W5_MATRIX_RESULTS=" + json.dumps(matrix, sort_keys=True), flush=True)
                 correlation = _correlate(matrix)
                 print(
@@ -1094,6 +1121,7 @@ class WindowsNativeWorkloadCompatibilityTests(unittest.IsolatedAsyncioTestCase):
                             "tool_provenance": provenance,
                             "matrix": matrix,
                             "correlation": correlation,
+                            "diagnostics": diagnostics,
                             "security_contract": {
                                 "read": "LIMITED",
                                 "write": "STRONG",
