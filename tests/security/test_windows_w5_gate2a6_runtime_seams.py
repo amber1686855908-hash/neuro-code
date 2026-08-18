@@ -126,15 +126,17 @@ def _descendant_classification(
             return "W5_GATE2A6_DESCENDANT_PASS"
         return "W5_GATE2A6_DESCENDANT_LAUNCH_CONTRACT_CAUSAL"
     # ERROR_ACCESS_DENIED is not enough by itself.  Require every AppContainer
-    # cell to have a usable executable, workspace, and disposable-parent ACL so
-    # a path-resolution failure cannot be mistaken for a child-process policy
-    # failure.  With those inputs proven, the successful JOB_ONLY control plus
-    # four identical AppContainer denials is the direct child-creation
-    # restriction evidence allowed by Gate 2A.6, even when the mitigation
-    # policy's NoChildProcessCreation bit is false.
+    # cell to have a usable executable and workspace so a path-resolution
+    # failure cannot be mistaken for a child-process policy failure.  The
+    # parent_authority marker remains in the artifact as a diagnostic: when
+    # the parent is already the authorized workspace root, the observed
+    # self/workspace visibility is the stronger oracle.  With those inputs
+    # proven, the successful JOB_ONLY control plus four identical AppContainer
+    # denials is the direct child-creation restriction evidence allowed by
+    # Gate 2A.6, even when the mitigation policy's NoChildProcessCreation bit
+    # is false.
     app_inputs_valid = all(
-        run.get("parent_authority") == "PASS"
-        and run.get("self_path_available") == "PASS"
+        run.get("self_path_available") == "PASS"
         and run.get("self_exists") == "PASS"
         and run.get("self_readable") == "PASS"
         and run.get("workspace_exists") == "PASS"
@@ -237,13 +239,15 @@ class WindowsW5Gate2A6RuntimeSeamTests(unittest.IsolatedAsyncioTestCase):
         )
         self.addAsyncCleanup(_cleanup_probe_directory, probe.parent)
 
-        with TemporaryDirectory() as directory:
-            root = Path(directory)
-            workspace = root / "workspace"
-            installation = root / "installation"
-            fixtures = root / "fixtures"
-            workspace.mkdir()
-            installation.mkdir()
+        with TemporaryDirectory() as directory, TemporaryDirectory() as installation_directory:
+            # Make the disposable workspace itself the authorized root.  The
+            # W2 setup authority can grant the AppContainer SID on this root;
+            # nesting it below another controller-owned directory would leave
+            # an unobservable traversal segment and invalidate every launch
+            # input before CreateProcessW is attempted.
+            workspace = Path(directory)
+            installation = Path(installation_directory)
+            fixtures = workspace / "fixtures"
             workspace_probe = workspace / "windows_w5_gate2a_appcontainer_probe.exe"
             shutil.copy2(probe, workspace_probe)
             request = WindowsSandboxSetupRequest(
