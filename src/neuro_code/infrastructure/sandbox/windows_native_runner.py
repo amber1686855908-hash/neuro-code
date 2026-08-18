@@ -1211,7 +1211,10 @@ class _RunnerChild:
                 # The inherited/default desktop is a diagnostic-only launch
                 # mode.  It changes no token, ACL, filesystem, or network
                 # authority and is never selected by SandboxedProcessRequest.
-                self._desktop_handle, self._desktop_name = None, None
+                # Keep the comparison equivalent to the canonical Windows
+                # launch contract: an omitted lpDesktop is not the same as
+                # explicitly selecting the interactive default desktop.
+                self._desktop_handle, self._desktop_name = None, r"Winsta0\Default"
             # Capture-backed launches use the inherited-console mode from the
             # canonical Windows contract.  The trusted adapter sends this
             # field explicitly; keep the fail-safe default aligned as well so
