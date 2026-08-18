@@ -1106,6 +1106,37 @@ class WindowsNativeWorkloadCompatibilityTests(unittest.IsolatedAsyncioTestCase):
                         + json.dumps(diagnostics["powershell_inherited_desktop"], sort_keys=True),
                         flush=True,
                     )
+                    cmd = paths.get("cmd")
+                    if cmd is not None:
+                        powershell_via_cmd = _Workload(
+                            "POWERSHELL_VIA_CMD",
+                            "cmd-wrapper",
+                            cmd,
+                            (
+                                "/d",
+                                "/s",
+                                "/c",
+                                subprocess.list2cmdline(
+                                    [
+                                        str(powershell),
+                                        *powershell_spec.arguments,
+                                    ]
+                                ),
+                            ),
+                            powershell_spec.expected_markers,
+                        )
+                        diagnostics["powershell_via_cmd"] = await _w3_run(
+                            powershell_via_cmd,
+                            workspace=workspace,
+                            adapter=adapter,
+                            expected_user_sid=expected_online_sid,
+                            expected_write_sid=expected_write_sid,
+                        )
+                        print(
+                            "W5_POWERSHELL_VIA_CMD="
+                            + json.dumps(diagnostics["powershell_via_cmd"], sort_keys=True),
+                            flush=True,
+                        )
                 print("W5_MATRIX_RESULTS=" + json.dumps(matrix, sort_keys=True), flush=True)
                 correlation = _correlate(matrix)
                 print(
