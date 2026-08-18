@@ -74,7 +74,7 @@ def _int_marker(run: dict[str, object], key: str) -> int | None:
 
 
 def _descendant_projection(run: dict[str, object], mode: str) -> dict[str, object]:
-    projected = _projection(run, mode)
+    projected = dict(run)
     projected.update(
         {
             "mode": mode,
