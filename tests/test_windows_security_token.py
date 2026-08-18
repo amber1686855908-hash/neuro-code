@@ -114,7 +114,9 @@ class _FakeSecurityTokenApi:
         self.created_handle = 202
         self.child_token_handle = 303
         self.closed: list[int] = []
-        self.create_calls: list[tuple[int, int, tuple[SyntheticWindowsSid, ...]]] = []
+        self.create_calls: list[
+            tuple[int, int, tuple[SyntheticWindowsSid, ...], tuple[str, ...]]
+        ] = []
         sid = SyntheticWindowsSid.from_components((11, 22, 33, 44))
         self.inspection = WindowsTokenInspection(
             restricted_sid_count=1,
@@ -143,8 +145,11 @@ class _FakeSecurityTokenApi:
         existing_handle: int,
         flags: int,
         restricted_sids: tuple[SyntheticWindowsSid, ...],
+        additional_restricting_sids: tuple[str, ...] = (),
     ) -> int:
-        self.create_calls.append((existing_handle, flags, restricted_sids))
+        self.create_calls.append(
+            (existing_handle, flags, restricted_sids, additional_restricting_sids)
+        )
         if self.fail_create:
             raise WindowsTokenError("CreateRestrictedToken", 5)
         return self.created_handle
@@ -206,6 +211,29 @@ class WindowsRestrictedTokenRequestTests(unittest.TestCase):
         with self.assertRaises(TypeError):
             WindowsRestrictedTokenRequest((sid,), write_restricted=1)  # type: ignore[arg-type]
 
+    def test_request_validates_identity_restricting_sids_without_making_them_capabilities(
+        self,
+    ) -> None:
+        sid = SyntheticWindowsSid.from_components((1, 2, 3, 4))
+        request = WindowsRestrictedTokenRequest(
+            (sid,),
+            additional_restricting_sids=("S-1-5-5-0-123", "S-1-1-0"),
+        )
+        self.assertEqual(
+            request.all_restricting_sids,
+            (sid.value, "S-1-5-5-0-123", "S-1-1-0"),
+        )
+        with self.assertRaises(ValueError):
+            WindowsRestrictedTokenRequest(
+                (sid,),
+                additional_restricting_sids=(sid.value,),
+            )
+        with self.assertRaises(ValueError):
+            WindowsRestrictedTokenRequest(
+                (sid,),
+                additional_restricting_sids=("S-1-1-0", "S-1-1-0"),
+            )
+
 
 class WindowsRestrictedTokenTests(unittest.TestCase):
     def test_creation_attests_token_and_closes_source_handle(self) -> None:
@@ -222,7 +250,7 @@ class WindowsRestrictedTokenTests(unittest.TestCase):
         self.assertEqual(api.closed, [api.source_handle])
         self.assertEqual(
             api.create_calls,
-            [(api.source_handle, request.flags, (sid,))],
+            [(api.source_handle, request.flags, (sid,), ())],
         )
         token.close()
         token.close()

@@ -1161,29 +1161,38 @@ class _RunnerChild:
 
     def _create(self, payload: Mapping[str, object]) -> None:
         write_sid = SyntheticWindowsSid(_validated_text(payload.get("write_sid"), "write SID"))
-        token_request = WindowsRestrictedTokenRequest((write_sid,))
-        # WRITE_RESTRICTED is evaluated in addition to the normal token SID
-        # check.  The installation-scoped synthetic SID is therefore the sole
-        # restricting SID and the sole second-half write authority.  Session,
-        # account, and Everyone SIDs belong only on object ACLs below.
         runner_sid = current_user_sid()
         runner_logon_sid = current_logon_sid()
+        # Match the complete elevated Windows token model: capability SIDs
+        # identify filesystem authorities, while the sandbox account, logon
+        # session, and World SIDs keep the restricted-token second access check
+        # compatible with ordinary Windows runtime objects.  Only the
+        # capability SID is granted write authority by the filesystem ACL plan.
+        token_request = WindowsRestrictedTokenRequest(
+            (write_sid,),
+            additional_restricting_sids=(runner_sid, runner_logon_sid, _WORLD_SID),
+        )
         token = WindowsRestrictedToken.create_from_current_process(token_request)
         handles_to_close: list[int] = []
         created: RunnerLaunch | None = None
         try:
-            if token.inspection.restricted_sids != (write_sid.value,):
+            expected_restricting_sids = (
+                write_sid.value,
+                runner_sid,
+                runner_logon_sid,
+                _WORLD_SID,
+            )
+            if token.inspection.restricted_sids != expected_restricting_sids:
                 raise SandboxError(
-                    "Windows restricted token does not contain the exact write SID authority"
+                    "Windows restricted token does not contain the expected capability and identity SIDs"
                 )
             if not token.inspection.change_notify_privilege_enabled:
                 raise SandboxError(
                     "Windows restricted token did not preserve SeChangeNotifyPrivilege"
                 )
-            # These SIDs are object-DACL principals for runner-created IPC and
-            # desktop objects.  They are deliberately not added to the
-            # restricted-token SID set; only ``write_sid`` is a
-            # WRITE_RESTRICTED authority.
+            # These same runtime identities are object-DACL principals for
+            # runner-created IPC and desktop objects.  The capability SID is
+            # still the only managed write principal on workspace roots.
             token.set_default_dacl((runner_logon_sid, _WORLD_SID, write_sid.value))
             desktop_value = payload.get(
                 "desktop_mode", _WindowsNativeDesktopMode.PRIVATE_DESKTOP.value
@@ -1358,9 +1367,9 @@ class _RunnerChild:
                 raise SandboxError("Windows final child TokenUser does not match selected identity")
             if not child_attestation.is_restricted:
                 raise SandboxError("Windows final child token is not restricted")
-            if child_attestation.restricted_sids != (write_sid.value,):
+            if child_attestation.restricted_sids != expected_restricting_sids:
                 raise SandboxError(
-                    "Windows final child token does not contain the exact write SID authority"
+                    "Windows final child token does not contain the expected capability and identity SIDs"
                 )
             if not child_attestation.change_notify_privilege_enabled:
                 raise SandboxError(

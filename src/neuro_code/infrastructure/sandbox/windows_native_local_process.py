@@ -108,6 +108,8 @@ _SUPPORTED_STDIO = frozenset(
 )
 _RUNNER_ENVIRONMENT = frozenset({"SystemRoot", "SystemDrive", "PATH", "PATHEXT"})
 _WINDOWS_SID_TEXT = re.compile(r"^S-1-(?:\d+)(?:-\d+)+$")
+_WINDOWS_LOGON_SID_TEXT = re.compile(r"^S-1-5-5-\d+-\d+$")
+_WORLD_SID = "S-1-1-0"
 
 
 def _runtime_is_windows() -> bool:
@@ -115,9 +117,12 @@ def _runtime_is_windows() -> bool:
 
 
 def _validated_child_token_attestation(
-    value: object, *, expected_write_sid: SyntheticWindowsSid
+    value: object,
+    *,
+    expected_write_sid: SyntheticWindowsSid,
+    expected_user_sid: str | None = None,
 ) -> dict[str, object]:
-    """Validate SpawnReady facts, including the exact restricting SID identity."""
+    """Validate SpawnReady facts, including the complete restricting SID model."""
 
     if not isinstance(value, dict):
         raise SandboxError("Windows runner omitted final-child token attestation")
@@ -128,6 +133,8 @@ def _validated_child_token_attestation(
     unexpected = value.get("unexpected_enabled_privilege_count")
     if not isinstance(user_sid, str) or _WINDOWS_SID_TEXT.fullmatch(user_sid) is None:
         raise SandboxError("Windows runner returned an invalid final-child TokenUser")
+    if expected_user_sid is not None and user_sid != expected_user_sid:
+        raise SandboxError("Windows runner returned an unexpected final-child TokenUser")
     if (
         not isinstance(restricted_sids, list)
         or len(restricted_sids) > 64
@@ -137,7 +144,17 @@ def _validated_child_token_attestation(
         )
     ):
         raise SandboxError("Windows runner returned invalid final-child restricting SIDs")
-    if tuple(restricted_sids) != (expected_write_sid.value,):
+    restricting = tuple(restricted_sids)
+    if expected_user_sid is not None:
+        if (
+            len(restricting) != 4
+            or restricting[0] != expected_write_sid.value
+            or restricting[1] != expected_user_sid
+            or not _WINDOWS_LOGON_SID_TEXT.fullmatch(restricting[2])
+            or restricting[3] != _WORLD_SID
+        ):
+            raise SandboxError("Windows runner returned an unexpected restricting SID set")
+    elif restricting != (expected_write_sid.value,):
         raise SandboxError("Windows runner returned an unexpected restricting SID set")
     if type(is_restricted) is not bool or type(change_notify) is not bool:
         raise SandboxError("Windows runner returned invalid final-child token flags")
@@ -146,7 +163,7 @@ def _validated_child_token_attestation(
     return {
         "user_sid": user_sid,
         "is_restricted": is_restricted,
-        "restricted_sids": tuple(restricted_sids),
+        "restricted_sids": restricting,
         "change_notify_privilege_enabled": change_notify,
         "unexpected_enabled_privilege_count": unexpected,
     }
@@ -744,7 +761,9 @@ class WindowsNativeLocalProcessSandbox(LocalProcessSandbox):
             transport.events.close()
             raise SandboxError("trusted Windows runner returned an invalid child PID")
         security_attestation = _validated_child_token_attestation(
-            payload.get("security"), expected_write_sid=identity.write_sid
+            payload.get("security"),
+            expected_write_sid=identity.write_sid,
+            expected_user_sid=identity.user_sid.value,
         )
         return _WindowsNativeOwnedLocalProcess(
             transport=transport,
@@ -871,7 +890,9 @@ class WindowsNativeLocalProcessSandbox(LocalProcessSandbox):
             close_runner_process(launch.process_handle)
             raise SandboxError("trusted Windows runner returned an invalid child PID")
         security_attestation = _validated_child_token_attestation(
-            payload.get("security"), expected_write_sid=identity.write_sid
+            payload.get("security"),
+            expected_write_sid=identity.write_sid,
+            expected_user_sid=identity.user_sid.value,
         )
         return _WindowsNativePtySession(
             transport=transport,

@@ -13,6 +13,8 @@ from pathlib import Path
 from tempfile import TemporaryDirectory, gettempdir, mkdtemp
 from typing import Any, cast
 
+from tests.security.windows_token_attestation import token_attestation_is_exact
+
 from neuro_code.application.permissions.policy import PermissionManager, PermissionMode
 from neuro_code.application.ports.sandbox import (
     LocalProcessEnvironmentPolicy,
@@ -778,7 +780,13 @@ class WindowsNativePtyAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                     self.assertIsInstance(attestation, dict)
                     self.assertEqual(attestation.get("user_sid"), expected_sid)
                     self.assertIs(attestation.get("is_restricted"), True)
-                    self.assertEqual(tuple(attestation.get("restricted_sids", ())), (write_sid,))
+                    self.assertTrue(
+                        token_attestation_is_exact(
+                            {"security_attestation": attestation},
+                            expected_user_sid=expected_sid,
+                            expected_write_sid=write_sid,
+                        )
+                    )
                     self.assertIs(attestation.get("change_notify_privilege_enabled"), True)
                     self.assertEqual(attestation.get("unexpected_enabled_privilege_count"), 0)
                     result = {

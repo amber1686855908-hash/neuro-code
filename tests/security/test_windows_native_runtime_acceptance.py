@@ -1030,7 +1030,11 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                             isinstance(attestation, dict)
                             and attestation.get("user_sid") == expected_user_sid
                             and attestation.get("is_restricted") is True
-                            and tuple(attestation.get("restricted_sids", ())) == (write_sid.value,)
+                            and _token_attestation_matches_exact(
+                                {"security_attestation": attestation},
+                                expected_user_sid=expected_user_sid,
+                                expected_write_sid=write_sid.value,
+                            )
                             and attestation.get("change_notify_privilege_enabled") is True
                             and attestation.get("unexpected_enabled_privilege_count") == 0
                         )
@@ -2107,7 +2111,11 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                             isinstance(attestation, dict)
                             and attestation.get("user_sid") == expected_sid
                             and attestation.get("is_restricted") is True
-                            and tuple(attestation.get("restricted_sids", ())) == (write_sid.value,)
+                            and _token_attestation_matches_exact(
+                                {"security_attestation": attestation},
+                                expected_user_sid=expected_sid,
+                                expected_write_sid=write_sid.value,
+                            )
                             and attestation.get("change_notify_privilege_enabled") is True
                             and attestation.get("unexpected_enabled_privilege_count") == 0
                         )
@@ -2503,7 +2511,11 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                         isinstance(attestation, dict)
                         and attestation.get("user_sid") == online_sid
                         and attestation.get("is_restricted") is True
-                        and tuple(attestation.get("restricted_sids", ())) == (write_sid.value,)
+                        and _token_attestation_matches_exact(
+                            {"security_attestation": attestation},
+                            expected_user_sid=online_sid,
+                            expected_write_sid=write_sid.value,
+                        )
                         and attestation.get("change_notify_privilege_enabled") is True
                         and attestation.get("unexpected_enabled_privilege_count") == 0
                     )
@@ -2742,7 +2754,11 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                     isinstance(attestation, dict)
                     and attestation.get("user_sid") == online_sid
                     and attestation.get("is_restricted") is True
-                    and tuple(attestation.get("restricted_sids", ())) == (write_sid.value,)
+                    and _token_attestation_matches_exact(
+                        {"security_attestation": attestation},
+                        expected_user_sid=online_sid,
+                        expected_write_sid=write_sid.value,
+                    )
                     and attestation.get("change_notify_privilege_enabled") is True
                     and attestation.get("unexpected_enabled_privilege_count") == 0
                 )
