@@ -631,7 +631,10 @@ class WindowsSandboxSetupAuthorityTests(unittest.TestCase):
                 request,
                 SyntheticWindowsSid.from_components((1, 2, 3, 4)),
             )
-            self.assertEqual(tuple(entry.path for entry in entries), (outside,))
+            self.assertEqual(
+                tuple(entry.path for entry in entries),
+                (outside.resolve(strict=False),),
+            )
             self.assertTrue(
                 all(
                     entry.kind is WindowsManagedAceKind.RESTRICTING_WRITE_DENY
