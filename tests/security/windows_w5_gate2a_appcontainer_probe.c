@@ -1501,6 +1501,7 @@ static void g2a_parse_variant(
         wcsstr(mode, L"-env-user") != NULL || wcsstr(mode, L"-user") != NULL ||
         wcsstr(mode, L"cd-") != NULL || wcsstr(mode, L"api-") != NULL ||
         wcsstr(mode, L"desc-") != NULL ||
+        wcsncmp(mode, L"pty", 3) == 0 ||
         wcsncmp(mode, L"a0", 2) == 0 || wcsncmp(mode, L"a1", 2) == 0 ||
         wcsncmp(mode, L"a2-", 3) == 0;
     *process_api = wcsstr(mode, L"api-current") != NULL
@@ -1543,6 +1544,9 @@ static const wchar_t *g2a_current_directory_for_mode(
         return NULL;
     }
     if (wcsstr(mode, L"workspace") != NULL) {
+        return workspace;
+    }
+    if (wcsncmp(mode, L"pty", 3) == 0) {
         return workspace;
     }
     if (wcsncmp(mode, L"desc-", 5) == 0) {
