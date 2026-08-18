@@ -1861,7 +1861,7 @@ int wmain(int argc, wchar_t **argv) {
         g2a_child_pipe(argv[2], minimal, input_only, no_descendant);
         return 0;
     }
-    if (argc >= 3 && wcsncmp(argv[1], L"child-pty", 10) == 0) {
+    if (argc >= 3 && wcsncmp(argv[1], L"child-pty", 9) == 0) {
         BOOL minimal = wcsstr(argv[1], L"minimal") != NULL || wcsstr(argv[1], L"min-output") != NULL;
         BOOL input_only = wcsstr(argv[1], L"input-") != NULL;
         BOOL no_descendant = wcsstr(argv[1], L"no-descendant") != NULL;
