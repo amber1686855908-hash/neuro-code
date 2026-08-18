@@ -1124,7 +1124,7 @@ class WindowsNativeWorkloadCompatibilityTests(unittest.IsolatedAsyncioTestCase):
                                     ]
                                 ),
                             ),
-                            powershell_spec.expected_patterns,
+                            (r"(?m)^W5_POWERSHELL_OK$",),
                         )
                         diagnostics["powershell_via_cmd"] = await _w3_run(
                             powershell_via_cmd,
