@@ -182,6 +182,16 @@ def _controller_loss_pty_helper_source(
             runtime_state = Path(runtime_text)
             probe = Path(probe_text)
             ready = Path(ready_text)
+            stage_path = ready.with_name("controller-stage.txt")
+            from neuro_code.infrastructure.sandbox import windows_native_local_process as _local_process_module
+
+            def _record_native_stage(value: str) -> None:
+                try:
+                    stage_path.write_text(value[:160], encoding="ascii")
+                except OSError:
+                    pass
+
+            _local_process_module._native_acceptance_stage = _record_native_stage
             setup_request = WindowsSandboxSetupRequest(
                 installation_root=installation,
                 read_roots=(workspace,),
@@ -269,6 +279,10 @@ def _controller_loss_pty_helper_source(
                 # Keep controller-loss startup failures diagnosable without
                 # exposing paths, credentials, handles, or exception text.
                 payload = {"error": type(error).__name__, "phase": phase}
+                try:
+                    payload["native_stage"] = stage_path.read_text(encoding="ascii")[:160]
+                except (OSError, UnicodeError):
+                    pass
                 diagnostic_payload = getattr(error, "diagnostic_payload", None)
                 if callable(diagnostic_payload):
                     try:
