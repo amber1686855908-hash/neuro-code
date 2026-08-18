@@ -1720,6 +1720,7 @@ static int g2a_controller(const wchar_t *mode, const wchar_t *workspace, const w
     BOOL local_timeout = FALSE;
     DWORD wait_result;
     int result = 0;
+    owned_self[0] = L'\0';
     g2a_seen_descendant_pid = 0;
     g2a_parse_variant(mode, &pty, &use_user_environment, &stage, &process_api,
         &include_security);
@@ -1948,6 +1949,9 @@ cleanup:
         g2a_emit("G2A_DESCENDANT_REAPED=NOT_OBSERVED\n");
     }
     g2a_profile_cleanup(&profile);
+    if (owned_self[0] != L'\0') {
+        g2a_bool("G2A_SELF_COPY_DELETE=", DeleteFileW(owned_self));
+    }
     return result;
 }
 
