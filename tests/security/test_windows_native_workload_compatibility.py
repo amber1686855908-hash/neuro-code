@@ -1023,7 +1023,9 @@ class WindowsNativeWorkloadCompatibilityTests(unittest.IsolatedAsyncioTestCase):
                 setup_authority=authority,
                 setup_request_factory=lambda _request: setup_request,
                 _diagnostic_desktop_mode=_WindowsNativeDesktopMode.PRIVATE_DESKTOP,
-                _diagnostic_create_no_window=True,
+                # Match the production capture contract: no CREATE_NO_WINDOW.
+                # The private desktop keeps the console surface isolated.
+                _diagnostic_create_no_window=False,
             )
             manager = LocalInteractiveTerminalManager(
                 workspace=workspace,

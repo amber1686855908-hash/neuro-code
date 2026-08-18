@@ -359,7 +359,13 @@ class WindowsNativeLocalProcessSandbox(LocalProcessSandbox):
         runner_launcher: Callable[..., RunnerLaunch] = launch_runner,
         pipe_server_factory: Callable[..., WindowsNamedPipeServer] = WindowsNamedPipeServer,
         _diagnostic_desktop_mode: _WindowsNativeDesktopMode = _WindowsNativeDesktopMode.PRIVATE_DESKTOP,
-        _diagnostic_create_no_window: bool = True,
+        # Capture-backed children follow the upstream Windows launch contract:
+        # redirected stdio is inherited without CREATE_NO_WINDOW.  The private
+        # desktop still keeps any console surface off the user's interactive
+        # desktop, while this preserves runtimes (notably Windows PowerShell's
+        # CLR bootstrap) that require normal console initialization.  PTY
+        # requests always override this to False below.
+        _diagnostic_create_no_window: bool = False,
     ) -> None:
         if not isinstance(profile, SandboxProfile) or not profile.enabled:
             raise ValueError("Windows native adapter requires an enabled sandbox profile")

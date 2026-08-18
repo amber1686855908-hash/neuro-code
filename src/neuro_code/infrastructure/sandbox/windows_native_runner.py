@@ -1212,7 +1212,12 @@ class _RunnerChild:
                 # mode.  It changes no token, ACL, filesystem, or network
                 # authority and is never selected by SandboxedProcessRequest.
                 self._desktop_handle, self._desktop_name = None, None
-            create_no_window = payload.get("create_no_window", True)
+            # Capture-backed launches use the inherited-console mode from the
+            # canonical Windows contract.  The trusted adapter sends this
+            # field explicitly; keep the fail-safe default aligned as well so
+            # a legacy payload cannot reintroduce CREATE_NO_WINDOW for runtimes
+            # whose CLR bootstrap requires normal console initialization.
+            create_no_window = payload.get("create_no_window", False)
             if not isinstance(create_no_window, bool):
                 raise SandboxError("Windows runtime console mode is invalid")
             stdio_mode = payload.get("stdio_mode", "")
