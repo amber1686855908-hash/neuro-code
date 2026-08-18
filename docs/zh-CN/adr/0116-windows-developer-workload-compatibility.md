@@ -7,8 +7,8 @@
 ## 决策
 
 W5 兼容性基线是对当前生产 W3/W4 路由的证据性测量。运行
-`32193614626`（head
-`a31097d47fcd40b01209770438f5b87a0a1c50a9`）已在 Windows Server 2025
+`32194952573`（head
+`75c07cb952765d8ab26ce8d219a39be7bc4e3ed5`）已在 Windows Server 2025
 验证矩阵；工作负载 probe 不修改 Windows 沙箱实现、token 模型、setup
 authority、ACL、Firewall、私有 profile、Job ownership 或 ConPTY。
 
@@ -74,7 +74,7 @@ runtime/dependency 初始化、repository discovery、timeout、非零退出、�
 
 ## W5 兼容性证据记录
 
-运行 `32193614626` 在 Windows Server 2025 hosted `windows-latest`、`WORKSPACE`、
+运行 `32194952573` 在 Windows Server 2025 hosted `windows-latest`、`WORKSPACE`、
 Online identity 上完成 20 行矩阵。HOST、W3 非 PTY 与 W4 PTY 的所有单元格均为
 `PASS / 0`：
 

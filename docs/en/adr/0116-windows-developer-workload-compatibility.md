@@ -7,8 +7,8 @@
 ## Decision
 
 The W5 compatibility baseline is an evidence-only measurement of the current
-production W3/W4 routes. Run `32193614626` (head
-`a31097d47fcd40b01209770438f5b87a0a1c50a9`) validated the Windows Server 2025
+production W3/W4 routes. Run `32194952573` (head
+`75c07cb952765d8ab26ce8d219a39be7bc4e3ed5`) validated the Windows Server 2025
 matrix; the workload probes do not change the Windows sandbox implementation,
 token model, setup authority, ACLs, Firewall, private profile, Job ownership,
 or ConPTY.
@@ -82,7 +82,7 @@ was observed.
 
 ## W5 compatibility evidence record
 
-Run `32193614626` completed the 20-row matrix on Windows Server 2025 hosted
+Run `32194952573` completed the 20-row matrix on Windows Server 2025 hosted
 `windows-latest`, `WORKSPACE`, and the Online identity. All HOST, W3 non-PTY,
 and W4 PTY cells are `PASS / 0`:
 

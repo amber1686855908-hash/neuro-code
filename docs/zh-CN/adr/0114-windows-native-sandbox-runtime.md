@@ -77,7 +77,7 @@ PowerShell、Git、Node/npm、curl、NUL 和动态 BCrypt 启动。
   `terminate()` 终止整个 Job；Gate 5C：controller 丢失后失败关闭整个 scope；Gate 5D：
   runner 退出证明 `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`。
 
-已接受的 W5 workload artifact（run `32193614626`）记录 20 行 HOST/W3/W4 PASS，
+已接受的 W5 workload artifact（run `32194952573`）记录 20 行 HOST/W3/W4 PASS，
 包括 Python child process、Git repository 操作、NUL 读写模式、curl 启动和动态
 `BCryptGenRandom`。这是有界的本地工作负载证据；未来工具和网络场景仍需独立 fixture。
 Full CI 与 focused 原生验收继续构成生产 runtime 的 merge-readiness 证据。

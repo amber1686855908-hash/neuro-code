@@ -4,6 +4,9 @@
 
 状态取值：`unassessed`（未评估）、`planned`（已规划）、`partial`（部分实现）、`compatible`（兼容）或 `intentionally-different`（有意不同）。“证据”指向固定版本的 Rust 源项目。
 
+最新 Windows sandbox production 验证为 CI run `32194952573`，head 为
+`75c07cb952765d8ab26ce8d219a39be7bc4e3ed5`；23 个 job 全部完成并通过。
+
 | 能力 | 目标 | 状态 | 证据 / 备注 |
 |---|---|---|---|
 | 软件包与 CLI 组合根 | M1 | partial | 普通软件包已包含 Textual，并发布等价的 `neuro` 和 `neuro-code` 控制台脚本；`neuro code` 是显式 TUI 别名，三者都把启动目录作为工作区，全局工具安装后无需每次激活虚拟环境。CLI、TUI 和 ACP 共享与界面无关的 `ApplicationComposition`；独立原生安装程序仍待实现 |

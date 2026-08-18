@@ -92,7 +92,7 @@ seven tests executed, zero skipped. The evidence covers:
   controller loss closes the scope fail-closed; Gate 5D: runner death proves
   `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`.
 
-The accepted W5 workload artifact (run `32193614626`) records 20 HOST/W3/W4
+The accepted W5 workload artifact (run `32194952573`) records 20 HOST/W3/W4
 rows with PASS results, including Python child processes, Git repository
 operations, NUL read/write modes, curl startup, and dynamic `BCryptGenRandom`.
 This is bounded local workload evidence; future tools and network scenarios

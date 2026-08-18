@@ -50,7 +50,7 @@ It is intentionally concise and is updated as implementation evidence changes.
   participates in READY/NEEDS_REPAIR inspection, and is cleaned before
   installation state is removed. The runtime runner no longer attempts a
   privileged DACL mutation.
-- The final W5 compatibility artifact (run `32193614626`, head `a31097d`)
+- The final W5 compatibility artifact (run `32194952573`, head `75c07cb`)
   passes all 20 installed workload rows through HOST, W3 capture, and W4
   ConPTY. It covers Windows PowerShell 5.1, PowerShell 7, normal and base
   Python, a Python child process, Git/local-repository operations, Node/npm,
@@ -99,9 +99,9 @@ It is intentionally concise and is updated as implementation evidence changes.
 - Frozen evidence PR #48: `a245ffeddff66ec18cc6168081202013a2f5232a` (Draft,
   evidence-only; its Gate 2A.6 line is not production).
 - Production PR #49 is Draft at `feat/windows-sandbox-codex-parity`; the
-  latest pushed head is `a31097d` after the final runtime evidence and
+  latest pushed head is `75c07cb` after the final runtime evidence and
   documentation-consistency updates.
-- Run `32193614626` (head `a31097d`) is the final full CI run: all 23 jobs
+- Run `32194952573` (head `75c07cb`) is the final full CI run: all 23 jobs
   succeeded, including quality, package smoke, ordinary Linux/Windows/macOS,
   Bubblewrap, Windows security/lifecycle/native acceptance/PTY/compatibility,
   terminal smoke, and macOS Seatbelt jobs. Its W5 artifact contains 20 rows,

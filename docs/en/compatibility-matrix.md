@@ -5,6 +5,9 @@
 Statuses: `unassessed`, `planned`, `partial`, `compatible`, or
 `intentionally-different`. “Evidence” points into the pinned Rust repository.
 
+The latest production Windows sandbox verification is CI run `32194952573` at
+head `75c07cb952765d8ab26ce8d219a39be7bc4e3ed5`; it completed all 23 jobs.
+
 | Capability | Target | Status | Evidence / notes |
 |---|---|---|---|
 | Package and CLI composition root | M1 | partial | The normal package includes Textual and publishes equivalent `neuro` and `neuro-code` console scripts; `neuro code` is the explicit TUI alias, all three use the launch directory as the workspace, and globally installed tools require no per-use venv activation. CLI, TUI, and ACP share an interface-neutral `ApplicationComposition`; standalone native installers remain pending |
