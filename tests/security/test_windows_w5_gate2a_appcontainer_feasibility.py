@@ -56,7 +56,10 @@ from neuro_code.infrastructure.sandbox.windows_sandbox_setup import (
 
 _HEAD = "902f82e014d0728445723630bc24d70bb1b52357"
 _MAIN = "00879b9b71f637804ff6e40c82451d86f2bd6165"
-_MARKER = re.compile(r"G2A_[A-Z0-9_]+=[^\r\n]*")
+# KsecDD access markers contain hexadecimal suffixes such as ``0x100000``;
+# retain the lowercase ``x`` (and any future mixed-case marker payload key)
+# while still accepting only bounded marker names.
+_MARKER = re.compile(r"G2A_[A-Za-z0-9_]+=[^\r\n]*")
 _STATUS_SUCCESS = 0
 _ACCESS_DENIED = 0xC0000022
 
