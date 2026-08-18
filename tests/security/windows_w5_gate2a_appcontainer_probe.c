@@ -14,6 +14,7 @@
 #include <windows.h>
 #include <aclapi.h>
 #include <ConsoleApi2.h>
+#include <processthreadsapi.h>
 #include <sddl.h>
 #include <strsafe.h>
 #include <userenv.h>
@@ -548,6 +549,65 @@ static void g2a_cng(void) {
     (void)FreeLibrary(bcrypt);
 }
 
+static void g2a_emit_wide(const char *prefix, const wchar_t *value);
+
+static void g2a_descendant_policy(void) {
+    PROCESS_MITIGATION_CHILD_PROCESS_POLICY policy;
+    ZeroMemory(&policy, sizeof(policy));
+    if (!GetProcessMitigationPolicy(
+        GetCurrentProcess(), ProcessChildProcessPolicy, &policy, sizeof(policy)
+    )) {
+        g2a_bool("G2A_DESCENDANT_POLICY_AVAILABLE=", FALSE);
+        g2a_u32("G2A_DESCENDANT_POLICY_ERROR=", GetLastError());
+        return;
+    }
+    g2a_bool("G2A_DESCENDANT_POLICY_AVAILABLE=", TRUE);
+    g2a_bool("G2A_DESCENDANT_NO_CHILD_PROCESS_CREATION=", policy.NoChildProcessCreation);
+    g2a_bool("G2A_DESCENDANT_AUDIT_NO_CHILD_PROCESS_CREATION=", policy.AuditNoChildProcessCreation);
+}
+
+static void g2a_descendant_launch_inputs(const wchar_t *workspace) {
+    WCHAR self[MAX_PATH * 4];
+    WCHAR current[MAX_PATH * 4];
+    DWORD length;
+    HANDLE readable;
+    DWORD attributes;
+    length = GetModuleFileNameW(NULL, self, sizeof(self) / sizeof(self[0]));
+    g2a_bool("G2A_DESCENDANT_SELF_PATH_AVAILABLE=", length > 0 && length < sizeof(self) / sizeof(self[0]));
+    if (length > 0 && length < sizeof(self) / sizeof(self[0])) {
+        attributes = GetFileAttributesW(self);
+        g2a_bool("G2A_DESCENDANT_SELF_EXISTS=", attributes != INVALID_FILE_ATTRIBUTES);
+        readable = CreateFileW(
+            self, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL
+        );
+        g2a_bool("G2A_DESCENDANT_SELF_READABLE=", g2a_valid_handle(readable));
+        if (g2a_valid_handle(readable)) {
+            CloseHandle(readable);
+        }
+        g2a_emit_wide("G2A_DESCENDANT_SELF_PATH=", self);
+    }
+    length = GetCurrentDirectoryW(sizeof(current) / sizeof(current[0]), current);
+    g2a_bool("G2A_DESCENDANT_CURRENT_DIRECTORY_AVAILABLE=", length > 0 && length < sizeof(current) / sizeof(current[0]));
+    if (length > 0 && length < sizeof(current) / sizeof(current[0])) {
+        g2a_emit_wide("G2A_DESCENDANT_CURRENT_DIRECTORY=", current);
+    }
+    if (workspace == NULL || workspace[0] == L'\0') {
+        g2a_emit("G2A_DESCENDANT_WORKSPACE=UNAVAILABLE\n");
+    } else {
+        attributes = GetFileAttributesW(workspace);
+        g2a_bool("G2A_DESCENDANT_WORKSPACE_EXISTS=", attributes != INVALID_FILE_ATTRIBUTES);
+        g2a_emit_wide("G2A_DESCENDANT_WORKSPACE=", workspace);
+    }
+    {
+        LPWCH environment = GetEnvironmentStringsW();
+        g2a_bool("G2A_DESCENDANT_ENV_PRESENT=", environment != NULL);
+        if (environment != NULL) {
+            (void)FreeEnvironmentStringsW(environment);
+        }
+    }
+}
+
 static BOOL g2a_read_line(HANDLE input, char *buffer, DWORD capacity) {
     DWORD used = 0;
     while (used + 1U < capacity) {
@@ -565,11 +625,15 @@ static BOOL g2a_read_line(HANDLE input, char *buffer, DWORD capacity) {
     return FALSE;
 }
 
-static BOOL g2a_spawn_descendant(void) {
+static BOOL g2a_spawn_descendant(const wchar_t *variant, const wchar_t *workspace) {
     WCHAR self[MAX_PATH * 4];
     WCHAR command[MAX_PATH * 4 + 64];
     STARTUPINFOW startup;
     PROCESS_INFORMATION process;
+    LPWCH environment = NULL;
+    LPCWSTR application_name = NULL;
+    LPCWSTR current_directory = NULL;
+    BOOL use_environment = variant != NULL && wcsstr(variant, L"env") != NULL;
     DWORD length = GetModuleFileNameW(NULL, self, sizeof(self) / sizeof(self[0]));
     if (length == 0 || length >= sizeof(self) / sizeof(self[0])) {
         g2a_u32("G2A_DESCENDANT_CREATE_ERROR=", GetLastError());
@@ -579,13 +643,33 @@ static BOOL g2a_spawn_descendant(void) {
         g2a_emit("G2A_DESCENDANT_CREATE_ERROR=87\n");
         return FALSE;
     }
+    if (variant != NULL && wcsstr(variant, L"application") != NULL) {
+        application_name = self;
+    }
+    if (variant != NULL && (wcsstr(variant, L"cwd") != NULL || wcsstr(variant, L"env") != NULL)) {
+        current_directory = workspace;
+    }
+    if (use_environment) {
+        environment = GetEnvironmentStringsW();
+        if (environment == NULL) {
+            g2a_u32("G2A_DESCENDANT_CREATE_ERROR=", GetLastError());
+            return FALSE;
+        }
+    }
     ZeroMemory(&startup, sizeof(startup));
     ZeroMemory(&process, sizeof(process));
     startup.cb = sizeof(startup);
-    if (!CreateProcessW(NULL, command, NULL, NULL, FALSE, G2A_CREATE_NO_WINDOW,
-        NULL, NULL, &startup, &process)) {
+    if (!CreateProcessW(application_name, command, NULL, NULL, FALSE,
+        G2A_CREATE_UNICODE_ENVIRONMENT | G2A_CREATE_NO_WINDOW,
+        use_environment ? environment : NULL, current_directory, &startup, &process)) {
         g2a_u32("G2A_DESCENDANT_CREATE_ERROR=", GetLastError());
+        if (environment != NULL) {
+            (void)FreeEnvironmentStringsW(environment);
+        }
         return FALSE;
+    }
+    if (environment != NULL) {
+        (void)FreeEnvironmentStringsW(environment);
     }
     g2a_emit("G2A_DESCENDANT_CREATE=PASS\n");
     g2a_u32("G2A_DESCENDANT_PID=", process.dwProcessId);
@@ -652,12 +736,28 @@ static int g2a_descendant(const wchar_t *path) {
     return 0;
 }
 
-static void g2a_child_common(const wchar_t *fixture_root, HANDLE input, BOOL pty, BOOL minimal) {
+static void g2a_child_common(
+    const wchar_t *fixture_root,
+    HANDLE input,
+    BOOL pty,
+    BOOL minimal,
+    BOOL input_only,
+    BOOL no_descendant
+) {
     char line[128];
     g2a_emit("G2A_CHILD_STARTED\n");
     g2a_attest_token();
     if (minimal) {
         g2a_emit("G2A_CHILD_MINIMAL=TRUE\n");
+        g2a_emit("G2A_CHILD_FINISHED\n");
+        return;
+    }
+    if (input_only) {
+        if (input != NULL && g2a_read_line(input, line, sizeof(line))) {
+            g2a_emitf("G2A_STDIN=%s\n", strcmp(line, "g2a-input") == 0 ? "PASS" : "UNEXPECTED");
+        } else {
+            g2a_emit("G2A_STDIN=UNAVAILABLE\n");
+        }
         g2a_emit("G2A_CHILD_FINISHED\n");
         return;
     }
@@ -671,19 +771,42 @@ static void g2a_child_common(const wchar_t *fixture_root, HANDLE input, BOOL pty
     } else if (pty) {
         g2a_emit("G2A_STDIN=UNAVAILABLE\n");
     }
-    (void)g2a_spawn_descendant();
+    if (!no_descendant) {
+        (void)g2a_spawn_descendant(L"original", NULL);
+    }
     g2a_emit("G2A_CHILD_FINISHED\n");
 }
 
-static int g2a_child_pipe(const wchar_t *fixture_root, BOOL minimal) {
+static int g2a_child_pipe(
+    const wchar_t *fixture_root,
+    BOOL minimal,
+    BOOL input_only,
+    BOOL no_descendant
+) {
     HANDLE input = GetStdHandle(STD_INPUT_HANDLE);
-    g2a_child_common(fixture_root, input, FALSE, minimal);
+    g2a_child_common(fixture_root, input, FALSE, minimal, input_only, no_descendant);
     return 0;
 }
 
-static int g2a_child_pty(const wchar_t *fixture_root, BOOL minimal) {
+static int g2a_child_pty(
+    const wchar_t *fixture_root,
+    BOOL minimal,
+    BOOL input_only,
+    BOOL no_descendant
+) {
     HANDLE input = GetStdHandle(STD_INPUT_HANDLE);
-    g2a_child_common(fixture_root, input, TRUE, minimal);
+    g2a_child_common(fixture_root, input, TRUE, minimal, input_only, no_descendant);
+    return 0;
+}
+
+static int g2a_child_descendant(const wchar_t *fixture_root, const wchar_t *workspace, const wchar_t *variant) {
+    g2a_emit("G2A_CHILD_STARTED\n");
+    g2a_attest_token();
+    g2a_descendant_policy();
+    g2a_descendant_launch_inputs(workspace);
+    (void)g2a_spawn_descendant(variant, workspace);
+    g2a_emit("G2A_CHILD_FINISHED\n");
+    (void)fixture_root;
     return 0;
 }
 
@@ -1218,6 +1341,7 @@ static BOOL g2a_create_child(
     BOOL created = FALSE;
     BOOL attributes_initialized = FALSE;
     LPVOID environment = NULL;
+    BOOL descendant_mode = wcsncmp(mode, L"desc-", 5) == 0;
     DWORD attribute_count = (include_security ? 1UL : 0UL) +
         (stage >= G2A_ATTRIBUTE_STAGE_JOB ? 1UL : 0UL) +
         (stage >= G2A_ATTRIBUTE_STAGE_IO ? 1UL : 0UL);
@@ -1231,9 +1355,16 @@ static BOOL g2a_create_child(
     backing.io_handles[1] = output_write;
     backing.io_handles[2] = error_write;
     backing.pseudo_console = pseudo_console;
-    count = swprintf_s(command, sizeof(command) / sizeof(command[0]),
-        L"\"%s\" child-%s%s \"%s\"", self, mode,
-        minimal_child ? L"-minimal" : L"", fixture_root);
+    if (descendant_mode) {
+        count = swprintf_s(command, sizeof(command) / sizeof(command[0]),
+            L"\"%s\" child-%s%s \"%s\" \"%s\"", self, mode,
+            minimal_child ? L"-minimal" : L"", fixture_root,
+            current_directory != NULL ? current_directory : L"");
+    } else {
+        count = swprintf_s(command, sizeof(command) / sizeof(command[0]),
+            L"\"%s\" child-%s%s \"%s\"", self, mode,
+            minimal_child ? L"-minimal" : L"", fixture_root);
+    }
     if (count <= 0) {
         g2a_emit("G2A_CHILD_CREATE=FAIL\n");
         return FALSE;
@@ -1369,6 +1500,7 @@ static void g2a_parse_variant(
     *use_user_environment =
         wcsstr(mode, L"-env-user") != NULL || wcsstr(mode, L"-user") != NULL ||
         wcsstr(mode, L"cd-") != NULL || wcsstr(mode, L"api-") != NULL ||
+        wcsstr(mode, L"desc-") != NULL ||
         wcsncmp(mode, L"a0", 2) == 0 || wcsncmp(mode, L"a1", 2) == 0 ||
         wcsncmp(mode, L"a2-", 3) == 0;
     *process_api = wcsstr(mode, L"api-current") != NULL
@@ -1383,6 +1515,8 @@ static void g2a_parse_variant(
         *stage = G2A_ATTRIBUTE_STAGE_IO;
     } else if (wcsstr(mode, L"cd-") != NULL || wcsstr(mode, L"api-") != NULL) {
         *stage = G2A_ATTRIBUTE_STAGE_SECURITY;
+    } else if (wcsncmp(mode, L"desc-", 5) == 0) {
+        *stage = G2A_ATTRIBUTE_STAGE_JOB;
     } else {
         *stage = G2A_ATTRIBUTE_STAGE_IO;
     }
@@ -1409,6 +1543,9 @@ static const wchar_t *g2a_current_directory_for_mode(
         return NULL;
     }
     if (wcsstr(mode, L"workspace") != NULL) {
+        return workspace;
+    }
+    if (wcsncmp(mode, L"desc-", 5) == 0) {
         return workspace;
     }
     if (wcsncmp(mode, L"a", 1) == 0) {
@@ -1486,8 +1623,16 @@ static int g2a_controller(const wchar_t *mode, const wchar_t *workspace, const w
     G2A_ATTRIBUTE_STAGE stage = G2A_ATTRIBUTE_STAGE_IO;
     G2A_PROCESS_API process_api = G2A_PROCESS_API_AS_USER;
     const wchar_t *current_directory = fixture_root;
+    const wchar_t *child_mode = L"pipe";
+    BOOL descendant_mode = wcsncmp(mode, L"desc-", 5) == 0;
+    BOOL minimal_child = wcsstr(mode, L"min-output") != NULL;
+    BOOL input_only = wcsstr(mode, L"input-cr") != NULL || wcsstr(mode, L"input-lf") != NULL;
+    BOOL no_descendant = wcsstr(mode, L"full-no-descendant") != NULL;
+    ULONGLONG deadline;
+    BOOL local_timeout = FALSE;
     DWORD wait_result;
     int result = 0;
+    g2a_seen_descendant_pid = 0;
     g2a_parse_variant(mode, &pty, &use_user_environment, &stage, &process_api,
         &include_security);
     transport = g2a_transport_for_mode(mode);
@@ -1527,6 +1672,12 @@ static int g2a_controller(const wchar_t *mode, const wchar_t *workspace, const w
         }
     } else if (pty) {
         g2a_emit("G2A_TRANSPORT=PTY\n");
+        if (no_descendant) {
+            child_mode = L"pty-full-no-descendant";
+        } else {
+            child_mode = (minimal_child || input_only || wcsncmp(mode, L"pty", 3) == 0)
+                ? mode : L"pty";
+        }
         COORD size;
         size.X = 80;
         size.Y = 25;
@@ -1548,19 +1699,37 @@ static int g2a_controller(const wchar_t *mode, const wchar_t *workspace, const w
             }
         }
         g2a_emit("G2A_PTY_CREATE=PASS\n");
-        if (!g2a_create_child(self, L"pty", fixture_root, current_directory, &profile, job, TRUE,
+        /* CreatePseudoConsole takes ownership of these two ends. */
+        if (pty_input_read != NULL) {
+            CloseHandle(pty_input_read);
+            pty_input_read = NULL;
+        }
+        if (pty_output_write != NULL) {
+            CloseHandle(pty_output_write);
+            pty_output_write = NULL;
+        }
+        g2a_emit("G2A_PTY_CONTROLLER_INPUT_READ_CLOSED=PASS\n");
+        g2a_emit("G2A_PTY_CONTROLLER_OUTPUT_WRITE_CLOSED=PASS\n");
+        if (!g2a_create_child(self, child_mode, fixture_root, current_directory, &profile, job, TRUE,
             NULL, NULL, NULL, pseudo_console, &process, use_user_environment, stage,
-            stage < G2A_ATTRIBUTE_STAGE_JOB, process_api, FALSE, include_security)) {
+            minimal_child, process_api, FALSE, include_security)) {
             result = 25;
             goto cleanup;
         }
         if (pty_input_write != NULL) {
-            const char input[] = "g2a-input\n";
+            const char *input = wcsstr(mode, L"input-cr") != NULL ? "g2a-input\r" : "g2a-input\n";
             DWORD written = 0;
-            (void)WriteFile(pty_input_write, input, (DWORD)strlen(input), &written, NULL);
+            BOOL write_ok = WriteFile(pty_input_write, input, (DWORD)strlen(input), &written, NULL);
+            g2a_emitf("G2A_PTY_STDIN_WRITE=%s|BYTES=%lu\n",
+                write_ok ? "PASS" : "FAIL", (unsigned long)written);
         }
     } else {
         g2a_emit("G2A_TRANSPORT=PIPE\n");
+        if (descendant_mode) {
+            child_mode = mode;
+        } else if (no_descendant) {
+            child_mode = L"pipe-full-no-descendant";
+        }
         if (!g2a_make_pipe(&input_read, &input_write) || !g2a_make_pipe(&output_read, &output_write) ||
             !g2a_make_pipe(&error_read, &error_write)) {
             g2a_u32("G2A_PIPE_CREATE_ERROR=", GetLastError());
@@ -1571,9 +1740,9 @@ static int g2a_controller(const wchar_t *mode, const wchar_t *workspace, const w
         (void)g2a_noninherit(output_read);
         (void)g2a_noninherit(error_read);
         g2a_emit("G2A_PIPE_CREATE=PASS\n");
-        if (!g2a_create_child(self, L"pipe", fixture_root, current_directory, &profile, job, FALSE,
+        if (!g2a_create_child(self, child_mode, fixture_root, current_directory, &profile, job, FALSE,
             input_read, output_write, error_write, NULL, &process, use_user_environment, stage,
-            stage < G2A_ATTRIBUTE_STAGE_JOB, process_api, FALSE, include_security)) {
+            minimal_child, process_api, FALSE, include_security)) {
             result = 27;
             goto cleanup;
         }
@@ -1593,12 +1762,20 @@ static int g2a_controller(const wchar_t *mode, const wchar_t *workspace, const w
             g2a_emit("G2A_JOB_MEMBER=NOT_REQUIRED\n");
         }
     }
+    deadline = GetTickCount64() + 30000ULL;
     for (;;) {
         if (transport != G2A_TRANSPORT_NONE) {
             g2a_forward_pipe(pty ? pty_output_read : output_read);
         }
         wait_result = WaitForSingleObject(process.hProcess, 20);
         if (wait_result != WAIT_TIMEOUT) {
+            break;
+        }
+        if (GetTickCount64() >= deadline) {
+            local_timeout = TRUE;
+            g2a_emit("G2A_LOCAL_TIMEOUT=TRUE\n");
+            g2a_emit("G2A_LAST_MILESTONE=WAITING_FOR_PROCESS_EXIT\n");
+            result = 29;
             break;
         }
     }
@@ -1629,11 +1806,13 @@ static int g2a_controller(const wchar_t *mode, const wchar_t *workspace, const w
         DWORD exit_code = 0;
         (void)GetExitCodeProcess(process.hProcess, &exit_code);
         g2a_u32("G2A_CHILD_EXIT=", exit_code);
-    } else {
+    } else if (!local_timeout) {
         g2a_u32("G2A_CHILD_WAIT_ERROR=", GetLastError());
         result = 28;
     }
-    g2a_emit("G2A_SCOPE_COMPLETE=PASS\n");
+    if (!local_timeout && wait_result == WAIT_OBJECT_0) {
+        g2a_emit("G2A_SCOPE_COMPLETE=PASS\n");
+    }
 cleanup:
     if (process.hProcess != NULL) CloseHandle(process.hProcess);
     if (process.hThread != NULL) CloseHandle(process.hThread);
@@ -1667,20 +1846,22 @@ int wmain(int argc, wchar_t **argv) {
     if (argc >= 2 && wcscmp(argv[1], L"descendant") == 0) {
         return g2a_descendant(NULL);
     }
-    if (argc >= 3 && wcscmp(argv[1], L"child-pipe") == 0) {
-        g2a_child_pipe(argv[2], FALSE);
+    if (argc >= 3 && wcsncmp(argv[1], L"child-desc-", 11) == 0) {
+        const wchar_t *workspace = argc >= 4 ? argv[3] : NULL;
+        return g2a_child_descendant(argv[2], workspace, argv[1] + 6);
+    }
+    if (argc >= 3 && wcsncmp(argv[1], L"child-pipe", 10) == 0) {
+        BOOL minimal = wcsstr(argv[1], L"minimal") != NULL || wcsstr(argv[1], L"min-output") != NULL;
+        BOOL input_only = wcsstr(argv[1], L"input-") != NULL;
+        BOOL no_descendant = wcsstr(argv[1], L"no-descendant") != NULL;
+        g2a_child_pipe(argv[2], minimal, input_only, no_descendant);
         return 0;
     }
-    if (argc >= 3 && wcscmp(argv[1], L"child-pipe-minimal") == 0) {
-        g2a_child_pipe(argv[2], TRUE);
-        return 0;
-    }
-    if (argc >= 3 && wcscmp(argv[1], L"child-pty") == 0) {
-        g2a_child_pty(argv[2], FALSE);
-        return 0;
-    }
-    if (argc >= 3 && wcscmp(argv[1], L"child-pty-minimal") == 0) {
-        g2a_child_pty(argv[2], TRUE);
+    if (argc >= 3 && wcsncmp(argv[1], L"child-pty", 10) == 0) {
+        BOOL minimal = wcsstr(argv[1], L"minimal") != NULL || wcsstr(argv[1], L"min-output") != NULL;
+        BOOL input_only = wcsstr(argv[1], L"input-") != NULL;
+        BOOL no_descendant = wcsstr(argv[1], L"no-descendant") != NULL;
+        g2a_child_pty(argv[2], minimal, input_only, no_descendant);
         return 0;
     }
     if (argc >= 4 && (
@@ -1691,7 +1872,8 @@ int wmain(int argc, wchar_t **argv) {
         wcsncmp(argv[1], L"layer-", 6) == 0 ||
         wcsncmp(argv[1], L"a0", 2) == 0 ||
         wcsncmp(argv[1], L"a1", 2) == 0 ||
-        wcsncmp(argv[1], L"a2-", 3) == 0
+        wcsncmp(argv[1], L"a2-", 3) == 0 ||
+        wcsncmp(argv[1], L"desc-", 5) == 0
     )) {
         return g2a_controller(argv[1], argv[2], argv[3]);
     }
