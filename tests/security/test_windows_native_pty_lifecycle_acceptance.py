@@ -141,6 +141,7 @@ def _controller_loss_pty_helper_source(
 
         import asyncio
         import json
+        import re
         import sys
         from pathlib import Path
 
@@ -281,6 +282,12 @@ def _controller_loss_pty_helper_source(
                 # Keep controller-loss startup failures diagnosable without
                 # exposing paths, credentials, handles, or exception text.
                 payload = {"error": type(error).__name__, "phase": phase}
+                safe_message = str(error)
+                safe_message = re.sub(r"[A-Za-z]:\\[^\s;]+", "<path>", safe_message)
+                if "\\\\" in safe_message or "/" in safe_message:
+                    safe_message = "<redacted-path>"
+                if safe_message and len(safe_message) <= 160:
+                    payload["safe_message"] = safe_message
                 try:
                     payload["native_stage"] = stage_path.read_text(encoding="ascii")[:160]
                 except (OSError, UnicodeError):
