@@ -767,9 +767,9 @@ static void g2a_child_common(
     if (fixture_root != NULL) {
         g2a_fs_fixture(fixture_root);
     }
-    if (input != NULL && g2a_read_line(input, line, sizeof(line))) {
+    if (!no_descendant && input != NULL && g2a_read_line(input, line, sizeof(line))) {
         g2a_emitf("G2A_STDIN=%s\n", strcmp(line, "g2a-input") == 0 ? "PASS" : "UNEXPECTED");
-    } else if (pty) {
+    } else if (!no_descendant && pty) {
         g2a_emit("G2A_STDIN=UNAVAILABLE\n");
     }
     if (!no_descendant) {
