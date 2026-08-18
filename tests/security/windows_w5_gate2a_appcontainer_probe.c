@@ -878,6 +878,12 @@ static BOOL g2a_grant_parent_traverse(const wchar_t *path, PSID sid) {
         return FALSE;
     }
     *separator = L'\0';
+    /* Never attempt to rewrite a drive root.  A root-level disposable
+     * workspace relies on the existing root traversal contract; the probe
+     * must not turn that into a system ACL mutation. */
+    if (wcslen(parent) <= 2 || (wcslen(parent) == 3 && parent[2] == L'\\')) {
+        return FALSE;
+    }
     return g2a_grant_sid(
         parent,
         sid,

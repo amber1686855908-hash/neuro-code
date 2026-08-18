@@ -239,7 +239,16 @@ class WindowsW5Gate2A6RuntimeSeamTests(unittest.IsolatedAsyncioTestCase):
         )
         self.addAsyncCleanup(_cleanup_probe_directory, probe.parent)
 
-        with TemporaryDirectory() as directory, TemporaryDirectory() as installation_directory:
+        # A temp directory nested below the controller-owned user temp root
+        # leaves an unowned traversal segment for an AppContainer.  Keep both
+        # roots disposable, but place each directly under the system drive so
+        # the existing drive-root traversal authority can be observed.  The
+        # native helper refuses to modify that drive root.
+        system_drive_root = os.environ.get("SYSTEMDRIVE", "C:") + "\\"
+        with (
+            TemporaryDirectory(dir=system_drive_root) as directory,
+            TemporaryDirectory(dir=system_drive_root) as installation_directory,
+        ):
             # Make the disposable workspace itself the authorized root.  The
             # W2 setup authority can grant the AppContainer SID on this root;
             # nesting it below another controller-owned directory would leave
