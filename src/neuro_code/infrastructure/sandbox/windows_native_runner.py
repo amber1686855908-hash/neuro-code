@@ -78,6 +78,9 @@ _WAIT_OBJECT_0 = 0
 _WAIT_TIMEOUT = 258
 _STILL_ACTIVE = 259
 _INFINITE = 0xFFFFFFFF
+_SEM_FAILCRITICALERRORS = 0x0001
+_SEM_NOGPFAULTERRORBOX = 0x0002
+_SEM_NOOPENFILEERRORBOX = 0x8000
 # Do not ask CreateProcessWithLogonW to synchronously load the account
 # profile.  W3 derives private HOME/TMP from the final token and creates those
 # directories inside the runner; loading a fresh W2 profile here can block the
@@ -1730,6 +1733,19 @@ class _NativeChildApi:
             raise OSError("Win32 API unavailable")
         kernel32 = cast(object, loader("kernel32.dll", use_last_error=True))
         self._get_last_error = cast(_CFunction, getattr(ctypes, "get_last_error", lambda: 0))
+        # The runner has no interactive error-dialog consumer.  Suppress
+        # system error UI so a DLL/CLR initialization failure becomes a
+        # bounded process result instead of leaving the owned Job blocked on a
+        # hidden dialog on the private desktop.
+        self._set_error_mode = _load_function(
+            kernel32,
+            "SetErrorMode",
+            [ctypes.c_uint32],
+            ctypes.c_uint32,
+        )
+        self._set_error_mode(
+            _SEM_FAILCRITICALERRORS | _SEM_NOGPFAULTERRORBOX | _SEM_NOOPENFILEERRORBOX
+        )
         self._create_pipe = _load_function(
             kernel32,
             "CreatePipe",
