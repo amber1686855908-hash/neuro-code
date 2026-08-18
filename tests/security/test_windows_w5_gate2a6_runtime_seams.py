@@ -345,10 +345,14 @@ class WindowsW5Gate2A6RuntimeSeamTests(unittest.IsolatedAsyncioTestCase):
             pty_lf: dict[str, object] | None = None
             if _pty_min_output_pass(pty_min):
                 pty_input = await run_mode("pty-input-cr")
-                # Always run the LF variant as a control.  A passing CR
-                # canary alone cannot establish that CR is causal; the two
-                # inputs must be compared before using the causal label.
-                pty_lf = await run_mode("pty-input-lf")
+                # The LF variant is optional evidence, not part of the
+                # transport contract.  Only run it when the canonical CR
+                # input does not complete.  This keeps the evidence gate
+                # bounded on ConPTY implementations whose line discipline
+                # does not deliver LF, and avoids treating an unbounded
+                # control as a successful causal comparison.
+                if not _pty_input_pass(pty_input):
+                    pty_lf = await run_mode("pty-input-lf")
 
             pipe_full = await run_mode("a2-pipe-full-no-descendant")
             pty_full: dict[str, object] | None = None
@@ -360,16 +364,10 @@ class WindowsW5Gate2A6RuntimeSeamTests(unittest.IsolatedAsyncioTestCase):
                 if _pty_min_output_pass(pty_min)
                 else "W5_GATE2A6_PTY_TRANSPORT_STILL_BLOCKED"
             )
-            if (
-                pty_input is not None
-                and pty_lf is not None
-                and _pty_input_pass(pty_input)
-                and not _pty_input_pass(pty_lf)
-            ):
-                pty_classification = "W5_GATE2A6_PTY_CR_INPUT_CAUSAL"
-            elif pty_input is not None and _pty_input_pass(pty_input):
-                # Both canonical CR and LF controls work.  Transport is
-                # proven, but neither newline byte is causal.
+            if pty_input is not None and _pty_input_pass(pty_input):
+                # CR completion proves the canonical input path.  No LF
+                # control was needed, so make no causal claim about the
+                # newline byte itself.
                 pty_classification = "W5_GATE2A6_PTY_MINIMAL_PASS"
             elif pty_input is not None and _pty_min_output_pass(pty_min):
                 # Output-only proves the ConPTY creation/relay seam.  A
