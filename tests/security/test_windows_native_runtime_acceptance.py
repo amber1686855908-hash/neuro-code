@@ -2356,7 +2356,6 @@ class WindowsNativeRuntimeAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                             "offline_2": offline_2_winsock,
                             "concurrent_online": concurrent_online_winsock,
                             "concurrent_offline": concurrent_offline_winsock,
-                            "curl_w5_classification": "CURL_RESTRICTED_RUNTIME_COMPATIBILITY",
                             "online_offline_concurrent_rule_observations": len(
                                 monitor_observations
                             ),

@@ -46,13 +46,12 @@ remains a W4 scope.
 
 Gate 1 does not depend on Python startup.  The basic Win32 child is attested
 from the actual process handle returned by `CreateProcessAsUserW`, before
-`SpawnReady`; the controller checks `TokenUser`, `IsTokenRestricted`, the exact
-singleton restricting SID, `SeChangeNotifyPrivilege`, and the absence of
-unexpected enabled privileges.  A focused Windows Server 2025 run showed the
-current venv interpreter, its `-I -S -B` form, and the base interpreter all
-failing before user code ran.  The cause is intentionally unresolved and is a
-W5 developer-tool compatibility blocker, not a reason to weaken the token,
-ACL, environment, desktop, Job, or provenance boundary.
+`SpawnReady`; the controller checks `TokenUser`, `IsTokenRestricted`, the
+production restricting-SID set, `SeChangeNotifyPrivilege`, and the absence of
+unexpected enabled privileges.  The W5 compatibility matrix then validated
+the current venv and base Python, child Python, PowerShell, Git, Node/npm, curl,
+NUL, and dynamic BCrypt startup through both W3 and W4 without changing those
+security boundaries.
 
 ## Consequences
 
@@ -90,7 +89,9 @@ seven tests executed, zero skipped. The evidence covers:
   controller loss closes the scope fail-closed; Gate 5D: runner death proves
   `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`.
 
-Restricted Python startup, restricted NUL write, and restricted curl behavior
-remain W5 compatibility seams, not security-isolation failures. Git, Python,
-Node, and general developer workloads are not compatibility-certified by W3.
-Full PR CI passed and completed this PR's merge-readiness certification.
+The accepted W5 workload artifact (run `32192058214`) records 20 HOST/W3/W4
+rows with PASS results, including Python child processes, Git repository
+operations, NUL read/write modes, curl startup, and dynamic `BCryptGenRandom`.
+This is bounded local workload evidence; future tools and network scenarios
+still require their own fixtures. Full CI and focused native acceptance continue
+to be the merge-readiness evidence for the production runtime.

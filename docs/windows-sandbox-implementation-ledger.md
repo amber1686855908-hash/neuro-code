@@ -50,28 +50,25 @@ It is intentionally concise and is updated as implementation evidence changes.
   participates in READY/NEEDS_REPAIR inspection, and is cleaned before
   installation state is removed. The runtime runner no longer attempts a
   privileged DACL mutation.
+- The latest W5 compatibility artifact (run `32191927547`, head `b8aca9c`)
+  passes every installed workload through both W3 capture and W4 ConPTY,
+  including Windows PowerShell 5.1, PowerShell 7, normal and base Python, a
+  Python child process, Git/local-repository operations, Node/npm, curl, NUL,
+  and a dynamic `BCryptGenRandom` probe. It also records zero active Job
+  processes and zero remaining output relays at each natural Exit frame.
 
 ## CURRENT_BLOCKER
 
-- Windows PowerShell 5.1 still does not produce output under the final
-  restricted child: direct W3 and W4 runs reach `SpawnReady` and token
-  attestation, then remain active until the bounded workload timeout. The
-  upstream-equivalent explicit `Winsta0\\Default` diagnostic and the minimal
-  environment hypothesis were both disproved. The first `cmd.exe` wrapper
-  diagnostic was invalid because C-runtime quoting made PowerShell print its
-  script text; an exact UTF-16LE `-EncodedCommand` wrapper also timed out.
-  Upstream parity audit identified the missing per-capability `\\.\\NUL`
-  device ACL grant used before final child creation. The first implementation
-  attempted it inside the normal W2 runner and was rejected with Win32 error 5;
-  the grant is now moved to elevated setup and its native artifact is pending.
+- No workload-specific blocker remains in the latest compatibility artifact.
+  The final merge gate still requires the complete native acceptance matrix,
+  local checks, and an explicit final audit of the fail-closed and cleanup
+  contracts.
 
 ## NEXT_ACTION
 
-- Inspect the next Windows compatibility artifact after the setup-owned NUL
-  grant. If Git, PowerShell, Python, and curl now leave their startup
-  timeout cluster, continue with the remaining native workload and lifecycle
-  acceptance. If not, use the bounded artifact to isolate the next smallest
-  upstream parity difference; do not weaken the token contract.
+- Finish the final native acceptance and local verification on the production
+  branch. Keep the ledger pending until every required DOD row has concrete
+  evidence and the full CI run is green.
 
 ## FAILED_HYPOTHESES
 
@@ -103,7 +100,9 @@ It is intentionally concise and is updated as implementation evidence changes.
 - Frozen evidence PR #48: `a245ffeddff66ec18cc6168081202013a2f5232a` (Draft,
   evidence-only; its Gate 2A.6 line is not production).
 - Production PR #49 is Draft at `feat/windows-sandbox-codex-parity`; the
-  latest pushed head is `23b3b3b` after environment, desktop-diagnostic,
-  hidden-error dialog, exact PowerShell wrapper, and setup-owned NUL changes.
-  Run `32188203385` recorded the pre-fix `CreateFileW(NUL security)` error 5;
-  its quality/platform jobs were still running when this entry was written.
+  latest pushed head is `b963448` after relay diagnostics, the explicit
+  Windows runtime environment, BCrypt, and child-Python workload probes.
+- Run `32191927547` (head `b8aca9c`) completed the compatibility job with all
+  20 workload rows passing in HOST, W3, and W4. Run `32191582133` is the
+  preceding diagnostics-only run; its sole failure was the quality job before
+  the local lint fix landed.

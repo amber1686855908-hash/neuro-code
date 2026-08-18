@@ -1569,9 +1569,10 @@ strong read isolation. Gates 1–5 execute seven native acceptance tests with
 zero skips and prove final-child identity, filesystem/network enforcement,
 binary/protocol transport, normal wait, explicit termination, controller-loss
 cleanup, and runner kill-on-close ownership. PTY/ConPTY remains W4, and the
-existing `off` path is unchanged. Restricted Python startup, NUL write, and
-curl behavior remain W5 compatibility seams rather than security-isolation
-failures.
+existing `off` path is unchanged. The accepted W5 workload matrix (run
+`32192058214`) passes Python and child Python, PowerShell, Git, Node/npm, curl,
+NUL read/write modes, and dynamic BCrypt startup through both W3 and W4; future
+developer tools still require their own bounded evidence rows.
 
 Enabled Linux startup performs a bounded controller-state hardlink audit before
 mounting any authorized workspace. It fails closed when a private regular file

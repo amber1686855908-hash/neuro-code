@@ -39,11 +39,10 @@ read isolation，因此失败关闭。交互式 PTY/ConPTY 留给 W4。
 
 Gate 1 不依赖 Python 启动。实际 `CreateProcessAsUserW` 返回的 process handle
 会在发送 `SpawnReady` 之前完成 attestation；controller 检查 `TokenUser`、
-`IsTokenRestricted`、精确 singleton restricting SID、`SeChangeNotifyPrivilege`，
-以及不存在意外的 enabled privilege。一次聚焦的 Windows Server 2025 运行显示，
-当前 venv interpreter、其 `-I -S -B` 形式和 base interpreter 都在用户代码运行前失败。
-根因有意保留为未确定的 W5 developer-tool compatibility blocker；不得因此放宽
-token、ACL、environment、desktop、Job 或 provenance 边界。
+`IsTokenRestricted`、生产 restricting-SID set、`SeChangeNotifyPrivilege`，
+以及不存在意外的 enabled privilege。随后接受的 W5 compatibility matrix 在不改变
+这些安全边界的情况下，通过 W3 与 W4 验证了当前 venv/base Python、child Python、
+PowerShell、Git、Node/npm、curl、NUL 和动态 BCrypt 启动。
 
 ## 后果
 
@@ -75,6 +74,7 @@ token、ACL、environment、desktop、Job 或 provenance 边界。
   `terminate()` 终止整个 Job；Gate 5C：controller 丢失后失败关闭整个 scope；Gate 5D：
   runner 退出证明 `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`。
 
-受限 Python 启动、受限 NUL 写入和受限 curl 行为仍记录为 W5 compatibility seam，
-不是 security-isolation failure。W3 不认证 Git、Python、Node 或一般 developer workload
-的兼容性。Full PR CI 已通过并完成本 PR 的 merge-readiness 认证。
+已接受的 W5 workload artifact（run `32192058214`）记录 20 行 HOST/W3/W4 PASS，
+包括 Python child process、Git repository 操作、NUL 读写模式、curl 启动和动态
+`BCryptGenRandom`。这是有界的本地工作负载证据；未来工具和网络场景仍需独立 fixture。
+Full CI 与 focused 原生验收继续构成生产 runtime 的 merge-readiness 证据。

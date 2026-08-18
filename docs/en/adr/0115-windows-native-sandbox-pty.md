@@ -85,8 +85,12 @@ continues to fail closed because READ LIMITED cannot satisfy its STRONG read
 requirement. Runtime never performs setup, repair, UAC, ACL, or Firewall
 mutation. SandboxProfile.OFF remains on the ordinary Windows ConPTY route.
 
-W5 has not started. Python, Git, Node, NUL, curl, and developer-tool
-compatibility remain future workload certification, not claims of this ADR.
+The W5 workload matrix is now accepted as bounded compatibility evidence. Run
+`32192058214` records 20 HOST/W3/W4 rows passing, including Python and child
+Python, Git repository operations, Node/npm, curl, NUL access modes, and a
+dynamic BCrypt probe. This evidence does not add a second PTY authority or
+weaken the W4 token, ConPTY, or Job contracts; future tools still require their
+own fixtures.
 
 ## Consequences
 
@@ -95,10 +99,10 @@ compatibility remain future workload certification, not claims of this ADR.
 - The runner keeps draining the PTY output channel before publishing `EXIT`.
 - `ClosePseudoConsole` is performed only after the Job-owned scope is empty;
   no second lifecycle or Job authority is introduced.
-- Gate 1, Gate 2, Gate 3, shared-runner hardening, and Gate 4 application
-  routing are the acceptance evidence for this production route. The route is
-  certified on the tested Windows CI matrix; W5 workload compatibility remains
-  explicitly out of scope.
+- Gate 1, Gate 2, Gate 3, shared-runner hardening, Gate 4 application routing,
+  and the accepted W5 workload matrix are the acceptance evidence for this
+  production route. The route is certified on the tested Windows CI matrix;
+  future developer tools remain explicitly bounded by their own evidence rows.
 
 ## References
 
