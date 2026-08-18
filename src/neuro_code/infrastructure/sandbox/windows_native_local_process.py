@@ -194,6 +194,31 @@ def _validated_child_token_attestation(
     }
 
 
+def _bounded_lifecycle_diagnostic(value: object) -> dict[str, object] | None:
+    """Project runner lifecycle facts without exposing native handles."""
+
+    if not isinstance(value, dict):
+        return None
+    result: dict[str, object] = {}
+    for key, item in value.items():
+        if (
+            (
+                key.startswith("job_active_processes_")
+                or key.startswith("relay_threads_")
+            )
+            and isinstance(item, int)
+            and 0 <= item <= 1_000_000
+        ):
+            result[key] = item
+        elif (
+            key == "job_active_processes_query_error"
+            and isinstance(item, str)
+            and len(item) <= 64
+        ):
+            result[key] = item
+    return result or None
+
+
 def _native_acceptance_stage(label: str) -> None:
     """Emit bounded setup/transport stages only in the focused native gate."""
 
@@ -1116,23 +1141,7 @@ class _WindowsNativePtySession:
                 raise SandboxError("Windows PTY Exit frame is invalid")
             self._returncode = int(payload["returncode"])
             termination_observation = payload.get("termination_observation")
-            lifecycle = payload.get("lifecycle")
-            bounded_lifecycle: dict[str, object] | None = None
-            if isinstance(lifecycle, dict):
-                bounded_lifecycle = {
-                    key: value
-                    for key, value in lifecycle.items()
-                    if (
-                        key.startswith("job_active_processes_")
-                        and isinstance(value, int)
-                        and 0 <= value <= 1_000_000
-                    )
-                    or (
-                        key == "job_active_processes_query_error"
-                        and isinstance(value, str)
-                        and len(value) <= 64
-                    )
-                }
+            bounded_lifecycle = _bounded_lifecycle_diagnostic(payload.get("lifecycle"))
             if isinstance(termination_observation, dict):
                 bounded: dict[str, object] = {}
                 for key in ("state", "exit_code", "wait_error"):
@@ -1155,6 +1164,14 @@ class _WindowsNativePtySession:
             payload = decode_json(frame.payload)
             if not isinstance(payload, dict):
                 raise SandboxError("trusted Windows PTY runner reported an invalid error")
+            bounded_lifecycle = _bounded_lifecycle_diagnostic(payload.get("lifecycle"))
+            self._diagnostic = {
+                "pipe": "EVENT_PIPE_BROKEN",
+                "runner": {"state": "RUNNER_EXITED"},
+                "child": payload.get("child"),
+                "lifecycle": bounded_lifecycle,
+                "security_attestation": dict(self._security_attestation),
+            }
             message = payload.get("message")
             detail = message[:512] if isinstance(message, str) and message else "runtime error"
             raise SandboxError(f"trusted Windows PTY runner reported a runtime error: {detail}")
@@ -1400,23 +1417,7 @@ class _WindowsNativeOwnedLocalProcess(OwnedLocalProcess):
             self._returncode = int(payload["returncode"])
             child_diagnostic = payload.get("child")
             termination_observation = payload.get("termination_observation")
-            lifecycle = payload.get("lifecycle")
-            bounded_lifecycle: dict[str, object] | None = None
-            if isinstance(lifecycle, dict):
-                bounded_lifecycle = {
-                    key: value
-                    for key, value in lifecycle.items()
-                    if (
-                        key.startswith("job_active_processes_")
-                        and isinstance(value, int)
-                        and 0 <= value <= 1_000_000
-                    )
-                    or (
-                        key == "job_active_processes_query_error"
-                        and isinstance(value, str)
-                        and len(value) <= 64
-                    )
-                }
+            bounded_lifecycle = _bounded_lifecycle_diagnostic(payload.get("lifecycle"))
             if (
                 isinstance(child_diagnostic, dict)
                 or isinstance(termination_observation, dict)
@@ -1440,6 +1441,7 @@ class _WindowsNativeOwnedLocalProcess(OwnedLocalProcess):
                 "pipe": "EVENT_PIPE_BROKEN",
                 "runner": {"state": "RUNNER_EXITED"},
                 "child": payload.get("child"),
+                "lifecycle": _bounded_lifecycle_diagnostic(payload.get("lifecycle")),
                 "security_attestation": dict(self._security_attestation),
             }
             message = payload.get("message")
