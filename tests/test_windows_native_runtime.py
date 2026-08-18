@@ -921,6 +921,25 @@ class WindowsNativeRuntimeContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("pythonhome", values)
         self.assertEqual(values["PATH"], r"C:\\explicit")
 
+    def test_child_environment_preserves_windows_runtime_core_paths(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {"SystemRoot": r"C:\\Windows", "SystemDrive": "C:"},
+            clear=True,
+        ):
+            values = WindowsNativeLocalProcessSandbox._child_environment(
+                LocalProcessEnvironmentPolicy({"PATH": r"C:\\Windows\\System32"})
+            )
+        self.assertEqual(values["WINDIR"], r"C:\\Windows")
+        self.assertEqual(
+            values["COMSPEC"].replace("/", "\\").replace("\\\\", "\\"),
+            r"C:\Windows\System32\cmd.exe",
+        )
+        self.assertEqual(values["PROGRAMFILES"], r"C:\Program Files")
+        self.assertEqual(values["PROGRAMW6432"], r"C:\Program Files")
+        self.assertEqual(values["PROGRAMFILES(X86)"], r"C:\Program Files (x86)")
+        self.assertEqual(values["PROGRAMDATA"], r"C:\ProgramData")
+
 
 if __name__ == "__main__":
     unittest.main()

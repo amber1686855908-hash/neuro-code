@@ -1253,6 +1253,14 @@ class _RunnerChild:
             if ephemeral_home:
                 self._ephemeral_home = Path(private_home)
             private_tmp = self._api.get_private_temp_path(private_home, runner_sid)
+            private_home_path = Path(private_home)
+            # Windows runtimes use APPDATA/LOCALAPPDATA and the drive/path
+            # pair in addition to USERPROFILE.  Keep every per-user location
+            # inside the account-private HOME; the controller's profile is
+            # never exposed through the final child environment.
+            self._api.create_private_directory(
+                private_home_path / "AppData" / "Roaming", runner_sid
+            )
             # These values are derived from the selected sandbox account, never
             # inherited from the controller.  A model request cannot redirect
             # an enabled child into controller HOME/TMP.
@@ -1260,6 +1268,15 @@ class _RunnerChild:
             environment["USERPROFILE"] = private_home
             environment["TEMP"] = private_tmp
             environment["TMP"] = private_tmp
+            environment["APPDATA"] = str(private_home_path / "AppData" / "Roaming")
+            environment["LOCALAPPDATA"] = str(private_home_path / "AppData" / "Local")
+            environment["USERNAME"] = profile_username
+            environment["USERDOMAIN"] = "."
+            drive = private_home_path.drive
+            if drive:
+                environment["HOMEDRIVE"] = drive
+                environment["HOMEPATH"] = str(private_home_path)[len(drive) :] or "\\"
+            environment["WINDIR"] = environment.get("SystemRoot", "")
             if shell_command is not None:
                 command = _validated_text(shell_command, "shell command")
                 system_root = _validated_text(os.environ.get("SYSTEMROOT"), "SystemRoot")

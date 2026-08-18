@@ -107,6 +107,31 @@ _SUPPORTED_STDIO = frozenset(
     }
 )
 _RUNNER_ENVIRONMENT = frozenset({"SystemRoot", "SystemDrive", "PATH", "PATHEXT"})
+
+# Keep the final child environment explicit, but retain the documented Windows
+# startup variables that developer runtimes use to locate the system, shell,
+# program files, and per-user application data.  Values that identify the
+# sandbox user or its profile are replaced by the trusted runner after it has
+# derived the private HOME/TMP paths; controller identity paths never pass
+# through this allowlist unchanged.
+_WINDOWS_CHILD_CORE_ENVIRONMENT = frozenset(
+    {
+        "COMSPEC",
+        "WINDIR",
+        "USERNAME",
+        "USERDOMAIN",
+        "HOMEDRIVE",
+        "HOMEPATH",
+        "PROGRAMFILES",
+        "PROGRAMFILES(X86)",
+        "PROGRAMW6432",
+        "PROGRAMDATA",
+        "LOCALAPPDATA",
+        "APPDATA",
+        "POWERSHELL",
+        "PWSH",
+    }
+)
 _WINDOWS_SID_TEXT = re.compile(r"^S-1-(?:\d+)(?:-\d+)+$")
 _WINDOWS_LOGON_SID_TEXT = re.compile(r"^S-1-5-5-\d+-\d+$")
 _WORLD_SID = "S-1-1-0"
@@ -518,7 +543,13 @@ class WindowsNativeLocalProcessSandbox(LocalProcessSandbox):
         values = dict(policy.variables)
         forbidden = {"pythonpath", "pythonhome", "pythonuserbase"}
         values = {name: value for name, value in values.items() if name.casefold() not in forbidden}
-        for canonical in ("SystemRoot", "SystemDrive", "PATH", "PATHEXT"):
+        for canonical in (
+            "SystemRoot",
+            "SystemDrive",
+            "PATH",
+            "PATHEXT",
+            *_WINDOWS_CHILD_CORE_ENVIRONMENT,
+        ):
             matching = next(
                 (
                     (name, value)
@@ -538,6 +569,17 @@ class WindowsNativeLocalProcessSandbox(LocalProcessSandbox):
                     break
         if "SystemRoot" not in values:
             raise SandboxError("Windows native child requires SystemRoot")
+        # These two values are stable derivations when a minimal caller policy
+        # omits them.  Do not inherit a controller-specific shell path or
+        # profile location when Windows itself can provide the canonical one.
+        values.setdefault("WINDIR", values["SystemRoot"])
+        system_drive = values.get("SystemDrive")
+        if system_drive:
+            values.setdefault("COMSPEC", str(Path(values["SystemRoot"]) / "System32" / "cmd.exe"))
+            values.setdefault("PROGRAMFILES", f"{system_drive}\\Program Files")
+            values.setdefault("PROGRAMW6432", values["PROGRAMFILES"])
+            values.setdefault("PROGRAMFILES(X86)", f"{system_drive}\\Program Files (x86)")
+            values.setdefault("PROGRAMDATA", f"{system_drive}\\ProgramData")
         values["PYTHONNOUSERSITE"] = "1"
         return values
 
