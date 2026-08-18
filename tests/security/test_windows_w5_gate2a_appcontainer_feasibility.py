@@ -210,6 +210,7 @@ def _projection(raw: dict[str, object], mode: str) -> dict[str, object]:
         "job_close": _last(markers, "G2A_JOB_CLOSE"),
         "descendant_create": _last(markers, "G2A_DESCENDANT_CREATE"),
         "descendant_active_before_close": _last(markers, "G2A_DESCENDANT_ACTIVE_BEFORE_CLOSE"),
+        "descendant_job_member": _last(markers, "G2A_DESCENDANT_JOB_MEMBER"),
         "descendant_reaped": _last(markers, "G2A_DESCENDANT_REAPED"),
         "stdin": _last(markers, "G2A_STDIN"),
         "ntopen": ntopen,
