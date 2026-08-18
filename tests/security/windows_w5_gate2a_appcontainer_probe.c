@@ -1581,6 +1581,37 @@ static void g2a_forward_pipe(HANDLE read_handle) {
     }
 }
 
+/*
+ * ConPTY output can be published asynchronously after the child handle has
+ * become signalled.  A single PeekNamedPipe call at that boundary can miss
+ * the child's final marker lines and would turn a transport-drain race into
+ * a false Gate 2A failure.  Keep this bounded and evidence-only: it waits
+ * for a short quiet interval (or the hard deadline) while continuing to
+ * drain the controller-owned output pipe.  No production lifecycle grace
+ * period is implied by this helper.
+ */
+static void g2a_forward_pipe_until_quiet(HANDLE read_handle, ULONGLONG deadline) {
+    ULONGLONG quiet_deadline = GetTickCount64() + 1000ULL;
+    for (;;) {
+        DWORD available = 0;
+        g2a_forward_pipe(read_handle);
+        if (!PeekNamedPipe(read_handle, NULL, 0, NULL, &available, NULL)) {
+            break;
+        }
+        {
+            ULONGLONG now = GetTickCount64();
+            if (available > 0) {
+                quiet_deadline = now + 1000ULL;
+            }
+            if (now >= deadline || now >= quiet_deadline) {
+                break;
+            }
+        }
+        Sleep(10);
+    }
+    g2a_forward_pipe(read_handle);
+}
+
 static BOOL g2a_pid_active(DWORD pid, HANDLE *process) {
     DWORD code = 0;
     *process = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
@@ -1783,8 +1814,10 @@ static int g2a_controller(const wchar_t *mode, const wchar_t *workspace, const w
             break;
         }
     }
-    if (transport != G2A_TRANSPORT_NONE) {
-        g2a_forward_pipe(pty ? pty_output_read : output_read);
+    if (transport == G2A_TRANSPORT_PTY) {
+        g2a_forward_pipe_until_quiet(pty_output_read, GetTickCount64() + 3000ULL);
+    } else if (transport != G2A_TRANSPORT_NONE) {
+        g2a_forward_pipe(output_read);
     }
     if (g2a_seen_descendant_pid != 0) {
         DWORD retries = 0;
