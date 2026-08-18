@@ -489,6 +489,9 @@ def _lifecycle_projection(diagnostic: object) -> dict[str, object] | None:
             "job_active_processes_at_direct_exit",
             "job_active_processes_before_quiesce",
             "job_active_processes_after_quiesce",
+            "relay_threads_before_join",
+            "relay_threads_after_join",
+            "relay_threads_after_force_close",
         ):
             item = value.get(key)
             if isinstance(item, int) and 0 <= item <= 1_000_000:

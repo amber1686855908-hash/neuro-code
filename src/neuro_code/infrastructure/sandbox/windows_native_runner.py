@@ -1602,6 +1602,9 @@ class _RunnerChild:
                 )
                 time.sleep(0.02)
             self._lifecycle_diagnostics["job_active_processes_after_quiesce"] = 0
+            self._lifecycle_diagnostics["relay_threads_before_join"] = sum(
+                thread.is_alive() for thread in self._threads
+            )
             # This is the only state transition that certifies the owned
             # scope is empty.  A direct-child exit alone is deliberately not
             # enough: a detached descendant may still be alive in the Job.
@@ -1625,6 +1628,7 @@ class _RunnerChild:
                 for thread in self._threads
                 if thread is not threading.current_thread() and thread.is_alive()
             ]
+            self._lifecycle_diagnostics["relay_threads_after_join"] = len(remaining)
             if remaining:
                 # A child exit should close every inherited stdout/stderr
                 # writer.  If a relay is nevertheless still blocked, close
@@ -1635,6 +1639,9 @@ class _RunnerChild:
                         self._api.close_handle(handle)
                 for thread in remaining:
                     thread.join(timeout=1.0)
+                self._lifecycle_diagnostics["relay_threads_after_force_close"] = sum(
+                    thread.is_alive() for thread in remaining
+                )
                 if any(thread.is_alive() for thread in remaining):
                     raise SandboxError("Windows runtime output relay did not quiesce before Exit")
             if self._event_failed.is_set():
