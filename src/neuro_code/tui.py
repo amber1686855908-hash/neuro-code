@@ -40,6 +40,7 @@ from neuro_code.application.ports.provider_catalog import (
 )
 from neuro_code.application.ports.provider_services import (
     DEFAULT_PROVIDER_SERVICE_CATALOG,
+    ModelCatalogStrategy,
     ProviderServiceCatalog,
     ProviderServiceDescriptor,
 )
@@ -2241,6 +2242,10 @@ class ProviderSettingsScreen(ModalScreen[ProviderSettingsSubmission | None]):
     async def _test_connection(self) -> None:
         if self.provider_catalog is None:
             return
+        service = self._service(self._active_preset)
+        if service is None:
+            self._show_provider_error("provider service selection is unavailable")
+            return
         button = self.query_one("#provider-settings-test", Button)
         button.disabled = True
         button.label = ui_text(self.language, "provider_settings.connection.testing")
@@ -2253,6 +2258,13 @@ class ProviderSettingsScreen(ModalScreen[ProviderSettingsSubmission | None]):
         signature: tuple[str, ...] | None = None
         spec: ProviderConnectionSpec | None = None
         try:
+            if service.catalog_strategy is ModelCatalogStrategy.STATIC:
+                await self._show_model_catalog(ProviderCatalogResult(service.static_models))
+                self._show_connection_status(
+                    ui_text(self.language, "provider_settings.connection.static"),
+                    kind="warning",
+                )
+                return
             spec, policy = self._connection_spec()
             signature = self._connection_signature()
             result = await self.provider_catalog.discover_models(spec, http_policy=policy)
@@ -2267,6 +2279,16 @@ class ProviderSettingsScreen(ModalScreen[ProviderSettingsSubmission | None]):
             if signature is not None and signature != self._connection_signature():
                 self._show_connection_status(
                     ui_text(self.language, "provider_settings.connection.stale"),
+                    kind="warning",
+                )
+            elif (
+                isinstance(error, ProviderCatalogError)
+                and error.kind in {"endpoint", "network", "proxy", "server", "timeout"}
+                and service.static_models
+            ):
+                await self._show_model_catalog(ProviderCatalogResult(service.static_models))
+                self._show_connection_status(
+                    ui_text(self.language, "provider_settings.connection.fallback"),
                     kind="warning",
                 )
             else:

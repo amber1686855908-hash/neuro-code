@@ -34,6 +34,9 @@ class ProviderServiceCatalogTests(unittest.TestCase):
                 "anthropic",
                 "google-ai-studio",
                 "xai",
+                "kimi",
+                "glm",
+                "minimax",
             ),
         )
         self.assertIs(
@@ -48,6 +51,40 @@ class ProviderServiceCatalogTests(unittest.TestCase):
             )
         with self.assertRaises(AttributeError):
             DEFAULT_PROVIDER_SERVICE_CATALOG.get("deepseek").display_name = "changed"  # type: ignore[misc]
+
+    def test_china_services_use_explicit_chat_dialects_and_conservative_model_facts(self) -> None:
+        expected = {
+            "kimi": ("https://api.moonshot.ai/v1", "kimi", ModelCatalogStrategy.OPENAI_COMPATIBLE),
+            "glm": ("https://open.bigmodel.cn/api/paas/v4", "glm", ModelCatalogStrategy.STATIC),
+            "minimax": (
+                "https://api.minimaxi.com/v1",
+                "minimax",
+                ModelCatalogStrategy.OPENAI_COMPATIBLE,
+            ),
+        }
+        for service_id, (base_url, dialect, strategy) in expected.items():
+            with self.subTest(service_id=service_id):
+                service = DEFAULT_PROVIDER_SERVICE_CATALOG.require(service_id)
+                self.assertEqual(service.default_protocol, "openai-chat")
+                self.assertEqual(service.default_base_url, base_url)
+                self.assertEqual(service.default_dialect, dialect)
+                self.assertEqual(service.model_catalog_strategy, strategy)
+                self.assertTrue(service.static_models)
+                self.assertEqual(
+                    service.upstream_capabilities_for(
+                        protocol="openai-chat",
+                        model=service.static_models[0],
+                    ).status(ModelCapability.HOSTED_WEB_SEARCH),
+                    CapabilityStatus.UNKNOWN,
+                )
+        self.assertIs(
+            DEFAULT_PROVIDER_SERVICE_CATALOG.get("moonshot"),
+            DEFAULT_PROVIDER_SERVICE_CATALOG.get("kimi"),
+        )
+        self.assertIs(
+            DEFAULT_PROVIDER_SERVICE_CATALOG.get("zhipu"),
+            DEFAULT_PROVIDER_SERVICE_CATALOG.get("glm"),
+        )
 
     def test_invalid_service_metadata_fails_closed(self) -> None:
         with self.assertRaises(ConfigurationError):

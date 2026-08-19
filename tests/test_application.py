@@ -39,6 +39,7 @@ from neuro_code.domain.tools import ToolDefinition, ToolResult
 from neuro_code.infrastructure.providers.gemini_interactions import (
     GeminiInteractionsProvider,
 )
+from neuro_code.infrastructure.providers.openai_compatible import OpenAICompatibleProvider
 from neuro_code.infrastructure.workspace.paths import workspaces_match
 from neuro_code.shared.errors import ConfigurationError, ToolError
 from tests.fakes import EmptyWorkspaceChangeObserver
@@ -283,6 +284,90 @@ proxy_mode = "direct"
                     [("google_search",), ()],
                 )
                 await sidecar_application.close()
+
+    async def test_china_main_profiles_use_local_web_search_sidecar_and_local_fetch(self) -> None:
+        cases = (
+            ("kimi", "kimi", "kimi-k2.6", "KIMI_KEY"),
+            ("glm", "glm", "glm-5.3", "GLM_KEY"),
+            ("minimax", "minimax", "MiniMax-M3", "MINIMAX_KEY"),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / "state"
+            state.mkdir()
+            for service_id, dialect, model, api_key_env in cases:
+                (state / "config.toml").write_text(
+                    f'''
+[web_search]
+mode = "sidecar"
+
+[web_fetch]
+mode = "local"
+
+[routing]
+default = "main"
+
+[routing.web_search]
+profile = "search"
+
+[providers.main]
+service_id = "{service_id}"
+protocol = "openai-chat"
+dialect = "{dialect}"
+model = "{model}"
+base_url = "https://provider.invalid/v1"
+api_key_env = "{api_key_env}"
+proxy_mode = "direct"
+
+[providers.search]
+service_id = "google-ai-studio"
+protocol = "gemini-interactions"
+model = "gemini-3.6-flash"
+base_url = "https://generativelanguage.googleapis.com/v1beta"
+api_key_env = "SEARCH_KEY"
+builtin_tools = ["google_search"]
+proxy_mode = "direct"
+''',
+                    encoding="utf-8",
+                )
+                calls: list[ProviderProfile] = []
+
+                def provider_factory(
+                    config: AppConfig,
+                    failover: bool,
+                    calls: list[ProviderProfile] = calls,
+                ) -> ModelProvider:
+                    del failover
+                    calls.append(config.provider)
+                    return ApplicationCapabilityProviderFixture(
+                        OpenAICompatibleProvider.implementation_capabilities(
+                            dialect=config.provider.dialect,
+                        )
+                    )
+
+                with patch.dict(
+                    "os.environ",
+                    {
+                        "HOME": str(root),
+                        "NEURO_CODE_HOME": str(state),
+                        api_key_env: "main-key",
+                        "SEARCH_KEY": "search-key",
+                    },
+                    clear=True,
+                ):
+                    application = await ApplicationComposition.open(
+                        ApplicationSettings(cwd=root),
+                        provider_factory=provider_factory,
+                    )
+                    binding = await application.create_binding()
+                    try:
+                        self.assertEqual(len(calls), 1)
+                        self.assertEqual(calls[0].service_id, service_id)
+                        self.assertEqual(calls[0].dialect, dialect)
+                        self.assertIn("web_search", binding.runner._runtime._tools.names())
+                        self.assertIn("web_fetch", binding.runner._runtime._tools.names())
+                    finally:
+                        await application.close()
 
     def test_application_settings_default_to_finalize_terminal(self) -> None:
         settings = ApplicationSettings()

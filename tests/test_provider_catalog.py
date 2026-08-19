@@ -64,6 +64,58 @@ class ProviderCatalogTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(requested, ["https://provider.invalid/v1/models"])
 
+    async def test_kimi_and_minimax_use_their_official_v1_model_catalogs(self) -> None:
+        cases = (
+            ("kimi", "kimi", "https://api.moonshot.ai/v1/models", "kimi-k2.6"),
+            ("minimax", "minimax", "https://api.minimaxi.com/v1/models", "MiniMax-M3"),
+        )
+        for service_id, dialect, endpoint, model in cases:
+            with self.subTest(service_id=service_id):
+
+                def handler(
+                    request: httpx.Request,
+                    endpoint: str = endpoint,
+                    model: str = model,
+                ) -> httpx.Response:
+                    self.assertEqual(str(request.url), endpoint)
+                    self.assertEqual(request.headers["authorization"], "Bearer china-secret")
+                    return httpx.Response(200, json={"data": [{"id": model}]})
+
+                result = await HttpProviderCatalog(
+                    transport=httpx.MockTransport(handler)
+                ).discover_models(
+                    ProviderConnectionSpec(
+                        protocol="openai-chat",
+                        dialect=dialect,
+                        service_id=service_id,
+                        catalog_strategy=ModelCatalogStrategy.OPENAI_COMPATIBLE,
+                        base_url=endpoint.removesuffix("/models"),
+                        api_key="china-secret",
+                    ),
+                    http_policy=self.policy,
+                )
+                self.assertEqual(result.models, (model,))
+
+    async def test_glm_static_catalog_does_not_invent_a_remote_models_endpoint(self) -> None:
+        catalog = HttpProviderCatalog(
+            transport=httpx.MockTransport(
+                lambda request: self.fail("static GLM discovery must not make a request")
+            )
+        )
+        with self.assertRaises(ProviderCatalogError) as raised:
+            await catalog.discover_models(
+                ProviderConnectionSpec(
+                    protocol="openai-chat",
+                    dialect="glm",
+                    service_id="glm",
+                    catalog_strategy=ModelCatalogStrategy.STATIC,
+                    base_url="https://open.bigmodel.cn/api/paas/v4",
+                    api_key="china-secret",
+                ),
+                http_policy=self.policy,
+            )
+        self.assertEqual(raised.exception.kind, "manual_only")
+
     async def test_anthropic_catalog_uses_native_path_and_headers(self) -> None:
         def handler(request: httpx.Request) -> httpx.Response:
             self.assertEqual(str(request.url), "https://api.anthropic.com/v1/models")

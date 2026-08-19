@@ -72,6 +72,7 @@ def create_provider(
             dialect=config.dialect,
             context_affinity=config.context_affinity,
             capabilities=capabilities,
+            tool_choice=tool_choice,
             timeout_seconds=config.timeout_seconds,
             max_output_tokens=config.max_output_tokens,
             http_policy=http_policy,

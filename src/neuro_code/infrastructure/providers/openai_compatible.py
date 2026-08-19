@@ -37,6 +37,7 @@ from neuro_code.domain.conversation.messages import (
     Role,
     ToolCall,
 )
+from neuro_code.domain.conversation.reasoning import ReasoningEffort
 from neuro_code.domain.tools import ToolDefinition
 from neuro_code.infrastructure.providers.image_references import (
     OPENAI_IMAGE_MEDIA_TYPES,
@@ -48,6 +49,22 @@ from neuro_code.shared.errors import ConfigurationError, ProviderError
 
 BACKEND_SUMMARY_FIELD_CHARS = 1000
 CODE_SUMMARY_CHARS = 100
+MAX_NATIVE_CONTEXT_BYTES = 1_048_576
+
+
+def _encode_bounded_native_context(payload: Mapping[str, object]) -> bytes:
+    try:
+        encoded = json.dumps(
+            payload,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except (TypeError, ValueError) as error:
+        raise ProviderError("provider native reasoning context is not JSON-safe") from error
+    if len(encoded) > MAX_NATIVE_CONTEXT_BYTES:
+        raise ProviderError("provider native reasoning context exceeds its size limit")
+    return encoded
 
 
 @dataclass(slots=True)
@@ -55,6 +72,40 @@ class _ToolCallBuffer:
     identifier: str = ""
     name: str = ""
     arguments: str = ""
+
+
+@dataclass(slots=True)
+class _ReasoningDetailsAccumulator:
+    """Accumulate MiniMax's cumulative streamed reasoning-details text."""
+
+    text: str = ""
+    details: tuple[Mapping[str, object], ...] = ()
+
+    def feed(self, value: object) -> tuple[str, tuple[Mapping[str, object], ...]]:
+        if isinstance(value, Mapping):
+            values: Sequence[object] = (value,)
+        elif isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+            values = value
+        else:
+            return "", self.details
+        normalized = tuple(dict(item) for item in values if isinstance(item, Mapping))
+        incoming = "".join(item["text"] for item in normalized if isinstance(item.get("text"), str))
+        next_details = (
+            normalized if incoming.startswith(self.text) else (*self.details, *normalized)
+        )
+        _encode_bounded_native_context({"details": [dict(detail) for detail in next_details]})
+        if not incoming:
+            if normalized:
+                self.details = normalized
+            return "", self.details
+        if incoming.startswith(self.text):
+            delta = incoming[len(self.text) :]
+            self.details = normalized
+        else:
+            delta = incoming
+            self.details = (*self.details, *normalized)
+        self.text += delta
+        return delta, self.details
 
 
 @dataclass(slots=True)
@@ -229,12 +280,20 @@ class OpenAICompatibleProvider:
     def implementation_capabilities(*, dialect: str = "standard") -> ModelCapabilitySet:
         """Return capabilities implemented by this Chat wire adapter."""
 
-        if dialect not in {"standard", "deepseek-v4"}:
+        if dialect not in {"standard", "deepseek-v4", "kimi", "glm", "minimax"}:
             raise ConfigurationError(f"unsupported OpenAI-compatible dialect: {dialect}")
-        return ModelCapabilitySet.from_supported(
+        supported = {
             ModelCapability.FUNCTION_TOOLS,
             ModelCapability.VISION,
-        )
+        }
+        if dialect in {"kimi", "glm", "minimax"}:
+            supported.update(
+                {
+                    ModelCapability.PROMPT_CACHE,
+                    ModelCapability.REASONING,
+                }
+            )
+        return ModelCapabilitySet.from_supported(*supported)
 
     def __init__(
         self,
@@ -246,18 +305,25 @@ class OpenAICompatibleProvider:
         dialect: str = "standard",
         context_affinity: str | None = None,
         capabilities: ModelCapabilitySet | None = None,
+        tool_choice: str | Mapping[str, object] | None = None,
         timeout_seconds: float = 120.0,
         max_output_tokens: int = 8192,
         transport: Any | None = None,
         http_policy: HttpClientPolicy | None = None,
     ) -> None:
-        if dialect not in {"standard", "deepseek-v4"}:
+        if dialect not in {"standard", "deepseek-v4", "kimi", "glm", "minimax"}:
             raise ConfigurationError(f"unsupported OpenAI-compatible dialect: {dialect}")
+        if tool_choice is not None and (
+            not isinstance(tool_choice, (str, Mapping))
+            or (isinstance(tool_choice, str) and not tool_choice.strip())
+        ):
+            raise ConfigurationError("tool_choice must be a non-empty string or mapping")
         self._model = model
         self._base_url = base_url.rstrip("/")
         self._api_key = api_key
         self._provider_name = provider_name
         self._dialect = dialect
+        self._tool_choice = dict(tool_choice) if isinstance(tool_choice, Mapping) else tool_choice
         self._context_affinity = context_affinity
         upstream = capabilities or ModelCapabilitySet.all_unknown()
         self._capabilities = resolve_capabilities(
@@ -295,6 +361,83 @@ class OpenAICompatibleProvider:
         """
 
         return self._dialect == "deepseek-v4"
+
+    def _preserves_reasoning_content(self) -> bool:
+        if self._dialect in {"glm", "minimax"}:
+            return True
+        if self._dialect != "kimi":
+            return False
+        return self._model.casefold() in {
+            "kimi-k3",
+            "kimi-k2.7-code",
+            "kimi-k2.7-code-highspeed",
+            "kimi-k2.6",
+        }
+
+    def _kimi_thinking_enabled(self) -> bool:
+        return self._dialect == "kimi" and self._model.casefold() in {
+            "kimi-k3",
+            "kimi-k2.7-code",
+            "kimi-k2.7-code-highspeed",
+            "kimi-k2.6",
+            "kimi-k2.5",
+        }
+
+    @staticmethod
+    def _effort_name(effort: ReasoningEffort) -> str:
+        return effort.effective.value
+
+    def _apply_dialect_request_fields(
+        self,
+        body: dict[str, Any],
+        *,
+        context: ModelContext,
+    ) -> None:
+        model = self._model.casefold()
+        if self._dialect == "kimi":
+            if model == "kimi-k3":
+                effort = self._effort_name(context.reasoning_effort)
+                body["reasoning_effort"] = {
+                    "low": "low",
+                    "medium": "high",
+                    "high": "high",
+                    "xhigh": "max",
+                }[effort]
+            elif model in {"kimi-k2.7-code", "kimi-k2.7-code-highspeed", "kimi-k2.6"}:
+                body["thinking"] = {"type": "enabled", "keep": "all"}
+            elif model == "kimi-k2.5":
+                body["thinking"] = {"type": "enabled"}
+        elif self._dialect == "glm":
+            if model in {
+                "glm-5.3",
+                "glm-5.2",
+                "glm-5.1",
+                "glm-5",
+                "glm-5-turbo",
+                "glm-5v-turbo",
+                "glm-4.7",
+                "glm-4.6",
+                "glm-4.6v",
+                "glm-4.5",
+            }:
+                body["thinking"] = {"type": "enabled", "clear_thinking": False}
+            if model == "glm-5.3":
+                body["reasoning_effort"] = {
+                    "low": "low",
+                    "medium": "high",
+                    "high": "high",
+                    "xhigh": "max",
+                }[self._effort_name(context.reasoning_effort)]
+            elif model == "glm-5.2":
+                body["reasoning_effort"] = {
+                    "low": "high",
+                    "medium": "high",
+                    "high": "high",
+                    "xhigh": "max",
+                }[self._effort_name(context.reasoning_effort)]
+        elif self._dialect == "minimax":
+            body["max_completion_tokens"] = body.pop("max_tokens")
+            body["reasoning_split"] = True
 
     @staticmethod
     def _token_count(value: object) -> int | None:
@@ -453,9 +596,66 @@ class OpenAICompatibleProvider:
                 }
                 for call in message.tool_calls
             ]
-            if message.reasoning_content is not None:
-                payload["reasoning_content"] = message.reasoning_content
+        if message.reasoning_content is not None and (
+            self._preserves_reasoning_content()
+            or (self._dialect not in {"kimi", "glm", "minimax"} and bool(message.tool_calls))
+        ):
+            payload["reasoning_content"] = message.reasoning_content
         return payload
+
+    def _can_replay_native_context(self, context: ModelContext) -> bool:
+        return (
+            self._dialect == "minimax"
+            and self._context_affinity is not None
+            and context.source_provider == self._provider_name
+            and context.source_model == self._model
+            and context.source_context_affinity == self._context_affinity
+        )
+
+    def _native_reasoning_details(
+        self,
+        item: PreservedContextItem,
+    ) -> tuple[Mapping[str, object], ...] | None:
+        if item.kind is not ContextItemKind.REASONING:
+            return None
+        native = item.to_dict().get("native")
+        if not isinstance(native, Mapping):
+            return None
+        if (
+            native.get("type") != "openai-chat-reasoning-details"
+            or native.get("provider") != self._provider_name
+            or native.get("protocol") != "openai-chat"
+            or native.get("model") != self._model
+        ):
+            return None
+        details = native.get("details")
+        if not isinstance(details, (list, tuple)) or not all(
+            isinstance(detail, Mapping) for detail in details
+        ):
+            return None
+        normalized = tuple(dict(detail) for detail in details)
+        try:
+            _encode_bounded_native_context({"details": [dict(detail) for detail in normalized]})
+        except ProviderError:
+            return None
+        return normalized
+
+    def _native_reasoning_item(
+        self,
+        details: tuple[Mapping[str, object], ...],
+    ) -> PreservedContextItem:
+        payload: dict[str, object] = {
+            "type": ContextItemKind.REASONING.value,
+            "native": {
+                "type": "openai-chat-reasoning-details",
+                "provider": self._provider_name,
+                "protocol": "openai-chat",
+                "model": self._model,
+                "details": [dict(detail) for detail in details],
+            },
+        }
+        _encode_bounded_native_context(payload)
+        return PreservedContextItem(ContextItemKind.REASONING, payload)
 
     def _has_xai_import_affinity(self, context: ModelContext) -> bool:
         if context.source_provider != UPSTREAM_IMPORT_PROVIDER or context.source_model is None:
@@ -532,18 +732,25 @@ class OpenAICompatibleProvider:
         return None
 
     def _message_payloads(self, context: ModelContext) -> list[dict[str, Any]]:
-        if not self._has_xai_import_affinity(context):
+        xai_import_affinity = self._has_xai_import_affinity(context)
+        minimax_native_affinity = self._can_replay_native_context(context)
+        if not xai_import_affinity and not minimax_native_affinity:
             return [self._message_payload(message) for message in context.messages]
 
         payloads: list[dict[str, Any]] = []
         pending_reasoning: list[str] = []
+        pending_reasoning_details: tuple[Mapping[str, object], ...] = ()
         for item in context.items:
             if isinstance(item, PreservedContextItem):
-                if item.kind is ContextItemKind.REASONING:
+                if xai_import_affinity and item.kind is ContextItemKind.REASONING:
                     text = self._reasoning_text(item)
                     if text:
                         pending_reasoning.append(text)
-                else:
+                if minimax_native_affinity:
+                    details = self._native_reasoning_details(item)
+                    if details is not None:
+                        pending_reasoning_details = details
+                if xai_import_affinity and item.kind is not ContextItemKind.REASONING:
                     summary = self._backend_tool_summary(item)
                     if summary is not None:
                         payloads.append({"role": Role.ASSISTANT.value, "content": summary})
@@ -558,8 +765,14 @@ class OpenAICompatibleProvider:
                         reasoning.append(existing)
                     payload["reasoning_content"] = "\n".join(reasoning)
                     pending_reasoning.clear()
+                if pending_reasoning_details:
+                    payload["reasoning_details"] = [
+                        dict(detail) for detail in pending_reasoning_details
+                    ]
+                    pending_reasoning_details = ()
             else:
                 pending_reasoning.clear()
+                pending_reasoning_details = ()
             payloads.append(payload)
         return payloads
 
@@ -589,6 +802,28 @@ class OpenAICompatibleProvider:
                 }
                 for tool in tools
             ]
+            if self._tool_choice is not None:
+                if self._dialect == "glm" and self._tool_choice != "auto":
+                    raise ConfigurationError(
+                        "GLM OpenAI compatibility currently supports only tool_choice 'auto'"
+                    )
+                if (
+                    self._dialect == "kimi"
+                    and self._kimi_thinking_enabled()
+                    and (
+                        isinstance(self._tool_choice, Mapping)
+                        or self._tool_choice not in {"auto", "none"}
+                    )
+                ):
+                    raise ConfigurationError(
+                        "Kimi tool_choice is incompatible with thinking; thinking was not disabled"
+                    )
+                body["tool_choice"] = (
+                    dict(self._tool_choice)
+                    if isinstance(self._tool_choice, Mapping)
+                    else self._tool_choice
+                )
+        self._apply_dialect_request_fields(body, context=context)
         return body
 
     async def stream(
@@ -610,6 +845,7 @@ class OpenAICompatibleProvider:
         headers = {"Authorization": f"Bearer {self._api_key}"}
         buffers: dict[int, _ToolCallBuffer] = {}
         dsml_parser = _DeepSeekDSMLStreamParser() if self._uses_deepseek_dsml() else None
+        reasoning_details = _ReasoningDetailsAccumulator() if self._dialect == "minimax" else None
         stop_reason = "stop"
         model_usage: ModelUsage | None = None
         endpoint = f"{self._base_url}/chat/completions"
@@ -669,6 +905,12 @@ class OpenAICompatibleProvider:
                     reasoning = delta.get("reasoning_content")
                     if isinstance(reasoning, str) and reasoning:
                         yield ModelReasoningDelta(reasoning)
+                    elif reasoning_details is not None:
+                        raw_details = delta.get("reasoning_details")
+                        if raw_details is not None:
+                            detail_delta, _ = reasoning_details.feed(raw_details)
+                            if detail_delta:
+                                yield ModelReasoningDelta(detail_delta)
                     tool_calls = delta.get("tool_calls")
                     if isinstance(tool_calls, list):
                         self._accumulate_tool_calls(tool_calls, buffers)
@@ -702,7 +944,10 @@ class OpenAICompatibleProvider:
             if not buffer.identifier or not buffer.name:
                 raise ProviderError("provider emitted an incomplete tool call")
             yield ModelToolCall(ToolCall(buffer.identifier, buffer.name, arguments))
-        yield ModelCompleted(stop_reason, usage=model_usage)
+        native_items: tuple[PreservedContextItem, ...] = ()
+        if reasoning_details is not None and reasoning_details.details and self._context_affinity:
+            native_items = (self._native_reasoning_item(reasoning_details.details),)
+        yield ModelCompleted(stop_reason, context_items=native_items, usage=model_usage)
 
     @staticmethod
     def _accumulate_tool_calls(

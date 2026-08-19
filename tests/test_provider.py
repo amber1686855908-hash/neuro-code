@@ -7,11 +7,17 @@ from unittest import mock
 
 import httpx
 
-from neuro_code.application.ports.model import ModelToolPolicy
+from neuro_code.application.ports.model import (
+    CapabilityStatus,
+    ModelCapability,
+    ModelToolPolicy,
+)
 from neuro_code.configuration.app import AppConfig, ProviderProfile
 from neuro_code.domain.conversation.context import UPSTREAM_IMPORT_PROVIDER, ModelContext
 from neuro_code.domain.conversation.events import (
     ModelCompleted,
+    ModelProviderAttemptFailed,
+    ModelProviderSelected,
     ModelReasoningDelta,
     ModelTextDelta,
     ModelToolCall,
@@ -25,10 +31,14 @@ from neuro_code.domain.conversation.messages import (
     Role,
     ToolCall,
 )
+from neuro_code.domain.conversation.reasoning import ReasoningEffort
 from neuro_code.domain.tools import ToolDefinition
 from neuro_code.infrastructure.providers import create_provider, create_routed_provider
 from neuro_code.infrastructure.providers.anthropic import AnthropicProvider
-from neuro_code.infrastructure.providers.failover import FailoverModelProvider
+from neuro_code.infrastructure.providers.failover import (
+    FailoverModelProvider,
+    ProviderCandidate,
+)
 from neuro_code.infrastructure.providers.gemini import GeminiProvider
 from neuro_code.infrastructure.providers.gemini_interactions import (
     GeminiInteractionsProvider,
@@ -140,6 +150,529 @@ class OpenAICompatibleProviderTests(unittest.IsolatedAsyncioTestCase):
             "Need to inspect a.py.",
         )
         self.assertNotIn("reasoning_content", provider._message_payload(completed_turn))
+
+        kimi_legacy = OpenAICompatibleProvider(
+            model="kimi-k2.5",
+            base_url="https://api.moonshot.ai/v1",
+            api_key="fixture",
+            dialect="kimi",
+        )
+        self.assertNotIn("reasoning_content", kimi_legacy._message_payload(tool_turn))
+
+    def test_china_dialects_replay_reasoning_and_map_official_request_fields(self) -> None:
+        context = ModelContext(
+            (
+                Message(Role.USER, "continue"),
+                Message(
+                    Role.ASSISTANT,
+                    "tool result pending",
+                    reasoning_content="preserve this reasoning",
+                    tool_calls=(ToolCall("call-1", "lookup", {"value": 1}),),
+                ),
+            ),
+            reasoning_effort=ReasoningEffort.XHIGH,
+        )
+        tool = ToolDefinition(
+            "lookup",
+            "Look up a fixture value.",
+            {"type": "object", "properties": {"value": {"type": "integer"}}},
+        )
+
+        kimi = OpenAICompatibleProvider(
+            model="kimi-k3",
+            base_url="https://api.moonshot.ai/v1",
+            api_key="fixture",
+            dialect="kimi",
+        )
+        kimi_body = kimi._request_body(context, (tool,))
+        self.assertEqual(kimi_body["reasoning_effort"], "max")
+        self.assertEqual(kimi_body["messages"][1]["reasoning_content"], "preserve this reasoning")
+
+        glm = OpenAICompatibleProvider(
+            model="glm-5.3",
+            base_url="https://open.bigmodel.cn/api/paas/v4",
+            api_key="fixture",
+            dialect="glm",
+        )
+        glm_body = glm._request_body(context, (tool,))
+        self.assertEqual(glm_body["thinking"], {"type": "enabled", "clear_thinking": False})
+        self.assertEqual(glm_body["reasoning_effort"], "max")
+
+        minimax = OpenAICompatibleProvider(
+            model="MiniMax-M3",
+            base_url="https://api.minimaxi.com/v1",
+            api_key="fixture",
+            provider_name="minimax-profile",
+            dialect="minimax",
+            context_affinity="profile-v1:minimax",
+        )
+        minimax_context = ModelContext(
+            context.items,
+            source_provider="minimax-profile",
+            source_model="MiniMax-M3",
+            source_context_affinity="profile-v1:minimax",
+            reasoning_effort=ReasoningEffort.XHIGH,
+        )
+        minimax_body = minimax._request_body(minimax_context, (tool,))
+        self.assertNotIn("max_tokens", minimax_body)
+        self.assertEqual(minimax_body["max_completion_tokens"], 8192)
+        self.assertTrue(minimax_body["reasoning_split"])
+        self.assertEqual(
+            minimax_body["messages"][1]["reasoning_content"], "preserve this reasoning"
+        )
+
+        native = PreservedContextItem(
+            ContextItemKind.REASONING,
+            {
+                "type": "reasoning",
+                "native": {
+                    "type": "openai-chat-reasoning-details",
+                    "provider": "minimax-profile",
+                    "protocol": "openai-chat",
+                    "model": "MiniMax-M3",
+                    "details": [{"type": "reasoning.text", "text": "structured reasoning"}],
+                },
+            },
+        )
+        structured_body = minimax._request_body(
+            ModelContext(
+                (
+                    Message(Role.USER, "continue"),
+                    native,
+                    Message(
+                        Role.ASSISTANT,
+                        "tool result pending",
+                        reasoning_content="structured reasoning",
+                        tool_calls=(ToolCall("call-1", "lookup", {"value": 1}),),
+                    ),
+                ),
+                source_provider="minimax-profile",
+                source_model="MiniMax-M3",
+                source_context_affinity="profile-v1:minimax",
+            ),
+            (tool,),
+        )
+        self.assertEqual(
+            structured_body["messages"][1]["reasoning_details"],
+            [{"type": "reasoning.text", "text": "structured reasoning"}],
+        )
+
+    def test_kimi_specific_tool_choice_fails_closed_without_disabling_thinking(self) -> None:
+        provider = OpenAICompatibleProvider(
+            model="kimi-k2.6",
+            base_url="https://api.moonshot.ai/v1",
+            api_key="fixture",
+            dialect="kimi",
+            tool_choice={"type": "function", "function": {"name": "lookup"}},
+        )
+        tool = ToolDefinition("lookup", "Lookup", {"type": "object"})
+        with self.assertRaisesRegex(ConfigurationError, "incompatible with thinking"):
+            provider._request_body(ModelContext((Message(Role.USER, "lookup"),)), (tool,))
+
+    async def test_kimi_and_glm_stream_fixtures_replay_tools_reasoning_and_usage(self) -> None:
+        tool = ToolDefinition("lookup", "Lookup a fixture value.", {"type": "object"})
+        for dialect, model, base_url in (
+            ("kimi", "kimi-k2.6", "https://api.moonshot.ai/v1"),
+            ("glm", "glm-5.3", "https://open.bigmodel.cn/api/paas/v4"),
+        ):
+            with self.subTest(dialect=dialect):
+                captured: dict[str, object] = {}
+
+                def handler(
+                    request: httpx.Request, captured: dict[str, object] = captured
+                ) -> httpx.Response:
+                    captured["body"] = json.loads(request.content)
+                    return httpx.Response(
+                        200,
+                        headers={"content-type": "text/event-stream"},
+                        text=_sse(
+                            {"choices": [{"delta": {"reasoning_content": "plan"}}]},
+                            {
+                                "choices": [
+                                    {
+                                        "delta": {
+                                            "tool_calls": [
+                                                {
+                                                    "index": 0,
+                                                    "id": "call-",
+                                                    "function": {
+                                                        "name": "look",
+                                                        "arguments": '{"value":',
+                                                    },
+                                                }
+                                            ]
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                "choices": [
+                                    {
+                                        "finish_reason": "tool_calls",
+                                        "delta": {
+                                            "tool_calls": [
+                                                {
+                                                    "index": 0,
+                                                    "id": "1",
+                                                    "function": {
+                                                        "name": "up",
+                                                        "arguments": "1}",
+                                                    },
+                                                }
+                                            ]
+                                        },
+                                    }
+                                ],
+                                "usage": {
+                                    "prompt_tokens": 12,
+                                    "completion_tokens": 4,
+                                    "prompt_tokens_details": {"cached_tokens": 3},
+                                },
+                            },
+                        ),
+                    )
+
+                provider = OpenAICompatibleProvider(
+                    model=model,
+                    base_url=base_url,
+                    api_key="fixture",
+                    dialect=dialect,
+                    transport=httpx.MockTransport(handler),
+                )
+                context = ModelContext(
+                    (
+                        Message(Role.USER, "lookup"),
+                        Message(
+                            Role.ASSISTANT,
+                            reasoning_content="prior plan",
+                            tool_calls=(ToolCall("old", "lookup", {"value": 0}),),
+                        ),
+                        Message(Role.TOOL, "fixture result", tool_call_id="old"),
+                    )
+                )
+                events = [event async for event in provider.stream(context, (tool,))]
+
+                reasoning = [
+                    event.text for event in events if isinstance(event, ModelReasoningDelta)
+                ]
+                self.assertEqual(reasoning, ["plan"])
+                tool_event = next(event for event in events if isinstance(event, ModelToolCall))
+                self.assertEqual(tool_event.call, ToolCall("call-1", "lookup", {"value": 1}))
+                completion = next(event for event in events if isinstance(event, ModelCompleted))
+                assert completion.usage is not None
+                self.assertEqual(completion.usage.cache_read_tokens, 3)
+                body = captured["body"]
+                assert isinstance(body, dict)
+                self.assertEqual(body["messages"][1]["reasoning_content"], "prior plan")
+                self.assertEqual(body["messages"][2]["tool_call_id"], "old")
+
+    def test_glm_tool_choice_is_limited_to_official_auto_contract(self) -> None:
+        provider = OpenAICompatibleProvider(
+            model="glm-5.3",
+            base_url="https://open.bigmodel.cn/api/paas/v4",
+            api_key="fixture",
+            dialect="glm",
+            tool_choice="required",
+        )
+        tool = ToolDefinition("lookup", "Lookup", {"type": "object"})
+        with self.assertRaisesRegex(ConfigurationError, "only tool_choice 'auto'"):
+            provider._request_body(ModelContext((Message(Role.USER, "lookup"),)), (tool,))
+
+    def test_kimi_thinking_rejects_required_tool_choice_without_disabling_thinking(self) -> None:
+        provider = OpenAICompatibleProvider(
+            model="kimi-k2.6",
+            base_url="https://api.moonshot.ai/v1",
+            api_key="fixture",
+            dialect="kimi",
+            tool_choice="required",
+        )
+        tool = ToolDefinition("lookup", "Lookup", {"type": "object"})
+        with self.assertRaisesRegex(ConfigurationError, "incompatible with thinking"):
+            provider._request_body(ModelContext((Message(Role.USER, "lookup"),)), (tool,))
+
+    async def test_minimax_reasoning_details_are_accumulated_without_duplicate_text(self) -> None:
+        provider = OpenAICompatibleProvider(
+            model="MiniMax-M3",
+            base_url="https://api.minimaxi.com/v1",
+            api_key="fixture",
+            provider_name="minimax-profile",
+            dialect="minimax",
+            context_affinity="profile-v1:minimax",
+            transport=httpx.MockTransport(
+                lambda request: httpx.Response(
+                    200,
+                    headers={"content-type": "text/event-stream"},
+                    content=_sse(
+                        {
+                            "choices": [
+                                {
+                                    "delta": {
+                                        "reasoning_details": [
+                                            {"text": "think", "type": "reasoning.text"}
+                                        ]
+                                    }
+                                }
+                            ]
+                        },
+                        {
+                            "choices": [
+                                {
+                                    "delta": {
+                                        "reasoning_details": [
+                                            {"text": "thinking", "type": "reasoning.text"}
+                                        ]
+                                    }
+                                }
+                            ]
+                        },
+                        {"choices": [{"delta": {"content": "done"}}]},
+                        {
+                            "choices": [],
+                            "usage": {
+                                "prompt_tokens": 10,
+                                "completion_tokens": 3,
+                                "prompt_tokens_details": {"cached_tokens": 4},
+                            },
+                        },
+                    ),
+                )
+            ),
+        )
+
+        events = [
+            event
+            async for event in provider.stream(ModelContext((Message(Role.USER, "hello"),)), ())
+        ]
+        self.assertEqual(
+            [event.text for event in events if isinstance(event, ModelReasoningDelta)],
+            ["think", "ing"],
+        )
+        self.assertEqual(
+            [event.text for event in events if isinstance(event, ModelTextDelta)],
+            ["done"],
+        )
+        completion = next(event for event in events if isinstance(event, ModelCompleted))
+        assert completion.usage is not None
+        self.assertEqual(completion.usage.cache_read_tokens, 4)
+        self.assertEqual(len(completion.context_items), 1)
+        self.assertEqual(
+            completion.context_items[0].to_dict()["native"]["details"],
+            [{"text": "thinking", "type": "reasoning.text"}],
+        )
+
+    async def test_provider_native_reasoning_is_not_sent_to_fallback_kimi(self) -> None:
+        native = PreservedContextItem(
+            ContextItemKind.REASONING,
+            {
+                "type": "reasoning",
+                "native": {
+                    "type": "openai-chat-reasoning-details",
+                    "provider": "minimax-profile",
+                    "protocol": "openai-chat",
+                    "model": "MiniMax-M3",
+                    "details": [{"text": "must not cross", "type": "reasoning.text"}],
+                },
+            },
+        )
+        minimax = OpenAICompatibleProvider(
+            model="MiniMax-M3",
+            base_url="https://api.minimaxi.com/v1",
+            api_key="fixture",
+            provider_name="minimax-profile",
+            dialect="minimax",
+            context_affinity="profile-v1:minimax",
+            transport=httpx.MockTransport(
+                lambda request: httpx.Response(503, text="primary offline")
+            ),
+        )
+        captured: dict[str, object] = {}
+
+        def kimi_handler(request: httpx.Request) -> httpx.Response:
+            captured["body"] = json.loads(request.content)
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                content=_sse(
+                    {"choices": [{"delta": {"content": "fallback"}}]},
+                    {"choices": [{"finish_reason": "stop", "delta": {}}]},
+                ),
+            )
+
+        kimi = OpenAICompatibleProvider(
+            model="kimi-k2.6",
+            base_url="https://api.moonshot.ai/v1",
+            api_key="fixture",
+            provider_name="kimi-profile",
+            dialect="kimi",
+            context_affinity="profile-v1:kimi",
+            transport=httpx.MockTransport(kimi_handler),
+        )
+        router = FailoverModelProvider(
+            (
+                ProviderCandidate(
+                    "minimax-profile",
+                    "MiniMax-M3",
+                    "profile-v1:minimax",
+                    lambda: minimax,
+                ),
+                ProviderCandidate(
+                    "kimi-profile",
+                    "kimi-k2.6",
+                    "profile-v1:kimi",
+                    lambda: kimi,
+                ),
+            )
+        )
+        events = [
+            event
+            async for event in router.stream(
+                ModelContext(
+                    (
+                        Message(Role.USER, "continue"),
+                        native,
+                        Message(
+                            Role.ASSISTANT,
+                            "answer",
+                            reasoning_content="canonical reasoning",
+                        ),
+                    ),
+                    source_provider="minimax-profile",
+                    source_model="MiniMax-M3",
+                    source_context_affinity="profile-v1:minimax",
+                ),
+                (),
+            )
+        ]
+
+        self.assertIsInstance(events[0], ModelProviderAttemptFailed)
+        self.assertIsInstance(events[1], ModelProviderSelected)
+        self.assertIsInstance(events[2], ModelTextDelta)
+        body = captured["body"]
+        assert isinstance(body, dict)
+        self.assertNotIn("reasoning_details", json.dumps(body))
+        self.assertNotIn("must not cross", json.dumps(body))
+
+    def test_minimax_native_reasoning_requires_the_exact_profile_affinity(self) -> None:
+        native = PreservedContextItem(
+            ContextItemKind.REASONING,
+            {
+                "type": "reasoning",
+                "native": {
+                    "type": "openai-chat-reasoning-details",
+                    "provider": "minimax-personal",
+                    "protocol": "openai-chat",
+                    "model": "MiniMax-M3",
+                    "details": [{"text": "same service must not cross"}],
+                },
+            },
+        )
+        backup = OpenAICompatibleProvider(
+            model="MiniMax-M3",
+            base_url="https://api.minimaxi.com/v1",
+            api_key="fixture",
+            provider_name="minimax-backup",
+            dialect="minimax",
+            context_affinity="profile-v1:minimax-backup",
+        )
+        body = backup._request_body(
+            ModelContext(
+                (Message(Role.USER, "continue"), native, Message(Role.ASSISTANT, "answer")),
+                source_provider="minimax-personal",
+                source_model="MiniMax-M3",
+                source_context_affinity="profile-v1:minimax-personal",
+            ),
+            (),
+        )
+
+        self.assertNotIn("reasoning_details", json.dumps(body))
+        self.assertNotIn("same service must not cross", json.dumps(body))
+
+    def test_minimax_native_reasoning_is_bounded_and_redacted_on_rejection(self) -> None:
+        provider = OpenAICompatibleProvider(
+            model="MiniMax-M3",
+            base_url="https://api.minimaxi.com/v1",
+            api_key="fixture",
+            provider_name="minimax-profile",
+            dialect="minimax",
+            context_affinity="profile-v1:minimax",
+        )
+        oversized_marker = "oversized-native-marker"
+        with self.assertRaisesRegex(ProviderError, "size limit") as oversized:
+            provider._native_reasoning_item(({"text": oversized_marker + ("x" * 1_100_000)},))
+        self.assertNotIn(oversized_marker, str(oversized.exception))
+
+        with self.assertRaisesRegex(ProviderError, "JSON-safe") as unsafe:
+            provider._native_reasoning_item(({"value": object()},))
+        self.assertNotIn("object at", str(unsafe.exception))
+
+    def test_china_dialects_expose_only_implemented_reasoning_and_cache(self) -> None:
+        capabilities = OpenAICompatibleProvider.implementation_capabilities(dialect="kimi")
+        self.assertTrue(capabilities.supports(ModelCapability.REASONING))
+        self.assertTrue(capabilities.supports(ModelCapability.PROMPT_CACHE))
+        self.assertFalse(capabilities.supports(ModelCapability.HOSTED_WEB_SEARCH))
+
+    def test_china_failover_keeps_safe_capability_intersection_and_context_affinity(self) -> None:
+        profiles = {
+            "kimi": ProviderProfile(
+                name="kimi",
+                service_id="kimi",
+                protocol="openai-chat",
+                dialect="kimi",
+                model="kimi-k2.6",
+                base_url="https://api.moonshot.ai/v1",
+                api_key_env="KIMI_KEY",
+                native_context="profile",
+                proxy_mode="direct",
+            ),
+            "glm": ProviderProfile(
+                name="glm",
+                service_id="glm",
+                protocol="openai-chat",
+                dialect="glm",
+                model="glm-5.3",
+                base_url="https://open.bigmodel.cn/api/paas/v4",
+                api_key_env="GLM_KEY",
+                native_context="profile",
+                proxy_mode="direct",
+            ),
+            "minimax": ProviderProfile(
+                name="minimax",
+                service_id="minimax",
+                protocol="openai-chat",
+                dialect="minimax",
+                model="MiniMax-M3",
+                base_url="https://api.minimaxi.com/v1",
+                api_key_env="MINIMAX_KEY",
+                native_context="profile",
+                proxy_mode="direct",
+            ),
+        }
+        for primary, fallback in (("kimi", "glm"), ("glm", "minimax")):
+            with self.subTest(primary=primary, fallback=fallback):
+                config = AppConfig(
+                    Path("/tmp/neuro-code-p3a-fixture"),
+                    Path("/tmp/neuro-code-p3a-fixture-state"),
+                    profiles,
+                    primary,
+                    primary,
+                    fallback_providers=(fallback,),
+                )
+                provider = create_routed_provider(config)
+
+                self.assertIsInstance(provider, FailoverModelProvider)
+                self.assertTrue(provider.capabilities.supports(ModelCapability.FUNCTION_TOOLS))
+                self.assertTrue(provider.capabilities.supports(ModelCapability.REASONING))
+                self.assertTrue(provider.capabilities.supports(ModelCapability.PROMPT_CACHE))
+                self.assertEqual(
+                    provider.capabilities.status(ModelCapability.HOSTED_WEB_SEARCH),
+                    CapabilityStatus.UNKNOWN,
+                )
+                self.assertIsNotNone(provider.context_affinity)
+                candidates = provider._candidates
+                self.assertNotEqual(
+                    candidates[0].context_affinity,
+                    candidates[1].context_affinity,
+                )
 
     def test_affine_xai_import_replays_visible_ordered_context(self) -> None:
         provider = OpenAICompatibleProvider(

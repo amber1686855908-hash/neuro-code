@@ -32,7 +32,16 @@ SUPPORTED_PROTOCOLS = frozenset(
         "gemini-interactions",
     }
 )
-SUPPORTED_DIALECTS = frozenset({"standard", "xai", "deepseek-v4"})
+SUPPORTED_DIALECTS = frozenset(
+    {
+        "standard",
+        "xai",
+        "deepseek-v4",
+        "kimi",
+        "glm",
+        "minimax",
+    }
+)
 _MAX_SERVICE_ID_CHARACTERS = 128
 _MAX_URL_CHARACTERS = 2_048
 
@@ -116,6 +125,7 @@ class ProviderServiceDescriptor:
     dialect_by_protocol: Mapping[str, str] = field(default_factory=dict)
     credential_style: CredentialStyle | str = CredentialStyle.API_KEY
     model_catalog_strategy: ModelCatalogStrategy | str = ModelCatalogStrategy.MANUAL_ONLY
+    static_models: tuple[str, ...] = ()
     capabilities: ModelCapabilitySet = field(default_factory=ModelCapabilitySet.all_unknown)
     protocol_capabilities: Mapping[str, ModelCapabilitySet] = field(default_factory=dict)
     model_capabilities: Mapping[str, ModelCapabilitySet] = field(default_factory=dict)
@@ -171,6 +181,16 @@ class ProviderServiceDescriptor:
             ) from error
         ui_key = (self.ui_key or service_id).strip()
         aliases = tuple(alias.strip() for alias in self.aliases)
+        static_models = tuple(model.strip() for model in self.static_models)
+        if any(
+            not model
+            or len(model) > 512
+            or any(ord(character) < 32 or ord(character) == 127 for character in model)
+            for model in static_models
+        ):
+            raise ConfigurationError("provider service static model identifiers are invalid")
+        if len(set(static_models)) != len(static_models):
+            raise ConfigurationError("provider service static model identifiers must be unique")
         if not ui_key or any(not alias for alias in aliases):
             raise ConfigurationError("provider service aliases must not be empty")
         if len(set(aliases)) != len(aliases) or any(
@@ -218,6 +238,7 @@ class ProviderServiceDescriptor:
         object.__setattr__(self, "dialect_by_protocol", MappingProxyType(dialect_by_protocol))
         object.__setattr__(self, "credential_style", credential_style)
         object.__setattr__(self, "model_catalog_strategy", catalog_strategy)
+        object.__setattr__(self, "static_models", static_models)
         object.__setattr__(self, "ui_key", ui_key)
         object.__setattr__(self, "aliases", aliases)
         object.__setattr__(self, "protocol_capabilities", MappingProxyType(protocol_capabilities))
@@ -492,6 +513,7 @@ def _descriptor(
     model_placeholder_key: str,
     protocol_hint_key: str,
     publisher_id: str,
+    static_models: tuple[str, ...] = (),
     capabilities: ModelCapabilitySet | None = None,
     model_capabilities: Mapping[str, ModelCapabilitySet] | None = None,
     model_capabilities_by_protocol: Mapping[str, Mapping[str, ModelCapabilitySet]] | None = None,
@@ -505,6 +527,7 @@ def _descriptor(
         default_dialect=default_dialect,
         dialect_by_protocol=dialect_by_protocol,
         model_catalog_strategy=catalog_strategy,
+        static_models=static_models,
         ui_key=ui_key,
         aliases=aliases,
         label_key=label_key,
@@ -577,6 +600,46 @@ def _gemini_interactions_model_capabilities(model: str) -> ModelCapabilitySet:
     if model in _GEMINI_INTERACTIONS_MIXED_TOOL_MODELS:
         supported.add(ModelCapability.MIXED_HOSTED_AND_CLIENT_TOOLS)
     return ModelCapabilitySet.from_supported(*supported)
+
+
+def _china_model_capabilities(*, vision: bool = False) -> ModelCapabilitySet:
+    supported = {
+        ModelCapability.FUNCTION_TOOLS,
+        ModelCapability.PROMPT_CACHE,
+        ModelCapability.REASONING,
+    }
+    if vision:
+        supported.add(ModelCapability.VISION)
+    return ModelCapabilitySet.from_supported(*supported)
+
+
+_KIMI_CURRENT_MODELS = (
+    "kimi-k3",
+    "kimi-k2.7-code",
+    "kimi-k2.7-code-highspeed",
+    "kimi-k2.6",
+    "kimi-k2.5",
+)
+_GLM_CURRENT_TEXT_MODELS = (
+    "glm-5.3",
+    "glm-5.2",
+    "glm-5.1",
+    "glm-5",
+    "glm-5-turbo",
+    "glm-4.7",
+    "glm-4.6",
+    "glm-4.5",
+)
+_MINIMAX_CURRENT_MODELS = (
+    "MiniMax-M3",
+    "MiniMax-M2.7",
+    "MiniMax-M2.7-highspeed",
+    "MiniMax-M2.5",
+    "MiniMax-M2.5-highspeed",
+    "MiniMax-M2.1",
+    "MiniMax-M2.1-highspeed",
+    "MiniMax-M2",
+)
 
 
 DEFAULT_PROVIDER_SERVICE_CATALOG = ProviderServiceCatalog(
@@ -706,6 +769,80 @@ DEFAULT_PROVIDER_SERVICE_CATALOG = ProviderServiceCatalog(
                 ModelCapability.HOSTED_X_SEARCH,
                 ModelCapability.HOSTED_CODE_INTERPRETER,
             ),
+        ),
+        _descriptor(
+            service_id="kimi",
+            display_name="Kimi",
+            default_protocol="openai-chat",
+            default_base_url="https://api.moonshot.ai/v1",
+            supported_protocols=frozenset({"openai-chat"}),
+            default_dialect="kimi",
+            dialect_by_protocol={"openai-chat": "kimi"},
+            catalog_strategy=ModelCatalogStrategy.OPENAI_COMPATIBLE,
+            static_models=("kimi-k3", "kimi-k2.7-code", "kimi-k2.6"),
+            ui_key="kimi",
+            aliases=("moonshot",),
+            label_key="provider_settings.preset.kimi",
+            model_placeholder_key="provider_settings.model.kimi",
+            protocol_hint_key="provider_settings.protocol.kimi",
+            publisher_id="moonshot",
+            model_capabilities={
+                model: _china_model_capabilities(vision=True) for model in _KIMI_CURRENT_MODELS
+            },
+        ),
+        _descriptor(
+            service_id="glm",
+            display_name="GLM",
+            default_protocol="openai-chat",
+            default_base_url="https://open.bigmodel.cn/api/paas/v4",
+            supported_protocols=frozenset({"openai-chat"}),
+            default_dialect="glm",
+            dialect_by_protocol={"openai-chat": "glm"},
+            catalog_strategy=ModelCatalogStrategy.STATIC,
+            static_models=(
+                "glm-5.3",
+                "glm-5.2",
+                "glm-5.1",
+                "glm-5",
+                "glm-5-turbo",
+                "glm-4.7",
+                "glm-4.6",
+                "glm-4.5",
+                "glm-5v-turbo",
+                "glm-4.6v",
+            ),
+            ui_key="glm",
+            aliases=("zhipu",),
+            label_key="provider_settings.preset.glm",
+            model_placeholder_key="provider_settings.model.glm",
+            protocol_hint_key="provider_settings.protocol.glm",
+            publisher_id="zhipu",
+            model_capabilities={
+                **{model: _china_model_capabilities() for model in _GLM_CURRENT_TEXT_MODELS},
+                "glm-5v-turbo": _china_model_capabilities(vision=True),
+                "glm-4.6v": _china_model_capabilities(vision=True),
+            },
+        ),
+        _descriptor(
+            service_id="minimax",
+            display_name="MiniMax",
+            default_protocol="openai-chat",
+            default_base_url="https://api.minimaxi.com/v1",
+            supported_protocols=frozenset({"openai-chat"}),
+            default_dialect="minimax",
+            dialect_by_protocol={"openai-chat": "minimax"},
+            catalog_strategy=ModelCatalogStrategy.OPENAI_COMPATIBLE,
+            static_models=("MiniMax-M3", "MiniMax-M2.7", "MiniMax-M2.5"),
+            ui_key="minimax",
+            aliases=(),
+            label_key="provider_settings.preset.minimax",
+            model_placeholder_key="provider_settings.model.minimax",
+            protocol_hint_key="provider_settings.protocol.minimax",
+            publisher_id="minimax",
+            model_capabilities={
+                **{model: _china_model_capabilities() for model in _MINIMAX_CURRENT_MODELS},
+                "MiniMax-M3": _china_model_capabilities(vision=True),
+            },
         ),
     )
 )

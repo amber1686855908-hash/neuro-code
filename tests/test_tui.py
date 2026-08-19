@@ -2321,6 +2321,41 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
                     "deepseek-reasoner",
                 )
 
+    async def test_glm_connection_uses_static_official_models_without_network_or_key(self) -> None:
+        catalog = ProviderCatalogFixture(
+            error=ProviderCatalogError("network", detail="catalog must not be called")
+        )
+        with tempfile.TemporaryDirectory() as directory, patch.dict("os.environ", {}, clear=True):
+            store = JsonProviderSettingsStore(Path(directory))
+            app = ProviderSetupApp(
+                provider_settings=ManagedProviderSettings(),
+                provider_settings_store=store,
+                provider_catalog=catalog,
+            )
+
+            async with app.run_test(size=(110, 48)) as pilot:
+                for _ in range(20):
+                    await pilot.pause(0.01)
+                    if isinstance(app.screen, ProviderSettingsScreen):
+                        break
+                screen = app.screen
+                self.assertIsInstance(screen, ProviderSettingsScreen)
+                screen._select_preset("glm")
+                screen.query_one("#provider-settings-name", Input).value = "glm"
+                await screen._test_connection()
+                await pilot.pause()
+
+                self.assertEqual(catalog.calls, [])
+                status = str(
+                    screen.query_one("#provider-settings-connection-status", Static).renderable
+                )
+                self.assertIn("official", status)
+                self.assertTrue(screen.query_one("#provider-settings-models").display)
+                self.assertIsInstance(
+                    screen.query_one("#provider-settings-catalog-model-1", Button),
+                    Button,
+                )
+
     async def test_provider_connection_error_is_localized_redacted_and_keeps_screen_open(
         self,
     ) -> None:
