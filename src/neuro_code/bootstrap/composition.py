@@ -32,12 +32,22 @@ from neuro_code.application.ports.background_tasks import (
 from neuro_code.application.ports.client_filesystem import ClientFileSystem
 from neuro_code.application.ports.client_terminal import ClientTerminal
 from neuro_code.application.ports.instructions import InstructionDiscovery
-from neuro_code.application.ports.model import ModelCapability, ModelCapabilitySet, ModelProvider
+from neuro_code.application.ports.model import (
+    CapabilityStatus,
+    ModelCapability,
+    ModelCapabilitySet,
+    ModelProvider,
+)
 from neuro_code.application.ports.sandbox import LocalProcessSandbox
 from neuro_code.application.ports.skills import SkillDiscovery
 from neuro_code.application.ports.storage import SessionStore
 from neuro_code.application.ports.tools import Tool, ToolContext
 from neuro_code.application.ports.user_interaction import UserInteractionPort
+from neuro_code.application.ports.web_fetch import (
+    WebFetchExecutionPath,
+    WebFetchMode,
+    resolve_web_fetch_path,
+)
 from neuro_code.application.ports.web_search import (
     WebSearchExecutionPath,
     WebSearchMode,
@@ -70,6 +80,7 @@ from neuro_code.application.sessions.summary import (
 )
 from neuro_code.application.settings import ApplicationSettings
 from neuro_code.application.tools.service import SessionToolOutputArtifactApplicationService
+from neuro_code.application.web_fetch.service import WebFetchService
 from neuro_code.application.web_search.service import WebSearchService
 from neuro_code.application.workflows.plan_execution import (
     PlanExecutionController,
@@ -107,8 +118,10 @@ from neuro_code.infrastructure.sandbox.windows_native_local_process import (
     WindowsNativeLocalProcessSandbox,
 )
 from neuro_code.infrastructure.tools.registry import ToolRegistry, default_tool_registry
+from neuro_code.infrastructure.tools.web_fetch import WebFetchTool
 from neuro_code.infrastructure.tools.web_search import WebSearchTool
 from neuro_code.infrastructure.tools.workspace_diff import WorkspaceMutationJournal
+from neuro_code.infrastructure.web_fetch.local import LocalWebFetcher
 from neuro_code.infrastructure.workspace.changes import (
     FilesystemWorkspaceChangeObserver,
     MultiRootWorkspaceChangeObserver,
@@ -151,6 +164,27 @@ def _without_main_inline_web_search(config: AppConfig) -> AppConfig:
                 tool_name
                 for tool_name in profile.builtin_tools
                 if tool_name not in {"web_search", "google_search"}
+            ),
+        )
+    return replace(config, providers=profiles)
+
+
+def _without_main_inline_web_fetch(config: AppConfig) -> AppConfig:
+    """Disable only MAIN hosted fetch tools for local/disabled modes."""
+
+    route = config.main_route
+    names = {route.provider_profile, *route.fallback_profiles}
+    profiles = dict(config.providers)
+    for name in names:
+        profile = profiles.get(name)
+        if profile is None or not ({"web_fetch", "url_context"} & set(profile.builtin_tools)):
+            continue
+        profiles[name] = replace(
+            profile,
+            builtin_tools=tuple(
+                tool_name
+                for tool_name in profile.builtin_tools
+                if tool_name not in {"web_fetch", "url_context"}
             ),
         )
     return replace(config, providers=profiles)
@@ -381,6 +415,10 @@ class ApplicationComposition:
                     f"tool {tool.definition.name!r} is outside the selected capability set"
                 )
             preview_tools.register(tool)
+        if selected_config.web_fetch_mode is not WebFetchMode.DISABLED and any(
+            tool.definition.name == "web_fetch" for tool in additional_tools
+        ):
+            raise ConfigurationError("duplicate or reserved tool name: 'web_fetch'")
         if selected_config.web_search_mode is WebSearchMode.SIDECAR and any(
             tool.definition.name == "web_search" for tool in additional_tools
         ):
@@ -407,22 +445,56 @@ class ApplicationComposition:
                     WebSearchMode.SIDECAR,
                 }:
                     provider_config = _without_main_inline_web_search(selected_config)
+                if selected_config.web_fetch_mode in {
+                    WebFetchMode.DISABLED,
+                    WebFetchMode.LOCAL,
+                }:
+                    provider_config = _without_main_inline_web_fetch(provider_config)
                 provider = self._provider_factory(provider_config, self.settings.failover)
-                search_resolver = RoutedWebSearchBackendResolver(selected_config)
-                search_route = selected_config.web_search_route
-                sidecar_available = (
-                    search_route is not None and search_resolver.resolve(search_route) is not None
-                )
                 provider_capabilities = getattr(
                     provider,
                     "capabilities",
                     ModelCapabilitySet.all_unknown(),
+                )
+                inline_fetch_supported = (
+                    isinstance(provider_capabilities, ModelCapabilitySet)
+                    and provider_capabilities.status(ModelCapability.HOSTED_WEB_FETCH)
+                    is CapabilityStatus.SUPPORTED
+                )
+                fetch_path = resolve_web_fetch_path(
+                    selected_config.web_fetch_mode,
+                    inline_supported=inline_fetch_supported,
+                )
+                if fetch_path is WebFetchExecutionPath.UNAVAILABLE:
+                    raise ConfigurationError(
+                        "inline web fetch was explicitly requested but MAIN does not have "
+                        "an explicitly supported hosted-fetch capability"
+                    )
+                if (
+                    fetch_path is WebFetchExecutionPath.LOCAL
+                    and selected_config.web_fetch_mode is WebFetchMode.AUTO
+                ):
+                    provider_config = _without_main_inline_web_fetch(provider_config)
+                    provider = self._provider_factory(provider_config, self.settings.failover)
+                    provider_capabilities = getattr(
+                        provider,
+                        "capabilities",
+                        ModelCapabilitySet.all_unknown(),
+                    )
+                search_resolver = RoutedWebSearchBackendResolver(selected_config)
+                search_route = selected_config.web_search_route
+                sidecar_available = (
+                    search_route is not None and search_resolver.resolve(search_route) is not None
                 )
                 client_tool_names = tuple(
                     name
                     for name in preview_tools.names()
                     if name not in {"web_search", "google_search", "url_context"}
                 )
+                if fetch_path is WebFetchExecutionPath.LOCAL and (
+                    allowed_tool_names is None or "web_fetch" in allowed_tool_names
+                ):
+                    client_tool_names += ("web_fetch",)
                 inline_supported = (
                     provider_capabilities.supports(ModelCapability.HOSTED_WEB_SEARCH)
                     and (
@@ -465,7 +537,14 @@ class ApplicationComposition:
                     # (or unavailable), so rebuild the provider without the
                     # inline hosted tool instead of exposing both paths.
                     provider_config = _without_main_inline_web_search(selected_config)
+                    if fetch_path is not WebFetchExecutionPath.INLINE_HOSTED:
+                        provider_config = _without_main_inline_web_fetch(provider_config)
                     provider = self._provider_factory(provider_config, self.settings.failover)
+                    provider_capabilities = getattr(
+                        provider,
+                        "capabilities",
+                        ModelCapabilitySet.all_unknown(),
+                    )
                 tools = default_tool_registry(
                     selected_config.sandbox_profile,
                     enable_background_tasks=enable_background_tasks,
@@ -474,6 +553,19 @@ class ApplicationComposition:
                     client_terminal=client_terminal,
                     user_interaction=user_interaction,
                 )
+                if fetch_path is WebFetchExecutionPath.LOCAL and (
+                    allowed_tool_names is None or "web_fetch" in allowed_tool_names
+                ):
+                    tools.register(
+                        WebFetchTool(
+                            WebFetchService(
+                                LocalWebFetcher(
+                                    redaction_values=selected_config.redaction_values(),
+                                ),
+                                redaction_values=selected_config.redaction_values(),
+                            )
+                        )
+                    )
                 if execution_path is WebSearchExecutionPath.SIDECAR_HOSTED and (
                     allowed_tool_names is None or "web_search" in allowed_tool_names
                 ):

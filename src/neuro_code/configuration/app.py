@@ -23,6 +23,7 @@ from neuro_code.application.ports.provider_services import (
     SUPPORTED_PROTOCOLS,
 )
 from neuro_code.application.ports.routing import ModelRoute, RuntimeRole
+from neuro_code.application.ports.web_fetch import WebFetchMode
 from neuro_code.application.ports.web_search import WebSearchMode
 from neuro_code.configuration.managed_provider_settings import (
     load_managed_provider_settings as _load_managed_provider_settings,
@@ -473,6 +474,7 @@ class AppConfig:
     loaded_files: tuple[Path, ...] = ()
     routes: Mapping[RuntimeRole, ModelRoute] = field(default_factory=dict)
     web_search_mode: WebSearchMode = WebSearchMode.AUTO
+    web_fetch_mode: WebFetchMode = WebFetchMode.DISABLED
 
     def __post_init__(self) -> None:
         try:
@@ -492,6 +494,8 @@ class AppConfig:
         object.__setattr__(self, "routes", MappingProxyType(normalized_routes))
         if not isinstance(self.web_search_mode, WebSearchMode):
             raise ConfigurationError("application web_search_mode must be canonical")
+        if not isinstance(self.web_fetch_mode, WebFetchMode):
+            raise ConfigurationError("application web_fetch_mode must be canonical")
 
     @property
     def provider(self) -> ProviderProfile:
@@ -576,6 +580,7 @@ class AppConfig:
                 "source": self.sandbox_profile_source,
             },
             "web_search": {"mode": self.web_search_mode.value},
+            "web_fetch": {"mode": self.web_fetch_mode.value},
             "provider": selected,
             "providers": profiles,
             "loaded_files": [str(path) for path in self.loaded_files],
@@ -659,6 +664,20 @@ def _web_search_mode_from_data(data: Mapping[str, object]) -> WebSearchMode:
     except ValueError as error:
         values = ", ".join(item.value for item in WebSearchMode)
         raise ConfigurationError(f"web_search mode must be one of: {values}") from error
+
+
+def _web_fetch_mode_from_data(data: Mapping[str, object]) -> WebFetchMode:
+    raw = data.get("web_fetch")
+    if raw is None:
+        return WebFetchMode.DISABLED
+    if not isinstance(raw, Mapping):
+        raise ConfigurationError("[web_fetch] must be a TOML table")
+    mode = _string(raw.get("mode"), WebFetchMode.DISABLED.value)
+    try:
+        return WebFetchMode(mode)
+    except ValueError as error:
+        values = ", ".join(item.value for item in WebFetchMode)
+        raise ConfigurationError(f"web_fetch mode must be one of: {values}") from error
 
 
 def _sandbox_profile_from_data(data: Mapping[str, object]) -> SandboxProfile | None:
@@ -1112,6 +1131,7 @@ def load_config(
 
     routes = _routes_from_data(routing, providers)
     web_search_mode = _web_search_mode_from_data(data)
+    web_fetch_mode = _web_fetch_mode_from_data(data)
 
     return AppConfig(
         cwd=resolved_cwd,
@@ -1125,6 +1145,7 @@ def load_config(
         loaded_files=tuple(loaded_files),
         routes=routes,
         web_search_mode=web_search_mode,
+        web_fetch_mode=web_fetch_mode,
     )
 
 

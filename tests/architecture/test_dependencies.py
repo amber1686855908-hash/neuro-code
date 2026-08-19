@@ -853,6 +853,7 @@ def test_canonical_ports_are_the_only_port_modules() -> None:
         "neuro_code.application.ports.terminal",
         "neuro_code.application.ports.tools",
         "neuro_code.application.ports.user_interaction",
+        "neuro_code.application.ports.web_fetch",
         "neuro_code.application.ports.ui_preferences",
         "neuro_code.application.ports.web_search",
         "neuro_code.application.ports.workspace",
@@ -949,6 +950,7 @@ def test_canonical_tool_modules_are_the_only_tool_implementations() -> None:
         "neuro_code.infrastructure.tools.registry",
         "neuro_code.infrastructure.tools.skills",
         "neuro_code.infrastructure.tools.workspace_diff",
+        "neuro_code.infrastructure.tools.web_fetch",
         "neuro_code.infrastructure.tools.web_search",
     }
     assert {

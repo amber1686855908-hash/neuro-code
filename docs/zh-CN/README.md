@@ -555,6 +555,21 @@ CC Switch 最终仍需合法的上游 API Key、OAuth 授权、中继 Token 或�
 `native_context = "profile"`；此时不透明推理也只会在会话中保存的 profile 亲和指纹
 完全一致时回放。
 
+### Local Safe Web Fetch
+
+Local Web Fetch 默认关闭，只有当前 session 被允许读取公网网页时才在配置中显式开启：
+
+```toml
+[web_fetch]
+mode = "local" # disabled | local | auto | inline
+```
+
+`local` 使用 Neuro Code 的 public-only、有界 HTTP fetcher；`auto` 在 MAIN 明确支持时保留
+hosted fetch，否则使用 local tool；`inline` 要求 MAIN 具备该 capability，不满足时失败关闭。
+Local tool 经过 permission gate，不发送 Provider proxy/cookie/auth state，拒绝 private/local
+destination，并将返回文本标记为不可信网页内容。不运行 JavaScript，也不会自动抓取所有
+search result。见 [ADR 0121](adr/0121-local-safe-web-fetch.md)。
+
 ### 可选 xAI 方言
 
 xAI 现在是可选 Responses 方言，而不是应用默认项：
