@@ -9,17 +9,13 @@ from typing import Protocol
 from urllib.parse import urlsplit
 
 from neuro_code.application.ports.http import HttpClientPolicy
+from neuro_code.application.ports.provider_services import (
+    SUPPORTED_DIALECTS,
+    SUPPORTED_PROTOCOLS,
+    ModelCatalogStrategy,
+)
 from neuro_code.shared.errors import ConfigurationError, ProviderError
 
-_SUPPORTED_PROTOCOLS = frozenset(
-    {
-        "openai-chat",
-        "openai-responses",
-        "anthropic-messages",
-        "gemini-generate-content",
-    }
-)
-_SUPPORTED_DIALECTS = frozenset({"standard", "xai", "deepseek-v4"})
 _MAX_URL_CHARACTERS = 2_048
 _MAX_API_KEY_CHARACTERS = 16_384
 _MAX_MODELS = 200
@@ -36,11 +32,13 @@ class ProviderConnectionSpec:
     base_url: str
     api_key: str = field(repr=False)
     dialect: str = "standard"
+    service_id: str | None = None
+    catalog_strategy: str | ModelCatalogStrategy | None = None
 
     def __post_init__(self) -> None:
-        if self.protocol not in _SUPPORTED_PROTOCOLS:
+        if self.protocol not in SUPPORTED_PROTOCOLS:
             raise ConfigurationError(f"unsupported provider protocol: {self.protocol}")
-        if self.dialect not in _SUPPORTED_DIALECTS:
+        if self.dialect not in SUPPORTED_DIALECTS:
             raise ConfigurationError(f"unsupported provider dialect: {self.dialect}")
         if self.dialect == "xai" and self.protocol != "openai-responses":
             raise ConfigurationError("xAI dialect requires protocol 'openai-responses'")
@@ -68,8 +66,14 @@ class ProviderConnectionSpec:
             raise ConfigurationError("provider connection test requires an API key")
         if len(api_key) > _MAX_API_KEY_CHARACTERS:
             raise ConfigurationError("provider API key is too long")
+        if self.service_id is not None and not self.service_id.strip():
+            raise ConfigurationError("provider service_id must not be empty")
+        if self.catalog_strategy is not None and not str(self.catalog_strategy).strip():
+            raise ConfigurationError("provider catalog strategy must not be empty")
         object.__setattr__(self, "base_url", base_url.rstrip("/"))
         object.__setattr__(self, "api_key", api_key)
+        if isinstance(self.catalog_strategy, ModelCatalogStrategy):
+            object.__setattr__(self, "catalog_strategy", self.catalog_strategy.value)
 
 
 @dataclass(frozen=True, slots=True)
@@ -129,6 +133,8 @@ class ProviderCatalog(Protocol):
 
 
 __all__ = [
+    "SUPPORTED_DIALECTS",
+    "SUPPORTED_PROTOCOLS",
     "ProviderCatalog",
     "ProviderCatalogError",
     "ProviderCatalogResult",

@@ -7,7 +7,7 @@ import httpx
 
 from neuro_code.application.ports.model import ModelToolPolicy
 from neuro_code.domain.conversation.context import ModelContext
-from neuro_code.domain.conversation.events import ModelCompleted
+from neuro_code.domain.conversation.events import ModelCompleted, ModelTextDelta
 from neuro_code.domain.conversation.messages import (
     ContextItemKind,
     Message,
@@ -16,6 +16,7 @@ from neuro_code.domain.conversation.messages import (
 )
 from neuro_code.domain.tools import ToolDefinition
 from neuro_code.infrastructure.providers.openai_responses import OpenAIResponsesProvider
+from neuro_code.shared.errors import ConfigurationError
 
 
 def _reasoning() -> PreservedContextItem:
@@ -50,6 +51,139 @@ class OpenAIResponsesProviderTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("include", body)
         self.assertFalse(body["store"])
         self.assertTrue(body["stream"])
+
+    def test_standard_hosted_search_requires_the_explicit_builtin_tool(self) -> None:
+        provider = OpenAIResponsesProvider(
+            model="response-model",
+            base_url="https://api.openai.com/v1",
+            api_key="fixture",
+            provider_name="openai",
+            builtin_tools=("web_search",),
+            builtin_tool_options={
+                "web_search": {"filters": {"allowed_domains": ["docs.openai.com"]}}
+            },
+            tool_choice="required",
+        )
+
+        body = provider._request_body(
+            ModelContext((Message(Role.USER, "current docs"),)),
+            (),
+        )
+
+        self.assertEqual(
+            body["tools"],
+            [
+                {
+                    "type": "web_search",
+                    "filters": {"allowed_domains": ["docs.openai.com"]},
+                }
+            ],
+        )
+        self.assertEqual(body["include"], ["web_search_call.action.sources"])
+        self.assertEqual(body["tool_choice"], "required")
+        inline_provider = OpenAIResponsesProvider(
+            model="response-model",
+            base_url="https://api.openai.com/v1",
+            api_key="fixture",
+            provider_name="openai-inline",
+            builtin_tools=("web_search",),
+        )
+        inline_body = inline_provider._request_body(
+            ModelContext((Message(Role.USER, "current docs"),)),
+            (),
+        )
+        self.assertNotIn("tool_choice", inline_body)
+        with self.assertRaisesRegex(ConfigurationError, "unsupported OpenAI Responses"):
+            OpenAIResponsesProvider(
+                model="response-model",
+                base_url="https://api.openai.com/v1",
+                api_key="fixture",
+                builtin_tools=("x_search",),
+            )
+
+    async def test_hosted_search_keeps_structured_sources_visible_in_assistant_text(self) -> None:
+        body = "\n\n".join(
+            (
+                "data: "
+                + json.dumps(
+                    {
+                        "type": "response.completed",
+                        "response": {
+                            "status": "completed",
+                            "citations": ["https://docs.x.ai/developers/tools/citations"],
+                            "output": [
+                                {
+                                    "type": "web_search_call",
+                                    "id": "search-1",
+                                    "status": "completed",
+                                    "action": {
+                                        "sources": [
+                                            {
+                                                "title": "OpenAI guide",
+                                                "url": "https://platform.openai.com/docs/quickstart",
+                                            }
+                                        ]
+                                    },
+                                },
+                                {
+                                    "type": "message",
+                                    "role": "assistant",
+                                    "content": [
+                                        {
+                                            "type": "output_text",
+                                            "text": "The guide is authoritative.",
+                                            "annotations": [
+                                                {
+                                                    "type": "url_citation",
+                                                    "url_citation": {
+                                                        "title": "OpenAI guide",
+                                                        "url": "https://platform.openai.com/docs/quickstart",
+                                                        "start_index": 4,
+                                                        "end_index": 9,
+                                                    },
+                                                }
+                                            ],
+                                        }
+                                    ],
+                                },
+                            ],
+                        },
+                    }
+                ),
+                "data: [DONE]",
+                "",
+            )
+        )
+        provider = OpenAIResponsesProvider(
+            model="response-model",
+            base_url="http://127.0.0.1:15721/provider/v1",
+            api_key="fixture",
+            provider_name="openai-search",
+            builtin_tools=("web_search",),
+            tool_choice="required",
+            transport=httpx.MockTransport(lambda request: httpx.Response(200, text=body)),
+        )
+
+        events = [
+            event
+            async for event in provider.stream(
+                ModelContext((Message(Role.USER, "official docs"),)),
+                (),
+            )
+        ]
+
+        completed = events[-1]
+        assert isinstance(completed, ModelCompleted)
+        self.assertIn("Sources:", completed.response_text)
+        self.assertIn("https://platform.openai.com/docs/quickstart", completed.response_text)
+        self.assertIn("https://docs.x.ai/developers/tools/citations", completed.response_text)
+        self.assertTrue(
+            any(
+                isinstance(event, ModelTextDelta)
+                and "https://platform.openai.com/docs/quickstart" in event.text
+                for event in events
+            )
+        )
 
     def test_opaque_context_requires_an_exact_profile_affinity(self) -> None:
         provider = OpenAIResponsesProvider(

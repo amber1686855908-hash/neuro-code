@@ -16,6 +16,14 @@ from typing import Any
 from urllib.parse import unquote, urlsplit, urlunsplit
 
 from neuro_code.application.ports.http import HttpClientPolicy
+from neuro_code.application.ports.model import CapabilityResolution, ModelCapabilitySet
+from neuro_code.application.ports.provider_services import (
+    DEFAULT_PROVIDER_SERVICE_CATALOG,
+    SUPPORTED_DIALECTS,
+    SUPPORTED_PROTOCOLS,
+)
+from neuro_code.application.ports.routing import ModelRoute, RuntimeRole
+from neuro_code.application.ports.web_search import WebSearchMode
 from neuro_code.configuration.managed_provider_settings import (
     load_managed_provider_settings as _load_managed_provider_settings,
 )
@@ -23,15 +31,6 @@ from neuro_code.configuration.provider_dialects import resolve_legacy_dialect
 from neuro_code.domain.sandbox.models import SandboxProfile
 from neuro_code.shared.errors import ConfigurationError
 
-SUPPORTED_PROTOCOLS = frozenset(
-    {
-        "openai-chat",
-        "openai-responses",
-        "anthropic-messages",
-        "gemini-generate-content",
-    }
-)
-SUPPORTED_DIALECTS = frozenset({"standard", "xai", "deepseek-v4"})
 SUPPORTED_AUTH = frozenset({"env", "stored", "proxy-managed", "unsupported-inline"})
 SUPPORTED_NATIVE_CONTEXT = frozenset({"disabled", "profile"})
 SUPPORTED_PROXY_MODES = frozenset({"environment", "direct", "explicit"})
@@ -57,6 +56,12 @@ _LEGACY_KINDS: dict[str, tuple[str, str]] = {
     "anthropic": ("anthropic-messages", "standard"),
     "gemini": ("gemini-generate-content", "standard"),
 }
+_LEGACY_SERVICE_IDS = {
+    "openai-compatible": "generic-openai-compatible",
+    "xai-responses": "xai",
+    "anthropic": "anthropic",
+    "gemini": "google-ai-studio",
+}
 _LEGACY_DEFAULTS: dict[str, tuple[str, str, str]] = {
     "openai-compatible": ("https://api.x.ai/v1", "XAI_API_KEY", ""),
     "xai-responses": ("https://api.x.ai/v1", "XAI_API_KEY", ""),
@@ -73,6 +78,9 @@ _CC_SWITCH_BACKENDS = {
     "messages": "anthropic-messages",
 }
 _XAI_BUILTIN_TOOLS = frozenset({"web_search", "x_search", "code_interpreter"})
+_OPENAI_RESPONSES_BUILTIN_TOOLS = frozenset({"web_search"})
+_ANTHROPIC_BUILTIN_TOOLS = frozenset({"web_search", "web_fetch"})
+_GEMINI_INTERACTIONS_BUILTIN_TOOLS = frozenset({"google_search", "url_context"})
 _PROXY_ENVIRONMENT_VARIABLES = frozenset({"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"})
 _HTTP_PROXY_SCHEMES = frozenset({"http", "https"})
 _SOCKS_PROXY_SCHEMES = frozenset({"socks5", "socks5h"})
@@ -229,12 +237,17 @@ class ProviderProfile:
     model: str
     base_url: str
     dialect: str = "standard"
+    service_id: str | None = None
     auth: str = "env"
     api_key_env: str | None = None
     timeout_seconds: float = 120.0
     context_window_tokens: int | None = None
     max_output_tokens: int = 8192
     builtin_tools: tuple[str, ...] = ()
+    capability_overrides: ModelCapabilitySet = field(
+        default_factory=ModelCapabilitySet.all_unknown,
+        repr=False,
+    )
     native_context: str = "disabled"
     proxy_mode: str = "environment"
     proxy_url_env: str | None = None
@@ -253,6 +266,10 @@ class ProviderProfile:
             raise ConfigurationError("xAI dialect requires protocol 'openai-responses'")
         if self.dialect == "deepseek-v4" and self.protocol != "openai-chat":
             raise ConfigurationError("DeepSeek V4 dialect requires protocol 'openai-chat'")
+        if self.service_id is not None and not self.service_id.strip():
+            raise ConfigurationError("provider service_id must not be empty")
+        if not isinstance(self.capability_overrides, ModelCapabilitySet):
+            raise ConfigurationError("provider capability overrides must be canonical")
         if not self.model:
             raise ConfigurationError(f"provider profile {self.name!r} requires an explicit model")
         if not self.base_url:
@@ -288,11 +305,27 @@ class ProviderProfile:
             raise ConfigurationError("provider proxy_url_env requires proxy_mode 'explicit'")
         if len(set(self.builtin_tools)) != len(self.builtin_tools):
             raise ConfigurationError("provider builtin_tools must not contain duplicates")
-        unsupported = sorted(set(self.builtin_tools) - _XAI_BUILTIN_TOOLS)
-        if unsupported:
-            names = ", ".join(repr(name) for name in unsupported)
-            raise ConfigurationError(f"unsupported xAI builtin_tools: {names}")
-        if self.builtin_tools and self.dialect != "xai":
+        if self.dialect == "xai":
+            unsupported = sorted(set(self.builtin_tools) - _XAI_BUILTIN_TOOLS)
+            if unsupported:
+                names = ", ".join(repr(name) for name in unsupported)
+                raise ConfigurationError(f"unsupported xAI builtin_tools: {names}")
+        elif self.protocol == "openai-responses":
+            unsupported = sorted(set(self.builtin_tools) - _OPENAI_RESPONSES_BUILTIN_TOOLS)
+            if unsupported:
+                names = ", ".join(repr(name) for name in unsupported)
+                raise ConfigurationError(f"unsupported OpenAI Responses builtin_tools: {names}")
+        elif self.protocol == "anthropic-messages":
+            unsupported = sorted(set(self.builtin_tools) - _ANTHROPIC_BUILTIN_TOOLS)
+            if unsupported:
+                names = ", ".join(repr(name) for name in unsupported)
+                raise ConfigurationError(f"unsupported Anthropic builtin_tools: {names}")
+        elif self.protocol == "gemini-interactions":
+            unsupported = sorted(set(self.builtin_tools) - _GEMINI_INTERACTIONS_BUILTIN_TOOLS)
+            if unsupported:
+                names = ", ".join(repr(name) for name in unsupported)
+                raise ConfigurationError(f"unsupported Gemini Interactions builtin_tools: {names}")
+        elif self.builtin_tools:
             raise ConfigurationError("provider builtin_tools require dialect 'xai'")
 
     @property
@@ -307,6 +340,41 @@ class ProviderProfile:
             (self.name, self.protocol, self.dialect, _canonical_url(self.base_url), self.model)
         )
         return f"profile-v1:{hashlib.sha256(identity.encode()).hexdigest()}"
+
+    def upstream_capabilities(self) -> ModelCapabilitySet:
+        """Resolve only service, protocol, and model capability facts."""
+
+        return DEFAULT_PROVIDER_SERVICE_CATALOG.upstream_capabilities_for_profile(
+            service_id=self.service_id,
+            protocol=self.protocol,
+            dialect=self.dialect,
+            base_url=self.base_url,
+            model=self.model,
+        )
+
+    def capability_resolution(
+        self,
+        implementation: ModelCapabilitySet | None = None,
+    ) -> CapabilityResolution:
+        """Resolve trusted adapter evidence for this profile."""
+
+        return DEFAULT_PROVIDER_SERVICE_CATALOG.capability_resolution_for_profile(
+            service_id=self.service_id,
+            protocol=self.protocol,
+            dialect=self.dialect,
+            base_url=self.base_url,
+            model=self.model,
+            implementation=implementation,
+            configuration=self.capability_overrides,
+        )
+
+    def effective_capabilities(
+        self,
+        implementation: ModelCapabilitySet | None = None,
+    ) -> ModelCapabilitySet:
+        """Return executable capabilities, failing closed without adapter evidence."""
+
+        return self.capability_resolution(implementation).effective
 
     @property
     def kind(self) -> str:
@@ -364,10 +432,12 @@ class ProviderProfile:
             if self.proxy_mode == "environment"
             else False
         )
+        capability_resolution = self.capability_resolution()
         return {
             "name": self.name,
             "protocol": self.protocol,
             "dialect": self.dialect,
+            "service_id": self.service_id,
             "kind": self.kind,
             "model": self.model,
             "base_url": self.base_url,
@@ -378,6 +448,8 @@ class ProviderProfile:
             "context_window_tokens": self.context_window_tokens,
             "max_output_tokens": self.max_output_tokens,
             "builtin_tools": list(self.builtin_tools),
+            "capabilities": capability_resolution.effective.to_mapping(),
+            "capability_provenance": capability_resolution.to_mapping(),
             "native_context": self.native_context,
             "proxy_mode": self.proxy_mode,
             "proxy_url_env": self.proxy_url_env,
@@ -399,6 +471,8 @@ class AppConfig:
     sandbox_profile_source: str = "default"
     fallback_providers: tuple[str, ...] = ()
     loaded_files: tuple[Path, ...] = ()
+    routes: Mapping[RuntimeRole, ModelRoute] = field(default_factory=dict)
+    web_search_mode: WebSearchMode = WebSearchMode.AUTO
 
     def __post_init__(self) -> None:
         try:
@@ -407,6 +481,17 @@ class AppConfig:
         except (AttributeError, OSError, RuntimeError) as error:
             raise ConfigurationError("application filesystem paths must be resolvable") from error
         object.__setattr__(self, "providers", MappingProxyType(dict(self.providers)))
+        normalized_routes = dict(self.routes)
+        if any(not isinstance(role, RuntimeRole) for role in normalized_routes):
+            raise ConfigurationError("application routes must use canonical runtime roles")
+        if any(
+            not isinstance(route, ModelRoute) or route.role is not role
+            for role, route in normalized_routes.items()
+        ):
+            raise ConfigurationError("application routes must contain matching canonical routes")
+        object.__setattr__(self, "routes", MappingProxyType(normalized_routes))
+        if not isinstance(self.web_search_mode, WebSearchMode):
+            raise ConfigurationError("application web_search_mode must be canonical")
 
     @property
     def provider(self) -> ProviderProfile:
@@ -421,6 +506,30 @@ class AppConfig:
             raise ConfigurationError(
                 f"selected provider profile does not exist: {self.selected_provider}"
             ) from error
+
+    @property
+    def main_route(self) -> ModelRoute:
+        """Return the canonical MAIN route, projecting legacy routing fields."""
+
+        explicit = self.routes.get(RuntimeRole.MAIN)
+        if explicit is not None:
+            return explicit
+        provider = self.provider
+        return ModelRoute(
+            RuntimeRole.MAIN,
+            provider.name,
+            provider.model,
+            tuple(name for name in self.fallback_providers if name != provider.name),
+        )
+
+    @property
+    def web_search_route(self) -> ModelRoute | None:
+        return self.routes.get(RuntimeRole.WEB_SEARCH)
+
+    def route(self, role: RuntimeRole) -> ModelRoute | None:
+        if role is RuntimeRole.MAIN:
+            return self.main_route
+        return self.web_search_route
 
     @property
     def protected_environment_variables(self) -> frozenset[str]:
@@ -460,11 +569,13 @@ class AppConfig:
                 "default": self.default_provider,
                 "selected": self.selected_provider,
                 "fallbacks": list(self.fallback_providers),
+                "routes": {role.value: route.to_dict() for role, route in self.routes.items()},
             },
             "sandbox": {
                 "profile": self.sandbox_profile.value,
                 "source": self.sandbox_profile_source,
             },
+            "web_search": {"mode": self.web_search_mode.value},
             "provider": selected,
             "providers": profiles,
             "loaded_files": [str(path) for path in self.loaded_files],
@@ -519,6 +630,35 @@ def _string_array(value: object, *, name: str) -> tuple[str, ...]:
     if any(not isinstance(item, str) or not item for item in value):
         raise ConfigurationError(f"provider {name} entries must be non-empty strings")
     return tuple(value)
+
+
+def _capability_overrides(value: object) -> ModelCapabilitySet:
+    if value is None:
+        return ModelCapabilitySet.all_unknown()
+    if not isinstance(value, Mapping):
+        raise ConfigurationError("provider capabilities must be a TOML table")
+    if any(
+        not isinstance(name, str) or not isinstance(status, str) for name, status in value.items()
+    ):
+        raise ConfigurationError("provider capabilities must map names to statuses")
+    try:
+        return ModelCapabilitySet.from_mapping(value)
+    except (TypeError, ValueError) as error:
+        raise ConfigurationError("provider capabilities contain an unsupported value") from error
+
+
+def _web_search_mode_from_data(data: Mapping[str, object]) -> WebSearchMode:
+    raw = data.get("web_search")
+    if raw is None:
+        return WebSearchMode.AUTO
+    if not isinstance(raw, Mapping):
+        raise ConfigurationError("[web_search] must be a TOML table")
+    mode = _string(raw.get("mode"), WebSearchMode.AUTO.value)
+    try:
+        return WebSearchMode(mode)
+    except ValueError as error:
+        values = ", ".join(item.value for item in WebSearchMode)
+        raise ConfigurationError(f"web_search mode must be one of: {values}") from error
 
 
 def _sandbox_profile_from_data(data: Mapping[str, object]) -> SandboxProfile | None:
@@ -594,17 +734,19 @@ def _native_profile(
     api_key_env = _string(raw.get("api_key_env"), default_env) or None
     native_context = _string(
         raw.get("native_context"),
-        "profile" if dialect == "xai" else "disabled",
+        "profile" if dialect == "xai" or protocol == "gemini-interactions" else "disabled",
     )
     unavailable_reason = (
         f"managed provider profile {name!r} is missing its stored API key"
         if auth == "stored" and stored_api_key is None
         else None
     )
+    configured_service = _string(raw.get("service_id"), _string(raw.get("service")))
     return ProviderProfile(
         name=name,
         protocol=protocol,
         dialect=dialect,
+        service_id=configured_service or _LEGACY_SERVICE_IDS.get(legacy_kind),
         model=model,
         base_url=base_url,
         auth=auth,
@@ -623,6 +765,7 @@ def _native_profile(
             raw.get("max_output_tokens"), name="max_output_tokens", default=8192
         ),
         builtin_tools=_string_array(raw.get("builtin_tools"), name="builtin_tools"),
+        capability_overrides=_capability_overrides(raw.get("capabilities")),
         native_context=native_context,
         proxy_mode=_string(raw.get("proxy_mode"), "environment"),
         proxy_url_env=_string(raw.get("proxy_url_env")) or None,
@@ -766,6 +909,57 @@ def _profiles_from_data(
     return profiles, cc_default
 
 
+def _role_route_from_data(
+    role: RuntimeRole,
+    raw: object,
+    providers: Mapping[str, ProviderProfile],
+) -> ModelRoute:
+    if not isinstance(raw, Mapping):
+        raise ConfigurationError(f"[routing.{role.value}] must be a TOML table")
+    profile_name = _string(raw.get("profile"), _string(raw.get("provider")))
+    if not profile_name:
+        raise ConfigurationError(f"[routing.{role.value}] requires profile")
+    profile = providers.get(profile_name)
+    if profile is None:
+        raise ConfigurationError(
+            f"{role.value} route provider profile does not exist: {profile_name}"
+        )
+    raw_fallbacks = raw.get("fallbacks", [])
+    if not isinstance(raw_fallbacks, list):
+        raise ConfigurationError(f"routing.{role.value} fallbacks must be a TOML array")
+    if any(not isinstance(name, str) or not name.strip() for name in raw_fallbacks):
+        raise ConfigurationError(f"routing.{role.value} fallback entries must be non-empty strings")
+    fallback_profiles = tuple(raw_fallbacks)
+    if len(set(fallback_profiles)) != len(fallback_profiles):
+        raise ConfigurationError(f"routing.{role.value} fallbacks must not contain duplicates")
+    missing = [name for name in fallback_profiles if name not in providers]
+    if missing:
+        names = ", ".join(repr(name) for name in missing)
+        raise ConfigurationError(f"routing.{role.value} fallback profiles do not exist: {names}")
+    if "execution_path" in raw:
+        raise ConfigurationError(
+            f"routing.{role.value} execution_path is not part of the generic route contract"
+        )
+    return ModelRoute(
+        role=role,
+        provider_profile=profile_name,
+        model=_string(raw.get("model"), profile.model),
+        fallback_profiles=fallback_profiles,
+    )
+
+
+def _routes_from_data(
+    routing: Mapping[str, object],
+    providers: Mapping[str, ProviderProfile],
+) -> dict[RuntimeRole, ModelRoute]:
+    routes: dict[RuntimeRole, ModelRoute] = {}
+    for role in RuntimeRole:
+        raw = routing.get(role.value)
+        if raw is not None:
+            routes[role] = _role_route_from_data(role, raw, providers)
+    return routes
+
+
 def load_config(
     cwd: Path | None = None,
     *,
@@ -832,10 +1026,14 @@ def load_config(
             managed_provider: dict[str, object] = {
                 "protocol": managed_profile.protocol,
                 "dialect": managed_profile.dialect,
+                "service_id": managed_profile.service_id,
                 "model": managed_profile.model,
                 "base_url": managed_profile.base_url,
                 "auth": "stored",
                 "proxy_mode": proxy_policy.mode,
+                "capabilities": managed_profile.capability_overrides.to_mapping(
+                    include_unknown=False
+                ),
             }
             if managed_profile.context_window_tokens is not None:
                 managed_provider["context_window_tokens"] = managed_profile.context_window_tokens
@@ -912,6 +1110,9 @@ def load_config(
                 base_url=(base_url_override or profile.base_url).rstrip("/"),
             )
 
+    routes = _routes_from_data(routing, providers)
+    web_search_mode = _web_search_mode_from_data(data)
+
     return AppConfig(
         cwd=resolved_cwd,
         state_dir=state_dir,
@@ -922,6 +1123,8 @@ def load_config(
         sandbox_profile_source=sandbox_profile_source,
         fallback_providers=fallback_providers,
         loaded_files=tuple(loaded_files),
+        routes=routes,
+        web_search_mode=web_search_mode,
     )
 
 

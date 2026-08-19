@@ -4,7 +4,12 @@ import asyncio
 import unittest
 from collections.abc import AsyncIterator, Sequence
 
-from neuro_code.application.ports.model import ModelToolPolicy
+from neuro_code.application.ports.model import (
+    CapabilityStatus,
+    ModelCapability,
+    ModelCapabilitySet,
+    ModelToolPolicy,
+)
 from neuro_code.domain.conversation.context import ModelContext
 from neuro_code.domain.conversation.events import (
     ModelCompleted,
@@ -31,6 +36,7 @@ class ScriptedModelProvider:
         self._scripts = [tuple(script) for script in scripts]
         self.calls = 0
         self.tool_policies: list[ModelToolPolicy] = []
+        self.capabilities = ModelCapabilitySet.all_unknown()
 
     async def stream(
         self,
@@ -49,17 +55,118 @@ class ScriptedModelProvider:
             yield item
 
 
-def _candidate(provider: ScriptedModelProvider) -> ProviderCandidate:
+def _candidate(
+    provider: ScriptedModelProvider,
+    capabilities: ModelCapabilitySet | None = None,
+) -> ProviderCandidate:
+    resolved_capabilities = capabilities or ModelCapabilitySet.all_unknown()
+    provider.capabilities = resolved_capabilities
     return ProviderCandidate(
         provider.provider_name,
         provider.model_name,
         provider.context_affinity,
         lambda: provider,
         context_window_tokens=128_000,
+        capabilities=resolved_capabilities,
     )
 
 
 class FailoverModelProviderTests(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def _hosted_capability(status: CapabilityStatus) -> ModelCapabilitySet:
+        return ModelCapabilitySet.from_mapping({ModelCapability.HOSTED_WEB_SEARCH: status})
+
+    async def test_pre_request_capability_is_intersection_when_fallback_is_unsupported(
+        self,
+    ) -> None:
+        primary = ScriptedModelProvider(
+            "primary",
+            ((ModelTextDelta("ok"), ModelCompleted("stop")),),
+        )
+        fallback = ScriptedModelProvider(
+            "fallback",
+            ((ModelTextDelta("fallback"), ModelCompleted("stop")),),
+        )
+        router = FailoverModelProvider(
+            (
+                _candidate(primary, self._hosted_capability(CapabilityStatus.SUPPORTED)),
+                _candidate(fallback, self._hosted_capability(CapabilityStatus.UNSUPPORTED)),
+            )
+        )
+
+        self.assertEqual(
+            router.capabilities.status(ModelCapability.HOSTED_WEB_SEARCH),
+            CapabilityStatus.UNSUPPORTED,
+        )
+        _ = [
+            event
+            async for event in router.stream(
+                ModelContext((Message(Role.USER, "hello"),)),
+                (),
+            )
+        ]
+        self.assertEqual(
+            router.capabilities.status(ModelCapability.HOSTED_WEB_SEARCH),
+            CapabilityStatus.SUPPORTED,
+        )
+
+    async def test_pre_request_capability_is_unknown_when_fallback_is_unknown(self) -> None:
+        primary = ScriptedModelProvider(
+            "primary",
+            ((ModelTextDelta("ok"), ModelCompleted("stop")),),
+        )
+        fallback = ScriptedModelProvider(
+            "fallback",
+            ((ModelTextDelta("fallback"), ModelCompleted("stop")),),
+        )
+        router = FailoverModelProvider(
+            (
+                _candidate(primary, self._hosted_capability(CapabilityStatus.SUPPORTED)),
+                _candidate(fallback),
+            )
+        )
+
+        self.assertEqual(
+            router.capabilities.status(ModelCapability.HOSTED_WEB_SEARCH),
+            CapabilityStatus.UNKNOWN,
+        )
+        _ = [
+            event
+            async for event in router.stream(
+                ModelContext((Message(Role.USER, "hello"),)),
+                (),
+            )
+        ]
+        self.assertEqual(
+            router.capabilities.status(ModelCapability.HOSTED_WEB_SEARCH),
+            CapabilityStatus.SUPPORTED,
+        )
+
+    async def test_all_candidates_support_capability_before_active_selection(self) -> None:
+        primary = ScriptedModelProvider(
+            "primary",
+            ((ProviderError("offline"),),),
+        )
+        fallback = ScriptedModelProvider(
+            "fallback",
+            ((ModelTextDelta("fallback"), ModelCompleted("stop")),),
+        )
+        supported = self._hosted_capability(CapabilityStatus.SUPPORTED)
+        router = FailoverModelProvider(
+            (_candidate(primary, supported), _candidate(fallback, supported))
+        )
+
+        self.assertTrue(router.capabilities.supports(ModelCapability.HOSTED_WEB_SEARCH))
+        _ = [
+            event
+            async for event in router.stream(
+                ModelContext((Message(Role.USER, "hello"),)),
+                (),
+            )
+        ]
+        self.assertEqual(router.provider_name, "fallback")
+        self.assertTrue(router.capabilities.supports(ModelCapability.HOSTED_WEB_SEARCH))
+
     async def test_failure_before_output_selects_the_next_provider(self) -> None:
         primary = ScriptedModelProvider(
             "primary",

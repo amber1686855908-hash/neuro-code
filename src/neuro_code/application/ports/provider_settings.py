@@ -9,6 +9,8 @@ from dataclasses import dataclass, field
 from typing import Protocol
 from urllib.parse import urlsplit
 
+from neuro_code.application.ports.model import ModelCapabilitySet
+from neuro_code.application.ports.provider_services import SUPPORTED_PROTOCOLS
 from neuro_code.domain.background_tasks.models import BackgroundTaskWakePolicy
 from neuro_code.shared.errors import ConfigurationError
 
@@ -18,14 +20,6 @@ _MAX_MODEL_CHARACTERS = 512
 _MAX_URL_CHARACTERS = 2_048
 _MAX_API_KEY_CHARACTERS = 16_384
 _ENVIRONMENT_VARIABLE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
-_SUPPORTED_PROTOCOLS = frozenset(
-    {
-        "openai-chat",
-        "openai-responses",
-        "anthropic-messages",
-        "gemini-generate-content",
-    }
-)
 _SUPPORTED_PROXY_MODES = frozenset({"environment", "direct", "explicit"})
 
 
@@ -68,6 +62,11 @@ class ManagedProviderProfile:
     model: str
     base_url: str
     dialect: str = "standard"
+    service_id: str | None = None
+    capability_overrides: ModelCapabilitySet = field(
+        default_factory=ModelCapabilitySet.all_unknown,
+        repr=False,
+    )
     context_window_tokens: int | None = None
     proxy_mode: str | None = None
     proxy_url_env: str | None = None
@@ -82,7 +81,7 @@ class ManagedProviderProfile:
             )
         if not self.protocol:
             raise ConfigurationError("provider protocol must not be empty")
-        if self.protocol not in _SUPPORTED_PROTOCOLS:
+        if self.protocol not in SUPPORTED_PROTOCOLS:
             raise ConfigurationError(f"unsupported provider protocol: {self.protocol}")
         if self.dialect not in {"standard", "xai", "deepseek-v4"}:
             raise ConfigurationError(f"unsupported provider dialect: {self.dialect}")
@@ -90,6 +89,10 @@ class ManagedProviderProfile:
             raise ConfigurationError("xAI dialect requires protocol 'openai-responses'")
         if self.dialect == "deepseek-v4" and self.protocol != "openai-chat":
             raise ConfigurationError("DeepSeek V4 dialect requires protocol 'openai-chat'")
+        if self.service_id is not None and not self.service_id.strip():
+            raise ConfigurationError("provider service_id must not be empty")
+        if not isinstance(self.capability_overrides, ModelCapabilitySet):
+            raise ConfigurationError("provider capability overrides must be canonical")
         if not self.model.strip():
             raise ConfigurationError("provider model must not be empty")
         if len(self.model) > _MAX_MODEL_CHARACTERS:

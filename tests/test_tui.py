@@ -29,6 +29,11 @@ from neuro_code.application.ports.provider_catalog import (
     ProviderCatalogResult,
     ProviderConnectionSpec,
 )
+from neuro_code.application.ports.provider_services import (
+    ModelCatalogStrategy,
+    ProviderServiceCatalog,
+    ProviderServiceDescriptor,
+)
 from neuro_code.application.ports.provider_settings import (
     ManagedProviderProfile,
     ManagedProviderSettings,
@@ -1215,6 +1220,38 @@ def background_snapshot(
 
 
 class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
+    def test_provider_settings_screen_consumes_an_injected_service_catalog(self) -> None:
+        service = ProviderServiceDescriptor(
+            service_id="example-cn",
+            display_name="Example CN",
+            default_protocol="openai-chat",
+            default_base_url="https://example.invalid/v1",
+            model_catalog_strategy=ModelCatalogStrategy.OPENAI_COMPATIBLE,
+        )
+        catalog = ProviderServiceCatalog((service,))
+        with tempfile.TemporaryDirectory() as directory:
+            screen = ProviderSettingsScreen(
+                language=UiLanguage.ENGLISH,
+                provider_settings=ManagedProviderSettings(),
+                provider_settings_store=JsonProviderSettingsStore(Path(directory)),
+                service_catalog=catalog,
+                first_run=True,
+            )
+
+        self.assertEqual(screen._default_service_key(), "example-cn")
+        self.assertEqual(
+            screen._preset_for_profile(
+                ManagedProviderProfile(
+                    name="example",
+                    protocol="openai-chat",
+                    model="example-model",
+                    base_url="https://example.invalid/v1",
+                ),
+                catalog,
+            ),
+            "example-cn",
+        )
+
     def test_recoverable_terminal_status_projection_is_fail_closed(self) -> None:
         self.assertEqual(
             recoverable_terminal_status({"execution_status": "stuck", "recoverable": True}),
@@ -1637,6 +1674,26 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn(TEXT_EMPHASIS.lower(), styled["Important"].lower())
             self.assertIn(TEXT_PRIMARY.lower(), styled["bold"].lower())
             self.assertIn(ACCENT_CODE.lower(), styled["code"].lower())
+
+    async def test_assistant_search_sources_keep_full_urls_visible(self) -> None:
+        app = NeuroCodeApp(
+            TuiConversation(),
+            provider_name="fixture",
+            model_name="fixture-model",
+            cwd=Path("/workspace"),
+        )
+
+        async with app.run_test(size=(100, 30)):
+            rendered = app._render_entry(
+                "assistant",
+                "Sources:\n- Official guide: https://docs.example.com/guide",
+            )
+            plain = "".join(
+                segment.text
+                for segment in app.console.render(rendered, app.console.options.update(width=80))
+            )
+
+            self.assertIn("https://docs.example.com/guide", plain)
 
     async def test_fenced_code_blocks_keep_the_custom_semantic_syntax_theme(self) -> None:
         app = NeuroCodeApp(

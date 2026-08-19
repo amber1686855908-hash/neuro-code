@@ -19,6 +19,7 @@ from neuro_code.application.ports.user_interaction import (
     InteractionEventSink,
     UserInteractionPort,
 )
+from neuro_code.application.ports.web_search import HostedWebSearchEventSink
 from neuro_code.application.ports.workspace_changes import WorkspaceChangeJournal
 from neuro_code.domain.sandbox.models import SandboxProfile
 from neuro_code.domain.tools import ToolDefinition, ToolResult
@@ -159,6 +160,7 @@ class ToolContext:
     workspace_change_journal: WorkspaceChangeJournal | None = None
     user_interaction: UserInteractionPort | None = None
     interaction_event_sink: InteractionEventSink | None = field(default=None, repr=False)
+    web_search_event_sink: HostedWebSearchEventSink | None = field(default=None, repr=False)
 
 
 class Tool(Protocol):

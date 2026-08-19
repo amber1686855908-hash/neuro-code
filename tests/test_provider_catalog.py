@@ -9,6 +9,7 @@ from neuro_code.application.ports.provider_catalog import (
     ProviderCatalogError,
     ProviderConnectionSpec,
 )
+from neuro_code.application.ports.provider_services import ModelCatalogStrategy
 from neuro_code.infrastructure.providers.provider_catalog import HttpProviderCatalog
 from neuro_code.shared.errors import ConfigurationError
 
@@ -82,6 +83,25 @@ class ProviderCatalogTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result.models, ("claude-fixture",))
 
+    async def test_explicit_catalog_strategy_overrides_protocol_default(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            self.assertEqual(str(request.url), "https://example.invalid/models")
+            self.assertEqual(request.headers["x-api-key"], "example-secret")
+            return httpx.Response(200, json={"data": [{"id": "example-model"}]})
+
+        result = await HttpProviderCatalog(transport=httpx.MockTransport(handler)).discover_models(
+            ProviderConnectionSpec(
+                protocol="anthropic-messages",
+                base_url="https://example.invalid",
+                api_key="example-secret",
+                service_id="example-cn",
+                catalog_strategy=ModelCatalogStrategy.OPENAI_COMPATIBLE,
+            ),
+            http_policy=self.policy,
+        )
+
+        self.assertEqual(result.models, ("example-model",))
+
     async def test_gemini_catalog_normalizes_names_and_filters_non_generation_models(
         self,
     ) -> None:
@@ -118,6 +138,43 @@ class ProviderCatalogTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(result.models, ("gemini-fixture",))
+
+    async def test_gemini_interactions_catalog_uses_the_same_read_only_gemini_endpoint(
+        self,
+    ) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            self.assertEqual(
+                str(request.url),
+                "https://generativelanguage.googleapis.com/v1/models",
+            )
+            self.assertEqual(request.headers["x-goog-api-key"], "gemini-secret")
+            self.assertNotIn("authorization", request.headers)
+            return httpx.Response(
+                200,
+                json={
+                    "models": [
+                        {
+                            "name": "models/gemini-interactions-fixture",
+                            "supportedGenerationMethods": ["generateContent"],
+                        },
+                        {
+                            "name": "models/embedding-fixture",
+                            "supportedGenerationMethods": ["embedContent"],
+                        },
+                    ]
+                },
+            )
+
+        result = await HttpProviderCatalog(transport=httpx.MockTransport(handler)).discover_models(
+            ProviderConnectionSpec(
+                protocol="gemini-interactions",
+                base_url="https://generativelanguage.googleapis.com/v1beta",
+                api_key="gemini-secret",
+            ),
+            http_policy=self.policy,
+        )
+
+        self.assertEqual(result.models, ("gemini-interactions-fixture",))
 
     async def test_catalog_is_truncated_to_two_hundred_models(self) -> None:
         catalog = HttpProviderCatalog(

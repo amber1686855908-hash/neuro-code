@@ -13,7 +13,12 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from neuro_code.application.ports.http import HttpClientPolicy
-from neuro_code.application.ports.model import ModelToolPolicy
+from neuro_code.application.ports.model import (
+    ModelCapability,
+    ModelCapabilitySet,
+    ModelToolPolicy,
+    resolve_capabilities,
+)
 from neuro_code.domain.conversation.context import UPSTREAM_IMPORT_PROVIDER, ModelContext
 from neuro_code.domain.conversation.events import (
     ModelCompleted,
@@ -220,6 +225,17 @@ class OpenAICompatibleProvider:
     提供流式 Chat Completions 适配器. 依赖项延迟导入,使配置检查和离线测试在可选运行时依赖未安装时仍可用.
     """
 
+    @staticmethod
+    def implementation_capabilities(*, dialect: str = "standard") -> ModelCapabilitySet:
+        """Return capabilities implemented by this Chat wire adapter."""
+
+        if dialect not in {"standard", "deepseek-v4"}:
+            raise ConfigurationError(f"unsupported OpenAI-compatible dialect: {dialect}")
+        return ModelCapabilitySet.from_supported(
+            ModelCapability.FUNCTION_TOOLS,
+            ModelCapability.VISION,
+        )
+
     def __init__(
         self,
         *,
@@ -229,6 +245,7 @@ class OpenAICompatibleProvider:
         provider_name: str = "openai-compatible",
         dialect: str = "standard",
         context_affinity: str | None = None,
+        capabilities: ModelCapabilitySet | None = None,
         timeout_seconds: float = 120.0,
         max_output_tokens: int = 8192,
         transport: Any | None = None,
@@ -242,6 +259,11 @@ class OpenAICompatibleProvider:
         self._provider_name = provider_name
         self._dialect = dialect
         self._context_affinity = context_affinity
+        upstream = capabilities or ModelCapabilitySet.all_unknown()
+        self._capabilities = resolve_capabilities(
+            upstream=upstream,
+            implementation=self.implementation_capabilities(dialect=dialect),
+        ).effective
         self._timeout_seconds = timeout_seconds
         self._max_output_tokens = max_output_tokens
         self._transport = transport
@@ -258,6 +280,10 @@ class OpenAICompatibleProvider:
     @property
     def context_affinity(self) -> str | None:
         return self._context_affinity
+
+    @property
+    def capabilities(self) -> ModelCapabilitySet:
+        return self._capabilities
 
     def _safe_detail(self, detail: str) -> str:
         return self._http_policy.redact(detail, self._api_key)

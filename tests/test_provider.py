@@ -30,6 +30,9 @@ from neuro_code.infrastructure.providers import create_provider, create_routed_p
 from neuro_code.infrastructure.providers.anthropic import AnthropicProvider
 from neuro_code.infrastructure.providers.failover import FailoverModelProvider
 from neuro_code.infrastructure.providers.gemini import GeminiProvider
+from neuro_code.infrastructure.providers.gemini_interactions import (
+    GeminiInteractionsProvider,
+)
 from neuro_code.infrastructure.providers.openai_compatible import (
     OpenAICompatibleProvider,
     _ToolCallBuffer,
@@ -934,6 +937,7 @@ class OpenAICompatibleProviderTests(unittest.IsolatedAsyncioTestCase):
             "openai-responses": OpenAIResponsesProvider,
             "anthropic-messages": AnthropicProvider,
             "gemini-generate-content": GeminiProvider,
+            "gemini-interactions": GeminiInteractionsProvider,
         }
         with mock.patch.dict("os.environ", {"TOKEN": "value"}, clear=True):
             for protocol, expected_type in expected_types.items():

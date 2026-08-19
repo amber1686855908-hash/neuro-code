@@ -37,6 +37,7 @@ from neuro_code.application.permissions.policy import (
 from neuro_code.application.ports.approval import PermissionApprover
 from neuro_code.application.ports.storage import SessionStore
 from neuro_code.application.ports.tools import Tool, ToolCollection, ToolContext
+from neuro_code.application.ports.web_search import HostedWebSearchEvent
 from neuro_code.application.ports.workspace_changes import (
     WorkspaceChangeCheckpoint,
     WorkspaceChangeObserver,
@@ -57,7 +58,7 @@ from neuro_code.domain.plans import SessionPlan
 from neuro_code.domain.tools import ToolResult
 from neuro_code.shared.async_utils import run_blocking
 from neuro_code.shared.errors import ToolError
-from neuro_code.shared.redaction import redact_sensitive_text
+from neuro_code.shared.redaction import redact_sensitive_arguments, redact_sensitive_text
 
 LOGGER = logging.getLogger(__name__)
 
@@ -330,9 +331,28 @@ class ToolExecutor:
                 )
 
         try:
+            safe_arguments = redact_sensitive_arguments(
+                call.arguments,
+                explicit_values=self._tool_context.redaction_values,
+            )
+
+            async def web_search_event_sink(event: HostedWebSearchEvent) -> AgentEvent | None:
+                await emit(
+                    AgentEventKind.BACKEND_TOOL_COMPLETED
+                    if event.completed
+                    else AgentEventKind.BACKEND_TOOL_STARTED,
+                    {
+                        "id": event.call_id,
+                        "name": event.name,
+                        "provider": event.provider_profile,
+                        "model": event.model,
+                    },
+                )
+                return None
+
             await emit(
                 AgentEventKind.TOOL_REQUESTED,
-                {"id": call.id, "name": call.name, "arguments": dict(call.arguments)},
+                {"id": call.id, "name": call.name, "arguments": safe_arguments},
             )
             tool = self._tools.get(call.name)
             if tool is None:
@@ -447,6 +467,7 @@ class ToolExecutor:
                     replace(
                         self._tool_context,
                         interaction_event_sink=interaction_event_sink,
+                        web_search_event_sink=web_search_event_sink,
                     ),
                 )
             except (ToolError, OSError, UnicodeError) as error:

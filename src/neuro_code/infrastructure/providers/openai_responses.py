@@ -5,12 +5,17 @@
 from __future__ import annotations
 
 import json
-from collections.abc import AsyncIterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from typing import Any
 from urllib.parse import urlsplit
 
 from neuro_code.application.ports.http import HttpClientPolicy
-from neuro_code.application.ports.model import ModelToolPolicy
+from neuro_code.application.ports.model import (
+    ModelCapability,
+    ModelCapabilitySet,
+    ModelToolPolicy,
+    resolve_capabilities,
+)
 from neuro_code.domain.conversation.context import UPSTREAM_IMPORT_PROVIDER, ModelContext
 from neuro_code.domain.conversation.events import (
     ModelBackendToolCompleted,
@@ -63,12 +68,129 @@ _BACKEND_EVENT_PREFIXES = {
     "response.code_interpreter_call.": "code_interpreter",
 }
 _BACKEND_START_PHASES = frozenset({"in_progress", "searching", "interpreting"})
+_MAX_VISIBLE_SOURCE_LINES = 32
+
+
+def _citation_payload(raw: Mapping[str, Any]) -> Mapping[str, Any]:
+    """Normalize current nested citations and older flat compatibility shapes."""
+
+    for key in ("url_citation", "url_citation_preview"):
+        nested = raw.get(key)
+        if isinstance(nested, Mapping):
+            return nested
+    return raw
+
+
+def _response_source_attributions(response: Mapping[str, Any]) -> tuple[tuple[str, str], ...]:
+    """Return bounded visible URLs from structured Responses search output."""
+
+    sources: list[tuple[str, str]] = []
+    seen: set[str] = set()
+
+    def add(raw: object) -> None:
+        payload: Mapping[str, Any]
+        url: object
+        if isinstance(raw, str):
+            payload = {}
+            url = raw
+        elif isinstance(raw, Mapping):
+            payload = _citation_payload(raw)
+            url = payload.get("url") or payload.get("link")
+            if not isinstance(url, str):
+                return
+        else:
+            return
+        url = url.strip()
+        try:
+            parsed = urlsplit(url)
+        except ValueError:
+            return
+        if parsed.scheme.casefold() not in {"http", "https"} or parsed.hostname is None:
+            return
+        key = url.casefold()
+        if key in seen or len(sources) >= _MAX_VISIBLE_SOURCE_LINES:
+            return
+        title = payload.get("title")
+        title_text = " ".join(title.split())[:256] if isinstance(title, str) else "Web source"
+        seen.add(key)
+        sources.append((title_text, url[:2048]))
+
+    for item in response.get("output", ()) if isinstance(response.get("output"), list) else ():
+        if not isinstance(item, Mapping):
+            continue
+        if item.get("type") == "web_search_call":
+            action = item.get("action")
+            if isinstance(action, Mapping) and isinstance(action.get("sources"), list):
+                for source in action["sources"]:
+                    add(source)
+            if isinstance(item.get("sources"), list):
+                for source in item["sources"]:
+                    add(source)
+        content = item.get("content")
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if not isinstance(part, Mapping) or not isinstance(part.get("annotations"), list):
+                continue
+            for annotation in part["annotations"]:
+                if isinstance(annotation, Mapping) and annotation.get("type") in {
+                    "url_citation",
+                    "url_citation_preview",
+                }:
+                    add(annotation)
+    for key in ("sources", "results", "citations"):
+        raw_values = response.get(key)
+        if isinstance(raw_values, list):
+            for raw_value in raw_values:
+                add(raw_value)
+    return tuple(sources)
+
+
+def _source_footer(response: Mapping[str, Any]) -> str:
+    sources = _response_source_attributions(response)
+    if not sources:
+        return ""
+    lines = ["", "Sources:"]
+    lines.extend(f"- {title}: {url}" for title, url in sources)
+    return "\n".join(lines)
 
 
 class OpenAIResponsesProvider:
     """Streaming Responses API adapter with optional dialect-specific behavior.
 
     提供带可选方言特定行为的流式 Responses API 适配器."""
+
+    @staticmethod
+    def implementation_capabilities(
+        *,
+        dialect: str = "standard",
+        builtin_tools: Sequence[str] = (),
+    ) -> ModelCapabilitySet:
+        """Return capabilities implemented by this Responses configuration."""
+
+        if dialect not in {"standard", "xai"}:
+            raise ConfigurationError(f"unsupported Responses dialect: {dialect}")
+        if isinstance(builtin_tools, (str, bytes)):
+            raise ConfigurationError("xAI builtin_tools must be a sequence of tool names")
+        normalized = tuple(builtin_tools)
+        if any(not isinstance(name, str) or not name for name in normalized):
+            raise ConfigurationError("xAI builtin_tools entries must be non-empty strings")
+        allowed = {"web_search"} if dialect == "standard" else _BUILTIN_TOOLS
+        unsupported = sorted(set(normalized) - allowed)
+        if unsupported:
+            names = ", ".join(repr(name) for name in unsupported)
+            label = "OpenAI Responses" if dialect == "standard" else "xAI"
+            raise ConfigurationError(f"unsupported {label} builtin_tools: {names}")
+        hosted = {
+            "web_search": ModelCapability.HOSTED_WEB_SEARCH,
+            "x_search": ModelCapability.HOSTED_X_SEARCH,
+            "code_interpreter": ModelCapability.HOSTED_CODE_INTERPRETER,
+        }
+        return ModelCapabilitySet.from_supported(
+            ModelCapability.FUNCTION_TOOLS,
+            ModelCapability.VISION,
+            *(hosted[name] for name in normalized),
+        )
 
     def __init__(
         self,
@@ -79,11 +201,15 @@ class OpenAIResponsesProvider:
         provider_name: str = "openai-responses",
         dialect: str = "standard",
         context_affinity: str | None = None,
+        capabilities: ModelCapabilitySet | None = None,
         timeout_seconds: float = 120.0,
         max_output_tokens: int = 8192,
         builtin_tools: Sequence[str] = (),
+        builtin_tool_options: Mapping[str, Mapping[str, Any]] | None = None,
+        tool_choice: str | Mapping[str, Any] | None = None,
         transport: Any | None = None,
         http_policy: HttpClientPolicy | None = None,
+        response_observer: Callable[[Mapping[str, Any]], None] | None = None,
     ) -> None:
         if dialect not in {"standard", "xai"}:
             raise ConfigurationError(f"unsupported Responses dialect: {dialect}")
@@ -94,23 +220,55 @@ class OpenAIResponsesProvider:
             raise ConfigurationError("xAI builtin_tools entries must be non-empty strings")
         if len(set(normalized_builtin_tools)) != len(normalized_builtin_tools):
             raise ConfigurationError("xAI builtin_tools must not contain duplicates")
-        unsupported = sorted(set(normalized_builtin_tools) - _BUILTIN_TOOLS)
+        allowed = {"web_search"} if dialect == "standard" else _BUILTIN_TOOLS
+        unsupported = sorted(set(normalized_builtin_tools) - allowed)
         if unsupported:
             names = ", ".join(repr(name) for name in unsupported)
-            raise ConfigurationError(f"unsupported xAI builtin_tools: {names}")
-        if normalized_builtin_tools and dialect != "xai":
-            raise ConfigurationError("xAI builtin_tools require dialect 'xai'")
+            label = "OpenAI Responses" if dialect == "standard" else "xAI"
+            raise ConfigurationError(f"unsupported {label} builtin_tools: {names}")
+        if builtin_tool_options is not None:
+            if not isinstance(builtin_tool_options, Mapping):
+                raise ConfigurationError("builtin_tool_options must be a mapping")
+            unknown_options = sorted(set(builtin_tool_options) - set(normalized_builtin_tools))
+            if unknown_options:
+                names = ", ".join(repr(name) for name in unknown_options)
+                raise ConfigurationError(
+                    f"builtin_tool_options contain tools that are not enabled: {names}"
+                )
+            for name, options in builtin_tool_options.items():
+                if not isinstance(name, str) or not name:
+                    raise ConfigurationError("builtin_tool_options names must be non-empty strings")
+                if not isinstance(options, Mapping):
+                    raise ConfigurationError(f"builtin_tool_options[{name!r}] must be a mapping")
+        if tool_choice is not None and (
+            (not isinstance(tool_choice, str) and not isinstance(tool_choice, Mapping))
+            or (isinstance(tool_choice, str) and not tool_choice.strip())
+        ):
+            raise ConfigurationError("tool_choice must be a non-empty string or mapping")
         self._model = model
         self._base_url = base_url.rstrip("/")
         self._api_key = api_key
         self._provider_name = provider_name
         self._dialect = dialect
         self._context_affinity = context_affinity
+        upstream = capabilities or ModelCapabilitySet.all_unknown()
+        self._capabilities = resolve_capabilities(
+            upstream=upstream,
+            implementation=self.implementation_capabilities(
+                dialect=dialect,
+                builtin_tools=normalized_builtin_tools,
+            ),
+        ).effective
         self._timeout_seconds = timeout_seconds
         self._max_output_tokens = max_output_tokens
         self._builtin_tools = normalized_builtin_tools
+        self._builtin_tool_options = {
+            name: dict(options) for name, options in (builtin_tool_options or {}).items()
+        }
+        self._tool_choice = dict(tool_choice) if isinstance(tool_choice, Mapping) else tool_choice
         self._transport = transport
         self._http_policy = http_policy or HttpClientPolicy()
+        self._response_observer = response_observer
 
     @property
     def provider_name(self) -> str:
@@ -123,6 +281,10 @@ class OpenAIResponsesProvider:
     @property
     def context_affinity(self) -> str | None:
         return self._context_affinity
+
+    @property
+    def capabilities(self) -> ModelCapabilitySet:
+        return self._capabilities
 
     def _safe_detail(self, detail: str) -> str:
         return self._http_policy.redact(detail, self._api_key)
@@ -142,10 +304,10 @@ class OpenAIResponsesProvider:
             port = endpoint.port
         except ValueError:
             return False
+        expected_hostname = "api.x.ai" if self._dialect == "xai" else "api.openai.com"
         return (
-            self._dialect == "xai"
-            and endpoint.scheme == "https"
-            and hostname == "api.x.ai"
+            endpoint.scheme == "https"
+            and hostname == expected_hostname
             and username is None
             and password is None
             and port in {None, 443}
@@ -162,8 +324,15 @@ class OpenAIResponsesProvider:
         return bool(
             context.source_context_affinity is None
             and self._is_official_target()
-            and context.source_provider in _NATIVE_SOURCE_PROVIDERS
+            and (
+                context.source_provider in _NATIVE_SOURCE_PROVIDERS
+                or context.source_provider == "openai-responses"
+            )
             and context.source_model is not None
+        ) or bool(
+            self._builtin_tools
+            and context.source_provider == self._provider_name
+            and context.source_model == self._model
         )
 
     @staticmethod
@@ -339,7 +508,13 @@ class OpenAIResponsesProvider:
         if includes:
             body["include"] = includes
         if tool_policy is ModelToolPolicy.ALLOWED:
-            request_tools: list[dict[str, Any]] = [{"type": name} for name in self._builtin_tools]
+            request_tools: list[dict[str, Any]] = []
+            for name in self._builtin_tools:
+                tool: dict[str, Any] = {"type": name}
+                options = self._builtin_tool_options.get(name)
+                if options:
+                    tool.update(options)
+                request_tools.append(tool)
             builtin_names = set(self._builtin_tools)
             request_tools.extend(
                 [
@@ -355,6 +530,12 @@ class OpenAIResponsesProvider:
             )
             if request_tools:
                 body["tools"] = request_tools
+                if self._tool_choice is not None:
+                    body["tool_choice"] = (
+                        dict(self._tool_choice)
+                        if isinstance(self._tool_choice, Mapping)
+                        else self._tool_choice
+                    )
         return body
 
     @staticmethod
@@ -435,7 +616,11 @@ class OpenAIResponsesProvider:
         self,
         response: Mapping[str, Any],
     ) -> tuple[PreservedContextItem, ...]:
-        if self._context_affinity is None and not self._is_official_target():
+        if (
+            self._context_affinity is None
+            and not self._is_official_target()
+            and not self._builtin_tools
+        ):
             return ()
         preserved: list[PreservedContextItem] = []
         for item in self._response_output(response):
@@ -661,6 +846,7 @@ class OpenAIResponsesProvider:
         headers = {"Authorization": f"Bearer {self._api_key}"}
         terminal: Mapping[str, Any] | None = None
         streamed_text = False
+        streamed_text_parts: list[str] = []
         streamed_reasoning = False
         reasoning_parts: list[str] = []
         started_backend_calls: set[tuple[str, str]] = set()
@@ -710,6 +896,7 @@ class OpenAIResponsesProvider:
                         delta = event.get("delta")
                         if isinstance(delta, str) and delta:
                             streamed_text = True
+                            streamed_text_parts.append(delta)
                             yield ModelTextDelta(delta)
                     elif event_type in {
                         "response.reasoning_summary_text.delta",
@@ -740,6 +927,13 @@ class OpenAIResponsesProvider:
             raise ProviderError("Responses API stream ended without a terminal response")
         if not isinstance(terminal.get("output"), list):
             raise ProviderError("Responses API terminal response omitted its output items")
+        if self._response_observer is not None:
+            try:
+                self._response_observer(terminal)
+            except Exception as error:
+                raise ProviderError(
+                    f"Responses API response observer failed: {type(error).__name__}"
+                ) from error
         for item in self._response_output(terminal):
             identity = self._backend_output_identity(item)
             if identity is None:
@@ -757,10 +951,16 @@ class OpenAIResponsesProvider:
             reasoning = self._response_reasoning(terminal)
             if reasoning:
                 yield ModelReasoningDelta(reasoning)
-        if not streamed_text:
-            text = self._response_text(terminal)
-            if text:
-                yield ModelTextDelta(text)
+        final_response_text = self._response_text(terminal) or "".join(streamed_text_parts)
+        source_footer = _source_footer(terminal) if "web_search" in self._builtin_tools else ""
+        if source_footer:
+            if streamed_text:
+                yield ModelTextDelta(source_footer)
+            else:
+                yield ModelTextDelta(final_response_text + source_footer)
+            final_response_text += source_footer
+        elif not streamed_text and final_response_text:
+            yield ModelTextDelta(final_response_text)
         tool_calls = self._response_tool_calls(terminal)
         for call in tool_calls:
             yield ModelToolCall(call)
@@ -774,7 +974,7 @@ class OpenAIResponsesProvider:
         yield ModelCompleted(
             self._stop_reason(terminal, tool_calls),
             context_items=context_items,
-            response_text=self._response_text(terminal),
+            response_text=final_response_text,
             usage=usage,
         )
 

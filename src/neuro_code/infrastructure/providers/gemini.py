@@ -10,7 +10,12 @@ from typing import Any, cast
 from urllib.parse import quote
 
 from neuro_code.application.ports.http import HttpClientPolicy
-from neuro_code.application.ports.model import ModelToolPolicy
+from neuro_code.application.ports.model import (
+    ModelCapability,
+    ModelCapabilitySet,
+    ModelToolPolicy,
+    resolve_capabilities,
+)
 from neuro_code.domain.conversation.context import ModelContext
 from neuro_code.domain.conversation.events import (
     ModelCompleted,
@@ -44,6 +49,15 @@ class GeminiProvider:
 
     提供原生 Gemini ``streamGenerateContent`` SSE 适配器."""
 
+    @staticmethod
+    def implementation_capabilities() -> ModelCapabilitySet:
+        """Return capabilities implemented by this generateContent adapter."""
+
+        return ModelCapabilitySet.from_supported(
+            ModelCapability.FUNCTION_TOOLS,
+            ModelCapability.VISION,
+        )
+
     def __init__(
         self,
         *,
@@ -52,6 +66,7 @@ class GeminiProvider:
         api_key: str,
         provider_name: str = "gemini",
         context_affinity: str | None = None,
+        capabilities: ModelCapabilitySet | None = None,
         timeout_seconds: float = 120.0,
         max_output_tokens: int = 8192,
         transport: Any | None = None,
@@ -62,6 +77,11 @@ class GeminiProvider:
         self._api_key = api_key
         self._provider_name = provider_name
         self._context_affinity = context_affinity
+        upstream = capabilities or ModelCapabilitySet.all_unknown()
+        self._capabilities = resolve_capabilities(
+            upstream=upstream,
+            implementation=self.implementation_capabilities(),
+        ).effective
         self._timeout_seconds = timeout_seconds
         self._max_output_tokens = max_output_tokens
         self._transport = transport
@@ -78,6 +98,10 @@ class GeminiProvider:
     @property
     def context_affinity(self) -> str | None:
         return self._context_affinity
+
+    @property
+    def capabilities(self) -> ModelCapabilitySet:
+        return self._capabilities
 
     @property
     def _endpoint(self) -> str:

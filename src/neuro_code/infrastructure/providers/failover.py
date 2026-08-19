@@ -5,9 +5,13 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator, Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
-from neuro_code.application.ports.model import ModelProvider, ModelToolPolicy
+from neuro_code.application.ports.model import (
+    ModelCapabilitySet,
+    ModelProvider,
+    ModelToolPolicy,
+)
 from neuro_code.domain.conversation.context import ModelContext
 from neuro_code.domain.conversation.events import (
     ModelEvent,
@@ -28,12 +32,18 @@ class ProviderCandidate:
     context_affinity: str | None
     factory: Callable[[], ModelProvider]
     context_window_tokens: int | None = None
+    capabilities: ModelCapabilitySet = field(default_factory=ModelCapabilitySet.all_unknown)
 
 
 class FailoverModelProvider:
     """Monotonic provider chain that switches only before the first model event.
 
-    定义单调 Provider 链,只允许在第一个模型事件之前切换."""
+    定义单调 Provider 链,只允许在第一个模型事件之前切换.
+
+    Before a candidate is selected, capability inspection returns the safe
+    intersection of every configured candidate. Once a candidate is selected,
+    inspection follows that active provider.
+    """
 
     def __init__(self, candidates: Sequence[ProviderCandidate]) -> None:
         self._candidates = tuple(candidates)
@@ -67,6 +77,14 @@ class FailoverModelProvider:
         if self._active_index is not None and self._active_index in self._providers:
             return self._providers[self._active_index].context_affinity
         return self._current_candidate.context_affinity
+
+    @property
+    def capabilities(self) -> ModelCapabilitySet:
+        if self._active_index is not None and self._active_index in self._providers:
+            return self._providers[self._active_index].capabilities
+        return ModelCapabilitySet.intersection(
+            candidate.capabilities for candidate in self._candidates
+        )
 
     def _provider(self, index: int) -> ModelProvider:
         provider = self._providers.get(index)

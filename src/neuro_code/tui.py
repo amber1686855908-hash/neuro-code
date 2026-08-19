@@ -12,7 +12,6 @@ from datetime import UTC, datetime
 from pathlib import Path
 from time import monotonic
 from typing import Any, ClassVar, Literal, Protocol, TypeVar, cast
-from urllib.parse import urlsplit
 
 from rich.console import RenderableType
 from rich.markdown import Markdown
@@ -32,11 +31,17 @@ from textual.worker import Worker
 from neuro_code.application.permissions.broker import ApprovalHandler
 from neuro_code.application.permissions.contracts import PermissionApproval, PermissionRequest
 from neuro_code.application.ports.http import HttpClientPolicy
+from neuro_code.application.ports.model import ModelCapabilitySet
 from neuro_code.application.ports.provider_catalog import (
     ProviderCatalog,
     ProviderCatalogError,
     ProviderCatalogResult,
     ProviderConnectionSpec,
+)
+from neuro_code.application.ports.provider_services import (
+    DEFAULT_PROVIDER_SERVICE_CATALOG,
+    ProviderServiceCatalog,
+    ProviderServiceDescriptor,
 )
 from neuro_code.application.ports.provider_settings import (
     ManagedProviderProfile,
@@ -268,14 +273,6 @@ def _markdown_code_theme() -> str:
     return cast(str, MONO_SYNTAX_THEME)
 
 
-@dataclass(frozen=True, slots=True)
-class ProviderPreset:
-    name: str
-    protocol: str
-    dialect: str
-    base_url: str
-
-
 @dataclass(slots=True)
 class CollapsingPulseAnimation:
     """Textual-friendly port of the user-supplied collapsing pulse demo.
@@ -353,28 +350,6 @@ class CollapsingPulseAnimation:
             trail_index = distance - 1
             rendered.append(trail[trail_index] if 0 <= trail_index < len(trail) else 0)
         return tuple(rendered)
-
-
-_PROVIDER_PRESETS: tuple[ProviderPreset, ...] = (
-    ProviderPreset("openai", "openai-responses", "standard", "https://api.openai.com/v1"),
-    ProviderPreset("compatible", "openai-chat", "standard", ""),
-    ProviderPreset("deepseek", "openai-chat", "deepseek-v4", "https://api.deepseek.com"),
-    ProviderPreset("anthropic", "anthropic-messages", "standard", "https://api.anthropic.com"),
-    ProviderPreset(
-        "gemini",
-        "gemini-generate-content",
-        "standard",
-        "https://generativelanguage.googleapis.com/v1beta",
-    ),
-    ProviderPreset("xai", "openai-responses", "xai", "https://api.x.ai/v1"),
-)
-
-
-def _is_deepseek_base_url(value: str) -> bool:
-    try:
-        return urlsplit(value.strip()).hostname == "api.deepseek.com"
-    except ValueError:
-        return False
 
 
 def _read_terminal_size() -> Size | None:
@@ -1734,6 +1709,7 @@ class ProviderSettingsScreen(ModalScreen[ProviderSettingsSubmission | None]):
         provider_settings: ManagedProviderSettings,
         provider_settings_store: ProviderSettingsStore,
         provider_catalog: ProviderCatalog | None = None,
+        service_catalog: ProviderServiceCatalog | None = None,
         first_run: bool = False,
         initial_profile: str | None = None,
         initial_error: str | None = None,
@@ -1743,11 +1719,12 @@ class ProviderSettingsScreen(ModalScreen[ProviderSettingsSubmission | None]):
         self.provider_settings = provider_settings
         self.provider_settings_store = provider_settings_store
         self.provider_catalog = provider_catalog
+        self.service_catalog = service_catalog or DEFAULT_PROVIDER_SERVICE_CATALOG
         self.first_run = first_run
         self.initial_profile = initial_profile
         self.initial_error = initial_error
         self._editing_profile: str | None = None
-        self._active_preset = "openai"
+        self._active_preset = self._default_service_key()
         self._active_proxy_mode: str | None = None
         self._active_background_wake_policy: BackgroundTaskWakePolicy | None = None
         self._delete_confirmation_for: str | None = None
@@ -1758,6 +1735,7 @@ class ProviderSettingsScreen(ModalScreen[ProviderSettingsSubmission | None]):
         }
 
     def compose(self) -> ComposeResult:
+        default_service = self._default_service()
         profile_widgets: list[Any] = [
             Button(
                 self._provider_label(profile),
@@ -1778,11 +1756,15 @@ class ProviderSettingsScreen(ModalScreen[ProviderSettingsSubmission | None]):
             )
         preset_buttons = [
             Button(
-                ui_text(self.language, f"provider_settings.preset.{preset.name}"),
-                id=f"provider-settings-preset-{preset.name}",
-                variant="primary" if preset.name == self._active_preset else "default",
+                self._service_label(service),
+                id=f"provider-settings-preset-{service.ui_key or service.service_id}",
+                variant=(
+                    "primary"
+                    if (service.ui_key or service.service_id) == self._active_preset
+                    else "default"
+                ),
             )
-            for preset in _PROVIDER_PRESETS
+            for service in self.service_catalog
         ]
         actions: list[Any] = []
         if not self.first_run:
@@ -1836,7 +1818,10 @@ class ProviderSettingsScreen(ModalScreen[ProviderSettingsSubmission | None]):
                     id="provider-settings-presets",
                 ),
                 Static(
-                    ui_text(self.language, "provider_settings.protocol.openai"),
+                    self._service_text(
+                        default_service.protocol_hint_key,
+                        f"{default_service.display_name} · {default_service.default_protocol}",
+                    ),
                     id="provider-settings-protocol-hint",
                 ),
                 Vertical(
@@ -1847,12 +1832,15 @@ class ProviderSettingsScreen(ModalScreen[ProviderSettingsSubmission | None]):
                     ),
                     Label(ui_text(self.language, "provider_settings.field.model")),
                     Input(
-                        placeholder=ui_text(self.language, "provider_settings.model.openai"),
+                        placeholder=self._service_text(
+                            default_service.model_placeholder_key,
+                            default_service.display_name,
+                        ),
                         id="provider-settings-model",
                     ),
                     Label(ui_text(self.language, "provider_settings.field.base_url")),
                     Input(
-                        value="https://api.openai.com/v1",
+                        value=default_service.default_base_url,
                         placeholder=ui_text(self.language, "provider_settings.base_url"),
                         id="provider-settings-base-url",
                     ),
@@ -1969,6 +1957,25 @@ class ProviderSettingsScreen(ModalScreen[ProviderSettingsSubmission | None]):
         )
         return f"{profile.name} · {profile.model}{suffix}"
 
+    def _service_label(self, service: ProviderServiceDescriptor) -> str:
+        if service.label_key is not None:
+            try:
+                return ui_text(self.language, service.label_key)
+            except KeyError:
+                pass
+        return service.display_name
+
+    def _service_text(self, key: str | None, fallback: str, **values: object) -> str:
+        if key is not None:
+            try:
+                return ui_text(self.language, key, **values)
+            except KeyError:
+                pass
+        return fallback
+
+    def _service(self, identifier: str) -> ProviderServiceDescriptor | None:
+        return self.service_catalog.get(identifier)
+
     def on_mount(self) -> None:
         if self.initial_profile is not None:
             self._edit_profile(self.initial_profile)
@@ -1980,6 +1987,13 @@ class ProviderSettingsScreen(ModalScreen[ProviderSettingsSubmission | None]):
             else "#provider-settings-name"
         )
         self.query_one(focus_target, Input).focus()
+
+    def _default_service(self) -> ProviderServiceDescriptor:
+        return self.service_catalog.services[0]
+
+    def _default_service_key(self) -> str:
+        service = self._default_service()
+        return service.ui_key or service.service_id
 
     async def on_button_pressed(self, event: Button.Pressed) -> None:
         button_id = event.button.id or ""
@@ -2048,7 +2062,10 @@ class ProviderSettingsScreen(ModalScreen[ProviderSettingsSubmission | None]):
         self.query_one("#provider-settings-context-window", Input).value = (
             str(profile.context_window_tokens) if profile.context_window_tokens is not None else ""
         )
-        self._select_preset(self._preset_for_profile(profile), update_endpoint=False)
+        self._select_preset(
+            self._preset_for_profile(profile, self.service_catalog),
+            update_endpoint=False,
+        )
         self.query_one("#provider-settings-proxy-env", Input).value = profile.proxy_url_env or ""
         self._select_proxy_mode(profile.proxy_mode)
         self._select_background_wake_policy(profile.background_task_wake_policy)
@@ -2059,34 +2076,19 @@ class ProviderSettingsScreen(ModalScreen[ProviderSettingsSubmission | None]):
         self.query_one("#provider-settings-model", Input).focus()
 
     @staticmethod
-    def _preset_for_profile(profile: ManagedProviderProfile) -> str:
-        base_url = profile.base_url.rstrip("/").casefold()
-        if _is_deepseek_base_url(profile.base_url):
-            if profile.protocol == "openai-chat" and profile.dialect == "deepseek-v4":
-                return "deepseek"
-            if profile.protocol == "openai-responses" and profile.dialect == "standard":
-                return "openai"
-        exact = next(
-            (
-                preset.name
-                for preset in _PROVIDER_PRESETS
-                if preset.base_url
-                and base_url == preset.base_url.rstrip("/").casefold()
-                and preset.protocol == profile.protocol
-                and preset.dialect == profile.dialect
-            ),
-            None,
+    def _preset_for_profile(
+        profile: ManagedProviderProfile,
+        service_catalog: ProviderServiceCatalog = DEFAULT_PROVIDER_SERVICE_CATALOG,
+    ) -> str:
+        service = service_catalog.match_profile(
+            service_id=profile.service_id,
+            protocol=profile.protocol,
+            dialect=profile.dialect,
+            base_url=profile.base_url,
         )
-        if exact is not None:
-            return exact
-        return next(
-            (
-                preset.name
-                for preset in _PROVIDER_PRESETS
-                if preset.protocol == profile.protocol and preset.dialect == profile.dialect
-            ),
-            "compatible",
-        )
+        if service is None:
+            service = service_catalog.services[0]
+        return service.ui_key or service.service_id
 
     def _new_profile(self) -> None:
         self._editing_profile = None
@@ -2098,7 +2100,7 @@ class ProviderSettingsScreen(ModalScreen[ProviderSettingsSubmission | None]):
         self.query_one("#provider-settings-api-key", Input).value = ""
         self.query_one("#provider-settings-context-window", Input).value = ""
         self.query_one("#provider-settings-proxy-env", Input).value = ""
-        self._select_preset("openai")
+        self._select_preset(self._default_service_key())
         self._select_proxy_mode(None)
         self._select_background_wake_policy(None)
         self._reset_delete_confirmation()
@@ -2108,26 +2110,33 @@ class ProviderSettingsScreen(ModalScreen[ProviderSettingsSubmission | None]):
         name_input.focus()
 
     def _select_preset(self, preset_name: str, *, update_endpoint: bool = True) -> None:
-        preset = next(
-            (entry for entry in _PROVIDER_PRESETS if entry.name == preset_name),
-            None,
-        )
-        if preset is None:
+        service = self._service(preset_name)
+        if service is None:
             return
         self._clear_model_catalog()
-        self._active_preset = preset_name
-        for candidate in _PROVIDER_PRESETS:
-            button = self.query_one(f"#provider-settings-preset-{candidate.name}", Button)
-            button.variant = "primary" if candidate.name == preset_name else "default"
+        self._active_preset = service.ui_key or service.service_id
+        for candidate in self.service_catalog:
+            button = self.query_one(
+                f"#provider-settings-preset-{candidate.ui_key or candidate.service_id}",
+                Button,
+            )
+            button.variant = (
+                "primary"
+                if (candidate.ui_key or candidate.service_id) == self._active_preset
+                else "default"
+            )
         self.query_one("#provider-settings-protocol-hint", Static).update(
-            ui_text(self.language, f"provider_settings.protocol.{preset_name}")
+            self._service_text(
+                service.protocol_hint_key,
+                f"{service.display_name} · {service.default_protocol}",
+            )
         )
-        self.query_one("#provider-settings-model", Input).placeholder = ui_text(
-            self.language,
-            f"provider_settings.model.{preset_name}",
+        self.query_one("#provider-settings-model", Input).placeholder = self._service_text(
+            service.model_placeholder_key,
+            service.display_name,
         )
         if update_endpoint:
-            self.query_one("#provider-settings-base-url", Input).value = preset.base_url
+            self.query_one("#provider-settings-base-url", Input).value = service.default_base_url
 
     def _select_proxy_mode(self, proxy_mode: str | None) -> None:
         if proxy_mode not in {None, "environment", "direct", "explicit"}:
@@ -2201,7 +2210,9 @@ class ProviderSettingsScreen(ModalScreen[ProviderSettingsSubmission | None]):
         return context_window_tokens
 
     def _connection_spec(self) -> tuple[ProviderConnectionSpec, HttpClientPolicy]:
-        preset = next(entry for entry in _PROVIDER_PRESETS if entry.name == self._active_preset)
+        service = self._service(self._active_preset)
+        if service is None:
+            raise ValueError("provider service selection is unavailable")
         base_url = self.query_one("#provider-settings-base-url", Input).value.strip()
         name = self.query_one("#provider-settings-name", Input).value.strip()
         existing = self.provider_settings.profile(name)
@@ -2217,10 +2228,12 @@ class ProviderSettingsScreen(ModalScreen[ProviderSettingsSubmission | None]):
         )
         return (
             ProviderConnectionSpec(
-                protocol=preset.protocol,
-                dialect=preset.dialect,
+                protocol=service.default_protocol,
+                dialect=service.dialect_for(service.default_protocol),
                 base_url=base_url,
                 api_key=api_key,
+                service_id=service.service_id,
+                catalog_strategy=service.model_catalog_strategy,
             ),
             policy,
         )
@@ -2369,16 +2382,26 @@ class ProviderSettingsScreen(ModalScreen[ProviderSettingsSubmission | None]):
         )
 
     async def _save_provider(self) -> None:
-        preset = next(entry for entry in _PROVIDER_PRESETS if entry.name == self._active_preset)
+        service = self._service(self._active_preset)
+        if service is None:
+            self._show_provider_error("provider service selection is unavailable")
+            return
         api_key = self.query_one("#provider-settings-api-key", Input).value.strip() or None
         name = self.query_one("#provider-settings-name", Input).value.strip()
         base_url = self.query_one("#provider-settings-base-url", Input).value.strip()
         try:
+            existing = self.provider_settings.profile(name)
             proxy_policy = self._draft_proxy_policy()
             profile = ManagedProviderProfile(
                 name=name,
-                protocol=preset.protocol,
-                dialect=preset.dialect,
+                protocol=service.default_protocol,
+                dialect=service.dialect_for(service.default_protocol),
+                service_id=service.service_id,
+                capability_overrides=(
+                    existing.capability_overrides
+                    if existing is not None
+                    else ModelCapabilitySet.all_unknown()
+                ),
                 model=self.query_one("#provider-settings-model", Input).value.strip(),
                 base_url=base_url,
                 context_window_tokens=self._context_window_tokens(),
@@ -2389,7 +2412,6 @@ class ProviderSettingsScreen(ModalScreen[ProviderSettingsSubmission | None]):
                 api_key=api_key,
                 background_task_wake_policy=self._active_background_wake_policy,
             )
-            existing = self.provider_settings.profile(name)
             if existing is None and api_key is None:
                 raise ValueError(ui_text(self.language, "provider_settings.api_key_required"))
             resolve_http_client_policy(
