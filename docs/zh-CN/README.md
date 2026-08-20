@@ -63,6 +63,12 @@ partial ACP v1 实现：
 uv run neuro-code acp --cwd /absolute/workspace
 ```
 
+同一 ACP 路由也可以通过有界的 WebSocket 换行 JSON 桥接提供服务：
+
+```bash
+uv run neuro-code acp --transport websocket --host 127.0.0.1 --port 8765 --cwd /absolute/workspace
+```
+
 本切片实现 `initialize`、`session/new`、`session/list`、`session/load`、
 `session/delete`、`session/fork`、`session/resume`、`session/prompt`、
 `session/cancel`（notification）和 `session/close`，发送 `session/update`
@@ -70,9 +76,12 @@ notification，并通过 `session/request_permission` 请求交互授权。它�
 `loadSession: true` 和 list/delete/fork/resume/close session capability。Text、内嵌
 Image、ResourceLink 与内嵌文本资源提示块会保持输入顺序并受数量/字节限制。Image 只接受一小组
 光栅 MIME 类型的原始 base64，最多八张、单张 5 MiB、总计 10 MiB；关联 URI 绝不会被读取或
-解引用。内嵌 `TextResourceContents` 只接受客户端已提供的文本，最多八个、单个 64 KiB、合计
-128 KiB；URI 只是来源标签，绝不会被解析。ResourceLink 元数据采用字段白名单，`_meta` 不会
-进入模型，提示转换期间也绝不会下载或解引用链接。
+解引用。Audio 接受经过校验的 `audio/*` MIME 类型和有界 base64；内嵌
+`BlobResourceContents` 接受经过校验且解码后有界的 base64。文本、音频和二进制内容会按顺序
+保留在持久化模型上下文中；不具备原生媒体能力的 Provider 会收到安全占位符。内嵌
+`TextResourceContents` 只接受客户端已提供的文本，最多八个、单个 64 KiB、合计 128 KiB；URI
+只是来源标签，绝不会被解析。ResourceLink 元数据采用字段白名单，`_meta` 不会进入模型，提示
+转换期间也绝不会下载或解引用链接。
 
 每条连接固定绑定到启动工作区。`session/new` 会拒绝不同或非绝对的 `cwd`；`off` profile
 的 binding 最多还可声明四个已存在、绝对且互不重叠的 `additionalDirectories`，所有已启用
@@ -90,8 +99,10 @@ reasoning、供应商原生上下文、任意参数与 raw 工具数据不会回
 每个接受的 MCP server 及其工具都由对应 ACP session 独立持有。官方 MCP Python SDK
 负责 Schema、`ClientSession`、协商与 JSON-RPC 调度。stdio 使用 Neuro Code 有界的
 `ProcessTree` 桥接；远程传输使用 SDK 的 Streamable HTTP 或 legacy SSE client，并校验
-HTTP/HTTPS URL 与 header、不继承环境代理、不跟随重定向且限制响应体。本切片只投影 MCP
-工具。每次调用都按有副作用操作处理，即使本地处于 bypass 模式也必须请求 ACP client 审批；
+HTTP/HTTPS URL 与 header、不继承环境代理、不跟随重定向且限制响应体。工具、resource 元数据、
+resource template 和 prompt 会通过有界私有 MCP session 扩展投影；该扩展也支持刷新及有界
+resource/prompt 读取。MCP sampling 和 elicitation 回调在客户端支持时通过有界私有回调方法转发。
+每次调用都按有副作用操作处理，即使本地处于 bypass 模式也必须请求 ACP client 审批；
 本地显式 deny 仍优先。`_meta` 被忽略，显式环境变量/header 值会被脱敏。取消远程请求会
 在本地关闭并令该连接不可再用；远程 server 不是本地持有的进程，因此不会把可能仍在执行的
 远程副作用表示成已成功取消。
@@ -103,9 +114,9 @@ ACP 会话 resume/delete/fork 已按工作区范围持久身份、事务 fork/de
 Shell 命令，也不会收到已配置的 Neuro Code 环境值。它也暴露有界的标准后台生命周期
 （`terminal_start`、`terminal_output`、`terminal_wait` 和 `terminal_kill`），并使用不透明 task ID；
 终端输入、resize 和 PTY framing 仍不可用。这仍明确不是完整 ACP v1
-支持：ACP MCP 传输、MCP resource/prompt/sampling/elicitation、音频 prompt、内嵌二进制
-资源 prompt、二进制多媒体历史回放、客户端交互式终端输入/resize/PTY 方法、WebSocket 传输和自定义扩展
-仍不支持，也不会被声明。详见
+支持：ACP MCP 传输、二进制多媒体历史回放、客户端交互式终端输入/resize/PTY 方法和任意自定义
+扩展仍不支持。artifact、subagent、lifecycle、MCP、compaction 私有扩展均有界实现，但不作为
+标准 ACP capability 声明。详见
 [兼容矩阵](compatibility-matrix.md)和
 [ADR 0035](adr/0035-partial-acp-v1-stdio.md)及
 [ADR 0036](adr/0036-durable-acp-session-load.md)和

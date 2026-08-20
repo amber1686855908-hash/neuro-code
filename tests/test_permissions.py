@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import json
+import tempfile
 import unittest
+from pathlib import Path
 
 from neuro_code.application.permissions.contracts import build_permission_request
 from neuro_code.application.permissions.policy import (
@@ -8,10 +11,92 @@ from neuro_code.application.permissions.policy import (
     PermissionManager,
     PermissionMode,
     PermissionRule,
+    PermissionRuleStore,
 )
 
 
 class PermissionTests(unittest.TestCase):
+    def test_permission_rule_and_persistent_store_reject_malformed_state(self) -> None:
+        invalid_rules = (
+            (PermissionEffect.ALLOW, " ", None, None),
+            (PermissionEffect.ALLOW, "read", " ", None),
+            (PermissionEffect.ALLOW, "read", None, " "),
+        )
+        for effect, pattern, path_pattern, operation in invalid_rules:
+            with (
+                self.subTest(pattern=pattern, path_pattern=path_pattern, operation=operation),
+                self.assertRaises(ValueError),
+            ):
+                PermissionRule(effect, pattern, path_pattern, operation)
+        with self.assertRaises(TypeError):
+            PermissionRule("allow", "read")  # type: ignore[arg-type]
+        with self.assertRaisesRegex(ValueError, "requires effect"):
+            PermissionRule.from_dict({"effect": "allow"})
+        with self.assertRaisesRegex(ValueError, "effect is invalid"):
+            PermissionRule.from_dict({"effect": "invalid", "pattern": "read"})
+        with self.assertRaisesRegex(ValueError, "path_pattern"):
+            PermissionRule.from_dict({"effect": "allow", "pattern": "read", "path_pattern": 1})
+        with self.assertRaisesRegex(ValueError, "operation"):
+            PermissionRule.from_dict({"effect": "allow", "pattern": "read", "operation": 1})
+
+        rule = PermissionRule(PermissionEffect.ALLOW, "read", path_pattern="src/*")
+        self.assertEqual(
+            rule.to_dict(), {"effect": "allow", "pattern": "read", "path_pattern": "src/*"}
+        )
+        self.assertFalse(rule.matches("read", {"path": "tests/a.py"}))
+        self.assertFalse(
+            PermissionRule(PermissionEffect.ALLOW, "read", operation="read").matches(
+                "read", {"operation": 1}
+            )
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "permissions.json"
+            store = PermissionRuleStore(path)
+            self.assertEqual(store.load(), ())
+            for payload, reason in (
+                ("not json", "unreadable"),
+                ({"schema_version": 99, "rules": []}, "schema"),
+                ({"schema_version": 1, "rules": [1]}, "entry"),
+                ({"schema_version": 1, "rules": [None]}, "entry"),
+            ):
+                path.write_text(
+                    payload if isinstance(payload, str) else json.dumps(payload),
+                    encoding="utf-8",
+                )
+                with self.subTest(reason=reason), self.assertRaisesRegex(ValueError, reason):
+                    store.load()
+            with self.assertRaises(ValueError):
+                store.save([object()])  # type: ignore[list-item]
+            with self.assertRaises(ValueError):
+                store.save([rule] * 513)
+
+    def test_permission_manager_modes_and_rule_lifecycle_are_explicit(self) -> None:
+        manager = PermissionManager(interactive=True)
+        with self.assertRaises(TypeError):
+            manager.replace_rules((object(),))  # type: ignore[arg-type]
+        with self.assertRaises(TypeError):
+            manager.set_mode("default")  # type: ignore[arg-type]
+        manager.set_mode(PermissionMode.DONT_ASK)
+        self.assertEqual(
+            manager.decide("bash", {"command": "echo hi"}, side_effecting=True).effect,
+            PermissionEffect.DENY,
+        )
+        manager.set_mode(PermissionMode.ACCEPT_EDITS)
+        self.assertTrue(manager.decide("apply_patch", {}, side_effecting=True).allowed)
+        self.assertEqual(
+            manager.decide("custom", {}, side_effecting=True).effect,
+            PermissionEffect.ASK,
+        )
+        manager.replace_rules((PermissionRule(PermissionEffect.ALLOW, "custom"),))
+        self.assertEqual(manager.rules[0].pattern, "custom")
+        with tempfile.TemporaryDirectory() as directory:
+            store = PermissionRuleStore(Path(directory) / "rules.json")
+            manager.save_rules(store)
+            manager.replace_rules(())
+            manager.load_rules(store)
+            self.assertEqual(manager.rules[0].pattern, "custom")
+
     def test_explicit_deny_wins_over_allow_and_bypass(self) -> None:
         manager = PermissionManager(
             mode=PermissionMode.BYPASS,
@@ -196,6 +281,22 @@ class PermissionTests(unittest.TestCase):
         self.assertIn("/workspace", request.summary)
         self.assertNotIn("opaque-digest", request.summary)
         self.assertIsNotNone(request.scope_key)
+
+    def test_path_and_operation_rules_round_trip_atomically(self) -> None:
+        rule = PermissionRule(
+            PermissionEffect.ALLOW,
+            "path:src/*",
+            path_pattern="src/*",
+            operation="read",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "permissions.json"
+            store = PermissionRuleStore(path)
+            store.save([rule])
+            self.assertEqual(store.load(), (rule,))
+            self.assertTrue(rule.matches("read_file", {"operation": "read", "path": "src/a.py"}))
+            self.assertFalse(rule.matches("read_file", {"operation": "write", "path": "src/a.py"}))
+            self.assertFalse(rule.matches("read_file", {"operation": "read", "path": "tests/a.py"}))
 
 
 if __name__ == "__main__":

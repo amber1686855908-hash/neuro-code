@@ -9,7 +9,7 @@ from typing import Any
 
 from neuro_code.application.ports.tools import ToolContext
 from neuro_code.domain.plans import PlanStep, SessionPlan, plan_from_update_arguments
-from neuro_code.domain.tools import ToolDefinition, ToolResult
+from neuro_code.domain.tools import ToolDefinition, ToolExecutionMode, ToolResult
 from neuro_code.shared.errors import ToolError
 from neuro_code.shared.redaction import redact_sensitive_text
 
@@ -21,6 +21,7 @@ class UpdatePlanTool:
 
     definition = ToolDefinition(
         name="update_plan",
+        execution_mode=ToolExecutionMode.EXCLUSIVE,
         description=(
             "Replace the current session plan with a concise, structured set of steps. "
             "Use this for multi-step work, keeping exactly one step in_progress when "

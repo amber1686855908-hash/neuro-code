@@ -4,8 +4,9 @@ import asyncio
 import json
 import unittest
 from collections.abc import AsyncIterator
+from types import SimpleNamespace
 from typing import Literal, cast
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import httpx
 
@@ -107,7 +108,7 @@ class _RemoteMcpTransportFixture:
         if method == "initialize":
             result: dict[str, object] = {
                 "protocolVersion": "2025-11-25",
-                "capabilities": {"tools": {}},
+                "capabilities": {"tools": {}, "resources": {}, "prompts": {}},
                 "serverInfo": {"name": "fixture-http-mcp", "version": "1"},
             }
         elif method == "tools/list":
@@ -123,6 +124,54 @@ class _RemoteMcpTransportFixture:
                     }
                 ]
             }
+        elif method == "resources/list":
+            result = {
+                "resources": [
+                    {
+                        "uri": "fixture://http-resource",
+                        "name": "http-resource",
+                        "mimeType": "text/plain",
+                    }
+                ]
+            }
+        elif method == "resources/templates/list":
+            result = {
+                "resourceTemplates": [
+                    {
+                        "uriTemplate": "fixture://http-resource/{name}",
+                        "name": "http-template",
+                    }
+                ]
+            }
+        elif method == "prompts/list":
+            result = {
+                "prompts": [
+                    {
+                        "name": "http-prompt",
+                        "arguments": [{"name": "topic", "required": True}],
+                    }
+                ]
+            }
+        elif method == "resources/read":
+            result = {
+                "contents": [
+                    {
+                        "uri": "fixture://http-resource",
+                        "mimeType": "text/plain",
+                        "text": "http resource text",
+                    }
+                ]
+            }
+        elif method == "prompts/get":
+            result = {
+                "description": "HTTP prompt",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": {"type": "text", "text": "http prompt text"},
+                    }
+                ],
+            }
         elif method == "tools/call":
             if self.block_tool_calls:
                 self.tool_call_started.set()
@@ -137,6 +186,245 @@ class _RemoteMcpTransportFixture:
 
 
 class McpHttpToolCollectionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_collection_open_rejects_server_tool_limits_and_closes_partial_state(
+        self,
+    ) -> None:
+        configuration = McpHttpServerConfig(
+            name="fixture",
+            url="https://mcp.fixture.test/mcp",
+        )
+        with self.assertRaisesRegex(McpHttpError, "too_many_mcp_servers"):
+            await McpHttpToolCollection.open(
+                tuple(configuration for _ in range(mcp_http.MAX_MCP_SERVERS + 1))
+            )
+
+        snapshot = SimpleNamespace(
+            tools=(SimpleNamespace(name="echo", description="echo", inputSchema={}),),
+            resources=(),
+            resource_templates=(),
+            prompts=(),
+        )
+        close = AsyncMock()
+        with (
+            patch.object(
+                mcp_http._McpHttpServerConnection,
+                "start",
+                new=AsyncMock(return_value=snapshot),
+            ),
+            patch.object(mcp_http._McpHttpServerConnection, "close", new=close),
+            self.assertRaisesRegex(McpHttpError, "tool_name_collision"),
+        ):
+            await McpHttpToolCollection.open((configuration, configuration))
+        self.assertEqual(close.await_count, 2)
+
+        close.reset_mock()
+        with (
+            patch.object(
+                mcp_http._McpHttpServerConnection,
+                "start",
+                new=AsyncMock(return_value=snapshot),
+            ),
+            patch.object(mcp_http._McpHttpServerConnection, "close", new=close),
+            patch.object(mcp_http, "MAX_MCP_TOTAL_TOOLS", 0),
+            self.assertRaisesRegex(McpHttpError, "too_many_mcp_tools"),
+        ):
+            await McpHttpToolCollection.open((configuration,))
+        self.assertEqual(close.await_count, 1)
+
+    async def test_paginated_listing_and_cursor_guards_are_fail_closed(self) -> None:
+        connection = mcp_http._McpHttpServerConnection(
+            McpHttpServerConfig(name="fixture", url="https://mcp.fixture.test/mcp"),
+            explicit_redactions=(),
+            sampling_handler=None,
+            elicitation_handler=None,
+        )
+        tool = SimpleNamespace(name="echo", description="echo", inputSchema={})
+        resource = SimpleNamespace(
+            uri="fixture://resource",
+            name="resource",
+            title=None,
+            description=None,
+            mimeType="text/plain",
+            size=None,
+        )
+        template = SimpleNamespace(name="template", uriTemplate="fixture://{name}")
+        prompt = SimpleNamespace(name="prompt", title=None, description=None, arguments=[])
+
+        class PagedSession:
+            async def list_tools(self, cursor: str | None) -> object:
+                return SimpleNamespace(
+                    tools=[tool],
+                    nextCursor=None if cursor == "second" else ("second" if cursor else "first"),
+                )
+
+            async def list_resources(self, cursor: str | None) -> object:
+                return SimpleNamespace(
+                    resources=[resource],
+                    nextCursor=None if cursor == "second" else ("second" if cursor else "first"),
+                )
+
+            async def list_resource_templates(self, cursor: str | None) -> object:
+                return SimpleNamespace(
+                    resourceTemplates=[template],
+                    nextCursor=None if cursor == "second" else ("second" if cursor else "first"),
+                )
+
+            async def list_prompts(self, cursor: str | None) -> object:
+                return SimpleNamespace(
+                    prompts=[prompt],
+                    nextCursor=None if cursor == "second" else ("second" if cursor else "first"),
+                )
+
+        session = PagedSession()
+        self.assertEqual(len(await connection._list_tools(session)), 3)
+        self.assertEqual(len(await connection._list_resources(session)), 3)
+        self.assertEqual(len(await connection._list_resource_templates(session)), 3)
+        self.assertEqual(len(await connection._list_prompts(session)), 3)
+
+        class CyclingSession:
+            async def list_tools(self, _cursor: str | None) -> object:
+                return SimpleNamespace(tools=[], nextCursor="cycle")
+
+            async def list_resources(self, _cursor: str | None) -> object:
+                return SimpleNamespace(resources=[], nextCursor="cycle")
+
+            async def list_resource_templates(self, _cursor: str | None) -> object:
+                return SimpleNamespace(resourceTemplates=[], nextCursor="cycle")
+
+            async def list_prompts(self, _cursor: str | None) -> object:
+                return SimpleNamespace(prompts=[], nextCursor="cycle")
+
+        cycling = CyclingSession()
+        for method, reason in (
+            (connection._list_tools, "tool_cursor_cycle"),
+            (connection._list_resources, "resource_cursor_cycle"),
+            (connection._list_resource_templates, "resource_template_cursor_cycle"),
+            (connection._list_prompts, "prompt_cursor_cycle"),
+        ):
+            with self.subTest(reason=reason), self.assertRaisesRegex(McpHttpError, reason):
+                await method(cycling)
+
+    async def test_auxiliary_requests_and_mcp_callbacks_are_bounded(self) -> None:
+        sampling_calls: list[tuple[object, object, object, object]] = []
+        elicitation_calls: list[tuple[object, object, object]] = []
+
+        async def sampling(
+            messages: object,
+            *,
+            model_preferences: object = None,
+            system_prompt: object = None,
+            max_tokens: object = None,
+        ) -> dict[str, object]:
+            sampling_calls.append((messages, model_preferences, system_prompt, max_tokens))
+            return {
+                "role": "assistant",
+                "content": {"type": "text", "text": "sampled"},
+                "model": "fixture",
+            }
+
+        async def elicitation(
+            message: str,
+            requested_schema: object,
+            *,
+            url: str | None = None,
+        ) -> dict[str, object]:
+            elicitation_calls.append((message, requested_schema, url))
+            return {"action": "accept", "content": {"answer": "yes"}}
+
+        connection = mcp_http._McpHttpServerConnection(
+            McpHttpServerConfig(name="fixture", url="https://mcp.fixture.test/mcp"),
+            explicit_redactions=(),
+            sampling_handler=sampling,
+            elicitation_handler=elicitation,
+        )
+
+        class Session:
+            async def read_resource(self, uri: str) -> str:
+                return uri
+
+            async def get_prompt(self, name: str, arguments: dict[str, str]) -> dict[str, object]:
+                return {"name": name, "arguments": arguments}
+
+        loop = asyncio.get_running_loop()
+        read_request = mcp_http._AuxRequest(
+            "read_resource", {"uri": "fixture://resource"}, 1, loop.create_future(), asyncio.Event()
+        )
+        prompt_request = mcp_http._AuxRequest(
+            "get_prompt",
+            {"name": "prompt", "arguments": {"topic": "test"}},
+            1,
+            loop.create_future(),
+            asyncio.Event(),
+        )
+        refresh_request = mcp_http._AuxRequest(
+            "refresh", {}, 1, loop.create_future(), asyncio.Event()
+        )
+        unsupported_request = mcp_http._AuxRequest(
+            "unknown", {}, 1, loop.create_future(), asyncio.Event()
+        )
+        for request in (read_request, prompt_request, refresh_request, unsupported_request):
+            connection._list_snapshot = lambda _session: asyncio.sleep(0, result="refreshed")  # type: ignore[method-assign]
+            await connection._execute_auxiliary(Session(), request)
+        self.assertEqual(read_request.result.result(), "fixture://resource")
+        self.assertEqual(prompt_request.result.result()["name"], "prompt")
+        self.assertEqual(refresh_request.result.result(), "refreshed")
+        with self.assertRaisesRegex(McpHttpError, "auxiliary_request_failed"):
+            unsupported_request.result.result()
+
+        params = SimpleNamespace(
+            model_dump=lambda **_kwargs: {
+                "messages": [{"role": "user"}],
+                "modelPreferences": {"hints": []},
+                "systemPrompt": "system",
+                "maxTokens": 8,
+            }
+        )
+        sampled = await connection._sampling_callback(None, params)
+        elicited = await connection._elicitation_callback(
+            None,
+            SimpleNamespace(
+                model_dump=lambda **_kwargs: {
+                    "message": "Choose",
+                    "requestedSchema": {"type": "object"},
+                    "url": "https://example.invalid/form",
+                }
+            ),
+        )
+        self.assertEqual(sampled.model, "fixture")
+        self.assertEqual(elicited.action, "accept")
+        self.assertEqual(sampling_calls[0][2], "system")
+        self.assertEqual(elicitation_calls[0][0], "Choose")
+
+    async def test_inactive_connection_and_transport_configuration_fail_closed(self) -> None:
+        connection = mcp_http._McpHttpServerConnection(
+            McpHttpServerConfig(name="fixture", url="https://mcp.fixture.test/mcp"),
+            explicit_redactions=(),
+            sampling_handler=None,
+            elicitation_handler=None,
+        )
+        with self.assertRaisesRegex(McpHttpError, "not_active"):
+            await connection.call("echo", {}, timeout_seconds=1)
+        with self.assertRaisesRegex(McpHttpError, "not_active"):
+            await connection.refresh()
+        with self.assertRaisesRegex(McpHttpError, "not_active"):
+            await connection.read_resource("fixture://missing")
+        with self.assertRaisesRegex(McpHttpError, "not_active"):
+            await connection.get_prompt("missing", {})
+        await connection.close()
+        await connection.close()
+        with self.assertRaisesRegex(McpHttpError, "auth"):
+            mcp_http._mcp_http_client(auth=object())
+
+    async def test_remote_transport_rejects_unknown_transport(self) -> None:
+        configuration = McpHttpServerConfig(
+            name="fixture",
+            url="https://mcp.fixture.test/mcp",
+            transport="invalid",  # type: ignore[arg-type]
+        )
+        with self.assertRaisesRegex(McpHttpError, "unsupported"):
+            async with mcp_http._remote_transport(configuration):
+                pass
+
     async def test_streamable_http_and_sse_use_official_sdk_and_redact_headers(self) -> None:
         for transport in ("http", "sse"):
             with self.subTest(transport=transport):
@@ -153,6 +441,18 @@ class McpHttpToolCollectionTests(unittest.IsolatedAsyncioTestCase):
                         )
                     )
                     self.addAsyncCleanup(collection.close)
+                    self.assertEqual(collection.resources[0].uri, "fixture://http-resource")
+                    self.assertEqual(collection.resource_templates[0].name, "http-template")
+                    self.assertEqual(collection.prompts[0].name, "http-prompt")
+                    contents = await collection.read_resource("fixture://http-resource")
+                    self.assertEqual(contents[0].text, "http resource text")
+                    messages = await collection.get_prompt("http-prompt", {"topic": "test"})
+                    self.assertEqual(messages[0].content["text"], "http prompt text")
+                    await collection.refresh()
+                    with self.assertRaisesRegex(McpHttpError, "resource_not_found"):
+                        await collection.read_resource("fixture://missing")
+                    with self.assertRaisesRegex(McpHttpError, "prompt_not_found"):
+                        await collection.get_prompt("missing", {})
                     result = await collection.tools[0].execute(
                         {"text": "hello"},
                         ToolContext(__file__, sandbox_profile=SandboxProfile.OFF),

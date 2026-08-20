@@ -2847,10 +2847,23 @@ def _content_part_from_dict(raw: object) -> ContentPart:
         if not isinstance(text, str):
             raise TypeError("text content part requires text")
         return ContentPart.from_text(text)
-    url = raw.get("url")
-    if not isinstance(url, str):
-        raise TypeError("image content part requires url")
-    return ContentPart.from_image(url)
+    if kind is ContentPartKind.IMAGE:
+        url = raw.get("url")
+        if not isinstance(url, str):
+            raise TypeError("image content part requires url")
+        return ContentPart.from_image(url)
+    data = raw.get("data")
+    mime_type = raw.get("mime_type", raw.get("mimeType"))
+    if not isinstance(data, str) or not isinstance(mime_type, str):
+        raise TypeError("binary content part requires data and MIME type")
+    if kind is ContentPartKind.AUDIO:
+        return ContentPart.from_audio(data, mime_type)
+    if kind is ContentPartKind.BLOB:
+        url = raw.get("url")
+        if not isinstance(url, str):
+            raise TypeError("blob content part requires url")
+        return ContentPart.from_blob(url, data, mime_type)
+    raise TypeError("unsupported content part kind")
 
 
 def _summary_from_row(row: tuple[Any, ...]) -> SessionSummary:

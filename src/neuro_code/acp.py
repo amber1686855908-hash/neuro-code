@@ -10,7 +10,7 @@ import math
 import re
 import uuid
 from collections import OrderedDict
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -48,6 +48,7 @@ from acp.schema import (
     McpServerStdio,
     NewSessionResponse,
     PermissionOption,
+    PromptCapabilities,
     PromptResponse,
     RequestPermissionRequest,
     RequestPermissionResponse,
@@ -79,6 +80,8 @@ from neuro_code import __version__
 from neuro_code.application.acp.contracts import (
     MAX_MCP_SERVERS,
     AcpMcpHttpServerConfig,
+    AcpMcpQuery,
+    AcpMcpQueryError,
     AcpMcpServerConfig,
     AcpMcpStdioServerConfig,
     AcpMcpToolError,
@@ -86,6 +89,7 @@ from neuro_code.application.acp.contracts import (
     AcpReadOnlySubagentQuery,
     AcpReadOnlySubagentQueryError,
     AcpResumeUnavailableError,
+    AcpSessionCommandQuery,
     AcpSubagentLifecycleQuery,
     AcpSubagentLifecycleQueryError,
     AcpToolOutputArtifactQuery,
@@ -104,6 +108,7 @@ from neuro_code.application.ports.client_terminal import (
     ClientTerminal,
     ClientTerminalResult,
 )
+from neuro_code.application.ports.mcp import McpElicitationHandler, McpSamplingHandler
 from neuro_code.application.ports.tools import (
     MAX_TOOL_OUTPUT_ARTIFACT_READ_BYTES,
 )
@@ -123,6 +128,7 @@ from neuro_code.domain.background_tasks.models import (
 from neuro_code.domain.conversation.events import AgentEvent, AgentEventKind
 from neuro_code.domain.conversation.messages import (
     ContentPart,
+    ContentPartKind,
     Message,
     Role,
     SessionItem,
@@ -153,9 +159,14 @@ MAX_PROMPT_BYTES = 256 * 1024
 MAX_IMAGE_BLOCKS = 8
 MAX_IMAGE_BLOCK_BYTES = 5 * 1024 * 1024
 MAX_IMAGE_TOTAL_BYTES = 10 * 1024 * 1024
+MAX_AUDIO_BLOCKS = 8
+MAX_AUDIO_BLOCK_BYTES = 5 * 1024 * 1024
+MAX_AUDIO_TOTAL_BYTES = 10 * 1024 * 1024
 MAX_EMBEDDED_TEXT_RESOURCES = 8
 MAX_EMBEDDED_TEXT_RESOURCE_BYTES = 64 * 1024
 MAX_EMBEDDED_TEXT_TOTAL_BYTES = 128 * 1024
+MAX_EMBEDDED_BINARY_RESOURCE_BYTES = 5 * 1024 * 1024
+MAX_EMBEDDED_BINARY_TOTAL_BYTES = 10 * 1024 * 1024
 MAX_RESOURCE_LINKS = 32
 MAX_RESOURCE_LINK_BYTES = 64 * 1024
 MAX_RESOURCE_URI_BYTES = 4 * 1024
@@ -191,6 +202,7 @@ MAX_MCP_HTTP_HEADER_NAME_BYTES = 256
 MAX_MCP_HTTP_HEADER_VALUE_BYTES = 16 * 1024
 MAX_MCP_HTTP_HEADER_TOTAL_BYTES = 64 * 1024
 MAX_MCP_CONFIGURATION_BYTES = 256 * 1024
+MAX_MCP_RESOURCE_BYTES = 512 * 1024
 MAX_CLIENT_FILE_BYTES = 1024 * 1024
 MAX_CLIENT_TERMINAL_COMMAND_BYTES = 4 * 1024
 MAX_CLIENT_TERMINAL_ARGUMENTS = 64
@@ -200,9 +212,15 @@ MAX_CLIENT_TERMINAL_ID_BYTES = 512
 MAX_CLIENT_TERMINAL_SIGNAL_BYTES = 128
 MAX_CLIENT_TERMINAL_TASKS = 8
 MAX_CLIENT_TERMINAL_RETAINED_TASKS = 32
+MAX_MCP_SAMPLING_MESSAGES = 128
+MAX_MCP_SAMPLING_TOKENS = 1_000_000
+MAX_MCP_ELICITATION_MESSAGE_BYTES = 64 * 1024
+MAX_MCP_CALLBACK_BYTES = 256 * 1024
 ACP_TOOL_OUTPUT_ARTIFACT_EXTENSION = "neuro-code/session/artifacts"
 ACP_READ_ONLY_SUBAGENT_EXTENSION = "neuro-code/session/subagent"
 ACP_SUBAGENT_LIFECYCLE_EXTENSION = "neuro-code/session/subagents"
+ACP_MCP_EXTENSION = "neuro-code/session/mcp"
+ACP_CONTEXT_COMPACTION_EXTENSION = "neuro-code/session/compact"
 
 _SESSION_NOT_ACTIVE = -32001
 _SESSION_NOT_FOUND = -32002
@@ -322,6 +340,51 @@ def _validated_session_id(value: object) -> str:
     if len(value.encode("utf-8")) > MAX_SESSION_ID_BYTES:
         raise _invalid_params("session_id_too_large")
     return value
+
+
+def _safe_mcp_extension_value(
+    value: object,
+    *,
+    explicit_redactions: tuple[str, ...],
+    depth: int = 0,
+) -> object:
+    """Project untrusted MCP metadata into bounded, redacted JSON values."""
+
+    if depth >= 5:
+        return "<nested-value-omitted>"
+    if isinstance(value, str):
+        return safe_output_text(value, 16 * 1024, explicit_redactions=explicit_redactions)
+    if value is None or isinstance(value, (bool, int)):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, Mapping):
+        result: dict[str, object] = {}
+        for index, (key, nested) in enumerate(value.items()):
+            if index >= 64:
+                result["<fields-omitted>"] = True
+                break
+            rendered_key = safe_output_text(
+                str(key),
+                512,
+                explicit_redactions=explicit_redactions,
+            )
+            result[rendered_key] = _safe_mcp_extension_value(
+                nested,
+                explicit_redactions=explicit_redactions,
+                depth=depth + 1,
+            )
+        return result
+    if isinstance(value, Sequence) and not isinstance(value, (bytes, bytearray, str)):
+        return [
+            _safe_mcp_extension_value(
+                nested,
+                explicit_redactions=explicit_redactions,
+                depth=depth + 1,
+            )
+            for nested in value[:64]
+        ]
+    return safe_output_text(str(value), 512, explicit_redactions=explicit_redactions)
 
 
 def _bounded_input_text(value: str, *, limit: int, field_name: str) -> str:
@@ -618,6 +681,24 @@ def _image_content_part(block: ImageContentBlock) -> tuple[ContentPart, int]:
     return ContentPart.from_image(f"data:{media_type};base64,{block.data}"), len(decoded)
 
 
+def _audio_content_part(block: AudioContentBlock) -> tuple[ContentPart, int]:
+    """Validate and preserve one inline ACP audio block."""
+
+    media_type = block.mime_type.casefold()
+    if not media_type.startswith("audio/"):
+        raise _invalid_params("audio_mime_type_unsupported")
+    max_encoded_bytes = 4 * ((MAX_AUDIO_BLOCK_BYTES + 2) // 3)
+    if not block.data or len(block.data) > max_encoded_bytes:
+        raise _invalid_params("audio_block_too_large")
+    try:
+        decoded = base64.b64decode(block.data, validate=True)
+    except (binascii.Error, ValueError):
+        raise _invalid_params("audio_data_invalid") from None
+    if not decoded or len(decoded) > MAX_AUDIO_BLOCK_BYTES:
+        raise _invalid_params("audio_block_too_large")
+    return ContentPart.from_audio(block.data, media_type), len(decoded)
+
+
 def _embedded_text_resource_part(
     block: EmbeddedResourceContentBlock,
 ) -> tuple[ContentPart, int]:
@@ -627,7 +708,32 @@ def _embedded_text_resource_part(
 
     resource = block.resource
     if isinstance(resource, BlobResourceContents):
-        raise _invalid_params("embedded_resource_blob_unsupported")
+        uri = _bounded_input_text(
+            resource.uri,
+            limit=MAX_RESOURCE_URI_BYTES,
+            field_name="embedded_resource_uri",
+        )
+        if not uri.strip():
+            raise _invalid_params("embedded_resource_uri_empty")
+        media_type = resource.mime_type or "application/octet-stream"
+        media_type = _bounded_input_text(
+            media_type,
+            limit=MAX_RESOURCE_FIELD_BYTES,
+            field_name="embedded_resource_mime_type",
+        )
+        max_encoded_bytes = 4 * ((MAX_EMBEDDED_BINARY_RESOURCE_BYTES + 2) // 3)
+        if not resource.blob or len(resource.blob) > max_encoded_bytes:
+            raise _invalid_params("embedded_resource_blob_too_large")
+        try:
+            decoded = base64.b64decode(resource.blob, validate=True)
+        except (binascii.Error, ValueError):
+            raise _invalid_params("embedded_resource_blob_invalid") from None
+        if not decoded or len(decoded) > MAX_EMBEDDED_BINARY_RESOURCE_BYTES:
+            raise _invalid_params("embedded_resource_blob_too_large")
+        return (
+            ContentPart.from_blob(uri, resource.blob, media_type),
+            len(decoded),
+        )
     if not isinstance(resource, TextResourceContents):
         raise _invalid_params("embedded_resource_unsupported")
 
@@ -678,8 +784,12 @@ def convert_prompt_content(prompt: list[PromptBlock]) -> ConvertedPrompt:
     text_count = 0
     image_count = 0
     image_bytes = 0
+    audio_count = 0
+    audio_bytes = 0
     embedded_text_resource_count = 0
     embedded_text_resource_bytes = 0
+    embedded_binary_resource_count = 0
+    embedded_binary_resource_bytes = 0
     resource_count = 0
     resource_bytes = 0
     for block in prompt:
@@ -707,14 +817,34 @@ def convert_prompt_content(prompt: list[PromptBlock]) -> ConvertedPrompt:
                 raise _invalid_params("images_too_large")
             content_parts.append(image)
             continue
+        if isinstance(block, AudioContentBlock):
+            audio_count += 1
+            if audio_count > MAX_AUDIO_BLOCKS:
+                raise _invalid_params("too_many_audio_blocks")
+            audio, decoded_bytes = _audio_content_part(block)
+            audio_bytes += decoded_bytes
+            if audio_bytes > MAX_AUDIO_TOTAL_BYTES:
+                raise _invalid_params("audio_too_large")
+            content_parts.append(audio)
+            continue
         if isinstance(block, EmbeddedResourceContentBlock):
-            embedded_text_resource_count += 1
-            if embedded_text_resource_count > MAX_EMBEDDED_TEXT_RESOURCES:
-                raise _invalid_params("too_many_embedded_text_resources")
-            embedded_resource, embedded_resource_bytes = _embedded_text_resource_part(block)
-            embedded_text_resource_bytes += embedded_resource_bytes
-            if embedded_text_resource_bytes > MAX_EMBEDDED_TEXT_TOTAL_BYTES:
-                raise _invalid_params("embedded_text_resources_too_large")
+            if isinstance(block.resource, BlobResourceContents):
+                embedded_binary_resource_count += 1
+                if embedded_binary_resource_count > MAX_EMBEDDED_TEXT_RESOURCES:
+                    raise _invalid_params("too_many_embedded_binary_resources")
+            else:
+                embedded_text_resource_count += 1
+                if embedded_text_resource_count > MAX_EMBEDDED_TEXT_RESOURCES:
+                    raise _invalid_params("too_many_embedded_text_resources")
+            embedded_resource, resource_bytes = _embedded_text_resource_part(block)
+            if embedded_resource.kind is ContentPartKind.BLOB:
+                embedded_binary_resource_bytes += resource_bytes
+                if embedded_binary_resource_bytes > MAX_EMBEDDED_BINARY_TOTAL_BYTES:
+                    raise _invalid_params("embedded_binary_resources_too_large")
+            else:
+                embedded_text_resource_bytes += resource_bytes
+                if embedded_text_resource_bytes > MAX_EMBEDDED_TEXT_TOTAL_BYTES:
+                    raise _invalid_params("embedded_text_resources_too_large")
             content_parts.append(embedded_resource)
             continue
         if isinstance(block, ResourceContentBlock):
@@ -739,7 +869,7 @@ def convert_prompt_content(prompt: list[PromptBlock]) -> ConvertedPrompt:
         raise _invalid_params("unsupported_prompt_content")
 
     converted = "\n".join(part.text for part in content_parts if part.text is not None)
-    if not converted.strip() and not image_count:
+    if not converted.strip() and not (image_count or audio_count or embedded_binary_resource_bytes):
         raise _invalid_params("prompt_empty")
     if len(converted.encode("utf-8")) > MAX_PROMPT_BYTES:
         raise _invalid_params("prompt_too_large")
@@ -1111,6 +1241,7 @@ class _AcpSession:
     approvals: SessionApprovalBroker
     context_window_tokens: int | None
     mcp_tools: AcpMcpTools | None
+    mcp_tool_names: tuple[str, ...] = ()
     client_terminal: ClientTerminal | None = None
     internal_session_id: str | None = None
     prompt_task: asyncio.Task[Any] | None = None
@@ -1806,7 +1937,11 @@ class NeuroCodeAcpAgent:
             protocol_version=negotiated,
             agent_capabilities=AgentCapabilities(
                 load_session=True,
-                prompt_capabilities=None,
+                prompt_capabilities=PromptCapabilities(
+                    image=True,
+                    audio=True,
+                    embedded_context=True,
+                ),
                 mcp_capabilities=McpCapabilities(http=True, sse=True),
                 auth=None,
                 session_capabilities=SessionCapabilities(
@@ -1853,6 +1988,88 @@ class NeuroCodeAcpAgent:
             return None
         return _AcpClientTerminal(client, session_id)
 
+    def _safe_mcp_callback_payload(self, value: object) -> dict[str, Any]:
+        projected = _safe_mcp_extension_value(
+            value,
+            explicit_redactions=self._explicit_redactions(),
+        )
+        if not isinstance(projected, dict):
+            raise ConfigurationError("MCP callback payload is not an object")
+        if serialized_size_bytes(projected) > MAX_MCP_CALLBACK_BYTES:
+            raise ConfigurationError("MCP callback payload is too large")
+        return cast(dict[str, Any], projected)
+
+    async def _mcp_sampling_handler(
+        self,
+        messages: Sequence[Mapping[str, Any]],
+        *,
+        model_preferences: Mapping[str, Any] | None = None,
+        system_prompt: str | None = None,
+        max_tokens: int | None = None,
+    ) -> Mapping[str, Any]:
+        client = self._client
+        if client is None:
+            raise ConfigurationError("ACP client is unavailable for MCP sampling")
+        if len(messages) > MAX_MCP_SAMPLING_MESSAGES:
+            raise ConfigurationError("MCP sampling message count exceeds the limit")
+        if system_prompt is not None and not isinstance(system_prompt, str):
+            raise ConfigurationError("MCP sampling system prompt is invalid")
+        if (
+            system_prompt is not None
+            and len(system_prompt.encode("utf-8")) > MAX_MCP_ELICITATION_MESSAGE_BYTES
+        ):
+            raise ConfigurationError("MCP sampling system prompt is too large")
+        if max_tokens is not None and (
+            isinstance(max_tokens, bool)
+            or not isinstance(max_tokens, int)
+            or not 1 <= max_tokens <= MAX_MCP_SAMPLING_TOKENS
+        ):
+            raise ConfigurationError("MCP sampling token limit is invalid")
+        payload: dict[str, object] = {
+            "messages": tuple(messages),
+        }
+        if model_preferences is not None:
+            payload["modelPreferences"] = model_preferences
+        if system_prompt is not None:
+            payload["systemPrompt"] = system_prompt
+        if max_tokens is not None:
+            payload["maxTokens"] = max_tokens
+        response = await client.ext_method(
+            "neuro-code/mcp/sampling",
+            self._safe_mcp_callback_payload(payload),
+        )
+        return self._safe_mcp_callback_payload(response)
+
+    async def _mcp_elicitation_handler(
+        self,
+        message: str,
+        schema: Mapping[str, Any] | None = None,
+        *,
+        url: str | None = None,
+    ) -> Mapping[str, Any]:
+        client = self._client
+        if client is None:
+            raise ConfigurationError("ACP client is unavailable for MCP elicitation")
+        if (
+            not isinstance(message, str)
+            or len(message.encode("utf-8")) > MAX_MCP_ELICITATION_MESSAGE_BYTES
+        ):
+            raise ConfigurationError("MCP elicitation message is invalid")
+        if url is not None and (
+            not isinstance(url, str) or len(url.encode("utf-8")) > MAX_MCP_URL_BYTES
+        ):
+            raise ConfigurationError("MCP elicitation URL is invalid")
+        payload: dict[str, object] = {"message": message}
+        if schema is not None:
+            payload["schema"] = schema
+        if url is not None:
+            payload["url"] = url
+        response = await client.ext_method(
+            "neuro-code/mcp/elicitation",
+            self._safe_mcp_callback_payload(payload),
+        )
+        return self._safe_mcp_callback_payload(response)
+
     async def _validate_session_workspace(
         self,
         cwd: str,
@@ -1875,7 +2092,17 @@ class NeuroCodeAcpAgent:
     ) -> AcpMcpTools | None:
         if not configurations:
             return None
-        return await self._service.open_mcp_tools(configurations)
+        sampling_handler: McpSamplingHandler | None = (
+            self._mcp_sampling_handler if self._client is not None else None
+        )
+        elicitation_handler: McpElicitationHandler | None = (
+            self._mcp_elicitation_handler if self._client is not None else None
+        )
+        return await self._service.open_mcp_tools(
+            configurations,
+            sampling_handler=sampling_handler,
+            elicitation_handler=elicitation_handler,
+        )
 
     async def _validate_workspace(
         self,
@@ -1961,6 +2188,11 @@ class NeuroCodeAcpAgent:
                 approvals,
                 opened_binding.context_window_tokens,
                 mcp_tools,
+                mcp_tool_names=(
+                    tuple(tool.definition.name for tool in mcp_tools.tools)
+                    if mcp_tools is not None
+                    else ()
+                ),
                 client_terminal=client_terminal,
             )
             if await self._publish_session(session):
@@ -2112,6 +2344,11 @@ class NeuroCodeAcpAgent:
                 approvals,
                 prepared_session.context_window_tokens,
                 mcp_tools,
+                mcp_tool_names=(
+                    tuple(tool.definition.name for tool in mcp_tools.tools)
+                    if mcp_tools is not None
+                    else ()
+                ),
                 client_terminal=client_terminal,
                 internal_session_id=internal_session_id,
             )
@@ -2382,6 +2619,11 @@ class NeuroCodeAcpAgent:
                 approvals,
                 prepared_session.context_window_tokens,
                 mcp_tools,
+                mcp_tool_names=(
+                    tuple(tool.definition.name for tool in mcp_tools.tools)
+                    if mcp_tools is not None
+                    else ()
+                ),
                 client_terminal=client_terminal,
                 internal_session_id=forked_internal_session_id,
             )
@@ -2480,6 +2722,116 @@ class NeuroCodeAcpAgent:
                 continue
         raise RequestError.internal_error({"reason": "session_alias_allocation_failed"})
 
+    def _mcp_list_payload(self, mcp_tools: AcpMcpTools) -> dict[str, object]:
+        explicit_redactions = self._explicit_redactions()
+        payload = {
+            "resources": [
+                _safe_mcp_extension_value(
+                    resource.to_dict(),
+                    explicit_redactions=explicit_redactions,
+                )
+                for resource in tuple(mcp_tools.resources)[:256]
+            ],
+            "resourceTemplates": [
+                _safe_mcp_extension_value(
+                    template.to_dict(),
+                    explicit_redactions=explicit_redactions,
+                )
+                for template in tuple(mcp_tools.resource_templates)[:256]
+            ],
+            "prompts": [
+                _safe_mcp_extension_value(
+                    prompt.to_dict(),
+                    explicit_redactions=explicit_redactions,
+                )
+                for prompt in tuple(mcp_tools.prompts)[:128]
+            ],
+            "toolCount": len(tuple(mcp_tools.tools)),
+        }
+        if serialized_size_bytes(payload) > MAX_MCP_CONFIGURATION_BYTES:
+            raise RequestError.internal_error({"reason": "mcp_metadata_too_large"})
+        return payload
+
+    async def _mcp_extension(self, query: AcpMcpQuery) -> dict[str, object]:
+        external_session_id = _validated_session_id(query.session_id)
+        session = await self._active_session(external_session_id)
+        mcp_tools = session.mcp_tools
+        if mcp_tools is None:
+            raise RequestError.internal_error({"reason": "mcp_unavailable"})
+        if query.operation == "list":
+            return self._mcp_list_payload(mcp_tools)
+        try:
+            if query.operation == "refresh":
+                await mcp_tools.refresh()
+                binding = session.binding
+                if binding is None:
+                    raise ConfigurationError("MCP session binding is unavailable")
+                binding.runner.replace_external_tools(
+                    mcp_tools.tools,
+                    session.mcp_tool_names,
+                )
+                session.mcp_tool_names = tuple(tool.definition.name for tool in mcp_tools.tools)
+                payload = self._mcp_list_payload(mcp_tools)
+                payload["refreshed"] = True
+                return payload
+            if query.operation == "read_resource":
+                assert query.uri is not None
+                contents = await mcp_tools.read_resource(query.uri)
+                explicit_redactions = self._explicit_redactions()
+                projected: list[dict[str, object]] = []
+                for content in tuple(contents)[:32]:
+                    raw = content.to_dict()
+                    if "text" in raw:
+                        raw["text"] = safe_output_text(
+                            raw["text"],
+                            MAX_MCP_RESOURCE_BYTES,
+                            explicit_redactions=explicit_redactions,
+                        )
+                    if "blob" in raw:
+                        raw["blob"] = safe_output_text(
+                            raw["blob"],
+                            MAX_MCP_RESOURCE_BYTES,
+                            explicit_redactions=explicit_redactions,
+                        )
+                    projected.append(
+                        cast(
+                            dict[str, object],
+                            _safe_mcp_extension_value(
+                                raw,
+                                explicit_redactions=explicit_redactions,
+                            ),
+                        )
+                    )
+                payload = {"contents": projected}
+                if serialized_size_bytes(payload) > MAX_MCP_RESOURCE_BYTES:
+                    raise RequestError.internal_error({"reason": "mcp_resource_too_large"})
+                return payload
+            if query.operation == "get_prompt":
+                assert query.name is not None
+                messages = await mcp_tools.get_prompt(query.name, dict(query.arguments))
+                explicit_redactions = self._explicit_redactions()
+                projected_messages = [
+                    cast(
+                        dict[str, object],
+                        _safe_mcp_extension_value(
+                            message.to_dict(),
+                            explicit_redactions=explicit_redactions,
+                        ),
+                    )
+                    for message in tuple(messages)[:128]
+                ]
+                payload = {"messages": projected_messages}
+                if serialized_size_bytes(payload) > MAX_MCP_CONFIGURATION_BYTES:
+                    raise RequestError.internal_error({"reason": "mcp_prompt_too_large"})
+                return payload
+        except asyncio.CancelledError:
+            raise
+        except RequestError:
+            raise
+        except Exception:
+            raise RequestError.internal_error({"reason": "mcp_operation_failed"}) from None
+        raise RequestError.internal_error({"reason": "mcp_operation_unsupported"})
+
     async def ext_method(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
         """Serve private, bounded session extensions.
 
@@ -2494,6 +2846,58 @@ class NeuroCodeAcpAgent:
         """
 
         self._require_initialized()
+        if method == ACP_MCP_EXTENSION:
+            try:
+                mcp_query = AcpMcpQuery.from_payload(params)
+            except AcpMcpQueryError as error:
+                raise _invalid_params(error.reason) from None
+            return await self._mcp_extension(mcp_query)
+
+        if method == ACP_CONTEXT_COMPACTION_EXTENSION:
+            try:
+                command_query = AcpSessionCommandQuery.from_payload(params)
+            except AcpMcpQueryError as error:
+                raise _invalid_params(error.reason) from None
+            session = await self._active_session(_validated_session_id(command_query.session_id))
+            if session.binding is None:
+                raise RequestError.internal_error({"reason": "session_binding_unavailable"})
+            try:
+                compact_result = await session.binding.runner.compact_now()
+            except asyncio.CancelledError:
+                raise
+            except ProviderError:
+                raise RequestError.internal_error({"reason": "provider_failure"}) from None
+            except ConfigurationError:
+                raise RequestError.internal_error({"reason": "compaction_unavailable"}) from None
+            except Exception:
+                raise RequestError.internal_error({"reason": "compaction_failed"}) from None
+            payload: dict[str, object] = {
+                "status": compact_result.status.value,
+                "triggered": compact_result.triggered,
+            }
+            for name in (
+                "compaction_id",
+                "source_item_count",
+                "candidate_item_count",
+                "summary_tokens",
+                "summary_truncated",
+            ):
+                value = getattr(compact_result, name)
+                if value is not None:
+                    payload[name] = value
+            if compact_result.outcome is not None:
+                payload["outcome"] = {
+                    "status": compact_result.outcome.status.value,
+                    "reason_code": (
+                        compact_result.outcome.reason_code.value
+                        if compact_result.outcome.reason_code is not None
+                        else None
+                    ),
+                    "finalized": compact_result.outcome.finalized,
+                    "recoverable": compact_result.outcome.recoverable,
+                }
+            return payload
+
         if method == ACP_SUBAGENT_LIFECYCLE_EXTENSION:
             try:
                 lifecycle_query = AcpSubagentLifecycleQuery.from_payload(params)
@@ -2504,7 +2908,7 @@ class NeuroCodeAcpAgent:
                 raise RequestError.internal_error({"reason": "subagent_lifecycle_unavailable"})
             internal_session_id = await self._artifact_internal_session_id(external_session_id)
             try:
-                result = await self._service.run_subagent_relationship_action(
+                lifecycle_result = await self._service.run_subagent_relationship_action(
                     internal_session_id,
                     lifecycle_query.task_id,
                     lifecycle_query.action,
@@ -2519,26 +2923,28 @@ class NeuroCodeAcpAgent:
                 raise RequestError.internal_error({"reason": "subagent_lifecycle_failed"}) from None
 
             if (
-                result.parent_session_id != internal_session_id
-                or result.parent_task_id != lifecycle_query.task_id
-                or result.action is not lifecycle_query.action
+                lifecycle_result.parent_session_id != internal_session_id
+                or lifecycle_result.parent_task_id != lifecycle_query.task_id
+                or lifecycle_result.action is not lifecycle_query.action
             ):
                 raise RequestError.internal_error({"reason": "subagent_lifecycle_invalid_result"})
-            if result.action is SubagentRelationshipAction.DELETE:
-                return serialize_subagent_lifecycle_action(result.action, deleted=True)
-            if result.action is SubagentRelationshipAction.RESUME:
+            if lifecycle_result.action is SubagentRelationshipAction.DELETE:
+                return serialize_subagent_lifecycle_action(lifecycle_result.action, deleted=True)
+            if lifecycle_result.action is SubagentRelationshipAction.RESUME:
                 external_child_id = await self._lifecycle_external_session_id(
-                    result.child_session_id
+                    lifecycle_result.child_session_id
                 )
                 return serialize_subagent_lifecycle_action(
-                    result.action,
+                    lifecycle_result.action,
                     session_id=external_child_id,
                 )
-            if result.forked_session_id is None:
+            if lifecycle_result.forked_session_id is None:
                 raise RequestError.internal_error({"reason": "subagent_lifecycle_invalid_result"})
-            external_forked_id = await self._lifecycle_external_session_id(result.forked_session_id)
+            external_forked_id = await self._lifecycle_external_session_id(
+                lifecycle_result.forked_session_id
+            )
             return serialize_subagent_lifecycle_action(
-                result.action,
+                lifecycle_result.action,
                 session_id=external_forked_id,
             )
 
@@ -2942,6 +3348,107 @@ class _AcpSdkConnection:
         )
 
 
+class _WebSocketWriter:
+    """Minimal asyncio writer bridge for ACP's newline JSON sender."""
+
+    def __init__(self, websocket: Any) -> None:
+        self._websocket = websocket
+        self._pending = bytearray()
+        self._closed = False
+
+    def write(self, data: bytes) -> None:
+        if self._closed:
+            raise ConnectionError("WebSocket ACP writer is closed")
+        self._pending.extend(data)
+
+    async def drain(self) -> None:
+        if self._closed or not self._pending:
+            return
+        payload = bytes(self._pending)
+        self._pending.clear()
+        await self._websocket.send(payload)
+
+    def close(self) -> None:
+        self._closed = True
+
+    async def wait_closed(self) -> None:
+        return
+
+    def is_closing(self) -> bool:
+        return self._closed
+
+    def get_extra_info(self, name: str, default: object = None) -> object:
+        return default
+
+
+async def serve_acp_websocket(
+    service: AcpApplicationService,
+    *,
+    host: str = "127.0.0.1",
+    port: int = 0,
+) -> None:
+    """Serve the same ACP router over bounded WebSocket JSON messages.
+
+    The WebSocket is only a transport bridge; ACP request validation,
+    permissions, workspace checks, and session ownership remain unchanged.
+    """
+
+    if not isinstance(host, str) or not host or "\x00" in host or len(host.encode("utf-8")) > 256:
+        raise ConfigurationError("WebSocket ACP host is invalid")
+    if isinstance(port, bool) or not isinstance(port, int) or not 0 <= port <= 65535:
+        raise ConfigurationError("WebSocket ACP port is invalid")
+    try:
+        from websockets.asyncio.server import serve  # type: ignore[import-not-found]
+    except ImportError:
+        raise ConfigurationError(
+            "WebSocket ACP support requires the websockets dependency"
+        ) from None
+
+    async def handle(websocket: Any) -> None:
+        agent = NeuroCodeAcpAgent(service)
+        reader = asyncio.StreamReader(limit=ACP_STDIO_BUFFER_LIMIT_BYTES)
+        writer = _WebSocketWriter(websocket)
+        connection = _AcpSdkConnection(agent, cast(asyncio.StreamWriter, writer), reader)
+        feeder: asyncio.Task[None] | None = None
+
+        async def feed_messages() -> None:
+            try:
+                async for message in websocket:
+                    if isinstance(message, str):
+                        data = message.encode("utf-8")
+                    elif isinstance(message, bytes):
+                        data = message
+                    else:
+                        raise ConnectionError("WebSocket ACP message type is unsupported")
+                    if not data or len(data) > ACP_STDIO_BUFFER_LIMIT_BYTES:
+                        raise ConnectionError("WebSocket ACP message exceeds the size limit")
+                    if not data.endswith(b"\n"):
+                        data += b"\n"
+                    reader.feed_data(data)
+            finally:
+                reader.feed_eof()
+
+        try:
+            feeder = asyncio.create_task(feed_messages(), name="neuro-code-acp-websocket-reader")
+            await connection.listen()
+        finally:
+            if feeder is not None and not feeder.done():
+                feeder.cancel()
+            if feeder is not None:
+                await asyncio.gather(feeder, return_exceptions=True)
+            await asyncio.shield(connection.close())
+            await asyncio.shield(agent.shutdown())
+
+    async with serve(
+        handle,
+        host,
+        port,
+        max_size=ACP_STDIO_BUFFER_LIMIT_BYTES,
+        max_queue=16,
+    ):
+        await asyncio.Future()
+
+
 async def serve_acp(service: AcpApplicationService) -> None:
     """Serve ACP on stdio through the official SDK framing and router.
 
@@ -2964,6 +3471,8 @@ async def serve_acp(service: AcpApplicationService) -> None:
 
 
 __all__ = [
+    "ACP_CONTEXT_COMPACTION_EXTENSION",
+    "ACP_MCP_EXTENSION",
     "ACP_PROTOCOL_VERSION",
     "ACP_READ_ONLY_SUBAGENT_EXTENSION",
     "ACP_STDIO_BUFFER_LIMIT_BYTES",
@@ -2971,4 +3480,5 @@ __all__ = [
     "NeuroCodeAcpAgent",
     "convert_prompt_content",
     "serve_acp",
+    "serve_acp_websocket",
 ]

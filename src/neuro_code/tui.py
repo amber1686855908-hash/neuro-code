@@ -28,6 +28,7 @@ from textual.widget import Widget
 from textual.widgets import Button, Input, Label, Static, TextArea
 from textual.worker import Worker
 
+from neuro_code.application.memory.compaction_runtime import ContextCompactionCommandResult
 from neuro_code.application.permissions.broker import ApprovalHandler
 from neuro_code.application.permissions.contracts import PermissionApproval, PermissionRequest
 from neuro_code.application.ports.http import HttpClientPolicy
@@ -375,6 +376,9 @@ class ConversationRunner(Protocol):
     @property
     def session_id(self) -> str | None: ...
 
+    @property
+    def items(self) -> tuple[SessionItem, ...]: ...
+
     async def run(
         self,
         prompt: str,
@@ -388,6 +392,8 @@ class ConversationRunner(Protocol):
     async def load_background_wake_state(self) -> BackgroundWakeState: ...
 
     async def save_background_wake_state(self, state: BackgroundWakeState) -> None: ...
+
+    async def compact_now(self) -> ContextCompactionCommandResult: ...
 
 
 class ApprovalController(Protocol):
@@ -5625,8 +5631,34 @@ class NeuroCodeApp(App[None]):
                 profile=profile,
                 cwd=self._cwd,
             )
+        elif command in {"compact", "context"}:
+            await self._run_context_compaction()
         else:
             self._write_ui_entry("error", "command.unknown", command=command)
+
+    async def _run_context_compaction(self) -> None:
+        if self._turn_worker is not None and self._turn_worker.is_running:
+            self._write_ui_entry("error", "turn.running")
+            return
+        try:
+            result = await self._runner.compact_now()
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            self._write_ui_entry(
+                "error",
+                "context.compaction_failed",
+                error=self._safe_tool_text(str(error)),
+            )
+            return
+        self._context_used_tokens = estimate_context_tokens(self._runner.items)
+        self._context_usage_estimated = True
+        self._refresh_runtime_bar()
+        self._write_ui_entry(
+            "status",
+            "context.compaction_result",
+            status=result.status.value,
+        )
 
     async def _run_read_only_subagent(self, raw_prompt: str) -> None:
         """Start one explicit, bounded read-only child without parent transcript reuse.

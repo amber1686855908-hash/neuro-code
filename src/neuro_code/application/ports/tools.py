@@ -22,7 +22,7 @@ from neuro_code.application.ports.user_interaction import (
 from neuro_code.application.ports.web_search import HostedWebSearchEventSink
 from neuro_code.application.ports.workspace_changes import WorkspaceChangeJournal
 from neuro_code.domain.sandbox.models import SandboxProfile
-from neuro_code.domain.tools import ToolDefinition, ToolResult
+from neuro_code.domain.tools import ToolDefinition, ToolExecutionMode, ToolResult
 
 MAX_TOOL_OUTPUT_ARTIFACT_BYTES = 8 * 1024 * 1024
 MAX_TOOL_OUTPUT_ARTIFACT_READ_BYTES = 256 * 1024
@@ -202,6 +202,7 @@ __all__ = [
     "Tool",
     "ToolCollection",
     "ToolContext",
+    "ToolExecutionMode",
     "ToolOutputArtifact",
     "ToolOutputArtifactGarbageCollector",
     "ToolOutputArtifactPruneResult",

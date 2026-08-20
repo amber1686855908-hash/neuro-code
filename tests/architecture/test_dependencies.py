@@ -842,6 +842,7 @@ def test_canonical_ports_are_the_only_port_modules() -> None:
         "neuro_code.application.ports.client_terminal",
         "neuro_code.application.ports.http",
         "neuro_code.application.ports.instructions",
+        "neuro_code.application.ports.mcp",
         "neuro_code.application.ports.model",
         "neuro_code.application.ports.provider_catalog",
         "neuro_code.application.ports.provider_services",
@@ -851,6 +852,7 @@ def test_canonical_ports_are_the_only_port_modules() -> None:
         "neuro_code.application.ports.skills",
         "neuro_code.application.ports.storage",
         "neuro_code.application.ports.terminal",
+        "neuro_code.application.ports.tool_pipeline",
         "neuro_code.application.ports.tools",
         "neuro_code.application.ports.user_interaction",
         "neuro_code.application.ports.web_fetch",
@@ -922,6 +924,7 @@ def test_canonical_provider_modules_are_the_only_provider_implementations() -> N
     canonical_modules = {
         "neuro_code.infrastructure.providers",
         "neuro_code.infrastructure.providers.anthropic",
+        "neuro_code.infrastructure.providers.catalog_cache",
         "neuro_code.infrastructure.providers.failover",
         "neuro_code.infrastructure.providers.gemini",
         "neuro_code.infrastructure.providers.gemini_interactions",
@@ -931,6 +934,7 @@ def test_canonical_provider_modules_are_the_only_provider_implementations() -> N
         "neuro_code.infrastructure.providers.provider_catalog",
         "neuro_code.infrastructure.providers.provider_settings",
         "neuro_code.infrastructure.providers.hosted_web_search",
+        "neuro_code.infrastructure.providers.resilience",
     }
     assert {
         module for module in modules if module.startswith("neuro_code.infrastructure.providers")
@@ -1036,6 +1040,7 @@ def test_canonical_runtime_modules_are_the_only_runtime_implementations() -> Non
         "neuro_code.application.runtime.finalization",
         "neuro_code.application.runtime.model_step",
         "neuro_code.application.runtime.supervision",
+        "neuro_code.application.runtime.tool_scheduler",
         "neuro_code.application.runtime.tool_pipeline",
     }
     assert {
@@ -1049,7 +1054,11 @@ def test_canonical_runtime_modules_are_the_only_runtime_implementations() -> Non
 
     expected_classes = {
         "neuro_code.application.runtime.agent": {"AgentRuntime"},
-        "neuro_code.application.runtime.agent_loop": {"AgentLoopRunner", "AgentRunResult"},
+        "neuro_code.application.runtime.agent_loop": {
+            "AgentLoopRunner",
+            "AgentRunResult",
+            "_ScheduledToolOutcome",
+        },
         "neuro_code.application.runtime.context_builder": {"ContextBuilder"},
         "neuro_code.application.runtime.event_recorder": {"TurnEventRecorder"},
         "neuro_code.application.runtime.model_step": {

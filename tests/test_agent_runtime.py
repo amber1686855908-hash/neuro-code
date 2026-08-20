@@ -3839,6 +3839,7 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
                     AgentEventKind.SESSION_STARTED,
                     AgentEventKind.USER_MESSAGE,
                     AgentEventKind.MODEL_STEP_STARTED,
+                    AgentEventKind.MODEL_REQUEST_SNAPSHOT,
                     AgentEventKind.MODEL_THINKING_COMPLETED,
                     AgentEventKind.TEXT_DELTA,
                     AgentEventKind.TURN_COMPLETED,

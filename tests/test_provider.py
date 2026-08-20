@@ -48,6 +48,7 @@ from neuro_code.infrastructure.providers.openai_compatible import (
     _ToolCallBuffer,
 )
 from neuro_code.infrastructure.providers.openai_responses import OpenAIResponsesProvider
+from neuro_code.infrastructure.providers.resilience import ResilientModelProvider
 from neuro_code.shared.errors import ConfigurationError, ProviderError
 
 
@@ -1565,7 +1566,7 @@ class OpenAICompatibleProviderTests(unittest.IsolatedAsyncioTestCase):
             direct = create_routed_provider(config, failover=False)
 
         self.assertIsInstance(routed, FailoverModelProvider)
-        self.assertIsInstance(direct, OpenAICompatibleProvider)
+        self.assertIsInstance(direct, ResilientModelProvider)
 
 
 if __name__ == "__main__":

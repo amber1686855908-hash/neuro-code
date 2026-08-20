@@ -1555,6 +1555,7 @@ def test_permissions_expose_policy_without_approval_contract_reexports() -> None
         "PermissionManager",
         "PermissionMode",
         "PermissionRule",
+        "PermissionRuleStore",
     )
     contract_names = (
         "PermissionApproval",

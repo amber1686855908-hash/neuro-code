@@ -31,9 +31,25 @@ from neuro_code.application.workflows.subagent import (
     SubagentResultProjection,
     SubagentRunResult,
 )
+from neuro_code.application.workflows.subagent_scheduler import (
+    MAX_SCHEDULED_SUBAGENTS,
+    MAX_SUBAGENT_DEPTH,
+    MAX_SUBAGENT_PARALLELISM,
+    MAX_SUBAGENT_RETRIES,
+    ScheduledSubagentResult,
+    ScopedSubagentRuntime,
+    ScopedSubagentRuntimeFactory,
+    SubagentRuntimeScope,
+    SubagentScheduler,
+    SubagentWorkRequest,
+)
 
 __all__ = [
+    "MAX_SCHEDULED_SUBAGENTS",
+    "MAX_SUBAGENT_DEPTH",
+    "MAX_SUBAGENT_PARALLELISM",
     "MAX_SUBAGENT_RESULT_BYTES",
+    "MAX_SUBAGENT_RETRIES",
     "ExecutePlanRequest",
     "IsolatedSubagentExecutionService",
     "IsolatedSubagentRuntime",
@@ -48,10 +64,16 @@ __all__ = [
     "RunSessionTaskRequest",
     "RunSubagentRequest",
     "SchedulePlanRequest",
+    "ScheduledSubagentResult",
+    "ScopedSubagentRuntime",
+    "ScopedSubagentRuntimeFactory",
     "SubagentExecutionController",
     "SubagentExecutionService",
     "SubagentExecutor",
     "SubagentExecutorFactory",
     "SubagentResultProjection",
     "SubagentRunResult",
+    "SubagentRuntimeScope",
+    "SubagentScheduler",
+    "SubagentWorkRequest",
 ]

@@ -36,6 +36,7 @@ from neuro_code.application.permissions.policy import (
 )
 from neuro_code.application.ports.approval import PermissionApprover
 from neuro_code.application.ports.storage import SessionStore
+from neuro_code.application.ports.tool_pipeline import ToolPipelineHook
 from neuro_code.application.ports.tools import Tool, ToolCollection, ToolContext
 from neuro_code.application.ports.web_search import HostedWebSearchEvent
 from neuro_code.application.ports.workspace_changes import (
@@ -55,7 +56,7 @@ from neuro_code.domain.conversation.events import AgentEvent, AgentEventKind
 from neuro_code.domain.conversation.messages import Message, Role, SessionItem, ToolCall
 from neuro_code.domain.execution import ProgressKind
 from neuro_code.domain.plans import SessionPlan
-from neuro_code.domain.tools import ToolResult
+from neuro_code.domain.tools import ToolExecutionResult, ToolResult
 from neuro_code.shared.async_utils import run_blocking
 from neuro_code.shared.errors import ToolError
 from neuro_code.shared.redaction import redact_sensitive_arguments, redact_sensitive_text
@@ -234,6 +235,7 @@ class ToolExecutor:
     __slots__ = (
         "_approver",
         "_context_builder",
+        "_hooks",
         "_observation_builder",
         "_permissions",
         "_session_store",
@@ -252,12 +254,14 @@ class ToolExecutor:
         session_store: SessionStore | None,
         workspace_change_observer: WorkspaceChangeObserver,
         context_builder: ContextBuilder,
+        hooks: Sequence[ToolPipelineHook] = (),
     ) -> None:
         self._tools = tools
         self._permissions = permissions
         self._approver = approver
         self._tool_context = tool_context
         self._session_store = session_store
+        self._hooks = tuple(hooks)
         self._workspace_change_observer = workspace_change_observer
         self._context_builder = context_builder
         self._observation_builder = ToolObservationBuilder(tool_context.redaction_values)
@@ -290,11 +294,21 @@ class ToolExecutor:
         )
 
         def terminal_event_data(result: ToolResult, **extra: object) -> dict[str, object]:
+            duration_seconds = monotonic() - tool_requested_at
+            canonical = ToolExecutionResult.from_tool_result(
+                call.id,
+                call.name,
+                result,
+                duration_seconds=duration_seconds,
+                not_started=extra.get("not_started") is True,
+                cancelled=extra.get("cancelled") is True,
+            )
             return {
                 "id": call.id,
                 "name": call.name,
                 **result.to_dict(),
-                "duration_seconds": monotonic() - tool_requested_at,
+                "duration_seconds": duration_seconds,
+                "execution_result": canonical.to_dict(),
                 **extra,
             }
 
@@ -432,6 +446,13 @@ class ToolExecutor:
                     plan_fingerprint_before=plan_fingerprint_before,
                 )
 
+            for hook in self._hooks:
+                await hook.before_tool(
+                    call.id,
+                    call.name,
+                    safe_arguments,
+                    side_effecting=tool.side_effecting,
+                )
             await emit(AgentEventKind.TOOL_STARTED, {"id": call.id, "name": call.name})
             if tool.side_effecting:
                 journal = self._tool_context.workspace_change_journal
@@ -482,6 +503,21 @@ class ToolExecutor:
                     is_error=result.is_error,
                     metadata=result.metadata,
                 )
+            hook_result = ToolExecutionResult.from_tool_result(
+                call.id,
+                call.name,
+                result,
+                duration_seconds=monotonic() - tool_requested_at,
+            )
+            for hook in self._hooks:
+                try:
+                    await hook.after_tool(hook_result)
+                except Exception as error:
+                    LOGGER.warning(
+                        "tool post-hook failed hook=%s error_type=%s",
+                        type(hook).__name__,
+                        type(error).__name__,
+                    )
             kind = AgentEventKind.TOOL_FAILED if result.is_error else AgentEventKind.TOOL_COMPLETED
             plan = self._observation_builder.plan_from_tool_result(call.name, result)
             if plan is not None:
@@ -675,6 +711,13 @@ class ToolExecutor:
             messages.append(message)
             context_items.append(message)
         for call in calls:
+            canonical = ToolExecutionResult.from_tool_result(
+                call.id,
+                call.name,
+                result,
+                not_started=True,
+                cancelled=cancelled,
+            )
             await emit(
                 AgentEventKind.TOOL_FAILED,
                 {
@@ -683,6 +726,7 @@ class ToolExecutor:
                     **result.to_dict(),
                     "cancelled": cancelled,
                     "not_started": True,
+                    "execution_result": canonical.to_dict(),
                 },
             )
 
@@ -703,6 +747,12 @@ class ToolExecutor:
             messages.append(message)
             context_items.append(message)
         for call in calls:
+            canonical = ToolExecutionResult.from_tool_result(
+                call.id,
+                call.name,
+                result,
+                not_started=True,
+            )
             await emit(
                 AgentEventKind.TOOL_FAILED,
                 {
@@ -711,6 +761,7 @@ class ToolExecutor:
                     **result.to_dict(),
                     "not_started": True,
                     "control_batch_rejected": True,
+                    "execution_result": canonical.to_dict(),
                 },
             )
 

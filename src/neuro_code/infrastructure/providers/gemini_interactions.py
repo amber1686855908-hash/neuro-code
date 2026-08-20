@@ -377,6 +377,9 @@ class GeminiInteractionsProvider:
                 assert part.text is not None
                 parts.append({"type": "text", "text": part.text})
                 continue
+            if part.kind is not ContentPartKind.IMAGE:
+                parts.append({"type": "text", "text": part.model_placeholder})
+                continue
             assert part.url is not None
             reference = parse_image_reference(
                 part.url,

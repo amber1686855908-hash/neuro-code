@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import builtins
 import tempfile
 import unittest
 from collections.abc import AsyncIterator, Sequence
@@ -47,6 +48,8 @@ from acp.schema import (
 
 import neuro_code.acp as acp_module
 from neuro_code.acp import (
+    ACP_CONTEXT_COMPACTION_EXTENSION,
+    ACP_MCP_EXTENSION,
     ACP_READ_ONLY_SUBAGENT_EXTENSION,
     ACP_STDIO_BUFFER_LIMIT_BYTES,
     ACP_SUBAGENT_LIFECYCLE_EXTENSION,
@@ -75,6 +78,13 @@ from neuro_code.application.memory.compaction_runtime import (
 )
 from neuro_code.application.permissions.contracts import PermissionApproval, PermissionRequest
 from neuro_code.application.ports.approval import PermissionApprover
+from neuro_code.application.ports.mcp import (
+    McpPrompt,
+    McpPromptMessage,
+    McpResource,
+    McpResourceContent,
+    McpResourceTemplate,
+)
 from neuro_code.application.ports.model import ModelProvider
 from neuro_code.application.ports.storage import SessionStore
 from neuro_code.application.ports.tools import ToolOutputArtifact, ToolOutputArtifactRead
@@ -336,8 +346,38 @@ class McpToolFixture:
 class McpCollectionFixture:
     def __init__(self, cleanup_events: list[str] | None = None) -> None:
         self.tools = (McpToolFixture(),)
+        self.resources = (
+            McpResource(
+                "fixture",
+                "resource",
+                "fixture://resource",
+                description="safe resource",
+            ),
+        )
+        self.resource_templates = (
+            McpResourceTemplate("fixture", "template", "fixture://resource/{name}"),
+        )
+        self.prompts = (McpPrompt("fixture", "prompt", description="safe prompt"),)
         self.close_calls = 0
         self._cleanup_events = cleanup_events
+
+    async def refresh(self) -> None:
+        return
+
+    async def read_resource(self, uri: str) -> tuple[McpResourceContent, ...]:
+        if uri != "fixture://resource":
+            raise RuntimeError("missing resource")
+        return (McpResourceContent(uri, "text/plain", text="safe resource text"),)
+
+    async def get_prompt(
+        self,
+        name: str,
+        arguments: dict[str, str] | None = None,
+    ) -> tuple[McpPromptMessage, ...]:
+        del arguments
+        if name != "prompt":
+            raise RuntimeError("missing prompt")
+        return (McpPromptMessage("user", {"type": "text", "text": "safe prompt text"}),)
 
     async def close(self) -> None:
         self.close_calls += 1
@@ -368,6 +408,7 @@ class RunnerFixture:
         self._failure = failure
         self._wrap_cancellation = wrap_cancellation
         self._outcome = outcome
+        self.external_tools: tuple[Any, ...] = ()
         self._approver: PermissionApprover | None = None
         self._started = asyncio.Event()
         self._release = asyncio.Event()
@@ -478,6 +519,14 @@ class RunnerFixture:
 
     def attach_approver(self, approver: PermissionApprover | None) -> None:
         self._approver = approver
+
+    def replace_external_tools(
+        self,
+        tools: Sequence[Any],
+        previous_names: Sequence[str] = (),
+    ) -> None:
+        del previous_names
+        self.external_tools = tuple(tools)
 
     async def wait_started(self) -> None:
         await self._started.wait()
@@ -1185,7 +1234,6 @@ class PromptContentTests(unittest.TestCase):
             ),
         )
         cases = (
-            (blob, "embedded_resource_blob_unsupported"),
             (
                 EmbeddedResourceContentBlock(
                     type="resource",
@@ -1211,6 +1259,8 @@ class PromptContentTests(unittest.TestCase):
                 "embedded_resource_text_too_large",
             ),
         )
+        converted_blob = convert_prompt_content([blob])
+        self.assertEqual(converted_blob.content_parts[0].kind.value, "blob")
         for resource, reason in cases:
             with self.subTest(reason=reason), self.assertRaises(RequestError) as error:
                 convert_prompt_content([resource])
@@ -1239,18 +1289,17 @@ class PromptContentTests(unittest.TestCase):
             "embedded_text_resources_too_large",
         )
 
-    def test_unsupported_and_oversized_content_is_rejected(self) -> None:
+    def test_audio_is_preserved_and_invalid_audio_is_rejected(self) -> None:
+        converted = convert_prompt_content(
+            [AudioContentBlock(type="audio", data="AA==", mime_type="audio/wav")]
+        )
+        self.assertEqual(converted.content_parts[0].kind.value, "audio")
+
         with self.assertRaises(RequestError) as audio_error:
             convert_prompt_content(
-                [
-                    AudioContentBlock(
-                        type="audio",
-                        data="AA==",
-                        mime_type="audio/wav",
-                    )
-                ]
+                [AudioContentBlock(type="audio", data="not-base64", mime_type="audio/wav")]
             )
-        self.assertEqual(audio_error.exception.data["reason"], "unsupported_prompt_content")
+        self.assertEqual(audio_error.exception.data["reason"], "audio_data_invalid")
 
         with self.assertRaises(RequestError) as text_error:
             convert_prompt_content(
@@ -1700,6 +1749,176 @@ class McpConfigurationTests(unittest.TestCase):
 
 
 class AcpAgentTests(unittest.IsolatedAsyncioTestCase):
+    async def test_websocket_server_validates_host_and_port_before_binding(self) -> None:
+        for kwargs, reason in (
+            ({"host": ""}, "host"),
+            ({"host": "fixture\x00"}, "host"),
+            ({"port": -1}, "port"),
+            ({"port": 65_536}, "port"),
+            ({"port": True}, "port"),
+        ):
+            with (
+                self.subTest(reason=reason, kwargs=kwargs),
+                self.assertRaisesRegex(ConfigurationError, reason),
+            ):
+                await acp_module.serve_acp_websocket(cast(Any, object()), **kwargs)
+
+        original_import = builtins.__import__
+
+        def reject_websockets(name: str, *args: Any, **kwargs: Any) -> Any:
+            if name == "websockets.asyncio.server":
+                raise ImportError("fixture dependency missing")
+            return original_import(name, *args, **kwargs)
+
+        with (
+            patch("builtins.__import__", side_effect=reject_websockets),
+            self.assertRaisesRegex(ConfigurationError, "requires the websockets dependency"),
+        ):
+            await acp_module.serve_acp_websocket(cast(Any, object()))
+
+    async def test_private_compaction_command_projects_safe_result_and_maps_failures(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            runner = RunnerFixture()
+            agent, _, _ = await initialized_agent(Path(directory), [runner])
+            session = await agent.new_session(directory)
+            active = agent._sessions[session.session_id]
+            assert active.binding is not None
+            active.binding.runner.compact_now = AsyncMock(
+                return_value=ContextCompactionCommandResult(
+                    status=ContextCompactionCommandStatus.NOT_NEEDED,
+                    triggered=False,
+                )
+            )
+            result = await agent.ext_method(
+                ACP_CONTEXT_COMPACTION_EXTENSION,
+                {"sessionId": session.session_id},
+            )
+            self.assertEqual(result, {"status": "not_needed", "triggered": False})
+            active.binding.runner.compact_now.return_value = ContextCompactionCommandResult(
+                status=ContextCompactionCommandStatus.BUDGET_LIMITED,
+                triggered=False,
+                outcome=AgentExecutionOutcome(
+                    AgentExecutionStatus.BUDGET_LIMITED,
+                    SupervisorReasonCode.WALL_TIME_BUDGET,
+                    finalized=False,
+                    recoverable=True,
+                ),
+            )
+            limited = await agent.ext_method(
+                ACP_CONTEXT_COMPACTION_EXTENSION,
+                {"sessionId": session.session_id},
+            )
+            self.assertEqual(limited["outcome"]["reason_code"], "wall_time_budget")
+
+            for failure, reason in (
+                (ProviderError("provider"), "provider_failure"),
+                (ConfigurationError("unavailable"), "compaction_unavailable"),
+                (RuntimeError("unexpected"), "compaction_failed"),
+            ):
+                with self.subTest(reason=reason):
+                    active.binding.runner.compact_now.side_effect = failure
+                    with self.assertRaises(RequestError) as error:
+                        await agent.ext_method(
+                            ACP_CONTEXT_COMPACTION_EXTENSION,
+                            {"sessionId": session.session_id},
+                        )
+                    self.assertEqual(error.exception.data["reason"], reason)
+                    active.binding.runner.compact_now.side_effect = None
+            await agent.shutdown()
+
+    async def test_private_mcp_extension_lists_reads_prompts_and_refreshes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            agent, _, _ = await initialized_agent(Path(directory), [RunnerFixture()])
+            collection = McpCollectionFixture()
+            with patch.object(
+                agent,
+                "_open_mcp_tools",
+                new=AsyncMock(return_value=collection),
+            ) as open_mcp:
+                session = await agent.new_session(
+                    directory,
+                    mcp_servers=[
+                        McpServerStdio(name="fixture", command="fixture", args=[], env=[])
+                    ],
+                )
+                listed = await agent.ext_method(
+                    ACP_MCP_EXTENSION,
+                    {"sessionId": session.session_id, "operation": "list"},
+                )
+                read = await agent.ext_method(
+                    ACP_MCP_EXTENSION,
+                    {
+                        "sessionId": session.session_id,
+                        "operation": "read_resource",
+                        "uri": "fixture://resource",
+                    },
+                )
+                prompt = await agent.ext_method(
+                    ACP_MCP_EXTENSION,
+                    {
+                        "sessionId": session.session_id,
+                        "operation": "get_prompt",
+                        "name": "prompt",
+                        "arguments": {"topic": "testing"},
+                    },
+                )
+                refreshed = await agent.ext_method(
+                    ACP_MCP_EXTENSION,
+                    {"sessionId": session.session_id, "operation": "refresh"},
+                )
+            await agent.shutdown()
+
+        self.assertEqual(open_mcp.await_count, 1)
+        self.assertEqual(listed["toolCount"], 1)
+        self.assertEqual(listed["resources"][0]["uri"], "fixture://resource")
+        self.assertEqual(read["contents"][0]["text"], "safe resource text")
+        self.assertEqual(prompt["messages"][0]["content"]["text"], "safe prompt text")
+        self.assertTrue(refreshed["refreshed"])
+
+    async def test_mcp_sampling_and_elicitation_callbacks_use_bounded_private_methods(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            agent, _, client = await initialized_agent(Path(directory), [])
+            client.ext_method = AsyncMock(
+                side_effect=[
+                    {"role": "assistant", "content": {"type": "text", "text": "sampled"}},
+                    {"action": "accept", "content": {"answer": "yes"}},
+                ]
+            )
+            sampled = await agent._mcp_sampling_handler(
+                ({"role": "user", "content": {"type": "text", "text": "hello"}},),
+                system_prompt="system",
+                max_tokens=64,
+            )
+            elicited = await agent._mcp_elicitation_handler(
+                "Choose one",
+                {"type": "object"},
+                url="https://example.invalid/form",
+            )
+
+        self.assertEqual(sampled["content"]["text"], "sampled")
+        self.assertEqual(elicited["action"], "accept")
+        self.assertEqual(client.ext_method.await_args_list[0].args[0], "neuro-code/mcp/sampling")
+        self.assertEqual(client.ext_method.await_args_list[1].args[0], "neuro-code/mcp/elicitation")
+
+    async def test_websocket_writer_batches_and_rejects_writes_after_close(self) -> None:
+        class WebSocket:
+            def __init__(self) -> None:
+                self.messages: list[bytes] = []
+
+            async def send(self, value: bytes) -> None:
+                self.messages.append(value)
+
+        websocket = WebSocket()
+        writer = acp_module._WebSocketWriter(websocket)
+        writer.write(b"first")
+        writer.write(b" second")
+        await writer.drain()
+        self.assertEqual(websocket.messages, [b"first second"])
+        writer.close()
+        self.assertTrue(writer.is_closing())
+        with self.assertRaises(ConnectionError):
+            writer.write(b"closed")
+
     async def test_private_subagent_lifecycle_extension_maps_external_ids_and_actions(
         self,
     ) -> None:
@@ -2103,6 +2322,11 @@ class AcpAgentTests(unittest.IsolatedAsyncioTestCase):
             ),
             {
                 "loadSession": True,
+                "promptCapabilities": {
+                    "image": True,
+                    "audio": True,
+                    "embeddedContext": True,
+                },
                 "mcpCapabilities": {"http": True, "sse": True},
                 "sessionCapabilities": {
                     "list": {},

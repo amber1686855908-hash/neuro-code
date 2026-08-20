@@ -82,7 +82,7 @@ from neuro_code.domain.session_tasks import SessionTaskStatus
 from neuro_code.domain.tools import ToolDefinition
 from neuro_code.infrastructure.persistence.output_artifacts import FileToolOutputArtifactStore
 from neuro_code.infrastructure.persistence.sqlite_session import SqliteSessionStore
-from neuro_code.infrastructure.providers.provider_catalog import HttpProviderCatalog
+from neuro_code.infrastructure.providers.catalog_cache import PersistentProviderCatalog
 from neuro_code.infrastructure.providers.provider_settings import JsonProviderSettingsStore
 from neuro_code.interfaces.cli.serialization import (
     serialize_context_compaction_result,
@@ -1493,7 +1493,7 @@ api_key_env = "FIXTURE_KEY"
             self.assertIsInstance(captured["turn_service"], SessionTurnService)
             self.assertEqual(captured["initial_items"], ())
             self.assertEqual(captured["language"], UiLanguage.SIMPLIFIED_CHINESE)
-            self.assertIsInstance(captured["provider_catalog"], HttpProviderCatalog)
+            self.assertIsInstance(captured["provider_catalog"], PersistentProviderCatalog)
             self.assertIsInstance(
                 captured["tool_output_artifact_service"],
                 SessionToolOutputArtifactApplicationService,

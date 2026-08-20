@@ -6,10 +6,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 from neuro_code.application.acp.contracts import (
     MAX_ADDITIONAL_DIRECTORIES,
@@ -30,6 +30,15 @@ from neuro_code.application.permissions.broker import SessionApprovalBroker
 from neuro_code.application.ports.approval import PermissionApprover
 from neuro_code.application.ports.client_filesystem import ClientFileSystem
 from neuro_code.application.ports.client_terminal import ClientTerminal
+from neuro_code.application.ports.mcp import (
+    McpElicitationHandler,
+    McpPrompt,
+    McpPromptMessage,
+    McpResource,
+    McpResourceContent,
+    McpResourceTemplate,
+    McpSamplingHandler,
+)
 from neuro_code.application.ports.sandbox import LocalProcessSandbox
 from neuro_code.application.ports.storage import SessionStore
 from neuro_code.application.ports.tools import Tool
@@ -67,6 +76,7 @@ from neuro_code.infrastructure.persistence.output_artifacts import FileToolOutpu
 from neuro_code.infrastructure.persistence.rust_session import load_rust_session
 from neuro_code.infrastructure.persistence.sqlite_session import SqliteSessionStore
 from neuro_code.infrastructure.persistence.ui_preferences import JsonUiPreferencesStore
+from neuro_code.infrastructure.providers.catalog_cache import PersistentProviderCatalog
 from neuro_code.infrastructure.providers.provider_catalog import HttpProviderCatalog
 from neuro_code.infrastructure.providers.provider_settings import JsonProviderSettingsStore
 from neuro_code.infrastructure.workspace.paths import workspaces_match
@@ -176,6 +186,8 @@ class _BootstrapMcpToolFactory:
         *,
         cwd: Path,
         explicit_redactions: Sequence[str],
+        sampling_handler: McpSamplingHandler | None = None,
+        elicitation_handler: McpElicitationHandler | None = None,
     ) -> AcpMcpTools:
         collections: list[AcpMcpTools] = []
         tools: list[Tool] = []
@@ -203,6 +215,8 @@ class _BootstrapMcpToolFactory:
                         explicit_redactions=explicit_redactions,
                         local_process_sandbox=local_process_sandbox,
                         sandbox_profile=self._sandbox_profile,
+                        sampling_handler=sampling_handler,
+                        elicitation_handler=elicitation_handler,
                     )
                 elif isinstance(configuration, AcpMcpHttpServerConfig):
                     collection = await McpHttpToolCollection.open(
@@ -215,6 +229,8 @@ class _BootstrapMcpToolFactory:
                             ),
                         ),
                         explicit_redactions=explicit_redactions,
+                        sampling_handler=sampling_handler,
+                        elicitation_handler=elicitation_handler,
                     )
                 else:  # pragma: no cover - the validated union is exhaustive.
                     raise AcpMcpToolError("mcp_transport_unsupported")
@@ -243,8 +259,73 @@ class _CompositeMcpTools:
     def __init__(self, collections: tuple[AcpMcpTools, ...], tools: tuple[Tool, ...]) -> None:
         self._collections = collections
         self.tools = tools
+        self.resources: tuple[McpResource, ...] = self._collect_resources()
+        self.resource_templates: tuple[McpResourceTemplate, ...] = (
+            self._collect_resource_templates()
+        )
+        self.prompts: tuple[McpPrompt, ...] = self._collect_prompts()
         self._closed = False
         self._close_lock = asyncio.Lock()
+
+    def _collect_resources(self) -> tuple[McpResource, ...]:
+        return tuple(
+            resource
+            for collection in self._collections
+            for resource in getattr(collection, "resources", ())
+        )
+
+    def _collect_resource_templates(self) -> tuple[McpResourceTemplate, ...]:
+        return tuple(
+            template
+            for collection in self._collections
+            for template in getattr(collection, "resource_templates", ())
+        )
+
+    def _collect_prompts(self) -> tuple[McpPrompt, ...]:
+        return tuple(
+            prompt
+            for collection in self._collections
+            for prompt in getattr(collection, "prompts", ())
+        )
+
+    async def refresh(self) -> None:
+        await asyncio.gather(*(collection.refresh() for collection in self._collections))
+        tools: list[Tool] = []
+        names: set[str] = set()
+        for collection in self._collections:
+            for tool in getattr(collection, "tools", ()):
+                if tool.definition.name in names:
+                    raise AcpMcpToolError("mcp_tool_name_collision")
+                names.add(tool.definition.name)
+                tools.append(tool)
+                if len(tools) > MAX_MCP_TOTAL_TOOLS:
+                    raise AcpMcpToolError("too_many_mcp_tools")
+        self.tools = tuple(tools)
+        self.resources = self._collect_resources()
+        self.resource_templates = self._collect_resource_templates()
+        self.prompts = self._collect_prompts()
+
+    async def read_resource(self, uri: str) -> tuple[McpResourceContent, ...]:
+        for collection in self._collections:
+            if any(resource.uri == uri for resource in getattr(collection, "resources", ())):
+                read_resource = getattr(collection, "read_resource", None)
+                if not callable(read_resource):
+                    raise AcpMcpToolError("mcp_resources_unavailable")
+                return cast(tuple[McpResourceContent, ...], await read_resource(uri))
+        raise AcpMcpToolError("mcp_resource_not_found")
+
+    async def get_prompt(
+        self,
+        name: str,
+        arguments: Mapping[str, str] | None = None,
+    ) -> tuple[McpPromptMessage, ...]:
+        for collection in self._collections:
+            if any(prompt.name == name for prompt in getattr(collection, "prompts", ())):
+                get_prompt = getattr(collection, "get_prompt", None)
+                if not callable(get_prompt):
+                    raise AcpMcpToolError("mcp_prompts_unavailable")
+                return cast(tuple[McpPromptMessage, ...], await get_prompt(name, arguments))
+        raise AcpMcpToolError("mcp_prompt_not_found")
 
     async def close(self) -> None:
         async with self._close_lock:
@@ -419,12 +500,19 @@ class BootstrapCliServices:
         """Open the process composition and serve ACP with injected dependencies.
 
         打开进程组合,使用注入的依赖提供 ACP 服务."""
-        del args
-        from neuro_code.acp import serve_acp
+        from neuro_code.acp import serve_acp, serve_acp_websocket
 
         application = await self.open_application(settings)
         try:
-            await serve_acp(self.create_acp_service(application))
+            service = self.create_acp_service(application)
+            if getattr(args, "transport", "stdio") == "websocket":
+                await serve_acp_websocket(
+                    service,
+                    host=getattr(args, "host", "127.0.0.1"),
+                    port=getattr(args, "port", 0),
+                )
+            else:
+                await serve_acp(service)
             return 0
         finally:
             await asyncio.shield(application.close())
@@ -450,7 +538,10 @@ class BootstrapCliServices:
 
         initial_config = load_config(args.cwd)
         provider_settings_store = JsonProviderSettingsStore(initial_config.state_dir)
-        provider_catalog = HttpProviderCatalog()
+        provider_catalog = PersistentProviderCatalog(
+            HttpProviderCatalog(),
+            initial_config.state_dir / "model-catalog-cache.json",
+        )
         ui_preferences = JsonUiPreferencesStore(initial_config.state_dir / "ui-preferences.json")
         explicit_provider_override = any(
             value is not None for value in (args.provider, args.model, args.base_url)

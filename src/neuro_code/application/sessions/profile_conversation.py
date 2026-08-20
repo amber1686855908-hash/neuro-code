@@ -12,6 +12,8 @@ import asyncio
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import replace
 
+from neuro_code.application.memory.compaction_runtime import ContextCompactionCommandResult
+from neuro_code.application.ports.tools import Tool
 from neuro_code.application.providers.contracts import (
     ProviderOption,
     ProviderSelectionResult,
@@ -198,6 +200,17 @@ class ProfileConversationController:
     async def save_background_wake_state(self, state: BackgroundWakeState) -> None:
         async with self._turn_lock:
             await self._binding.runner.save_background_wake_state(state)
+
+    async def compact_now(self) -> ContextCompactionCommandResult:
+        async with self._turn_lock:
+            return await self._binding.runner.compact_now()
+
+    def replace_external_tools(
+        self,
+        tools: Sequence[Tool],
+        previous_names: Sequence[str],
+    ) -> None:
+        self._binding.runner.replace_external_tools(tools, previous_names)
 
     async def schedule_plan(self) -> SessionTask:
         async with self._turn_lock:

@@ -29,6 +29,7 @@ from neuro_code.shared.errors import ToolError
 class ToolRegistry:
     def __init__(self, tools: Iterable[Tool] = ()) -> None:
         self._tools: dict[str, Tool] = {}
+        self._external_names: set[str] = set()
         for tool in tools:
             self.register(tool)
 
@@ -37,6 +38,36 @@ class ToolRegistry:
         if not name or name in self._tools:
             raise ToolError(f"duplicate or empty tool name: {name!r}")
         self._tools[name] = tool
+
+    def register_external(self, tool: Tool) -> None:
+        """Register a caller-owned extension and remember its ownership."""
+
+        self.register(tool)
+        self._external_names.add(tool.definition.name)
+
+    def replace_external(self, tools: Iterable[Tool], previous_names: Collection[str]) -> None:
+        """Replace a caller-owned extension set without touching built-ins.
+
+        替换调用方拥有的扩展工具集合,不触碰内置工具.
+        """
+
+        previous = set(previous_names)
+        if not previous.issubset(self._external_names):
+            raise ToolError("external tool ownership is invalid")
+        normalized = tuple(tools)
+        names = tuple(tool.definition.name for tool in normalized)
+        if len(set(names)) != len(names) or any(
+            name in self._tools and name not in previous for name in names
+        ):
+            raise ToolError("duplicate or reserved external tool name")
+        updated = dict(self._tools)
+        for name in previous:
+            updated.pop(name, None)
+        for tool in normalized:
+            updated[tool.definition.name] = tool
+        self._tools = updated
+        self._external_names.difference_update(previous)
+        self._external_names.update(names)
 
     def get(self, name: str) -> Tool | None:
         return self._tools.get(name)

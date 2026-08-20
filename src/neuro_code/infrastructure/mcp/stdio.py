@@ -8,6 +8,8 @@ The legacy adapter remains a compatibility facade for existing imports.
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import contextlib
 import json
 import math
@@ -19,7 +21,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 
 import anyio
 import mcp.types as mcp_types
@@ -28,6 +30,15 @@ from mcp import ClientSession
 from mcp.client.stdio import get_default_environment
 from mcp.shared.message import SessionMessage
 
+from neuro_code.application.ports.mcp import (
+    McpElicitationHandler,
+    McpPrompt,
+    McpPromptMessage,
+    McpResource,
+    McpResourceContent,
+    McpResourceTemplate,
+    McpSamplingHandler,
+)
 from neuro_code.application.ports.sandbox import (
     LocalProcessEnvironmentPolicy,
     LocalProcessFilesystemPolicy,
@@ -58,6 +69,9 @@ MAX_MCP_TOOL_DESCRIPTION_BYTES = 8 * 1024
 MAX_MCP_TOOL_SCHEMA_BYTES = 64 * 1024
 MAX_MCP_TOOL_ARGUMENT_BYTES = 64 * 1024
 MAX_MCP_TOOL_RESULT_BYTES = 128 * 1024
+MAX_MCP_RESOURCE_BYTES = 512 * 1024
+MAX_MCP_RESOURCE_ENTRIES = 256
+MAX_MCP_PROMPTS = 128
 MAX_MCP_STDIO_FRAME_BYTES = 1024 * 1024
 MAX_MCP_LIST_PAGES = 16
 MAX_MCP_JSON_DEPTH = 32
@@ -98,6 +112,33 @@ class _CallRequest:
     timeout_seconds: float
     result: asyncio.Future[mcp_types.CallToolResult]
     cancelled: asyncio.Event
+
+
+@dataclass(slots=True)
+class _AuxRequest:
+    operation: str
+    arguments: dict[str, Any]
+    timeout_seconds: float
+    result: asyncio.Future[Any]
+    cancelled: asyncio.Event
+
+
+@dataclass(frozen=True, slots=True)
+class _McpSnapshot:
+    tools: tuple[mcp_types.Tool, ...]
+    resources: tuple[mcp_types.Resource, ...]
+    resource_templates: tuple[mcp_types.ResourceTemplate, ...]
+    prompts: tuple[mcp_types.Prompt, ...]
+
+
+def _coerce_snapshot(value: object) -> _McpSnapshot:
+    """Keep the pre-resource test seam compatible with tool-only snapshots."""
+
+    if isinstance(value, _McpSnapshot):
+        return value
+    if isinstance(value, tuple) and all(isinstance(tool, mcp_types.Tool) for tool in value):
+        return _McpSnapshot(value, (), (), ())
+    raise McpStdioError("mcp_server_snapshot_invalid")
 
 
 class _McpToolConnection(Protocol):
@@ -179,6 +220,27 @@ class McpStdioToolCollection:
     ) -> None:
         self._connections = connections
         self.tools = tools
+        self.resources: tuple[McpResource, ...] = tuple(
+            resource
+            for connection in connections
+            for resource in _resource_descriptors(
+                connection.configuration.name,
+                connection.resources,
+            )
+        )
+        self.resource_templates: tuple[McpResourceTemplate, ...] = tuple(
+            resource
+            for connection in connections
+            for resource in _resource_template_descriptors(
+                connection.configuration.name,
+                connection.resource_templates,
+            )
+        )
+        self.prompts: tuple[McpPrompt, ...] = tuple(
+            prompt
+            for connection in connections
+            for prompt in _prompt_descriptors(connection.configuration.name, connection.prompts)
+        )
         self._closed = False
         self._close_lock = asyncio.Lock()
 
@@ -191,6 +253,8 @@ class McpStdioToolCollection:
         explicit_redactions: Sequence[str] = (),
         local_process_sandbox: LocalProcessSandbox | None = None,
         sandbox_profile: SandboxProfile = SandboxProfile.OFF,
+        sampling_handler: McpSamplingHandler | None = None,
+        elicitation_handler: McpElicitationHandler | None = None,
     ) -> McpStdioToolCollection:
         if len(configurations) > MAX_MCP_SERVERS:
             raise McpStdioError("too_many_mcp_servers")
@@ -213,10 +277,12 @@ class McpStdioToolCollection:
                     explicit_redactions=explicit_redactions,
                     local_process_sandbox=launcher,
                     sandbox_profile=sandbox_profile,
+                    sampling_handler=sampling_handler,
+                    elicitation_handler=elicitation_handler,
                 )
-                remote_tools = await connection.start()
+                snapshot = _coerce_snapshot(await connection.start())
                 connections.append(connection)
-                for remote_tool in remote_tools:
+                for remote_tool in snapshot.tools:
                     definition = _tool_definition(
                         configuration.name,
                         remote_tool,
@@ -243,6 +309,67 @@ class McpStdioToolCollection:
                 )
             raise
 
+    async def refresh(self) -> None:
+        """Refresh all MCP capability lists through their owning transports."""
+
+        snapshots = await asyncio.gather(
+            *(connection.refresh() for connection in self._connections)
+        )
+        tools: list[McpTool] = []
+        resources: list[McpResource] = []
+        templates: list[McpResourceTemplate] = []
+        prompts: list[McpPrompt] = []
+        names: set[str] = set()
+        for connection, snapshot in zip(self._connections, snapshots, strict=True):
+            for remote_tool in snapshot.tools:
+                definition = _tool_definition(
+                    connection.configuration.name,
+                    remote_tool,
+                    explicit_redactions=connection.explicit_redactions,
+                )
+                if definition.name in names:
+                    raise McpStdioError("mcp_tool_name_collision")
+                names.add(definition.name)
+                tools.append(
+                    McpTool(
+                        connection=connection,
+                        definition=definition,
+                        remote_name=remote_tool.name,
+                    )
+                )
+            resources.extend(
+                _resource_descriptors(connection.configuration.name, snapshot.resources)
+            )
+            templates.extend(
+                _resource_template_descriptors(
+                    connection.configuration.name,
+                    snapshot.resource_templates,
+                )
+            )
+            prompts.extend(_prompt_descriptors(connection.configuration.name, snapshot.prompts))
+        if len(tools) > MAX_MCP_TOTAL_TOOLS:
+            raise McpStdioError("too_many_mcp_tools")
+        self.tools = tuple(tools)
+        self.resources = tuple(resources)
+        self.resource_templates = tuple(templates)
+        self.prompts = tuple(prompts)
+
+    async def read_resource(self, uri: str) -> tuple[McpResourceContent, ...]:
+        for connection in self._connections:
+            if any(str(resource.uri) == uri for resource in connection.resources):
+                return _resource_contents(await connection.read_resource(uri))
+        raise McpStdioError("mcp_resource_not_found")
+
+    async def get_prompt(
+        self,
+        name: str,
+        arguments: Mapping[str, str] | None = None,
+    ) -> tuple[McpPromptMessage, ...]:
+        for connection in self._connections:
+            if any(prompt.name == name for prompt in connection.prompts):
+                return _prompt_messages(await connection.get_prompt(name, dict(arguments or {})))
+        raise McpStdioError("mcp_prompt_not_found")
+
     async def close(self) -> None:
         async with self._close_lock:
             if self._closed:
@@ -263,11 +390,15 @@ class _McpServerConnection:
         explicit_redactions: Sequence[str],
         local_process_sandbox: LocalProcessSandbox,
         sandbox_profile: SandboxProfile,
+        sampling_handler: McpSamplingHandler | None = None,
+        elicitation_handler: McpElicitationHandler | None = None,
     ) -> None:
         self._configuration = configuration
         self._cwd = cwd
         self._local_process_sandbox = local_process_sandbox
         self._sandbox_profile = sandbox_profile
+        self._sampling_handler = sampling_handler
+        self._elicitation_handler = elicitation_handler
         self._explicit_environment_names = frozenset(name for name, _ in configuration.env)
         self.explicit_redactions = tuple(
             dict.fromkeys(
@@ -277,16 +408,23 @@ class _McpServerConnection:
                 )
             )
         )
-        self._commands: asyncio.Queue[_CallRequest | None] = asyncio.Queue()
-        self._ready: asyncio.Future[tuple[mcp_types.Tool, ...]] | None = None
+        self._commands: asyncio.Queue[_CallRequest | _AuxRequest | None] = asyncio.Queue()
+        self._ready: asyncio.Future[_McpSnapshot] | None = None
         self._owner: asyncio.Task[None] | None = None
-        self._current: _CallRequest | None = None
+        self._current: _CallRequest | _AuxRequest | None = None
         self._closing = False
         self._closed = False
         self._transport_ended = asyncio.Event()
         self._close_lock = asyncio.Lock()
+        self.resources: tuple[mcp_types.Resource, ...] = ()
+        self.resource_templates: tuple[mcp_types.ResourceTemplate, ...] = ()
+        self.prompts: tuple[mcp_types.Prompt, ...] = ()
 
-    async def start(self) -> tuple[mcp_types.Tool, ...]:
+    @property
+    def configuration(self) -> McpStdioServerConfig:
+        return self._configuration
+
+    async def start(self) -> _McpSnapshot:
         if self._owner is not None:
             raise McpStdioError("mcp_server_already_started")
         loop = asyncio.get_running_loop()
@@ -314,6 +452,25 @@ class _McpServerConnection:
             await self.close()
             raise McpStdioError("mcp_server_initialization_failed") from None
 
+    async def refresh(self) -> _McpSnapshot:
+        return cast(_McpSnapshot, await self._auxiliary("refresh", {}))
+
+    async def read_resource(self, uri: str) -> mcp_types.ReadResourceResult:
+        return cast(
+            mcp_types.ReadResourceResult,
+            await self._auxiliary("read_resource", {"uri": uri}),
+        )
+
+    async def get_prompt(
+        self,
+        name: str,
+        arguments: dict[str, str],
+    ) -> mcp_types.GetPromptResult:
+        return cast(
+            mcp_types.GetPromptResult,
+            await self._auxiliary("get_prompt", {"name": name, "arguments": arguments}),
+        )
+
     async def call(
         self,
         name: str,
@@ -340,6 +497,26 @@ class _McpServerConnection:
                 # The owner resolves this only after the process tree has been
                 # terminated, so the ACP prompt cannot complete while a
                 # cancelled remote side effect is still running.
+                await asyncio.shield(request.result)
+            raise
+
+    async def _auxiliary(self, operation: str, arguments: dict[str, Any]) -> Any:
+        if self._closing or self._closed or self._owner is None or self._owner.done():
+            raise McpStdioError("mcp_server_not_active")
+        loop = asyncio.get_running_loop()
+        request = _AuxRequest(
+            operation,
+            arguments,
+            MCP_CALL_TIMEOUT_SECONDS,
+            loop.create_future(),
+            asyncio.Event(),
+        )
+        await self._commands.put(request)
+        try:
+            return await asyncio.shield(request.result)
+        except asyncio.CancelledError:
+            request.cancelled.set()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
                 await asyncio.shield(request.result)
             raise
 
@@ -414,14 +591,18 @@ class _McpServerConnection:
                     name=f"neuro-code-mcp-wait-{self._configuration.name}",
                 ),
             ]
+            sampling_callback = self._sampling_callback if self._sampling_handler else None
+            elicitation_callback = self._elicitation_callback if self._elicitation_handler else None
             async with ClientSession(
                 read_receive,
                 write_send,
                 read_timeout_seconds=timedelta(seconds=MCP_INITIALIZE_TIMEOUT_SECONDS),
+                sampling_callback=cast(Any, sampling_callback),
+                elicitation_callback=cast(Any, elicitation_callback),
             ) as session:
                 await session.initialize()
-                tools = await self._list_tools(session)
-                self._set_ready_result(tools)
+                snapshot = await self._list_snapshot(session)
+                self._set_ready_result(snapshot)
                 while True:
                     if self._closing or self._transport_ended.is_set():
                         break
@@ -432,7 +613,10 @@ class _McpServerConnection:
                     if self._connection_closing():
                         failure_reason = "mcp_server_connection_closed"
                         break
-                    should_continue = await self._execute_call(session, command)
+                    if isinstance(command, _CallRequest):
+                        should_continue = await self._execute_call(session, command)
+                    else:
+                        should_continue = await self._execute_auxiliary(session, command)
                     if not should_continue:
                         failure_reason = "mcp_tool_call_aborted"
                         break
@@ -471,7 +655,7 @@ class _McpServerConnection:
 
         return self._closing
 
-    async def _next_command(self) -> _CallRequest | None:
+    async def _next_command(self) -> _CallRequest | _AuxRequest | None:
         command_task = asyncio.create_task(self._commands.get())
         ended_task = asyncio.create_task(self._transport_ended.wait())
         done, pending = await asyncio.wait(
@@ -527,6 +711,60 @@ class _McpServerConnection:
         # effect can continue after the ACP prompt has returned.
         return False
 
+    async def _execute_auxiliary(
+        self,
+        session: ClientSession,
+        request: _AuxRequest,
+    ) -> bool:
+        try:
+            if request.operation == "refresh":
+                result: Any = await self._list_snapshot(session)
+            elif request.operation == "read_resource":
+                result = await session.read_resource(request.arguments["uri"])
+            elif request.operation == "get_prompt":
+                result = await session.get_prompt(
+                    request.arguments["name"],
+                    request.arguments["arguments"],
+                )
+            else:
+                raise McpStdioError("mcp_auxiliary_operation_unsupported")
+            if not request.result.done():
+                request.result.set_result(result)
+            return True
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            if not request.result.done():
+                request.result.set_exception(McpStdioError("mcp_auxiliary_request_failed"))
+            return True
+
+    async def _sampling_callback(self, _context: Any, params: Any) -> Any:
+        handler = self._sampling_handler
+        if handler is None:
+            raise McpStdioError("mcp_sampling_unavailable")
+        payload = params.model_dump(by_alias=True, exclude_none=True)
+        messages = payload.get("messages", [])
+        preferences = payload.get("modelPreferences")
+        result = await handler(
+            messages,
+            model_preferences=preferences,
+            system_prompt=payload.get("systemPrompt"),
+            max_tokens=payload.get("maxTokens"),
+        )
+        return mcp_types.CreateMessageResult.model_validate(result)
+
+    async def _elicitation_callback(self, _context: Any, params: Any) -> Any:
+        handler = self._elicitation_handler
+        if handler is None:
+            raise McpStdioError("mcp_elicitation_unavailable")
+        payload = params.model_dump(by_alias=True, exclude_none=True)
+        result = await handler(
+            str(payload.get("message", "")),
+            payload.get("requestedSchema"),
+            url=payload.get("url"),
+        )
+        return mcp_types.ElicitResult.model_validate(result)
+
     async def _list_tools(
         self,
         session: ClientSession,
@@ -546,6 +784,86 @@ class _McpServerConnection:
                 raise McpStdioError("mcp_tool_cursor_cycle")
             seen_cursors.add(cursor)
         raise McpStdioError("too_many_mcp_tool_pages")
+
+    async def _list_snapshot(self, session: ClientSession) -> _McpSnapshot:
+        tools = await self._list_tools(session)
+        capabilities = session.get_server_capabilities()
+        resources = (
+            await self._list_resources(session)
+            if capabilities is not None and capabilities.resources is not None
+            else ()
+        )
+        resource_templates = (
+            await self._list_resource_templates(session)
+            if capabilities is not None and capabilities.resources is not None
+            else ()
+        )
+        prompts = (
+            await self._list_prompts(session)
+            if capabilities is not None and capabilities.prompts is not None
+            else ()
+        )
+        self.resources = resources
+        self.resource_templates = resource_templates
+        self.prompts = prompts
+        return _McpSnapshot(tools, resources, resource_templates, prompts)
+
+    async def _list_resources(
+        self,
+        session: ClientSession,
+    ) -> tuple[mcp_types.Resource, ...]:
+        resources: list[mcp_types.Resource] = []
+        cursor: str | None = None
+        seen: set[str] = set()
+        for _page in range(MAX_MCP_LIST_PAGES):
+            result = await session.list_resources(cursor)
+            resources.extend(result.resources)
+            if len(resources) > MAX_MCP_RESOURCE_ENTRIES:
+                raise McpStdioError("too_many_mcp_resources")
+            cursor = result.nextCursor
+            if cursor is None:
+                return tuple(resources)
+            if cursor in seen:
+                raise McpStdioError("mcp_resource_cursor_cycle")
+            seen.add(cursor)
+        raise McpStdioError("too_many_mcp_resource_pages")
+
+    async def _list_resource_templates(
+        self,
+        session: ClientSession,
+    ) -> tuple[mcp_types.ResourceTemplate, ...]:
+        templates: list[mcp_types.ResourceTemplate] = []
+        cursor: str | None = None
+        seen: set[str] = set()
+        for _page in range(MAX_MCP_LIST_PAGES):
+            result = await session.list_resource_templates(cursor)
+            templates.extend(result.resourceTemplates)
+            if len(templates) > MAX_MCP_RESOURCE_ENTRIES:
+                raise McpStdioError("too_many_mcp_resource_templates")
+            cursor = result.nextCursor
+            if cursor is None:
+                return tuple(templates)
+            if cursor in seen:
+                raise McpStdioError("mcp_resource_template_cursor_cycle")
+            seen.add(cursor)
+        raise McpStdioError("too_many_mcp_resource_template_pages")
+
+    async def _list_prompts(self, session: ClientSession) -> tuple[mcp_types.Prompt, ...]:
+        prompts: list[mcp_types.Prompt] = []
+        cursor: str | None = None
+        seen: set[str] = set()
+        for _page in range(MAX_MCP_LIST_PAGES):
+            result = await session.list_prompts(cursor)
+            prompts.extend(result.prompts)
+            if len(prompts) > MAX_MCP_PROMPTS:
+                raise McpStdioError("too_many_mcp_prompts")
+            cursor = result.nextCursor
+            if cursor is None:
+                return tuple(prompts)
+            if cursor in seen:
+                raise McpStdioError("mcp_prompt_cursor_cycle")
+            seen.add(cursor)
+        raise McpStdioError("too_many_mcp_prompt_pages")
 
     async def _stdout_reader(
         self,
@@ -696,10 +1014,10 @@ class _McpServerConnection:
             ),
         )
 
-    def _set_ready_result(self, tools: tuple[mcp_types.Tool, ...]) -> None:
+    def _set_ready_result(self, snapshot: _McpSnapshot) -> None:
         ready = self._ready
         if ready is not None and not ready.done():
-            ready.set_result(tools)
+            ready.set_result(snapshot)
 
     def _set_ready_exception(self, error: Exception) -> None:
         ready = self._ready
@@ -926,6 +1244,157 @@ def _render_tool_result(
         _truncate_utf8(rendered, MAX_MCP_TOOL_RESULT_BYTES),
         is_error=result.isError,
     )
+
+
+def _resource_descriptors(
+    server_name: str,
+    resources: Sequence[mcp_types.Resource],
+) -> tuple[McpResource, ...]:
+    result: list[McpResource] = []
+    for resource in resources:
+        result.append(
+            McpResource(
+                server_name=server_name,
+                name=_bounded_text(
+                    resource.name,
+                    MAX_MCP_TOOL_NAME_BYTES,
+                    explicit_redactions=(),
+                ),
+                uri=_bounded_text(
+                    str(resource.uri),
+                    MAX_MCP_TOOL_SCHEMA_BYTES,
+                    explicit_redactions=(),
+                ),
+                title=(
+                    _bounded_text(
+                        resource.title, MAX_MCP_TOOL_DESCRIPTION_BYTES, explicit_redactions=()
+                    )
+                    if resource.title
+                    else None
+                ),
+                description=(
+                    _bounded_text(
+                        resource.description,
+                        MAX_MCP_TOOL_DESCRIPTION_BYTES,
+                        explicit_redactions=(),
+                    )
+                    if resource.description
+                    else None
+                ),
+                mime_type=resource.mimeType,
+                size=resource.size,
+            )
+        )
+    return tuple(result)
+
+
+def _resource_template_descriptors(
+    server_name: str,
+    templates: Sequence[mcp_types.ResourceTemplate],
+) -> tuple[McpResourceTemplate, ...]:
+    return tuple(
+        McpResourceTemplate(
+            server_name=server_name,
+            name=_bounded_text(item.name, MAX_MCP_TOOL_NAME_BYTES, explicit_redactions=()),
+            uri_template=_bounded_text(
+                item.uriTemplate,
+                MAX_MCP_TOOL_SCHEMA_BYTES,
+                explicit_redactions=(),
+            ),
+            title=(
+                _bounded_text(item.title, MAX_MCP_TOOL_DESCRIPTION_BYTES, explicit_redactions=())
+                if item.title
+                else None
+            ),
+            description=(
+                _bounded_text(
+                    item.description,
+                    MAX_MCP_TOOL_DESCRIPTION_BYTES,
+                    explicit_redactions=(),
+                )
+                if item.description
+                else None
+            ),
+            mime_type=item.mimeType,
+        )
+        for item in templates
+    )
+
+
+def _prompt_descriptors(
+    server_name: str,
+    prompts: Sequence[mcp_types.Prompt],
+) -> tuple[McpPrompt, ...]:
+    if len(prompts) > MAX_MCP_PROMPTS:
+        raise McpStdioError("too_many_mcp_prompts")
+    return tuple(
+        McpPrompt(
+            server_name=server_name,
+            name=_bounded_text(item.name, MAX_MCP_TOOL_NAME_BYTES, explicit_redactions=()),
+            title=(
+                _bounded_text(item.title, MAX_MCP_TOOL_DESCRIPTION_BYTES, explicit_redactions=())
+                if item.title
+                else None
+            ),
+            description=(
+                _bounded_text(
+                    item.description,
+                    MAX_MCP_TOOL_DESCRIPTION_BYTES,
+                    explicit_redactions=(),
+                )
+                if item.description
+                else None
+            ),
+            arguments=tuple(
+                argument.model_dump(by_alias=True, exclude_none=True)
+                for argument in (item.arguments or ())
+            ),
+        )
+        for item in prompts
+    )
+
+
+def _resource_contents(
+    result: mcp_types.ReadResourceResult,
+) -> tuple[McpResourceContent, ...]:
+    contents: list[McpResourceContent] = []
+    for item in result.contents:
+        if isinstance(item, mcp_types.TextResourceContents):
+            text = _bounded_text(
+                item.text,
+                MAX_MCP_RESOURCE_BYTES,
+                explicit_redactions=(),
+            )
+            contents.append(McpResourceContent(str(item.uri), item.mimeType, text=text))
+        elif isinstance(item, mcp_types.BlobResourceContents):
+            blob = item.blob
+            try:
+                decoded = base64.b64decode(blob, validate=True)
+            except (binascii.Error, ValueError):
+                raise McpStdioError("mcp_resource_blob_invalid") from None
+            if len(decoded) > MAX_MCP_RESOURCE_BYTES:
+                raise McpStdioError("mcp_resource_blob_too_large")
+            contents.append(McpResourceContent(str(item.uri), item.mimeType, blob=blob))
+        else:  # pragma: no cover - official SDK union is exhaustive.
+            raise McpStdioError("mcp_resource_content_unsupported")
+        if len(contents) > MAX_MCP_RESOURCE_ENTRIES:
+            raise McpStdioError("too_many_mcp_resource_contents")
+    return tuple(contents)
+
+
+def _prompt_messages(
+    result: mcp_types.GetPromptResult,
+) -> tuple[McpPromptMessage, ...]:
+    messages: list[McpPromptMessage] = []
+    for message in result.messages:
+        content = message.content.model_dump(by_alias=True, exclude_none=True)
+        bounded = _bounded_json(content, explicit_redactions=(), redact=True)
+        if not isinstance(bounded, dict):
+            raise McpStdioError("mcp_prompt_content_invalid")
+        messages.append(McpPromptMessage(message.role, bounded))
+        if len(messages) > MAX_MCP_RESOURCE_ENTRIES:
+            raise McpStdioError("too_many_mcp_prompt_messages")
+    return tuple(messages)
 
 
 def _annotations_payload(annotations: mcp_types.Annotations | None) -> dict[str, object]:

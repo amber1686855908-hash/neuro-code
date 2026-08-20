@@ -14,15 +14,19 @@ from typing import TypeVar
 
 from neuro_code.application.memory.compaction import ProviderContextWindow
 from neuro_code.application.memory.compaction_runtime import (
+    ContextCompactionCommandResult,
     ContextCompactionRuntimeBoundary,
     ContextCompactionRuntimeRequest,
     ContextCompactionRuntimeResult,
+    ContextCompactionSafePoint,
     ContextCompactionTurnProjection,
+    project_context_compaction_command_result,
     project_context_compaction_failure,
     project_context_compaction_result,
 )
 from neuro_code.application.memory.compaction_trigger import ContextCompactionTriggerMode
 from neuro_code.application.ports.storage import SessionStore
+from neuro_code.application.ports.tools import Tool
 from neuro_code.application.ports.workspace import WorkspaceIdentity
 from neuro_code.application.runtime.agent import AgentRunResult, AgentRuntime, EventSink
 from neuro_code.application.sessions.execution_queries import (
@@ -342,6 +346,50 @@ class AgentConversation:
         async with self._turn_lock:
             self._validate_context_compaction_request(request)
             return await self._runtime.trigger_context_compaction(request)
+
+    async def compact_now(
+        self,
+        *,
+        boundary: ContextCompactionRuntimeBoundary | None = None,
+        provider_window: ProviderContextWindow | None = None,
+        protected_item_count: int = 0,
+    ) -> ContextCompactionCommandResult:
+        """Expose one safe, user-invoked compaction command.
+
+        The command owns the live-context snapshot and returns only the bounded
+        public projection. It never starts an ordinary model turn.
+        """
+
+        effective_boundary = boundary or ContextCompactionRuntimeBoundary(
+            ContextCompactionSafePoint.BEFORE_MODEL_REQUEST,
+            0,
+        )
+        effective_window = (
+            provider_window
+            if provider_window is not None
+            else self._runtime.provider_context_window
+        )
+
+        async def owner(
+            projection: ContextCompactionTurnProjection,
+        ) -> ContextCompactionCommandResult:
+            return project_context_compaction_command_result(projection)
+
+        return await self.run_explicit_context_compaction_with_owner(
+            boundary=effective_boundary,
+            provider_window=effective_window,
+            owner=owner,
+            protected_item_count=protected_item_count,
+        )
+
+    def replace_external_tools(
+        self,
+        tools: Sequence[Tool],
+        previous_names: Sequence[str],
+    ) -> None:
+        """Refresh session-owned extension tools without changing the transcript."""
+
+        self._runtime.replace_external_tools(tools, previous_names)
 
     async def run_context_compaction_with_owner(
         self,

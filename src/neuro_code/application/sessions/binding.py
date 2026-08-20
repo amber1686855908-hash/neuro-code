@@ -12,6 +12,7 @@ from typing import Protocol, TypeVar
 
 from neuro_code.application.memory.compaction import ProviderContextWindow
 from neuro_code.application.memory.compaction_runtime import (
+    ContextCompactionCommandResult,
     ContextCompactionRuntimeBoundary,
     ContextCompactionRuntimeRequest,
     ContextCompactionRuntimeResult,
@@ -19,6 +20,7 @@ from neuro_code.application.memory.compaction_runtime import (
 )
 from neuro_code.application.ports.background_tasks import BackgroundTaskManager
 from neuro_code.application.ports.model import ModelProvider
+from neuro_code.application.ports.tools import Tool
 from neuro_code.application.runtime.agent import AgentRunResult, EventSink
 from neuro_code.domain.background_tasks.models import BackgroundWakeState
 from neuro_code.domain.conversation.interaction_mode import InteractionMode
@@ -84,6 +86,14 @@ class ConversationRunner(Protocol):
         self,
         request: ContextCompactionRuntimeRequest,
     ) -> ContextCompactionRuntimeResult: ...
+
+    async def compact_now(self) -> ContextCompactionCommandResult: ...
+
+    def replace_external_tools(
+        self,
+        tools: Sequence[Tool],
+        previous_names: Sequence[str],
+    ) -> None: ...
 
     async def run_context_compaction_with_owner(
         self,

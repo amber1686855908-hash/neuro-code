@@ -10,6 +10,15 @@ from neuro_code.application.ports.background_tasks import (
 from neuro_code.application.ports.client_filesystem import ClientFileSystem
 from neuro_code.application.ports.client_terminal import ClientTerminal, ClientTerminalResult
 from neuro_code.application.ports.http import HttpClientPolicy
+from neuro_code.application.ports.mcp import (
+    McpElicitationHandler,
+    McpPrompt,
+    McpPromptMessage,
+    McpResource,
+    McpResourceContent,
+    McpResourceTemplate,
+    McpSamplingHandler,
+)
 from neuro_code.application.ports.model import (
     CapabilityResolution,
     CapabilityStatus,
@@ -68,6 +77,7 @@ from neuro_code.application.ports.terminal import (
     InteractiveTerminalManager,
     InteractiveTerminalSession,
 )
+from neuro_code.application.ports.tool_pipeline import ToolPipelineHook
 from neuro_code.application.ports.tools import (
     MAX_TOOL_OUTPUT_ARTIFACT_BYTES,
     MAX_TOOL_OUTPUT_ARTIFACT_READ_BYTES,
@@ -230,6 +240,13 @@ __all__ = [
     "ManagedProviderProfile",
     "ManagedProviderSettings",
     "ManagedProxyPolicy",
+    "McpElicitationHandler",
+    "McpPrompt",
+    "McpPromptMessage",
+    "McpResource",
+    "McpResourceContent",
+    "McpResourceTemplate",
+    "McpSamplingHandler",
     "ModelCapability",
     "ModelCapabilitySet",
     "ModelCatalogStrategy",
@@ -261,6 +278,7 @@ __all__ = [
     "ToolOutputArtifactRead",
     "ToolOutputArtifactReader",
     "ToolOutputArtifactStore",
+    "ToolPipelineHook",
     "UiPreferencesStore",
     "UnavailableUserInteraction",
     "UserInputOption",

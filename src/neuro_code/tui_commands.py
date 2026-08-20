@@ -29,6 +29,8 @@ class _Command:
 _COMMANDS = (
     _Command("help"),
     _Command("status"),
+    _Command("compact"),
+    _Command("context"),
     _Command("provider", "PROFILE"),
     _Command("model", "PROFILE"),
     _Command("effort", "LEVEL", ("low", "medium", "high", "xhigh", "ultracode")),

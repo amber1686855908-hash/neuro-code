@@ -13,6 +13,15 @@ from typing import Literal, Protocol
 from neuro_code.application.ports.approval import PermissionApprover
 from neuro_code.application.ports.client_filesystem import ClientFileSystem
 from neuro_code.application.ports.client_terminal import ClientTerminal
+from neuro_code.application.ports.mcp import (
+    McpElicitationHandler,
+    McpPrompt,
+    McpPromptMessage,
+    McpResource,
+    McpResourceContent,
+    McpResourceTemplate,
+    McpSamplingHandler,
+)
 from neuro_code.application.ports.tools import Tool
 from neuro_code.application.sessions.binding import ConversationBinding
 from neuro_code.application.sessions.subagent_queries import SubagentRelationshipAction
@@ -31,6 +40,10 @@ MAX_ACP_ARTIFACT_QUERY_READ_BYTES = 256 * 1024
 MAX_ACP_SUBAGENT_PROMPT_BYTES = MAX_SUBAGENT_PROMPT_BYTES
 MAX_ACP_SUBAGENT_STEPS = MAX_SUBAGENT_STEPS
 MAX_ACP_SUBAGENT_TASK_ID_BYTES = 512
+MAX_ACP_MCP_URI_BYTES = 4 * 1024
+MAX_ACP_MCP_PROMPT_NAME_BYTES = 512
+MAX_ACP_MCP_ARGUMENTS = 32
+MAX_ACP_MCP_ARGUMENT_BYTES = 8 * 1024
 _ARTIFACT_ID_PATTERN = re.compile(r"[0-9a-f]{32}\Z")
 
 
@@ -65,6 +78,151 @@ class AcpSubagentLifecycleQueryError(ValueError):
     def __init__(self, reason: str) -> None:
         super().__init__(reason)
         self.reason = reason
+
+
+class AcpMcpQueryError(ValueError):
+    """Stable validation failure for the private MCP capability extension.
+
+    私有 MCP 能力扩展使用的稳定输入校验失败.
+    """
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
+@dataclass(frozen=True, slots=True)
+class AcpMcpQuery:
+    """Bounded external request for one session-owned MCP capability.
+
+    一个会话拥有的 MCP 能力操作使用的有界外部请求.
+    """
+
+    session_id: str
+    operation: Literal["list", "read_resource", "get_prompt", "refresh"]
+    uri: str | None = None
+    name: str | None = None
+    arguments: tuple[tuple[str, str], ...] = ()
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.session_id, str)
+            or not self.session_id.strip()
+            or "\x00" in self.session_id
+            or any(ord(character) < 32 or ord(character) == 127 for character in self.session_id)
+            or len(self.session_id.encode("utf-8")) > MAX_ACP_ARTIFACT_QUERY_SESSION_ID_BYTES
+        ):
+            raise AcpMcpQueryError("session_id_invalid")
+        if self.operation not in {"list", "read_resource", "get_prompt", "refresh"}:
+            raise AcpMcpQueryError("operation_invalid")
+        for field_name, value, limit in (
+            ("uri", self.uri, MAX_ACP_MCP_URI_BYTES),
+            ("name", self.name, MAX_ACP_MCP_PROMPT_NAME_BYTES),
+        ):
+            if value is not None and (
+                not isinstance(value, str)
+                or not value
+                or "\x00" in value
+                or any(ord(character) < 32 or ord(character) == 127 for character in value)
+                or len(value.encode("utf-8")) > limit
+            ):
+                raise AcpMcpQueryError(f"{field_name}_invalid")
+        if len(self.arguments) > MAX_ACP_MCP_ARGUMENTS:
+            raise AcpMcpQueryError("arguments_too_many")
+        seen: set[str] = set()
+        total_bytes = 0
+        for key, value in self.arguments:
+            if (
+                not isinstance(key, str)
+                or not key
+                or key in seen
+                or "\x00" in key
+                or any(ord(character) < 32 or ord(character) == 127 for character in key)
+                or not isinstance(value, str)
+                or "\x00" in value
+            ):
+                raise AcpMcpQueryError("argument_invalid")
+            seen.add(key)
+            total_bytes += len(key.encode("utf-8")) + len(value.encode("utf-8"))
+        if total_bytes > MAX_ACP_MCP_ARGUMENT_BYTES:
+            raise AcpMcpQueryError("arguments_too_large")
+        if self.operation == "read_resource" and self.uri is None:
+            raise AcpMcpQueryError("uri_required")
+        if self.operation == "get_prompt" and self.name is None:
+            raise AcpMcpQueryError("name_required")
+        if self.operation in {"list", "refresh"} and (
+            self.uri is not None or self.name is not None or self.arguments
+        ):
+            raise AcpMcpQueryError("operation_arguments_unsupported")
+        if self.operation == "read_resource" and (self.name is not None or self.arguments):
+            raise AcpMcpQueryError("operation_arguments_unsupported")
+
+    @classmethod
+    def from_payload(cls, payload: Mapping[str, object]) -> AcpMcpQuery:
+        if not isinstance(payload, Mapping):
+            raise AcpMcpQueryError("mcp_query_invalid")
+        allowed = {"sessionId", "operation", "uri", "name", "arguments"}
+        if any(key not in allowed for key in payload):
+            raise AcpMcpQueryError("mcp_query_field_unsupported")
+        session_id = payload.get("sessionId")
+        operation = payload.get("operation")
+        if not isinstance(session_id, str):
+            raise AcpMcpQueryError("session_id_invalid")
+        if not isinstance(operation, str):
+            raise AcpMcpQueryError("operation_invalid")
+        uri = payload.get("uri")
+        name = payload.get("name")
+        if uri is not None and not isinstance(uri, str):
+            raise AcpMcpQueryError("uri_invalid")
+        if name is not None and not isinstance(name, str):
+            raise AcpMcpQueryError("name_invalid")
+        raw_arguments = payload.get("arguments", {})
+        if not isinstance(raw_arguments, Mapping):
+            raise AcpMcpQueryError("arguments_invalid")
+        if any(
+            not isinstance(key, str) or not isinstance(value, str)
+            for key, value in raw_arguments.items()
+        ):
+            raise AcpMcpQueryError("argument_invalid")
+        try:
+            canonical_operation: Literal["list", "read_resource", "get_prompt", "refresh"] = (
+                operation  # type: ignore[assignment]
+            )
+        except (TypeError, ValueError):
+            raise AcpMcpQueryError("operation_invalid") from None
+        return cls(
+            session_id=session_id,
+            operation=canonical_operation,
+            uri=uri,
+            name=name,
+            arguments=tuple(sorted(raw_arguments.items())),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class AcpSessionCommandQuery:
+    """Bounded external request for a session command such as compaction."""
+
+    session_id: str
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.session_id, str)
+            or not self.session_id.strip()
+            or "\x00" in self.session_id
+            or any(ord(character) < 32 or ord(character) == 127 for character in self.session_id)
+            or len(self.session_id.encode("utf-8")) > MAX_ACP_ARTIFACT_QUERY_SESSION_ID_BYTES
+        ):
+            raise AcpMcpQueryError("session_id_invalid")
+
+    @classmethod
+    def from_payload(cls, payload: Mapping[str, object]) -> AcpSessionCommandQuery:
+        if not isinstance(payload, Mapping) or set(payload) != {"sessionId"}:
+            raise AcpMcpQueryError("session_command_invalid")
+        session_id = payload.get("sessionId")
+        if not isinstance(session_id, str):
+            raise AcpMcpQueryError("session_id_invalid")
+        return cls(session_id)
 
 
 @dataclass(frozen=True, slots=True)
@@ -388,6 +546,25 @@ class AcpMcpTools(Protocol):
     @property
     def tools(self) -> Sequence[Tool]: ...
 
+    @property
+    def resources(self) -> Sequence[McpResource]: ...
+
+    @property
+    def resource_templates(self) -> Sequence[McpResourceTemplate]: ...
+
+    @property
+    def prompts(self) -> Sequence[McpPrompt]: ...
+
+    async def refresh(self) -> None: ...
+
+    async def read_resource(self, uri: str) -> tuple[McpResourceContent, ...]: ...
+
+    async def get_prompt(
+        self,
+        name: str,
+        arguments: Mapping[str, str] | None = None,
+    ) -> tuple[McpPromptMessage, ...]: ...
+
     async def close(self) -> None: ...
 
 
@@ -402,6 +579,8 @@ class AcpMcpToolFactory(Protocol):
         *,
         cwd: Path,
         explicit_redactions: Sequence[str],
+        sampling_handler: McpSamplingHandler | None = None,
+        elicitation_handler: McpElicitationHandler | None = None,
     ) -> AcpMcpTools: ...
 
 

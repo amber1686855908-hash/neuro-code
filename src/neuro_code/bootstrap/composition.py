@@ -22,6 +22,7 @@ from neuro_code.application.permissions.policy import (
     PermissionEffect,
     PermissionManager,
     PermissionRule,
+    PermissionRuleStore,
 )
 from neuro_code.application.permissions.service import ToolApprovalService
 from neuro_code.application.ports.approval import PermissionApprover
@@ -100,6 +101,11 @@ from neuro_code.application.workflows.subagent import (
     ReadOnlySubagentApplicationService,
     SubagentExecutionService,
     SubagentExecutorFactory,
+)
+from neuro_code.application.workflows.subagent_scheduler import (
+    MAX_SUBAGENT_PARALLELISM,
+    ScopedSubagentRuntimeFactory,
+    SubagentScheduler,
 )
 from neuro_code.domain.conversation.reasoning import ReasoningEffort
 from neuro_code.domain.sandbox.models import SandboxProfile
@@ -414,7 +420,7 @@ class ApplicationComposition:
                 raise ConfigurationError(
                     f"tool {tool.definition.name!r} is outside the selected capability set"
                 )
-            preview_tools.register(tool)
+            preview_tools.register_external(tool)
         if selected_config.web_fetch_mode is not WebFetchMode.DISABLED and any(
             tool.definition.name == "web_fetch" for tool in additional_tools
         ):
@@ -586,7 +592,7 @@ class ApplicationComposition:
                         raise ConfigurationError(
                             f"tool {tool.definition.name!r} is outside the selected capability set"
                         )
-                    tools.register(tool)
+                    tools.register_external(tool)
                 return task_scope, provider, tools, local_process_sandbox
             except BaseException:
                 await asyncio.shield(task_scope.shutdown())
@@ -637,9 +643,18 @@ class ApplicationComposition:
             def skill_provider() -> SkillDiscoveryResult | None:
                 return skill_tracker.current_result()
 
+            persisted_rules: tuple[PermissionRule, ...] = ()
+            if self.settings.permission_rules_path is not None:
+                try:
+                    persisted_rules = PermissionRuleStore(
+                        self.settings.permission_rules_path
+                    ).load()
+                except ValueError as error:
+                    raise ConfigurationError(str(error)) from error
             permissions = PermissionManager(
                 mode=self.settings.permission_mode,
                 rules=(
+                    *persisted_rules,
                     *self.settings.permission_rules,
                     *(
                         PermissionRule(PermissionEffect.ASK, tool.definition.name)
@@ -902,6 +917,23 @@ class ApplicationComposition:
         return IsolatedSubagentExecutionService(
             self.store,
             CompositionReadOnlySubagentRuntimeFactory(self),
+            timeout_seconds=timeout_seconds,
+        )
+
+    def create_subagent_scheduler(
+        self,
+        factory: ScopedSubagentRuntimeFactory,
+        *,
+        max_parallel: int = MAX_SUBAGENT_PARALLELISM,
+        max_retries: int = 0,
+        timeout_seconds: float | None = None,
+    ) -> SubagentScheduler:
+        """Create an opt-in scheduler over a caller-owned scoped factory."""
+
+        return SubagentScheduler(
+            factory,
+            max_parallel=max_parallel,
+            max_retries=max_retries,
             timeout_seconds=timeout_seconds,
         )
 

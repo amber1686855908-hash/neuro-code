@@ -65,6 +65,10 @@ from neuro_code.application.runtime.supervision import (
     ToolExecutionObservation,
 )
 from neuro_code.application.runtime.tool_pipeline import ToolExecutor
+from neuro_code.application.runtime.tool_scheduler import (
+    ToolBatchExecutionError,
+    ToolScheduler,
+)
 from neuro_code.application.sessions.lifecycle import (
     SessionLifecycleService,
     StartSessionRequest,
@@ -86,6 +90,7 @@ from neuro_code.domain.conversation.messages import (
     SyntheticReason,
     ToolCall,
 )
+from neuro_code.domain.conversation.request import ModelRequestSnapshot
 from neuro_code.domain.execution import (
     AgentExecutionOutcome,
     AgentExecutionStatus,
@@ -145,6 +150,13 @@ class AgentRunResult:
     outcome: AgentExecutionOutcome | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class _ScheduledToolOutcome:
+    observation: ToolExecutionObservation | None
+    messages: tuple[Message, ...] = ()
+    context_items: tuple[SessionItem, ...] = ()
+
+
 class AgentLoopRunner:
     """Own one agent turn's step loop and finalization orchestration.
 
@@ -167,6 +179,7 @@ class AgentLoopRunner:
         "_system_prompt",
         "_tool_context",
         "_tool_executor",
+        "_tool_scheduler",
         "_tools",
     )
 
@@ -218,8 +231,13 @@ class AgentLoopRunner:
         self._finalizer_factory = finalizer_factory
         self._finalizer_max_attempts = finalizer_max_attempts
         self._tool_executor = tool_executor
+        self._tool_scheduler: ToolScheduler[_ScheduledToolOutcome] = ToolScheduler(tools)
         self._compaction_runtime_gate = compaction_runtime_gate
         self._provider_context_window = provider_context_window
+
+    @property
+    def provider_context_window(self) -> ProviderContextWindow | None:
+        return self._provider_context_window
 
     async def run(
         self,
@@ -970,8 +988,22 @@ class AgentLoopRunner:
                 if terminal_before_model is not None:
                     return await complete_finalized_turn(terminal_before_model, step=step - 1)
                 await emit_budget_usage()
+                tool_definitions = self._tools.definitions()
+                request_snapshot = ModelRequestSnapshot.build(
+                    context=context,
+                    tools=tool_definitions,
+                    provider=self._provider.provider_name,
+                    model=self._provider.model_name,
+                    context_affinity=getattr(self._provider, "context_affinity", None),
+                    step=step,
+                    reasoning_effort=context.reasoning_effort,
+                )
+                await emit(
+                    AgentEventKind.MODEL_REQUEST_SNAPSHOT,
+                    request_snapshot.to_event_data(),
+                )
                 step_result = await ModelStepProcessor(session_store=self._session_store).consume(
-                    self._provider.stream(context, self._tools.definitions()),
+                    self._provider.stream(context, tool_definitions),
                     emit=emit,
                     step=step,
                     step_started_at=step_started_at,
@@ -1177,7 +1209,19 @@ class AgentLoopRunner:
                     )
                     update_runtime_supervision_guidance(after_tool_batch_decision)
                     continue
-                for index, call in enumerate(tool_calls):
+
+                async def execute_scheduled_tool(
+                    call: ToolCall,
+                    isolated: bool,
+                ) -> _ScheduledToolOutcome:
+                    # Parallel calls get private append-only projections.  The
+                    # executor still owns every permission, approval, sandbox,
+                    # redaction, and event boundary; only transcript merging
+                    # is deferred until model order is restored.
+                    base_message_count = len(messages)
+                    base_context_count = len(context_items)
+                    target_messages = list(messages) if isolated else messages
+                    target_context_items = list(context_items) if isolated else context_items
                     interaction_tool = isinstance(
                         self._tools.get(call.name), InteractionControlTool
                     )
@@ -1186,8 +1230,8 @@ class AgentLoopRunner:
                     try:
                         observation = await self._tool_executor.execute(
                             call,
-                            messages,
-                            context_items,
+                            target_messages,
+                            target_context_items,
                             emit,
                             session_id,
                             interrupted_observation_sink=record_interrupted_tool_outcome,
@@ -1198,32 +1242,47 @@ class AgentLoopRunner:
                                 else None
                             ),
                         )
-                        if observation is None:
-                            disable_supervision("tool_observation_unavailable")
-                        else:
-                            record_verification_evidence(observation)
-                            last_tool_decision = record_tool_outcome(observation)
-                            if (
-                                supervisor is not None
-                                and observation.progress_kind is not ProgressKind.NONE
-                            ):
-                                segment_progress_kinds.add(observation.progress_kind)
-                            pending_terminal_decision = select_terminal_decision(
-                                pending_terminal_decision,
-                                last_tool_decision,
-                            )
-                    except BaseException as error:
-                        await self._tool_executor.record_unstarted_tool_calls(
-                            tool_calls[index + 1 :],
-                            messages,
-                            context_items,
-                            emit,
-                            cancelled=isinstance(error, asyncio.CancelledError),
+                        return _ScheduledToolOutcome(
+                            observation,
+                            tuple(target_messages[base_message_count:]) if isolated else (),
+                            tuple(target_context_items[base_context_count:]) if isolated else (),
                         )
-                        raise
                     finally:
                         if interaction_tool and supervisor is not None:
                             supervisor.resume_wall_clock()
+
+                try:
+                    scheduled_observations = await self._tool_scheduler.run(
+                        tool_calls,
+                        execute_scheduled_tool,
+                    )
+                except ToolBatchExecutionError as batch_error:
+                    await self._tool_executor.record_unstarted_tool_calls(
+                        batch_error.not_started,
+                        messages,
+                        context_items,
+                        emit,
+                        cancelled=isinstance(batch_error.cause, asyncio.CancelledError),
+                    )
+                    raise batch_error.cause from batch_error
+                for scheduled in scheduled_observations:
+                    messages.extend(scheduled.messages)
+                    context_items.extend(scheduled.context_items)
+                    observation = scheduled.observation
+                    if observation is None:
+                        disable_supervision("tool_observation_unavailable")
+                    else:
+                        record_verification_evidence(observation)
+                        last_tool_decision = record_tool_outcome(observation)
+                        if (
+                            supervisor is not None
+                            and observation.progress_kind is not ProgressKind.NONE
+                        ):
+                            segment_progress_kinds.add(observation.progress_kind)
+                        pending_terminal_decision = select_terminal_decision(
+                            pending_terminal_decision,
+                            last_tool_decision,
+                        )
                 if pending_terminal_decision is not None:
                     return await complete_finalized_turn(pending_terminal_decision, step=step)
                 update_runtime_supervision_guidance(

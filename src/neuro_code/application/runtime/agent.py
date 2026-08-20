@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Collection, Sequence
 from datetime import datetime
 
 from neuro_code.application.execution_policy import ExecutionBudgetPolicy
@@ -15,7 +15,8 @@ from neuro_code.application.permissions.policy import PermissionManager, Permiss
 from neuro_code.application.ports.approval import PermissionApprover
 from neuro_code.application.ports.model import ModelProvider
 from neuro_code.application.ports.storage import SessionStore
-from neuro_code.application.ports.tools import ToolCollection, ToolContext
+from neuro_code.application.ports.tool_pipeline import ToolPipelineHook
+from neuro_code.application.ports.tools import Tool, ToolCollection, ToolContext
 from neuro_code.application.ports.workspace_changes import WorkspaceChangeObserver
 from neuro_code.application.runtime.agent_loop import (
     AgentLoopRunner,
@@ -103,6 +104,7 @@ class AgentRuntime:
         finalizer_max_attempts: int = 2,
         compaction_runtime_gate: ContextCompactionRuntimeGate | None = None,
         provider_context_window: ProviderContextWindow | None = None,
+        tool_hooks: Sequence[ToolPipelineHook] = (),
     ) -> None:
         if execution_budget is not None and not isinstance(execution_budget, ExecutionBudget):
             raise TypeError("execution_budget must be an ExecutionBudget or None")
@@ -180,6 +182,7 @@ class AgentRuntime:
             session_store=self._session_store,
             workspace_change_observer=self._workspace_change_observer,
             context_builder=self._context_builder,
+            hooks=tool_hooks,
         )
         self._loop_runner = AgentLoopRunner(
             provider=self._provider,
@@ -207,6 +210,10 @@ class AgentRuntime:
     @property
     def reasoning_effort(self) -> ReasoningEffort:
         return self._context_builder.reasoning_effort
+
+    @property
+    def provider_context_window(self) -> ProviderContextWindow | None:
+        return self._loop_runner.provider_context_window
 
     def set_reasoning_effort(self, effort: ReasoningEffort) -> None:
         self._context_builder.set_reasoning_effort(effort)
@@ -236,6 +243,21 @@ class AgentRuntime:
     def set_interaction_mode(self, mode: InteractionMode) -> None:
         self._context_builder.set_interaction_mode(mode)
         self._apply_interaction_mode_permissions()
+
+    def replace_external_tools(
+        self,
+        tools: Sequence[Tool],
+        previous_names: Collection[str],
+    ) -> None:
+        """Replace a bounded extension set while preserving built-in tools.
+
+        替换有界扩展工具集合,同时保留内置工具.
+        """
+
+        replace_external = getattr(self._tools, "replace_external", None)
+        if not callable(replace_external):
+            raise ConfigurationError("runtime tool collection cannot refresh external tools")
+        replace_external(tools, previous_names)
 
     def _apply_interaction_mode_permissions(self) -> None:
         permission_mode = {

@@ -280,6 +280,17 @@ class AnthropicProvider:
                     }
                 )
                 continue
+            if part.kind is not ContentPartKind.IMAGE:
+                blocks.append(
+                    {
+                        "type": "text",
+                        "text": redact_sensitive_text(
+                            part.model_placeholder,
+                            explicit_values=explicit_values,
+                        ),
+                    }
+                )
+                continue
             assert part.url is not None
             reference = parse_image_reference(
                 part.url,

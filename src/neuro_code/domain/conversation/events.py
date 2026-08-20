@@ -14,6 +14,7 @@ class AgentEventKind(StrEnum):
     SESSION_STARTED = "session_started"
     USER_MESSAGE = "user_message"
     MODEL_STEP_STARTED = "model_step_started"
+    MODEL_REQUEST_SNAPSHOT = "model_request_snapshot"
     MODEL_THINKING_COMPLETED = "model_thinking_completed"
     CONTEXT_USAGE_UPDATED = "context_usage_updated"
     EXECUTION_BUDGET_UPDATED = "execution_budget_updated"

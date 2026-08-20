@@ -51,6 +51,8 @@ from neuro_code.domain.conversation.interaction_mode import (
     interaction_mode_guidance,
 )
 from neuro_code.domain.conversation.messages import (
+    AUDIO_MODEL_PLACEHOLDER,
+    BLOB_MODEL_PLACEHOLDER,
     ContentPart,
     ContentPartKind,
     ContextItemKind,
@@ -61,6 +63,13 @@ from neuro_code.domain.conversation.messages import (
     ToolCall,
 )
 from neuro_code.domain.conversation.reasoning import ReasoningEffort, reasoning_guidance
+from neuro_code.domain.conversation.request import (
+    MAX_REQUEST_SNAPSHOT_ID_BYTES,
+    REQUEST_SNAPSHOT_SCHEMA_VERSION,
+    ModelRequestSnapshot,
+    RequestContextFingerprints,
+    context_fingerprints,
+)
 from neuro_code.domain.plans import (
     MAX_PLAN_COMMENT_BYTES,
     MAX_PLAN_COMMENT_ID_BYTES,
@@ -88,10 +97,17 @@ from neuro_code.domain.terminal.models import (
     TerminalSignal,
     TerminalSize,
 )
-from neuro_code.domain.tools import ToolDefinition, ToolResult
+from neuro_code.domain.tools import (
+    ToolDefinition,
+    ToolExecutionMode,
+    ToolExecutionResult,
+    ToolResult,
+)
 from neuro_code.shared.ui_language import UiLanguage
 
 __all__ = [
+    "AUDIO_MODEL_PLACEHOLDER",
+    "BLOB_MODEL_PLACEHOLDER",
     "COMPACTION_SOURCE_FINGERPRINT_BYTES",
     "DEFAULT_BACKGROUND_WAKE_COOLDOWN_SECONDS",
     "DEFAULT_BACKGROUND_WAKE_MAX_PER_SESSION",
@@ -104,11 +120,13 @@ __all__ = [
     "MAX_PLAN_COMMENT_BYTES",
     "MAX_PLAN_COMMENT_ID_BYTES",
     "MAX_QUEUED_SESSION_TASKS",
+    "MAX_REQUEST_SNAPSHOT_ID_BYTES",
     "MAX_SESSION_TASK_ID_BYTES",
     "MAX_TERMINAL_DIMENSION",
     "MAX_TERMINAL_OUTPUT_BYTES",
     "MAX_TERMINAL_READ_BYTES",
     "MAX_TERMINAL_WRITE_BYTES",
+    "REQUEST_SNAPSHOT_SCHEMA_VERSION",
     "AgentEvent",
     "AgentEventKind",
     "BackgroundTaskKillOutcome",
@@ -136,6 +154,7 @@ __all__ = [
     "ModelProviderAttemptFailed",
     "ModelProviderSelected",
     "ModelReasoningDelta",
+    "ModelRequestSnapshot",
     "ModelTextDelta",
     "ModelToolCall",
     "ModelUsage",
@@ -144,6 +163,7 @@ __all__ = [
     "PlanStepStatus",
     "PreservedContextItem",
     "ReasoningEffort",
+    "RequestContextFingerprints",
     "Role",
     "SessionItem",
     "SessionPlan",
@@ -159,9 +179,12 @@ __all__ = [
     "TerminalSize",
     "ToolCall",
     "ToolDefinition",
+    "ToolExecutionMode",
+    "ToolExecutionResult",
     "ToolResult",
     "UiLanguage",
     "compute_compaction_source_fingerprint",
+    "context_fingerprints",
     "estimate_context_tokens",
     "estimate_text_tokens",
     "interaction_mode_guidance",

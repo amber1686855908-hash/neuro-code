@@ -67,6 +67,13 @@ the official Python SDK's newline-delimited stdio transport:
 uv run neuro-code acp --cwd /absolute/workspace
 ```
 
+The same ACP router can be served over a bounded WebSocket newline-JSON
+bridge:
+
+```bash
+uv run neuro-code acp --transport websocket --host 127.0.0.1 --port 8765 --cwd /absolute/workspace
+```
+
 The slice implements `initialize`, `session/new`, `session/list`,
 `session/load`, `session/delete`, `session/fork`, `session/resume`,
 `session/prompt`, `session/cancel` (notification), and `session/close`, sends
@@ -76,11 +83,16 @@ list/delete/fork/resume/close session capabilities. Text, inline Image,
 ResourceLink, and embedded text-resource prompt blocks preserve their order
 and are bounded. An Image block accepts raw base64 only for a small raster MIME
 allowlist, with at most eight 5 MiB images and 10 MiB in total; its associated
-URI is never read or dereferenced. An embedded `TextResourceContents` block
-accepts only client-provided text, at most eight 64 KiB resources and 128 KiB
-in aggregate; its URI is an origin label and is never resolved. ResourceLink
-metadata is allowlisted, `_meta` is not sent to the model, and links are never
-downloaded or dereferenced during prompt conversion.
+URI is never read or dereferenced. Audio blocks accept validated `audio/*` MIME
+types and bounded base64, and embedded `BlobResourceContents` accepts validated
+base64 with a bounded decoded size. Text, audio, and binary content remain
+ordered in the durable model context; non-image media is projected to a safe
+placeholder for providers that do not natively support it. An embedded
+`TextResourceContents` block accepts only client-provided text, at most eight
+64 KiB resources and 128 KiB in aggregate; its URI is an origin label and is
+never resolved. ResourceLink metadata is allowlisted, `_meta` is not sent to
+the model, and links are never downloaded or dereferenced during prompt
+conversion.
 
 Each connection remains bound to its launch workspace. `session/new` rejects a
 different or relative `cwd`; an `off`-profile binding may additionally declare
@@ -108,7 +120,11 @@ official MCP Python SDK owns schemas, `ClientSession`, negotiation, and
 JSON-RPC dispatch. Stdio uses Neuro Code's bounded `ProcessTree` bridge, while
 remote transports use the SDK's Streamable HTTP or legacy SSE clients with
 HTTPS/HTTP URL and header validation, no environment proxy inheritance, no
-redirect following, and bounded response bodies. Only MCP tools are projected.
+redirect following, and bounded response bodies. Tools, resource metadata,
+resource templates, and prompts are projected through a bounded private MCP
+session extension; that extension also supports refresh and bounded resource/
+prompt reads. MCP sampling and elicitation callbacks are forwarded to the ACP
+client through bounded private callback methods when the client supports them.
 Every invocation is treated as side-effecting and requires ACP client approval
 even under local bypass mode; explicit local deny still wins. `_meta` is
 ignored and configured environment/header values are redacted. Cancelling a
@@ -127,10 +143,11 @@ not receive configured Neuro Code environment values. It also exposes the bounde
 background lifecycle (`terminal_start`, `terminal_output`, `terminal_wait`, and `terminal_kill`)
 with opaque task IDs; terminal input, resize, and PTY framing remain unavailable. This is still
 explicitly not complete ACP v1
-support: ACP MCP transport, MCP resources/prompts/sampling/elicitation, audio
-prompt content, embedded binary-resource prompt content, binary multimedia
-history replay, client interactive terminal input/resize/PTY methods, WebSocket
-transport, and custom extensions remain unsupported and are not advertised. See the
+support: ACP MCP transport, binary multimedia history replay, client
+interactive terminal input/resize/PTY methods, and arbitrary custom
+extensions remain unsupported. The bounded private artifact, subagent,
+lifecycle, MCP, and compaction extensions are intentionally outside the
+standard ACP capability advertisement. See the
 [compatibility matrix](compatibility-matrix.md) and
 [ADR 0035](adr/0035-partial-acp-v1-stdio.md) plus
 [ADR 0036](adr/0036-durable-acp-session-load.md) and

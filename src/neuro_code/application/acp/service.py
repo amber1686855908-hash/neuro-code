@@ -22,6 +22,7 @@ from neuro_code.application.acp.contracts import (
 from neuro_code.application.ports.approval import PermissionApprover
 from neuro_code.application.ports.client_filesystem import ClientFileSystem
 from neuro_code.application.ports.client_terminal import ClientTerminal
+from neuro_code.application.ports.mcp import McpElicitationHandler, McpSamplingHandler
 from neuro_code.application.ports.storage import SessionStore
 from neuro_code.application.ports.tools import (
     MAX_TOOL_OUTPUT_ARTIFACT_READ_BYTES,
@@ -158,11 +159,16 @@ class AcpApplicationService:
     async def open_mcp_tools(
         self,
         configurations: Sequence[AcpMcpServerConfig],
+        *,
+        sampling_handler: McpSamplingHandler | None = None,
+        elicitation_handler: McpElicitationHandler | None = None,
     ) -> AcpMcpTools:
         return await self._mcp_tools.open(
             configurations,
             cwd=self._metadata.workspace,
             explicit_redactions=self.explicit_redactions(),
+            sampling_handler=sampling_handler,
+            elicitation_handler=elicitation_handler,
         )
 
     async def create_binding(

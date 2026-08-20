@@ -208,6 +208,11 @@ def _add_run_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--allow", action="append", default=[], metavar="PATTERN")
     parser.add_argument("--deny", action="append", default=[], metavar="PATTERN")
     parser.add_argument(
+        "--permissions-file",
+        type=Path,
+        help="load persistent permission rules from this JSON file",
+    )
+    parser.add_argument(
         "--execution-profile",
         choices=tuple(profile.value for profile in ExecutionProfile),
         default=ExecutionProfile.NORMAL.value,
@@ -234,6 +239,14 @@ def _add_run_arguments(parser: argparse.ArgumentParser) -> None:
 
 
 def _add_acp_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--transport",
+        choices=("stdio", "websocket"),
+        default="stdio",
+        help="ACP transport (default: stdio)",
+    )
+    parser.add_argument("--host", default="127.0.0.1", help="WebSocket bind host")
+    parser.add_argument("--port", type=int, default=0, help="WebSocket bind port")
     parser.add_argument("--cwd", type=Path, help="connection workspace")
     parser.add_argument("-m", "--model", help="model identifier")
     parser.add_argument("--provider", help="named provider profile")
@@ -250,6 +263,11 @@ def _add_acp_arguments(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--allow", action="append", default=[], metavar="PATTERN")
     parser.add_argument("--deny", action="append", default=[], metavar="PATTERN")
+    parser.add_argument(
+        "--permissions-file",
+        type=Path,
+        help="load persistent permission rules from this JSON file",
+    )
     parser.add_argument(
         "--execution-profile",
         choices=tuple(profile.value for profile in ExecutionProfile),
@@ -385,7 +403,7 @@ def build_parser() -> argparse.ArgumentParser:
     sessions_parser.add_argument(
         "session_action",
         nargs="?",
-        choices=("list", "search", "rename", "artifacts"),
+        choices=("list", "search", "rename", "compact", "artifacts"),
         default="list",
         help="session operation (default: list)",
     )
@@ -614,7 +632,8 @@ async def _run_agent(args: argparse.Namespace, services: CliServices) -> int:
                 if isinstance(text, str):
                     print(text, end="", flush=True)
             elif args.output_format == "jsonl":
-                print(json.dumps(event.to_dict(), ensure_ascii=False), flush=True)
+                if event.kind is not AgentEventKind.MODEL_REQUEST_SNAPSHOT:
+                    print(json.dumps(event.to_dict(), ensure_ascii=False), flush=True)
 
         turn_service = application.session_service.bind_runner(binding.runner)
         result = await turn_service.run_turn(
@@ -633,7 +652,11 @@ async def _run_agent(args: argparse.Namespace, services: CliServices) -> int:
                         "session_id": result.session_id,
                         "response": result.response,
                         "steps": result.steps,
-                        "events": [event.to_dict() for event in result.events],
+                        "events": [
+                            event.to_dict()
+                            for event in result.events
+                            if event.kind is not AgentEventKind.MODEL_REQUEST_SNAPSHOT
+                        ],
                         "outcome": serialize_execution_outcome(result.outcome),
                     },
                     ensure_ascii=False,
@@ -739,6 +762,7 @@ def _application_settings(
             else PermissionMode.DEFAULT
         ),
         permission_rules=_rules(args),
+        permission_rules_path=getattr(args, "permissions_file", None),
         max_steps=args.max_steps,
         execution_profile=ExecutionProfile(
             getattr(args, "execution_profile", ExecutionProfile.NORMAL.value)
@@ -825,6 +849,37 @@ async def _sessions_command(args: argparse.Namespace, services: CliServices) -> 
     store = await services.create_session_store(config)
     session_lifecycle = SessionLifecycleService(store)
     session_catalog = SessionCatalogApplicationService(store)
+    if args.session_action == "compact":
+        if args.query is None or not args.query.strip():
+            raise ConfigurationError("sessions compact requires a session ID")
+        if args.title is not None or args.prune or args.include_content or args.offset != 0:
+            raise ConfigurationError("sessions compact accepts only a session ID")
+        application = await services.open_application(
+            ApplicationSettings(cwd=args.cwd, resume_id=args.query)
+        )
+        try:
+            await application.config_for_session_resume(args.query)
+            binding = await application.create_binding(resume_id=args.query)
+            result = await binding.runner.compact_now()
+            payload = {
+                "status": result.status.value,
+                "triggered": result.triggered,
+                "compaction_id": result.compaction_id,
+                "source_item_count": result.source_item_count,
+                "candidate_item_count": result.candidate_item_count,
+                "summary_tokens": result.summary_tokens,
+                "summary_truncated": result.summary_truncated,
+            }
+            if args.json:
+                print(json.dumps(payload, ensure_ascii=False))
+            else:
+                print(
+                    f"Context compaction: {result.status.value}"
+                    + (f" ({result.compaction_id})" if result.compaction_id is not None else "")
+                )
+            return 0
+        finally:
+            await asyncio.shield(application.close())
     if args.session_action == "artifacts":
         artifact_service = services.create_tool_output_artifact_service(config, store)
         if args.prune:

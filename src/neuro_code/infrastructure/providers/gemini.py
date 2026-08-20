@@ -143,6 +143,9 @@ class GeminiProvider:
                 assert part.text is not None
                 parts.append({"text": part.text})
                 continue
+            if part.kind is not ContentPartKind.IMAGE:
+                parts.append({"text": part.model_placeholder})
+                continue
             assert part.url is not None
             reference = parse_image_reference(
                 part.url,

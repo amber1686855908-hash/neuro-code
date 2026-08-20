@@ -4,10 +4,15 @@
 
 from __future__ import annotations
 
+import contextlib
 import fnmatch
+import json
+import os
+import tempfile
 from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
+from pathlib import Path
 from typing import Any
 
 from neuro_code.domain.permissions.bash_commands import analyze_bash_command
@@ -18,6 +23,7 @@ __all__ = [
     "PermissionManager",
     "PermissionMode",
     "PermissionRule",
+    "PermissionRuleStore",
 ]
 
 
@@ -38,13 +44,40 @@ class PermissionMode(StrEnum):
 class PermissionRule:
     effect: PermissionEffect
     pattern: str
+    path_pattern: str | None = None
+    operation: str | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.effect, PermissionEffect):
+            raise TypeError("permission rule effect must be a PermissionEffect")
+        if not isinstance(self.pattern, str) or not self.pattern.strip():
+            raise ValueError("permission rule pattern must be non-empty")
+        if self.path_pattern is not None and not self.path_pattern.strip():
+            raise ValueError("permission rule path pattern must be non-empty")
+        if self.operation is not None and not self.operation.strip():
+            raise ValueError("permission rule operation must be non-empty")
 
     def matches(self, tool_name: str, arguments: Mapping[str, Any]) -> bool:
+        if self.operation is not None:
+            requested_operation = arguments.get("operation", tool_name)
+            if not isinstance(requested_operation, str) or not fnmatch.fnmatchcase(
+                requested_operation,
+                self.operation,
+            ):
+                return False
+        paths = _argument_paths(arguments)
+        if self.path_pattern is not None and not any(
+            fnmatch.fnmatchcase(path, self.path_pattern) for path in paths
+        ):
+            return False
         subject = tool_name
         if tool_name == "bash":
             command = arguments.get("command", "")
             subject = f"bash:{command}" if isinstance(command, str) else "bash:"
-        return fnmatch.fnmatchcase(subject, self.pattern)
+        subjects = [subject]
+        subjects.extend(f"{tool_name}:{path}" for path in paths)
+        subjects.extend(f"path:{path}" for path in paths)
+        return any(fnmatch.fnmatchcase(candidate, self.pattern) for candidate in subjects)
 
     def matches_subject(self, subject: str) -> bool:
         return fnmatch.fnmatchcase(subject, self.pattern)
@@ -58,6 +91,89 @@ class PermissionRule:
         return fnmatch.fnmatchcase("bash", self.pattern) or fnmatch.fnmatchcase(
             "bash:any", self.pattern
         )
+
+    def to_dict(self) -> dict[str, str]:
+        result = {"effect": self.effect.value, "pattern": self.pattern}
+        if self.path_pattern is not None:
+            result["path_pattern"] = self.path_pattern
+        if self.operation is not None:
+            result["operation"] = self.operation
+        return result
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> PermissionRule:
+        effect = value.get("effect")
+        pattern = value.get("pattern")
+        if not isinstance(effect, str) or not isinstance(pattern, str):
+            raise ValueError("permission rule requires effect and pattern")
+        try:
+            parsed_effect = PermissionEffect(effect)
+        except ValueError as error:
+            raise ValueError("permission rule effect is invalid") from error
+        path_pattern = value.get("path_pattern")
+        operation = value.get("operation")
+        if path_pattern is not None and not isinstance(path_pattern, str):
+            raise ValueError("permission rule path_pattern must be text")
+        if operation is not None and not isinstance(operation, str):
+            raise ValueError("permission rule operation must be text")
+        return cls(parsed_effect, pattern, path_pattern, operation)
+
+
+class PermissionRuleStore:
+    """Load and save bounded permission rules without storing credentials."""
+
+    schema_version = 1
+
+    def __init__(self, path: Path) -> None:
+        self.path = path.expanduser().resolve(strict=False)
+
+    def load(self) -> tuple[PermissionRule, ...]:
+        if not self.path.exists():
+            return ()
+        try:
+            payload = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as error:
+            raise ValueError("permission rule file is unreadable") from error
+        if not isinstance(payload, dict) or payload.get("schema_version") != self.schema_version:
+            raise ValueError("permission rule file schema is unsupported")
+        raw_rules = payload.get("rules")
+        if not isinstance(raw_rules, list) or len(raw_rules) > 512:
+            raise ValueError("permission rule file has too many rules")
+        rules: list[PermissionRule] = []
+        for raw_rule in raw_rules:
+            if not isinstance(raw_rule, Mapping):
+                raise ValueError("permission rule entry is invalid")
+            rules.append(PermissionRule.from_dict(raw_rule))
+        return tuple(rules)
+
+    def save(self, rules: tuple[PermissionRule, ...] | list[PermissionRule]) -> None:
+        normalized = tuple(rules)
+        if len(normalized) > 512 or not all(
+            isinstance(rule, PermissionRule) for rule in normalized
+        ):
+            raise ValueError("permission rules exceed the bounded store contract")
+        payload = {
+            "schema_version": self.schema_version,
+            "rules": [rule.to_dict() for rule in normalized],
+        }
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        fd, temporary_name = tempfile.mkstemp(
+            prefix=f".{self.path.name}.",
+            suffix=".tmp",
+            dir=self.path.parent,
+            text=True,
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                json.dump(payload, stream, ensure_ascii=False, sort_keys=True, indent=2)
+                stream.write("\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary_name, self.path)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.unlink(temporary_name)
+            raise
 
 
 @dataclass(frozen=True, slots=True)
@@ -96,6 +212,21 @@ class PermissionManager:
     @property
     def mode(self) -> PermissionMode:
         return self._mode
+
+    @property
+    def rules(self) -> tuple[PermissionRule, ...]:
+        return self._rules
+
+    def replace_rules(self, rules: tuple[PermissionRule, ...]) -> None:
+        if not all(isinstance(rule, PermissionRule) for rule in rules):
+            raise TypeError("rules must contain PermissionRule values")
+        self._rules = tuple(rules)
+
+    def load_rules(self, store: PermissionRuleStore) -> None:
+        self.replace_rules(store.load())
+
+    def save_rules(self, store: PermissionRuleStore) -> None:
+        store.save(self._rules)
 
     def set_mode(self, mode: PermissionMode) -> None:
         if not isinstance(mode, PermissionMode):
@@ -190,3 +321,26 @@ class PermissionManager:
                 "every bash command segment matched an explicit allow rule",
             )
         return None
+
+
+def _argument_paths(arguments: Mapping[str, Any]) -> tuple[str, ...]:
+    """Extract only conventional file targets for path-scoped rules."""
+
+    values: list[str] = []
+    keys = frozenset({"path", "paths", "file", "files", "source", "target", "destination"})
+
+    def visit(value: Any, key: str | None = None) -> None:
+        if isinstance(value, str) and key in keys:
+            if value and "\x00" not in value and len(value) <= 4_096:
+                values.append(value)
+            return
+        if isinstance(value, Mapping):
+            for nested_key, nested_value in value.items():
+                visit(nested_value, str(nested_key))
+        elif isinstance(value, (list, tuple)):
+            for nested_value in value:
+                visit(nested_value, key)
+
+    for name, value in arguments.items():
+        visit(value, str(name))
+    return tuple(dict.fromkeys(values))
