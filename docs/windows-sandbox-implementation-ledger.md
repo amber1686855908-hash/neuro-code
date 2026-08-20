@@ -6,12 +6,13 @@ It is intentionally concise and is updated as implementation evidence changes.
 ## UPSTREAM_BASELINE
 
 - OpenAI Codex repository: `https://github.com/openai/codex`
-- Pinned default-branch commit: `22b860e80b06dff3c5e86160e5dc3199b7816693`
+- Pinned default-branch commit: `59f7da58d6ae8401304554f807023610181f65f0`
 - Primary reference: `codex-rs/windows-sandbox-rs/`
 - Relevant upstream sources inspected: `token.rs`, `proc_thread_attr.rs`,
   `process.rs`, `spawn_prep.rs`, `setup.rs`, `identity.rs`, `wfp.rs`,
-  `wfp_setup.rs`, `elevated/runner_client.rs`, and the unified-exec Windows
-  backends, plus `desktop.rs` and `bin/command_runner/win.rs`.
+  `wfp_setup.rs`, `elevated/runner_client.rs`, `elevated/runner_pipe.rs`,
+  and the unified-exec Windows backends, plus `desktop.rs` and
+  `bin/command_runner/win.rs`.
 - Upstream is Apache-2.0. This implementation adapts observable Win32
   semantics to Neuro Code's Python boundaries; no upstream source is copied
   into production.
@@ -50,7 +51,7 @@ It is intentionally concise and is updated as implementation evidence changes.
   participates in READY/NEEDS_REPAIR inspection, and is cleaned before
   installation state is removed. The runtime runner no longer attempts a
   privileged DACL mutation.
-- The final W5 compatibility artifact (run `32194952573`, head `75c07cb`)
+- The historical W5 compatibility artifact (run `32194952573`, head `75c07cb`)
   passes all 20 installed workload rows through HOST, W3 capture, and W4
   ConPTY. It covers Windows PowerShell 5.1, PowerShell 7, normal and base
   Python, a Python child process, Git/local-repository operations, Node/npm,
@@ -66,15 +67,16 @@ It is intentionally concise and is updated as implementation evidence changes.
 
 ## CURRENT_BLOCKER
 
-- None. The production implementation, focused native acceptance, measured W5
-  workload matrix, local checks, and full CI evidence are complete. PR #49
-  remains Draft for the owner's merge decision.
+- No implementation blocker is currently known. A new full local/native/CI
+  revalidation is pending after this current-upstream parity audit; the old
+  green run remains historical evidence only.
 
 ## NEXT_ACTION
 
-- Keep PR #49 Draft and unmerged until the owner explicitly authorizes the
-  ordinary merge-commit operation. Do not start another Windows sandbox phase
-  from this branch.
+- Run the required local gates, push the current audit, wait for the new full
+  CI/native evidence, then update this ledger with the final head and run.
+  Keep PR #49 Draft and unmerged until the owner explicitly authorizes the
+  ordinary merge-commit operation.
 
 ## FAILED_HYPOTHESES
 
@@ -89,23 +91,28 @@ It is intentionally concise and is updated as implementation evidence changes.
 
 ## PENDING_DOD
 
-- None. Every DOD row has concrete local, native, or full-CI evidence recorded
-  in this ledger and the linked ADRs.
+- Local gates on the final audited head.
+- A new full CI run on that head, including native Windows token, filesystem,
+  network, lifecycle, PTY, and workload jobs with zero skips where required.
+- Final clean-worktree and pushed-PR verification, then replacement of this
+  temporary pending list with concrete evidence.
 
 ## CI_STATE
 
-- Production base: `origin/main` at `00879b9b71f637804ff6e40c82451d86f2bd6165`.
+- Current production base: `origin/main` at
+  `458afc19c478c2ecc5e9c6282f318ab1358a1586` (not merged automatically).
 - Production branch: `feat/windows-sandbox-codex-parity`.
 - Frozen evidence PR #48: `a245ffeddff66ec18cc6168081202013a2f5232a` (Draft,
   evidence-only; its Gate 2A.6 line is not production).
-- Production PR #49 is Draft at `feat/windows-sandbox-codex-parity`; the
-  latest pushed head is `75c07cb` after the final runtime evidence and
-  documentation-consistency updates.
-- Run `32194952573` (head `75c07cb`) is the final full CI run: all 23 jobs
-  succeeded, including quality, package smoke, ordinary Linux/Windows/macOS,
-  Bubblewrap, Windows security/lifecycle/native acceptance/PTY/compatibility,
-  terminal smoke, and macOS Seatbelt jobs. Its W5 artifact contains 20 rows,
-  all PASS in HOST/W3/W4. Local gates also pass: lock check, documentation
-  parity (125 bilingual pairs), Ruff, format check, mypy, 1,817 pytest
-  tests with 48 expected skips and 3 deselections at 85.47% coverage, and
-  package build.
+- Production PR #49 is Draft at `feat/windows-sandbox-codex-parity`; current
+  pushed head is `dcc5cbebbaa942da89ca6e717fe5f6710b3080fc`.
+- Run `32194952573` (head `75c07cb`) is the historical full CI run: all 23 jobs
+  succeeded, including quality, package smoke, ordinary
+  Linux/Windows/macOS, Bubblewrap, Windows security/lifecycle/native
+  acceptance/PTY/compatibility, terminal smoke, and macOS Seatbelt jobs. Its
+  W5 artifact contains 20 rows, all PASS in HOST/W3/W4. This evidence does not
+  replace a run on the audited head.
+- Previous local gates passed on the prior production snapshot: lock check,
+  documentation parity (125 bilingual pairs), Ruff, format check, mypy, 1,817
+  pytest tests with 48 expected skips and 3 deselections at 85.47% coverage,
+  and package build. They must be rerun after the audit commit.
