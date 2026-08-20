@@ -41,6 +41,7 @@ from neuro_code.application.ports.provider_catalog import (
 from neuro_code.application.ports.provider_services import (
     DEFAULT_PROVIDER_SERVICE_CATALOG,
     ModelCatalogStrategy,
+    ProtocolSupportStatus,
     ProviderServiceCatalog,
     ProviderServiceDescriptor,
 )
@@ -1647,6 +1648,8 @@ class ProviderSettingsScreen(ModalScreen[ProviderSettingsSubmission | None]):
     #provider-settings-presets,
     #provider-settings-presets-row-one,
     #provider-settings-presets-row-two,
+    #provider-settings-endpoints,
+    #provider-settings-protocols,
     #provider-settings-proxy-modes,
     #provider-settings-wake-modes,
     #provider-settings-form,
@@ -1661,6 +1664,18 @@ class ProviderSettingsScreen(ModalScreen[ProviderSettingsSubmission | None]):
     #provider-settings-presets Button {
         width: 1fr;
         margin-right: 1;
+    }
+
+    #provider-settings-endpoints Button,
+    #provider-settings-protocols Button {
+        width: 1fr;
+        margin-right: 1;
+    }
+
+    #provider-settings-endpoint-title,
+    #provider-settings-protocol-title {
+        color: $text-primary;
+        margin-top: 1;
     }
 
     #provider-settings-presets-row-one {
@@ -1702,6 +1717,14 @@ class ProviderSettingsScreen(ModalScreen[ProviderSettingsSubmission | None]):
         Binding("escape", "cancel", "Back", show=False),
         Binding("ctrl+c", "cancel", "Back", show=False),
     ]
+    _RECOMMENDED_PROTOCOL = "recommended"
+    _PROTOCOL_SELECTION_ORDER = (
+        "openai-chat",
+        "openai-responses",
+        "anthropic-messages",
+        "gemini-generate-content",
+        "gemini-interactions",
+    )
 
     def __init__(
         self,
@@ -1726,6 +1749,14 @@ class ProviderSettingsScreen(ModalScreen[ProviderSettingsSubmission | None]):
         self.initial_error = initial_error
         self._editing_profile: str | None = None
         self._active_preset = self._default_service_key()
+        self._active_protocol = self._default_service().default_protocol
+        self._protocol_auto = False
+        default_endpoint_variant = self._default_service().default_endpoint_variant
+        self._active_endpoint_variant: str | None = (
+            default_endpoint_variant.variant_id if default_endpoint_variant is not None else None
+        )
+        self._endpoint_url_managed = True
+        self._updating_endpoint = False
         self._active_proxy_mode: str | None = None
         self._active_background_wake_policy: BackgroundTaskWakePolicy | None = None
         self._delete_confirmation_for: str | None = None
@@ -1766,6 +1797,42 @@ class ProviderSettingsScreen(ModalScreen[ProviderSettingsSubmission | None]):
                 ),
             )
             for service in self.service_catalog
+        ]
+        preset_rows = [
+            Horizontal(
+                *preset_buttons[index : index + 3],
+                id=f"provider-settings-presets-row-{index // 3}",
+            )
+            for index in range(0, len(preset_buttons), 3)
+        ]
+        endpoint_buttons = [
+            Button(
+                variant.display_name,
+                id=f"provider-settings-endpoint-{variant.variant_id}",
+                variant="primary"
+                if (service.ui_key or service.service_id) == self._active_preset
+                and variant.variant_id == self._active_endpoint_variant
+                else "default",
+            )
+            for service in self.service_catalog
+            for variant in service.endpoint_variants
+        ]
+        protocol_order = (self._RECOMMENDED_PROTOCOL, *self._PROTOCOL_SELECTION_ORDER)
+        protocol_buttons = [
+            Button(
+                self._protocol_label(protocol),
+                id=f"provider-settings-protocol-{protocol}",
+                variant=(
+                    "primary"
+                    if (
+                        self._protocol_auto
+                        if protocol == self._RECOMMENDED_PROTOCOL
+                        else not self._protocol_auto and protocol == self._active_protocol
+                    )
+                    else "default"
+                ),
+            )
+            for protocol in protocol_order
         ]
         actions: list[Any] = []
         if not self.first_run:
@@ -1814,13 +1881,22 @@ class ProviderSettingsScreen(ModalScreen[ProviderSettingsSubmission | None]):
                 ),
                 VerticalScroll(*profile_widgets, id="provider-settings-profiles"),
                 Vertical(
-                    Horizontal(*preset_buttons[:3], id="provider-settings-presets-row-one"),
-                    Horizontal(*preset_buttons[3:], id="provider-settings-presets-row-two"),
+                    *preset_rows,
                     id="provider-settings-presets",
                 ),
                 Static(
+                    ui_text(self.language, "provider_settings.endpoint.title"),
+                    id="provider-settings-endpoint-title",
+                ),
+                Horizontal(*endpoint_buttons, id="provider-settings-endpoints"),
+                Static(
+                    ui_text(self.language, "provider_settings.protocol.title"),
+                    id="provider-settings-protocol-title",
+                ),
+                Horizontal(*protocol_buttons, id="provider-settings-protocols"),
+                Static(
                     self._service_text(
-                        default_service.protocol_hint_key,
+                        default_service.protocol_hint_for(self._active_protocol),
                         f"{default_service.display_name} · {default_service.default_protocol}",
                     ),
                     id="provider-settings-protocol-hint",
@@ -1966,6 +2042,22 @@ class ProviderSettingsScreen(ModalScreen[ProviderSettingsSubmission | None]):
                 pass
         return service.display_name
 
+    def _protocol_label(self, protocol: str) -> str:
+        key = {
+            self._RECOMMENDED_PROTOCOL: "provider_settings.protocol.option.recommended",
+            "openai-chat": "provider_settings.protocol.option.chat",
+            "openai-responses": "provider_settings.protocol.option.responses",
+            "anthropic-messages": "provider_settings.protocol.option.anthropic",
+            "gemini-generate-content": "provider_settings.protocol.option.gemini",
+            "gemini-interactions": "provider_settings.protocol.option.gemini_interactions",
+        }.get(protocol)
+        if key is None:
+            return protocol
+        try:
+            return ui_text(self.language, key)
+        except KeyError:
+            return protocol
+
     def _service_text(self, key: str | None, fallback: str, **values: object) -> str:
         if key is not None:
             try:
@@ -1977,7 +2069,147 @@ class ProviderSettingsScreen(ModalScreen[ProviderSettingsSubmission | None]):
     def _service(self, identifier: str) -> ProviderServiceDescriptor | None:
         return self.service_catalog.get(identifier)
 
+    def _active_service(self) -> ProviderServiceDescriptor | None:
+        return self._service(self._active_preset)
+
+    def _model_protocol_status(
+        self,
+        service: ProviderServiceDescriptor,
+        protocol: str,
+    ) -> ProtocolSupportStatus:
+        model = self.query_one("#provider-settings-model", Input).value.strip()
+        if not model:
+            return (
+                ProtocolSupportStatus.SUPPORTED
+                if protocol in service.supported_protocols
+                else ProtocolSupportStatus.UNSUPPORTED
+            )
+        return service.protocol_support_for(model=model, protocol=protocol)
+
+    def _recommended_protocol(self, service: ProviderServiceDescriptor) -> str:
+        """Choose a concrete protocol without persisting an auto sentinel.
+
+        Chat is the portable fallback.  A documented Responses or Anthropic
+        route wins over an unknown Chat route, while unknown models retain the
+        service default instead of silently changing wire protocols.
+        自动选择只存在于设置界面,保存时始终落成具体协议.
+        """
+
+        model = self.query_one("#provider-settings-model", Input).value.strip()
+        available = tuple(
+            protocol
+            for protocol in self._PROTOCOL_SELECTION_ORDER
+            if protocol in service.supported_protocols
+        )
+        if not available:
+            return service.default_protocol
+        if not model:
+            return (
+                service.default_protocol if service.default_protocol in available else available[0]
+            )
+        for protocol in available:
+            if self._model_protocol_status(service, protocol) is ProtocolSupportStatus.SUPPORTED:
+                return protocol
+        return service.default_protocol if service.default_protocol in available else available[0]
+
+    def _refresh_endpoint_controls(self, service: ProviderServiceDescriptor) -> None:
+        container = self.query_one("#provider-settings-endpoints", Horizontal)
+        available = {variant.variant_id for variant in service.endpoint_variants}
+        container.display = bool(available)
+        for button in container.query(Button):
+            variant_id = (button.id or "").removeprefix("provider-settings-endpoint-")
+            button.display = variant_id in available
+            button.variant = "primary" if variant_id == self._active_endpoint_variant else "default"
+
+    def _refresh_protocol_controls(self, service: ProviderServiceDescriptor) -> None:
+        for button in self.query_one("#provider-settings-protocols", Horizontal).query(Button):
+            protocol = (button.id or "").removeprefix("provider-settings-protocol-")
+            if protocol == self._RECOMMENDED_PROTOCOL:
+                button.display = bool(service.supported_protocols)
+                button.disabled = not bool(service.supported_protocols)
+                button.label = self._protocol_label(protocol)
+                button.variant = "primary" if self._protocol_auto else "default"
+                continue
+            available = protocol in service.supported_protocols
+            status = self._model_protocol_status(service, protocol)
+            button.display = available
+            button.disabled = not available or status is ProtocolSupportStatus.UNSUPPORTED
+            label = self._protocol_label(protocol)
+            if (
+                status is ProtocolSupportStatus.UNKNOWN
+                and self.query_one("#provider-settings-model", Input).value.strip()
+            ):
+                label = f"? {label}"
+            button.label = label
+            button.variant = (
+                "primary"
+                if not self._protocol_auto and protocol == self._active_protocol
+                else "default"
+            )
+
+    def _set_endpoint_url(self, value: str) -> None:
+        self._updating_endpoint = True
+        try:
+            self.query_one("#provider-settings-base-url", Input).value = value
+        finally:
+            self._updating_endpoint = False
+
+    def _refresh_provider_controls(self, service: ProviderServiceDescriptor) -> None:
+        self._refresh_endpoint_controls(service)
+        self._refresh_protocol_controls(service)
+        hint = service.protocol_hint_for(self._active_protocol)
+        self.query_one("#provider-settings-protocol-hint", Static).update(
+            self._service_text(
+                hint,
+                f"{service.display_name} · {self._active_protocol}",
+            )
+        )
+
+    def _select_endpoint_variant(self, variant_id: str) -> None:
+        service = self._active_service()
+        if service is None or service.endpoint_variant_for(variant_id) is None:
+            return
+        self._active_endpoint_variant = variant_id
+        if self._endpoint_url_managed:
+            self._set_endpoint_url(
+                service.endpoint_for(protocol=self._active_protocol, variant_id=variant_id)
+            )
+        self._clear_model_catalog()
+        self._refresh_endpoint_controls(service)
+
+    def _select_protocol(self, protocol: str) -> None:
+        service = self._active_service()
+        if protocol == self._RECOMMENDED_PROTOCOL:
+            if service is None or not service.supported_protocols:
+                return
+            self._protocol_auto = True
+            protocol = self._recommended_protocol(service)
+        else:
+            self._protocol_auto = False
+        if service is None or protocol not in service.supported_protocols:
+            return
+        status = self._model_protocol_status(service, protocol)
+        if status is ProtocolSupportStatus.UNSUPPORTED:
+            self._show_provider_error(
+                f"{service.display_name} does not document {protocol} for the selected model"
+            )
+            return
+        self._active_protocol = protocol
+        if self._endpoint_url_managed:
+            self._set_endpoint_url(
+                service.endpoint_for(
+                    protocol=protocol,
+                    variant_id=self._active_endpoint_variant,
+                )
+            )
+        self._clear_model_catalog()
+        self._refresh_provider_controls(service)
+        if status is ProtocolSupportStatus.UNKNOWN:
+            self._show_provider_error(ui_text(self.language, "provider_settings.protocol.unknown"))
+
     def on_mount(self) -> None:
+        default_service = self._default_service()
+        self._refresh_provider_controls(default_service)
         if self.initial_profile is not None:
             self._edit_profile(self.initial_profile)
         if self.initial_error:
@@ -1985,9 +2217,9 @@ class ProviderSettingsScreen(ModalScreen[ProviderSettingsSubmission | None]):
         focus_target = (
             "#provider-settings-model"
             if self._editing_profile is not None
-            else "#provider-settings-name"
+            else f"#provider-settings-preset-{self._active_preset}"
         )
-        self.query_one(focus_target, Input).focus()
+        self.query_one(focus_target).focus()
 
     def _default_service(self) -> ProviderServiceDescriptor:
         return self.service_catalog.services[0]
@@ -2015,7 +2247,16 @@ class ProviderSettingsScreen(ModalScreen[ProviderSettingsSubmission | None]):
             )
             return
         if button_id.startswith("provider-settings-preset-"):
-            self._select_preset(button_id.removeprefix("provider-settings-preset-"))
+            self._select_preset(
+                button_id.removeprefix("provider-settings-preset-"),
+                clear_model=True,
+            )
+            return
+        if button_id.startswith("provider-settings-endpoint-"):
+            self._select_endpoint_variant(button_id.removeprefix("provider-settings-endpoint-"))
+            return
+        if button_id.startswith("provider-settings-protocol-"):
+            self._select_protocol(button_id.removeprefix("provider-settings-protocol-"))
             return
         if button_id.startswith("provider-settings-proxy-"):
             selection = button_id.removeprefix("provider-settings-proxy-")
@@ -2063,10 +2304,32 @@ class ProviderSettingsScreen(ModalScreen[ProviderSettingsSubmission | None]):
         self.query_one("#provider-settings-context-window", Input).value = (
             str(profile.context_window_tokens) if profile.context_window_tokens is not None else ""
         )
+        service = self.service_catalog.match_profile(
+            service_id=profile.service_id,
+            protocol=profile.protocol,
+            dialect=profile.dialect,
+            base_url=profile.base_url,
+        )
+        self._endpoint_url_managed = False
+        self._protocol_auto = False
         self._select_preset(
             self._preset_for_profile(profile, self.service_catalog),
             update_endpoint=False,
         )
+        self._active_protocol = profile.protocol
+        self._active_endpoint_variant = None
+        if service is not None:
+            normalized_base_url = profile.base_url.rstrip("/").casefold()
+            self._active_endpoint_variant = next(
+                (
+                    variant.variant_id
+                    for variant in service.endpoint_variants
+                    if (variant.base_url_for(profile.protocol) or "").rstrip("/").casefold()
+                    == normalized_base_url
+                ),
+                None,
+            )
+            self._refresh_provider_controls(service)
         self.query_one("#provider-settings-proxy-env", Input).value = profile.proxy_url_env or ""
         self._select_proxy_mode(profile.proxy_mode)
         self._select_background_wake_policy(profile.background_task_wake_policy)
@@ -2094,6 +2357,7 @@ class ProviderSettingsScreen(ModalScreen[ProviderSettingsSubmission | None]):
     def _new_profile(self) -> None:
         self._editing_profile = None
         self._clear_model_catalog()
+        self._endpoint_url_managed = True
         name_input = self.query_one("#provider-settings-name", Input)
         name_input.disabled = False
         name_input.value = ""
@@ -2110,12 +2374,29 @@ class ProviderSettingsScreen(ModalScreen[ProviderSettingsSubmission | None]):
         self._show_provider_error("")
         name_input.focus()
 
-    def _select_preset(self, preset_name: str, *, update_endpoint: bool = True) -> None:
+    def _select_preset(
+        self,
+        preset_name: str,
+        *,
+        update_endpoint: bool = True,
+        clear_model: bool = False,
+    ) -> None:
         service = self._service(preset_name)
         if service is None:
             return
         self._clear_model_catalog()
         self._active_preset = service.ui_key or service.service_id
+        self._active_protocol = service.default_protocol
+        self._protocol_auto = False
+        self._active_endpoint_variant = (
+            service.default_endpoint_variant.variant_id
+            if service.default_endpoint_variant is not None
+            else None
+        )
+        if clear_model:
+            self.query_one("#provider-settings-model", Input).value = ""
+        if update_endpoint:
+            self._endpoint_url_managed = True
         for candidate in self.service_catalog:
             button = self.query_one(
                 f"#provider-settings-preset-{candidate.ui_key or candidate.service_id}",
@@ -2126,18 +2407,40 @@ class ProviderSettingsScreen(ModalScreen[ProviderSettingsSubmission | None]):
                 if (candidate.ui_key or candidate.service_id) == self._active_preset
                 else "default"
             )
-        self.query_one("#provider-settings-protocol-hint", Static).update(
-            self._service_text(
-                service.protocol_hint_key,
-                f"{service.display_name} · {service.default_protocol}",
-            )
-        )
         self.query_one("#provider-settings-model", Input).placeholder = self._service_text(
             service.model_placeholder_key,
             service.display_name,
         )
         if update_endpoint:
-            self.query_one("#provider-settings-base-url", Input).value = service.default_base_url
+            self._set_endpoint_url(
+                service.endpoint_for(
+                    protocol=self._active_protocol,
+                    variant_id=self._active_endpoint_variant,
+                )
+            )
+        self._refresh_provider_controls(service)
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        if event.input.id == "provider-settings-base-url" and not self._updating_endpoint:
+            self._endpoint_url_managed = False
+            return
+        if event.input.id == "provider-settings-model":
+            service = self._active_service()
+            if service is not None:
+                if self._protocol_auto:
+                    previous_protocol = self._active_protocol
+                    self._active_protocol = self._recommended_protocol(service)
+                    if previous_protocol != self._active_protocol and self._endpoint_url_managed:
+                        self._set_endpoint_url(
+                            service.endpoint_for(
+                                protocol=self._active_protocol,
+                                variant_id=self._active_endpoint_variant,
+                            )
+                        )
+                        self._clear_model_catalog()
+                    self._refresh_provider_controls(service)
+                else:
+                    self._refresh_protocol_controls(service)
 
     def _select_proxy_mode(self, proxy_mode: str | None) -> None:
         if proxy_mode not in {None, "environment", "direct", "explicit"}:
@@ -2229,12 +2532,12 @@ class ProviderSettingsScreen(ModalScreen[ProviderSettingsSubmission | None]):
         )
         return (
             ProviderConnectionSpec(
-                protocol=service.default_protocol,
-                dialect=service.dialect_for(service.default_protocol),
+                protocol=self._active_protocol,
+                dialect=service.dialect_for(self._active_protocol),
                 base_url=base_url,
                 api_key=api_key,
                 service_id=service.service_id,
-                catalog_strategy=service.model_catalog_strategy,
+                catalog_strategy=service.catalog_strategy_for(self._active_protocol),
             ),
             policy,
         )
@@ -2258,10 +2561,17 @@ class ProviderSettingsScreen(ModalScreen[ProviderSettingsSubmission | None]):
         signature: tuple[str, ...] | None = None
         spec: ProviderConnectionSpec | None = None
         try:
-            if service.catalog_strategy is ModelCatalogStrategy.STATIC:
+            catalog_strategy = service.catalog_strategy_for(self._active_protocol)
+            if catalog_strategy is ModelCatalogStrategy.STATIC:
                 await self._show_model_catalog(ProviderCatalogResult(service.static_models))
                 self._show_connection_status(
                     ui_text(self.language, "provider_settings.connection.static"),
+                    kind="warning",
+                )
+                return
+            if catalog_strategy is ModelCatalogStrategy.MANUAL_ONLY:
+                self._show_connection_status(
+                    ui_text(self.language, "provider_settings.connection.manual_only"),
                     kind="warning",
                 )
                 return
@@ -2306,6 +2616,8 @@ class ProviderSettingsScreen(ModalScreen[ProviderSettingsSubmission | None]):
     def _connection_signature(self) -> tuple[str, ...]:
         return (
             self._active_preset,
+            self._active_protocol,
+            self._active_endpoint_variant or "default",
             self._active_proxy_mode or "inherit",
             self.provider_settings.proxy_defaults.mode,
             self.provider_settings.proxy_defaults.proxy_url_env or "",
@@ -2411,20 +2723,30 @@ class ProviderSettingsScreen(ModalScreen[ProviderSettingsSubmission | None]):
         api_key = self.query_one("#provider-settings-api-key", Input).value.strip() or None
         name = self.query_one("#provider-settings-name", Input).value.strip()
         base_url = self.query_one("#provider-settings-base-url", Input).value.strip()
+        model = self.query_one("#provider-settings-model", Input).value.strip()
         try:
+            protocol_status = service.protocol_support_for(
+                model=model,
+                protocol=self._active_protocol,
+            )
+            if protocol_status is ProtocolSupportStatus.UNSUPPORTED:
+                raise ValueError(
+                    f"{service.display_name} does not document {self._active_protocol} "
+                    f"for model {model!r}"
+                )
             existing = self.provider_settings.profile(name)
             proxy_policy = self._draft_proxy_policy()
             profile = ManagedProviderProfile(
                 name=name,
-                protocol=service.default_protocol,
-                dialect=service.dialect_for(service.default_protocol),
+                protocol=self._active_protocol,
+                dialect=service.dialect_for(self._active_protocol),
                 service_id=service.service_id,
                 capability_overrides=(
                     existing.capability_overrides
                     if existing is not None
                     else ModelCapabilitySet.all_unknown()
                 ),
-                model=self.query_one("#provider-settings-model", Input).value.strip(),
+                model=model,
                 base_url=base_url,
                 context_window_tokens=self._context_window_tokens(),
                 proxy_mode=self._active_proxy_mode,

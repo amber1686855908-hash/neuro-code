@@ -21,6 +21,7 @@ from neuro_code.application.ports.provider_services import (
     DEFAULT_PROVIDER_SERVICE_CATALOG,
     SUPPORTED_DIALECTS,
     SUPPORTED_PROTOCOLS,
+    ProtocolSupportStatus,
 )
 from neuro_code.application.ports.routing import ModelRoute, RuntimeRole
 from neuro_code.application.ports.web_fetch import WebFetchMode
@@ -276,6 +277,18 @@ class ProviderProfile:
         if not self.base_url:
             raise ConfigurationError(f"provider profile {self.name!r} requires a base_url")
         _validate_base_url(self.base_url)
+        protocol_status = DEFAULT_PROVIDER_SERVICE_CATALOG.protocol_support_for_profile(
+            service_id=self.service_id,
+            protocol=self.protocol,
+            dialect=self.dialect,
+            base_url=self.base_url,
+            model=self.model,
+        )
+        if protocol_status is ProtocolSupportStatus.UNSUPPORTED:
+            raise ConfigurationError(
+                f"provider service {self.service_id!r} does not document protocol "
+                f"{self.protocol!r} for model {self.model!r}"
+            )
         if self.auth not in SUPPORTED_AUTH:
             raise ConfigurationError(f"unsupported provider authentication mode: {self.auth}")
         if self.auth == "env" and not self.api_key_env:
@@ -338,7 +351,14 @@ class ProviderProfile:
         if self.native_context != "profile":
             return None
         identity = "\0".join(
-            (self.name, self.protocol, self.dialect, _canonical_url(self.base_url), self.model)
+            (
+                self.name,
+                self.service_id or "",
+                self.protocol,
+                self.dialect,
+                _canonical_url(self.base_url),
+                self.model,
+            )
         )
         return f"profile-v1:{hashlib.sha256(identity.encode()).hexdigest()}"
 

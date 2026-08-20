@@ -10,6 +10,8 @@ from neuro_code.application.ports.model import (
 from neuro_code.application.ports.provider_services import (
     DEFAULT_PROVIDER_SERVICE_CATALOG,
     ModelCatalogStrategy,
+    ProtocolSupportStatus,
+    ProviderModelDescriptor,
     ProviderServiceCatalog,
     ProviderServiceDescriptor,
 )
@@ -37,6 +39,10 @@ class ProviderServiceCatalogTests(unittest.TestCase):
                 "kimi",
                 "glm",
                 "minimax",
+                "ark",
+                "qianfan",
+                "bailian",
+                "tokenhub",
             ),
         )
         self.assertIs(
@@ -321,6 +327,149 @@ class ProviderServiceCatalogTests(unittest.TestCase):
             ),
             ModelCapabilitySet.all_unknown(),
         )
+
+    def test_fake_platform_model_matrix_requires_no_new_runtime_dispatch(self) -> None:
+        fake = ProviderServiceDescriptor(
+            service_id="example-platform",
+            display_name="Example Platform",
+            default_protocol="openai-chat",
+            default_base_url="https://example.invalid/v1",
+            supported_protocols=frozenset({"openai-chat", "openai-responses"}),
+            dialect_by_protocol={
+                "openai-chat": "standard",
+                "openai-responses": "standard",
+            },
+            model_descriptors={
+                "model-a": ProviderModelDescriptor(
+                    "model-a",
+                    protocol_support={
+                        "openai-chat": ProtocolSupportStatus.SUPPORTED,
+                        "openai-responses": ProtocolSupportStatus.SUPPORTED,
+                    },
+                ),
+                "model-b": ProviderModelDescriptor(
+                    "model-b",
+                    protocol_support={
+                        "openai-chat": ProtocolSupportStatus.SUPPORTED,
+                        "openai-responses": ProtocolSupportStatus.UNSUPPORTED,
+                    },
+                ),
+            },
+        )
+        catalog = ProviderServiceCatalog((fake,))
+        self.assertEqual(
+            catalog.protocol_support_for_profile(
+                service_id="example-platform",
+                protocol="openai-responses",
+                dialect="standard",
+                base_url=fake.default_base_url,
+                model="model-a",
+            ),
+            ProtocolSupportStatus.SUPPORTED,
+        )
+        self.assertEqual(
+            catalog.protocol_support_for_profile(
+                service_id="example-platform",
+                protocol="openai-responses",
+                dialect="standard",
+                base_url=fake.default_base_url,
+                model="model-b",
+            ),
+            ProtocolSupportStatus.UNSUPPORTED,
+        )
+
+    def test_platform_protocol_support_is_model_specific_and_publisher_is_optional(self) -> None:
+        for service_id in ("ark", "qianfan", "bailian", "tokenhub"):
+            self.assertIsNone(DEFAULT_PROVIDER_SERVICE_CATALOG.require(service_id).publisher)
+
+        tokenhub = DEFAULT_PROVIDER_SERVICE_CATALOG.require("tokenhub")
+        self.assertEqual(
+            tokenhub.protocol_support_for(model="hy3", protocol="openai-responses"),
+            ProtocolSupportStatus.SUPPORTED,
+        )
+        self.assertEqual(
+            tokenhub.protocol_support_for(model="hy-mt2-pro", protocol="openai-responses"),
+            ProtocolSupportStatus.UNSUPPORTED,
+        )
+        self.assertEqual(
+            tokenhub.protocol_support_for(model="qwen3.5-plus", protocol="openai-responses"),
+            ProtocolSupportStatus.UNKNOWN,
+        )
+        self.assertEqual(
+            tokenhub.model_descriptors["deepseek-v4-pro"].protocol_modes["openai-responses"],
+            "compatibility-converted",
+        )
+        self.assertEqual(
+            tokenhub.model_descriptors["deepseek-v4-pro"].publisher.publisher_id,
+            "deepseek",
+        )
+        self.assertEqual(
+            DEFAULT_PROVIDER_SERVICE_CATALOG.require("qianfan").protocol_support_for(
+                model="provider-model-not-in-evidence",
+                protocol="openai-responses",
+            ),
+            ProtocolSupportStatus.UNKNOWN,
+        )
+
+        bailian = DEFAULT_PROVIDER_SERVICE_CATALOG.require("bailian")
+        self.assertEqual(
+            bailian.endpoint_for(protocol="anthropic-messages", variant_id="beijing-payg"),
+            "https://dashscope.aliyuncs.com/apps/anthropic",
+        )
+        self.assertEqual(
+            bailian.catalog_strategy_for("anthropic-messages"),
+            ModelCatalogStrategy.MANUAL_ONLY,
+        )
+        self.assertTrue(bailian.endpoint_variant_for("singapore-workspace").workspace_scoped)
+
+    def test_platform_profile_rejects_explicitly_unsupported_protocol(self) -> None:
+        with self.assertRaisesRegex(ConfigurationError, "does not document"):
+            ProviderProfile(
+                name="tokenhub-invalid",
+                protocol="openai-responses",
+                service_id="tokenhub",
+                model="hy-mt2-pro",
+                base_url="https://tokenhub.tencentmaas.com/v1",
+                api_key_env="TOKENHUB_API_KEY",
+            )
+
+    def test_anthropic_compatibility_does_not_inherit_hosted_tools_on_qianfan(self) -> None:
+        profile = ProviderProfile(
+            name="qianfan-anthropic-compatibility",
+            protocol="anthropic-messages",
+            service_id="qianfan",
+            model="claude-sonnet-4-6",
+            base_url="https://qianfan.baidubce.com/anthropic",
+            api_key_env="QIANFAN_API_KEY",
+            builtin_tools=("web_search", "web_fetch"),
+        )
+        capabilities = profile.effective_capabilities(
+            AnthropicProvider.implementation_capabilities(
+                model=profile.model,
+                builtin_tools=profile.builtin_tools,
+            )
+        )
+        self.assertEqual(
+            capabilities.status(ModelCapability.HOSTED_WEB_SEARCH),
+            CapabilityStatus.UNKNOWN,
+        )
+        self.assertEqual(
+            capabilities.status(ModelCapability.HOSTED_WEB_FETCH),
+            CapabilityStatus.UNKNOWN,
+        )
+
+    def test_context_affinity_includes_service_identity(self) -> None:
+        common = {
+            "name": "same-profile-name",
+            "protocol": "openai-chat",
+            "model": "deepseek-v4-pro",
+            "base_url": "https://shared.invalid/v1",
+            "api_key_env": "PLATFORM_KEY",
+            "native_context": "profile",
+        }
+        first = ProviderProfile(service_id="deepseek", **common)
+        second = ProviderProfile(service_id="tokenhub", **common)
+        self.assertNotEqual(first.context_affinity, second.context_affinity)
 
     def test_upstream_hosted_claim_cannot_become_runtime_support_without_adapter_evidence(
         self,

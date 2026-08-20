@@ -10,6 +10,7 @@ from neuro_code.application.ports.model import (
     ModelCapabilitySet,
     ModelToolPolicy,
 )
+from neuro_code.configuration.app import ProviderProfile
 from neuro_code.domain.conversation.context import ModelContext
 from neuro_code.domain.conversation.events import (
     ModelCompleted,
@@ -203,6 +204,67 @@ class FailoverModelProviderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(router.context_affinity, "profile-v1:fallback")
         self.assertEqual(primary.tool_policies, [ModelToolPolicy.ALLOWED])
         self.assertEqual(fallback.tool_policies, [ModelToolPolicy.ALLOWED])
+
+    async def test_cross_platform_failover_keeps_native_affinity_on_the_selected_route(
+        self,
+    ) -> None:
+        routes = (
+            ("tokenhub", "glm-5.3", "bailian", "qwen3.7-plus"),
+            ("bailian", "qwen3.7-plus", "qianfan", "deepseek-v4-flash"),
+            ("ark", "doubao-seed-2-0-lite-260215", "kimi", "kimi-k2.6"),
+        )
+        for primary_service, primary_model, fallback_service, fallback_model in routes:
+            with self.subTest(primary=primary_service, fallback=fallback_service):
+                primary_profile = ProviderProfile(
+                    name=f"{primary_service}-primary",
+                    service_id=primary_service,
+                    protocol="openai-chat",
+                    dialect="kimi" if primary_service == "kimi" else "standard",
+                    model=primary_model,
+                    base_url="https://shared.example.invalid/v1",
+                    api_key_env="FAILOVER_TEST_KEY",
+                    native_context="profile",
+                )
+                fallback_profile = ProviderProfile(
+                    name=f"{fallback_service}-fallback",
+                    service_id=fallback_service,
+                    protocol="openai-chat",
+                    model=fallback_model,
+                    base_url="https://shared.example.invalid/v1",
+                    api_key_env="FAILOVER_TEST_KEY",
+                    native_context="profile",
+                )
+                primary = ScriptedModelProvider(primary_service, ((ProviderError("offline"),),))
+                primary.model_name = primary_profile.model
+                primary.context_affinity = primary_profile.context_affinity
+                fallback = ScriptedModelProvider(
+                    fallback_service,
+                    ((ModelTextDelta("fallback"), ModelCompleted("stop")),),
+                )
+                fallback.model_name = fallback_profile.model
+                fallback.context_affinity = fallback_profile.context_affinity
+                self.assertNotEqual(primary.context_affinity, fallback.context_affinity)
+                router = FailoverModelProvider((_candidate(primary), _candidate(fallback)))
+
+                events = [
+                    event
+                    async for event in router.stream(
+                        ModelContext(
+                            (Message(Role.USER, "hello"),),
+                            source_provider=primary.provider_name,
+                            source_model=primary.model_name,
+                            source_context_affinity=primary.context_affinity,
+                        ),
+                        (),
+                    )
+                ]
+
+                selected = next(
+                    event for event in events if isinstance(event, ModelProviderSelected)
+                )
+                self.assertTrue(selected.failover)
+                self.assertEqual(selected.context_affinity, fallback.context_affinity)
+                self.assertNotEqual(selected.context_affinity, primary.context_affinity)
 
     async def test_disabled_policy_is_forwarded_to_every_failover_candidate(self) -> None:
         primary = ScriptedModelProvider(

@@ -10,7 +10,11 @@ from typing import Protocol
 from urllib.parse import urlsplit
 
 from neuro_code.application.ports.model import ModelCapabilitySet
-from neuro_code.application.ports.provider_services import SUPPORTED_PROTOCOLS
+from neuro_code.application.ports.provider_services import (
+    DEFAULT_PROVIDER_SERVICE_CATALOG,
+    SUPPORTED_PROTOCOLS,
+    ProtocolSupportStatus,
+)
 from neuro_code.domain.background_tasks.models import BackgroundTaskWakePolicy
 from neuro_code.shared.errors import ConfigurationError
 
@@ -113,6 +117,18 @@ class ManagedProviderProfile:
             raise ConfigurationError("provider base URL must not contain user information")
         if parsed.query or parsed.fragment:
             raise ConfigurationError("provider base URL must not contain a query or fragment")
+        protocol_status = DEFAULT_PROVIDER_SERVICE_CATALOG.protocol_support_for_profile(
+            service_id=self.service_id,
+            protocol=self.protocol,
+            dialect=self.dialect,
+            base_url=self.base_url,
+            model=self.model,
+        )
+        if protocol_status is ProtocolSupportStatus.UNSUPPORTED:
+            raise ConfigurationError(
+                f"provider service {self.service_id!r} does not document protocol "
+                f"{self.protocol!r} for model {self.model!r}"
+            )
         if self.context_window_tokens is not None and (
             isinstance(self.context_window_tokens, bool) or self.context_window_tokens <= 0
         ):

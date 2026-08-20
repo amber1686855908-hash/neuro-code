@@ -1252,6 +1252,73 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
             "example-cn",
         )
 
+    async def test_platform_settings_select_endpoint_then_protocol_and_gate_model_matrix(
+        self,
+    ) -> None:
+        catalog = ProviderCatalogFixture(ProviderCatalogResult(("fixture-model",)))
+        with tempfile.TemporaryDirectory() as directory, patch.dict("os.environ", {}, clear=True):
+            app = ProviderSetupApp(
+                provider_settings=ManagedProviderSettings(),
+                provider_settings_store=JsonProviderSettingsStore(Path(directory)),
+                provider_catalog=catalog,
+            )
+
+            async with app.run_test(size=(110, 48)) as pilot:
+                for _ in range(20):
+                    await pilot.pause(0.01)
+                    if isinstance(app.screen, ProviderSettingsScreen):
+                        break
+                screen = app.screen
+                self.assertIsInstance(screen, ProviderSettingsScreen)
+
+                screen._select_preset("bailian")
+                self.assertEqual(
+                    screen.query_one("#provider-settings-base-url", Input).value,
+                    "https://dashscope.aliyuncs.com/compatible-mode/v1",
+                )
+                screen._select_endpoint_variant("singapore-workspace")
+                self.assertIn(
+                    "{workspace-id}.ap-southeast-1.maas.aliyuncs.com",
+                    screen.query_one("#provider-settings-base-url", Input).value,
+                )
+                screen.query_one("#provider-settings-model", Input).value = "qwen3.7-plus"
+                screen._select_protocol("anthropic-messages")
+                self.assertIn(
+                    "/apps/anthropic",
+                    screen.query_one("#provider-settings-base-url", Input).value,
+                )
+
+                screen._select_preset("tokenhub")
+                screen.query_one("#provider-settings-model", Input).value = "hy-mt2-pro"
+                await pilot.pause()
+                responses = screen.query_one("#provider-settings-protocol-openai-responses", Button)
+                self.assertTrue(responses.disabled)
+                screen._select_protocol("recommended")
+                self.assertTrue(screen._protocol_auto)
+                self.assertEqual(screen._active_protocol, "openai-chat")
+                self.assertEqual(
+                    screen.query_one("#provider-settings-protocol-recommended", Button).variant,
+                    "primary",
+                )
+                screen.query_one("#provider-settings-api-key", Input).value = "temporary-key"
+                self.assertEqual(screen._connection_spec()[0].protocol, "openai-chat")
+
+                screen._select_preset("qianfan")
+                screen.query_one("#provider-settings-model", Input).value = "deepseek-v4-flash"
+                screen._select_protocol("anthropic-messages")
+                screen._select_proxy_mode("direct")
+                screen.query_one("#provider-settings-name", Input).value = "qianfan-anthropic"
+                screen.query_one("#provider-settings-api-key", Input).value = "never-render-key"
+                await screen._test_connection()
+                self.assertEqual(len(catalog.calls), 0)
+                spec, policy = screen._connection_spec()
+                self.assertEqual(spec.service_id, "qianfan")
+                self.assertEqual(spec.protocol, "anthropic-messages")
+                self.assertEqual(spec.base_url, "https://qianfan.baidubce.com/anthropic")
+                self.assertEqual(spec.catalog_strategy, ModelCatalogStrategy.MANUAL_ONLY.value)
+                self.assertFalse(policy.trust_env)
+                self.assertNotIn("never-render-key", repr(spec))
+
     def test_recoverable_terminal_status_projection_is_fail_closed(self) -> None:
         self.assertEqual(
             recoverable_terminal_status({"execution_status": "stuck", "recoverable": True}),

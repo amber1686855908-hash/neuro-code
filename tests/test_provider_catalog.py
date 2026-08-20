@@ -135,6 +135,100 @@ class ProviderCatalogTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result.models, ("claude-fixture",))
 
+    async def test_platform_catalog_paths_follow_selected_protocol_and_endpoint(self) -> None:
+        cases = (
+            (
+                "qianfan-openai",
+                ProviderConnectionSpec(
+                    protocol="openai-responses",
+                    service_id="qianfan",
+                    base_url="https://qianfan.baidubce.com/v2",
+                    api_key="qianfan-secret",
+                    catalog_strategy=ModelCatalogStrategy.OPENAI_COMPATIBLE,
+                ),
+                "https://qianfan.baidubce.com/v2/models",
+                {"authorization": "Bearer qianfan-secret"},
+            ),
+            (
+                "bailian-openai",
+                ProviderConnectionSpec(
+                    protocol="openai-chat",
+                    service_id="bailian",
+                    base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+                    api_key="bailian-secret",
+                    catalog_strategy=ModelCatalogStrategy.OPENAI_COMPATIBLE,
+                ),
+                "https://dashscope.aliyuncs.com/compatible-mode/v1/models",
+                {"authorization": "Bearer bailian-secret"},
+            ),
+            (
+                "tokenhub-responses",
+                ProviderConnectionSpec(
+                    protocol="openai-responses",
+                    service_id="tokenhub",
+                    base_url="https://tokenhub.tencentmaas.com/v1",
+                    api_key="tokenhub-secret",
+                    catalog_strategy=ModelCatalogStrategy.OPENAI_COMPATIBLE,
+                ),
+                "https://tokenhub.tencentmaas.com/v1/models",
+                {"authorization": "Bearer tokenhub-secret"},
+            ),
+        )
+        for name, spec, endpoint, expected_headers in cases:
+            with self.subTest(name=name):
+
+                def handler(
+                    request: httpx.Request,
+                    endpoint: str = endpoint,
+                    expected_headers: dict[str, str] = expected_headers,
+                    model_name: str = f"{name}-model",
+                ) -> httpx.Response:
+                    self.assertEqual(str(request.url), endpoint)
+                    for header, value in expected_headers.items():
+                        self.assertEqual(request.headers[header], value)
+                    return httpx.Response(200, json={"data": [{"id": model_name}]})
+
+                result = await HttpProviderCatalog(
+                    transport=httpx.MockTransport(handler)
+                ).discover_models(spec, http_policy=self.policy)
+                self.assertEqual(result.models, (f"{name}-model",))
+
+    async def test_static_platform_catalog_is_manual_only(self) -> None:
+        catalog = HttpProviderCatalog(
+            transport=httpx.MockTransport(
+                lambda request: self.fail("Ark static discovery must not make a request")
+            )
+        )
+        with self.assertRaises(ProviderCatalogError) as raised:
+            await catalog.discover_models(
+                ProviderConnectionSpec(
+                    protocol="openai-chat",
+                    service_id="ark",
+                    base_url="https://ark.cn-beijing.volces.com/api/v3",
+                    api_key="ark-secret",
+                    catalog_strategy=ModelCatalogStrategy.STATIC,
+                ),
+                http_policy=self.policy,
+            )
+        self.assertEqual(raised.exception.kind, "manual_only")
+
+        for base_url in (
+            "https://qianfan.baidubce.com/anthropic",
+            "https://dashscope.aliyuncs.com/apps/anthropic",
+        ):
+            with self.subTest(base_url=base_url):
+                with self.assertRaises(ProviderCatalogError) as raised:
+                    await catalog.discover_models(
+                        ProviderConnectionSpec(
+                            protocol="anthropic-messages",
+                            base_url=base_url,
+                            api_key="platform-secret",
+                            catalog_strategy=ModelCatalogStrategy.MANUAL_ONLY,
+                        ),
+                        http_policy=self.policy,
+                    )
+                self.assertEqual(raised.exception.kind, "manual_only")
+
     async def test_explicit_catalog_strategy_overrides_protocol_default(self) -> None:
         def handler(request: httpx.Request) -> httpx.Response:
             self.assertEqual(str(request.url), "https://example.invalid/models")

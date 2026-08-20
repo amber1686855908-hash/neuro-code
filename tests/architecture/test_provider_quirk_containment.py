@@ -22,7 +22,10 @@ _ALLOWED_PROVIDER_PRESENTATION = frozenset(
     }
 )
 _VENDOR_PATTERN = re.compile(
-    r"(?:^|[^a-z0-9])(kimi|moonshot|glm|zhipu|minimax|minimaxi)(?:[^a-z0-9]|$)"
+    r"(?:^|[^a-z0-9])"
+    r"(kimi|moonshot|glm|zhipu|minimax|minimaxi|ark|volcengine|qianfan|"
+    r"baidu|bailian|alibaba|tokenhub|tencent)"
+    r"(?:[^a-z0-9]|$)"
 )
 _WIRE_MARKERS = frozenset(
     {
