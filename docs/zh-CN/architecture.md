@@ -1111,7 +1111,7 @@ network `STRONG` provider contract。W1/W2 foundation actual-capability constant
 isolation 而失败关闭。Gate 1–5 执行 7 个 native acceptance test 且 0 skip，证明
 final-child identity、文件系统/网络 enforcement、binary/protocol transport、normal wait、
 显式 termination、controller-loss cleanup 与 runner kill-on-close ownership。PTY/ConPTY 留给
-W4，现有 `off` 路径保持不变；已接受的 W5 workload matrix（run `32194952573`）已通过
+W4，现有 `off` 路径保持不变；已接受的 W5 workload matrix（run `32374860136`）已通过
 W3 与 W4 验证 Python/child Python、PowerShell、Git、Node/npm、curl、NUL 读写模式和动态
 BCrypt 启动；未来 developer tool 仍需各自的有界证据行。
 

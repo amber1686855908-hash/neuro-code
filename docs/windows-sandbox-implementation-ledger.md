@@ -51,13 +51,15 @@ It is intentionally concise and is updated as implementation evidence changes.
   participates in READY/NEEDS_REPAIR inspection, and is cleaned before
   installation state is removed. The runtime runner no longer attempts a
   privileged DACL mutation.
-- The historical W5 compatibility artifact (run `32194952573`, head `75c07cb`)
-  passes all 20 installed workload rows through HOST, W3 capture, and W4
-  ConPTY. It covers Windows PowerShell 5.1, PowerShell 7, normal and base
-  Python, a Python child process, Git/local-repository operations, Node/npm,
-  curl, NUL access modes, and a dynamic `BCryptGenRandom` probe. Every W3/W4
-  row reaches `SpawnReady`, passes token attestation, and records zero active
-  Job processes after quiescence and zero output relays after join.
+- The current W5 compatibility artifact (run `32374860136`, source head
+  `1175fa046cde263a9a1c9afbb1a32b7f6ed34914`) passes all 20 installed
+  workload rows through HOST, W3 capture, and W4 ConPTY: all 60 cells are
+  `PASS`, with no host failures. It covers Windows PowerShell 5.1, PowerShell
+  7, normal and base Python, a Python child process, Git/local-repository
+  operations, Node/npm, curl, NUL access modes, and a dynamic
+  `BCryptGenRandom` probe. Every W3/W4 row reaches `SpawnReady`, passes token
+  attestation, and records zero active Job processes after quiescence and zero
+  output relays after join.
 - The final W3 native acceptance job executes seven tests with zero skips. Gate
   5A proves natural descendant completion before `Exit`; Gates 5B, 5C, and 5D
   prove explicit termination, controller-loss cleanup, and kill-on-close Job
@@ -68,15 +70,14 @@ It is intentionally concise and is updated as implementation evidence changes.
 ## CURRENT_BLOCKER
 
 - No implementation blocker is currently known. The current-upstream parity
-  audit and manually reviewed mainline integration pass all local gates; the
-  old green run remains historical evidence until the new native CI run passes.
+  audit, manually reviewed mainline integration, local gates, and the current
+  full native CI run all pass.
 
 ## NEXT_ACTION
 
-- Push the manually resolved merge commit, wait for the new full CI/native
-  evidence, then update this ledger with the final head and run.
-  Keep PR #49 Draft and unmerged until the owner explicitly authorizes the
-  ordinary merge-commit operation.
+- Keep PR #49 Draft and unmerged until the owner explicitly authorizes the
+  ordinary merge-commit operation. No further Windows implementation action is
+  required by this audit.
 
 ## FAILED_HYPOTHESES
 
@@ -91,10 +92,10 @@ It is intentionally concise and is updated as implementation evidence changes.
 
 ## PENDING_DOD
 
-- A new full CI run on that head, including native Windows token, filesystem,
-  network, lifecycle, PTY, and workload jobs with zero skips where required.
-- Final clean-worktree and pushed-PR verification, then replacement of this
-  temporary pending list with concrete evidence.
+- None. The current source head has a successful full CI run including native
+  Windows token, filesystem, network, lifecycle, PTY, and workload jobs; the
+  final evidence-only documentation update is also kept under the same PR
+  checks.
 
 ## CI_STATE
 
@@ -105,14 +106,15 @@ It is intentionally concise and is updated as implementation evidence changes.
 - Production branch: `feat/windows-sandbox-codex-parity`.
 - Frozen evidence PR #48: `a245ffeddff66ec18cc6168081202013a2f5232a` (Draft,
   evidence-only; its Gate 2A.6 line is not production).
-- Production PR #49 is Draft at `feat/windows-sandbox-codex-parity`; current
-  local head is `c510917ebd1e45f8cc051b95095aff1ddcbefa8a`; it is pending push.
-- Run `32194952573` (head `75c07cb`) is the historical full CI run: all 23 jobs
-  succeeded, including quality, package smoke, ordinary
+- Production PR #49 is Draft at `feat/windows-sandbox-codex-parity`; the
+  audited source head is `1175fa046cde263a9a1c9afbb1a32b7f6ed34914`, and the
+  final branch update only adds evidence documentation.
+- Run `32374860136` at the audited source head is the current full CI run: all
+  23 jobs succeeded, including quality, package smoke, ordinary
   Linux/Windows/macOS, Bubblewrap, Windows security/lifecycle/native
   acceptance/PTY/compatibility, terminal smoke, and macOS Seatbelt jobs. Its
-  W5 artifact contains 20 rows, all PASS in HOST/W3/W4. This evidence does not
-  replace a run on the audited head.
+  W5 artifact contains 20 rows and 60 HOST/W3/W4 cells, all `PASS`, with no
+  host failures and all nine tool-provenance records passing.
 - Current local gates on the merged head pass: lock check, documentation parity
   (134 bilingual pairs), Ruff, format check, mypy, 1,986 pytest tests with 48
   expected skips and 17 deselections at 85.15% coverage, and package build.

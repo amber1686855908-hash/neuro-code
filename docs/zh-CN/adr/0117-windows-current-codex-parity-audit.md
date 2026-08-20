@@ -8,8 +8,8 @@
 
 本审计固定了可复核的源码基线：
 
-- Neuro Code 生产分支：`feat/windows-sandbox-codex-parity`，HEAD
-  `c510917ebd1e45f8cc051b95095aff1ddcbefa8a`。
+- Neuro Code 生产分支源码审计：`feat/windows-sandbox-codex-parity`，HEAD
+  `1175fa046cde263a9a1c9afbb1a32b7f6ed34914`。
 - OpenAI Codex 默认分支：`59f7da58d6ae8401304554f807023610181f65f0`。
 - DeepSeek Harness Windows ACL 参考：
   `141eb6fef83422698aef7a981029e843e8161534`。
@@ -48,8 +48,8 @@ runtime fallback 或全局 firewall rule 临时解决。
 - 本审计不把 HTTP 200、偶发 `partial` 或仅有的单元测试当作 Windows enforcement 证据。
 - 最终生产判定必须由 Windows native token、filesystem、network、Job、pipe、ConPTY、
   child/grandchild 和 W5 workload jobs 重新产生；Linux 本地运行只能验证静态和跨平台部分。
-- `docs/windows-sandbox-implementation-ledger.md` 是当前验证状态的唯一简明记录；旧的 W5
-  artifact 与旧 CI run 只保留为历史证据，不能覆盖新 head 的验证。
+- `docs/windows-sandbox-implementation-ledger.md` 是当前验证状态的唯一简明记录。CI run
+  `32374860136` 验证了源码审计 head；最终分支更新仅增加证据文档，并由 PR checks 覆盖。
 
 ## 参考
 

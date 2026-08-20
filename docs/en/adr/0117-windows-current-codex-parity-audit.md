@@ -8,8 +8,8 @@
 
 This audit fixes the reviewable source baselines:
 
-- Neuro Code production branch: `feat/windows-sandbox-codex-parity`, HEAD
-  `c510917ebd1e45f8cc051b95095aff1ddcbefa8a`.
+- Neuro Code production branch source audit: `feat/windows-sandbox-codex-parity`,
+  HEAD `1175fa046cde263a9a1c9afbb1a32b7f6ed34914`.
 - OpenAI Codex default branch: `59f7da58d6ae8401304554f807023610181f65f0`.
 - DeepSeek Harness Windows ACL reference:
   `141eb6fef83422698aef7a981029e843e8161534`.
@@ -54,8 +54,8 @@ firewall rule is not an acceptable workaround.
   Job, pipe, ConPTY, child/grandchild, and W5 workload jobs; local Linux runs can validate only
   static and cross-platform portions.
 - `docs/windows-sandbox-implementation-ledger.md` is the concise source of current validation
-  state. The old W5 artifact and old CI run remain historical evidence and cannot substitute for
-  validation of a new head.
+  state. CI run `32374860136` validates the audited source head; the final branch update is
+  evidence-only documentation and remains covered by the PR checks.
 
 ## References
 
