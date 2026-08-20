@@ -9,15 +9,15 @@
 This audit fixes the reviewable source baselines:
 
 - Neuro Code production branch: `feat/windows-sandbox-codex-parity`, HEAD
-  `dcc5cbebbaa942da89ca6e717fe5f6710b3080fc`.
+  `c510917ebd1e45f8cc051b95095aff1ddcbefa8a`.
 - OpenAI Codex default branch: `59f7da58d6ae8401304554f807023610181f65f0`.
 - DeepSeek Harness Windows ACL reference:
   `141eb6fef83422698aef7a981029e843e8161534`.
 
 Neuro Code `origin/main` is currently
-`458afc19c478c2ecc5e9c6282f318ab1358a1586`. The production branch intentionally does not
-automatically merge that commit; this records PR #49's branch state and is not a reason to bring
-unreviewed mainline changes into the sandbox.
+`458afc19c478c2ecc5e9c6282f318ab1358a1586`. It was manually integrated into the production branch
+in `c510917` after review found a single add/add conflict in the ledger; no automatic merge result
+was accepted as a sandbox design decision.
 
 ## Decision
 

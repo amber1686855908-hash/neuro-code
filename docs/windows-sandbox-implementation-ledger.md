@@ -67,15 +67,14 @@ It is intentionally concise and is updated as implementation evidence changes.
 
 ## CURRENT_BLOCKER
 
-- No implementation blocker is currently known. A new full local/native/CI
-  revalidation is pending after this current-upstream parity audit and the
-  manually reviewed mainline integration; the old green run remains historical
-  evidence only.
+- No implementation blocker is currently known. The current-upstream parity
+  audit and manually reviewed mainline integration pass all local gates; the
+  old green run remains historical evidence until the new native CI run passes.
 
 ## NEXT_ACTION
 
-- Run the required local gates, push the current audit, wait for the new full
-  CI/native evidence, then update this ledger with the final head and run.
+- Push the manually resolved merge commit, wait for the new full CI/native
+  evidence, then update this ledger with the final head and run.
   Keep PR #49 Draft and unmerged until the owner explicitly authorizes the
   ordinary merge-commit operation.
 
@@ -92,7 +91,6 @@ It is intentionally concise and is updated as implementation evidence changes.
 
 ## PENDING_DOD
 
-- Local gates on the final audited head.
 - A new full CI run on that head, including native Windows token, filesystem,
   network, lifecycle, PTY, and workload jobs with zero skips where required.
 - Final clean-worktree and pushed-PR verification, then replacement of this
@@ -108,14 +106,13 @@ It is intentionally concise and is updated as implementation evidence changes.
 - Frozen evidence PR #48: `a245ffeddff66ec18cc6168081202013a2f5232a` (Draft,
   evidence-only; its Gate 2A.6 line is not production).
 - Production PR #49 is Draft at `feat/windows-sandbox-codex-parity`; current
-  pushed head is pending the manual conflict-resolution merge commit.
+  local head is `c510917ebd1e45f8cc051b95095aff1ddcbefa8a`; it is pending push.
 - Run `32194952573` (head `75c07cb`) is the historical full CI run: all 23 jobs
   succeeded, including quality, package smoke, ordinary
   Linux/Windows/macOS, Bubblewrap, Windows security/lifecycle/native
   acceptance/PTY/compatibility, terminal smoke, and macOS Seatbelt jobs. Its
   W5 artifact contains 20 rows, all PASS in HOST/W3/W4. This evidence does not
   replace a run on the audited head.
-- Previous local gates passed on the prior production snapshot: lock check,
-  documentation parity (125 bilingual pairs), Ruff, format check, mypy, 1,817
-  pytest tests with 48 expected skips and 3 deselections at 85.47% coverage,
-  and package build. They must be rerun after the audit commit.
+- Current local gates on the merged head pass: lock check, documentation parity
+  (134 bilingual pairs), Ruff, format check, mypy, 1,986 pytest tests with 48
+  expected skips and 17 deselections at 85.15% coverage, and package build.

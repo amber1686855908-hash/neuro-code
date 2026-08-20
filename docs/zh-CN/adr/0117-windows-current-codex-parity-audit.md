@@ -9,14 +9,14 @@
 本审计固定了可复核的源码基线：
 
 - Neuro Code 生产分支：`feat/windows-sandbox-codex-parity`，HEAD
-  `dcc5cbebbaa942da89ca6e717fe5f6710b3080fc`。
+  `c510917ebd1e45f8cc051b95095aff1ddcbefa8a`。
 - OpenAI Codex 默认分支：`59f7da58d6ae8401304554f807023610181f65f0`。
 - DeepSeek Harness Windows ACL 参考：
   `141eb6fef83422698aef7a981029e843e8161534`。
 
 当前 Neuro Code `origin/main` 为
-`458afc19c478c2ecc5e9c6282f318ab1358a1586`。生产分支有意没有自动合并该提交；这
-是 PR #49 的分支状态记录，不是把未审计的主干变更带入 sandbox 的理由。
+`458afc19c478c2ecc5e9c6282f318ab1358a1586`。该提交经过人工检查后在 `c510917` 中
+手工集成，唯一冲突是 ledger 的 add/add；没有把自动 merge 结果当作 sandbox 设计决策。
 
 ## 决策
 
