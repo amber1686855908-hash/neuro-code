@@ -84,6 +84,7 @@ from neuro_code.domain.conversation.messages import (
     Role,
     SessionItem,
     SyntheticReason,
+    ToolCall,
 )
 from neuro_code.domain.execution import (
     AgentExecutionOutcome,
@@ -103,11 +104,33 @@ from neuro_code.domain.plans import PlanStepStatus, SessionPlan
 from neuro_code.domain.session_tasks import SessionTask, SessionTaskKind, SessionTaskStatus
 from neuro_code.shared.async_utils import run_blocking
 from neuro_code.shared.errors import ConfigurationError, ProviderError
-from neuro_code.shared.redaction import redact_sensitive_text
+from neuro_code.shared.redaction import redact_sensitive_arguments, redact_sensitive_text
 
 LOGGER = logging.getLogger(__name__)
 
 EventSink = Callable[[AgentEvent], Awaitable[None] | None]
+
+
+def _redacted_persisted_tool_calls(
+    calls: Sequence[ToolCall],
+    redaction_values: tuple[str, ...],
+) -> tuple[ToolCall, ...]:
+    """Keep externally sent web-search queries redacted in persisted context."""
+
+    return tuple(
+        ToolCall(
+            call.id,
+            call.name,
+            redact_sensitive_arguments(
+                call.arguments,
+                explicit_values=redaction_values,
+            ),
+            call.metadata,
+        )
+        if call.name == "web_search"
+        else call
+        for call in calls
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -1052,7 +1075,10 @@ class AgentLoopRunner:
                 assistant_message = Message(
                     Role.ASSISTANT,
                     assistant_content,
-                    tool_calls=tuple(tool_calls),
+                    tool_calls=_redacted_persisted_tool_calls(
+                        tool_calls,
+                        self._tool_context.redaction_values,
+                    ),
                     reasoning_content="".join(step_reasoning) or None,
                 )
                 messages.append(assistant_message)

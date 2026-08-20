@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping, Sequence
 
 _SECRET_KEY = (
     r"(?:[a-z0-9.]+[_-])*(?:api[_-]?key|access[_-]?token|refresh[_-]?token|token|"
@@ -44,4 +44,34 @@ def redact_sensitive_text(text: str, *, explicit_values: Iterable[str] = ()) -> 
     return _UNQUOTED_SECRET_ASSIGNMENT.sub(r"\g<prefix>[REDACTED]", redacted)
 
 
-__all__ = ["redact_sensitive_text"]
+def redact_sensitive_value(value: object, *, explicit_values: Iterable[str] = ()) -> object:
+    """Recursively redact strings in a bounded event/tool projection."""
+
+    if isinstance(value, str):
+        return redact_sensitive_text(value, explicit_values=explicit_values)
+    if isinstance(value, Mapping):
+        return {
+            key: redact_sensitive_value(item, explicit_values=explicit_values)
+            for key, item in value.items()
+        }
+    if isinstance(value, Sequence) and not isinstance(value, (bytes, bytearray, str)):
+        return [redact_sensitive_value(item, explicit_values=explicit_values) for item in value]
+    return value
+
+
+def redact_sensitive_arguments(
+    arguments: Mapping[str, object],
+    *,
+    explicit_values: Iterable[str] = (),
+) -> dict[str, object]:
+    """Return a redacted mapping suitable for an event or UI projection."""
+
+    value = redact_sensitive_value(arguments, explicit_values=explicit_values)
+    return value if isinstance(value, dict) else {}
+
+
+__all__ = [
+    "redact_sensitive_arguments",
+    "redact_sensitive_text",
+    "redact_sensitive_value",
+]

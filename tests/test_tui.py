@@ -29,6 +29,11 @@ from neuro_code.application.ports.provider_catalog import (
     ProviderCatalogResult,
     ProviderConnectionSpec,
 )
+from neuro_code.application.ports.provider_services import (
+    ModelCatalogStrategy,
+    ProviderServiceCatalog,
+    ProviderServiceDescriptor,
+)
 from neuro_code.application.ports.provider_settings import (
     ManagedProviderProfile,
     ManagedProviderSettings,
@@ -1215,6 +1220,105 @@ def background_snapshot(
 
 
 class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
+    def test_provider_settings_screen_consumes_an_injected_service_catalog(self) -> None:
+        service = ProviderServiceDescriptor(
+            service_id="example-cn",
+            display_name="Example CN",
+            default_protocol="openai-chat",
+            default_base_url="https://example.invalid/v1",
+            model_catalog_strategy=ModelCatalogStrategy.OPENAI_COMPATIBLE,
+        )
+        catalog = ProviderServiceCatalog((service,))
+        with tempfile.TemporaryDirectory() as directory:
+            screen = ProviderSettingsScreen(
+                language=UiLanguage.ENGLISH,
+                provider_settings=ManagedProviderSettings(),
+                provider_settings_store=JsonProviderSettingsStore(Path(directory)),
+                service_catalog=catalog,
+                first_run=True,
+            )
+
+        self.assertEqual(screen._default_service_key(), "example-cn")
+        self.assertEqual(
+            screen._preset_for_profile(
+                ManagedProviderProfile(
+                    name="example",
+                    protocol="openai-chat",
+                    model="example-model",
+                    base_url="https://example.invalid/v1",
+                ),
+                catalog,
+            ),
+            "example-cn",
+        )
+
+    async def test_platform_settings_select_endpoint_then_protocol_and_gate_model_matrix(
+        self,
+    ) -> None:
+        catalog = ProviderCatalogFixture(ProviderCatalogResult(("fixture-model",)))
+        with tempfile.TemporaryDirectory() as directory, patch.dict("os.environ", {}, clear=True):
+            app = ProviderSetupApp(
+                provider_settings=ManagedProviderSettings(),
+                provider_settings_store=JsonProviderSettingsStore(Path(directory)),
+                provider_catalog=catalog,
+            )
+
+            async with app.run_test(size=(110, 48)) as pilot:
+                for _ in range(20):
+                    await pilot.pause(0.01)
+                    if isinstance(app.screen, ProviderSettingsScreen):
+                        break
+                screen = app.screen
+                self.assertIsInstance(screen, ProviderSettingsScreen)
+
+                screen._select_preset("bailian")
+                self.assertEqual(
+                    screen.query_one("#provider-settings-base-url", Input).value,
+                    "https://dashscope.aliyuncs.com/compatible-mode/v1",
+                )
+                screen._select_endpoint_variant("singapore-workspace")
+                self.assertIn(
+                    "{workspace-id}.ap-southeast-1.maas.aliyuncs.com",
+                    screen.query_one("#provider-settings-base-url", Input).value,
+                )
+                screen.query_one("#provider-settings-model", Input).value = "qwen3.7-plus"
+                screen._select_protocol("anthropic-messages")
+                self.assertIn(
+                    "/apps/anthropic",
+                    screen.query_one("#provider-settings-base-url", Input).value,
+                )
+
+                screen._select_preset("tokenhub")
+                screen.query_one("#provider-settings-model", Input).value = "hy-mt2-pro"
+                await pilot.pause()
+                responses = screen.query_one("#provider-settings-protocol-openai-responses", Button)
+                self.assertTrue(responses.disabled)
+                screen._select_protocol("recommended")
+                self.assertTrue(screen._protocol_auto)
+                self.assertEqual(screen._active_protocol, "openai-chat")
+                self.assertEqual(
+                    screen.query_one("#provider-settings-protocol-recommended", Button).variant,
+                    "primary",
+                )
+                screen.query_one("#provider-settings-api-key", Input).value = "temporary-key"
+                self.assertEqual(screen._connection_spec()[0].protocol, "openai-chat")
+
+                screen._select_preset("qianfan")
+                screen.query_one("#provider-settings-model", Input).value = "deepseek-v4-flash"
+                screen._select_protocol("anthropic-messages")
+                screen._select_proxy_mode("direct")
+                screen.query_one("#provider-settings-name", Input).value = "qianfan-anthropic"
+                screen.query_one("#provider-settings-api-key", Input).value = "never-render-key"
+                await screen._test_connection()
+                self.assertEqual(len(catalog.calls), 0)
+                spec, policy = screen._connection_spec()
+                self.assertEqual(spec.service_id, "qianfan")
+                self.assertEqual(spec.protocol, "anthropic-messages")
+                self.assertEqual(spec.base_url, "https://qianfan.baidubce.com/anthropic")
+                self.assertEqual(spec.catalog_strategy, ModelCatalogStrategy.MANUAL_ONLY.value)
+                self.assertFalse(policy.trust_env)
+                self.assertNotIn("never-render-key", repr(spec))
+
     def test_recoverable_terminal_status_projection_is_fail_closed(self) -> None:
         self.assertEqual(
             recoverable_terminal_status({"execution_status": "stuck", "recoverable": True}),
@@ -1637,6 +1741,26 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn(TEXT_EMPHASIS.lower(), styled["Important"].lower())
             self.assertIn(TEXT_PRIMARY.lower(), styled["bold"].lower())
             self.assertIn(ACCENT_CODE.lower(), styled["code"].lower())
+
+    async def test_assistant_search_sources_keep_full_urls_visible(self) -> None:
+        app = NeuroCodeApp(
+            TuiConversation(),
+            provider_name="fixture",
+            model_name="fixture-model",
+            cwd=Path("/workspace"),
+        )
+
+        async with app.run_test(size=(100, 30)):
+            rendered = app._render_entry(
+                "assistant",
+                "Sources:\n- Official guide: https://docs.example.com/guide",
+            )
+            plain = "".join(
+                segment.text
+                for segment in app.console.render(rendered, app.console.options.update(width=80))
+            )
+
+            self.assertIn("https://docs.example.com/guide", plain)
 
     async def test_fenced_code_blocks_keep_the_custom_semantic_syntax_theme(self) -> None:
         app = NeuroCodeApp(
@@ -2262,6 +2386,41 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(
                     screen.query_one("#provider-settings-model", Input).value,
                     "deepseek-reasoner",
+                )
+
+    async def test_glm_connection_uses_static_official_models_without_network_or_key(self) -> None:
+        catalog = ProviderCatalogFixture(
+            error=ProviderCatalogError("network", detail="catalog must not be called")
+        )
+        with tempfile.TemporaryDirectory() as directory, patch.dict("os.environ", {}, clear=True):
+            store = JsonProviderSettingsStore(Path(directory))
+            app = ProviderSetupApp(
+                provider_settings=ManagedProviderSettings(),
+                provider_settings_store=store,
+                provider_catalog=catalog,
+            )
+
+            async with app.run_test(size=(110, 48)) as pilot:
+                for _ in range(20):
+                    await pilot.pause(0.01)
+                    if isinstance(app.screen, ProviderSettingsScreen):
+                        break
+                screen = app.screen
+                self.assertIsInstance(screen, ProviderSettingsScreen)
+                screen._select_preset("glm")
+                screen.query_one("#provider-settings-name", Input).value = "glm"
+                await screen._test_connection()
+                await pilot.pause()
+
+                self.assertEqual(catalog.calls, [])
+                status = str(
+                    screen.query_one("#provider-settings-connection-status", Static).renderable
+                )
+                self.assertIn("official", status)
+                self.assertTrue(screen.query_one("#provider-settings-models").display)
+                self.assertIsInstance(
+                    screen.query_one("#provider-settings-catalog-model-1", Button),
+                    Button,
                 )
 
     async def test_provider_connection_error_is_localized_redacted_and_keeps_screen_open(

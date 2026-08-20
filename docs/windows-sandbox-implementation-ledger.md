@@ -68,8 +68,9 @@ It is intentionally concise and is updated as implementation evidence changes.
 ## CURRENT_BLOCKER
 
 - No implementation blocker is currently known. A new full local/native/CI
-  revalidation is pending after this current-upstream parity audit; the old
-  green run remains historical evidence only.
+  revalidation is pending after this current-upstream parity audit and the
+  manually reviewed mainline integration; the old green run remains historical
+  evidence only.
 
 ## NEXT_ACTION
 
@@ -100,12 +101,14 @@ It is intentionally concise and is updated as implementation evidence changes.
 ## CI_STATE
 
 - Current production base: `origin/main` at
-  `458afc19c478c2ecc5e9c6282f318ab1358a1586` (not merged automatically).
+  `458afc19c478c2ecc5e9c6282f318ab1358a1586`; it was manually integrated
+  after the sole ledger add/add conflict was reviewed, not automatically
+  accepted as a production change.
 - Production branch: `feat/windows-sandbox-codex-parity`.
 - Frozen evidence PR #48: `a245ffeddff66ec18cc6168081202013a2f5232a` (Draft,
   evidence-only; its Gate 2A.6 line is not production).
 - Production PR #49 is Draft at `feat/windows-sandbox-codex-parity`; current
-  pushed head is `dcc5cbebbaa942da89ca6e717fe5f6710b3080fc`.
+  pushed head is pending the manual conflict-resolution merge commit.
 - Run `32194952573` (head `75c07cb`) is the historical full CI run: all 23 jobs
   succeeded, including quality, package smoke, ordinary
   Linux/Windows/macOS, Bubblewrap, Windows security/lifecycle/native

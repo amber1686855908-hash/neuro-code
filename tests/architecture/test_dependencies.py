@@ -844,14 +844,18 @@ def test_canonical_ports_are_the_only_port_modules() -> None:
         "neuro_code.application.ports.instructions",
         "neuro_code.application.ports.model",
         "neuro_code.application.ports.provider_catalog",
+        "neuro_code.application.ports.provider_services",
         "neuro_code.application.ports.provider_settings",
+        "neuro_code.application.ports.routing",
         "neuro_code.application.ports.sandbox",
         "neuro_code.application.ports.skills",
         "neuro_code.application.ports.storage",
         "neuro_code.application.ports.terminal",
         "neuro_code.application.ports.tools",
         "neuro_code.application.ports.user_interaction",
+        "neuro_code.application.ports.web_fetch",
         "neuro_code.application.ports.ui_preferences",
+        "neuro_code.application.ports.web_search",
         "neuro_code.application.ports.workspace",
         "neuro_code.application.ports.workspace_changes",
         "neuro_code.application.ports.windows_sandbox",
@@ -920,11 +924,13 @@ def test_canonical_provider_modules_are_the_only_provider_implementations() -> N
         "neuro_code.infrastructure.providers.anthropic",
         "neuro_code.infrastructure.providers.failover",
         "neuro_code.infrastructure.providers.gemini",
+        "neuro_code.infrastructure.providers.gemini_interactions",
         "neuro_code.infrastructure.providers.image_references",
         "neuro_code.infrastructure.providers.openai_compatible",
         "neuro_code.infrastructure.providers.openai_responses",
         "neuro_code.infrastructure.providers.provider_catalog",
         "neuro_code.infrastructure.providers.provider_settings",
+        "neuro_code.infrastructure.providers.hosted_web_search",
     }
     assert {
         module for module in modules if module.startswith("neuro_code.infrastructure.providers")
@@ -944,6 +950,8 @@ def test_canonical_tool_modules_are_the_only_tool_implementations() -> None:
         "neuro_code.infrastructure.tools.registry",
         "neuro_code.infrastructure.tools.skills",
         "neuro_code.infrastructure.tools.workspace_diff",
+        "neuro_code.infrastructure.tools.web_fetch",
+        "neuro_code.infrastructure.tools.web_search",
     }
     assert {
         module for module in modules if module.startswith("neuro_code.infrastructure.tools")

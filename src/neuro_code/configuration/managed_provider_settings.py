@@ -8,6 +8,8 @@ import json
 from collections.abc import Mapping
 from pathlib import Path
 
+from neuro_code.application.ports.model import ModelCapabilitySet
+from neuro_code.application.ports.provider_services import SUPPORTED_DIALECTS, SUPPORTED_PROTOCOLS
 from neuro_code.application.ports.provider_settings import (
     ManagedProviderProfile,
     ManagedProviderSettings,
@@ -22,15 +24,6 @@ _SCHEMA_VERSION = 2
 _METADATA_NAME = "providers.json"
 _CREDENTIALS_NAME = "credentials.json"
 _MAX_FILE_BYTES = 1_048_576
-_SUPPORTED_PROTOCOLS = frozenset(
-    {
-        "openai-chat",
-        "openai-responses",
-        "anthropic-messages",
-        "gemini-generate-content",
-    }
-)
-_SUPPORTED_DIALECTS = frozenset({"standard", "xai", "deepseek-v4"})
 
 
 def _read_json(path: Path, *, missing: object) -> object:
@@ -117,6 +110,26 @@ def load_managed_provider_settings(state_dir: Path) -> ManagedProviderSettings:
             raise ConfigurationError(f"managed provider settings {metadata_path} are invalid")
         else:
             dialect = raw_dialect.strip()
+        raw_service_id = raw_profile.get("service_id")
+        if raw_service_id is not None and (
+            not isinstance(raw_service_id, str) or not raw_service_id.strip()
+        ):
+            raise ConfigurationError(f"managed provider settings {metadata_path} are invalid")
+        raw_capabilities = raw_profile.get("capabilities")
+        if raw_capabilities is None:
+            capability_overrides = ModelCapabilitySet.all_unknown()
+        elif not isinstance(raw_capabilities, Mapping) or any(
+            not isinstance(name, str) or not isinstance(status, str)
+            for name, status in raw_capabilities.items()
+        ):
+            raise ConfigurationError(f"managed provider settings {metadata_path} are invalid")
+        else:
+            try:
+                capability_overrides = ModelCapabilitySet.from_mapping(raw_capabilities)
+            except (TypeError, ValueError) as error:
+                raise ConfigurationError(
+                    f"managed provider settings {metadata_path} are invalid"
+                ) from error
         # Version-one files always implied the environment policy when this
         # field was absent. Treat that legacy default as inheritance so the new
         # user-wide setting has the same behavior until the user changes it.
@@ -147,7 +160,7 @@ def load_managed_provider_settings(state_dir: Path) -> ManagedProviderSettings:
             raise ConfigurationError(
                 f"managed provider settings {metadata_path} are invalid"
             ) from error
-        if protocol not in _SUPPORTED_PROTOCOLS or dialect not in _SUPPORTED_DIALECTS:
+        if protocol not in SUPPORTED_PROTOCOLS or dialect not in SUPPORTED_DIALECTS:
             raise ConfigurationError(f"managed provider settings {metadata_path} are invalid")
         profiles.append(
             ManagedProviderProfile(
@@ -156,6 +169,8 @@ def load_managed_provider_settings(state_dir: Path) -> ManagedProviderSettings:
                 model=model,
                 base_url=base_url,
                 dialect=dialect,
+                service_id=raw_service_id,
+                capability_overrides=capability_overrides,
                 context_window_tokens=context_window_tokens,
                 proxy_mode=proxy_mode,
                 proxy_url_env=proxy_url_env,

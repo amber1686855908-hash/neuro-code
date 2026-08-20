@@ -12,6 +12,7 @@ from neuro_code.application.ports.provider_catalog import (
     ProviderCatalogResult,
     ProviderConnectionSpec,
 )
+from neuro_code.application.ports.provider_services import ModelCatalogStrategy
 from neuro_code.shared.redaction import redact_sensitive_text
 
 _MAX_RESPONSE_BYTES = 1_048_576
@@ -20,23 +21,47 @@ _MAX_MODEL_CHARACTERS = 512
 
 
 def _without_known_operation(base_url: str) -> str:
-    for suffix in ("/chat/completions", "/responses", "/messages"):
+    for suffix in ("/chat/completions", "/responses", "/messages", "/interactions"):
         if base_url.endswith(suffix):
             return base_url.removesuffix(suffix)
     return base_url
 
 
+def _catalog_strategy(spec: ProviderConnectionSpec) -> str:
+    if spec.catalog_strategy is not None:
+        return str(spec.catalog_strategy)
+    if spec.protocol == "anthropic-messages":
+        return ModelCatalogStrategy.ANTHROPIC.value
+    if spec.protocol in {"gemini-generate-content", "gemini-interactions"}:
+        return ModelCatalogStrategy.GEMINI.value
+    return ModelCatalogStrategy.OPENAI_COMPATIBLE.value
+
+
 def _catalog_endpoint(spec: ProviderConnectionSpec) -> str:
     base_url = _without_known_operation(spec.base_url)
-    if spec.protocol == "anthropic-messages":
+    strategy = _catalog_strategy(spec)
+    if strategy == ModelCatalogStrategy.ANTHROPIC.value:
         if not base_url.endswith("/v1"):
             base_url = f"{base_url}/v1"
         return f"{base_url}/models"
-    if spec.protocol == "gemini-generate-content":
+    if strategy == ModelCatalogStrategy.GEMINI.value:
+        if spec.protocol == "gemini-interactions":
+            for suffix in ("/v1beta2", "/v1beta", "/v1"):
+                if base_url.endswith(suffix):
+                    base_url = base_url[: -len(suffix)]
+                    break
+            return f"{base_url}/v1/models"
         if not base_url.endswith(("/v1", "/v1beta")):
             base_url = f"{base_url}/v1beta"
         return f"{base_url}/models"
-    return f"{base_url}/models"
+    if strategy == ModelCatalogStrategy.OPENAI_COMPATIBLE.value:
+        return f"{base_url}/models"
+    if strategy in {
+        ModelCatalogStrategy.STATIC.value,
+        ModelCatalogStrategy.MANUAL_ONLY.value,
+    }:
+        raise ProviderCatalogError("manual_only")
+    raise ProviderCatalogError("unsupported_strategy")
 
 
 def _headers(spec: ProviderConnectionSpec) -> dict[str, str]:
@@ -48,7 +73,7 @@ def _headers(spec: ProviderConnectionSpec) -> dict[str, str]:
                 "x-api-key": spec.api_key,
             }
         )
-    elif spec.protocol == "gemini-generate-content":
+    elif spec.protocol in {"gemini-generate-content", "gemini-interactions"}:
         headers["x-goog-api-key"] = spec.api_key
     else:
         headers["authorization"] = f"Bearer {spec.api_key}"
@@ -206,7 +231,7 @@ class HttpProviderCatalog:
             raise ProviderCatalogError("invalid_response") from error
         return _parse_catalog(
             payload,
-            gemini=spec.protocol == "gemini-generate-content",
+            gemini=spec.protocol in {"gemini-generate-content", "gemini-interactions"},
         )
 
 

@@ -709,6 +709,24 @@ the proxy may change upstream providers. A project-local override may set
 trusted. Opaque reasoning is then replayed solely when the stored profile
 affinity fingerprint matches exactly.
 
+### Local safe Web Fetch
+
+Local Web Fetch is opt-in and defaults to disabled. Add the following only
+when the current session is allowed to read public web pages:
+
+```toml
+[web_fetch]
+mode = "local" # disabled | local | auto | inline
+```
+
+`local` uses Neuro Code's public-only, bounded HTTP fetcher; `auto` keeps an
+explicitly supported MAIN hosted fetch and otherwise uses the local tool;
+`inline` requires that MAIN capability and fails closed. The local tool is
+permission-gated, sends no provider proxy/cookie/auth state, rejects private or
+local destinations, and labels returned text as untrusted web content. It does
+not browse with JavaScript or automatically fetch search results. See
+[ADR 0121](adr/0121-local-safe-web-fetch.md).
+
 ### Optional xAI dialect
 
 xAI is an optional Responses dialect rather than the application default:
