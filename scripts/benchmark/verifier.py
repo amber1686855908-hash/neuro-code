@@ -19,6 +19,32 @@ from .models import TaskSpec
 
 MAX_OUTPUT_BYTES = 24_000
 
+_WINDOWS_RUNTIME_ENVIRONMENT = (
+    "SystemRoot",
+    "SystemDrive",
+    "PATHEXT",
+    "COMSPEC",
+    "WINDIR",
+    "TEMP",
+    "TMP",
+    "HOMEDRIVE",
+    "HOMEPATH",
+    "LOCALAPPDATA",
+    "APPDATA",
+    "PROGRAMDATA",
+    "PROGRAMFILES",
+    "PROGRAMFILES(X86)",
+    "PROGRAMW6432",
+    "COMMONPROGRAMFILES",
+    "COMMONPROGRAMFILES(X86)",
+    "COMMONPROGRAMW6432",
+    "ALLUSERSPROFILE",
+    "PUBLIC",
+    "OS",
+    "PSMODULEPATH",
+    "PSHOME",
+)
+
 
 @dataclass(frozen=True, slots=True)
 class VerifierResult:
@@ -62,6 +88,27 @@ def _bounded_output(value: bytes) -> str:
     if len(value) <= MAX_OUTPUT_BYTES:
         return value.decode("utf-8", "replace")
     return value[:MAX_OUTPUT_BYTES].decode("utf-8", "replace") + "\n[truncated]"
+
+
+def _verification_environment(workspace: Path) -> dict[str, str]:
+    """Build a bounded child environment without dropping Windows startup inputs."""
+
+    environment = {
+        "PATH": os.environ.get("PATH", ""),
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "PYTHONHASHSEED": "0",
+    }
+    if os.name == "nt":
+        for name in _WINDOWS_RUNTIME_ENVIRONMENT:
+            value = os.environ.get(name)
+            if value is not None:
+                environment[name] = value
+        # Keep the verifier's user-facing home isolated while allowing Python
+        # and pytest to resolve the system runtime and temporary directories.
+        environment["HOME"] = str(workspace)
+        environment["USERPROFILE"] = str(workspace)
+        environment["PYTHONNOUSERSITE"] = "1"
+    return environment
 
 
 def _safe_read(workspace: Path, relative: str) -> str:
@@ -140,16 +187,11 @@ def verify_workspace(task: TaskSpec, workspace: Path) -> VerifierResult:
     error_type: str | None = None
     if verifier.run_pytest:
         command = (sys.executable, "-m", "pytest", "-q")
-        env = {
-            "PATH": os.environ.get("PATH", ""),
-            "PYTHONDONTWRITEBYTECODE": "1",
-            "PYTHONHASHSEED": "0",
-        }
         try:
             completed = subprocess.run(
                 command,
                 cwd=workspace,
-                env=env,
+                env=_verification_environment(workspace),
                 capture_output=True,
                 timeout=verifier.timeout_seconds,
                 check=False,
