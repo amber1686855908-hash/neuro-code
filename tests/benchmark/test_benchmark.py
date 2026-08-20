@@ -39,6 +39,12 @@ from neuro_code.domain.conversation.events import AgentEvent, AgentEventKind
 from neuro_code.shared.errors import ProviderError
 
 
+def _unit_benchmark_config(output: Path) -> BenchmarkConfig:
+    """Keep headless unit tests independent of optional host sandbox binaries."""
+
+    return BenchmarkConfig(runtime=RuntimeConfig(sandbox_profile="off"), output=output)
+
+
 def test_frozen_corpus_has_expected_shape_and_stable_hash() -> None:
     assert len(TASKS) == 40
     assert validate_corpus(TASKS) == ()
@@ -171,7 +177,7 @@ def test_scripted_provider_emits_normal_tool_call_events() -> None:
 
 def test_headless_harness_smoke_uses_real_application_path(tmp_path: Path) -> None:
     task = task_by_id("A01-repository-lookup")
-    config = BenchmarkConfig(output=tmp_path / "results")
+    config = _unit_benchmark_config(tmp_path / "results")
     results = BenchmarkHarness(config).run((task,))
     assert results[0].outcome is BenchmarkOutcome.PASS
     attempt = config.output / next(config.output.iterdir()).name / "attempts" / task.task_id
@@ -188,7 +194,7 @@ def test_headless_harness_smoke_uses_real_application_path(tmp_path: Path) -> No
 def test_harness_reruns_only_failed_tasks(tmp_path: Path) -> None:
     task = task_by_id("A01-repository-lookup")
     broken = replace(task, fake_commands=("false",))
-    results = BenchmarkHarness(BenchmarkConfig(output=tmp_path / "results")).run(
+    results = BenchmarkHarness(_unit_benchmark_config(tmp_path / "results")).run(
         (broken,),
         rerun_failures=True,
     )
