@@ -246,6 +246,9 @@ class ModelCompleted:
     usage: ModelUsage | None = None
 
     def __post_init__(self) -> None:
+        object.__setattr__(self, "context_items", tuple(self.context_items))
+        if not all(isinstance(item, PreservedContextItem) for item in self.context_items):
+            raise TypeError("context_items must contain PreservedContextItem values")
         if self.usage is not None and not isinstance(self.usage, ModelUsage):
             raise TypeError("usage must be a ModelUsage or None")
         legacy_usage = ModelUsage(self.input_tokens, self.output_tokens)

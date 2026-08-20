@@ -526,6 +526,33 @@ max_output_tokens = 2048
                 with self.assertRaisesRegex(ConfigurationError, expected):
                     load_config(root, home=root)
 
+    def test_gemini_interactions_is_explicit_and_gets_profile_native_context(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / ".neuro-code"
+            state.mkdir()
+            (state / "config.toml").write_text(
+                """
+[provider.default]
+protocol = "gemini-interactions"
+service_id = "google-ai-studio"
+model = "gemini-3.6-flash"
+base_url = "https://generativelanguage.googleapis.com/v1beta"
+api_key_env = "GEMINI_KEY"
+builtin_tools = ["google_search", "url_context"]
+proxy_mode = "direct"
+""",
+                encoding="utf-8",
+            )
+
+            config = load_config(root, home=root, environ={})
+
+        self.assertEqual(config.provider.protocol, "gemini-interactions")
+        self.assertEqual(config.provider.service_id, "google-ai-studio")
+        self.assertEqual(config.provider.builtin_tools, ("google_search", "url_context"))
+        self.assertEqual(config.provider.native_context, "profile")
+        self.assertIsNotNone(config.provider.context_affinity)
+
     def test_legacy_native_dialect_resolution_is_conservative_and_explicit(self) -> None:
         cases = (
             (
@@ -675,6 +702,32 @@ builtin_tools = ["web_search", "x_search", "code_interpreter"]
                 ["web_search", "x_search", "code_interpreter"],
             )
 
+    def test_standard_openai_responses_search_and_mode_are_explicitly_configured(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / ".neuro-code"
+            state.mkdir()
+            (state / "config.toml").write_text(
+                """
+[web_search]
+mode = "sidecar"
+
+[provider.default]
+protocol = "openai-responses"
+model = "gpt-search"
+base_url = "https://api.openai.com/v1"
+api_key_env = "OPENAI_KEY"
+builtin_tools = ["web_search"]
+""",
+                encoding="utf-8",
+            )
+
+            config = load_config(root, home=root, environ={})
+
+        self.assertEqual(config.web_search_mode.value, "sidecar")
+        self.assertEqual(config.provider.builtin_tools, ("web_search",))
+        self.assertEqual(config.redacted_dict()["web_search"], {"mode": "sidecar"})
+
     def test_xai_builtin_tools_are_strictly_validated(self) -> None:
         invalid_tables = (
             ('kind = "xai-responses"\nbuiltin_tools = "web_search"', "TOML array"),
@@ -693,6 +746,13 @@ builtin_tools = ["web_search", "x_search", "code_interpreter"]
             (
                 'kind = "openai-compatible"\nbuiltin_tools = ["web_search"]',
                 "require dialect 'xai'",
+            ),
+            (
+                'protocol = "gemini-interactions"\n'
+                'base_url = "https://generativelanguage.googleapis.com/v1"\n'
+                'api_key_env = "GEMINI_KEY"\n'
+                'builtin_tools = ["google_search", "function"]',
+                "unsupported Gemini Interactions builtin_tools",
             ),
         )
         for table, expected in invalid_tables:

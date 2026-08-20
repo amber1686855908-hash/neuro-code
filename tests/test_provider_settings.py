@@ -6,14 +6,17 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from neuro_code.application.ports.model import CapabilityStatus, ModelCapability, ModelCapabilitySet
 from neuro_code.application.ports.provider_settings import (
     ManagedProviderProfile,
     ManagedProxyPolicy,
 )
+from neuro_code.configuration.app import ProviderProfile
 from neuro_code.configuration.managed_provider_settings import (
     load_managed_provider_settings as canonical_load_managed_provider_settings,
 )
 from neuro_code.domain.background_tasks import BackgroundTaskWakePolicy
+from neuro_code.infrastructure.providers.openai_responses import OpenAIResponsesProvider
 from neuro_code.infrastructure.providers.provider_settings import JsonProviderSettingsStore
 from neuro_code.shared.errors import ConfigurationError
 
@@ -76,6 +79,55 @@ class JsonProviderSettingsStoreTests(unittest.IsolatedAsyncioTestCase):
             if os.name == "posix":
                 self.assertEqual(store.metadata_path.stat().st_mode & 0o777, 0o600)
                 self.assertEqual(store.credentials_path.stat().st_mode & 0o777, 0o600)
+
+    async def test_persisted_supported_claim_cannot_enable_unimplemented_hosted_wire_behavior(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = JsonProviderSettingsStore(Path(directory))
+            await store.save_profile(
+                ManagedProviderProfile(
+                    name="xai-claims",
+                    protocol="openai-responses",
+                    dialect="xai",
+                    service_id="xai",
+                    model="fixture-model",
+                    base_url="https://api.x.ai/v1",
+                    capability_overrides=ModelCapabilitySet.from_mapping(
+                        {ModelCapability.HOSTED_WEB_SEARCH: CapabilityStatus.SUPPORTED}
+                    ),
+                    api_key="secret-value",
+                )
+            )
+            loaded = await store.load()
+            persisted = loaded.profile("xai-claims")
+            assert persisted is not None
+            self.assertTrue(
+                persisted.capability_overrides.supports(ModelCapability.HOSTED_WEB_SEARCH)
+            )
+
+            profile = ProviderProfile(
+                name=persisted.name,
+                protocol=persisted.protocol,
+                dialect=persisted.dialect,
+                service_id=persisted.service_id,
+                model=persisted.model,
+                base_url=persisted.base_url,
+                api_key_env="XAI_API_KEY",
+                capability_overrides=persisted.capability_overrides,
+            )
+            effective = profile.effective_capabilities(
+                OpenAIResponsesProvider.implementation_capabilities(
+                    dialect="xai",
+                    builtin_tools=(),
+                )
+            )
+
+        self.assertEqual(
+            effective.status(ModelCapability.HOSTED_WEB_SEARCH),
+            CapabilityStatus.UNKNOWN,
+        )
+        self.assertFalse(effective.supports(ModelCapability.HOSTED_WEB_SEARCH))
 
     async def test_multiple_profiles_can_be_updated_and_selected_without_retyping_key(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

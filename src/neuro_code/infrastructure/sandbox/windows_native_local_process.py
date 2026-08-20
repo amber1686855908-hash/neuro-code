@@ -107,7 +107,42 @@ _SUPPORTED_STDIO = frozenset(
     }
 )
 _RUNNER_ENVIRONMENT = frozenset({"SystemRoot", "SystemDrive", "PATH", "PATHEXT"})
+
+# Keep the final child environment explicit, but retain the documented Windows
+# startup variables that developer runtimes use to locate the system, shell,
+# program files, and per-user application data.  Values that identify the
+# sandbox user or its profile are replaced by the trusted runner after it has
+# derived the private HOME/TMP paths; controller identity paths never pass
+# through this allowlist unchanged.
+_WINDOWS_CHILD_CORE_ENVIRONMENT = frozenset(
+    {
+        "COMSPEC",
+        "WINDIR",
+        "USERNAME",
+        "USERDOMAIN",
+        "HOMEDRIVE",
+        "HOMEPATH",
+        "PROGRAMFILES",
+        "PROGRAMFILES(X86)",
+        "PROGRAMW6432",
+        "COMMONPROGRAMFILES",
+        "COMMONPROGRAMFILES(X86)",
+        "COMMONPROGRAMW6432",
+        "PROGRAMDATA",
+        "ALLUSERSPROFILE",
+        "PUBLIC",
+        "OS",
+        "PSMODULEPATH",
+        "PSHOME",
+        "LOCALAPPDATA",
+        "APPDATA",
+        "POWERSHELL",
+        "PWSH",
+    }
+)
 _WINDOWS_SID_TEXT = re.compile(r"^S-1-(?:\d+)(?:-\d+)+$")
+_WINDOWS_LOGON_SID_TEXT = re.compile(r"^S-1-5-5-\d+-\d+$")
+_WORLD_SID = "S-1-1-0"
 
 
 def _runtime_is_windows() -> bool:
@@ -115,9 +150,12 @@ def _runtime_is_windows() -> bool:
 
 
 def _validated_child_token_attestation(
-    value: object, *, expected_write_sid: SyntheticWindowsSid
+    value: object,
+    *,
+    expected_write_sid: SyntheticWindowsSid,
+    expected_user_sid: str | None = None,
 ) -> dict[str, object]:
-    """Validate SpawnReady facts, including the exact restricting SID identity."""
+    """Validate SpawnReady facts, including the complete restricting SID model."""
 
     if not isinstance(value, dict):
         raise SandboxError("Windows runner omitted final-child token attestation")
@@ -128,6 +166,8 @@ def _validated_child_token_attestation(
     unexpected = value.get("unexpected_enabled_privilege_count")
     if not isinstance(user_sid, str) or _WINDOWS_SID_TEXT.fullmatch(user_sid) is None:
         raise SandboxError("Windows runner returned an invalid final-child TokenUser")
+    if expected_user_sid is not None and user_sid != expected_user_sid:
+        raise SandboxError("Windows runner returned an unexpected final-child TokenUser")
     if (
         not isinstance(restricted_sids, list)
         or len(restricted_sids) > 64
@@ -137,7 +177,17 @@ def _validated_child_token_attestation(
         )
     ):
         raise SandboxError("Windows runner returned invalid final-child restricting SIDs")
-    if tuple(restricted_sids) != (expected_write_sid.value,):
+    restricting = tuple(restricted_sids)
+    if expected_user_sid is not None:
+        if (
+            len(restricting) != 4
+            or restricting[0] != expected_write_sid.value
+            or restricting[1] != expected_user_sid
+            or not _WINDOWS_LOGON_SID_TEXT.fullmatch(restricting[2])
+            or restricting[3] != _WORLD_SID
+        ):
+            raise SandboxError("Windows runner returned an unexpected restricting SID set")
+    elif restricting != (expected_write_sid.value,):
         raise SandboxError("Windows runner returned an unexpected restricting SID set")
     if type(is_restricted) is not bool or type(change_notify) is not bool:
         raise SandboxError("Windows runner returned invalid final-child token flags")
@@ -146,10 +196,28 @@ def _validated_child_token_attestation(
     return {
         "user_sid": user_sid,
         "is_restricted": is_restricted,
-        "restricted_sids": tuple(restricted_sids),
+        "restricted_sids": restricting,
         "change_notify_privilege_enabled": change_notify,
         "unexpected_enabled_privilege_count": unexpected,
     }
+
+
+def _bounded_lifecycle_diagnostic(value: object) -> dict[str, object] | None:
+    """Project runner lifecycle facts without exposing native handles."""
+
+    if not isinstance(value, dict):
+        return None
+    result: dict[str, object] = {}
+    for key, item in value.items():
+        if (
+            key.startswith(("job_active_processes_", "relay_threads_"))
+            and isinstance(item, int)
+            and 0 <= item <= 1_000_000
+        ) or (
+            key == "job_active_processes_query_error" and isinstance(item, str) and len(item) <= 64
+        ):
+            result[key] = item
+    return result or None
 
 
 def _native_acceptance_stage(label: str) -> None:
@@ -342,7 +410,13 @@ class WindowsNativeLocalProcessSandbox(LocalProcessSandbox):
         runner_launcher: Callable[..., RunnerLaunch] = launch_runner,
         pipe_server_factory: Callable[..., WindowsNamedPipeServer] = WindowsNamedPipeServer,
         _diagnostic_desktop_mode: _WindowsNativeDesktopMode = _WindowsNativeDesktopMode.PRIVATE_DESKTOP,
-        _diagnostic_create_no_window: bool = True,
+        # Capture-backed children follow the upstream Windows launch contract:
+        # redirected stdio is inherited without CREATE_NO_WINDOW.  The private
+        # desktop still keeps any console surface off the user's interactive
+        # desktop, while this preserves runtimes (notably Windows PowerShell's
+        # CLR bootstrap) that require normal console initialization.  PTY
+        # requests always override this to False below.
+        _diagnostic_create_no_window: bool = False,
     ) -> None:
         if not isinstance(profile, SandboxProfile) or not profile.enabled:
             raise ValueError("Windows native adapter requires an enabled sandbox profile")
@@ -495,7 +569,13 @@ class WindowsNativeLocalProcessSandbox(LocalProcessSandbox):
         values = dict(policy.variables)
         forbidden = {"pythonpath", "pythonhome", "pythonuserbase"}
         values = {name: value for name, value in values.items() if name.casefold() not in forbidden}
-        for canonical in ("SystemRoot", "SystemDrive", "PATH", "PATHEXT"):
+        for canonical in (
+            "SystemRoot",
+            "SystemDrive",
+            "PATH",
+            "PATHEXT",
+            *_WINDOWS_CHILD_CORE_ENVIRONMENT,
+        ):
             matching = next(
                 (
                     (name, value)
@@ -515,6 +595,37 @@ class WindowsNativeLocalProcessSandbox(LocalProcessSandbox):
                     break
         if "SystemRoot" not in values:
             raise SandboxError("Windows native child requires SystemRoot")
+        # These two values are stable derivations when a minimal caller policy
+        # omits them.  Do not inherit a controller-specific shell path or
+        # profile location when Windows itself can provide the canonical one.
+        values.setdefault("WINDIR", values["SystemRoot"])
+        system_drive = values.get("SystemDrive")
+        if system_drive:
+            values.setdefault("COMSPEC", str(Path(values["SystemRoot"]) / "System32" / "cmd.exe"))
+            values.setdefault("PROGRAMFILES", f"{system_drive}\\Program Files")
+            values.setdefault("PROGRAMW6432", values["PROGRAMFILES"])
+            values.setdefault("PROGRAMFILES(X86)", f"{system_drive}\\Program Files (x86)")
+            values.setdefault("COMMONPROGRAMFILES", f"{values['PROGRAMFILES']}\\Common Files")
+            values.setdefault("COMMONPROGRAMW6432", values["COMMONPROGRAMFILES"])
+            values.setdefault(
+                "COMMONPROGRAMFILES(X86)",
+                f"{values['PROGRAMFILES(X86)']}\\Common Files",
+            )
+            values.setdefault("PROGRAMDATA", f"{system_drive}\\ProgramData")
+            values.setdefault("ALLUSERSPROFILE", values["PROGRAMDATA"])
+            values.setdefault("PUBLIC", f"{system_drive}\\Users\\Public")
+            values.setdefault("OS", "Windows_NT")
+            windir = values["WINDIR"].rstrip("\\/")
+            values.setdefault(
+                "PSMODULEPATH",
+                ";".join(
+                    (
+                        f"{values['PROGRAMFILES']}\\WindowsPowerShell\\Modules",
+                        f"{windir}\\System32\\WindowsPowerShell\\v1.0\\Modules",
+                    )
+                ),
+            )
+            values.setdefault("PSHOME", f"{windir}\\System32\\WindowsPowerShell\\v1.0")
         values["PYTHONNOUSERSITE"] = "1"
         return values
 
@@ -744,7 +855,9 @@ class WindowsNativeLocalProcessSandbox(LocalProcessSandbox):
             transport.events.close()
             raise SandboxError("trusted Windows runner returned an invalid child PID")
         security_attestation = _validated_child_token_attestation(
-            payload.get("security"), expected_write_sid=identity.write_sid
+            payload.get("security"),
+            expected_write_sid=identity.write_sid,
+            expected_user_sid=identity.user_sid.value,
         )
         return _WindowsNativeOwnedLocalProcess(
             transport=transport,
@@ -871,7 +984,9 @@ class WindowsNativeLocalProcessSandbox(LocalProcessSandbox):
             close_runner_process(launch.process_handle)
             raise SandboxError("trusted Windows runner returned an invalid child PID")
         security_attestation = _validated_child_token_attestation(
-            payload.get("security"), expected_write_sid=identity.write_sid
+            payload.get("security"),
+            expected_write_sid=identity.write_sid,
+            expected_user_sid=identity.user_sid.value,
         )
         return _WindowsNativePtySession(
             transport=transport,
@@ -1047,6 +1162,7 @@ class _WindowsNativePtySession:
                 raise SandboxError("Windows PTY Exit frame is invalid")
             self._returncode = int(payload["returncode"])
             termination_observation = payload.get("termination_observation")
+            bounded_lifecycle = _bounded_lifecycle_diagnostic(payload.get("lifecycle"))
             if isinstance(termination_observation, dict):
                 bounded: dict[str, object] = {}
                 for key in ("state", "exit_code", "wait_error"):
@@ -1056,6 +1172,11 @@ class _WindowsNativePtySession:
                     ):
                         bounded[key] = value
                 self._termination_observation = bounded or None
+            if bounded_lifecycle:
+                self._termination_observation = {
+                    **(self._termination_observation or {}),
+                    "lifecycle": bounded_lifecycle,
+                }
             if not self._eof_sent:
                 self._eof_sent = True
                 self._on_eof()
@@ -1064,6 +1185,14 @@ class _WindowsNativePtySession:
             payload = decode_json(frame.payload)
             if not isinstance(payload, dict):
                 raise SandboxError("trusted Windows PTY runner reported an invalid error")
+            bounded_lifecycle = _bounded_lifecycle_diagnostic(payload.get("lifecycle"))
+            self._diagnostic = {
+                "pipe": "EVENT_PIPE_BROKEN",
+                "runner": {"state": "RUNNER_EXITED"},
+                "child": payload.get("child"),
+                "lifecycle": bounded_lifecycle,
+                "security_attestation": dict(self._security_attestation),
+            }
             message = payload.get("message")
             detail = message[:512] if isinstance(message, str) and message else "runtime error"
             raise SandboxError(f"trusted Windows PTY runner reported a runtime error: {detail}")
@@ -1309,11 +1438,17 @@ class _WindowsNativeOwnedLocalProcess(OwnedLocalProcess):
             self._returncode = int(payload["returncode"])
             child_diagnostic = payload.get("child")
             termination_observation = payload.get("termination_observation")
-            if isinstance(child_diagnostic, dict) or isinstance(termination_observation, dict):
+            bounded_lifecycle = _bounded_lifecycle_diagnostic(payload.get("lifecycle"))
+            if (
+                isinstance(child_diagnostic, dict)
+                or isinstance(termination_observation, dict)
+                or bounded_lifecycle
+            ):
                 self._diagnostic = {
                     "pipe": None,
                     "child": child_diagnostic,
                     "termination_observation": termination_observation,
+                    "lifecycle": bounded_lifecycle,
                     "security_attestation": dict(self._security_attestation),
                 }
             self._call(self._stdout.feed_eof)
@@ -1327,6 +1462,7 @@ class _WindowsNativeOwnedLocalProcess(OwnedLocalProcess):
                 "pipe": "EVENT_PIPE_BROKEN",
                 "runner": {"state": "RUNNER_EXITED"},
                 "child": payload.get("child"),
+                "lifecycle": _bounded_lifecycle_diagnostic(payload.get("lifecycle")),
                 "security_attestation": dict(self._security_attestation),
             }
             message = payload.get("message")

@@ -30,6 +30,7 @@ from neuro_code.infrastructure.sandbox.windows_sandbox_acl import (
     WindowsFilesystemSetupPlan,
     WindowsManagedAce,
     WindowsManagedAceKind,
+    plan_restricting_boundary_denies,
     plan_windows_filesystem_authority,
 )
 from neuro_code.infrastructure.sandbox.windows_sandbox_diagnostics import (
@@ -619,6 +620,73 @@ class WindowsSandboxSetupAuthorityTests(unittest.TestCase):
                 request.installation_root,
                 {entry.path for entry in credential_denies},
             )
+
+    def test_boundary_deny_plan_protects_existing_siblings_without_authorized_roots(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            request = self._request(directory)
+            outside = root / "outside"
+            outside_file = root / "outside-file.txt"
+            outside.mkdir()
+            outside_file.write_text("fixture", encoding="utf-8")
+            entries = plan_restricting_boundary_denies(
+                request,
+                SyntheticWindowsSid.from_components((1, 2, 3, 4)),
+            )
+            self.assertEqual(
+                tuple(entry.path for entry in entries),
+                (
+                    outside.resolve(strict=False),
+                    outside_file.resolve(strict=False),
+                ),
+            )
+            self.assertTrue(
+                all(
+                    entry.kind is WindowsManagedAceKind.RESTRICTING_WRITE_DENY
+                    and isinstance(entry.sid, SyntheticWindowsSid)
+                    and entry.is_deny
+                    for entry in entries
+                )
+            )
+            inheritance_by_path = {entry.path: entry.inheritance for entry in entries}
+            self.assertEqual(inheritance_by_path[outside.resolve(strict=False)], 0x00000003)
+            self.assertEqual(inheritance_by_path[outside_file.resolve(strict=False)], 0)
+
+    def test_boundary_deny_reinspection_keeps_known_files_and_ignores_new_files(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            request = self._request(directory)
+            outside = root / "outside"
+            known_file = root / "known-file.txt"
+            transient_file = root / "transient-helper.py"
+            new_directory = root / "new-outside"
+            outside.mkdir()
+            known_file.write_text("fixture", encoding="utf-8")
+            initial = plan_restricting_boundary_denies(
+                request,
+                SyntheticWindowsSid.from_components((1, 2, 3, 4)),
+            )
+            transient_file.write_text("marker", encoding="utf-8")
+            new_directory.mkdir()
+            reinspected = plan_restricting_boundary_denies(
+                request,
+                SyntheticWindowsSid.from_components((1, 2, 3, 4)),
+                existing_boundary_paths=tuple(entry.path for entry in initial),
+            )
+            self.assertEqual(
+                {entry.path for entry in reinspected},
+                {
+                    outside.resolve(strict=False),
+                    known_file.resolve(strict=False),
+                    new_directory.resolve(strict=False),
+                },
+            )
+            self.assertNotIn(
+                transient_file.resolve(strict=False), {entry.path for entry in reinspected}
+            )
+            inheritance_by_path = {entry.path: entry.inheritance for entry in reinspected}
+            self.assertEqual(inheritance_by_path[known_file.resolve(strict=False)], 0)
+            self.assertEqual(inheritance_by_path[new_directory.resolve(strict=False)], 0x00000003)
 
     def test_setup_creates_dedicated_identities_with_one_persistent_write_sid(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

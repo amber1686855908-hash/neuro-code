@@ -62,15 +62,19 @@ class WindowsRestrictedTokenRequest:
     """Validated inputs for one write-restricted token creation.
 
     The default flags disable maximum privilege, request a LUA-style token, and
-    apply ``WRITE_RESTRICTED``.  W1 supplies no disabled privileges or disabled
-    SIDs; the one synthetic restricted SID is the only new write authority.
+    apply ``WRITE_RESTRICTED``.  Capability SIDs are the explicit filesystem
+    authorities.  Runtime callers may additionally provide identity SIDs used
+    by the Windows restricted-token second access check; those SIDs are not
+    capability grants and must be paired with the complete ACL model.
 
     一个受验证的 write-restricted token 创建请求.默认 flags 会禁用最大权限、请求 LUA
     token 并启用 ``WRITE_RESTRICTED``.W1 不传入 disabled privileges 或 disabled SIDs;
-    one synthetic restricted SID 是唯一新增的写入 authority.
+    synthetic SID 是 capability authority; additional restricting SIDs 只表示
+    runtime identity and do not replace the ACL authority model.
     """
 
     restricted_sids: tuple[SyntheticWindowsSid, ...]
+    additional_restricting_sids: tuple[str, ...] = ()
     disable_max_privilege: bool = True
     lua_token: bool = True
     write_restricted: bool = True
@@ -80,8 +84,18 @@ class WindowsRestrictedTokenRequest:
             not isinstance(sid, SyntheticWindowsSid) for sid in self.restricted_sids
         ):
             raise TypeError("restricted_sids must be a tuple of canonical synthetic SIDs")
+        if not isinstance(self.additional_restricting_sids, tuple) or any(
+            not isinstance(sid, str) or _SID_TEXT_PATTERN.fullmatch(sid) is None or "\x00" in sid
+            for sid in self.additional_restricting_sids
+        ):
+            raise TypeError("additional_restricting_sids must be canonical SID strings")
         if self.write_restricted and len(self.restricted_sids) != 1:
             raise ValueError("WRITE_RESTRICTED requires exactly one synthetic write SID")
+        capability_values = {sid.value for sid in self.restricted_sids}
+        if capability_values.intersection(self.additional_restricting_sids):
+            raise ValueError("additional restricting SIDs must not duplicate capability SIDs")
+        if len(set(self.additional_restricting_sids)) != len(self.additional_restricting_sids):
+            raise ValueError("additional restricting SIDs must be unique")
         for value, name in (
             (self.disable_max_privilege, "disable_max_privilege"),
             (self.lua_token, "lua_token"),
@@ -102,6 +116,12 @@ class WindowsRestrictedTokenRequest:
         if self.write_restricted:
             flags |= _WRITE_RESTRICTED
         return flags
+
+    @property
+    def all_restricting_sids(self) -> tuple[str, ...]:
+        """Return capability and identity SIDs in CreateRestrictedToken order."""
+
+        return tuple(sid.value for sid in self.restricted_sids) + self.additional_restricting_sids
 
 
 @dataclass(frozen=True, slots=True)
@@ -164,6 +184,7 @@ class _WindowsSecurityTokenApi(Protocol):
         existing_handle: int,
         flags: int,
         restricted_sids: tuple[SyntheticWindowsSid, ...],
+        additional_restricting_sids: tuple[str, ...] = (),
     ) -> int: ...
 
     def inspect_token(self, token_handle: int) -> WindowsTokenInspection: ...
@@ -417,12 +438,14 @@ class _NativeWindowsSecurityTokenApi:
         existing_handle: int,
         flags: int,
         restricted_sids: tuple[SyntheticWindowsSid, ...],
+        additional_restricting_sids: tuple[str, ...] = (),
     ) -> int:
         sid_pointers: list[int] = []
         created_handle: int | None = None
         operation_failure: BaseException | None = None
         try:
             sid_pointers.extend(self._convert_sid(sid) for sid in restricted_sids)
+            sid_pointers.extend(self._convert_sid_text(sid) for sid in additional_restricting_sids)
             sid_array_type = _SidAndAttributes * len(sid_pointers)
             sid_array = sid_array_type(*(_SidAndAttributes(pointer, 0) for pointer in sid_pointers))
             new_token = ctypes.c_void_p()
@@ -714,11 +737,19 @@ class WindowsRestrictedToken:
             source_handle = token_api.open_current_process_token()
             if source_handle <= 0:
                 raise WindowsTokenError("OpenProcessToken returned an invalid handle")
-            created_handle = token_api.create_restricted_token(
-                source_handle,
-                request.flags,
-                request.restricted_sids,
-            )
+            if request.additional_restricting_sids:
+                created_handle = token_api.create_restricted_token(
+                    source_handle,
+                    request.flags,
+                    request.restricted_sids,
+                    request.additional_restricting_sids,
+                )
+            else:
+                created_handle = token_api.create_restricted_token(
+                    source_handle,
+                    request.flags,
+                    request.restricted_sids,
+                )
             if created_handle <= 0:
                 raise WindowsTokenError("CreateRestrictedToken returned an invalid handle")
             inspection = token_api.inspect_token(created_handle)

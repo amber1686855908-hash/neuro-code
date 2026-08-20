@@ -10,6 +10,7 @@ silently lost.
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import json
 import os
@@ -191,6 +192,69 @@ def _compile_nul_probe() -> Path:  # pragma: no cover - Windows CI
     return output
 
 
+def _compile_bcrypt_probe() -> Path:  # pragma: no cover - Windows CI
+    source = Path(__file__).with_name("windows_bcrypt_probe.c").resolve(strict=False)
+    if not source.is_file():
+        raise _NativeProbeBuildError("BCrypt probe source is unavailable")
+    discovery = subprocess.run(
+        [
+            str(_find_vswhere()),
+            "-latest",
+            "-products",
+            "*",
+            "-requires",
+            "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+            "-property",
+            "installationPath",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        shell=False,
+    )
+    if discovery.returncode != 0:
+        raise _NativeProbeBuildError("vswhere did not find an MSVC installation")
+    installation = next(
+        (Path(line.strip()) for line in discovery.stdout.splitlines() if line.strip()),
+        None,
+    )
+    if installation is None:
+        raise _NativeProbeBuildError("vswhere returned no installation path")
+    vcvars = installation / "VC" / "Auxiliary" / "Build" / "vcvars64.bat"
+    if not vcvars.is_file():
+        raise _NativeProbeBuildError("vcvars64.bat is unavailable")
+    build_directory = Path(
+        mkdtemp(prefix="neuro-code-w5-bcrypt-", dir=os.environ.get("RUNNER_TEMP", gettempdir()))
+    )
+    output = build_directory / "windows_bcrypt_probe.exe"
+    script = build_directory / "build_probe.cmd"
+    script.write_text(
+        "@echo off\r\n"
+        f'call "{vcvars}"\r\n'
+        "if errorlevel 1 exit /b 1\r\n"
+        f'cl /nologo /W4 /WX /MT /O2 /Fe:"{output}" "{source}"\r\n',
+        encoding="ascii",
+        newline="",
+    )
+    build = subprocess.run(
+        ["cmd.exe", "/d", "/c", script.name],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=120,
+        shell=False,
+        cwd=str(build_directory),
+    )
+    if build.returncode != 0 or not output.is_file():
+        detail = (build.stderr or build.stdout or "").strip().replace("\x00", "")[:512]
+        shutil.rmtree(build_directory, ignore_errors=True)
+        raise _NativeProbeBuildError(
+            f"MSVC BCrypt probe build failed (returncode={build.returncode}): {detail}"
+        )
+    return output
+
+
 def _strip_terminal(text: str) -> str:
     return _ANSI_RE.sub("", text).replace("\r", "")
 
@@ -329,6 +393,7 @@ def _cell_base(
         "stderr_preview": "",
         "win32_error": None,
         "runner_exit": "NOT_APPLICABLE",
+        "lifecycle": None,
         "forced_termination": False,
         "orphan_count": None,
         "timeout_cleanup": "NOT_APPLICABLE",
@@ -473,6 +538,42 @@ def _runner_projection(diagnostic: object) -> object:
     return diagnostic.get("runner_state", "UNKNOWN")
 
 
+def _lifecycle_projection(diagnostic: object) -> dict[str, object] | None:
+    """Keep only bounded Job-scope facts from the native diagnostic."""
+
+    if not isinstance(diagnostic, dict):
+        return None
+
+    def project(value: object) -> dict[str, object] | None:
+        if not isinstance(value, dict):
+            return None
+        result: dict[str, object] = {}
+        for key in (
+            "job_active_processes_at_direct_exit",
+            "job_active_processes_before_quiesce",
+            "job_active_processes_after_quiesce",
+            "relay_threads_before_join",
+            "relay_threads_after_join",
+            "relay_threads_after_force_close",
+        ):
+            item = value.get(key)
+            if isinstance(item, int) and 0 <= item <= 1_000_000:
+                result[key] = item
+        error = value.get("job_active_processes_query_error")
+        if isinstance(error, str) and len(error) <= 64:
+            result["job_active_processes_query_error"] = error
+        return result or None
+
+    lifecycle = project(diagnostic.get("lifecycle"))
+    termination = diagnostic.get("termination_observation")
+    termination_lifecycle = (
+        project(termination.get("lifecycle")) if isinstance(termination, dict) else None
+    )
+    if termination_lifecycle:
+        lifecycle = {**(lifecycle or {}), **termination_lifecycle}
+    return lifecycle
+
+
 def _request(spec: _Workload, workspace: Path) -> SandboxedProcessRequest:
     if spec.executable is None:
         raise ValueError("cannot create a request for an unavailable workload")
@@ -560,6 +661,7 @@ async def _w3_run(
                     result["exit_code"] = tasks[2].result()
         diagnostic = process.diagnostic_snapshot()
         result["runner_exit"] = _runner_projection(diagnostic)
+        result["lifecycle"] = _lifecycle_projection(diagnostic)
         result["forced_termination"] = bool(
             isinstance(diagnostic, dict) and diagnostic.get("runner_forced_termination", False)
         )
@@ -677,6 +779,7 @@ async def _w4_run(
             platform = getattr(session, "_platform_session", None)
             diagnostic = platform.diagnostic_snapshot() if platform is not None else None
             result["runner_exit"] = _runner_projection(diagnostic)
+            result["lifecycle"] = _lifecycle_projection(diagnostic)
             result["forced_termination"] = bool(
                 isinstance(diagnostic, dict) and diagnostic.get("runner_forced_termination", False)
             )
@@ -723,6 +826,7 @@ def _build_workloads(
     workspace: Path,
     repo: Path,
     nul_probe: Path,
+    bcrypt_probe: Path,
     cmd: Path | None,
     powershell: Path | None,
     pwsh: Path | None,
@@ -793,6 +897,22 @@ def _build_workloads(
             ("w5_python_normal_ok",),
         ),
         _Workload(
+            "PYTHON_CHILD_PROCESS",
+            "subprocess-child",
+            python,
+            (
+                "-c",
+                (
+                    "import subprocess,sys; "
+                    "child=subprocess.run([sys.executable,'-c',\"print('W5_PYTHON_CHILD_OK')\"],"
+                    "check=False,capture_output=True,text=True); "
+                    "print(child.stdout,end=''); raise SystemExit(child.returncode)"
+                ),
+            ),
+            ("w5_python_child_ok",),
+            note="Python launches a child Python in the same Job-owned scope",
+        ),
+        _Workload(
             "PYTHON_BASE_VERSION", "base-interpreter", python_base, ("--version",), ("python ",)
         ),
         _Workload(
@@ -843,6 +963,14 @@ def _build_workloads(
                 r'"write":\{"create":"pass"',
                 r'"read_write":\{"create":"pass"',
             ),
+        ),
+        _Workload(
+            "BCRYPT_CNG_RUNTIME",
+            "BCryptGenRandom",
+            bcrypt_probe,
+            (),
+            (r"w5_bcrypt_ok",),
+            note="dynamic bcrypt.dll load and BCryptGenRandom on the final child token",
         ),
     ]
     npm_arguments: _Command
@@ -972,6 +1100,8 @@ class WindowsNativeWorkloadCompatibilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(privilege_api.is_administrator(), "W5 setup requires Windows elevation")
         nul_probe = await asyncio.to_thread(_compile_nul_probe)
         self.addAsyncCleanup(_remove_directory, nul_probe.parent)
+        bcrypt_probe = await asyncio.to_thread(_compile_bcrypt_probe)
+        self.addAsyncCleanup(_remove_directory, bcrypt_probe.parent)
         paths = _tool_paths()
         paths["python_base"] = _discover_base_python(paths["python"])
 
@@ -997,6 +1127,8 @@ class WindowsNativeWorkloadCompatibilityTests(unittest.IsolatedAsyncioTestCase):
             )
             copied_probe = workspace / "windows-nul-probe.exe"
             shutil.copy2(nul_probe, copied_probe)
+            copied_bcrypt_probe = workspace / "windows-bcrypt-probe.exe"
+            shutil.copy2(bcrypt_probe, copied_bcrypt_probe)
             setup_request = WindowsSandboxSetupRequest(
                 installation_root=installation,
                 read_roots=(workspace,),
@@ -1023,7 +1155,9 @@ class WindowsNativeWorkloadCompatibilityTests(unittest.IsolatedAsyncioTestCase):
                 setup_authority=authority,
                 setup_request_factory=lambda _request: setup_request,
                 _diagnostic_desktop_mode=_WindowsNativeDesktopMode.PRIVATE_DESKTOP,
-                _diagnostic_create_no_window=True,
+                # Match the production capture contract: no CREATE_NO_WINDOW.
+                # The private desktop keeps the console surface isolated.
+                _diagnostic_create_no_window=False,
             )
             manager = LocalInteractiveTerminalManager(
                 workspace=workspace,
@@ -1041,6 +1175,7 @@ class WindowsNativeWorkloadCompatibilityTests(unittest.IsolatedAsyncioTestCase):
                     workspace=workspace,
                     repo=repo,
                     nul_probe=copied_probe,
+                    bcrypt_probe=copied_bcrypt_probe,
                     cmd=paths["cmd"],
                     powershell=paths["powershell"],
                     pwsh=paths["pwsh"],
@@ -1077,6 +1212,92 @@ class WindowsNativeWorkloadCompatibilityTests(unittest.IsolatedAsyncioTestCase):
                             "W4": w4,
                         }
                     )
+                diagnostics: dict[str, object] = {}
+                powershell = paths.get("powershell")
+                if powershell is not None:
+                    powershell_spec = next(
+                        workload for workload in workloads if workload.name == "POWERSHELL_BASIC"
+                    )
+                    inherited_desktop_adapter = WindowsNativeLocalProcessSandbox(
+                        SandboxProfile.WORKSPACE,
+                        workspace,
+                        runtime_state,
+                        setup_authority=authority,
+                        setup_request_factory=lambda _request: setup_request,
+                        _diagnostic_desktop_mode=_WindowsNativeDesktopMode.INHERIT_DESKTOP,
+                        _diagnostic_create_no_window=False,
+                    )
+                    diagnostics["powershell_inherited_desktop"] = await _w3_run(
+                        powershell_spec,
+                        workspace=workspace,
+                        adapter=inherited_desktop_adapter,
+                        expected_user_sid=expected_online_sid,
+                        expected_write_sid=expected_write_sid,
+                    )
+                    print(
+                        "W5_POWERSHELL_INHERITED_DESKTOP="
+                        + json.dumps(diagnostics["powershell_inherited_desktop"], sort_keys=True),
+                        flush=True,
+                    )
+                    no_window_adapter = WindowsNativeLocalProcessSandbox(
+                        SandboxProfile.WORKSPACE,
+                        workspace,
+                        runtime_state,
+                        setup_authority=authority,
+                        setup_request_factory=lambda _request: setup_request,
+                        _diagnostic_desktop_mode=_WindowsNativeDesktopMode.PRIVATE_DESKTOP,
+                        _diagnostic_create_no_window=True,
+                    )
+                    diagnostics["powershell_create_no_window"] = await _w3_run(
+                        powershell_spec,
+                        workspace=workspace,
+                        adapter=no_window_adapter,
+                        expected_user_sid=expected_online_sid,
+                        expected_write_sid=expected_write_sid,
+                    )
+                    print(
+                        "W5_POWERSHELL_CREATE_NO_WINDOW="
+                        + json.dumps(diagnostics["powershell_create_no_window"], sort_keys=True),
+                        flush=True,
+                    )
+                    cmd = paths.get("cmd")
+                    if cmd is not None:
+                        encoded_command = base64.b64encode(
+                            "Write-Output W5_POWERSHELL_OK".encode("utf-16le")
+                        ).decode("ascii")
+                        powershell_via_cmd = _Workload(
+                            "POWERSHELL_VIA_CMD",
+                            "cmd-wrapper",
+                            cmd,
+                            (
+                                "/d",
+                                "/s",
+                                "/c",
+                                subprocess.list2cmdline(
+                                    [
+                                        str(powershell),
+                                        "-NoLogo",
+                                        "-NoProfile",
+                                        "-NonInteractive",
+                                        "-EncodedCommand",
+                                        encoded_command,
+                                    ]
+                                ),
+                            ),
+                            (r"(?m)^W5_POWERSHELL_OK$",),
+                        )
+                        diagnostics["powershell_via_cmd"] = await _w3_run(
+                            powershell_via_cmd,
+                            workspace=workspace,
+                            adapter=adapter,
+                            expected_user_sid=expected_online_sid,
+                            expected_write_sid=expected_write_sid,
+                        )
+                        print(
+                            "W5_POWERSHELL_VIA_CMD="
+                            + json.dumps(diagnostics["powershell_via_cmd"], sort_keys=True),
+                            flush=True,
+                        )
                 print("W5_MATRIX_RESULTS=" + json.dumps(matrix, sort_keys=True), flush=True)
                 correlation = _correlate(matrix)
                 print(
@@ -1092,6 +1313,7 @@ class WindowsNativeWorkloadCompatibilityTests(unittest.IsolatedAsyncioTestCase):
                             "tool_provenance": provenance,
                             "matrix": matrix,
                             "correlation": correlation,
+                            "diagnostics": diagnostics,
                             "security_contract": {
                                 "read": "LIMITED",
                                 "write": "STRONG",

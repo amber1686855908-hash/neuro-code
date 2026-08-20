@@ -47,6 +47,7 @@ from neuro_code.domain.session_tasks import (
 )
 from neuro_code.domain.sessions import SessionSnapshot, SessionSummary
 from neuro_code.infrastructure.persistence.sqlite_session import SqliteSessionStore
+from neuro_code.interfaces.cli.serialization import render_session_markdown
 from neuro_code.shared.errors import SessionError
 
 
@@ -105,6 +106,67 @@ def _compaction_item(
 
 
 class SessionStoreTests(unittest.IsolatedAsyncioTestCase):
+    async def test_provider_native_context_round_trips_without_search_or_markdown_leakage(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "sessions.db"
+            store = SqliteSessionStore(database)
+            await store.initialize()
+            session_id = await store.create_session(
+                "/workspace",
+                "minimax-profile",
+                "MiniMax-M3",
+                "profile-v1:minimax",
+            )
+            native = PreservedContextItem(
+                ContextItemKind.REASONING,
+                {
+                    "type": "reasoning",
+                    "native": {
+                        "type": "openai-chat-reasoning-details",
+                        "provider": "minimax-profile",
+                        "protocol": "openai-chat",
+                        "model": "MiniMax-M3",
+                        "details": [{"type": "reasoning.text", "text": "native-marker-private"}],
+                    },
+                },
+            )
+            items = [
+                Message(Role.USER, "visible continuation"),
+                native,
+                Message(
+                    Role.ASSISTANT,
+                    "visible answer",
+                    reasoning_content="private canonical reasoning",
+                ),
+            ]
+            await store.save_session_items(session_id, items)
+
+            reopened = SqliteSessionStore(database)
+            await reopened.initialize()
+            self.assertEqual(await reopened.load_session_items(session_id), items)
+            summary = await reopened.get_session(session_id)
+            self.assertEqual(summary.context_affinity, "profile-v1:minimax")
+            self.assertEqual(summary.title, "visible continuation")
+
+            forked_id = await reopened.fork_session(session_id)
+            self.assertEqual(await reopened.load_session_items(forked_id), items)
+            self.assertEqual(
+                (await reopened.get_session(forked_id)).context_affinity,
+                "profile-v1:minimax",
+            )
+            self.assertEqual(
+                (await reopened.search_sessions("native-marker-private")).results,
+                (),
+            )
+            self.assertTrue((await reopened.search_sessions("visible continuation")).results)
+
+            markdown = render_session_markdown(items)
+            self.assertIn("visible answer", markdown)
+            self.assertNotIn("native-marker-private", markdown)
+            self.assertNotIn("private canonical reasoning", markdown)
+
     async def test_compaction_items_round_trip_are_bounded_and_not_forked(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = SqliteSessionStore(Path(directory) / "sessions.db")

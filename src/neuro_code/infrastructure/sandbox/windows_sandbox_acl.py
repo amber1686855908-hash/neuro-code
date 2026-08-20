@@ -94,6 +94,7 @@ class WindowsManagedAceKind(StrEnum):
     READ_ALLOW = "read-allow"
     WRITE_ALLOW = "write-allow"
     RESTRICTING_WRITE_ALLOW = "restricting-write-allow"
+    RESTRICTING_WRITE_DENY = "restricting-write-deny"
     READ_ONLY_WRITE_DENY = "read-only-write-deny"
     SENSITIVE_READ_DENY = "sensitive-read-deny"
     CREDENTIAL_PROTECTION_DENY = "credential-protection-deny"
@@ -137,6 +138,10 @@ class WindowsManagedAce:
             if not isinstance(self.sid, SyntheticWindowsSid):
                 raise TypeError("restricting write ACEs must target the synthetic SID")
             expected_mask = WRITE_ONLY_ACCESS_MASK
+        elif self.kind is WindowsManagedAceKind.RESTRICTING_WRITE_DENY:
+            if not isinstance(self.sid, SyntheticWindowsSid):
+                raise TypeError("restricting deny ACEs must target the synthetic SID")
+            expected_mask = WRITE_ONLY_ACCESS_MASK
         elif self.kind is WindowsManagedAceKind.READ_ONLY_WRITE_DENY:
             expected_mask = WRITE_ONLY_ACCESS_MASK
         elif self.kind is WindowsManagedAceKind.CREDENTIAL_PROTECTION_DENY:
@@ -155,6 +160,12 @@ class WindowsManagedAce:
         ):
             if self.inheritance not in (0, INHERIT_TO_CHILDREN):
                 raise ValueError("sensitive deny inheritance must be exact or cover descendants")
+        elif self.kind is WindowsManagedAceKind.RESTRICTING_WRITE_DENY:
+            # A deny on an existing sibling file is an exact-file boundary;
+            # Windows may normalize directory inheritance flags away on files.
+            # Directory boundaries retain inheritance for future descendants.
+            if self.inheritance not in (0, INHERIT_TO_CHILDREN):
+                raise ValueError("restricting deny inheritance must be exact or cover descendants")
         elif self.inheritance != INHERIT_TO_CHILDREN:
             raise ValueError("managed ACE inheritance must cover files and child directories")
         object.__setattr__(self, "path", canonical)
@@ -165,7 +176,86 @@ class WindowsManagedAce:
             WindowsManagedAceKind.SENSITIVE_READ_DENY,
             WindowsManagedAceKind.READ_ONLY_WRITE_DENY,
             WindowsManagedAceKind.CREDENTIAL_PROTECTION_DENY,
+            WindowsManagedAceKind.RESTRICTING_WRITE_DENY,
         )
+
+
+def plan_restricting_boundary_denies(
+    request: WindowsSandboxSetupRequest,
+    write_sid: SyntheticWindowsSid,
+    *,
+    existing_boundary_paths: Iterable[Path] | None = None,
+) -> tuple[WindowsManagedAce, ...]:
+    """Plan explicit capability denies for sibling boundary paths.
+
+    A compatibility restricted token includes identity SIDs that are needed by
+    ordinary Windows runtime objects.  A broad ``Everyone`` write ACE would
+    otherwise satisfy the restricted-side check.  These explicit, persisted
+    synthetic-SID denies preserve the capability boundary without changing
+    unrelated principals or authorized roots.
+
+    A fresh setup records every existing sibling path, including files.  On a
+    later inspection the persisted file paths remain authoritative, while
+    newly-created sibling directories are added because their inherited deny
+    protects future descendants.  Newly-created sibling files are deliberately
+    not treated as setup drift: controller-side helper/marker files commonly
+    appear after setup and must not make a READY installation fail closed.
+    """
+
+    if not isinstance(request, WindowsSandboxSetupRequest):
+        raise TypeError("filesystem setup request must be canonical")
+    if not isinstance(write_sid, SyntheticWindowsSid):
+        raise TypeError("filesystem setup write SID must be canonical")
+    authorized = set(request.read_roots) | set(request.writable_roots)
+    candidates: set[Path] = set()
+    known_paths = None if existing_boundary_paths is None else set(existing_boundary_paths)
+
+    def add_candidate(candidate: Path) -> None:
+        try:
+            canonical = candidate.expanduser().resolve(strict=False)
+        except (OSError, RuntimeError) as error:
+            raise SandboxError("cannot canonicalize Windows sandbox boundary sibling") from error
+        if canonical == request.installation_root or canonical in authorized:
+            return
+        if any(root.is_relative_to(canonical) for root in request.read_roots):
+            return
+        if canonical.is_file() or canonical.is_dir():
+            candidates.add(canonical)
+
+    if known_paths is not None:
+        for path in known_paths:
+            if not isinstance(path, Path):
+                raise TypeError("existing boundary paths must be pathlib.Path values")
+            add_candidate(path)
+
+    for root in request.read_roots:
+        try:
+            children = tuple(root.parent.iterdir())
+        except OSError as error:
+            raise SandboxError("cannot audit Windows sandbox boundary siblings") from error
+        for child in children:
+            try:
+                canonical = child.expanduser().resolve(strict=False)
+            except (OSError, RuntimeError) as error:
+                raise SandboxError(
+                    "cannot canonicalize Windows sandbox boundary sibling"
+                ) from error
+            # New directories are stable boundary roots: their inherited deny
+            # also protects files created underneath them after setup.  New
+            # files are transient controller artifacts and are considered only
+            # on a fresh setup (known_paths is None).
+            if known_paths is None or canonical.is_dir():
+                add_candidate(canonical)
+    return tuple(
+        WindowsManagedAce(
+            path,
+            write_sid,
+            WindowsManagedAceKind.RESTRICTING_WRITE_DENY,
+            WRITE_ONLY_ACCESS_MASK,
+            inheritance=INHERIT_TO_CHILDREN if path.is_dir() else 0,
+        )
+        for path in sorted(candidates, key=str)
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -320,6 +410,32 @@ class WindowsAclApi(Protocol):
     ) -> None: ...
 
     def matches(self, path: Path, desired: tuple[WindowsManagedAce, ...]) -> bool: ...
+
+
+class WindowsNullDeviceApi(Protocol):
+    """Privileged authority for the installation capability ACE on ``NUL``."""
+
+    def reconcile(self, sid: SyntheticWindowsSid, *, required: bool) -> None: ...
+
+    def is_ready(self, sid: SyntheticWindowsSid, *, required: bool) -> bool: ...
+
+
+class InMemoryWindowsNullDeviceApi:
+    """Portable model of the process-global NUL capability grant."""
+
+    def __init__(self) -> None:
+        self.authorized_sids: set[str] = set()
+        self.calls: list[tuple[SyntheticWindowsSid, bool]] = []
+
+    def reconcile(self, sid: SyntheticWindowsSid, *, required: bool) -> None:
+        self.calls.append((sid, required))
+        if required:
+            self.authorized_sids.add(sid.value)
+        else:
+            self.authorized_sids.discard(sid.value)
+
+    def is_ready(self, sid: SyntheticWindowsSid, *, required: bool) -> bool:
+        return (sid.value in self.authorized_sids) is required
 
 
 class InMemoryWindowsAclApi:
@@ -795,18 +911,329 @@ class _NativeWindowsAclApi:  # pragma: no cover - exercised by Windows native CI
                 self._local_free(new_acl)
 
 
+class _NativeWindowsNullDeviceApi:  # pragma: no cover - exercised by Windows native CI
+    """Reconcile the installation capability ACE on the kernel NUL device.
+
+    ``WRITE_RESTRICTED`` performs a second access check for device handles.  A
+    normal W2 runner must not have ``WRITE_DAC`` authority on a process-global
+    device, so this operation is deliberately owned by the elevated setup
+    boundary and is persisted/verified independently of filesystem roots.
+    """
+
+    _NULL_DEVICE = r"\\.\NUL"
+    _INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+    _OPEN_EXISTING = 3
+    _FILE_ATTRIBUTE_NORMAL = 0x80
+    _FILE_SHARE_READ = 0x00000001
+    _FILE_SHARE_WRITE = 0x00000002
+    _READ_CONTROL = 0x00020000
+    _WRITE_DAC = 0x00040000
+    _SE_KERNEL_OBJECT = 6
+    _ACCESS_ALLOWED_ACE_TYPE = 0
+    _SET_ACCESS = 2
+    _TRUSTEE_IS_SID = 0
+    _TRUSTEE_IS_UNKNOWN = 0
+    _MAXDWORD = 0xFFFFFFFF
+    _NULL_ACCESS_MASK = 0x001201BF  # FILE_GENERIC_READ|WRITE|EXECUTE, mapped
+    _DACL_SECURITY_INFORMATION = 0x00000004
+    _ACL_SIZE_INFORMATION = 2
+    _ACL_REVISION = 2
+
+    def __init__(self) -> None:
+        if os.name != "nt":
+            raise WindowsAclError("native Windows NUL authority is available only on Windows")
+        loader = getattr(ctypes, "WinDLL", None)
+        get_last_error = getattr(ctypes, "get_last_error", None)
+        if loader is None or get_last_error is None:  # pragma: no cover - defensive
+            raise WindowsAclError("this Python runtime does not expose the Win32 ctypes API")
+        advapi32 = cast(object, loader("advapi32.dll", use_last_error=True))
+        kernel32 = cast(object, loader("kernel32.dll", use_last_error=True))
+        self._get_last_error = cast(_NativeAclFunction, get_last_error)
+        self._local_free = _load_acl_function(
+            kernel32, "LocalFree", [ctypes.c_void_p], ctypes.c_void_p
+        )
+        self._create_file = _load_acl_function(
+            kernel32,
+            "CreateFileW",
+            [
+                ctypes.c_wchar_p,
+                ctypes.c_uint32,
+                ctypes.c_uint32,
+                ctypes.c_void_p,
+                ctypes.c_uint32,
+                ctypes.c_uint32,
+                ctypes.c_void_p,
+            ],
+            ctypes.c_void_p,
+        )
+        self._close_handle = _load_acl_function(
+            kernel32, "CloseHandle", [ctypes.c_void_p], ctypes.c_int32
+        )
+        self._convert_sid = _load_acl_function(
+            advapi32,
+            "ConvertStringSidToSidW",
+            [ctypes.c_wchar_p, ctypes.POINTER(ctypes.c_void_p)],
+            ctypes.c_int32,
+        )
+        self._sid_to_string = _load_acl_function(
+            advapi32,
+            "ConvertSidToStringSidW",
+            [ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)],
+            ctypes.c_int32,
+        )
+        self._get_security_info = _load_acl_function(
+            advapi32,
+            "GetSecurityInfo",
+            [
+                ctypes.c_void_p,
+                ctypes.c_uint32,
+                ctypes.c_uint32,
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.POINTER(ctypes.c_void_p),
+                ctypes.c_void_p,
+                ctypes.POINTER(ctypes.c_void_p),
+            ],
+            ctypes.c_uint32,
+        )
+        self._get_acl_information = _load_acl_function(
+            advapi32,
+            "GetAclInformation",
+            [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32],
+            ctypes.c_int32,
+        )
+        self._get_ace = _load_acl_function(
+            advapi32,
+            "GetAce",
+            [ctypes.c_void_p, ctypes.c_uint32, ctypes.POINTER(ctypes.c_void_p)],
+            ctypes.c_int32,
+        )
+        self._initialize_acl = _load_acl_function(
+            advapi32,
+            "InitializeAcl",
+            [ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32],
+            ctypes.c_int32,
+        )
+        self._add_ace = _load_acl_function(
+            advapi32,
+            "AddAce",
+            [ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p, ctypes.c_uint32],
+            ctypes.c_int32,
+        )
+        self._set_entries_in_acl = _load_acl_function(
+            advapi32,
+            "SetEntriesInAclW",
+            [
+                ctypes.c_uint32,
+                ctypes.POINTER(_ExplicitAccessW),
+                ctypes.c_void_p,
+                ctypes.POINTER(ctypes.c_void_p),
+            ],
+            ctypes.c_uint32,
+        )
+        self._set_security_info = _load_acl_function(
+            advapi32,
+            "SetSecurityInfo",
+            [
+                ctypes.c_void_p,
+                ctypes.c_uint32,
+                ctypes.c_uint32,
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+            ],
+            ctypes.c_uint32,
+        )
+
+    def _error(self, operation: str, code: int | None = None) -> WindowsAclError:
+        error = cast(int, self._get_last_error()) if code is None else code
+        return WindowsAclError(
+            f"{operation} failed with Windows error {error}",
+            safe_diagnostic=WindowsSandboxOperationDiagnostic(
+                operation,
+                "Win32Error",
+                winerror=error,
+            ),
+        )
+
+    def _sid_pointer(self, sid: SyntheticWindowsSid) -> int:
+        pointer = ctypes.c_void_p()
+        if not self._convert_sid(sid.value, ctypes.byref(pointer)) or not pointer.value:
+            raise self._error("ConvertStringSidToSidW(NUL capability)")
+        return int(pointer.value)
+
+    def _sid_string(self, pointer: int) -> str:
+        output = ctypes.c_void_p()
+        if not self._sid_to_string(pointer, ctypes.byref(output)) or not output.value:
+            raise self._error("ConvertSidToStringSidW(NUL ACE)")
+        try:
+            return ctypes.wstring_at(output.value)
+        finally:
+            self._local_free(output)
+
+    def _open(self) -> int:
+        handle = self._create_file(
+            self._NULL_DEVICE,
+            self._READ_CONTROL | self._WRITE_DAC,
+            self._FILE_SHARE_READ | self._FILE_SHARE_WRITE,
+            None,
+            self._OPEN_EXISTING,
+            self._FILE_ATTRIBUTE_NORMAL,
+            None,
+        )
+        value = cast(int | None, handle)
+        if value is None or value == 0 or value == self._INVALID_HANDLE_VALUE:
+            raise self._error("CreateFileW(NUL security)")
+        return int(value)
+
+    def _entries(self, handle: int) -> list[bytes]:
+        descriptor = ctypes.c_void_p()
+        dacl = ctypes.c_void_p()
+        result = self._get_security_info(
+            handle,
+            self._SE_KERNEL_OBJECT,
+            self._DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            ctypes.byref(dacl),
+            None,
+            ctypes.byref(descriptor),
+        )
+        if result != 0:
+            raise self._error("GetSecurityInfo(NUL)", cast(int, result))
+        try:
+            if not dacl.value:
+                raise WindowsAclError("refusing to mutate a NULL NUL DACL")
+            information = _AclSizeInformation()
+            if not self._get_acl_information(
+                dacl,
+                ctypes.byref(information),
+                ctypes.sizeof(information),
+                self._ACL_SIZE_INFORMATION,
+            ):
+                raise self._error("GetAclInformation(NUL)")
+            entries: list[bytes] = []
+            for index in range(information.AceCount):
+                ace = ctypes.c_void_p()
+                if not self._get_ace(dacl, index, ctypes.byref(ace)) or not ace.value:
+                    raise self._error("GetAce(NUL)")
+                header = _AceHeader.from_address(ace.value)
+                entries.append(ctypes.string_at(ace.value, header.AceSize))
+            return entries
+        finally:
+            if descriptor.value:
+                self._local_free(descriptor)
+
+    def _sid_matches(self, raw: bytes, sid: SyntheticWindowsSid) -> bool:
+        if len(raw) < 8:
+            return False
+        header = _AceHeader.from_buffer_copy(raw)
+        if header.AceType != self._ACCESS_ALLOWED_ACE_TYPE:
+            return False
+        sid_buffer = ctypes.create_string_buffer(raw[8:])
+        return self._sid_string(ctypes.addressof(sid_buffer)) == sid.value
+
+    def is_ready(self, sid: SyntheticWindowsSid, *, required: bool) -> bool:
+        handle = self._open()
+        try:
+            matches = [raw for raw in self._entries(handle) if self._sid_matches(raw, sid)]
+            if not required:
+                return not matches
+            eligible = []
+            for raw in matches:
+                header = _AceHeader.from_buffer_copy(raw)
+                mask = int.from_bytes(raw[4:8], "little")
+                if (
+                    header.AceFlags == 0
+                    and (mask & self._NULL_ACCESS_MASK) == self._NULL_ACCESS_MASK
+                ):
+                    eligible.append(raw)
+            return len(matches) == 1 and len(eligible) == 1
+        finally:
+            self._close_handle(handle)
+
+    def reconcile(self, sid: SyntheticWindowsSid, *, required: bool) -> None:
+        handle = self._open()
+        sid_pointer = 0
+        descriptor_acl = ctypes.c_void_p()
+        try:
+            retained = [raw for raw in self._entries(handle) if not self._sid_matches(raw, sid)]
+            estimated_size = max(256, sum(len(raw) for raw in retained) + 256)
+            acl_buffer = ctypes.create_string_buffer(estimated_size)
+            if not self._initialize_acl(acl_buffer, estimated_size, self._ACL_REVISION):
+                raise self._error("InitializeAcl(NUL)")
+            for raw in retained:
+                raw_buffer = ctypes.create_string_buffer(raw)
+                if not self._add_ace(
+                    acl_buffer,
+                    self._ACL_REVISION,
+                    self._MAXDWORD,
+                    raw_buffer,
+                    len(raw),
+                ):
+                    raise self._error("AddAce(NUL)")
+            new_acl = ctypes.c_void_p()
+            if required:
+                sid_pointer = self._sid_pointer(sid)
+                explicit = _ExplicitAccessW(
+                    self._NULL_ACCESS_MASK,
+                    self._SET_ACCESS,
+                    0,
+                    _TrusteeW(
+                        None,
+                        0,
+                        self._TRUSTEE_IS_SID,
+                        self._TRUSTEE_IS_UNKNOWN,
+                        sid_pointer,
+                    ),
+                )
+                result = self._set_entries_in_acl(
+                    1,
+                    ctypes.byref(explicit),
+                    ctypes.cast(acl_buffer, ctypes.c_void_p),
+                    ctypes.byref(new_acl),
+                )
+                if result != 0 or not new_acl.value:
+                    raise self._error("SetEntriesInAclW(NUL)", cast(int, result))
+                descriptor_acl = new_acl
+            else:
+                descriptor_acl = ctypes.cast(acl_buffer, ctypes.c_void_p)
+            result = self._set_security_info(
+                handle,
+                self._SE_KERNEL_OBJECT,
+                self._DACL_SECURITY_INFORMATION,
+                None,
+                None,
+                descriptor_acl,
+                None,
+            )
+            if result != 0:
+                raise self._error("SetSecurityInfo(NUL)", cast(int, result))
+        finally:
+            if sid_pointer:
+                self._local_free(sid_pointer)
+            if required and descriptor_acl.value:
+                self._local_free(descriptor_acl)
+            self._close_handle(handle)
+
+
 __all__ = [
     "INHERIT_TO_CHILDREN",
     "READ_ACCESS_MASK",
     "WRITE_ACCESS_MASK",
     "WRITE_ONLY_ACCESS_MASK",
     "InMemoryWindowsAclApi",
+    "InMemoryWindowsNullDeviceApi",
     "WindowsAclApi",
     "WindowsAclError",
     "WindowsFilesystemAclAuthority",
     "WindowsFilesystemSetupPlan",
     "WindowsManagedAce",
     "WindowsManagedAceKind",
+    "WindowsNullDeviceApi",
     "_NativeWindowsAclApi",
+    "_NativeWindowsNullDeviceApi",
+    "plan_restricting_boundary_denies",
     "plan_windows_filesystem_authority",
 ]

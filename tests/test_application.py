@@ -21,7 +21,7 @@ from neuro_code.application.ports.background_tasks import (
     BackgroundTaskManager,
     BackgroundTaskSupervisor,
 )
-from neuro_code.application.ports.model import ModelProvider
+from neuro_code.application.ports.model import ModelCapabilitySet, ModelProvider
 from neuro_code.application.ports.sandbox import LocalProcessSandbox
 from neuro_code.application.runtime.supervision import ExecutionControlMode
 from neuro_code.application.sessions import GetSessionSummaryRequest, SessionApplicationService
@@ -29,13 +29,17 @@ from neuro_code.application.sessions.summary import SessionSummaryQueryService
 from neuro_code.application.settings import ApplicationSettings
 from neuro_code.application.workflows import IsolatedSubagentExecutionService
 from neuro_code.bootstrap.composition import ApplicationComposition
-from neuro_code.configuration.app import AppConfig
+from neuro_code.configuration.app import AppConfig, ProviderProfile
 from neuro_code.domain.conversation.context import ModelContext
 from neuro_code.domain.conversation.events import ModelEvent
 from neuro_code.domain.conversation.reasoning import ReasoningEffort
 from neuro_code.domain.sandbox import SandboxProfile
 from neuro_code.domain.sessions import SessionSummary
 from neuro_code.domain.tools import ToolDefinition, ToolResult
+from neuro_code.infrastructure.providers.gemini_interactions import (
+    GeminiInteractionsProvider,
+)
+from neuro_code.infrastructure.providers.openai_compatible import OpenAICompatibleProvider
 from neuro_code.infrastructure.workspace.paths import workspaces_match
 from neuro_code.shared.errors import ConfigurationError, ToolError
 from tests.fakes import EmptyWorkspaceChangeObserver
@@ -57,6 +61,11 @@ class ApplicationProviderFixture:
         del context, tools
         if False:
             yield
+
+
+class ApplicationCapabilityProviderFixture(ApplicationProviderFixture):
+    def __init__(self, capabilities: ModelCapabilitySet) -> None:
+        self.capabilities = capabilities
 
 
 class ApplicationToolFixture:
@@ -127,7 +136,7 @@ class OrderedSessionStoreFixture:
 class ApplicationCompositionTests(unittest.IsolatedAsyncioTestCase):
     @staticmethod
     def _write_config(state: Path) -> None:
-        state.mkdir()
+        state.mkdir(exist_ok=True)
         (state / "config.toml").write_text(
             """
 [routing]
@@ -149,6 +158,216 @@ context_window_tokens = 65536
 """,
             encoding="utf-8",
         )
+
+    @staticmethod
+    def _write_gemini_web_config(
+        state: Path,
+        *,
+        mode: str,
+        main_model: str,
+        include_search_route: bool,
+    ) -> None:
+        state.mkdir(exist_ok=True)
+        route = '\n[routing.web_search]\nprofile = "search"\n' if include_search_route else ""
+        search_profile = (
+            (
+                "\n[providers.search]\n"
+                'protocol = "gemini-interactions"\n'
+                'service_id = "google-ai-studio"\n'
+                'model = "gemini-3.6-flash"\n'
+                'base_url = "https://generativelanguage.googleapis.com/v1beta"\n'
+                'api_key_env = "SEARCH_KEY"\n'
+                'builtin_tools = ["google_search"]\n'
+                'proxy_mode = "direct"\n'
+            )
+            if include_search_route
+            else ""
+        )
+        (state / "config.toml").write_text(
+            f"""
+[web_search]
+mode = "{mode}"
+
+[routing]
+default = "main"
+{route}
+[providers.main]
+protocol = "gemini-interactions"
+service_id = "google-ai-studio"
+model = "{main_model}"
+base_url = "https://generativelanguage.googleapis.com/v1beta"
+api_key_env = "GEMINI_KEY"
+builtin_tools = ["google_search"]
+proxy_mode = "direct"
+{search_profile}
+""",
+            encoding="utf-8",
+        )
+
+    async def test_gemini_inline_and_auto_sidecar_paths_are_composition_aware(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / "state"
+            self._write_gemini_web_config(
+                state,
+                mode="inline",
+                main_model="gemini-3.6-flash",
+                include_search_route=False,
+            )
+            inline_calls: list[ProviderProfile] = []
+
+            def inline_factory(config: AppConfig, failover: bool) -> ModelProvider:
+                del failover
+                inline_calls.append(config.provider)
+                return ApplicationCapabilityProviderFixture(
+                    GeminiInteractionsProvider.implementation_capabilities(
+                        model=config.provider.model,
+                        builtin_tools=config.provider.builtin_tools,
+                    )
+                )
+
+            with patch.dict(
+                "os.environ",
+                {
+                    "HOME": str(root),
+                    "NEURO_CODE_HOME": str(state),
+                    "GEMINI_KEY": "gemini-key",
+                },
+                clear=True,
+            ):
+                inline_application = await ApplicationComposition.open(
+                    ApplicationSettings(cwd=root),
+                    provider_factory=inline_factory,
+                )
+                inline_binding = await inline_application.create_binding()
+                self.assertNotIn("web_search", inline_binding.runner._runtime._tools.names())
+                self.assertEqual(len(inline_calls), 1)
+                self.assertEqual(inline_calls[0].builtin_tools, ("google_search",))
+                await inline_application.close()
+
+            self._write_gemini_web_config(
+                state,
+                mode="auto",
+                main_model="gemini-2.5-flash",
+                include_search_route=True,
+            )
+            sidecar_calls: list[ProviderProfile] = []
+
+            def sidecar_factory(config: AppConfig, failover: bool) -> ModelProvider:
+                del failover
+                sidecar_calls.append(config.provider)
+                return ApplicationCapabilityProviderFixture(
+                    GeminiInteractionsProvider.implementation_capabilities(
+                        model=config.provider.model,
+                        builtin_tools=config.provider.builtin_tools,
+                    )
+                )
+
+            with patch.dict(
+                "os.environ",
+                {
+                    "HOME": str(root),
+                    "NEURO_CODE_HOME": str(state),
+                    "GEMINI_KEY": "gemini-key",
+                    "SEARCH_KEY": "search-key",
+                },
+                clear=True,
+            ):
+                sidecar_application = await ApplicationComposition.open(
+                    ApplicationSettings(cwd=root),
+                    provider_factory=sidecar_factory,
+                )
+                sidecar_binding = await sidecar_application.create_binding()
+                self.assertIn("web_search", sidecar_binding.runner._runtime._tools.names())
+                self.assertEqual(
+                    [profile.builtin_tools for profile in sidecar_calls],
+                    [("google_search",), ()],
+                )
+                await sidecar_application.close()
+
+    async def test_china_main_profiles_use_local_web_search_sidecar_and_local_fetch(self) -> None:
+        cases = (
+            ("kimi", "kimi", "kimi-k2.6", "KIMI_KEY"),
+            ("glm", "glm", "glm-5.3", "GLM_KEY"),
+            ("minimax", "minimax", "MiniMax-M3", "MINIMAX_KEY"),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / "state"
+            state.mkdir()
+            for service_id, dialect, model, api_key_env in cases:
+                (state / "config.toml").write_text(
+                    f'''
+[web_search]
+mode = "sidecar"
+
+[web_fetch]
+mode = "local"
+
+[routing]
+default = "main"
+
+[routing.web_search]
+profile = "search"
+
+[providers.main]
+service_id = "{service_id}"
+protocol = "openai-chat"
+dialect = "{dialect}"
+model = "{model}"
+base_url = "https://provider.invalid/v1"
+api_key_env = "{api_key_env}"
+proxy_mode = "direct"
+
+[providers.search]
+service_id = "google-ai-studio"
+protocol = "gemini-interactions"
+model = "gemini-3.6-flash"
+base_url = "https://generativelanguage.googleapis.com/v1beta"
+api_key_env = "SEARCH_KEY"
+builtin_tools = ["google_search"]
+proxy_mode = "direct"
+''',
+                    encoding="utf-8",
+                )
+                calls: list[ProviderProfile] = []
+
+                def provider_factory(
+                    config: AppConfig,
+                    failover: bool,
+                    calls: list[ProviderProfile] = calls,
+                ) -> ModelProvider:
+                    del failover
+                    calls.append(config.provider)
+                    return ApplicationCapabilityProviderFixture(
+                        OpenAICompatibleProvider.implementation_capabilities(
+                            dialect=config.provider.dialect,
+                        )
+                    )
+
+                with patch.dict(
+                    "os.environ",
+                    {
+                        "HOME": str(root),
+                        "NEURO_CODE_HOME": str(state),
+                        api_key_env: "main-key",
+                        "SEARCH_KEY": "search-key",
+                    },
+                    clear=True,
+                ):
+                    application = await ApplicationComposition.open(
+                        ApplicationSettings(cwd=root),
+                        provider_factory=provider_factory,
+                    )
+                    binding = await application.create_binding()
+                    try:
+                        self.assertEqual(len(calls), 1)
+                        self.assertEqual(calls[0].service_id, service_id)
+                        self.assertEqual(calls[0].dialect, dialect)
+                        self.assertIn("web_search", binding.runner._runtime._tools.names())
+                        self.assertIn("web_fetch", binding.runner._runtime._tools.names())
+                    finally:
+                        await application.close()
 
     def test_application_settings_default_to_finalize_terminal(self) -> None:
         settings = ApplicationSettings()

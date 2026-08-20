@@ -1,30 +1,30 @@
 # ADR 0116：Windows 开发者工作负载兼容性基线
 
-- 状态：W5 Gate 0 证据采集；不包含生产兼容性修复
+- 状态：已接受；W5 工作负载兼容性已在生产 W3/W4 路由验证
 - 日期：2026-08-16
-- 范围：通过 W3 与 W4 路由运行普通 Windows 开发者工作负载
+- 范围：通过 W3 与 W4 路由运行的普通 Windows 开发者工作负载
 
 ## 决策
 
-W5 先建立只读兼容性基线。证据分支测量 W4 合入后的固定树
-`716d56c2e769af5868e03d8e05d15eadec1cd8df`；不修改 Windows 沙箱实现、
-token 模型、setup authority、ACL、Firewall、私有 profile、Job ownership
-或 ConPTY。
+W5 兼容性基线是对当前生产 W3/W4 路由的证据性测量。运行
+`32194952573`（head
+`75c07cb952765d8ab26ce8d219a39be7bc4e3ed5`）已在 Windows Server 2025
+验证矩阵；工作负载 probe 不修改 Windows 沙箱实现、token 模型、setup
+authority、ACL、Firewall、私有 profile、Job ownership 或 ConPTY。
 
-每个工作负载先作为 HOST 对照运行，再使用相同的已解析可执行文件和等价
+每个工作负载先作为 HOST 对照运行，再用相同的已解析可执行文件和等价
 argv，通过生产 W3 非 PTY `WindowsNativeLocalProcessSandbox.spawn()` 路由，
 以及经由 `LocalInteractiveTerminalManager` 的生产 W4 PTY
-`spawn_terminal()` 路由运行。主 profile 为 `WORKSPACE`，初始使用 Online
-identity。缺失工具记录为 `NOT_INSTALLED`；观察到的工作负载失败属于证据，
-不得自动实现兼容性修复。
+`spawn_terminal()` 路由运行。主 profile 为 `WORKSPACE`，使用 Online identity。
+工具缺失记录为 `NOT_INSTALLED`；观测结果属于证据，不构成放宽安全边界的理由。
 
-专用 Windows job 产生有界 JSON 和 JUnit artifact。JSON artifact 才是工具
-来源、每个 HOST/W3/W4 单元格、分类及关联分析的权威记录，而不是人工推断的
-摘要。不会记录 credential、环境 secret、handle 或无界完整输出。
+专用 Windows job 产生有界 JSON 和 JUnit artifact。JSON artifact 才是工具来源、
+每个 HOST/W3/W4 单元格、分类和关联分析的权威记录，而不是人工推断摘要。
+不会记录 credential、环境 secret、handle 或无界完整输出。
 
 ## 冻结的安全 contract
 
-矩阵必须保持已认证的 W1-W4 contract：
+矩阵保持已认证的 W1-W4 contract：
 
 | Contract | 当前值 |
 | --- | --- |
@@ -36,15 +36,14 @@ identity。缺失工具记录为 `NOT_INSTALLED`；观察到的工作负载失�
 | 只读 profile | 已支持 |
 | Strict profile | 因无法提供 strong read isolation 而失败关闭 |
 
-`TokenRestrictedSids` 继续是安装级 write SID 的精确单例；
-`SeChangeNotifyPrivilege` 以及现有 privilege、ACL、Firewall、私有
-HOME/TEMP、identity、Job、named-pipe 与 ConPTY 边界均不变。不得为使某个
-工作负载通过而添加 SID、privilege、fallback 或扩大 authority。
+`TokenRestrictedSids` 继续使用生产定义的精确有序集合；现有 privilege、ACL、
+Firewall、私有 HOME/TEMP、identity、Job、named-pipe 和 ConPTY 边界均不变。
+不得为使某个工作负载通过而添加 SID、privilege、fallback 或扩大 authority。
 
-对于启用的 W3/W4 单元格，只有当诊断事实同时满足选定的 Online W2 identity、
-`IsTokenRestricted=true`、精确单例 synthetic write SID、启用的
-`SeChangeNotifyPrivilege` 以及 unexpected enabled privilege 数量为 0 时，
-才会输出 `token_attestation=PASS`。
+启用的 W3/W4 单元格只有在诊断事实同时满足选定的 Online W2 identity、
+`IsTokenRestricted=true`、生产 restricting-SID set、启用的
+`SeChangeNotifyPrivilege` 以及 unexpected enabled privilege 数量为 0 时，才会
+输出 `token_attestation=PASS`。
 
 ## 矩阵工作负载
 
@@ -52,113 +51,72 @@ HOME/TEMP、identity、Job、named-pipe 与 ConPTY 边界均不变。不得为�
 
 - `CMD_BASIC` 以及独立的 `CMD_NUL_REDIRECT` 退出码判据；
 - 已安装时的 Windows PowerShell 与 `pwsh`；
-- venv Python version、`-I -S`、`-I` 和 normal 启动行，以及经过验证的 base
-  interpreter version 与 `-I -S` 启动行；
-- Git version、在授权 workspace 内 disposable repository 中的 repository
-  discovery、`status --porcelain=v1`；
+- venv Python version、`-I -S`、`-I`、normal 启动、child-Python subprocess，
+  以及经过验证的 base interpreter version 与 `-I -S` 启动行；
+- Git version、授权 workspace 内 disposable repository 的 discovery 与
+  `status --porcelain=v1`；
 - Node version/`-e` 执行和实际解析到的 npm launcher；
 - 仅运行 curl `--version`；
-- 仅用于验收的原生 `NUL_DIRECT_WIN32` probe，使用文档化的
-  `CreateFileW(L"NUL")` 与 `WriteFile`。
+- 使用文档化 `CreateFileW(L"NUL")` 与 `WriteFile` 的原生
+  `NUL_DIRECT_WIN32` probe；
+- 在最终 restricted child token 中动态加载 `bcrypt.dll` 并执行
+  `BCryptGenRandom`。
 
-不包含 package 下载、公共网络依赖、全局 Git 配置、execution policy 修改或
-兼容性 workaround。当前 W3 证据中没有精确的既有 restricted-curl 命令，因而
-不会伪造一个替代命令作为复现。
+该矩阵不包含 package 下载、公共网络依赖、全局 Git 配置、execution policy
+修改或兼容性 workaround。
 
 ## 结果解释
 
-结果分类区分 `PASS`、`NOT_INSTALLED`、process creation/access 错误、设备访问
-拒绝、runtime/dependency 初始化、repository discovery、timeout、非零退出、
-输出不匹配和 `INCONCLUSIVE`。HOST 失败是 fixture/工具证据，不是沙箱兼容性证据。
-HOST 通过而 W3、W4 均失败时，记录为共享 restricted-runtime 候选；仅 W3 或仅
-W4 失败则保留为 transport-specific 证据。这些只是下一阶段的假设，不是修复或
-因果结论。
+结果分类区分 `PASS`、`NOT_INSTALLED`、process creation/access 错误、设备访问拒绝、
+runtime/dependency 初始化、repository discovery、timeout、非零退出、输出不匹配和
+`INCONCLUSIVE`。已接受 artifact 中所有已安装的 W3/W4 单元格都先达到
+`SpawnReady`，并在观察工作负载结果前保留通过的 token attestation。
 
-## Gate 0 证据记录
+## W5 兼容性证据记录
 
-PR body 是最新 exact-head CI run 与 artifact 的 canonical pointer。本 ADR
-有意不硬编码易变化的当前 run ID；历史 run ID 只有在明确标注其测试的 exact
-commit 时才保留。`windows-native-sandbox-compatibility` job 必须执行一个
-矩阵测试、0 skip，并上传有界 JSON 与 JUnit artifact。矩阵运行于 Windows
-Server 2025 hosted `windows-latest`、`WORKSPACE` 和 Online identity。
-
-controller 记录的工具来源：
-
-| 工具 | 已解析路径与版本 |
-| --- | --- |
-| `cmd.exe` | `C:\Windows\System32\cmd.exe`；Windows 10.0.26100.33158 |
-| `powershell.exe` | `C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe`；5.1.26100.33158 |
-| `pwsh.exe` | `C:\Program Files\PowerShell\7\pwsh.exe`；7.6.4 |
-| `python.exe` | `D:\a\neuro-code\neuro-code\.venv\Scripts\python.exe`；3.12.10 |
-| base `python.exe` | 从 venv 已验证的 `sys._base_executable` 发现；artifact 记录为 `C:\\hostedtoolcache\\windows\\Python\\3.12.10\\x64\\python.exe` / Python 3.12.10 |
-| `git.exe` | `C:\Program Files\Git\bin\git.exe`；2.55.0.windows.3 |
-| `node.exe` | `C:\Program Files\nodejs\node.exe`；v22.23.2 |
-| `npm.cmd` | `C:\Program Files\nodejs\npm.cmd`；10.9.8 |
-| `curl.exe` | `C:\Windows\System32\curl.exe`；8.16.0 Schannel |
-
-下表记录 `HOST / W3 / W4` 的 `classification` 与退出码；`T` 表示达到有界
-timeout。所有已安装的 W3/W4 单元格都先达到 `SpawnReady`，并在观察工作负载
-结果前保留通过的 token attestation。
+运行 `32194952573` 在 Windows Server 2025 hosted `windows-latest`、`WORKSPACE`、
+Online identity 上完成 20 行矩阵。HOST、W3 非 PTY 与 W4 PTY 的所有单元格均为
+`PASS / 0`：
 
 | 工作负载 / variant | HOST | W3 非 PTY | W4 PTY |
 | --- | --- | --- | --- |
 | `CMD_BASIC` / default | PASS / 0 | PASS / 0 | PASS / 0 |
-| `CMD_NUL_REDIRECT` / default | PASS / 0 | DEVICE_ACCESS_DENIED / 1 | DEVICE_ACCESS_DENIED / 1 |
-| `POWERSHELL_BASIC` / Windows PowerShell | PASS / 0 | RUNTIME_INITIALIZATION_FAILURE / 4294901760 | RUNTIME_INITIALIZATION_FAILURE / 4294901760 |
-| `PWSH_BASIC` / pwsh | PASS / 0 | TIMEOUT / 1 / T | TIMEOUT / T |
-| `PYTHON_VERSION` / default | PASS / 0 | TIMEOUT / 1 / T | TIMEOUT / T |
-| `PYTHON_MINIMAL_NO_SITE` / `-I -S` | PASS / 0 | TIMEOUT / 1 / T | TIMEOUT / T |
-| `PYTHON_ISOLATED` / `-I` | PASS / 0 | TIMEOUT / 1 / T | TIMEOUT / T |
-| `PYTHON_NORMAL` / normal | PASS / 0 | TIMEOUT / 1 / T | TIMEOUT / T |
-| `PYTHON_BASE_VERSION` / 已验证 base interpreter | PASS / 0 | TIMEOUT / 1 / T | TIMEOUT / T |
-| `PYTHON_BASE_MINIMAL_NO_SITE` / base `-I -S` | PASS / 0 | TIMEOUT / 1 / T | TIMEOUT / T |
-| `GIT_VERSION` / default | PASS / 0 | DEVICE_ACCESS_DENIED / 128 | DEVICE_ACCESS_DENIED / 128 |
-| `GIT_REPO_DISCOVERY` / disposable repo | PASS / 0 | DEVICE_ACCESS_DENIED / 128 | DEVICE_ACCESS_DENIED / 128 |
-| `GIT_STATUS` / porcelain v1 | PASS / 0 | DEVICE_ACCESS_DENIED / 128 | DEVICE_ACCESS_DENIED / 128 |
+| `CMD_NUL_REDIRECT` / default | PASS / 0 | PASS / 0 | PASS / 0 |
+| `POWERSHELL_BASIC` / Windows PowerShell | PASS / 0 | PASS / 0 | PASS / 0 |
+| `PWSH_BASIC` / pwsh | PASS / 0 | PASS / 0 | PASS / 0 |
+| `PYTHON_VERSION` / default | PASS / 0 | PASS / 0 | PASS / 0 |
+| `PYTHON_MINIMAL_NO_SITE` / `-I -S` | PASS / 0 | PASS / 0 | PASS / 0 |
+| `PYTHON_ISOLATED` / `-I` | PASS / 0 | PASS / 0 | PASS / 0 |
+| `PYTHON_NORMAL` / normal | PASS / 0 | PASS / 0 | PASS / 0 |
+| `PYTHON_CHILD_PROCESS` / subprocess | PASS / 0 | PASS / 0 | PASS / 0 |
+| `PYTHON_BASE_VERSION` / verified base interpreter | PASS / 0 | PASS / 0 | PASS / 0 |
+| `PYTHON_BASE_MINIMAL_NO_SITE` / base `-I -S` | PASS / 0 | PASS / 0 | PASS / 0 |
+| `GIT_VERSION` / default | PASS / 0 | PASS / 0 | PASS / 0 |
+| `GIT_REPO_DISCOVERY` / disposable repo | PASS / 0 | PASS / 0 | PASS / 0 |
+| `GIT_STATUS` / porcelain v1 | PASS / 0 | PASS / 0 | PASS / 0 |
 | `NODE_VERSION` / default | PASS / 0 | PASS / 0 | PASS / 0 |
 | `NODE_EXEC` / `-e` | PASS / 0 | PASS / 0 | PASS / 0 |
 | `NPM_VERSION` / resolved `npm.cmd` | PASS / 0 | PASS / 0 | PASS / 0 |
-| `CURL_VERSION` / `--version` | PASS / 0 | TIMEOUT / 1 / T | TIMEOUT / T |
-| `NUL_DIRECT_WIN32` / `CreateFileW` + `WriteFile` | PASS / 0 | DEVICE_ACCESS_DENIED / 2（Win32 5） | DEVICE_ACCESS_DENIED / 2（Win32 5） |
+| `CURL_VERSION` / `--version` | PASS / 0 | PASS / 0 | PASS / 0 |
+| `NUL_DIRECT_WIN32` / `CreateFileW` + `WriteFile` | PASS / 0 | PASS / 0 | PASS / 0 |
+| `BCRYPT_CNG_RUNTIME` / dynamic `bcrypt.dll` + `BCryptGenRandom` | PASS / 0 | PASS / 0 | PASS / 0 |
 
-venv 与已验证的 base interpreter 在 HOST 上都报告 Python 3.12.10，但二者是
-不同的 executable；六个 Python 行在 W3 与 W4 均 timeout。因此 base 行不能证明
-问题只存在于 venv 启动。
-
-按 access mode 分开的 NUL 证据也保留在 artifact 中：
+按 access mode 的 NUL 证据也全部通过：
 
 | NUL access mode | HOST | W3 非 PTY | W4 PTY |
 | --- | --- | --- | --- |
 | `NUL_READ`（`GENERIC_READ`） | Create PASS / error 0；未尝试写入 | Create PASS / error 0；未尝试写入 | Create PASS / error 0；未尝试写入 |
-| `NUL_WRITE`（`GENERIC_WRITE`） | Create PASS / error 0；`WriteFile` PASS | Create FAIL / error 5；未尝试 `WriteFile` | Create FAIL / error 5；未尝试 `WriteFile` |
-| `NUL_READ_WRITE`（两者） | Create PASS / error 0；`WriteFile` PASS | Create FAIL / error 5；未尝试 `WriteFile` | Create FAIL / error 5；未尝试 `WriteFile` |
+| `NUL_WRITE`（`GENERIC_WRITE`） | Create PASS / error 0；`WriteFile` PASS | Create PASS / error 0；`WriteFile` PASS | Create PASS / error 0；`WriteFile` PASS |
+| `NUL_READ_WRITE`（两者） | Create PASS / error 0；`WriteFile` PASS | Create PASS / error 0；`WriteFile` PASS | Create PASS / error 0；`WriteFile` PASS |
 
-artifact 保留的重要有界错误事实：Windows PowerShell 在 CLR 启动时报告
-`HRESULT 80070005`（Win32 `2147942405`）；Git 报告
-`fatal: could not open '/dev/null' for reading and writing: Permission denied`；
-直接 NUL probe 报告 `CreateFileW` error 5；`pwsh` PTY 输出包含有界的
-`BCrypt.dll` 初始化失败（`0x8007045A`）。Python 的任何启动变体都没有产生
-用户 marker。curl 行只测启动；当前 W3 evidence 没有精确的既有 restricted-curl
-命令，因此没有运行替代网络命令。所有 timeout 行的 W3 都通过 canonical
-process termination 后进行有界两秒 pipe drain，W4 都通过 canonical
-terminal-session close 后进行有界 close/drain；runner 报告 exit 0，artifact
-没有记录 forced-runner fallback。这只是 cleanup 证据，不测量也不声称
-`orphan_count`。
-
-解释至少分为两个证据 cluster。Cluster A 是 device/NUL 证据：
-`CMD_NUL_REDIRECT`、按 access mode 分开的 `NUL_DIRECT_WIN32` probe，以及
-Git 的 `/dev/null` 启动失败。Cluster B 是 runtime initialization：Windows
-PowerShell 的 `HRESULT 0x80070005`、pwsh 的 `BCrypt.dll`/`0x8007045A` 输出、
-Python 启动 timeout 和 curl 启动 timeout。Node 与 npm 在两种 transport 中
-均通过。W3/W4 共享模式是事实，但 cluster 之间的关系仍未证明；没有新证据
-时，不把 Python 等同于 BCrypt、不把 curl 等同于 BCrypt，也不把 PowerShell
-等同于 NUL。
+artifact 保留了 Windows PowerShell、PowerShell 7、Python 及其 child process、Git
+repository、Node/npm、curl、NUL 读写模式和动态 BCrypt CNG 启动的有界 PASS 证据。
+每次自然完成的 W3/W4 还记录
+`job_active_processes_after_quiesce=0` 与 `relay_threads_after_join=0`。矩阵是工作负载
+证据，不是放宽 token、SID、ACL、environment 或 lifecycle contract 的授权。
 
 ## 下一决策边界
 
-下一阶段首先调查影响多个 W3/W4 工作负载的 restricted startup/device
-compatibility seam；在任何改动之前仍必须分离其中的子原因。Gate 0 不授权
-CNG/Bcrypt、token、SID、privilege、ACL、Firewall 或 fallback 变更，也不实现
-修复，W5 Gate 1 尚未开始。兼容性 timeout 行记录 canonical termination、runner
-状态和有界 drain 事实；当没有测量 `orphan_count` 时，不声称观察到
-`orphan_count=0`。
+当前测量矩阵没有工作负载兼容性 blocker。未来 developer tool 或 network workload
+必须拥有独立的有界 fixture 和 artifact 行；不能从这些本地启动 probe 推断，也不能用来
+放宽当前安全 contract。

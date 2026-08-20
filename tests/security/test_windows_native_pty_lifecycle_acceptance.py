@@ -141,6 +141,7 @@ def _controller_loss_pty_helper_source(
 
         import asyncio
         import json
+        import re
         import sys
         from pathlib import Path
 
@@ -182,6 +183,17 @@ def _controller_loss_pty_helper_source(
             runtime_state = Path(runtime_text)
             probe = Path(probe_text)
             ready = Path(ready_text)
+            stage_path = ready.with_name("controller-stage.txt")
+            inspect_path = ready.with_name("controller-inspect.json")
+            from neuro_code.infrastructure.sandbox import windows_native_local_process as _local_process_module
+
+            def _record_native_stage(value: str) -> None:
+                try:
+                    stage_path.write_text(value[:160], encoding="ascii")
+                except OSError:
+                    pass
+
+            _local_process_module._native_acceptance_stage = _record_native_stage
             setup_request = WindowsSandboxSetupRequest(
                 installation_root=installation,
                 read_roots=(workspace,),
@@ -209,8 +221,10 @@ def _controller_loss_pty_helper_source(
                 privilege_api=_NativeWindowsSetupPrivilegeApi(),
             )
             process = None
+            phase = "AUTHORITY_SETUP"
             try:
                 authority.setup(setup_request)
+                phase = "ADAPTER_CONSTRUCTION"
                 adapter = WindowsNativeLocalProcessSandbox(
                     SandboxProfile.WORKSPACE,
                     workspace,
@@ -220,6 +234,48 @@ def _controller_loss_pty_helper_source(
                     _diagnostic_desktop_mode=_WindowsNativeDesktopMode.PRIVATE_DESKTOP,
                     _diagnostic_create_no_window=False,
                 )
+                phase = "PTY_VALIDATE"
+                snapshot = authority.inspect(setup_request)
+                if snapshot.state.value != "READY":
+                    details: dict[str, object] = {
+                        "snapshot_state": snapshot.state.value,
+                    }
+                    try:
+                        acl_authority, firewall, accounts = authority._apis(setup_request)
+                        record = authority._load(setup_request)
+                        if record is not None:
+                            plan = authority._plan(
+                                setup_request,
+                                record,
+                                authority._store(setup_request).path,
+                            )
+                            path_readiness: list[dict[str, object]] = []
+                            for path, entries in authority._acl_authority._group(plan.entries).items():
+                                path_readiness.append(
+                                    {
+                                        "name": path.name,
+                                        "ready": acl_authority._api.matches(path, entries),
+                                        "kinds": sorted(entry.kind.value for entry in entries),
+                                    }
+                                )
+                            details.update(
+                                {
+                                    "acl_ready": acl_authority.is_ready(plan),
+                                    "firewall_ready": firewall.rule_exists(
+                                        record.offline_firewall_rule
+                                    ),
+                                    "record_aces": len(record.managed_aces),
+                                    "plan_aces": len(plan.entries),
+                                    "record_paths": len({entry.path for entry in record.managed_aces}),
+                                    "plan_paths": len(set(plan.paths)),
+                                    "path_readiness": sorted(path_readiness, key=lambda item: str(item["name"])),
+                                }
+                            )
+                    except BaseException as diagnostic_error:
+                        details["diagnostic_error"] = type(diagnostic_error).__name__
+                    inspect_path.write_text(json.dumps(details, sort_keys=True), encoding="ascii")
+                adapter._validate_terminal_request(request)
+                phase = "PTY_SPAWN"
                 process = await asyncio.to_thread(
                     adapter.spawn_terminal,
                     request,
@@ -228,6 +284,7 @@ def _controller_loss_pty_helper_source(
                     on_eof=lambda: None,
                     on_error=lambda _error: None,
                 )
+                phase = "DESCENDANT_READINESS"
                 runner = getattr(process, "_runner", None)
                 runner_pid = int(getattr(runner, "process_id", 0))
                 pid_file = workspace / "grandchild.pid"
@@ -262,8 +319,35 @@ def _controller_loss_pty_helper_source(
                 await asyncio.Event().wait()
                 return 0
             except BaseException as error:
+                # Keep controller-loss startup failures diagnosable without
+                # exposing paths, credentials, handles, or exception text.
+                payload = {"error": type(error).__name__, "phase": phase}
+                safe_message = str(error)
+                safe_message = re.sub(r"[A-Za-z]:\\[^\s;]+", "<path>", safe_message)
+                if "\\\\" in safe_message or "/" in safe_message:
+                    safe_message = "<redacted-path>"
+                if safe_message and len(safe_message) <= 160:
+                    payload["safe_message"] = safe_message
+                try:
+                    payload["native_stage"] = stage_path.read_text(encoding="ascii")[:160]
+                except (OSError, UnicodeError):
+                    pass
+                try:
+                    value = json.loads(inspect_path.read_text(encoding="ascii"))
+                except (OSError, UnicodeError, ValueError, json.JSONDecodeError):
+                    value = None
+                if isinstance(value, dict):
+                    payload["inspect"] = value
+                diagnostic_payload = getattr(error, "diagnostic_payload", None)
+                if callable(diagnostic_payload):
+                    try:
+                        value = diagnostic_payload()
+                    except BaseException:
+                        value = None
+                    if isinstance(value, dict):
+                        payload["diagnostic"] = value
                 ready.with_name("controller-error.json").write_text(
-                    json.dumps({"error": type(error).__name__}), encoding="ascii"
+                    json.dumps(payload, sort_keys=True), encoding="ascii"
                 )
                 return 23
             finally:
@@ -635,6 +719,7 @@ class WindowsNativePtyLifecycleAcceptanceTests(unittest.IsolatedAsyncioTestCase)
             grandchild_observer: _WindowsPidHandle | None = None
             classification: str | None = None
             ready: dict[str, object] = {}
+            helper_error: dict[str, object] = {}
             helper_exit: int | None = None
             runner_post: dict[str, object] = {"state": "NOT_OBSERVED"}
             leader_post: dict[str, object] = {"state": "NOT_OBSERVED"}
@@ -648,7 +733,15 @@ class WindowsNativePtyLifecycleAcceptanceTests(unittest.IsolatedAsyncioTestCase)
                     and asyncio.get_running_loop().time() < deadline
                 ):
                     await asyncio.sleep(0.02)
-                if error_path.is_file() or not ready_path.is_file():
+                if error_path.is_file():
+                    try:
+                        value = json.loads(error_path.read_text(encoding="ascii"))
+                        if isinstance(value, dict):
+                            helper_error = value
+                    except (OSError, UnicodeError, ValueError, json.JSONDecodeError):
+                        pass
+                    classification = "CONTROLLER_LOSS_HELPER_STARTUP_FAILURE"
+                elif not ready_path.is_file():
                     classification = "CONTROLLER_LOSS_HELPER_STARTUP_FAILURE"
                 else:
                     try:
@@ -705,6 +798,7 @@ class WindowsNativePtyLifecycleAcceptanceTests(unittest.IsolatedAsyncioTestCase)
                     "grandchild_pre_state": "ACTIVE",
                     "forced_controller_death": forced_controller_death,
                     "controller_helper_exit": helper_exit,
+                    "helper_error": helper_error,
                     "runner_post_state": runner_post.get("state"),
                     "runner_exit_code": runner_post.get("exit_code"),
                     "leader_post_state": leader_post.get("state"),

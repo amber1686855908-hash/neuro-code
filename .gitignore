@@ -11,6 +11,8 @@ htmlcov/
 build/
 dist/
 .neuro-code/
+# Benchmark runs are local, potentially large, and redacted only for handoff.
+benchmark-results/
 # Local manual agent/TUI scratch workspace.
 testdp/
 # Local agent handoff memory.

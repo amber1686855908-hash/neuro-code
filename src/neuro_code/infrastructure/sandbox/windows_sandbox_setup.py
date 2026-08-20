@@ -39,11 +39,15 @@ from neuro_code.infrastructure.sandbox.windows_sandbox_accounts import (
     generate_windows_account_password,
 )
 from neuro_code.infrastructure.sandbox.windows_sandbox_acl import (
+    InMemoryWindowsNullDeviceApi,
     WindowsFilesystemAclAuthority,
     WindowsFilesystemSetupPlan,
     WindowsManagedAce,
     WindowsManagedAceKind,
+    WindowsNullDeviceApi,
     _NativeWindowsAclApi,
+    _NativeWindowsNullDeviceApi,
+    plan_restricting_boundary_denies,
     plan_windows_filesystem_authority,
 )
 from neuro_code.infrastructure.sandbox.windows_sandbox_diagnostics import (
@@ -68,8 +72,10 @@ class WindowsSandboxSetupStage(StrEnum):
 
     STORE_SAVE = "STORE_SAVE"
     ACL_RECONCILE = "ACL_RECONCILE"
+    NULL_DEVICE_RECONCILE = "NULL_DEVICE_RECONCILE"
     FIREWALL_ENSURE = "FIREWALL_ENSURE"
     ROLLBACK_ACL = "ROLLBACK_ACL"
+    ROLLBACK_NULL_DEVICE = "ROLLBACK_NULL_DEVICE"
     ROLLBACK_FIREWALL = "ROLLBACK_FIREWALL"
     ROLLBACK_ACCOUNTS = "ROLLBACK_ACCOUNTS"
     ROLLBACK_STORE_CLEAR = "ROLLBACK_STORE_CLEAR"
@@ -417,12 +423,14 @@ class WindowsNativeSandboxSetupAuthority:
         firewall_api: WindowsFirewallApi | None = None,
         account_api: WindowsSandboxAccountApi | None = None,
         privilege_api: WindowsSetupPrivilegeApi | None = None,
+        null_device_api: WindowsNullDeviceApi | None = None,
     ) -> None:
         self._credential_store = credential_store
         self._acl_api = acl_api
         self._firewall_api = firewall_api
         self._account_api = account_api
         self._privilege_api = privilege_api
+        self._null_device_api = null_device_api
         self._acl_authority: WindowsFilesystemAclAuthority | None = None
 
     @property
@@ -438,10 +446,16 @@ class WindowsNativeSandboxSetupAuthority:
 
     def _apis(
         self, request: WindowsSandboxSetupRequest
-    ) -> tuple[WindowsFilesystemAclAuthority, WindowsFirewallApi, WindowsSandboxAccountApi]:
+    ) -> tuple[
+        WindowsFilesystemAclAuthority,
+        WindowsFirewallApi,
+        WindowsSandboxAccountApi,
+        WindowsNullDeviceApi,
+    ]:
         del request
+        api = self._acl_api
         if self._acl_authority is None:
-            api = self._acl_api if self._acl_api is not None else _NativeWindowsAclApi()
+            api = api if api is not None else _NativeWindowsAclApi()
             self._acl_authority = WindowsFilesystemAclAuthority(api)  # type: ignore[arg-type]
         firewall = (
             self._firewall_api if self._firewall_api is not None else _NativeWindowsFirewallApi()
@@ -451,7 +465,18 @@ class WindowsNativeSandboxSetupAuthority:
             if self._account_api is not None
             else _NativeWindowsSandboxAccountApi()
         )
-        return self._acl_authority, firewall, accounts
+        null_device = self._null_device_api
+        if null_device is None:
+            # Unit tests inject the portable ACL model; production Windows
+            # setup uses the elevated device authority.  Never make a normal
+            # non-Windows test process attempt to open a Win32 device.
+            null_device = (
+                _NativeWindowsNullDeviceApi()
+                if api is None or isinstance(api, _NativeWindowsAclApi)
+                else InMemoryWindowsNullDeviceApi()
+            )
+            self._null_device_api = null_device
+        return self._acl_authority, firewall, accounts, null_device
 
     def _load(self, request: WindowsSandboxSetupRequest) -> _InstallationRecord | None:
         store = self._store(request)
@@ -517,9 +542,11 @@ class WindowsNativeSandboxSetupAuthority:
         request: WindowsSandboxSetupRequest,
         record: _InstallationRecord,
         credential_path: Path,
+        *,
+        include_new_boundary_files: bool = False,
     ) -> WindowsFilesystemSetupPlan:
         user_sids = tuple(identity.user_sid for identity in record.identities)
-        return plan_windows_filesystem_authority(
+        base = plan_windows_filesystem_authority(
             request,
             record.write_sid,
             read_user_sids=user_sids,
@@ -527,6 +554,19 @@ class WindowsNativeSandboxSetupAuthority:
             credential_path=credential_path,
             private_root=request.installation_root,
         )
+        existing_boundary_paths = tuple(
+            entry.path
+            for entry in record.managed_aces
+            if entry.kind is WindowsManagedAceKind.RESTRICTING_WRITE_DENY
+        )
+        boundary_denies = plan_restricting_boundary_denies(
+            request,
+            record.write_sid,
+            existing_boundary_paths=(
+                None if include_new_boundary_files else existing_boundary_paths
+            ),
+        )
+        return WindowsFilesystemSetupPlan((*base.entries, *boundary_denies))
 
     @staticmethod
     def _account_password(identity: _StoredIdentity) -> str:
@@ -557,7 +597,7 @@ class WindowsNativeSandboxSetupAuthority:
         if not isinstance(request, WindowsSandboxSetupRequest):
             raise TypeError("Windows sandbox setup request must be canonical")
         try:
-            acl_authority, firewall, accounts = self._apis(request)
+            acl_authority, firewall, accounts, null_device = self._apis(request)
         except (SandboxError, OSError):
             return self._snapshot(WindowsSandboxSetupState.UNSUPPORTED, None)
         try:
@@ -570,13 +610,17 @@ class WindowsNativeSandboxSetupAuthority:
             self._validate_accounts(accounts, record)
             plan = self._plan(request, record, self._store(request).path)
             acl_ready = acl_authority.is_ready(plan)
+            null_device_ready = null_device.is_ready(
+                record.write_sid,
+                required=bool(request.writable_roots),
+            )
             # The Offline outbound block is a persistent installation policy,
             # not a process-global mode.  READY always requires the complete
             # managed rule; Online child identity use never removes it.
             firewall_ready = firewall.rule_exists(record.offline_firewall_rule)
         except (WindowsSandboxSetupError, WindowsSandboxAccountError, OSError):
             return self._snapshot(WindowsSandboxSetupState.NEEDS_REPAIR, record)
-        if not acl_ready or not firewall_ready:
+        if not acl_ready or not null_device_ready or not firewall_ready:
             return self._snapshot(WindowsSandboxSetupState.NEEDS_REPAIR, record)
         return self._snapshot(
             WindowsSandboxSetupState.READY,
@@ -701,7 +745,7 @@ class WindowsNativeSandboxSetupAuthority:
         request: WindowsSandboxSetupRequest,
     ) -> WindowsSandboxSetupSnapshot:
         self._require_admin()
-        acl_authority, firewall, account_api = self._apis(request)
+        acl_authority, firewall, account_api, null_device = self._apis(request)
         record = self._load(request)
         fresh = record is None
         created_facts: tuple[WindowsLocalUserFacts, ...] = ()
@@ -710,7 +754,12 @@ class WindowsNativeSandboxSetupAuthority:
         else:
             record, _ = self._repair_missing_accounts(account_api, record)
         store = self._store(request)
-        plan = self._plan(request, record, store.path)
+        plan = self._plan(
+            request,
+            record,
+            store.path,
+            include_new_boundary_files=fresh,
+        )
         updated = _InstallationRecord(
             record.schema_version,
             record.installation_id,
@@ -730,6 +779,13 @@ class WindowsNativeSandboxSetupAuthority:
             (
                 WindowsSandboxSetupStage.ACL_RECONCILE,
                 lambda: acl_authority.reconcile(record.managed_aces, plan),
+            ),
+            (
+                WindowsSandboxSetupStage.NULL_DEVICE_RECONCILE,
+                lambda: null_device.reconcile(
+                    record.write_sid,
+                    required=bool(request.writable_roots),
+                ),
             ),
             (
                 WindowsSandboxSetupStage.FIREWALL_ENSURE,
@@ -760,6 +816,10 @@ class WindowsNativeSandboxSetupAuthority:
                 (
                     WindowsSandboxSetupStage.ROLLBACK_ACL,
                     lambda: acl_authority.cleanup(plan.entries),
+                ),
+                (
+                    WindowsSandboxSetupStage.ROLLBACK_NULL_DEVICE,
+                    lambda: null_device.reconcile(record.write_sid, required=False),
                 ),
                 (
                     WindowsSandboxSetupStage.ROLLBACK_FIREWALL,
@@ -814,9 +874,10 @@ class WindowsNativeSandboxSetupAuthority:
         record = self._load(request)
         if record is None:
             return self._snapshot(WindowsSandboxSetupState.NEEDS_SETUP, None)
-        acl_authority, firewall, account_api = self._apis(request)
+        acl_authority, firewall, account_api, null_device = self._apis(request)
         try:
             acl_authority.cleanup(record.managed_aces)
+            null_device.reconcile(record.write_sid, required=False)
             firewall.remove_rule(record.offline_firewall_rule)
             for identity in record.identities:
                 if account_api.user_exists(identity.username):

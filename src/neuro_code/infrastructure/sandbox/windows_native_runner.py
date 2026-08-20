@@ -78,6 +78,19 @@ _WAIT_OBJECT_0 = 0
 _WAIT_TIMEOUT = 258
 _STILL_ACTIVE = 259
 _INFINITE = 0xFFFFFFFF
+_SEM_FAILCRITICALERRORS = 0x0001
+_SEM_NOGPFAULTERRORBOX = 0x0002
+_SEM_NOOPENFILEERRORBOX = 0x8000
+_READ_CONTROL = 0x00020000
+_WRITE_DAC = 0x00040000
+_SE_KERNEL_OBJECT = 6
+_SET_ACCESS = 2
+_TRUSTEE_IS_SID = 0
+_TRUSTEE_IS_UNKNOWN = 0
+_FILE_GENERIC_READ = 0x00120089
+_FILE_GENERIC_WRITE = 0x00120116
+_FILE_GENERIC_EXECUTE = 0x001200A0
+_FILE_GENERIC_READ_WRITE_EXECUTE = _FILE_GENERIC_READ | _FILE_GENERIC_WRITE | _FILE_GENERIC_EXECUTE
 # Do not ask CreateProcessWithLogonW to synchronously load the account
 # profile.  W3 derives private HOME/TMP from the final token and creates those
 # directories inside the runner; loading a fresh W2 profile here can block the
@@ -239,6 +252,25 @@ class _ProcessInformation(ctypes.Structure):
         ("hThread", ctypes.c_void_p),
         ("dwProcessId", ctypes.c_uint32),
         ("dwThreadId", ctypes.c_uint32),
+    ]
+
+
+class _TrusteeW(ctypes.Structure):
+    _fields_ = [
+        ("pMultipleTrustee", ctypes.c_void_p),
+        ("MultipleTrusteeOperation", ctypes.c_uint32),
+        ("TrusteeForm", ctypes.c_uint32),
+        ("TrusteeType", ctypes.c_uint32),
+        ("ptstrName", ctypes.c_void_p),
+    ]
+
+
+class _ExplicitAccessW(ctypes.Structure):
+    _fields_ = [
+        ("grfAccessPermissions", ctypes.c_uint32),
+        ("grfAccessMode", ctypes.c_uint32),
+        ("grfInheritance", ctypes.c_uint32),
+        ("Trustee", _TrusteeW),
     ]
 
 
@@ -1142,6 +1174,7 @@ class _RunnerChild:
         self._process_id: int | None = None
         self._last_exit_code: int | None = None
         self._termination_observation: dict[str, object] | None = None
+        self._lifecycle_diagnostics: dict[str, object] = {}
         self._stdin_handle: int | None = None
         self._desktop_handle: int | None = None
         self._desktop_name: str | None = None
@@ -1161,29 +1194,38 @@ class _RunnerChild:
 
     def _create(self, payload: Mapping[str, object]) -> None:
         write_sid = SyntheticWindowsSid(_validated_text(payload.get("write_sid"), "write SID"))
-        token_request = WindowsRestrictedTokenRequest((write_sid,))
-        # WRITE_RESTRICTED is evaluated in addition to the normal token SID
-        # check.  The installation-scoped synthetic SID is therefore the sole
-        # restricting SID and the sole second-half write authority.  Session,
-        # account, and Everyone SIDs belong only on object ACLs below.
         runner_sid = current_user_sid()
         runner_logon_sid = current_logon_sid()
+        # Match the complete elevated Windows token model: capability SIDs
+        # identify filesystem authorities, while the sandbox account, logon
+        # session, and World SIDs keep the restricted-token second access check
+        # compatible with ordinary Windows runtime objects.  Only the
+        # capability SID is granted write authority by the filesystem ACL plan.
+        token_request = WindowsRestrictedTokenRequest(
+            (write_sid,),
+            additional_restricting_sids=(runner_sid, runner_logon_sid, _WORLD_SID),
+        )
         token = WindowsRestrictedToken.create_from_current_process(token_request)
         handles_to_close: list[int] = []
         created: RunnerLaunch | None = None
         try:
-            if token.inspection.restricted_sids != (write_sid.value,):
+            expected_restricting_sids = (
+                write_sid.value,
+                runner_sid,
+                runner_logon_sid,
+                _WORLD_SID,
+            )
+            if token.inspection.restricted_sids != expected_restricting_sids:
                 raise SandboxError(
-                    "Windows restricted token does not contain the exact write SID authority"
+                    "Windows restricted token does not contain the expected capability and identity SIDs"
                 )
             if not token.inspection.change_notify_privilege_enabled:
                 raise SandboxError(
                     "Windows restricted token did not preserve SeChangeNotifyPrivilege"
                 )
-            # These SIDs are object-DACL principals for runner-created IPC and
-            # desktop objects.  They are deliberately not added to the
-            # restricted-token SID set; only ``write_sid`` is a
-            # WRITE_RESTRICTED authority.
+            # These same runtime identities are object-DACL principals for
+            # runner-created IPC and desktop objects.  The capability SID is
+            # still the only managed write principal on workspace roots.
             token.set_default_dacl((runner_logon_sid, _WORLD_SID, write_sid.value))
             desktop_value = payload.get(
                 "desktop_mode", _WindowsNativeDesktopMode.PRIVATE_DESKTOP.value
@@ -1202,8 +1244,16 @@ class _RunnerChild:
                 # The inherited/default desktop is a diagnostic-only launch
                 # mode.  It changes no token, ACL, filesystem, or network
                 # authority and is never selected by SandboxedProcessRequest.
-                self._desktop_handle, self._desktop_name = None, None
-            create_no_window = payload.get("create_no_window", True)
+                # Keep the comparison equivalent to the canonical Windows
+                # launch contract: an omitted lpDesktop is not the same as
+                # explicitly selecting the interactive default desktop.
+                self._desktop_handle, self._desktop_name = None, r"Winsta0\Default"
+            # Capture-backed launches use the inherited-console mode from the
+            # canonical Windows contract.  The trusted adapter sends this
+            # field explicitly; keep the fail-safe default aligned as well so
+            # a legacy payload cannot reintroduce CREATE_NO_WINDOW for runtimes
+            # whose CLR bootstrap requires normal console initialization.
+            create_no_window = payload.get("create_no_window", False)
             if not isinstance(create_no_window, bool):
                 raise SandboxError("Windows runtime console mode is invalid")
             stdio_mode = payload.get("stdio_mode", "")
@@ -1236,6 +1286,14 @@ class _RunnerChild:
             if ephemeral_home:
                 self._ephemeral_home = Path(private_home)
             private_tmp = self._api.get_private_temp_path(private_home, runner_sid)
+            private_home_path = Path(private_home)
+            # Windows runtimes use APPDATA/LOCALAPPDATA and the drive/path
+            # pair in addition to USERPROFILE.  Keep every per-user location
+            # inside the account-private HOME; the controller's profile is
+            # never exposed through the final child environment.
+            self._api.create_private_directory(
+                private_home_path / "AppData" / "Roaming", runner_sid
+            )
             # These values are derived from the selected sandbox account, never
             # inherited from the controller.  A model request cannot redirect
             # an enabled child into controller HOME/TMP.
@@ -1243,6 +1301,15 @@ class _RunnerChild:
             environment["USERPROFILE"] = private_home
             environment["TEMP"] = private_tmp
             environment["TMP"] = private_tmp
+            environment["APPDATA"] = str(private_home_path / "AppData" / "Roaming")
+            environment["LOCALAPPDATA"] = str(private_home_path / "AppData" / "Local")
+            environment["USERNAME"] = profile_username
+            environment["USERDOMAIN"] = "."
+            drive = private_home_path.drive
+            if drive:
+                environment["HOMEDRIVE"] = drive
+                environment["HOMEPATH"] = str(private_home_path)[len(drive) :] or "\\"
+            environment["WINDIR"] = environment.get("SystemRoot", "")
             if shell_command is not None:
                 command = _validated_text(shell_command, "shell command")
                 system_root = _validated_text(os.environ.get("SYSTEMROOT"), "SystemRoot")
@@ -1358,9 +1425,9 @@ class _RunnerChild:
                 raise SandboxError("Windows final child TokenUser does not match selected identity")
             if not child_attestation.is_restricted:
                 raise SandboxError("Windows final child token is not restricted")
-            if child_attestation.restricted_sids != (write_sid.value,):
+            if child_attestation.restricted_sids != expected_restricting_sids:
                 raise SandboxError(
-                    "Windows final child token does not contain the exact write SID authority"
+                    "Windows final child token does not contain the expected capability and identity SIDs"
                 )
             if not child_attestation.change_notify_privilege_enabled:
                 raise SandboxError(
@@ -1480,6 +1547,7 @@ class _RunnerChild:
             "version": PROTOCOL_VERSION,
             "message": str(error)[:512],
             "child": self.observe(),
+            "lifecycle": dict(self._lifecycle_diagnostics),
         }
 
     def _relay(self, handle: int, kind: RuntimeFrameType) -> None:
@@ -1506,13 +1574,37 @@ class _RunnerChild:
             code = self._api.get_exit_code(self._process_handle)
             self._last_exit_code = code
             self._direct_child_exited.set()
+            try:
+                self._lifecycle_diagnostics["job_active_processes_at_direct_exit"] = (
+                    self._job.active_processes
+                )
+            except BaseException as error:
+                self._lifecycle_diagnostics["job_active_processes_query_error"] = type(
+                    error
+                ).__name__
             # A direct child exit is not the end of the Job-owned scope.  A
             # descendant may still be running without holding any relay
             # handle, so keep the independent wait thread alive until the Job
             # reports no active processes.  The control thread remains free to
             # receive TERMINATE/EOF while this bounded-frequency poll runs.
-            while self._job.active_processes:
+            while True:
+                try:
+                    active_processes = self._job.active_processes
+                except BaseException as error:
+                    self._lifecycle_diagnostics["job_active_processes_query_error"] = type(
+                        error
+                    ).__name__
+                    raise
+                if active_processes == 0:
+                    break
+                self._lifecycle_diagnostics["job_active_processes_before_quiesce"] = (
+                    active_processes
+                )
                 time.sleep(0.02)
+            self._lifecycle_diagnostics["job_active_processes_after_quiesce"] = 0
+            self._lifecycle_diagnostics["relay_threads_before_join"] = sum(
+                thread.is_alive() for thread in self._threads
+            )
             # This is the only state transition that certifies the owned
             # scope is empty.  A direct-child exit alone is deliberately not
             # enough: a detached descendant may still be alive in the Job.
@@ -1536,6 +1628,7 @@ class _RunnerChild:
                 for thread in self._threads
                 if thread is not threading.current_thread() and thread.is_alive()
             ]
+            self._lifecycle_diagnostics["relay_threads_after_join"] = len(remaining)
             if remaining:
                 # A child exit should close every inherited stdout/stderr
                 # writer.  If a relay is nevertheless still blocked, close
@@ -1546,6 +1639,9 @@ class _RunnerChild:
                         self._api.close_handle(handle)
                 for thread in remaining:
                     thread.join(timeout=1.0)
+                self._lifecycle_diagnostics["relay_threads_after_force_close"] = sum(
+                    thread.is_alive() for thread in remaining
+                )
                 if any(thread.is_alive() for thread in remaining):
                     raise SandboxError("Windows runtime output relay did not quiesce before Exit")
             if self._event_failed.is_set():
@@ -1557,6 +1653,7 @@ class _RunnerChild:
                     "returncode": code,
                     "child": self.observe(),
                     "termination_observation": self._termination_observation,
+                    "lifecycle": dict(self._lifecycle_diagnostics),
                 },
             )
             self._exit_sent.set()
@@ -1616,7 +1713,10 @@ class _RunnerChild:
                 self._stdin_handle = None
             return True
         if frame.kind is RuntimeFrameType.TERMINATE:
-            self._termination_observation = self.observe()
+            self._termination_observation = {
+                **self.observe(),
+                "lifecycle": dict(self._lifecycle_diagnostics),
+            }
             self._job.terminate()
             return True
         if frame.kind in {
@@ -1696,6 +1796,19 @@ class _NativeChildApi:
             raise OSError("Win32 API unavailable")
         kernel32 = cast(object, loader("kernel32.dll", use_last_error=True))
         self._get_last_error = cast(_CFunction, getattr(ctypes, "get_last_error", lambda: 0))
+        # The runner has no interactive error-dialog consumer.  Suppress
+        # system error UI so a DLL/CLR initialization failure becomes a
+        # bounded process result instead of leaving the owned Job blocked on a
+        # hidden dialog on the private desktop.
+        self._set_error_mode = _load_function(
+            kernel32,
+            "SetErrorMode",
+            [ctypes.c_uint32],
+            ctypes.c_uint32,
+        )
+        self._set_error_mode(
+            _SEM_FAILCRITICALERRORS | _SEM_NOGPFAULTERRORBOX | _SEM_NOOPENFILEERRORBOX
+        )
         self._create_pipe = _load_function(
             kernel32,
             "CreatePipe",
@@ -1777,6 +1890,7 @@ class _NativeChildApi:
         self._close_handle = _load_function(
             kernel32, "CloseHandle", [ctypes.c_void_p], ctypes.c_int32
         )
+        self._local_free = _load_function(kernel32, "LocalFree", [ctypes.c_void_p], ctypes.c_void_p)
         self._read_file = _load_function(
             kernel32,
             "ReadFile",
@@ -1853,6 +1967,52 @@ class _NativeChildApi:
                 ctypes.c_void_p,
             ],
             ctypes.c_int32,
+        )
+        self._convert_string_sid = _load_function(
+            advapi32,
+            "ConvertStringSidToSidW",
+            [ctypes.c_wchar_p, ctypes.POINTER(ctypes.c_void_p)],
+            ctypes.c_int32,
+        )
+        self._get_security_info = _load_function(
+            advapi32,
+            "GetSecurityInfo",
+            [
+                ctypes.c_void_p,
+                ctypes.c_uint32,
+                ctypes.c_uint32,
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.POINTER(ctypes.c_void_p),
+                ctypes.c_void_p,
+                ctypes.POINTER(ctypes.c_void_p),
+            ],
+            ctypes.c_uint32,
+        )
+        self._set_entries_in_acl = _load_function(
+            advapi32,
+            "SetEntriesInAclW",
+            [
+                ctypes.c_uint32,
+                ctypes.POINTER(_ExplicitAccessW),
+                ctypes.c_void_p,
+                ctypes.POINTER(ctypes.c_void_p),
+            ],
+            ctypes.c_uint32,
+        )
+        self._set_security_info = _load_function(
+            advapi32,
+            "SetSecurityInfo",
+            [
+                ctypes.c_void_p,
+                ctypes.c_uint32,
+                ctypes.c_uint32,
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+            ],
+            ctypes.c_uint32,
         )
         user32 = cast(object, loader("user32.dll", use_last_error=True))
         self._create_desktop = _load_function(
@@ -1955,6 +2115,92 @@ class _NativeChildApi:
         if value is None or value == 0 or value == _INVALID_HANDLE_VALUE:
             self._error("CreateFileW(NUL)")
         return int(cast(int, value))
+
+    def allow_null_device(self, sid_text: str) -> None:
+        r"""Grant one installation capability SID access to ``\\.\NUL``.
+
+        Windows' ``WRITE_RESTRICTED`` second access check applies to device
+        objects as well as ordinary files.  The capability SID is therefore
+        added to the existing NUL DACL using the same narrow SET_ACCESS
+        operation as the upstream Windows sandbox.  No inherited or broad
+        principal is added, and every Win32 failure aborts child creation.
+        """
+
+        if not isinstance(sid_text, str) or not sid_text or "\x00" in sid_text:
+            raise ValueError("Windows NUL capability SID is invalid")
+        sid_pointer = ctypes.c_void_p()
+        if not self._convert_string_sid(sid_text, ctypes.byref(sid_pointer)):
+            self._error("ConvertStringSidToSidW(NUL capability)")
+        device: int | None = None
+        security_descriptor = ctypes.c_void_p()
+        old_dacl = ctypes.c_void_p()
+        new_dacl = ctypes.c_void_p()
+        try:
+            value = self._create_file(
+                r"\\.\NUL",
+                _READ_CONTROL | _WRITE_DAC,
+                _FILE_SHARE_READ | _FILE_SHARE_WRITE,
+                None,
+                _OPEN_EXISTING,
+                0x80,
+                None,
+            )
+            if value is None or value == 0 or value == _INVALID_HANDLE_VALUE:
+                self._error("CreateFileW(NUL security)")
+            device = int(cast(int, value))
+            result = self._get_security_info(
+                device,
+                _SE_KERNEL_OBJECT,
+                _DACL_SECURITY_INFORMATION,
+                None,
+                None,
+                ctypes.byref(old_dacl),
+                None,
+                ctypes.byref(security_descriptor),
+            )
+            if result != 0:
+                raise OSError(cast(int, result), "GetSecurityInfo(NUL) failed")
+            trustee = _TrusteeW(
+                None,
+                0,
+                _TRUSTEE_IS_SID,
+                _TRUSTEE_IS_UNKNOWN,
+                sid_pointer.value,
+            )
+            explicit = _ExplicitAccessW(
+                _FILE_GENERIC_READ_WRITE_EXECUTE,
+                _SET_ACCESS,
+                0,
+                trustee,
+            )
+            result = self._set_entries_in_acl(
+                1,
+                ctypes.byref(explicit),
+                old_dacl,
+                ctypes.byref(new_dacl),
+            )
+            if result != 0 or not new_dacl.value:
+                raise OSError(cast(int, result), "SetEntriesInAclW(NUL) failed")
+            result = self._set_security_info(
+                device,
+                _SE_KERNEL_OBJECT,
+                _DACL_SECURITY_INFORMATION,
+                None,
+                None,
+                new_dacl,
+                None,
+            )
+            if result != 0:
+                raise OSError(cast(int, result), "SetSecurityInfo(NUL) failed")
+        finally:
+            if new_dacl.value:
+                self._local_free(new_dacl)
+            if security_descriptor.value:
+                self._local_free(security_descriptor)
+            if sid_pointer.value:
+                self._local_free(sid_pointer)
+            if device is not None:
+                self.close_handle(device)
 
     def create_process_as_user(
         self,

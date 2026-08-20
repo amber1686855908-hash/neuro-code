@@ -4,7 +4,13 @@ import asyncio
 import unittest
 from collections.abc import AsyncIterator, Sequence
 
-from neuro_code.application.ports.model import ModelToolPolicy
+from neuro_code.application.ports.model import (
+    CapabilityStatus,
+    ModelCapability,
+    ModelCapabilitySet,
+    ModelToolPolicy,
+)
+from neuro_code.configuration.app import ProviderProfile
 from neuro_code.domain.conversation.context import ModelContext
 from neuro_code.domain.conversation.events import (
     ModelCompleted,
@@ -31,6 +37,7 @@ class ScriptedModelProvider:
         self._scripts = [tuple(script) for script in scripts]
         self.calls = 0
         self.tool_policies: list[ModelToolPolicy] = []
+        self.capabilities = ModelCapabilitySet.all_unknown()
 
     async def stream(
         self,
@@ -49,17 +56,118 @@ class ScriptedModelProvider:
             yield item
 
 
-def _candidate(provider: ScriptedModelProvider) -> ProviderCandidate:
+def _candidate(
+    provider: ScriptedModelProvider,
+    capabilities: ModelCapabilitySet | None = None,
+) -> ProviderCandidate:
+    resolved_capabilities = capabilities or ModelCapabilitySet.all_unknown()
+    provider.capabilities = resolved_capabilities
     return ProviderCandidate(
         provider.provider_name,
         provider.model_name,
         provider.context_affinity,
         lambda: provider,
         context_window_tokens=128_000,
+        capabilities=resolved_capabilities,
     )
 
 
 class FailoverModelProviderTests(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def _hosted_capability(status: CapabilityStatus) -> ModelCapabilitySet:
+        return ModelCapabilitySet.from_mapping({ModelCapability.HOSTED_WEB_SEARCH: status})
+
+    async def test_pre_request_capability_is_intersection_when_fallback_is_unsupported(
+        self,
+    ) -> None:
+        primary = ScriptedModelProvider(
+            "primary",
+            ((ModelTextDelta("ok"), ModelCompleted("stop")),),
+        )
+        fallback = ScriptedModelProvider(
+            "fallback",
+            ((ModelTextDelta("fallback"), ModelCompleted("stop")),),
+        )
+        router = FailoverModelProvider(
+            (
+                _candidate(primary, self._hosted_capability(CapabilityStatus.SUPPORTED)),
+                _candidate(fallback, self._hosted_capability(CapabilityStatus.UNSUPPORTED)),
+            )
+        )
+
+        self.assertEqual(
+            router.capabilities.status(ModelCapability.HOSTED_WEB_SEARCH),
+            CapabilityStatus.UNSUPPORTED,
+        )
+        _ = [
+            event
+            async for event in router.stream(
+                ModelContext((Message(Role.USER, "hello"),)),
+                (),
+            )
+        ]
+        self.assertEqual(
+            router.capabilities.status(ModelCapability.HOSTED_WEB_SEARCH),
+            CapabilityStatus.SUPPORTED,
+        )
+
+    async def test_pre_request_capability_is_unknown_when_fallback_is_unknown(self) -> None:
+        primary = ScriptedModelProvider(
+            "primary",
+            ((ModelTextDelta("ok"), ModelCompleted("stop")),),
+        )
+        fallback = ScriptedModelProvider(
+            "fallback",
+            ((ModelTextDelta("fallback"), ModelCompleted("stop")),),
+        )
+        router = FailoverModelProvider(
+            (
+                _candidate(primary, self._hosted_capability(CapabilityStatus.SUPPORTED)),
+                _candidate(fallback),
+            )
+        )
+
+        self.assertEqual(
+            router.capabilities.status(ModelCapability.HOSTED_WEB_SEARCH),
+            CapabilityStatus.UNKNOWN,
+        )
+        _ = [
+            event
+            async for event in router.stream(
+                ModelContext((Message(Role.USER, "hello"),)),
+                (),
+            )
+        ]
+        self.assertEqual(
+            router.capabilities.status(ModelCapability.HOSTED_WEB_SEARCH),
+            CapabilityStatus.SUPPORTED,
+        )
+
+    async def test_all_candidates_support_capability_before_active_selection(self) -> None:
+        primary = ScriptedModelProvider(
+            "primary",
+            ((ProviderError("offline"),),),
+        )
+        fallback = ScriptedModelProvider(
+            "fallback",
+            ((ModelTextDelta("fallback"), ModelCompleted("stop")),),
+        )
+        supported = self._hosted_capability(CapabilityStatus.SUPPORTED)
+        router = FailoverModelProvider(
+            (_candidate(primary, supported), _candidate(fallback, supported))
+        )
+
+        self.assertTrue(router.capabilities.supports(ModelCapability.HOSTED_WEB_SEARCH))
+        _ = [
+            event
+            async for event in router.stream(
+                ModelContext((Message(Role.USER, "hello"),)),
+                (),
+            )
+        ]
+        self.assertEqual(router.provider_name, "fallback")
+        self.assertTrue(router.capabilities.supports(ModelCapability.HOSTED_WEB_SEARCH))
+
     async def test_failure_before_output_selects_the_next_provider(self) -> None:
         primary = ScriptedModelProvider(
             "primary",
@@ -96,6 +204,67 @@ class FailoverModelProviderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(router.context_affinity, "profile-v1:fallback")
         self.assertEqual(primary.tool_policies, [ModelToolPolicy.ALLOWED])
         self.assertEqual(fallback.tool_policies, [ModelToolPolicy.ALLOWED])
+
+    async def test_cross_platform_failover_keeps_native_affinity_on_the_selected_route(
+        self,
+    ) -> None:
+        routes = (
+            ("tokenhub", "glm-5.3", "bailian", "qwen3.7-plus"),
+            ("bailian", "qwen3.7-plus", "qianfan", "deepseek-v4-flash"),
+            ("ark", "doubao-seed-2-0-lite-260215", "kimi", "kimi-k2.6"),
+        )
+        for primary_service, primary_model, fallback_service, fallback_model in routes:
+            with self.subTest(primary=primary_service, fallback=fallback_service):
+                primary_profile = ProviderProfile(
+                    name=f"{primary_service}-primary",
+                    service_id=primary_service,
+                    protocol="openai-chat",
+                    dialect="kimi" if primary_service == "kimi" else "standard",
+                    model=primary_model,
+                    base_url="https://shared.example.invalid/v1",
+                    api_key_env="FAILOVER_TEST_KEY",
+                    native_context="profile",
+                )
+                fallback_profile = ProviderProfile(
+                    name=f"{fallback_service}-fallback",
+                    service_id=fallback_service,
+                    protocol="openai-chat",
+                    model=fallback_model,
+                    base_url="https://shared.example.invalid/v1",
+                    api_key_env="FAILOVER_TEST_KEY",
+                    native_context="profile",
+                )
+                primary = ScriptedModelProvider(primary_service, ((ProviderError("offline"),),))
+                primary.model_name = primary_profile.model
+                primary.context_affinity = primary_profile.context_affinity
+                fallback = ScriptedModelProvider(
+                    fallback_service,
+                    ((ModelTextDelta("fallback"), ModelCompleted("stop")),),
+                )
+                fallback.model_name = fallback_profile.model
+                fallback.context_affinity = fallback_profile.context_affinity
+                self.assertNotEqual(primary.context_affinity, fallback.context_affinity)
+                router = FailoverModelProvider((_candidate(primary), _candidate(fallback)))
+
+                events = [
+                    event
+                    async for event in router.stream(
+                        ModelContext(
+                            (Message(Role.USER, "hello"),),
+                            source_provider=primary.provider_name,
+                            source_model=primary.model_name,
+                            source_context_affinity=primary.context_affinity,
+                        ),
+                        (),
+                    )
+                ]
+
+                selected = next(
+                    event for event in events if isinstance(event, ModelProviderSelected)
+                )
+                self.assertTrue(selected.failover)
+                self.assertEqual(selected.context_affinity, fallback.context_affinity)
+                self.assertNotEqual(selected.context_affinity, primary.context_affinity)
 
     async def test_disabled_policy_is_forwarded_to_every_failover_candidate(self) -> None:
         primary = ScriptedModelProvider(

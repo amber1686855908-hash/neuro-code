@@ -5,7 +5,14 @@ from tests.security.windows_token_attestation import token_attestation_is_exact
 
 
 def _diagnostic(
-    *, user: str = "S-1-5-21-online", restricted: tuple[str, ...] = ("S-1-5-21-write",)
+    *,
+    user: str = "S-1-5-21-online",
+    restricted: tuple[str, ...] = (
+        "S-1-5-21-write",
+        "S-1-5-21-online",
+        "S-1-5-5-100-200",
+        "S-1-1-0",
+    ),
 ) -> dict[str, object]:
     return {
         "security_attestation": {

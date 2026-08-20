@@ -1111,8 +1111,9 @@ network `STRONG` provider contract。W1/W2 foundation actual-capability constant
 isolation 而失败关闭。Gate 1–5 执行 7 个 native acceptance test 且 0 skip，证明
 final-child identity、文件系统/网络 enforcement、binary/protocol transport、normal wait、
 显式 termination、controller-loss cleanup 与 runner kill-on-close ownership。PTY/ConPTY 留给
-W4，现有 `off` 路径保持不变；受限 Python 启动、NUL 写入和 curl 行为记录为 W5 compatibility
-seam，而非 security-isolation failure。
+W4，现有 `off` 路径保持不变；已接受的 W5 workload matrix（run `32194952573`）已通过
+W3 与 W4 验证 Python/child Python、PowerShell、Git、Node/npm、curl、NUL 读写模式和动态
+BCrypt 启动；未来 developer tool 仍需各自的有界证据行。
 
 启用的 Linux 启动器会在挂载任何授权工作区前，对 controller 状态目录执行有界硬链接审计。
 私有常规文件存在另一个 inode 名称时失败关闭，防止工作区中既存硬链接重新引入凭据或会话

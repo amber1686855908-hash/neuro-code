@@ -191,6 +191,37 @@ class XaiDialectResponsesProviderTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
 
+    def test_sidecar_web_search_forces_execution_and_forwards_xai_filters(self) -> None:
+        provider = _xai_provider(
+            model="xai-search-model",
+            base_url="https://api.x.ai/v1",
+            api_key="fixture",
+            builtin_tools=("web_search",),
+            builtin_tool_options={
+                "web_search": {"filters": {"excluded_domains": ["ads.example.com"]}}
+            },
+            tool_choice="required",
+        )
+
+        body = provider._request_body(
+            ModelContext((Message(Role.USER, "search"),)),
+            (),
+        )
+
+        self.assertEqual(
+            body["tools"],
+            [
+                {
+                    "type": "web_search",
+                    "filters": {"excluded_domains": ["ads.example.com"]},
+                }
+            ],
+        )
+        self.assertEqual(body["tool_choice"], "required")
+        self.assertEqual(
+            body["include"], ["reasoning.encrypted_content", "web_search_call.action.sources"]
+        )
+
     def test_disabled_tool_policy_omits_builtin_and_local_tools_without_sticky_state(self) -> None:
         provider = _xai_provider(
             model="xai-test-model",
