@@ -7,6 +7,7 @@ copied into the task workspace.
 
 from __future__ import annotations
 
+from base64 import b64encode
 from hashlib import sha256
 
 from .models import TaskCategory, TaskSpec, VerifierSpec
@@ -44,48 +45,53 @@ def _base_files(extra: dict[str, str] | None = None) -> tuple[tuple[str, str], .
     return tuple(sorted(files.items()))
 
 
+def _encoded(value: str) -> str:
+    return b64encode(value.encode("utf-8")).decode("ascii")
+
+
+def _python_command(script: str) -> str:
+    """Return a shell command that works under both POSIX shells and cmd.exe."""
+
+    return f'python -c "{script}"'
+
+
 def _replace(path: str, old: str, new: str) -> str:
-    return (
-        "python - <<'PY'\n"
-        "from pathlib import Path\n"
-        f"path = Path({path!r})\n"
-        "text = path.read_text()\n"
-        f"old = {old!r}\n"
-        "if old not in text:\n    raise SystemExit('expected source fragment was not found')\n"
-        f"path.write_text(text.replace(old, {new!r}, 1))\n"
-        "PY"
+    return _python_command(
+        "import base64;from pathlib import Path;"
+        f"p=Path(base64.b64decode('{_encoded(path)}').decode());"
+        "t=p.read_text();"
+        f"o=base64.b64decode('{_encoded(old)}').decode();"
+        f"n=base64.b64decode('{_encoded(new)}').decode();"
+        "assert o in t,'expected source fragment was not found';"
+        "p.write_text(t.replace(o,n,1))"
     )
 
 
 def _replace_all(path: str, old: str, new: str) -> str:
-    return (
-        "python - <<'PY'\n"
-        "from pathlib import Path\n"
-        f"path = Path({path!r})\n"
-        "text = path.read_text()\n"
-        f"path.write_text(text.replace({old!r}, {new!r}))\n"
-        "PY"
+    return _python_command(
+        "import base64;from pathlib import Path;"
+        f"p=Path(base64.b64decode('{_encoded(path)}').decode());"
+        "t=p.read_text();"
+        f"o=base64.b64decode('{_encoded(old)}').decode();"
+        f"n=base64.b64decode('{_encoded(new)}').decode();"
+        "p.write_text(t.replace(o,n))"
     )
 
 
 def _append(path: str, content: str) -> str:
-    return (
-        "python - <<'PY'\n"
-        "from pathlib import Path\n"
-        f"path = Path({path!r})\n"
-        f"path.write_text(path.read_text() + {content!r})\n"
-        "PY"
+    return _python_command(
+        "import base64;from pathlib import Path;"
+        f"p=Path(base64.b64decode('{_encoded(path)}').decode());"
+        f"p.write_text(p.read_text()+base64.b64decode('{_encoded(content)}').decode())"
     )
 
 
 def _write(path: str, content: str) -> str:
-    return (
-        "python - <<'PY'\n"
-        "from pathlib import Path\n"
-        f"path = Path({path!r})\n"
-        "path.parent.mkdir(parents=True, exist_ok=True)\n"
-        f"path.write_text({content!r})\n"
-        "PY"
+    return _python_command(
+        "import base64;from pathlib import Path;"
+        f"p=Path(base64.b64decode('{_encoded(path)}').decode());"
+        "p.parent.mkdir(parents=True,exist_ok=True);"
+        f"p.write_text(base64.b64decode('{_encoded(content)}').decode())"
     )
 
 
