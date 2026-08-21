@@ -130,7 +130,7 @@ def _reject_ambiguous_windows_path(requested: str) -> None:
     if windows_path.drive and not windows_path.root:
         raise ToolError("Windows drive-relative paths are unsupported")
     for part in windows_path.parts:
-        if part in {windows_path.drive, "\\"}:
+        if part in {windows_path.anchor, windows_path.drive, windows_path.root, "\\"}:
             continue
         if ":" in part:
             raise ToolError("Windows alternate data streams are unsupported")

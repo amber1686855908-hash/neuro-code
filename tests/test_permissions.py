@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -21,6 +22,7 @@ from neuro_code.application.ports.workspace import (
     FilesystemTargetRequest,
 )
 from neuro_code.infrastructure.workspace.paths import (
+    _reject_ambiguous_windows_path,
     resolve_delegated_workspace_path,
     resolve_filesystem_access_targets,
 )
@@ -330,6 +332,25 @@ class PermissionTests(unittest.TestCase):
         self.assertEqual({item.policy_path for item in plan.targets}, {"src/secret.py"})
         self.assertTrue(all(item.is_primary_workspace for item in plan.targets))
 
+    @unittest.skipUnless(os.name == "nt", "Windows filesystem case identity required")
+    def test_windows_case_aliases_share_one_canonical_policy_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "Src" / "Secret.py"
+            target.parent.mkdir()
+            target.write_text("secret = 1\n", encoding="utf-8")
+            plan = resolve_filesystem_access_targets(
+                "read_file",
+                root,
+                tuple(
+                    FilesystemTargetRequest(path, FilesystemAccessOperation.READ, must_exist=True)
+                    for path in (str(target), str(root / "src" / "secret.py"))
+                ),
+            )
+
+        self.assertEqual(plan.targets[0].canonical_path, plan.targets[1].canonical_path)
+        self.assertEqual(plan.targets[0].policy_path, plan.targets[1].policy_path)
+
     def test_create_target_proves_an_existing_ancestor_before_authorizing_missing_leaf(
         self,
     ) -> None:
@@ -348,7 +369,13 @@ class PermissionTests(unittest.TestCase):
             )
             target = plan.targets[0]
             self.assertFalse(target.exists)
-            self.assertEqual(target.canonical_path, root / "src" / "generated" / "deep" / "new.py")
+            canonical_root = root.resolve(strict=False)
+            self.assertEqual(
+                target.canonical_path,
+                canonical_root / "src" / "generated" / "deep" / "new.py",
+            )
+            self.assertEqual(target.owning_workspace_root, canonical_root)
+            self.assertEqual(target.policy_path, "src/generated/deep/new.py")
             with self.assertRaises(ToolError):
                 resolve_filesystem_access_targets(
                     "apply_patch",
@@ -360,6 +387,20 @@ class PermissionTests(unittest.TestCase):
                         ),
                     ),
                 )
+
+    def test_windows_path_classifier_preserves_drive_root_and_rejects_ads(self) -> None:
+        with patch("neuro_code.infrastructure.workspace.paths.os.name", "nt"):
+            _reject_ambiguous_windows_path(r"C:\repo\file.py")
+            _reject_ambiguous_windows_path(r"C:/repo/file.py")
+            _reject_ambiguous_windows_path(r"\\server\share\repo\file.py")
+            for requested in (r"C:", r"C:relative\file.py"):
+                with (
+                    self.subTest(requested=requested),
+                    self.assertRaisesRegex(ToolError, "drive-relative"),
+                ):
+                    _reject_ambiguous_windows_path(requested)
+            with self.assertRaisesRegex(ToolError, "alternate data streams"):
+                _reject_ambiguous_windows_path(r"C:\repo\file.py:stream")
 
     def test_structured_permission_requires_every_target_to_match_a_path_allowlist(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

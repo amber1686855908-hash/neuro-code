@@ -400,6 +400,8 @@ USER 候选。按名称先见为准的去重确保 LOCAL 技能遮蔽同名 REPO
 1. 一次解析全部目标，包括 `apply_patch` 的所有源路径和目标路径。对缺失的创建叶子会证明
    已存在的父级/祖先，并拒绝符号链接、junction、Windows reparse traversal、父级逃逸以及
    含义不明确的 Windows device/extended/ADS 命名空间。
+   普通 drive-absolute 和 UNC 写法只有在其规范目标位于已配置工作区根内时才可用；
+   drive-relative 路径会在文件系统解析前被拒绝。
 2. `PermissionManager.decide_targets()` 对每个规范目标独立评估。显式 deny 优先；无头模式中
    未解决的 ask 会拒绝；路径范围 allow 是 allowlist。只有所有目标都获授权时，结构化调用才会通过。
 3. 工具执行接收同一个不可变计划，并按提取索引消费规范目标，不会再次解析原始路径。因此混合

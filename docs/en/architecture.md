@@ -541,6 +541,9 @@ The authority chain is deliberately ordered:
    paths. Existing parents/ancestors are proven for missing create leaves, and
    symlinks, junctions, Windows reparse traversal, parent escapes, and ambiguous
    Windows device/extended/ADS namespaces are rejected.
+   Normal drive-absolute and UNC spellings remain eligible only when their
+   canonical target is inside a configured workspace root; drive-relative paths
+   are rejected before filesystem resolution.
 2. `PermissionManager.decide_targets()` evaluates every canonical target
    independently. Explicit deny wins; an unresolved ask denies in headless mode;
    a path-scoped allow is an allowlist. A structured call is allowed only when
