@@ -111,11 +111,10 @@ def _classify_anthropic(values: frozenset[str]) -> ProviderFailureKind | None:
         return ProviderFailureKind.AUTHORIZATION
     if _first(values, frozenset({"invalid_request_error", "request_too_large"})):
         return ProviderFailureKind.INVALID_REQUEST
-    # Anthropic documents that this envelope can also represent a monthly
-    # spend cap and may omit Retry-After. Keep it unknown until the response
-    # contains an unambiguous transient signal rather than retrying billing.
+    # Anthropic's current error catalog separates 402 billing_error from 429
+    # rate_limit_error; the rate-limit contract supplies Retry-After guidance.
     if _first(values, frozenset({"rate_limit_error"})):
-        return ProviderFailureKind.UNKNOWN
+        return ProviderFailureKind.RATE_LIMIT
     if _first(values, frozenset({"api_error", "overloaded_error"})):
         return ProviderFailureKind.SERVER
     if _first(values, frozenset({"timeout_error"})):
@@ -130,10 +129,10 @@ def _classify_gemini_generate(values: frozenset[str]) -> ProviderFailureKind | N
         return ProviderFailureKind.AUTHORIZATION
     if _first(values, frozenset({"invalid_argument", "not_found", "out_of_range"})):
         return ProviderFailureKind.INVALID_REQUEST
-    # RESOURCE_EXHAUSTED covers RPM/TPM/RPD and spend/quota in the official
-    # GenerateContent contract; it is intentionally not made retryable here.
+    # GenerateContent documents 429 RESOURCE_EXHAUSTED as a rate-limit fact
+    # across RPM/TPM/RPD/spend dimensions and recommends waiting and retrying.
     if _first(values, frozenset({"resource_exhausted"})):
-        return ProviderFailureKind.UNKNOWN
+        return ProviderFailureKind.RATE_LIMIT
     if _first(values, frozenset({"deadline_exceeded"})):
         return ProviderFailureKind.TIMEOUT
     if _first(values, frozenset({"internal", "unavailable", "aborted"})):

@@ -53,15 +53,17 @@ Gemini Generate Content 和 Gemini Interactions。Provider 目录发现拥有独
 | 协议 | 使用的精确结构化证据 | 规范事实与策略边界 |
 |---|---|---|
 | OpenAI-compatible Chat / OpenAI Responses | OpenAI 文档中的认证、临时限流、余额、组织/项目 spend、usage limit、服务端错误和 `response.failed` 的 `server_error` 字段 | 明确的 billing/spend/usage code 归为 `authorization`；明确的瞬时 rate code 归为 `rate_limit`；未知 429 保持 `unknown` |
-| Anthropic Messages | `error.type` 的 `authentication_error`、`billing_error`、`permission_error`、`invalid_request_error`、`request_too_large`、`api_error`、`timeout_error`、`overloaded_error` 等 | `not_found_error` 保留为通用资源/endpoint 404；`rate_limit_error` 有 spend cap 歧义，因此保留为 `unknown` |
-| Gemini Generate Content | `error.status` / ErrorInfo reason 的 `API_KEY_INVALID`、`INVALID_ARGUMENT`、`FAILED_PRECONDITION`、`PERMISSION_DENIED`、`RESOURCE_EXHAUSTED`、`INTERNAL`、`UNAVAILABLE`、`DEADLINE_EXCEEDED` 等 | `RESOURCE_EXHAUSTED` 同时覆盖 rate 与 spend/quota，因此保留为 `unknown` |
+| Anthropic Messages | `error.type` 的 `authentication_error`、`billing_error`、`permission_error`、`invalid_request_error`、`request_too_large`、`rate_limit_error`、`api_error`、`timeout_error`、`overloaded_error` 等 | `billing_error` 归为 `authorization`；`rate_limit_error` 归为 `rate_limit` 并保留文档规定的 `Retry-After` 提示；`not_found_error` 保留为通用资源/endpoint 404 |
+| Gemini Generate Content | `error.status` / ErrorInfo reason 的 `API_KEY_INVALID`、`INVALID_ARGUMENT`、`FAILED_PRECONDITION`、`PERMISSION_DENIED`、`RESOURCE_EXHAUSTED`、`INTERNAL`、`UNAVAILABLE`、`DEADLINE_EXCEEDED` 等 | `RESOURCE_EXHAUSTED` 是文档定义的 429 rate-limit 事实，覆盖 RPM/TPM/RPD/spend 维度，归为 `rate_limit`；有界策略会重试但不计入熔断 |
 | Gemini Interactions | `error.code` 的 `authentication`、`permission_denied`、`model_not_found`、`not_found`、`rate_limit_exceeded`、`quota_exceeded`、`api_error`、`service_unavailable`、`deadline_exceeded` 等 | 明确的 rate、quota、model code 分开分类；未来 code 保持 `unknown` |
 
 主要参考：[OpenAI error codes](https://developers.openai.com/api/docs/guides/error-codes)、
 [OpenAI rate limits](https://developers.openai.com/api/docs/guides/rate-limits)、
 [OpenAI Responses streaming](https://platform.openai.com/docs/api-reference/responses-streaming/response/refusal/delta)、
 [Anthropic API errors](https://platform.claude.com/docs/en/api/errors)、
-[Gemini Generate Content API errors](https://ai.google.dev/gemini-api/docs/generate-content/api-errors)
+[Anthropic rate limits](https://platform.claude.com/docs/en/api/rate-limits)、
+[Gemini Generate Content API errors](https://ai.google.dev/gemini-api/docs/generate-content/api-errors)、
+[Gemini rate limits](https://ai.google.dev/gemini-api/docs/rate-limits)、
 和 [Gemini API errors](https://ai.google.dev/gemini-api/docs/api-errors)。
 
 ## 熔断与配置语义

@@ -70,15 +70,17 @@ provider compatibility.
 | Protocol | Exact structured evidence used | Canonical fact and policy boundary |
 |---|---|---|
 | OpenAI-compatible Chat / OpenAI Responses | OpenAI documents authentication, temporary rate limits, credit balance, organization/project spend, usage limits, server errors, and `response.failed` `server_error` fields | Explicit billing/spend/usage codes map to `authorization`; explicit transient rate codes map to `rate_limit`; unknown 429 remains `unknown` |
-| Anthropic Messages | `error.type` values such as `authentication_error`, `billing_error`, `permission_error`, `invalid_request_error`, `request_too_large`, `api_error`, `timeout_error`, and `overloaded_error` | `not_found_error` remains a generic resource/endpoint 404; ambiguous `rate_limit_error` remains `unknown` because the official contract also covers spend caps |
-| Gemini Generate Content | `error.status` / ErrorInfo reasons such as `API_KEY_INVALID`, `INVALID_ARGUMENT`, `FAILED_PRECONDITION`, `PERMISSION_DENIED`, `RESOURCE_EXHAUSTED`, `INTERNAL`, `UNAVAILABLE`, and `DEADLINE_EXCEEDED` | `RESOURCE_EXHAUSTED` remains `unknown` because the official contract combines rate and spend/quota cases |
+| Anthropic Messages | `error.type` values such as `authentication_error`, `billing_error`, `permission_error`, `invalid_request_error`, `request_too_large`, `rate_limit_error`, `api_error`, `timeout_error`, and `overloaded_error` | `billing_error` maps to `authorization`; `rate_limit_error` maps to `rate_limit` and preserves the documented `Retry-After` response hint; `not_found_error` remains a generic resource/endpoint 404 |
+| Gemini Generate Content | `error.status` / ErrorInfo reasons such as `API_KEY_INVALID`, `INVALID_ARGUMENT`, `FAILED_PRECONDITION`, `PERMISSION_DENIED`, `RESOURCE_EXHAUSTED`, `INTERNAL`, `UNAVAILABLE`, and `DEADLINE_EXCEEDED` | `RESOURCE_EXHAUSTED` is the documented 429 rate-limit fact for RPM/TPM/RPD/spend dimensions and maps to `rate_limit`; the bounded policy retries without counting it toward the circuit |
 | Gemini Interactions | `error.code` values including `authentication`, `permission_denied`, `model_not_found`, `not_found`, `rate_limit_exceeded`, `quota_exceeded`, `api_error`, `service_unavailable`, and `deadline_exceeded` | Explicit rate, quota, and model codes receive separate facts; future codes remain `unknown` |
 
 Primary references: [OpenAI error codes](https://developers.openai.com/api/docs/guides/error-codes),
 [OpenAI rate limits](https://developers.openai.com/api/docs/guides/rate-limits),
 [OpenAI Responses streaming](https://platform.openai.com/docs/api-reference/responses-streaming/response/refusal/delta),
 [Anthropic API errors](https://platform.claude.com/docs/en/api/errors),
+[Anthropic rate limits](https://platform.claude.com/docs/en/api/rate-limits),
 [Gemini Generate Content API errors](https://ai.google.dev/gemini-api/docs/generate-content/api-errors),
+[Gemini rate limits](https://ai.google.dev/gemini-api/docs/rate-limits),
 and [Gemini API errors](https://ai.google.dev/gemini-api/docs/api-errors).
 
 ## Circuit and configuration semantics

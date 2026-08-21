@@ -897,8 +897,11 @@ request 不故障转移，protocol 使用明确的保守策略。第一个模型
 failover。`consecutive_failures` 表示自上次成功或不计入熔断的失败后，连续的、输出前且
 有资格计入熔断的失败数。`ProviderHealth.last_failure_kind` 以及失败事件可选的
 `failure_kind`/`status_code` 字段提供稳定且有界的事实，同时保留兼容性的
-`last_error_type` 和原有事件字段。离线 fixtures 只覆盖列出的官方 envelope，不宣称完整
-Provider 兼容或 live 验证。详见 [ADR 0126](adr/0126-provider-typed-failure-taxonomy.md)。
+`last_error_type` 和原有事件字段。协议专属的 Anthropic `rate_limit_error` 和 Gemini
+Generate Content `RESOURCE_EXHAUSTED` envelope 是明确的 rate-limit 事实；Anthropic
+`billing_error` 仍是 authorization，未结构化或未来的通用 429 仍是 unknown。离线
+fixtures 只覆盖列出的官方 envelope，不宣称完整 Provider 兼容或 live 验证。详见
+[ADR 0126](adr/0126-provider-typed-failure-taxonomy.md)。
 
 每个 profile 还会在构造适配器时解析一个 `HttpClientPolicy`。环境模式把标准代理/证书
 环境变量交给 HTTPX；直连模式关闭 HTTPX 环境信任；显式模式从指定环境变量读取一个

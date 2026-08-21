@@ -1307,7 +1307,10 @@ number of consecutive pre-output circuit-eligible failures since the last
 success or circuit-ineligible failure. `ProviderHealth.last_failure_kind` and
 the optional `failure_kind`/`status_code` fields on attempt events expose
 stable bounded facts while retaining `last_error_type` and the original event
-fields for compatibility. Offline fixtures cover the listed official
+fields for compatibility. The protocol-owned Anthropic `rate_limit_error` and
+Gemini Generate Content `RESOURCE_EXHAUSTED` envelopes are explicit rate-limit
+facts; Anthropic `billing_error` remains authorization, and an unstructured or
+future generic 429 remains unknown. Offline fixtures cover the listed official
 envelopes; this does not claim full provider compatibility or live validation.
 See [ADR 0126](adr/0126-provider-typed-failure-taxonomy.md).
 
