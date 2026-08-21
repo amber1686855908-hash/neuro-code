@@ -544,7 +544,10 @@ class PermissionTests(unittest.TestCase):
             )
             self.assertFalse(plan.targets[0].is_primary_workspace)
             self.assertEqual(plan.targets[0].additional_workspace_root, extra.resolve())
-            self.assertEqual(plan.targets[0].policy_path, str(extra_target.resolve()))
+            expected_policy_path = os.path.normcase(os.fspath(extra_target.resolve())).replace(
+                "\\", "/"
+            )
+            self.assertEqual(plan.targets[0].policy_path, expected_policy_path)
             with self.assertRaises(ToolError):
                 resolve_filesystem_access_targets(
                     "read_file",
