@@ -189,6 +189,12 @@ class OpenAICompatibleProviderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(kimi_body["reasoning_effort"], "max")
         self.assertEqual(kimi_body["messages"][1]["reasoning_content"], "preserve this reasoning")
 
+        max_context = ModelContext(
+            context.items,
+            reasoning_effort=ReasoningEffort.MAX,
+        )
+        self.assertEqual(kimi._request_body(max_context, (tool,))["reasoning_effort"], "max")
+
         glm = OpenAICompatibleProvider(
             model="glm-5.3",
             base_url="https://open.bigmodel.cn/api/paas/v4",

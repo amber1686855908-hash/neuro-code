@@ -16,6 +16,7 @@ class ReasoningEffort(StrEnum):
     MEDIUM = "medium"
     HIGH = "high"
     XHIGH = "xhigh"
+    MAX = "max"
     ULTRACODE = "ultracode"
 
     @property
@@ -25,6 +26,7 @@ class ReasoningEffort(StrEnum):
             ReasoningEffort.MEDIUM: "◐",
             ReasoningEffort.HIGH: "●",
             ReasoningEffort.XHIGH: "⬤",
+            ReasoningEffort.MAX: "◆",
             ReasoningEffort.ULTRACODE: "⚡",
         }[self]
 
@@ -35,7 +37,7 @@ class ReasoningEffort(StrEnum):
         返回所请求等级实际实现的策略深度."""
 
         if self is ReasoningEffort.ULTRACODE:
-            return ReasoningEffort.XHIGH
+            return ReasoningEffort.MAX
         return self
 
     @property
@@ -62,6 +64,12 @@ _GUIDANCE = {
         "assumptions, perform multiple validation passes, and reconcile conflicting "
         "evidence before concluding."
     ),
+    ReasoningEffort.MAX: (
+        "Use maximum ordinary single-agent review depth: trace all relevant dependencies, "
+        "inspect adversarial edge cases, challenge every plausible explanation, and run "
+        "broad but bounded verification. Exhaust the relevant single-agent investigation "
+        "before concluding; do not start child agents or claim workflow orchestration."
+    ),
 }
 
 
@@ -75,7 +83,7 @@ def reasoning_guidance(effort: ReasoningEffort) -> str:
     if effort is ReasoningEffort.ULTRACODE:
         return (
             f"{guidance} Ultracode workflow orchestration is not available in this "
-            "runtime yet; use the extra-high policy only and do not claim that sub-agent "
+            "runtime yet; use the maximum ordinary single-agent policy only and do not claim that sub-agent "
             "workflows were started."
         )
     return guidance

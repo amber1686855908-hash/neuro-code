@@ -254,10 +254,10 @@ configured, the bar shows the known token use without inventing a percentage.
 Managed provider details expose this local capability field so every configured
 model can supply its own real denominator. When a requested effort has a different
 implemented policy, the status projection shows both values, for example
-`ultracode → xhigh`. Its text updates with the selected UI language.
+`ultracode → max`. Its text updates with the selected UI language.
 
 Typing `/` shows command syntax and parameter hints. The suggestions include
-the five effort values, four modes, and currently selectable provider profile names; free
+the six effort values, four modes, and currently selectable provider profile names; free
 text commands display placeholders such as `SESSION_ID`, `QUERY`, and `TITLE`.
 `Tab` applies the first valid completion while ordinary prompt text and modal
 focus traversal retain their normal behavior.
@@ -297,7 +297,7 @@ redirect its stored key to another endpoint. The storage port is replaceable
 by a future OS-keychain adapter; the current credential file is not encrypted
 at rest.
 
-Use `Ctrl+E`, bare `/effort`, or bare `/reasoning` to open the five-level effort
+Use `Ctrl+E`, bare `/effort`, or bare `/reasoning` to open the six-level effort
 picker. `/effort LEVEL` and `/reasoning LEVEL` select directly, and `--effort
 LEVEL` selects a level for an interactive launch or headless run. A TUI change
 is saved as a user preference and is reapplied after a later launch, profile
@@ -312,15 +312,16 @@ turn is active and applies from the next model step.
 | `medium` | ◐ | Routine inspection, self-review, and focused verification |
 | `high` | ● | Deeper investigation and proactive regression checks; the default |
 | `xhigh` | ⬤ | Difficult edge cases, challenged assumptions, and multiple validation passes |
-| `ultracode` | ⚡ | Currently uses the `xhigh` policy; workflow orchestration is not implemented |
+| `max` | ◆ | Maximum ordinary single-agent depth with broad but bounded verification |
+| `ultracode` | ⚡ | Currently uses the `max` policy; workflow orchestration is not implemented |
 
 These levels are currently Neuro Code review policies, not claims about a
 provider's private reasoning controls. For every model request, the runtime
 adds non-persistent policy guidance and carries the typed requested value in
-`ModelContext`. Provider adapters do not blindly translate it into proprietary
-API parameters; any future native mapping must be explicit and
-capability-gated. Selecting `ultracode` does not start sub-agents and explicitly
-reports its `xhigh` fallback. See
+`ModelContext`. Explicit Kimi K3 and GLM 5.3/5.2 dialect mappings may send the
+configured native `max` value; other dialects omit a native effort field while
+retaining the application guidance. Selecting `ultracode` does not start
+sub-agents and explicitly reports its `max` fallback. See
 [ADR 0027](adr/0027-semantic-tui-and-application-reasoning-effort.md).
 
 Ordinary Agent execution uses the `normal` budget profile by default (48 model

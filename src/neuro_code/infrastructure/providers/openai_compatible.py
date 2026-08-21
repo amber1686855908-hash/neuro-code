@@ -429,6 +429,7 @@ class OpenAICompatibleProvider:
                     "medium": "high",
                     "high": "high",
                     "xhigh": "max",
+                    "max": "max",
                 }[effort]
             elif model in {"kimi-k2.7-code", "kimi-k2.7-code-highspeed", "kimi-k2.6"}:
                 body["thinking"] = {"type": "enabled", "keep": "all"}
@@ -454,6 +455,7 @@ class OpenAICompatibleProvider:
                     "medium": "high",
                     "high": "high",
                     "xhigh": "max",
+                    "max": "max",
                 }[self._effort_name(context.reasoning_effort)]
             elif model == "glm-5.2":
                 body["reasoning_effort"] = {
@@ -461,6 +463,7 @@ class OpenAICompatibleProvider:
                     "medium": "high",
                     "high": "high",
                     "xhigh": "max",
+                    "max": "max",
                 }[self._effort_name(context.reasoning_effort)]
         elif self._dialect == "minimax":
             body["max_completion_tokens"] = body.pop("max_tokens")

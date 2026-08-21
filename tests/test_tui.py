@@ -3160,7 +3160,9 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("\N{SINGLE RIGHT-POINTING ANGLE QUOTATION MARK}", current_text)
             self.assertIn("✓", current_text)
             self.assertFalse(any(effort.glyph in current_text for effort in ReasoningEffort))
-            ultracode = app.screen.query_one("#effort-choice-4", Button)
+            max_effort = app.screen.query_one("#effort-choice-4", Button)
+            self.assertIn("maximum", rendered_text(app, max_effort.render(), width=72).lower())
+            ultracode = app.screen.query_one("#effort-choice-5", Button)
             ultracode_segments = list(
                 app.console.render(ultracode.render(), app.console.options.update(width=72))
             )
@@ -3168,17 +3170,17 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
                 segment for segment in ultracode_segments if "coming soon" in segment.text
             )
             self.assertIn(TEXT_DISABLED.lower(), str(coming_soon.style).lower())
-            clicked = await pilot.click("#effort-choice-3")
+            clicked = await pilot.click("#effort-choice-4")
             self.assertTrue(clicked)
             for _ in range(20):
                 await pilot.pause(0.01)
                 if profiles.effort_selections:
                     break
 
-            self.assertEqual(profiles.effort_selections, [ReasoningEffort.XHIGH])
-            self.assertEqual(preferences.saved_efforts, [ReasoningEffort.XHIGH])
+            self.assertEqual(profiles.effort_selections, [ReasoningEffort.MAX])
+            self.assertEqual(preferences.saved_efforts, [ReasoningEffort.MAX])
             self.assertIn(
-                "xhigh",
+                "max",
                 rendered_text(app, app.query_one("#runtime-primary", Static).renderable),
             )
 
@@ -3189,14 +3191,14 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(profiles.effort_selections[-1], ReasoningEffort.ULTRACODE)
             self.assertIn("workflow orchestration is not implemented", app.entries[-1].text)
             self.assertIn(
-                "ultracode → xhigh",
+                "ultracode → max",
                 rendered_text(app, app.query_one("#runtime-primary", Static).renderable),
             )
 
             prompt.value = "/status"
             await pilot.press("enter")
             await pilot.pause()
-            self.assertIn("Effort: ⚡ ultracode → ⬤ xhigh", app.entries[-1].text)
+            self.assertIn("Effort: ⚡ ultracode → ◆ max", app.entries[-1].text)
 
     async def test_effort_validation_and_running_turn_guard_do_not_change_policy(self) -> None:
         runner = CancellableTuiConversation()
