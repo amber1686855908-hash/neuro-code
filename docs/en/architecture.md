@@ -533,7 +533,9 @@ call. The tool adapter extracts every target from the validated tool grammar,
 then `resolve_filesystem_access_targets()` canonicalizes each local path before
 permission evaluation. Each target records its canonical path, owning primary or
 additional workspace root, policy path, operation, existence state, and link-like
-component proof. The raw spelling remains diagnostic only.
+component proof. Primary roots use workspace-relative POSIX-style policy paths;
+additional roots use absolute canonical policy paths normalized with platform case
+rules and forward slashes. The raw spelling remains diagnostic only.
 
 The authority chain is deliberately ordered:
 
