@@ -1044,6 +1044,31 @@ bounded UTF-8 size and control characters. Invalid owner results or aliases
 fail closed without changing valid wire responses. See
 [ADR 0082](adr/0082-fail-closed-acp-subagent-lifecycle-projection.md).
 
+## Subagent capability closure
+
+The canonical parent authority for every production child-runtime creation
+path is the actual `ConversationBinding.capabilities` manifest. The headless
+CLI opens a parent binding before starting its explicit child; TUI reads the
+active binding; and the private ACP child extension requires an active parent
+binding. Missing metadata fails closed. The composition-owned global policy is
+shared by the scheduler and explicit service.
+
+The explicit read-only workflow treats
+`READ_ONLY_SUBAGENT_TOOL_NAMES` as a requested capability only. It resolves
+`parent ∩ requested ∩ global_policy` through
+`SubagentCapabilitySet.resolve_child()` before creating the child task or
+binding, passes that exact manifest into the factory and
+`ApplicationComposition.create_binding(capabilities=...)`, and verifies the
+runtime fingerprint. This prevents a restricted child from regaining root
+workspace roots, tools, sandbox strength, MCP, terminal, or network authority.
+The legacy arbitrary `SubagentExecutor` binding remains only as a marked
+test/internal compatibility seam and is rejected by the normal composition
+boundary. Subagent relationship `resume`, `fork`, and `delete` do not recreate
+a runtime; a normal ACP fork is an independent session binding. This closure
+proves only `child capability <= actual parent capability`, not the complete
+permission, workspace, sandbox, MCP, provider-transport, or agent-security
+system. See [ADR 0125](adr/0125-subagent-capability-closure.md).
+
 `ProfileConversationController` in
 `neuro_code.application.sessions.profile_conversation` wraps the active
 `AgentConversation` for the interactive composition. The former

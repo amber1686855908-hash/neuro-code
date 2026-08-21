@@ -102,7 +102,10 @@ from neuro_code.application.workflows.subagent import (
     SubagentExecutionService,
     SubagentExecutorFactory,
 )
-from neuro_code.application.workflows.subagent_capabilities import SubagentCapabilitySet
+from neuro_code.application.workflows.subagent_capabilities import (
+    MAX_SUBAGENT_CAPABILITY_STEPS,
+    SubagentCapabilitySet,
+)
 from neuro_code.application.workflows.subagent_scheduler import (
     MAX_SUBAGENT_PARALLELISM,
     ScopedSubagentRuntimeFactory,
@@ -936,19 +939,46 @@ class ApplicationComposition:
     def bind_subagent_executor(
         self,
         executor_factory: SubagentExecutorFactory,
+        *,
+        _test_only: bool = False,
     ) -> SubagentExecutionService:
-        """Bind an explicit subagent executor to the durable task lifecycle.
+        """Bind the legacy executor seam for tests/internal compatibility only.
 
-        The executor remains responsible for creating an isolated runtime and
-        selecting its capabilities.  Composition only supplies the shared
-        session store; it does not enable automatic scheduling.
+        This seam accepts an arbitrary executor and therefore is not a
+        capability boundary.  Normal production entrypoints must use the
+        capability-aware read-only service or scheduler.  The explicit flag
+        keeps the compatibility API available without presenting it as a
+        production security guarantee.
 
-        将明确的子代理执行器绑定到持久任务生命周期.
-        执行器仍负责创建隔离运行时并选择能力,组合根只提供共享会话存储,
-        不会启用自动调度.
+        仅为测试/内部兼容绑定旧版执行器接缝. 该接缝接受任意执行器,因此不是 capability
+        边界.正常生产入口必须使用 capability-aware 只读服务或 scheduler.
         """
 
+        if _test_only is not True:
+            raise ConfigurationError("legacy subagent executor binding is test-only")
         return SubagentExecutionService(self.store, executor_factory)
+
+    def subagent_global_policy(self) -> SubagentCapabilitySet:
+        """Return the one composition-owned child capability ceiling.
+
+        The parent binding remains the primary authority.  This manifest is
+        only the process-wide ceiling used by both the canonical scheduler and
+        the explicit read-only workflow.
+        """
+
+        config = self.config
+        tools = default_tool_registry(
+            config.sandbox_profile,
+            enable_background_tasks=True,
+        )
+        return SubagentCapabilitySet.from_runtime(
+            tool_names=tools.names(),
+            provider_tool_names=config.provider.builtin_tools,
+            cwd=config.cwd,
+            sandbox_profile=config.sandbox_profile,
+            enable_background_tasks=True,
+            max_steps=MAX_SUBAGENT_CAPABILITY_STEPS,
+        )
 
     def create_read_only_subagent_service(
         self,
@@ -968,9 +998,12 @@ class ApplicationComposition:
 
         from neuro_code.bootstrap.subagent import CompositionReadOnlySubagentRuntimeFactory
 
+        factory = CompositionReadOnlySubagentRuntimeFactory(self)
         return IsolatedSubagentExecutionService(
             self.store,
-            CompositionReadOnlySubagentRuntimeFactory(self),
+            factory,
+            global_policy=self.subagent_global_policy(),
+            requested_capability_factory=factory.requested_capabilities,
             timeout_seconds=timeout_seconds,
         )
 
@@ -998,13 +1031,14 @@ class ApplicationComposition:
             parent_capabilities = parent_binding.capabilities
         if parent_capabilities is None:
             raise ConfigurationError("parent subagent capability metadata is required")
-        if global_policy is None:
-            raise ConfigurationError("global subagent capability policy is required")
+        owned_global_policy = self.subagent_global_policy()
+        if global_policy is not None and global_policy != owned_global_policy:
+            raise ConfigurationError("global subagent capability policy is not composition-owned")
 
         return SubagentScheduler(
             factory,
             parent_capabilities=parent_capabilities,
-            global_policy=global_policy,
+            global_policy=owned_global_policy,
             max_parallel=max_parallel,
             max_retries=max_retries,
             timeout_seconds=timeout_seconds,

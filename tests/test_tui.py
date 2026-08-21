@@ -77,6 +77,7 @@ from neuro_code.application.workflows import (
     RunSubagentRequest,
     SubagentResultProjection,
 )
+from neuro_code.application.workflows.subagent_capabilities import SubagentCapabilitySet
 from neuro_code.domain.background_tasks import (
     BackgroundTaskSnapshot,
     BackgroundTaskStatus,
@@ -1132,12 +1133,29 @@ class FailingTaskTuiController:
         del state
 
 
+def _tui_parent_capability() -> SubagentCapabilitySet:
+    return SubagentCapabilitySet.from_runtime(
+        tool_names=("read_file",),
+        cwd=Path("/workspace"),
+        sandbox_profile=SandboxProfile.OFF,
+        enable_background_tasks=False,
+        max_steps=8,
+    )
+
+
 class ReadOnlySubagentTuiService:
     def __init__(self, projection: SubagentResultProjection) -> None:
         self.projection = projection
         self.requests: list[RunSubagentRequest] = []
 
-    async def run_subagent(self, request: RunSubagentRequest) -> SubagentResultProjection:
+    async def run_subagent(
+        self,
+        request: RunSubagentRequest,
+        *,
+        parent_capabilities: SubagentCapabilitySet,
+    ) -> SubagentResultProjection:
+        if not isinstance(parent_capabilities, SubagentCapabilitySet):
+            raise AssertionError("fixture parent capability is missing")
         self.requests.append(request)
         return self.projection
 
@@ -4527,6 +4545,7 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
         app = NeuroCodeApp(
             runner,
             read_only_subagent_service=cast(ReadOnlySubagentApplicationService, service),
+            subagent_parent_capability_provider=_tui_parent_capability,
             provider_name="fixture",
             model_name="fixture-model",
             cwd=Path("/workspace"),

@@ -105,6 +105,7 @@ from neuro_code.application.workflows.subagent import (
     ReadOnlySubagentApplicationService,
     RunSubagentRequest,
 )
+from neuro_code.application.workflows.subagent_capabilities import SubagentCapabilitySet
 from neuro_code.configuration.app import resolve_http_client_policy
 from neuro_code.domain.background_tasks.models import (
     BackgroundTaskSnapshot,
@@ -148,7 +149,7 @@ from neuro_code.interfaces.tui.tool_activity.renderers import (
     bounded_inline,
     safe_tool_text,
 )
-from neuro_code.shared.errors import ProviderError
+from neuro_code.shared.errors import ConfigurationError, ProviderError
 from neuro_code.shared.redaction import redact_sensitive_text
 from neuro_code.shared.ui_language import UiLanguage
 from neuro_code.tui_commands import SlashCompletion, slash_completions
@@ -3865,6 +3866,7 @@ class NeuroCodeApp(App[None]):
         execution_record: SessionExecutionRecord | None = None,
         tool_output_artifact_service: SessionToolOutputArtifactApplicationService | None = None,
         read_only_subagent_service: ReadOnlySubagentApplicationService | None = None,
+        subagent_parent_capability_provider: Callable[[], SubagentCapabilitySet] | None = None,
         subagent_relationship_query: SubagentRelationshipQueryController | None = None,
         subagent_relationship_lifecycle: SubagentRelationshipLifecycleController | None = None,
         provider_name: str,
@@ -3958,6 +3960,7 @@ class NeuroCodeApp(App[None]):
         self._initial_items = tuple(initial_items)
         self._tool_output_artifact_service = tool_output_artifact_service
         self._read_only_subagent_service = read_only_subagent_service
+        self._subagent_parent_capability_provider = subagent_parent_capability_provider
         self._subagent_relationship_query = subagent_relationship_query
         self._subagent_relationship_lifecycle = subagent_relationship_lifecycle
         runner_record = getattr(runner, "execution_record", None)
@@ -5694,8 +5697,13 @@ class NeuroCodeApp(App[None]):
         if service is None:
             return
         try:
+            parent_capability_provider = self._subagent_parent_capability_provider
+            if parent_capability_provider is None:
+                raise ConfigurationError("active parent capability metadata is unavailable")
+            parent_capabilities = parent_capability_provider()
             projection = await service.run_subagent(
                 RunSubagentRequest(session_id, prompt),
+                parent_capabilities=parent_capabilities,
             )
         except asyncio.CancelledError:
             self._write_ui_entry("status", "subagent.cancelled")

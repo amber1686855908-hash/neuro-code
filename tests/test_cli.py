@@ -48,6 +48,7 @@ from neuro_code.application.workflows import (
     SubagentResultProjection,
 )
 from neuro_code.application.workflows.subagent import MAX_SUBAGENT_STEPS
+from neuro_code.application.workflows.subagent_capabilities import SubagentCapabilitySet
 from neuro_code.bootstrap.entrypoints import main
 from neuro_code.cli import (
     _application_settings,
@@ -244,7 +245,14 @@ class CliSubagentServiceFixture:
         self.projection = projection
         self.requests: list[RunSubagentRequest] = []
 
-    async def run_subagent(self, request: RunSubagentRequest) -> SubagentResultProjection:
+    async def run_subagent(
+        self,
+        request: RunSubagentRequest,
+        *,
+        parent_capabilities: SubagentCapabilitySet,
+    ) -> SubagentResultProjection:
+        if not isinstance(parent_capabilities, SubagentCapabilitySet):
+            raise AssertionError("fixture parent capability is missing")
         self.requests.append(request)
         return self.projection
 
@@ -253,10 +261,29 @@ class CliSubagentApplicationFixture:
     def __init__(self, projection: SubagentResultProjection) -> None:
         self.subagent_service = CliSubagentServiceFixture(projection)
         self.resume_checks: list[str] = []
+        self.config = cast(AppConfig, object())
+        self.parent_capabilities = SubagentCapabilitySet.from_runtime(
+            tool_names=("read_file",),
+            cwd=Path("/workspace"),
+            sandbox_profile=SandboxProfile.OFF,
+            enable_background_tasks=False,
+            max_steps=8,
+        )
+        self.binding_calls: list[tuple[AppConfig, str | None]] = []
         self.close_calls = 0
 
-    async def config_for_session_resume(self, session_id: str) -> None:
+    async def config_for_session_resume(self, session_id: str) -> AppConfig:
         self.resume_checks.append(session_id)
+        return self.config
+
+    async def create_binding(
+        self,
+        *,
+        config: AppConfig,
+        resume_id: str | None = None,
+    ) -> SimpleNamespace:
+        self.binding_calls.append((config, resume_id))
+        return SimpleNamespace(capabilities=self.parent_capabilities, background_tasks=None)
 
     def create_read_only_subagent_application_service(
         self,
@@ -1413,6 +1440,7 @@ api_key_env = "FIXTURE_KEY"
                     managed_provider_settings: object,
                     tool_output_artifact_service: object,
                     read_only_subagent_service: object,
+                    subagent_parent_capability_provider: object,
                     subagent_relationship_query: object,
                     subagent_relationship_lifecycle: object,
                     language: UiLanguage,
@@ -1443,6 +1471,7 @@ api_key_env = "FIXTURE_KEY"
                         managed_provider_settings=managed_provider_settings,
                         tool_output_artifact_service=tool_output_artifact_service,
                         read_only_subagent_service=read_only_subagent_service,
+                        subagent_parent_capability_provider=subagent_parent_capability_provider,
                         subagent_relationship_query=subagent_relationship_query,
                         subagent_relationship_lifecycle=subagent_relationship_lifecycle,
                         language=language,
@@ -1645,6 +1674,7 @@ api_key_env = "FIXTURE_KEY"
                     managed_provider_settings: object,
                     tool_output_artifact_service: object,
                     read_only_subagent_service: object,
+                    subagent_parent_capability_provider: object,
                     subagent_relationship_query: object,
                     subagent_relationship_lifecycle: object,
                     language: UiLanguage,
@@ -1674,6 +1704,7 @@ api_key_env = "FIXTURE_KEY"
                         managed_provider_settings,
                         tool_output_artifact_service,
                         read_only_subagent_service,
+                        subagent_parent_capability_provider,
                         subagent_relationship_query,
                         subagent_relationship_lifecycle,
                         language,
@@ -1770,6 +1801,7 @@ api_key_env = "SECOND_KEY"
                     managed_provider_settings: object,
                     tool_output_artifact_service: object,
                     read_only_subagent_service: object,
+                    subagent_parent_capability_provider: object,
                     subagent_relationship_query: object,
                     subagent_relationship_lifecycle: object,
                     language: UiLanguage,
@@ -1795,6 +1827,7 @@ api_key_env = "SECOND_KEY"
                         managed_provider_settings,
                         tool_output_artifact_service,
                         read_only_subagent_service,
+                        subagent_parent_capability_provider,
                         subagent_relationship_query,
                         subagent_relationship_lifecycle,
                         language,
@@ -1938,6 +1971,7 @@ api_key_env = "SECOND_KEY"
                     managed_provider_settings: object,
                     tool_output_artifact_service: object,
                     read_only_subagent_service: object,
+                    subagent_parent_capability_provider: object,
                     subagent_relationship_query: object,
                     subagent_relationship_lifecycle: object,
                     language: UiLanguage,
@@ -1959,6 +1993,7 @@ api_key_env = "SECOND_KEY"
                         managed_provider_settings,
                         tool_output_artifact_service,
                         read_only_subagent_service,
+                        subagent_parent_capability_provider,
                         subagent_relationship_query,
                         subagent_relationship_lifecycle,
                         plan_controller,

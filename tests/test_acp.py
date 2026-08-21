@@ -119,6 +119,7 @@ from neuro_code.application.workflows import (
     RunSubagentRequest,
     SubagentResultProjection,
 )
+from neuro_code.application.workflows.subagent_capabilities import SubagentCapabilitySet
 from neuro_code.bootstrap.composition import ApplicationComposition
 from neuro_code.bootstrap.entrypoints import BootstrapCliServices
 from neuro_code.configuration.app import AppConfig, ProviderProfile
@@ -579,7 +580,14 @@ class ReadOnlySubagentServiceFixture:
         self.projection = projection
         self.requests: list[RunSubagentRequest] = []
 
-    async def run_subagent(self, request: RunSubagentRequest) -> SubagentResultProjection:
+    async def run_subagent(
+        self,
+        request: RunSubagentRequest,
+        *,
+        parent_capabilities: SubagentCapabilitySet,
+    ) -> SubagentResultProjection:
+        if not isinstance(parent_capabilities, SubagentCapabilitySet):
+            raise AssertionError("fixture parent capability is missing")
         self.requests.append(request)
         return self.projection
 
@@ -640,6 +648,13 @@ class ApplicationFixture:
         self.artifact_service: SessionToolOutputArtifactApplicationService | None = None
         self.subagent_service: ReadOnlySubagentServiceFixture | None = None
         self.subagent_lifecycle_service: SubagentRelationshipLifecycleController | None = None
+        self.parent_capabilities = SubagentCapabilitySet.from_runtime(
+            tool_names=("read_file",),
+            cwd=self.config.cwd,
+            sandbox_profile=self.config.sandbox_profile,
+            enable_background_tasks=False,
+            max_steps=8,
+        )
 
     async def config_for_session_resume(self, session_id: str) -> AppConfig:
         del session_id
@@ -695,6 +710,7 @@ class ApplicationFixture:
             runner,
             cast(ModelProvider, ProviderFixture()),
             cast(Any, background),
+            self.parent_capabilities,
         )
 
 
@@ -947,6 +963,16 @@ async def initialized_subagent_agent(
     client = AcpClientFixture()
     agent.on_connect(cast(Client, client))
     await agent.initialize(1, ClientCapabilities(terminal=True))
+    application._runners.append(RunnerFixture(session_id="subagent-internal"))
+    binding = await application.create_binding(resume_id="subagent-internal")
+    agent._sessions["acp-subagent"] = acp_module._AcpSession(
+        session_id="acp-subagent",
+        binding=binding,
+        approvals=cast(Any, object()),
+        context_window_tokens=None,
+        mcp_tools=None,
+        internal_session_id="subagent-internal",
+    )
     return agent, application, subagent_service
 
 

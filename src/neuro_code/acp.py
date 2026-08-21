@@ -2956,11 +2956,21 @@ class NeuroCodeAcpAgent:
             external_session_id = _validated_session_id(subagent_query.session_id)
             if not self._service.read_only_subagent_available:
                 raise RequestError.internal_error({"reason": "subagent_unavailable"})
+            # A persisted session summary is not an authorization manifest.
+            # The explicit child may run only while its actual ACP parent
+            # binding is active and can supply immutable capability metadata.
+            parent_session = await self._active_session(external_session_id)
+            async with parent_session.state_lock:
+                parent_binding = parent_session.binding
+                if parent_binding is None or parent_binding.capabilities is None:
+                    raise RequestError.internal_error({"reason": "parent_capability_unavailable"})
+                parent_capabilities = parent_binding.capabilities
             internal_session_id = await self._artifact_internal_session_id(external_session_id)
             try:
                 projection = await self._service.run_read_only_subagent(
                     internal_session_id,
                     subagent_query.prompt,
+                    parent_capabilities=parent_capabilities,
                     max_steps=subagent_query.max_steps,
                 )
             except SessionError:

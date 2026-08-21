@@ -54,6 +54,7 @@ from neuro_code.application.sessions.service import (
 )
 from neuro_code.application.settings import ApplicationSettings
 from neuro_code.application.tools.service import SessionToolOutputArtifactApplicationService
+from neuro_code.application.workflows.subagent_capabilities import SubagentCapabilitySet
 from neuro_code.bootstrap.composition import ApplicationComposition
 from neuro_code.configuration.app import AppConfig, load_config, override_provider
 from neuro_code.domain.conversation.interaction_mode import InteractionMode
@@ -754,6 +755,12 @@ class BootstrapCliServices:
                 subagent_relationship_lifecycle = (
                     application.create_subagent_relationship_lifecycle_service()
                 )
+
+                def subagent_parent_capability_provider(
+                    controller_: ProfileConversationController = controller,
+                ) -> SubagentCapabilitySet:
+                    return controller_.capabilities
+
                 app = NeuroCodeApp(
                     controller,
                     turn_service=turn_service,
@@ -771,6 +778,7 @@ class BootstrapCliServices:
                     queued_plan_execution_service=queued_plan_execution_service,
                     tool_output_artifact_service=tool_output_artifact_service,
                     read_only_subagent_service=read_only_subagent_service,
+                    subagent_parent_capability_provider=subagent_parent_capability_provider,
                     subagent_relationship_query=subagent_relationship_query,
                     subagent_relationship_lifecycle=subagent_relationship_lifecycle,
                     ui_preferences=ui_preferences,

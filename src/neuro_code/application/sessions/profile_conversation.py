@@ -31,6 +31,7 @@ from neuro_code.application.sessions.contracts import (
     SessionOption,
     SessionSelectionResult,
 )
+from neuro_code.application.workflows.subagent_capabilities import SubagentCapabilitySet
 from neuro_code.domain.background_tasks.models import (
     BackgroundTaskSnapshot,
     BackgroundTaskStatus,
@@ -121,6 +122,15 @@ class ProfileConversationController:
     @property
     def model_name(self) -> str:
         return self._binding.provider.model_name
+
+    @property
+    def capabilities(self) -> SubagentCapabilitySet:
+        """Return the immutable capability manifest of the active binding."""
+
+        capabilities = self._binding.capabilities
+        if capabilities is None:
+            raise ConfigurationError("active binding capability metadata is missing")
+        return capabilities
 
     @property
     def reasoning_effort(self) -> ReasoningEffort:

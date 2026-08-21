@@ -1154,6 +1154,23 @@ ACP 命名空间再次解析每个已分配的 alias。不可用、无法解析�
 子代理执行、schema、ACP 标准 capability 或明确的单子会话只读边界。详见
 [ADR 0083](adr/0083-acp-subagent-alias-reconnect-compatibility.md)。
 
+## 子代理 capability 闭包
+
+所有生产 child-runtime 构造路径的 canonical parent authority 都是实际
+`ConversationBinding.capabilities` manifest。无头 CLI 会在启动显式 child 前打开 parent binding；TUI
+读取活动 binding；私有 ACP child 扩展要求活动 parent binding。缺少 metadata 时失败关闭。Scheduler 和
+显式服务共用由 composition 拥有的 global policy。
+
+显式只读工作流把 `READ_ONLY_SUBAGENT_TOOL_NAMES` 只当作 requested capability。它会在创建 child task 或
+binding 前通过 `SubagentCapabilitySet.resolve_child()` 解析
+`parent ∩ requested ∩ global_policy`，把同一个 manifest 传给 factory 和
+`ApplicationComposition.create_binding(capabilities=...)`，并校验 runtime fingerprint。这阻止受限 child
+恢复 root 工作区、工具、沙箱强度、MCP、terminal 或 network authority。旧版任意
+`SubagentExecutor` binding 只作为明确标记的测试/内部兼容接缝保留，普通 composition 边界会拒绝它。子代理
+关系的 `resume`、`fork` 和 `delete` 不会重新构造 Runtime；普通 ACP fork 是独立的 session binding。本闭包
+只证明 `child capability <= actual parent capability`，不等于完整证明 Permission、Workspace、Sandbox、MCP、
+Provider transport 或整个 Agent security system。详见 [ADR 0125](adr/0125-subagent-capability-closure.md)。
+
 ## Stage5DD 确定性上下文压缩评估
 
 `neuro_code.application.memory.compaction` 是类型化 `ContextCompactionPlanner`、

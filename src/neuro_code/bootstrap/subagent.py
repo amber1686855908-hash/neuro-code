@@ -22,7 +22,10 @@ from neuro_code.application.workflows.subagent import (
     IsolatedSubagentRuntimeFactory,
     RunSubagentRequest,
 )
-from neuro_code.application.workflows.subagent_capabilities import SubagentCapabilitySet
+from neuro_code.application.workflows.subagent_capabilities import (
+    NetworkAccess,
+    SubagentCapabilitySet,
+)
 from neuro_code.bootstrap.composition import ApplicationComposition
 from neuro_code.shared.errors import ConfigurationError
 
@@ -96,21 +99,61 @@ class CompositionReadOnlySubagentRuntimeFactory(IsolatedSubagentRuntimeFactory):
     def __init__(self, composition: ApplicationComposition) -> None:
         self._composition = composition
 
+    def requested_capabilities(
+        self,
+        request: RunSubagentRequest,
+        *,
+        parent_capabilities: SubagentCapabilitySet,
+    ) -> SubagentCapabilitySet:
+        """Build a read-only request bounded by the actual parent manifest.
+
+        ``READ_ONLY_SUBAGENT_TOOL_NAMES`` is only a request policy.  The
+        workflow resolves it against the parent and global manifests before
+        this factory is allowed to construct a binding.
+        """
+
+        if not isinstance(parent_capabilities, SubagentCapabilitySet):
+            raise ConfigurationError("parent subagent capability metadata is required")
+        tool_names = tuple(
+            name
+            for name in READ_ONLY_SUBAGENT_TOOL_NAMES
+            if name in parent_capabilities.allowed_tool_names
+        )
+        return SubagentCapabilitySet.from_runtime(
+            tool_names=tool_names,
+            cwd=parent_capabilities.cwd,
+            additional_workspace_roots=parent_capabilities.workspace_roots[1:],
+            sandbox_profile=parent_capabilities.sandbox_profile,
+            enable_background_tasks=False,
+            max_steps=min(request.max_steps, parent_capabilities.max_steps),
+        )
+
     async def create(
         self,
         request: RunSubagentRequest,
         *,
         parent_task_id: str,
+        capabilities: SubagentCapabilitySet,
     ) -> IsolatedSubagentRuntime:
         if not parent_task_id:
             raise ValueError("parent task id must not be empty")
-        selected_config = _without_provider_builtin_tools(self._composition.config)
-        capabilities = SubagentCapabilitySet.from_runtime(
-            tool_names=READ_ONLY_SUBAGENT_TOOL_NAMES,
-            cwd=selected_config.cwd,
-            sandbox_profile=selected_config.sandbox_profile,
-            enable_background_tasks=False,
-            max_steps=request.max_steps,
+        if not isinstance(capabilities, SubagentCapabilitySet):
+            raise ConfigurationError("child capabilities must be canonical")
+        if (
+            not capabilities.allowed_tool_names.issubset(READ_ONLY_SUBAGENT_TOOL_NAMES)
+            or capabilities.filesystem_write
+            or capabilities.bash
+            or capabilities.terminal
+            or capabilities.background_tasks
+            or capabilities.mcp_tool_names
+            or capabilities.mcp_server_names
+            or capabilities.network_access is not NetworkAccess.NONE
+        ):
+            raise ConfigurationError("read-only subagent factory received an unsafe capability")
+        selected_config = replace(
+            _without_provider_builtin_tools(self._composition.config),
+            cwd=capabilities.cwd,
+            sandbox_profile=capabilities.sandbox_profile,
         )
         provider = selected_config.provider
         child_session_id = await self._composition.store.create_session(
@@ -124,6 +167,7 @@ class CompositionReadOnlySubagentRuntimeFactory(IsolatedSubagentRuntimeFactory):
             binding = await self._composition.create_binding(
                 config=selected_config,
                 resume_id=child_session_id,
+                additional_workspace_roots=capabilities.workspace_roots[1:],
                 capabilities=capabilities,
             )
         except BaseException:

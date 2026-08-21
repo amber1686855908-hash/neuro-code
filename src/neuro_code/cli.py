@@ -678,8 +678,16 @@ async def _run_subagent(args: argparse.Namespace, services: CliServices) -> int:
     """
 
     application = await services.open_application(_application_settings(args))
+    parent_binding = None
     try:
-        await application.config_for_session_resume(args.parent_session)
+        parent_config = await application.config_for_session_resume(args.parent_session)
+        parent_binding = await application.create_binding(
+            config=parent_config,
+            resume_id=args.parent_session,
+        )
+        parent_capabilities = parent_binding.capabilities
+        if parent_capabilities is None:
+            raise ConfigurationError("parent binding capability metadata is missing")
         try:
             request = RunSubagentRequest(
                 args.parent_session,
@@ -689,13 +697,18 @@ async def _run_subagent(args: argparse.Namespace, services: CliServices) -> int:
         except ValueError as error:
             raise ConfigurationError(str(error)) from None
         service = application.create_read_only_subagent_application_service()
-        projection = await service.run_subagent(request)
+        projection = await service.run_subagent(
+            request,
+            parent_capabilities=parent_capabilities,
+        )
         if args.json:
             print(json.dumps(serialize_subagent_result(projection), ensure_ascii=False))
         else:
             print(projection.response)
         return 0
     finally:
+        if parent_binding is not None and parent_binding.background_tasks is not None:
+            await asyncio.shield(parent_binding.background_tasks.shutdown())
         await asyncio.shield(application.close())
 
 
