@@ -20,6 +20,10 @@ from neuro_code.application.ports.user_interaction import (
     UserInteractionPort,
 )
 from neuro_code.application.ports.web_search import HostedWebSearchEventSink
+from neuro_code.application.ports.workspace import (
+    FilesystemAccessPlan,
+    FilesystemTargetProvider,
+)
 from neuro_code.application.ports.workspace_changes import WorkspaceChangeJournal
 from neuro_code.domain.sandbox.models import SandboxProfile
 from neuro_code.domain.tools import ToolDefinition, ToolExecutionMode, ToolResult
@@ -144,6 +148,11 @@ class ToolOutputArtifactReader(Protocol):
 class ToolContext:
     cwd: Path
     additional_workspace_roots: tuple[Path, ...] = ()
+    filesystem_access_plan: FilesystemAccessPlan | None = field(
+        default=None,
+        repr=False,
+        kw_only=True,
+    )
     output_byte_limit: int = 200_000
     command_timeout_seconds: float = 120.0
     termination_grace_seconds: float = 1.0
@@ -198,6 +207,7 @@ __all__ = [
     "MAX_TOOL_OUTPUT_ARTIFACT_BYTES",
     "MAX_TOOL_OUTPUT_ARTIFACT_READ_BYTES",
     "TOOL_OUTPUT_ARTIFACT_PRUNE_GRACE_SECONDS",
+    "FilesystemTargetProvider",
     "InteractionControlTool",
     "Tool",
     "ToolCollection",

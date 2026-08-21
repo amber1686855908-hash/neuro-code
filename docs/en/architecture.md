@@ -526,6 +526,40 @@ intermediate ancestors remain unique and `SkillTool` resolves them against
 one stable boundary. See
 [ADR 0044](adr/0044-repository-level-skill-discovery.md).
 
+## Canonical structured filesystem targets
+
+Structured local filesystem tools use one immutable `FilesystemAccessPlan` per
+call. The tool adapter extracts every target from the validated tool grammar,
+then `resolve_filesystem_access_targets()` canonicalizes each local path before
+permission evaluation. Each target records its canonical path, owning primary or
+additional workspace root, policy path, operation, existence state, and link-like
+component proof. The raw spelling remains diagnostic only.
+
+The authority chain is deliberately ordered:
+
+1. Resolve every target once, including all `apply_patch` source and destination
+   paths. Existing parents/ancestors are proven for missing create leaves, and
+   symlinks, junctions, Windows reparse traversal, parent escapes, and ambiguous
+   Windows device/extended/ADS namespaces are rejected.
+2. `PermissionManager.decide_targets()` evaluates every canonical target
+   independently. Explicit deny wins; an unresolved ask denies in headless mode;
+   a path-scoped allow is an allowlist. A structured call is allowed only when
+   every target is authorized.
+3. Tool execution receives the same immutable plan and consumes canonical target
+   entries by extraction index. It does not resolve the raw path again. A mixed
+   allowed/denied `apply_patch` therefore stops before journaling or mutation.
+
+This contract covers local structured tools: `read_file`, `read_files`, directory
+listing, glob/search, `search_replace`, and `apply_patch`. Workspace identity,
+permission, sandbox, and execution remain separate decisions; the plan does not
+turn arbitrary Bash path interpretation, MCP calls, delegated ACP execution, or
+opaque artifact handles into structured filesystem targets. ACP client paths stay
+under the separate client authority: Neuro Code performs only lexical session-root
+validation and never calls host `Path.resolve()`, existence, or link inspection for
+those remote paths. The plan closes the raw-path authority gap at the local
+structured tool boundary; it is not a blanket claim of race-free TOCTOU protection
+for every process or provider capability.
+
 ## Partial ACP v1 adapter
 
 `neuro-code acp` is a protocol adapter over `ApplicationComposition` and the
@@ -578,10 +612,10 @@ preserves the explicit sandbox boundary rather than adding late host mounts.
 
 When an ACP client explicitly advertises `fs.readTextFile`, a session receives
 a narrow `ClientFileSystem` application port bound to that ACP session. The
-existing `read_file` and `read_files` tools still resolve every path through the
-selected primary or additional workspace roots, then delegate each absolute path
-and its bounded line range to `fs/read_text_file`; they never fall back to an
-unadvertised client operation. The ACP filesystem capability does not expose a
+existing `read_file` and `read_files` tools apply only lexical session-root
+validation, then delegate the client-owned path and its bounded line range to
+`fs/read_text_file`; the host does not resolve or inspect that path and never
+falls back to a local operation. The ACP filesystem capability does not expose a
 directory walk or search operation, so `list_tree` and `grep_many` retain the
 same local workspace semantics as `list_dir` and `grep`. When the client
 advertises both text read and write, `search_replace`
@@ -1084,18 +1118,19 @@ metadata, and profile-affine context. See
 The controller also owns one process-local `ReasoningEffort` selection and
 serializes changes with turns. It reapplies the requested value whenever a
 profile or session replacement installs a new conversation binding. `low`,
-`medium`, `high`, and `xhigh` map to application review guidance;
-`ultracode` has an explicit effective value of `xhigh` until workflow
-orchestration exists. The TUI exposes the selection through `Ctrl+E`, `/effort`,
-and `/reasoning`; the CLI exposes `--effort`. Selection does not rewrite
-provider configuration or session identity.
+`medium`, `high`, `xhigh`, and `max` map to application review guidance;
+`max` is the deepest ordinary single-agent policy, and `ultracode` has an
+explicit effective value of `max` until workflow orchestration exists. The TUI
+exposes the selection through `Ctrl+E`, `/effort`, and `/reasoning`; the CLI
+exposes `--effort`. Selection does not rewrite provider configuration or session
+identity.
 
 At each model step, `AgentRuntime` adds the selected guidance to a request-only
 system message and places the typed requested value on `ModelContext`. The
 guidance is not added to canonical `SessionItem` history. Provider adapters may
-inspect the typed value, but the current adapters do not translate it into
-provider-private reasoning parameters. A future native mapping must declare and
-test its capability explicitly. See
+inspect the typed value. The explicit Kimi K3 and GLM 5.3/5.2 dialect mappings
+send the configured native `max` field for `max`; other dialects omit a native
+effort field while retaining the application guidance. See
 [ADR 0027](adr/0027-semantic-tui-and-application-reasoning-effort.md).
 
 The same controller exposes a workspace-scoped `SessionOption` catalog and

@@ -22,10 +22,17 @@ from typing import Any
 
 from neuro_code.application.ports.client_filesystem import ClientFileSystem
 from neuro_code.application.ports.tools import ToolContext
+from neuro_code.application.ports.workspace import (
+    FilesystemAccessOperation,
+    FilesystemAccessPlan,
+    FilesystemTargetRequest,
+)
 from neuro_code.domain.sandbox.models import SandboxProfile
 from neuro_code.domain.tools import ToolDefinition, ToolResult
 from neuro_code.infrastructure.workspace.paths import (
     is_additional_workspace_path,
+    resolve_delegated_workspace_path,
+    resolve_filesystem_access_targets,
     resolve_workspace_path,
     workspace_display_path,
 )
@@ -496,7 +503,46 @@ def _require_bool(arguments: Mapping[str, Any], key: str, *, default: bool) -> b
     return value
 
 
-def _resolve_path(context: ToolContext, requested: str, *, must_exist: bool) -> Path:
+def _prepare_local_targets(
+    tool_name: str,
+    context: ToolContext,
+    requests: Sequence[FilesystemTargetRequest],
+) -> FilesystemAccessPlan | None:
+    if context.client_file_system is not None:
+        return None
+    return resolve_filesystem_access_targets(
+        tool_name,
+        context.cwd,
+        requests,
+        additional_workspace_roots=context.additional_workspace_roots,
+    )
+
+
+def _resolve_path(
+    context: ToolContext,
+    requested: str,
+    *,
+    must_exist: bool,
+    operation: FilesystemAccessOperation | None = None,
+    target_index: int = 0,
+) -> Path:
+    if context.client_file_system is not None:
+        return resolve_delegated_workspace_path(
+            context.cwd,
+            requested,
+            additional_workspace_roots=context.additional_workspace_roots,
+        )
+    plan = context.filesystem_access_plan
+    if plan is not None:
+        try:
+            target = plan.target_at(target_index)
+        except IndexError as error:
+            raise ToolError("filesystem execution target plan is incomplete") from error
+        if target.requested_path != requested or (
+            operation is not None and target.operation is not operation
+        ):
+            raise ToolError("filesystem execution target plan does not match the request")
+        return target.canonical_path
     return resolve_workspace_path(
         context.cwd,
         requested,
@@ -506,6 +552,22 @@ def _resolve_path(context: ToolContext, requested: str, *, must_exist: bool) -> 
 
 
 def _is_primary_workspace_path(context: ToolContext, path: Path) -> bool:
+    if context.client_file_system is not None:
+        roots = (context.cwd, *context.additional_workspace_roots)
+        try:
+            path_text = os.path.normcase(os.path.normpath(os.fspath(path)))
+            return not any(
+                os.path.commonpath((path_text, os.path.normcase(os.path.normpath(os.fspath(root)))))
+                == os.path.normcase(os.path.normpath(os.fspath(root)))
+                for root in roots[1:]
+            )
+        except (OSError, ValueError):
+            return False
+    plan = context.filesystem_access_plan
+    if plan is not None:
+        for target in plan.targets:
+            if target.canonical_path == path:
+                return target.is_primary_workspace
     return not is_additional_workspace_path(
         context.cwd,
         path,
@@ -514,6 +576,13 @@ def _is_primary_workspace_path(context: ToolContext, path: Path) -> bool:
 
 
 def _display_path(context: ToolContext, path: Path) -> str:
+    plan = context.filesystem_access_plan
+    if plan is not None:
+        for target in plan.targets:
+            if target.canonical_path == path:
+                return target.policy_path
+    if context.client_file_system is not None:
+        return os.path.normpath(os.fspath(path)).replace("\\", "/")
     return workspace_display_path(
         context.cwd,
         path,
@@ -560,6 +629,19 @@ class ReadFileTool:
     )
     side_effecting = False
 
+    def prepare_filesystem_targets(
+        self,
+        arguments: Mapping[str, Any],
+        context: ToolContext,
+        /,
+    ) -> FilesystemAccessPlan | None:
+        requested = _require_string(arguments, "path")
+        return _prepare_local_targets(
+            "read_file",
+            context,
+            (FilesystemTargetRequest(requested, FilesystemAccessOperation.READ, must_exist=True),),
+        )
+
     async def execute(self, arguments: Mapping[str, Any], context: ToolContext) -> ToolResult:
         start_line = arguments.get("start_line", 1)
         max_lines = arguments.get("max_lines", 500)
@@ -574,6 +656,7 @@ class ReadFileTool:
             context,
             requested,
             must_exist=client_file_system is None,
+            operation=FilesystemAccessOperation.READ,
         )
         if client_file_system is not None:
             if not client_file_system.supports_read:
@@ -660,6 +743,28 @@ class ReadFilesTool:
     )
     side_effecting = False
 
+    def prepare_filesystem_targets(
+        self,
+        arguments: Mapping[str, Any],
+        context: ToolContext,
+        /,
+    ) -> FilesystemAccessPlan | None:
+        raw_files = arguments.get("files")
+        if not isinstance(raw_files, Sequence) or isinstance(raw_files, (str, bytes)):
+            raise ToolError("files must be an array")
+        files = tuple(raw_files)
+        if not 1 <= len(files) <= MAX_BATCH_READ_FILES:
+            raise ToolError(f"files must contain between 1 and {MAX_BATCH_READ_FILES} items")
+        requests = tuple(
+            FilesystemTargetRequest(
+                _parse_file_read_request(value, index=index).requested_path,
+                FilesystemAccessOperation.READ,
+                must_exist=False,
+            )
+            for index, value in enumerate(files)
+        )
+        return _prepare_local_targets("read_files", context, requests)
+
     async def execute(self, arguments: Mapping[str, Any], context: ToolContext) -> ToolResult:
         raw_files = arguments.get("files")
         if not isinstance(raw_files, Sequence) or isinstance(raw_files, (str, bytes)):
@@ -681,6 +786,8 @@ class ReadFilesTool:
                     context,
                     request.requested_path,
                     must_exist=client_file_system is None,
+                    operation=FilesystemAccessOperation.READ,
+                    target_index=index,
                 )
                 label = _display_path(context, path)
                 if client_file_system is not None:
@@ -753,6 +860,21 @@ class ListDirTool:
     )
     side_effecting = False
 
+    def prepare_filesystem_targets(
+        self,
+        arguments: Mapping[str, Any],
+        context: ToolContext,
+        /,
+    ) -> FilesystemAccessPlan | None:
+        raw_path = arguments.get("path", ".")
+        if not isinstance(raw_path, str):
+            raise ToolError("path must be a string")
+        return _prepare_local_targets(
+            "list_dir",
+            context,
+            (FilesystemTargetRequest(raw_path, FilesystemAccessOperation.LIST, must_exist=True),),
+        )
+
     async def execute(self, arguments: Mapping[str, Any], context: ToolContext) -> ToolResult:
         if context.client_file_system is not None:
             raise ToolError(
@@ -763,7 +885,12 @@ class ListDirTool:
         if not isinstance(raw_path, str):
             raise ToolError("path must be a string")
         _ensure_no_link_components(context, raw_path)
-        path = _resolve_path(context, raw_path, must_exist=True)
+        path = _resolve_path(
+            context,
+            raw_path,
+            must_exist=True,
+            operation=FilesystemAccessOperation.LIST,
+        )
         if not path.is_dir():
             raise ToolError(f"not a directory: {path}")
         _track_primary_workspace_path(context, path)
@@ -815,6 +942,21 @@ class ListTreeTool:
     )
     side_effecting = False
 
+    def prepare_filesystem_targets(
+        self,
+        arguments: Mapping[str, Any],
+        context: ToolContext,
+        /,
+    ) -> FilesystemAccessPlan | None:
+        raw_path = arguments.get("path", ".")
+        if not isinstance(raw_path, str):
+            raise ToolError("path must be a string")
+        return _prepare_local_targets(
+            "list_tree",
+            context,
+            (FilesystemTargetRequest(raw_path, FilesystemAccessOperation.LIST, must_exist=True),),
+        )
+
     async def execute(self, arguments: Mapping[str, Any], context: ToolContext) -> ToolResult:
         raw_path = arguments.get("path", ".")
         if not isinstance(raw_path, str):
@@ -835,7 +977,12 @@ class ListTreeTool:
         respect_git_ignore = arguments.get("respect_git_ignore", True)
         if not isinstance(respect_git_ignore, bool):
             raise ToolError("respect_git_ignore must be a boolean")
-        root = _resolve_path(context, raw_path, must_exist=True)
+        root = _resolve_path(
+            context,
+            raw_path,
+            must_exist=True,
+            operation=FilesystemAccessOperation.LIST,
+        )
         if not root.is_dir():
             raise ToolError(f"not a directory: {root}")
         _track_primary_workspace_path(context, root)
@@ -899,6 +1046,21 @@ class GlobTool:
     )
     side_effecting = False
 
+    def prepare_filesystem_targets(
+        self,
+        arguments: Mapping[str, Any],
+        context: ToolContext,
+        /,
+    ) -> FilesystemAccessPlan | None:
+        raw_path = arguments.get("path", ".")
+        if not isinstance(raw_path, str):
+            raise ToolError("path must be a string")
+        return _prepare_local_targets(
+            "glob",
+            context,
+            (FilesystemTargetRequest(raw_path, FilesystemAccessOperation.SEARCH, must_exist=True),),
+        )
+
     async def execute(self, arguments: Mapping[str, Any], context: ToolContext) -> ToolResult:
         pattern = _require_string(arguments, "pattern")
         if len(pattern) > MAX_GLOB_PATTERN_LENGTH:
@@ -919,6 +1081,7 @@ class GlobTool:
             context,
             raw_path,
             must_exist=True,
+            operation=FilesystemAccessOperation.SEARCH,
         )
         if not root.is_dir() and not root.is_file():
             raise ToolError(f"not a file or directory: {root}")
@@ -989,6 +1152,21 @@ class GrepTool:
     )
     side_effecting = False
 
+    def prepare_filesystem_targets(
+        self,
+        arguments: Mapping[str, Any],
+        context: ToolContext,
+        /,
+    ) -> FilesystemAccessPlan | None:
+        raw_path = arguments.get("path", ".")
+        if not isinstance(raw_path, str):
+            raise ToolError("path must be a string")
+        return _prepare_local_targets(
+            "grep",
+            context,
+            (FilesystemTargetRequest(raw_path, FilesystemAccessOperation.SEARCH, must_exist=True),),
+        )
+
     async def execute(self, arguments: Mapping[str, Any], context: ToolContext) -> ToolResult:
         query = _require_string(arguments, "query")
         raw_path = arguments.get("path", ".")
@@ -1031,7 +1209,12 @@ class GrepTool:
             minimum=1,
             maximum=1000,
         )
-        root = _resolve_path(context, raw_path, must_exist=True)
+        root = _resolve_path(
+            context,
+            raw_path,
+            must_exist=True,
+            operation=FilesystemAccessOperation.SEARCH,
+        )
         _track_primary_workspace_path(context, root)
         selector = _WorkspaceFileSelector(
             context,
@@ -1185,6 +1368,21 @@ class GrepManyTool:
     )
     side_effecting = False
 
+    def prepare_filesystem_targets(
+        self,
+        arguments: Mapping[str, Any],
+        context: ToolContext,
+        /,
+    ) -> FilesystemAccessPlan | None:
+        raw_path = arguments.get("path", ".")
+        if not isinstance(raw_path, str):
+            raise ToolError("path must be a string")
+        return _prepare_local_targets(
+            "grep_many",
+            context,
+            (FilesystemTargetRequest(raw_path, FilesystemAccessOperation.SEARCH, must_exist=True),),
+        )
+
     async def execute(self, arguments: Mapping[str, Any], context: ToolContext) -> ToolResult:
         queries = _require_string_sequence(
             arguments.get("queries"),
@@ -1213,7 +1411,12 @@ class GrepManyTool:
             minimum=1,
             maximum=MAX_GREP_TOTAL_RESULTS,
         )
-        root = _resolve_path(context, raw_path, must_exist=True)
+        root = _resolve_path(
+            context,
+            raw_path,
+            must_exist=True,
+            operation=FilesystemAccessOperation.SEARCH,
+        )
         _track_primary_workspace_path(context, root)
         selector = _WorkspaceFileSelector(
             context,
@@ -1502,6 +1705,10 @@ def _add_file_content(lines: tuple[str, ...]) -> str:
 
 
 def _ensure_no_link_components(context: ToolContext, requested: str) -> None:
+    if context.client_file_system is not None:
+        # A delegated client owns link/reparse semantics.  Inspecting the host
+        # path here would create a false local security proof.
+        return
     candidate = Path(requested).expanduser()
     if not candidate.is_absolute():
         candidate = context.cwd / candidate
@@ -1545,6 +1752,45 @@ class ApplyPatchTool:
         },
     )
     side_effecting = True
+
+    def prepare_filesystem_targets(
+        self,
+        arguments: Mapping[str, Any],
+        context: ToolContext,
+        /,
+    ) -> FilesystemAccessPlan | None:
+        patch = _require_string(arguments, "patch")
+        operations = _parse_patch(patch)
+        requests: list[FilesystemTargetRequest] = []
+        for operation in operations:
+            if operation.kind == "add":
+                access_operation = FilesystemAccessOperation.CREATE
+                must_exist = False
+            elif operation.kind == "delete":
+                access_operation = FilesystemAccessOperation.DELETE
+                must_exist = True
+            elif operation.move_to is not None:
+                access_operation = FilesystemAccessOperation.MOVE
+                must_exist = True
+            else:
+                access_operation = FilesystemAccessOperation.UPDATE
+                must_exist = True
+            requests.append(
+                FilesystemTargetRequest(
+                    operation.path,
+                    access_operation,
+                    must_exist=must_exist,
+                )
+            )
+            if operation.move_to is not None:
+                requests.append(
+                    FilesystemTargetRequest(
+                        operation.move_to,
+                        FilesystemAccessOperation.MOVE,
+                        must_exist=False,
+                    )
+                )
+        return _prepare_local_targets("apply_patch", context, tuple(requests))
 
     def workspace_target_paths(self, arguments: Mapping[str, Any]) -> tuple[str, ...]:
         """Return patch source and destination paths without touching the workspace."""
@@ -1594,17 +1840,40 @@ class ApplyPatchTool:
     ) -> tuple[tuple[_PatchOperation, Path, Path | None], ...]:
         resolved: list[tuple[_PatchOperation, Path, Path | None]] = []
         occupied: set[Path] = set()
+        target_index = 0
         for operation in operations:
             _ensure_no_link_components(context, operation.path)
+            if operation.kind == "add":
+                access_operation = FilesystemAccessOperation.CREATE
+                must_exist = False
+            elif operation.kind == "delete":
+                access_operation = FilesystemAccessOperation.DELETE
+                must_exist = True
+            elif operation.move_to is not None:
+                access_operation = FilesystemAccessOperation.MOVE
+                must_exist = True
+            else:
+                access_operation = FilesystemAccessOperation.UPDATE
+                must_exist = True
             source = _resolve_path(
                 context,
                 operation.path,
-                must_exist=operation.kind != "add" and context.client_file_system is None,
+                must_exist=must_exist and context.client_file_system is None,
+                operation=access_operation,
+                target_index=target_index,
             )
+            target_index += 1
             destination: Path | None = None
             if operation.move_to is not None:
                 _ensure_no_link_components(context, operation.move_to)
-                destination = _resolve_path(context, operation.move_to, must_exist=False)
+                destination = _resolve_path(
+                    context,
+                    operation.move_to,
+                    must_exist=False,
+                    operation=FilesystemAccessOperation.MOVE,
+                    target_index=target_index,
+                )
+                target_index += 1
             targets = (source, destination) if destination is not None else (source,)
             for target in targets:
                 if target is None or target in occupied:
@@ -1838,6 +2107,23 @@ class SearchReplaceTool:
     )
     side_effecting = True
 
+    def prepare_filesystem_targets(
+        self,
+        arguments: Mapping[str, Any],
+        context: ToolContext,
+        /,
+    ) -> FilesystemAccessPlan | None:
+        requested = _require_string(arguments, "path")
+        return _prepare_local_targets(
+            "search_replace",
+            context,
+            (
+                FilesystemTargetRequest(
+                    requested, FilesystemAccessOperation.UPDATE, must_exist=True
+                ),
+            ),
+        )
+
     def workspace_target_paths(self, arguments: Mapping[str, Any]) -> tuple[str, ...]:
         path = arguments.get("path")
         return (path,) if isinstance(path, str) and path else ()
@@ -1848,10 +2134,13 @@ class SearchReplaceTool:
                 f"sandbox profile {context.sandbox_profile.value!r} prohibits workspace edits"
             )
         client_file_system = context.client_file_system
+        requested_path = _require_string(arguments, "path")
+        _ensure_no_link_components(context, requested_path)
         path = _resolve_path(
             context,
-            _require_string(arguments, "path"),
+            requested_path,
             must_exist=client_file_system is None,
+            operation=FilesystemAccessOperation.UPDATE,
         )
         old = _require_string(arguments, "old")
         new = arguments.get("new")

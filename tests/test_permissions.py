@@ -4,6 +4,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from neuro_code.application.permissions.contracts import build_permission_request
 from neuro_code.application.permissions.policy import (
@@ -13,6 +14,17 @@ from neuro_code.application.permissions.policy import (
     PermissionRule,
     PermissionRuleStore,
 )
+from neuro_code.application.ports.workspace import (
+    FilesystemAccessOperation,
+    FilesystemAccessPlan,
+    FilesystemAccessTarget,
+    FilesystemTargetRequest,
+)
+from neuro_code.infrastructure.workspace.paths import (
+    resolve_delegated_workspace_path,
+    resolve_filesystem_access_targets,
+)
+from neuro_code.shared.errors import ToolError
 
 
 class PermissionTests(unittest.TestCase):
@@ -297,6 +309,293 @@ class PermissionTests(unittest.TestCase):
             self.assertTrue(rule.matches("read_file", {"operation": "read", "path": "src/a.py"}))
             self.assertFalse(rule.matches("read_file", {"operation": "write", "path": "src/a.py"}))
             self.assertFalse(rule.matches("read_file", {"operation": "read", "path": "tests/a.py"}))
+
+    def test_canonical_targets_collapse_lexical_aliases_to_one_policy_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "src").mkdir()
+            target = root / "src" / "secret.py"
+            target.write_text("secret = 1\n", encoding="utf-8")
+
+            plan = resolve_filesystem_access_targets(
+                "read_file",
+                root,
+                tuple(
+                    FilesystemTargetRequest(path, FilesystemAccessOperation.READ, must_exist=True)
+                    for path in ("./src/secret.py", "src/../src/secret.py", str(target))
+                ),
+            )
+
+        self.assertEqual({item.canonical_path for item in plan.targets}, {target.resolve()})
+        self.assertEqual({item.policy_path for item in plan.targets}, {"src/secret.py"})
+        self.assertTrue(all(item.is_primary_workspace for item in plan.targets))
+
+    def test_create_target_proves_an_existing_ancestor_before_authorizing_missing_leaf(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "src").mkdir()
+            plan = resolve_filesystem_access_targets(
+                "apply_patch",
+                root,
+                (
+                    FilesystemTargetRequest(
+                        "src/generated/deep/new.py",
+                        FilesystemAccessOperation.CREATE,
+                    ),
+                ),
+            )
+            target = plan.targets[0]
+            self.assertFalse(target.exists)
+            self.assertEqual(target.canonical_path, root / "src" / "generated" / "deep" / "new.py")
+            with self.assertRaises(ToolError):
+                resolve_filesystem_access_targets(
+                    "apply_patch",
+                    root,
+                    (
+                        FilesystemTargetRequest(
+                            "../outside/new.py",
+                            FilesystemAccessOperation.CREATE,
+                        ),
+                    ),
+                )
+
+    def test_structured_permission_requires_every_target_to_match_a_path_allowlist(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "src").mkdir()
+            (root / "tests").mkdir()
+            (root / "src" / "a.py").write_text("a\n", encoding="utf-8")
+            (root / "tests" / "b.py").write_text("b\n", encoding="utf-8")
+            plan = resolve_filesystem_access_targets(
+                "search_replace",
+                root,
+                (
+                    FilesystemTargetRequest(
+                        "src/a.py", FilesystemAccessOperation.UPDATE, must_exist=True
+                    ),
+                    FilesystemTargetRequest(
+                        "tests/b.py", FilesystemAccessOperation.UPDATE, must_exist=True
+                    ),
+                ),
+            )
+            manager = PermissionManager(
+                mode=PermissionMode.DEFAULT,
+                interactive=False,
+                rules=(
+                    PermissionRule(
+                        PermissionEffect.ALLOW,
+                        "search_replace",
+                        path_pattern="src/*",
+                        operation="update",
+                    ),
+                ),
+            )
+
+            mixed = manager.decide_targets("search_replace", plan.targets, side_effecting=True)
+            allowed = manager.decide_targets(
+                "search_replace", (plan.targets[0],), side_effecting=True
+            )
+
+        self.assertEqual(mixed.effect, PermissionEffect.DENY)
+        self.assertIn("outside explicit path allow rules", mixed.reason)
+        self.assertEqual(allowed.effect, PermissionEffect.ALLOW)
+
+    def test_canonical_target_contract_rejects_invalid_shapes_and_indices(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target_path = root / "target.py"
+            target = FilesystemAccessTarget(
+                "target.py",
+                target_path,
+                root,
+                "target.py",
+                FilesystemAccessOperation.UPDATE,
+                True,
+                True,
+            )
+            plan = FilesystemAccessPlan("search_replace", (target,))
+
+            self.assertIs(plan.target_at(0), target)
+            for invalid_index in (True, -1, 1):
+                with self.subTest(invalid_index=invalid_index), self.assertRaises(IndexError):
+                    plan.target_at(invalid_index)
+            with self.assertRaises(ValueError):
+                FilesystemAccessPlan("", (target,))
+            with self.assertRaises(ValueError):
+                FilesystemAccessPlan("tool", ())
+            with self.assertRaises(TypeError):
+                FilesystemAccessPlan("tool", (object(),))  # type: ignore[tuple-item]
+
+            invalid_requests = (
+                ("", FilesystemAccessOperation.READ, False, True),
+                ("bad\x00path", FilesystemAccessOperation.READ, False, True),
+                ("path", "read", False, True),
+                ("path", FilesystemAccessOperation.READ, 1, True),
+                ("path", FilesystemAccessOperation.READ, False, 1),
+            )
+            for values in invalid_requests:
+                with self.subTest(values=values), self.assertRaises((TypeError, ValueError)):
+                    FilesystemTargetRequest(*values)  # type: ignore[arg-type]
+
+            invalid_targets = (
+                {"requested_path": "", "canonical_path": target_path},
+                {"requested_path": "target.py", "canonical_path": "not-a-path"},
+                {"requested_path": "target.py", "owning_workspace_root": "not-a-path"},
+                {"requested_path": "target.py", "policy_path": ""},
+                {"requested_path": "target.py", "operation": "update"},
+            )
+            for overrides in invalid_targets:
+                values = {
+                    "requested_path": "target.py",
+                    "canonical_path": target_path,
+                    "owning_workspace_root": root,
+                    "policy_path": "target.py",
+                    "operation": FilesystemAccessOperation.UPDATE,
+                    "exists": True,
+                    "is_primary_workspace": True,
+                    **overrides,
+                }
+                with self.subTest(overrides=overrides), self.assertRaises((TypeError, ValueError)):
+                    FilesystemAccessTarget(**values)  # type: ignore[arg-type]
+
+            with self.assertRaises(ValueError):
+                FilesystemAccessTarget(
+                    "target.py",
+                    target_path,
+                    root,
+                    "target.py",
+                    FilesystemAccessOperation.UPDATE,
+                    True,
+                    True,
+                    additional_workspace_root=root,
+                )
+            with self.assertRaises(ValueError):
+                FilesystemAccessTarget(
+                    "target.py",
+                    target_path,
+                    root,
+                    "target.py",
+                    FilesystemAccessOperation.UPDATE,
+                    True,
+                    False,
+                )
+
+    def test_canonical_resolver_handles_extra_roots_windows_ambiguity_and_delegation(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as primary_directory,
+            tempfile.TemporaryDirectory() as extra_directory,
+        ):
+            root = Path(primary_directory)
+            extra = Path(extra_directory)
+            extra_target = extra / "shared.py"
+            extra_target.write_text("shared\n", encoding="utf-8")
+            plan = resolve_filesystem_access_targets(
+                "read_file",
+                root,
+                (
+                    FilesystemTargetRequest(
+                        str(extra_target), FilesystemAccessOperation.READ, must_exist=True
+                    ),
+                ),
+                additional_workspace_roots=(extra,),
+            )
+            self.assertFalse(plan.targets[0].is_primary_workspace)
+            self.assertEqual(plan.targets[0].additional_workspace_root, extra.resolve())
+            self.assertEqual(plan.targets[0].policy_path, str(extra_target.resolve()))
+            with self.assertRaises(ToolError):
+                resolve_filesystem_access_targets(
+                    "read_file",
+                    root,
+                    (FilesystemTargetRequest("shared.py", FilesystemAccessOperation.READ),),
+                    additional_workspace_roots=(root / "nested",),
+                )
+
+            delegated = resolve_delegated_workspace_path(root, "./remote/../remote.txt")
+            self.assertEqual(delegated, root / "remote.txt")
+            with self.assertRaises(ToolError):
+                resolve_delegated_workspace_path(root, "../outside.txt")
+
+            ambiguous = (
+                r"\\?\C:\workspace\file.txt",
+                r"\\.\PIPE\name",
+                "C:relative",
+                "file.txt:stream",
+                "CON",
+            )
+            with patch("neuro_code.infrastructure.workspace.paths.os.name", "nt"):
+                for requested in ambiguous:
+                    with self.subTest(requested=requested), self.assertRaises(ToolError):
+                        resolve_filesystem_access_targets(
+                            "read_file",
+                            root,
+                            (FilesystemTargetRequest(requested, FilesystemAccessOperation.READ),),
+                        )
+
+    def test_structured_permission_aggregates_ask_and_preserves_modes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target_path = root / "target.py"
+            target_path.write_text("target\n", encoding="utf-8")
+            plan = resolve_filesystem_access_targets(
+                "search_replace",
+                root,
+                (
+                    FilesystemTargetRequest(
+                        "target.py", FilesystemAccessOperation.UPDATE, must_exist=True
+                    ),
+                ),
+            )
+            target = plan.targets
+
+            self.assertEqual(
+                PermissionManager(mode=PermissionMode.BYPASS)
+                .decide_targets("search_replace", target, side_effecting=True)
+                .effect,
+                PermissionEffect.ALLOW,
+            )
+            self.assertEqual(
+                PermissionManager(mode=PermissionMode.ACCEPT_EDITS)
+                .decide_targets("search_replace", target, side_effecting=True)
+                .effect,
+                PermissionEffect.ALLOW,
+            )
+            self.assertEqual(
+                PermissionManager(mode=PermissionMode.DONT_ASK)
+                .decide_targets("search_replace", target, side_effecting=True)
+                .effect,
+                PermissionEffect.DENY,
+            )
+            self.assertEqual(
+                PermissionManager(interactive=True)
+                .decide_targets("search_replace", target, side_effecting=True)
+                .effect,
+                PermissionEffect.ASK,
+            )
+            self.assertEqual(
+                PermissionManager()
+                .decide_targets("read_file", target, side_effecting=False)
+                .effect,
+                PermissionEffect.ALLOW,
+            )
+            ask_rule = PermissionRule(PermissionEffect.ASK, "search_replace", operation="update")
+            self.assertEqual(
+                PermissionManager(rules=(ask_rule,), interactive=False)
+                .decide_targets("search_replace", target, side_effecting=True)
+                .effect,
+                PermissionEffect.DENY,
+            )
+            self.assertEqual(
+                PermissionManager(rules=(ask_rule,), interactive=True)
+                .decide_targets("search_replace", target, side_effecting=True)
+                .effect,
+                PermissionEffect.ASK,
+            )
+            self.assertEqual(
+                PermissionManager().decide_targets("read_file", (), side_effecting=False).effect,
+                PermissionEffect.DENY,
+            )
 
 
 if __name__ == "__main__":

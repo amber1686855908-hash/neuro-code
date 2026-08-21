@@ -161,7 +161,15 @@ from neuro_code.application.ports.windows_sandbox import (
     WindowsSandboxSetupSnapshot,
     WindowsSandboxSetupState,
 )
-from neuro_code.application.ports.workspace import WorkspaceIdentity, WorkspacePathResolver
+from neuro_code.application.ports.workspace import (
+    FilesystemAccessOperation,
+    FilesystemAccessPlan,
+    FilesystemAccessTarget,
+    FilesystemTargetProvider,
+    FilesystemTargetRequest,
+    WorkspaceIdentity,
+    WorkspacePathResolver,
+)
 from neuro_code.application.ports.workspace_changes import (
     WorkspaceChangeCheckpoint,
     WorkspaceChangeEventPayload,
@@ -214,6 +222,11 @@ __all__ = [
     "ClientTerminal",
     "ClientTerminalResult",
     "CredentialStyle",
+    "FilesystemAccessOperation",
+    "FilesystemAccessPlan",
+    "FilesystemAccessTarget",
+    "FilesystemTargetProvider",
+    "FilesystemTargetRequest",
     "HostedWebSearch",
     "HostedWebSearchEvent",
     "HostedWebSearchEventSink",

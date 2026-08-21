@@ -37,7 +37,12 @@ from neuro_code.application.permissions.policy import (
 from neuro_code.application.ports.approval import PermissionApprover
 from neuro_code.application.ports.storage import SessionStore
 from neuro_code.application.ports.tool_pipeline import ToolPipelineHook
-from neuro_code.application.ports.tools import Tool, ToolCollection, ToolContext
+from neuro_code.application.ports.tools import (
+    FilesystemTargetProvider,
+    Tool,
+    ToolCollection,
+    ToolContext,
+)
 from neuro_code.application.ports.web_search import HostedWebSearchEvent
 from neuro_code.application.ports.workspace_changes import (
     WorkspaceChangeCheckpoint,
@@ -384,11 +389,67 @@ class ToolExecutor:
                     plan_fingerprint_before=plan_fingerprint_before,
                 )
 
-            decision = self._permissions.decide(
-                call.name,
-                call.arguments,
-                side_effecting=tool.side_effecting,
-            )
+            filesystem_access_plan = None
+            try:
+                if isinstance(tool, FilesystemTargetProvider):
+                    filesystem_access_plan = tool.prepare_filesystem_targets(
+                        call.arguments,
+                        self._tool_context,
+                    )
+                    if (
+                        self._tool_context.client_file_system is None
+                        and filesystem_access_plan is None
+                    ):
+                        raise ToolError(
+                            "local structured filesystem tool did not prepare a canonical target plan"
+                        )
+                    if (
+                        filesystem_access_plan is not None
+                        and filesystem_access_plan.tool_name != call.name
+                    ):
+                        raise ToolError(
+                            "canonical filesystem target plan does not match the requested tool"
+                        )
+            except Exception as error:
+                decision = PermissionDecision(
+                    PermissionEffect.DENY,
+                    f"canonical filesystem target preflight failed: {type(error).__name__}: {error}",
+                )
+                await emit(
+                    AgentEventKind.TOOL_PERMISSION,
+                    {
+                        "id": call.id,
+                        "name": call.name,
+                        "effect": decision.effect.value,
+                        "reason": decision.reason,
+                    },
+                )
+                result = ToolResult(f"permission denied: {decision.reason}", is_error=True)
+                record_result(result)
+                await emit(
+                    AgentEventKind.TOOL_FAILED,
+                    terminal_event_data(result),
+                )
+                return self._tool_execution_observation(
+                    call,
+                    result,
+                    tool=tool,
+                    change_report=None,
+                    plan_fingerprint_before=plan_fingerprint_before,
+                )
+
+            if filesystem_access_plan is not None:
+                decision = self._permissions.decide_targets(
+                    call.name,
+                    filesystem_access_plan.targets,
+                    side_effecting=tool.side_effecting,
+                )
+            else:
+                decision = self._permissions.decide(
+                    call.name,
+                    call.arguments,
+                    side_effecting=tool.side_effecting,
+                )
             await emit(
                 AgentEventKind.TOOL_PERMISSION,
                 {
@@ -456,7 +517,11 @@ class ToolExecutor:
             await emit(AgentEventKind.TOOL_STARTED, {"id": call.id, "name": call.name})
             if tool.side_effecting:
                 journal = self._tool_context.workspace_change_journal
-                target_paths = _workspace_target_paths(tool, call.arguments)
+                target_paths = (
+                    tuple(str(target.canonical_path) for target in filesystem_access_plan.targets)
+                    if filesystem_access_plan is not None
+                    else _workspace_target_paths(tool, call.arguments)
+                )
                 targeted_mutation = bool(target_paths and journal is not None)
                 if not targeted_mutation:
                     workspace_before = await self.capture_workspace_snapshot()
@@ -487,6 +552,7 @@ class ToolExecutor:
                     call.arguments,
                     replace(
                         self._tool_context,
+                        filesystem_access_plan=filesystem_access_plan,
                         interaction_event_sink=interaction_event_sink,
                         web_search_event_sink=web_search_event_sink,
                     ),

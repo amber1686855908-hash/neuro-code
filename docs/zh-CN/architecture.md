@@ -387,6 +387,32 @@ USER 候选。按名称先见为准的去重确保 LOCAL 技能遮蔽同名 REPO
 `SkillTool` 始终针对同一稳定边界解析。详见
 [ADR 0044](adr/0044-repository-level-skill-discovery.md)。
 
+## 规范的结构化文件系统目标
+
+结构化本地文件系统工具对每次调用使用一个不可变的
+`FilesystemAccessPlan`。工具适配器先从经过校验的工具语法中提取全部目标，随后
+`resolve_filesystem_access_targets()` 在权限评估前一次性规范化每个本地路径。每个目标
+记录规范路径、所属主工作区或附加工作区根、策略路径、操作、存在状态和链接样组件证明；
+原始写法只用于诊断。
+
+权限链严格按以下顺序执行：
+
+1. 一次解析全部目标，包括 `apply_patch` 的所有源路径和目标路径。对缺失的创建叶子会证明
+   已存在的父级/祖先，并拒绝符号链接、junction、Windows reparse traversal、父级逃逸以及
+   含义不明确的 Windows device/extended/ADS 命名空间。
+2. `PermissionManager.decide_targets()` 对每个规范目标独立评估。显式 deny 优先；无头模式中
+   未解决的 ask 会拒绝；路径范围 allow 是 allowlist。只有所有目标都获授权时，结构化调用才会通过。
+3. 工具执行接收同一个不可变计划，并按提取索引消费规范目标，不会再次解析原始路径。因此混合
+   允许/拒绝目标的 `apply_patch` 会在 journal 或任何写入前停止。
+
+该契约覆盖本地结构化工具：`read_file`、`read_files`、目录列举、glob/search、
+`search_replace` 和 `apply_patch`。工作区身份、permission、sandbox 和 execution 仍是分离
+决策；该计划不会把任意 Bash 路径解释、MCP 调用、ACP 委托执行或不透明 artifact 句柄变成
+结构化文件系统目标。ACP 客户端路径属于独立的 client authority：Neuro Code 只做 session 根
+的词法校验，不会对远程路径调用宿主 `Path.resolve()`、存在性或链接检查。该契约收口的是
+本地结构化工具边界上的 raw-path authority gap，不声称为所有进程或 Provider capability 提供
+无竞态的 TOCTOU 保护。
+
 ## Partial ACP v1 适配器
 
 `neuro-code acp` 是位于 `ApplicationComposition` 与官方
@@ -426,8 +452,8 @@ scope，释放运行时绑定，同时保留持久历史与 alias。EOF 或连�
 
 当 ACP 客户端明确声明 `fs.readTextFile` 时，session 会获得一个绑定到该 ACP session 的窄
 `ClientFileSystem` 应用端口。既有 `read_file` 和 `read_files` 工具仍会先通过选定的主工作区或
-额外工作区根解析每个路径，再将每个绝对路径及有界行范围委托给 `fs/read_text_file`；它们绝不会
-回退调用未声明的客户端操作。ACP 文件系统能力不提供目录遍历或搜索操作，因此 `list_tree` 和
+额外工作区根做词法 session 根校验，再将客户端拥有的路径及有界行范围委托给
+`fs/read_text_file`；宿主机不会解析或检查该路径，也绝不会回退调用本地操作。ACP 文件系统能力不提供目录遍历或搜索操作，因此 `list_tree` 和
 `grep_many` 与 `list_dir`、`grep` 一样继续使用本地工作区语义。当客户端同时声明文本读写能力时，
 `search_replace` 会使用同一端口读取、保留现有
 精确匹配/歧义检查和指令预检规则，再通过 `fs/write_text_file` 写回结果。只读客户端不会暴露该
@@ -738,15 +764,16 @@ profile 时，组合根创建不恢复任何会话的新供应商/运行时/会�
 上下文。详见 [ADR 0017](adr/0017-safe-interactive-profile-selection.md)。
 
 该控制器还持有一项进程内 `ReasoningEffort` 选择，并让强度切换与轮次串行。profile 或
-会话切换安装新对话绑定时，会把请求等级重新应用到新绑定。`low`、`medium`、`high` 与
-`xhigh` 对应应用层审查指引；在工作流编排实现前，`ultracode` 的明确实际值是 `xhigh`。
+会话切换安装新对话绑定时，会把请求等级重新应用到新绑定。`low`、`medium`、`high`、
+`xhigh` 与 `max` 对应应用层审查指引；`max` 是普通单智能体的最深策略，在工作流编排实现
+前，`ultracode` 的明确实际值是 `max`。
 TUI 通过 `Ctrl+E`、`/effort` 和 `/reasoning` 暴露选择，CLI 则使用 `--effort`。选择不会
 改写供应商配置，也不成为会话身份。
 
 每次模型步骤开始时，`AgentRuntime` 会把所选指引加入仅用于本次请求的系统消息，并将
 有类型的请求值写入 `ModelContext`；该指引不会加入规范 `SessionItem` 历史。供应商
-适配器可以读取这个类型值，但当前适配器不会把它翻译成供应商私有推理参数。未来若增加
-原生映射，必须显式声明能力并提供相应测试。详见
+适配器可以读取这个类型值。显式的 Kimi K3 与 GLM 5.3/5.2 dialect 会为 `max` 发送配置的
+原生 `max` 字段；其他 dialect 会省略原生强度字段，但仍保留应用层指引。详见
 [ADR 0027](adr/0027-semantic-tui-and-application-reasoning-effort.md)。
 
 同一控制器还暴露限定工作区的 `SessionOption` 目录，并让会话选择与轮次串行。组合根

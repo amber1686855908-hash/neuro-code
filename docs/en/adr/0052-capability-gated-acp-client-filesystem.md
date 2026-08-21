@@ -26,14 +26,16 @@ compare-and-swap, directory enumeration, recursive search, or delete operation.
   resuming, or forking that session. Bootstrap passes the port through the
   composition root; application code never imports ACP SDK types.
 - `read_file` delegates to `fs/read_text_file` when that port is bound. Its
-  path still passes Neuro Code workspace-root validation and its line range
+  path receives only lexical session-root validation; the host must not resolve,
+  inspect, or substitute a local path for a client-owned target. Its line range
   retains existing bounds. A read capability is required; no local fallback is
   used for that delegated operation.
 - `search_replace` is registered for a delegated client only when both read and
-  write are advertised. It retains sandbox, additional-directory, instruction
-  preflight, exact-match, ambiguity, and ordinary permission gates, then reads
-  and writes through the port. The client owns the final write's atomicity and
-  filesystem semantics, which the protocol cannot represent.
+  write are advertised. It retains session-root, sandbox, additional-directory,
+  instruction preflight, exact-match, ambiguity, and ordinary permission gates,
+  then reads and writes through the port. The client owns the final write's
+  atomicity, link semantics, and filesystem identity, which the protocol cannot
+  represent on the host.
 - Bound each client text response and write request to 1 MiB. Convert client
   exceptions and malformed text to stable fail-closed `ToolError` messages;
   do not echo client errors or credentials.

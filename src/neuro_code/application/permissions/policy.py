@@ -15,6 +15,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
+from neuro_code.application.ports.workspace import FilesystemAccessTarget
 from neuro_code.domain.permissions.bash_commands import analyze_bash_command
 
 __all__ = [
@@ -78,6 +79,45 @@ class PermissionRule:
         subjects.extend(f"{tool_name}:{path}" for path in paths)
         subjects.extend(f"path:{path}" for path in paths)
         return any(fnmatch.fnmatchcase(candidate, self.pattern) for candidate in subjects)
+
+    def matches_target(self, tool_name: str, target: FilesystemAccessTarget) -> bool:
+        """Match one canonical target without consulting its raw spelling."""
+
+        if self.operation is not None and not _path_or_text_match(
+            target.operation.value,
+            self.operation,
+        ):
+            return False
+        if self.path_pattern is not None and not _path_or_text_match(
+            target.policy_path,
+            self.path_pattern,
+        ):
+            return False
+        subjects = (
+            tool_name,
+            f"{tool_name}:{target.policy_path}",
+            f"path:{target.policy_path}",
+        )
+        return any(_path_or_text_match(subject, self.pattern) for subject in subjects)
+
+    def matches_tool_operation(self, tool_name: str, target: FilesystemAccessTarget) -> bool:
+        """Return whether this rule could apply before its path qualifier."""
+
+        if self.operation is not None and not _path_or_text_match(
+            target.operation.value,
+            self.operation,
+        ):
+            return False
+        prefix, separator, _suffix = self.pattern.partition(":")
+        return (
+            _path_or_text_match(tool_name, self.pattern)
+            or (bool(separator) and _path_or_text_match(tool_name, prefix))
+            or prefix == "path"
+        )
+
+    @property
+    def is_path_scoped(self) -> bool:
+        return self.path_pattern is not None or ":" in self.pattern
 
     def matches_subject(self, subject: str) -> bool:
         return fnmatch.fnmatchcase(subject, self.pattern)
@@ -265,6 +305,104 @@ class PermissionManager:
             return PermissionDecision(PermissionEffect.ASK, "interactive approval required")
         return PermissionDecision(PermissionEffect.DENY, "headless approval required")
 
+    def decide_targets(
+        self,
+        tool_name: str,
+        targets: tuple[FilesystemAccessTarget, ...],
+        *,
+        side_effecting: bool,
+    ) -> PermissionDecision:
+        """Authorize every canonical target independently, then aggregate.
+
+        A path-scoped allow rule is an allowlist for the targets it covers;
+        one matching target never authorizes an unrelated target in the same
+        structured call.
+
+        独立授权每个规范目标后再聚合. 路径范围 allow 规则只允许它覆盖的目标;一次
+        调用中命中的一个目标不能替另一个无关目标授权.
+        """
+
+        if not targets:
+            return PermissionDecision(PermissionEffect.DENY, "filesystem call has no targets")
+        decisions = [
+            self._decide_target(tool_name, target, side_effecting=side_effecting)
+            for target in targets
+        ]
+        for effect in (PermissionEffect.DENY, PermissionEffect.ASK, PermissionEffect.ALLOW):
+            matching = [decision for decision in decisions if decision.effect is effect]
+            if not matching:
+                continue
+            if effect is PermissionEffect.DENY:
+                return PermissionDecision(
+                    PermissionEffect.DENY,
+                    f"structured target authorization failed: {matching[0].reason}",
+                )
+            if effect is PermissionEffect.ASK:
+                if not self._interactive:
+                    return PermissionDecision(
+                        PermissionEffect.DENY,
+                        "headless mode cannot prompt for every structured target",
+                    )
+                return PermissionDecision(
+                    PermissionEffect.ASK,
+                    "one or more structured targets require approval",
+                )
+        return PermissionDecision(
+            PermissionEffect.ALLOW,
+            "every structured target was authorized independently",
+        )
+
+    def _decide_target(
+        self,
+        tool_name: str,
+        target: FilesystemAccessTarget,
+        *,
+        side_effecting: bool,
+    ) -> PermissionDecision:
+        matches = [rule for rule in self._rules if rule.matches_target(tool_name, target)]
+        for effect in (PermissionEffect.DENY, PermissionEffect.ASK, PermissionEffect.ALLOW):
+            if any(rule.effect is effect for rule in matches):
+                if effect is PermissionEffect.ASK and not self._interactive:
+                    return PermissionDecision(
+                        PermissionEffect.DENY,
+                        f"headless mode cannot prompt for target {target.policy_path!r}",
+                    )
+                return PermissionDecision(
+                    effect,
+                    f"target {target.policy_path!r} matched explicit {effect.value} rule",
+                )
+
+        if any(
+            rule.effect is PermissionEffect.ALLOW
+            and rule.is_path_scoped
+            and rule.matches_tool_operation(tool_name, target)
+            for rule in self._rules
+        ):
+            return PermissionDecision(
+                PermissionEffect.DENY,
+                f"target {target.policy_path!r} is outside explicit path allow rules",
+            )
+        if not side_effecting:
+            return PermissionDecision(PermissionEffect.ALLOW, "built-in read-only target")
+        if self._mode is PermissionMode.BYPASS:
+            return PermissionDecision(PermissionEffect.ALLOW, "bypassPermissions mode")
+        if self._mode is PermissionMode.ACCEPT_EDITS and tool_name in self._EDIT_TOOLS:
+            return PermissionDecision(PermissionEffect.ALLOW, "acceptEdits mode")
+        if self._mode is PermissionMode.DONT_ASK:
+            return PermissionDecision(
+                PermissionEffect.DENY,
+                f"dontAsk denies unmatched target {target.policy_path!r}",
+            )
+        if self._interactive:
+            return PermissionDecision(
+                PermissionEffect.ASK,
+                f"interactive approval required for target {target.policy_path!r}",
+            )
+        return PermissionDecision(
+            PermissionEffect.DENY,
+            f"headless approval required for target {target.policy_path!r}",
+        )
+
     def _decide_bash(self, arguments: Mapping[str, Any]) -> PermissionDecision | None:
         command = arguments.get("command")
         if not isinstance(command, str):
@@ -344,3 +482,12 @@ def _argument_paths(arguments: Mapping[str, Any]) -> tuple[str, ...]:
     for name, value in arguments.items():
         visit(value, str(name))
     return tuple(dict.fromkeys(values))
+
+
+def _path_or_text_match(value: str, pattern: str) -> bool:
+    normalized_value = value.replace("\\", "/")
+    normalized_pattern = pattern.replace("\\", "/")
+    if os.name == "nt":
+        normalized_value = normalized_value.casefold()
+        normalized_pattern = normalized_pattern.casefold()
+    return fnmatch.fnmatchcase(normalized_value, normalized_pattern)

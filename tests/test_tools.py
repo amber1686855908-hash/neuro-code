@@ -845,6 +845,22 @@ class FilesystemToolTests(unittest.IsolatedAsyncioTestCase):
                     ToolContext(root, client_file_system=client),
                 )
 
+    async def test_delegated_filesystem_never_host_resolves_or_falls_back_locally(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = _canonical_path(directory)
+            remote = root / "remote-only.txt"
+            client = ClientFileSystemFixture(contents={str(remote): "remote content\n"})
+
+            with patch.object(Path, "resolve", side_effect=AssertionError("host resolve")):
+                result = await ReadFileTool().execute(
+                    {"path": "remote-only.txt"},
+                    ToolContext(root, client_file_system=client),
+                )
+
+        self.assertIn("remote content", result.content)
+        self.assertTrue(result.metadata and result.metadata["client_delegated"])
+        self.assertEqual(client.reads[0][0], remote)
+
     async def test_filesystem_tools_fail_closed_for_invalid_arguments_and_capabilities(
         self,
     ) -> None:

@@ -3055,6 +3055,66 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("permission denied", denial[0].content)
             self.assertEqual(observer.capture_roots, [])
 
+    async def test_mixed_apply_patch_targets_are_denied_before_any_file_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            allowed = root / "allowed.py"
+            denied = root / "denied.py"
+            allowed.write_text("allowed = 1\n", encoding="utf-8")
+            denied.write_text("denied = 1\n", encoding="utf-8")
+            patch = """*** Begin Patch
+*** Update File: allowed.py
+@@
+-allowed = 1
++allowed = 2
+*** Update File: denied.py
+@@
+-denied = 1
++denied = 2
+*** End Patch"""
+            provider = ScriptedProvider(
+                (
+                    (
+                        ModelToolCall(ToolCall("mixed", "apply_patch", {"patch": patch})),
+                        ModelCompleted("tool_calls"),
+                    ),
+                    (ModelTextDelta("The mixed patch was denied."), ModelCompleted("stop")),
+                )
+            )
+            observer = RecordingWorkspaceChangeObserver(
+                WorkspaceChangeReport(files=(), omitted_files=0, scan_limited=False)
+            )
+            runtime = AgentRuntime(
+                provider=provider,
+                tools=default_tool_registry(),
+                workspace_change_observer=observer,
+                permissions=PermissionManager(
+                    mode=PermissionMode.DEFAULT,
+                    interactive=False,
+                    rules=(
+                        PermissionRule(
+                            PermissionEffect.ALLOW,
+                            "apply_patch",
+                            path_pattern="allowed.py",
+                            operation="update",
+                        ),
+                    ),
+                ),
+                tool_context=ToolContext(root),
+            )
+
+            result = await runtime.run("Update both files")
+
+            self.assertEqual(allowed.read_text(encoding="utf-8"), "allowed = 1\n")
+            self.assertEqual(denied.read_text(encoding="utf-8"), "denied = 1\n")
+            self.assertIn(AgentEventKind.TOOL_FAILED, [event.kind for event in result.events])
+            denial = [
+                message for message in provider.calls[1].messages if message.role is Role.TOOL
+            ]
+            self.assertEqual(len(denial), 1)
+            self.assertIn("outside explicit path allow rules", denial[0].content)
+            self.assertEqual(observer.capture_roots, [])
+
     async def test_interactive_approval_blocks_the_tool_until_user_allows(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
