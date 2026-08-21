@@ -25,6 +25,7 @@ from typing import Protocol, runtime_checkable
 
 from neuro_code.application.ports.storage import SessionStore
 from neuro_code.application.runtime.agent import AgentRunResult, EventSink
+from neuro_code.application.workflows.subagent_capabilities import MAX_SUBAGENT_STEPS
 from neuro_code.domain.execution import AgentExecutionOutcome
 from neuro_code.domain.session_tasks import (
     SessionTask,
@@ -36,7 +37,6 @@ from neuro_code.shared.errors import ConfigurationError, SubagentTimeoutError
 from neuro_code.shared.redaction import redact_sensitive_text
 
 MAX_SUBAGENT_PROMPT_BYTES = 16 * 1024
-MAX_SUBAGENT_STEPS = 12
 MAX_SUBAGENT_SESSION_ID_BYTES = 512
 MAX_SUBAGENT_TIMEOUT_SECONDS = 300.0
 MAX_SUBAGENT_RESULT_BYTES = 32 * 1024
@@ -112,6 +112,9 @@ class IsolatedSubagentRuntime(Protocol):
 
     @property
     def child_session_id(self) -> str: ...
+
+    @property
+    def capability_fingerprint(self) -> str: ...
 
     async def run(
         self,

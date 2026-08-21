@@ -27,7 +27,7 @@ from neuro_code.application.runtime.supervision import ExecutionControlMode
 from neuro_code.application.sessions import GetSessionSummaryRequest, SessionApplicationService
 from neuro_code.application.sessions.summary import SessionSummaryQueryService
 from neuro_code.application.settings import ApplicationSettings
-from neuro_code.application.workflows import IsolatedSubagentExecutionService
+from neuro_code.application.workflows import IsolatedSubagentExecutionService, SubagentCapabilitySet
 from neuro_code.bootstrap.composition import ApplicationComposition
 from neuro_code.configuration.app import AppConfig, ProviderProfile
 from neuro_code.domain.conversation.context import ModelContext
@@ -158,6 +158,51 @@ context_window_tokens = 65536
 """,
             encoding="utf-8",
         )
+
+    async def test_capability_bound_child_uses_exact_registry_and_context_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / "state"
+            self._write_config(state)
+            with patch.dict(
+                "os.environ",
+                {
+                    "HOME": str(root),
+                    "NEURO_CODE_HOME": str(state),
+                    "FIXTURE_KEY": "fixture-key",
+                },
+                clear=True,
+            ):
+                application = await ApplicationComposition.open(
+                    ApplicationSettings(cwd=root),
+                    provider_factory=lambda config, failover: ApplicationProviderFixture(),
+                )
+                try:
+                    capabilities = SubagentCapabilitySet.from_runtime(
+                        tool_names=(
+                            "read_file",
+                            "read_files",
+                            "list_dir",
+                            "list_tree",
+                            "glob",
+                            "grep",
+                            "grep_many",
+                            "skill",
+                        ),
+                        cwd=root,
+                        sandbox_profile=SandboxProfile.OFF,
+                        enable_background_tasks=False,
+                        max_steps=3,
+                    )
+                    binding = await application.create_binding(capabilities=capabilities)
+                    self.assertEqual(binding.capabilities, capabilities)
+                    self.assertEqual(
+                        frozenset(binding.runner._runtime._tools.names()),
+                        capabilities.allowed_tool_names,
+                    )
+                    self.assertIsNone(binding.runner._runtime._tool_context.background_tasks)
+                finally:
+                    await application.close()
 
     @staticmethod
     def _write_gemini_web_config(

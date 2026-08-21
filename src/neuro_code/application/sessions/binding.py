@@ -22,6 +22,7 @@ from neuro_code.application.ports.background_tasks import BackgroundTaskManager
 from neuro_code.application.ports.model import ModelProvider
 from neuro_code.application.ports.tools import Tool
 from neuro_code.application.runtime.agent import AgentRunResult, EventSink
+from neuro_code.application.workflows.subagent_capabilities import SubagentCapabilitySet
 from neuro_code.domain.background_tasks.models import BackgroundWakeState
 from neuro_code.domain.conversation.interaction_mode import InteractionMode
 from neuro_code.domain.conversation.messages import ContentPart, SessionItem
@@ -147,6 +148,7 @@ class ConversationBinding:
     runner: ConversationRunner
     provider: ModelProvider
     background_tasks: BackgroundTaskManager | None = None
+    capabilities: SubagentCapabilitySet | None = None
 
 
 __all__ = ["ConversationBinding", "ConversationRunner"]

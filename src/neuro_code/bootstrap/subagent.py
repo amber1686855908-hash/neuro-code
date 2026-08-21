@@ -22,6 +22,7 @@ from neuro_code.application.workflows.subagent import (
     IsolatedSubagentRuntimeFactory,
     RunSubagentRequest,
 )
+from neuro_code.application.workflows.subagent_capabilities import SubagentCapabilitySet
 from neuro_code.bootstrap.composition import ApplicationComposition
 from neuro_code.shared.errors import ConfigurationError
 
@@ -42,20 +43,28 @@ READ_ONLY_SUBAGENT_TOOL_NAMES = (
 
 
 class _CompositionReadOnlySubagentRuntime:
-    __slots__ = ("_binding", "_child_session_id", "_closed")
+    __slots__ = ("_binding", "_capability_fingerprint", "_child_session_id", "_closed")
 
     def __init__(
         self,
         binding: ConversationBinding,
         child_session_id: str,
+        capabilities: SubagentCapabilitySet,
     ) -> None:
+        if binding.capabilities != capabilities:
+            raise ConfigurationError("child binding capability metadata is inconsistent")
         self._binding = binding
+        self._capability_fingerprint = capabilities.fingerprint
         self._child_session_id = child_session_id
         self._closed = False
 
     @property
     def child_session_id(self) -> str:
         return self._child_session_id
+
+    @property
+    def capability_fingerprint(self) -> str:
+        return self._capability_fingerprint
 
     async def run(
         self,
@@ -96,6 +105,13 @@ class CompositionReadOnlySubagentRuntimeFactory(IsolatedSubagentRuntimeFactory):
         if not parent_task_id:
             raise ValueError("parent task id must not be empty")
         selected_config = _without_provider_builtin_tools(self._composition.config)
+        capabilities = SubagentCapabilitySet.from_runtime(
+            tool_names=READ_ONLY_SUBAGENT_TOOL_NAMES,
+            cwd=selected_config.cwd,
+            sandbox_profile=selected_config.sandbox_profile,
+            enable_background_tasks=False,
+            max_steps=request.max_steps,
+        )
         provider = selected_config.provider
         child_session_id = await self._composition.store.create_session(
             str(selected_config.cwd),
@@ -108,15 +124,13 @@ class CompositionReadOnlySubagentRuntimeFactory(IsolatedSubagentRuntimeFactory):
             binding = await self._composition.create_binding(
                 config=selected_config,
                 resume_id=child_session_id,
-                max_steps=request.max_steps,
-                allowed_tool_names=READ_ONLY_SUBAGENT_TOOL_NAMES,
-                enable_background_tasks=False,
+                capabilities=capabilities,
             )
         except BaseException:
             with suppress(BaseException):
                 await asyncio.shield(self._composition.store.delete_session(child_session_id))
             raise
-        return _CompositionReadOnlySubagentRuntime(binding, child_session_id)
+        return _CompositionReadOnlySubagentRuntime(binding, child_session_id, capabilities)
 
 
 def _without_provider_builtin_tools(config: AppConfig) -> AppConfig:

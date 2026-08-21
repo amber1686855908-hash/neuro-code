@@ -2307,17 +2307,20 @@ def test_canonical_runtime_public_types_keep_module_paths_and_metadata() -> None
         "runner",
         "provider",
         "background_tasks",
+        "capabilities",
     )
     assert profile.ConversationBinding.__dataclass_params__.frozen
     assert profile.ConversationBinding.__slots__ == (
         "runner",
         "provider",
         "background_tasks",
+        "capabilities",
     )
     assert profile.ConversationBinding.__match_args__ == (
         "runner",
         "provider",
         "background_tasks",
+        "capabilities",
     )
     assert not profile.ConversationRunner._is_runtime_protocol
     for name in profile.__all__:

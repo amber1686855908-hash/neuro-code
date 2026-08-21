@@ -102,6 +102,7 @@ from neuro_code.application.workflows.subagent import (
     SubagentExecutionService,
     SubagentExecutorFactory,
 )
+from neuro_code.application.workflows.subagent_capabilities import SubagentCapabilitySet
 from neuro_code.application.workflows.subagent_scheduler import (
     MAX_SUBAGENT_PARALLELISM,
     ScopedSubagentRuntimeFactory,
@@ -392,12 +393,46 @@ class ApplicationComposition:
         client_terminal: ClientTerminal | None = None,
         max_steps: int | None = None,
         allowed_tool_names: Collection[str] | None = None,
-        enable_background_tasks: bool = True,
+        enable_background_tasks: bool | None = None,
+        capabilities: SubagentCapabilitySet | None = None,
         user_interaction: UserInteractionPort | None = None,
     ) -> ConversationBinding:
         if self._closed:
             raise RuntimeError("application composition is closed")
         selected_config = config or self.config
+        if capabilities is not None:
+            if not isinstance(capabilities, SubagentCapabilitySet):
+                raise ConfigurationError("child capabilities must be canonical")
+            if selected_config.cwd != capabilities.cwd:
+                raise ConfigurationError("child capability cwd does not match child config")
+            if selected_config.sandbox_profile is not capabilities.sandbox_profile:
+                raise ConfigurationError("child capability sandbox does not match child config")
+            if max_steps is not None and max_steps != capabilities.max_steps:
+                raise ConfigurationError("child max_steps conflicts with capability budget")
+            if allowed_tool_names is not None and frozenset(allowed_tool_names) != (
+                capabilities.allowed_tool_names
+            ):
+                raise ConfigurationError("raw tool allowlist conflicts with child capability")
+            if enable_background_tasks is not None and (
+                enable_background_tasks is not capabilities.background_tasks
+            ):
+                raise ConfigurationError("raw background-task flag conflicts with child capability")
+            expected_additional_roots = capabilities.workspace_roots[1:]
+            if (
+                additional_workspace_roots
+                and tuple(
+                    path.expanduser().resolve(strict=False) for path in additional_workspace_roots
+                )
+                != expected_additional_roots
+            ):
+                raise ConfigurationError("raw workspace roots conflict with child capability")
+            max_steps = capabilities.max_steps
+            allowed_tool_names = capabilities.allowed_tool_names
+            additional_workspace_roots = expected_additional_roots
+            enable_background_tasks = capabilities.background_tasks
+        elif enable_background_tasks is None:
+            enable_background_tasks = True
+        assert enable_background_tasks is not None
         selected_execution_budget = (
             self.settings.execution_budget
             if max_steps is None
@@ -724,7 +759,26 @@ class ApplicationComposition:
                 workspace_identity=FilesystemWorkspaceIdentity(),
                 resume_id=resume_id,
             )
-            return ConversationBinding(conversation, provider, task_scope)
+            binding_capabilities = SubagentCapabilitySet.from_runtime(
+                tool_names=tools.names(),
+                provider_tool_names=selected_config.provider.builtin_tools,
+                mcp_tool_names=tuple(tool.definition.name for tool in additional_tools),
+                cwd=selected_config.cwd,
+                additional_workspace_roots=additional_workspace_roots,
+                sandbox_profile=selected_config.sandbox_profile,
+                enable_background_tasks=enable_background_tasks,
+                max_steps=selected_execution_budget.max_model_calls,
+            )
+            if capabilities is not None and binding_capabilities != capabilities:
+                raise ConfigurationError(
+                    "child binding capability metadata does not match its construction"
+                )
+            return ConversationBinding(
+                conversation,
+                provider,
+                task_scope,
+                binding_capabilities,
+            )
         except BaseException:
             if task_scope is not None:
                 await asyncio.shield(task_scope.shutdown())
@@ -924,14 +978,33 @@ class ApplicationComposition:
         self,
         factory: ScopedSubagentRuntimeFactory,
         *,
+        parent_capabilities: SubagentCapabilitySet | None = None,
+        parent_binding: ConversationBinding | None = None,
+        global_policy: SubagentCapabilitySet | None = None,
         max_parallel: int = MAX_SUBAGENT_PARALLELISM,
         max_retries: int = 0,
         timeout_seconds: float | None = None,
     ) -> SubagentScheduler:
-        """Create an opt-in scheduler over a caller-owned scoped factory."""
+        """Create an opt-in scheduler with explicit capability authorities."""
+
+        if parent_binding is not None:
+            if parent_binding.capabilities is None:
+                raise ConfigurationError("parent binding capability metadata is missing")
+            if (
+                parent_capabilities is not None
+                and parent_capabilities != parent_binding.capabilities
+            ):
+                raise ConfigurationError("parent capability metadata conflicts with binding")
+            parent_capabilities = parent_binding.capabilities
+        if parent_capabilities is None:
+            raise ConfigurationError("parent subagent capability metadata is required")
+        if global_policy is None:
+            raise ConfigurationError("global subagent capability policy is required")
 
         return SubagentScheduler(
             factory,
+            parent_capabilities=parent_capabilities,
+            global_policy=global_policy,
             max_parallel=max_parallel,
             max_retries=max_retries,
             timeout_seconds=timeout_seconds,

@@ -2,14 +2,103 @@ from __future__ import annotations
 
 import asyncio
 import unittest
+from pathlib import Path
 
 from neuro_code.application.runtime.agent import AgentRunResult
+from neuro_code.application.workflows.subagent_capabilities import (
+    NetworkAccess,
+    SubagentCapabilitySet,
+)
 from neuro_code.application.workflows.subagent_scheduler import (
     SubagentRuntimeScope,
     SubagentScheduler,
     SubagentWorkRequest,
 )
+from neuro_code.domain.sandbox.models import SandboxProfile
 from neuro_code.shared.errors import ConfigurationError
+
+
+def _capability(
+    tools: tuple[str, ...] = ("read_file", "grep"),
+    *,
+    cwd: Path = Path("/workspace/project"),
+    roots: tuple[Path, ...] = (Path("/workspace/project"),),
+    sandbox_profile: SandboxProfile | None = None,
+    mcp_tools: tuple[str, ...] = (),
+    mcp_servers: tuple[str, ...] = (),
+    max_steps: int = 8,
+) -> SubagentCapabilitySet:
+    profile = SandboxProfile.OFF if sandbox_profile is None else sandbox_profile
+    tool_set = frozenset(tools)
+    network = (
+        NetworkAccess.INHERIT
+        if tool_set.intersection(
+            {"web_fetch", "web_search", "google_search", "url_context", *mcp_tools}
+        )
+        else NetworkAccess.NONE
+    )
+    if network is NetworkAccess.NONE and tool_set.intersection(
+        {"bash", "create_terminal", "terminal_start"}
+    ):
+        network = (
+            NetworkAccess.ISOLATED if profile.restricts_child_network else NetworkAccess.INHERIT
+        )
+    return SubagentCapabilitySet(
+        allowed_tool_names=tool_set,
+        filesystem_read=bool(tool_set.intersection({"read_file", "grep"})),
+        filesystem_write=bool(tool_set.intersection({"search_replace", "apply_patch"})),
+        bash="bash" in tool_set,
+        terminal=bool(tool_set.intersection({"create_terminal", "terminal_start"})),
+        background_tasks=bool(tool_set.intersection({"bash", "task_output", "wait_tasks"})),
+        mcp_tool_names=frozenset(mcp_tools),
+        mcp_server_names=frozenset(mcp_servers),
+        network_access=network,
+        cwd=cwd,
+        workspace_roots=(cwd, *roots),
+        sandbox_profile=profile,
+        max_steps=max_steps,
+    )
+
+
+def _global_policy() -> SubagentCapabilitySet:
+    return _capability(
+        (
+            "read_file",
+            "grep",
+            "search_replace",
+            "apply_patch",
+            "bash",
+            "create_terminal",
+            "terminal_start",
+            "task_output",
+            "wait_tasks",
+            "mcp_lookup",
+            "web_search",
+        ),
+        cwd=Path("/workspace"),
+        roots=(Path("/"),),
+        mcp_tools=("mcp_lookup",),
+        mcp_servers=("fixture",),
+        max_steps=12,
+    )
+
+
+def _request(prompt: str, capabilities: SubagentCapabilitySet | None = None) -> SubagentWorkRequest:
+    return SubagentWorkRequest(prompt, capabilities or _capability())
+
+
+def _scheduler(
+    factory: _Factory,
+    *,
+    parent: SubagentCapabilitySet | None = None,
+    **kwargs: object,
+) -> SubagentScheduler:
+    return SubagentScheduler(
+        factory,
+        parent_capabilities=parent or _capability(),
+        global_policy=_global_policy(),
+        **kwargs,
+    )
 
 
 class _Runtime:
@@ -17,6 +106,7 @@ class _Runtime:
         self,
         session_id: str,
         *,
+        capabilities: SubagentCapabilitySet,
         error: BaseException | None = None,
         activity: _Factory | None = None,
     ) -> None:
@@ -24,6 +114,7 @@ class _Runtime:
         self.error = error
         self.activity = activity
         self.closed = False
+        self.capability_fingerprint = capabilities.fingerprint
         self.writes_enabled = False
         self.allowed_tool_names: tuple[str, ...] = ()
 
@@ -53,12 +144,17 @@ class _Factory:
         self.maximum = 0
 
     async def create(
-        self, request: SubagentWorkRequest, *, scope: SubagentRuntimeScope
+        self,
+        request: SubagentWorkRequest,
+        *,
+        scope: SubagentRuntimeScope,
+        capabilities: SubagentCapabilitySet,
     ) -> _Runtime:
         del request, scope
         error = self.errors.pop(0) if self.errors else None
         runtime = _Runtime(
             f"child-{len(self.runtimes)}",
+            capabilities=capabilities,
             error=error,
             activity=self,
         )
@@ -69,19 +165,19 @@ class _Factory:
 class SubagentSchedulerTests(unittest.IsolatedAsyncioTestCase):
     def test_request_and_scope_bounds_are_fail_closed(self) -> None:
         with self.assertRaises(ValueError):
-            SubagentWorkRequest(" ")
+            _request(" ")
         with self.assertRaises(ValueError):
-            SubagentWorkRequest("prompt", max_steps=0)
+            _request("prompt", _capability(max_steps=0))
         with self.assertRaises(ValueError):
             SubagentRuntimeScope("parent", depth=2, max_depth=1)
-        with self.assertRaises(ValueError):
-            SubagentRuntimeScope("parent", allowed_tool_names=("read", "read"))
+        with self.assertRaises(TypeError):
+            SubagentWorkRequest("prompt", object())  # type: ignore[arg-type]
 
     async def test_scheduler_rejects_bad_factory_timeout_and_mismatched_runtime(self) -> None:
         with self.assertRaises(ConfigurationError):
             SubagentScheduler(object())  # type: ignore[arg-type]
         with self.assertRaises(ValueError):
-            SubagentScheduler(_Factory(), timeout_seconds=0)
+            _scheduler(_Factory(), timeout_seconds=0)
 
         factory = _Factory()
         original_create = factory.create
@@ -90,22 +186,23 @@ class SubagentSchedulerTests(unittest.IsolatedAsyncioTestCase):
             request: SubagentWorkRequest,
             *,
             scope: SubagentRuntimeScope,
+            capabilities: SubagentCapabilitySet,
         ) -> _Runtime:
-            runtime = await original_create(request, scope=scope)
+            runtime = await original_create(request, scope=scope, capabilities=capabilities)
             runtime.child_session_id = scope.parent_session_id
             return runtime
 
         factory.create = mismatched_create  # type: ignore[method-assign]
-        result = await SubagentScheduler(factory).run(
-            SubagentWorkRequest("mismatch"),
+        result = await _scheduler(factory).run(
+            _request("mismatch"),
             scope=SubagentRuntimeScope("parent"),
         )
         self.assertEqual(result.error_type, "ConfigurationError")
 
         slow_factory = _Factory()
-        slow_scheduler = SubagentScheduler(slow_factory, timeout_seconds=0.001)
+        slow_scheduler = _scheduler(slow_factory, timeout_seconds=0.001)
         timeout_result = await slow_scheduler.run(
-            SubagentWorkRequest("timeout"),
+            _request("timeout"),
             scope=SubagentRuntimeScope("parent"),
         )
         self.assertEqual(timeout_result.error_type, "TimeoutError")
@@ -118,20 +215,22 @@ class SubagentSchedulerTests(unittest.IsolatedAsyncioTestCase):
             request: SubagentWorkRequest,
             *,
             scope: SubagentRuntimeScope,
+            capabilities: SubagentCapabilitySet,
         ) -> _Runtime:
-            runtime = await original_create(request, scope=scope)
+            runtime = await original_create(request, scope=scope, capabilities=capabilities)
+            runtime.capability_fingerprint = _capability(("read_file", "grep", "bash")).fingerprint
             runtime.allowed_tool_names = ("write",)
             return runtime
 
         factory.create = tool_escalating_create  # type: ignore[method-assign]
-        result = await SubagentScheduler(factory).run(
-            SubagentWorkRequest("tool scope"),
-            scope=SubagentRuntimeScope("parent", allowed_tool_names=("read",)),
+        result = await _scheduler(factory).run(
+            _request("tool scope"),
+            scope=SubagentRuntimeScope("parent"),
         )
         self.assertEqual(result.error_type, "ConfigurationError")
         with self.assertRaises(ValueError):
-            await SubagentScheduler(factory).run_many(
-                tuple(SubagentWorkRequest(str(index)) for index in range(17)),
+            await _scheduler(factory).run_many(
+                tuple(_request(str(index)) for index in range(17)),
                 scope=SubagentRuntimeScope("parent"),
             )
 
@@ -147,8 +246,8 @@ class SubagentSchedulerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_run_many_is_bounded_and_keeps_request_order(self) -> None:
         factory = _Factory()
-        scheduler = SubagentScheduler(factory, max_parallel=2)
-        requests = tuple(SubagentWorkRequest(f"prompt-{index}") for index in range(5))
+        scheduler = _scheduler(factory, max_parallel=2)
+        requests = tuple(_request(f"prompt-{index}") for index in range(5))
         results = await scheduler.run_many(
             requests,
             scope=SubagentRuntimeScope("parent"),
@@ -163,9 +262,9 @@ class SubagentSchedulerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_retry_uses_a_fresh_runtime_and_closes_each_attempt(self) -> None:
         factory = _Factory([RuntimeError("transient")])
-        scheduler = SubagentScheduler(factory, max_retries=1)
+        scheduler = _scheduler(factory, max_retries=1)
         result = await scheduler.run(
-            SubagentWorkRequest("retry"),
+            _request("retry"),
             scope=SubagentRuntimeScope("parent"),
         )
         self.assertIsNotNone(result.result)
@@ -177,15 +276,23 @@ class SubagentSchedulerTests(unittest.IsolatedAsyncioTestCase):
         factory = _Factory()
         original_create = factory.create
 
-        async def create(request: SubagentWorkRequest, *, scope: SubagentRuntimeScope) -> _Runtime:
-            runtime = await original_create(request, scope=scope)
+        async def create(
+            request: SubagentWorkRequest,
+            *,
+            scope: SubagentRuntimeScope,
+            capabilities: SubagentCapabilitySet,
+        ) -> _Runtime:
+            runtime = await original_create(request, scope=scope, capabilities=capabilities)
+            runtime.capability_fingerprint = _capability(
+                ("read_file", "grep", "apply_patch")
+            ).fingerprint
             runtime.writes_enabled = True
             return runtime
 
         factory.create = create  # type: ignore[method-assign]
-        scheduler = SubagentScheduler(factory)
+        scheduler = _scheduler(factory)
         result = await scheduler.run(
-            SubagentWorkRequest("read-only"),
+            _request("read-only"),
             scope=SubagentRuntimeScope("parent"),
         )
         self.assertIsNone(result.result)

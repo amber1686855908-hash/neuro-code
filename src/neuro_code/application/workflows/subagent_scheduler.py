@@ -2,9 +2,10 @@
 
 显式且有界的隔离子代理运行时调度器.
 
-The scheduler owns only concurrency, retry, depth, and capability checks. A
-factory remains responsible for creating a fresh child conversation and for
-enforcing the selected permission/tool set at the runtime boundary.
+The scheduler owns only concurrency, retry, depth, and capability resolution.
+A factory receives the resolved immutable capability manifest before it creates
+the child conversation. Runtime self-declared capability attributes are not an
+authorization source.
 """
 
 from __future__ import annotations
@@ -15,7 +16,8 @@ from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
 from neuro_code.application.runtime.agent import AgentRunResult, EventSink
-from neuro_code.application.workflows.subagent import MAX_SUBAGENT_PROMPT_BYTES, MAX_SUBAGENT_STEPS
+from neuro_code.application.workflows.subagent import MAX_SUBAGENT_PROMPT_BYTES
+from neuro_code.application.workflows.subagent_capabilities import SubagentCapabilitySet
 from neuro_code.shared.errors import ConfigurationError
 
 MAX_SCHEDULED_SUBAGENTS = 16
@@ -26,14 +28,17 @@ MAX_SUBAGENT_DEPTH = 4
 
 @dataclass(frozen=True, slots=True)
 class SubagentRuntimeScope:
-    """Capabilities inherited by exactly one explicitly created child."""
+    """Lifecycle scope for exactly one explicitly created child.
+
+    Tool, filesystem, sandbox, network, and execution capabilities live in
+    :class:`SubagentCapabilitySet`; keeping them out of this lifecycle value
+    prevents two competing authorization authorities.
+    """
 
     parent_session_id: str
     depth: int = 0
     max_depth: int = 1
     recursive: bool = False
-    allow_writes: bool = False
-    allowed_tool_names: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.parent_session_id, str) or not self.parent_session_id.strip():
@@ -48,14 +53,8 @@ class SubagentRuntimeScope:
                 raise ValueError(f"subagent scope {name} is out of bounds")
         if self.depth > self.max_depth:
             raise ValueError("subagent scope depth exceeds max_depth")
-        if not isinstance(self.recursive, bool) or not isinstance(self.allow_writes, bool):
-            raise TypeError("subagent scope flags must be bools")
-        names = tuple(self.allowed_tool_names)
-        if len(names) > 128 or len(set(names)) != len(names):
-            raise ValueError("subagent scope tool set is invalid")
-        if not all(isinstance(name, str) and name and "\x00" not in name for name in names):
-            raise ValueError("subagent scope tool set is invalid")
-        object.__setattr__(self, "allowed_tool_names", names)
+        if not isinstance(self.recursive, bool):
+            raise TypeError("subagent scope recursive flag must be a bool")
 
     def child(self, parent_session_id: str) -> SubagentRuntimeScope:
         """Derive a child scope, enforcing the recursive-spawn gate."""
@@ -69,8 +68,6 @@ class SubagentRuntimeScope:
             depth=self.depth + 1,
             max_depth=self.max_depth,
             recursive=self.recursive,
-            allow_writes=self.allow_writes,
-            allowed_tool_names=self.allowed_tool_names,
         )
 
 
@@ -79,7 +76,7 @@ class SubagentWorkRequest:
     """One bounded independent child prompt."""
 
     prompt: str
-    max_steps: int = 8
+    capabilities: SubagentCapabilitySet
 
     def __post_init__(self) -> None:
         if (
@@ -89,12 +86,14 @@ class SubagentWorkRequest:
             or len(self.prompt.encode("utf-8")) > MAX_SUBAGENT_PROMPT_BYTES
         ):
             raise ValueError("subagent prompt must be non-empty and bounded")
-        if (
-            isinstance(self.max_steps, bool)
-            or not isinstance(self.max_steps, int)
-            or not 1 <= self.max_steps <= MAX_SUBAGENT_STEPS
-        ):
-            raise ValueError("subagent max_steps is out of bounds")
+        if not isinstance(self.capabilities, SubagentCapabilitySet):
+            raise TypeError("subagent request capabilities must be canonical")
+
+    @property
+    def max_steps(self) -> int:
+        """Compatibility projection of the requested resource limit."""
+
+        return self.capabilities.max_steps
 
 
 @runtime_checkable
@@ -103,6 +102,9 @@ class ScopedSubagentRuntime(Protocol):
 
     @property
     def child_session_id(self) -> str: ...
+
+    @property
+    def capability_fingerprint(self) -> str: ...
 
     async def run(self, prompt: str, *, sink: EventSink | None = None) -> AgentRunResult: ...
 
@@ -116,6 +118,7 @@ class ScopedSubagentRuntimeFactory(Protocol):
         request: SubagentWorkRequest,
         *,
         scope: SubagentRuntimeScope,
+        capabilities: SubagentCapabilitySet,
     ) -> ScopedSubagentRuntime: ...
 
 
@@ -150,12 +153,18 @@ class SubagentScheduler:
         self,
         factory: ScopedSubagentRuntimeFactory,
         *,
+        parent_capabilities: SubagentCapabilitySet | None = None,
+        global_policy: SubagentCapabilitySet | None = None,
         max_parallel: int = MAX_SUBAGENT_PARALLELISM,
         max_retries: int = 0,
         timeout_seconds: float | None = None,
     ) -> None:
         if not isinstance(factory, ScopedSubagentRuntimeFactory):
             raise ConfigurationError("subagent runtime factory is invalid")
+        if not isinstance(parent_capabilities, SubagentCapabilitySet):
+            raise ConfigurationError("parent subagent capability metadata is required")
+        if not isinstance(global_policy, SubagentCapabilitySet):
+            raise ConfigurationError("global subagent capability policy is required")
         if isinstance(max_parallel, bool) or not 1 <= max_parallel <= MAX_SUBAGENT_PARALLELISM:
             raise ValueError("subagent max_parallel is out of bounds")
         if isinstance(max_retries, bool) or not 0 <= max_retries <= MAX_SUBAGENT_RETRIES:
@@ -167,26 +176,24 @@ class SubagentScheduler:
         ):
             raise ValueError("subagent timeout_seconds must be positive")
         self._factory = factory
+        self._parent_capabilities = parent_capabilities
+        self._global_policy = global_policy
         self._max_parallel = max_parallel
         self._max_retries = max_retries
         self._timeout_seconds = float(timeout_seconds) if timeout_seconds is not None else None
 
     @staticmethod
-    def _validate_runtime(runtime: ScopedSubagentRuntime, scope: SubagentRuntimeScope) -> None:
+    def _validate_runtime(
+        runtime: ScopedSubagentRuntime,
+        scope: SubagentRuntimeScope,
+        capabilities: SubagentCapabilitySet,
+    ) -> None:
         if not isinstance(runtime, ScopedSubagentRuntime):
             raise ConfigurationError("subagent factory returned an invalid runtime")
         if not runtime.child_session_id or runtime.child_session_id == scope.parent_session_id:
             raise ConfigurationError("subagent runtime returned an invalid child session")
-        writes_enabled = getattr(runtime, "writes_enabled", False)
-        if writes_enabled is True and not scope.allow_writes:
-            raise ConfigurationError("subagent runtime exceeded its read-only scope")
-        runtime_tools = getattr(runtime, "allowed_tool_names", None)
-        if (
-            scope.allowed_tool_names
-            and runtime_tools is not None
-            and not set(runtime_tools).issubset(scope.allowed_tool_names)
-        ):
-            raise ConfigurationError("subagent runtime exceeded its tool scope")
+        if runtime.capability_fingerprint != capabilities.fingerprint:
+            raise ConfigurationError("subagent runtime capability metadata is inconsistent")
 
     async def run(
         self,
@@ -200,12 +207,29 @@ class SubagentScheduler:
             raise TypeError("subagent request must be canonical")
         if not isinstance(scope, SubagentRuntimeScope):
             raise TypeError("subagent scope must be canonical")
+        try:
+            effective_capabilities = SubagentCapabilitySet.resolve_child(
+                parent=self._parent_capabilities,
+                requested=request.capabilities,
+                global_policy=self._global_policy,
+            )
+        except Exception as error:
+            return ScheduledSubagentResult(
+                request_index,
+                None,
+                1,
+                type(error).__name__,
+            )
         last_error: BaseException | None = None
         for attempt in range(1, self._max_retries + 2):
             runtime: ScopedSubagentRuntime | None = None
             try:
-                runtime = await self._factory.create(request, scope=scope)
-                self._validate_runtime(runtime, scope)
+                runtime = await self._factory.create(
+                    request,
+                    scope=scope,
+                    capabilities=effective_capabilities,
+                )
+                self._validate_runtime(runtime, scope, effective_capabilities)
                 if self._timeout_seconds is None:
                     result = await runtime.run(request.prompt, sink=sink)
                 else:

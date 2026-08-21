@@ -29,6 +29,7 @@ from neuro_code.application.workflows import (
     SubagentExecutor,
     SubagentRunResult,
 )
+from neuro_code.application.workflows.subagent_capabilities import SubagentCapabilitySet
 from neuro_code.bootstrap.composition import ApplicationComposition
 from neuro_code.bootstrap.subagent import (
     READ_ONLY_SUBAGENT_TOOL_NAMES,
@@ -92,6 +93,7 @@ class IsolatedSubagentStoreFixture(SubagentStoreFixture):
 class IsolatedRuntimeFixture:
     def __init__(self, child_session_id: str = "child-session") -> None:
         self.child_session_id = child_session_id
+        self.capability_fingerprint = "fixture-capability"
         self.result = AgentRunResult(child_session_id, "child result", (), (), (), 1)
         self.error: BaseException | None = None
         self.closed = 0
@@ -178,10 +180,12 @@ class CompositionSubagentBindingFactoryFixture:
         self.calls.append(kwargs)
         if self.fail:
             raise RuntimeError("child binding failed")
+        capabilities = cast(SubagentCapabilitySet, kwargs["capabilities"])
         return ConversationBinding(
             CompositionSubagentRunnerFixture(),
             self.config.provider,
             self.scope,
+            capabilities,
         )
 
 
@@ -712,8 +716,9 @@ class CompositionReadOnlySubagentRuntimeFactoryTests(unittest.IsolatedAsyncioTes
         self.assertEqual(self.store.created[0][1:3], ("xai", "fixture-model"))
         call = self.composition.calls[0]
         self.assertEqual(call["resume_id"], "child-session")
-        self.assertEqual(call["max_steps"], 3)
-        self.assertEqual(call["allowed_tool_names"], READ_ONLY_SUBAGENT_TOOL_NAMES)
+        capabilities = cast(SubagentCapabilitySet, call["capabilities"])
+        self.assertEqual(capabilities.max_steps, 3)
+        self.assertEqual(capabilities.allowed_tool_names, frozenset(READ_ONLY_SUBAGENT_TOOL_NAMES))
         self.assertEqual(
             READ_ONLY_SUBAGENT_TOOL_NAMES,
             (
@@ -727,7 +732,7 @@ class CompositionReadOnlySubagentRuntimeFactoryTests(unittest.IsolatedAsyncioTes
                 "skill",
             ),
         )
-        self.assertFalse(call["enable_background_tasks"])
+        self.assertFalse(capabilities.background_tasks)
         selected = cast(AppConfig, call["config"])
         self.assertEqual(selected.provider.builtin_tools, ())
 
