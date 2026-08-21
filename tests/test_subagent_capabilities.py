@@ -400,8 +400,8 @@ class SubagentCapabilityBoundaryTests(unittest.IsolatedAsyncioTestCase):
             roots=(Path("/workspace/project/src"),),
         )
         intersection = parent.intersection(child)
-        self.assertEqual(intersection.cwd, Path("/workspace/project/src"))
-        self.assertEqual(intersection.workspace_roots, (Path("/workspace/project/src"),))
+        self.assertEqual(intersection.cwd, child.cwd)
+        self.assertEqual(intersection.workspace_roots, child.workspace_roots)
         with self.assertRaises(ConfigurationError):
             _intersect_roots((Path("/workspace/project"),), (Path("/unrelated"),))
         with self.assertRaises(ConfigurationError):
