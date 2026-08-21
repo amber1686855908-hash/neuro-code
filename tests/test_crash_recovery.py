@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import closing
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -245,7 +246,7 @@ class CrashRecoveryTests(unittest.IsolatedAsyncioTestCase):
             "provider",
             "model",
         )
-        with sqlite3.connect(self.database) as connection:
+        with closing(sqlite3.connect(self.database)) as connection, connection:
             connection.execute(
                 "UPDATE sessions SET messages_json = ? WHERE id = ?",
                 ("{", corrupted_session),
@@ -271,7 +272,7 @@ class CrashRecoveryTests(unittest.IsolatedAsyncioTestCase):
             await self.store.save_messages(corrupted_session, [])
         with self.assertRaises(SessionError):
             await self.store.save_session_items(corrupted_session, [])
-        with sqlite3.connect(self.database) as connection:
+        with closing(sqlite3.connect(self.database)) as connection, connection:
             connection.execute("UPDATE schema_meta SET version = 99 WHERE singleton = 1")
         with self.assertRaises(SessionError):
             await SqliteSessionStore(self.database).initialize()
@@ -449,7 +450,7 @@ class CrashRecoveryTests(unittest.IsolatedAsyncioTestCase):
         await self.store.start_turn_attempt(attempt)
 
         def update(column: str, value: object) -> None:
-            with sqlite3.connect(self.database) as connection:
+            with closing(sqlite3.connect(self.database)) as connection, connection:
                 connection.execute("PRAGMA ignore_check_constraints = ON")
                 connection.execute(
                     f"UPDATE session_turn_attempts SET {column} = ? WHERE turn_id = ?",
@@ -1264,7 +1265,8 @@ asyncio.run(main())
 
         reopened = SqliteSessionStore(process_database)
         await reopened.initialize()
-        rows = sqlite3.connect(process_database).execute("SELECT id FROM sessions").fetchall()
+        with closing(sqlite3.connect(process_database)) as connection:
+            rows = connection.execute("SELECT id FROM sessions").fetchall()
         self.assertEqual(len(rows), 1)
         session_id = str(rows[0][0])
         inspection = (await TurnRecoveryService(reopened).inspect_open(session_id))[0]
@@ -1313,9 +1315,8 @@ asyncio.run(main())
 
         reopened = SqliteSessionStore(process_database)
         await reopened.initialize()
-        session_id = str(
-            sqlite3.connect(process_database).execute("SELECT id FROM sessions").fetchone()[0]
-        )
+        with closing(sqlite3.connect(process_database)) as connection:
+            session_id = str(connection.execute("SELECT id FROM sessions").fetchone()[0])
         self.assertEqual(await TurnRecoveryService(reopened).inspect_open(session_id), ())
         inspection = (await TurnRecoveryService(reopened).inspect(session_id))[0]
         self.assertEqual(inspection.status, TurnRecoveryStatus.COMMITTED)

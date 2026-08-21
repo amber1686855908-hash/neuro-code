@@ -3343,7 +3343,11 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
             )
 
             turn = asyncio.create_task(runtime.run("Run both tools"))
-            await asyncio.wait_for(blocking.started.wait(), timeout=1)
+            # Persisted turn/tool write-ahead markers add a bounded SQLite
+            # boundary before the tool body. Keep this synchronization timeout
+            # independent of normal local scheduling variance across Python
+            # versions and hosted CI runners.
+            await asyncio.wait_for(blocking.started.wait(), timeout=5)
             turn.cancel()
             with self.assertRaises(asyncio.CancelledError):
                 await turn
