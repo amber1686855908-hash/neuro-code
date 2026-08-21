@@ -3,12 +3,14 @@ from __future__ import annotations
 import asyncio
 import base64
 import builtins
+import sys
 import tempfile
 import unittest
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
+from types import ModuleType
 from typing import Any, cast
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -1918,6 +1920,56 @@ class AcpAgentTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(writer.is_closing())
         with self.assertRaises(ConnectionError):
             writer.write(b"closed")
+
+    async def test_websocket_server_runs_and_closes_a_connection(self) -> None:
+        class StopServer(Exception):
+            pass
+
+        class WebSocket:
+            def __aiter__(self) -> WebSocket:
+                return self
+
+            async def __anext__(self) -> str:
+                raise StopAsyncIteration
+
+            async def send(self, _value: bytes) -> None:
+                return
+
+        class ServerContext:
+            def __init__(self, handler: Any) -> None:
+                self._handler = handler
+
+            async def __aenter__(self) -> ServerContext:
+                await self._handler(WebSocket())
+                raise StopServer
+
+            async def __aexit__(self, *_args: Any) -> bool:
+                return False
+
+        calls: list[tuple[str, int, dict[str, Any]]] = []
+
+        def fake_serve(handler: Any, host: str, port: int, **kwargs: Any) -> ServerContext:
+            calls.append((host, port, kwargs))
+            return ServerContext(handler)
+
+        fake_server = ModuleType("websockets.asyncio.server")
+        fake_server.__dict__["serve"] = fake_serve
+        with (
+            patch.dict(sys.modules, {"websockets.asyncio.server": fake_server}),
+            self.assertRaises(StopServer),
+        ):
+            await acp_module.serve_acp_websocket(cast(Any, object()), port=8765)
+
+        self.assertEqual(
+            calls,
+            [
+                (
+                    "127.0.0.1",
+                    8765,
+                    {"max_size": ACP_STDIO_BUFFER_LIMIT_BYTES, "max_queue": 16},
+                )
+            ],
+        )
 
     async def test_private_subagent_lifecycle_extension_maps_external_ids_and_actions(
         self,

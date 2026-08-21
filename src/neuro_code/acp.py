@@ -3398,7 +3398,7 @@ async def serve_acp_websocket(
     if isinstance(port, bool) or not isinstance(port, int) or not 0 <= port <= 65535:
         raise ConfigurationError("WebSocket ACP port is invalid")
     try:
-        from websockets.asyncio.server import serve  # type: ignore[import-not-found]
+        from websockets.asyncio.server import serve
     except ImportError:
         raise ConfigurationError(
             "WebSocket ACP support requires the websockets dependency"
