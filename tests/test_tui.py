@@ -304,7 +304,13 @@ class ProviderFailureThenSuccessTuiConversation(TuiConversation):
             self._fail_first_request = False
             self.prompts.append(prompt)
             self._session_id = "provider-failure-session"
-            raise ProviderError.from_http(402, "insufficient balance")
+            raise ProviderError.from_http(
+                402,
+                "insufficient balance; api_key=provider-secret-value; "
+                "Authorization: Bearer bearer-fixture-token; "
+                "https://user:password@example.invalid/v1",
+                redaction_values=("provider-secret-value",),
+            )
         return await super().run(
             prompt,
             sink=sink,
@@ -3917,6 +3923,9 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("balance is insufficient", recoverable.text)
             self.assertIn("session is still open", recoverable.text)
             self.assertNotIn("ProviderError", recoverable.text)
+            self.assertNotIn("provider-secret-value", recoverable.text)
+            self.assertNotIn("bearer-fixture-token", recoverable.text)
+            self.assertNotIn("password@example.invalid", recoverable.text)
             self.assertFalse(prompt.disabled)
             self.assertTrue(prompt.has_focus)
 

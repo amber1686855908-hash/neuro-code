@@ -39,13 +39,21 @@ from neuro_code.domain.conversation.messages import (
 )
 from neuro_code.domain.conversation.reasoning import ReasoningEffort
 from neuro_code.domain.tools import ToolDefinition
+from neuro_code.infrastructure.providers.failure_conformance import (
+    ProviderFailureProtocol,
+    classify_provider_failure,
+)
 from neuro_code.infrastructure.providers.image_references import (
     OPENAI_IMAGE_MEDIA_TYPES,
     OPENAI_MAX_INLINE_IMAGE_BYTES,
     InlineImageReference,
     parse_image_reference,
 )
-from neuro_code.shared.errors import ConfigurationError, ProviderError, ProviderFailureKind
+from neuro_code.shared.errors import (
+    ConfigurationError,
+    ProviderError,
+    ProviderFailureKind,
+)
 
 BACKEND_SUMMARY_FIELD_CHARS = 1000
 CODE_SUMMARY_CHARS = 100
@@ -858,7 +866,7 @@ class OpenAICompatibleProvider:
         try:
             import httpx
         except ImportError as error:
-            raise ProviderError(
+            raise ProviderError.local(
                 "httpx is required for live model requests; install the project"
             ) from error
 
@@ -887,6 +895,10 @@ class OpenAICompatibleProvider:
                         response.status_code,
                         detail,
                         headers=response.headers,
+                        failure_kind=classify_provider_failure(
+                            ProviderFailureProtocol.OPENAI_COMPATIBLE,
+                            detail,
+                        ),
                         provider=self._provider_name,
                         model=self._model,
                         redaction_values=(self._api_key, *self._http_policy.redaction_values),
@@ -949,7 +961,7 @@ class OpenAICompatibleProvider:
             raise
         except Exception as error:
             # Deliberately exclude request headers and body from the exception.
-            raise ProviderError.from_transport(
+            raise ProviderError.from_runtime(
                 error,
                 provider=self._provider_name,
                 model=self._model,

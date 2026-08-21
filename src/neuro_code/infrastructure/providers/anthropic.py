@@ -44,13 +44,22 @@ from neuro_code.domain.conversation.messages import (
     ToolCall,
 )
 from neuro_code.domain.tools import ToolDefinition
+from neuro_code.infrastructure.providers.failure_conformance import (
+    ProviderFailureProtocol,
+    classify_provider_failure,
+)
 from neuro_code.infrastructure.providers.image_references import (
     ANTHROPIC_IMAGE_MEDIA_TYPES,
     ANTHROPIC_MAX_INLINE_IMAGE_BYTES,
     InlineImageReference,
     parse_image_reference,
 )
-from neuro_code.shared.errors import ConfigurationError, ProviderError, ProviderFailureKind
+from neuro_code.shared.errors import (
+    ConfigurationError,
+    ProviderError,
+    ProviderFailureKind,
+    ProviderFailureOrigin,
+)
 from neuro_code.shared.redaction import redact_sensitive_text
 
 ANTHROPIC_WEB_SEARCH_TOOL_TYPE = "web_search_20260318"
@@ -723,7 +732,7 @@ class AnthropicProvider:
         try:
             import httpx
         except ImportError as error:
-            raise ProviderError(
+            raise ProviderError.local(
                 "httpx is required for live model requests; install the project"
             ) from error
 
@@ -779,6 +788,10 @@ class AnthropicProvider:
                                 response.status_code,
                                 detail,
                                 headers=response.headers,
+                                failure_kind=classify_provider_failure(
+                                    ProviderFailureProtocol.ANTHROPIC,
+                                    detail,
+                                ),
                                 provider=self._provider_name,
                                 model=self._model,
                                 redaction_values=self._redaction_values,
@@ -804,10 +817,15 @@ class AnthropicProvider:
                                 error_data = event.get("error")
                                 detail = json.dumps(error_data, ensure_ascii=False)
                                 raise ProviderError.classified(
-                                    ProviderFailureKind.SERVER,
+                                    classify_provider_failure(
+                                        ProviderFailureProtocol.ANTHROPIC,
+                                        json.dumps(event, ensure_ascii=False),
+                                    )
+                                    or ProviderFailureKind.UNKNOWN,
                                     f"Anthropic stream error: {self._safe_detail(detail)}",
                                     provider=self._provider_name,
                                     model=self._model,
+                                    origin=ProviderFailureOrigin.PROVIDER,
                                     redaction_values=self._redaction_values,
                                 )
                             if event_type == "message_start":
@@ -1067,7 +1085,7 @@ class AnthropicProvider:
                         try:
                             self._response_observer(terminal)
                         except Exception as error:
-                            raise ProviderError(
+                            raise ProviderError.local(
                                 f"Anthropic response observer failed: {type(error).__name__}"
                             ) from error
 
@@ -1103,7 +1121,7 @@ class AnthropicProvider:
         except ProviderError:
             raise
         except Exception as error:
-            raise ProviderError.from_transport(
+            raise ProviderError.from_runtime(
                 error,
                 provider=self._provider_name,
                 model=self._model,

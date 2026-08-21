@@ -37,6 +37,10 @@ from neuro_code.domain.conversation.messages import (
     ToolCall,
 )
 from neuro_code.domain.tools import ToolDefinition
+from neuro_code.infrastructure.providers.failure_conformance import (
+    ProviderFailureProtocol,
+    classify_provider_failure,
+)
 from neuro_code.infrastructure.providers.image_references import (
     OPENAI_IMAGE_MEDIA_TYPES,
     OPENAI_MAX_INLINE_IMAGE_BYTES,
@@ -47,6 +51,7 @@ from neuro_code.shared.errors import (
     ConfigurationError,
     ProviderError,
     ProviderFailureKind,
+    ProviderFailureOrigin,
 )
 
 _NATIVE_SOURCE_PROVIDERS = frozenset({UPSTREAM_IMPORT_PROVIDER, "xai-responses"})
@@ -847,7 +852,7 @@ class OpenAIResponsesProvider:
         try:
             import httpx
         except ImportError as error:
-            raise ProviderError(
+            raise ProviderError.local(
                 "httpx is required for live model requests; install the project"
             ) from error
 
@@ -876,6 +881,10 @@ class OpenAIResponsesProvider:
                         response.status_code,
                         detail,
                         headers=response.headers,
+                        failure_kind=classify_provider_failure(
+                            ProviderFailureProtocol.OPENAI_RESPONSES,
+                            detail,
+                        ),
                         provider=self._provider_name,
                         model=self._model,
                         redaction_values=(self._api_key, *self._http_policy.redaction_values),
@@ -938,17 +947,23 @@ class OpenAIResponsesProvider:
                         terminal = raw_response
                     elif event_type in {"response.failed", "error", "response.error"}:
                         detail = self._safe_detail(self._failure_detail(event))
+                        envelope = json.dumps(event, ensure_ascii=False)
                         raise ProviderError.classified(
-                            ProviderFailureKind.SERVER,
+                            classify_provider_failure(
+                                ProviderFailureProtocol.OPENAI_RESPONSES,
+                                envelope,
+                            )
+                            or ProviderFailureKind.UNKNOWN,
                             f"Responses API failed: {detail}",
                             provider=self._provider_name,
                             model=self._model,
+                            origin=ProviderFailureOrigin.PROVIDER,
                             redaction_values=(self._api_key, *self._http_policy.redaction_values),
                         )
         except ProviderError:
             raise
         except Exception as error:
-            raise ProviderError.from_transport(
+            raise ProviderError.from_runtime(
                 error,
                 provider=self._provider_name,
                 model=self._model,
@@ -972,7 +987,7 @@ class OpenAIResponsesProvider:
             try:
                 self._response_observer(terminal)
             except Exception as error:
-                raise ProviderError(
+                raise ProviderError.local(
                     f"Responses API response observer failed: {type(error).__name__}"
                 ) from error
         for item in self._response_output(terminal):

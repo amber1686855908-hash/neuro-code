@@ -926,6 +926,7 @@ def test_canonical_provider_modules_are_the_only_provider_implementations() -> N
         "neuro_code.infrastructure.providers.anthropic",
         "neuro_code.infrastructure.providers.catalog_cache",
         "neuro_code.infrastructure.providers.failover",
+        "neuro_code.infrastructure.providers.failure_conformance",
         "neuro_code.infrastructure.providers.failure_policy",
         "neuro_code.infrastructure.providers.gemini",
         "neuro_code.infrastructure.providers.gemini_interactions",

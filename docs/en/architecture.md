@@ -1284,24 +1284,32 @@ or a CC Switch gateway. See
 Provider transport and protocol failures cross a typed boundary before they
 reach resilience. `ProviderFailure` in `shared.errors` is an immutable,
 redacted, bounded fact containing kind, safe detail, optional status/
-`Retry-After`, provider/model identity, and lifecycle phase. It never contains
-retry, circuit, or failover decisions. The five model HTTP adapters classify
-status and structured error fields at the transport boundary, distinguish
-timeouts from network failures, and classify malformed streams as protocol
-failures. `ConfigurationError` remains separate, and cancellation propagates
-unchanged.
+`Retry-After`, provider/model identity, lifecycle phase, and evidence origin
+(`provider`, `transport`, `local`, or `unknown`). It never contains retry,
+circuit, or failover decisions. The five model HTTP adapters use a conservative
+generic HTTP fallback and then classify exact provider-owned structured fields;
+generic 404 is not asserted to be a missing model, generic 429 is not made
+retryable without an explicit rate code, and generic 413 is an invalid request.
+Timeout/network failures are transport facts, malformed provider streams are
+protocol facts, and unexpected non-transport runtime failures are local facts.
+`ConfigurationError` remains separate, and cancellation propagates unchanged.
 
 `ProviderFailurePolicy` owns retry, circuit, and failover independently. Server,
-timeout, and network facts are transient circuit inputs; rate limits may retry
-or isolate a candidate without marking it unhealthy; permanent request,
-authentication, authorization, model, and context failures do not poison the
-transient circuit. Invalid requests do not fail over, while protocol and unknown
-failures use their explicit conservative policies. After the first model event,
-both retry and failover are disabled. `ProviderHealth.last_failure_kind` and
-the optional `failure_kind`/`status_code` fields on attempt events expose stable
-bounded facts while retaining `last_error_type` and the original event fields
-for compatibility. See
-[ADR 0126](adr/0126-provider-typed-failure-taxonomy.md).
+timeout, and network facts are transient circuit inputs; an unambiguous rate
+limit may retry or isolate a candidate without marking it unhealthy; permanent
+request, authentication, authorization, model, and context failures do not
+poison the transient circuit. Provider/transport unknown facts do not retry or
+count toward the circuit but may fail over before output; local unknown facts
+stop at the current candidate. Invalid requests do not fail over, while
+protocol failures use their explicit conservative policy. After the first model
+event, both retry and failover are disabled. `consecutive_failures` means the
+number of consecutive pre-output circuit-eligible failures since the last
+success or circuit-ineligible failure. `ProviderHealth.last_failure_kind` and
+the optional `failure_kind`/`status_code` fields on attempt events expose
+stable bounded facts while retaining `last_error_type` and the original event
+fields for compatibility. Offline fixtures cover the listed official
+envelopes; this does not claim full provider compatibility or live validation.
+See [ADR 0126](adr/0126-provider-typed-failure-taxonomy.md).
 
 Each profile also resolves one `HttpClientPolicy` at adapter construction.
 Environment mode delegates standard proxy/certificate variables to HTTPX,

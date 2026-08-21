@@ -881,19 +881,24 @@ CC Switch 是可选配置源和 HTTP 网关，不是应用依赖。其导出的�
 
 Provider 传输和协议失败在进入 resilience 之前会经过类型化边界。
 `shared.errors` 中的 `ProviderFailure` 是不可变、有界且已脱敏的事实对象，包含 kind、
-安全 detail、可选状态码/`Retry-After`、Provider/模型身份和生命周期 phase，但不包含
-retry、circuit 或 failover 决策。五个模型 HTTP 适配器在传输边界分类状态码和结构化
-错误字段，区分 timeout 与 network，并把损坏流分类为 protocol。`ConfigurationError`
-保持独立，取消原样传播。
+安全 detail、可选状态码/`Retry-After`、Provider/模型身份、生命周期 phase 和证据来源
+（`provider`、`transport`、`local` 或 `unknown`），但不包含 retry、circuit 或 failover
+决策。五个模型 HTTP 适配器先使用保守的通用 HTTP fallback，再分类本协议拥有的精确
+结构化字段；通用 404 不断言为模型不存在，没有明确 rate code 的通用 429 不可重试，
+通用 413 归为 invalid request。timeout/network 是 transport 事实，损坏的 Provider 流是
+protocol 事实，非传输的意外 runtime 是 local 事实。`ConfigurationError` 保持独立，
+取消原样传播。
 
 `ProviderFailurePolicy` 独立拥有 retry、circuit 和 failover 决策。server、timeout 和
-network 是瞬态熔断输入；限流可以重试或隔离候选项，但不标记 Provider 不健康；永久的
-请求、认证、授权、模型和上下文失败不会污染瞬态熔断。invalid request 不故障转移，
-protocol 与 unknown 使用各自明确的保守策略。第一个模型事件之后同时禁止 retry 和
-failover。`ProviderHealth.last_failure_kind` 以及失败事件可选的
+network 是瞬态熔断输入；明确的限流可以重试或隔离候选项，但不标记 Provider 不健康；
+永久的请求、认证、授权、模型和上下文失败不会污染瞬态熔断。Provider/transport unknown
+不重试、不计入熔断，但可以在输出前故障转移；local unknown 停在当前候选项。invalid
+request 不故障转移，protocol 使用明确的保守策略。第一个模型事件之后同时禁止 retry 和
+failover。`consecutive_failures` 表示自上次成功或不计入熔断的失败后，连续的、输出前且
+有资格计入熔断的失败数。`ProviderHealth.last_failure_kind` 以及失败事件可选的
 `failure_kind`/`status_code` 字段提供稳定且有界的事实，同时保留兼容性的
-`last_error_type` 和原有事件字段。详见
-[ADR 0126](adr/0126-provider-typed-failure-taxonomy.md)。
+`last_error_type` 和原有事件字段。离线 fixtures 只覆盖列出的官方 envelope，不宣称完整
+Provider 兼容或 live 验证。详见 [ADR 0126](adr/0126-provider-typed-failure-taxonomy.md)。
 
 每个 profile 还会在构造适配器时解析一个 `HttpClientPolicy`。环境模式把标准代理/证书
 环境变量交给 HTTPX；直连模式关闭 HTTPX 环境信任；显式模式从指定环境变量读取一个

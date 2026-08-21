@@ -18,6 +18,7 @@ from neuro_code.shared.errors import (
     ProviderError,
     ProviderFailure,
     ProviderFailureKind,
+    ProviderFailureOrigin,
 )
 
 
@@ -41,9 +42,10 @@ _POLICY: dict[ProviderFailureKind, ProviderFailureDecision] = {
     ProviderFailureKind.TIMEOUT: ProviderFailureDecision(True, True, True),
     ProviderFailureKind.NETWORK: ProviderFailureDecision(True, True, True),
     ProviderFailureKind.PROTOCOL: ProviderFailureDecision(False, False, True),
-    # Unknown failures are conservative: do not repeat the same request, mark
-    # the provider unhealthy, and isolate the candidate before any output.
-    ProviderFailureKind.UNKNOWN: ProviderFailureDecision(False, True, True),
+    # Unknown facts are not evidence that the provider is unhealthy. They may
+    # still justify trying another candidate before output, but never retry the
+    # same request or poison the provider circuit by default.
+    ProviderFailureKind.UNKNOWN: ProviderFailureDecision(False, False, True),
 }
 
 
@@ -59,6 +61,11 @@ class ProviderFailurePolicy:
         if output_observed:
             # A partial stream cannot be safely replayed or switched. It also
             # does not prove that a clean provider request failed.
+            return ProviderFailureDecision(False, False, False)
+        if failure.origin is ProviderFailureOrigin.LOCAL:
+            # Dependency imports, observers, and adapter bugs are local to the
+            # current process/candidate. Replaying or switching candidates
+            # cannot establish provider health and can hide a local defect.
             return ProviderFailureDecision(False, False, False)
         return _POLICY[failure.kind]
 

@@ -101,6 +101,39 @@ class ProviderResilienceTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(fallback.models, ("cached-model",))
             self.assertEqual(delegate.calls, 2)
 
+    async def test_health_projection_never_contains_provider_credentials(self) -> None:
+        secret = "provider-secret-value"
+        failure = ProviderError.from_http(
+            401,
+            f"api_key={secret}; Authorization: Bearer bearer-fixture-token; "
+            "https://user:password@example.invalid/v1",
+            redaction_values=(secret,),
+        )
+
+        class SecretFailureProvider(_Provider):
+            async def stream(
+                self,
+                context: ModelContext,
+                tools: tuple[object, ...],
+                *,
+                tool_policy: ModelToolPolicy = ModelToolPolicy.ALLOWED,
+            ) -> AsyncIterator[ModelEvent]:
+                del context, tools, tool_policy
+                self.calls += 1
+                raise failure
+                yield ModelTextDelta("unreachable")
+
+        provider = SecretFailureProvider(failures=0)
+        resilient = ResilientModelProvider(provider, max_attempts=1, backoff_seconds=0)
+        with self.assertRaises(ProviderError):
+            _ = [
+                event
+                async for event in resilient.stream(
+                    ModelContext((Message(Role.USER, "hello"),)), ()
+                )
+            ]
+        self.assertNotIn(secret, json.dumps(resilient.health.to_dict()))
+
 
 if __name__ == "__main__":
     unittest.main()

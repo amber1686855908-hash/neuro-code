@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import unittest
 from collections.abc import AsyncIterator, Sequence
+from datetime import UTC, datetime, timedelta
+from email.utils import format_datetime
 from unittest.mock import AsyncMock, patch
 
 from neuro_code.application.ports.model import ModelCapabilitySet, ModelToolPolicy
@@ -22,6 +24,7 @@ from neuro_code.shared.errors import (
     ProviderError,
     ProviderFailure,
     ProviderFailureKind,
+    ProviderFailureOrigin,
     ProviderFailurePhase,
 )
 
@@ -70,6 +73,30 @@ class _SuccessProvider:
         yield ModelCompleted("stop")
 
 
+class _SequenceProvider:
+    provider_name = "fixture"
+    model_name = "fixture-model"
+    context_affinity = None
+    capabilities = ModelCapabilitySet.all_unknown()
+
+    def __init__(self, failures: Sequence[ProviderError]) -> None:
+        self.failures = tuple(failures)
+        self.calls = 0
+
+    async def stream(
+        self,
+        context: ModelContext,
+        tools: Sequence[ToolDefinition],
+        *,
+        tool_policy: ModelToolPolicy = ModelToolPolicy.ALLOWED,
+    ) -> AsyncIterator[ModelEvent]:
+        del context, tools, tool_policy
+        failure = self.failures[self.calls]
+        self.calls += 1
+        raise failure
+        yield ModelCompleted("stop")
+
+
 def _context() -> ModelContext:
     return ModelContext((Message(Role.USER, "hello"),))
 
@@ -79,17 +106,17 @@ class ProviderFailureFactTests(unittest.TestCase):
         cases = (
             (401, "denied", ProviderFailureKind.AUTHENTICATION),
             (403, "denied", ProviderFailureKind.AUTHORIZATION),
-            (404, "missing", ProviderFailureKind.MODEL_NOT_FOUND),
+            (404, "missing", ProviderFailureKind.INVALID_REQUEST),
             (408, "slow", ProviderFailureKind.TIMEOUT),
             (409, "conflict", ProviderFailureKind.INVALID_REQUEST),
-            (413, "payload too large", ProviderFailureKind.CONTEXT_OVERFLOW),
+            (413, "payload too large", ProviderFailureKind.INVALID_REQUEST),
             (422, "invalid", ProviderFailureKind.INVALID_REQUEST),
-            (429, "busy", ProviderFailureKind.RATE_LIMIT),
+            (429, "busy", ProviderFailureKind.UNKNOWN),
             (500, "upstream", ProviderFailureKind.SERVER),
             (
                 400,
                 '{"error": {"code": "context_length_exceeded"}}',
-                ProviderFailureKind.CONTEXT_OVERFLOW,
+                ProviderFailureKind.INVALID_REQUEST,
             ),
         )
         for status, detail, expected in cases:
@@ -117,6 +144,16 @@ class ProviderFailureFactTests(unittest.TestCase):
                 429, "busy", headers={"Retry-After": "never"}
             ).failure.retry_after_seconds
         )
+        future = format_datetime(datetime.now(UTC) + timedelta(seconds=60), usegmt=True)
+        date_value = ProviderError.from_http(
+            429,
+            "busy",
+            headers={"Retry-After": future},
+        ).failure.retry_after_seconds
+        self.assertIsNotNone(date_value)
+        self.assertGreaterEqual(date_value or 0.0, 0.0)
+        self.assertLessEqual(date_value or 0.0, 61.0)
+        self.assertIsNone(ProviderError.from_http(429, "busy").failure.retry_after_seconds)
 
     def test_facts_are_bounded_redacted_and_do_not_contain_policy(self) -> None:
         failure = ProviderFailure(
@@ -130,6 +167,34 @@ class ProviderFailureFactTests(unittest.TestCase):
         self.assertNotIn("retryable", vars(failure) if hasattr(failure, "__dict__") else {})
         self.assertFalse(hasattr(failure, "failover_allowed"))
         self.assertEqual(failure.phase, ProviderFailurePhase.STREAM)
+
+    def test_unknown_facts_keep_their_evidence_origin(self) -> None:
+        http_failure = ProviderError.from_http(451, "opaque").failure
+        transport_failure = ProviderError.from_transport(RuntimeError("opaque")).failure
+        runtime_transport_failure = ProviderError.from_runtime(OSError("offline")).failure
+        local_failure = ProviderError.local("observer failed").failure
+        runtime_failure = ProviderError.failure_for_exception(RuntimeError("adapter bug"))
+        protocol_failure = ProviderError.protocol("malformed envelope").failure
+
+        self.assertEqual(http_failure.origin, ProviderFailureOrigin.PROVIDER)
+        self.assertEqual(http_failure.kind, ProviderFailureKind.UNKNOWN)
+        self.assertEqual(transport_failure.origin, ProviderFailureOrigin.TRANSPORT)
+        self.assertEqual(runtime_transport_failure.origin, ProviderFailureOrigin.TRANSPORT)
+        self.assertEqual(local_failure.origin, ProviderFailureOrigin.LOCAL)
+        self.assertEqual(runtime_failure.origin, ProviderFailureOrigin.LOCAL)
+        self.assertEqual(protocol_failure.origin, ProviderFailureOrigin.PROVIDER)
+        self.assertEqual(ProviderError("synthetic").failure.origin, ProviderFailureOrigin.UNKNOWN)
+
+    def test_generic_fallback_never_uses_human_message_as_policy_authority(self) -> None:
+        for detail in (
+            "model not found",
+            "quota exhausted",
+            "context length exceeded",
+            '{"error": {"message": "quota exhausted"}}',
+        ):
+            with self.subTest(detail=detail):
+                failure = ProviderError.from_http(500, detail).failure
+                self.assertEqual(failure.kind, ProviderFailureKind.SERVER)
 
 
 class ProviderFailurePolicyTests(unittest.TestCase):
@@ -145,7 +210,7 @@ class ProviderFailurePolicyTests(unittest.TestCase):
             ProviderFailureKind.TIMEOUT: (True, True, True),
             ProviderFailureKind.NETWORK: (True, True, True),
             ProviderFailureKind.PROTOCOL: (False, False, True),
-            ProviderFailureKind.UNKNOWN: (False, True, True),
+            ProviderFailureKind.UNKNOWN: (False, False, True),
         }
         for kind, values in expected.items():
             with self.subTest(kind=kind):
@@ -171,6 +236,10 @@ class ProviderFailurePolicyTests(unittest.TestCase):
         self.assertEqual(
             (decision.retry, decision.counts_toward_circuit, decision.failover),
             (False, False, True),
+        )
+        local = ProviderFailurePolicy.decide(ProviderError.local("adapter bug").failure)
+        self.assertEqual(
+            (local.retry, local.counts_toward_circuit, local.failover), (False, False, False)
         )
 
 
@@ -210,8 +279,45 @@ class ProviderFailureRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(resilient.health.circuit_open)
         self.assertEqual(resilient.health.last_failure_kind, "server")
 
+    async def test_non_circuit_failures_break_the_transient_streak(self) -> None:
+        sequences = (
+            (
+                ProviderFailureKind.SERVER,
+                ProviderFailureKind.SERVER,
+                ProviderFailureKind.INVALID_REQUEST,
+                ProviderFailureKind.SERVER,
+            ),
+            (
+                ProviderFailureKind.SERVER,
+                ProviderFailureKind.SERVER,
+                ProviderFailureKind.RATE_LIMIT,
+                ProviderFailureKind.SERVER,
+            ),
+        )
+        for kinds in sequences:
+            with self.subTest(kinds=kinds):
+                provider = _SequenceProvider(
+                    tuple(ProviderError.classified(kind, kind.value) for kind in kinds)
+                )
+                resilient = ResilientModelProvider(
+                    provider,
+                    max_attempts=1,
+                    failure_threshold=3,
+                    backoff_seconds=0,
+                )
+                for _ in kinds:
+                    with self.assertRaises(ProviderError):
+                        _ = [event async for event in resilient.stream(_context(), ())]
+                self.assertFalse(resilient.health.circuit_open)
+                self.assertEqual(resilient.health.consecutive_failures, 1)
+
     async def test_rate_limit_retries_without_poisoning_circuit_and_honors_bound(self) -> None:
-        error = ProviderError.from_http(429, "busy", headers={"Retry-After": "999999"})
+        error = ProviderError.classified(
+            ProviderFailureKind.RATE_LIMIT,
+            "busy",
+            retry_after_seconds=3_600,
+            origin=ProviderFailureOrigin.PROVIDER,
+        )
 
         class RetryOnce(_FailingProvider):
             async def stream(

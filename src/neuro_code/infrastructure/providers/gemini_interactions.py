@@ -42,6 +42,10 @@ from neuro_code.domain.conversation.messages import (
     ToolCall,
 )
 from neuro_code.domain.tools import ToolDefinition
+from neuro_code.infrastructure.providers.failure_conformance import (
+    ProviderFailureProtocol,
+    classify_provider_failure,
+)
 from neuro_code.infrastructure.providers.image_references import (
     GEMINI_IMAGE_MEDIA_TYPES,
     GEMINI_MAX_INLINE_IMAGE_BYTES,
@@ -50,7 +54,12 @@ from neuro_code.infrastructure.providers.image_references import (
     is_gemini_file_uri,
     parse_image_reference,
 )
-from neuro_code.shared.errors import ConfigurationError, ProviderError, ProviderFailureKind
+from neuro_code.shared.errors import (
+    ConfigurationError,
+    ProviderError,
+    ProviderFailureKind,
+    ProviderFailureOrigin,
+)
 
 GEMINI_INTERACTIONS_PROTOCOL = "gemini-interactions"
 GEMINI_INTERACTIONS_API_VERSION = "v1"
@@ -788,7 +797,7 @@ class GeminiInteractionsProvider:
         try:
             import httpx
         except ImportError as error:
-            raise ProviderError(
+            raise ProviderError.local(
                 "httpx is required for live model requests; install the project"
             ) from error
 
@@ -819,10 +828,15 @@ class GeminiInteractionsProvider:
             if event_type == "error":
                 detail = json.dumps(event.get("error", event), ensure_ascii=False)
                 raise ProviderError.classified(
-                    ProviderFailureKind.SERVER,
+                    classify_provider_failure(
+                        ProviderFailureProtocol.GEMINI_INTERACTIONS,
+                        json.dumps(event, ensure_ascii=False),
+                    )
+                    or ProviderFailureKind.UNKNOWN,
                     f"Gemini Interactions stream error: {self._safe_detail(detail)}",
                     provider=self._provider_name,
                     model=self._model,
+                    origin=ProviderFailureOrigin.PROVIDER,
                     redaction_values=(self._api_key, *self._http_policy.redaction_values),
                 )
             if event_type in {
@@ -846,10 +860,15 @@ class GeminiInteractionsProvider:
                     terminal_status = status
                 if status in _FAILURE_STATUSES:
                     raise ProviderError.classified(
-                        ProviderFailureKind.SERVER,
+                        classify_provider_failure(
+                            ProviderFailureProtocol.GEMINI_INTERACTIONS,
+                            json.dumps(event, ensure_ascii=False),
+                        )
+                        or ProviderFailureKind.UNKNOWN,
                         f"Gemini Interactions failed with status {status}",
                         provider=self._provider_name,
                         model=self._model,
+                        origin=ProviderFailureOrigin.PROVIDER,
                     )
                 return []
             if event_type in {"interaction.requires_action", "interaction.completed"}:
@@ -868,10 +887,15 @@ class GeminiInteractionsProvider:
                 )
                 if terminal_status in _FAILURE_STATUSES:
                     raise ProviderError.classified(
-                        ProviderFailureKind.SERVER,
+                        classify_provider_failure(
+                            ProviderFailureProtocol.GEMINI_INTERACTIONS,
+                            json.dumps(event, ensure_ascii=False),
+                        )
+                        or ProviderFailureKind.UNKNOWN,
                         f"Gemini Interactions failed with status {terminal_status}",
                         provider=self._provider_name,
                         model=self._model,
+                        origin=ProviderFailureOrigin.PROVIDER,
                     )
                 return []
             if event_type == "step.start":
@@ -985,6 +1009,10 @@ class GeminiInteractionsProvider:
                         response.status_code,
                         detail,
                         headers=response.headers,
+                        failure_kind=classify_provider_failure(
+                            ProviderFailureProtocol.GEMINI_INTERACTIONS,
+                            detail,
+                        ),
                         provider=self._provider_name,
                         model=self._model,
                         redaction_values=(self._api_key, *self._http_policy.redaction_values),
@@ -1014,7 +1042,7 @@ class GeminiInteractionsProvider:
         except ProviderError:
             raise
         except Exception as error:
-            raise ProviderError.from_transport(
+            raise ProviderError.from_runtime(
                 error,
                 provider=self._provider_name,
                 model=self._model,
@@ -1062,7 +1090,7 @@ class GeminiInteractionsProvider:
             try:
                 self._response_observer(observed)
             except Exception as error:
-                raise ProviderError(
+                raise ProviderError.local(
                     f"Gemini Interactions response observer failed: {type(error).__name__}"
                 ) from error
         final_text = _model_output_text(steps)

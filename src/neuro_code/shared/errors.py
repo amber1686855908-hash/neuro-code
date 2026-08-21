@@ -13,14 +13,12 @@ Provider 失败事实与重试、熔断和故障转移策略明确分离. 适配
 from __future__ import annotations
 
 import asyncio
-import json
 import math
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from enum import StrEnum
-from typing import Any
 
 from neuro_code.shared.redaction import redact_sensitive_text
 
@@ -53,6 +51,21 @@ class ProviderFailurePhase(StrEnum):
     RESPONSE_BODY = "response_body"
     STREAM = "stream"
     PROTOCOL = "protocol"
+
+
+class ProviderFailureOrigin(StrEnum):
+    """Evidence source for a provider failure fact.
+
+    ``PROVIDER`` means the provider returned an HTTP/SSE/protocol envelope.
+    ``TRANSPORT`` means no trustworthy provider response was observed.
+    ``LOCAL`` means the adapter or its dependency failed after the request
+    boundary. ``UNKNOWN`` is reserved for synthetic or unclassified facts.
+    """
+
+    PROVIDER = "provider"
+    TRANSPORT = "transport"
+    LOCAL = "local"
+    UNKNOWN = "unknown"
 
 
 def _safe_text(
@@ -91,81 +104,22 @@ def _bounded_retry_after(value: object) -> float | None:
     return min(seconds, _MAX_RETRY_AFTER_SECONDS)
 
 
-def _structured_detail_text(detail: str) -> str:
-    """Return safe structured provider fields used only for fact classification."""
+def _classify_http_failure(status_code: int) -> ProviderFailureKind:
+    """Map only unambiguous HTTP facts to a conservative fallback.
 
-    try:
-        parsed: Any = json.loads(detail)
-    except (TypeError, ValueError):
-        return detail.casefold()
-
-    values: list[str] = []
-
-    def collect(value: object, *, depth: int = 0) -> None:
-        if depth > 4:
-            return
-        if isinstance(value, Mapping):
-            for key, item in value.items():
-                if str(key).casefold() in {
-                    "code",
-                    "error",
-                    "error_code",
-                    "message",
-                    "status",
-                    "type",
-                }:
-                    collect(item, depth=depth + 1)
-        elif isinstance(value, (list, tuple)):
-            for item in value[:8]:
-                collect(item, depth=depth + 1)
-        elif isinstance(value, str):
-            values.append(value.casefold())
-
-    collect(parsed)
-    return " ".join(values) or detail.casefold()
-
-
-def _classify_http_failure(status_code: int, detail: str) -> ProviderFailureKind:
-    """Map response status and structured provider codes to facts.
-
-    This is an adapter-boundary classifier. Policy code never parses this text.
+    Provider-specific structured codes are classified in the infrastructure
+    adapter boundary. This fallback deliberately never inspects human error
+    messages: an unknown endpoint, resource, quota, or billing condition must
+    not silently become a retry or model-selection decision.
     """
 
-    structured = _structured_detail_text(detail)
-    if status_code == 401 or any(
-        marker in structured for marker in ("authentication", "unauthenticated", "invalid_api_key")
-    ):
+    if status_code == 401:
         return ProviderFailureKind.AUTHENTICATION
-    if status_code in {402, 403} or any(
-        marker in structured
-        for marker in ("authorization", "unauthorized", "forbidden", "permission")
-    ):
+    if status_code in {402, 403}:
         return ProviderFailureKind.AUTHORIZATION
-    if status_code == 429 or any(
-        marker in structured for marker in ("rate_limit", "ratelimit", "too_many_requests", "quota")
-    ):
-        return ProviderFailureKind.RATE_LIMIT
-    if status_code == 404 or any(
-        marker in structured for marker in ("model_not_found", "model not found", "unknown_model")
-    ):
-        return ProviderFailureKind.MODEL_NOT_FOUND
-    if any(
-        marker in structured
-        for marker in (
-            "context_length",
-            "context length",
-            "maximum context",
-            "max_tokens",
-            "too many tokens",
-            "token limit",
-        )
-    ):
-        return ProviderFailureKind.CONTEXT_OVERFLOW
     if status_code == 408:
         return ProviderFailureKind.TIMEOUT
-    if status_code == 413:
-        return ProviderFailureKind.CONTEXT_OVERFLOW
-    if status_code in {400, 409, 422}:
+    if status_code in {400, 404, 409, 413, 422}:
         return ProviderFailureKind.INVALID_REQUEST
     if 500 <= status_code <= 599:
         return ProviderFailureKind.SERVER
@@ -226,6 +180,7 @@ class ProviderFailure:
     provider: str | None = None
     model: str | None = None
     phase: ProviderFailurePhase | None = None
+    origin: ProviderFailureOrigin = ProviderFailureOrigin.UNKNOWN
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "detail", _safe_text(self.detail))
@@ -251,7 +206,11 @@ class ProviderError(NeuroCodeError):
     """A model provider failed or returned an invalid stream."""
 
     def __init__(self, message: str = "", *, failure: ProviderFailure | None = None) -> None:
-        resolved = failure or ProviderFailure(ProviderFailureKind.UNKNOWN, message)
+        resolved = failure or ProviderFailure(
+            ProviderFailureKind.UNKNOWN,
+            message,
+            origin=ProviderFailureOrigin.UNKNOWN,
+        )
         self.failure = resolved
         super().__init__(resolved.detail)
 
@@ -266,6 +225,7 @@ class ProviderError(NeuroCodeError):
         provider: str | None = None,
         model: str | None = None,
         phase: ProviderFailurePhase | None = None,
+        origin: ProviderFailureOrigin = ProviderFailureOrigin.UNKNOWN,
         redaction_values: Iterable[str] = (),
     ) -> ProviderError:
         return cls(
@@ -277,6 +237,7 @@ class ProviderError(NeuroCodeError):
                 provider,
                 model,
                 phase,
+                origin,
             )
         )
 
@@ -287,9 +248,11 @@ class ProviderError(NeuroCodeError):
         detail: str,
         *,
         headers: Mapping[str, str] | None = None,
+        failure_kind: ProviderFailureKind | None = None,
         provider: str | None = None,
         model: str | None = None,
         phase: ProviderFailurePhase = ProviderFailurePhase.RESPONSE_BODY,
+        origin: ProviderFailureOrigin = ProviderFailureOrigin.PROVIDER,
         redaction_values: Iterable[str] = (),
     ) -> ProviderError:
         safe_detail = _safe_text(detail, explicit_values=redaction_values)
@@ -297,13 +260,14 @@ class ProviderError(NeuroCodeError):
         if safe_detail:
             visible_detail = f"{visible_detail}: {safe_detail}"
         return cls.classified(
-            _classify_http_failure(status_code, safe_detail),
+            failure_kind or _classify_http_failure(status_code),
             visible_detail,
             status_code=status_code,
             retry_after_seconds=_parse_retry_after(headers),
             provider=provider,
             model=model,
             phase=phase,
+            origin=origin,
             redaction_values=redaction_values,
         )
 
@@ -315,6 +279,7 @@ class ProviderError(NeuroCodeError):
         provider: str | None = None,
         model: str | None = None,
         phase: ProviderFailurePhase = ProviderFailurePhase.STREAM,
+        origin: ProviderFailureOrigin = ProviderFailureOrigin.TRANSPORT,
         redaction_values: Iterable[str] = (),
         prefix: str | None = None,
     ) -> ProviderError:
@@ -329,6 +294,62 @@ class ProviderError(NeuroCodeError):
             provider=provider,
             model=model,
             phase=phase,
+            origin=origin,
+            redaction_values=redaction_values,
+        )
+
+    @classmethod
+    def from_runtime(
+        cls,
+        error: BaseException,
+        *,
+        provider: str | None = None,
+        model: str | None = None,
+        phase: ProviderFailurePhase = ProviderFailurePhase.STREAM,
+        redaction_values: Iterable[str] = (),
+        prefix: str | None = None,
+    ) -> ProviderError:
+        """Classify a broad adapter catch without blaming the provider.
+
+        Known timeout/network shapes retain TRANSPORT provenance. Other
+        unexpected runtime exceptions are LOCAL adapter/dependency failures.
+        """
+
+        kind = _transport_kind(error)
+        origin = (
+            ProviderFailureOrigin.TRANSPORT
+            if kind in {ProviderFailureKind.TIMEOUT, ProviderFailureKind.NETWORK}
+            else ProviderFailureOrigin.LOCAL
+        )
+        return cls.from_transport(
+            error,
+            provider=provider,
+            model=model,
+            phase=phase,
+            origin=origin,
+            redaction_values=redaction_values,
+            prefix=prefix,
+        )
+
+    @classmethod
+    def local(
+        cls,
+        detail: str,
+        *,
+        provider: str | None = None,
+        model: str | None = None,
+        phase: ProviderFailurePhase = ProviderFailurePhase.STREAM,
+        redaction_values: Iterable[str] = (),
+    ) -> ProviderError:
+        """Build a local adapter/dependency failure without provider blame."""
+
+        return cls.classified(
+            ProviderFailureKind.UNKNOWN,
+            detail,
+            provider=provider,
+            model=model,
+            phase=phase,
+            origin=ProviderFailureOrigin.LOCAL,
             redaction_values=redaction_values,
         )
 
@@ -348,6 +369,7 @@ class ProviderError(NeuroCodeError):
             provider=provider,
             model=model,
             phase=phase,
+            origin=ProviderFailureOrigin.PROVIDER,
             redaction_values=redaction_values,
         )
 
@@ -363,7 +385,7 @@ class ProviderError(NeuroCodeError):
     ) -> ProviderFailure:
         if isinstance(error, ProviderError):
             return error.failure
-        return cls.from_transport(
+        return cls.from_runtime(
             error,
             provider=provider,
             model=model,
@@ -408,6 +430,7 @@ __all__ = [
     "ProviderError",
     "ProviderFailure",
     "ProviderFailureKind",
+    "ProviderFailureOrigin",
     "ProviderFailurePhase",
     "SandboxError",
     "SessionError",

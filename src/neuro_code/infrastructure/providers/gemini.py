@@ -33,6 +33,10 @@ from neuro_code.domain.conversation.messages import (
     ToolCall,
 )
 from neuro_code.domain.tools import ToolDefinition
+from neuro_code.infrastructure.providers.failure_conformance import (
+    ProviderFailureProtocol,
+    classify_provider_failure,
+)
 from neuro_code.infrastructure.providers.image_references import (
     GEMINI_IMAGE_MEDIA_TYPES,
     GEMINI_MAX_INLINE_IMAGE_BYTES,
@@ -41,7 +45,7 @@ from neuro_code.infrastructure.providers.image_references import (
     is_gemini_file_uri,
     parse_image_reference,
 )
-from neuro_code.shared.errors import ProviderError, ProviderFailureKind
+from neuro_code.shared.errors import ProviderError, ProviderFailureKind, ProviderFailureOrigin
 
 
 class GeminiProvider:
@@ -267,7 +271,7 @@ class GeminiProvider:
         try:
             import httpx
         except ImportError as error:
-            raise ProviderError(
+            raise ProviderError.local(
                 "httpx is required for live model requests; install the project"
             ) from error
 
@@ -293,6 +297,10 @@ class GeminiProvider:
                         response.status_code,
                         detail,
                         headers=response.headers,
+                        failure_kind=classify_provider_failure(
+                            ProviderFailureProtocol.GEMINI_GENERATE_CONTENT,
+                            detail,
+                        ),
                         provider=self._provider_name,
                         model=self._model,
                         redaction_values=(self._api_key, *self._http_policy.redaction_values),
@@ -316,10 +324,15 @@ class GeminiProvider:
                     if "error" in chunk:
                         detail = json.dumps(chunk["error"], ensure_ascii=False)
                         raise ProviderError.classified(
-                            ProviderFailureKind.SERVER,
+                            classify_provider_failure(
+                                ProviderFailureProtocol.GEMINI_GENERATE_CONTENT,
+                                json.dumps(chunk, ensure_ascii=False),
+                            )
+                            or ProviderFailureKind.UNKNOWN,
                             f"Gemini stream error: {self._safe_detail(detail)}",
                             provider=self._provider_name,
                             model=self._model,
+                            origin=ProviderFailureOrigin.PROVIDER,
                             redaction_values=(self._api_key, *self._http_policy.redaction_values),
                         )
                     usage = chunk.get("usageMetadata")
@@ -397,7 +410,7 @@ class GeminiProvider:
         except ProviderError:
             raise
         except Exception as error:
-            raise ProviderError.from_transport(
+            raise ProviderError.from_runtime(
                 error,
                 provider=self._provider_name,
                 model=self._model,

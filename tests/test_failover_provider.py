@@ -209,6 +209,36 @@ class FailoverModelProviderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(primary.tool_policies, [ModelToolPolicy.ALLOWED])
         self.assertEqual(fallback.tool_policies, [ModelToolPolicy.ALLOWED])
 
+    async def test_failure_event_redacts_api_bearer_and_url_credentials(self) -> None:
+        secret = "provider-secret-value"
+        bearer = "bearer-fixture-token"
+        detail = (
+            f"api_key={secret}; Authorization: Bearer {bearer}; "
+            "https://user:password@example.invalid/v1"
+        )
+        primary = ScriptedModelProvider(
+            "primary",
+            ((ProviderError.from_http(401, detail, redaction_values=(secret,)),),),
+        )
+        fallback = ScriptedModelProvider(
+            "fallback",
+            ((ModelTextDelta("ok"), ModelCompleted("stop")),),
+        )
+        router = FailoverModelProvider((_candidate(primary), _candidate(fallback)))
+
+        events = [
+            event
+            async for event in router.stream(
+                ModelContext((Message(Role.USER, "hello"),)),
+                (),
+            )
+        ]
+        failed = events[0]
+        assert isinstance(failed, ModelProviderAttemptFailed)
+        self.assertNotIn(secret, failed.message)
+        self.assertNotIn(bearer, failed.message)
+        self.assertNotIn("password@example.invalid", failed.message)
+
     async def test_cross_platform_failover_keeps_native_affinity_on_the_selected_route(
         self,
     ) -> None:

@@ -24,7 +24,8 @@ separate read-only discovery boundary.
 
 - `ProviderFailure` is an immutable, bounded, redacted fact object. It contains
   `kind`, safe detail, optional HTTP status, bounded `Retry-After`, provider and
-  model identity when known, and an optional lifecycle phase. It never contains
+  model identity when known, an optional lifecycle phase, and an evidence
+  origin (`provider`, `transport`, `local`, or `unknown`). It never contains
   retry, circuit, or failover decisions, request bodies, headers, raw causes, or
   credentials. Exception chaining remains available through `__cause__`.
 - The runtime taxonomy is `authentication`, `authorization`, `rate_limit`,
@@ -33,19 +34,26 @@ separate read-only discovery boundary.
   existing `ConfigurationError` hierarchy rather than becoming a provider kind.
   `asyncio.CancelledError` is propagated unchanged.
 - HTTP status and structured provider error fields are classified at the
-  adapter boundary. Transport exception types distinguish timeout from network
-  failures, and malformed stream/protocol payloads are classified as protocol
-  failures. `Retry-After` is parsed only when valid and is bounded before it
-  reaches the local scheduler.
+  adapter boundary. The shared HTTP classifier is deliberately conservative:
+  it does not parse human messages, does not turn a generic 404 into
+  `model_not_found`, does not turn an unstructured 429 into a retryable
+  `rate_limit`, and treats generic 413 as `invalid_request`. Each adapter then
+  owns exact documented envelope fields for its protocol. Transport exception
+  types distinguish timeout from network failures, and malformed
+  stream/protocol payloads are classified as provider protocol facts.
+  `Retry-After` is parsed only when valid and is bounded before it reaches the
+  local scheduler.
 - `ProviderFailurePolicy` owns three independent decisions. Authentication,
   authorization, model-not-found, and context-overflow failures do not retry or
   count toward a transient circuit but may isolate a candidate before output.
-  Rate limits retry and may fail over without counting as unhealthy. Server,
+  Rate limits retry and may fail over without counting as unhealthy when the
+  provider envelope is unambiguous. Server,
   timeout, and network failures retry, count toward the circuit, and may fail
   over. Invalid requests do none of those actions; protocol failures do not
-  retry or count but may fail over; unknown failures conservatively do not retry,
-  count toward the circuit, and may fail over. Configuration skips a candidate
-  without poisoning the circuit.
+  retry or count but may fail over; provider/transport unknown failures do not
+  retry or count but may fail over, while local unknown failures stop at the
+  current candidate. Configuration skips a candidate without poisoning the
+  circuit.
 - Once any model event has been observed, retry and failover are both disabled.
   The partial stream also does not add a new circuit failure because replaying it
   would not be safe and it does not represent a clean request attempt.
@@ -53,13 +61,49 @@ separate read-only discovery boundary.
   existing `last_error_type` remains as a compatibility field. Attempt-failure
   events retain their original fields and add optional typed kind/status fields.
 
+## Conformance evidence
+
+The implementation uses offline fixtures derived from the official protocol
+error envelopes. This is a bounded conformance slice, not a claim of complete
+provider compatibility.
+
+| Protocol | Exact structured evidence used | Canonical fact and policy boundary |
+|---|---|---|
+| OpenAI-compatible Chat / OpenAI Responses | OpenAI documents authentication, temporary rate limits, credit balance, organization/project spend, usage limits, server errors, and `response.failed` `server_error` fields | Explicit billing/spend/usage codes map to `authorization`; explicit transient rate codes map to `rate_limit`; unknown 429 remains `unknown` |
+| Anthropic Messages | `error.type` values such as `authentication_error`, `billing_error`, `permission_error`, `invalid_request_error`, `request_too_large`, `api_error`, `timeout_error`, and `overloaded_error` | `not_found_error` remains a generic resource/endpoint 404; ambiguous `rate_limit_error` remains `unknown` because the official contract also covers spend caps |
+| Gemini Generate Content | `error.status` / ErrorInfo reasons such as `API_KEY_INVALID`, `INVALID_ARGUMENT`, `FAILED_PRECONDITION`, `PERMISSION_DENIED`, `RESOURCE_EXHAUSTED`, `INTERNAL`, `UNAVAILABLE`, and `DEADLINE_EXCEEDED` | `RESOURCE_EXHAUSTED` remains `unknown` because the official contract combines rate and spend/quota cases |
+| Gemini Interactions | `error.code` values including `authentication`, `permission_denied`, `model_not_found`, `not_found`, `rate_limit_exceeded`, `quota_exceeded`, `api_error`, `service_unavailable`, and `deadline_exceeded` | Explicit rate, quota, and model codes receive separate facts; future codes remain `unknown` |
+
+Primary references: [OpenAI error codes](https://developers.openai.com/api/docs/guides/error-codes),
+[OpenAI rate limits](https://developers.openai.com/api/docs/guides/rate-limits),
+[OpenAI Responses streaming](https://platform.openai.com/docs/api-reference/responses-streaming/response/refusal/delta),
+[Anthropic API errors](https://platform.claude.com/docs/en/api/errors),
+[Gemini Generate Content API errors](https://ai.google.dev/gemini-api/docs/generate-content/api-errors),
+and [Gemini API errors](https://ai.google.dev/gemini-api/docs/api-errors).
+
+## Circuit and configuration semantics
+
+`consecutive_failures` is the number of consecutive pre-output failures that
+are eligible to count toward the transient circuit, starting after the last
+successful request or any circuit-ineligible failure. A `SERVER, SERVER,
+INVALID_REQUEST, SERVER` sequence therefore ends at one, as does
+`SERVER, SERVER, RATE_LIMIT, SERVER`; neither sequence opens a threshold-three
+circuit. A partial stream never adds a circuit failure.
+
+`ConfigurationError` remains separate. Its current pre-output behavior is
+candidate-specific: a provider dialect or tool configuration can be skipped
+in a failover chain, but it is not retried and never counts toward health. A
+global configuration error is expected to fail before candidate execution and
+is not reinterpreted as provider health evidence.
+
 ## Consequences
 
 Provider resilience no longer depends on error-message wording. A provider
 adapter can evolve its user-facing detail without changing retry or routing
 behavior. Health and event projections remain bounded and redacted, while
-operators can distinguish request, quota, transport, server, and protocol
-incidents.
+operators can distinguish request, ambiguous quota, transport, local runtime,
+server, and protocol incidents. Offline fixtures prove the listed envelopes;
+live/paid calls and a real-provider benchmark remain unrun.
 
 The taxonomy is process-local and does not claim persistent health scoring,
 automatic model substitution after visible output, provider-specific billing
@@ -68,8 +112,8 @@ sidecar errors retain their existing separate contracts.
 
 ## Invariants
 
-1. A permanent request/configuration failure cannot open the transient provider
-   circuit.
+1. A permanent request/configuration or circuit-ineligible unknown failure
+   cannot open the transient provider circuit.
 2. No retry or failover occurs after observable model output.
 3. Retry is selected from typed facts and canonical policy, never from a new
    error-message substring heuristic.
