@@ -49,7 +49,11 @@ from neuro_code.domain.conversation.request import ModelRequestSnapshot, context
 from neuro_code.domain.tools import ToolDefinition, ToolExecutionMode
 from neuro_code.infrastructure.providers.catalog_cache import PersistentProviderCatalog
 from neuro_code.infrastructure.providers.resilience import ResilientModelProvider
-from neuro_code.shared.errors import ConfigurationError, ProviderError
+from neuro_code.shared.errors import (
+    ConfigurationError,
+    ProviderError,
+    ProviderFailureKind,
+)
 
 
 class RuntimeParityContractTests(unittest.TestCase):
@@ -319,12 +323,15 @@ class _Provider:
 
 class RuntimeParityResilienceTests(unittest.IsolatedAsyncioTestCase):
     async def test_provider_authentication_errors_are_not_retried(self) -> None:
-        provider = _Provider(ProviderError("authentication failed"))
+        provider = _Provider(
+            ProviderError.classified(ProviderFailureKind.AUTHENTICATION, "authentication failed")
+        )
         resilient = ResilientModelProvider(provider, max_attempts=3, backoff_seconds=0)
         with self.assertRaisesRegex(ProviderError, "authentication"):
             await anext(resilient.stream(ModelContext.from_messages(()), ()))
         self.assertEqual(provider.calls, 1)
         self.assertEqual(resilient.health.last_error_type, "ProviderError")
+        self.assertEqual(resilient.health.last_failure_kind, "authentication")
 
     async def test_provider_circuit_opens_after_repeated_failures(self) -> None:
         provider = _Provider(TimeoutError("timeout"))

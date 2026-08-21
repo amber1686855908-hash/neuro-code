@@ -14,7 +14,16 @@ from neuro_code.application.ports.model import ModelCapabilitySet, ModelProvider
 from neuro_code.domain.conversation.context import ModelContext
 from neuro_code.domain.conversation.events import ModelEvent
 from neuro_code.domain.tools import ToolDefinition
-from neuro_code.shared.errors import ConfigurationError, ProviderError
+from neuro_code.infrastructure.providers.failure_policy import ProviderFailurePolicy
+from neuro_code.shared.errors import (
+    ConfigurationError,
+    ProviderError,
+    ProviderFailure,
+    ProviderFailureKind,
+    ProviderFailurePhase,
+)
+
+MAX_RETRY_DELAY_SECONDS = 10.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -25,6 +34,7 @@ class ProviderHealth:
     consecutive_failures: int
     circuit_open: bool
     last_error_type: str | None
+    last_failure_kind: str | None = None
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -34,6 +44,7 @@ class ProviderHealth:
             "consecutive_failures": self.consecutive_failures,
             "circuit_open": self.circuit_open,
             "last_error_type": self.last_error_type,
+            "last_failure_kind": self.last_failure_kind,
         }
 
 
@@ -67,6 +78,7 @@ class ResilientModelProvider:
         self._successes = 0
         self._consecutive_failures = 0
         self._last_error_type: str | None = None
+        self._last_failure_kind: str | None = None
 
     @property
     def provider_name(self) -> str:
@@ -93,6 +105,7 @@ class ResilientModelProvider:
             self._consecutive_failures,
             self._circuit_is_open(),
             self._last_error_type,
+            self._last_failure_kind,
         )
 
     def _circuit_is_open(self) -> bool:
@@ -103,21 +116,22 @@ class ResilientModelProvider:
             return False
         return True
 
-    @staticmethod
-    def _retryable(error: BaseException) -> bool:
-        if isinstance(error, ConfigurationError):
-            return False
-        if isinstance(error, ProviderError):
-            message = str(error).casefold()
-            return not any(
-                marker in message
-                for marker in ("authentication", "unauthorized", "forbidden", "401", "403")
-            )
-        return isinstance(error, (TimeoutError, OSError, asyncio.TimeoutError))
-
-    def _record_failure(self, error: BaseException) -> None:
-        self._consecutive_failures += 1
+    def _record_failure(
+        self,
+        error: BaseException,
+        failure: ProviderFailure | None,
+        *,
+        counts_toward_circuit: bool,
+    ) -> None:
         self._last_error_type = type(error).__name__
+        self._last_failure_kind = failure.kind.value if failure is not None else None
+        if not counts_toward_circuit:
+            # A request/configuration failure must not preserve or extend a
+            # transient transport streak.
+            self._consecutive_failures = 0
+            self._opened_until = 0.0
+            return
+        self._consecutive_failures += 1
         if self._consecutive_failures >= self._failure_threshold:
             self._opened_until = monotonic() + self._cooldown_seconds
 
@@ -129,7 +143,13 @@ class ResilientModelProvider:
         tool_policy: ModelToolPolicy = ModelToolPolicy.ALLOWED,
     ) -> AsyncIterator[ModelEvent]:
         if self._circuit_is_open():
-            raise ProviderError("provider circuit is open")
+            raise ProviderError.classified(
+                ProviderFailureKind.UNKNOWN,
+                "provider circuit is open",
+                provider=self.provider_name,
+                model=self.model_name,
+                phase=ProviderFailurePhase.REQUEST,
+            )
         for attempt in range(self._max_attempts):
             self._attempts += 1
             emitted = False
@@ -141,15 +161,43 @@ class ResilientModelProvider:
                 self._successes += 1
                 self._consecutive_failures = 0
                 self._last_error_type = None
+                self._last_failure_kind = None
                 return
             except asyncio.CancelledError:
                 raise
             except (ConfigurationError, ProviderError, OSError, TimeoutError) as error:
-                self._record_failure(error)
-                if emitted or not self._retryable(error) or attempt + 1 >= self._max_attempts:
+                failure = (
+                    None
+                    if isinstance(error, ConfigurationError)
+                    else ProviderError.failure_for_exception(
+                        error,
+                        provider=self.provider_name,
+                        model=self.model_name,
+                        phase=ProviderFailurePhase.STREAM,
+                    )
+                )
+                decision = ProviderFailurePolicy.decide_error(
+                    error,
+                    output_observed=emitted,
+                    provider=self.provider_name,
+                    model=self.model_name,
+                )
+                self._record_failure(
+                    error,
+                    failure,
+                    counts_toward_circuit=decision.counts_toward_circuit,
+                )
+                if emitted or not decision.retry or attempt + 1 >= self._max_attempts:
                     raise
-                if self._backoff_seconds:
-                    await asyncio.sleep(self._backoff_seconds * (attempt + 1))
+                delay = min(
+                    MAX_RETRY_DELAY_SECONDS,
+                    max(
+                        self._backoff_seconds * (attempt + 1),
+                        (failure.retry_after_seconds or 0.0) if failure is not None else 0.0,
+                    ),
+                )
+                if delay:
+                    await asyncio.sleep(delay)
 
 
 __all__ = ["ProviderHealth", "ResilientModelProvider"]

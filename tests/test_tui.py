@@ -304,7 +304,7 @@ class ProviderFailureThenSuccessTuiConversation(TuiConversation):
             self._fail_first_request = False
             self.prompts.append(prompt)
             self._session_id = "provider-failure-session"
-            raise ProviderError("Responses API request failed with HTTP 402: insufficient balance")
+            raise ProviderError.from_http(402, "insufficient balance")
         return await super().run(
             prompt,
             sink=sink,

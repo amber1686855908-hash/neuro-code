@@ -4717,8 +4717,7 @@ class NeuroCodeApp(App[None]):
         识别可操作的付款失败,但不解析或暴露 Provider 原始载荷.
         """
 
-        detail = str(error).casefold()
-        return "http 402" in detail or "insufficient balance" in detail
+        return error.failure.status_code == 402
 
     async def _handle_event(self, event: AgentEvent) -> None:
         data = event.data

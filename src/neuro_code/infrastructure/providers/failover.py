@@ -19,7 +19,9 @@ from neuro_code.domain.conversation.events import (
     ModelProviderSelected,
 )
 from neuro_code.domain.tools import ToolDefinition
-from neuro_code.shared.errors import ConfigurationError, ProviderError
+from neuro_code.infrastructure.providers.failure_policy import ProviderFailurePolicy
+from neuro_code.shared.errors import ConfigurationError, ProviderError, ProviderFailureKind
+from neuro_code.shared.redaction import redact_sensitive_text
 
 _FAILURE_MESSAGE_LIMIT = 500
 _AGGREGATE_DETAIL_LIMIT = 2_000
@@ -95,7 +97,20 @@ class FailoverModelProvider:
 
     @staticmethod
     def _failure_message(error: ConfigurationError | ProviderError) -> str:
-        return " ".join(str(error).split())[:_FAILURE_MESSAGE_LIMIT] or type(error).__name__
+        detail = (
+            error.failure.detail
+            if isinstance(error, ProviderError)
+            else redact_sensitive_text(str(error))
+        )
+        return " ".join(detail.split())[:_FAILURE_MESSAGE_LIMIT] or type(error).__name__
+
+    @staticmethod
+    def _failure_projection(
+        error: ConfigurationError | ProviderError,
+    ) -> tuple[str | None, int | None]:
+        if not isinstance(error, ProviderError):
+            return None, None
+        return error.failure.kind.value, error.failure.status_code
 
     @staticmethod
     def _aggregate_detail(failures: Sequence[tuple[str, str]]) -> str:
@@ -122,21 +137,33 @@ class FailoverModelProvider:
             except (ConfigurationError, ProviderError) as error:
                 message = self._failure_message(error)
                 failures.append((candidate.name, message))
+                failure_kind, status_code = self._failure_projection(error)
                 yield ModelProviderAttemptFailed(
                     candidate.name,
                     candidate.model,
                     type(error).__name__,
                     message,
+                    failure_kind,
+                    status_code,
                 )
+                if not ProviderFailurePolicy.decide_error(error).failover:
+                    raise
                 continue
             except StopAsyncIteration:
-                message = "provider stream ended before emitting an event"
+                empty_error = ProviderError.protocol(
+                    "provider stream ended before emitting an event",
+                    provider=candidate.name,
+                    model=candidate.model,
+                )
+                message = self._failure_message(empty_error)
                 failures.append((candidate.name, message))
                 yield ModelProviderAttemptFailed(
                     candidate.name,
                     candidate.model,
                     "ProviderError",
                     message,
+                    empty_error.failure.kind.value,
+                    empty_error.failure.status_code,
                 )
                 continue
 
@@ -156,7 +183,10 @@ class FailoverModelProvider:
             return
 
         detail = self._aggregate_detail(failures)
-        raise ProviderError(f"all configured model providers failed before output: {detail}")
+        raise ProviderError.classified(
+            ProviderFailureKind.UNKNOWN,
+            f"all configured model providers failed before output: {detail}",
+        )
 
 
 __all__ = ["FailoverModelProvider", "ProviderCandidate"]

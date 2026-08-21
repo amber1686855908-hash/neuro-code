@@ -1281,6 +1281,28 @@ This behavior is independent of whether a candidate reaches a direct endpoint
 or a CC Switch gateway. See
 [ADR 0011](adr/0011-safe-pre-output-provider-failover.md).
 
+Provider transport and protocol failures cross a typed boundary before they
+reach resilience. `ProviderFailure` in `shared.errors` is an immutable,
+redacted, bounded fact containing kind, safe detail, optional status/
+`Retry-After`, provider/model identity, and lifecycle phase. It never contains
+retry, circuit, or failover decisions. The five model HTTP adapters classify
+status and structured error fields at the transport boundary, distinguish
+timeouts from network failures, and classify malformed streams as protocol
+failures. `ConfigurationError` remains separate, and cancellation propagates
+unchanged.
+
+`ProviderFailurePolicy` owns retry, circuit, and failover independently. Server,
+timeout, and network facts are transient circuit inputs; rate limits may retry
+or isolate a candidate without marking it unhealthy; permanent request,
+authentication, authorization, model, and context failures do not poison the
+transient circuit. Invalid requests do not fail over, while protocol and unknown
+failures use their explicit conservative policies. After the first model event,
+both retry and failover are disabled. `ProviderHealth.last_failure_kind` and
+the optional `failure_kind`/`status_code` fields on attempt events expose stable
+bounded facts while retaining `last_error_type` and the original event fields
+for compatibility. See
+[ADR 0126](adr/0126-provider-typed-failure-taxonomy.md).
+
 Each profile also resolves one `HttpClientPolicy` at adapter construction.
 Environment mode delegates standard proxy/certificate variables to HTTPX,
 direct mode disables HTTPX environment trust, and explicit mode reads one proxy

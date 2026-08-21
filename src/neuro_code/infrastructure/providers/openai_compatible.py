@@ -45,7 +45,7 @@ from neuro_code.infrastructure.providers.image_references import (
     InlineImageReference,
     parse_image_reference,
 )
-from neuro_code.shared.errors import ConfigurationError, ProviderError
+from neuro_code.shared.errors import ConfigurationError, ProviderError, ProviderFailureKind
 
 BACKEND_SUMMARY_FIELD_CHARS = 1000
 CODE_SUMMARY_CHARS = 100
@@ -61,9 +61,14 @@ def _encode_bounded_native_context(payload: Mapping[str, object]) -> bytes:
             separators=(",", ":"),
         ).encode("utf-8")
     except (TypeError, ValueError) as error:
-        raise ProviderError("provider native reasoning context is not JSON-safe") from error
+        raise ProviderError.protocol(
+            "provider native reasoning context is not JSON-safe"
+        ) from error
     if len(encoded) > MAX_NATIVE_CONTEXT_BYTES:
-        raise ProviderError("provider native reasoning context exceeds its size limit")
+        raise ProviderError.classified(
+            ProviderFailureKind.CONTEXT_OVERFLOW,
+            "provider native reasoning context exceeds its size limit",
+        )
     return encoded
 
 
@@ -152,7 +157,9 @@ class _DeepSeekDSMLStreamParser:
                 end_index = self._buffer.find(self._active_end)
                 if end_index < 0:
                     if final:
-                        raise ProviderError("provider returned incomplete DeepSeek DSML tool call")
+                        raise ProviderError.protocol(
+                            "provider returned incomplete DeepSeek DSML tool call"
+                        )
                     return tuple(visible), tuple(calls)
                 block = self._buffer[:end_index]
                 self._buffer = self._buffer[end_index + len(self._active_end) :]
@@ -171,7 +178,9 @@ class _DeepSeekDSMLStreamParser:
 
             if final:
                 if any(prefix in self._buffer for prefix in self._DSML_PREFIXES):
-                    raise ProviderError("provider returned malformed DeepSeek DSML content")
+                    raise ProviderError.protocol(
+                        "provider returned malformed DeepSeek DSML content"
+                    )
                 if self._buffer:
                     visible.append(self._buffer)
                     self._buffer = ""
@@ -181,7 +190,9 @@ class _DeepSeekDSMLStreamParser:
             for prefix in self._DSML_PREFIXES:
                 index = self._buffer.find(prefix)
                 if index >= 0 and index < len(self._buffer) - keep:
-                    raise ProviderError("provider returned malformed DeepSeek DSML content")
+                    raise ProviderError.protocol(
+                        "provider returned malformed DeepSeek DSML content"
+                    )
             if keep:
                 if len(self._buffer) > keep:
                     visible.append(self._buffer[:-keep])
@@ -221,25 +232,33 @@ class _DeepSeekDSMLStreamParser:
         cursor = 0
         for match in self._INVOKE_PATTERN.finditer(block):
             if block[cursor : match.start()].strip():
-                raise ProviderError("provider returned malformed DeepSeek DSML tool call")
+                raise ProviderError.protocol("provider returned malformed DeepSeek DSML tool call")
             attributes = match.group("attributes")
             name_match = re.search(r'\bname\s*=\s*"([^"]+)"', attributes)
             if name_match is None:
-                raise ProviderError("provider returned a DeepSeek DSML call without a name")
+                raise ProviderError.protocol(
+                    "provider returned a DeepSeek DSML call without a name"
+                )
             arguments: dict[str, object] = {}
             body = match.group("body")
             parameter_cursor = 0
             for parameter in self._PARAMETER_PATTERN.finditer(body):
                 if body[parameter_cursor : parameter.start()].strip():
-                    raise ProviderError("provider returned malformed DeepSeek DSML parameters")
+                    raise ProviderError.protocol(
+                        "provider returned malformed DeepSeek DSML parameters"
+                    )
                 parameter_attributes = parameter.group("attributes")
                 parameter_name = re.search(r'\bname\s*=\s*"([^"]+)"', parameter_attributes)
                 string_flag = re.search(r'\bstring\s*=\s*"(true|false)"', parameter_attributes)
                 if parameter_name is None or string_flag is None:
-                    raise ProviderError("provider returned malformed DeepSeek DSML parameter")
+                    raise ProviderError.protocol(
+                        "provider returned malformed DeepSeek DSML parameter"
+                    )
                 key = html.unescape(parameter_name.group(1))
                 if key in arguments:
-                    raise ProviderError("provider returned duplicate DeepSeek DSML parameter")
+                    raise ProviderError.protocol(
+                        "provider returned duplicate DeepSeek DSML parameter"
+                    )
                 raw_value = html.unescape(parameter.group("body"))
                 if string_flag.group(1) == "true":
                     arguments[key] = raw_value
@@ -247,12 +266,12 @@ class _DeepSeekDSMLStreamParser:
                     try:
                         arguments[key] = json.loads(raw_value)
                     except json.JSONDecodeError as error:
-                        raise ProviderError(
+                        raise ProviderError.protocol(
                             "provider returned invalid JSON in a DeepSeek DSML parameter"
                         ) from error
                 parameter_cursor = parameter.end()
             if body[parameter_cursor:].strip():
-                raise ProviderError("provider returned malformed DeepSeek DSML parameters")
+                raise ProviderError.protocol("provider returned malformed DeepSeek DSML parameters")
             calls.append(
                 ToolCall(
                     f"dsml-{self._next_tool_id}",
@@ -263,7 +282,7 @@ class _DeepSeekDSMLStreamParser:
             self._next_tool_id += 1
             cursor = match.end()
         if not calls or block[cursor:].strip():
-            raise ProviderError("provider returned malformed DeepSeek DSML tool call")
+            raise ProviderError.protocol("provider returned malformed DeepSeek DSML tool call")
         return calls
 
 
@@ -864,8 +883,13 @@ class OpenAICompatibleProvider:
             ):
                 if response.status_code >= 400:
                     detail = self._safe_detail((await response.aread()).decode("utf-8", "replace"))
-                    raise ProviderError(
-                        f"provider request failed with HTTP {response.status_code}: {detail}"
+                    raise ProviderError.from_http(
+                        response.status_code,
+                        detail,
+                        headers=response.headers,
+                        provider=self._provider_name,
+                        model=self._model,
+                        redaction_values=(self._api_key, *self._http_policy.redaction_values),
                     )
                 async for line in response.aiter_lines():
                     if not line.startswith("data:"):
@@ -876,7 +900,11 @@ class OpenAICompatibleProvider:
                     try:
                         chunk = json.loads(payload)
                     except json.JSONDecodeError as error:
-                        raise ProviderError("provider returned malformed streaming JSON") from error
+                        raise ProviderError.protocol(
+                            "provider returned malformed streaming JSON",
+                            provider=self._provider_name,
+                            model=self._model,
+                        ) from error
                     usage = chunk.get("usage")
                     if isinstance(usage, Mapping):
                         model_usage = self._merge_usage(
@@ -921,9 +949,12 @@ class OpenAICompatibleProvider:
             raise
         except Exception as error:
             # Deliberately exclude request headers and body from the exception.
-            detail = self._safe_detail(str(error))
-            raise ProviderError(
-                f"provider stream failed: {type(error).__name__}: {detail}"
+            raise ProviderError.from_transport(
+                error,
+                provider=self._provider_name,
+                model=self._model,
+                redaction_values=(self._api_key, *self._http_policy.redaction_values),
+                prefix="provider stream failed",
             ) from error
 
         if dsml_parser is not None:
@@ -939,13 +970,15 @@ class OpenAICompatibleProvider:
             try:
                 arguments = json.loads(buffer.arguments or "{}")
             except json.JSONDecodeError as error:
-                raise ProviderError(
+                raise ProviderError.protocol(
                     f"tool call {buffer.name!r} contained invalid JSON arguments"
                 ) from error
             if not isinstance(arguments, dict):
-                raise ProviderError(f"tool call {buffer.name!r} arguments must be a JSON object")
+                raise ProviderError.protocol(
+                    f"tool call {buffer.name!r} arguments must be a JSON object"
+                )
             if not buffer.identifier or not buffer.name:
-                raise ProviderError("provider emitted an incomplete tool call")
+                raise ProviderError.protocol("provider emitted an incomplete tool call")
             yield ModelToolCall(ToolCall(buffer.identifier, buffer.name, arguments))
         native_items: tuple[PreservedContextItem, ...] = ()
         if reasoning_details is not None and reasoning_details.details and self._context_affinity:

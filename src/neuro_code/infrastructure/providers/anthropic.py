@@ -50,7 +50,7 @@ from neuro_code.infrastructure.providers.image_references import (
     InlineImageReference,
     parse_image_reference,
 )
-from neuro_code.shared.errors import ConfigurationError, ProviderError
+from neuro_code.shared.errors import ConfigurationError, ProviderError, ProviderFailureKind
 from neuro_code.shared.redaction import redact_sensitive_text
 
 ANTHROPIC_WEB_SEARCH_TOOL_TYPE = "web_search_20260318"
@@ -365,9 +365,15 @@ class AnthropicProvider:
             cls._append_content(converted, "assistant", blocks)
             return
         if message.role is not Role.TOOL:
-            raise ProviderError(f"unsupported Anthropic message role: {message.role}")
+            raise ProviderError.classified(
+                ProviderFailureKind.INVALID_REQUEST,
+                f"unsupported Anthropic message role: {message.role}",
+            )
         if not message.tool_call_id:
-            raise ProviderError("Anthropic tool results require a tool_call_id")
+            raise ProviderError.classified(
+                ProviderFailureKind.INVALID_REQUEST,
+                "Anthropic tool results require a tool_call_id",
+            )
         cls._append_content(
             converted,
             "user",
@@ -543,18 +549,20 @@ class AnthropicProvider:
             try:
                 parsed = json.loads(buffer.partial_json)
             except json.JSONDecodeError as error:
-                raise ProviderError(
+                raise ProviderError.protocol(
                     f"tool call {buffer.name!r} contained invalid JSON arguments"
                 ) from error
             if not isinstance(parsed, dict):
-                raise ProviderError(f"tool call {buffer.name!r} arguments must be a JSON object")
+                raise ProviderError.protocol(
+                    f"tool call {buffer.name!r} arguments must be a JSON object"
+                )
             arguments.update(parsed)
         return arguments
 
     @classmethod
     def _finish_tool(cls, buffer: _ToolUseBuffer) -> ToolCall:
         if not buffer.identifier or not buffer.name:
-            raise ProviderError("Anthropic emitted an incomplete tool call")
+            raise ProviderError.protocol("Anthropic emitted an incomplete tool call")
         arguments = cls._finish_arguments(buffer)
         return ToolCall(buffer.identifier, buffer.name, arguments)
 
@@ -598,9 +606,14 @@ class AnthropicProvider:
                 len(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
                 > MAX_NATIVE_CONTEXT_BYTES
             ):
-                raise ProviderError("Anthropic native server-tool context exceeds its size limit")
+                raise ProviderError.classified(
+                    ProviderFailureKind.CONTEXT_OVERFLOW,
+                    "Anthropic native server-tool context exceeds its size limit",
+                )
         except (TypeError, ValueError) as error:
-            raise ProviderError("Anthropic native server-tool context is not JSON-safe") from error
+            raise ProviderError.protocol(
+                "Anthropic native server-tool context is not JSON-safe"
+            ) from error
         return PreservedContextItem(ContextItemKind.BACKEND_TOOL_CALL, payload)
 
     @staticmethod
@@ -762,8 +775,13 @@ class AnthropicProvider:
                             detail = self._safe_detail(
                                 (await response.aread()).decode("utf-8", "replace")
                             )
-                            raise ProviderError(
-                                f"Anthropic request failed with HTTP {response.status_code}: {detail}"
+                            raise ProviderError.from_http(
+                                response.status_code,
+                                detail,
+                                headers=response.headers,
+                                provider=self._provider_name,
+                                model=self._model,
+                                redaction_values=self._redaction_values,
                             )
                         async for line in response.aiter_lines():
                             if not line.startswith("data:"):
@@ -774,8 +792,10 @@ class AnthropicProvider:
                             try:
                                 event = json.loads(payload)
                             except json.JSONDecodeError as error:
-                                raise ProviderError(
-                                    "Anthropic returned malformed streaming JSON"
+                                raise ProviderError.protocol(
+                                    "Anthropic returned malformed streaming JSON",
+                                    provider=self._provider_name,
+                                    model=self._model,
                                 ) from error
                             if not isinstance(event, dict):
                                 continue
@@ -783,8 +803,12 @@ class AnthropicProvider:
                             if event_type == "error":
                                 error_data = event.get("error")
                                 detail = json.dumps(error_data, ensure_ascii=False)
-                                raise ProviderError(
-                                    f"Anthropic stream error: {self._safe_detail(detail)}"
+                                raise ProviderError.classified(
+                                    ProviderFailureKind.SERVER,
+                                    f"Anthropic stream error: {self._safe_detail(detail)}",
+                                    provider=self._provider_name,
+                                    model=self._model,
+                                    redaction_values=self._redaction_values,
                                 )
                             if event_type == "message_start":
                                 raw_message = event.get("message")
@@ -809,7 +833,7 @@ class AnthropicProvider:
                                 if block_type == "tool_use":
                                     initial_input = block_copy.get("input")
                                     if not isinstance(initial_input, dict):
-                                        raise ProviderError(
+                                        raise ProviderError.protocol(
                                             "Anthropic tool input must be a JSON object"
                                         )
                                     raw_identifier = block_copy.get("id")
@@ -826,7 +850,7 @@ class AnthropicProvider:
                                 elif block_type == "server_tool_use":
                                     identity = self._server_identity(block_copy)
                                     if identity is None or identity[1] not in self._builtin_tools:
-                                        raise ProviderError(
+                                        raise ProviderError.protocol(
                                             "Anthropic emitted an unsupported server tool call"
                                         )
                                     call_id, name = identity
@@ -835,7 +859,7 @@ class AnthropicProvider:
                                         yield ModelBackendToolStarted(call_id, name)
                                     initial_input = block_copy.get("input", {})
                                     if not isinstance(initial_input, dict):
-                                        raise ProviderError(
+                                        raise ProviderError.protocol(
                                             "Anthropic server tool input must be a JSON object"
                                         )
                                     server_buffers[index] = _ToolUseBuffer(
@@ -867,21 +891,22 @@ class AnthropicProvider:
                                         )
                                     )
                                     if result_error:
-                                        raise ProviderError(
+                                        raise ProviderError.classified(
+                                            ProviderFailureKind.SERVER,
                                             "Anthropic server tool failed: "
-                                            + self._server_error_detail(block_copy)
+                                            + self._server_error_detail(block_copy),
                                         )
                                     if (
                                         not isinstance(tool_call_id, str)
                                         or not tool_call_id
                                         or name not in self._builtin_tools
                                     ):
-                                        raise ProviderError(
+                                        raise ProviderError.protocol(
                                             "Anthropic emitted an invalid server tool result"
                                         )
                                     started_name = started_server_calls.get(tool_call_id)
                                     if started_name is not None and started_name != name:
-                                        raise ProviderError(
+                                        raise ProviderError.protocol(
                                             "Anthropic server tool result did not match its call"
                                         )
                                     if started_name is None:
@@ -891,9 +916,10 @@ class AnthropicProvider:
                                         completed_server_calls.add(tool_call_id)
                                         yield ModelBackendToolCompleted(tool_call_id, name)
                                 elif block_type in _SERVER_ERROR_TYPES:
-                                    raise ProviderError(
+                                    raise ProviderError.classified(
+                                        ProviderFailureKind.SERVER,
                                         "Anthropic server tool failed: "
-                                        + self._server_error_detail(block_copy)
+                                        + self._server_error_detail(block_copy),
                                     )
                                 elif block_type == "text" and isinstance(
                                     block_copy.get("text"), str
@@ -987,9 +1013,17 @@ class AnthropicProvider:
                         if index in blocks_by_index:
                             blocks_by_index[index]["input"] = arguments
                     if buffers:
-                        raise ProviderError("Anthropic stream ended during a tool call")
+                        raise ProviderError.protocol(
+                            "Anthropic stream ended during a tool call",
+                            provider=self._provider_name,
+                            model=self._model,
+                        )
                     if not saw_message_stop:
-                        raise ProviderError("Anthropic stream ended without message_stop")
+                        raise ProviderError.protocol(
+                            "Anthropic stream ended without message_stop",
+                            provider=self._provider_name,
+                            model=self._model,
+                        )
                     response_blocks = [
                         blocks_by_index[index] for index in block_order if index in blocks_by_index
                     ]
@@ -1040,7 +1074,9 @@ class AnthropicProvider:
                     if stop_reason == "pause_turn" and not response_tool_calls:
                         continuations += 1
                         if continuations > MAX_SERVER_TOOL_CONTINUATIONS:
-                            raise ProviderError("Anthropic server-tool continuation limit exceeded")
+                            raise ProviderError.protocol(
+                                "Anthropic server-tool continuation limit exceeded"
+                            )
                         wire_messages.append(
                             {"role": "assistant", "content": copy.deepcopy(response_blocks)}
                         )
@@ -1067,9 +1103,12 @@ class AnthropicProvider:
         except ProviderError:
             raise
         except Exception as error:
-            detail = self._safe_detail(str(error))
-            raise ProviderError(
-                f"Anthropic stream failed: {type(error).__name__}: {detail}"
+            raise ProviderError.from_transport(
+                error,
+                provider=self._provider_name,
+                model=self._model,
+                redaction_values=self._redaction_values,
+                prefix="Anthropic stream failed",
             ) from error
 
 

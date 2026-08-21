@@ -18,7 +18,7 @@ from neuro_code.domain.conversation.events import ModelEvent, ModelTextDelta
 from neuro_code.domain.conversation.messages import Message, Role
 from neuro_code.infrastructure.providers.catalog_cache import PersistentProviderCatalog
 from neuro_code.infrastructure.providers.resilience import ResilientModelProvider
-from neuro_code.shared.errors import ProviderError
+from neuro_code.shared.errors import ProviderError, ProviderFailureKind
 
 
 class _Provider:
@@ -41,7 +41,7 @@ class _Provider:
         del context, tools, tool_policy
         self.calls += 1
         if self.calls <= self.failures:
-            raise ProviderError("temporary network failure")
+            raise ProviderError.classified(ProviderFailureKind.NETWORK, "temporary network failure")
         yield ModelTextDelta("ok")
 
 

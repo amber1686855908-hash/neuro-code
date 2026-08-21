@@ -23,6 +23,7 @@
 | 类型化 Provider 投影接缝 | M3 | compatible | `ProviderOption` 与 `ProviderSelectionResult` 由 `neuro_code.application.providers.contracts` 拥有；Provider 应用服务、bootstrap 和 TUI 使用规范接缝，而 profile/session 与旧 runtime 导入保留保持 identity 的兼容 re-export。Provider 生命周期与选择行为保持不变 |
 | CC Switch 兼容 | M2 | partial | 已实现只读映射 `NEURO_CODE_CC_SWITCH_CONFIG`、三种 backend 格式、回环 `PROXY_MANAGED`、环境变量引用、内联密钥拒绝和项目配置覆盖；仍不包含 CC Switch 数据库/进程控制及其内部故障转移 |
 | 安全供应商故障转移 | M2 | partial | 已实现有序按需备用 profile、第一个事件提交边界、单次运行单向选择、可审计失败/选择事件、`--no-failover`、汇总错误和不透明会话来源保护；新增输出前有界重试、冷却熔断与不含密钥的进程内健康快照。跨进程持久化健康状态仍明确不实现
+| Provider 类型化失败分类 | M2 | compatible | `ProviderFailure` 事实对象对认证、授权、限流、无效请求、模型、上下文、服务端、超时、网络、协议和未知失败进行分类，并提供有界脱敏 detail、状态码、phase、Provider/模型身份和有界 `Retry-After`。`ProviderFailurePolicy` 独立处理 retry、circuit 和输出前 failover；永久请求/配置失败不会污染瞬态 health，输出提交后禁止重放。`ProviderHealth.last_failure_kind` 与失败事件追加字段，同时保留现有公开字段。详见 [ADR 0126](adr/0126-provider-typed-failure-taxonomy.md) |
 | 供应商 HTTP 代理策略 | M2/M3 | partial | 已实现按 profile 配置环境/直连/显式环境变量模式、TUI 编辑与保存前校验、受管默认项启动失败的 TUI 内恢复、四适配器统一 HTTPX 选项、检查/错误脱敏、含义不明 SOCKS scheme 的严格诊断，以及 `socks` 可选安装 extra；保留无效继承 `ALL_PROXY` 时，显式路由已通过 DeepSeek 手动验证。PAC、多代理挂载和默认捆绑 SOCKS 支持仍待实现 |
 | 无头单次提示 | M2 | partial | 已实现流式文本/工具循环，以及纯文本、JSON、JSONL 输出 |
 | 应用自有思考强度 | M3 | partial | 已实现供应商中立的 `low`/`medium`/`high`/`xhigh`/`ultracode`、默认 `high`、请求指引、`ModelContext` 传递、`--effort`、TUI 控件及偏好持久化。显式 Provider dialect mapping 已接入；`ultracode` 仍回退到 `xhigh`，不会自动委托工作流。显式调用方可使用有界、带 scope/depth/parallel/retry/timeout/write 检查的子代理 scheduler；自动 Ultracode delegation 仍未接入

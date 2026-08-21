@@ -104,6 +104,8 @@ class ModelStepProcessor:
                         "model": model_event.model,
                         "error_type": model_event.error_type,
                         "message": model_event.message,
+                        "failure_kind": model_event.failure_kind,
+                        "status_code": model_event.status_code,
                     },
                 )
             elif isinstance(model_event, ModelProviderSelected):

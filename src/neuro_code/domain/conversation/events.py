@@ -112,6 +112,8 @@ class ModelProviderAttemptFailed:
     model: str
     error_type: str
     message: str
+    failure_kind: str | None = None
+    status_code: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
