@@ -39,6 +39,13 @@ from neuro_code.domain.execution import (
     AgentExecutionStatus,
     SessionExecutionRecord,
     SupervisorReasonCode,
+    TurnInput,
+    TurnRecoveryAttempt,
+    TurnRecoveryFact,
+    TurnRecoveryFactKind,
+    TurnRecoveryResolution,
+    TurnRecoveryStage,
+    TurnSource,
 )
 from neuro_code.domain.plans import MAX_PLAN_COMMENTS, PlanComment, SessionPlan
 from neuro_code.domain.sandbox.models import SandboxProfile
@@ -64,7 +71,7 @@ from neuro_code.domain.sessions.search import (
 from neuro_code.shared.async_utils import run_blocking
 from neuro_code.shared.errors import SessionError
 
-SCHEMA_VERSION = 13
+SCHEMA_VERSION = 14
 _SEARCH_SNIPPET_LIMIT = 500
 _SQLITE_TIMEOUT_SECONDS = 30.0
 _SESSION_ALIAS_NAMESPACE_LIMIT = 64
@@ -198,6 +205,12 @@ class SqliteSessionStore:
                             "UPDATE schema_meta SET version = 13 WHERE singleton = 1"
                         )
                         version = (13,)
+                    if version is not None and version[0] == 13:
+                        _ensure_session_turn_attempt_schema(connection)
+                        connection.execute(
+                            "UPDATE schema_meta SET version = 14 WHERE singleton = 1"
+                        )
+                        version = (14,)
                     if version is None or version[0] != SCHEMA_VERSION:
                         raise SessionError(
                             "unsupported session schema version: "
@@ -212,6 +225,7 @@ class SqliteSessionStore:
                     _ensure_session_background_wake_schema(connection)
                     _ensure_subagent_link_schema(connection)
                     _ensure_session_compaction_schema(connection)
+                    _ensure_session_turn_attempt_schema(connection)
                     _backfill_search_documents(connection, missing_only=True)
                     connection.commit()
                 except BaseException:
@@ -622,12 +636,206 @@ class SqliteSessionStore:
         async with self._write_lock:
             await run_blocking(save)
 
+    async def start_turn_attempt(self, attempt: TurnRecoveryAttempt) -> None:
+        """Durably accept one turn before any provider or tool boundary."""
+
+        if not isinstance(attempt, TurnRecoveryAttempt):
+            raise TypeError("attempt must be a TurnRecoveryAttempt")
+        input_json = attempt.input.canonical_json() if attempt.input is not None else ""
+
+        def start() -> None:
+            connection = self._connect()
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                session = connection.execute(
+                    "SELECT 1 FROM sessions WHERE id = ?", (attempt.session_id,)
+                ).fetchone()
+                if session is None:
+                    raise SessionError(f"unknown session: {attempt.session_id}")
+                existing = connection.execute(
+                    """
+                    SELECT turn_id
+                    FROM session_turn_attempts
+                    WHERE session_id = ? AND resolution IS NULL
+                    LIMIT 1
+                    """,
+                    (attempt.session_id,),
+                ).fetchone()
+                if existing is not None:
+                    raise SessionError(
+                        f"session {attempt.session_id} already has an open turn attempt"
+                    )
+                connection.execute(
+                    """
+                    INSERT INTO session_turn_attempts(
+                        turn_id, session_id, source, task_id, input_json,
+                        input_fingerprint, input_reconstructable, accepted_at,
+                        last_stage, last_stage_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        attempt.turn_id,
+                        attempt.session_id,
+                        attempt.source.value,
+                        attempt.task_id,
+                        input_json,
+                        attempt.input_fingerprint,
+                        int(attempt.input_reconstructable),
+                        attempt.accepted_at.isoformat(),
+                        attempt.last_stage.value,
+                        attempt.last_stage_at.isoformat()
+                        if attempt.last_stage_at is not None
+                        else attempt.accepted_at.isoformat(),
+                    ),
+                )
+                connection.execute(
+                    "UPDATE sessions SET updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                    (attempt.session_id,),
+                )
+                connection.commit()
+            except sqlite3.IntegrityError as error:
+                connection.rollback()
+                raise SessionError(f"cannot create turn attempt: {attempt.turn_id}") from error
+            except BaseException:
+                connection.rollback()
+                raise
+            finally:
+                connection.close()
+
+        async with self._write_lock:
+            await run_blocking(start)
+
+    async def append_turn_recovery_fact(
+        self,
+        session_id: str,
+        turn_id: str,
+        event: AgentEvent,
+        fact: TurnRecoveryFact,
+    ) -> None:
+        """Append a recovery marker and update its sticky facts atomically."""
+
+        if not isinstance(event, AgentEvent):
+            raise TypeError("event must be an AgentEvent")
+        if not isinstance(fact, TurnRecoveryFact):
+            raise TypeError("fact must be a TurnRecoveryFact")
+        expected_kind = {
+            TurnRecoveryFactKind.MODEL_REQUEST_STARTED: AgentEventKind.MODEL_REQUEST_STARTED,
+            TurnRecoveryFactKind.MODEL_OUTPUT_STARTED: AgentEventKind.MODEL_OUTPUT_STARTED,
+            TurnRecoveryFactKind.TOOL_STARTED: AgentEventKind.TOOL_STARTED,
+        }[fact.kind]
+        if event.kind is not expected_kind:
+            raise SessionError("recovery fact event kind does not match its fact")
+        if event.data.get("turn_id") != turn_id:
+            raise SessionError("recovery fact event has a different turn identity")
+        payload = json.dumps(dict(event.data), ensure_ascii=False, separators=(",", ":"))
+
+        def append() -> None:
+            connection = self._connect()
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                row = connection.execute(
+                    """
+                    SELECT resolution
+                    FROM session_turn_attempts
+                    WHERE session_id = ? AND turn_id = ?
+                    """,
+                    (session_id, turn_id),
+                ).fetchone()
+                if row is None:
+                    raise SessionError(f"unknown turn attempt: {turn_id}")
+                if row[0] is not None:
+                    raise SessionError(f"turn attempt is already resolved: {turn_id}")
+                _insert_event_row(
+                    connection,
+                    session_id=session_id,
+                    event=event,
+                    payload=payload,
+                )
+                if fact.kind is TurnRecoveryFactKind.MODEL_REQUEST_STARTED:
+                    connection.execute(
+                        """
+                        UPDATE session_turn_attempts
+                        SET request_started_count = request_started_count + 1,
+                            request_id = ?, step = ?, provider = ?, model = ?,
+                            last_stage = ?, last_stage_at = ?
+                        WHERE session_id = ? AND turn_id = ?
+                        """,
+                        (
+                            fact.request_id,
+                            fact.step,
+                            fact.provider,
+                            fact.model,
+                            TurnRecoveryStage.REQUEST_STARTED.value,
+                            event.created_at.isoformat(),
+                            session_id,
+                            turn_id,
+                        ),
+                    )
+                elif fact.kind is TurnRecoveryFactKind.MODEL_OUTPUT_STARTED:
+                    connection.execute(
+                        """
+                        UPDATE session_turn_attempts
+                        SET output_started = 1,
+                            last_stage = ?, last_stage_at = ?
+                        WHERE session_id = ? AND turn_id = ?
+                        """,
+                        (
+                            TurnRecoveryStage.MODEL_OUTPUT_STARTED.value,
+                            event.created_at.isoformat(),
+                            session_id,
+                            turn_id,
+                        ),
+                    )
+                else:
+                    connection.execute(
+                        """
+                        UPDATE session_turn_attempts
+                        SET tool_started_count = tool_started_count + 1,
+                            side_effecting_tool_started = CASE
+                                WHEN side_effecting_tool_started = 1 OR ? = 1 THEN 1
+                                ELSE 0 END,
+                            last_tool_id = ?, last_tool_name = ?,
+                            last_stage = ?, last_stage_at = ?
+                        WHERE session_id = ? AND turn_id = ?
+                        """,
+                        (
+                            int(fact.side_effecting),
+                            fact.tool_id,
+                            fact.tool_name,
+                            TurnRecoveryStage.TOOL_STARTED.value,
+                            event.created_at.isoformat(),
+                            session_id,
+                            turn_id,
+                        ),
+                    )
+                connection.execute(
+                    "UPDATE sessions SET updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                    (session_id,),
+                )
+                connection.commit()
+            except sqlite3.IntegrityError as error:
+                connection.rollback()
+                raise SessionError(
+                    f"cannot append recovery fact {event.sequence} for turn {turn_id}"
+                ) from error
+            except BaseException:
+                connection.rollback()
+                raise
+            finally:
+                connection.close()
+
+        async with self._write_lock:
+            await run_blocking(append)
+
     async def finalize_turn(
         self,
         session_id: str,
         event: AgentEvent,
         items: Sequence[SessionItem],
         record: SessionExecutionRecord | None,
+        turn_id: str | None = None,
+        task: SessionTask | None = None,
+        task_event: AgentEvent | None = None,
     ) -> None:
         if not isinstance(event, AgentEvent):
             raise TypeError("event must be an AgentEvent")
@@ -657,6 +865,9 @@ class SqliteSessionStore:
                     items=new_items,
                     record=record,
                     compaction_item=None,
+                    turn_id=turn_id,
+                    task=task,
+                    task_event=task_event,
                 )
                 connection.commit()
             except sqlite3.IntegrityError as error:
@@ -680,6 +891,9 @@ class SqliteSessionStore:
         items: Sequence[SessionItem],
         record: SessionExecutionRecord | None,
         compaction_item: DurableCompactionItem,
+        turn_id: str | None = None,
+        task: SessionTask | None = None,
+        task_event: AgentEvent | None = None,
     ) -> None:
         """Atomically finalize a turn and persist one compaction item.
 
@@ -726,6 +940,9 @@ class SqliteSessionStore:
                     items=new_items,
                     record=record,
                     compaction_item=compaction_item,
+                    turn_id=turn_id,
+                    task=task,
+                    task_event=task_event,
                 )
                 connection.commit()
             except sqlite3.IntegrityError as error:
@@ -741,6 +958,177 @@ class SqliteSessionStore:
 
         async with self._write_lock:
             await run_blocking(finalize)
+
+    async def finalize_turn_failure(
+        self,
+        session_id: str,
+        turn_id: str | None,
+        event: AgentEvent,
+        items: Sequence[SessionItem],
+        *,
+        resolution: str,
+        task: SessionTask | None = None,
+        task_event: AgentEvent | None = None,
+    ) -> None:
+        """Atomically close a failed/cancelled turn and its task."""
+
+        if not isinstance(event, AgentEvent):
+            raise TypeError("event must be an AgentEvent")
+        if event.kind is not AgentEventKind.TURN_FAILED:
+            raise SessionError("finalize_turn_failure requires a TURN_FAILED event")
+        if resolution not in {
+            TurnRecoveryResolution.FAILED.value,
+            TurnRecoveryResolution.CANCELLED.value,
+        }:
+            raise SessionError("turn failure resolution must be failed or cancelled")
+        new_items = list(items)
+
+        def finalize() -> None:
+            connection = self._connect()
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                _persist_failed_turn(
+                    connection,
+                    session_id=session_id,
+                    turn_id=turn_id,
+                    event=event,
+                    items=new_items,
+                    resolution=resolution,
+                    task=task,
+                    task_event=task_event,
+                )
+                connection.commit()
+            except sqlite3.IntegrityError as error:
+                connection.rollback()
+                raise SessionError(
+                    f"cannot finalize failed turn event {event.sequence} for session {session_id}"
+                ) from error
+            except BaseException:
+                connection.rollback()
+                raise
+            finally:
+                connection.close()
+
+        async with self._write_lock:
+            await run_blocking(finalize)
+
+    async def abandon_turn_attempt(
+        self,
+        session_id: str,
+        turn_id: str,
+        event: AgentEvent,
+        reason: str,
+    ) -> None:
+        """Persist an explicit user-directed abandon resolution."""
+
+        if not isinstance(event, AgentEvent) or event.kind is not AgentEventKind.TURN_ABANDONED:
+            raise SessionError("abandon_turn_attempt requires a TURN_ABANDONED event")
+        if not isinstance(reason, str) or not reason.strip() or len(reason.encode("utf-8")) > 512:
+            raise SessionError("abandon reason is invalid")
+        if event.data.get("turn_id") != turn_id:
+            raise SessionError("abandon event has a different turn identity")
+        payload = json.dumps(dict(event.data), ensure_ascii=False, separators=(",", ":"))
+
+        def abandon() -> None:
+            connection = self._connect()
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                row = connection.execute(
+                    """
+                    SELECT resolution
+                    FROM session_turn_attempts
+                    WHERE session_id = ? AND turn_id = ?
+                    """,
+                    (session_id, turn_id),
+                ).fetchone()
+                if row is None:
+                    raise SessionError(f"unknown turn attempt: {turn_id}")
+                if row[0] is not None:
+                    raise SessionError(f"turn attempt is already resolved: {turn_id}")
+                _insert_event_row(
+                    connection,
+                    session_id=session_id,
+                    event=event,
+                    payload=payload,
+                )
+                updated = connection.execute(
+                    """
+                    UPDATE session_turn_attempts
+                    SET resolution = ?, resolution_at = ?,
+                        last_stage = ?, last_stage_at = ?
+                    WHERE session_id = ? AND turn_id = ? AND resolution IS NULL
+                    """,
+                    (
+                        TurnRecoveryResolution.ABANDONED.value,
+                        event.created_at.isoformat(),
+                        TurnRecoveryStage.ABANDONED.value,
+                        event.created_at.isoformat(),
+                        session_id,
+                        turn_id,
+                    ),
+                )
+                if updated.rowcount != 1:
+                    raise SessionError(f"cannot abandon turn attempt: {turn_id}")
+                connection.execute(
+                    "UPDATE sessions SET updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                    (session_id,),
+                )
+                connection.commit()
+            except sqlite3.IntegrityError as error:
+                connection.rollback()
+                raise SessionError(f"cannot append abandon event for turn {turn_id}") from error
+            except BaseException:
+                connection.rollback()
+                raise
+            finally:
+                connection.close()
+
+        async with self._write_lock:
+            await run_blocking(abandon)
+
+    async def load_turn_attempts(self, session_id: str) -> list[TurnRecoveryAttempt]:
+        def load() -> list[TurnRecoveryAttempt]:
+            with closing(self._connect()) as connection:
+                rows = connection.execute(
+                    """
+                    SELECT turn_id, session_id, source, task_id, input_json,
+                           input_fingerprint, input_reconstructable, accepted_at,
+                           resolution, resolution_at, request_started_count,
+                           request_id, step, provider, model, output_started,
+                           tool_started_count, side_effecting_tool_started,
+                           last_tool_id, last_tool_name, last_stage, last_stage_at,
+                           fact_conflict
+                    FROM session_turn_attempts
+                    WHERE session_id = ?
+                    ORDER BY accepted_at ASC, turn_id ASC
+                    """,
+                    (session_id,),
+                ).fetchall()
+            return [_turn_recovery_attempt_from_row(row) for row in rows]
+
+        return await run_blocking(load)
+
+    async def load_open_turn_attempts(self, session_id: str) -> list[TurnRecoveryAttempt]:
+        def load() -> list[TurnRecoveryAttempt]:
+            with closing(self._connect()) as connection:
+                rows = connection.execute(
+                    """
+                    SELECT turn_id, session_id, source, task_id, input_json,
+                           input_fingerprint, input_reconstructable, accepted_at,
+                           resolution, resolution_at, request_started_count,
+                           request_id, step, provider, model, output_started,
+                           tool_started_count, side_effecting_tool_started,
+                           last_tool_id, last_tool_name, last_stage, last_stage_at,
+                           fact_conflict
+                    FROM session_turn_attempts
+                    WHERE session_id = ? AND resolution IS NULL
+                    ORDER BY accepted_at ASC, turn_id ASC
+                    """,
+                    (session_id,),
+                ).fetchall()
+            return [_turn_recovery_attempt_from_row(row) for row in rows]
+
+        return await run_blocking(load)
 
     async def load_messages(self, session_id: str) -> list[Message]:
         items = await self.load_session_items(session_id)
@@ -2200,6 +2588,53 @@ def _ensure_session_compaction_schema(connection: sqlite3.Connection) -> None:
     )
 
 
+def _ensure_session_turn_attempt_schema(connection: sqlite3.Connection) -> None:
+    """Create the canonical crash-recovery attempt projection.
+
+    The row is the small source of truth for accepted input, sticky lifecycle
+    facts, and explicit resolution.  The append-only events table remains the
+    ordered audit evidence and is updated in the same transaction as each fact.
+    """
+
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS session_turn_attempts (
+            turn_id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            source TEXT NOT NULL,
+            task_id TEXT,
+            input_json TEXT NOT NULL DEFAULT '',
+            input_fingerprint TEXT NOT NULL,
+            input_reconstructable INTEGER NOT NULL CHECK (input_reconstructable IN (0, 1)),
+            accepted_at TEXT NOT NULL,
+            resolution TEXT,
+            resolution_at TEXT,
+            request_started_count INTEGER NOT NULL DEFAULT 0 CHECK (request_started_count >= 0),
+            request_id TEXT,
+            step INTEGER,
+            provider TEXT,
+            model TEXT,
+            output_started INTEGER NOT NULL DEFAULT 0 CHECK (output_started IN (0, 1)),
+            tool_started_count INTEGER NOT NULL DEFAULT 0 CHECK (tool_started_count >= 0),
+            side_effecting_tool_started INTEGER NOT NULL DEFAULT 0
+                CHECK (side_effecting_tool_started IN (0, 1)),
+            last_tool_id TEXT,
+            last_tool_name TEXT,
+            last_stage TEXT NOT NULL DEFAULT 'accepted',
+            last_stage_at TEXT,
+            fact_conflict INTEGER NOT NULL DEFAULT 0 CHECK (fact_conflict IN (0, 1)),
+            FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS session_turn_attempts_by_session_status
+        ON session_turn_attempts(session_id, resolution, accepted_at DESC, turn_id DESC)
+        """
+    )
+
+
 def _compaction_item_from_row(row: Sequence[object]) -> DurableCompactionItem:
     (
         compaction_id,
@@ -2341,6 +2776,193 @@ def _validate_execution_record_order(
         raise SessionError("conflicting execution records use the same event sequence")
 
 
+def _insert_event_row(
+    connection: sqlite3.Connection,
+    *,
+    session_id: str,
+    event: AgentEvent,
+    payload: str | None = None,
+) -> None:
+    """Insert one already-created event into an open transaction."""
+
+    connection.execute(
+        """
+        INSERT INTO events(session_id, sequence, kind, created_at, data_json)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (
+            session_id,
+            event.sequence,
+            event.kind.value,
+            event.created_at.isoformat(),
+            payload
+            if payload is not None
+            else json.dumps(dict(event.data), ensure_ascii=False, separators=(",", ":")),
+        ),
+    )
+    connection.execute(
+        "UPDATE sessions SET updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+        (session_id,),
+    )
+
+
+def _persist_task_terminal(
+    connection: sqlite3.Connection,
+    *,
+    session_id: str,
+    task: SessionTask | None,
+    task_event: AgentEvent | None,
+    before_sequence: int,
+) -> None:
+    """Apply a task terminal transition inside the owning turn transaction."""
+
+    if task is None:
+        if task_event is not None:
+            raise SessionError("task event cannot exist without a task")
+        return
+    if task_event is None:
+        raise SessionError("a terminal task requires a task event")
+    expected_kind = {
+        SessionTaskStatus.COMPLETED: AgentEventKind.SESSION_TASK_COMPLETED,
+        SessionTaskStatus.FAILED: AgentEventKind.SESSION_TASK_FAILED,
+        SessionTaskStatus.CANCELLED: AgentEventKind.SESSION_TASK_CANCELLED,
+    }.get(task.status)
+    if expected_kind is None or task_event.kind is not expected_kind:
+        raise SessionError("task terminal event does not match task status")
+    if task_event.sequence >= before_sequence:
+        raise SessionError("task terminal event must precede the turn terminal event")
+    row = connection.execute(
+        """
+        SELECT task_id, kind, status, started_at, finished_at, plan_snapshot_json
+        FROM session_tasks
+        WHERE session_id = ? AND task_id = ?
+        """,
+        (session_id, task.task_id),
+    ).fetchone()
+    if row is None:
+        raise SessionError(f"unknown session task: {task.task_id}")
+    current = _session_task_from_row(row, session_id=session_id)
+    try:
+        if task.finished_at is None:
+            raise ValueError("session task finish time is missing")
+        expected = current.finish(task.status, finished_at=task.finished_at)
+    except ValueError as error:
+        raise SessionError(f"invalid session task transition: {task.task_id}") from error
+    if task != expected:
+        raise SessionError(f"invalid session task transition: {task.task_id}")
+    connection.execute(
+        """
+        UPDATE session_tasks
+        SET status = ?, finished_at = ?
+        WHERE session_id = ? AND task_id = ?
+        """,
+        (
+            task.status.value,
+            task.finished_at.isoformat() if task.finished_at is not None else None,
+            session_id,
+            task.task_id,
+        ),
+    )
+    _insert_event_row(connection, session_id=session_id, event=task_event)
+
+
+def _turn_recovery_attempt_from_row(row: Sequence[object]) -> TurnRecoveryAttempt:
+    try:
+        (
+            raw_turn_id,
+            raw_session_id,
+            raw_source,
+            raw_task_id,
+            raw_input_json,
+            raw_fingerprint,
+            raw_input_reconstructable,
+            raw_accepted_at,
+            raw_resolution,
+            raw_resolution_at,
+            raw_request_count,
+            raw_request_id,
+            raw_step,
+            raw_provider,
+            raw_model,
+            raw_output_started,
+            raw_tool_count,
+            raw_side_effecting,
+            raw_tool_id,
+            raw_tool_name,
+            raw_stage,
+            raw_stage_at,
+            raw_conflict,
+        ) = row
+        source = TurnSource(str(raw_source))
+        resolution = (
+            TurnRecoveryResolution(str(raw_resolution)) if raw_resolution is not None else None
+        )
+        stage = TurnRecoveryStage(str(raw_stage))
+        if not isinstance(raw_input_reconstructable, int) or raw_input_reconstructable not in (
+            0,
+            1,
+        ):
+            raise ValueError("input reconstructable flag is invalid")
+        if not isinstance(raw_output_started, int) or raw_output_started not in (0, 1):
+            raise ValueError("output started flag is invalid")
+        if not isinstance(raw_side_effecting, int) or raw_side_effecting not in (0, 1):
+            raise ValueError("side-effecting flag is invalid")
+        if not isinstance(raw_conflict, int) or raw_conflict not in (0, 1):
+            raise ValueError("fact conflict flag is invalid")
+        input_value: TurnInput | None = None
+        input_reconstructable = bool(raw_input_reconstructable)
+        fact_conflict = bool(raw_conflict)
+        if isinstance(raw_input_json, str) and raw_input_json:
+            try:
+                parsed = TurnInput.from_dict(json.loads(raw_input_json))
+                if parsed.fingerprint != str(raw_fingerprint):
+                    input_reconstructable = False
+                    fact_conflict = True
+                elif input_reconstructable:
+                    input_value = parsed
+            except (TypeError, ValueError, json.JSONDecodeError):
+                input_reconstructable = False
+                fact_conflict = True
+        else:
+            input_reconstructable = False
+
+        def parse_time(value: object) -> datetime | None:
+            return datetime.fromisoformat(str(value)) if value is not None else None
+
+        def parse_integer(value: object, field_name: str) -> int:
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise ValueError(f"{field_name} is invalid")
+            return value
+
+        return TurnRecoveryAttempt(
+            str(raw_turn_id),
+            str(raw_session_id),
+            source,
+            str(raw_task_id) if raw_task_id is not None else None,
+            str(raw_fingerprint),
+            input_value,
+            input_reconstructable,
+            datetime.fromisoformat(str(raw_accepted_at)),
+            resolution,
+            parse_time(raw_resolution_at),
+            parse_integer(raw_request_count, "request count"),
+            str(raw_request_id) if raw_request_id is not None else None,
+            parse_integer(raw_step, "step") if raw_step is not None else None,
+            str(raw_provider) if raw_provider is not None else None,
+            str(raw_model) if raw_model is not None else None,
+            bool(raw_output_started),
+            parse_integer(raw_tool_count, "tool count"),
+            bool(raw_side_effecting),
+            str(raw_tool_id) if raw_tool_id is not None else None,
+            str(raw_tool_name) if raw_tool_name is not None else None,
+            stage,
+            parse_time(raw_stage_at),
+            fact_conflict,
+        )
+    except (TypeError, ValueError) as error:
+        raise SessionError("session contains an invalid turn recovery attempt") from error
+
+
 def _persist_finalized_turn(
     connection: sqlite3.Connection,
     *,
@@ -2349,6 +2971,9 @@ def _persist_finalized_turn(
     items: Sequence[SessionItem],
     record: SessionExecutionRecord | None,
     compaction_item: DurableCompactionItem | None,
+    turn_id: str | None,
+    task: SessionTask | None,
+    task_event: AgentEvent | None,
 ) -> None:
     """Write all owned turn-finalization projections on one open transaction.
 
@@ -2379,6 +3004,15 @@ def _persist_finalized_turn(
             session_id=session_id,
             incoming=record,
         )
+    if turn_id is not None and event.data.get("turn_id") != turn_id:
+        raise SessionError("completion event has a different turn identity")
+    _persist_task_terminal(
+        connection,
+        session_id=session_id,
+        task=task,
+        task_event=task_event,
+        before_sequence=event.sequence,
+    )
     duplicate = connection.execute(
         "SELECT 1 FROM events WHERE session_id = ? AND sequence = ?",
         (session_id, event.sequence),
@@ -2388,19 +3022,7 @@ def _persist_finalized_turn(
     payload = json.dumps(dict(event.data), ensure_ascii=False, separators=(",", ":"))
     items_payload = _serialize_session_items(items)
     title = str(row[1]) or fallback_session_title(items)
-    connection.execute(
-        """
-        INSERT INTO events(session_id, sequence, kind, created_at, data_json)
-        VALUES (?, ?, ?, ?, ?)
-        """,
-        (
-            session_id,
-            event.sequence,
-            event.kind.value,
-            event.created_at.isoformat(),
-            payload,
-        ),
-    )
+    _insert_event_row(connection, session_id=session_id, event=event, payload=payload)
     cursor = connection.execute(
         """
         UPDATE sessions
@@ -2448,6 +3070,118 @@ def _persist_finalized_turn(
         )
     if compaction_item is not None:
         _persist_compaction_item(connection, session_id, compaction_item)
+    if turn_id is not None:
+        _resolve_turn_attempt(
+            connection,
+            session_id=session_id,
+            turn_id=turn_id,
+            resolution=TurnRecoveryResolution.COMMITTED,
+            resolved_at=event.created_at,
+            stage=TurnRecoveryStage.TURN_COMPLETED,
+        )
+
+
+def _persist_failed_turn(
+    connection: sqlite3.Connection,
+    *,
+    session_id: str,
+    turn_id: str | None,
+    event: AgentEvent,
+    items: Sequence[SessionItem],
+    resolution: str,
+    task: SessionTask | None,
+    task_event: AgentEvent | None,
+) -> None:
+    """Write failure/cancellation projections in one open transaction."""
+
+    row = connection.execute(
+        "SELECT messages_json, title FROM sessions WHERE id = ?", (session_id,)
+    ).fetchone()
+    if row is None:
+        raise SessionError(f"unknown session: {session_id}")
+    try:
+        current_items = _session_items_from_json(row[0])
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+        raise SessionError(f"session {session_id} contains invalid session items") from error
+    if len(items) < len(current_items) or list(items)[: len(current_items)] != current_items:
+        raise SessionError("cannot rewrite the persisted session item prefix")
+    if turn_id is not None and event.data.get("turn_id") != turn_id:
+        raise SessionError("failure event has a different turn identity")
+    _persist_task_terminal(
+        connection,
+        session_id=session_id,
+        task=task,
+        task_event=task_event,
+        before_sequence=event.sequence,
+    )
+    _insert_event_row(connection, session_id=session_id, event=event)
+    items_payload = _serialize_session_items(items)
+    title = str(row[1]) or fallback_session_title(items)
+    cursor = connection.execute(
+        """
+        UPDATE sessions
+        SET messages_json = ?, title = ?, updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+        """,
+        (items_payload, title, session_id),
+    )
+    if cursor.rowcount != 1:
+        raise SessionError(f"unknown session: {session_id}")
+    _upsert_search_document(
+        connection,
+        session_id=session_id,
+        title=title,
+        content=searchable_session_text(items),
+    )
+    if turn_id is not None:
+        _resolve_turn_attempt(
+            connection,
+            session_id=session_id,
+            turn_id=turn_id,
+            resolution=TurnRecoveryResolution(resolution),
+            resolved_at=event.created_at,
+            stage=TurnRecoveryStage.TURN_FAILED,
+        )
+
+
+def _resolve_turn_attempt(
+    connection: sqlite3.Connection,
+    *,
+    session_id: str,
+    turn_id: str,
+    resolution: TurnRecoveryResolution,
+    resolved_at: datetime,
+    stage: TurnRecoveryStage,
+) -> None:
+    row = connection.execute(
+        """
+        SELECT resolution
+        FROM session_turn_attempts
+        WHERE session_id = ? AND turn_id = ?
+        """,
+        (session_id, turn_id),
+    ).fetchone()
+    if row is None:
+        raise SessionError(f"unknown turn attempt: {turn_id}")
+    if row[0] is not None:
+        raise SessionError(f"turn attempt is already resolved: {turn_id}")
+    updated = connection.execute(
+        """
+        UPDATE session_turn_attempts
+        SET resolution = ?, resolution_at = ?, last_stage = ?, last_stage_at = ?
+        WHERE session_id = ? AND turn_id = ? AND resolution IS NULL
+        """,
+        (
+            resolution.value,
+            resolved_at.isoformat(),
+            stage.value,
+            resolved_at.isoformat(),
+            session_id,
+            turn_id,
+        ),
+    )
+    if updated.rowcount != 1:
+        raise SessionError(f"cannot resolve turn attempt: {turn_id}")
 
 
 def _persist_compaction_item(

@@ -94,6 +94,7 @@ from neuro_code.application.acp.contracts import (
     AcpSubagentLifecycleQueryError,
     AcpToolOutputArtifactQuery,
     AcpToolOutputArtifactQueryError,
+    AcpTurnRecoveryQuery,
     AcpWorkspaceValidationError,
 )
 from neuro_code.application.acp.service import AcpApplicationService
@@ -221,6 +222,7 @@ ACP_READ_ONLY_SUBAGENT_EXTENSION = "neuro-code/session/subagent"
 ACP_SUBAGENT_LIFECYCLE_EXTENSION = "neuro-code/session/subagents"
 ACP_MCP_EXTENSION = "neuro-code/session/mcp"
 ACP_CONTEXT_COMPACTION_EXTENSION = "neuro-code/session/compact"
+ACP_TURN_RECOVERY_EXTENSION = "neuro-code/session/recovery"
 
 _SESSION_NOT_ACTIVE = -32001
 _SESSION_NOT_FOUND = -32002
@@ -2898,6 +2900,47 @@ class NeuroCodeAcpAgent:
                 }
             return payload
 
+        if method == ACP_TURN_RECOVERY_EXTENSION:
+            try:
+                recovery_query = AcpTurnRecoveryQuery.from_payload(params)
+            except AcpMcpQueryError as error:
+                raise _invalid_params(error.reason) from None
+            session = await self._active_session(_validated_session_id(recovery_query.session_id))
+            binding = session.binding
+            if binding is None:
+                raise RequestError.internal_error({"reason": "session_binding_unavailable"})
+            try:
+                if recovery_query.operation == "inspect":
+                    inspections = await binding.runner.inspect_recovery()
+                    return {
+                        "attempts": [inspection.to_dict() for inspection in inspections],
+                    }
+                assert recovery_query.turn_id is not None
+                if recovery_query.operation == "abandon":
+                    inspection = await binding.runner.abandon_recovery(
+                        recovery_query.turn_id,
+                        reason=recovery_query.reason,
+                    )
+                    return inspection.to_dict()
+                result = await binding.runner.retry_recovery(recovery_query.turn_id)
+                return {
+                    "status": "retried",
+                    "sessionId": recovery_query.session_id,
+                    "steps": result.steps,
+                }
+            except ConfigurationError as error:
+                message = str(error)
+                reason = (
+                    "recovery_not_safe"
+                    if "indeterminate" in message or "safely_retryable" not in message
+                    else "recovery_retry_unavailable"
+                )
+                raise RequestError.internal_error({"reason": reason}) from None
+            except SessionError:
+                raise _session_not_found(recovery_query.session_id) from None
+            except Exception:
+                raise RequestError.internal_error({"reason": "recovery_operation_failed"}) from None
+
         if method == ACP_SUBAGENT_LIFECYCLE_EXTENSION:
             try:
                 lifecycle_query = AcpSubagentLifecycleQuery.from_payload(params)
@@ -3119,6 +3162,13 @@ class NeuroCodeAcpAgent:
             if "exceeded the maximum" in str(error):
                 return PromptResponse(stop_reason="max_turn_requests")
             raise RequestError.internal_error({"reason": "provider_failure"}) from None
+        except ConfigurationError as error:
+            await self._capture_runner_session(session, binding, suppress_errors=True)
+            if session.cancel_requested or session.closing:
+                return PromptResponse(stop_reason="cancelled")
+            if "unresolved interrupted turn" in str(error):
+                raise RequestError.internal_error({"reason": "turn_recovery_required"}) from None
+            raise RequestError.internal_error({"reason": "prompt_configuration"}) from None
         except RequestError:
             raise
         except Exception:
@@ -3487,6 +3537,7 @@ __all__ = [
     "ACP_READ_ONLY_SUBAGENT_EXTENSION",
     "ACP_STDIO_BUFFER_LIMIT_BYTES",
     "ACP_SUBAGENT_LIFECYCLE_EXTENSION",
+    "ACP_TURN_RECOVERY_EXTENSION",
     "NeuroCodeAcpAgent",
     "convert_prompt_content",
     "serve_acp",

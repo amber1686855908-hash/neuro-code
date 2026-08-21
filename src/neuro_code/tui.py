@@ -124,6 +124,7 @@ from neuro_code.domain.execution import (
     AgentExecutionStatus,
     SessionExecutionRecord,
     TurnCancellationPolicy,
+    TurnRecoveryStatus,
 )
 from neuro_code.domain.plans import PlanComment, PlanStepStatus, SessionPlan
 from neuro_code.domain.sandbox.models import SandboxProfile
@@ -4130,6 +4131,13 @@ class NeuroCodeApp(App[None]):
                 cwd=self._cwd,
             )
             self._write_recoverable_resume_notice(self._execution_record)
+            self.run_worker(
+                self._announce_recovery_state(),
+                name="crash-recovery-inspection",
+                group="session",
+                exclusive=False,
+                exit_on_error=False,
+            )
         else:
             self._write_ui_entry(
                 "system",
@@ -5561,6 +5569,9 @@ class NeuroCodeApp(App[None]):
             else:
                 await self._select_session(requested_session)
             return
+        if command == "recover":
+            await self._dispatch_recovery_command(arguments)
+            return
         if command in {"rename", "title"}:
             await self._rename_session(arguments)
             return
@@ -5637,6 +5648,105 @@ class NeuroCodeApp(App[None]):
             await self._run_context_compaction()
         else:
             self._write_ui_entry("error", "command.unknown", command=command)
+
+    async def _dispatch_recovery_command(self, arguments: str) -> None:
+        tokens = arguments.split()
+        if not tokens or tokens[0].casefold() == "inspect":
+            if len(tokens) > 1:
+                self._write_ui_entry("error", "recovery.usage")
+                return
+            await self._announce_recovery_state(verbose=True)
+            return
+        if len(tokens) != 2 or tokens[0].casefold() not in {"abandon", "retry"}:
+            self._write_ui_entry("error", "recovery.usage")
+            return
+        owner = self._session_selection_owner()
+        if owner is None:
+            self._write_ui_entry("error", "recovery.unavailable")
+            return
+        if self._turn_worker is not None and self._turn_worker.is_running:
+            self._write_ui_entry("error", "turn.running")
+            return
+        action, turn_id = tokens[0].casefold(), tokens[1]
+        if action == "abandon":
+            try:
+                result = await owner.abandon_recovery(turn_id)
+            except Exception as error:
+                self._write_entry("error", f"{type(error).__name__}: {error}")
+                return
+            self._write_ui_entry(
+                "status",
+                "session.recovery.abandoned",
+                turn_id=result.attempt.turn_id,
+            )
+            return
+
+        self._assistant_parts.clear()
+        self._first_token_seen = False
+        self._turn_completion = None
+        self._terminal_execution_status = None
+        self._terminal_execution_recoverable = False
+        self._finalizing = False
+        self._begin_pending_assistant()
+        self._turn_worker = self.run_worker(
+            self._run_recovery_retry(owner, turn_id),
+            name="agent-recovery-retry",
+            group="agent",
+            exclusive=True,
+            exit_on_error=False,
+        )
+
+    async def _run_recovery_retry(
+        self,
+        owner: SessionController,
+        turn_id: str,
+    ) -> None:
+        await self._run_agent_turn(lambda: owner.retry_recovery(turn_id, sink=self._handle_event))
+
+    async def _announce_recovery_state(self, *, verbose: bool = False) -> None:
+        owner = self._session_selection_owner()
+        if owner is None:
+            return
+        try:
+            inspections = await owner.inspect_recovery()
+        except Exception:
+            return
+        visible = tuple(
+            inspection
+            for inspection in inspections
+            if verbose or inspection.attempt.resolution is None
+        )
+        if not visible:
+            if verbose:
+                self._write_ui_entry("status", "recovery.none")
+            return
+        for inspection in visible:
+            attempt = inspection.attempt
+            input_state = "exact" if attempt.input_reconstructable else "unavailable"
+            if verbose:
+                self._write_ui_entry(
+                    "system",
+                    "recovery.item",
+                    turn_id=attempt.turn_id,
+                    status=attempt.status.value,
+                    stage=attempt.last_stage.value,
+                    input_state=input_state,
+                    reason=attempt.status_reason,
+                )
+                continue
+            if attempt.status is TurnRecoveryStatus.SAFELY_RETRYABLE:
+                self._write_ui_entry(
+                    "recoverable",
+                    "session.recovery.safe",
+                    turn_id=attempt.turn_id,
+                )
+            elif attempt.status is TurnRecoveryStatus.INDETERMINATE:
+                self._write_ui_entry(
+                    "recoverable",
+                    "session.recovery.indeterminate",
+                    turn_id=attempt.turn_id,
+                    stage=attempt.last_stage.value,
+                )
 
     async def _run_context_compaction(self) -> None:
         if self._turn_worker is not None and self._turn_worker.is_running:
@@ -6447,6 +6557,7 @@ class NeuroCodeApp(App[None]):
                 "session.already_open",
                 session_id=result.session_id,
             )
+            await self._announce_recovery_state()
             return
 
         self._queued_interjections.clear()
@@ -6488,6 +6599,7 @@ class NeuroCodeApp(App[None]):
             stopped=self._stopped_task_note(result.stopped_background_tasks),
         )
         self._write_recoverable_resume_notice(self._execution_record)
+        await self._announce_recovery_state()
 
     async def _add_plan_comment(self, arguments: str) -> None:
         controller = self._plan_controller

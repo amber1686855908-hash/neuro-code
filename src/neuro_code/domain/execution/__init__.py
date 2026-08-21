@@ -19,6 +19,18 @@ from neuro_code.domain.execution.outcomes import (
     SupervisorDecisionKind,
     SupervisorReasonCode,
 )
+from neuro_code.domain.execution.recovery import (
+    MAX_RECOVERY_ID_BYTES,
+    MAX_RECOVERY_REASON_BYTES,
+    MAX_TURN_INPUT_BYTES,
+    TurnInput,
+    TurnRecoveryAttempt,
+    TurnRecoveryFact,
+    TurnRecoveryFactKind,
+    TurnRecoveryResolution,
+    TurnRecoveryStage,
+    TurnRecoveryStatus,
+)
 from neuro_code.domain.execution.tasks import (
     ExecutionBudget,
     ExecutionBudgetPressure,
@@ -33,6 +45,9 @@ from neuro_code.domain.execution.tasks import (
 )
 
 __all__ = [
+    "MAX_RECOVERY_ID_BYTES",
+    "MAX_RECOVERY_REASON_BYTES",
+    "MAX_TURN_INPUT_BYTES",
     "AgentExecutionOutcome",
     "AgentExecutionStatus",
     "ExecutionBudget",
@@ -51,5 +66,12 @@ __all__ = [
     "ToolCallCount",
     "ToolInteractionFingerprint",
     "TurnCancellationPolicy",
+    "TurnInput",
+    "TurnRecoveryAttempt",
+    "TurnRecoveryFact",
+    "TurnRecoveryFactKind",
+    "TurnRecoveryResolution",
+    "TurnRecoveryStage",
+    "TurnRecoveryStatus",
     "TurnSource",
 ]

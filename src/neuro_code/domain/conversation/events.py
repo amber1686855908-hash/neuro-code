@@ -15,6 +15,8 @@ class AgentEventKind(StrEnum):
     USER_MESSAGE = "user_message"
     MODEL_STEP_STARTED = "model_step_started"
     MODEL_REQUEST_SNAPSHOT = "model_request_snapshot"
+    MODEL_REQUEST_STARTED = "model_request_started"
+    MODEL_OUTPUT_STARTED = "model_output_started"
     MODEL_THINKING_COMPLETED = "model_thinking_completed"
     CONTEXT_USAGE_UPDATED = "context_usage_updated"
     EXECUTION_BUDGET_UPDATED = "execution_budget_updated"
@@ -47,6 +49,7 @@ class AgentEventKind(StrEnum):
     SESSION_TASK_CANCELLED = "session_task_cancelled"
     TURN_COMPLETED = "turn_completed"
     TURN_FAILED = "turn_failed"
+    TURN_ABANDONED = "turn_abandoned"
 
 
 @dataclass(frozen=True, slots=True)

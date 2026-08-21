@@ -44,6 +44,8 @@ MAX_ACP_MCP_URI_BYTES = 4 * 1024
 MAX_ACP_MCP_PROMPT_NAME_BYTES = 512
 MAX_ACP_MCP_ARGUMENTS = 32
 MAX_ACP_MCP_ARGUMENT_BYTES = 8 * 1024
+MAX_ACP_RECOVERY_REASON_BYTES = 512
+MAX_ACP_RECOVERY_TURN_ID_BYTES = 512
 _ARTIFACT_ID_PATTERN = re.compile(r"[0-9a-f]{32}\Z")
 
 
@@ -223,6 +225,66 @@ class AcpSessionCommandQuery:
         if not isinstance(session_id, str):
             raise AcpMcpQueryError("session_id_invalid")
         return cls(session_id)
+
+
+@dataclass(frozen=True, slots=True)
+class AcpTurnRecoveryQuery:
+    """Bounded private ACP operation for inspecting or resolving recovery."""
+
+    session_id: str
+    operation: Literal["inspect", "abandon", "retry"] = "inspect"
+    turn_id: str | None = None
+    reason: str = "explicit_user_resolution"
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.session_id, str)
+            or not self.session_id.strip()
+            or "\x00" in self.session_id
+            or len(self.session_id.encode("utf-8")) > MAX_ACP_ARTIFACT_QUERY_SESSION_ID_BYTES
+        ):
+            raise AcpMcpQueryError("session_id_invalid")
+        if self.operation not in {"inspect", "abandon", "retry"}:
+            raise AcpMcpQueryError("recovery_operation_invalid")
+        if self.turn_id is not None and (
+            not isinstance(self.turn_id, str)
+            or not self.turn_id.strip()
+            or "\x00" in self.turn_id
+            or len(self.turn_id.encode("utf-8")) > MAX_ACP_RECOVERY_TURN_ID_BYTES
+        ):
+            raise AcpMcpQueryError("turn_id_invalid")
+        if self.operation in {"abandon", "retry"} and self.turn_id is None:
+            raise AcpMcpQueryError("turn_id_required")
+        if self.operation == "inspect" and self.turn_id is not None:
+            raise AcpMcpQueryError("turn_id_not_allowed")
+        if (
+            not isinstance(self.reason, str)
+            or not self.reason.strip()
+            or "\x00" in self.reason
+            or len(self.reason.encode("utf-8")) > MAX_ACP_RECOVERY_REASON_BYTES
+        ):
+            raise AcpMcpQueryError("recovery_reason_invalid")
+
+    @classmethod
+    def from_payload(cls, payload: Mapping[str, object]) -> AcpTurnRecoveryQuery:
+        if not isinstance(payload, Mapping):
+            raise AcpMcpQueryError("recovery_query_invalid")
+        allowed = {"sessionId", "operation", "turnId", "reason"}
+        if any(key not in allowed for key in payload):
+            raise AcpMcpQueryError("recovery_query_field_unsupported")
+        session_id = payload.get("sessionId")
+        operation = payload.get("operation", "inspect")
+        turn_id = payload.get("turnId")
+        reason = payload.get("reason", "explicit_user_resolution")
+        if not isinstance(session_id, str):
+            raise AcpMcpQueryError("session_id_invalid")
+        if not isinstance(operation, str):
+            raise AcpMcpQueryError("recovery_operation_invalid")
+        if turn_id is not None and not isinstance(turn_id, str):
+            raise AcpMcpQueryError("turn_id_invalid")
+        if not isinstance(reason, str):
+            raise AcpMcpQueryError("recovery_reason_invalid")
+        return cls(session_id, operation, turn_id, reason)  # type: ignore[arg-type]
 
 
 @dataclass(frozen=True, slots=True)

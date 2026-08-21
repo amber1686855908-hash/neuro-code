@@ -70,8 +70,13 @@ from neuro_code.acp import (
     serve_acp,
 )
 from neuro_code.application.acp.contracts import (
+    AcpMcpQueryError,
+    AcpMcpToolError,
     AcpSubagentLifecycleQuery,
     AcpSubagentLifecycleQueryError,
+    AcpToolOutputArtifactQuery,
+    AcpToolOutputArtifactQueryError,
+    AcpTurnRecoveryQuery,
 )
 from neuro_code.application.acp.service import AcpApplicationService
 from neuro_code.application.memory.compaction_runtime import (
@@ -1013,6 +1018,83 @@ def _acp_service(application: ApplicationFixture) -> AcpApplicationService:
 
 
 class PromptContentTests(unittest.TestCase):
+    def test_acp_artifact_and_lifecycle_value_objects_reject_invalid_fields(self) -> None:
+        mcp_error = AcpMcpToolError("bounded_failure")
+        self.assertEqual(mcp_error.reason, "bounded_failure")
+        with self.assertRaises(AcpSubagentLifecycleQueryError):
+            AcpSubagentLifecycleQuery("", "task-1", SubagentRelationshipAction.RESUME)
+        with self.assertRaises(AcpSubagentLifecycleQueryError):
+            AcpSubagentLifecycleQuery("session-1", "task-1", "resume")  # type: ignore[arg-type]
+        with self.assertRaises(AcpToolOutputArtifactQueryError):
+            AcpToolOutputArtifactQuery("")
+        with self.assertRaises(AcpToolOutputArtifactQueryError):
+            AcpToolOutputArtifactQuery("session-1", limit=0)
+        with self.assertRaises(AcpToolOutputArtifactQueryError):
+            AcpToolOutputArtifactQuery("session-1", max_bytes=0)
+
+    def test_acp_turn_recovery_query_is_strict_and_typed(self) -> None:
+        inspect_query = AcpTurnRecoveryQuery.from_payload({"sessionId": "acp-session"})
+        self.assertEqual(inspect_query.operation, "inspect")
+        self.assertIsNone(inspect_query.turn_id)
+
+        abandon_query = AcpTurnRecoveryQuery.from_payload(
+            {
+                "sessionId": "acp-session",
+                "operation": "abandon",
+                "turnId": "turn-1",
+                "reason": "operator decision",
+            }
+        )
+        self.assertEqual(abandon_query.operation, "abandon")
+        self.assertEqual(abandon_query.turn_id, "turn-1")
+        retry_query = AcpTurnRecoveryQuery.from_payload(
+            {"sessionId": "acp-session", "operation": "retry", "turnId": "turn-1"}
+        )
+        self.assertEqual(retry_query.operation, "retry")
+
+        invalid_payloads = (
+            {},
+            {"sessionId": ""},
+            None,
+            {"sessionId": "acp-session", "extra": True},
+            {"sessionId": "acp-session", "operation": 1},
+            {"sessionId": "acp-session", "turnId": 1},
+            {"sessionId": "acp-session", "reason": 1},
+            {"sessionId": "acp-session", "operation": "unsupported"},
+            {"sessionId": "acp-session", "operation": "abandon"},
+            {
+                "sessionId": "acp-session",
+                "operation": "inspect",
+                "turnId": "turn-1",
+            },
+            {
+                "sessionId": "acp-session",
+                "operation": "abandon",
+                "turnId": "",
+            },
+            {
+                "sessionId": "acp-session",
+                "operation": "abandon",
+                "turnId": "turn-1",
+                "reason": "",
+            },
+            {
+                "sessionId": "acp-session",
+                "operation": "abandon",
+                "turnId": "turn-1",
+                "reason": "\x00bad",
+            },
+            {
+                "sessionId": "acp-session",
+                "operation": "abandon",
+                "turnId": "turn-1",
+                "reason": "x" * 513,
+            },
+        )
+        for payload in invalid_payloads:
+            with self.subTest(payload=payload), self.assertRaises(AcpMcpQueryError):
+                AcpTurnRecoveryQuery.from_payload(payload)
+
     def test_acp_subagent_lifecycle_query_is_strict_and_typed(self) -> None:
         query = AcpSubagentLifecycleQuery.from_payload(
             {

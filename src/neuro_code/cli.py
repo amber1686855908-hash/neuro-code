@@ -33,6 +33,7 @@ from neuro_code.application.sessions.lifecycle import (
     RenameSessionRequest,
     SessionLifecycleService,
 )
+from neuro_code.application.sessions.recovery import TurnRecoveryService
 from neuro_code.application.sessions.service import (
     ExportSessionRequest,
     ResumeSessionRequest,
@@ -403,7 +404,7 @@ def build_parser() -> argparse.ArgumentParser:
     sessions_parser.add_argument(
         "session_action",
         nargs="?",
-        choices=("list", "search", "rename", "compact", "artifacts"),
+        choices=("list", "search", "rename", "compact", "artifacts", "recover"),
         default="list",
         help="session operation (default: list)",
     )
@@ -420,6 +421,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="new title or artifact ID",
     )
     sessions_parser.add_argument("--json", action="store_true")
+    sessions_parser.add_argument(
+        "--action",
+        choices=("inspect", "abandon", "retry"),
+        default="inspect",
+        help="recovery action (only valid for sessions recover)",
+    )
+    sessions_parser.add_argument(
+        "--reason",
+        default="explicit_user_resolution",
+        help="bounded reason for an explicit recovery abandon",
+    )
     sessions_parser.add_argument("--limit", type=int, default=50)
     sessions_parser.add_argument("--offset", type=int, default=0)
     sessions_parser.add_argument("--include-content", action="store_true")
@@ -862,6 +874,64 @@ async def _sessions_command(args: argparse.Namespace, services: CliServices) -> 
     store = await services.create_session_store(config)
     session_lifecycle = SessionLifecycleService(store)
     session_catalog = SessionCatalogApplicationService(store)
+    if args.session_action == "recover":
+        if args.query is None or not args.query.strip():
+            raise ConfigurationError("sessions recover requires a session ID")
+        if args.limit != 50 or args.offset != 0 or args.include_content or args.prune:
+            raise ConfigurationError(
+                "sessions recover accepts only a session ID and recovery options"
+            )
+        recovery = TurnRecoveryService(store)
+        if args.action == "inspect":
+            if args.title is not None:
+                raise ConfigurationError("sessions recover inspect does not accept a turn ID")
+            recovery_inspections = await recovery.inspect(args.query)
+            recovery_payload = [inspection.to_dict() for inspection in recovery_inspections]
+            if args.json:
+                print(json.dumps(recovery_payload, ensure_ascii=False))
+            elif not recovery_payload:
+                print("No turn recovery attempts found.")
+            else:
+                for recovery_row in recovery_payload:
+                    print(
+                        f"{recovery_row['turn_id']}\t{recovery_row['status']}\t"
+                        f"{recovery_row['last_stage']}\t"
+                        "input_reconstructable="
+                        f"{str(recovery_row['input_reconstructable']).lower()}\t"
+                        f"reason={recovery_row['reason']}"
+                    )
+            return 0
+        if args.title is None or not args.title.strip():
+            raise ConfigurationError("sessions recover action requires a turn ID")
+        if args.action == "abandon":
+            abandoned = await recovery.abandon(args.query, args.title, reason=args.reason)
+            abandoned_payload = abandoned.to_dict()
+            if args.json:
+                print(json.dumps(abandoned_payload, ensure_ascii=False))
+            else:
+                print(f"Turn {args.title} is now {abandoned_payload['status']}.")
+            return 0
+        if args.action == "retry":
+            application = await services.open_application(
+                ApplicationSettings(cwd=args.cwd, resume_id=args.query)
+            )
+            try:
+                await application.config_for_session_resume(args.query)
+                binding = await application.create_binding(resume_id=args.query)
+                result = await binding.runner.retry_recovery(args.title)
+                payload = {
+                    "status": "retried",
+                    "session_id": result.session_id,
+                    "steps": result.steps,
+                }
+                if args.json:
+                    print(json.dumps(payload, ensure_ascii=False))
+                else:
+                    print(f"Turn {args.title} was explicitly retried.")
+                return 0
+            finally:
+                await asyncio.shield(application.close())
+        raise ConfigurationError(f"unsupported recovery action: {args.action}")
     if args.session_action == "compact":
         if args.query is None or not args.query.strip():
             raise ConfigurationError("sessions compact requires a session ID")
@@ -955,7 +1025,7 @@ async def _sessions_command(args: argparse.Namespace, services: CliServices) -> 
 
         if args.limit != 50:
             raise ConfigurationError("--limit is not valid when an artifact ID is provided")
-        result = await artifact_service.read(
+        artifact_result = await artifact_service.read(
             ReadSessionToolOutputArtifactRequest(
                 args.query,
                 args.title,
@@ -966,16 +1036,19 @@ async def _sessions_command(args: argparse.Namespace, services: CliServices) -> 
             print(
                 json.dumps(
                     serialize_tool_output_artifact_read(
-                        result.artifact.artifact_id,
-                        result.content,
-                        result.read_truncated,
+                        artifact_result.artifact.artifact_id,
+                        artifact_result.content,
+                        artifact_result.read_truncated,
                     ),
                     ensure_ascii=False,
                 )
             )
         else:
-            print(result.content, end="" if result.content.endswith("\n") else "\n")
-            if result.read_truncated:
+            print(
+                artifact_result.content,
+                end="" if artifact_result.content.endswith("\n") else "\n",
+            )
+            if artifact_result.read_truncated:
                 print("[output truncated at the requested read limit]")
         return 0
     if args.prune:

@@ -31,6 +31,7 @@ from neuro_code.application.sessions.contracts import (
     SessionOption,
     SessionSelectionResult,
 )
+from neuro_code.application.sessions.recovery import TurnRecoveryInspection
 from neuro_code.application.workflows.subagent_capabilities import SubagentCapabilitySet
 from neuro_code.domain.background_tasks.models import (
     BackgroundTaskSnapshot,
@@ -258,6 +259,27 @@ class ProfileConversationController:
 
     async def get_session_task(self, task_id: str) -> SessionTask | None:
         return await self._binding.runner.get_session_task(task_id)
+
+    async def inspect_recovery(self) -> tuple[TurnRecoveryInspection, ...]:
+        return await self._binding.runner.inspect_recovery()
+
+    async def abandon_recovery(
+        self,
+        turn_id: str,
+        *,
+        reason: str = "explicit_user_resolution",
+    ) -> TurnRecoveryInspection:
+        async with self._turn_lock:
+            return await self._binding.runner.abandon_recovery(turn_id, reason=reason)
+
+    async def retry_recovery(
+        self,
+        turn_id: str,
+        *,
+        sink: EventSink | None = None,
+    ) -> AgentRunResult:
+        async with self._turn_lock:
+            return await self._binding.runner.retry_recovery(turn_id, sink=sink)
 
     async def list_background_tasks(self) -> tuple[BackgroundTaskSnapshot, ...]:
         manager = self._binding.background_tasks

@@ -1070,6 +1070,40 @@ ID、工作区、模型和时间戳；ID 已存在时不做任何修改并返回
 以写入模式打开。恢复授权按文件系统身份比较已记录工作区与请求工作区，并以规范化路径
 作为回退，因此可以接受平台路径别名，同时仍拒绝不同工作区。
 
+## 持久化回合崩溃恢复
+
+每个持久化的 `AgentRuntime.run()` 都会分配唯一的不透明 `turn_id`，并在 Provider 请求或
+工具 body 可能开始前，先在 `session_turn_attempts` 写入小型记录。该行是规范恢复索引；
+有序 `events` 表继续作为追加式审计证据。恢复事实与对应事件一起写入，因此重启分类依赖
+sticky facts，而不是事件缺失。
+对计划执行而言，接受写入先于新任务创建或排队任务激活，因此两次操作之间的进程退出会
+留下明确的未决 attempt，而不是孤立的 `RUNNING` 任务。
+
+write-ahead 边界是明确的：进入 Provider stream 前提交 `MODEL_REQUEST_STARTED`；第一个
+可观察的文本、推理、后端工具、工具调用或完成事件处理前提交 `MODEL_OUTPUT_STARTED`；
+工具 body 执行前提交 `TOOL_STARTED`，并记录工具是否可能产生副作用。Provider 请求体、
+请求头、凭据、完整上下文、工具参数和无界输出不会复制到该恢复索引。
+
+现有 `SessionStore.finalize_turn()` 和 `finalize_turn_with_compaction()` 事务是唯一的
+`COMMITTED` 点：完成事件、最终会话项、标题/搜索投影、可选 execution record、任务终态和
+attempt resolution 共享同一个 SQLite 事务。失败和取消使用对应的原子终态路径。普通的
+`FAILED` 或 `CANCELLED` attempt 属于执行历史，不是孤立的崩溃回合，因此不会进入恢复 UI。
+
+派生状态为 `COMMITTED`、`SAFELY_RETRYABLE`、`INDETERMINATE` 和 `ABANDONED`。只有输入可重建
+且不超过 256 KiB 时才保存精确的用户归属输入；后台唤醒输入刻意不可重建。没有可观察输出、
+没有工具开始、有精确输入且没有事实冲突的未决 attempt 可以被明确 retry。可观察输出、任意
+工具开始、可能的副作用、输入缺失、后台唤醒或矛盾事实都会得到 `INDETERMINATE`，且永不
+自动 replay。只有明确恢复操作可以写入 `ABANDONED`。重试会放弃旧 attempt 并创建新的回合
+身份，不会继续旧 attempt。
+
+CLI 和 TUI 暴露有界恢复元数据及明确的 `inspect`、`retry`、`abandon` 操作。ACP 通过私有
+`neuro-code/session/recovery` 扩展复用同一个应用服务，并返回机器可读的有界投影。存在未决
+attempt 时，resume 会阻止新回合。本层不实现回合中途续接、工具补偿、后台子进程协调、计划
+执行重试或工作区回滚。尤其是 `EXECUTION_SEGMENT_CHECKPOINTED` 仍是进度/审计标记：崩溃
+恢复不是工作区回滚点。
+
+详见 [ADR 0127](adr/0127-durable-turn-crash-recovery.md)。
+
 规范序列由普通 `Message` 和不透明但经过校验的 `PreservedContextItem` 联合组成。
 消息内容项保留文本/图片顺序及图片 URL；推理和后端工具载荷保留供应商 JSON 与相对
 顺序。运行时会把完整有序序列带入每个模型步骤，应用层视图仍使用普通消息投影。恢复

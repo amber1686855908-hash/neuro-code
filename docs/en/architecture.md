@@ -1536,6 +1536,55 @@ requested workspaces by filesystem identity, with canonical normalized paths as
 a fallback, so platform aliases are accepted without admitting a different
 workspace. Source session files are never opened for writing.
 
+## Durable turn crash recovery
+
+Each persisted `AgentRuntime.run()` allocates a unique opaque `turn_id` and
+accepts a small row in `session_turn_attempts` before a provider request or
+tool body can start. The row is the canonical recovery index; the ordered
+`events` table remains append-only audit evidence. Recovery facts and their
+events are written together, so restart classification is derived from sticky
+facts rather than from the absence of an event.
+For plan execution, acceptance is persisted before a new task is created or a
+queued task is activated, so an exit between those operations leaves an
+explicit unresolved attempt instead of an orphaned `RUNNING` task.
+
+The write-ahead boundaries are explicit. `MODEL_REQUEST_STARTED` is committed
+before entering the Provider stream. On the first observable text, reasoning,
+backend-tool, tool-call, or completion event, `MODEL_OUTPUT_STARTED` is
+committed before the event is handled. `TOOL_STARTED` is committed before the
+tool body and records whether the tool is side-effecting. Provider request
+bodies, headers, credentials, full context, tool arguments, and unbounded
+outputs are not copied into this recovery index.
+
+The existing `SessionStore.finalize_turn()` and
+`finalize_turn_with_compaction()` transaction is the only `COMMITTED` point:
+completion event, final session items, title/search projection, optional
+execution record, task terminalization, and attempt resolution share the same
+SQLite transaction. Failure and cancellation use the corresponding atomic
+terminalization path. A normal `FAILED` or `CANCELLED` attempt is execution
+history, not an orphaned crash attempt, and is excluded from recovery UX.
+
+The derived statuses are `COMMITTED`, `SAFELY_RETRYABLE`, `INDETERMINATE`, and
+`ABANDONED`. Exact user-owned input is stored only when it is reconstructable
+and at most 256 KiB; background wake input is deliberately not reconstructable.
+An open attempt with no observable output, no tool start, exact input, and no
+fact conflict may be explicitly retried. Observable output, any tool start,
+possible side effects, missing input, background wake, or contradictory facts
+are `INDETERMINATE` and never auto-replayed. `ABANDONED` is written only by an
+explicit recovery action. A retry abandons the old attempt and creates a new
+turn identity rather than continuing the old one.
+
+CLI and TUI expose bounded recovery metadata and explicit `inspect`, `retry`,
+and `abandon` operations. ACP exposes the same application service through
+the private `neuro-code/session/recovery` extension and returns machine-readable
+bounded projections. Resume blocks a new turn while an unresolved attempt is
+present. This layer does not implement mid-turn continuation, tool
+compensation, background-child reconciliation, plan execution retry, or
+workspace rollback. In particular, `EXECUTION_SEGMENT_CHECKPOINTED` remains a
+progress/audit marker: crash recovery is not a workspace rollback point.
+
+See [ADR 0127](adr/0127-durable-turn-crash-recovery.md).
+
 The canonical sequence is a union of ordinary `Message` values and opaque but
 validated `PreservedContextItem` values. Message content parts retain text/image
 ordering and image URLs. Reasoning and backend-tool payloads retain their

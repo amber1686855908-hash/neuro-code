@@ -22,6 +22,7 @@ from neuro_code.application.ports.background_tasks import BackgroundTaskManager
 from neuro_code.application.ports.model import ModelProvider
 from neuro_code.application.ports.tools import Tool
 from neuro_code.application.runtime.agent import AgentRunResult, EventSink
+from neuro_code.application.sessions.recovery import TurnRecoveryInspection
 from neuro_code.application.workflows.subagent_capabilities import SubagentCapabilitySet
 from neuro_code.domain.background_tasks.models import BackgroundWakeState
 from neuro_code.domain.conversation.interaction_mode import InteractionMode
@@ -59,6 +60,22 @@ class ConversationRunner(Protocol):
     async def list_session_tasks(self) -> tuple[SessionTask, ...]: ...
 
     async def get_session_task(self, task_id: str) -> SessionTask | None: ...
+
+    async def inspect_recovery(self) -> tuple[TurnRecoveryInspection, ...]: ...
+
+    async def abandon_recovery(
+        self,
+        turn_id: str,
+        *,
+        reason: str = "explicit_user_resolution",
+    ) -> TurnRecoveryInspection: ...
+
+    async def retry_recovery(
+        self,
+        turn_id: str,
+        *,
+        sink: EventSink | None = None,
+    ) -> AgentRunResult: ...
 
     @property
     def reasoning_effort(self) -> ReasoningEffort: ...

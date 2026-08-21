@@ -1165,6 +1165,7 @@ def test_canonical_session_modules_are_the_only_session_implementations() -> Non
         "neuro_code.application.sessions.lifecycle",
         "neuro_code.application.sessions.item_queries",
         "neuro_code.application.sessions.profile_conversation",
+        "neuro_code.application.sessions.recovery",
         "neuro_code.application.sessions.selection",
         "neuro_code.application.sessions.service",
         "neuro_code.application.sessions.summary",
@@ -1192,6 +1193,11 @@ def test_canonical_session_modules_are_the_only_session_implementations() -> Non
         },
         "neuro_code.application.sessions.profile_conversation": {
             "ProfileConversationController",
+        },
+        "neuro_code.application.sessions.recovery": {
+            "TurnInputForRetry",
+            "TurnRecoveryInspection",
+            "TurnRecoveryService",
         },
         "neuro_code.application.sessions.binding": {
             "ConversationRunner",

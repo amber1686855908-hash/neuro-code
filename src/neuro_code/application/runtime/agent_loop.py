@@ -103,6 +103,8 @@ from neuro_code.domain.execution import (
     SupervisorDecisionKind,
     SupervisorReasonCode,
     TurnCancellationPolicy,
+    TurnInput,
+    TurnRecoveryAttempt,
     TurnSource,
 )
 from neuro_code.domain.plans import PlanStepStatus, SessionPlan
@@ -321,6 +323,14 @@ class AgentLoopRunner:
         if plan_execution_requested and self._context_builder.plan is None:
             raise ConfigurationError("cannot execute a plan that has not been saved")
         session_task: SessionTask | None = None
+        if self._session_store is not None and session_id is not None:
+            open_attempts = await self._session_store.load_open_turn_attempts(session_id)
+            if open_attempts:
+                raise ConfigurationError(
+                    "session has an unresolved interrupted turn; explicitly abandon it "
+                    "before starting another turn"
+                )
+        queued_plan_task: SessionTask | None = None
         if plan_execution_requested:
             assert self._session_store is not None
             assert session_id is not None
@@ -332,26 +342,50 @@ class AgentLoopRunner:
                     datetime.now(UTC),
                     plan_snapshot=self._context_builder.plan,
                 )
-                await self._session_store.create_session_task(session_id, session_task)
             else:
-                queued_task = await SessionTaskQueryService(self._session_store).get_session_task(
-                    GetSessionTaskRequest(session_id, plan_execution_task_id)
-                )
-                if queued_task is None:
+                queued_plan_task = await SessionTaskQueryService(
+                    self._session_store
+                ).get_session_task(GetSessionTaskRequest(session_id, plan_execution_task_id))
+                if queued_plan_task is None:
                     raise ConfigurationError(f"unknown queued plan task: {plan_execution_task_id}")
-                if queued_task.kind is not SessionTaskKind.PLAN_EXECUTION:
+                if queued_plan_task.kind is not SessionTaskKind.PLAN_EXECUTION:
                     raise ConfigurationError("only plan execution tasks can be started")
-                if queued_task.status is not SessionTaskStatus.QUEUED:
+                if queued_plan_task.status is not SessionTaskStatus.QUEUED:
                     raise ConfigurationError(f"plan task {plan_execution_task_id} is not queued")
-                if queued_task.plan_snapshot != self._context_builder.plan:
+                if queued_plan_task.plan_snapshot != self._context_builder.plan:
                     raise ConfigurationError(
                         f"plan task {plan_execution_task_id} does not match the saved plan"
                     )
-                session_task = await self._session_store.start_session_task(
-                    session_id,
-                    plan_execution_task_id,
-                    datetime.now(UTC),
+
+        turn_id: str | None = None
+        if self._session_store is not None and session_id is not None:
+            turn_id = f"turn-{uuid.uuid4().hex}"
+            turn_input = TurnInput(
+                prompt,
+                prompt_parts,
+                turn_source,
+                plan_execution_requested,
+                session_task.task_id if session_task is not None else plan_execution_task_id,
+            )
+            await self._session_store.start_turn_attempt(
+                TurnRecoveryAttempt.create(
+                    turn_id=turn_id,
+                    session_id=session_id,
+                    input=turn_input,
+                    task_id=session_task.task_id if session_task is not None else None,
+                    accepted_at=datetime.now(UTC),
                 )
+            )
+            if plan_execution_requested:
+                if queued_plan_task is None:
+                    assert session_task is not None
+                    await self._session_store.create_session_task(session_id, session_task)
+                else:
+                    session_task = await self._session_store.start_session_task(
+                        session_id,
+                        queued_plan_task.task_id,
+                        datetime.now(UTC),
+                    )
 
         recorder = TurnEventRecorder(
             sink=sink,
@@ -366,9 +400,9 @@ class AgentLoopRunner:
             sequence=sequence,
             session_task=session_task,
             pristine_cancel_eligible=pristine_cancel_eligible,
+            turn_id=turn_id,
         )
         emit = recorder.emit
-        finish_session_task = recorder.finish_session_task
         record_turn_failure = recorder.record_turn_failure
         finalize_turn_completion = recorder.finalize_turn_completion
 
@@ -802,7 +836,6 @@ class AgentLoopRunner:
             if persist_turn_context:
                 context_items.append(final_message)
             await emit(AgentEventKind.TEXT_DELTA, {"text": finalization.response})
-            await finish_session_task(SessionTaskStatus.COMPLETED)
             result_items = (
                 persistent_context_items() if persist_turn_context else turn_context_prefix
             )
@@ -1002,6 +1035,27 @@ class AgentLoopRunner:
                     AgentEventKind.MODEL_REQUEST_SNAPSHOT,
                     request_snapshot.to_event_data(),
                 )
+                await recorder.record_model_request_started(
+                    request_id=request_snapshot.request_id,
+                    step=step,
+                    provider=self._provider.provider_name,
+                    model=self._provider.model_name,
+                )
+
+                request_id = request_snapshot.request_id
+                current_step = step
+
+                async def record_output_started(
+                    output_kind: str,
+                    bound_request_id: str = request_id,
+                    bound_step: int = current_step,
+                ) -> None:
+                    await recorder.record_model_output_started(
+                        request_id=bound_request_id,
+                        step=bound_step,
+                        output_kind=output_kind,
+                    )
+
                 step_result = await ModelStepProcessor(session_store=self._session_store).consume(
                     self._provider.stream(context, tool_definitions),
                     emit=emit,
@@ -1010,6 +1064,7 @@ class AgentLoopRunner:
                     session_id=session_id,
                     can_adopt_provider_origin=can_adopt_provider_origin,
                     on_imperfect=lambda: setattr(recorder, "pristine_cancel_eligible", False),
+                    on_output_started=record_output_started,
                 )
                 step_text = step_result.text
                 step_reasoning = step_result.reasoning
@@ -1118,7 +1173,6 @@ class AgentLoopRunner:
                     context_items.append(assistant_message)
 
                 if not tool_calls:
-                    await finish_session_task(SessionTaskStatus.COMPLETED)
                     result_items = (
                         persistent_context_items() if persist_turn_context else turn_context_prefix
                     )
@@ -1241,6 +1295,21 @@ class AgentLoopRunner:
                                 is ExecutionControlMode.FINALIZE_TERMINAL
                                 else None
                             ),
+                            recovery_started_sink=(
+                                (
+                                    lambda tool_id, tool_name, side_effecting: (
+                                        recorder.record_tool_started(
+                                            tool_id=tool_id,
+                                            tool_name=tool_name,
+                                            side_effecting=side_effecting,
+                                        )
+                                    )
+                                )
+                                if self._session_store is not None
+                                and session_id is not None
+                                and turn_id is not None
+                                else None
+                            ),
                         )
                         return _ScheduledToolOutcome(
                             observation,
@@ -1360,11 +1429,6 @@ class AgentLoopRunner:
                         SupervisorReasonCode.MODEL_STEP_LIMIT,
                     ),
                     step=self._max_steps,
-                )
-            if self._session_store is not None and session_id is not None:
-                await self._session_store.save_session_items(
-                    session_id,
-                    persistent_context_items() if persist_turn_context else turn_context_prefix,
                 )
             raise ProviderError(f"agent exceeded the maximum of {self._max_steps} model steps")
         except BaseException as error:

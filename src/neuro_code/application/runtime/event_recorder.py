@@ -28,6 +28,8 @@ from neuro_code.domain.conversation.messages import Message, SessionItem
 from neuro_code.domain.execution import (
     AgentExecutionOutcome,
     SessionExecutionRecord,
+    TurnRecoveryFact,
+    TurnRecoveryFactKind,
     TurnSource,
 )
 from neuro_code.domain.session_tasks import SessionTask, SessionTaskStatus
@@ -74,6 +76,7 @@ class TurnEventRecorder:
         "_session_store",
         "_sink",
         "_turn_context_prefix",
+        "_turn_id",
         "_turn_source",
         "_turn_started_at",
         "pristine_cancel_eligible",
@@ -95,6 +98,7 @@ class TurnEventRecorder:
         sequence: int,
         session_task: SessionTask | None,
         pristine_cancel_eligible: bool,
+        turn_id: str | None = None,
     ) -> None:
         self._sink = sink
         self._session_store = session_store
@@ -106,6 +110,7 @@ class TurnEventRecorder:
         self._context_items = context_items
         self._events = events
         self._sequence = sequence
+        self._turn_id = turn_id
         self.session_task = session_task
         self.pristine_cancel_eligible = pristine_cancel_eligible
 
@@ -117,14 +122,131 @@ class TurnEventRecorder:
         persist: bool = True,
         deliver_event: bool = True,
     ) -> AgentEvent:
-        self._sequence += 1
-        event = AgentEvent.create(self._sequence, kind, data)
+        event = self._create_event(kind, data)
         self._events.append(event)
         if persist and self._session_store is not None and self._session_id is not None:
             await self._session_store.append_event(self._session_id, event)
         if deliver_event:
             await self._deliver(event)
         return event
+
+    def _create_event(self, kind: AgentEventKind, data: dict[str, object]) -> AgentEvent:
+        self._sequence += 1
+        return AgentEvent.create(self._sequence, kind, data)
+
+    async def _persist_recovery_fact(
+        self,
+        event: AgentEvent,
+        fact: TurnRecoveryFact,
+        *,
+        deliver_after_persistence: bool = True,
+    ) -> None:
+        """Finish a durable marker before propagating cancellation.
+
+        A cancellation can arrive while SQLite is committing a tool marker.
+        The marker must not be abandoned halfway through its write-ahead
+        boundary, and the already-committed lifecycle event should still reach
+        the interface before the cancellation is re-raised.
+
+        在 SQLite 提交工具标记期间可能收到取消。标记不能在 write-ahead 边界中途被放弃,
+        已提交的生命周期事件也必须在重新抛出取消前到达接口。
+        """
+
+        assert self._session_store is not None
+        assert self._session_id is not None
+        assert self._turn_id is not None
+        persistence = asyncio.create_task(
+            self._session_store.append_turn_recovery_fact(
+                self._session_id,
+                self._turn_id,
+                event,
+                fact,
+            )
+        )
+        try:
+            await asyncio.shield(persistence)
+        except asyncio.CancelledError:
+            await persistence
+            if deliver_after_persistence:
+                await self._deliver(event)
+            raise
+        if deliver_after_persistence:
+            await self._deliver(event)
+
+    async def record_model_request_started(
+        self,
+        *,
+        request_id: str,
+        step: int,
+        provider: str,
+        model: str,
+    ) -> None:
+        if self._session_store is None or self._session_id is None or self._turn_id is None:
+            return
+        fact = TurnRecoveryFact(
+            TurnRecoveryFactKind.MODEL_REQUEST_STARTED,
+            request_id=request_id,
+            step=step,
+            provider=provider,
+            model=model,
+        )
+        event = self._create_event(
+            AgentEventKind.MODEL_REQUEST_STARTED,
+            fact.to_event_data(self._turn_id),
+        )
+        self._events.append(event)
+        await self._persist_recovery_fact(event, fact)
+
+    async def record_model_output_started(
+        self,
+        *,
+        request_id: str,
+        step: int,
+        output_kind: str,
+    ) -> None:
+        if self._session_store is None or self._session_id is None or self._turn_id is None:
+            return
+        fact = TurnRecoveryFact(
+            TurnRecoveryFactKind.MODEL_OUTPUT_STARTED,
+            request_id=request_id,
+            step=step,
+            output_kind=output_kind,
+        )
+        event = self._create_event(
+            AgentEventKind.MODEL_OUTPUT_STARTED,
+            fact.to_event_data(self._turn_id),
+        )
+        self._events.append(event)
+        await self._persist_recovery_fact(event, fact)
+
+    async def record_tool_started(
+        self,
+        *,
+        tool_id: str,
+        tool_name: str,
+        side_effecting: bool,
+    ) -> None:
+        if self._session_store is None or self._session_id is None or self._turn_id is None:
+            return
+        fact = TurnRecoveryFact(
+            TurnRecoveryFactKind.TOOL_STARTED,
+            tool_id=tool_id,
+            tool_name=tool_name,
+            side_effecting=side_effecting,
+        )
+        tool_started_data = fact.to_event_data(self._turn_id)
+        tool_started_data.update({"id": tool_id, "name": tool_name})
+        event = self._create_event(AgentEventKind.TOOL_STARTED, tool_started_data)
+        self._events.append(event)
+        # Keep the established interface timing: the in-progress projection is
+        # delivered as soon as the tool crosses its local start boundary. The
+        # durable marker still completes before ToolExecutor enters the body.
+        await self._deliver(event)
+        await self._persist_recovery_fact(
+            event,
+            fact,
+            deliver_after_persistence=False,
+        )
 
     async def finish_session_task(self, status: SessionTaskStatus) -> None:
         if self.session_task is None:
@@ -147,28 +269,67 @@ class TurnEventRecorder:
     async def record_turn_failure(self, error: BaseException) -> None:
         cancelled = isinstance(error, asyncio.CancelledError)
         pristine_rewound = cancelled and self.pristine_cancel_eligible
-        await self.finish_session_task(
-            SessionTaskStatus.CANCELLED if cancelled else SessionTaskStatus.FAILED
-        )
-        await self.emit(
+        task_status = SessionTaskStatus.CANCELLED if cancelled else SessionTaskStatus.FAILED
+        task, task_event = self._prepare_task_terminal(task_status)
+        failure_data: dict[str, object] = {
+            "error_type": type(error).__name__,
+            "message": "turn cancelled" if cancelled else str(error)[:1024],
+            "cancelled": cancelled,
+            "pristine_rewound": pristine_rewound,
+            "duration_seconds": monotonic() - self._turn_started_at,
+        }
+        if self._turn_id is not None:
+            failure_data["turn_id"] = self._turn_id
+        failure_event = self._create_event(
             AgentEventKind.TURN_FAILED,
-            {
-                "error_type": type(error).__name__,
-                "message": "turn cancelled" if cancelled else str(error),
-                "cancelled": cancelled,
-                "pristine_rewound": pristine_rewound,
-                "duration_seconds": monotonic() - self._turn_started_at,
-            },
+            failure_data,
+        )
+        self._events.append(failure_event)
+        durable_items = (
+            self._turn_context_prefix
+            if pristine_rewound or not self._persist_turn_context
+            else _durable_session_items(self._context_items)
         )
         if self._session_store is not None and self._session_id is not None:
-            await self._session_store.save_session_items(
-                self._session_id,
-                (
-                    self._turn_context_prefix
-                    if pristine_rewound or not self._persist_turn_context
-                    else _durable_session_items(self._context_items)
-                ),
-            )
+            atomic_failure = getattr(self._session_store, "finalize_turn_failure", None)
+            if callable(atomic_failure):
+                await atomic_failure(
+                    self._session_id,
+                    self._turn_id,
+                    failure_event,
+                    durable_items,
+                    resolution="cancelled" if cancelled else "failed",
+                    task=task,
+                    task_event=task_event,
+                )
+            else:
+                if task is not None:
+                    await self._session_store.update_session_task(self._session_id, task)
+                if task_event is not None:
+                    await self._session_store.append_event(self._session_id, task_event)
+                await self._session_store.append_event(self._session_id, failure_event)
+                await self._session_store.save_session_items(self._session_id, durable_items)
+        if task_event is not None:
+            await self._deliver(task_event)
+        await self._deliver(failure_event)
+
+    def _prepare_task_terminal(
+        self,
+        status: SessionTaskStatus,
+    ) -> tuple[SessionTask | None, AgentEvent | None]:
+        task = self.session_task
+        if task is None or task.status is not SessionTaskStatus.RUNNING:
+            return None, None
+        task = task.finish(status, finished_at=datetime.now(UTC))
+        self.session_task = task
+        event_kind = {
+            SessionTaskStatus.COMPLETED: AgentEventKind.SESSION_TASK_COMPLETED,
+            SessionTaskStatus.FAILED: AgentEventKind.SESSION_TASK_FAILED,
+            SessionTaskStatus.CANCELLED: AgentEventKind.SESSION_TASK_CANCELLED,
+        }[status]
+        event = self._create_event(event_kind, {"task": task.to_dict()})
+        self._events.append(event)
+        return task, event
 
     async def finalize_turn_completion(
         self,
@@ -201,12 +362,12 @@ class TurnEventRecorder:
             self._session_store is None or self._session_id is None
         ):
             raise ConfigurationError("compaction finalization requires a persisted session")
-        completed_event = await self.emit(
-            AgentEventKind.TURN_COMPLETED,
-            data,
-            persist=False,
-            deliver_event=False,
-        )
+        completion_data = dict(data)
+        if self._turn_id is not None:
+            completion_data.setdefault("turn_id", self._turn_id)
+        task, task_event = self._prepare_task_terminal(SessionTaskStatus.COMPLETED)
+        completed_event = self._create_event(AgentEventKind.TURN_COMPLETED, completion_data)
+        self._events.append(completed_event)
         record = (
             None
             if self._turn_source is TurnSource.BACKGROUND_TASK_AUTO_WAKE
@@ -218,21 +379,47 @@ class TurnEventRecorder:
         )
         durable_result_items = _durable_session_items(result_items)
         if self._session_store is not None and self._session_id is not None:
+            finalizer: Callable[..., Awaitable[None]]
             if compaction_item is None:
-                await self._session_store.finalize_turn(
-                    self._session_id,
-                    completed_event,
-                    durable_result_items,
-                    record,
-                )
+                finalizer = self._session_store.finalize_turn
+                if callable(getattr(self._session_store, "start_turn_attempt", None)):
+                    await finalizer(
+                        self._session_id,
+                        completed_event,
+                        durable_result_items,
+                        record,
+                        self._turn_id,
+                        task,
+                        task_event,
+                    )
+                else:
+                    await finalizer(
+                        self._session_id,
+                        completed_event,
+                        durable_result_items,
+                        record,
+                    )
             else:
-                await self._session_store.finalize_turn_with_compaction(
-                    self._session_id,
-                    completed_event,
-                    durable_result_items,
-                    record,
-                    compaction_item,
-                )
+                finalizer = self._session_store.finalize_turn_with_compaction
+                if callable(getattr(self._session_store, "start_turn_attempt", None)):
+                    await finalizer(
+                        self._session_id,
+                        completed_event,
+                        durable_result_items,
+                        record,
+                        compaction_item,
+                        self._turn_id,
+                        task,
+                        task_event,
+                    )
+                else:
+                    await finalizer(
+                        self._session_id,
+                        completed_event,
+                        durable_result_items,
+                        record,
+                        compaction_item,
+                    )
         await self._deliver(completed_event)
 
     async def finalize_turn_from_compaction_projection(

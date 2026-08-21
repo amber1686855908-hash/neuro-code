@@ -281,6 +281,7 @@ class ToolExecutor:
         *,
         interrupted_observation_sink: Callable[[ToolExecutionObservation], None] | None = None,
         workspace_change_sink: Callable[[WorkspaceChangeReport], None] | None = None,
+        recovery_started_sink: Callable[[str, str, bool], Awaitable[None]] | None = None,
     ) -> ToolExecutionObservation | None:
         resolved = False
         tool_requested_at = monotonic()
@@ -514,7 +515,10 @@ class ToolExecutor:
                     safe_arguments,
                     side_effecting=tool.side_effecting,
                 )
-            await emit(AgentEventKind.TOOL_STARTED, {"id": call.id, "name": call.name})
+            if recovery_started_sink is None:
+                await emit(AgentEventKind.TOOL_STARTED, {"id": call.id, "name": call.name})
+            else:
+                await recovery_started_sink(call.id, call.name, tool.side_effecting)
             if tool.side_effecting:
                 journal = self._tool_context.workspace_change_journal
                 target_paths = (

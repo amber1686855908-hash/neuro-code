@@ -37,6 +37,10 @@ from neuro_code.application.sessions.item_queries import (
     LoadSessionItemsRequest,
     SessionItemQueryService,
 )
+from neuro_code.application.sessions.recovery import (
+    TurnRecoveryInspection,
+    TurnRecoveryService,
+)
 from neuro_code.application.sessions.service import (
     ListPlanCommentsRequest,
     LoadSessionPlanRequest,
@@ -311,6 +315,86 @@ class AgentConversation:
                     session_id=self._session_id,
                     cancellation_policy=cancellation_policy,
                     turn_source=turn_source,
+                )
+            except asyncio.CancelledError:
+                await self._reload_persisted_state()
+                raise
+            except Exception:
+                await self._reload_persisted_state()
+                raise
+            self._items = result.items
+            self._session_id = result.session_id
+            await self._reload_plan_state()
+            await self._reload_provider_origin()
+            await self._reload_execution_record()
+            return result
+
+    async def inspect_recovery(self) -> tuple[TurnRecoveryInspection, ...]:
+        """Return bounded durable recovery state without taking action."""
+
+        if self._session_id is None:
+            return ()
+        async with self._turn_lock:
+            return await TurnRecoveryService(self._store).inspect(self._session_id)
+
+    async def abandon_recovery(
+        self,
+        turn_id: str,
+        *,
+        reason: str = "explicit_user_resolution",
+    ) -> TurnRecoveryInspection:
+        """Explicitly resolve one interrupted attempt as abandoned."""
+
+        if self._session_id is None:
+            raise ConfigurationError("recovery requires a persisted session")
+        async with self._turn_lock:
+            return await TurnRecoveryService(self._store).abandon(
+                self._session_id,
+                turn_id,
+                reason=reason,
+            )
+
+    async def retry_recovery(
+        self,
+        turn_id: str,
+        *,
+        sink: EventSink | None = None,
+    ) -> AgentRunResult:
+        """Explicitly retry an exact, pre-output user turn with a new identity."""
+
+        if self._session_id is None:
+            raise ConfigurationError("recovery requires a persisted session")
+        async with self._turn_lock:
+            service = TurnRecoveryService(self._store)
+            handoff = await service.require_safe_retry(self._session_id, turn_id)
+            if handoff.input.plan_execution_requested:
+                raise ConfigurationError("explicit retry for plan execution is unavailable")
+            await service.abandon(
+                self._session_id,
+                turn_id,
+                reason="retry_requested",
+            )
+
+            async def capture_session(event: AgentEvent) -> None:
+                if event.kind is AgentEventKind.SESSION_STARTED:
+                    session_id = event.data.get("session_id")
+                    if isinstance(session_id, str) and session_id:
+                        self._session_id = session_id
+                if sink is not None:
+                    outcome = sink(event)
+                    if inspect.isawaitable(outcome):
+                        await outcome
+
+            try:
+                result = await self._runtime.run(
+                    handoff.input.prompt,
+                    sink=capture_session,
+                    content_parts=handoff.input.content_parts,
+                    initial_items=self._items,
+                    source_provider=self._source_provider,
+                    source_model=self._source_model,
+                    source_context_affinity=self._source_context_affinity,
+                    session_id=self._session_id,
                 )
             except asyncio.CancelledError:
                 await self._reload_persisted_state()
