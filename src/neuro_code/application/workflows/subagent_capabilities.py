@@ -38,6 +38,7 @@ _READ_TOOL_NAMES = frozenset(
         "grep_many",
         "workspace_diff",
         "skill",
+        "lsp",
     }
 )
 _WRITE_TOOL_NAMES = frozenset({"search_replace", "apply_patch"})

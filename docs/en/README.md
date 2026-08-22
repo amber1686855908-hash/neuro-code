@@ -860,6 +860,29 @@ that cannot yet be decomposed safely are denied in headless mode. Commands run
 with null stdin, bounded output, disabled pagers/prompts, and process-tree
 cleanup on timeout or cancellation.
 
+## Read-only LSP semantic navigation
+
+Neuro Code exposes a stable `lsp` read-only tool for definition, references,
+hover, document symbols, workspace symbols, diagnostics, server status, and a
+bounded explicit restart. Configure a server explicitly in the existing user
+or project TOML file:
+
+```toml
+[lsp.servers.python]
+language = "python"
+command = ["pyright-langserver", "--stdio"]
+extensions = [".py"]
+root_markers = ["pyproject.toml"]
+```
+
+The command is argv-only. Neuro Code does not download or install a language
+server, and an unavailable executable fails closed at execution time. The
+server runs through the canonical local-process boundary, receives a read-only
+workspace, and cannot apply workspace edits. LSP locations are filtered to
+safe local workspace files and existing permission rules; unsafe or unresolved
+cross-file results are omitted. Use `grep` for text search. Rename, formatting,
+code actions, worktrees, and checkpoints are not part of this slice.
+
 ## Project status
 
 - Minimum Python: 3.12

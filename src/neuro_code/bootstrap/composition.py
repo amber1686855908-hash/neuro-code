@@ -116,6 +116,7 @@ from neuro_code.domain.sandbox.models import SandboxProfile
 from neuro_code.domain.workspace.instructions import InstructionDiscoveryResult
 from neuro_code.domain.workspace.skills import SkillDiscoveryResult
 from neuro_code.infrastructure.background_tasks import LocalBackgroundTaskManager
+from neuro_code.infrastructure.lsp.manager import LanguageServerManager
 from neuro_code.infrastructure.persistence.output_artifacts import FileToolOutputArtifactStore
 from neuro_code.infrastructure.persistence.sqlite_session import SqliteSessionStore
 from neuro_code.infrastructure.providers import create_routed_provider
@@ -301,6 +302,7 @@ class ApplicationComposition:
             skill_discovery if skill_discovery is not None else _default_skill_discovery_factory()
         )
         self._workspace_change_observer_factory = workspace_change_observer_factory
+        self._lsp_services: set[LanguageServerManager] = set()
         self._closed = False
 
     def create_local_process_sandbox(
@@ -473,11 +475,19 @@ class ApplicationComposition:
             ModelProvider,
             ToolRegistry,
             LocalProcessSandbox,
+            LanguageServerManager,
         ]:
             local_process_sandbox = self._local_process_sandbox_factory(
                 selected_config.sandbox_profile,
                 selected_config.cwd,
                 selected_config.state_dir,
+            )
+            lsp_service = LanguageServerManager(
+                config=selected_config,
+                local_process_sandbox=local_process_sandbox,
+                workspace_root=selected_config.cwd,
+                additional_workspace_roots=tuple(additional_workspace_roots),
+                redaction_values=selected_config.redaction_values(),
             )
             task_scope = self.background_tasks.open_scope(
                 local_process_sandbox=local_process_sandbox,
@@ -596,6 +606,7 @@ class ApplicationComposition:
                     client_file_system=client_file_system,
                     client_terminal=client_terminal,
                     user_interaction=user_interaction,
+                    lsp_service=lsp_service,
                 )
                 if fetch_path is WebFetchExecutionPath.LOCAL and (
                     allowed_tool_names is None or "web_fetch" in allowed_tool_names
@@ -631,12 +642,20 @@ class ApplicationComposition:
                             f"tool {tool.definition.name!r} is outside the selected capability set"
                         )
                     tools.register_external(tool)
-                return task_scope, provider, tools, local_process_sandbox
+                return task_scope, provider, tools, local_process_sandbox, lsp_service
             except BaseException:
+                await asyncio.shield(lsp_service.close())
                 await asyncio.shield(task_scope.shutdown())
                 raise
 
-        task_scope, provider, tools, local_process_sandbox = await prepare_provider_and_tools()
+        (
+            task_scope,
+            provider,
+            tools,
+            local_process_sandbox,
+            lsp_service,
+        ) = await prepare_provider_and_tools()
+        self._lsp_services.add(lsp_service)
         try:
             compaction_persistence = ContextCompactionApplicationService(
                 self.store,
@@ -701,6 +720,7 @@ class ApplicationComposition:
                 ),
                 interactive=approval_service is not None,
             )
+            lsp_service.set_visibility_policy(permissions)
             workspace_change_observer = self._workspace_change_observer_factory()
             if additional_workspace_roots:
                 workspace_change_observer = MultiRootWorkspaceChangeObserver(
@@ -783,6 +803,8 @@ class ApplicationComposition:
                 binding_capabilities,
             )
         except BaseException:
+            self._lsp_services.discard(lsp_service)
+            await asyncio.shield(lsp_service.close())
             if task_scope is not None:
                 await asyncio.shield(task_scope.shutdown())
             raise
@@ -1163,6 +1185,12 @@ class ApplicationComposition:
         if self._closed:
             return
         self._closed = True
+        lsp_services = tuple(self._lsp_services)
+        self._lsp_services.clear()
+        await asyncio.gather(
+            *(service.close() for service in lsp_services),
+            return_exceptions=True,
+        )
         await self.background_tasks.shutdown()
 
 

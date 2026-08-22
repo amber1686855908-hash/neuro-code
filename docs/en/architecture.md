@@ -2186,3 +2186,32 @@ can advance with an append-only Agent conversation and preserves cache
 creation/read usage, and Gemini preserves reported implicit cached-content usage.
 Unreported fields remain `None`; the Runtime never infers a cache split or
 claims a cache hit from an aggregate input total.
+
+## Read-only Language Server Protocol boundary
+
+The LSP vertical slice is an application-owned semantic read path. The stable
+`lsp` tool is registered by `ToolRegistry` and executed by the ordinary
+`ToolExecutor`, so its input path uses the same canonical
+`FilesystemAccessPlan` and permission decision as other structured read tools.
+The tool is never journaled as a mutation and its cross-file result projection
+does not open an approval prompt.
+
+`ApplicationComposition` creates one `LanguageServerManager` per binding and
+closes it before the application background supervisor. The manager routes by
+canonical workspace root plus explicit `LanguageServerProfile`; it is not a
+TUI singleton and does not own a second configuration system. Profile commands
+are argv-only and are started through `LocalProcessSandbox` with
+`LocalProcessPurpose.LSP_SERVER`, read-only workspace roots, explicit
+environment, and bounded process lifecycle.
+
+The MCP stdio adapter remains MCP-owned and newline-framed. LSP has a separate
+Content-Length JSON-RPC framer and its own request correlation, cancellation,
+server-request safety responses, diagnostics cache, bounded stderr, and close
+handshake. LSP output is untrusted: only safe local file URIs within the
+canonical workspace roots are projected, and permission DENY/ASK plus invalid,
+outside, or link-like locations are omitted.
+
+The implemented operations are definition, references, hover, document
+symbols, workspace symbols, diagnostics, status, and bounded restart. Rename,
+format, code actions, `workspace/applyEdit`, arbitrary server edits, worktrees,
+and checkpoints remain planned capabilities.

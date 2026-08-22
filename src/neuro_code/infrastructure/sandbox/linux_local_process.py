@@ -69,6 +69,7 @@ _SUPPORTED_PURPOSES = frozenset(
         LocalProcessPurpose.BASH,
         LocalProcessPurpose.BACKGROUND_BASH,
         LocalProcessPurpose.MCP_STDIO,
+        LocalProcessPurpose.LSP_SERVER,
         LocalProcessPurpose.INTERACTIVE_TERMINAL,
     }
 )

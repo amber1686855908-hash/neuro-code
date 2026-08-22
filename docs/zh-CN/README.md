@@ -680,6 +680,26 @@ neuro-code -p "Inspect the repository" \
 多行脚本以及当前无法安全分解的其他结构会在无头模式下被拒绝。命令使用空 stdin、
 有界输出、禁用的分页器/交互提示，并在超时或取消时清理整个进程树。
 
+## 只读 LSP 语义导航
+
+Neuro Code 提供稳定的只读 `lsp` tool，支持 definition、references、hover、document
+symbols、workspace symbols、diagnostics、server status 和有界的显式 restart。可以在现有
+user 或 project TOML 中显式配置 server：
+
+```toml
+[lsp.servers.python]
+language = "python"
+command = ["pyright-langserver", "--stdio"]
+extensions = [".py"]
+root_markers = ["pyproject.toml"]
+```
+
+command 只能是 argv。Neuro Code 不会下载或安装 language server；executable 不可用时会在
+execution-time 失败关闭。server 通过规范 local-process boundary 运行，只获得只读 workspace，
+不能应用 workspace edit。LSP location 会按安全 local workspace file 和现有 permission rule 过滤；
+不安全或未解决的跨文件结果会被省略。文本搜索使用 `grep`。Rename、formatting、code action、
+worktree 与 checkpoint 不属于本切片。
+
 ## 项目状态
 
 - 最低 Python 版本：3.12

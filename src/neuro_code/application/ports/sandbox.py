@@ -39,6 +39,7 @@ class LocalProcessPurpose(StrEnum):
     BASH = "bash"
     BACKGROUND_BASH = "background-bash"
     MCP_STDIO = "mcp-stdio"
+    LSP_SERVER = "lsp-server"
     INTERACTIVE_TERMINAL = "interactive-terminal"
 
 

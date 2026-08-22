@@ -10,6 +10,18 @@ from neuro_code.application.ports.background_tasks import (
 from neuro_code.application.ports.client_filesystem import ClientFileSystem
 from neuro_code.application.ports.client_terminal import ClientTerminal, ClientTerminalResult
 from neuro_code.application.ports.http import HttpClientPolicy
+from neuro_code.application.ports.lsp import (
+    LanguageServerProfile,
+    LanguageServerService,
+    LspError,
+    LspFailureKind,
+    LspFailurePhase,
+    LspOperation,
+    LspOperationResult,
+    LspRequest,
+    LspResultVisibilityPolicy,
+    LspStatus,
+)
 from neuro_code.application.ports.mcp import (
     McpElicitationHandler,
     McpPrompt,
@@ -236,6 +248,8 @@ __all__ = [
     "InteractionUnavailable",
     "InteractiveTerminalManager",
     "InteractiveTerminalSession",
+    "LanguageServerProfile",
+    "LanguageServerService",
     "LocalProcessCancellationPolicy",
     "LocalProcessEnvironmentPolicy",
     "LocalProcessFilesystemPolicy",
@@ -250,6 +264,14 @@ __all__ = [
     "LocalProcessStdioMode",
     "LocalWorkspaceAccess",
     "LocalWorkspaceAccessMode",
+    "LspError",
+    "LspFailureKind",
+    "LspFailurePhase",
+    "LspOperation",
+    "LspOperationResult",
+    "LspRequest",
+    "LspResultVisibilityPolicy",
+    "LspStatus",
     "ManagedProviderProfile",
     "ManagedProviderSettings",
     "ManagedProxyPolicy",

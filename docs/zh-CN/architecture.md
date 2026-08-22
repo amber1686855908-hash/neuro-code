@@ -1526,3 +1526,25 @@ Runtime 门控现在会在允许的显式压缩操作外层真正执行有限的
 prompt-cache 字段，OpenAI Responses 保留 cached-input 详情，Anthropic 使用原生顶层 automatic ephemeral cache
 control，使缓存断点可随着仅追加的 Agent 会话前移，并保留 cache creation/read 用量，Gemini 保留其实际返回的
 implicit cached-content 用量。未上报字段保持 `None`；Runtime 不从总输入 token 推断缓存拆分，也不会声称命中了缓存。
+
+## 只读 Language Server Protocol 边界
+
+LSP 纵向切片是由 application 拥有的语义只读路径。稳定的 `lsp` tool 由
+`ToolRegistry` 注册，并通过普通 `ToolExecutor` 执行，因此输入路径使用与其他结构化只读工具相同的
+canonical `FilesystemAccessPlan` 和 permission decision。该 tool 不会被记入 mutation journal，
+跨文件结果投影也不会弹出 approval。
+
+`ApplicationComposition` 为每个 binding 创建一个 `LanguageServerManager`，并在 application
+background supervisor 之前关闭它。manager 按 canonical workspace root 加显式
+`LanguageServerProfile` 路由，不是 TUI singleton，也不拥有第二套 configuration system。profile command
+只能是 argv，并通过 `LocalProcessSandbox`、`LocalProcessPurpose.LSP_SERVER`、只读 workspace root、
+显式 environment 和有界 process lifecycle 启动。
+
+MCP stdio adapter 仍由 MCP 自己拥有并使用 newline framing。LSP 使用独立的 Content-Length JSON-RPC
+framer，以及自己的 request correlation、cancellation、server-request 安全回复、diagnostics cache、
+有界 stderr 与 close handshake。LSP 输出是不可信内容：只有位于 canonical workspace roots 内且安全的
+local file URI 才会投影；permission DENY/ASK，以及 invalid、workspace 外或 link-like 的 location 都会省略。
+
+当前实现的 operation 是 definition、references、hover、document symbols、workspace symbols、diagnostics、
+status 与有界 restart。Rename、format、code actions、`workspace/applyEdit`、任意 server edit、worktree 与
+checkpoint 仍是规划能力。

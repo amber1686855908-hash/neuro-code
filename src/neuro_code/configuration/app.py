@@ -16,6 +16,7 @@ from typing import Any
 from urllib.parse import unquote, urlsplit, urlunsplit
 
 from neuro_code.application.ports.http import HttpClientPolicy
+from neuro_code.application.ports.lsp import LanguageServerProfile
 from neuro_code.application.ports.model import CapabilityResolution, ModelCapabilitySet
 from neuro_code.application.ports.provider_services import (
     DEFAULT_PROVIDER_SERVICE_CATALOG,
@@ -495,6 +496,7 @@ class AppConfig:
     routes: Mapping[RuntimeRole, ModelRoute] = field(default_factory=dict)
     web_search_mode: WebSearchMode = WebSearchMode.AUTO
     web_fetch_mode: WebFetchMode = WebFetchMode.DISABLED
+    language_servers: Mapping[str, LanguageServerProfile] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         try:
@@ -503,6 +505,15 @@ class AppConfig:
         except (AttributeError, OSError, RuntimeError) as error:
             raise ConfigurationError("application filesystem paths must be resolvable") from error
         object.__setattr__(self, "providers", MappingProxyType(dict(self.providers)))
+        language_servers = dict(self.language_servers)
+        if any(
+            not isinstance(name, str)
+            or not isinstance(profile, LanguageServerProfile)
+            or profile.name != name
+            for name, profile in language_servers.items()
+        ):
+            raise ConfigurationError("application language-server profiles are invalid")
+        object.__setattr__(self, "language_servers", MappingProxyType(language_servers))
         normalized_routes = dict(self.routes)
         if any(not isinstance(role, RuntimeRole) for role in normalized_routes):
             raise ConfigurationError("application routes must use canonical runtime roles")
@@ -563,6 +574,8 @@ class AppConfig:
                 names.add(profile.api_key_env)
             if profile.proxy_url_env is not None:
                 names.add(profile.proxy_url_env)
+        for lsp_profile in self.language_servers.values():
+            names.update(lsp_profile.environment)
         return frozenset(name.casefold() for name in names)
 
     def redaction_values(self, environ: Mapping[str, str] | None = None) -> tuple[str, ...]:
@@ -579,6 +592,8 @@ class AppConfig:
                 values.append(env[profile.api_key_env])
             if profile.proxy_url_env and env.get(profile.proxy_url_env):
                 values.append(env[profile.proxy_url_env])
+        for lsp_profile in self.language_servers.values():
+            values.extend(lsp_profile.environment.values())
         return tuple(dict.fromkeys(value for value in values if value))
 
     def redacted_dict(self, environ: Mapping[str, str] | None = None) -> dict[str, Any]:
@@ -601,6 +616,19 @@ class AppConfig:
             },
             "web_search": {"mode": self.web_search_mode.value},
             "web_fetch": {"mode": self.web_fetch_mode.value},
+            "lsp": {
+                "servers": {
+                    name: {
+                        "language": profile.language,
+                        "command": list(profile.command),
+                        "extensions": list(profile.extensions),
+                        "root_markers": list(profile.root_markers),
+                        "environment_names": sorted(profile.environment),
+                        "enabled": profile.enabled,
+                    }
+                    for name, profile in self.language_servers.items()
+                }
+            },
             "provider": selected,
             "providers": profiles,
             "loaded_files": [str(path) for path in self.loaded_files],
@@ -999,6 +1027,69 @@ def _routes_from_data(
     return routes
 
 
+def _language_servers_from_data(data: Mapping[str, object]) -> dict[str, LanguageServerProfile]:
+    """Parse only explicit argv-safe LSP profiles; never install or infer one."""
+
+    raw_section = data.get("lsp", data.get("language_servers", {}))
+    if raw_section is None:
+        return {}
+    if not isinstance(raw_section, Mapping):
+        raise ConfigurationError("[lsp] must be a TOML table")
+    raw_servers = raw_section.get("servers", raw_section)
+    if not isinstance(raw_servers, Mapping):
+        raise ConfigurationError("[lsp.servers] must be a TOML table")
+    profiles: dict[str, LanguageServerProfile] = {}
+    for name, raw_profile in raw_servers.items():
+        if not isinstance(name, str) or not name.strip():
+            raise ConfigurationError("LSP profile names must be non-empty strings")
+        if not isinstance(raw_profile, Mapping):
+            raise ConfigurationError(f"[lsp.servers.{name}] must be a TOML table")
+        raw_command = raw_profile.get("command")
+        if (
+            not isinstance(raw_command, list)
+            or not raw_command
+            or any(not isinstance(part, str) or not part for part in raw_command)
+        ):
+            raise ConfigurationError(
+                f"[lsp.servers.{name}] command must be a non-empty TOML argv array"
+            )
+        raw_extensions = raw_profile.get("extensions", [])
+        if not isinstance(raw_extensions, list) or any(
+            not isinstance(extension, str) for extension in raw_extensions
+        ):
+            raise ConfigurationError(f"[lsp.servers.{name}] extensions must be a TOML array")
+        raw_markers = raw_profile.get("root_markers", [])
+        if not isinstance(raw_markers, list) or any(
+            not isinstance(marker, str) for marker in raw_markers
+        ):
+            raise ConfigurationError(f"[lsp.servers.{name}] root_markers must be a TOML array")
+        raw_environment = raw_profile.get("environment", {})
+        if not isinstance(raw_environment, Mapping) or any(
+            not isinstance(key, str) or not isinstance(value, str)
+            for key, value in raw_environment.items()
+        ):
+            raise ConfigurationError(
+                f"[lsp.servers.{name}] environment must be a string TOML table"
+            )
+        enabled = raw_profile.get("enabled", True)
+        if not isinstance(enabled, bool):
+            raise ConfigurationError(f"[lsp.servers.{name}] enabled must be boolean")
+        try:
+            profile = LanguageServerProfile(
+                name=name,
+                language=_string(raw_profile.get("language"), name),
+                command=tuple(raw_command),
+                extensions=tuple(raw_extensions),
+                root_markers=tuple(raw_markers),
+                environment=dict(raw_environment),
+                enabled=enabled,
+            )
+        except (TypeError, ValueError) as error:
+            raise ConfigurationError(f"invalid LSP profile {name!r}: {error}") from error
+        profiles[name] = profile
+    return profiles
+
+
 def load_config(
     cwd: Path | None = None,
     *,
@@ -1152,6 +1243,7 @@ def load_config(
     routes = _routes_from_data(routing, providers)
     web_search_mode = _web_search_mode_from_data(data)
     web_fetch_mode = _web_fetch_mode_from_data(data)
+    language_servers = _language_servers_from_data(data)
 
     return AppConfig(
         cwd=resolved_cwd,
@@ -1166,6 +1258,7 @@ def load_config(
         routes=routes,
         web_search_mode=web_search_mode,
         web_fetch_mode=web_fetch_mode,
+        language_servers=language_servers,
     )
 
 

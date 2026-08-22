@@ -19,6 +19,7 @@ from collections.abc import Collection, Iterable
 
 from neuro_code.application.ports.client_filesystem import ClientFileSystem
 from neuro_code.application.ports.client_terminal import ClientTerminal
+from neuro_code.application.ports.lsp import LanguageServerService
 from neuro_code.application.ports.tools import Tool
 from neuro_code.application.ports.user_interaction import UserInteractionPort
 from neuro_code.domain.sandbox.models import SandboxProfile
@@ -87,6 +88,7 @@ def default_tool_registry(
     client_file_system: ClientFileSystem | None = None,
     client_terminal: ClientTerminal | None = None,
     user_interaction: UserInteractionPort | None = None,
+    lsp_service: LanguageServerService | None = None,
 ) -> ToolRegistry:
     from neuro_code.infrastructure.tools.background_tasks import (
         KillTaskTool,
@@ -113,6 +115,7 @@ def default_tool_registry(
         SearchReplaceTool,
     )
     from neuro_code.infrastructure.tools.interaction import AskUserTool
+    from neuro_code.infrastructure.tools.lsp import LspTool
     from neuro_code.infrastructure.tools.plans import UpdatePlanTool
     from neuro_code.infrastructure.tools.skills import SkillTool
     from neuro_code.infrastructure.tools.workspace_diff import WorkspaceDiffTool
@@ -122,6 +125,7 @@ def default_tool_registry(
         ReadFilesTool(),
         SkillTool(),
         UpdatePlanTool(),
+        LspTool(lsp_service),
     ]
     if user_interaction is not None:
         tools.append(AskUserTool())
