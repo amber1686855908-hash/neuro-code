@@ -56,8 +56,9 @@ def _hash_files(files: Mapping[str, bytes]) -> str:
 
 
 def _write_durable(path: Path, data: bytes) -> None:
-    path.write_bytes(data)
-    with path.open("rb") as stream:
+    with path.open("wb") as stream:
+        stream.write(data)
+        stream.flush()
         os.fsync(stream.fileno())
 
 
