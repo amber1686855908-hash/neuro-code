@@ -881,7 +881,9 @@ server runs through the canonical local-process boundary, receives a read-only
 workspace, and cannot apply workspace edits. LSP locations are filtered to
 safe local workspace files and existing permission rules; unsafe or unresolved
 cross-file results are omitted. Use `grep` for text search. Rename, formatting,
-code actions, worktrees, and checkpoints are not part of this slice.
+code actions, and LSP-to-worktree/checkpoint binding are not part of this
+slice. Worktree and managed workspace checkpoint capabilities are explicit
+application seams, not LSP tools.
 
 ## Project status
 

@@ -2213,8 +2213,9 @@ outside, or link-like locations are omitted.
 
 The implemented operations are definition, references, hover, document
 symbols, workspace symbols, diagnostics, status, and bounded restart. Rename,
-format, code actions, `workspace/applyEdit`, arbitrary server edits, worktrees,
-and checkpoints remain planned capabilities.
+format, code actions, `workspace/applyEdit`, and arbitrary server edits remain
+outside the LSP slice. Worktree and checkpoint capabilities are application-
+owned seams described below; LSP does not bind or mutate them.
 
 ## Application-owned managed Git worktrees
 
@@ -2262,7 +2263,35 @@ overwriting it. Durable `CREATING`/`REMOVING` records are reconciled against
 actual Git records after process death. Exact matches can become `READY`, an
 absent record after a remove intent becomes `REMOVED`, and path reuse, missing
 repositories, and identity mismatches become `ORPHANED` without filesystem
-deletion. The capability does not implement checkpoint/rollback, commit or
-patch integration, branch deletion, writable subagents, or model-facing Git
-tools.
-See [ADR 0129](adr/0129-managed-git-worktree-capability.md).
+deletion. See [ADR 0129](adr/0129-managed-git-worktree-capability.md).
+
+## Managed workspace checkpoint and rollback
+
+Workspace checkpointing is a separate explicit internal capability and does
+not reuse execution segment checkpoints or `session_turn_attempts`. The
+segment event is a progress/audit marker; turn recovery is request/output/tool
+durability; a workspace checkpoint is a source projection owned by one ready
+managed worktree. `WorkspaceCheckpointApplicationService` is constructed only
+through `ApplicationComposition.create_workspace_checkpoint_service()` and is
+not a model-facing tool or an automatic policy.
+
+Capture accepts a `WorktreeHandle`, proves the durable managed-worktree record,
+and stores the exact per-worktree Git index plus tracked and non-ignored
+untracked regular files/symlinks under a separate `checkpoints.db` and
+state-owned content-addressed artifacts. It includes staged and unstaged
+content, tracked deletions, binary bytes, modes, and safe symlink targets;
+ignored files are out of scope. Unmerged stages, intent-to-add, sparse/split
+indexes, submodules, nested repositories, special files, and unsafe link-like
+parents fail closed. A deterministic SHA-256 fingerprint covers identity,
+HEAD, index, modes, paths, and in-scope content.
+
+Rollback is restricted to the same owned managed worktree and exact checkpoint
+HEAD. It persists a separate `RollbackAttempt` before mutation, acquires a
+unique Neuro Code Git worktree lock, enumerates exact checkpoint-after paths,
+restores files and the index through the workspace adapter, and verifies the
+final fingerprint. It never uses broad `git clean`, stash, reset, checkout,
+branch-ref rewrite, history rewind, or arbitrary recursive deletion. Ignored
+files remain untouched. Partial or uncertain operations are durable
+`INDETERMINATE` and can be reconciled after process death; READY checkpoint
+targets are immutable and CAS-protected. See [ADR
+0130](adr/0130-managed-workspace-checkpoint-rollback.md).

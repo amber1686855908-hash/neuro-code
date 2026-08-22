@@ -11,6 +11,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from neuro_code.application.checkpoints import WorkspaceCheckpointApplicationService
 from neuro_code.application.execution_policy import ExecutionBudgetPolicy
 from neuro_code.application.memory.compaction import ProviderContextWindow
 from neuro_code.application.memory.compaction_runtime import ContextCompactionRuntimeGate
@@ -119,9 +120,13 @@ from neuro_code.domain.workspace.skills import SkillDiscoveryResult
 from neuro_code.infrastructure.background_tasks import LocalBackgroundTaskManager
 from neuro_code.infrastructure.git.worktree import LocalGitWorktreeAdapter
 from neuro_code.infrastructure.lsp.manager import LanguageServerManager
+from neuro_code.infrastructure.persistence.checkpoint_artifacts import LocalCheckpointArtifactStore
 from neuro_code.infrastructure.persistence.managed_worktrees import SqliteManagedWorktreeStore
 from neuro_code.infrastructure.persistence.output_artifacts import FileToolOutputArtifactStore
 from neuro_code.infrastructure.persistence.sqlite_session import SqliteSessionStore
+from neuro_code.infrastructure.persistence.workspace_checkpoints import (
+    SqliteWorkspaceCheckpointStore,
+)
 from neuro_code.infrastructure.providers import create_routed_provider
 from neuro_code.infrastructure.providers.hosted_web_search import (
     RoutedWebSearchBackendResolver,
@@ -140,6 +145,7 @@ from neuro_code.infrastructure.workspace.changes import (
     FilesystemWorkspaceChangeObserver,
     MultiRootWorkspaceChangeObserver,
 )
+from neuro_code.infrastructure.workspace.checkpoints import LocalWorkspaceStateAdapter
 from neuro_code.infrastructure.workspace.instructions import FilesystemInstructionDiscovery
 from neuro_code.infrastructure.workspace.paths import FilesystemWorkspaceIdentity, workspaces_match
 from neuro_code.infrastructure.workspace.skills import FilesystemSkillDiscovery
@@ -351,6 +357,23 @@ class ApplicationComposition:
             git=LocalGitWorktreeAdapter(hooks_directory=self.config.state_dir / "git-hooks"),
             store=SqliteManagedWorktreeStore(self.config.state_dir / "worktrees.db"),
             managed_root=self.config.state_dir / "worktrees",
+        )
+
+    def create_workspace_checkpoint_service(self) -> WorkspaceCheckpointApplicationService:
+        """Create the internal managed-workspace checkpoint capability.
+
+        The capability is intentionally explicit and is not registered as a
+        model-facing tool.  Callers must await ``initialize`` before use.
+        """
+
+        git = LocalGitWorktreeAdapter(hooks_directory=self.config.state_dir / "git-hooks")
+        return WorkspaceCheckpointApplicationService(
+            git=git,
+            workspace_git=git,
+            worktrees=SqliteManagedWorktreeStore(self.config.state_dir / "worktrees.db"),
+            state=LocalWorkspaceStateAdapter(git=git, workspace_git=git),
+            checkpoints=SqliteWorkspaceCheckpointStore(self.config.state_dir / "checkpoints.db"),
+            artifacts=LocalCheckpointArtifactStore(self.config.state_dir),
         )
 
     @classmethod

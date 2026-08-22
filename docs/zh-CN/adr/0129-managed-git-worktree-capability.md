@@ -142,9 +142,11 @@ subagent，不共享 source 的 document cache，也不实现 integration。
 
 ## 未实现
 
-Checkpoint/rollback、patch 或 commit integration、merge/cherry-pick/rebase、冲突解决、
-自动删除 branch、dirty-state 复制、面向模型的 Git/worktree tool、writable subagent、
-relay/DAG/leader/swarm 以及 automatic Ultracode delegation 都不属于本 ADR。
+Workspace checkpoint/rollback 现在由独立的内部能力定义，详见
+[ADR 0130](0130-managed-workspace-checkpoint-rollback.md)。Patch 或 commit integration、
+merge/cherry-pick/rebase、冲突解决、自动删除 branch、dirty-state 复制、面向模型的
+Git/worktree tool、writable subagent、relay/DAG/leader/swarm 以及 automatic Ultracode
+delegation 仍不属于本 ADR 或当前纵向切片。
 
 ## 验证
 

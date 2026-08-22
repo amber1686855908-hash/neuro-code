@@ -1546,8 +1546,8 @@ framer，以及自己的 request correlation、cancellation、server-request 安
 local file URI 才会投影；permission DENY/ASK，以及 invalid、workspace 外或 link-like 的 location 都会省略。
 
 当前实现的 operation 是 definition、references、hover、document symbols、workspace symbols、diagnostics、
-status 与有界 restart。Rename、format、code actions、`workspace/applyEdit`、任意 server edit、worktree 与
-checkpoint 仍是规划能力。
+status 与有界 restart。Rename、format、code actions、`workspace/applyEdit` 和任意 server edit 仍不属于
+LSP slice。Worktree 与 checkpoint capability 是下面定义的 application-owned seam；LSP 不绑定也不修改它们。
 
 ## 由应用拥有的受管 Git Worktree
 
@@ -1581,5 +1581,26 @@ unique，后续每次 mutation 都要求 expected generation/state 并增加 gen
 返回 `CONCURRENT_MODIFICATION`；reconciliation 会重新读取赢家而不覆盖它。进程退出后，durable
 `CREATING`/`REMOVING` 记录会与实际 Git record reconciliation。精确匹配可以变为 `READY`，remove
 intent 后实际记录缺失可以变为 `REMOVED`；path reuse、仓库缺失和 identity mismatch 会变为
-`ORPHANED`，且不执行文件系统删除。本能力不实现 checkpoint/rollback、commit 或 patch
-integration、branch deletion、writable subagent 或面向模型的 Git tool。详见 [ADR 0129](adr/0129-managed-git-worktree-capability.md)。
+`ORPHANED`，且不执行文件系统删除。详见 [ADR 0129](adr/0129-managed-git-worktree-capability.md)。
+
+## 受管 Workspace Checkpoint 与 Rollback
+
+Workspace checkpoint 是独立的显式内部 capability，不复用 execution segment checkpoint 或
+`session_turn_attempts`。分段 event 是进展/审计标记；turn recovery 是 request/output/tool 耐久性；
+workspace checkpoint 是某个 READY managed worktree 拥有的 source projection。
+`WorkspaceCheckpointApplicationService` 只由 `ApplicationComposition.create_workspace_checkpoint_service()`
+构造，不是面向模型的 tool，也没有自动 policy。
+
+Capture 接收 `WorktreeHandle`，先证明 durable managed-worktree record，然后在独立的 `checkpoints.db`
+和 state-owned content-addressed artifact 中保存 exact per-worktree Git index，以及 tracked 与 non-ignored
+untracked regular file/symlink。它包含 staged/unstaged content、tracked deletion、binary bytes、mode 和
+安全的 symlink target；ignored file 不在范围内。Unmerged stage、intent-to-add、sparse/split index、
+submodule、nested repository、special file 和不安全 link-like parent 都失败关闭。确定性 SHA-256
+fingerprint 覆盖 identity、HEAD、index、mode、path 与范围内 content。
+
+Rollback 只作用于同一个 owned managed worktree 与 exact checkpoint HEAD。它在 mutation 前持久化独立的
+`RollbackAttempt`，获取唯一 Neuro Code Git worktree lock，通过 workspace adapter 枚举 exact
+checkpoint-after path，恢复 file 与 index，并验证最终 fingerprint。它不使用宽泛 `git clean`、stash、
+reset、checkout、branch-ref rewrite、history rewind 或任意 recursive deletion；ignored file 保持不变。
+Partial 或不确定 operation 持久化为 `INDETERMINATE`，可在进程退出后 reconciliation；READY checkpoint
+target 不可变并受 CAS 保护。详见 [ADR 0130](adr/0130-managed-workspace-checkpoint-rollback.md)。

@@ -163,10 +163,12 @@ does not share source document caches, and does not implement integration.
 
 ## Not implemented
 
-Checkpoint/rollback, patch or commit integration, merge/cherry-pick/rebase,
-conflict resolution, automatic branch deletion, dirty-state copying, model
-facing Git/worktree tools, writable subagents, relay/DAG/leader/swarm, and
-automatic Ultracode delegation remain outside this ADR.
+Workspace checkpoint/rollback is now a separate internal capability defined by
+[ADR 0130](0130-managed-workspace-checkpoint-rollback.md). Patch or commit
+integration, merge/cherry-pick/rebase, conflict resolution, automatic branch
+deletion, dirty-state copying, model-facing Git/worktree tools, writable
+subagents, relay/DAG/leader/swarm, and automatic Ultracode delegation remain
+outside this ADR and the current vertical slice.
 
 ## Validation
 

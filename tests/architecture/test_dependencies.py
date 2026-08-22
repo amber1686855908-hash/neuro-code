@@ -840,6 +840,7 @@ def test_canonical_ports_are_the_only_port_modules() -> None:
         "neuro_code.application.ports.background_tasks",
         "neuro_code.application.ports.client_filesystem",
         "neuro_code.application.ports.client_terminal",
+        "neuro_code.application.ports.checkpoints",
         "neuro_code.application.ports.http",
         "neuro_code.application.ports.instructions",
         "neuro_code.application.ports.lsp",
@@ -879,7 +880,9 @@ def test_canonical_persistence_modules_are_the_only_persistence_implementations(
     canonical_modules = {
         "neuro_code.infrastructure.persistence",
         "neuro_code.infrastructure.persistence.output_artifacts",
+        "neuro_code.infrastructure.persistence.checkpoint_artifacts",
         "neuro_code.infrastructure.persistence.managed_worktrees",
+        "neuro_code.infrastructure.persistence.workspace_checkpoints",
         "neuro_code.infrastructure.persistence.rust_session",
         "neuro_code.infrastructure.persistence.sqlite_session",
         "neuro_code.infrastructure.persistence.ui_preferences",
@@ -913,6 +916,7 @@ def test_canonical_workspace_modules_are_the_only_workspace_implementations() ->
     canonical_modules = {
         "neuro_code.infrastructure.workspace",
         "neuro_code.infrastructure.workspace.changes",
+        "neuro_code.infrastructure.workspace.checkpoints",
         "neuro_code.infrastructure.workspace.instructions",
         "neuro_code.infrastructure.workspace.paths",
         "neuro_code.infrastructure.workspace.skills",

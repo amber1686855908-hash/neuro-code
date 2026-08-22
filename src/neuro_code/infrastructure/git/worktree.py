@@ -338,6 +338,7 @@ def parse_worktree_porcelain(output: bytes | str) -> tuple[GitWorktreeRecord, ..
         branch_value: str | None = None
         detached = False
         locked = False
+        lock_reason: str | None = None
         prunable = False
         for field in fields:
             name, value = _parse_field(field)
@@ -363,6 +364,7 @@ def parse_worktree_porcelain(output: bytes | str) -> tuple[GitWorktreeRecord, ..
                 detached = True
             elif name == "locked":
                 locked = True
+                lock_reason = value
             elif name == "prunable":
                 prunable = True
         if path_value is None or head_value is None:
@@ -386,6 +388,7 @@ def parse_worktree_porcelain(output: bytes | str) -> tuple[GitWorktreeRecord, ..
                 detached=detached,
                 locked=locked,
                 prunable=prunable,
+                lock_reason=lock_reason,
             )
         )
 
@@ -652,6 +655,152 @@ class LocalGitWorktreeAdapter:
         await self._run_git(
             repository_path,
             ("worktree", "remove", "--", str(target_path)),
+            failure_kind=WorktreeFailureKind.COMMAND_FAILED,
+        )
+
+    async def index_path(self, path: Path, /) -> Path:
+        """Resolve the exact per-worktree index without reading Git internals by convention."""
+
+        result = await self._run_git(
+            path,
+            ("rev-parse", "--git-path", "index"),
+            failure_kind=WorktreeFailureKind.PROTOCOL,
+        )
+        rendered = _decode_output(result.stdout)
+        if not rendered:
+            raise WorktreeError(
+                "Git did not return the worktree index path", kind=WorktreeFailureKind.PROTOCOL
+            )
+        candidate = Path(rendered)
+        if not candidate.is_absolute():
+            candidate = path / candidate
+        try:
+            return candidate.expanduser().resolve(strict=False)
+        except (OSError, RuntimeError) as error:
+            raise WorktreeError(
+                "Git returned an unsafe worktree index path", kind=WorktreeFailureKind.PROTOCOL
+            ) from error
+
+    async def index_entries(self, path: Path, /) -> bytes:
+        result = await self._run_git(
+            path,
+            ("ls-files", "--stage", "-z", "--full-name"),
+            failure_kind=WorktreeFailureKind.PROTOCOL,
+        )
+        return result.stdout
+
+    async def nonignored_untracked_paths(self, path: Path, /) -> bytes:
+        result = await self._run_git(
+            path,
+            ("ls-files", "--others", "--exclude-standard", "-z", "--full-name"),
+            failure_kind=WorktreeFailureKind.PROTOCOL,
+        )
+        return result.stdout
+
+    async def status_porcelain(self, path: Path, /) -> bytes:
+        result = await self._run_git(
+            path,
+            ("status", "--porcelain=v2", "-z", "--untracked-files=all", "--ignored=matching"),
+            failure_kind=WorktreeFailureKind.PROTOCOL,
+        )
+        return result.stdout
+
+    async def config_bool(self, path: Path, key: str, /) -> bool:
+        if not isinstance(key, str) or not key or "\x00" in key:
+            raise WorktreeError(
+                "Git configuration key is invalid", kind=WorktreeFailureKind.PROTOCOL
+            )
+        result = await self._run_git(
+            path,
+            ("config", "--bool", "--get", key),
+            accepted_returncodes=frozenset({1}),
+            failure_kind=WorktreeFailureKind.PROTOCOL,
+        )
+        if result.returncode == 1:
+            return False
+        rendered = result.stdout.strip().lower()
+        if rendered == b"true":
+            return True
+        if rendered == b"false":
+            return False
+        raise WorktreeError(
+            "Git boolean configuration output is malformed",
+            kind=WorktreeFailureKind.PROTOCOL,
+        )
+
+    async def read_index(self, path: Path, /) -> bytes:
+        index = await self.index_path(path)
+
+        def read() -> bytes:
+            if index.is_symlink() or not index.is_file():
+                raise OSError("worktree index is not a regular file")
+            return index.read_bytes()
+
+        try:
+            return await run_blocking(read)
+        except OSError as error:
+            raise WorktreeError(
+                "worktree index is unavailable or unsafe", kind=WorktreeFailureKind.PROTOCOL
+            ) from error
+
+    async def replace_index(self, path: Path, content: bytes, /) -> None:
+        if not isinstance(content, bytes):
+            raise TypeError("worktree index content must be bytes")
+        index = await self.index_path(path)
+
+        def replace_index_sync() -> None:
+            parent = index.parent
+            if not parent.is_dir() or parent.is_symlink():
+                raise OSError("worktree index parent is unavailable or unsafe")
+            if index.is_symlink():
+                raise OSError("worktree index is a symlink")
+            mode = 0o600
+            if index.exists():
+                mode = index.stat().st_mode & 0o777
+            descriptor, temporary_name = tempfile.mkstemp(prefix=".neuro-index-", dir=parent)
+            temporary = Path(temporary_name)
+            try:
+                with os.fdopen(descriptor, "wb") as stream:
+                    stream.write(content)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                temporary.chmod(mode)
+                os.replace(temporary, index)
+                try:
+                    descriptor = os.open(parent, os.O_RDONLY)
+                except OSError:
+                    pass
+                else:
+                    try:
+                        os.fsync(descriptor)
+                    finally:
+                        os.close(descriptor)
+            finally:
+                if temporary.exists() or temporary.is_symlink():
+                    temporary.unlink()
+
+        try:
+            await run_blocking(replace_index_sync)
+        except OSError as error:
+            raise WorktreeError(
+                "worktree index could not be restored", kind=WorktreeFailureKind.COMMAND_FAILED
+            ) from error
+
+    async def lock_worktree(self, path: Path, reason: str, /) -> None:
+        if not isinstance(reason, str) or not reason or "\x00" in reason or len(reason) > 256:
+            raise WorktreeError(
+                "worktree lock reason is invalid", kind=WorktreeFailureKind.PROTOCOL
+            )
+        await self._run_git(
+            path,
+            ("worktree", "lock", f"--reason={reason}", "--", str(path)),
+            failure_kind=WorktreeFailureKind.COMMAND_FAILED,
+        )
+
+    async def unlock_worktree(self, path: Path, /) -> None:
+        await self._run_git(
+            path,
+            ("worktree", "unlock", "--", str(path)),
             failure_kind=WorktreeFailureKind.COMMAND_FAILED,
         )
 

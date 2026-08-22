@@ -73,6 +73,7 @@ class GitWorktreeRecord:
     detached: bool = False
     locked: bool = False
     prunable: bool = False
+    lock_reason: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.path, Path) or not self.path.is_absolute():
@@ -92,6 +93,8 @@ class GitWorktreeRecord:
             raise ValueError("attached Git worktree record must expose a branch")
         if not isinstance(self.locked, bool) or not isinstance(self.prunable, bool):
             raise TypeError("Git worktree record flags must be boolean")
+        if self.lock_reason is not None and (not self.lock_reason or "\x00" in self.lock_reason):
+            raise ValueError("Git worktree record lock reason is invalid")
 
 
 class GitWorktreePort(Protocol):
