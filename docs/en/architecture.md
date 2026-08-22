@@ -1544,9 +1544,12 @@ tool body can start. The row is the canonical recovery index; the ordered
 `events` table remains append-only audit evidence. Recovery facts and their
 events are written together, so restart classification is derived from sticky
 facts rather than from the absence of an event.
-For plan execution, acceptance is persisted before a new task is created or a
-queued task is activated, so an exit between those operations leaves an
-explicit unresolved attempt instead of an orphaned `RUNNING` task.
+For plan execution, acceptance and task ownership are one SQLite transaction.
+A new `RUNNING` plan task is inserted with the exact `attempt.task_id`, or the
+exact `QUEUED` task is validated and transitioned to `RUNNING` with that same
+identity. The recovery projection never infers ownership from the latest task,
+an input fingerprint, or an event. If the transaction fails, neither the
+attempt nor the task activation is visible.
 
 The write-ahead boundaries are explicit. `MODEL_REQUEST_STARTED` is committed
 before entering the Provider stream. On the first observable text, reasoning,
@@ -1562,20 +1565,28 @@ completion event, final session items, title/search projection, optional
 execution record, task terminalization, and attempt resolution share the same
 SQLite transaction. Failure and cancellation use the corresponding atomic
 terminalization path. A normal `FAILED` or `CANCELLED` attempt is execution
-history, not an orphaned crash attempt, and is excluded from recovery UX.
+history, not an orphaned crash attempt, and is excluded from recovery UX. The
+default recovery inspect view is unresolved/open only; committed and explicitly
+abandoned history is available through an audit-specific view.
 
 The derived statuses are `COMMITTED`, `SAFELY_RETRYABLE`, `INDETERMINATE`, and
 `ABANDONED`. Exact user-owned input is stored only when it is reconstructable
 and at most 256 KiB; background wake input is deliberately not reconstructable.
 An open attempt with no observable output, no tool start, exact input, and no
-fact conflict may be explicitly retried. Observable output, any tool start,
-possible side effects, missing input, background wake, or contradictory facts
-are `INDETERMINATE` and never auto-replayed. `ABANDONED` is written only by an
-explicit recovery action. A retry abandons the old attempt and creates a new
-turn identity rather than continuing the old one.
+fact conflict may be explicitly retried when it is a non-plan user attempt.
+Observable output, any tool start, possible side effects, missing input,
+background wake, or contradictory facts are `INDETERMINATE` and never
+auto-replayed. Plan attempts may remain `SAFELY_RETRYABLE` when no output or
+tool effect was observed, but `retry_available` is false because plan execution
+retry is unsupported; their explicit recovery action is abandon. `ABANDONED`
+is written only by an explicit recovery action. A retry abandons the old
+attempt and creates a new turn identity rather than continuing the old one.
 
 CLI and TUI expose bounded recovery metadata and explicit `inspect`, `retry`,
-and `abandon` operations. ACP exposes the same application service through
+and `abandon` operations. For a linked `RUNNING` plan task, abandon atomically
+transitions the task to `CANCELLED` and writes `SESSION_TASK_CANCELLED` before
+`TURN_ABANDONED`; ordinary user attempts without a task keep the existing path.
+ACP exposes the same application service through
 the private `neuro-code/session/recovery` extension and returns machine-readable
 bounded projections. Resume blocks a new turn while an unresolved attempt is
 present. This layer does not implement mid-turn continuation, tool

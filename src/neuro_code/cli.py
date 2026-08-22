@@ -898,6 +898,10 @@ async def _sessions_command(args: argparse.Namespace, services: CliServices) -> 
                         f"{recovery_row['last_stage']}\t"
                         "input_reconstructable="
                         f"{str(recovery_row['input_reconstructable']).lower()}\t"
+                        "retry_available="
+                        f"{str(recovery_row['retry_available']).lower()}\t"
+                        "abandon_available="
+                        f"{str(recovery_row['abandon_available']).lower()}\t"
                         f"reason={recovery_row['reason']}"
                     )
             return 0

@@ -5732,12 +5732,20 @@ class NeuroCodeApp(App[None]):
                     stage=attempt.last_stage.value,
                     input_state=input_state,
                     reason=attempt.status_reason,
+                    retry_available=str(attempt.retry_available).lower(),
+                    abandon_available=str(attempt.abandon_available).lower(),
                 )
                 continue
-            if attempt.status is TurnRecoveryStatus.SAFELY_RETRYABLE:
+            if attempt.status is TurnRecoveryStatus.SAFELY_RETRYABLE and attempt.retry_available:
                 self._write_ui_entry(
                     "recoverable",
                     "session.recovery.safe",
+                    turn_id=attempt.turn_id,
+                )
+            elif attempt.status is TurnRecoveryStatus.SAFELY_RETRYABLE:
+                self._write_ui_entry(
+                    "recoverable",
+                    "session.recovery.retry_unavailable",
                     turn_id=attempt.turn_id,
                 )
             elif attempt.status is TurnRecoveryStatus.INDETERMINATE:

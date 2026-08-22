@@ -647,50 +647,10 @@ class SqliteSessionStore:
             connection = self._connect()
             try:
                 connection.execute("BEGIN IMMEDIATE")
-                session = connection.execute(
-                    "SELECT 1 FROM sessions WHERE id = ?", (attempt.session_id,)
-                ).fetchone()
-                if session is None:
-                    raise SessionError(f"unknown session: {attempt.session_id}")
-                existing = connection.execute(
-                    """
-                    SELECT turn_id
-                    FROM session_turn_attempts
-                    WHERE session_id = ? AND resolution IS NULL
-                    LIMIT 1
-                    """,
-                    (attempt.session_id,),
-                ).fetchone()
-                if existing is not None:
-                    raise SessionError(
-                        f"session {attempt.session_id} already has an open turn attempt"
-                    )
-                connection.execute(
-                    """
-                    INSERT INTO session_turn_attempts(
-                        turn_id, session_id, source, task_id, input_json,
-                        input_fingerprint, input_reconstructable, accepted_at,
-                        last_stage, last_stage_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        attempt.turn_id,
-                        attempt.session_id,
-                        attempt.source.value,
-                        attempt.task_id,
-                        input_json,
-                        attempt.input_fingerprint,
-                        int(attempt.input_reconstructable),
-                        attempt.accepted_at.isoformat(),
-                        attempt.last_stage.value,
-                        attempt.last_stage_at.isoformat()
-                        if attempt.last_stage_at is not None
-                        else attempt.accepted_at.isoformat(),
-                    ),
-                )
-                connection.execute(
-                    "UPDATE sessions SET updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-                    (attempt.session_id,),
+                _persist_turn_attempt_acceptance(
+                    connection,
+                    attempt=attempt,
+                    input_json=input_json,
                 )
                 connection.commit()
             except sqlite3.IntegrityError as error:
@@ -704,6 +664,83 @@ class SqliteSessionStore:
 
         async with self._write_lock:
             await run_blocking(start)
+
+    async def start_plan_turn_attempt(
+        self,
+        attempt: TurnRecoveryAttempt,
+        *,
+        task: SessionTask | None = None,
+        queued_task_id: str | None = None,
+        started_at: datetime | None = None,
+    ) -> SessionTask:
+        """Accept a plan turn and establish its exact task owner atomically."""
+
+        if not isinstance(attempt, TurnRecoveryAttempt):
+            raise TypeError("attempt must be a TurnRecoveryAttempt")
+        if attempt.input is None or not attempt.input.plan_execution_requested:
+            raise SessionError("plan turn attempt input is required")
+        if (task is None) == (queued_task_id is None):
+            raise SessionError("plan turn acceptance requires one task ownership mode")
+        input_json = attempt.input.canonical_json()
+        if task is not None:
+            if task.kind is not SessionTaskKind.PLAN_EXECUTION:
+                raise SessionError("plan turn acceptance requires a plan execution task")
+            if task.status is not SessionTaskStatus.RUNNING:
+                raise SessionError("new plan turn acceptance requires a running task")
+            if attempt.task_id != task.task_id:
+                raise SessionError("plan turn attempt task ownership does not match the task")
+            if started_at is not None:
+                raise SessionError("new plan turn acceptance does not accept a queued start time")
+        else:
+            assert queued_task_id is not None
+            _validated_session_task_id(queued_task_id)
+            if attempt.task_id != queued_task_id:
+                raise SessionError("plan turn attempt task ownership does not match the task")
+            if started_at is None:
+                started_at = datetime.now(UTC)
+            if started_at.tzinfo is None:
+                raise SessionError("queued plan task start time must be timezone-aware")
+
+        def start() -> SessionTask:
+            connection = self._connect()
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                _persist_turn_attempt_acceptance(
+                    connection,
+                    attempt=attempt,
+                    input_json=input_json,
+                )
+                if task is not None:
+                    _insert_session_task_row(
+                        connection,
+                        session_id=attempt.session_id,
+                        task=task,
+                    )
+                    started_task = task
+                else:
+                    assert queued_task_id is not None
+                    assert started_at is not None
+                    started_task = _start_session_task_row(
+                        connection,
+                        session_id=attempt.session_id,
+                        task_id=queued_task_id,
+                        started_at=started_at,
+                    )
+                connection.commit()
+                return started_task
+            except sqlite3.IntegrityError as error:
+                connection.rollback()
+                raise SessionError(
+                    f"cannot atomically accept plan turn: {attempt.turn_id}"
+                ) from error
+            except BaseException:
+                connection.rollback()
+                raise
+            finally:
+                connection.close()
+
+        async with self._write_lock:
+            return await run_blocking(start)
 
     async def append_turn_recovery_fact(
         self,
@@ -1018,6 +1055,9 @@ class SqliteSessionStore:
         turn_id: str,
         event: AgentEvent,
         reason: str,
+        *,
+        task: SessionTask | None = None,
+        task_event: AgentEvent | None = None,
     ) -> None:
         """Persist an explicit user-directed abandon resolution."""
 
@@ -1027,6 +1067,26 @@ class SqliteSessionStore:
             raise SessionError("abandon reason is invalid")
         if event.data.get("turn_id") != turn_id:
             raise SessionError("abandon event has a different turn identity")
+        if task is None and task_event is not None:
+            raise SessionError("task event cannot exist without a linked task")
+        if task is not None:
+            if not isinstance(task, SessionTask):
+                raise TypeError("task must be a SessionTask")
+            if task.kind is not SessionTaskKind.PLAN_EXECUTION:
+                raise SessionError("only a plan execution task may be abandoned with a turn")
+            if task.status is not SessionTaskStatus.CANCELLED or task.finished_at is None:
+                raise SessionError("linked plan task must be cancelled before abandon")
+            if task_event is None:
+                raise SessionError("a linked task abandon requires a task event")
+            if (
+                not isinstance(task_event, AgentEvent)
+                or task_event.kind is not AgentEventKind.SESSION_TASK_CANCELLED
+            ):
+                raise SessionError("linked plan abandon requires a task-cancel event")
+            if task_event.sequence >= event.sequence:
+                raise SessionError("task-cancel event must precede the turn abandon event")
+            if task_event.data.get("task") != task.to_dict():
+                raise SessionError("task-cancel event does not match the linked task")
         payload = json.dumps(dict(event.data), ensure_ascii=False, separators=(",", ":"))
 
         def abandon() -> None:
@@ -1036,6 +1096,7 @@ class SqliteSessionStore:
                 row = connection.execute(
                     """
                     SELECT resolution
+                           , task_id
                     FROM session_turn_attempts
                     WHERE session_id = ? AND turn_id = ?
                     """,
@@ -1045,30 +1106,31 @@ class SqliteSessionStore:
                     raise SessionError(f"unknown turn attempt: {turn_id}")
                 if row[0] is not None:
                     raise SessionError(f"turn attempt is already resolved: {turn_id}")
+                if task is not None:
+                    if row[1] != task.task_id:
+                        raise SessionError("linked plan task does not own this turn attempt")
+                    assert task_event is not None
+                    _persist_task_terminal(
+                        connection,
+                        session_id=session_id,
+                        task=task,
+                        task_event=task_event,
+                        before_sequence=event.sequence,
+                    )
+                elif row[1] is not None:
+                    raise SessionError("linked plan task ownership is required for abandon")
                 _insert_event_row(
                     connection,
                     session_id=session_id,
                     event=event,
                     payload=payload,
                 )
-                updated = connection.execute(
-                    """
-                    UPDATE session_turn_attempts
-                    SET resolution = ?, resolution_at = ?,
-                        last_stage = ?, last_stage_at = ?
-                    WHERE session_id = ? AND turn_id = ? AND resolution IS NULL
-                    """,
-                    (
-                        TurnRecoveryResolution.ABANDONED.value,
-                        event.created_at.isoformat(),
-                        TurnRecoveryStage.ABANDONED.value,
-                        event.created_at.isoformat(),
-                        session_id,
-                        turn_id,
-                    ),
+                _resolve_abandoned_turn_attempt(
+                    connection,
+                    session_id=session_id,
+                    turn_id=turn_id,
+                    event=event,
                 )
-                if updated.rowcount != 1:
-                    raise SessionError(f"cannot abandon turn attempt: {turn_id}")
                 connection.execute(
                     "UPDATE sessions SET updated_at = CURRENT_TIMESTAMP WHERE id = ?",
                     (session_id,),
@@ -1594,61 +1656,11 @@ class SqliteSessionStore:
     async def create_session_task(self, session_id: str, task: SessionTask) -> None:
         if not isinstance(task, SessionTask):
             raise TypeError("task must be a SessionTask")
-        plan_snapshot_json = (
-            json.dumps(
-                task.plan_snapshot.to_dict(),
-                ensure_ascii=False,
-                separators=(",", ":"),
-                sort_keys=True,
-            )
-            if task.plan_snapshot is not None
-            else ""
-        )
 
         def create() -> None:
             try:
                 with closing(self._connect()) as connection, connection:
-                    if (
-                        task.kind is SessionTaskKind.PLAN_EXECUTION
-                        and task.status is SessionTaskStatus.QUEUED
-                    ):
-                        queued = connection.execute(
-                            """
-                            SELECT COUNT(*)
-                            FROM session_tasks
-                            WHERE session_id = ? AND kind = ? AND status = ?
-                            """,
-                            (
-                                session_id,
-                                SessionTaskKind.PLAN_EXECUTION.value,
-                                SessionTaskStatus.QUEUED.value,
-                            ),
-                        ).fetchone()
-                        if queued is not None and int(queued[0]) >= MAX_QUEUED_SESSION_TASKS:
-                            raise SessionError(
-                                f"at most {MAX_QUEUED_SESSION_TASKS} plan tasks may be queued"
-                            )
-                    connection.execute(
-                        """
-                        INSERT INTO session_tasks(
-                            task_id, session_id, kind, status, started_at, finished_at,
-                            plan_snapshot_json
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                        """,
-                        (
-                            task.task_id,
-                            session_id,
-                            task.kind.value,
-                            task.status.value,
-                            task.started_at.isoformat(),
-                            task.finished_at.isoformat() if task.finished_at else None,
-                            plan_snapshot_json,
-                        ),
-                    )
-                    connection.execute(
-                        "UPDATE sessions SET updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-                        (session_id,),
-                    )
+                    _insert_session_task_row(connection, session_id=session_id, task=task)
             except sqlite3.IntegrityError as error:
                 raise SessionError(f"cannot create session task: {task.task_id}") from error
 
@@ -1671,37 +1683,11 @@ class SqliteSessionStore:
             connection = self._connect()
             try:
                 connection.execute("BEGIN IMMEDIATE")
-                row = connection.execute(
-                    """
-                    SELECT task_id, kind, status, started_at, finished_at, plan_snapshot_json
-                    FROM session_tasks
-                    WHERE session_id = ? AND task_id = ?
-                    """,
-                    (session_id, task_id),
-                ).fetchone()
-                if row is None:
-                    raise SessionError(f"unknown session task: {task_id}")
-                current = _session_task_from_row(row, session_id=session_id)
-                try:
-                    claimed = current.start(started_at=started_at)
-                except ValueError as error:
-                    raise SessionError(f"invalid session task transition: {task_id}") from error
-                connection.execute(
-                    """
-                    UPDATE session_tasks
-                    SET status = ?, started_at = ?, finished_at = NULL
-                    WHERE session_id = ? AND task_id = ?
-                    """,
-                    (
-                        claimed.status.value,
-                        claimed.started_at.isoformat(),
-                        session_id,
-                        task_id,
-                    ),
-                )
-                connection.execute(
-                    "UPDATE sessions SET updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-                    (session_id,),
+                claimed = _start_session_task_row(
+                    connection,
+                    session_id=session_id,
+                    task_id=task_id,
+                    started_at=started_at,
                 )
                 connection.commit()
                 return claimed
@@ -2804,6 +2790,188 @@ def _insert_event_row(
         "UPDATE sessions SET updated_at = CURRENT_TIMESTAMP WHERE id = ?",
         (session_id,),
     )
+
+
+def _persist_turn_attempt_acceptance(
+    connection: sqlite3.Connection,
+    *,
+    attempt: TurnRecoveryAttempt,
+    input_json: str,
+) -> None:
+    """Insert one accepted attempt inside the caller-owned transaction."""
+
+    session = connection.execute(
+        "SELECT 1 FROM sessions WHERE id = ?", (attempt.session_id,)
+    ).fetchone()
+    if session is None:
+        raise SessionError(f"unknown session: {attempt.session_id}")
+    existing = connection.execute(
+        """
+        SELECT turn_id
+        FROM session_turn_attempts
+        WHERE session_id = ? AND resolution IS NULL
+        LIMIT 1
+        """,
+        (attempt.session_id,),
+    ).fetchone()
+    if existing is not None:
+        raise SessionError(f"session {attempt.session_id} already has an open turn attempt")
+    connection.execute(
+        """
+        INSERT INTO session_turn_attempts(
+            turn_id, session_id, source, task_id, input_json,
+            input_fingerprint, input_reconstructable, accepted_at,
+            last_stage, last_stage_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            attempt.turn_id,
+            attempt.session_id,
+            attempt.source.value,
+            attempt.task_id,
+            input_json,
+            attempt.input_fingerprint,
+            int(attempt.input_reconstructable),
+            attempt.accepted_at.isoformat(),
+            attempt.last_stage.value,
+            attempt.last_stage_at.isoformat()
+            if attempt.last_stage_at is not None
+            else attempt.accepted_at.isoformat(),
+        ),
+    )
+    connection.execute(
+        "UPDATE sessions SET updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+        (attempt.session_id,),
+    )
+
+
+def _insert_session_task_row(
+    connection: sqlite3.Connection,
+    *,
+    session_id: str,
+    task: SessionTask,
+) -> None:
+    """Insert one task inside the caller-owned transaction."""
+
+    plan_snapshot_json = (
+        json.dumps(
+            task.plan_snapshot.to_dict(),
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        if task.plan_snapshot is not None
+        else ""
+    )
+    if task.kind is SessionTaskKind.PLAN_EXECUTION and task.status is SessionTaskStatus.QUEUED:
+        queued = connection.execute(
+            """
+            SELECT COUNT(*)
+            FROM session_tasks
+            WHERE session_id = ? AND kind = ? AND status = ?
+            """,
+            (
+                session_id,
+                SessionTaskKind.PLAN_EXECUTION.value,
+                SessionTaskStatus.QUEUED.value,
+            ),
+        ).fetchone()
+        if queued is not None and int(queued[0]) >= MAX_QUEUED_SESSION_TASKS:
+            raise SessionError(f"at most {MAX_QUEUED_SESSION_TASKS} plan tasks may be queued")
+    connection.execute(
+        """
+        INSERT INTO session_tasks(
+            task_id, session_id, kind, status, started_at, finished_at,
+            plan_snapshot_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            task.task_id,
+            session_id,
+            task.kind.value,
+            task.status.value,
+            task.started_at.isoformat(),
+            task.finished_at.isoformat() if task.finished_at else None,
+            plan_snapshot_json,
+        ),
+    )
+    connection.execute(
+        "UPDATE sessions SET updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+        (session_id,),
+    )
+
+
+def _resolve_abandoned_turn_attempt(
+    connection: sqlite3.Connection,
+    *,
+    session_id: str,
+    turn_id: str,
+    event: AgentEvent,
+) -> None:
+    """Resolve an open attempt inside the caller-owned transaction."""
+
+    updated = connection.execute(
+        """
+        UPDATE session_turn_attempts
+        SET resolution = ?, resolution_at = ?,
+            last_stage = ?, last_stage_at = ?
+        WHERE session_id = ? AND turn_id = ? AND resolution IS NULL
+        """,
+        (
+            TurnRecoveryResolution.ABANDONED.value,
+            event.created_at.isoformat(),
+            TurnRecoveryStage.ABANDONED.value,
+            event.created_at.isoformat(),
+            session_id,
+            turn_id,
+        ),
+    )
+    if updated.rowcount != 1:
+        raise SessionError(f"cannot abandon turn attempt: {turn_id}")
+
+
+def _start_session_task_row(
+    connection: sqlite3.Connection,
+    *,
+    session_id: str,
+    task_id: str,
+    started_at: datetime,
+) -> SessionTask:
+    """Claim one queued task inside the caller-owned transaction."""
+
+    row = connection.execute(
+        """
+        SELECT task_id, kind, status, started_at, finished_at, plan_snapshot_json
+        FROM session_tasks
+        WHERE session_id = ? AND task_id = ?
+        """,
+        (session_id, task_id),
+    ).fetchone()
+    if row is None:
+        raise SessionError(f"unknown session task: {task_id}")
+    current = _session_task_from_row(row, session_id=session_id)
+    try:
+        claimed = current.start(started_at=started_at)
+    except ValueError as error:
+        raise SessionError(f"invalid session task transition: {task_id}") from error
+    connection.execute(
+        """
+        UPDATE session_tasks
+        SET status = ?, started_at = ?, finished_at = NULL
+        WHERE session_id = ? AND task_id = ?
+        """,
+        (
+            claimed.status.value,
+            claimed.started_at.isoformat(),
+            session_id,
+            task_id,
+        ),
+    )
+    connection.execute(
+        "UPDATE sessions SET updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+        (session_id,),
+    )
+    return claimed
 
 
 def _persist_task_terminal(

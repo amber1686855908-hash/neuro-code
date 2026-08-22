@@ -69,6 +69,15 @@ class SessionStore(Protocol):
 
     async def start_turn_attempt(self, attempt: TurnRecoveryAttempt) -> None: ...
 
+    async def start_plan_turn_attempt(
+        self,
+        attempt: TurnRecoveryAttempt,
+        *,
+        task: SessionTask | None = None,
+        queued_task_id: str | None = None,
+        started_at: datetime | None = None,
+    ) -> SessionTask: ...
+
     async def append_turn_recovery_fact(
         self,
         session_id: str,
@@ -118,6 +127,9 @@ class SessionStore(Protocol):
         turn_id: str,
         event: AgentEvent,
         reason: str,
+        *,
+        task: SessionTask | None = None,
+        task_event: AgentEvent | None = None,
     ) -> None: ...
 
     async def load_turn_attempts(self, session_id: str) -> list[TurnRecoveryAttempt]: ...

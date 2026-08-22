@@ -368,7 +368,7 @@ class AgentConversation:
             service = TurnRecoveryService(self._store)
             handoff = await service.require_safe_retry(self._session_id, turn_id)
             if handoff.input.plan_execution_requested:
-                raise ConfigurationError("explicit retry for plan execution is unavailable")
+                raise ConfigurationError("explicit retry is unavailable for plan execution")
             await service.abandon(
                 self._session_id,
                 turn_id,

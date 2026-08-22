@@ -13,6 +13,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
+import neuro_code.infrastructure.persistence.sqlite_session as sqlite_session_module
 from neuro_code.application.sessions.recovery import (
     TurnRecoveryInspection,
     TurnRecoveryService,
@@ -33,6 +34,7 @@ from neuro_code.domain.execution import (
     TurnRecoveryStatus,
     TurnSource,
 )
+from neuro_code.domain.plans import PlanStep, SessionPlan
 from neuro_code.domain.session_tasks import SessionTask, SessionTaskKind, SessionTaskStatus
 from neuro_code.infrastructure.persistence.sqlite_session import SqliteSessionStore
 from neuro_code.shared.errors import ConfigurationError, SessionError
@@ -72,6 +74,601 @@ class CrashRecoveryTests(unittest.IsolatedAsyncioTestCase):
             ),
             accepted_at=datetime.now(UTC),
         )
+
+    def _plan(self) -> SessionPlan:
+        return SessionPlan((PlanStep("execute the saved plan"),))
+
+    async def test_new_plan_acceptance_owns_running_task_exactly(self) -> None:
+        plan = self._plan()
+        now = datetime.now(UTC)
+        task = SessionTask(
+            "task-plan-new",
+            SessionTaskKind.PLAN_EXECUTION,
+            SessionTaskStatus.RUNNING,
+            now,
+            plan_snapshot=plan,
+        )
+        attempt = TurnRecoveryAttempt.create(
+            turn_id="turn-plan-new",
+            session_id=self.session_id,
+            input=TurnInput(
+                "execute the saved plan",
+                (ContentPart.from_text("execute the saved plan"),),
+                plan_execution_requested=True,
+                plan_execution_task_id=task.task_id,
+            ),
+            task_id=task.task_id,
+            accepted_at=now,
+        )
+
+        await self.store.start_plan_turn_attempt(attempt, task=task)
+
+        loaded_attempt = (await self.store.load_open_turn_attempts(self.session_id))[0]
+        loaded_task = await self.store.get_session_task(self.session_id, task.task_id)
+        self.assertEqual(loaded_attempt.task_id, task.task_id)
+        self.assertIsNotNone(loaded_task)
+        assert loaded_task is not None
+        self.assertEqual(loaded_task.status, SessionTaskStatus.RUNNING)
+
+    async def test_plan_acceptance_validates_atomic_ownership_modes(self) -> None:
+        plan = self._plan()
+        now = datetime.now(UTC)
+
+        def plan_attempt(task_id: str | None) -> TurnRecoveryAttempt:
+            return TurnRecoveryAttempt.create(
+                turn_id=f"turn-plan-validation-{task_id or 'none'}",
+                session_id=self.session_id,
+                input=TurnInput(
+                    "execute the saved plan",
+                    (ContentPart.from_text("execute the saved plan"),),
+                    plan_execution_requested=True,
+                    plan_execution_task_id=task_id,
+                ),
+                task_id=task_id,
+                accepted_at=now,
+            )
+
+        running_task = SessionTask(
+            "task-plan-validation",
+            SessionTaskKind.PLAN_EXECUTION,
+            SessionTaskStatus.RUNNING,
+            now,
+            plan_snapshot=plan,
+        )
+        with self.assertRaises(TypeError):
+            await self.store.start_plan_turn_attempt("not an attempt", task=running_task)  # type: ignore[arg-type]
+        with self.assertRaisesRegex(SessionError, "input is required"):
+            await self.store.start_plan_turn_attempt(self._attempt(), task=running_task)
+        with self.assertRaisesRegex(SessionError, "one task ownership mode"):
+            await self.store.start_plan_turn_attempt(plan_attempt(None))
+        with self.assertRaisesRegex(SessionError, "one task ownership mode"):
+            await self.store.start_plan_turn_attempt(
+                plan_attempt(running_task.task_id),
+                task=running_task,
+                queued_task_id=running_task.task_id,
+            )
+
+        with self.assertRaisesRegex(SessionError, "plan execution task"):
+            await self.store.start_plan_turn_attempt(
+                plan_attempt("task-subagent"),
+                task=SessionTask(
+                    "task-subagent",
+                    SessionTaskKind.SUBAGENT,
+                    SessionTaskStatus.RUNNING,
+                    now,
+                ),
+            )
+        with self.assertRaisesRegex(SessionError, "running task"):
+            await self.store.start_plan_turn_attempt(
+                plan_attempt("task-plan-queued-validation"),
+                task=SessionTask(
+                    "task-plan-queued-validation",
+                    SessionTaskKind.PLAN_EXECUTION,
+                    SessionTaskStatus.QUEUED,
+                    now,
+                    plan_snapshot=plan,
+                ),
+            )
+        with self.assertRaisesRegex(SessionError, "does not match"):
+            await self.store.start_plan_turn_attempt(
+                plan_attempt("task-plan-other"),
+                task=running_task,
+            )
+        with self.assertRaisesRegex(SessionError, "queued start time"):
+            await self.store.start_plan_turn_attempt(
+                plan_attempt(running_task.task_id),
+                task=running_task,
+                started_at=now,
+            )
+        with self.assertRaisesRegex(SessionError, "does not match"):
+            await self.store.start_plan_turn_attempt(
+                plan_attempt("task-plan-queued-validation"),
+                queued_task_id="task-plan-different",
+            )
+        with self.assertRaisesRegex(SessionError, "timezone-aware"):
+            await self.store.start_plan_turn_attempt(
+                plan_attempt("task-plan-queued-validation"),
+                queued_task_id="task-plan-queued-validation",
+                started_at=now.replace(tzinfo=None),
+            )
+        with self.assertRaisesRegex(SessionError, "unknown session task"):
+            await self.store.start_plan_turn_attempt(
+                plan_attempt("task-plan-queued-validation"),
+                queued_task_id="task-plan-queued-validation",
+            )
+
+    async def test_queued_plan_acceptance_preserves_task_identity(self) -> None:
+        plan = self._plan()
+        queued_task = SessionTask(
+            "task-plan-queued",
+            SessionTaskKind.PLAN_EXECUTION,
+            SessionTaskStatus.QUEUED,
+            datetime.now(UTC),
+            plan_snapshot=plan,
+        )
+        await self.store.create_session_task(self.session_id, queued_task)
+        attempt = TurnRecoveryAttempt.create(
+            turn_id="turn-plan-queued",
+            session_id=self.session_id,
+            input=TurnInput(
+                "execute the saved plan",
+                (ContentPart.from_text("execute the saved plan"),),
+                plan_execution_requested=True,
+                plan_execution_task_id=queued_task.task_id,
+            ),
+            task_id=queued_task.task_id,
+            accepted_at=datetime.now(UTC),
+        )
+
+        await self.store.start_plan_turn_attempt(
+            attempt,
+            queued_task_id=queued_task.task_id,
+            started_at=datetime.now(UTC),
+        )
+
+        loaded_attempt = (await self.store.load_open_turn_attempts(self.session_id))[0]
+        loaded_task = await self.store.get_session_task(self.session_id, queued_task.task_id)
+        self.assertEqual(loaded_attempt.task_id, queued_task.task_id)
+        self.assertIsNotNone(loaded_task)
+        assert loaded_task is not None
+        self.assertEqual(loaded_task.status, SessionTaskStatus.RUNNING)
+
+    async def test_plan_abandon_cancels_the_linked_running_task(self) -> None:
+        plan = self._plan()
+        now = datetime.now(UTC)
+        task = SessionTask(
+            "task-plan-abandon",
+            SessionTaskKind.PLAN_EXECUTION,
+            SessionTaskStatus.RUNNING,
+            now,
+            plan_snapshot=plan,
+        )
+        attempt = TurnRecoveryAttempt.create(
+            turn_id="turn-plan-abandon",
+            session_id=self.session_id,
+            input=TurnInput(
+                "execute the saved plan",
+                (ContentPart.from_text("execute the saved plan"),),
+                plan_execution_requested=True,
+                plan_execution_task_id=task.task_id,
+            ),
+            task_id=task.task_id,
+            accepted_at=now,
+        )
+        await self.store.start_turn_attempt(attempt)
+        await self.store.create_session_task(self.session_id, task)
+
+        resolved = await TurnRecoveryService(self.store).abandon(
+            self.session_id,
+            attempt.turn_id,
+        )
+
+        self.assertEqual(resolved.status, TurnRecoveryStatus.ABANDONED)
+        loaded_task = await self.store.get_session_task(self.session_id, task.task_id)
+        self.assertIsNotNone(loaded_task)
+        assert loaded_task is not None
+        self.assertEqual(loaded_task.status, SessionTaskStatus.CANCELLED)
+        self.assertEqual(
+            [event["kind"] for event in await self.store.load_events(self.session_id)],
+            [
+                AgentEventKind.SESSION_TASK_CANCELLED.value,
+                AgentEventKind.TURN_ABANDONED.value,
+            ],
+        )
+
+    async def test_new_plan_acceptance_rolls_back_when_task_insert_fails(self) -> None:
+        plan = self._plan()
+        now = datetime.now(UTC)
+        task = SessionTask(
+            "task-plan-insert-failure",
+            SessionTaskKind.PLAN_EXECUTION,
+            SessionTaskStatus.RUNNING,
+            now,
+            plan_snapshot=plan,
+        )
+        attempt = TurnRecoveryAttempt.create(
+            turn_id="turn-plan-insert-failure",
+            session_id=self.session_id,
+            input=TurnInput(
+                "execute the saved plan",
+                (ContentPart.from_text("execute the saved plan"),),
+                plan_execution_requested=True,
+                plan_execution_task_id=task.task_id,
+            ),
+            task_id=task.task_id,
+            accepted_at=now,
+        )
+
+        with (
+            patch(
+                "neuro_code.infrastructure.persistence.sqlite_session._insert_session_task_row",
+                side_effect=RuntimeError("injected task insert failure"),
+            ),
+            self.assertRaises(RuntimeError),
+        ):
+            await self.store.start_plan_turn_attempt(attempt, task=task)
+
+        self.assertEqual(await self.store.load_open_turn_attempts(self.session_id), [])
+        self.assertIsNone(await self.store.get_session_task(self.session_id, task.task_id))
+
+    async def test_queued_plan_acceptance_rolls_back_when_activation_fails(self) -> None:
+        plan = self._plan()
+        queued_task = SessionTask(
+            "task-plan-activation-failure",
+            SessionTaskKind.PLAN_EXECUTION,
+            SessionTaskStatus.QUEUED,
+            datetime.now(UTC),
+            plan_snapshot=plan,
+        )
+        await self.store.create_session_task(self.session_id, queued_task)
+        attempt = TurnRecoveryAttempt.create(
+            turn_id="turn-plan-activation-failure",
+            session_id=self.session_id,
+            input=TurnInput(
+                "execute the saved plan",
+                (ContentPart.from_text("execute the saved plan"),),
+                plan_execution_requested=True,
+                plan_execution_task_id=queued_task.task_id,
+            ),
+            task_id=queued_task.task_id,
+            accepted_at=datetime.now(UTC),
+        )
+
+        with (
+            patch(
+                "neuro_code.infrastructure.persistence.sqlite_session._start_session_task_row",
+                side_effect=RuntimeError("injected task activation failure"),
+            ),
+            self.assertRaises(RuntimeError),
+        ):
+            await self.store.start_plan_turn_attempt(
+                attempt,
+                queued_task_id=queued_task.task_id,
+                started_at=datetime.now(UTC),
+            )
+
+        self.assertEqual(await self.store.load_open_turn_attempts(self.session_id), [])
+        loaded_task = await self.store.get_session_task(self.session_id, queued_task.task_id)
+        self.assertIsNotNone(loaded_task)
+        assert loaded_task is not None
+        self.assertEqual(loaded_task.status, SessionTaskStatus.QUEUED)
+
+    async def _start_linked_plan_attempt(
+        self,
+        *,
+        turn_id: str,
+        task_id: str,
+    ) -> tuple[TurnRecoveryAttempt, SessionTask]:
+        plan = self._plan()
+        now = datetime.now(UTC)
+        task = SessionTask(
+            task_id,
+            SessionTaskKind.PLAN_EXECUTION,
+            SessionTaskStatus.RUNNING,
+            now,
+            plan_snapshot=plan,
+        )
+        attempt = TurnRecoveryAttempt.create(
+            turn_id=turn_id,
+            session_id=self.session_id,
+            input=TurnInput(
+                "execute the saved plan",
+                (ContentPart.from_text("execute the saved plan"),),
+                plan_execution_requested=True,
+                plan_execution_task_id=task.task_id,
+            ),
+            task_id=task.task_id,
+            accepted_at=now,
+        )
+        await self.store.start_plan_turn_attempt(attempt, task=task)
+        return attempt, task
+
+    async def test_plan_abandon_rolls_back_when_task_terminalization_fails(self) -> None:
+        attempt, task = await self._start_linked_plan_attempt(
+            turn_id="turn-plan-terminalization-failure",
+            task_id="task-plan-terminalization-failure",
+        )
+        service = TurnRecoveryService(self.store)
+        with (
+            patch(
+                "neuro_code.infrastructure.persistence.sqlite_session._persist_task_terminal",
+                side_effect=RuntimeError("injected task terminalization failure"),
+            ),
+            self.assertRaises(RuntimeError),
+        ):
+            await service.abandon(self.session_id, attempt.turn_id)
+
+        self.assertEqual(len(await self.store.load_open_turn_attempts(self.session_id)), 1)
+        loaded_task = await self.store.get_session_task(self.session_id, task.task_id)
+        self.assertIsNotNone(loaded_task)
+        assert loaded_task is not None
+        self.assertEqual(loaded_task.status, SessionTaskStatus.RUNNING)
+        self.assertEqual(await self.store.load_events(self.session_id), [])
+
+    async def test_plan_abandon_rolls_back_when_task_event_fails(self) -> None:
+        attempt, task = await self._start_linked_plan_attempt(
+            turn_id="turn-plan-task-event-failure",
+            task_id="task-plan-task-event-failure",
+        )
+        with (
+            patch(
+                "neuro_code.infrastructure.persistence.sqlite_session._insert_event_row",
+                side_effect=RuntimeError("injected task event failure"),
+            ),
+            self.assertRaises(RuntimeError),
+        ):
+            await TurnRecoveryService(self.store).abandon(self.session_id, attempt.turn_id)
+
+        self.assertEqual(len(await self.store.load_open_turn_attempts(self.session_id)), 1)
+        loaded_task = await self.store.get_session_task(self.session_id, task.task_id)
+        self.assertIsNotNone(loaded_task)
+        assert loaded_task is not None
+        self.assertEqual(loaded_task.status, SessionTaskStatus.RUNNING)
+        self.assertEqual(await self.store.load_events(self.session_id), [])
+
+    async def test_plan_abandon_rolls_back_when_turn_event_fails(self) -> None:
+        attempt, task = await self._start_linked_plan_attempt(
+            turn_id="turn-plan-turn-event-failure",
+            task_id="task-plan-turn-event-failure",
+        )
+        original_insert_event_row = sqlite_session_module._insert_event_row
+
+        def fail_turn_event(
+            connection: sqlite3.Connection,
+            *,
+            session_id: str,
+            event: AgentEvent,
+            payload: str | None = None,
+        ) -> None:
+            if event.kind is AgentEventKind.TURN_ABANDONED:
+                raise RuntimeError("injected turn event failure")
+            original_insert_event_row(
+                connection,
+                session_id=session_id,
+                event=event,
+                payload=payload,
+            )
+
+        with (
+            patch(
+                "neuro_code.infrastructure.persistence.sqlite_session._insert_event_row",
+                side_effect=fail_turn_event,
+            ),
+            self.assertRaises(RuntimeError),
+        ):
+            await TurnRecoveryService(self.store).abandon(self.session_id, attempt.turn_id)
+
+        self.assertEqual(len(await self.store.load_open_turn_attempts(self.session_id)), 1)
+        loaded_task = await self.store.get_session_task(self.session_id, task.task_id)
+        self.assertIsNotNone(loaded_task)
+        assert loaded_task is not None
+        self.assertEqual(loaded_task.status, SessionTaskStatus.RUNNING)
+        self.assertEqual(await self.store.load_events(self.session_id), [])
+
+    async def test_plan_abandon_rolls_back_when_attempt_resolution_fails(self) -> None:
+        attempt, task = await self._start_linked_plan_attempt(
+            turn_id="turn-plan-attempt-resolution-failure",
+            task_id="task-plan-attempt-resolution-failure",
+        )
+        with (
+            patch(
+                "neuro_code.infrastructure.persistence.sqlite_session._resolve_abandoned_turn_attempt",
+                side_effect=RuntimeError("injected attempt resolution failure"),
+            ),
+            self.assertRaises(RuntimeError),
+        ):
+            await TurnRecoveryService(self.store).abandon(self.session_id, attempt.turn_id)
+
+        self.assertEqual(len(await self.store.load_open_turn_attempts(self.session_id)), 1)
+        loaded_task = await self.store.get_session_task(self.session_id, task.task_id)
+        self.assertIsNotNone(loaded_task)
+        assert loaded_task is not None
+        self.assertEqual(loaded_task.status, SessionTaskStatus.RUNNING)
+        self.assertEqual(await self.store.load_events(self.session_id), [])
+
+    async def test_plan_abandon_requires_exact_running_plan_task_at_storage_boundary(self) -> None:
+        attempt, task = await self._start_linked_plan_attempt(
+            turn_id="turn-plan-abandon-storage-validation",
+            task_id="task-plan-abandon-storage-validation",
+        )
+        cancelled_task = task.finish(SessionTaskStatus.CANCELLED, finished_at=datetime.now(UTC))
+        turn_event = AgentEvent.create(
+            2,
+            AgentEventKind.TURN_ABANDONED,
+            {"turn_id": attempt.turn_id},
+        )
+        with self.assertRaisesRegex(SessionError, "must be cancelled"):
+            await self.store.abandon_turn_attempt(
+                self.session_id,
+                attempt.turn_id,
+                turn_event,
+                "test",
+                task=task,
+                task_event=AgentEvent.create(
+                    1,
+                    AgentEventKind.SESSION_TASK_CANCELLED,
+                    {"task": cancelled_task.to_dict()},
+                ),
+            )
+        with self.assertRaisesRegex(SessionError, "task event cannot exist"):
+            await self.store.abandon_turn_attempt(
+                self.session_id,
+                attempt.turn_id,
+                turn_event,
+                "test",
+                task_event=AgentEvent.create(
+                    1,
+                    AgentEventKind.SESSION_TASK_CANCELLED,
+                    {"task": cancelled_task.to_dict()},
+                ),
+            )
+        with self.assertRaisesRegex(SessionError, "task-cancel event"):
+            await self.store.abandon_turn_attempt(
+                self.session_id,
+                attempt.turn_id,
+                turn_event,
+                "test",
+                task=cancelled_task,
+                task_event=AgentEvent.create(1, AgentEventKind.TURN_ABANDONED),
+            )
+        with self.assertRaisesRegex(SessionError, "must precede"):
+            await self.store.abandon_turn_attempt(
+                self.session_id,
+                attempt.turn_id,
+                turn_event,
+                "test",
+                task=cancelled_task,
+                task_event=AgentEvent.create(
+                    2,
+                    AgentEventKind.SESSION_TASK_CANCELLED,
+                    {"task": cancelled_task.to_dict()},
+                ),
+            )
+        with self.assertRaisesRegex(SessionError, "does not match"):
+            await self.store.abandon_turn_attempt(
+                self.session_id,
+                attempt.turn_id,
+                turn_event,
+                "test",
+                task=cancelled_task,
+                task_event=AgentEvent.create(
+                    1,
+                    AgentEventKind.SESSION_TASK_CANCELLED,
+                    {"task": task.to_dict()},
+                ),
+            )
+
+    async def test_plan_abandon_service_rejects_missing_or_mismatched_ownership(self) -> None:
+        async def install_and_reject(
+            *,
+            task: SessionTask | None,
+            plan_requested: bool,
+            task_id: str,
+            expected: str,
+        ) -> None:
+            session_id = await self.store.create_session("/workspace", "provider", "model")
+            attempt = TurnRecoveryAttempt.create(
+                turn_id=f"turn-service-validation-{task_id}",
+                session_id=session_id,
+                input=TurnInput(
+                    "execute the saved plan",
+                    (ContentPart.from_text("execute the saved plan"),),
+                    plan_execution_requested=plan_requested,
+                    plan_execution_task_id=task_id,
+                ),
+                task_id=task_id,
+                accepted_at=datetime.now(UTC),
+            )
+            await self.store.start_turn_attempt(attempt)
+            if task is not None:
+                await self.store.create_session_task(session_id, task)
+            with self.assertRaisesRegex(ConfigurationError, expected):
+                await TurnRecoveryService(self.store).abandon(session_id, attempt.turn_id)
+
+        now = datetime.now(UTC)
+        await install_and_reject(
+            task=SessionTask(
+                "task-service-unexpected",
+                SessionTaskKind.PLAN_EXECUTION,
+                SessionTaskStatus.RUNNING,
+                now,
+                plan_snapshot=self._plan(),
+            ),
+            plan_requested=False,
+            task_id="task-service-unexpected",
+            expected="unexpected task ownership",
+        )
+        await install_and_reject(
+            task=None,
+            plan_requested=True,
+            task_id="task-service-missing",
+            expected="does not exist",
+        )
+        await install_and_reject(
+            task=SessionTask(
+                "task-service-subagent",
+                SessionTaskKind.SUBAGENT,
+                SessionTaskStatus.RUNNING,
+                now,
+            ),
+            plan_requested=True,
+            task_id="task-service-subagent",
+            expected="only a plan execution task",
+        )
+        await install_and_reject(
+            task=SessionTask(
+                "task-service-queued",
+                SessionTaskKind.PLAN_EXECUTION,
+                SessionTaskStatus.QUEUED,
+                now,
+                plan_snapshot=self._plan(),
+            ),
+            plan_requested=True,
+            task_id="task-service-queued",
+            expected="not running",
+        )
+
+    async def test_plan_recovery_is_safe_but_retry_is_not_available(self) -> None:
+        attempt, _task = await self._start_linked_plan_attempt(
+            turn_id="turn-plan-no-retry",
+            task_id="task-plan-no-retry",
+        )
+        inspection = (await TurnRecoveryService(self.store).inspect(self.session_id))[0]
+        self.assertEqual(inspection.attempt.turn_id, attempt.turn_id)
+        self.assertEqual(inspection.status, TurnRecoveryStatus.SAFELY_RETRYABLE)
+        self.assertFalse(inspection.attempt.retry_available)
+        self.assertTrue(inspection.attempt.abandon_available)
+        self.assertEqual(inspection.to_dict()["task_id"], "task-plan-no-retry")
+        self.assertFalse(inspection.to_dict()["retry_available"])
+        self.assertTrue(inspection.to_dict()["abandon_available"])
+        with self.assertRaisesRegex(ConfigurationError, "retry is unavailable"):
+            await TurnRecoveryService(self.store).require_safe_retry(
+                self.session_id,
+                attempt.turn_id,
+            )
+
+    async def test_plan_attempt_without_explicit_owner_is_indeterminate_and_fail_closed(
+        self,
+    ) -> None:
+        attempt = TurnRecoveryAttempt.create(
+            turn_id="turn-plan-missing-owner",
+            session_id=self.session_id,
+            input=TurnInput(
+                "execute the saved plan",
+                (ContentPart.from_text("execute the saved plan"),),
+                plan_execution_requested=True,
+            ),
+            accepted_at=datetime.now(UTC),
+        )
+        await self.store.start_turn_attempt(attempt)
+
+        inspection = (await TurnRecoveryService(self.store).inspect(self.session_id))[0]
+        self.assertEqual(inspection.status, TurnRecoveryStatus.INDETERMINATE)
+        self.assertEqual(inspection.attempt.status_reason, "plan_task_ownership_missing")
+        self.assertFalse(inspection.attempt.retry_available)
+        self.assertFalse(inspection.attempt.abandon_available)
+        with self.assertRaises(ConfigurationError):
+            await TurnRecoveryService(self.store).abandon(self.session_id, attempt.turn_id)
 
     async def test_request_before_output_is_safe_and_exact_input_survives(self) -> None:
         attempt = self._attempt()
@@ -1190,7 +1787,7 @@ class CrashRecoveryTests(unittest.IsolatedAsyncioTestCase):
             attempt.turn_id,
         )
         self.assertEqual(await self.store.load_open_turn_attempts(self.session_id), [])
-        inspection = (await TurnRecoveryService(self.store).inspect(self.session_id))[0]
+        inspection = (await TurnRecoveryService(self.store).inspect_history(self.session_id))[0]
         self.assertEqual(inspection.status, TurnRecoveryStatus.COMMITTED)
         self.assertEqual(
             [row["kind"] for row in await self.store.load_events(self.session_id)],
@@ -1222,6 +1819,71 @@ class CrashRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(await self.store.load_open_turn_attempts(self.session_id)), 1)
         self.assertEqual(await self.store.load_events(self.session_id), [])
         self.assertEqual(await self.store.load_session_items(self.session_id), [])
+
+    async def test_process_death_after_plan_acceptance_preserves_exact_task_owner(self) -> None:
+        script = """
+import asyncio
+import os
+import sys
+from datetime import UTC, datetime
+from pathlib import Path
+from neuro_code.domain.execution import TurnInput, TurnRecoveryAttempt
+from neuro_code.domain.plans import PlanStep, SessionPlan
+from neuro_code.domain.session_tasks import SessionTask, SessionTaskKind, SessionTaskStatus
+from neuro_code.infrastructure.persistence.sqlite_session import SqliteSessionStore
+
+async def main() -> None:
+    store = SqliteSessionStore(Path(sys.argv[1]))
+    await store.initialize()
+    session_id = await store.create_session('/workspace', 'provider', 'model')
+    plan = SessionPlan((PlanStep('execute the saved plan'),))
+    now = datetime.now(UTC)
+    task = SessionTask(
+        'task-plan-process-death',
+        SessionTaskKind.PLAN_EXECUTION,
+        SessionTaskStatus.RUNNING,
+        now,
+        plan_snapshot=plan,
+    )
+    attempt = TurnRecoveryAttempt.create(
+        turn_id='turn-plan-process-death',
+        session_id=session_id,
+        input=TurnInput(
+            'execute the saved plan',
+            plan_execution_requested=True,
+            plan_execution_task_id=task.task_id,
+        ),
+        task_id=task.task_id,
+        accepted_at=now,
+    )
+    await store.start_plan_turn_attempt(attempt, task=task)
+    os._exit(0)
+
+asyncio.run(main())
+"""
+        process_database = Path(self._temporary_directory.name) / "plan-process-death.db"
+        self.assertEqual(await asyncio.to_thread(_run_process_death, script, process_database), 0)
+
+        reopened = SqliteSessionStore(process_database)
+        await reopened.initialize()
+        with closing(sqlite3.connect(process_database)) as connection:
+            session_id = str(connection.execute("SELECT id FROM sessions").fetchone()[0])
+        inspection = (await TurnRecoveryService(reopened).inspect_open(session_id))[0]
+        self.assertEqual(inspection.attempt.task_id, "task-plan-process-death")
+        task = await reopened.get_session_task(session_id, "task-plan-process-death")
+        self.assertIsNotNone(task)
+        assert task is not None
+        self.assertEqual(task.status, SessionTaskStatus.RUNNING)
+
+        abandoned = await TurnRecoveryService(reopened).abandon(
+            session_id,
+            "turn-plan-process-death",
+        )
+        self.assertEqual(abandoned.status, TurnRecoveryStatus.ABANDONED)
+        cancelled = await reopened.get_session_task(session_id, "task-plan-process-death")
+        self.assertIsNotNone(cancelled)
+        assert cancelled is not None
+        self.assertEqual(cancelled.status, SessionTaskStatus.CANCELLED)
 
     async def test_process_death_after_output_is_fail_closed(self) -> None:
         script = """
@@ -1318,7 +1980,7 @@ asyncio.run(main())
         with closing(sqlite3.connect(process_database)) as connection:
             session_id = str(connection.execute("SELECT id FROM sessions").fetchone()[0])
         self.assertEqual(await TurnRecoveryService(reopened).inspect_open(session_id), ())
-        inspection = (await TurnRecoveryService(reopened).inspect(session_id))[0]
+        inspection = (await TurnRecoveryService(reopened).inspect_history(session_id))[0]
         self.assertEqual(inspection.status, TurnRecoveryStatus.COMMITTED)
 
 

@@ -2930,11 +2930,12 @@ class NeuroCodeAcpAgent:
                 }
             except ConfigurationError as error:
                 message = str(error)
-                reason = (
-                    "recovery_not_safe"
-                    if "indeterminate" in message or "safely_retryable" not in message
-                    else "recovery_retry_unavailable"
-                )
+                if "retry" in message and "unavailable" in message:
+                    reason = "recovery_retry_unavailable"
+                elif "indeterminate" in message or "safely_retryable" not in message:
+                    reason = "recovery_not_safe"
+                else:
+                    reason = "recovery_retry_unavailable"
                 raise RequestError.internal_error({"reason": reason}) from None
             except SessionError:
                 raise _session_not_found(recovery_query.session_id) from None

@@ -360,7 +360,8 @@ class TurnRecoveryAttempt:
             # closed rather than allowing a replay path.
             return TurnRecoveryStatus.ABANDONED
         if (
-            self.fact_conflict
+            self.plan_task_ownership_missing
+            or self.fact_conflict
             or self.output_started
             or self.tool_started_count > 0
             or self.side_effecting_tool_started
@@ -371,6 +372,32 @@ class TurnRecoveryAttempt:
         return TurnRecoveryStatus.SAFELY_RETRYABLE
 
     @property
+    def plan_task_ownership_missing(self) -> bool:
+        """Whether a plan attempt lacks its explicit durable task owner."""
+
+        return (
+            self.input is not None and self.input.plan_execution_requested and self.task_id is None
+        )
+
+    @property
+    def retry_available(self) -> bool:
+        """Whether the user-facing recovery surface may offer explicit retry."""
+
+        return (
+            self.resolution is None
+            and self.status is TurnRecoveryStatus.SAFELY_RETRYABLE
+            and self.input is not None
+            and self.source is TurnSource.USER
+            and not self.input.plan_execution_requested
+        )
+
+    @property
+    def abandon_available(self) -> bool:
+        """Whether explicit abandon is safe to offer for this projection."""
+
+        return self.resolution is None and not self.plan_task_ownership_missing
+
+    @property
     def status_reason(self) -> str:
         if self.resolution is TurnRecoveryResolution.COMMITTED:
             return "atomic_turn_commit"
@@ -378,6 +405,8 @@ class TurnRecoveryAttempt:
             return "explicitly_abandoned"
         if self.resolution is not None:
             return "terminal_failure_recorded"
+        if self.plan_task_ownership_missing:
+            return "plan_task_ownership_missing"
         if self.fact_conflict:
             return "contradictory_recovery_facts"
         if self.output_started:
@@ -400,7 +429,10 @@ class TurnRecoveryAttempt:
             "status": self.status.value,
             "reason": self.status_reason,
             "source": self.source.value,
+            "task_id": self.task_id,
             "resolution": self.resolution.value if self.resolution is not None else None,
+            "retry_available": self.retry_available,
+            "abandon_available": self.abandon_available,
             "last_stage": self.last_stage.value,
             "accepted_at": self.accepted_at.isoformat(),
             "resolution_at": (

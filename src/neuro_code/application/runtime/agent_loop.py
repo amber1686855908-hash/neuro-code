@@ -367,25 +367,34 @@ class AgentLoopRunner:
                 plan_execution_requested,
                 session_task.task_id if session_task is not None else plan_execution_task_id,
             )
-            await self._session_store.start_turn_attempt(
-                TurnRecoveryAttempt.create(
-                    turn_id=turn_id,
-                    session_id=session_id,
-                    input=turn_input,
-                    task_id=session_task.task_id if session_task is not None else None,
-                    accepted_at=datetime.now(UTC),
-                )
+            attempt = TurnRecoveryAttempt.create(
+                turn_id=turn_id,
+                session_id=session_id,
+                input=turn_input,
+                task_id=(
+                    session_task.task_id
+                    if session_task is not None
+                    else queued_plan_task.task_id
+                    if queued_plan_task is not None
+                    else None
+                ),
+                accepted_at=datetime.now(UTC),
             )
             if plan_execution_requested:
                 if queued_plan_task is None:
                     assert session_task is not None
-                    await self._session_store.create_session_task(session_id, session_task)
-                else:
-                    session_task = await self._session_store.start_session_task(
-                        session_id,
-                        queued_plan_task.task_id,
-                        datetime.now(UTC),
+                    session_task = await self._session_store.start_plan_turn_attempt(
+                        attempt,
+                        task=session_task,
                     )
+                else:
+                    session_task = await self._session_store.start_plan_turn_attempt(
+                        attempt,
+                        queued_task_id=queued_plan_task.task_id,
+                        started_at=datetime.now(UTC),
+                    )
+            else:
+                await self._session_store.start_turn_attempt(attempt)
 
         recorder = TurnEventRecorder(
             sink=sink,

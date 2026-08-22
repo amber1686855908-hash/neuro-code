@@ -1076,8 +1076,10 @@ ID、工作区、模型和时间戳；ID 已存在时不做任何修改并返回
 工具 body 可能开始前，先在 `session_turn_attempts` 写入小型记录。该行是规范恢复索引；
 有序 `events` 表继续作为追加式审计证据。恢复事实与对应事件一起写入，因此重启分类依赖
 sticky facts，而不是事件缺失。
-对计划执行而言，接受写入先于新任务创建或排队任务激活，因此两次操作之间的进程退出会
-留下明确的未决 attempt，而不是孤立的 `RUNNING` 任务。
+对计划执行而言，接受与任务归属属于同一个 SQLite 事务。新建的 `RUNNING` 计划任务与精确
+的 `attempt.task_id` 一起插入，或校验精确的 `QUEUED` 任务并使用相同身份转为 `RUNNING`。
+恢复投影不会从最新任务、输入指纹或事件推断归属；事务失败时，attempt 和任务激活都不会
+对外可见。
 
 write-ahead 边界是明确的：进入 Provider stream 前提交 `MODEL_REQUEST_STARTED`；第一个
 可观察的文本、推理、后端工具、工具调用或完成事件处理前提交 `MODEL_OUTPUT_STARTED`；
@@ -1088,15 +1090,19 @@ write-ahead 边界是明确的：进入 Provider stream 前提交 `MODEL_REQUEST
 `COMMITTED` 点：完成事件、最终会话项、标题/搜索投影、可选 execution record、任务终态和
 attempt resolution 共享同一个 SQLite 事务。失败和取消使用对应的原子终态路径。普通的
 `FAILED` 或 `CANCELLED` attempt 属于执行历史，不是孤立的崩溃回合，因此不会进入恢复 UI。
+默认恢复 inspect 只展示未决/开放 attempt；已提交和明确放弃的历史通过独立的审计视图获取。
 
 派生状态为 `COMMITTED`、`SAFELY_RETRYABLE`、`INDETERMINATE` 和 `ABANDONED`。只有输入可重建
 且不超过 256 KiB 时才保存精确的用户归属输入；后台唤醒输入刻意不可重建。没有可观察输出、
-没有工具开始、有精确输入且没有事实冲突的未决 attempt 可以被明确 retry。可观察输出、任意
-工具开始、可能的副作用、输入缺失、后台唤醒或矛盾事实都会得到 `INDETERMINATE`，且永不
-自动 replay。只有明确恢复操作可以写入 `ABANDONED`。重试会放弃旧 attempt 并创建新的回合
-身份，不会继续旧 attempt。
+没有工具开始、有精确输入且没有事实冲突的非计划用户 attempt 可以被明确 retry。可观察输出、
+任意工具开始、可能的副作用、输入缺失、后台唤醒或矛盾事实都会得到 `INDETERMINATE`，且永不
+自动 replay。若没有观察到输出或工具副作用，计划 attempt 可以保持 `SAFELY_RETRYABLE`，但
+由于计划执行 retry 尚未支持，其 `retry_available` 为 false，只能明确 abandon。只有明确恢复
+操作可以写入 `ABANDONED`。重试会放弃旧 attempt 并创建新的回合身份，不会继续旧 attempt。
 
-CLI 和 TUI 暴露有界恢复元数据及明确的 `inspect`、`retry`、`abandon` 操作。ACP 通过私有
+CLI 和 TUI 暴露有界恢复元数据及明确的 `inspect`、`retry`、`abandon` 操作。对已关联的
+`RUNNING` 计划任务，abandon 会原子地将任务转为 `CANCELLED`，并先写入 `SESSION_TASK_CANCELLED`
+再写入 `TURN_ABANDONED`；没有任务的普通用户 attempt 保持原有路径。ACP 通过私有
 `neuro-code/session/recovery` 扩展复用同一个应用服务，并返回机器可读的有界投影。存在未决
 attempt 时，resume 会阻止新回合。本层不实现回合中途续接、工具补偿、后台子进程协调、计划
 执行重试或工作区回滚。尤其是 `EXECUTION_SEGMENT_CHECKPOINTED` 仍是进度/审计标记：崩溃
