@@ -142,19 +142,32 @@ class WorktreeParserTests(unittest.TestCase):
     def test_porcelain_parser_handles_detached_branch_lock_prunable_and_unknown_fields(
         self,
     ) -> None:
-        records = parse_worktree_porcelain(
-            b"".join(
-                (
-                    b"worktree /repo\0HEAD "
-                    + b"a" * 40
-                    + b"\0branch refs/heads/main\0unknown future\0\0",
-                    b"worktree /detached\0HEAD " + b"b" * 40 + b"\0detached\0locked by test\0\0",
-                    b"worktree /stale\0HEAD "
-                    + b"c" * 40
-                    + b"\0branch refs/heads/stale\0prunable missing\0\0",
+        with tempfile.TemporaryDirectory(prefix="neuro-worktree-parser-") as raw_root:
+            root = Path(raw_root)
+            repository = os.fsencode(str(root / "repo"))
+            detached = os.fsencode(str(root / "detached"))
+            stale = os.fsencode(str(root / "stale"))
+            records = parse_worktree_porcelain(
+                b"".join(
+                    (
+                        b"worktree "
+                        + repository
+                        + b"\0HEAD "
+                        + b"a" * 40
+                        + b"\0branch refs/heads/main\0unknown future\0\0",
+                        b"worktree "
+                        + detached
+                        + b"\0HEAD "
+                        + b"b" * 40
+                        + b"\0detached\0locked by test\0\0",
+                        b"worktree "
+                        + stale
+                        + b"\0HEAD "
+                        + b"c" * 40
+                        + b"\0branch refs/heads/stale\0prunable missing\0\0",
+                    )
                 )
             )
-        )
         self.assertEqual(len(records), 3)
         self.assertEqual(records[0].branch, "refs/heads/main")
         self.assertTrue(records[1].detached)
@@ -192,6 +205,7 @@ class WorktreeGitBoundaryTests(unittest.TestCase):
             self.assertEqual(process.terminate_calls, 1)
             self.assertIsNotNone(sandbox.request)
             assert sandbox.request is not None
+            self.assertTrue(Path(sandbox.request.executable).is_absolute())
             self.assertFalse(sandbox.request.uses_shell)
             self.assertIs(sandbox.request.purpose, LocalProcessPurpose.GIT_WORKTREE)
             self.assertIs(sandbox.request.network_policy, LocalProcessNetworkPolicy.ISOLATED)

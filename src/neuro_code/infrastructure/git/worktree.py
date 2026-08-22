@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import os
 import re
+import shutil
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -146,8 +147,13 @@ async def _run_git(
             value = os.environ.get(name)
             if value:
                 environment[name] = value
+    git_executable = await run_blocking(shutil.which, "git", path=environment["PATH"])
+    if git_executable is None:
+        raise WorktreeError(
+            "Git executable is not available", kind=WorktreeFailureKind.NOT_AVAILABLE
+        )
     request = SandboxedProcessRequest.exec(
-        "git",
+        git_executable,
         args,
         purpose=LocalProcessPurpose.GIT_WORKTREE,
         cwd=cwd,
