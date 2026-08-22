@@ -241,6 +241,10 @@ class WorktreeDomainTests(unittest.TestCase):
                 WorktreeStatus(root / "status", head, detached=True, changed_file_count=-1)
             with self.assertRaises(TypeError):
                 WorktreeStatus(root / "status", head, detached=True, locked=1)  # type: ignore[arg-type]
+            self.assertEqual(
+                GitWorktreeRecord(root / "worker", head, detached=True).path,
+                (root / "worker").resolve(),
+            )
             snapshot = WorktreeSnapshot(
                 worktree_id=WorktreeId("wt-domain"),
                 repository=identity,
@@ -254,7 +258,7 @@ class WorktreeDomainTests(unittest.TestCase):
                 created_at=datetime(2026, 1, 1, tzinfo=UTC),
                 created_by_session_id="session-1",
             )
-            self.assertEqual(snapshot.handle.path, root / "worker")
+            self.assertEqual(snapshot.handle.path, (root / "worker").resolve())
             self.assertEqual(snapshot.handle.base_commit_sha, head)
             with self.assertRaises(ValueError):
                 WorktreeWorkspaceBinding(root / "worker", (root / "worker" / "nested",))

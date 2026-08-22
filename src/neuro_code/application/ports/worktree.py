@@ -73,6 +73,11 @@ class GitWorktreeRecord:
     def __post_init__(self) -> None:
         if not isinstance(self.path, Path) or not self.path.is_absolute():
             raise ValueError("Git worktree record path must be absolute")
+        try:
+            canonical_path = self.path.expanduser().resolve(strict=False)
+        except (OSError, RuntimeError) as error:
+            raise ValueError("Git worktree record path must be canonicalizable") from error
+        object.__setattr__(self, "path", canonical_path)
         if not isinstance(self.head_sha, str) or not self.head_sha:
             raise ValueError("Git worktree record HEAD must be non-empty")
         if self.branch is not None and (not self.branch or "\x00" in self.branch):
