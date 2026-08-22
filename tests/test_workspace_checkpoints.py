@@ -9,6 +9,7 @@ import stat
 import subprocess
 import tempfile
 import unittest
+from contextlib import suppress
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -44,7 +45,12 @@ from neuro_code.domain.checkpoints import (
     WorkspaceProjection,
     workspace_projection_fingerprint,
 )
-from neuro_code.domain.worktree import WorktreeCreateRequest, WorktreeId
+from neuro_code.domain.worktree import (
+    WorktreeCreateRequest,
+    WorktreeId,
+    WorktreeRemoveRequest,
+    WorktreeState,
+)
 from neuro_code.infrastructure.git.worktree import LocalGitWorktreeAdapter
 from neuro_code.infrastructure.persistence.checkpoint_artifacts import (
     LocalCheckpointArtifactStore,
@@ -53,6 +59,7 @@ from neuro_code.infrastructure.persistence.managed_worktrees import SqliteManage
 from neuro_code.infrastructure.persistence.workspace_checkpoints import (
     SqliteWorkspaceCheckpointStore,
 )
+from neuro_code.infrastructure.workspace import checkpoints as workspace_checkpoint_module
 from neuro_code.infrastructure.workspace.checkpoints import (
     LocalWorkspaceStateAdapter,
     _assert_root,
@@ -64,6 +71,7 @@ from neuro_code.infrastructure.workspace.checkpoints import (
     _remove_leaf,
     _safe_relative,
     _safe_target,
+    _write_regular,
 )
 
 
@@ -109,6 +117,216 @@ def _crash_child_start_attempt(database: str, checkpoint_id: str, worktree_id: s
     except BaseException:
         os._exit(1)
     os._exit(0)
+
+
+def _checkpoint_child_components(
+    state_root: Path,
+) -> tuple[
+    WorkspaceCheckpointApplicationService,
+    LocalGitWorktreeAdapter,
+    SqliteWorkspaceCheckpointStore,
+    LocalCheckpointArtifactStore,
+]:
+    adapter = LocalGitWorktreeAdapter(hooks_directory=state_root / "hooks")
+    worktree_store = SqliteManagedWorktreeStore(state_root / "worktrees.db")
+    checkpoint_store = SqliteWorkspaceCheckpointStore(state_root / "checkpoints.db")
+    artifacts = LocalCheckpointArtifactStore(state_root)
+    state_adapter = LocalWorkspaceStateAdapter(git=adapter, workspace_git=adapter)
+    service = WorkspaceCheckpointApplicationService(
+        git=adapter,
+        workspace_git=adapter,
+        worktrees=worktree_store,
+        state=state_adapter,
+        checkpoints=checkpoint_store,
+        artifacts=artifacts,
+    )
+    return service, adapter, checkpoint_store, artifacts
+
+
+def _crash_child_rollback(
+    database: str,
+    state_root: str,
+    checkpoint_id: str,
+    attempt_id: str,
+    phase: str,
+    ready: object,
+) -> None:
+    async def run() -> None:
+        service, adapter, checkpoint_store, _ = _checkpoint_child_components(Path(state_root))
+        await service.initialize()
+        checkpoint = await checkpoint_store.get(CheckpointId(checkpoint_id))
+        assert checkpoint is not None
+
+        if phase == "before-index":
+            original_write_regular = workspace_checkpoint_module._write_regular
+
+            def crash_after_first_write(target: Path, content: bytes, mode: int) -> None:
+                original_write_regular(target, content, mode)
+                ready.set()  # type: ignore[attr-defined]
+                os._exit(0)
+
+            workspace_checkpoint_module._write_regular = crash_after_first_write
+        elif phase == "after-index":
+            original_replace_index = adapter.replace_index
+
+            async def crash_after_index(path: Path, content: bytes) -> None:
+                await original_replace_index(path, content)
+                _write_regular(path / "tracked.txt", b"partial-after-index\n", 0o100644)
+                ready.set()  # type: ignore[attr-defined]
+                os._exit(0)
+
+            adapter.replace_index = crash_after_index
+        elif phase == "after-unlock":
+            original_unlock_worktree = adapter.unlock_worktree
+
+            async def crash_after_unlock(path: Path) -> None:
+                await original_unlock_worktree(path)
+                ready.set()  # type: ignore[attr-defined]
+                os._exit(0)
+
+            adapter.unlock_worktree = crash_after_unlock
+        elif phase == "corrupt-artifact":
+
+            async def corrupt_after_lock(handle: object, projection: object) -> None:
+                del handle, projection
+                manifest = checkpoint.artifact_path / "manifest.json"
+                manifest.write_bytes(manifest.read_bytes() + b"corrupt")
+                ready.set()  # type: ignore[attr-defined]
+                os._exit(0)
+
+            service._state.restore = corrupt_after_lock
+        else:
+            raise ValueError(f"unknown rollback crash phase: {phase}")
+
+        await service.rollback(
+            checkpoint.checkpoint_id,
+            attempt_id=RollbackAttemptId(attempt_id),
+        )
+
+    try:
+        asyncio.run(run())
+    except BaseException:
+        os._exit(1)
+    os._exit(2)
+
+
+def _gated_rollback_child(
+    state_root: str,
+    checkpoint_id: str,
+    attempt_id: str,
+    ready: object,
+    release: object,
+    results: object,
+) -> None:
+    async def run() -> None:
+        service, _, _, _ = _checkpoint_child_components(Path(state_root))
+        await service.initialize()
+        original_restore = service._state.restore
+
+        async def gated_restore(handle: object, projection: object) -> None:
+            ready.set()  # type: ignore[attr-defined]
+            if not release.wait(timeout=30):  # type: ignore[attr-defined]
+                raise RuntimeError("rollback test release timed out")
+            await original_restore(handle, projection)  # type: ignore[arg-type]
+
+        service._state.restore = gated_restore
+        result = await service.rollback(
+            CheckpointId(checkpoint_id),
+            attempt_id=RollbackAttemptId(attempt_id),
+        )
+        results.put(("owner", result.state.value))  # type: ignore[attr-defined]
+
+    try:
+        asyncio.run(run())
+    except BaseException as error:
+        results.put(("unexpected", repr(error)))  # type: ignore[attr-defined]
+
+
+def _rollback_loser_child(
+    state_root: str,
+    checkpoint_id: str,
+    ready: object,
+    results: object,
+) -> None:
+    try:
+        if not ready.wait(timeout=30):  # type: ignore[attr-defined]
+            raise RuntimeError("rollback owner did not acquire its lock")
+        service, _, _, _ = _checkpoint_child_components(Path(state_root))
+        asyncio.run(service.initialize())
+        result = asyncio.run(service.rollback(CheckpointId(checkpoint_id)))
+        results.put(("unexpected-success", result.state.value))  # type: ignore[attr-defined]
+    except WorkspaceCheckpointError as error:
+        results.put(("error", str(error.kind)))  # type: ignore[attr-defined]
+    except BaseException as error:
+        results.put(("unexpected", repr(error)))  # type: ignore[attr-defined]
+
+
+def _remove_loser_child(
+    repository: str,
+    database: str,
+    managed_root: str,
+    hooks_directory: str,
+    worktree_id: str,
+    ready: object,
+    results: object,
+) -> None:
+    try:
+        if not ready.wait(timeout=30):  # type: ignore[attr-defined]
+            raise RuntimeError("rollback owner did not acquire its lock")
+        service = WorktreeApplicationService(
+            git=LocalGitWorktreeAdapter(hooks_directory=Path(hooks_directory)),
+            store=SqliteManagedWorktreeStore(Path(database)),
+            managed_root=Path(managed_root),
+        )
+        asyncio.run(service.initialize())
+        result = asyncio.run(service.remove(WorktreeRemoveRequest(WorktreeId(worktree_id))))
+        results.put(("unexpected-success", result.state.value))  # type: ignore[attr-defined]
+    except WorktreeError as error:
+        results.put(("error", str(error.kind)))  # type: ignore[attr-defined]
+    except BaseException as error:
+        results.put(("unexpected", repr(error)))  # type: ignore[attr-defined]
+
+
+def _remove_wins_child(
+    repository: str,
+    database: str,
+    managed_root: str,
+    hooks_directory: str,
+    worktree_id: str,
+    removed: object,
+    results: object,
+) -> None:
+    try:
+        service = WorktreeApplicationService(
+            git=LocalGitWorktreeAdapter(hooks_directory=Path(hooks_directory)),
+            store=SqliteManagedWorktreeStore(Path(database)),
+            managed_root=Path(managed_root),
+        )
+        asyncio.run(service.initialize())
+        result = asyncio.run(service.remove(WorktreeRemoveRequest(WorktreeId(worktree_id))))
+        results.put(("removed", result.state.value))  # type: ignore[attr-defined]
+        removed.set()  # type: ignore[attr-defined]
+    except BaseException as error:
+        results.put(("unexpected", repr(error)))  # type: ignore[attr-defined]
+
+
+def _rollback_after_remove_child(
+    state_root: str,
+    checkpoint_id: str,
+    removed: object,
+    results: object,
+) -> None:
+    try:
+        if not removed.wait(timeout=30):  # type: ignore[attr-defined]
+            raise RuntimeError("worktree removal did not complete")
+        service, _, _, _ = _checkpoint_child_components(Path(state_root))
+        asyncio.run(service.initialize())
+        result = asyncio.run(service.rollback(CheckpointId(checkpoint_id)))
+        results.put(("unexpected-success", result.state.value))  # type: ignore[attr-defined]
+    except WorkspaceCheckpointError as error:
+        results.put(("error", str(error.kind)))  # type: ignore[attr-defined]
+    except BaseException as error:
+        results.put(("unexpected", repr(error)))  # type: ignore[attr-defined]
 
 
 class _CheckpointFixture:
@@ -168,6 +386,42 @@ class _CheckpointFixture:
 
     def close(self) -> None:
         self.directory.cleanup()
+
+
+def _source_checkout_evidence(fixture: _CheckpointFixture) -> tuple[object, ...]:
+    return (
+        _git(fixture.repository, "rev-parse", "HEAD"),
+        _git(fixture.repository, "symbolic-ref", "--short", "HEAD"),
+        _git(fixture.repository, "status", "--porcelain=v2", "-z"),
+        tuple(
+            (name, (fixture.repository / name).read_bytes())
+            for name in ("tracked.txt", "binary.bin", "deleted.txt")
+        ),
+    )
+
+
+def _prepare_multi_difference_checkpoint(fixture: _CheckpointFixture) -> WorkspaceCheckpoint:
+    target = fixture.target
+    (target / ".gitignore").write_bytes(b"ignored.tmp\n")
+    (target / "tracked.txt").write_bytes(b"checkpoint-A\n")
+    _git(target, "add", "tracked.txt")
+    (target / "binary.bin").write_bytes(b"checkpoint-B\x00\xff")
+    (target / "deleted.txt").unlink()
+    (target / "checkpoint.txt").write_bytes(b"checkpoint-untracked\n")
+    ignored = target / "ignored.tmp"
+    ignored.write_bytes(b"ignored-A")
+
+    checkpoint = _run(fixture.checkpoints.create(CheckpointCreateRequest(fixture.snapshot.handle)))
+
+    (target / ".gitignore").write_bytes(b"ignored.tmp\nchanged\n")
+    (target / "tracked.txt").write_bytes(b"after-A\n")
+    _git(target, "add", "tracked.txt")
+    (target / "binary.bin").write_bytes(b"after-B\x10\x11")
+    (target / "deleted.txt").write_bytes(b"recreated\n")
+    (target / "checkpoint.txt").unlink()
+    (target / "extra-after-checkpoint.txt").write_bytes(b"remove me\n")
+    ignored.write_bytes(b"ignored-B")
+    return checkpoint
 
 
 class WorkspaceCheckpointDomainTests(unittest.TestCase):
@@ -457,6 +711,176 @@ class WorkspaceCheckpointPersistenceTests(unittest.TestCase):
         self.assertIs(results[0].state, RollbackState.COMPLETED)
         self.assertEqual((fixture.target / "tracked.txt").read_bytes(), b"base\n")
 
+    def _assert_real_partial_rollback_crash_converges(
+        self,
+        *,
+        phase: str,
+        attempt_id: str,
+    ) -> None:
+        fixture = _CheckpointFixture()
+        self.addCleanup(fixture.close)
+        source_before = _source_checkout_evidence(fixture)
+        checkpoint = _prepare_multi_difference_checkpoint(fixture)
+        context = multiprocessing.get_context("spawn")
+        ready = context.Event()
+        process = context.Process(
+            target=_crash_child_rollback,
+            args=(
+                str(fixture.checkpoint_store.database_path),
+                str(fixture.state),
+                checkpoint.checkpoint_id.value,
+                attempt_id,
+                phase,
+                ready,
+            ),
+        )
+        process.start()
+        ready_observed = ready.wait(timeout=30)
+        process.join(timeout=30)
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=30)
+        self.assertTrue(ready_observed)
+        self.assertFalse(process.is_alive())
+        self.assertEqual(process.exitcode, 0)
+
+        locked = next(
+            item
+            for item in _run(fixture.adapter.list_worktrees(fixture.repository))
+            if item.path == fixture.target
+        )
+        self.assertTrue(locked.locked)
+        self.assertEqual(locked.lock_reason, f"neuro-code-checkpoint:{attempt_id}")
+
+        results = _run(fixture.checkpoints.reconcile())
+        self.assertEqual(len(results), 1)
+        self.assertIs(results[0].state, RollbackState.COMPLETED)
+        actual = _run(fixture.state_adapter.inspect(fixture.snapshot.handle))
+        self.assertEqual(
+            workspace_projection_fingerprint(fixture.snapshot.handle, actual),
+            checkpoint.source_fingerprint,
+        )
+        self.assertEqual((fixture.target / "ignored.tmp").read_bytes(), b"ignored-B")
+        self.assertEqual(_source_checkout_evidence(fixture), source_before)
+        unlocked = next(
+            item
+            for item in _run(fixture.adapter.list_worktrees(fixture.repository))
+            if item.path == fixture.target
+        )
+        self.assertFalse(unlocked.locked)
+
+    def test_real_partial_destructive_rollback_process_death_before_index_converges(self) -> None:
+        self._assert_real_partial_rollback_crash_converges(
+            phase="before-index",
+            attempt_id="rb-crash-partial-a",
+        )
+
+    def test_real_partial_destructive_rollback_process_death_after_index_converges(self) -> None:
+        self._assert_real_partial_rollback_crash_converges(
+            phase="after-index",
+            attempt_id="rb-crash-partial-b",
+        )
+
+    def test_reconcile_completes_exact_fingerprint_without_rewriting(self) -> None:
+        fixture = _CheckpointFixture()
+        self.addCleanup(fixture.close)
+        source_before = _source_checkout_evidence(fixture)
+        checkpoint = _prepare_multi_difference_checkpoint(fixture)
+        context = multiprocessing.get_context("spawn")
+        ready = context.Event()
+        process = context.Process(
+            target=_crash_child_rollback,
+            args=(
+                str(fixture.checkpoint_store.database_path),
+                str(fixture.state),
+                checkpoint.checkpoint_id.value,
+                "rb-crash-after-unlock",
+                "after-unlock",
+                ready,
+            ),
+        )
+        process.start()
+        ready_observed = ready.wait(timeout=30)
+        process.join(timeout=30)
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=30)
+        self.assertTrue(ready_observed)
+        self.assertFalse(process.is_alive())
+        self.assertEqual(process.exitcode, 0)
+
+        async def unexpected_restore(handle: object, projection: object) -> None:
+            del handle, projection
+            raise AssertionError("exact-fingerprint recovery must not rewrite the worktree")
+
+        with patch.object(fixture.state_adapter, "restore", unexpected_restore):
+            results = _run(fixture.checkpoints.reconcile())
+        self.assertEqual(len(results), 1)
+        self.assertIs(results[0].state, RollbackState.COMPLETED)
+        self.assertEqual(_source_checkout_evidence(fixture), source_before)
+        self.assertEqual((fixture.target / "ignored.tmp").read_bytes(), b"ignored-B")
+
+    def test_active_rollback_artifact_corruption_becomes_indeterminate(self) -> None:
+        fixture = _CheckpointFixture()
+        self.addCleanup(fixture.close)
+
+        def release_owned_lock() -> None:
+            with suppress(OSError, WorktreeError):
+                _run(fixture.adapter.unlock_worktree(fixture.target))
+
+        self.addCleanup(release_owned_lock)
+        source_before = _source_checkout_evidence(fixture)
+        checkpoint = _prepare_multi_difference_checkpoint(fixture)
+        before = _run(fixture.state_adapter.inspect(fixture.snapshot.handle))
+        before_fingerprint = workspace_projection_fingerprint(fixture.snapshot.handle, before)
+        context = multiprocessing.get_context("spawn")
+        ready = context.Event()
+        attempt_id = "rb-artifact-corrupt"
+        process = context.Process(
+            target=_crash_child_rollback,
+            args=(
+                str(fixture.checkpoint_store.database_path),
+                str(fixture.state),
+                checkpoint.checkpoint_id.value,
+                attempt_id,
+                "corrupt-artifact",
+                ready,
+            ),
+        )
+        process.start()
+        ready_observed = ready.wait(timeout=30)
+        process.join(timeout=30)
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=30)
+        self.assertTrue(ready_observed)
+        self.assertFalse(process.is_alive())
+        self.assertEqual(process.exitcode, 0)
+
+        result = _run(fixture.checkpoints.reconcile())
+        self.assertEqual(len(result), 1)
+        self.assertIs(result[0].state, RollbackState.INDETERMINATE)
+        self.assertEqual(result[0].error_kind, str(CheckpointFailureKind.CHECKPOINT_CORRUPT))
+        durable = _run(fixture.checkpoint_store.get_attempt(RollbackAttemptId(attempt_id)))
+        self.assertIsNotNone(durable)
+        assert durable is not None
+        self.assertIs(durable.state, RollbackState.INDETERMINATE)
+        self.assertEqual(durable.error_kind, str(CheckpointFailureKind.CHECKPOINT_CORRUPT))
+        locked = next(
+            item
+            for item in _run(fixture.adapter.list_worktrees(fixture.repository))
+            if item.path == fixture.target
+        )
+        self.assertTrue(locked.locked)
+        self.assertEqual(locked.lock_reason, f"neuro-code-checkpoint:{attempt_id}")
+        after = _run(fixture.state_adapter.inspect(fixture.snapshot.handle))
+        self.assertEqual(
+            workspace_projection_fingerprint(fixture.snapshot.handle, after),
+            before_fingerprint,
+        )
+        self.assertEqual((fixture.target / "ignored.tmp").read_bytes(), b"ignored-B")
+        self.assertEqual(_source_checkout_evidence(fixture), source_before)
+
     def test_malformed_schema_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory(prefix="neuro-checkpoint-schema-") as directory:
             path = Path(directory) / "checkpoints.db"
@@ -486,6 +910,193 @@ class WorkspaceCheckpointPersistenceTests(unittest.TestCase):
         self.assertNotIn(str(fixture.repository), rendered)
         for entry in manifest["projection"]["entries"]:
             self.assertFalse(Path(entry["path"]).is_absolute())
+
+
+class WorkspaceCheckpointCrossProcessRaceTests(unittest.TestCase):
+    def test_cross_process_rollback_rollback_has_one_destructive_owner(self) -> None:
+        fixture = _CheckpointFixture()
+        self.addCleanup(fixture.close)
+        source_before = _source_checkout_evidence(fixture)
+        checkpoint = _prepare_multi_difference_checkpoint(fixture)
+        context = multiprocessing.get_context("spawn")
+        ready = context.Event()
+        release = context.Event()
+        results = context.Queue()
+        owner = context.Process(
+            target=_gated_rollback_child,
+            args=(
+                str(fixture.state),
+                checkpoint.checkpoint_id.value,
+                "rb-cross-owner",
+                ready,
+                release,
+                results,
+            ),
+        )
+        loser = context.Process(
+            target=_rollback_loser_child,
+            args=(str(fixture.state), checkpoint.checkpoint_id.value, ready, results),
+        )
+        owner.start()
+        loser.start()
+        try:
+            self.assertTrue(ready.wait(timeout=30))
+            loser.join(timeout=30)
+            if loser.is_alive():
+                loser.terminate()
+                loser.join(timeout=30)
+            self.assertFalse(loser.is_alive())
+            self.assertEqual(loser.exitcode, 0)
+            self.assertEqual(results.get(timeout=5), ("error", CheckpointFailureKind.LOCKED.value))
+        finally:
+            release.set()
+            owner.join(timeout=45)
+            if owner.is_alive():
+                owner.terminate()
+                owner.join(timeout=30)
+        self.assertFalse(owner.is_alive())
+        self.assertEqual(owner.exitcode, 0)
+        self.assertEqual(results.get(timeout=5), ("owner", RollbackState.COMPLETED.value))
+
+        attempt = _run(fixture.checkpoint_store.get_attempt(RollbackAttemptId("rb-cross-owner")))
+        self.assertIsNotNone(attempt)
+        assert attempt is not None
+        self.assertIs(attempt.state, RollbackState.COMPLETED)
+        self.assertIsNone(
+            _run(fixture.checkpoint_store.active_attempt(fixture.snapshot.worktree_id.value))
+        )
+        actual = _run(fixture.state_adapter.inspect(fixture.snapshot.handle))
+        self.assertEqual(
+            workspace_projection_fingerprint(fixture.snapshot.handle, actual),
+            checkpoint.source_fingerprint,
+        )
+        self.assertEqual(_source_checkout_evidence(fixture), source_before)
+
+    def test_cross_process_rollback_remove_race_keeps_rollback_lock_winner(self) -> None:
+        fixture = _CheckpointFixture()
+        self.addCleanup(fixture.close)
+        source_before = _source_checkout_evidence(fixture)
+        checkpoint = _prepare_multi_difference_checkpoint(fixture)
+        context = multiprocessing.get_context("spawn")
+        ready = context.Event()
+        release = context.Event()
+        results = context.Queue()
+        owner = context.Process(
+            target=_gated_rollback_child,
+            args=(
+                str(fixture.state),
+                checkpoint.checkpoint_id.value,
+                "rb-cross-remove-owner",
+                ready,
+                release,
+                results,
+            ),
+        )
+        remover = context.Process(
+            target=_remove_loser_child,
+            args=(
+                str(fixture.repository),
+                str(fixture.worktree_store.database_path),
+                str(fixture.state / "worktrees"),
+                str(fixture.state / "hooks"),
+                fixture.snapshot.worktree_id.value,
+                ready,
+                results,
+            ),
+        )
+        owner.start()
+        remover.start()
+        try:
+            self.assertTrue(ready.wait(timeout=30))
+            remover.join(timeout=30)
+            if remover.is_alive():
+                remover.terminate()
+                remover.join(timeout=30)
+            self.assertFalse(remover.is_alive())
+            self.assertEqual(remover.exitcode, 0)
+            self.assertEqual(results.get(timeout=5), ("error", "locked"))
+        finally:
+            release.set()
+            owner.join(timeout=45)
+            if owner.is_alive():
+                owner.terminate()
+                owner.join(timeout=30)
+        self.assertFalse(owner.is_alive())
+        self.assertEqual(owner.exitcode, 0)
+        self.assertEqual(
+            results.get(timeout=5),
+            ("owner", RollbackState.COMPLETED.value),
+        )
+
+        managed = _run(fixture.worktrees.inspect(fixture.snapshot.worktree_id.value))
+        self.assertIs(managed.state, WorktreeState.READY)
+        actual = _run(fixture.state_adapter.inspect(fixture.snapshot.handle))
+        self.assertEqual(
+            workspace_projection_fingerprint(fixture.snapshot.handle, actual),
+            checkpoint.source_fingerprint,
+        )
+        self.assertEqual(_source_checkout_evidence(fixture), source_before)
+        record = next(
+            item
+            for item in _run(fixture.adapter.list_worktrees(fixture.repository))
+            if item.path == fixture.target
+        )
+        self.assertFalse(record.locked)
+
+    def test_cross_process_remove_wins_before_rollback_ownership(self) -> None:
+        fixture = _CheckpointFixture()
+        self.addCleanup(fixture.close)
+        source_before = _source_checkout_evidence(fixture)
+        checkpoint = _run(
+            fixture.checkpoints.create(CheckpointCreateRequest(fixture.snapshot.handle))
+        )
+        context = multiprocessing.get_context("spawn")
+        removed = context.Event()
+        results = context.Queue()
+        remover = context.Process(
+            target=_remove_wins_child,
+            args=(
+                str(fixture.repository),
+                str(fixture.worktree_store.database_path),
+                str(fixture.state / "worktrees"),
+                str(fixture.state / "hooks"),
+                fixture.snapshot.worktree_id.value,
+                removed,
+                results,
+            ),
+        )
+        rollbacker = context.Process(
+            target=_rollback_after_remove_child,
+            args=(str(fixture.state), checkpoint.checkpoint_id.value, removed, results),
+        )
+        remover.start()
+        rollbacker.start()
+        remover.join(timeout=45)
+        rollbacker.join(timeout=45)
+        if remover.is_alive():
+            remover.terminate()
+            remover.join(timeout=30)
+        if rollbacker.is_alive():
+            rollbacker.terminate()
+            rollbacker.join(timeout=30)
+        self.assertFalse(remover.is_alive())
+        self.assertFalse(rollbacker.is_alive())
+        self.assertEqual(remover.exitcode, 0)
+        self.assertEqual(rollbacker.exitcode, 0)
+        outcomes = {results.get(timeout=5), results.get(timeout=5)}
+        self.assertIn(("removed", WorktreeState.REMOVED.value), outcomes)
+        self.assertIn(
+            ("error", CheckpointFailureKind.IDENTITY_MISMATCH.value),
+            outcomes,
+        )
+        self.assertIsNone(
+            _run(fixture.checkpoint_store.active_attempt(fixture.snapshot.worktree_id.value))
+        )
+        final = _run(fixture.worktree_store.get(fixture.snapshot.worktree_id.value))
+        self.assertIsNotNone(final)
+        assert final is not None
+        self.assertIs(final.state, WorktreeState.REMOVED)
+        self.assertEqual(_source_checkout_evidence(fixture), source_before)
 
 
 class WorkspaceCheckpointBoundaryTests(unittest.TestCase):
@@ -1432,7 +2043,7 @@ class WorkspaceCheckpointServiceBoundaryTests(unittest.TestCase):
             patch.object(
                 fixture.state_adapter,
                 "inspect",
-                side_effect=(projection, wrong_projection),
+                side_effect=(wrong_projection, projection, wrong_projection),
             ),
             self.assertRaises(WorkspaceCheckpointError) as raised,
         ):

@@ -330,9 +330,11 @@ class WorkspaceCheckpointApplicationService:
                         snapshot,
                         active_attempt,
                     )
-                except WorkspaceCheckpointError:
+                except WorkspaceCheckpointError as error:
                     latest = await self._checkpoints.get_attempt(active.attempt_id)
-                    result = latest or active_attempt
+                    if latest is None:
+                        raise error
+                    result = await self._record_indeterminate(latest, error)
                 results.append(result)
         return tuple(results)
 
@@ -409,6 +411,7 @@ class WorkspaceCheckpointApplicationService:
         attempt: RollbackAttempt,
     ) -> RollbackAttempt:
         reason = f"neuro-code-checkpoint:{attempt.attempt_id.value}"
+        destructive_started = False
         try:
             _, status = await self._prove_handle(snapshot.handle, allow_lock_reason=reason)
             if status.head_sha != checkpoint.head_sha:
@@ -418,14 +421,32 @@ class WorkspaceCheckpointApplicationService:
                 )
             if not status.locked:
                 await self._workspace_git.lock_worktree(snapshot.canonical_path, reason)
+                destructive_started = True
                 _, status = await self._prove_handle(snapshot.handle, allow_lock_reason=reason)
-            await self._state.restore(snapshot.handle, projection)
+            else:
+                # An existing lock with this exact attempt reason means a
+                # previous owner may already have entered the destructive
+                # phase before dying.
+                destructive_started = True
             actual = await self._state.inspect(snapshot.handle)
             actual_fingerprint = workspace_projection_fingerprint(snapshot.handle, actual)
+            if actual_fingerprint != checkpoint.source_fingerprint:
+                await self._state.restore(snapshot.handle, projection)
+                actual = await self._state.inspect(snapshot.handle)
+                actual_fingerprint = workspace_projection_fingerprint(snapshot.handle, actual)
             if actual_fingerprint != checkpoint.source_fingerprint:
                 raise WorkspaceCheckpointError(
                     "rollback final workspace fingerprint does not match checkpoint",
                     kind=CheckpointFailureKind.ROLLBACK_VERIFICATION_FAILED,
+                )
+            _, final_status = await self._prove_handle(
+                snapshot.handle,
+                allow_lock_reason=reason,
+            )
+            if not final_status.locked:
+                raise WorkspaceCheckpointError(
+                    "managed worktree rollback lock disappeared before completion",
+                    kind=CheckpointFailureKind.LOCKED,
                 )
             await self._workspace_git.unlock_worktree(snapshot.canonical_path)
             completed = replace(
@@ -441,7 +462,7 @@ class WorkspaceCheckpointApplicationService:
                 expected_state=attempt.state,
             )
         except WorkspaceCheckpointError as error:
-            return await self._mark_attempt_failure(attempt, error)
+            return await self._mark_attempt_failure(attempt, error, destructive_started)
         except WorktreeError as error:
             wrapped = WorkspaceCheckpointError(
                 "managed worktree rollback Git boundary failed",
@@ -451,16 +472,18 @@ class WorkspaceCheckpointApplicationService:
                     else CheckpointFailureKind.COMMAND_FAILED
                 ),
             )
-            return await self._mark_attempt_failure(attempt, wrapped)
+            return await self._mark_attempt_failure(attempt, wrapped, destructive_started)
 
     async def _mark_attempt_failure(
         self,
         attempt: RollbackAttempt,
         error: WorkspaceCheckpointError,
+        destructive_started: bool = False,
     ) -> RollbackAttempt:
         state = (
             RollbackState.FAILED
-            if error.kind
+            if not destructive_started
+            and error.kind
             in {
                 CheckpointFailureKind.HEAD_MISMATCH,
                 CheckpointFailureKind.LOCKED,
@@ -481,6 +504,30 @@ class WorkspaceCheckpointApplicationService:
             if updated is None:
                 raise error from None
         raise error
+
+    async def _record_indeterminate(
+        self,
+        attempt: RollbackAttempt,
+        error: WorkspaceCheckpointError,
+    ) -> RollbackAttempt:
+        """Persist uncertainty without touching a potentially protected worktree."""
+
+        indeterminate = replace(
+            attempt,
+            state=RollbackState.INDETERMINATE,
+            error_kind=str(error.kind),
+        )
+        try:
+            return await self._checkpoints.compare_and_transition_attempt(
+                indeterminate,
+                expected_version=attempt.version,
+                expected_state=attempt.state,
+            )
+        except WorkspaceCheckpointError:
+            latest = await self._checkpoints.get_attempt(attempt.attempt_id)
+            if latest is None:
+                raise error from None
+            return latest
 
     async def _prove_handle(
         self,

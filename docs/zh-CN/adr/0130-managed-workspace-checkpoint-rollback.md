@@ -109,8 +109,47 @@ partial restore、lock/index 结果不确定、start 后 artifact issue 或 fina
 重启时检查 durable `STARTED`/`INDETERMINATE` attempt。存活 owner 仍受保护；死亡 owner 只有
 在 worktree identity、exact HEAD 和 artifact integrity 仍然证明安全时，才可通过 CAS claim
 并 retry。如果 target fingerprint 已经存在，恢复可以在不重写 source content 的情况下完成
-attempt。并发 stale writer 由 SQLite generation CAS 失败；同一 worktree 的两个 rollback
-attempt 只有一个确定性的 durable winner。
+attempt。active attempt 的 artifact verification 失败会持久化为 `INDETERMINATE`；恢复不执行
+restore，也不释放已有的 Neuro-owned protective lock，直到后续显式 resolution。并发 stale
+writer 由 SQLite generation CAS 失败；同一 worktree 的两个 rollback attempt 只有一个确定性的
+durable winner。
+
+恢复测试使用真实 child process 在 exact-leaf effect 之后和 index replacement 之后退出，再由
+正常 `reconcile()` 路径收敛到 target fingerprint。真实进程 race 证明 rollback/rollback 只有
+一个 destructive owner，rollback/remove containment 由 Git worktree lock 强制。取得 owned lock
+之后发现的不确定性绝不会被终态化为干净的 `FAILED`。
+
+## 恢复状态矩阵
+
+| Case | Durable state 与观察结果 | 恢复行为 | 结果 |
+| --- | --- | --- | --- |
+| A | `STARTED`、没有 mutation、owner 已死亡、artifact 有效 | 使用 CAS claim，证明 identity/HEAD/lock，再 restore 与 verify | `COMPLETED` |
+| B | `STARTED`、file 或 leaf 已部分恢复、index 仍旧、owner 已死亡、artifact 有效 | 使用 CAS claim，继续执行幂等 restore path | `COMPLETED`，exact target fingerprint |
+| C | `STARTED`、index 已恢复但 workspace leaf 仍部分不一致、owner 已死亡、artifact 有效 | 使用 CAS claim，继续执行幂等 restore path | `COMPLETED`，exact target fingerprint |
+| D | `STARTED` 或 `INDETERMINATE`、artifact 损坏 | 持久化 `INDETERMINATE`；不 restore、不把 artifact 标记为 healthy、不移除 worktree、不释放 owned protective lock | Durable `INDETERMINATE` |
+| E | workspace fingerprint 已等于 target，但尚未持久化 `COMPLETED` | 不重写 source content，完成 verify，只释放 exact owned lock | `COMPLETED` |
+| F | 存在 external lock | 在 destructive attempt 开始前失败关闭；永不解锁 external owner | typed `LOCKED` failure |
+
+## 不变量
+
+| 不变量 | 本切片状态 |
+| --- | --- |
+| 只有 READY、managed、identity-proven worktree 才能成为 target | PROVEN：service 与 adversarial tests |
+| Capture 不修改 source checkout 或 managed worktree | PROVEN：real Git tests |
+| READY checkpoint 不可变且 integrity/bound 有界 | PROVEN：insert-only/CAS/artifact tests |
+| Rollback 恢复完整声明投影并校验 fingerprint | PROVEN：staged/unstaged、deletion、binary、mode、symlink、untracked cases |
+| Ignored files 不被修改 | PROVEN：before/after ignored-file tests |
+| 不使用 broad clean 或任意 recursive deletion | PROVEN：exact-leaf adapter 与 tests |
+| 崩溃恢复不能伪造成功 | PROVEN：真实 child process 在 destructive effect 前后退出的测试 |
+| active rollback artifact corruption 持久化为 INDETERMINATE | PROVEN：corrupt-after-lock restart/reconcile tests |
+| destructive uncertainty 不会被终态化为干净 FAILED | PROVEN：owned-lock 与 final-verification failure tests |
+| 并发 writer 不会回退 durable record | PROVEN：SQLite CAS 与 active-worktree uniqueness |
+| rollback/rollback 只有一个跨进程 destructive owner | PROVEN：multiprocessing race tests |
+| rollback 不会失控地与 managed removal 竞争 | PROVEN：multiprocessing rollback/remove race tests |
+| Neuro-owned rollback lock 只有在 COMPLETED 后释放 | PROVEN：lock retention/cleanup tests |
+| 没有新的面向模型 external execution surface | PROVEN：composition-only wiring |
+| Source checkout 保持不变 | PROVEN：dirty/source preservation tests |
+| Core lifecycle platform-aware 且 fail-closed | Linux real-Git path covered；macOS/Windows exact-head CI required |
 
 ## 不实现
 

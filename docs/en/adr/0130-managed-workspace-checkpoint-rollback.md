@@ -127,9 +127,30 @@ On restart, durable `STARTED`/`INDETERMINATE` attempts are inspected. A live
 owner remains protected; a dead owner can be claimed with CAS and retried only
 when the worktree identity, exact HEAD, and artifact integrity still prove
 safe. If the target fingerprint is already present, recovery finalizes the
-attempt without rewriting source content. Concurrent stale writers lose by
-SQLite generation CAS; two rollback attempts for one worktree have one
+attempt without rewriting source content. An artifact verification failure for
+an active attempt is recorded durably as `INDETERMINATE`; recovery performs no
+restore and does not release an existing Neuro-owned protective lock. The lock
+is released only by an explicit later resolution. Concurrent stale writers
+lose by SQLite generation CAS; two rollback attempts for one worktree have one
 deterministic durable winner.
+
+The recovery tests exercise real child-process death after exact-leaf effects
+and after index replacement, then use the normal `reconcile()` path to converge
+to the target fingerprint. Real process races prove that rollback/rollback has
+one destructive owner and that rollback/remove containment is enforced by the
+Git worktree lock. An uncertainty discovered after the owned lock is acquired
+is never terminalized as a clean `FAILED` result.
+
+### Recovery state matrix
+
+| Case | Durable state and observation | Recovery behavior | Result |
+| --- | --- | --- | --- |
+| A | `STARTED`, no mutation, owner dead, artifact valid | Claim with CAS, prove identity/HEAD/lock, restore and verify | `COMPLETED` |
+| B | `STARTED`, files or leaves partially restored, index old, owner dead, artifact valid | Claim with CAS and continue through the idempotent restore path | `COMPLETED` with exact target fingerprint |
+| C | `STARTED`, index restored but workspace leaves remain partial, owner dead, artifact valid | Claim with CAS and continue through the idempotent restore path | `COMPLETED` with exact target fingerprint |
+| D | `STARTED` or `INDETERMINATE`, artifact corrupt | Persist `INDETERMINATE`; do not restore, mark the artifact healthy, remove the worktree, or release an owned protective lock | Durable `INDETERMINATE` |
+| E | Workspace fingerprint already equals target; `COMPLETED` not persisted | Verify without rewriting source content, then release only the exact owned lock | `COMPLETED` |
+| F | External lock is present | Fail closed before starting a destructive attempt; never unlock the external owner | Typed `LOCKED` failure |
 
 ## Invariants
 
@@ -141,9 +162,13 @@ deterministic durable winner.
 | Rollback restores the complete declared projection and verifies fingerprint | PROVEN for staged/unstaged, deletion, binary, mode, symlink, and untracked cases |
 | Ignored files are untouched | PROVEN by before/after ignored-file tests |
 | No broad clean or arbitrary recursive deletion | PROVEN by exact-leaf adapter design and tests |
-| Crash recovery cannot claim false success | PROVEN by durable attempt states and verification path |
+| Crash recovery cannot claim false success | PROVEN by real child-process death before and after destructive effects |
+| Active rollback artifact corruption becomes durable `INDETERMINATE` | PROVEN by corrupt-after-lock restart/reconcile tests |
+| Destructive uncertainty is not terminalized as clean `FAILED` | PROVEN by owned-lock and final-verification failure tests |
 | Concurrent writers cannot regress a durable record | PROVEN by SQLite CAS and active-worktree uniqueness |
-| Rollback cannot race managed removal uncontrolled | PROVEN by the Neuro Code Git worktree lock |
+| Rollback/rollback has one cross-process destructive owner | PROVEN by multiprocessing race tests |
+| Rollback cannot race managed removal uncontrolled | PROVEN by multiprocessing rollback/remove race tests |
+| A Neuro-owned rollback lock is released only after `COMPLETED` | PROVEN by lock retention/cleanup tests |
 | No new model-facing external execution surface | PROVEN by explicit composition-only wiring |
 | Source checkout remains unchanged | PROVEN by dirty/source preservation tests |
 | Core lifecycle is platform-aware and fail-closed | Linux real-Git path covered; macOS/Windows exact-head CI is required |
