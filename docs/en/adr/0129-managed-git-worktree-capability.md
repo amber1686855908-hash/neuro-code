@@ -78,9 +78,10 @@ tree and evaluates its attributes with `check-attr`; an applicable
 
 The adapter uses `git rev-parse` for repository and immutable base-commit
 identity, `git check-ref-format` for branch validation, and
-`git worktree list --porcelain -z` for NUL-safe typed parsing. Git 2.30 or
-newer is required because revision resolution uses `rev-parse
---end-of-options`; older versions fail closed.
+`git worktree list --porcelain -z` for NUL-safe typed parsing. Git 2.40.0 or
+newer is required because filter preflight uses
+`git check-attr --source=<tree-ish>`; older versions fail closed. Revision
+resolution also uses `rev-parse --end-of-options`.
 
 ### Creation
 

@@ -68,7 +68,8 @@ branch。默认 managed branch namespace 为 `neuro/worktree/<id>`。
 适配器用 `git rev-parse` 获取仓库和不可变 base commit 身份，用 `git check-ref-format` 校验
 branch，并用 `git worktree list --porcelain -z` 进行 NUL-safe 类型化解析。它不调用 fetch、
 pull、push、clone 或 prune。由于 revision resolution 使用 `rev-parse --end-of-options`，
-要求 Git 2.30 或更高版本；更低版本失败关闭。
+并且 filter preflight 使用 `git check-attr --source=<tree-ish>`，要求 Git 2.40.0 或更高版本；
+更低版本失败关闭。
 
 ### 创建
 

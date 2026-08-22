@@ -27,7 +27,7 @@ from neuro_code.domain.worktree import (
 MAX_GIT_ERROR_BYTES = 1_000
 MAX_GIT_OUTPUT_BYTES = 1_000_000
 MAX_GIT_COMMAND_TIMEOUT_SECONDS = 120.0
-MINIMUM_GIT_VERSION = (2, 30, 0)
+MINIMUM_GIT_VERSION = (2, 40, 0)
 
 
 class WorktreeFailureKind(StrEnum):

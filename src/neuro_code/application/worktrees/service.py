@@ -126,7 +126,7 @@ class WorktreeApplicationService:
         version = await self._git.git_version()
         if version < MINIMUM_GIT_VERSION:
             raise WorktreeError(
-                "installed Git does not support worktree lifecycle operations",
+                "installed Git must be >= 2.40.0 for managed worktree lifecycle operations",
                 kind=WorktreeFailureKind.NOT_AVAILABLE,
             )
         self._initialized = True

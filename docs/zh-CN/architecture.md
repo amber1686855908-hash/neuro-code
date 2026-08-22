@@ -1572,6 +1572,8 @@ worktree binding 不继承 additional workspace roots。
 仍不存在：不执行 fetch/pull/push/clone 或全仓库 prune。移除要求 durable managed ownership
 以及匹配的 repository/path/HEAD/branch identity，并使用不带 `--force` 的 `git worktree remove`；
 dirty 和 locked worktree 拒绝移除，managed branch 则保留。
+受管 worktree capability 要求 Git 2.40.0 或更高版本，因为 fail-closed filter preflight
+依赖 `git check-attr --source=<tree-ish>`；更低版本会在初始化时被拒绝。
 
 SQLite intent 与 Git metadata 不被当作一个事务。worktree schema 使用 insert-only ownership
 claim 和持久化 generation CAS：`WorktreeId` conflict 不能覆盖已有 row，canonical path 仍保持

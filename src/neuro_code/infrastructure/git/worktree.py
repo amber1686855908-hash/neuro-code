@@ -666,7 +666,8 @@ class LocalGitWorktreeAdapter:
         version = (major, minor, patch)
         if version < MINIMUM_GIT_VERSION:
             raise WorktreeError(
-                "installed Git does not support worktrees", kind=WorktreeFailureKind.NOT_AVAILABLE
+                "installed Git must be >= 2.40.0 for managed worktree operations",
+                kind=WorktreeFailureKind.NOT_AVAILABLE,
             )
         return version
 

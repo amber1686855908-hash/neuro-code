@@ -20,6 +20,7 @@ from neuro_code.application.ports.workspace import (
 )
 from neuro_code.application.ports.worktree import (
     MAX_GIT_OUTPUT_BYTES,
+    MINIMUM_GIT_VERSION,
     GitWorktreeRecord,
     WorktreeError,
     WorktreeFailureKind,
@@ -770,6 +771,34 @@ class WorktreeApplicationTests(unittest.TestCase):
             with self.assertRaises(WorktreeError) as no_handle:
                 _run(service.get_handle(ready.worktree_id.value))
             self.assertEqual(no_handle.exception.kind, WorktreeFailureKind.FAILED_STATE)
+
+    def test_initialize_enforces_exact_minimum_git_version(self) -> None:
+        self.assertEqual(MINIMUM_GIT_VERSION, (2, 40, 0))
+
+        for version, accepted in (((2, 39, 5), False), ((2, 40, 0), True)):
+            with self.subTest(git_version=version):
+
+                class _VersionedGit:
+                    def __init__(self, version: tuple[int, int, int]) -> None:
+                        self._version = version
+
+                    async def git_version(self) -> tuple[int, int, int]:
+                        return self._version
+
+                with tempfile.TemporaryDirectory(prefix="neuro-worktree-version-") as raw:
+                    root = Path(raw)
+                    service = WorktreeApplicationService(
+                        git=_VersionedGit(version),  # type: ignore[arg-type]
+                        store=SqliteManagedWorktreeStore(root / "state" / "worktrees.db"),
+                        managed_root=root / "state" / "worktrees",
+                    )
+                    if accepted:
+                        _run(service.initialize())
+                        continue
+
+                    with self.assertRaises(WorktreeError) as error:
+                        _run(service.initialize())
+                    self.assertEqual(error.exception.kind, WorktreeFailureKind.NOT_AVAILABLE)
 
     def test_initialize_rejects_unsupported_git_version(self) -> None:
         class _OldGit:

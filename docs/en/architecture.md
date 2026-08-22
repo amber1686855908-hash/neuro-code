@@ -2248,6 +2248,9 @@ absent: it performs no fetch/pull/push/clone or repo-wide prune. Removal
 requires durable managed ownership plus matching repository/path/HEAD/branch
 identity and uses `git worktree remove` without `--force`; dirty and locked
 worktrees refuse removal, while managed branches are retained.
+The managed worktree capability requires Git 2.40.0 or newer because its
+fail-closed filter preflight relies on `git check-attr --source=<tree-ish>`;
+older Git is rejected during initialization.
 
 SQLite intent and Git metadata are not treated as one transaction. The
 worktree schema uses an insert-only ownership claim plus a durable generation
