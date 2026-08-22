@@ -15,6 +15,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from neuro_code.application.checkpoints import WorkspaceCheckpointApplicationService
+from neuro_code.application.checkpoints import service as checkpoint_service
 from neuro_code.application.checkpoints.service import _owner_is_alive
 from neuro_code.application.ports.checkpoints import (
     MAX_CHECKPOINT_MANIFEST_BYTES,
@@ -221,6 +222,10 @@ class WorkspaceCheckpointIntegrationTests(unittest.TestCase):
         ignored.write_bytes(b"ignored-A")
         script = target / "script.sh"
         script.chmod(0o755)
+        if os.name == "nt":
+            # Windows does not expose POSIX execute bits through chmod/stat;
+            # exercise the equivalent durable Git-index mode instead.
+            _git(target, "update-index", "--chmod=+x", "script.sh")
         symlink = target / "untracked-link"
         try:
             symlink.symlink_to("tracked.txt")
@@ -240,6 +245,8 @@ class WorkspaceCheckpointIntegrationTests(unittest.TestCase):
         (target / "new-after-checkpoint.txt").write_text("remove me", encoding="utf-8")
         ignored.write_bytes(b"ignored-B")
         script.chmod(0o644)
+        if os.name == "nt":
+            _git(target, "update-index", "--chmod=-x", "script.sh")
         (target / "deleted.txt").write_bytes(b"recreated")
 
         result = _run(fixture.checkpoints.rollback(checkpoint.checkpoint_id))
@@ -249,7 +256,12 @@ class WorkspaceCheckpointIntegrationTests(unittest.TestCase):
         self.assertFalse((target / "deleted.txt").exists())
         self.assertFalse((target / "new-after-checkpoint.txt").exists())
         self.assertEqual(ignored.read_bytes(), b"ignored-B")
-        self.assertTrue(script.stat().st_mode & stat.S_IXUSR)
+        if os.name == "nt":
+            self.assertTrue(
+                _git(target, "ls-files", "--stage", "--", "script.sh").startswith("100755 ")
+            )
+        else:
+            self.assertTrue(script.stat().st_mode & stat.S_IXUSR)
         self.assertTrue(symlink.is_symlink())
         self.assertEqual(os.readlink(symlink), "tracked.txt")
         self.assertIn("staged", _git(target, "diff", "--cached", "--", "tracked.txt"))
@@ -1458,6 +1470,47 @@ class WorkspaceCheckpointServiceBoundaryTests(unittest.TestCase):
         ):
             _run(lock_fixture.checkpoints.rollback(checkpoint_2.checkpoint_id))
         self.assertEqual(raised.exception.kind, CheckpointFailureKind.COMMAND_FAILED)
+
+    def test_windows_owner_probe_uses_process_handle_state(self) -> None:
+        class _FakeFunction:
+            def __init__(self, result: object) -> None:
+                self.result = result
+
+            def __call__(self, *arguments: object) -> object:
+                del arguments
+                return self.result
+
+        class _FakeKernel32:
+            def __init__(self, handle: object, wait_result: int) -> None:
+                self.OpenProcess = _FakeFunction(handle)
+                self.WaitForSingleObject = _FakeFunction(wait_result)
+                self.CloseHandle = _FakeFunction(1)
+
+        cases = (
+            (1, checkpoint_service._WAIT_TIMEOUT, 0, True),
+            (1, checkpoint_service._WAIT_OBJECT_0, 0, False),
+            (None, 0, checkpoint_service._ERROR_FILE_NOT_FOUND, False),
+            (None, 0, 5, True),
+        )
+        for handle, wait_result, last_error, expected in cases:
+            with self.subTest(handle=handle, wait_result=wait_result, last_error=last_error):
+                kernel32 = _FakeKernel32(handle, wait_result)
+                with (
+                    patch.object(checkpoint_service.os, "name", "nt"),
+                    patch.object(
+                        checkpoint_service.ctypes,
+                        "WinDLL",
+                        return_value=kernel32,
+                        create=True,
+                    ),
+                    patch.object(
+                        checkpoint_service.ctypes,
+                        "get_last_error",
+                        return_value=last_error,
+                        create=True,
+                    ),
+                ):
+                    self.assertEqual(_owner_is_alive(1234), expected)
 
     def test_service_ownership_and_capture_timeout_guards(self) -> None:
         fixture = _CheckpointFixture()
