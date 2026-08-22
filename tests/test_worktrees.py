@@ -3,9 +3,11 @@ from __future__ import annotations
 import asyncio
 import multiprocessing
 import os
+import sqlite3
 import subprocess
 import tempfile
 import unittest
+from contextlib import suppress
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -76,6 +78,12 @@ def _new_repository(root: Path) -> tuple[Path, str]:
     return repository, _git(repository, "rev-parse", "HEAD")
 
 
+def _write_executable(path: Path, content: str) -> None:
+    path.write_text(content, encoding="utf-8")
+    with suppress(OSError):
+        path.chmod(0o755)
+
+
 def _run(coroutine: object) -> object:
     return asyncio.run(coroutine)  # type: ignore[arg-type]
 
@@ -101,6 +109,75 @@ def _crash_child_remove(repository: str, target: str) -> None:
     except BaseException:
         os._exit(1)
     os._exit(0)
+
+
+def _cross_process_create(
+    repository: str,
+    database: str,
+    managed_root: str,
+    hooks_directory: str,
+    worktree_id: str,
+    barrier: multiprocessing.Barrier,
+    results: object,
+) -> None:
+    service = WorktreeApplicationService(
+        git=LocalGitWorktreeAdapter(hooks_directory=Path(hooks_directory)),
+        store=SqliteManagedWorktreeStore(Path(database)),
+        managed_root=Path(managed_root),
+        id_factory=lambda: WorktreeId(worktree_id),
+    )
+    try:
+        asyncio.run(service.initialize())
+        barrier.wait(timeout=30)
+        snapshot = asyncio.run(service.create(WorktreeCreateRequest(Path(repository), "HEAD")))
+        results.put(("ok", snapshot.state.value, snapshot.version))  # type: ignore[attr-defined]
+    except WorktreeError as error:
+        results.put(("error", error.kind.value))  # type: ignore[attr-defined]
+    except BaseException as error:
+        results.put(("unexpected", repr(error)))  # type: ignore[attr-defined]
+
+
+def _cross_process_store_insert(
+    database: str,
+    snapshot: WorktreeSnapshot,
+    barrier: multiprocessing.Barrier,
+    results: object,
+) -> None:
+    store = SqliteManagedWorktreeStore(Path(database))
+    try:
+        asyncio.run(store.initialize())
+        barrier.wait(timeout=30)
+        inserted = asyncio.run(store.insert_intent(snapshot))
+        results.put(("ok", inserted.worktree_id.value))  # type: ignore[attr-defined]
+    except WorktreeError as error:
+        results.put(("error", error.kind.value))  # type: ignore[attr-defined]
+    except BaseException as error:
+        results.put(("unexpected", repr(error)))  # type: ignore[attr-defined]
+
+
+def _cross_process_remove(
+    repository: str,
+    database: str,
+    managed_root: str,
+    hooks_directory: str,
+    worktree_id: str,
+    barrier: multiprocessing.Barrier,
+    results: object,
+) -> None:
+    service = WorktreeApplicationService(
+        git=LocalGitWorktreeAdapter(hooks_directory=Path(hooks_directory)),
+        store=SqliteManagedWorktreeStore(Path(database)),
+        managed_root=Path(managed_root),
+    )
+    try:
+        asyncio.run(service.initialize())
+        barrier.wait(timeout=30)
+        snapshot = asyncio.run(service.remove(WorktreeRemoveRequest(WorktreeId(worktree_id))))
+        results.put(("ok", snapshot.state.value, snapshot.version))  # type: ignore[attr-defined]
+    except WorktreeError as error:
+        results.put(("error", error.kind.value))  # type: ignore[attr-defined]
+    except BaseException as error:
+        results.put(("unexpected", repr(error)))  # type: ignore[attr-defined]
 
 
 class _ControlledOutput:
@@ -211,6 +288,10 @@ class WorktreeGitBoundaryTests(unittest.TestCase):
             self.assertFalse(sandbox.request.uses_shell)
             self.assertIs(sandbox.request.purpose, LocalProcessPurpose.GIT_WORKTREE)
             self.assertIs(sandbox.request.network_policy, LocalProcessNetworkPolicy.ISOLATED)
+            self.assertTrue(
+                any(arg.startswith("core.hooksPath=") for arg in sandbox.request.arguments)
+            )
+            self.assertIn("core.fsmonitor=false", sandbox.request.arguments)
 
     def test_git_output_limit_terminates_the_owned_process(self) -> None:
         with tempfile.TemporaryDirectory(prefix="neuro-worktree-output-limit-") as raw:
@@ -224,6 +305,148 @@ class WorktreeGitBoundaryTests(unittest.TestCase):
                 _run(adapter._run_git(Path(raw), ("status",)))
             self.assertEqual(output_limit.exception.kind, WorktreeFailureKind.OUTPUT_LIMIT)
             self.assertEqual(process.terminate_calls, 1)
+
+    def test_git_hooks_are_disabled_for_default_and_external_hook_paths(self) -> None:
+        for hook_mode in ("default", "external"):
+            with (
+                self.subTest(hook_mode=hook_mode),
+                tempfile.TemporaryDirectory(prefix=f"neuro-worktree-hooks-{hook_mode}-") as raw,
+            ):
+                root = Path(raw)
+                repository, head = _new_repository(root)
+                marker_name = f"{hook_mode}-post-checkout-marker"
+                hook_body = f"#!/bin/sh\nprintf marker > {marker_name}\n"
+                if hook_mode == "default":
+                    _write_executable(repository / ".git" / "hooks" / "post-checkout", hook_body)
+                else:
+                    external_hooks = root / "external-hooks"
+                    external_hooks.mkdir()
+                    _write_executable(external_hooks / "post-checkout", hook_body)
+                    _git(repository, "config", "core.hooksPath", str(external_hooks))
+                hooks_directory = root / "owned-hooks"
+                adapter = LocalGitWorktreeAdapter(hooks_directory=hooks_directory)
+                store = SqliteManagedWorktreeStore(root / "state" / "worktrees.db")
+                service = WorktreeApplicationService(
+                    git=adapter,
+                    store=store,
+                    managed_root=root / "state" / "worktrees",
+                    id_factory=lambda hook_mode=hook_mode: WorktreeId(f"wt-hook-{hook_mode}"),
+                )
+                _run(service.initialize())
+                created = _run(service.create(WorktreeCreateRequest(repository, head)))
+                try:
+                    self.assertEqual(tuple(root.rglob(marker_name)), ())
+                    self.assertEqual(tuple(hooks_directory.iterdir()), ())
+                finally:
+                    _git(
+                        repository,
+                        "worktree",
+                        "remove",
+                        "--force",
+                        "--",
+                        str(created.canonical_path),
+                        check=False,
+                    )
+
+    def test_git_rejects_unowned_or_nonempty_hooks_directory(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="neuro-worktree-hooks-invalid-") as raw:
+            root = Path(raw)
+            nonempty = root / "nonempty-hooks"
+            nonempty.mkdir()
+            (nonempty / "unexpected-hook").write_text("marker", encoding="utf-8")
+            for hooks_directory in (nonempty, root / "hooks-file"):
+                if hooks_directory.name == "hooks-file":
+                    hooks_directory.write_text("not a directory", encoding="utf-8")
+                adapter = LocalGitWorktreeAdapter(hooks_directory=hooks_directory)
+                with self.assertRaises(WorktreeError) as rejected:
+                    _run(adapter._run_git(root, ("status",)))
+                self.assertEqual(
+                    rejected.exception.kind,
+                    WorktreeFailureKind.UNSAFE_GIT_CONFIGURATION,
+                )
+
+    def test_git_fsmonitor_hook_is_disabled_for_status(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="neuro-worktree-fsmonitor-") as raw:
+            root = Path(raw)
+            repository, head = _new_repository(root)
+            _write_executable(
+                repository / "fsmonitor-hook",
+                "#!/bin/sh\nprintf marker > fsmonitor-marker\n",
+            )
+            _git(repository, "config", "core.fsmonitor", str(repository / "fsmonitor-hook"))
+            adapter = LocalGitWorktreeAdapter(hooks_directory=root / "owned-hooks")
+            store = SqliteManagedWorktreeStore(root / "state" / "worktrees.db")
+            service = WorktreeApplicationService(
+                git=adapter,
+                store=store,
+                managed_root=root / "state" / "worktrees",
+                id_factory=lambda: WorktreeId("wt-fsmonitor"),
+            )
+            _run(service.initialize())
+            created = _run(service.create(WorktreeCreateRequest(repository, head)))
+            try:
+                _run(adapter.inspect_status(created.canonical_path))
+                self.assertEqual(tuple(root.rglob("fsmonitor-marker")), ())
+            finally:
+                _git(
+                    repository,
+                    "worktree",
+                    "remove",
+                    "--force",
+                    "--",
+                    str(created.canonical_path),
+                    check=False,
+                )
+
+    def test_target_commit_external_filters_fail_closed_before_checkout(self) -> None:
+        for operation in ("smudge", "process"):
+            with (
+                self.subTest(operation=operation),
+                tempfile.TemporaryDirectory(prefix=f"neuro-worktree-filter-{operation}-") as raw,
+            ):
+                root = Path(raw)
+                repository, _ = _new_repository(root)
+                (repository / ".gitattributes").write_text(
+                    "*.txt filter=neuro-adversarial\n", encoding="utf-8"
+                )
+                _git(repository, "add", ".gitattributes")
+                _git(repository, "commit", "-qm", "add filter attribute")
+                filtered_commit = _git(repository, "rev-parse", "HEAD")
+                # The source checkout is intentionally dirty and no longer
+                # advertises the filter; the target commit remains authoritative.
+                (repository / ".gitattributes").write_text("# changed source\n", encoding="utf-8")
+                _git(
+                    repository,
+                    "config",
+                    f"filter.neuro-adversarial.{operation}",
+                    "printf external-filter-marker",
+                )
+                adapter = LocalGitWorktreeAdapter(hooks_directory=root / "owned-hooks")
+                store = SqliteManagedWorktreeStore(root / "state" / "worktrees.db")
+                service = WorktreeApplicationService(
+                    git=adapter,
+                    store=store,
+                    managed_root=root / "state" / "worktrees",
+                    id_factory=lambda operation=operation: WorktreeId(f"wt-filter-{operation}"),
+                )
+                _run(service.initialize())
+                with self.assertRaises(WorktreeError) as rejected:
+                    _run(
+                        service.create(
+                            WorktreeCreateRequest(repository, filtered_commit),
+                        )
+                    )
+                self.assertEqual(
+                    rejected.exception.kind,
+                    WorktreeFailureKind.EXTERNAL_FILTER_UNSUPPORTED,
+                )
+                self.assertEqual(_run(store.list(include_removed=True)), ())
+                identity = _run(adapter.repository_identity(repository))
+                target = (
+                    root / "state" / "worktrees" / identity.repository_id / f"wt-filter-{operation}"
+                )
+                self.assertFalse(target.exists())
+                self.assertEqual(tuple(root.rglob("external-filter-marker")), ())
 
 
 class WorktreeDomainTests(unittest.TestCase):
@@ -279,6 +502,12 @@ class WorktreeDomainTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 WorktreeWorkspaceBinding(root / "worker", (root / "worker" / "nested",))
             with self.assertRaises(ValueError):
+                WorktreeWorkspaceBinding(root / "worker", (root,))
+            self.assertEqual(
+                WorktreeWorkspaceBinding(root / "worker", (root / "sibling",)).additional_roots,
+                ((root / "sibling").resolve(),),
+            )
+            with self.assertRaises(ValueError):
                 WorktreeWorkspaceBinding(root / "worker", (root / "one", root / "one" / "two"))
 
 
@@ -333,6 +562,166 @@ class ManagedWorktreePersistenceTests(unittest.TestCase):
             connection.close()
             self.assertEqual(version, SCHEMA_VERSION)
             self.assertIn("created_by_session_id", columns)
+            self.assertIn("version", columns)
+
+    def test_compare_and_transition_rejects_stale_reconcile_and_status_writers(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="neuro-worktree-cas-") as raw:
+            root = Path(raw)
+            head = "a" * 40
+            identity = WorktreeRepositoryIdentity(
+                root / "repo" / ".git",
+                root / "repo",
+                root / "repo" / ".git",
+                head,
+            )
+            snapshot = WorktreeSnapshot(
+                worktree_id=WorktreeId("wt-cas"),
+                repository=identity,
+                canonical_path=root / "state" / "worktrees" / "wt-cas",
+                base_revision="HEAD",
+                base_commit_sha=head,
+                branch=None,
+                kind=WorktreeKind.DETACHED,
+                ownership=WorktreeOwnership.MANAGED,
+                state=WorktreeState.CREATING,
+                created_at=datetime.now(UTC),
+            )
+            store = SqliteManagedWorktreeStore(root / "state" / "worktrees.db")
+            _run(store.initialize())
+            inserted = _run(store.insert_intent(snapshot))
+            ready = _run(
+                store.compare_and_transition(
+                    replace(inserted, state=WorktreeState.READY),
+                    expected_version=inserted.version,
+                    expected_state=WorktreeState.CREATING,
+                )
+            )
+            self.assertEqual(ready.version, inserted.version + 1)
+            stale_status = replace(
+                inserted,
+                status=WorktreeStatus(root / "state" / "worktrees" / "wt-cas", head, detached=True),
+            )
+            for stale in (
+                replace(inserted, state=WorktreeState.FAILED),
+                stale_status,
+            ):
+                with self.assertRaises(WorktreeError) as rejected:
+                    _run(
+                        store.compare_and_transition(
+                            stale,
+                            expected_version=inserted.version,
+                            expected_state=WorktreeState.CREATING,
+                        )
+                    )
+                self.assertEqual(
+                    rejected.exception.kind,
+                    WorktreeFailureKind.CONCURRENT_MODIFICATION,
+                )
+            latest = _run(store.get("wt-cas"))
+            assert latest is not None
+            self.assertEqual(latest.state, WorktreeState.READY)
+            self.assertEqual(latest.version, ready.version)
+
+    def test_schema_v1_migrates_to_generation_v2_without_overwriting_rows(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="neuro-worktree-db-migration-") as raw:
+            root = Path(raw)
+            database = root / "state" / "worktrees.db"
+            database.parent.mkdir()
+            connection = sqlite3.connect(database)
+            connection.execute(
+                "CREATE TABLE schema_meta (singleton INTEGER PRIMARY KEY CHECK (singleton = 1), version INTEGER NOT NULL)"
+            )
+            connection.execute("INSERT INTO schema_meta(singleton, version) VALUES (1, 1)")
+            connection.execute(
+                """
+                CREATE TABLE managed_worktrees (
+                    worktree_id TEXT PRIMARY KEY,
+                    common_dir TEXT NOT NULL,
+                    source_worktree TEXT NOT NULL,
+                    git_dir TEXT NOT NULL,
+                    repository_head_sha TEXT NOT NULL,
+                    canonical_path TEXT NOT NULL UNIQUE,
+                    base_revision TEXT NOT NULL,
+                    base_commit_sha TEXT NOT NULL,
+                    branch TEXT,
+                    kind TEXT NOT NULL,
+                    ownership TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    managed INTEGER NOT NULL CHECK (managed IN (0, 1)),
+                    created_by_session_id TEXT
+                )
+                """
+            )
+            connection.commit()
+            connection.close()
+
+            store = SqliteManagedWorktreeStore(database)
+            _run(store.initialize())
+            connection = sqlite3.connect(database)
+            self.assertEqual(
+                connection.execute(
+                    "SELECT version FROM schema_meta WHERE singleton = 1"
+                ).fetchone()[0],
+                SCHEMA_VERSION,
+            )
+            columns = {row[1] for row in connection.execute("PRAGMA table_info(managed_worktrees)")}
+            connection.close()
+            self.assertIn("version", columns)
+
+    def test_store_rejects_noncanonical_and_stale_transition_inputs(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="neuro-worktree-db-inputs-") as raw:
+            root = Path(raw)
+            head = "a" * 40
+            identity = WorktreeRepositoryIdentity(
+                root / "repo" / ".git",
+                root / "repo",
+                root / "repo" / ".git",
+                head,
+            )
+            snapshot = WorktreeSnapshot(
+                worktree_id=WorktreeId("wt-inputs"),
+                repository=identity,
+                canonical_path=root / "worker",
+                base_revision="HEAD",
+                base_commit_sha=head,
+                branch=None,
+                kind=WorktreeKind.DETACHED,
+                ownership=WorktreeOwnership.MANAGED,
+                state=WorktreeState.CREATING,
+                created_at=datetime.now(UTC),
+            )
+            store = SqliteManagedWorktreeStore(root / "state" / "worktrees.db")
+            _run(store.initialize())
+            with self.assertRaises(TypeError):
+                _run(store.insert_intent(object()))  # type: ignore[arg-type]
+            with self.assertRaises(ValueError):
+                _run(store.insert_intent(replace(snapshot, version=1)))
+            inserted = _run(store.insert_intent(snapshot))
+            with self.assertRaises(TypeError):
+                _run(
+                    store.compare_and_transition(
+                        inserted,
+                        expected_version=True,  # type: ignore[arg-type]
+                    )
+                )
+            with self.assertRaises(TypeError):
+                _run(
+                    store.compare_and_transition(
+                        inserted,
+                        expected_version=inserted.version,
+                        expected_state="creating",  # type: ignore[arg-type]
+                    )
+                )
+            with self.assertRaises(WorktreeError) as stale:
+                _run(
+                    store.compare_and_transition(
+                        inserted,
+                        expected_version=inserted.version + 1,
+                    )
+                )
+            self.assertEqual(stale.exception.kind, WorktreeFailureKind.CONCURRENT_MODIFICATION)
 
 
 class WorktreeApplicationTests(unittest.TestCase):
@@ -425,6 +814,178 @@ class WorktreeApplicationTests(unittest.TestCase):
             finally:
                 for snapshot in snapshots:
                     _run(service.remove(WorktreeRemoveRequest(snapshot.worktree_id)))
+
+    def test_cross_process_same_id_creation_has_one_insert_only_owner(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="neuro-worktree-cross-process-create-") as raw:
+            root = Path(raw)
+            repository, _ = _new_repository(root)
+            source_before = (repository / "tracked.txt").read_bytes()
+            database = root / "state" / "worktrees.db"
+            managed_root = root / "state" / "worktrees"
+            hooks_directory = root / "git-hooks"
+            barrier = multiprocessing.Barrier(2)
+            results = multiprocessing.Queue()
+            children = [
+                multiprocessing.Process(
+                    target=_cross_process_create,
+                    args=(
+                        str(repository),
+                        str(database),
+                        str(managed_root),
+                        str(hooks_directory),
+                        "wt-cross-process",
+                        barrier,
+                        results,
+                    ),
+                )
+                for _ in range(2)
+            ]
+            for child in children:
+                child.start()
+            for child in children:
+                child.join(timeout=45)
+                self.assertFalse(child.is_alive())
+                self.assertEqual(child.exitcode, 0)
+            outcomes = [results.get(timeout=5) for _ in children]
+            self.assertEqual(sum(outcome[0] == "ok" for outcome in outcomes), 1)
+            self.assertEqual(
+                sum(
+                    outcome[0] == "error" and outcome[1] == WorktreeFailureKind.PATH_CONFLICT.value
+                    for outcome in outcomes
+                ),
+                1,
+            )
+            self.assertNotIn("unexpected", {outcome[0] for outcome in outcomes})
+            service = WorktreeApplicationService(
+                git=LocalGitWorktreeAdapter(hooks_directory=hooks_directory),
+                store=SqliteManagedWorktreeStore(database),
+                managed_root=managed_root,
+                id_factory=lambda: WorktreeId("wt-cross-process"),
+            )
+            _run(service.initialize())
+            owned = _run(service.list_managed(reconcile=False))
+            self.assertEqual(len(owned), 1)
+            self.assertEqual(owned[0].state, WorktreeState.READY)
+            self.assertGreaterEqual(owned[0].version, 1)
+            self.assertEqual((repository / "tracked.txt").read_bytes(), source_before)
+            _run(service.remove(WorktreeRemoveRequest(owned[0].worktree_id)))
+
+    def test_cross_process_same_path_claim_is_unique(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="neuro-worktree-cross-process-path-") as raw:
+            root = Path(raw)
+            head = "a" * 40
+            identity = WorktreeRepositoryIdentity(
+                root / "repo" / ".git",
+                root / "repo",
+                root / "repo" / ".git",
+                head,
+            )
+            canonical_path = root / "state" / "worktrees" / "same-path"
+
+            def snapshot(worktree_id: str) -> WorktreeSnapshot:
+                return WorktreeSnapshot(
+                    worktree_id=WorktreeId(worktree_id),
+                    repository=identity,
+                    canonical_path=canonical_path,
+                    base_revision="HEAD",
+                    base_commit_sha=head,
+                    branch=None,
+                    kind=WorktreeKind.DETACHED,
+                    ownership=WorktreeOwnership.MANAGED,
+                    state=WorktreeState.CREATING,
+                    created_at=datetime.now(UTC),
+                )
+
+            database = root / "state" / "worktrees.db"
+            _run(SqliteManagedWorktreeStore(database).initialize())
+            barrier = multiprocessing.Barrier(2)
+            results = multiprocessing.Queue()
+            children = [
+                multiprocessing.Process(
+                    target=_cross_process_store_insert,
+                    args=(str(database), item, barrier, results),
+                )
+                for item in (snapshot("wt-path-a"), snapshot("wt-path-b"))
+            ]
+            for child in children:
+                child.start()
+            for child in children:
+                child.join(timeout=30)
+                self.assertFalse(child.is_alive())
+                self.assertEqual(child.exitcode, 0)
+            outcomes = [results.get(timeout=5) for _ in children]
+            self.assertEqual(sum(outcome[0] == "ok" for outcome in outcomes), 1)
+            self.assertEqual(
+                sum(
+                    outcome[0] == "error" and outcome[1] == WorktreeFailureKind.PATH_CONFLICT.value
+                    for outcome in outcomes
+                ),
+                1,
+            )
+            loaded = _run(SqliteManagedWorktreeStore(database).list(include_removed=True))
+            self.assertEqual(len(loaded), 1)
+            self.assertEqual(loaded[0].canonical_path, canonical_path.resolve())
+
+    def test_cross_process_simultaneous_remove_never_leaves_failed_regression(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="neuro-worktree-cross-process-remove-") as raw:
+            root = Path(raw)
+            repository, head = _new_repository(root)
+            database = root / "state" / "worktrees.db"
+            managed_root = root / "state" / "worktrees"
+            hooks_directory = root / "git-hooks"
+            service = WorktreeApplicationService(
+                git=LocalGitWorktreeAdapter(hooks_directory=hooks_directory),
+                store=SqliteManagedWorktreeStore(database),
+                managed_root=managed_root,
+                id_factory=lambda: WorktreeId("wt-cross-remove"),
+            )
+            _run(service.initialize())
+            created = _run(service.create(WorktreeCreateRequest(repository, head)))
+            barrier = multiprocessing.Barrier(2)
+            results = multiprocessing.Queue()
+            children = [
+                multiprocessing.Process(
+                    target=_cross_process_remove,
+                    args=(
+                        str(repository),
+                        str(database),
+                        str(managed_root),
+                        str(hooks_directory),
+                        created.worktree_id.value,
+                        barrier,
+                        results,
+                    ),
+                )
+                for _ in range(2)
+            ]
+            for child in children:
+                child.start()
+            for child in children:
+                child.join(timeout=45)
+                self.assertFalse(child.is_alive())
+                self.assertEqual(child.exitcode, 0)
+            outcomes = [results.get(timeout=5) for _ in children]
+            self.assertNotIn("unexpected", {outcome[0] for outcome in outcomes})
+            self.assertEqual(sum(outcome[0] == "ok" for outcome in outcomes), 1)
+            self.assertIn(
+                next(outcome for outcome in outcomes if outcome[0] == "error")[1],
+                {
+                    WorktreeFailureKind.CONCURRENT_MODIFICATION.value,
+                    WorktreeFailureKind.FAILED_STATE.value,
+                    WorktreeFailureKind.UNMANAGED.value,
+                },
+            )
+            reopened = SqliteManagedWorktreeStore(database)
+            final = _run(reopened.get(created.worktree_id.value))
+            assert final is not None
+            self.assertEqual(final.state, WorktreeState.REMOVED)
+            self.assertGreaterEqual(final.version, created.version + 2)
+            self.assertFalse(
+                any(
+                    record.path == created.canonical_path
+                    for record in _run(LocalGitWorktreeAdapter().list_worktrees(repository))
+                )
+            )
 
     def test_reconciliation_fails_closed_for_identity_and_lifecycle_uncertainty(self) -> None:
         with tempfile.TemporaryDirectory(prefix="neuro-worktree-reconcile-branches-") as raw:
@@ -559,6 +1120,7 @@ class WorktreeApplicationTests(unittest.TestCase):
                 git.resolve_commit = AsyncMock(return_value=head)
                 git.validate_branch = AsyncMock(side_effect=lambda _path, branch: branch)
                 git.branch_exists = AsyncMock(return_value=False)
+                git.preflight_checkout = AsyncMock()
                 git.list_worktrees = AsyncMock(return_value=())
                 git.inspect_status = AsyncMock(
                     return_value=WorktreeStatus(root / "worker", head, detached=True)

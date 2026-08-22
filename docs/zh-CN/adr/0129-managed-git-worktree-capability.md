@@ -53,15 +53,28 @@ branch。默认 managed branch namespace 为 `neuro/worktree/<id>`。
 ### Git 契约
 
 适配器将 argv-safe 的 `SandboxedProcessRequest` 提交给规范的 `LocalProcessSandbox` 端口；
-它不直接创建子进程，也不使用 shell。关闭终端提示，只执行本地命令，并对 stdout/stderr、
-时间、取消和子进程终止设置边界。它用 `git rev-parse` 获取仓库和不可变 base commit 身份，
-用 `git check-ref-format` 校验 branch，并用 `git worktree list --porcelain -z` 进行 NUL-safe
-类型化解析。它不调用 fetch、pull、push、clone 或 prune。由于 revision resolution 使用
-`rev-parse --end-of-options`，要求 Git 2.30 或更高版本；更低版本失败关闭。
+它不直接创建子进程，也不使用 shell。关闭终端提示，并对 stdout/stderr、时间、取消和
+子进程终止设置边界。每一次受管 Git 调用都会在 argv 前加入命令级
+`-c core.hooksPath=<Neuro Code 拥有的空目录>` 与 `-c core.fsmonitor=false`。该 hooks
+目录由适配器创建，必须一直是空的普通目录；symlink 或非空目录会失败关闭，不依赖单独使用
+`/dev/null`。
+
+`ProcessTreeLocalProcessSandbox` 配合 `SandboxProfile.OFF` 只提供已有的进程生命周期桥接，
+并不提供 OS 强制的文件系统或网络隔离；Git capability 不会从该请求字段宣称隔离已经成立。
+它不调用显式 remote transport（`fetch`、`pull`、`push`、`clone`、`prune`），并会中和或拒绝
+其余隐式 checkout 执行面。checkout 前，适配器让 Git 针对精确目标 tree 通过 `check-attr`
+解析 attribute；适用的 `filter.<driver>.smudge` 或 `.process` 配置会以类型化错误拒绝。
+
+适配器用 `git rev-parse` 获取仓库和不可变 base commit 身份，用 `git check-ref-format` 校验
+branch，并用 `git worktree list --porcelain -z` 进行 NUL-safe 类型化解析。它不调用 fetch、
+pull、push、clone 或 prune。由于 revision resolution 使用 `rev-parse --end-of-options`，
+要求 Git 2.30 或更高版本；更低版本失败关闭。
 
 ### 创建
 
-创建先把 `base_revision^{commit}` 解析为不可变 commit SHA 并持久化 `CREATING`，再以
+创建先把 `base_revision^{commit}` 解析为不可变 commit SHA，并针对精确目标 commit
+预检 external checkout filter。被拒绝的 filter 不会留下 durable ownership record 或
+worktree target。预检通过后，服务才以 insert-only 方式持久化 `CREATING` intent，再以
 该 SHA 创建 exact detached worktree 或新 managed branch。服务在持久化 `READY` 前校验
 path、Git common directory、HEAD 和 branch identity。dirty source checkout 不作为
 patch 读取，也不会被修改。
@@ -76,9 +89,14 @@ dirty 或 locked worktree 返回类型化失败并继续归 Neuro Code 所有。
 
 ### 持久化与协调
 
-`worktrees.db` 使用独立版本化 schema，不与 session turn recovery 混合。重新打开时会检查
-schema version，未知版本失败关闭；schema upgrade 仍属于未来显式 migration。SQLite 与 Git
-metadata 不是同一个事务：
+`worktrees.db` 使用独立版本化 schema，不与 session turn recovery 混合。schema version 2
+新增持久化的非负 generation，并包含 v1 到 v2 的 migration；已有记录从 generation zero
+开始。未知版本失败关闭。ownership claim 使用 insert-only 操作：已存在的 `WorktreeId`
+永远不能被覆盖，canonical path 仍由 SQLite `UNIQUE` 原子保护。之后每一次 lifecycle/status
+mutation 都要求 expected generation，以及（若提供）expected state；成功 mutation 增加
+generation，stale writer 返回 `CONCURRENT_MODIFICATION`。
+
+SQLite 与 Git metadata 不是同一个事务：
 
 | Durable state | 实际 Git state | 分类 | 动作 |
 | --- | --- | --- | --- |
@@ -91,15 +109,18 @@ metadata 不是同一个事务：
 | `REMOVING` | exact worktree 仍存在 | ready | 协调一次失败的移除 |
 | 任一 active state | 仓库缺失或 common-dir 不匹配 | orphaned | 不执行文件系统清理 |
 
-协调是显式操作，managed list/inspect 也会使用它。因此进程可能在 durable intent、Git
-action 和最终化之间退出时，仍可在不声称跨系统 ACID 的前提下恢复状态。
+协调是显式操作，managed list/inspect 也会使用它。最终写入使用观察到的 generation；如果
+另一进程先赢得 CAS，服务会重新读取并返回当前 coherent record，不覆盖赢家。因此进程
+可能在 durable intent、Git action 和最终化之间退出时，仍可在不声称跨系统 ACID 的前提下
+恢复状态。
 
 ### Workspace、sandbox 与 LSP 接缝
 
 `WorktreeWorkspaceBinding` 从 ready 的不可变 handle 得到一个规范 primary root，且不继承
-additional roots。该 binding 可以交给现有 filesystem target resolver、sandbox factory
-以及未来按工作区管理的 LSP manager。本切片不创建 writable subagent，不共享 source 的
-document cache，也不实现 integration。
+additional roots。如果未来提供 additional roots，则 primary root 的两个方向重叠，以及
+additional roots 之间的成对重叠，都会被拒绝。该 binding 可以交给现有 filesystem target
+resolver、sandbox factory 以及未来按工作区管理的 LSP manager。本切片不创建 writable
+subagent，不共享 source 的 document cache，也不实现 integration。
 
 ## 不变量
 
@@ -108,8 +129,12 @@ document cache，也不实现 integration。
 | Neuro Code 只移除能够证明 ownership 的 worktree | PROVEN：服务 guard 与移除测试 |
 | 源 checkout dirty state 保持不变 | PROVEN：真实 Git 集成测试 |
 | repository/path/base identity 不可变且会校验 | PROVEN：创建/移除路径 |
-| Git 执行 argv-safe、有界且 local-only | PROVEN：适配器实现与 parser 测试 |
+| Git 执行 argv-safe 且有界 | PROVEN：适配器实现与 parser 测试 |
+| Git hook/fsmonitor 执行被中和 | PROVEN：default path、external path、fsmonitor marker 测试 |
+| 适用目标 commit 的 checkout filter 失败关闭 | PROVEN：精确 commit 的 `check-attr` smudge/process 测试 |
+| `SandboxProfile.OFF` 提供 OS 文件系统/网络隔离 | NOT_PROVEN：fallback 明确只有生命周期能力 |
 | SQLite intent 与 Git state 可在进程退出后协调 | PROVEN：真实 child `os._exit()` 测试 |
+| 跨进程 ownership claim 与 lifecycle write 单调推进 | PROVEN：insert-only/UNIQUE/CAS 与真实进程竞态测试 |
 | dirty、locked、mismatch、unmanaged 不会被强删 | PROVEN：dirty/locked/path-reuse；mismatch 失败关闭 |
 | Worktree 是独立 workspace root | PROVEN：规范 filesystem binding 集成 |
 | 不产生隐式网络 Git 操作 | PROVEN：本地命令 allowlist |
@@ -122,7 +147,8 @@ relay/DAG/leader/swarm 以及 automatic Ultracode delegation 都不属于本 ADR
 
 ## 验证
 
-focused real-Git suite 覆盖 porcelain parser、类型化领域校验、SQLite reopen round trip、detached
-与 managed-branch 创建、dirty source preservation、branch collision、locked/dirty 移除拒绝、
-规范 workspace binding、path reuse、remove failure、timeout/output bound，以及创建和移除的
-进程退出后 reconciliation。发布前仍需完成完整本地仓库验证。
+focused real-Git suite 覆盖 porcelain parser、类型化领域校验、SQLite reopen/CAS round trip、
+detached 与 managed-branch 创建、dirty source preservation、branch collision、locked/dirty
+移除拒绝、包含 parent overlap 的规范 workspace binding、hook/fsmonitor/filter 对抗用例、
+same-ID 与 same-path 跨进程 claim、simultaneous remove、path reuse、remove failure、timeout/
+output bound，以及创建和移除的进程退出后 reconciliation。发布前仍需完成完整本地仓库验证。

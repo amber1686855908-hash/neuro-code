@@ -185,6 +185,7 @@ class WorktreeApplicationService:
                 "detached worktree cannot use a branch",
                 kind=WorktreeFailureKind.INVALID_REF,
             )
+        await self._git.preflight_checkout(repository.source_worktree, base_commit_sha)
 
         intent = WorktreeSnapshot(
             worktree_id=worktree_id,
@@ -199,7 +200,7 @@ class WorktreeApplicationService:
             created_at=self._clock().astimezone(UTC),
             created_by_session_id=request.created_by_session_id,
         )
-        await self._store.save(intent)
+        intent = await self._store.insert_intent(intent)
         try:
             await self._git.add_worktree(
                 repository.source_worktree,
@@ -208,14 +209,14 @@ class WorktreeApplicationService:
                 branch=branch,
             )
         except WorktreeError:
-            await self._store.save(replace(intent, state=WorktreeState.FAILED))
+            await self._transition(intent, replace(intent, state=WorktreeState.FAILED))
             raise
 
         try:
             actual = await self._actual_record(repository, target)
             if actual is None or not _record_matches_snapshot(actual, intent):
                 orphaned = replace(intent, state=WorktreeState.ORPHANED)
-                await self._store.save(orphaned)
+                await self._transition(intent, orphaned)
                 raise WorktreeError(
                     "created worktree identity does not match durable intent",
                     kind=WorktreeFailureKind.IDENTITY_MISMATCH,
@@ -223,7 +224,7 @@ class WorktreeApplicationService:
             status = await self._git.inspect_status(target)
             if status.dirty:
                 orphaned = replace(intent, state=WorktreeState.ORPHANED, status=status)
-                await self._store.save(orphaned)
+                await self._transition(intent, orphaned)
                 raise WorktreeError(
                     "new worktree is unexpectedly dirty",
                     kind=WorktreeFailureKind.IDENTITY_MISMATCH,
@@ -233,11 +234,10 @@ class WorktreeApplicationService:
             # intentionally left for explicit reconciliation/inspection.
             current = await self._store.get(worktree_id.value)
             if current is not None and current.state is WorktreeState.CREATING:
-                await self._store.save(replace(current, state=WorktreeState.FAILED))
+                await self._transition(current, replace(current, state=WorktreeState.FAILED))
             raise
         ready = replace(intent, state=WorktreeState.READY, status=status)
-        await self._store.save(ready)
-        return ready
+        return await self._transition(intent, ready)
 
     async def list_managed(self, *, reconcile: bool = True) -> tuple[WorktreeSnapshot, ...]:
         self._require_initialized()
@@ -266,7 +266,7 @@ class WorktreeApplicationService:
                 kind=WorktreeFailureKind.FAILED_STATE,
             )
         status = await self._git.inspect_status(snapshot.canonical_path)
-        await self._store.save(replace(snapshot, status=status))
+        await self._transition(snapshot, replace(snapshot, status=status))
         return status
 
     async def workspace_binding(self, worktree_id: str, /) -> WorktreeWorkspaceBinding:
@@ -313,7 +313,7 @@ class WorktreeApplicationService:
             )
         repository = await self._git.repository_identity(snapshot.repository.source_worktree)
         if not _repository_identity_matches(repository, snapshot):
-            await self._store.save(replace(snapshot, state=WorktreeState.ORPHANED))
+            await self._transition(snapshot, replace(snapshot, state=WorktreeState.ORPHANED))
             raise WorktreeError(
                 "repository identity no longer matches ownership record",
                 kind=WorktreeFailureKind.IDENTITY_MISMATCH,
@@ -321,40 +321,39 @@ class WorktreeApplicationService:
         actual = await self._actual_record(repository, snapshot.canonical_path)
         if actual is None or not _record_matches_snapshot(actual, snapshot):
             orphaned = replace(snapshot, state=WorktreeState.ORPHANED)
-            await self._store.save(orphaned)
+            await self._transition(snapshot, orphaned)
             raise WorktreeError(
                 "worktree identity cannot be proven for removal",
                 kind=WorktreeFailureKind.IDENTITY_MISMATCH,
             )
         status = await self._git.inspect_status(snapshot.canonical_path)
         if status.locked:
-            await self._store.save(replace(snapshot, status=status))
+            await self._transition(snapshot, replace(snapshot, status=status))
             raise WorktreeError(
                 "locked worktree cannot be removed automatically", kind=WorktreeFailureKind.LOCKED
             )
         if status.dirty:
-            await self._store.save(replace(snapshot, status=status))
+            await self._transition(snapshot, replace(snapshot, status=status))
             raise WorktreeError(
                 "dirty worktree refuses non-force removal", kind=WorktreeFailureKind.DIRTY
             )
         removing = replace(snapshot, state=WorktreeState.REMOVING, status=status)
-        await self._store.save(removing)
+        removing = await self._transition(snapshot, removing)
         try:
             await self._git.remove_worktree(repository.source_worktree, snapshot.canonical_path)
         except WorktreeError:
-            await self._store.save(replace(removing, state=WorktreeState.FAILED))
+            await self._transition(removing, replace(removing, state=WorktreeState.FAILED))
             raise
         records = await self._git.list_worktrees(repository.source_worktree)
         if any(record.path == snapshot.canonical_path for record in records):
             orphaned = replace(removing, state=WorktreeState.ORPHANED)
-            await self._store.save(orphaned)
+            await self._transition(removing, orphaned)
             raise WorktreeError(
                 "Git still reports the worktree after removal",
                 kind=WorktreeFailureKind.IDENTITY_MISMATCH,
             )
         removed = replace(removing, state=WorktreeState.REMOVED, status=None)
-        await self._store.save(removed)
-        return removed
+        return await self._transition(removing, removed)
 
     async def reconcile_managed_worktrees(
         self,
@@ -376,7 +375,15 @@ class WorktreeApplicationService:
                     continue
                 updated = await self._reconcile_one(current)
                 if updated != current:
-                    await self._store.save(updated)
+                    try:
+                        updated = await self._transition(current, updated)
+                    except WorktreeError as error:
+                        if error.kind is not WorktreeFailureKind.CONCURRENT_MODIFICATION:
+                            raise
+                        latest = await self._store.get(current.worktree_id.value)
+                        if latest is None or latest.state is WorktreeState.REMOVED:
+                            continue
+                        updated = latest
                 reconciled.append(updated)
         return tuple(reconciled)
 
@@ -435,6 +442,17 @@ class WorktreeApplicationService:
         records = await self._git.list_worktrees(repository.source_worktree)
         canonical = await run_blocking(lambda: target.expanduser().resolve(strict=False))
         return next((record for record in records if record.path == canonical), None)
+
+    async def _transition(
+        self,
+        current: WorktreeSnapshot,
+        proposed: WorktreeSnapshot,
+    ) -> WorktreeSnapshot:
+        return await self._store.compare_and_transition(
+            proposed,
+            expected_version=current.version,
+            expected_state=current.state,
+        )
 
     def _managed_path(
         self,

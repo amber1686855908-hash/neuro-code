@@ -1558,18 +1558,26 @@ binding 阶段复用现有 canonical filesystem resolver；Git repository identi
 基于规范 common Git directory、source worktree、Git directory 和观察到的 HEAD。
 
 managed path 位于 state directory 下的 `worktrees/<repository-id>/<worktree-id>`，并且在 source
-checkout 之外。create request 必须明确 base revision，先解析为精确 commit，再创建 detached
-或 `neuro/worktree/<id>` branch worktree。源 checkout 的 dirty 变更始终只留在源 checkout 中。
+checkout 之外。create request 必须明确 base revision，先解析为精确 commit，并预检适用的
+external checkout filter，再创建 detached 或 `neuro/worktree/<id>` branch worktree。源 checkout
+的 dirty 变更始终只留在源 checkout 中。
 worktree binding 不继承 additional workspace roots。
 
 本地 Git adapter 通过规范的 local process sandbox 端口提交 argv-safe request，并设置有界输出、
-超时和取消清理；它不直接创建子进程。它使用 `rev-parse`、`check-ref-format` 和 NUL-safe
-`worktree list --porcelain -z` parser。不执行 fetch/pull/push/clone，也不执行全仓库 prune。移除要求 durable managed ownership 以及匹配的 repository/path/HEAD/branch
-identity，并使用不带 `--force` 的 `git worktree remove`；dirty 和 locked worktree 拒绝移除，
-managed branch 则保留。
+超时和取消清理；它不直接创建子进程。每次调用都将 `core.hooksPath` 覆盖为 Neuro Code 拥有
+的空目录，并设置 `core.fsmonitor=false`。它还会针对精确目标 commit 让 Git 检查是否存在
+适用且配置了 `smudge` 或 `process` driver 的 checkout filter；存在时在 checkout 前拒绝。
+已有的 `ProcessTreeLocalProcessSandbox` 配合 `SandboxProfile.OFF` 只是 lifecycle bridge，
+不是 OS 强制的文件系统或网络隔离，因此该 capability 不会宣称这项保证。显式 remote operation
+仍不存在：不执行 fetch/pull/push/clone 或全仓库 prune。移除要求 durable managed ownership
+以及匹配的 repository/path/HEAD/branch identity，并使用不带 `--force` 的 `git worktree remove`；
+dirty 和 locked worktree 拒绝移除，managed branch 则保留。
 
-SQLite intent 与 Git metadata 不被当作一个事务。进程退出后，durable `CREATING`/`REMOVING`
-记录会与实际 Git record reconciliation。精确匹配可以变为 `READY`，remove intent 后实际记录
-缺失可以变为 `REMOVED`；path reuse、仓库缺失和 identity mismatch 会变为 `ORPHANED`，且不执行
-文件系统删除。本能力不实现 checkpoint/rollback、commit 或 patch integration、branch deletion、
-writable subagent 或面向模型的 Git tool。详见 [ADR 0129](adr/0129-managed-git-worktree-capability.md)。
+SQLite intent 与 Git metadata 不被当作一个事务。worktree schema 使用 insert-only ownership
+claim 和持久化 generation CAS：`WorktreeId` conflict 不能覆盖已有 row，canonical path 仍保持
+unique，后续每次 mutation 都要求 expected generation/state 并增加 generation。stale writer
+返回 `CONCURRENT_MODIFICATION`；reconciliation 会重新读取赢家而不覆盖它。进程退出后，durable
+`CREATING`/`REMOVING` 记录会与实际 Git record reconciliation。精确匹配可以变为 `READY`，remove
+intent 后实际记录缺失可以变为 `REMOVED`；path reuse、仓库缺失和 identity mismatch 会变为
+`ORPHANED`，且不执行文件系统删除。本能力不实现 checkpoint/rollback、commit 或 patch
+integration、branch deletion、writable subagent 或面向模型的 Git tool。详见 [ADR 0129](adr/0129-managed-git-worktree-capability.md)。

@@ -16,6 +16,7 @@ import asyncio
 import sqlite3
 from collections.abc import Sequence
 from contextlib import closing
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -34,7 +35,7 @@ from neuro_code.domain.worktree import (
 )
 from neuro_code.shared.async_utils import run_blocking
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 _SQLITE_TIMEOUT_SECONDS = 30.0
 
 
@@ -83,18 +84,34 @@ class SqliteManagedWorktreeStore(ManagedWorktreeStore):
                         """
                     )
                     connection.execute(
-                        "INSERT OR IGNORE INTO schema_meta(singleton, version) VALUES (1, 1)"
+                        "INSERT OR IGNORE INTO schema_meta(singleton, version) VALUES (?, ?)",
+                        (1, SCHEMA_VERSION),
                     )
                     version_row = connection.execute(
                         "SELECT version FROM schema_meta WHERE singleton = 1"
                     ).fetchone()
-                    if version_row is None or int(version_row[0]) != SCHEMA_VERSION:
+                    if version_row is None:
                         raise WorktreeError(
-                            f"unsupported managed worktree schema version: "
-                            f"{version_row[0] if version_row else 'missing'}",
+                            "unsupported managed worktree schema version: missing",
+                            kind=WorktreeFailureKind.PROTOCOL,
+                        )
+                    version = int(version_row[0])
+                    if version not in {1, SCHEMA_VERSION}:
+                        raise WorktreeError(
+                            f"unsupported managed worktree schema version: {version}",
                             kind=WorktreeFailureKind.PROTOCOL,
                         )
                     _ensure_schema(connection)
+                    if not _has_version_column(connection):
+                        connection.execute(
+                            "ALTER TABLE managed_worktrees "
+                            "ADD COLUMN version INTEGER NOT NULL DEFAULT 0"
+                        )
+                    if version != SCHEMA_VERSION:
+                        connection.execute(
+                            "UPDATE schema_meta SET version = ? WHERE singleton = 1",
+                            (SCHEMA_VERSION,),
+                        )
                     connection.commit()
                 except BaseException:
                     connection.rollback()
@@ -112,7 +129,7 @@ class SqliteManagedWorktreeStore(ManagedWorktreeStore):
                     """
                     SELECT worktree_id, common_dir, source_worktree, git_dir, repository_head_sha,
                            canonical_path, base_revision, base_commit_sha, branch, kind,
-                           ownership, state, created_at, managed, created_by_session_id
+                           ownership, state, created_at, managed, created_by_session_id, version
                     FROM managed_worktrees
                     WHERE worktree_id = ?
                     """,
@@ -137,7 +154,7 @@ class SqliteManagedWorktreeStore(ManagedWorktreeStore):
                     """
                     SELECT worktree_id, common_dir, source_worktree, git_dir, repository_head_sha,
                            canonical_path, base_revision, base_commit_sha, branch, kind,
-                           ownership, state, created_at, managed, created_by_session_id
+                           ownership, state, created_at, managed, created_by_session_id, version
                     FROM managed_worktrees
                     ORDER BY created_at ASC, worktree_id ASC
                     """
@@ -159,11 +176,13 @@ class SqliteManagedWorktreeStore(ManagedWorktreeStore):
 
         return await run_blocking(load)
 
-    async def save(self, snapshot: WorktreeSnapshot, /) -> None:
+    async def insert_intent(self, snapshot: WorktreeSnapshot, /) -> WorktreeSnapshot:
         if not isinstance(snapshot, WorktreeSnapshot):
             raise TypeError("managed worktree store accepts canonical snapshots")
+        if snapshot.version != 0:
+            raise ValueError("new managed worktree intent must start at version zero")
 
-        def save_sync() -> None:
+        def insert_sync() -> WorktreeSnapshot:
             try:
                 with closing(self._connect()) as connection, connection:
                     connection.execute(
@@ -172,23 +191,8 @@ class SqliteManagedWorktreeStore(ManagedWorktreeStore):
                             worktree_id, common_dir, source_worktree, git_dir,
                             repository_head_sha, canonical_path, base_revision,
                             base_commit_sha, branch, kind, ownership, state,
-                            created_at, updated_at, managed, created_by_session_id
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        ON CONFLICT(worktree_id) DO UPDATE SET
-                            common_dir = excluded.common_dir,
-                            source_worktree = excluded.source_worktree,
-                            git_dir = excluded.git_dir,
-                            repository_head_sha = excluded.repository_head_sha,
-                            canonical_path = excluded.canonical_path,
-                            base_revision = excluded.base_revision,
-                            base_commit_sha = excluded.base_commit_sha,
-                            branch = excluded.branch,
-                            kind = excluded.kind,
-                            ownership = excluded.ownership,
-                            state = excluded.state,
-                            updated_at = excluded.updated_at,
-                            managed = excluded.managed,
-                            created_by_session_id = excluded.created_by_session_id
+                            created_at, updated_at, managed, created_by_session_id, version
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             snapshot.worktree_id.value,
@@ -207,8 +211,10 @@ class SqliteManagedWorktreeStore(ManagedWorktreeStore):
                             _utc_now(),
                             int(snapshot.managed),
                             snapshot.created_by_session_id,
+                            snapshot.version,
                         ),
                     )
+                return snapshot
             except sqlite3.IntegrityError as error:
                 raise WorktreeError(
                     "managed worktree ownership conflicts with an existing record",
@@ -221,7 +227,120 @@ class SqliteManagedWorktreeStore(ManagedWorktreeStore):
                 ) from error
 
         async with self._write_lock:
-            await run_blocking(save_sync)
+            return await run_blocking(insert_sync)
+
+    async def compare_and_transition(
+        self,
+        snapshot: WorktreeSnapshot,
+        *,
+        expected_version: int,
+        expected_state: WorktreeState | None = None,
+    ) -> WorktreeSnapshot:
+        if not isinstance(snapshot, WorktreeSnapshot):
+            raise TypeError("managed worktree store accepts canonical snapshots")
+        if not isinstance(expected_version, int) or isinstance(expected_version, bool):
+            raise TypeError("expected worktree version must be an integer")
+        if expected_version < 0 or snapshot.version != expected_version:
+            raise WorktreeError(
+                "managed worktree version does not match the compare-and-swap claim",
+                kind=WorktreeFailureKind.CONCURRENT_MODIFICATION,
+            )
+        if expected_state is not None and not isinstance(expected_state, WorktreeState):
+            raise TypeError("expected worktree state must be canonical")
+
+        def transition_sync() -> WorktreeSnapshot:
+            try:
+                with closing(self._connect()) as connection, connection:
+                    conditions = "worktree_id = ? AND version = ?"
+                    parameters: list[object] = [
+                        snapshot.worktree_id.value,
+                        expected_version,
+                    ]
+                    if expected_state is not None:
+                        conditions += " AND state = ?"
+                        parameters.append(expected_state.value)
+                    cursor = connection.execute(
+                        f"""
+                        UPDATE managed_worktrees SET
+                            common_dir = ?,
+                            source_worktree = ?,
+                            git_dir = ?,
+                            repository_head_sha = ?,
+                            canonical_path = ?,
+                            base_revision = ?,
+                            base_commit_sha = ?,
+                            branch = ?,
+                            kind = ?,
+                            ownership = ?,
+                            state = ?,
+                            updated_at = ?,
+                            managed = ?,
+                            created_by_session_id = ?,
+                            version = ?
+                        WHERE {conditions}
+                        """,
+                        (
+                            str(snapshot.repository.common_dir),
+                            str(snapshot.repository.source_worktree),
+                            str(snapshot.repository.git_dir),
+                            snapshot.repository.head_sha,
+                            str(snapshot.canonical_path),
+                            snapshot.base_revision,
+                            snapshot.base_commit_sha,
+                            snapshot.branch,
+                            snapshot.kind.value,
+                            snapshot.ownership.value,
+                            snapshot.state.value,
+                            _utc_now(),
+                            int(snapshot.managed),
+                            snapshot.created_by_session_id,
+                            expected_version + 1,
+                            *parameters,
+                        ),
+                    )
+                    if cursor.rowcount != 1:
+                        raise WorktreeError(
+                            "managed worktree was changed by another process",
+                            kind=WorktreeFailureKind.CONCURRENT_MODIFICATION,
+                        )
+                return replace(snapshot, version=expected_version + 1)
+            except sqlite3.IntegrityError as error:
+                raise WorktreeError(
+                    "managed worktree transition conflicts with an existing record",
+                    kind=WorktreeFailureKind.PATH_CONFLICT,
+                ) from error
+            except sqlite3.Error as error:
+                raise WorktreeError(
+                    "managed worktree transition could not be persisted",
+                    kind=WorktreeFailureKind.COMMAND_FAILED,
+                ) from error
+
+        async with self._write_lock:
+            return await run_blocking(transition_sync)
+
+    async def save(self, snapshot: WorktreeSnapshot, /) -> WorktreeSnapshot:
+        """Compatibility shim that routes callers through insert/CAS semantics.
+
+        This method intentionally has no upsert behavior.  New version-zero
+        records are insert-only; an existing record is updated only when the
+        caller's version and current lifecycle state still match.
+        """
+
+        if not isinstance(snapshot, WorktreeSnapshot):
+            raise TypeError("managed worktree store accepts canonical snapshots")
+        current = await self.get(snapshot.worktree_id.value)
+        if current is None:
+            return await self.insert_intent(snapshot)
+        if snapshot.version != current.version:
+            raise WorktreeError(
+                "managed worktree was changed by another process",
+                kind=WorktreeFailureKind.CONCURRENT_MODIFICATION,
+            )
+        return await self.compare_and_transition(
+            snapshot,
+            expected_version=current.version,
+            expected_state=current.state,
+        )
 
 
 def _ensure_schema(connection: sqlite3.Connection) -> None:
@@ -243,7 +362,8 @@ def _ensure_schema(connection: sqlite3.Connection) -> None:
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
             managed INTEGER NOT NULL CHECK (managed IN (0, 1)),
-            created_by_session_id TEXT
+            created_by_session_id TEXT,
+            version INTEGER NOT NULL DEFAULT 0
         )
         """
     )
@@ -255,8 +375,15 @@ def _ensure_schema(connection: sqlite3.Connection) -> None:
     )
 
 
+def _has_version_column(connection: sqlite3.Connection) -> bool:
+    return any(
+        row[1] == "version"
+        for row in connection.execute("PRAGMA table_info(managed_worktrees)").fetchall()
+    )
+
+
 def _snapshot_from_row(row: Sequence[object] | None) -> WorktreeSnapshot:
-    if row is None or len(row) != 15:
+    if row is None or len(row) != 16:
         raise WorktreeError(
             "managed worktree record is malformed", kind=WorktreeFailureKind.PROTOCOL
         )
@@ -279,6 +406,7 @@ def _snapshot_from_row(row: Sequence[object] | None) -> WorktreeSnapshot:
             created_at=_parse_timestamp(row[12]),
             managed=bool(row[13]),
             created_by_session_id=None if row[14] is None else str(row[14]),
+            version=int(str(row[15])),
         )
     except (TypeError, ValueError) as error:
         raise WorktreeError(

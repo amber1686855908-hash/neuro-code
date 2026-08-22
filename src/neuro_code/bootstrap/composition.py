@@ -348,7 +348,7 @@ class ApplicationComposition:
         """
 
         return WorktreeApplicationService(
-            git=LocalGitWorktreeAdapter(),
+            git=LocalGitWorktreeAdapter(hooks_directory=self.config.state_dir / "git-hooks"),
             store=SqliteManagedWorktreeStore(self.config.state_dir / "worktrees.db"),
             managed_root=self.config.state_dir / "worktrees",
         )

@@ -1,13 +1,16 @@
 """argv-safe local Git adapter for the managed worktree capability.
 
-No operation in this module invokes a shell or a remote Git action.  Output is
-read concurrently with a hard bound, and cancellation/timeout kills the child
-before returning to the caller.
+No operation in this module invokes a shell or an explicit remote Git action.
+Output is read concurrently with a hard bound, and cancellation/timeout kills
+the child before returning to the caller.  The fallback process bridge does not
+provide OS network/filesystem isolation; command-scoped Git configuration and
+target-commit filter preflight close the implicit Git execution surfaces.
 
 受管 worktree 能力使用的 argv-safe 本地 Git 适配器.
 
-本模块不通过 shell,也不执行任何远程 Git 操作.输出并发读取且有硬上限,超时或
-取消时会先终止子进程再返回.
+本模块不通过 shell,也不执行显式远程 Git 操作.输出并发读取且有硬上限,超时或
+取消时会先终止子进程再返回. fallback process bridge 不提供 OS 网络/文件系统隔离;
+命令级 Git 配置和目标 commit filter 预检负责关闭隐式 Git 执行面.
 """
 
 from __future__ import annotations
@@ -16,6 +19,7 @@ import asyncio
 import os
 import re
 import shutil
+import tempfile
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -67,6 +71,20 @@ def _decode_output(value: bytes) -> str:
 def _bounded_error(value: bytes, fallback: str) -> str:
     rendered = redact_sensitive_text(_decode_output(value) or fallback)
     return rendered[:1_000]
+
+
+def _prepare_hooks_directory(path: Path) -> Path:
+    candidate = path.expanduser()
+    for ancestor in (candidate, *candidate.parents):
+        if ancestor.is_symlink():
+            raise OSError("Git hooks path contains a symlink")
+    hooks_directory = candidate.resolve(strict=False)
+    hooks_directory.mkdir(parents=True, exist_ok=True)
+    if hooks_directory.is_symlink() or not hooks_directory.is_dir():
+        raise OSError("Git hooks path is not a regular directory")
+    if next(hooks_directory.iterdir(), None) is not None:
+        raise OSError("Git hooks path is not empty")
+    return hooks_directory
 
 
 def _validate_sha(value: str, *, field_name: str) -> str:
@@ -126,6 +144,9 @@ async def _run_git(
     cwd: Path,
     args: tuple[str, ...],
     *,
+    hooks_directory: Path,
+    stdin: bytes | None = None,
+    accepted_returncodes: frozenset[int] = frozenset(),
     timeout_seconds: float = MAX_GIT_COMMAND_TIMEOUT_SECONDS,
     failure_kind: WorktreeFailureKind = WorktreeFailureKind.COMMAND_FAILED,
 ) -> _GitCommandResult:
@@ -135,6 +156,13 @@ async def _run_git(
         )
     if not 0 < timeout_seconds <= MAX_GIT_COMMAND_TIMEOUT_SECONDS:
         raise ValueError("Git command timeout is outside the bounded range")
+    try:
+        hooks_directory = await run_blocking(_prepare_hooks_directory, hooks_directory)
+    except (OSError, RuntimeError) as error:
+        raise WorktreeError(
+            "Neuro Code Git hooks directory is unavailable or unsafe",
+            kind=WorktreeFailureKind.UNSAFE_GIT_CONFIGURATION,
+        ) from error
     environment = {
         "GIT_TERMINAL_PROMPT": "0",
         "GIT_OPTIONAL_LOCKS": "0",
@@ -152,9 +180,16 @@ async def _run_git(
         raise WorktreeError(
             "Git executable is not available", kind=WorktreeFailureKind.NOT_AVAILABLE
         )
+    hardened_args = (
+        "-c",
+        f"core.hooksPath={hooks_directory}",
+        "-c",
+        "core.fsmonitor=false",
+        *args,
+    )
     request = SandboxedProcessRequest.exec(
         git_executable,
-        args,
+        hardened_args,
         purpose=LocalProcessPurpose.GIT_WORKTREE,
         cwd=cwd,
         sandbox_profile=SandboxProfile.OFF,
@@ -164,13 +199,19 @@ async def _run_git(
                     cwd,
                     LocalWorkspaceAccessMode.READ_WRITE,
                 ),
+                LocalWorkspaceAccess(
+                    hooks_directory,
+                    LocalWorkspaceAccessMode.READ_ONLY,
+                ),
             ),
             private_home=False,
             private_temporary_directory=False,
         ),
         network_policy=LocalProcessNetworkPolicy.ISOLATED,
         environment_policy=LocalProcessEnvironmentPolicy(environment),
-        stdio_mode=LocalProcessStdioMode.CAPTURE,
+        stdio_mode=(
+            LocalProcessStdioMode.PROTOCOL if stdin is not None else LocalProcessStdioMode.CAPTURE
+        ),
         lifecycle=LocalProcessLifecycle(
             required_capability=LocalProcessLifecycleCapability.PROCESS_GROUP_BEST_EFFORT,
             termination_grace_seconds=1.0,
@@ -211,6 +252,9 @@ async def _run_git(
     )
     try:
         async with asyncio.timeout(timeout_seconds):
+            if stdin is not None:
+                await process.write_stdin(stdin)
+                await process.close_stdin()
             returncode = await process.wait()
         stdout, stderr = await asyncio.gather(stdout_task, stderr_task)
     except TimeoutError as error:
@@ -235,10 +279,16 @@ async def _run_git(
         raise WorktreeError(
             "Git command output exceeded the bound", kind=WorktreeFailureKind.OUTPUT_LIMIT
         )
-    if returncode != 0:
+    if returncode != 0 and returncode not in accepted_returncodes:
         detail = _bounded_error(
             stderr_bytes or stdout_bytes,
             f"git {' '.join(args[:3])} failed with exit code {returncode}",
+        )
+        raise WorktreeError(detail, kind=failure_kind)
+    if returncode != 0 and stderr_bytes:
+        detail = _bounded_error(
+            stderr_bytes,
+            f"git {' '.join(args[:3])} returned an unexpected diagnostic",
         )
         raise WorktreeError(detail, kind=failure_kind)
     return _GitCommandResult(stdout_bytes, stderr_bytes, returncode)
@@ -360,14 +410,37 @@ def _changed_file_count(output: bytes) -> int:
 class LocalGitWorktreeAdapter:
     """Concrete local Git implementation of :class:`GitWorktreePort`."""
 
-    def __init__(self, *, local_process_sandbox: LocalProcessSandbox | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        local_process_sandbox: LocalProcessSandbox | None = None,
+        hooks_directory: Path | None = None,
+    ) -> None:
         self._local_process_sandbox = local_process_sandbox or ProcessTreeLocalProcessSandbox()
+        self._temporary_hooks_directory: tempfile.TemporaryDirectory[str] | None = None
+        if hooks_directory is None:
+            self._temporary_hooks_directory = tempfile.TemporaryDirectory(
+                prefix="neuro-code-git-hooks-"
+            )
+            hooks_directory = Path(self._temporary_hooks_directory.name)
+        hooks_directory = hooks_directory.expanduser()
+        if not hooks_directory.is_absolute():
+            hooks_directory = Path.cwd() / hooks_directory
+        self._hooks_directory = hooks_directory.absolute()
+
+    @property
+    def hooks_directory(self) -> Path:
+        """Return the empty Neuro Code-owned Git hooks directory."""
+
+        return self._hooks_directory
 
     async def _run_git(
         self,
         cwd: Path,
         args: tuple[str, ...],
         *,
+        stdin: bytes | None = None,
+        accepted_returncodes: frozenset[int] = frozenset(),
         timeout_seconds: float = MAX_GIT_COMMAND_TIMEOUT_SECONDS,
         failure_kind: WorktreeFailureKind = WorktreeFailureKind.COMMAND_FAILED,
     ) -> _GitCommandResult:
@@ -375,6 +448,9 @@ class LocalGitWorktreeAdapter:
             self._local_process_sandbox,
             cwd,
             args,
+            hooks_directory=self._hooks_directory,
+            stdin=stdin,
+            accepted_returncodes=accepted_returncodes,
             timeout_seconds=timeout_seconds,
             failure_kind=failure_kind,
         )
@@ -446,6 +522,68 @@ class LocalGitWorktreeAdapter:
                 return False
             raise
         return True
+
+    async def preflight_checkout(self, repository_path: Path, commit_sha: str, /) -> None:
+        """Reject effective external checkout filters for one exact commit.
+
+        Git resolves attributes from the target tree.  The adapter therefore
+        asks Git itself for the target paths and attributes instead of parsing
+        ``.gitattributes`` as application data.  A configured smudge/process
+        driver is rejected before ``worktree add`` can create a path.
+        """
+
+        commit_sha = _validate_sha(commit_sha, field_name="worktree base commit")
+        tree = await self._run_git(
+            repository_path,
+            ("ls-tree", "-r", "-z", "--name-only", "--full-tree", commit_sha),
+            failure_kind=WorktreeFailureKind.UNSAFE_GIT_CONFIGURATION,
+        )
+        if not tree.stdout:
+            return
+        if not tree.stdout.endswith(b"\0"):
+            raise WorktreeError(
+                "Git target tree path output is malformed",
+                kind=WorktreeFailureKind.UNSAFE_GIT_CONFIGURATION,
+            )
+        paths = tuple(path for path in tree.stdout.split(b"\0") if path)
+        if not paths:
+            return
+        attributes = await self._run_git(
+            repository_path,
+            ("check-attr", "-z", "--all", f"--source={commit_sha}", "--stdin"),
+            stdin=b"".join(path + b"\0" for path in paths),
+            failure_kind=WorktreeFailureKind.UNSAFE_GIT_CONFIGURATION,
+        )
+        fields = attributes.stdout.split(b"\0")
+        if fields and fields[-1] == b"":
+            fields.pop()
+        if len(fields) % 3 != 0:
+            raise WorktreeError(
+                "Git target attribute output is malformed",
+                kind=WorktreeFailureKind.UNSAFE_GIT_CONFIGURATION,
+            )
+        for index in range(0, len(fields), 3):
+            attribute = os.fsdecode(fields[index + 1])
+            value = os.fsdecode(fields[index + 2])
+            if attribute != "filter" or value in {"", "unspecified", "unset"}:
+                continue
+            if "\x00" in value or any(ord(character) < 32 for character in value):
+                raise WorktreeError(
+                    "Git target filter attribute is unsafe",
+                    kind=WorktreeFailureKind.UNSAFE_GIT_CONFIGURATION,
+                )
+            for operation in ("smudge", "process"):
+                configured = await self._run_git(
+                    repository_path,
+                    ("config", "--get-all", f"filter.{value}.{operation}"),
+                    accepted_returncodes=frozenset({1}),
+                    failure_kind=WorktreeFailureKind.UNSAFE_GIT_CONFIGURATION,
+                )
+                if configured.returncode == 0 and configured.stdout.strip():
+                    raise WorktreeError(
+                        f"target commit uses external Git filter driver {value!r}",
+                        kind=WorktreeFailureKind.EXTERNAL_FILTER_UNSUPPORTED,
+                    )
 
     async def list_worktrees(self, path: Path, /) -> tuple[GitWorktreeRecord, ...]:
         result = await self._run_git(

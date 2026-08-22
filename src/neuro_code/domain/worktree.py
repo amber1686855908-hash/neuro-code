@@ -269,6 +269,7 @@ class WorktreeSnapshot:
     managed: bool = True
     created_by_session_id: str | None = None
     status: WorktreeStatus | None = None
+    version: int = 0
 
     def __post_init__(self) -> None:
         if not isinstance(self.worktree_id, WorktreeId):
@@ -319,6 +320,8 @@ class WorktreeSnapshot:
             )
         if self.status is not None and not isinstance(self.status, WorktreeStatus):
             raise TypeError("worktree snapshot status must be canonical")
+        if not isinstance(self.version, int) or isinstance(self.version, bool) or self.version < 0:
+            raise ValueError("worktree snapshot version must be a non-negative integer")
         if self.kind is WorktreeKind.DETACHED and self.branch is not None:
             raise ValueError("detached snapshot must not expose a branch")
         if self.kind is WorktreeKind.MANAGED_BRANCH and self.branch is None:
@@ -379,7 +382,10 @@ class WorktreeWorkspaceBinding:
             _canonical_path(root, field_name="additional root") for root in self.additional_roots
         )
         if any(
-            root == self.primary_root or root.is_relative_to(self.primary_root) for root in roots
+            root == self.primary_root
+            or root.is_relative_to(self.primary_root)
+            or self.primary_root.is_relative_to(root)
+            for root in roots
         ):
             raise ValueError("additional roots must not overlap the primary worktree root")
         if any(

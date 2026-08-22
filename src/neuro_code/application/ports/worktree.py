@@ -20,6 +20,7 @@ from neuro_code.domain.worktree import (
     WorktreeRemoveRequest,
     WorktreeRepositoryIdentity,
     WorktreeSnapshot,
+    WorktreeState,
     WorktreeStatus,
 )
 
@@ -49,6 +50,9 @@ class WorktreeFailureKind(StrEnum):
     LOCKED = "locked"
     UNMANAGED = "unmanaged"
     FAILED_STATE = "failed_state"
+    EXTERNAL_FILTER_UNSUPPORTED = "external_filter_unsupported"
+    UNSAFE_GIT_CONFIGURATION = "unsafe_git_configuration"
+    CONCURRENT_MODIFICATION = "concurrent_modification"
 
 
 class WorktreeError(Exception):
@@ -101,6 +105,8 @@ class GitWorktreePort(Protocol):
 
     async def branch_exists(self, path: Path, branch: str, /) -> bool: ...
 
+    async def preflight_checkout(self, path: Path, commit_sha: str, /) -> None: ...
+
     async def list_worktrees(self, path: Path, /) -> tuple[GitWorktreeRecord, ...]: ...
 
     async def add_worktree(
@@ -133,7 +139,15 @@ class ManagedWorktreeStore(Protocol):
         repository_id: str | None = None,
     ) -> tuple[WorktreeSnapshot, ...]: ...
 
-    async def save(self, snapshot: WorktreeSnapshot, /) -> None: ...
+    async def insert_intent(self, snapshot: WorktreeSnapshot, /) -> WorktreeSnapshot: ...
+
+    async def compare_and_transition(
+        self,
+        snapshot: WorktreeSnapshot,
+        *,
+        expected_version: int,
+        expected_state: WorktreeState | None = None,
+    ) -> WorktreeSnapshot: ...
 
 
 class WorktreeApplication(Protocol):

@@ -2229,24 +2229,37 @@ source worktree, Git directory, and observed HEAD.
 Managed paths live below the state directory at
 `worktrees/<repository-id>/<worktree-id>`, outside the source checkout. A
 create request names an explicit base revision, which is resolved to an exact
-commit before a detached or `neuro/worktree/<id>` branch worktree is added.
+commit and preflighted for applicable external checkout filters before a
+detached or `neuro/worktree/<id>` branch worktree is added.
 Source dirty changes remain exclusively in the source checkout. Additional
 workspace roots are not inherited by a worktree binding.
 
 The local Git adapter submits argv-safe requests through the canonical local
 process sandbox port, with bounded output, timeouts, and cancellation cleanup;
-it does not create subprocesses directly. It uses `rev-parse`,
-`check-ref-format`, and NUL-safe `worktree list --porcelain -z` parsing. It
-performs no fetch/pull/push/clone or repo-wide prune. Removal requires durable managed ownership plus matching
-repository/path/HEAD/branch identity and uses `git worktree remove` without
-`--force`; dirty and locked worktrees refuse removal, while managed branches
-are retained.
+it does not create subprocesses directly. Every invocation overrides
+`core.hooksPath` with an empty Neuro Code-owned directory and sets
+`core.fsmonitor=false`. It also asks Git, using the exact target commit,
+whether an applicable checkout filter has a configured `smudge` or `process`
+driver; such a driver is rejected before checkout. The existing
+`ProcessTreeLocalProcessSandbox` bridge with `SandboxProfile.OFF` is a
+lifecycle bridge, not OS-enforced filesystem or network isolation, so the
+capability does not claim that guarantee. Explicit remote operations remain
+absent: it performs no fetch/pull/push/clone or repo-wide prune. Removal
+requires durable managed ownership plus matching repository/path/HEAD/branch
+identity and uses `git worktree remove` without `--force`; dirty and locked
+worktrees refuse removal, while managed branches are retained.
 
-SQLite intent and Git metadata are not treated as one transaction. Durable
-`CREATING`/`REMOVING` records are reconciled against actual Git records after
-process death. Exact matches can become `READY`, an absent record after a
-remove intent becomes `REMOVED`, and path reuse, missing repositories, and
-identity mismatches become `ORPHANED` without filesystem deletion. The
-capability does not implement checkpoint/rollback, commit or patch
-integration, branch deletion, writable subagents, or model-facing Git tools.
+SQLite intent and Git metadata are not treated as one transaction. The
+worktree schema uses an insert-only ownership claim plus a durable generation
+CAS: `WorktreeId` conflicts cannot overwrite an existing row, canonical paths
+remain unique, and every later mutation requires the expected generation/state
+and increments the generation. A stale writer receives
+`CONCURRENT_MODIFICATION`; reconciliation rereads the winner instead of
+overwriting it. Durable `CREATING`/`REMOVING` records are reconciled against
+actual Git records after process death. Exact matches can become `READY`, an
+absent record after a remove intent becomes `REMOVED`, and path reuse, missing
+repositories, and identity mismatches become `ORPHANED` without filesystem
+deletion. The capability does not implement checkpoint/rollback, commit or
+patch integration, branch deletion, writable subagents, or model-facing Git
+tools.
 See [ADR 0129](adr/0129-managed-git-worktree-capability.md).
