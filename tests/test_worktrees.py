@@ -354,7 +354,17 @@ class WorktreeGitBoundaryTests(unittest.TestCase):
             nonempty = root / "nonempty-hooks"
             nonempty.mkdir()
             (nonempty / "unexpected-hook").write_text("marker", encoding="utf-8")
-            for hooks_directory in (nonempty, root / "hooks-file"):
+            rejected_paths = [nonempty, root / "hooks-file"]
+            symlink_target = root / "real-hooks"
+            symlink_target.mkdir()
+            symlink = root / "hooks-link"
+            try:
+                symlink.symlink_to(symlink_target, target_is_directory=True)
+            except (NotImplementedError, OSError):
+                pass
+            else:
+                rejected_paths.append(symlink)
+            for hooks_directory in rejected_paths:
                 if hooks_directory.name == "hooks-file":
                     hooks_directory.write_text("not a directory", encoding="utf-8")
                 adapter = LocalGitWorktreeAdapter(hooks_directory=hooks_directory)

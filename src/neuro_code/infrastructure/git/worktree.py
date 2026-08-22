@@ -75,9 +75,11 @@ def _bounded_error(value: bytes, fallback: str) -> str:
 
 def _prepare_hooks_directory(path: Path) -> Path:
     candidate = path.expanduser()
-    for ancestor in (candidate, *candidate.parents):
-        if ancestor.is_symlink():
-            raise OSError("Git hooks path contains a symlink")
+    # macOS exposes the temporary directory through symlink aliases such as
+    # ``/var`` -> ``/private/var``.  Reject the configured hooks directory
+    # itself, then canonicalize parent aliases before creating the owned path.
+    if candidate.is_symlink():
+        raise OSError("Git hooks path contains a symlink")
     hooks_directory = candidate.resolve(strict=False)
     hooks_directory.mkdir(parents=True, exist_ok=True)
     if hooks_directory.is_symlink() or not hooks_directory.is_dir():
