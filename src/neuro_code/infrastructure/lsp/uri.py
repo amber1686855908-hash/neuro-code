@@ -46,13 +46,12 @@ def local_path_from_file_uri(uri: object) -> Path | None:
     decoded = _decode_uri_path(parsed.path)
     if not decoded:
         return None
+    if decoded.startswith("//"):
+        # An empty-authority URI with two path-root slashes is ambiguous
+        # across POSIX and Windows.  Reject it before platform path parsing.
+        return None
     if os.name == "nt" and decoded.startswith("/") and len(decoded) >= 3 and decoded[2] == ":":
         decoded = decoded[1:]
-    elif os.name != "nt" and decoded.startswith("//"):
-        # A local POSIX file URI has one path-root slash.  Reject an encoded
-        # authority-like prefix instead of relying on platform-specific
-        # double-slash path semantics.
-        return None
     candidate = Path(decoded)
     return candidate if candidate.is_absolute() else None
 
