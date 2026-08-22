@@ -5,6 +5,10 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from neuro_code.application.ports.workspace import (
+    FilesystemAccessOperation,
+    FilesystemTargetRequest,
+)
 from neuro_code.infrastructure.lsp.positions import (
     PositionEncoding,
     from_lsp_position,
@@ -18,7 +22,13 @@ from neuro_code.infrastructure.lsp.protocol import (
     encode_message,
     write_message,
 )
-from neuro_code.infrastructure.lsp.uri import display_path, file_uri_from_path, path_from_file_uri
+from neuro_code.infrastructure.lsp.uri import (
+    display_path,
+    file_uri_from_path,
+    local_path_from_file_uri,
+)
+from neuro_code.infrastructure.workspace.paths import resolve_filesystem_access_targets
+from neuro_code.shared.errors import ToolError
 
 
 class _ChunkedStream:
@@ -176,24 +186,30 @@ class LspProtocolTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(model_range_from_lsp(text, {}, encoding=PositionEncoding.UTF16))
 
     def test_uri_projection_rejects_outside_and_non_file_results(self) -> None:
-        root = Path("/tmp/neuro-code-lsp-test-root").resolve()
-        self.assertIsNotNone(path_from_file_uri(root.joinpath("a.py").as_uri(), (root,)))
-        self.assertIsNone(path_from_file_uri("https://example.test/a.py", (root,)))
-        self.assertIsNone(path_from_file_uri("file:///tmp/outside.py", (root,)))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve(strict=False)
+            local = root.joinpath("a.py")
+            self.assertEqual(local_path_from_file_uri(local.as_uri()), local)
+            self.assertIsNone(local_path_from_file_uri("https://example.test/a.py"))
+            outside = root.parent / "outside.py"
+            self.assertEqual(local_path_from_file_uri(outside.as_uri()), outside)
 
     def test_uri_projection_rejects_ambiguous_file_forms_and_bounds_paths(self) -> None:
-        root = Path("/tmp/neuro-code-lsp-test-root").resolve()
-        self.assertIsNone(path_from_file_uri("file://remote/a.py", (root,)))
-        self.assertIsNone(path_from_file_uri(f"{root}/a.py?query", (root,)))
-        self.assertIsNone(path_from_file_uri(f"{root}/a.py#fragment", (root,)))
-        self.assertIsNone(path_from_file_uri("file:///%2Frelative", (root,)))
-        self.assertIsNone(path_from_file_uri("file:///tmp/%00bad", (root,)))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve(strict=False)
+            self.assertIsNone(local_path_from_file_uri("file://remote/a.py"))
+            self.assertIsNone(local_path_from_file_uri(f"{root}/a.py?query"))
+            self.assertIsNone(local_path_from_file_uri(f"{root}/a.py#fragment"))
+            self.assertIsNone(local_path_from_file_uri("file:///%2Frelative"))
+            self.assertIsNone(local_path_from_file_uri("file:///tmp/%00bad"))
+            self.assertIsNone(local_path_from_file_uri("file:///tmp/%GGbad"))
         self.assertIsNone(file_uri_from_path(Path("relative.py")))
         self.assertEqual(display_path(root / "nested" / "a.py", root), "nested/a.py")
-        self.assertEqual(display_path(Path("/tmp/other.py"), root), "/tmp/other.py")
+        outside = root.parent / "other.py"
+        self.assertEqual(display_path(outside, root), outside.as_posix())
 
         with tempfile.TemporaryDirectory() as directory:
-            workspace = Path(directory)
+            workspace = Path(directory).resolve(strict=False)
             actual = workspace / "actual.py"
             actual.write_text("x\n", encoding="utf-8")
             link = workspace / "link.py"
@@ -201,8 +217,21 @@ class LspProtocolTests(unittest.IsolatedAsyncioTestCase):
                 link.symlink_to(actual)
             except (OSError, NotImplementedError):
                 self.skipTest("symbolic links are unavailable")
-            self.assertIsNone(path_from_file_uri(link.as_uri(), (workspace,)))
-            self.assertIsNone(file_uri_from_path(link))
+            self.assertEqual(local_path_from_file_uri(link.as_uri()), link)
+            self.assertEqual(file_uri_from_path(link), link.as_uri())
+            with self.assertRaises(ToolError):
+                resolve_filesystem_access_targets(
+                    "lsp",
+                    workspace,
+                    (
+                        FilesystemTargetRequest(
+                            str(link),
+                            FilesystemAccessOperation.READ,
+                            must_exist=True,
+                            reject_link_like=True,
+                        ),
+                    ),
+                )
 
 
 if __name__ == "__main__":

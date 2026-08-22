@@ -26,6 +26,10 @@ from neuro_code.infrastructure.lsp.positions import PositionEncoding
 from neuro_code.infrastructure.sandbox.local_process import ProcessTreeLocalProcessSandbox
 
 
+def _resolved_path(value: str) -> Path:
+    return Path(value).resolve(strict=False)
+
+
 def _profile() -> LanguageServerProfile:
     return LanguageServerProfile(
         name="python",
@@ -109,16 +113,25 @@ class LspPortContractTests(unittest.TestCase):
         with self.assertRaises(TypeError):
             LspOperationResult("status", {})  # type: ignore[arg-type]
 
-        status = LspStatus(Path("/tmp/workspace"), "python", "python", "ready")
-        self.assertEqual(status.capabilities, ())
+        with tempfile.TemporaryDirectory() as directory:
+            workspace_root = _resolved_path(directory)
+            status = LspStatus(workspace_root, "python", "python", "ready")
+            self.assertEqual(status.capabilities, ())
+            invalid_status_root = workspace_root
         with self.assertRaises(ValueError):
             LspStatus(Path("relative"), None, None, "ready")
         with self.assertRaises(ValueError):
-            LspStatus(Path("/tmp/workspace"), None, None, "")
+            LspStatus(invalid_status_root, None, None, "")
         with self.assertRaises(ValueError):
-            LspStatus(Path("/tmp/workspace"), None, None, "ready", restart_count=-1)
+            LspStatus(invalid_status_root, None, None, "ready", restart_count=-1)
         with self.assertRaises(TypeError):
-            LspStatus(Path("/tmp/workspace"), None, None, "ready", restart_count=True)  # type: ignore[arg-type]
+            LspStatus(  # type: ignore[arg-type]
+                invalid_status_root,
+                None,
+                None,
+                "ready",
+                restart_count=True,
+            )
 
         error = LspError(
             "x" * 2_000,
@@ -133,7 +146,7 @@ class LspPortContractTests(unittest.TestCase):
 class LspProjectionContractTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
-        self.root = Path(self.temporary.name)
+        self.root = _resolved_path(self.temporary.name)
         self.path = self.root / "main.py"
         self.other = self.root / "other.py"
         self.path.write_text("汉😀x\n", encoding="utf-8")

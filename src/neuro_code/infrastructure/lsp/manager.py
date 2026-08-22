@@ -42,6 +42,7 @@ from neuro_code.application.ports.sandbox import (
 )
 from neuro_code.application.ports.workspace import (
     FilesystemAccessOperation,
+    FilesystemAccessTarget,
     FilesystemTargetRequest,
 )
 from neuro_code.infrastructure.lsp.client import (
@@ -54,7 +55,11 @@ from neuro_code.infrastructure.lsp.positions import (
     model_range_from_lsp,
     to_lsp_position,
 )
-from neuro_code.infrastructure.lsp.uri import display_path, file_uri_from_path, path_from_file_uri
+from neuro_code.infrastructure.lsp.uri import (
+    display_path,
+    file_uri_from_path,
+    local_path_from_file_uri,
+)
 from neuro_code.infrastructure.workspace.paths import resolve_filesystem_access_targets
 from neuro_code.shared.async_utils import run_blocking
 from neuro_code.shared.errors import ToolError
@@ -162,27 +167,35 @@ class LanguageServerManager(LanguageServerService):
             return LspOperationResult(request.operation, self._status_payload())
         if request.operation is LspOperation.RESTART:
             return await self._restart(request)
-        profile = self._select_profile(request)
-        route = await self._get_route(profile)
-        if request.operation in {
+        document_path: Path | None = None
+        document_target: FilesystemAccessTarget | None = None
+        document_operations = {
             LspOperation.DEFINITION,
             LspOperation.REFERENCES,
             LspOperation.HOVER,
             LspOperation.DOCUMENT_SYMBOLS,
             LspOperation.DIAGNOSTICS,
-        }:
+        }
+        if request.operation in document_operations:
             if request.path is None:
                 raise LspError(
                     "LSP operation requires a path",
                     kind=LspFailureKind.DOCUMENT_ERROR,
                     phase=LspFailurePhase.REQUEST,
                 )
-            text, document = await self._sync_document(route, request.path)
+            document_target = await self._resolve_document_target(request.path)
+            document_path = document_target.canonical_path
+        profile = self._select_profile(request, path=document_path)
+        route = await self._get_route(profile)
+        if request.operation in document_operations:
+            assert document_path is not None
+            assert document_target is not None
+            text, document = await self._sync_document(route, document_target)
             if request.operation is LspOperation.DIAGNOSTICS:
-                return await self._diagnostics(route, profile, request.path, text, document)
+                return await self._diagnostics(route, profile, document_path, text, document)
             if request.operation is LspOperation.DOCUMENT_SYMBOLS:
                 self._require_capability(route, "documentSymbolProvider")
-                return await self._document_symbols(route, profile, request.path, text, document)
+                return await self._document_symbols(route, profile, document_path, text, document)
             if request.line is None or request.column is None:
                 raise LspError(
                     "LSP semantic navigation requires line and column",
@@ -235,7 +248,7 @@ class LanguageServerManager(LanguageServerService):
                     policy=policy,
                     max_results=request.max_results,
                     encoding=route.client.position_encoding,
-                    source_path=request.path,
+                    source_path=document_path,
                 )
             payload.update(
                 {
@@ -308,7 +321,12 @@ class LanguageServerManager(LanguageServerService):
                 )
         await client.close()
 
-    def _select_profile(self, request: LspRequest) -> LanguageServerProfile:
+    def _select_profile(
+        self,
+        request: LspRequest,
+        *,
+        path: Path | None = None,
+    ) -> LanguageServerProfile:
         profiles = self._config.language_servers
         if request.profile is not None:
             profile = profiles.get(request.profile)
@@ -320,15 +338,16 @@ class LanguageServerManager(LanguageServerService):
                 )
             return profile
         candidates = [profile for profile in profiles.values() if profile.enabled]
-        if request.path is not None:
-            suffix = request.path.suffix.casefold()
+        selection_path = path if path is not None else request.path
+        if selection_path is not None:
+            suffix = selection_path.suffix.casefold()
             matching = [profile for profile in candidates if suffix in profile.extensions]
             if matching:
                 candidates = matching
             marked = [
                 profile
                 for profile in candidates
-                if profile.root_markers and self._root_markers_match(request.path, profile)
+                if profile.root_markers and self._root_markers_match(selection_path, profile)
             ]
             if marked:
                 candidates = marked
@@ -494,23 +513,20 @@ class LanguageServerManager(LanguageServerService):
     async def _sync_document(
         self,
         route: _Route,
-        path: Path,
+        target: FilesystemAccessTarget,
     ) -> tuple[str, _DocumentState]:
-        canonical_path = await run_blocking(path.resolve, strict=False)
-        if path != canonical_path:
+        if (
+            target.operation is not FilesystemAccessOperation.READ
+            or not target.exists
+            or target.contains_link_like_component
+        ):
             raise LspError(
-                "LSP input path changed through a link-like component",
+                "LSP input path did not pass the canonical read target boundary",
                 kind=LspFailureKind.SECURITY_FILTERED,
                 phase=LspFailurePhase.DOCUMENT_SYNC,
             )
-        roots = (self._workspace_root, *self._additional_roots)
-        if not any(canonical_path == root or canonical_path.is_relative_to(root) for root in roots):
-            raise LspError(
-                "LSP input path is outside the configured workspace roots",
-                kind=LspFailureKind.SECURITY_FILTERED,
-                phase=LspFailurePhase.DOCUMENT_SYNC,
-            )
-        uri = file_uri_from_path(path)
+        canonical_path = target.canonical_path
+        uri = file_uri_from_path(canonical_path)
         if uri is None:
             raise LspError(
                 "LSP input path cannot be represented as a safe file URI",
@@ -518,7 +534,7 @@ class LanguageServerManager(LanguageServerService):
                 phase=LspFailurePhase.DOCUMENT_SYNC,
             )
         try:
-            encoded = await run_blocking(path.read_bytes)
+            encoded = await run_blocking(canonical_path.read_bytes)
         except OSError as error:
             raise LspError(
                 f"LSP document read failed: {type(error).__name__}",
@@ -540,11 +556,11 @@ class LanguageServerManager(LanguageServerService):
                 phase=LspFailurePhase.DOCUMENT_SYNC,
             ) from error
         fingerprint = hashlib.sha256(encoded).hexdigest()
-        current = route.documents.get(path)
+        current = route.documents.get(canonical_path)
         assert route.client is not None
         if current is None:
             current = _DocumentState(uri, 1, fingerprint, text)
-            route.documents[path] = current
+            route.documents[canonical_path] = current
             await route.client.notify(
                 "textDocument/didOpen",
                 {
@@ -682,14 +698,30 @@ class LanguageServerManager(LanguageServerService):
             uri = location.get("uri") or location.get("targetUri")
             range_value = location.get("range") or location.get("targetRange")
             selected_uri = location.get("targetSelectionRange") or range_value
-            path = path_from_file_uri(
-                uri,
-                (workspace_root, *self._additional_roots),
-            )
-            if path is None:
+            lexical_path = local_path_from_file_uri(uri)
+            if lexical_path is None:
                 omitted += 1
                 continue
-            if policy is not None and not self._visible_to_policy(path, policy):
+            try:
+                plan = resolve_filesystem_access_targets(
+                    "lsp",
+                    self._workspace_root,
+                    (
+                        FilesystemTargetRequest(
+                            str(lexical_path),
+                            FilesystemAccessOperation.READ,
+                            must_exist=False,
+                            reject_link_like=True,
+                        ),
+                    ),
+                    additional_workspace_roots=self._additional_roots,
+                )
+                target = plan.target_at(0)
+            except (OSError, RuntimeError, TypeError, ValueError, ToolError):
+                omitted += 1
+                continue
+            path = target.canonical_path
+            if policy is not None and not self._visible_to_policy(target, policy):
                 omitted += 1
                 continue
             text = (
@@ -720,27 +752,41 @@ class LanguageServerManager(LanguageServerService):
                 omitted += 1
         return {"locations": locations, "omitted_count": omitted}
 
-    def _visible_to_policy(self, path: Path, policy: LspResultVisibilityPolicy) -> bool:
+    def _visible_to_policy(
+        self,
+        target: FilesystemAccessTarget,
+        policy: LspResultVisibilityPolicy,
+    ) -> bool:
+        decision = policy.decide_targets("lsp", (target,), side_effecting=False)
+        return bool(getattr(decision, "allowed", False)) and getattr(
+            getattr(decision, "effect", None), "value", getattr(decision, "effect", None)
+        ) not in {"ask", "deny"}
+
+    async def _resolve_document_target(self, path: Path) -> FilesystemAccessTarget:
+        """Resolve a local LSP document through the shared filesystem authority."""
+
         try:
-            plan = resolve_filesystem_access_targets(
+            plan = await run_blocking(
+                resolve_filesystem_access_targets,
                 "lsp",
                 self._workspace_root,
                 (
                     FilesystemTargetRequest(
                         str(path),
                         FilesystemAccessOperation.READ,
-                        must_exist=False,
+                        must_exist=True,
                         reject_link_like=True,
                     ),
                 ),
                 additional_workspace_roots=self._additional_roots,
             )
-        except (OSError, RuntimeError, ValueError, ToolError):
-            return False
-        decision = policy.decide_targets("lsp", plan.targets, side_effecting=False)
-        return bool(getattr(decision, "allowed", False)) and getattr(
-            getattr(decision, "effect", None), "value", getattr(decision, "effect", None)
-        ) not in {"ask", "deny"}
+            return plan.target_at(0)
+        except (OSError, RuntimeError, TypeError, ValueError, ToolError) as error:
+            raise LspError(
+                "LSP input path did not pass the canonical read target boundary",
+                kind=LspFailureKind.SECURITY_FILTERED,
+                phase=LspFailurePhase.DOCUMENT_SYNC,
+            ) from error
 
     async def _read_optional_text(self, path: Path) -> str | None:
         try:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import tempfile
 import unittest
 from collections.abc import AsyncIterator, Sequence
@@ -158,6 +159,29 @@ context_window_tokens = 65536
 """,
             encoding="utf-8",
         )
+
+    async def test_idle_lsp_service_does_not_delay_composition_close(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / "state"
+            self._write_config(state)
+            with patch.dict(
+                "os.environ",
+                {
+                    "HOME": str(root),
+                    "NEURO_CODE_HOME": str(state),
+                    "FIXTURE_KEY": "fixture-key",
+                },
+                clear=True,
+            ):
+                application = await ApplicationComposition.open(
+                    ApplicationSettings(cwd=root),
+                    provider_factory=lambda config, failover: ApplicationProviderFixture(),
+                )
+                await application.create_binding()
+                self.assertEqual(len(application._lsp_services), 1)
+                await asyncio.wait_for(application.close(), timeout=1.0)
+                self.assertEqual(application._lsp_services, set())
 
     async def test_capability_bound_child_uses_exact_registry_and_context_manifest(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

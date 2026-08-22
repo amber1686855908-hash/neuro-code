@@ -12,6 +12,10 @@ from neuro_code.infrastructure.lsp.positions import PositionEncoding
 from neuro_code.infrastructure.lsp.protocol import LspProtocolError
 
 
+def _resolved_path(value: str) -> Path:
+    return Path(value).resolve(strict=False)
+
+
 class _MemoryStream:
     def __init__(self, data: bytes = b"", error: BaseException | None = None) -> None:
         self.data = bytearray(data)
@@ -69,7 +73,7 @@ def _error(kind: LspFailureKind = LspFailureKind.PROTOCOL_ERROR) -> LspError:
 
 class LspClientTests(unittest.IsolatedAsyncioTestCase):
     async def test_constructor_dispatch_and_server_request_paths(self) -> None:
-        root = Path(tempfile.mkdtemp())
+        root = _resolved_path(tempfile.mkdtemp())
         process = _FakeProcess()
         client = LspClient(process, workspace_root=root)
         self.assertEqual(client.position_encoding, PositionEncoding.UTF16)
@@ -121,7 +125,7 @@ class LspClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreaterEqual(len(process.writes), 7)
 
     async def test_requests_cancel_and_transport_failures_are_typed(self) -> None:
-        root = Path(tempfile.mkdtemp())
+        root = _resolved_path(tempfile.mkdtemp())
         process = _FakeProcess()
         client = LspClient(process, workspace_root=root)
         with self.assertRaises(LspError) as timed_out:
@@ -163,7 +167,7 @@ class LspClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(transport_failure.terminal_error.kind, LspFailureKind.SERVER_CRASH)  # type: ignore[union-attr]
 
     async def test_initialize_validation_and_close_fallbacks(self) -> None:
-        root = Path(tempfile.mkdtemp())
+        root = _resolved_path(tempfile.mkdtemp())
         client = LspClient(_FakeProcess(), workspace_root=root)
         client.request = AsyncMock(  # type: ignore[method-assign]
             return_value={"capabilities": {"offsetEncoding": ["utf-8"]}}
