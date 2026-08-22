@@ -70,7 +70,7 @@ def _new_repository(root: Path) -> tuple[Path, str]:
     _git(repository, "config", "core.eol", "lf")
     _git(repository, "config", "user.email", "neuro-code-tests@example.invalid")
     _git(repository, "config", "user.name", "Neuro Code Tests")
-    (repository / "tracked.txt").write_text("committed\n", encoding="utf-8")
+    (repository / "tracked.txt").write_bytes(b"committed\n")
     _git(repository, "add", "tracked.txt")
     _git(repository, "commit", "-qm", "initial")
     return repository, _git(repository, "rev-parse", "HEAD")
@@ -664,7 +664,7 @@ class WorktreeApplicationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="neuro-worktree-lifecycle-") as raw:
             root = Path(raw)
             repository, head = _new_repository(root)
-            (repository / "tracked.txt").write_text("dirty source\n", encoding="utf-8")
+            (repository / "tracked.txt").write_bytes(b"dirty source\n")
             source_before = (repository / "tracked.txt").read_bytes()
             service = WorktreeApplicationService(
                 git=LocalGitWorktreeAdapter(),
