@@ -66,6 +66,8 @@ def _new_repository(root: Path) -> tuple[Path, str]:
     repository = root / "repo"
     repository.mkdir()
     _git(repository, "init", "-q")
+    _git(repository, "config", "core.autocrlf", "false")
+    _git(repository, "config", "core.eol", "lf")
     _git(repository, "config", "user.email", "neuro-code-tests@example.invalid")
     _git(repository, "config", "user.name", "Neuro Code Tests")
     (repository / "tracked.txt").write_text("committed\n", encoding="utf-8")
