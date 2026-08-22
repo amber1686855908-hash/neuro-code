@@ -1548,3 +1548,28 @@ local file URI 才会投影；permission DENY/ASK，以及 invalid、workspace �
 当前实现的 operation 是 definition、references、hover、document symbols、workspace symbols、diagnostics、
 status 与有界 restart。Rename、format、code actions、`workspace/applyEdit`、任意 server edit、worktree 与
 checkpoint 仍是规划能力。
+
+## 由应用拥有的受管 Git Worktree
+
+首个 worktree 能力是显式 application service，而不是面向模型的任意 Git tool。
+`ApplicationComposition` 可以构造一个由 `GitWorktreePort` 和独立、版本化
+`worktrees.db` ownership store 支持的 `WorktreeApplicationService`。该服务只在 workspace
+binding 阶段复用现有 canonical filesystem resolver；Git repository identity 是独立领域值，
+基于规范 common Git directory、source worktree、Git directory 和观察到的 HEAD。
+
+managed path 位于 state directory 下的 `worktrees/<repository-id>/<worktree-id>`，并且在 source
+checkout 之外。create request 必须明确 base revision，先解析为精确 commit，再创建 detached
+或 `neuro/worktree/<id>` branch worktree。源 checkout 的 dirty 变更始终只留在源 checkout 中。
+worktree binding 不继承 additional workspace roots。
+
+本地 Git adapter 通过规范的 local process sandbox 端口提交 argv-safe request，并设置有界输出、
+超时和取消清理；它不直接创建子进程。它使用 `rev-parse`、`check-ref-format` 和 NUL-safe
+`worktree list --porcelain -z` parser。不执行 fetch/pull/push/clone，也不执行全仓库 prune。移除要求 durable managed ownership 以及匹配的 repository/path/HEAD/branch
+identity，并使用不带 `--force` 的 `git worktree remove`；dirty 和 locked worktree 拒绝移除，
+managed branch 则保留。
+
+SQLite intent 与 Git metadata 不被当作一个事务。进程退出后，durable `CREATING`/`REMOVING`
+记录会与实际 Git record reconciliation。精确匹配可以变为 `READY`，remove intent 后实际记录
+缺失可以变为 `REMOVED`；path reuse、仓库缺失和 identity mismatch 会变为 `ORPHANED`，且不执行
+文件系统删除。本能力不实现 checkpoint/rollback、commit 或 patch integration、branch deletion、
+writable subagent 或面向模型的 Git tool。详见 [ADR 0129](adr/0129-managed-git-worktree-capability.md)。

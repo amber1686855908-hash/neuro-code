@@ -2215,3 +2215,38 @@ The implemented operations are definition, references, hover, document
 symbols, workspace symbols, diagnostics, status, and bounded restart. Rename,
 format, code actions, `workspace/applyEdit`, arbitrary server edits, worktrees,
 and checkpoints remain planned capabilities.
+
+## Application-owned managed Git worktrees
+
+The first worktree capability is an explicit application service rather than a
+model-facing arbitrary Git tool. `ApplicationComposition` can construct one
+`WorktreeApplicationService` backed by `GitWorktreePort` and a separate,
+versioned `worktrees.db` ownership store. The service uses the existing
+canonical filesystem resolver only for workspace binding; Git repository
+identity is a separate value based on the canonical common Git directory,
+source worktree, Git directory, and observed HEAD.
+
+Managed paths live below the state directory at
+`worktrees/<repository-id>/<worktree-id>`, outside the source checkout. A
+create request names an explicit base revision, which is resolved to an exact
+commit before a detached or `neuro/worktree/<id>` branch worktree is added.
+Source dirty changes remain exclusively in the source checkout. Additional
+workspace roots are not inherited by a worktree binding.
+
+The local Git adapter submits argv-safe requests through the canonical local
+process sandbox port, with bounded output, timeouts, and cancellation cleanup;
+it does not create subprocesses directly. It uses `rev-parse`,
+`check-ref-format`, and NUL-safe `worktree list --porcelain -z` parsing. It
+performs no fetch/pull/push/clone or repo-wide prune. Removal requires durable managed ownership plus matching
+repository/path/HEAD/branch identity and uses `git worktree remove` without
+`--force`; dirty and locked worktrees refuse removal, while managed branches
+are retained.
+
+SQLite intent and Git metadata are not treated as one transaction. Durable
+`CREATING`/`REMOVING` records are reconciled against actual Git records after
+process death. Exact matches can become `READY`, an absent record after a
+remove intent becomes `REMOVED`, and path reuse, missing repositories, and
+identity mismatches become `ORPHANED` without filesystem deletion. The
+capability does not implement checkpoint/rollback, commit or patch
+integration, branch deletion, writable subagents, or model-facing Git tools.
+See [ADR 0129](adr/0129-managed-git-worktree-capability.md).

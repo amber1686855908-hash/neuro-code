@@ -862,6 +862,7 @@ def test_canonical_ports_are_the_only_port_modules() -> None:
         "neuro_code.application.ports.workspace",
         "neuro_code.application.ports.workspace_changes",
         "neuro_code.application.ports.windows_sandbox",
+        "neuro_code.application.ports.worktree",
     }
     assert {
         module for module in modules if module.startswith("neuro_code.application.ports")
@@ -878,6 +879,7 @@ def test_canonical_persistence_modules_are_the_only_persistence_implementations(
     canonical_modules = {
         "neuro_code.infrastructure.persistence",
         "neuro_code.infrastructure.persistence.output_artifacts",
+        "neuro_code.infrastructure.persistence.managed_worktrees",
         "neuro_code.infrastructure.persistence.rust_session",
         "neuro_code.infrastructure.persistence.sqlite_session",
         "neuro_code.infrastructure.persistence.ui_preferences",

@@ -103,6 +103,19 @@ from neuro_code.domain.tools import (
     ToolExecutionResult,
     ToolResult,
 )
+from neuro_code.domain.worktree import (
+    WorktreeCreateRequest,
+    WorktreeHandle,
+    WorktreeId,
+    WorktreeKind,
+    WorktreeOwnership,
+    WorktreeRemoveRequest,
+    WorktreeRepositoryIdentity,
+    WorktreeSnapshot,
+    WorktreeState,
+    WorktreeStatus,
+    WorktreeWorkspaceBinding,
+)
 from neuro_code.shared.ui_language import UiLanguage
 
 __all__ = [
@@ -183,6 +196,17 @@ __all__ = [
     "ToolExecutionResult",
     "ToolResult",
     "UiLanguage",
+    "WorktreeCreateRequest",
+    "WorktreeHandle",
+    "WorktreeId",
+    "WorktreeKind",
+    "WorktreeOwnership",
+    "WorktreeRemoveRequest",
+    "WorktreeRepositoryIdentity",
+    "WorktreeSnapshot",
+    "WorktreeState",
+    "WorktreeStatus",
+    "WorktreeWorkspaceBinding",
     "compute_compaction_source_fingerprint",
     "context_fingerprints",
     "estimate_context_tokens",

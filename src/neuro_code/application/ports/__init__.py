@@ -200,6 +200,14 @@ from neuro_code.application.ports.workspace_changes import (
     WorkspaceMutationJournalProjection,
     WorkspaceMutationTargetProvider,
 )
+from neuro_code.application.ports.worktree import (
+    GitWorktreePort,
+    GitWorktreeRecord,
+    ManagedWorktreeStore,
+    WorktreeApplication,
+    WorktreeError,
+    WorktreeFailureKind,
+)
 
 __all__ = [
     "DEFAULT_FETCH_MAX_CHARS",
@@ -239,6 +247,8 @@ __all__ = [
     "FilesystemAccessTarget",
     "FilesystemTargetProvider",
     "FilesystemTargetRequest",
+    "GitWorktreePort",
+    "GitWorktreeRecord",
     "HostedWebSearch",
     "HostedWebSearchEvent",
     "HostedWebSearchEventSink",
@@ -275,6 +285,7 @@ __all__ = [
     "ManagedProviderProfile",
     "ManagedProviderSettings",
     "ManagedProxyPolicy",
+    "ManagedWorktreeStore",
     "McpElicitationHandler",
     "McpPrompt",
     "McpPromptMessage",
@@ -364,6 +375,9 @@ __all__ = [
     "WorkspaceMutationJournalProjection",
     "WorkspaceMutationTargetProvider",
     "WorkspacePathResolver",
+    "WorktreeApplication",
+    "WorktreeError",
+    "WorktreeFailureKind",
     "lifecycle_capability_satisfies",
     "normalize_web_fetch_url",
     "resolve_capabilities",

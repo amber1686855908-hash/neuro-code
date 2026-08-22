@@ -41,6 +41,7 @@ class LocalProcessPurpose(StrEnum):
     MCP_STDIO = "mcp-stdio"
     LSP_SERVER = "lsp-server"
     INTERACTIVE_TERMINAL = "interactive-terminal"
+    GIT_WORKTREE = "git-worktree"
 
 
 class LocalProcessStdioMode(StrEnum):

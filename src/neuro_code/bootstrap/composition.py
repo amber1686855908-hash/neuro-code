@@ -111,12 +111,15 @@ from neuro_code.application.workflows.subagent_scheduler import (
     ScopedSubagentRuntimeFactory,
     SubagentScheduler,
 )
+from neuro_code.application.worktrees import WorktreeApplicationService
 from neuro_code.domain.conversation.reasoning import ReasoningEffort
 from neuro_code.domain.sandbox.models import SandboxProfile
 from neuro_code.domain.workspace.instructions import InstructionDiscoveryResult
 from neuro_code.domain.workspace.skills import SkillDiscoveryResult
 from neuro_code.infrastructure.background_tasks import LocalBackgroundTaskManager
+from neuro_code.infrastructure.git.worktree import LocalGitWorktreeAdapter
 from neuro_code.infrastructure.lsp.manager import LanguageServerManager
+from neuro_code.infrastructure.persistence.managed_worktrees import SqliteManagedWorktreeStore
 from neuro_code.infrastructure.persistence.output_artifacts import FileToolOutputArtifactStore
 from neuro_code.infrastructure.persistence.sqlite_session import SqliteSessionStore
 from neuro_code.infrastructure.providers import create_routed_provider
@@ -329,6 +332,25 @@ class ApplicationComposition:
             selected_config.sandbox_profile,
             selected_config.cwd,
             selected_config.state_dir,
+        )
+
+    def create_worktree_service(self) -> WorktreeApplicationService:
+        """Create the application-owned local Git worktree capability.
+
+        The service is explicit and not automatically exposed to ordinary
+        model-facing tools.  Its database and managed root are both owned by
+        the configured state directory; callers must await ``initialize``
+        before using lifecycle operations.
+
+        创建应用拥有的本地 Git worktree 能力.该服务是显式的,不会自动暴露给普通模型工具.
+        database 和 managed root 都属于配置的 state directory;调用方必须先 await
+        ``initialize`` 再使用生命周期操作.
+        """
+
+        return WorktreeApplicationService(
+            git=LocalGitWorktreeAdapter(),
+            store=SqliteManagedWorktreeStore(self.config.state_dir / "worktrees.db"),
+            managed_root=self.config.state_dir / "worktrees",
         )
 
     @classmethod
