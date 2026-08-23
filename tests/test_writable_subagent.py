@@ -1338,9 +1338,18 @@ context_window_tokens = 131072
                 case=case,
                 trace=trace,
             )
+            runtime_environment = {
+                "PATH": os.environ.get("PATH") or os.defpath,
+            }
+            if os.name == "nt":
+                for name in ("SystemRoot", "SystemDrive", "PATHEXT"):
+                    value = os.environ.get(name)
+                    if value:
+                        runtime_environment[name] = value
             with patch.dict(
                 os.environ,
                 {
+                    **runtime_environment,
                     "HOME": str(root),
                     "NEURO_CODE_HOME": str(state_dir),
                     "FIXTURE_KEY": "fixture-key",
