@@ -1421,7 +1421,7 @@ context_window_tokens = 131072
                     self.assertEqual(child_provider.cwd, snapshot.canonical_path)
                     self.assertEqual(
                         (snapshot.canonical_path / "tracked.txt").read_bytes(),
-                        b"child-edited\n",
+                        ("child-edited" + os.linesep).encode(),
                     )
                     lease = (
                         await application.store.list_writable_subagent_leases(
