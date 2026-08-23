@@ -1229,6 +1229,47 @@ class _ProductionWritableProviderFactory:
 
 
 class WritableApplicationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_parent_binding_validation_is_canonical_at_both_boundaries(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            parent = root / "parent"
+            parent.mkdir()
+            global_policy = _capability(root / "global", max_steps=12)
+            worktrees = _FakeWorktrees(root, _repository(root))
+            checkpoints = _FakeCheckpoints(root, worktrees)
+            store = SqliteSessionStore(root / "sessions.db")
+            factory = _FakeRuntimeFactory(store, worktrees)
+            parent_capabilities = _capability(parent)
+            invalid_bindings = (
+                (cast(ConversationBinding, object()), "parent binding is required"),
+                (_parent_binding("parent", None), "capability metadata is missing"),
+                (_parent_binding(None, parent_capabilities), "session identity is missing"),
+            )
+            for binding, message in invalid_bindings:
+                with self.subTest(message=message):
+                    with self.assertRaisesRegex(ConfigurationError, message):
+                        WritableSubagentApplicationService(
+                            store,
+                            store,
+                            worktrees,
+                            checkpoints,
+                            factory,
+                            parent_binding=binding,
+                            global_policy=global_policy,
+                        )
+                    with self.assertRaisesRegex(ConfigurationError, message):
+                        ApplicationComposition.create_writable_subagent_service(
+                            cast(ApplicationComposition, object()),
+                            parent_binding=binding,
+                        )
+
+    def test_posix_owner_probe_is_conservative_on_permission_error(self) -> None:
+        with patch(
+            "neuro_code.application.runtime.process_liveness.os.kill",
+            side_effect=PermissionError,
+        ):
+            self.assertTrue(owner_is_alive(1234))
+
     async def _service(
         self,
         root: Path,
@@ -2138,10 +2179,39 @@ context_window_tokens = 131072
             )
             await _insert_reconciliation_lease(store, dead)
             snapshots[dead_id.value] = _fake_snapshot(dead_handle)
+
+            ready_dead_id = WorktreeId("wt-ready-dead-owner")
+            ready_dead_handle = WorktreeHandle(
+                worktree_id=ready_dead_id,
+                repository=repository,
+                path=worktrees.planned_managed_path(repository, ready_dead_id),
+                base_commit_sha=BASE_SHA,
+                branch="neuro/writable-subagent/wt-ready-dead-owner",
+            )
+            ready_dead = _reconciliation_lease(
+                root,
+                await store.create_session(str(root / "ready-dead-parent"), "fixture", "model"),
+                parent_capabilities,
+                worktree_id_value=ready_dead_id.value,
+                state=WritableSubagentWorkspaceState.WORKTREE_READY,
+                owner_pid=None,
+                worktree=ready_dead_handle,
+                baseline_checkpoint_id=None,
+            )
+            await _insert_reconciliation_lease(store, ready_dead)
+            snapshots[ready_dead_id.value] = _fake_snapshot(ready_dead_handle)
             reconciled = await service.reconcile_writable_subagent_workspaces()
             by_id = {lease.worktree_id.value: lease for lease in reconciled}
             self.assertIs(by_id[dead_id.value].state, WritableSubagentWorkspaceState.ORPHANED)
             self.assertEqual(by_id[dead_id.value].error_kind, "dead_writable_subagent_owner")
+            self.assertIs(
+                by_id[ready_dead_id.value].state,
+                WritableSubagentWorkspaceState.ORPHANED,
+            )
+            self.assertEqual(
+                by_id[ready_dead_id.value].error_kind,
+                "worktree_ready_without_baseline",
+            )
 
     async def test_reconciliation_detects_missing_handle_and_baseline_link(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
