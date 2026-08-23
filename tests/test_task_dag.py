@@ -9,6 +9,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
+from unittest.mock import AsyncMock
 
 from neuro_code.application.ports.model import ModelProvider
 from neuro_code.application.ports.task_dag import TaskDagError
@@ -17,13 +18,18 @@ from neuro_code.application.workflows.task_dag import (
     CreateTaskDagRequest,
     RunTaskDagRequest,
     TaskDagApplicationService,
+    TaskDagWritableService,
 )
 from neuro_code.domain.session_tasks import SessionTask, SessionTaskKind, SessionTaskStatus
 from neuro_code.domain.task_dag import (
+    MAX_TASK_DAG_ERROR_BYTES,
+    MAX_TASK_DAG_NODE_DEPENDENCIES,
     MAX_TASK_DAG_NODES,
+    MAX_TASK_DAG_PROMPT_BYTES,
     MAX_TASK_DAG_RESPONSE_PREVIEW_BYTES,
     TaskDag,
     TaskDagNode,
+    TaskDagNodeKind,
     TaskDagNodeState,
     TaskDagState,
 )
@@ -34,7 +40,7 @@ from neuro_code.shared.errors import ConfigurationError
 
 
 def _now() -> datetime:
-    return datetime(2026, 8, 24, 12, tzinfo=UTC)
+    return datetime.now(UTC)
 
 
 def _node(node_id: str, ordinal: int, dependencies: tuple[str, ...] = ()) -> TaskDagNode:
@@ -74,6 +80,22 @@ class _FakeLeaseStore:
 class _FakeRelayStore:
     async def get_parent_context_relay_for_lease(self, lease_id: str) -> object:
         return SimpleNamespace(relay_id=f"relay-for-{lease_id}")
+
+
+class _IntermittentClaimStore:
+    def __init__(self, delegate: SqliteSessionStore, error: TaskDagError) -> None:
+        self._delegate = delegate
+        self._error = error
+        self._raised = False
+
+    async def claim_task_dag_node(self, *args, **kwargs):
+        if not self._raised:
+            self._raised = True
+            raise self._error
+        return await self._delegate.claim_task_dag_node(*args, **kwargs)
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._delegate, name)
 
 
 class _FakeWritableService:
@@ -202,6 +224,206 @@ class TaskDagDomainTests(unittest.TestCase):
                 prompt="prompt",
                 state=TaskDagNodeState.RUNNING,
             )
+
+    def test_domain_rejects_untrusted_and_inconsistent_values(self) -> None:
+        with self.assertRaisesRegex(ValueError, "safe identifier"):
+            TaskDagNode(node_id="bad\x01", ordinal=0, prompt="prompt")
+        with self.assertRaisesRegex(ValueError, "non-negative"):
+            TaskDagNode(node_id="negative", ordinal=-1, prompt="prompt")
+        with self.assertRaisesRegex(ValueError, "non-empty and bounded"):
+            TaskDagNode(node_id="empty", ordinal=0, prompt="")
+        with self.assertRaisesRegex(ValueError, "non-empty and bounded"):
+            TaskDagNode(
+                node_id="long-prompt",
+                ordinal=0,
+                prompt="x" * (MAX_TASK_DAG_PROMPT_BYTES + 1),
+            )
+        with self.assertRaisesRegex(ValueError, "unsafe control"):
+            TaskDagNode(node_id="control", ordinal=0, prompt="bad\x01prompt")
+        with self.assertRaisesRegex(ValueError, "error kind is not bounded"):
+            TaskDagNode(
+                node_id="long-error-kind",
+                ordinal=0,
+                prompt="prompt",
+                error_kind="x" * (MAX_TASK_DAG_ERROR_BYTES + 1),
+            )
+        with self.assertRaisesRegex(ValueError, "too many dependencies"):
+            TaskDagNode(
+                node_id="many-deps",
+                ordinal=0,
+                prompt="prompt",
+                dependencies=tuple(
+                    f"dep-{index}" for index in range(MAX_TASK_DAG_NODE_DEPENDENCIES + 1)
+                ),
+            )
+        with self.assertRaisesRegex(TypeError, "dependencies must be a tuple"):
+            TaskDagNode(
+                node_id="list-deps",
+                ordinal=0,
+                prompt="prompt",
+                dependencies=["dep"],  # type: ignore[arg-type]
+            )
+        with self.assertRaisesRegex(ValueError, "dependencies must be unique"):
+            TaskDagNode(
+                node_id="duplicate-deps",
+                ordinal=0,
+                prompt="prompt",
+                dependencies=("dep", "dep"),
+            )
+        with self.assertRaisesRegex(ValueError, "kind must be canonical"):
+            TaskDagNode(
+                node_id="bad-kind",
+                ordinal=0,
+                prompt="prompt",
+                kind=cast(TaskDagNodeKind, object()),
+            )
+        with self.assertRaisesRegex(ValueError, "state must be canonical"):
+            TaskDagNode(
+                node_id="bad-state",
+                ordinal=0,
+                prompt="prompt",
+                state=cast(TaskDagNodeState, object()),
+            )
+        with self.assertRaisesRegex(ValueError, "generation must be non-negative"):
+            TaskDagNode(node_id="bad-generation", ordinal=0, prompt="prompt", generation=True)
+        with self.assertRaisesRegex(ValueError, "changed file count"):
+            TaskDagNode(node_id="bad-count", ordinal=0, prompt="prompt", changed_file_count=True)
+        with self.assertRaisesRegex(ValueError, "unsafe control"):
+            TaskDagNode(node_id="bad-error", ordinal=0, prompt="prompt", error_reason="bad\x01")
+        with self.assertRaisesRegex(ValueError, "response preview is not bounded"):
+            TaskDagNode(
+                node_id="long-response",
+                ordinal=0,
+                prompt="prompt",
+                response_preview="x" * (MAX_TASK_DAG_RESPONSE_PREVIEW_BYTES + 1),
+            )
+        with self.assertRaisesRegex(ValueError, "workspace fingerprint"):
+            TaskDagNode(
+                node_id="bad-fingerprint",
+                ordinal=0,
+                prompt="prompt",
+                final_workspace_fingerprint="not-a-digest",
+            )
+
+        with self.assertRaisesRegex(ValueError, "must not carry execution state"):
+            TaskDag.create(
+                dag_id="prepopulated",
+                parent_session_id="parent",
+                nodes=(replace(_node("a", 0), parent_task_id="worker-a"),),
+                created_at=_now(),
+            )
+        with self.assertRaisesRegex(ValueError, "at least one node"):
+            TaskDag.create(
+                dag_id="empty-dag",
+                parent_session_id="parent",
+                nodes=(),
+                created_at=_now(),
+            )
+        with self.assertRaisesRegex(ValueError, "node ids must be unique"):
+            TaskDag.create(
+                dag_id="duplicate-ids",
+                parent_session_id="parent",
+                nodes=(_node("a", 0), _node("a", 1)),
+                created_at=_now(),
+            )
+        with self.assertRaisesRegex(ValueError, "ordinals must match"):
+            TaskDag.create(
+                dag_id="bad-ordinals",
+                parent_session_id="parent",
+                nodes=(_node("a", 0), _node("b", 2)),
+                created_at=_now(),
+            )
+        too_many_edges = tuple(
+            _node(
+                f"node-{index}",
+                index,
+                tuple(f"node-{dependency}" for dependency in range(max(0, index - 4), index)),
+            )
+            for index in range(MAX_TASK_DAG_NODES)
+        )
+        with self.assertRaisesRegex(ValueError, "too many edges"):
+            TaskDag.create(
+                dag_id="too-many-edges",
+                parent_session_id="parent",
+                nodes=too_many_edges,
+                created_at=_now(),
+            )
+
+        base = TaskDag.create(
+            dag_id="invalid-snapshot",
+            parent_session_id="parent",
+            nodes=(_node("a", 0), _node("b", 1, ("a",))),
+            created_at=_now(),
+        )
+        with self.assertRaisesRegex(ValueError, "state must be canonical"):
+            TaskDag(
+                dag_id=base.dag_id,
+                parent_session_id=base.parent_session_id,
+                nodes=base.nodes,
+                state=cast(TaskDagState, object()),
+            )
+        with self.assertRaisesRegex(ValueError, "generation must be non-negative"):
+            TaskDag(
+                dag_id=base.dag_id,
+                parent_session_id=base.parent_session_id,
+                nodes=base.nodes,
+                generation=-1,
+            )
+        with self.assertRaisesRegex(ValueError, "creation time must be timezone-aware"):
+            TaskDag(
+                dag_id=base.dag_id,
+                parent_session_id=base.parent_session_id,
+                nodes=base.nodes,
+                created_at=datetime.min,  # noqa: DTZ901 - intentionally invalid input
+            )
+        with self.assertRaisesRegex(ValueError, "update time must be timezone-aware"):
+            TaskDag(
+                dag_id=base.dag_id,
+                parent_session_id=base.parent_session_id,
+                nodes=base.nodes,
+                created_at=_now(),
+                updated_at=datetime.min,  # noqa: DTZ901 - intentionally invalid input
+            )
+        with self.assertRaisesRegex(ValueError, "must not precede creation"):
+            TaskDag(
+                dag_id=base.dag_id,
+                parent_session_id=base.parent_session_id,
+                nodes=base.nodes,
+                created_at=_now(),
+                updated_at=_now() - timedelta(seconds=1),
+            )
+        with self.assertRaisesRegex(ValueError, "active node must be running"):
+            TaskDag(
+                dag_id=base.dag_id,
+                parent_session_id=base.parent_session_id,
+                nodes=base.nodes,
+                active_node_id="a",
+            )
+        running = replace(base.node("a"), state=TaskDagNodeState.RUNNING, parent_task_id="worker-a")
+        with self.assertRaisesRegex(ValueError, "requires an active node id"):
+            TaskDag(
+                dag_id=base.dag_id,
+                parent_session_id=base.parent_session_id,
+                nodes=(running, base.node("b")),
+                state=TaskDagState.RUNNING,
+            )
+        with self.assertRaises(KeyError):
+            base.node("missing")
+        self.assertEqual(base.with_nodes(base.nodes).node_states(), base.node_states())
+        self.assertTrue(TaskDagState.COMPLETED.terminal)
+        self.assertTrue(TaskDagNodeState.SKIPPED.terminal)
+        self.assertTrue(TaskDagNodeState.COMPLETED.successful)
+        self.assertFalse(TaskDagNodeState.FAILED.successful)
+
+        corrupt = TaskDag.create(
+            dag_id="corrupt-topology",
+            parent_session_id="parent",
+            nodes=(_node("a", 0), _node("b", 1, ("a",))),
+            created_at=_now(),
+        )
+        object.__setattr__(corrupt.node("a"), "dependencies", ("b",))
+        with self.assertRaisesRegex(ValueError, "contain a cycle"):
+            corrupt.topological_order()
 
 
 class TaskDagPersistenceTests(unittest.IsolatedAsyncioTestCase):
@@ -410,6 +632,438 @@ class TaskDagSchedulerTests(unittest.IsolatedAsyncioTestCase):
             state=WritableSubagentWorkspaceState.PRESERVED,
         )
 
+    async def test_service_rejects_noncanonical_requests_and_binding_errors(self) -> None:
+        writable = _FakeWritableService(self.parent_session_id)
+        service = self._service(writable)
+        with self.assertRaisesRegex(ValueError, "creation request must be canonical"):
+            await service.create_task_dag(cast(CreateTaskDagRequest, object()))
+        with self.assertRaisesRegex(ValueError, "query request must be canonical"):
+            await service.get_task_dag(cast(RunTaskDagRequest, object()))
+        with self.assertRaisesRegex(ValueError, "run request must be canonical"):
+            await service.run_task_dag(cast(RunTaskDagRequest, object()))
+        with self.assertRaisesRegex(ValueError, "reconciliation request must be canonical"):
+            await service.reconcile_task_dag(cast(RunTaskDagRequest, object()))
+        with self.assertRaisesRegex(ConfigurationError, "unknown task DAG"):
+            await service.run_task_dag(RunTaskDagRequest("unknown"))
+
+        with self.assertRaisesRegex(ConfigurationError, "parent binding is required"):
+            TaskDagApplicationService(
+                self.store,
+                self.store,
+                writable,
+                self.leases,
+                self.relays,
+                parent_binding=cast(ConversationBinding, object()),
+            )
+        with self.assertRaisesRegex(ConfigurationError, "writable service is invalid"):
+            TaskDagApplicationService(
+                self.store,
+                self.store,
+                cast(TaskDagWritableService, object()),
+                self.leases,
+                self.relays,
+                parent_binding=self.binding,
+            )
+        with self.assertRaisesRegex(ConfigurationError, "session identity is missing"):
+            TaskDagApplicationService(
+                self.store,
+                self.store,
+                _FakeWritableService(""),
+                self.leases,
+                self.relays,
+                parent_binding=_binding(""),
+            )
+
+    async def test_publication_and_parent_verification_fail_closed(self) -> None:
+        foreign = TaskDag.create(
+            dag_id="foreign",
+            parent_session_id="different-parent",
+            nodes=(_node("a", 0),),
+            created_at=_now(),
+        )
+        dag_store = SimpleNamespace(
+            insert_task_dag=AsyncMock(
+                side_effect=TaskDagError("definition conflict", kind="definition_conflict")
+            ),
+            get_task_dag=AsyncMock(return_value=foreign),
+        )
+        service = TaskDagApplicationService(
+            self.store,
+            dag_store,
+            _FakeWritableService(self.parent_session_id),
+            self.leases,
+            self.relays,
+            parent_binding=self.binding,
+        )
+        with self.assertRaisesRegex(ConfigurationError, "publication failed"):
+            await service.create_task_dag(CreateTaskDagRequest("publish-error", (_node("a", 0),)))
+        with self.assertRaisesRegex(ConfigurationError, "does not match the actual binding"):
+            await service.get_task_dag(RunTaskDagRequest("foreign"))
+
+    async def test_result_without_exact_evidence_becomes_indeterminate(self) -> None:
+        service = self._service(_FakeWritableService(self.parent_session_id))
+        await service.create_task_dag(CreateTaskDagRequest("no-evidence", (_node("a", 0),)))
+        result = await service.run_task_dag(RunTaskDagRequest("no-evidence"))
+        self.assertIs(result.state, TaskDagState.INDETERMINATE)
+        self.assertIs(result.node("a").state, TaskDagNodeState.INDETERMINATE)
+
+    async def test_non_completed_worker_result_is_recorded_as_failure(self) -> None:
+        writable = _FakeWritableService(self.parent_session_id)
+
+        async def run_failed(request, *, execution_identity, sink=None):
+            del request, sink
+            self.leases.by_parent_task[execution_identity.parent_task_id] = self._evidence(
+                execution_identity.parent_task_id,
+                execution_identity.node_id,
+            )
+            return SimpleNamespace(status=SessionTaskStatus.FAILED, response="failed result")
+
+        writable.run_subagent_with_execution_identity = run_failed
+        service = self._service(writable)
+        await service.create_task_dag(CreateTaskDagRequest("failed-result", (_node("a", 0),)))
+        result = await service.run_task_dag(RunTaskDagRequest("failed-result"))
+        self.assertIs(result.state, TaskDagState.FAILED)
+        self.assertEqual(result.node("a").state, TaskDagNodeState.FAILED)
+        self.assertEqual(
+            result.node("a").error_reason, "writable worker returned a non-completed result"
+        )
+
+    async def test_claim_race_reloads_and_non_concurrent_claim_error_is_wrapped(self) -> None:
+        writable = _FakeWritableService(self.parent_session_id)
+        original_run = writable.run_subagent_with_execution_identity
+
+        async def run_and_publish(request, *, execution_identity, sink=None):
+            self.leases.by_parent_task[execution_identity.parent_task_id] = self._evidence(
+                execution_identity.parent_task_id,
+                execution_identity.node_id,
+            )
+            return await original_run(
+                request,
+                execution_identity=execution_identity,
+                sink=sink,
+            )
+
+        writable.run_subagent_with_execution_identity = run_and_publish
+        race_store = _IntermittentClaimStore(
+            self.store,
+            TaskDagError("claim race", kind="concurrent_modification"),
+        )
+        race_service = TaskDagApplicationService(
+            self.store,
+            race_store,
+            writable,
+            self.leases,
+            self.relays,
+            parent_binding=self.binding,
+        )
+        await race_service.create_task_dag(CreateTaskDagRequest("claim-race", (_node("a", 0),)))
+        result = await race_service.run_task_dag(RunTaskDagRequest("claim-race"))
+        self.assertIs(result.state, TaskDagState.COMPLETED)
+
+        error_store = _IntermittentClaimStore(
+            self.store,
+            TaskDagError("claim failed", kind="command_failed"),
+        )
+        error_service = TaskDagApplicationService(
+            self.store,
+            error_store,
+            _FakeWritableService(self.parent_session_id),
+            self.leases,
+            self.relays,
+            parent_binding=self.binding,
+        )
+        await error_service.create_task_dag(CreateTaskDagRequest("claim-error", (_node("a", 0),)))
+        with self.assertRaisesRegex(ConfigurationError, "node claim failed"):
+            await error_service.run_task_dag(RunTaskDagRequest("claim-error"))
+
+    async def test_dependency_uncertainty_and_persistence_errors_are_fail_closed(self) -> None:
+        base = TaskDag.create(
+            dag_id="dependency-boundaries",
+            parent_session_id=self.parent_session_id,
+            nodes=(_node("a", 0), _node("b", 1, ("a",))),
+            created_at=_now(),
+        )
+        for dependency_state, reason in (
+            (TaskDagNodeState.INDETERMINATE, "dependency_indeterminate"),
+            (TaskDagNodeState.CANCELLED, "dependency_cancelled"),
+        ):
+            snapshot = replace(
+                base,
+                nodes=(replace(base.node("a"), state=dependency_state), base.node("b")),
+            )
+            dag_store = SimpleNamespace(
+                compare_and_transition_task_dag_node=AsyncMock(
+                    side_effect=lambda dag_id, node, snapshot=snapshot, **kwargs: replace(
+                        snapshot,
+                        nodes=(snapshot.node("a"), node),
+                    )
+                ),
+                get_task_dag=AsyncMock(return_value=snapshot),
+            )
+            service = TaskDagApplicationService(
+                self.store,
+                dag_store,
+                _FakeWritableService(self.parent_session_id),
+                self.leases,
+                self.relays,
+                parent_binding=self.binding,
+            )
+            result = await service._propagate_dependencies(snapshot)
+            self.assertEqual(result.node("b").state, TaskDagNodeState.SKIPPED)
+            self.assertEqual(result.node("b").error_reason, reason)
+
+        complete_snapshot = replace(
+            base,
+            nodes=(replace(base.node("a"), state=TaskDagNodeState.COMPLETED), base.node("b")),
+        )
+        for error, message in (
+            (TaskDagError("dependency race", kind="concurrent_modification"), ""),
+            (
+                TaskDagError("dependency write failed", kind="command_failed"),
+                "dependency propagation failed",
+            ),
+        ):
+            dag_store = SimpleNamespace(
+                compare_and_transition_task_dag_node=AsyncMock(side_effect=error),
+                get_task_dag=AsyncMock(return_value=complete_snapshot),
+            )
+            service = TaskDagApplicationService(
+                self.store,
+                dag_store,
+                _FakeWritableService(self.parent_session_id),
+                self.leases,
+                self.relays,
+                parent_binding=self.binding,
+            )
+            if message:
+                with self.assertRaisesRegex(ConfigurationError, message):
+                    await service._propagate_dependencies(complete_snapshot)
+            else:
+                reloaded = await service._propagate_dependencies(complete_snapshot)
+                self.assertEqual(reloaded, complete_snapshot)
+
+    async def test_terminal_classification_and_transition_errors_are_bounded(self) -> None:
+        base = TaskDag.create(
+            dag_id="classification",
+            parent_session_id=self.parent_session_id,
+            nodes=(_node("a", 0), _node("b", 1, ("a",))),
+            created_at=_now(),
+        )
+        dag_store = SimpleNamespace(
+            compare_and_transition_task_dag=AsyncMock(
+                side_effect=lambda proposed, **kwargs: proposed
+            ),
+            get_task_dag=AsyncMock(return_value=base),
+        )
+        service = TaskDagApplicationService(
+            self.store,
+            dag_store,
+            _FakeWritableService(self.parent_session_id),
+            self.leases,
+            self.relays,
+            parent_binding=self.binding,
+        )
+        snapshots = (
+            (
+                replace(
+                    base,
+                    nodes=(
+                        replace(base.node("a"), state=TaskDagNodeState.INDETERMINATE),
+                        base.node("b"),
+                    ),
+                ),
+                TaskDagState.INDETERMINATE,
+            ),
+            (base, TaskDagState.INDETERMINATE),
+            (
+                replace(
+                    base,
+                    nodes=(
+                        replace(base.node("a"), state=TaskDagNodeState.COMPLETED),
+                        replace(base.node("b"), state=TaskDagNodeState.COMPLETED),
+                    ),
+                ),
+                TaskDagState.COMPLETED,
+            ),
+            (
+                replace(
+                    base,
+                    nodes=(
+                        replace(base.node("a"), state=TaskDagNodeState.CANCELLED),
+                        replace(base.node("b"), state=TaskDagNodeState.SKIPPED),
+                    ),
+                ),
+                TaskDagState.CANCELLED,
+            ),
+            (
+                replace(
+                    base,
+                    nodes=(
+                        replace(base.node("a"), state=TaskDagNodeState.FAILED),
+                        replace(base.node("b"), state=TaskDagNodeState.SKIPPED),
+                    ),
+                ),
+                TaskDagState.FAILED,
+            ),
+        )
+        for snapshot, expected in snapshots:
+            classified = await service._classify_terminal_or_uncertain(snapshot)
+            self.assertIs(classified.state, expected)
+        self.assertIs(await service._set_graph_state_if_needed(base, TaskDagState.READY), base)
+
+        for error, message in (
+            (TaskDagError("state race", kind="concurrent_modification"), ""),
+            (TaskDagError("state write failed", kind="command_failed"), "state transition failed"),
+        ):
+            failing_store = SimpleNamespace(
+                compare_and_transition_task_dag=AsyncMock(side_effect=error),
+                get_task_dag=AsyncMock(return_value=base),
+            )
+            failing_service = TaskDagApplicationService(
+                self.store,
+                failing_store,
+                _FakeWritableService(self.parent_session_id),
+                self.leases,
+                self.relays,
+                parent_binding=self.binding,
+            )
+            if message:
+                with self.assertRaisesRegex(ConfigurationError, message):
+                    await failing_service._set_graph_state_if_needed(base, TaskDagState.COMPLETED)
+            else:
+                self.assertEqual(
+                    await failing_service._set_graph_state_if_needed(base, TaskDagState.COMPLETED),
+                    base,
+                )
+
+    async def test_worker_finish_and_cancellation_errors_are_wrapped(self) -> None:
+        base = TaskDag.create(
+            dag_id="finish-boundaries",
+            parent_session_id=self.parent_session_id,
+            nodes=(_node("a", 0), _node("b", 1)),
+            created_at=_now(),
+        )
+        running_node = replace(
+            base.node("a"),
+            state=TaskDagNodeState.RUNNING,
+            generation=1,
+            parent_task_id="worker-a",
+        )
+        claimed = TaskDag(
+            dag_id=base.dag_id,
+            parent_session_id=base.parent_session_id,
+            nodes=(running_node, base.node("b")),
+            state=TaskDagState.RUNNING,
+            active_node_id="a",
+        )
+        for error, message in (
+            (TaskDagError("finish race", kind="concurrent_modification"), ""),
+            (TaskDagError("finish failed", kind="command_failed"), "node finish failed"),
+        ):
+            dag_store = SimpleNamespace(
+                finish_task_dag_node=AsyncMock(side_effect=error),
+                get_task_dag=AsyncMock(return_value=claimed),
+            )
+            service = TaskDagApplicationService(
+                self.store,
+                dag_store,
+                _FakeWritableService(self.parent_session_id),
+                self.leases,
+                self.relays,
+                parent_binding=self.binding,
+            )
+            if message:
+                with self.assertRaisesRegex(ConfigurationError, message):
+                    await service._finish_worker_node(
+                        claimed,
+                        running_node,
+                        TaskDagNodeState.FAILED,
+                        error=RuntimeError("worker failed"),
+                    )
+            else:
+                self.assertEqual(
+                    await service._finish_worker_node(
+                        claimed,
+                        running_node,
+                        TaskDagNodeState.FAILED,
+                        error=RuntimeError("worker failed"),
+                    ),
+                    claimed,
+                )
+
+        for error, message in (
+            (TaskDagError("cancel race", kind="concurrent_modification"), ""),
+            (TaskDagError("cancel failed", kind="command_failed"), "cancellation failed"),
+        ):
+            cancel_base = TaskDag.create(
+                dag_id="cancel-boundary",
+                parent_session_id=self.parent_session_id,
+                nodes=(_node("a", 0),),
+                created_at=_now(),
+            )
+            dag_store = SimpleNamespace(
+                compare_and_transition_task_dag_node=AsyncMock(side_effect=error),
+                compare_and_transition_task_dag=AsyncMock(
+                    side_effect=lambda proposed, **kwargs: proposed
+                ),
+                get_task_dag=AsyncMock(return_value=cancel_base),
+            )
+            service = TaskDagApplicationService(
+                self.store,
+                dag_store,
+                _FakeWritableService(self.parent_session_id),
+                self.leases,
+                self.relays,
+                parent_binding=self.binding,
+            )
+            if message:
+                with self.assertRaisesRegex(ConfigurationError, message):
+                    await service._cancel_remaining_graph(cancel_base.dag_id)
+            else:
+                cancelled = await service._cancel_remaining_graph(cancel_base.dag_id)
+                self.assertIs(cancelled.state, TaskDagState.CANCELLED)
+
+    async def test_reconciliation_covers_missing_identity_and_nonterminal_workers(self) -> None:
+        base = TaskDag.create(
+            dag_id="missing-worker-identity",
+            parent_session_id=self.parent_session_id,
+            nodes=(_node("a", 0),),
+            created_at=_now(),
+        )
+        running_node = replace(
+            base.node("a"),
+            state=TaskDagNodeState.RUNNING,
+            generation=1,
+            parent_task_id="worker-a",
+        )
+        claimed = TaskDag(
+            dag_id=base.dag_id,
+            parent_session_id=base.parent_session_id,
+            nodes=(running_node,),
+            state=TaskDagState.RUNNING,
+            active_node_id="a",
+        )
+        object.__setattr__(running_node, "parent_task_id", None)
+        dag_store = SimpleNamespace(
+            finish_task_dag_node=AsyncMock(
+                side_effect=lambda dag_id, node, **kwargs: replace(
+                    claimed,
+                    nodes=(node,),
+                    active_node_id=None,
+                )
+            ),
+        )
+        service = TaskDagApplicationService(
+            self.store,
+            dag_store,
+            _FakeWritableService(self.parent_session_id),
+            self.leases,
+            self.relays,
+            parent_binding=self.binding,
+        )
+        reconciled = await service._reconcile_active_node(claimed)
+        self.assertIs(reconciled.node("a").state, TaskDagNodeState.INDETERMINATE)
+
     async def test_diamond_failure_skips_only_descendants_and_keeps_independent_branch(
         self,
     ) -> None:
@@ -609,6 +1263,75 @@ class TaskDagSchedulerTests(unittest.IsolatedAsyncioTestCase):
                 SessionTaskStatus.CANCELLED: TaskDagNodeState.CANCELLED,
             }[status]
             self.assertIs(reconciled.node("a").state, expected)
+
+        await service.create_task_dag(CreateTaskDagRequest("not-preserved", (_node("a", 0),)))
+        completed_task = SessionTask(
+            "worker-not-preserved",
+            SessionTaskKind.SUBAGENT,
+            SessionTaskStatus.RUNNING,
+            _now(),
+        )
+        await self.store.create_session_task(self.parent_session_id, completed_task)
+        not_preserved = await self.store.get_task_dag("not-preserved")
+        assert not_preserved is not None
+        await self.store.claim_task_dag_node(
+            "not-preserved",
+            replace(
+                not_preserved.node("a"),
+                state=TaskDagNodeState.RUNNING,
+                generation=1,
+                parent_task_id=completed_task.task_id,
+            ),
+            expected_generation=0,
+            expected_state=TaskDagNodeState.READY,
+            updated_at=_now(),
+        )
+        completed_task = completed_task.finish(
+            SessionTaskStatus.COMPLETED,
+            finished_at=_now() + timedelta(seconds=1),
+        )
+        await self.store.update_session_task(self.parent_session_id, completed_task)
+        not_preserved_evidence = self._evidence(completed_task.task_id, "a")
+        not_preserved_values = vars(cast(SimpleNamespace, not_preserved_evidence)).copy()
+        not_preserved_values["state"] = WritableSubagentWorkspaceState.FAILED
+        self.leases.by_parent_task[completed_task.task_id] = SimpleNamespace(
+            **not_preserved_values,
+        )
+        not_preserved_result = await service.reconcile_task_dag(RunTaskDagRequest("not-preserved"))
+        self.assertIs(
+            not_preserved_result.node("a").state,
+            TaskDagNodeState.INDETERMINATE,
+        )
+
+        await service.create_task_dag(CreateTaskDagRequest("still-running", (_node("a", 0),)))
+        running_task = SessionTask(
+            "worker-still-running",
+            SessionTaskKind.SUBAGENT,
+            SessionTaskStatus.RUNNING,
+            _now(),
+        )
+        await self.store.create_session_task(self.parent_session_id, running_task)
+        still_running = await self.store.get_task_dag("still-running")
+        assert still_running is not None
+        await self.store.claim_task_dag_node(
+            "still-running",
+            replace(
+                still_running.node("a"),
+                state=TaskDagNodeState.RUNNING,
+                generation=1,
+                parent_task_id=running_task.task_id,
+            ),
+            expected_generation=0,
+            expected_state=TaskDagNodeState.READY,
+            updated_at=_now(),
+        )
+        self.leases.by_parent_task[running_task.task_id] = self._evidence(
+            running_task.task_id,
+            "a",
+        )
+        still_running_result = await service.reconcile_task_dag(RunTaskDagRequest("still-running"))
+        self.assertIs(still_running_result.node("a").state, TaskDagNodeState.RUNNING)
+        self.assertEqual(still_running_result.active_node_id, "a")
 
         await service.create_task_dag(CreateTaskDagRequest("orphaned", (_node("a", 0),)))
         orphan_task = SessionTask(
