@@ -92,10 +92,11 @@ parent transcript/context reuse。
 
 ## 未实现
 
-Parallel worker、Parent Context/Relay、DAG/Leader/Swarm/Ultracode orchestration、Bash 或
-terminal worker、writable LSP operation、自动委派、commit/merge/cherry-pick/patch integration、
-冲突处理、workspace retirement 和自动 worktree/checkpoint cleanup 仍是未来能力。CLI、TUI、
-ACP 与 `/subagent` 暴露保持不变。
+Parallel worker、DAG/Leader/Swarm/Ultracode orchestration、Bash 或 terminal worker、
+writable LSP operation、自动委派、commit/merge/cherry-pick/patch integration、冲突处理、
+workspace retirement 和自动 worktree/checkpoint cleanup 仍是未来能力。有界 Parent Context
+Relay 是 ADR 0133 定义的后续独立层，不改变本 LSP 契约。CLI、TUI、ACP 与 `/subagent`
+暴露保持不变。
 
 ## 验证边界
 

@@ -106,11 +106,13 @@ Parent transcript/context reuse is not added.
 
 ## Not implemented
 
-Parallel workers, Parent Context/Relay, DAG/Leader/Swarm/Ultracode
-orchestration, Bash or terminal workers, writable LSP operations, automatic
-delegation, commit/merge/cherry-pick/patch integration, conflict resolution,
-workspace retirement, and automatic worktree/checkpoint cleanup remain future
-capabilities. CLI, TUI, ACP, and `/subagent` exposure are unchanged.
+Parallel workers, DAG/Leader/Swarm/Ultracode orchestration, Bash or terminal
+workers, writable LSP operations, automatic delegation,
+commit/merge/cherry-pick/patch integration, conflict resolution, workspace
+retirement, and automatic worktree/checkpoint cleanup remain future
+capabilities. Bounded Parent Context Relay is a later separate layer defined by
+ADR 0133 and does not alter this LSP contract. CLI, TUI, ACP, and `/subagent`
+exposure are unchanged.
 
 ## Validation boundary
 

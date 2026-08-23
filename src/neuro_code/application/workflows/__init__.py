@@ -2,6 +2,10 @@
 
 提供应用工作流用例."""
 
+from neuro_code.application.workflows.parent_context_relay import (
+    ParentContextRelayApplicationService,
+    project_parent_context_items,
+)
 from neuro_code.application.workflows.plan_execution import (
     ExecutePlanRequest,
     PlanExecutionController,
@@ -80,6 +84,7 @@ __all__ = [
     "IsolatedSubagentRuntime",
     "IsolatedSubagentRuntimeFactory",
     "NetworkAccess",
+    "ParentContextRelayApplicationService",
     "PlanExecutionController",
     "PlanExecutionService",
     "PlanSchedulingController",
@@ -110,6 +115,7 @@ __all__ = [
     "WritableSubagentResultProjection",
     "WritableSubagentRuntime",
     "WritableSubagentRuntimeFactory",
+    "project_parent_context_items",
     "resolve_writable_subagent_capability",
     "writable_subagent_request",
 ]

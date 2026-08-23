@@ -48,6 +48,7 @@ class SyntheticReason(StrEnum):
 
     PROJECT_INSTRUCTIONS = "project-instructions"
     AVAILABLE_SKILLS = "available-skills"
+    PARENT_RELAY = "parent-relay"
     COMPACTION_SUMMARY = "compaction-summary"
     RUNTIME_PLAN = "runtime-plan"
     RUNTIME_BUDGET = "runtime-budget"

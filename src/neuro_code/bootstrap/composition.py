@@ -40,6 +40,10 @@ from neuro_code.application.ports.model import (
     ModelCapabilitySet,
     ModelProvider,
 )
+from neuro_code.application.ports.parent_context_relay import (
+    ParentContextRelayError,
+    ParentContextRelayStore,
+)
 from neuro_code.application.ports.sandbox import LocalProcessSandbox
 from neuro_code.application.ports.skills import SkillDiscovery
 from neuro_code.application.ports.storage import SessionStore
@@ -120,7 +124,12 @@ from neuro_code.application.workflows.writable_subagent import (
     WritableSubagentApplicationService,
 )
 from neuro_code.application.worktrees import WorktreeApplicationService
+from neuro_code.domain.conversation.messages import Message, Role, SyntheticReason
 from neuro_code.domain.conversation.reasoning import ReasoningEffort
+from neuro_code.domain.parent_context_relay import (
+    ParentContextRelay,
+    render_parent_context_relay,
+)
 from neuro_code.domain.sandbox.models import SandboxProfile
 from neuro_code.domain.workspace.instructions import InstructionDiscoveryResult
 from neuro_code.domain.workspace.skills import SkillDiscoveryResult
@@ -453,10 +462,29 @@ class ApplicationComposition:
         enable_background_tasks: bool | None = None,
         capabilities: SubagentCapabilitySet | None = None,
         user_interaction: UserInteractionPort | None = None,
+        parent_context_relay: ParentContextRelay | None = None,
     ) -> ConversationBinding:
         if self._closed:
             raise RuntimeError("application composition is closed")
         selected_config = config or self.config
+        if parent_context_relay is not None:
+            if not isinstance(parent_context_relay, ParentContextRelay):
+                raise ConfigurationError("parent context relay must be canonical")
+            if capabilities is None or resume_id != parent_context_relay.child_session_id:
+                raise ConfigurationError("parent context relay child binding is inconsistent")
+            if capabilities.fingerprint != parent_context_relay.capability_fingerprint:
+                raise ConfigurationError("parent context relay capability binding is inconsistent")
+            try:
+                durable_relay = await cast(
+                    ParentContextRelayStore,
+                    self.store,
+                ).get_parent_context_relay(parent_context_relay.relay_id)
+            except ParentContextRelayError as error:
+                raise ConfigurationError(
+                    f"parent context relay integrity verification failed: {error}"
+                ) from error
+            if durable_relay != parent_context_relay:
+                raise ConfigurationError("parent context relay is not the published durable record")
         if capabilities is not None:
             if not isinstance(capabilities, SubagentCapabilitySet):
                 raise ConfigurationError("child capabilities must be canonical")
@@ -826,6 +854,15 @@ class ApplicationComposition:
                 ),
                 instruction_provider=instruction_provider,
                 skill_provider=skill_provider,
+                parent_relay_message=(
+                    Message(
+                        Role.USER,
+                        render_parent_context_relay(parent_context_relay.items),
+                        synthetic_reason=SyntheticReason.PARENT_RELAY,
+                    )
+                    if parent_context_relay is not None
+                    else None
+                ),
             )
             conversation = await AgentConversation.open(
                 runtime=runtime,
@@ -1124,6 +1161,8 @@ class ApplicationComposition:
             factory,
             parent_binding=parent_binding,
             global_policy=self.subagent_global_policy(),
+            relay_store=cast(ParentContextRelayStore, self.store),
+            redaction_values=self.config.redaction_values(),
             timeout_seconds=timeout_seconds,
         )
 

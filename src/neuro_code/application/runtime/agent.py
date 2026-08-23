@@ -39,6 +39,7 @@ from neuro_code.domain.conversation.context import ModelContext, estimate_contex
 from neuro_code.domain.conversation.interaction_mode import InteractionMode
 from neuro_code.domain.conversation.messages import (
     ContentPart,
+    Message,
     SessionItem,
 )
 from neuro_code.domain.conversation.reasoning import ReasoningEffort
@@ -105,6 +106,7 @@ class AgentRuntime:
         compaction_runtime_gate: ContextCompactionRuntimeGate | None = None,
         provider_context_window: ProviderContextWindow | None = None,
         tool_hooks: Sequence[ToolPipelineHook] = (),
+        parent_relay_message: Message | None = None,
     ) -> None:
         if execution_budget is not None and not isinstance(execution_budget, ExecutionBudget):
             raise TypeError("execution_budget must be an ExecutionBudget or None")
@@ -172,6 +174,7 @@ class AgentRuntime:
             plan=plan,
             instruction_provider=instruction_provider,
             skill_provider=skill_provider,
+            parent_relay_message=parent_relay_message,
         )
         self._context_builder.set_plan_comments(plan_comments)
         self._tool_executor = ToolExecutor(

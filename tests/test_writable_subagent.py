@@ -3,12 +3,14 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import multiprocessing
 import os
 import sqlite3
 import subprocess
 import sys
 import tempfile
 import unittest
+import uuid
 from collections.abc import AsyncIterator, Sequence
 from contextlib import suppress
 from dataclasses import replace
@@ -21,6 +23,7 @@ from neuro_code.application.permissions.policy import PermissionMode
 from neuro_code.application.ports.checkpoints import WorkspaceCheckpointApplication
 from neuro_code.application.ports.lsp import LspOperation, LspRequest
 from neuro_code.application.ports.model import ModelCapabilitySet, ModelProvider, ModelToolPolicy
+from neuro_code.application.ports.parent_context_relay import ParentContextRelayError
 from neuro_code.application.ports.sandbox import (
     LocalProcessLifecycleCapability,
     LocalProcessPurpose,
@@ -35,6 +38,7 @@ from neuro_code.application.runtime.agent import AgentRunResult, EventSink
 from neuro_code.application.runtime.process_liveness import owner_is_alive
 from neuro_code.application.sessions.binding import ConversationBinding, ConversationRunner
 from neuro_code.application.settings import ApplicationSettings
+from neuro_code.application.workflows.parent_context_relay import project_parent_context_items
 from neuro_code.application.workflows.subagent_capabilities import (
     NetworkAccess,
     SubagentCapabilitySet,
@@ -70,7 +74,22 @@ from neuro_code.domain.conversation.events import (
     ModelTextDelta,
     ModelToolCall,
 )
-from neuro_code.domain.conversation.messages import Role, ToolCall
+from neuro_code.domain.conversation.messages import (
+    ContentPart,
+    ContextItemKind,
+    Message,
+    PreservedContextItem,
+    Role,
+    SyntheticReason,
+    ToolCall,
+)
+from neuro_code.domain.parent_context_relay import (
+    MAX_PARENT_RELAY_ITEM_BYTES,
+    MAX_PARENT_RELAY_ITEMS,
+    MAX_PARENT_RELAY_PROJECTED_BYTES,
+    ParentContextRelay,
+    render_parent_context_relay,
+)
 from neuro_code.domain.sandbox.models import SandboxProfile
 from neuro_code.domain.session_tasks import SessionTaskStatus
 from neuro_code.domain.tools import ToolDefinition
@@ -777,6 +796,92 @@ class WritableCapabilityTests(unittest.TestCase):
 
 
 class WritableContractValidationTests(unittest.TestCase):
+    def test_parent_relay_projection_bounds_utf8_and_is_deterministic(self) -> None:
+        source = [
+            Message(
+                Role.USER,
+                "SYNTHETIC_MUST_NOT_RELAY",
+                synthetic_reason=SyntheticReason.RUNTIME_PLAN,
+            ),
+            Message(
+                Role.ASSISTANT,
+                "TOOL_MESSAGE_MUST_NOT_RELAY",
+                tool_calls=(ToolCall("call", "read_file", {"path": "/etc/passwd"}),),
+            ),
+        ]
+        source.extend(Message(Role.USER, f"item-{index}-" + "界" * 5_000) for index in range(15))
+
+        first, first_truncated = project_parent_context_items(source)
+        second, second_truncated = project_parent_context_items(tuple(source))
+
+        self.assertEqual(first, second)
+        self.assertEqual(first_truncated, second_truncated)
+        self.assertTrue(first_truncated)
+        self.assertLessEqual(len(first), MAX_PARENT_RELAY_ITEMS)
+        self.assertLessEqual(
+            sum(len(item.text.encode("utf-8")) for item in first),
+            MAX_PARENT_RELAY_PROJECTED_BYTES,
+        )
+        self.assertTrue(
+            all(len(item.text.encode("utf-8")) <= MAX_PARENT_RELAY_ITEM_BYTES for item in first)
+        )
+        self.assertTrue(
+            all(item.text.encode("utf-8").decode("utf-8") == item.text for item in first)
+        )
+        rendered = render_parent_context_relay(first)
+        self.assertNotIn("SYNTHETIC_MUST_NOT_RELAY", rendered)
+        self.assertNotIn("TOOL_MESSAGE_MUST_NOT_RELAY", rendered)
+
+    def test_parent_relay_snapshot_does_not_mutate_when_source_changes(self) -> None:
+        source_a = (Message(Role.USER, "decision A"),)
+        items_a, truncated_a = project_parent_context_items(source_a)
+        common = {
+            "parent_session_id": "parent",
+            "parent_task_id": "task-a",
+            "child_session_id": "child-a",
+            "lease_id": "lease-a",
+            "worktree_id": WorktreeId("worktree-a"),
+            "baseline_checkpoint_id": CheckpointId("cp-checkpoint-a"),
+            "base_commit_sha": BASE_SHA,
+            "capability_fingerprint": "a" * 64,
+            "grant_fingerprint": "b" * 64,
+            "task_prompt_fingerprint": "c" * 64,
+            "created_at": datetime(2026, 8, 24, tzinfo=UTC),
+        }
+        relay_a = ParentContextRelay.create(
+            relay_id="relay-a",
+            source_item_count=len(source_a),
+            items=items_a,
+            truncated=truncated_a,
+            **common,
+        )
+        relay_a_rendered = render_parent_context_relay(relay_a.items)
+
+        source_b = (*source_a, Message(Role.USER, "decision B"))
+        items_b, truncated_b = project_parent_context_items(source_b)
+        relay_b = ParentContextRelay.create(
+            relay_id="relay-b",
+            parent_session_id="parent",
+            parent_task_id="task-b",
+            child_session_id="child-b",
+            lease_id="lease-b",
+            worktree_id=WorktreeId("worktree-b"),
+            baseline_checkpoint_id=CheckpointId("cp-checkpoint-b"),
+            base_commit_sha=BASE_SHA,
+            capability_fingerprint="a" * 64,
+            grant_fingerprint="b" * 64,
+            task_prompt_fingerprint="d" * 64,
+            source_item_count=len(source_b),
+            items=items_b,
+            truncated=truncated_b,
+            created_at=datetime(2026, 8, 24, tzinfo=UTC),
+        )
+
+        self.assertEqual(render_parent_context_relay(relay_a.items), relay_a_rendered)
+        self.assertEqual(relay_a.source_fingerprint, relay_a.computed_source_fingerprint)
+        self.assertNotEqual(relay_a.source_fingerprint, relay_b.source_fingerprint)
+        self.assertNotEqual(relay_a.content_fingerprint, relay_b.content_fingerprint)
+
     def test_request_and_result_projections_reject_unbounded_or_noncanonical_values(self) -> None:
         with self.assertRaises(ValueError):
             RunWritableSubagentRequest("", "prompt")
@@ -1231,6 +1336,7 @@ class _FakeRuntimeFactory:
         self.response = response
         self.close_error = close_error
         self.runtime: _FakeRuntime | None = None
+        self.relay: ParentContextRelay | None = None
 
     async def create_session(self, request: RunWritableSubagentRequest, *, capabilities):
         del request
@@ -1246,8 +1352,10 @@ class _FakeRuntimeFactory:
         parent_task_id: str,
         child_session_id: str,
         capabilities,
+        relay: ParentContextRelay,
     ) -> _FakeRuntime:
         del request, parent_task_id
+        self.relay = relay
         self.runtime = _FakeRuntime(
             child_session_id,
             capabilities.fingerprint,
@@ -1261,6 +1369,123 @@ class _FakeRuntimeFactory:
             close_error=self.close_error,
         )
         return self.runtime
+
+
+class _CrashGuardProvider:
+    provider_name = "fixture"
+    model_name = "fixture-model"
+    context_affinity = "fixture-v1"
+    capabilities = ModelCapabilitySet.all_unknown()
+
+    def __init__(self, marker: Path) -> None:
+        self._marker = marker
+
+    async def stream(
+        self,
+        context: ModelContext,
+        tools: Sequence[ToolDefinition],
+        *,
+        tool_policy: ModelToolPolicy = ModelToolPolicy.ALLOWED,
+    ) -> AsyncIterator[ModelEvent]:
+        del context, tools, tool_policy
+        self._marker.write_text("model called", encoding="utf-8")
+        if False:
+            yield ModelCompleted("stop")
+        raise AssertionError("child model must not run in the pre-model crash fixture")
+
+
+def _crash_guard_provider_factory(config: AppConfig, failover: bool) -> ModelProvider:
+    del failover
+    return cast(ModelProvider, _CrashGuardProvider(config.state_dir / "model-called"))
+
+
+class _ExitBeforeRuntimeFactory:
+    def __init__(self, store: SqliteSessionStore) -> None:
+        self._store = store
+
+    async def create_session(
+        self,
+        request: RunWritableSubagentRequest,
+        *,
+        capabilities: WritableSubagentCapabilityGrant,
+    ) -> str:
+        del request
+        return await self._store.create_session(
+            str(capabilities.capabilities.cwd),
+            "fixture",
+            "fixture-model",
+            sandbox_profile=SandboxProfile.OFF,
+        )
+
+    async def create(
+        self,
+        request: RunWritableSubagentRequest,
+        *,
+        parent_task_id: str,
+        child_session_id: str,
+        capabilities: WritableSubagentCapabilityGrant,
+        relay: ParentContextRelay,
+    ) -> _FakeRuntime:
+        del request, parent_task_id, child_session_id, capabilities
+        durable = await self._store.get_parent_context_relay(relay.relay_id)
+        if durable != relay:
+            raise AssertionError("relay was not durable before runtime creation")
+        os._exit(73)
+
+
+def _crash_after_relay_publication(root_value: str, repository_value: str) -> None:
+    root = Path(root_value)
+    repository = Path(repository_value)
+    state_dir = root / "state"
+    os.environ.update(
+        {
+            "HOME": str(root),
+            "NEURO_CODE_HOME": str(state_dir),
+            "FIXTURE_KEY": "fixture-key",
+        }
+    )
+
+    async def run() -> None:
+        application = await ApplicationComposition.open(
+            ApplicationSettings(
+                cwd=repository,
+                sandbox="off",
+                permission_mode=PermissionMode.BYPASS,
+                max_steps=8,
+            ),
+            provider_factory=_crash_guard_provider_factory,
+        )
+        parent_session_id = await application.store.create_session(
+            str(repository),
+            "fixture",
+            "fixture-model",
+            sandbox_profile=SandboxProfile.OFF,
+        )
+        await application.store.save_session_items(
+            parent_session_id,
+            (Message(Role.USER, "durable context before crash"),),
+        )
+        parent_capabilities = _capability(repository, sandbox=SandboxProfile.OFF)
+        parent_binding = await application.create_binding(
+            resume_id=parent_session_id,
+            capabilities=parent_capabilities,
+        )
+        service = WritableSubagentApplicationService(
+            application.store,
+            application.store,
+            application.create_worktree_service(),
+            application.create_workspace_checkpoint_service(),
+            _ExitBeforeRuntimeFactory(application.store),
+            parent_binding=parent_binding,
+            global_policy=application.subagent_global_policy(),
+            redaction_values=application.config.redaction_values(),
+        )
+        await service.initialize()
+        await service.run_subagent(
+            RunWritableSubagentRequest(parent_session_id, "crash before first model request"),
+        )
+
+    asyncio.run(run())
 
 
 class _ProductionWritableProvider:
@@ -1290,6 +1515,7 @@ class _ProductionWritableProvider:
         self.application = application
         self.trace = trace
         self.calls: list[tuple[ToolDefinition, ...]] = []
+        self.contexts: list[ModelContext] = []
         self.target_path: Path | None = None
         self.lsp_manager: LanguageServerManager | None = None
         self.lsp_client: object | None = None
@@ -1310,6 +1536,7 @@ class _ProductionWritableProvider:
     ) -> AsyncIterator[ModelEvent]:
         del tool_policy
         self.calls.append(tuple(tools))
+        self.contexts.append(context)
         if len(self.calls) == 1:
             leases = await self.store.list_writable_subagent_leases(include_terminal=False)
             active = [
@@ -1639,6 +1866,7 @@ class WritableApplicationTests(unittest.IsolatedAsyncioTestCase):
         response: str = "completed",
         close_error: BaseException | None = None,
         bound_capabilities: SubagentCapabilitySet | None = None,
+        redaction_values: tuple[str, ...] = (),
     ) -> tuple[
         WritableSubagentApplicationService,
         SqliteSessionStore,
@@ -1679,6 +1907,7 @@ class WritableApplicationTests(unittest.IsolatedAsyncioTestCase):
             factory,
             parent_binding=_parent_binding(parent_session_id, parent_capabilities),
             global_policy=_capability(root / "global", max_steps=12),
+            redaction_values=redaction_values,
         )
         await service.initialize()
         return (
@@ -1691,6 +1920,352 @@ class WritableApplicationTests(unittest.IsolatedAsyncioTestCase):
             parent_capabilities,
             parent_session_id,
         )
+
+    async def test_parent_relay_excludes_unsafe_structures_and_redacts_visible_text(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            secret = "relay-secret-value"
+            (
+                service,
+                store,
+                _parent,
+                _worktrees,
+                _checkpoints,
+                factory,
+                _parent_capabilities,
+                parent_session_id,
+            ) = await self._service(root, redaction_values=(secret,))
+            source = (
+                Message(Role.SYSTEM, "SYSTEM_MARKER"),
+                Message(Role.USER, f"VISIBLE_USER {secret}"),
+                Message(
+                    Role.ASSISTANT,
+                    "VISIBLE_ASSISTANT",
+                    reasoning_content=f"REASONING_MARKER {secret}",
+                ),
+                Message(
+                    Role.ASSISTANT,
+                    "TOOL_BEARING_VISIBLE_MARKER",
+                    tool_calls=(
+                        ToolCall(
+                            "tool-call",
+                            "read_file",
+                            {"path": f"TOOL_ARGUMENT_MARKER-{secret}"},
+                            {"private": "TOOL_METADATA_MARKER"},
+                        ),
+                    ),
+                ),
+                Message(
+                    Role.TOOL,
+                    f"TOOL_OUTPUT_MARKER {secret}",
+                    name="read_file",
+                    tool_call_id="tool-call",
+                ),
+                Message(
+                    Role.USER,
+                    content_parts=(
+                        ContentPart.from_text("MEDIA_TEXT_MARKER"),
+                        ContentPart.from_image("https://media.invalid/RAW_MEDIA_URL"),
+                    ),
+                ),
+                PreservedContextItem(
+                    ContextItemKind.REASONING,
+                    {"type": "reasoning", "text": "PRESERVED_REASONING_MARKER"},
+                ),
+                PreservedContextItem(
+                    ContextItemKind.BACKEND_TOOL_CALL,
+                    {"type": "backend_tool_call", "name": "BACKEND_TOOL_MARKER"},
+                ),
+            )
+            await store.save_session_items(parent_session_id, source)
+
+            result = await service.run_subagent(
+                RunWritableSubagentRequest(parent_session_id, "bounded child task"),
+            )
+            relay = factory.relay
+            self.assertIsNotNone(relay)
+            assert relay is not None
+            rendered = render_parent_context_relay(relay.items)
+            self.assertIn("VISIBLE_USER [REDACTED]", rendered)
+            self.assertIn("VISIBLE_ASSISTANT", rendered)
+            for forbidden in (
+                secret,
+                "SYSTEM_MARKER",
+                "REASONING_MARKER",
+                "TOOL_BEARING_VISIBLE_MARKER",
+                "TOOL_ARGUMENT_MARKER",
+                "TOOL_METADATA_MARKER",
+                "TOOL_OUTPUT_MARKER",
+                "MEDIA_TEXT_MARKER",
+                "RAW_MEDIA_URL",
+                "PRESERVED_REASONING_MARKER",
+                "BACKEND_TOOL_MARKER",
+            ):
+                self.assertNotIn(forbidden, rendered)
+                self.assertNotIn(forbidden, repr(relay))
+            self.assertEqual(relay.parent_session_id, parent_session_id)
+            self.assertEqual(relay.parent_task_id, result.parent_task_id)
+            self.assertEqual(relay.child_session_id, result.child_session_id)
+            self.assertEqual(relay.worktree_id, result.worktree_id)
+            self.assertEqual(
+                relay.baseline_checkpoint_id.value,
+                result.baseline_checkpoint_id,
+            )
+            durable = await store.get_parent_context_relay_for_lease(relay.lease_id)
+            self.assertEqual(durable, relay)
+            connection = sqlite3.connect(store.database_path)
+            raw = connection.execute(
+                "SELECT items_json FROM parent_context_relays WHERE relay_id = ?",
+                (relay.relay_id,),
+            ).fetchone()
+            connection.close()
+            self.assertIsNotNone(raw)
+            raw_payload = str(raw[0])
+            self.assertNotIn(secret, raw_payload)
+            self.assertNotIn("TOOL_ARGUMENT_MARKER", raw_payload)
+
+    async def test_parent_relay_is_insert_only_and_tamper_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (
+                service,
+                store,
+                _parent,
+                _worktrees,
+                _checkpoints,
+                factory,
+                _parent_capabilities,
+                parent_session_id,
+            ) = await self._service(root)
+            await store.save_session_items(
+                parent_session_id,
+                (Message(Role.USER, "immutable relay source"),),
+            )
+            await service.run_subagent(
+                RunWritableSubagentRequest(parent_session_id, "relay identity prompt"),
+            )
+            relay = factory.relay
+            assert relay is not None
+            self.assertEqual(await store.insert_parent_context_relay(relay), relay)
+            with self.assertRaisesRegex(ParentContextRelayError, "immutable"):
+                await store.insert_parent_context_relay(
+                    replace(relay, relay_id=f"pcr-{uuid.uuid4().hex}")
+                )
+
+            connection = sqlite3.connect(store.database_path)
+            connection.execute(
+                "UPDATE parent_context_relays SET items_json = ? WHERE relay_id = ?",
+                (
+                    '[{"role":"user","source_index":0,"text":"tampered","truncated":false}]',
+                    relay.relay_id,
+                ),
+            )
+            connection.commit()
+            connection.close()
+            with self.assertRaisesRegex(ParentContextRelayError, "integrity"):
+                await store.get_parent_context_relay(relay.relay_id)
+
+    async def test_parent_relay_persistence_failure_prevents_child_model_execution(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (
+                service,
+                store,
+                _parent,
+                worktrees,
+                checkpoints,
+                factory,
+                _parent_capabilities,
+                parent_session_id,
+            ) = await self._service(root)
+            with (
+                patch.object(
+                    store,
+                    "insert_parent_context_relay",
+                    side_effect=ParentContextRelayError("injected relay failure"),
+                ),
+                self.assertRaisesRegex(ConfigurationError, "relay publication failed"),
+            ):
+                await service.run_subagent(
+                    RunWritableSubagentRequest(parent_session_id, "must not reach model"),
+                )
+            self.assertIsNone(factory.runtime)
+            leases = await store.list_writable_subagent_leases(parent_session_id=parent_session_id)
+            self.assertEqual(len(leases), 1)
+            self.assertIs(leases[0].state, WritableSubagentWorkspaceState.PRESERVED)
+            self.assertIsNone(await store.get_parent_context_relay_for_lease(leases[0].lease_id))
+            self.assertIsNotNone(worktrees.snapshot)
+            self.assertIsNotNone(leases[0].baseline_checkpoint_id)
+            assert leases[0].baseline_checkpoint_id is not None
+            self.assertIsNotNone(await checkpoints.get(leases[0].baseline_checkpoint_id))
+
+    async def test_populated_schema_16_migrates_to_17_without_losing_worker_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (
+                service,
+                store,
+                _parent,
+                _worktrees,
+                _checkpoints,
+                _factory,
+                _parent_capabilities,
+                parent_session_id,
+            ) = await self._service(root)
+            result = await service.run_subagent(
+                RunWritableSubagentRequest(parent_session_id, "populate schema 16 fixture"),
+            )
+            before_lease = (
+                await store.list_writable_subagent_leases(parent_session_id=parent_session_id)
+            )[0]
+            before_link = await store.load_subagent_link(parent_session_id, result.parent_task_id)
+            connection = sqlite3.connect(store.database_path)
+            connection.execute("DROP TABLE parent_context_relays")
+            connection.execute("UPDATE schema_meta SET version = 16 WHERE singleton = 1")
+            connection.commit()
+            connection.close()
+
+            migrated = SqliteSessionStore(store.database_path)
+            await migrated.initialize()
+            connection = sqlite3.connect(store.database_path)
+            version = connection.execute(
+                "SELECT version FROM schema_meta WHERE singleton = 1"
+            ).fetchone()
+            table = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'parent_context_relays'"
+            ).fetchone()
+            connection.close()
+            self.assertEqual(version, (17,))
+            self.assertEqual(table, (1,))
+            self.assertEqual(
+                (await migrated.list_writable_subagent_leases(parent_session_id=parent_session_id))[
+                    0
+                ],
+                before_lease,
+            )
+            self.assertEqual(
+                await migrated.load_subagent_link(parent_session_id, result.parent_task_id),
+                before_link,
+            )
+            self.assertIsNotNone(await migrated.get_session(parent_session_id))
+            self.assertIsNotNone(await migrated.get_session(result.child_session_id))
+
+    async def test_process_death_after_relay_publication_preserves_exact_worker_snapshot(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repository, _head = _make_real_repository(root)
+            state_dir = root / "state"
+            state_dir.mkdir()
+            (state_dir / "config.toml").write_text(
+                """
+[web_search]
+mode = "disabled"
+
+[web_fetch]
+mode = "disabled"
+
+[routing]
+default = "fixture"
+
+[providers.fixture]
+protocol = "openai-chat"
+model = "fixture-model"
+base_url = "https://provider.invalid/v1"
+api_key_env = "FIXTURE_KEY"
+context_window_tokens = 131072
+""",
+                encoding="utf-8",
+            )
+            process = multiprocessing.get_context("spawn").Process(
+                target=_crash_after_relay_publication,
+                args=(str(root), str(repository)),
+            )
+            process.start()
+            await asyncio.to_thread(process.join, 45)
+            if process.is_alive():
+                process.terminate()
+                await asyncio.to_thread(process.join, 15)
+                self.fail("pre-model crash fixture did not reach its process-death boundary")
+            self.assertEqual(process.exitcode, 73)
+            self.assertFalse((state_dir / "model-called").exists())
+
+            store = SqliteSessionStore(state_dir / "sessions.db")
+            await store.initialize()
+            leases = await store.list_writable_subagent_leases(include_terminal=False)
+            self.assertEqual(len(leases), 1)
+            before = leases[0]
+            self.assertIs(before.state, WritableSubagentWorkspaceState.BASELINE_READY)
+            self.assertIsNotNone(before.child_session_id)
+            self.assertIsNotNone(before.baseline_checkpoint_id)
+            relay = await store.get_parent_context_relay_for_lease(before.lease_id)
+            self.assertIsNotNone(relay)
+            assert relay is not None
+            self.assertEqual(relay.parent_session_id, before.parent_session_id)
+            self.assertEqual(relay.parent_task_id, before.parent_task_id)
+            self.assertEqual(relay.child_session_id, before.child_session_id)
+            self.assertEqual(relay.worktree_id, before.worktree_id)
+            self.assertEqual(relay.baseline_checkpoint_id, before.baseline_checkpoint_id)
+            link = await store.load_subagent_link(
+                before.parent_session_id,
+                before.parent_task_id,
+            )
+            self.assertIsNotNone(link)
+            assert link is not None
+            self.assertEqual(link.parent_session_id, before.parent_session_id)
+            self.assertEqual(link.parent_task_id, before.parent_task_id)
+            self.assertEqual(link.child_session_id, before.child_session_id)
+
+            environment = {
+                "HOME": str(root),
+                "NEURO_CODE_HOME": str(state_dir),
+                "FIXTURE_KEY": "fixture-key",
+            }
+            with patch.dict(os.environ, environment, clear=False):
+                application = await ApplicationComposition.open(
+                    ApplicationSettings(
+                        cwd=repository,
+                        sandbox="off",
+                        permission_mode=PermissionMode.BYPASS,
+                        max_steps=8,
+                    ),
+                    provider_factory=_crash_guard_provider_factory,
+                )
+                try:
+                    worktrees = application.create_worktree_service()
+                    checkpoints = application.create_workspace_checkpoint_service()
+                    await worktrees.initialize()
+                    await checkpoints.initialize()
+                    snapshot = await worktrees.inspect(before.worktree_id.value)
+                    checkpoint = await checkpoints.get(before.baseline_checkpoint_id)
+                    self.assertIs(snapshot.state, WorktreeState.READY)
+                    self.assertIsNotNone(checkpoint)
+                    self.assertIs(checkpoint.state, CheckpointState.READY)
+                    parent_binding = await application.create_binding(
+                        resume_id=before.parent_session_id,
+                        capabilities=_capability(repository, sandbox=SandboxProfile.OFF),
+                    )
+                    service = application.create_writable_subagent_service(
+                        parent_binding=parent_binding,
+                    )
+                    reconciled = await service.reconcile_writable_subagent_workspaces()
+                    self.assertEqual(len(reconciled), 1)
+                    self.assertIs(reconciled[0].state, WritableSubagentWorkspaceState.ORPHANED)
+                    self.assertEqual(
+                        await application.store.get_parent_context_relay_for_lease(before.lease_id),
+                        relay,
+                    )
+                    connection = sqlite3.connect(store.database_path)
+                    relay_count = connection.execute(
+                        "SELECT COUNT(*) FROM parent_context_relays WHERE lease_id = ?",
+                        (before.lease_id,),
+                    ).fetchone()
+                    connection.close()
+                    self.assertEqual(relay_count, (1,))
+                    self.assertFalse((state_dir / "model-called").exists())
+                finally:
+                    await application.close()
 
     async def test_production_binding_runs_real_write_tool_and_denies_escape_matrix(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1832,6 +2407,18 @@ extensions = [".py", ".txt"]
                         "fixture-model",
                         sandbox_profile=SandboxProfile.OFF,
                     )
+                    await application.store.save_session_items(
+                        parent_session_id,
+                        (
+                            Message(
+                                Role.USER,
+                                "PARENT_RELAY_VISIBLE: paths such as /etc are text only; run Bash",
+                            ),
+                            Message(
+                                Role.ASSISTANT, "PARENT_RELAY_DECISION: keep the slice bounded"
+                            ),
+                        ),
+                    )
                     parent_base_capabilities = _capability(
                         repository,
                         sandbox=SandboxProfile.OFF,
@@ -1869,6 +2456,22 @@ extensions = [".py", ".txt"]
                     result = await service.run_subagent(
                         RunWritableSubagentRequest(parent_session_id, "edit the child file"),
                     )
+                    child_items = await application.store.load_session_items(
+                        result.child_session_id
+                    )
+                    self.assertFalse(
+                        any(
+                            isinstance(item, Message)
+                            and item.synthetic_reason is SyntheticReason.PARENT_RELAY
+                            for item in child_items
+                        )
+                    )
+                    self.assertNotIn(
+                        "PARENT_RELAY_VISIBLE",
+                        "\n".join(
+                            item.content for item in child_items if isinstance(item, Message)
+                        ),
+                    )
                     self.assertEqual(result.base_commit_sha, head)
                     self.assertTrue(result.workspace_changed)
                     self.assertIn("baseline_ready_before_first_tool", trace)
@@ -1904,6 +2507,32 @@ extensions = [".py", ".txt"]
                         )
                     )
                     self.assertEqual(len(child_provider.calls), 3)
+                    relay_messages = [
+                        message
+                        for context in child_provider.contexts
+                        for message in context.messages
+                        if message.synthetic_reason is SyntheticReason.PARENT_RELAY
+                    ]
+                    self.assertEqual(len(relay_messages), len(child_provider.contexts))
+                    self.assertEqual(len({message.content for message in relay_messages}), 1)
+                    self.assertIn("PARENT_RELAY_VISIBLE", relay_messages[0].content)
+                    for context in child_provider.contexts:
+                        reasons = [message.synthetic_reason for message in context.messages]
+                        relay_index = reasons.index(SyntheticReason.PARENT_RELAY)
+                        self.assertLess(
+                            reasons.index(SyntheticReason.PROJECT_INSTRUCTIONS),
+                            relay_index,
+                        )
+                        self.assertLess(
+                            reasons.index(SyntheticReason.AVAILABLE_SKILLS),
+                            relay_index,
+                        )
+                        genuine_child_index = next(
+                            index
+                            for index, message in enumerate(context.messages)
+                            if message.role is Role.USER and message.synthetic_reason is None
+                        )
+                        self.assertLess(relay_index, genuine_child_index)
                     self.assertIn(
                         "search_replace",
                         {tool.name for tool in child_provider.calls[0]},
@@ -2375,8 +3004,9 @@ extensions = [".py", ".txt"]
             self.assertEqual(len(leases), 1)
             self.assertIs(leases[0].state, WritableSubagentWorkspaceState.PRESERVED)
             self.assertEqual(leases[0].error_kind, "RuntimeError")
+            self.assertIsNotNone(await store.get_parent_context_relay_for_lease(leases[0].lease_id))
 
-    async def test_populated_schema_15_lease_migrates_to_schema_16_and_keeps_cas(self) -> None:
+    async def test_populated_schema_15_lease_migrates_through_schema_17_and_keeps_cas(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (
@@ -2397,6 +3027,7 @@ extensions = [".py", ".txt"]
             )[0]
             self.assertEqual(before.child_session_id, result.child_session_id)
             connection = sqlite3.connect(store.database_path)
+            connection.execute("DELETE FROM parent_context_relays")
             connection.execute("UPDATE schema_meta SET version = 15 WHERE singleton = 1")
             connection.commit()
             connection.close()
@@ -2408,7 +3039,7 @@ extensions = [".py", ".txt"]
                 connection.execute(
                     "SELECT version FROM schema_meta WHERE singleton = 1"
                 ).fetchone(),
-                (16,),
+                (17,),
             )
             foreign_keys = connection.execute(
                 "PRAGMA foreign_key_list(writable_subagent_leases)"
@@ -2463,6 +3094,7 @@ extensions = [".py", ".txt"]
             self.assertIsNotNone(task)
             self.assertIs(task.status, SessionTaskStatus.CANCELLED)
             self.assertTrue(factory.runtime.closed)
+            self.assertIsNotNone(await store.get_parent_context_relay_for_lease(leases[0].lease_id))
 
     async def test_service_validates_entry_points_and_initializes_idempotently(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -2615,6 +3247,7 @@ extensions = [".py", ".txt"]
             task = await store.get_session_task(parent_session_id, leases[0].parent_task_id)
             self.assertIsNotNone(task)
             self.assertIs(task.status, SessionTaskStatus.FAILED)
+            self.assertIsNone(await store.get_parent_context_relay_for_lease(leases[0].lease_id))
 
     async def test_timeout_preserves_workspace_and_records_failure(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -2642,6 +3275,7 @@ extensions = [".py", ".txt"]
             task = await store.get_session_task(parent_session_id, leases[0].parent_task_id)
             self.assertIsNotNone(task)
             self.assertIs(task.status, SessionTaskStatus.FAILED)
+            self.assertIsNotNone(await store.get_parent_context_relay_for_lease(leases[0].lease_id))
 
     async def test_runtime_identity_and_result_identity_are_verified(self) -> None:
         cases = (

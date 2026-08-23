@@ -97,6 +97,7 @@ class ContextBuilder:
         "_interaction_mode",
         "_last_instruction_result",
         "_last_skill_result",
+        "_parent_relay_message",
         "_plan",
         "_plan_comments",
         "_reasoning_effort",
@@ -111,6 +112,7 @@ class ContextBuilder:
         plan: SessionPlan | None,
         instruction_provider: Callable[[], InstructionDiscoveryResult | None] | None,
         skill_provider: Callable[[], SkillDiscoveryResult | None] | None,
+        parent_relay_message: Message | None = None,
     ) -> None:
         self._reasoning_effort = reasoning_effort
         self._interaction_mode = interaction_mode
@@ -118,6 +120,12 @@ class ContextBuilder:
         self._plan_comments: tuple[PlanComment, ...] = ()
         self._instruction_provider = instruction_provider
         self._skill_provider = skill_provider
+        if parent_relay_message is not None and (
+            not isinstance(parent_relay_message, Message)
+            or parent_relay_message.synthetic_reason is not SyntheticReason.PARENT_RELAY
+        ):
+            raise TypeError("parent relay message must be canonical synthetic context")
+        self._parent_relay_message = parent_relay_message
         self._last_instruction_result: InstructionDiscoveryResult | None = None
         self._last_skill_result: SkillDiscoveryResult | None = None
 
@@ -279,7 +287,13 @@ class ContextBuilder:
             BATCH_FIRST_RUNTIME_GUIDANCE,
         ]
         guidance = "\n\n".join(guidance_parts)
-        rendered = list(items)
+        rendered = [
+            item
+            for item in items
+            if not (
+                isinstance(item, Message) and item.synthetic_reason is SyntheticReason.PARENT_RELAY
+            )
+        ]
 
         # Apply guidance to the system message (or create one if missing).
         system_index: int | None = None
@@ -322,6 +336,21 @@ class ContextBuilder:
                     insert_at = i + 1
                     break
             rendered.insert(insert_at, skill_msg)
+
+        # The immutable parent relay is context rather than authority. Insert
+        # its single owned copy after stable workspace context and before
+        # genuine child history on every request.
+        if self._parent_relay_message is not None:
+            insert_at = system_index + 1
+            while insert_at < len(rendered):
+                item = rendered[insert_at]
+                if not isinstance(item, Message) or item.synthetic_reason not in {
+                    SyntheticReason.PROJECT_INSTRUCTIONS,
+                    SyntheticReason.AVAILABLE_SKILLS,
+                }:
+                    break
+                insert_at += 1
+            rendered.insert(insert_at, self._parent_relay_message)
 
         return tuple(rendered)
 

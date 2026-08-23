@@ -12,13 +12,14 @@ import asyncio
 import math
 import os
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Protocol, cast, runtime_checkable
 
 from neuro_code.application.ports.checkpoints import WorkspaceCheckpointApplication
+from neuro_code.application.ports.parent_context_relay import ParentContextRelayStore
 from neuro_code.application.ports.storage import SessionStore
 from neuro_code.application.ports.worktree import WorktreeError
 from neuro_code.application.ports.writable_subagent import (
@@ -27,6 +28,9 @@ from neuro_code.application.ports.writable_subagent import (
 )
 from neuro_code.application.runtime.agent import AgentRunResult, EventSink
 from neuro_code.application.runtime.process_liveness import owner_is_alive
+from neuro_code.application.workflows.parent_context_relay import (
+    ParentContextRelayApplicationService,
+)
 from neuro_code.application.workflows.subagent_capabilities import (
     MAX_SUBAGENT_STEPS,
     WRITABLE_SUBAGENT_WRITE_TOOL_NAMES,
@@ -41,6 +45,7 @@ from neuro_code.domain.checkpoints import (
     workspace_projection_fingerprint,
 )
 from neuro_code.domain.execution import AgentExecutionOutcome
+from neuro_code.domain.parent_context_relay import ParentContextRelay
 from neuro_code.domain.session_tasks import (
     SessionTask,
     SessionTaskKind,
@@ -164,6 +169,7 @@ class WritableSubagentRuntimeFactory(Protocol):
         parent_task_id: str,
         child_session_id: str,
         capabilities: WritableSubagentCapabilityGrant,
+        relay: ParentContextRelay,
     ) -> WritableSubagentRuntime: ...
 
 
@@ -269,6 +275,8 @@ class WritableSubagentApplicationService:
         *,
         parent_binding: ConversationBinding,
         global_policy: SubagentCapabilitySet,
+        relay_store: ParentContextRelayStore | None = None,
+        redaction_values: Iterable[str] = (),
         timeout_seconds: float = 120.0,
         clock: Callable[[], datetime] = _now,
     ) -> None:
@@ -322,6 +330,15 @@ class WritableSubagentApplicationService:
         self._parent_session_id = parent_session_id
         self._parent_capabilities = parent_capabilities
         self._global_policy = global_policy
+        resolved_relay_store = relay_store or cast(ParentContextRelayStore, store)
+        self._relay_service = ParentContextRelayApplicationService(
+            store,
+            resolved_relay_store,
+            parent_binding=parent_binding,
+            redaction_values=redaction_values,
+            clock=clock,
+        )
+        self._relay_store = resolved_relay_store
         self._timeout_seconds = float(timeout_seconds)
         self._clock = clock
         self._lock = asyncio.Lock()
@@ -332,6 +349,7 @@ class WritableSubagentApplicationService:
         if self._initialized:
             return
         await self._lease_store.initialize()
+        await self._relay_store.initialize()
         await self._worktrees.initialize()
         await self._checkpoints.initialize()
         self._initialized = True
@@ -460,11 +478,13 @@ class WritableSubagentApplicationService:
                     self._clock().astimezone(UTC),
                 )
             )
+            relay = await self._relay_service.publish(lease, prompt=request.prompt)
             runtime = await self._runtime_factory.create(
                 request,
                 parent_task_id=task.task_id,
                 child_session_id=child_session_id,
                 capabilities=effective,
+                relay=relay,
             )
             if runtime.capability_fingerprint != effective.fingerprint:
                 raise ConfigurationError(

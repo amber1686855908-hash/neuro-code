@@ -60,6 +60,7 @@ from neuro_code.domain.conversation.messages import (
     PreservedContextItem,
     Role,
     SessionItem,
+    SyntheticReason,
     ToolCall,
 )
 from neuro_code.domain.conversation.reasoning import ReasoningEffort, reasoning_guidance
@@ -69,6 +70,15 @@ from neuro_code.domain.conversation.request import (
     ModelRequestSnapshot,
     RequestContextFingerprints,
     context_fingerprints,
+)
+from neuro_code.domain.parent_context_relay import (
+    MAX_PARENT_RELAY_ITEM_BYTES,
+    MAX_PARENT_RELAY_ITEMS,
+    MAX_PARENT_RELAY_PROJECTED_BYTES,
+    MAX_PARENT_RELAY_RENDERED_BYTES,
+    ParentContextRelay,
+    ParentContextRelayItem,
+    render_parent_context_relay,
 )
 from neuro_code.domain.plans import (
     MAX_PLAN_COMMENT_BYTES,
@@ -134,6 +144,10 @@ __all__ = [
     "MAX_BACKGROUND_WAKE_TASK_IDS",
     "MAX_DURABLE_COMPACTION_ID_BYTES",
     "MAX_DURABLE_COMPACTION_SUMMARY_BYTES",
+    "MAX_PARENT_RELAY_ITEMS",
+    "MAX_PARENT_RELAY_ITEM_BYTES",
+    "MAX_PARENT_RELAY_PROJECTED_BYTES",
+    "MAX_PARENT_RELAY_RENDERED_BYTES",
     "MAX_PLAN_COMMENTS",
     "MAX_PLAN_COMMENT_BYTES",
     "MAX_PLAN_COMMENT_ID_BYTES",
@@ -177,6 +191,8 @@ __all__ = [
     "ModelTextDelta",
     "ModelToolCall",
     "ModelUsage",
+    "ParentContextRelay",
+    "ParentContextRelayItem",
     "PlanComment",
     "PlanStep",
     "PlanStepStatus",
@@ -193,6 +209,7 @@ __all__ = [
     "SessionTask",
     "SessionTaskKind",
     "SessionTaskStatus",
+    "SyntheticReason",
     "TerminalOutputChunk",
     "TerminalSignal",
     "TerminalSize",
@@ -221,4 +238,5 @@ __all__ = [
     "estimate_text_tokens",
     "interaction_mode_guidance",
     "reasoning_guidance",
+    "render_parent_context_relay",
 ]

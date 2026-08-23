@@ -33,6 +33,7 @@ from neuro_code.application.workflows.writable_subagent import (
     WritableSubagentRuntimeFactory,
 )
 from neuro_code.bootstrap.composition import ApplicationComposition
+from neuro_code.domain.parent_context_relay import ParentContextRelay
 from neuro_code.domain.worktree import WorktreeWorkspaceBinding
 from neuro_code.shared.errors import ConfigurationError
 
@@ -264,6 +265,7 @@ class CompositionWritableSubagentRuntimeFactory(WritableSubagentRuntimeFactory):
         parent_task_id: str,
         child_session_id: str,
         capabilities: WritableSubagentCapabilityGrant,
+        relay: ParentContextRelay,
     ) -> WritableSubagentRuntime:
         if not parent_task_id:
             raise ValueError("parent task id must not be empty")
@@ -271,6 +273,14 @@ class CompositionWritableSubagentRuntimeFactory(WritableSubagentRuntimeFactory):
             raise ValueError("child session id must not be empty")
         if not isinstance(capabilities, WritableSubagentCapabilityGrant):
             raise ConfigurationError("writable child capabilities must be canonical")
+        if not isinstance(relay, ParentContextRelay):
+            raise ConfigurationError("writable child parent relay must be canonical")
+        if (
+            relay.child_session_id != child_session_id
+            or relay.capability_fingerprint != capabilities.capabilities.fingerprint
+            or relay.grant_fingerprint != capabilities.workspace_grant.fingerprint
+        ):
+            raise ConfigurationError("writable child parent relay identity is inconsistent")
         workspace_binding = _writable_workspace_binding(capabilities)
         selected_config = replace(
             _without_provider_builtin_tools(self._composition.config),
@@ -283,6 +293,7 @@ class CompositionWritableSubagentRuntimeFactory(WritableSubagentRuntimeFactory):
             additional_workspace_roots=workspace_binding.additional_roots,
             capabilities=capabilities.capabilities,
             enable_background_tasks=False,
+            parent_context_relay=relay,
         )
         return _CompositionWritableSubagentRuntime(binding, child_session_id, capabilities)
 

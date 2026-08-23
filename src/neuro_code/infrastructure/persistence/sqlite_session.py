@@ -22,6 +22,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from neuro_code.application.ports.parent_context_relay import ParentContextRelayError
 from neuro_code.application.ports.writable_subagent import WritableSubagentLeaseError
 from neuro_code.domain.background_tasks.models import BackgroundWakeState
 from neuro_code.domain.checkpoints import CheckpointId
@@ -50,6 +51,7 @@ from neuro_code.domain.execution import (
     TurnRecoveryStage,
     TurnSource,
 )
+from neuro_code.domain.parent_context_relay import ParentContextRelay, ParentContextRelayItem
 from neuro_code.domain.plans import MAX_PLAN_COMMENTS, PlanComment, SessionPlan
 from neuro_code.domain.sandbox.models import SandboxProfile
 from neuro_code.domain.session_tasks import (
@@ -79,7 +81,7 @@ from neuro_code.domain.writable_subagent import (
 from neuro_code.shared.async_utils import run_blocking
 from neuro_code.shared.errors import SessionError
 
-SCHEMA_VERSION = 16
+SCHEMA_VERSION = 17
 _SEARCH_SNIPPET_LIMIT = 500
 _SQLITE_TIMEOUT_SECONDS = 30.0
 _SESSION_ALIAS_NAMESPACE_LIMIT = 64
@@ -231,6 +233,12 @@ class SqliteSessionStore:
                             "UPDATE schema_meta SET version = 16 WHERE singleton = 1"
                         )
                         version = (16,)
+                    if version is not None and version[0] == 16:
+                        _ensure_parent_context_relay_schema(connection)
+                        connection.execute(
+                            "UPDATE schema_meta SET version = 17 WHERE singleton = 1"
+                        )
+                        version = (17,)
                     if version is None or version[0] != SCHEMA_VERSION:
                         raise SessionError(
                             "unsupported session schema version: "
@@ -247,6 +255,7 @@ class SqliteSessionStore:
                     _ensure_session_compaction_schema(connection)
                     _ensure_session_turn_attempt_schema(connection)
                     _ensure_writable_subagent_lease_schema(connection)
+                    _ensure_parent_context_relay_schema(connection)
                     _backfill_search_documents(connection, missing_only=True)
                     connection.commit()
                 except BaseException:
@@ -2010,6 +2019,150 @@ class SqliteSessionStore:
 
         return await run_blocking(load)
 
+    async def insert_parent_context_relay(
+        self,
+        relay: ParentContextRelay,
+    ) -> ParentContextRelay:
+        """Publish one immutable READY relay after verifying exact lease linkage."""
+
+        if not isinstance(relay, ParentContextRelay):
+            raise TypeError("parent context relay must be canonical")
+
+        def insert() -> ParentContextRelay:
+            try:
+                with closing(self._connect()) as connection, connection:
+                    lease = connection.execute(
+                        """
+                        SELECT parent_session_id, parent_task_id, child_session_id,
+                               worktree_id, baseline_checkpoint_id, base_commit_sha,
+                               capability_fingerprint, grant_fingerprint
+                        FROM writable_subagent_leases
+                        WHERE lease_id = ?
+                        """,
+                        (relay.lease_id,),
+                    ).fetchone()
+                    expected = (
+                        relay.parent_session_id,
+                        relay.parent_task_id,
+                        relay.child_session_id,
+                        relay.worktree_id.value,
+                        relay.baseline_checkpoint_id.value,
+                        relay.base_commit_sha,
+                        relay.capability_fingerprint,
+                        relay.grant_fingerprint,
+                    )
+                    if lease is None or tuple(lease) != expected:
+                        raise ParentContextRelayError(
+                            "parent context relay does not match its writable lease",
+                            kind="protocol",
+                        )
+                    link = connection.execute(
+                        """
+                        SELECT child_session_id
+                        FROM subagent_links
+                        WHERE parent_session_id = ? AND parent_task_id = ?
+                        """,
+                        (relay.parent_session_id, relay.parent_task_id),
+                    ).fetchone()
+                    if link is None or str(link[0]) != relay.child_session_id:
+                        raise ParentContextRelayError(
+                            "parent context relay does not match its subagent link",
+                            kind="protocol",
+                        )
+                    values = _parent_context_relay_values(relay)
+                    cursor = connection.execute(
+                        """
+                        INSERT OR IGNORE INTO parent_context_relays(
+                            relay_id, lease_id, parent_session_id, parent_task_id,
+                            child_session_id, worktree_id, baseline_checkpoint_id,
+                            base_commit_sha, capability_fingerprint, grant_fingerprint,
+                            task_prompt_fingerprint, source_item_count, items_json,
+                            source_fingerprint, content_fingerprint, byte_count,
+                            truncated, created_at, integrity_fingerprint, state
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ready')
+                        """,
+                        values,
+                    )
+                    row = connection.execute(
+                        _PARENT_CONTEXT_RELAY_SELECT + " WHERE lease_id = ?",
+                        (relay.lease_id,),
+                    ).fetchone()
+                    if row is None:
+                        raise ParentContextRelayError(
+                            "parent context relay was not persisted",
+                        )
+                    current = _parent_context_relay_from_row(row)
+                    if current != relay:
+                        raise ParentContextRelayError(
+                            "an immutable parent context relay already exists for this worker",
+                            kind="concurrent_modification",
+                        )
+                    if cursor.rowcount not in {0, 1}:
+                        raise ParentContextRelayError("parent context relay insert was ambiguous")
+                    return current
+            except ParentContextRelayError:
+                raise
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+                raise ParentContextRelayError(
+                    "parent context relay integrity verification failed",
+                    kind="integrity",
+                ) from error
+            except sqlite3.Error as error:
+                raise ParentContextRelayError(
+                    "parent context relay could not be persisted",
+                ) from error
+
+        async with self._write_lock:
+            return await run_blocking(insert)
+
+    async def get_parent_context_relay(
+        self,
+        relay_id: str,
+    ) -> ParentContextRelay | None:
+        _validated_session_task_id(relay_id)
+
+        def load() -> ParentContextRelay | None:
+            try:
+                with closing(self._connect()) as connection:
+                    row = connection.execute(
+                        _PARENT_CONTEXT_RELAY_SELECT + " WHERE relay_id = ?",
+                        (relay_id,),
+                    ).fetchone()
+                return _parent_context_relay_from_row(row) if row is not None else None
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+                raise ParentContextRelayError(
+                    "parent context relay integrity verification failed",
+                    kind="integrity",
+                ) from error
+            except sqlite3.Error as error:
+                raise ParentContextRelayError("parent context relay could not be loaded") from error
+
+        return await run_blocking(load)
+
+    async def get_parent_context_relay_for_lease(
+        self,
+        lease_id: str,
+    ) -> ParentContextRelay | None:
+        _validated_session_task_id(lease_id)
+
+        def load() -> ParentContextRelay | None:
+            try:
+                with closing(self._connect()) as connection:
+                    row = connection.execute(
+                        _PARENT_CONTEXT_RELAY_SELECT + " WHERE lease_id = ?",
+                        (lease_id,),
+                    ).fetchone()
+                return _parent_context_relay_from_row(row) if row is not None else None
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+                raise ParentContextRelayError(
+                    "parent context relay integrity verification failed",
+                    kind="integrity",
+                ) from error
+            except sqlite3.Error as error:
+                raise ParentContextRelayError("parent context relay could not be loaded") from error
+
+        return await run_blocking(load)
+
     async def list_writable_subagent_leases(
         self,
         *,
@@ -2855,6 +3008,46 @@ def _ensure_writable_subagent_lease_schema(connection: sqlite3.Connection) -> No
         """
         CREATE INDEX IF NOT EXISTS writable_subagent_leases_by_state
         ON writable_subagent_leases(state, updated_at, lease_id)
+        """
+    )
+
+
+def _ensure_parent_context_relay_schema(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS parent_context_relays (
+            relay_id TEXT PRIMARY KEY,
+            lease_id TEXT NOT NULL UNIQUE,
+            parent_session_id TEXT NOT NULL,
+            parent_task_id TEXT NOT NULL,
+            child_session_id TEXT NOT NULL UNIQUE,
+            worktree_id TEXT NOT NULL UNIQUE,
+            baseline_checkpoint_id TEXT NOT NULL,
+            base_commit_sha TEXT NOT NULL,
+            capability_fingerprint TEXT NOT NULL,
+            grant_fingerprint TEXT NOT NULL,
+            task_prompt_fingerprint TEXT NOT NULL,
+            source_item_count INTEGER NOT NULL CHECK (source_item_count >= 0),
+            items_json TEXT NOT NULL,
+            source_fingerprint TEXT NOT NULL,
+            content_fingerprint TEXT NOT NULL,
+            byte_count INTEGER NOT NULL CHECK (byte_count > 0),
+            truncated INTEGER NOT NULL CHECK (truncated IN (0, 1)),
+            created_at TEXT NOT NULL,
+            integrity_fingerprint TEXT NOT NULL,
+            state TEXT NOT NULL CHECK (state = 'ready'),
+            FOREIGN KEY (lease_id) REFERENCES writable_subagent_leases(lease_id)
+                ON DELETE RESTRICT,
+            FOREIGN KEY (parent_session_id) REFERENCES sessions(id) ON DELETE RESTRICT,
+            FOREIGN KEY (parent_task_id) REFERENCES session_tasks(task_id) ON DELETE RESTRICT,
+            FOREIGN KEY (child_session_id) REFERENCES sessions(id) ON DELETE RESTRICT
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS parent_context_relays_by_parent
+        ON parent_context_relays(parent_session_id, created_at, relay_id)
         """
     )
 
@@ -3793,6 +3986,109 @@ def _background_wake_state_from_row(
         raise SessionError(
             f"session {session_id} contains an invalid background wake state"
         ) from error
+
+
+_PARENT_CONTEXT_RELAY_SELECT = """
+    SELECT relay_id, lease_id, parent_session_id, parent_task_id,
+           child_session_id, worktree_id, baseline_checkpoint_id,
+           base_commit_sha, capability_fingerprint, grant_fingerprint,
+           task_prompt_fingerprint, source_item_count, items_json,
+           source_fingerprint, content_fingerprint, byte_count,
+           truncated, created_at, integrity_fingerprint, state
+    FROM parent_context_relays
+"""
+
+
+def _parent_context_relay_values(relay: ParentContextRelay) -> tuple[object, ...]:
+    return (
+        relay.relay_id,
+        relay.lease_id,
+        relay.parent_session_id,
+        relay.parent_task_id,
+        relay.child_session_id,
+        relay.worktree_id.value,
+        relay.baseline_checkpoint_id.value,
+        relay.base_commit_sha,
+        relay.capability_fingerprint,
+        relay.grant_fingerprint,
+        relay.task_prompt_fingerprint,
+        relay.source_item_count,
+        json.dumps(
+            [item.to_dict() for item in relay.items],
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        relay.source_fingerprint,
+        relay.content_fingerprint,
+        relay.byte_count,
+        int(relay.truncated),
+        relay.created_at.isoformat(),
+        relay.integrity_fingerprint,
+    )
+
+
+def _parent_context_relay_from_row(row: Sequence[object]) -> ParentContextRelay:
+    if len(row) != 20:
+        raise ValueError("parent context relay record is malformed")
+    (
+        relay_id,
+        lease_id,
+        parent_session_id,
+        parent_task_id,
+        child_session_id,
+        worktree_id,
+        baseline_checkpoint_id,
+        base_commit_sha,
+        capability_fingerprint,
+        grant_fingerprint,
+        task_prompt_fingerprint,
+        source_item_count,
+        raw_items,
+        source_fingerprint,
+        content_fingerprint,
+        byte_count,
+        raw_truncated,
+        created_at,
+        integrity_fingerprint,
+        state,
+    ) = row
+    if state != "ready":
+        raise ValueError("parent context relay is not READY")
+    if not isinstance(source_item_count, int) or isinstance(source_item_count, bool):
+        raise ValueError("parent context relay source item count is invalid")
+    if not isinstance(byte_count, int) or isinstance(byte_count, bool):
+        raise ValueError("parent context relay byte count is invalid")
+    if raw_truncated not in (0, 1) or isinstance(raw_truncated, bool):
+        raise ValueError("parent context relay truncated flag is invalid")
+    payload = json.loads(str(raw_items))
+    if not isinstance(payload, list):
+        raise ValueError("parent context relay item payload is invalid")
+    relay = ParentContextRelay(
+        relay_id=str(relay_id),
+        parent_session_id=str(parent_session_id),
+        parent_task_id=str(parent_task_id),
+        child_session_id=str(child_session_id),
+        lease_id=str(lease_id),
+        worktree_id=WorktreeId(str(worktree_id)),
+        baseline_checkpoint_id=CheckpointId(str(baseline_checkpoint_id)),
+        base_commit_sha=str(base_commit_sha),
+        capability_fingerprint=str(capability_fingerprint),
+        grant_fingerprint=str(grant_fingerprint),
+        task_prompt_fingerprint=str(task_prompt_fingerprint),
+        source_item_count=source_item_count,
+        items=tuple(ParentContextRelayItem.from_dict(item) for item in payload),
+        source_fingerprint=str(source_fingerprint),
+        content_fingerprint=str(content_fingerprint),
+        byte_count=byte_count,
+        truncated=bool(raw_truncated),
+        created_at=datetime.fromisoformat(str(created_at)),
+    )
+    if not isinstance(integrity_fingerprint, str) or (
+        relay.integrity_fingerprint != integrity_fingerprint
+    ):
+        raise ValueError("parent context relay integrity fingerprint is inconsistent")
+    return relay
 
 
 _WRITABLE_LEASE_SELECT = """

@@ -1715,6 +1715,38 @@ process/cache state is ephemeral, is not stored in SQLite, and is reconstructed
 by a future binding. See
 [ADR 0132](adr/0132-worker-scoped-lsp-runtime-integration.md).
 
+### Bounded parent context relay
+
+The writable workflow now derives one `ParentContextRelay` only from the
+durable items of the session bound to the actual parent `ConversationBinding`.
+It deterministically selects recent genuine plain-text USER/ASSISTANT content,
+applies the composition-owned configured redaction, and enforces 10-item,
+4-KiB-per-item, 24-KiB-projected, and 32-KiB-rendered UTF-8 bounds. System,
+tool-role, synthetic, tool-call-bearing, media-bearing, preserved reasoning,
+and preserved backend-call structures are excluded; assistant visible prose is
+separable from and never carries its `reasoning_content`.
+
+Session schema 17 stores one insert-only READY relay per writable lease. Its
+identity binds the parent/task/child, lease, worktree, baseline checkpoint,
+base commit, capability/grant fingerprints, and child-task digest. Source,
+content, and complete-record fingerprints are verified on load; inconsistent
+rows fail closed. Projection and durable verification happen after the
+`SubagentLink` and before child runtime creation, so no child model request can
+occur before relay publication. Failure preserves the existing durable worker
+identities rather than deleting or rolling back them.
+
+`ContextBuilder` injects exactly one immutable
+`SyntheticReason.PARENT_RELAY` USER message after project instructions and
+skills and before genuine child history on every model request. It is not
+stored as child conversation history and remains byte-stable across model,
+tool, and LSP steps. Relay strings are evidence only: they are not parsed into
+tools, roots, sandbox, network, LSP, worktree, or checkpoint authority. The
+existing capability intersection and child-root instruction/skill discovery
+remain the sole authority owners. Durable compaction-summary reuse, live
+context sharing, parallel workers, DAG/Leader orchestration, and automatic
+delegation remain absent. See
+[ADR 0133](adr/0133-bounded-parent-context-relay.md).
+
 ## Platform policy
 
 Linux, macOS, and Windows are first-class CI targets. Platform-specific code is

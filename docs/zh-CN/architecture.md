@@ -1662,3 +1662,27 @@ task。Worker 成功、Provider 失败、取消或超时都会关闭 LSP client/
 application shutdown 仍是未关闭 binding 的兜底。Worktree、checkpoint、lease 与 session evidence
 保持持久并保留；LSP process/cache state 是临时状态，不写入 SQLite，由未来 binding 重新构造。
 详见 [ADR 0132](adr/0132-worker-scoped-lsp-runtime-integration.md)。
+
+### 有界 Parent Context Relay
+
+Writable workflow 现在只从实际 parent `ConversationBinding` 所绑定 session 的 durable item
+派生一个 `ParentContextRelay`。它以确定性方式选择最近的真实纯文本 USER/ASSISTANT 内容，
+应用 composition-owned 的既有配置脱敏，并执行 10 项、每项 4 KiB、投影合计 24 KiB、
+完整渲染 32 KiB 的 UTF-8 边界。SYSTEM、TOOL role、synthetic、含 tool call、含 media、
+保留 reasoning 与保留 backend-call 的结构都会排除；assistant 可见正文可与
+`reasoning_content` 明确分离，后者绝不进入 Relay。
+
+Session schema 17 为每个 writable lease 保存一条 insert-only READY Relay。其 identity
+绑定 parent/task/child、lease、worktree、baseline checkpoint、base commit、
+capability/grant fingerprint 与 child-task digest。加载时校验 source、content 和完整记录
+fingerprint，不一致时 fail closed。投影和 durable 复验发生在 `SubagentLink` 之后、child
+runtime 创建之前，因此 Relay 发布前不会发生 child model request。发布失败会保留既有
+durable worker identity，而不是删除或 rollback。
+
+`ContextBuilder` 在每次模型请求中，于 project instructions/skills 之后、真实 child history
+之前精确注入一条不可变 `SyntheticReason.PARENT_RELAY` USER 消息。它不写入 child
+conversation history，并在模型、tool 与 LSP 多步骤间保持字节稳定。Relay 字符串只作为证据，
+不会被解析为 tool、root、sandbox、network、LSP、worktree 或 checkpoint 权限。既有 capability
+求交与 child-root instruction/skill discovery 仍是唯一权限 owner。Durable compaction summary
+复用、实时 context sharing、并行 worker、DAG/Leader 编排与自动委派仍未实现。详见
+[ADR 0133](adr/0133-bounded-parent-context-relay.md)。

@@ -40,6 +40,10 @@ from neuro_code.application.ports.model import (
     ModelToolPolicy,
     resolve_capabilities,
 )
+from neuro_code.application.ports.parent_context_relay import (
+    ParentContextRelayError,
+    ParentContextRelayStore,
+)
 from neuro_code.application.ports.provider_catalog import (
     ProviderCatalog,
     ProviderCatalogError,
@@ -304,6 +308,8 @@ __all__ = [
     "ModelRoute",
     "ModelToolPolicy",
     "OwnedLocalProcess",
+    "ParentContextRelayError",
+    "ParentContextRelayStore",
     "PermissionApprover",
     "ProtocolSupportStatus",
     "ProviderCatalog",
