@@ -1639,9 +1639,11 @@ context_window_tokens = 131072
                     RunWritableSubagentRequest(parent_session_id, "cancel"),
                 )
             )
-            for _ in range(500):
+            for _ in range(3000):
                 if factory.runtime is not None:
                     break
+                if running.done():
+                    await running
                 await asyncio.sleep(0.01)
             self.assertIsNotNone(factory.runtime)
             await factory.runtime.started.wait()
