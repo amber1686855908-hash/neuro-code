@@ -98,6 +98,13 @@ from neuro_code.domain.session_tasks import (
 )
 from neuro_code.domain.sessions import SessionSnapshot, SessionSummary
 from neuro_code.domain.sessions.search import SessionSearchHit, SessionSearchPage
+from neuro_code.domain.task_dag import (
+    TaskDag,
+    TaskDagNode,
+    TaskDagNodeKind,
+    TaskDagNodeState,
+    TaskDagState,
+)
 from neuro_code.domain.terminal.models import (
     MAX_TERMINAL_DIMENSION,
     MAX_TERMINAL_OUTPUT_BYTES,
@@ -210,6 +217,11 @@ __all__ = [
     "SessionTaskKind",
     "SessionTaskStatus",
     "SyntheticReason",
+    "TaskDag",
+    "TaskDagNode",
+    "TaskDagNodeKind",
+    "TaskDagNodeState",
+    "TaskDagState",
     "TerminalOutputChunk",
     "TerminalSignal",
     "TerminalSize",

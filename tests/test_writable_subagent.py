@@ -23,7 +23,10 @@ from neuro_code.application.permissions.policy import PermissionMode
 from neuro_code.application.ports.checkpoints import WorkspaceCheckpointApplication
 from neuro_code.application.ports.lsp import LspOperation, LspRequest
 from neuro_code.application.ports.model import ModelCapabilitySet, ModelProvider, ModelToolPolicy
-from neuro_code.application.ports.parent_context_relay import ParentContextRelayError
+from neuro_code.application.ports.parent_context_relay import (
+    ParentContextRelayError,
+    ParentContextRelayStore,
+)
 from neuro_code.application.ports.sandbox import (
     LocalProcessLifecycleCapability,
     LocalProcessPurpose,
@@ -31,6 +34,7 @@ from neuro_code.application.ports.sandbox import (
     OwnedLocalProcess,
     SandboxedProcessRequest,
 )
+from neuro_code.application.ports.task_dag import TaskDagStore
 from neuro_code.application.ports.tools import ToolContext
 from neuro_code.application.ports.worktree import WorktreeError, WorktreeFailureKind
 from neuro_code.application.ports.writable_subagent import WritableSubagentLeaseError
@@ -45,6 +49,11 @@ from neuro_code.application.workflows.subagent_capabilities import (
     WritableSubagentCapabilityGrant,
     resolve_writable_subagent_capability,
     writable_subagent_request,
+)
+from neuro_code.application.workflows.task_dag import (
+    CreateTaskDagRequest,
+    RunTaskDagRequest,
+    TaskDagApplicationService,
 )
 from neuro_code.application.workflows.writable_subagent import (
     MAX_WRITABLE_SUBAGENT_RESULT_BYTES,
@@ -92,6 +101,7 @@ from neuro_code.domain.parent_context_relay import (
 )
 from neuro_code.domain.sandbox.models import SandboxProfile
 from neuro_code.domain.session_tasks import SessionTaskStatus
+from neuro_code.domain.task_dag import TaskDagNode, TaskDagNodeState, TaskDagState
 from neuro_code.domain.tools import ToolDefinition
 from neuro_code.domain.worktree import (
     WorktreeCreateRequest,
@@ -1921,6 +1931,76 @@ class WritableApplicationTests(unittest.IsolatedAsyncioTestCase):
             parent_session_id,
         )
 
+    async def test_task_dag_reuses_writable_pipeline_and_keeps_parent_dirty_state(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (
+                writable,
+                store,
+                parent,
+                _worktrees,
+                _checkpoints,
+                factory,
+                parent_capabilities,
+                parent_session_id,
+            ) = await self._service(root)
+            parent_binding = _parent_binding(parent_session_id, parent_capabilities)
+            dag_service = TaskDagApplicationService(
+                store,
+                cast(TaskDagStore, store),
+                writable,
+                store,
+                cast(ParentContextRelayStore, store),
+                parent_binding=parent_binding,
+            )
+            before_parent = (parent / "parent.txt").read_bytes()
+            dag = await dag_service.create_task_dag(
+                CreateTaskDagRequest(
+                    "writable-dag",
+                    (
+                        TaskDagNode(node_id="a", ordinal=0, prompt="child A"),
+                        TaskDagNode(node_id="b", ordinal=1, prompt="child B"),
+                    ),
+                )
+            )
+            result = await dag_service.run_task_dag(RunTaskDagRequest(dag.dag_id))
+
+            self.assertIs(result.state, TaskDagState.COMPLETED)
+            self.assertEqual(
+                [node.state for node in result.nodes],
+                [TaskDagNodeState.COMPLETED, TaskDagNodeState.COMPLETED],
+            )
+            self.assertEqual(
+                len({node.worktree_id for node in result.nodes}),
+                2,
+            )
+            self.assertEqual(
+                len({node.relay_id for node in result.nodes}),
+                2,
+            )
+            self.assertIsNotNone(factory.relay)
+            for node in result.nodes:
+                self.assertIsNotNone(node.parent_task_id)
+                assert node.parent_task_id is not None
+                task = await store.get_session_task(parent_session_id, node.parent_task_id)
+                self.assertIsNotNone(task)
+                assert task is not None
+                self.assertIs(task.status, SessionTaskStatus.COMPLETED)
+                lease = await store.get_writable_subagent_lease_for_parent_task(
+                    parent_session_id,
+                    node.parent_task_id,
+                )
+                self.assertIsNotNone(lease)
+                assert lease is not None
+                self.assertEqual(lease.worktree_id.value, node.worktree_id)
+                relay = await store.get_parent_context_relay_for_lease(lease.lease_id)
+                self.assertIsNotNone(relay)
+                assert relay is not None
+                self.assertEqual(relay.relay_id, node.relay_id)
+            self.assertEqual((parent / "parent.txt").read_bytes(), before_parent)
+            self.assertEqual(len(await store.list_writable_subagent_leases()), 2)
+            self.assertEqual(len(await store.list_subagent_links(parent_session_id)), 2)
+
     async def test_parent_relay_excludes_unsafe_structures_and_redacts_visible_text(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -2099,7 +2179,7 @@ class WritableApplicationTests(unittest.IsolatedAsyncioTestCase):
             assert leases[0].baseline_checkpoint_id is not None
             self.assertIsNotNone(await checkpoints.get(leases[0].baseline_checkpoint_id))
 
-    async def test_populated_schema_16_migrates_to_17_without_losing_worker_identity(self) -> None:
+    async def test_populated_schema_16_migrates_to_18_without_losing_worker_identity(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (
@@ -2135,7 +2215,7 @@ class WritableApplicationTests(unittest.IsolatedAsyncioTestCase):
                 "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'parent_context_relays'"
             ).fetchone()
             connection.close()
-            self.assertEqual(version, (17,))
+            self.assertEqual(version, (18,))
             self.assertEqual(table, (1,))
             self.assertEqual(
                 (await migrated.list_writable_subagent_leases(parent_session_id=parent_session_id))[
@@ -2149,6 +2229,53 @@ class WritableApplicationTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertIsNotNone(await migrated.get_session(parent_session_id))
             self.assertIsNotNone(await migrated.get_session(result.child_session_id))
+
+    async def test_schema_17_to_18_keeps_populated_parent_relay(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (
+                service,
+                store,
+                _parent,
+                _worktrees,
+                _checkpoints,
+                _factory,
+                _parent_capabilities,
+                parent_session_id,
+            ) = await self._service(root)
+            result = await service.run_subagent(
+                RunWritableSubagentRequest(parent_session_id, "populate schema 17 relay"),
+            )
+            lease = await store.get_writable_subagent_lease_for_parent_task(
+                parent_session_id,
+                result.parent_task_id,
+            )
+            self.assertIsNotNone(lease)
+            assert lease is not None
+            before = await store.get_parent_context_relay_for_lease(lease.lease_id)
+            self.assertIsNotNone(before)
+            connection = sqlite3.connect(store.database_path)
+            connection.execute("UPDATE schema_meta SET version = 17 WHERE singleton = 1")
+            connection.commit()
+            connection.close()
+
+            migrated = SqliteSessionStore(store.database_path)
+            await migrated.initialize()
+            self.assertEqual(
+                await migrated.get_parent_context_relay_for_lease(lease.lease_id),
+                before,
+            )
+            connection = sqlite3.connect(store.database_path)
+            version = connection.execute(
+                "SELECT version FROM schema_meta WHERE singleton = 1"
+            ).fetchone()
+            task_dag_tables = connection.execute(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' "
+                "AND name IN ('task_dags', 'task_dag_nodes')"
+            ).fetchone()
+            connection.close()
+            self.assertEqual(version, (18,))
+            self.assertEqual(task_dag_tables, (2,))
 
     async def test_process_death_after_relay_publication_preserves_exact_worker_snapshot(
         self,
@@ -3006,7 +3133,7 @@ extensions = [".py", ".txt"]
             self.assertEqual(leases[0].error_kind, "RuntimeError")
             self.assertIsNotNone(await store.get_parent_context_relay_for_lease(leases[0].lease_id))
 
-    async def test_populated_schema_15_lease_migrates_through_schema_17_and_keeps_cas(self) -> None:
+    async def test_populated_schema_15_lease_migrates_through_schema_18_and_keeps_cas(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (
@@ -3039,7 +3166,7 @@ extensions = [".py", ".txt"]
                 connection.execute(
                     "SELECT version FROM schema_meta WHERE singleton = 1"
                 ).fetchone(),
-                (17,),
+                (18,),
             )
             foreign_keys = connection.execute(
                 "PRAGMA foreign_key_list(writable_subagent_leases)"

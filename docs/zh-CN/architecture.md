@@ -1672,7 +1672,8 @@ Writable workflow 现在只从实际 parent `ConversationBinding` 所绑定 sess
 保留 reasoning 与保留 backend-call 的结构都会排除；assistant 可见正文可与
 `reasoning_content` 明确分离，后者绝不进入 Relay。
 
-Session schema 17 为每个 writable lease 保存一条 insert-only READY Relay。其 identity
+Session schema 18 保留 schema 17 的每个 writable lease 一条一对一、insert-only READY Relay，
+并新增下述持久化 Task DAG 表。其 identity
 绑定 parent/task/child、lease、worktree、baseline checkpoint、base commit、
 capability/grant fingerprint 与 child-task digest。加载时校验 source、content 和完整记录
 fingerprint，不一致时 fail closed。投影和 durable 复验发生在 `SubagentLink` 之后、child
@@ -1684,5 +1685,33 @@ durable worker identity，而不是删除或 rollback。
 conversation history，并在模型、tool 与 LSP 多步骤间保持字节稳定。Relay 字符串只作为证据，
 不会被解析为 tool、root、sandbox、network、LSP、worktree 或 checkpoint 权限。既有 capability
 求交与 child-root instruction/skill discovery 仍是唯一权限 owner。Durable compaction summary
-复用、实时 context sharing、并行 worker、DAG/Leader 编排与自动委派仍未实现。详见
-[ADR 0133](adr/0133-bounded-parent-context-relay.md)。
+复用、实时 context sharing、并行 worker、Leader/Swarm/Ultracode 编排与自动委派仍未实现。
+有界串行 Task DAG 切片由独立的 [ADR 0134](adr/0134-durable-serialized-task-dag.md) 规定；Relay
+边界详见 [ADR 0133](adr/0133-bounded-parent-context-relay.md)。
+
+### 有界持久化 Task DAG
+
+ADR 0134 增加了一个显式的内部编排边界：一个有界 DAG 的节点定义必须由调用方以 typed value
+提供。第一切片最多允许 8 个节点、16 条依赖边、每个节点最多 4 个依赖，并且只允许
+`WRITABLE_SUBAGENT` 节点。发布前会拒绝未知引用、重复边、自依赖和环。拓扑顺序与 ready 节点
+选择按声明 ordinal 和 node ID 确定；依赖边只控制执行，不会转发前置节点的 prompt、transcript、
+tool output 或 workspace 数据。
+
+DAG service 只从真实的 `ConversationBinding` 推导 parent session。每个节点复用既有
+`SessionTask` owner 和既有 `WritableSubagentApplicationService`。worker 启动前，节点持久化一条
+生成的精确 parent task ID，并通过 node-generation CAS 与 graph `active_node_id` claim 原子认领。
+active-node claim 是跨进程串行闸门：两个 scheduler 不能同时执行不同的 ready 节点，DAG 也不会
+使用 `SubagentScheduler.run_many()` 或对节点进行无界 gather。
+
+Session schema 18 在 `task_dags` 与 `task_dag_nodes` 中保存不可变 DAG 定义和有界节点运行投影。
+定义是 insert-only；graph 与 node 生命周期更新使用 generation CAS。成功节点记录精确的 worker
+task、child session、writable lease、worktree、baseline checkpoint、Parent Relay 和有界结果投影。
+缺失或不一致的成功关联不会被当作成功。
+
+生命周期为 `PENDING -> READY -> RUNNING -> COMPLETED/FAILED/CANCELLED/INDETERMINATE`；因依赖被
+阻塞的后代进入 `SKIPPED`。失败或取消的依赖只阻塞其后代，独立分支继续执行。重启 reconciliation
+按精确 parent task 与 lease 查询：worker 已完成/失败/取消时映射为 DAG 相同的终态；证据缺失、
+orphan 或不确定时映射为 `INDETERMINATE`。不增加自动 retry、崩溃重跑、merge、copy-back、rollback、
+cleanup、dataflow relay、UI、Leader、Swarm 或 Ultracode 行为。既有 Worktree、Checkpoint、Parent
+Relay 和 worker-scoped 只读 LSP 合约继续作为 authority owner。详见
+[ADR 0134](adr/0134-durable-serialized-task-dag.md)。

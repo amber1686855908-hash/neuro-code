@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any
 
 from neuro_code.application.ports.parent_context_relay import ParentContextRelayError
+from neuro_code.application.ports.task_dag import TaskDagError
 from neuro_code.application.ports.writable_subagent import WritableSubagentLeaseError
 from neuro_code.domain.background_tasks.models import BackgroundWakeState
 from neuro_code.domain.checkpoints import CheckpointId
@@ -73,6 +74,13 @@ from neuro_code.domain.sessions.search import (
     fallback_session_title,
     searchable_session_text,
 )
+from neuro_code.domain.task_dag import (
+    TaskDag,
+    TaskDagNode,
+    TaskDagNodeKind,
+    TaskDagNodeState,
+    TaskDagState,
+)
 from neuro_code.domain.worktree import WorktreeHandle, WorktreeId, WorktreeRepositoryIdentity
 from neuro_code.domain.writable_subagent import (
     WritableSubagentWorkspaceLease,
@@ -81,7 +89,7 @@ from neuro_code.domain.writable_subagent import (
 from neuro_code.shared.async_utils import run_blocking
 from neuro_code.shared.errors import SessionError
 
-SCHEMA_VERSION = 17
+SCHEMA_VERSION = 18
 _SEARCH_SNIPPET_LIMIT = 500
 _SQLITE_TIMEOUT_SECONDS = 30.0
 _SESSION_ALIAS_NAMESPACE_LIMIT = 64
@@ -239,6 +247,12 @@ class SqliteSessionStore:
                             "UPDATE schema_meta SET version = 17 WHERE singleton = 1"
                         )
                         version = (17,)
+                    if version is not None and version[0] == 17:
+                        _ensure_task_dag_schema(connection)
+                        connection.execute(
+                            "UPDATE schema_meta SET version = 18 WHERE singleton = 1"
+                        )
+                        version = (18,)
                     if version is None or version[0] != SCHEMA_VERSION:
                         raise SessionError(
                             "unsupported session schema version: "
@@ -256,6 +270,7 @@ class SqliteSessionStore:
                     _ensure_session_turn_attempt_schema(connection)
                     _ensure_writable_subagent_lease_schema(connection)
                     _ensure_parent_context_relay_schema(connection)
+                    _ensure_task_dag_schema(connection)
                     _backfill_search_documents(connection, missing_only=True)
                     connection.commit()
                 except BaseException:
@@ -2019,6 +2034,407 @@ class SqliteSessionStore:
 
         return await run_blocking(load)
 
+    async def get_writable_subagent_lease_for_parent_task(
+        self,
+        parent_session_id: str,
+        parent_task_id: str,
+    ) -> WritableSubagentWorkspaceLease | None:
+        _validated_session_task_id(parent_session_id)
+        _validated_session_task_id(parent_task_id)
+
+        def load() -> WritableSubagentWorkspaceLease | None:
+            with closing(self._connect()) as connection:
+                row = connection.execute(
+                    _WRITABLE_LEASE_SELECT + " WHERE parent_session_id = ? AND parent_task_id = ?",
+                    (parent_session_id, parent_task_id),
+                ).fetchone()
+            return _writable_lease_from_row(row) if row is not None else None
+
+        return await run_blocking(load)
+
+    async def insert_task_dag(self, dag: TaskDag) -> TaskDag:
+        if not isinstance(dag, TaskDag):
+            raise TypeError("task DAG must be canonical")
+
+        def insert() -> TaskDag:
+            try:
+                with closing(self._connect()) as connection, connection:
+                    current = _load_task_dag(connection, dag.dag_id)
+                    if current is not None:
+                        if current.definition_fingerprint != dag.definition_fingerprint:
+                            raise TaskDagError(
+                                "task DAG identity already exists with a different definition",
+                                kind="protocol",
+                            )
+                        return current
+                    if dag.created_at is None or dag.updated_at is None:
+                        raise TaskDagError("task DAG timestamps are required", kind="protocol")
+                    connection.execute(
+                        """
+                        INSERT INTO task_dags(
+                            dag_id, parent_session_id, definition_fingerprint,
+                            state, generation, created_at, updated_at, active_node_id
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            dag.dag_id,
+                            dag.parent_session_id,
+                            dag.definition_fingerprint,
+                            dag.state.value,
+                            dag.generation,
+                            dag.created_at.isoformat(),
+                            dag.updated_at.isoformat(),
+                            dag.active_node_id,
+                        ),
+                    )
+                    for node in dag.nodes:
+                        connection.execute(
+                            """
+                            INSERT INTO task_dag_nodes(
+                                dag_id, node_id, ordinal, prompt, prompt_fingerprint,
+                                dependencies_json, kind, state, generation,
+                                parent_task_id, child_session_id, lease_id, worktree_id,
+                                baseline_checkpoint_id, relay_id, error_kind, error_reason,
+                                response_preview, final_workspace_fingerprint, changed_file_count
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            _task_dag_node_values(dag.dag_id, node),
+                        )
+                return dag
+            except TaskDagError:
+                raise
+            except sqlite3.IntegrityError as error:
+                raise TaskDagError("task DAG definition could not be persisted") from error
+            except sqlite3.Error as error:
+                raise TaskDagError("task DAG definition could not be persisted") from error
+
+        async with self._write_lock:
+            return await run_blocking(insert)
+
+    async def get_task_dag(self, dag_id: str) -> TaskDag | None:
+        _validated_task_dag_identifier(dag_id)
+
+        def load() -> TaskDag | None:
+            try:
+                with closing(self._connect()) as connection:
+                    return _load_task_dag(connection, dag_id)
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+                raise TaskDagError("task DAG record is invalid", kind="integrity") from error
+            except sqlite3.Error as error:
+                raise TaskDagError("task DAG could not be loaded") from error
+
+        return await run_blocking(load)
+
+    async def compare_and_transition_task_dag(
+        self,
+        dag: TaskDag,
+        *,
+        expected_generation: int,
+        expected_state: TaskDagState,
+    ) -> TaskDag:
+        if not isinstance(dag, TaskDag):
+            raise TypeError("task DAG must be canonical")
+        if isinstance(expected_generation, bool) or expected_generation < 0:
+            raise TypeError("task DAG expected generation must be non-negative")
+        if not isinstance(expected_state, TaskDagState):
+            raise TypeError("task DAG expected state must be canonical")
+
+        def transition() -> TaskDag:
+            try:
+                with closing(self._connect()) as connection, connection:
+                    current = _load_task_dag(connection, dag.dag_id)
+                    if current is None:
+                        raise TaskDagError("task DAG is missing", kind="unmanaged")
+                    _verify_task_dag_definition(current, dag)
+                    if (
+                        current.generation != expected_generation
+                        or current.state is not expected_state
+                        or dag.generation != expected_generation + 1
+                        or dag.active_node_id != current.active_node_id
+                    ):
+                        raise TaskDagError(
+                            "task DAG was changed by another scheduler",
+                            kind="concurrent_modification",
+                        )
+                    if not _task_dag_state_transition_allowed(current.state, dag.state):
+                        raise TaskDagError(
+                            "invalid task DAG state transition",
+                            kind="protocol",
+                        )
+                    if dag.updated_at is None:
+                        raise TaskDagError("task DAG update time is missing", kind="protocol")
+                    cursor = connection.execute(
+                        """
+                        UPDATE task_dags
+                        SET state = ?, generation = ?, updated_at = ?
+                        WHERE dag_id = ? AND generation = ? AND state = ?
+                        """,
+                        (
+                            dag.state.value,
+                            dag.generation,
+                            dag.updated_at.isoformat(),
+                            dag.dag_id,
+                            expected_generation,
+                            expected_state.value,
+                        ),
+                    )
+                    if cursor.rowcount != 1:
+                        raise TaskDagError(
+                            "task DAG was changed by another scheduler",
+                            kind="concurrent_modification",
+                        )
+                    result = _load_task_dag(connection, dag.dag_id)
+                    if result is None:
+                        raise TaskDagError("task DAG disappeared after transition")
+                    return result
+            except TaskDagError:
+                raise
+            except sqlite3.Error as error:
+                raise TaskDagError("task DAG transition failed") from error
+
+        async with self._write_lock:
+            return await run_blocking(transition)
+
+    async def compare_and_transition_task_dag_node(
+        self,
+        dag_id: str,
+        node: TaskDagNode,
+        *,
+        expected_generation: int,
+        expected_state: TaskDagNodeState,
+    ) -> TaskDag:
+        _validated_task_dag_identifier(dag_id)
+        if not isinstance(node, TaskDagNode):
+            raise TypeError("task DAG node must be canonical")
+        if isinstance(expected_generation, bool) or expected_generation < 0:
+            raise TypeError("task DAG node expected generation must be non-negative")
+        if not isinstance(expected_state, TaskDagNodeState):
+            raise TypeError("task DAG node expected state must be canonical")
+
+        def transition() -> TaskDag:
+            try:
+                with closing(self._connect()) as connection, connection:
+                    current_dag = _load_task_dag(connection, dag_id)
+                    if current_dag is None:
+                        raise TaskDagError("task DAG is missing", kind="unmanaged")
+                    if current_dag.active_node_id is not None:
+                        raise TaskDagError(
+                            "task DAG has an active node",
+                            kind="concurrent_modification",
+                        )
+                    current = current_dag.node(node.node_id)
+                    _verify_task_dag_node_definition(current, node)
+                    if (
+                        current.generation != expected_generation
+                        or current.state is not expected_state
+                        or node.generation != expected_generation + 1
+                        or not current.can_transition_to(node.state)
+                    ):
+                        raise TaskDagError(
+                            "task DAG node was changed by another scheduler",
+                            kind="concurrent_modification",
+                        )
+                    cursor = connection.execute(
+                        _TASK_DAG_NODE_UPDATE
+                        + " WHERE dag_id = ? AND node_id = ? AND generation = ? AND state = ?",
+                        (
+                            *_task_dag_node_mutable_values(node),
+                            dag_id,
+                            node.node_id,
+                            expected_generation,
+                            expected_state.value,
+                        ),
+                    )
+                    if cursor.rowcount != 1:
+                        raise TaskDagError(
+                            "task DAG node was changed by another scheduler",
+                            kind="concurrent_modification",
+                        )
+                    result = _load_task_dag(connection, dag_id)
+                    if result is None:
+                        raise TaskDagError("task DAG disappeared after node transition")
+                    return result
+            except TaskDagError:
+                raise
+            except sqlite3.Error as error:
+                raise TaskDagError("task DAG node transition failed") from error
+
+        async with self._write_lock:
+            return await run_blocking(transition)
+
+    async def claim_task_dag_node(
+        self,
+        dag_id: str,
+        node: TaskDagNode,
+        *,
+        expected_generation: int,
+        expected_state: TaskDagNodeState,
+        updated_at: datetime,
+    ) -> TaskDag:
+        _validated_task_dag_identifier(dag_id)
+        if not isinstance(node, TaskDagNode) or node.state is not TaskDagNodeState.RUNNING:
+            raise TypeError("task DAG claim must contain a running node")
+        if not isinstance(updated_at, datetime) or updated_at.tzinfo is None:
+            raise TypeError("task DAG claim update time must be timezone-aware")
+
+        def claim() -> TaskDag:
+            connection = self._connect()
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                current_dag = _load_task_dag(connection, dag_id)
+                if current_dag is None:
+                    raise TaskDagError("task DAG is missing", kind="unmanaged")
+                if current_dag.active_node_id is not None:
+                    raise TaskDagError(
+                        "another task DAG node is already active",
+                        kind="concurrent_modification",
+                    )
+                current = current_dag.node(node.node_id)
+                _verify_task_dag_node_definition(current, node)
+                if (
+                    current.generation != expected_generation
+                    or current.state is not expected_state
+                    or node.generation != expected_generation + 1
+                    or expected_state is not TaskDagNodeState.READY
+                    or not current.can_transition_to(TaskDagNodeState.RUNNING)
+                ):
+                    raise TaskDagError(
+                        "task DAG node cannot be claimed",
+                        kind="concurrent_modification",
+                    )
+                node_cursor = connection.execute(
+                    _TASK_DAG_NODE_UPDATE
+                    + " WHERE dag_id = ? AND node_id = ? AND generation = ? AND state = ?",
+                    (
+                        *_task_dag_node_mutable_values(node),
+                        dag_id,
+                        node.node_id,
+                        expected_generation,
+                        expected_state.value,
+                    ),
+                )
+                if node_cursor.rowcount != 1:
+                    raise TaskDagError(
+                        "task DAG node was changed by another scheduler",
+                        kind="concurrent_modification",
+                    )
+                graph_cursor = connection.execute(
+                    """
+                    UPDATE task_dags
+                    SET state = ?, generation = generation + 1,
+                        updated_at = ?, active_node_id = ?
+                    WHERE dag_id = ? AND active_node_id IS NULL AND generation = ?
+                    """,
+                    (
+                        TaskDagState.RUNNING.value,
+                        updated_at.isoformat(),
+                        node.node_id,
+                        dag_id,
+                        current_dag.generation,
+                    ),
+                )
+                if graph_cursor.rowcount != 1:
+                    raise TaskDagError(
+                        "task DAG active-node claim was lost",
+                        kind="concurrent_modification",
+                    )
+                connection.commit()
+                result = _load_task_dag(connection, dag_id)
+                if result is None:
+                    raise TaskDagError("task DAG disappeared after node claim")
+                return result
+            except BaseException:
+                connection.rollback()
+                raise
+            finally:
+                connection.close()
+
+        async with self._write_lock:
+            return await run_blocking(claim)
+
+    async def finish_task_dag_node(
+        self,
+        dag_id: str,
+        node: TaskDagNode,
+        *,
+        expected_generation: int,
+        expected_state: TaskDagNodeState,
+        updated_at: datetime,
+    ) -> TaskDag:
+        _validated_task_dag_identifier(dag_id)
+        if not isinstance(node, TaskDagNode) or not node.state.terminal:
+            raise TypeError("task DAG finish must contain a terminal node")
+        if not isinstance(updated_at, datetime) or updated_at.tzinfo is None:
+            raise TypeError("task DAG finish update time must be timezone-aware")
+
+        def finish() -> TaskDag:
+            connection = self._connect()
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                current_dag = _load_task_dag(connection, dag_id)
+                if current_dag is None:
+                    raise TaskDagError("task DAG is missing", kind="unmanaged")
+                if current_dag.active_node_id != node.node_id:
+                    raise TaskDagError(
+                        "task DAG node is not the active node",
+                        kind="concurrent_modification",
+                    )
+                current = current_dag.node(node.node_id)
+                _verify_task_dag_node_definition(current, node)
+                if (
+                    current.generation != expected_generation
+                    or current.state is not expected_state
+                    or expected_state is not TaskDagNodeState.RUNNING
+                    or node.generation != expected_generation + 1
+                    or not current.can_transition_to(node.state)
+                ):
+                    raise TaskDagError(
+                        "task DAG node cannot be finished",
+                        kind="concurrent_modification",
+                    )
+                node_cursor = connection.execute(
+                    _TASK_DAG_NODE_UPDATE
+                    + " WHERE dag_id = ? AND node_id = ? AND generation = ? AND state = ?",
+                    (
+                        *_task_dag_node_mutable_values(node),
+                        dag_id,
+                        node.node_id,
+                        expected_generation,
+                        expected_state.value,
+                    ),
+                )
+                if node_cursor.rowcount != 1:
+                    raise TaskDagError(
+                        "task DAG node was changed by another scheduler",
+                        kind="concurrent_modification",
+                    )
+                graph_cursor = connection.execute(
+                    """
+                    UPDATE task_dags
+                    SET generation = generation + 1, updated_at = ?, active_node_id = NULL
+                    WHERE dag_id = ? AND active_node_id = ? AND generation = ?
+                    """,
+                    (updated_at.isoformat(), dag_id, node.node_id, current_dag.generation),
+                )
+                if graph_cursor.rowcount != 1:
+                    raise TaskDagError(
+                        "task DAG active-node release was lost",
+                        kind="concurrent_modification",
+                    )
+                connection.commit()
+                result = _load_task_dag(connection, dag_id)
+                if result is None:
+                    raise TaskDagError("task DAG disappeared after node finish")
+                return result
+            except BaseException:
+                connection.rollback()
+                raise
+            finally:
+                connection.close()
+
+        async with self._write_lock:
+            return await run_blocking(finish)
+
     async def insert_parent_context_relay(
         self,
         relay: ParentContextRelay,
@@ -3052,6 +3468,65 @@ def _ensure_parent_context_relay_schema(connection: sqlite3.Connection) -> None:
     )
 
 
+def _ensure_task_dag_schema(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS task_dags (
+            dag_id TEXT PRIMARY KEY,
+            parent_session_id TEXT NOT NULL,
+            definition_fingerprint TEXT NOT NULL,
+            state TEXT NOT NULL,
+            generation INTEGER NOT NULL CHECK (generation >= 0),
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            active_node_id TEXT,
+            FOREIGN KEY (parent_session_id) REFERENCES sessions(id) ON DELETE RESTRICT
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS task_dag_nodes (
+            dag_id TEXT NOT NULL,
+            node_id TEXT NOT NULL,
+            ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+            prompt TEXT NOT NULL,
+            prompt_fingerprint TEXT NOT NULL,
+            dependencies_json TEXT NOT NULL,
+            kind TEXT NOT NULL CHECK (kind = 'writable_subagent'),
+            state TEXT NOT NULL,
+            generation INTEGER NOT NULL CHECK (generation >= 0),
+            parent_task_id TEXT,
+            child_session_id TEXT,
+            lease_id TEXT,
+            worktree_id TEXT,
+            baseline_checkpoint_id TEXT,
+            relay_id TEXT,
+            error_kind TEXT,
+            error_reason TEXT,
+            response_preview TEXT,
+            final_workspace_fingerprint TEXT,
+            changed_file_count INTEGER,
+            PRIMARY KEY (dag_id, node_id),
+            UNIQUE (dag_id, ordinal),
+            FOREIGN KEY (dag_id) REFERENCES task_dags(dag_id) ON DELETE RESTRICT
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS task_dags_by_parent
+        ON task_dags(parent_session_id, updated_at, dag_id)
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS task_dag_nodes_by_state
+        ON task_dag_nodes(dag_id, state, ordinal, node_id)
+        """
+    )
+
+
 def _ensure_session_compaction_schema(connection: sqlite3.Connection) -> None:
     connection.execute(
         """
@@ -3986,6 +4461,206 @@ def _background_wake_state_from_row(
         raise SessionError(
             f"session {session_id} contains an invalid background wake state"
         ) from error
+
+
+_TASK_DAG_SELECT = """
+    SELECT dag_id, parent_session_id, definition_fingerprint,
+           state, generation, created_at, updated_at, active_node_id
+    FROM task_dags
+    WHERE dag_id = ?
+"""
+
+_TASK_DAG_NODE_SELECT = """
+    SELECT node_id, ordinal, prompt, prompt_fingerprint,
+           dependencies_json, kind, state, generation,
+           parent_task_id, child_session_id, lease_id, worktree_id,
+           baseline_checkpoint_id, relay_id, error_kind, error_reason,
+           response_preview, final_workspace_fingerprint, changed_file_count
+    FROM task_dag_nodes
+    WHERE dag_id = ?
+    ORDER BY ordinal ASC, node_id ASC
+"""
+
+_TASK_DAG_NODE_UPDATE = """
+    UPDATE task_dag_nodes SET
+        state = ?, generation = ?, parent_task_id = ?, child_session_id = ?,
+        lease_id = ?, worktree_id = ?, baseline_checkpoint_id = ?, relay_id = ?,
+        error_kind = ?, error_reason = ?, response_preview = ?,
+        final_workspace_fingerprint = ?, changed_file_count = ?
+"""
+
+
+def _validated_task_dag_identifier(value: str) -> None:
+    if (
+        not isinstance(value, str)
+        or not value.strip()
+        or "\x00" in value
+        or len(value.encode("utf-8")) > 128
+        or any(ord(character) < 32 or ord(character) == 127 for character in value)
+    ):
+        raise ValueError("task DAG identifier is invalid")
+
+
+def _task_dag_state_transition_allowed(
+    current: TaskDagState,
+    proposed: TaskDagState,
+) -> bool:
+    if current is TaskDagState.READY:
+        return proposed is TaskDagState.RUNNING
+    if current is TaskDagState.RUNNING:
+        return proposed in {
+            TaskDagState.COMPLETED,
+            TaskDagState.FAILED,
+            TaskDagState.CANCELLED,
+            TaskDagState.INDETERMINATE,
+        }
+    return False
+
+
+def _verify_task_dag_definition(current: TaskDag, proposed: TaskDag) -> None:
+    if (
+        current.dag_id != proposed.dag_id
+        or current.parent_session_id != proposed.parent_session_id
+        or current.definition_fingerprint != proposed.definition_fingerprint
+        or len(current.nodes) != len(proposed.nodes)
+    ):
+        raise TaskDagError("task DAG definition is immutable", kind="protocol")
+    for current_node, proposed_node in zip(current.nodes, proposed.nodes, strict=True):
+        _verify_task_dag_node_definition(current_node, proposed_node)
+
+
+def _verify_task_dag_node_definition(current: TaskDagNode, proposed: TaskDagNode) -> None:
+    if current.definition_payload != proposed.definition_payload:
+        raise TaskDagError("task DAG node definition is immutable", kind="protocol")
+
+
+def _task_dag_node_mutable_values(node: TaskDagNode) -> tuple[object, ...]:
+    return (
+        node.state.value,
+        node.generation,
+        node.parent_task_id,
+        node.child_session_id,
+        node.lease_id,
+        node.worktree_id,
+        node.baseline_checkpoint_id,
+        node.relay_id,
+        node.error_kind,
+        node.error_reason,
+        node.response_preview,
+        node.final_workspace_fingerprint,
+        node.changed_file_count,
+    )
+
+
+def _task_dag_node_values(dag_id: str, node: TaskDagNode) -> tuple[object, ...]:
+    return (
+        dag_id,
+        node.node_id,
+        node.ordinal,
+        node.prompt,
+        node.prompt_fingerprint,
+        json.dumps(list(node.dependencies), ensure_ascii=False, separators=(",", ":")),
+        node.kind.value,
+        *_task_dag_node_mutable_values(node),
+    )
+
+
+def _load_task_dag(
+    connection: sqlite3.Connection,
+    dag_id: str,
+) -> TaskDag | None:
+    row = connection.execute(_TASK_DAG_SELECT, (dag_id,)).fetchone()
+    if row is None:
+        return None
+    if len(row) != 8:
+        raise ValueError("task DAG record is malformed")
+    (
+        raw_dag_id,
+        parent_session_id,
+        definition_fingerprint,
+        raw_state,
+        generation,
+        raw_created_at,
+        raw_updated_at,
+        active_node_id,
+    ) = row
+    node_rows = connection.execute(_TASK_DAG_NODE_SELECT, (dag_id,)).fetchall()
+    nodes = tuple(_task_dag_node_from_row(node_row) for node_row in node_rows)
+    dag = TaskDag(
+        dag_id=str(raw_dag_id),
+        parent_session_id=str(parent_session_id),
+        nodes=nodes,
+        state=TaskDagState(str(raw_state)),
+        generation=int(generation),
+        created_at=datetime.fromisoformat(str(raw_created_at)),
+        updated_at=datetime.fromisoformat(str(raw_updated_at)),
+        active_node_id=str(active_node_id) if active_node_id is not None else None,
+    )
+    if dag.definition_fingerprint != str(definition_fingerprint):
+        raise ValueError("task DAG definition fingerprint is inconsistent")
+    return dag
+
+
+def _task_dag_node_from_row(row: Sequence[object]) -> TaskDagNode:
+    if len(row) != 19:
+        raise ValueError("task DAG node record is malformed")
+    (
+        node_id,
+        ordinal,
+        prompt,
+        prompt_fingerprint,
+        dependencies_json,
+        raw_kind,
+        raw_state,
+        generation,
+        parent_task_id,
+        child_session_id,
+        lease_id,
+        worktree_id,
+        baseline_checkpoint_id,
+        relay_id,
+        error_kind,
+        error_reason,
+        response_preview,
+        final_workspace_fingerprint,
+        changed_file_count,
+    ) = row
+    if not isinstance(ordinal, int) or not isinstance(generation, int):
+        raise ValueError("task DAG node ordinal or generation is invalid")
+    if changed_file_count is not None and not isinstance(changed_file_count, int):
+        raise ValueError("task DAG node changed file count is invalid")
+    dependencies = json.loads(str(dependencies_json))
+    if not isinstance(dependencies, list) or not all(
+        isinstance(dependency, str) for dependency in dependencies
+    ):
+        raise ValueError("task DAG node dependencies are invalid")
+    node = TaskDagNode(
+        node_id=str(node_id),
+        ordinal=ordinal,
+        prompt=str(prompt),
+        dependencies=tuple(dependencies),
+        kind=TaskDagNodeKind(str(raw_kind)),
+        state=TaskDagNodeState(str(raw_state)),
+        generation=generation,
+        parent_task_id=str(parent_task_id) if parent_task_id is not None else None,
+        child_session_id=str(child_session_id) if child_session_id is not None else None,
+        lease_id=str(lease_id) if lease_id is not None else None,
+        worktree_id=str(worktree_id) if worktree_id is not None else None,
+        baseline_checkpoint_id=(
+            str(baseline_checkpoint_id) if baseline_checkpoint_id is not None else None
+        ),
+        relay_id=str(relay_id) if relay_id is not None else None,
+        error_kind=str(error_kind) if error_kind is not None else None,
+        error_reason=str(error_reason) if error_reason is not None else None,
+        response_preview=str(response_preview) if response_preview is not None else None,
+        final_workspace_fingerprint=(
+            str(final_workspace_fingerprint) if final_workspace_fingerprint is not None else None
+        ),
+        changed_file_count=changed_file_count,
+    )
+    if node.prompt_fingerprint != str(prompt_fingerprint):
+        raise ValueError("task DAG node prompt fingerprint is inconsistent")
+    return node
 
 
 _PARENT_CONTEXT_RELAY_SELECT = """

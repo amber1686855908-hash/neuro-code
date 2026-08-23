@@ -26,6 +26,13 @@ class WritableSubagentLeaseStore(Protocol):
         /,
     ) -> WritableSubagentWorkspaceLease | None: ...
 
+    async def get_writable_subagent_lease_for_parent_task(
+        self,
+        parent_session_id: str,
+        parent_task_id: str,
+        /,
+    ) -> WritableSubagentWorkspaceLease | None: ...
+
     async def list_writable_subagent_leases(
         self,
         *,

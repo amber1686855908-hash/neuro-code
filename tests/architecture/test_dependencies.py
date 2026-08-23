@@ -847,6 +847,7 @@ def test_canonical_ports_are_the_only_port_modules() -> None:
         "neuro_code.application.ports.mcp",
         "neuro_code.application.ports.model",
         "neuro_code.application.ports.parent_context_relay",
+        "neuro_code.application.ports.task_dag",
         "neuro_code.application.ports.provider_catalog",
         "neuro_code.application.ports.provider_services",
         "neuro_code.application.ports.provider_settings",

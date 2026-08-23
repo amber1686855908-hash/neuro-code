@@ -1726,7 +1726,8 @@ tool-role, synthetic, tool-call-bearing, media-bearing, preserved reasoning,
 and preserved backend-call structures are excluded; assistant visible prose is
 separable from and never carries its `reasoning_content`.
 
-Session schema 17 stores one insert-only READY relay per writable lease. Its
+Session schema 18 retains the schema-17 one-to-one insert-only READY relay per
+writable lease and adds the durable Task DAG tables described below. Its
 identity binds the parent/task/child, lease, worktree, baseline checkpoint,
 base commit, capability/grant fingerprints, and child-task digest. Source,
 content, and complete-record fingerprints are verified on load; inconsistent
@@ -1743,9 +1744,49 @@ tool, and LSP steps. Relay strings are evidence only: they are not parsed into
 tools, roots, sandbox, network, LSP, worktree, or checkpoint authority. The
 existing capability intersection and child-root instruction/skill discovery
 remain the sole authority owners. Durable compaction-summary reuse, live
-context sharing, parallel workers, DAG/Leader orchestration, and automatic
-delegation remain absent. See
-[ADR 0133](adr/0133-bounded-parent-context-relay.md).
+context sharing, parallel workers, Leader/Swarm/Ultracode orchestration, and
+automatic delegation remain absent. The bounded serialized Task DAG slice is
+specified separately by [ADR 0134](adr/0134-durable-serialized-task-dag.md).
+See [ADR 0133](adr/0133-bounded-parent-context-relay.md) for the relay
+boundary.
+
+### Bounded durable Task DAG
+
+ADR 0134 adds an explicit internal orchestration boundary for one bounded DAG
+whose node definitions are supplied by the caller as typed values. The first
+slice admits at most eight nodes, sixteen dependency edges, four dependencies
+per node, and only `WRITABLE_SUBAGENT` nodes. Definition validation rejects
+unknown references, duplicate edges, self-dependencies, and cycles before
+publication. Topological order and ready-node selection are deterministic by
+declaration ordinal and node ID; dependency edges are control-only and never
+forward predecessor prompts, transcripts, tool output, or workspace data.
+
+The DAG service derives the parent session only from the actual
+`ConversationBinding`. It reuses the existing `SessionTask` owner and the
+existing `WritableSubagentApplicationService` for every node. Before a worker
+starts, the node durably records one generated parent task ID and the
+application atomically claims the node with node-generation CAS plus a graph
+`active_node_id` claim. The active-node claim is the cross-process serial gate:
+two schedulers cannot execute different ready nodes at once, and the DAG
+never uses `SubagentScheduler.run_many()` or an unbounded gather over nodes.
+
+Session schema 18 stores immutable DAG definitions and bounded node runtime
+projections in `task_dags` and `task_dag_nodes`. Definitions are insert-only;
+graph and node lifecycle updates use generation CAS. A successful node records
+the exact worker task, child session, writable lease, worktree, baseline
+checkpoint, Parent Relay, and bounded result projection. A missing or
+inconsistent success correlation is not treated as success.
+
+The lifecycle is `PENDING -> READY -> RUNNING -> COMPLETED/FAILED/CANCELLED/
+INDETERMINATE`; dependency-blocked descendants become `SKIPPED`. A failed or
+cancelled dependency blocks only its descendants while independent branches
+continue. Restart reconciliation looks up the exact parent task and lease:
+completed/failed/cancelled worker tasks map to the same DAG terminal meaning;
+missing, orphaned, or uncertain evidence maps to `INDETERMINATE`. No automatic
+retry, crash rerun, merge, copy-back, rollback, cleanup, dataflow relay, UI
+surface, Leader, Swarm, or Ultracode behavior is added. Existing Worktree,
+Checkpoint, Parent Relay, and worker-scoped read-only LSP contracts remain the
+authority owners. See [ADR 0134](adr/0134-durable-serialized-task-dag.md).
 
 ## Platform policy
 

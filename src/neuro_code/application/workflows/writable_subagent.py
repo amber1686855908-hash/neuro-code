@@ -203,6 +203,20 @@ class RunWritableSubagentRequest:
 
 
 @dataclass(frozen=True, slots=True)
+class WritableSubagentExecutionIdentity:
+    """Internal DAG-to-worker correlation owned by the application layer."""
+
+    dag_id: str
+    node_id: str
+    parent_task_id: str
+
+    def __post_init__(self) -> None:
+        _safe_identifier(self.dag_id, field_name="writable execution DAG id")
+        _safe_identifier(self.node_id, field_name="writable execution node id")
+        _safe_identifier(self.parent_task_id, field_name="writable execution parent task id")
+
+
+@dataclass(frozen=True, slots=True)
 class WritableSubagentResultProjection:
     """Bounded outcome plus workspace identity; never a diff or transcript."""
 
@@ -345,6 +359,12 @@ class WritableSubagentApplicationService:
         self._owner_token = f"writable-owner-{uuid.uuid4().hex}"
         self._initialized = False
 
+    @property
+    def parent_session_id(self) -> str:
+        """The actual parent binding identity captured by this service."""
+
+        return self._parent_session_id
+
     async def initialize(self) -> None:
         if self._initialized:
             return
@@ -374,12 +394,47 @@ class WritableSubagentApplicationService:
         async with self._lock:
             return await self._run_locked(request, requested, sink=sink)
 
+    async def run_subagent_with_execution_identity(
+        self,
+        request: RunWritableSubagentRequest,
+        *,
+        execution_identity: WritableSubagentExecutionIdentity,
+        sink: EventSink | None = None,
+    ) -> WritableSubagentResultProjection:
+        """Run one DAG node with its pre-persisted exact SessionTask id.
+
+        This is an application-internal seam.  Ordinary writable callers keep
+        the generated task identity used by :meth:`run_subagent`.
+        """
+
+        if not isinstance(request, RunWritableSubagentRequest):
+            raise ValueError("writable subagent request must be canonical")
+        if not isinstance(execution_identity, WritableSubagentExecutionIdentity):
+            raise ConfigurationError("writable execution identity must be canonical")
+        if request.parent_session_id != self._parent_session_id:
+            raise ConfigurationError("writable subagent request parent session does not match")
+        if not self._initialized:
+            raise ConfigurationError("writable subagent service is not initialized")
+        requested = writable_subagent_request(
+            self._parent_capabilities,
+            global_policy=self._global_policy,
+            max_steps=request.max_steps,
+        )
+        async with self._lock:
+            return await self._run_locked(
+                request,
+                requested,
+                sink=sink,
+                parent_task_id=execution_identity.parent_task_id,
+            )
+
     async def _run_locked(
         self,
         request: RunWritableSubagentRequest,
         requested: SubagentCapabilitySet,
         *,
         sink: EventSink | None,
+        parent_task_id: str | None = None,
     ) -> WritableSubagentResultProjection:
         parent_capabilities = self._parent_capabilities
         parent_session_id = self._parent_session_id
@@ -390,7 +445,7 @@ class WritableSubagentApplicationService:
         lease = WritableSubagentWorkspaceLease(
             lease_id=f"wsl-{uuid.uuid4().hex}",
             parent_session_id=parent_session_id,
-            parent_task_id=f"writable-subagent-{uuid.uuid4().hex}",
+            parent_task_id=parent_task_id or f"writable-subagent-{uuid.uuid4().hex}",
             worktree_id=worktree_id,
             parent_capability_fingerprint=parent_capabilities.fingerprint,
             parent_workspace_root=parent_capabilities.cwd,
@@ -880,6 +935,7 @@ __all__ = [
     "MAX_WRITABLE_SUBAGENT_TIMEOUT_SECONDS",
     "RunWritableSubagentRequest",
     "WritableSubagentApplicationService",
+    "WritableSubagentExecutionIdentity",
     "WritableSubagentResultProjection",
     "WritableSubagentRuntime",
     "WritableSubagentRuntimeFactory",

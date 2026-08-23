@@ -47,6 +47,7 @@ from neuro_code.application.ports.parent_context_relay import (
 from neuro_code.application.ports.sandbox import LocalProcessSandbox
 from neuro_code.application.ports.skills import SkillDiscovery
 from neuro_code.application.ports.storage import SessionStore
+from neuro_code.application.ports.task_dag import TaskDagStore
 from neuro_code.application.ports.tools import Tool, ToolContext
 from neuro_code.application.ports.user_interaction import UserInteractionPort
 from neuro_code.application.ports.web_fetch import (
@@ -120,6 +121,7 @@ from neuro_code.application.workflows.subagent_scheduler import (
     ScopedSubagentRuntimeFactory,
     SubagentScheduler,
 )
+from neuro_code.application.workflows.task_dag import TaskDagApplicationService
 from neuro_code.application.workflows.writable_subagent import (
     WritableSubagentApplicationService,
 )
@@ -1164,6 +1166,29 @@ class ApplicationComposition:
             relay_store=cast(ParentContextRelayStore, self.store),
             redaction_values=self.config.redaction_values(),
             timeout_seconds=timeout_seconds,
+        )
+
+    def create_task_dag_service(
+        self,
+        *,
+        parent_binding: ConversationBinding,
+        timeout_seconds: float = 120.0,
+    ) -> TaskDagApplicationService:
+        """Create the explicit serialized Task DAG application slice."""
+
+        if not isinstance(parent_binding, ConversationBinding):
+            raise ConfigurationError("task DAG parent binding is required")
+        writable = self.create_writable_subagent_service(
+            parent_binding=parent_binding,
+            timeout_seconds=timeout_seconds,
+        )
+        return TaskDagApplicationService(
+            self.store,
+            cast(TaskDagStore, self.store),
+            writable,
+            cast(WritableSubagentLeaseStore, self.store),
+            cast(ParentContextRelayStore, self.store),
+            parent_binding=parent_binding,
         )
 
     def create_subagent_scheduler(
