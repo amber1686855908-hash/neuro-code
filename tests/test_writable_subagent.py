@@ -2148,12 +2148,49 @@ extensions = [".py", ".txt"]
                     )
 
                     case[0] = "lsp-timeout"
-                    service._timeout_seconds = 3.0
-                    with self.assertRaises(SubagentTimeoutError):
-                        await service.run_subagent(
-                            RunWritableSubagentRequest(parent_session_id, "timeout after LSP"),
+                    service._timeout_seconds = 119.125
+                    real_timeout = asyncio.timeout
+                    worker_timeout_scopes: list[asyncio.Timeout] = []
+
+                    def controlled_worker_timeout(
+                        delay: float | None,
+                    ) -> asyncio.Timeout:
+                        if delay == service._timeout_seconds:
+                            scope = real_timeout(None)
+                            worker_timeout_scopes.append(scope)
+                            return scope
+                        return real_timeout(delay)
+
+                    with patch("asyncio.timeout", new=controlled_worker_timeout):
+                        timing_out = asyncio.create_task(
+                            service.run_subagent(
+                                RunWritableSubagentRequest(
+                                    parent_session_id,
+                                    "timeout after LSP",
+                                ),
+                            )
                         )
-                    timeout_provider = provider_factory.providers[-1]
+                        try:
+                            for _ in range(3_000):
+                                timeout_provider = provider_factory.providers[-1]
+                                if timeout_provider.case_name == "lsp-timeout":
+                                    break
+                                await asyncio.sleep(0.01)
+                            else:
+                                self.fail("timeout worker provider was not created")
+                            await asyncio.wait_for(
+                                timeout_provider.blocking_started.wait(),
+                                timeout=30,
+                            )
+                            self.assertEqual(len(worker_timeout_scopes), 1)
+                            worker_timeout_scopes[0].reschedule(asyncio.get_running_loop().time())
+                            with self.assertRaises(SubagentTimeoutError):
+                                await timing_out
+                        finally:
+                            if not timing_out.done():
+                                timing_out.cancel()
+                                with suppress(asyncio.CancelledError):
+                                    await timing_out
                     timeout_manager = timeout_provider.lsp_manager
                     assert timeout_manager is not None
                     self.assertTrue(timeout_provider.blocking_started.is_set())
