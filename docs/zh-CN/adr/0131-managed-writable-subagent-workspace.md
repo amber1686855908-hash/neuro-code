@@ -1,6 +1,6 @@
 # ADR 0131：串行受管 Writable Subagent 工作区
 
-- 状态：已实现为显式内部纵向切片；最终评级等待 exact-head CI
+- 状态：已接受；在串行 writable-workspace 纵向切片范围内已证明
 - 日期：2026-08-23
 - 范围：一个有界 writable child、一个 Neuro Code 拥有的 managed worktree 和一个保留的 baseline
 
@@ -14,9 +14,12 @@ conversation，也不能修改 dirty source checkout。因此首个 writable 能
 ## 决策
 
 新增由 `ApplicationComposition.create_writable_subagent_service()` 构造的内部
-`WritableSubagentApplicationService`。它不接入 `/subagent`、CLI、TUI、ACP、自动调度、
-LSP worker 或任何 checkpoint/rollback orchestration。调用在进程内串行化，SQLite lease
+`WritableSubagentApplicationService`。它不接入 `/subagent`、CLI、TUI、ACP、自动调度或任何
+checkpoint/rollback orchestration。调用在进程内串行化，SQLite lease
 提供跨进程 active-parent 与 active-worktree 唯一性边界。
+
+ADR 0132 随后把现有只读 LSP capability 组合进该 runtime，但不改变其 worktree、checkpoint、
+lease 或 write-authority contract。
 
 Service 只有在以下步骤完成后，才从类型化的
 `ManagedChildWorkspaceGrant` 派生 child authority：
@@ -38,9 +41,10 @@ Effective child tool set 是显式 parent 与 global policy 的安全交集，�
 - read：`read_file`、`read_files`、`list_dir`、`list_tree`、`glob`、`grep`、`grep_many`、`skill`；
 - write：`search_replace`、`apply_patch`。
 
-不授予 Bash、terminal、background task、MCP、network、Git/worktree/checkpoint/rollback、
-subagent 或 LSP authority。Parent 与 global policy 都必须暴露两个 write tool、filesystem
-write authority 和 writable sandbox profile。通用
+不授予 Bash、terminal、background task、MCP、network、Git/worktree/checkpoint/rollback 或
+subagent authority。ADR 0132 只允许通过相同 parent/global/bounded-worker 交集获得可选只读
+`lsp`。Parent 与 global policy 都必须暴露两个 write tool、filesystem write authority 和
+writable sandbox profile。通用
 `SubagentCapabilitySet.is_subset_of()` 语义保持不变；只有 typed grant 可以替换继承式
 workspace-root authority。
 

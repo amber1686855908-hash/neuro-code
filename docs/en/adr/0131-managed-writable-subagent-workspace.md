@@ -1,6 +1,6 @@
 # ADR 0131: Serialized managed writable-subagent workspace
 
-- Status: implemented as an explicit internal vertical slice; final rating waits for exact-head CI
+- Status: accepted; proven within the serialized writable-workspace vertical slice
 - Date: 2026-08-23
 - Scope: one bounded writable child, one Neuro-owned managed worktree, and one preserved baseline
 
@@ -17,10 +17,14 @@ or process death.
 
 Add an internal `WritableSubagentApplicationService` that is constructed by
 `ApplicationComposition.create_writable_subagent_service()`. It is not wired
-into `/subagent`, CLI, TUI, ACP, automatic scheduling, LSP workers, or any
+into `/subagent`, CLI, TUI, ACP, automatic scheduling, or any
 checkpoint/rollback orchestration. Calls are serialized in-process and the
 SQLite lease provides the cross-process active-parent and active-worktree
 uniqueness boundary.
+
+ADR 0132 subsequently composes the existing read-only LSP capability into this
+runtime without changing its worktree, checkpoint, lease, or write-authority
+contract.
 
 The service derives a typed `ManagedChildWorkspaceGrant` only after it has:
 
@@ -46,9 +50,10 @@ global policy, with only these names in scope:
 - write: `search_replace` and `apply_patch`.
 
 Bash, terminal, background tasks, MCP, network, Git/worktree/checkpoint/
-rollback, subagent, and LSP authority are not granted. The parent and global
-policy must both expose the two write tools, filesystem write authority, and a
-writable sandbox profile. The generic
+rollback, and subagent authority are not granted. ADR 0132 permits optional
+read-only `lsp` only through the same parent/global/bounded-worker
+intersection. The parent and global policy must both expose the two write
+tools, filesystem write authority, and a writable sandbox profile. The generic
 `SubagentCapabilitySet.is_subset_of()` semantics remain unchanged; the typed
 grant is the only boundary that replaces inherited workspace-root authority.
 

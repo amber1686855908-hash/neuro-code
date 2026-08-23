@@ -33,6 +33,7 @@ from neuro_code.application.workflows.writable_subagent import (
     WritableSubagentRuntimeFactory,
 )
 from neuro_code.bootstrap.composition import ApplicationComposition
+from neuro_code.domain.worktree import WorktreeWorkspaceBinding
 from neuro_code.shared.errors import ConfigurationError
 
 if TYPE_CHECKING:
@@ -92,9 +93,7 @@ class _CompositionReadOnlySubagentRuntime:
         if self._closed:
             return
         self._closed = True
-        background_tasks = self._binding.background_tasks
-        if background_tasks is not None:
-            await background_tasks.shutdown()
+        await self._binding.close()
 
 
 class CompositionReadOnlySubagentRuntimeFactory(IsolatedSubagentRuntimeFactory):
@@ -224,9 +223,7 @@ class _CompositionWritableSubagentRuntime:
         if self._closed:
             return
         self._closed = True
-        background_tasks = self._binding.background_tasks
-        if background_tasks is not None:
-            await background_tasks.shutdown()
+        await self._binding.close()
 
 
 class CompositionWritableSubagentRuntimeFactory(WritableSubagentRuntimeFactory):
@@ -245,9 +242,10 @@ class CompositionWritableSubagentRuntimeFactory(WritableSubagentRuntimeFactory):
     ) -> str:
         if not isinstance(request, RunWritableSubagentRequest):
             raise ValueError("writable subagent request must be canonical")
+        workspace_binding = _writable_workspace_binding(capabilities)
         selected_config = replace(
             _without_provider_builtin_tools(self._composition.config),
-            cwd=capabilities.capabilities.cwd,
+            cwd=workspace_binding.primary_root,
             sandbox_profile=capabilities.capabilities.sandbox_profile,
         )
         provider = selected_config.provider
@@ -273,19 +271,34 @@ class CompositionWritableSubagentRuntimeFactory(WritableSubagentRuntimeFactory):
             raise ValueError("child session id must not be empty")
         if not isinstance(capabilities, WritableSubagentCapabilityGrant):
             raise ConfigurationError("writable child capabilities must be canonical")
+        workspace_binding = _writable_workspace_binding(capabilities)
         selected_config = replace(
             _without_provider_builtin_tools(self._composition.config),
-            cwd=capabilities.capabilities.cwd,
+            cwd=workspace_binding.primary_root,
             sandbox_profile=capabilities.capabilities.sandbox_profile,
         )
         binding = await self._composition.create_binding(
             config=selected_config,
             resume_id=child_session_id,
-            additional_workspace_roots=(),
+            additional_workspace_roots=workspace_binding.additional_roots,
             capabilities=capabilities.capabilities,
             enable_background_tasks=False,
         )
         return _CompositionWritableSubagentRuntime(binding, child_session_id, capabilities)
+
+
+def _writable_workspace_binding(
+    capabilities: WritableSubagentCapabilityGrant,
+) -> WorktreeWorkspaceBinding:
+    workspace_binding = capabilities.workspace_grant.workspace_binding
+    if (
+        workspace_binding.primary_root != capabilities.workspace_grant.canonical_child_root
+        or workspace_binding.primary_root != capabilities.capabilities.cwd
+        or workspace_binding.additional_roots
+        or capabilities.capabilities.workspace_roots != (workspace_binding.primary_root,)
+    ):
+        raise ConfigurationError("writable child workspace binding identity is inconsistent")
+    return workspace_binding
 
 
 def _without_provider_builtin_tools(config: AppConfig) -> AppConfig:

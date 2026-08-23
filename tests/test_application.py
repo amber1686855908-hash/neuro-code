@@ -26,6 +26,7 @@ from neuro_code.application.ports.model import ModelCapabilitySet, ModelProvider
 from neuro_code.application.ports.sandbox import LocalProcessSandbox
 from neuro_code.application.runtime.supervision import ExecutionControlMode
 from neuro_code.application.sessions import GetSessionSummaryRequest, SessionApplicationService
+from neuro_code.application.sessions.binding import ConversationBindingResourceScope
 from neuro_code.application.sessions.summary import SessionSummaryQueryService
 from neuro_code.application.settings import ApplicationSettings
 from neuro_code.application.workflows import IsolatedSubagentExecutionService, SubagentCapabilitySet
@@ -178,10 +179,38 @@ context_window_tokens = 65536
                     ApplicationSettings(cwd=root),
                     provider_factory=lambda config, failover: ApplicationProviderFixture(),
                 )
-                await application.create_binding()
+                binding = await application.create_binding()
                 self.assertEqual(len(application._lsp_services), 1)
+                manager = next(iter(application._lsp_services))
+                await binding.close()
+                await binding.close()
+                self.assertTrue(manager._closed)
+                self.assertEqual(manager._routes, {})
+                self.assertEqual(application._lsp_services, set())
                 await asyncio.wait_for(application.close(), timeout=1.0)
                 self.assertEqual(application._lsp_services, set())
+
+    async def test_binding_resource_close_is_shared_idempotent_and_cancellation_safe(self) -> None:
+        started = asyncio.Event()
+        release = asyncio.Event()
+        close_calls = 0
+
+        async def close_resources() -> None:
+            nonlocal close_calls
+            close_calls += 1
+            started.set()
+            await release.wait()
+
+        resources = ConversationBindingResourceScope(close_resources)
+        first_close = asyncio.create_task(resources.close())
+        await started.wait()
+        first_close.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await first_close
+        release.set()
+        await resources.close()
+        await resources.close()
+        self.assertEqual(close_calls, 1)
 
     async def test_capability_bound_child_uses_exact_registry_and_context_manifest(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

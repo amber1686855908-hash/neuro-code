@@ -881,9 +881,10 @@ server runs through the canonical local-process boundary, receives a read-only
 workspace, and cannot apply workspace edits. LSP locations are filtered to
 safe local workspace files and existing permission rules; unsafe or unresolved
 cross-file results are omitted. Use `grep` for text search. Rename, formatting,
-code actions, and LSP-to-worktree/checkpoint binding are not part of this
-slice. Worktree and managed workspace checkpoint capabilities are explicit
-application seams, not LSP tools.
+code actions, and workspace edits remain unsupported. The explicit internal
+writable-worker runtime may compose this same read-only LSP service into its
+managed child worktree; it does not turn worktree or checkpoint lifecycle into
+LSP tools. See [ADR 0132](adr/0132-worker-scoped-lsp-runtime-integration.md).
 
 ## Project status
 

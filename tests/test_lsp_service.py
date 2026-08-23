@@ -327,6 +327,65 @@ class LspServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(not_configured.exception.kind, LspFailureKind.NOT_CONFIGURED)
         await manager.close()
 
+        explicit_profile = await self._manager()
+        try:
+            with self.assertRaises(LspError) as missing_profile:
+                await explicit_profile.execute(
+                    LspRequest(
+                        LspOperation.DEFINITION,
+                        path=self.path,
+                        line=1,
+                        column=1,
+                        profile="missing",
+                    )
+                )
+            self.assertEqual(missing_profile.exception.kind, LspFailureKind.PROFILE_NOT_FOUND)
+        finally:
+            await explicit_profile.close()
+
+        missing_executable = LanguageServerManager(
+            config=AppConfig(
+                cwd=self.root,
+                state_dir=self.root / ".state",
+                providers={},
+                default_provider=None,
+                selected_provider=None,
+                sandbox_profile=SandboxProfile.OFF,
+                language_servers={
+                    "missing": LanguageServerProfile(
+                        name="missing",
+                        language="python",
+                        command=("neuro-code-definitely-missing-lsp-executable",),
+                        extensions=(".py",),
+                    )
+                },
+            ),
+            local_process_sandbox=ProcessTreeLocalProcessSandbox(),
+            workspace_root=self.root,
+        )
+        try:
+            with self.assertRaises(LspError) as executable_error:
+                await missing_executable.execute(
+                    LspRequest(LspOperation.DEFINITION, path=self.path, line=1, column=1)
+                )
+            self.assertEqual(
+                executable_error.exception.kind,
+                LspFailureKind.EXECUTABLE_NOT_FOUND,
+            )
+        finally:
+            await missing_executable.close()
+
+        initialize_failure = await self._manager("initialize-error")
+        try:
+            with self.assertRaises(LspError) as initialization_error:
+                await initialize_failure.execute(
+                    LspRequest(LspOperation.DEFINITION, path=self.path, line=1, column=1)
+                )
+            self.assertEqual(initialization_error.exception.kind, LspFailureKind.PROTOCOL_ERROR)
+            self.assertLessEqual(len(str(initialization_error.exception).encode("utf-8")), 1_000)
+        finally:
+            await initialize_failure.close()
+
         minimal = await self._manager("minimal")
         try:
             with self.assertRaises(LspError) as unsupported:

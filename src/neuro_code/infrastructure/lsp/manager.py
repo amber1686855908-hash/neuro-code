@@ -147,6 +147,10 @@ class LanguageServerManager(LanguageServerService):
     def workspace_root(self) -> Path:
         return self._workspace_root
 
+    @property
+    def additional_workspace_roots(self) -> tuple[Path, ...]:
+        return self._additional_roots
+
     def set_visibility_policy(self, policy: LspResultVisibilityPolicy) -> None:
         self._visibility_policy = policy
 
@@ -304,6 +308,7 @@ class LanguageServerManager(LanguageServerService):
                 return
             self._closed = True
             routes = tuple(self._routes.values())
+            self._routes.clear()
         await asyncio.gather(
             *(self._close_route(route) for route in routes if route.client is not None),
             return_exceptions=True,
@@ -320,6 +325,8 @@ class LanguageServerManager(LanguageServerService):
                     {"textDocument": {"uri": document.uri}},
                 )
         await client.close()
+        route.client = None
+        route.documents.clear()
 
     def _select_profile(
         self,
@@ -381,6 +388,12 @@ class LanguageServerManager(LanguageServerService):
 
     async def _get_route(self, profile: LanguageServerProfile) -> _Route:
         async with self._lock:
+            if self._closed:
+                raise LspError(
+                    "LSP application service is closed",
+                    kind=LspFailureKind.SERVER_CRASH,
+                    phase=LspFailurePhase.REQUEST,
+                )
             route = self._routes.setdefault(profile.name, _Route(profile))
             client = route.client
             if client is not None and client.alive:

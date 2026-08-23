@@ -65,7 +65,10 @@ from neuro_code.application.runtime.agent import AgentRuntime
 from neuro_code.application.sessions import (
     SessionApplicationService,
 )
-from neuro_code.application.sessions.binding import ConversationBinding
+from neuro_code.application.sessions.binding import (
+    ConversationBinding,
+    ConversationBindingResourceScope,
+)
 from neuro_code.application.sessions.conversation import AgentConversation
 from neuro_code.application.sessions.selection import (
     SessionSelectionController,
@@ -845,11 +848,18 @@ class ApplicationComposition:
                 raise ConfigurationError(
                     "child binding capability metadata does not match its construction"
                 )
+
+            async def close_binding_resources() -> None:
+                self._lsp_services.discard(lsp_service)
+                await lsp_service.close()
+                await task_scope.shutdown()
+
             return ConversationBinding(
-                conversation,
-                provider,
-                task_scope,
-                binding_capabilities,
+                runner=conversation,
+                provider=provider,
+                background_tasks=task_scope,
+                capabilities=binding_capabilities,
+                resource_scope=ConversationBindingResourceScope(close_binding_resources),
             )
         except BaseException:
             self._lsp_services.discard(lsp_service)

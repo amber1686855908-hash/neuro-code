@@ -697,9 +697,10 @@ root_markers = ["pyproject.toml"]
 command 只能是 argv。Neuro Code 不会下载或安装 language server；executable 不可用时会在
 execution-time 失败关闭。server 通过规范 local-process boundary 运行，只获得只读 workspace，
 不能应用 workspace edit。LSP location 会按安全 local workspace file 和现有 permission rule 过滤；
-不安全或未解决的跨文件结果会被省略。文本搜索使用 `grep`。Rename、formatting、code action 以及
-LSP 到 worktree/checkpoint 的 binding 不属于本切片。Worktree 与 managed workspace checkpoint
-capability 是显式 application seam，不是 LSP tool。
+不安全或未解决的跨文件结果会被省略。文本搜索使用 `grep`。Rename、formatting、code action 与
+workspace edit 仍不支持。显式内部 writable-worker runtime 可以把同一个只读 LSP service 组合进
+managed child worktree，但不会把 worktree 或 checkpoint lifecycle 变成 LSP tool。详见
+[ADR 0132](adr/0132-worker-scoped-lsp-runtime-integration.md)。
 
 ## 项目状态
 

@@ -350,6 +350,7 @@ class WritableSubagentApplicationService:
             raise ConfigurationError("writable subagent service is not initialized")
         requested = writable_subagent_request(
             self._parent_capabilities,
+            global_policy=self._global_policy,
             max_steps=request.max_steps,
         )
         async with self._lock:

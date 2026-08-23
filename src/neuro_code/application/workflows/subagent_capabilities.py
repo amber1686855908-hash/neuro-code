@@ -76,6 +76,7 @@ WRITABLE_SUBAGENT_READ_TOOL_NAMES = frozenset(
         "grep",
         "grep_many",
         "skill",
+        "lsp",
     }
 )
 WRITABLE_SUBAGENT_WRITE_TOOL_NAMES = frozenset({"search_replace", "apply_patch"})
@@ -98,7 +99,6 @@ WRITABLE_SUBAGENT_FORBIDDEN_TOOL_NAMES = frozenset(
         "x_search",
         "code_interpreter",
         "subagent",
-        "lsp",
     }
 )
 
@@ -539,13 +539,19 @@ class WritableSubagentCapabilityGrant:
 def writable_subagent_request(
     parent: SubagentCapabilitySet,
     *,
+    global_policy: SubagentCapabilitySet,
     max_steps: int,
 ) -> SubagentCapabilitySet:
-    """Build the fixed, internal writable request without inheriting roots."""
+    """Build the fixed internal request from both real authority ceilings."""
 
     if not isinstance(parent, SubagentCapabilitySet):
         raise ConfigurationError("parent subagent capability metadata is required")
-    read_tools = WRITABLE_SUBAGENT_READ_TOOL_NAMES.intersection(parent.allowed_tool_names)
+    if not isinstance(global_policy, SubagentCapabilitySet):
+        raise ConfigurationError("global subagent capability policy is required")
+    read_tools = WRITABLE_SUBAGENT_READ_TOOL_NAMES.intersection(
+        parent.allowed_tool_names,
+        global_policy.allowed_tool_names,
+    )
     return SubagentCapabilitySet.from_runtime(
         tool_names=tuple(sorted((*read_tools, *WRITABLE_SUBAGENT_WRITE_TOOL_NAMES))),
         cwd=parent.cwd,

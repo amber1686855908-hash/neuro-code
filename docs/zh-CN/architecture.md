@@ -1534,8 +1534,9 @@ LSP 纵向切片是由 application 拥有的语义只读路径。稳定的 `lsp`
 canonical `FilesystemAccessPlan` 和 permission decision。该 tool 不会被记入 mutation journal，
 跨文件结果投影也不会弹出 approval。
 
-`ApplicationComposition` 为每个 binding 创建一个 `LanguageServerManager`，并在 application
-background supervisor 之前关闭它。manager 按 canonical workspace root 加显式
+`ApplicationComposition` 为每个 binding 创建一个 `LanguageServerManager`。Binding-owned
+resource scope 会立即关闭短生命周期 worker manager；application shutdown 关闭仍然存活的 manager。
+manager 按 canonical workspace root 加显式
 `LanguageServerProfile` 路由，不是 TUI singleton，也不拥有第二套 configuration system。profile command
 只能是 argv，并通过 `LocalProcessSandbox`、`LocalProcessPurpose.LSP_SERVER`、只读 workspace root、
 显式 environment 和有界 process lifecycle 启动。
@@ -1547,7 +1548,8 @@ local file URI 才会投影；permission DENY/ASK，以及 invalid、workspace �
 
 当前实现的 operation 是 definition、references、hover、document symbols、workspace symbols、diagnostics、
 status 与有界 restart。Rename、format、code actions、`workspace/applyEdit` 和任意 server edit 仍不属于
-LSP slice。Worktree 与 checkpoint capability 是下面定义的 application-owned seam；LSP 不绑定也不修改它们。
+LSP slice。Worktree 与 checkpoint capability 是下面定义的 application-owned seam；LSP manager
+不会修改它们，ADR 0132 把只读 manager 组合进显式 managed-worktree worker binding。
 
 ## 由应用拥有的受管 Git Worktree
 
@@ -1609,8 +1611,8 @@ target 不可变并受 CAS 保护。详见 [ADR 0130](adr/0130-managed-workspace
 
 现有 `/subagent` capability 仍然只读。首个 writable subagent 是由
 `ApplicationComposition.create_writable_subagent_service()` 构造的独立、显式内部纵向切片。
-它不接入 `/subagent`、CLI、TUI、ACP、自动调度、writable parallel worker 或 LSP worker，
-也不启动 checkpoint/rollback orchestration。
+它不接入 `/subagent`、CLI、TUI、ACP、自动调度或 writable parallel worker，也不启动
+checkpoint/rollback orchestration。
 
 `WritableSubagentApplicationService` 一次只串行运行一个 child。它先记录 `ALLOCATING` lease，
 读取 parent 的 exact committed HEAD，在 parent workspace roots 之外创建 Neuro Code 拥有的 managed
@@ -1620,9 +1622,10 @@ exact base SHA、不可变 `WorktreeHandle`、managed worktree ID/path、创建�
 Child 使用全新的 session 与 binding，cwd 和唯一 root 都恰好是该 worktree。
 
 Derived child 只有有界 read set（`read_file`、`read_files`、`list_dir`、`list_tree`、`glob`、
-`grep`、`grep_many`、`skill`）以及 `search_replace`、`apply_patch`。它没有 Bash、terminal、
-background、MCP、network、Git/worktree/checkpoint/rollback、subagent 或 LSP authority。Parent
-和 global policy 都必须证明 write tool、write authority 与 writable sandbox。通用
+`grep`、`grep_many`、`skill` 与可选只读 `lsp`）以及 `search_replace`、`apply_patch`。`lsp`
+只有位于真实 parent/global/worker policy 交集时才会出现。Child 没有 Bash、terminal、
+background、MCP、network、Git/worktree/checkpoint/rollback 或 subagent authority。Parent 和
+global policy 都必须证明 write tool、write authority 与 writable sandbox。通用
 `SubagentCapabilitySet.is_subset_of()` 保持不变；typed grant 是把 child 绑定到新 managed
 workspace 的窄边界。每一次 child write 仍执行正常的 Permission、canonical filesystem target、
 execution 与 sandbox pipeline。
@@ -1640,3 +1643,22 @@ store schema 16 会重建并保留 schema 15 lease row，两个 lease session fo
 删除就会拒绝。共享 owner liveness 在 POSIX 使用真实 probe，在 Windows 使用 process-handle wait，
 未能证明的 access/API failure 保守地视为 alive。完整契约见
 [ADR 0131](adr/0131-managed-writable-subagent-workspace.md)。
+
+### Worker-scoped 只读 LSP runtime
+
+Managed grant 从不可变 handle 派生 `WorktreeWorkspaceBinding`。除非 binding cwd、effective
+capability cwd、workspace-binding primary root、LSP manager root 与 canonical managed child
+root 全部相等且 additional root 为空，否则 Writable runtime composition 会拒绝。现有 per-binding
+instruction 与 skill tracker 因此也只从 managed child root 发现内容。
+
+每个 worker 继续使用现有 per-binding `LanguageServerManager`；manager、client、route、
+document/diagnostics cache、version 与 restart counter 不与 parent 或另一 worker 共享。Manager
+会在语义请求前重新读取 canonical child document，因此显式 `search_replace`/`apply_patch`
+写入之后，会用新的 child bytes 发送 `didOpen` 或带版本的 `didChange`。输入路径与 server 返回
+URI 仍通过 LSP canonical target 与 visibility boundary。
+
+`ConversationBindingResourceScope` 为 binding 提供一个幂等且 cancellation-safe 的异步 close
+task。Worker 成功、Provider 失败、取消或超时都会关闭 LSP client/process 并释放 cache；
+application shutdown 仍是未关闭 binding 的兜底。Worktree、checkpoint、lease 与 session evidence
+保持持久并保留；LSP process/cache state 是临时状态，不写入 SQLite，由未来 binding 重新构造。
+详见 [ADR 0132](adr/0132-worker-scoped-lsp-runtime-integration.md)。

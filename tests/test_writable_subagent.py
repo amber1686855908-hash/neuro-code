@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import os
 import sqlite3
 import subprocess
@@ -9,6 +10,7 @@ import sys
 import tempfile
 import unittest
 from collections.abc import AsyncIterator, Sequence
+from contextlib import suppress
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -17,7 +19,15 @@ from unittest.mock import patch
 
 from neuro_code.application.permissions.policy import PermissionMode
 from neuro_code.application.ports.checkpoints import WorkspaceCheckpointApplication
+from neuro_code.application.ports.lsp import LspOperation, LspRequest
 from neuro_code.application.ports.model import ModelCapabilitySet, ModelProvider, ModelToolPolicy
+from neuro_code.application.ports.sandbox import (
+    LocalProcessLifecycleCapability,
+    LocalProcessPurpose,
+    LocalProcessSandbox,
+    OwnedLocalProcess,
+    SandboxedProcessRequest,
+)
 from neuro_code.application.ports.tools import ToolContext
 from neuro_code.application.ports.worktree import WorktreeError, WorktreeFailureKind
 from neuro_code.application.ports.writable_subagent import WritableSubagentLeaseError
@@ -60,7 +70,7 @@ from neuro_code.domain.conversation.events import (
     ModelTextDelta,
     ModelToolCall,
 )
-from neuro_code.domain.conversation.messages import ToolCall
+from neuro_code.domain.conversation.messages import Role, ToolCall
 from neuro_code.domain.sandbox.models import SandboxProfile
 from neuro_code.domain.session_tasks import SessionTaskStatus
 from neuro_code.domain.tools import ToolDefinition
@@ -80,7 +90,9 @@ from neuro_code.domain.writable_subagent import (
     WritableSubagentWorkspaceLease,
     WritableSubagentWorkspaceState,
 )
+from neuro_code.infrastructure.lsp.manager import LanguageServerManager
 from neuro_code.infrastructure.persistence.sqlite_session import SqliteSessionStore
+from neuro_code.infrastructure.sandbox.local_process import ProcessTreeLocalProcessSandbox
 from neuro_code.infrastructure.tools.filesystem import ApplyPatchTool, SearchReplaceTool
 from neuro_code.shared.errors import (
     ConfigurationError,
@@ -90,6 +102,7 @@ from neuro_code.shared.errors import (
 )
 
 BASE_SHA = "a" * 40
+_LSP_FIXTURE = Path(__file__).parent / "fixtures" / "fake_lsp_server.py"
 
 
 class _ParentRunner:
@@ -110,6 +123,24 @@ def _parent_binding(
         cast(ModelProvider, object()),
         capabilities=capabilities,
     )
+
+
+class _RecordingProcessSandbox:
+    def __init__(self, workspace_root: Path) -> None:
+        self.workspace_root = workspace_root.resolve(strict=False)
+        self._delegate = ProcessTreeLocalProcessSandbox()
+        self.requests: list[SandboxedProcessRequest] = []
+        self.processes: list[OwnedLocalProcess] = []
+
+    @property
+    def lifecycle_capability(self) -> LocalProcessLifecycleCapability:
+        return self._delegate.lifecycle_capability
+
+    async def spawn(self, request: SandboxedProcessRequest) -> OwnedLocalProcess:
+        self.requests.append(request)
+        process = await self._delegate.spawn(request)
+        self.processes.append(process)
+        return process
 
 
 def _run_git(repository: Path, *arguments: str) -> bytes:
@@ -275,7 +306,11 @@ class WritableCapabilityTests(unittest.TestCase):
             parent = _capability(root / "parent")
             global_policy = _capability(root / "global", max_steps=12)
             grant = _grant(root, parent)
-            requested = writable_subagent_request(parent, max_steps=8)
+            requested = writable_subagent_request(
+                parent,
+                global_policy=global_policy,
+                max_steps=8,
+            )
 
             resolved = resolve_writable_subagent_capability(
                 parent=parent,
@@ -296,6 +331,82 @@ class WritableCapabilityTests(unittest.TestCase):
             self.assertFalse(resolved.capabilities.background_tasks)
             self.assertIs(resolved.capabilities.network_access, NetworkAccess.NONE)
             self.assertFalse(resolved.capabilities.is_subset_of(parent))
+            self.assertEqual(
+                resolved.workspace_grant.workspace_binding.primary_root,
+                grant.canonical_child_root,
+            )
+            self.assertEqual(resolved.workspace_grant.workspace_binding.additional_roots, ())
+
+    def test_lsp_requires_parent_global_and_bounded_worker_authority(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            parent_without_lsp = _capability(root / "parent")
+            global_without_lsp = _capability(root / "global", max_steps=12)
+            parent_with_lsp = _capability(
+                root / "parent",
+                tools=(*parent_without_lsp.allowed_tool_names, "lsp"),
+            )
+            global_with_lsp = _capability(
+                root / "global",
+                tools=(*global_without_lsp.allowed_tool_names, "lsp"),
+                max_steps=12,
+            )
+
+            both = writable_subagent_request(
+                parent_with_lsp,
+                global_policy=global_with_lsp,
+                max_steps=8,
+            )
+            self.assertIn("lsp", both.allowed_tool_names)
+            resolved = resolve_writable_subagent_capability(
+                parent=parent_with_lsp,
+                requested=both,
+                global_policy=global_with_lsp,
+                workspace_grant=_grant(root, parent_with_lsp),
+            )
+            self.assertIn("lsp", resolved.capabilities.allowed_tool_names)
+
+            parent_denied = writable_subagent_request(
+                parent_without_lsp,
+                global_policy=global_with_lsp,
+                max_steps=8,
+            )
+            global_denied = writable_subagent_request(
+                parent_with_lsp,
+                global_policy=global_without_lsp,
+                max_steps=8,
+            )
+            self.assertNotIn("lsp", parent_denied.allowed_tool_names)
+            self.assertNotIn("lsp", global_denied.allowed_tool_names)
+            resolved_parent_denied = resolve_writable_subagent_capability(
+                parent=parent_without_lsp,
+                requested=parent_denied,
+                global_policy=global_with_lsp,
+                workspace_grant=_grant(root, parent_without_lsp),
+            )
+            resolved_global_denied = resolve_writable_subagent_capability(
+                parent=parent_with_lsp,
+                requested=global_denied,
+                global_policy=global_without_lsp,
+                workspace_grant=_grant(root, parent_with_lsp),
+            )
+            self.assertNotIn("lsp", resolved_parent_denied.capabilities.allowed_tool_names)
+            self.assertNotIn("lsp", resolved_global_denied.capabilities.allowed_tool_names)
+
+            forged = SubagentCapabilitySet.from_runtime(
+                tool_names=(*parent_without_lsp.allowed_tool_names, "lsp"),
+                cwd=parent_without_lsp.cwd,
+                sandbox_profile=parent_without_lsp.sandbox_profile,
+                enable_background_tasks=False,
+                max_steps=8,
+            )
+            with self.assertRaisesRegex(ConfigurationError, "exceeds parent"):
+                resolve_writable_subagent_capability(
+                    parent=parent_without_lsp,
+                    requested=forged,
+                    global_policy=global_with_lsp,
+                    workspace_grant=_grant(root, parent_without_lsp),
+                )
 
     def test_resolver_rejects_missing_write_authority_and_forged_grants(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -312,7 +423,11 @@ class WritableCapabilityTests(unittest.TestCase):
             with self.assertRaises(ConfigurationError):
                 resolve_writable_subagent_capability(
                     parent=read_only_parent,
-                    requested=writable_subagent_request(read_only_parent, max_steps=8),
+                    requested=writable_subagent_request(
+                        read_only_parent,
+                        global_policy=global_policy,
+                        max_steps=8,
+                    ),
                     global_policy=global_policy,
                     workspace_grant=grant,
                 )
@@ -321,7 +436,11 @@ class WritableCapabilityTests(unittest.TestCase):
             with self.assertRaises(ConfigurationError):
                 resolve_writable_subagent_capability(
                     parent=parent,
-                    requested=writable_subagent_request(parent, max_steps=8),
+                    requested=writable_subagent_request(
+                        parent,
+                        global_policy=global_policy,
+                        max_steps=8,
+                    ),
                     global_policy=global_policy,
                     workspace_grant=forged,
                 )
@@ -347,7 +466,11 @@ class WritableCapabilityTests(unittest.TestCase):
             parent = _capability(root / "parent")
             global_policy = _capability(root / "global", max_steps=12)
             grant = _grant(root, parent)
-            requested = writable_subagent_request(parent, max_steps=8)
+            requested = writable_subagent_request(
+                parent,
+                global_policy=global_policy,
+                max_steps=8,
+            )
 
             invalid_inputs = (
                 {"parent": object()},
@@ -478,7 +601,11 @@ class WritableCapabilityTests(unittest.TestCase):
                 sandbox=SandboxProfile.READ_ONLY,
             )
             readonly_grant = _grant(root, readonly_parent)
-            readonly_request = writable_subagent_request(readonly_parent, max_steps=8)
+            readonly_request = writable_subagent_request(
+                readonly_parent,
+                global_policy=global_policy,
+                max_steps=8,
+            )
             with self.assertRaises(ConfigurationError):
                 resolve_writable_subagent_capability(
                     parent=readonly_parent,
@@ -513,7 +640,11 @@ class WritableCapabilityTests(unittest.TestCase):
                 )
 
             with self.assertRaises(ConfigurationError):
-                writable_subagent_request(object(), max_steps=8)  # type: ignore[arg-type]
+                writable_subagent_request(  # type: ignore[arg-type]
+                    object(),
+                    global_policy=global_policy,
+                    max_steps=8,
+                )
 
     def test_writable_capability_grant_validates_its_composed_fingerprint(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -523,7 +654,11 @@ class WritableCapabilityTests(unittest.TestCase):
             grant = _grant(root, parent)
             resolved = resolve_writable_subagent_capability(
                 parent=parent,
-                requested=writable_subagent_request(parent, max_steps=8),
+                requested=writable_subagent_request(
+                    parent,
+                    global_policy=global_policy,
+                    max_steps=8,
+                ),
                 global_policy=global_policy,
                 workspace_grant=grant,
             )
@@ -1142,6 +1277,7 @@ class _ProductionWritableProvider:
         state_dir: Path,
         store: SqliteSessionStore,
         checkpoints: WorkspaceCheckpointApplication,
+        application: ApplicationComposition,
         trace: list[str],
     ) -> None:
         self.cwd = cwd
@@ -1150,9 +1286,19 @@ class _ProductionWritableProvider:
         self.state_dir = state_dir
         self.store = store
         self.checkpoints = checkpoints
+        self.application = application
         self.trace = trace
         self.calls: list[tuple[ToolDefinition, ...]] = []
         self.target_path: Path | None = None
+        self.lsp_manager: LanguageServerManager | None = None
+        self.lsp_client: object | None = None
+        self.lsp_document_paths: tuple[Path, ...] = ()
+        self.lsp_process_alive_during_run = False
+        self.lsp_hover_payload: dict[str, object] | None = None
+        self.lsp_definition_payload: dict[str, object] | None = None
+        self.lsp_configuration_error: dict[str, object] | None = None
+        self.blocking_started = asyncio.Event()
+        self.blocking_release = asyncio.Event()
 
     async def stream(
         self,
@@ -1161,7 +1307,7 @@ class _ProductionWritableProvider:
         *,
         tool_policy: ModelToolPolicy = ModelToolPolicy.ALLOWED,
     ) -> AsyncIterator[ModelEvent]:
-        del context, tool_policy
+        del tool_policy
         self.calls.append(tuple(tools))
         if len(self.calls) == 1:
             leases = await self.store.list_writable_subagent_leases(include_terminal=False)
@@ -1176,6 +1322,19 @@ class _ProductionWritableProvider:
             self.trace.append("baseline_ready_before_first_tool")
             if "search_replace" not in {tool.name for tool in tools}:
                 raise AssertionError("production writable child did not receive search_replace")
+            if self._uses_lsp():
+                names = {tool.name for tool in tools}
+                if "lsp" not in names:
+                    raise AssertionError("production writable child did not receive lsp")
+                model_context = "\n".join(message.content for message in context.messages)
+                if "WORKER_COMMITTED_INSTRUCTION" not in model_context:
+                    raise AssertionError("worker did not discover child-root instructions")
+                if "PARENT_DIRTY_INSTRUCTION" in model_context:
+                    raise AssertionError("worker instruction context leaked from dirty parent")
+                if "worker-committed-skill" not in model_context:
+                    raise AssertionError("worker did not discover child-root skill metadata")
+                if "parent-dirty-skill" in model_context:
+                    raise AssertionError("worker skill context leaked from dirty parent")
             path = self._prepare_target()
             target = Path(path)
             self.target_path = target if target.is_absolute() else self.cwd / target
@@ -1183,16 +1342,117 @@ class _ProductionWritableProvider:
                 ToolCall(
                     "writable-tool-1",
                     "search_replace",
-                    {"path": path, "old": "committed\n", "new": "child-edited\n"},
+                    {"path": path, "old": "committed\n", "new": self._replacement_text()},
                 )
             )
             yield ModelCompleted("tool_calls")
             return
+        if self._uses_lsp() and len(self.calls) == 2:
+            managers = [
+                manager
+                for manager in self.application._lsp_services
+                if manager.workspace_root == self.cwd
+            ]
+            if len(managers) != 1:
+                raise AssertionError("worker binding did not own exactly one child LSP manager")
+            self.lsp_manager = managers[0]
+            if self.lsp_manager.additional_workspace_roots:
+                raise AssertionError("worker LSP inherited additional workspace roots")
+            if self.case_name == "lsp-config-failure":
+                yield ModelToolCall(
+                    ToolCall(
+                        "writable-lsp-config-failure",
+                        "lsp",
+                        {
+                            "operation": "hover",
+                            "path": "tracked.txt",
+                            "line": 1,
+                            "column": 1,
+                            "profile": "missing",
+                        },
+                    )
+                )
+                yield ModelCompleted("tool_calls")
+                return
+            yield ModelToolCall(
+                ToolCall(
+                    "writable-lsp-hover",
+                    "lsp",
+                    {"operation": "hover", "path": "tracked.txt", "line": 1, "column": 1},
+                )
+            )
+            yield ModelToolCall(
+                ToolCall(
+                    "writable-lsp-definition",
+                    "lsp",
+                    {
+                        "operation": "definition",
+                        "path": "tracked.txt",
+                        "line": 1,
+                        "column": 1,
+                    },
+                )
+            )
+            yield ModelCompleted("tool_calls")
+            return
+        if self._uses_lsp():
+            tool_results = {
+                message.tool_call_id: message.content
+                for message in context.messages
+                if message.role is Role.TOOL and message.tool_call_id is not None
+            }
+            if self.case_name == "lsp-config-failure":
+                failure = json.loads(tool_results["writable-lsp-config-failure"])
+                error = failure.get("error")
+                if not isinstance(error, dict) or error.get("kind") != "profile_not_found":
+                    raise AssertionError("worker LSP configuration failure was not typed")
+                self.lsp_configuration_error = error
+                yield ModelTextDelta("scripted writable child observed typed LSP failure")
+                yield ModelCompleted("stop")
+                return
+            hover = json.loads(tool_results["writable-lsp-hover"])
+            definition = json.loads(tool_results["writable-lsp-definition"])
+            if self._replacement_text().strip() not in hover.get("hover", ""):
+                raise AssertionError("worker LSP did not observe post-write child bytes")
+            self.lsp_hover_payload = hover
+            self.lsp_definition_payload = definition
+            if self.lsp_manager is None:
+                raise AssertionError("worker LSP manager identity was not captured")
+            route = self.lsp_manager._routes.get("fake")
+            if route is None or route.client is None:
+                raise AssertionError("worker LSP route was not alive during the run")
+            self.lsp_client = route.client
+            self.lsp_document_paths = tuple(route.documents)
+            self.lsp_process_alive_during_run = route.client._process.returncode is None
+            if self.case_name == "lsp-provider-failure":
+                raise RuntimeError("scripted provider failure after LSP startup")
+            if self.case_name in {"lsp-cancel", "lsp-timeout"}:
+                self.blocking_started.set()
+                await self.blocking_release.wait()
         yield ModelTextDelta("scripted writable child completed")
         yield ModelCompleted("stop")
 
+    def _uses_lsp(self) -> bool:
+        return self.case_name in {
+            "lsp-success-a",
+            "lsp-success-b",
+            "lsp-provider-failure",
+            "lsp-config-failure",
+            "lsp-cancel",
+            "lsp-timeout",
+        }
+
+    def _replacement_text(self) -> str:
+        if self.case_name == "lsp-success-a":
+            return "child-edited-a\n"
+        if self.case_name == "lsp-success-b":
+            return "child-edited-b\n"
+        if self.case_name.startswith("lsp-"):
+            return f"child-edited-{self.case_name.removeprefix('lsp-')}\n"
+        return "child-edited\n"
+
     def _prepare_target(self) -> str:
-        if self.case_name == "success":
+        if self.case_name == "success" or self._uses_lsp():
             return "tracked.txt"
         if self.case_name == "relative-parent":
             return os.path.relpath(self.parent / "tracked.txt", self.cwd)
@@ -1234,6 +1494,7 @@ class _ProductionWritableProviderFactory:
         self.state_dir = state_dir
         self.store = store
         self.checkpoints = checkpoints
+        self.application: ApplicationComposition | None = None
         self.case = case
         self.trace = trace
         self.providers: list[_ProductionWritableProvider] = []
@@ -1242,13 +1503,15 @@ class _ProductionWritableProviderFactory:
         self,
         store: SqliteSessionStore,
         checkpoints: WorkspaceCheckpointApplication,
+        application: ApplicationComposition,
     ) -> None:
         self.store = store
         self.checkpoints = checkpoints
+        self.application = application
 
     def __call__(self, config: AppConfig, failover: bool) -> ModelProvider:
         del failover
-        if self.store is None or self.checkpoints is None:
+        if self.store is None or self.checkpoints is None or self.application is None:
             raise AssertionError("production provider factory was used before composition binding")
         provider = _ProductionWritableProvider(
             cwd=config.cwd,
@@ -1257,6 +1520,7 @@ class _ProductionWritableProviderFactory:
             state_dir=self.state_dir,
             store=self.store,
             checkpoints=self.checkpoints,
+            application=self.application,
             trace=self.trace,
         )
         self.providers.append(provider)
@@ -1430,7 +1694,30 @@ class WritableApplicationTests(unittest.IsolatedAsyncioTestCase):
     async def test_production_binding_runs_real_write_tool_and_denies_escape_matrix(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            repository, head = _make_real_repository(root)
+            repository, _initial_head = _make_real_repository(root)
+            (repository / "AGENTS.md").write_text(
+                "WORKER_COMMITTED_INSTRUCTION\n",
+                encoding="utf-8",
+            )
+            skill_file = repository / ".agents" / "skills" / "worker" / "SKILL.md"
+            skill_file.parent.mkdir(parents=True)
+            skill_file.write_text(
+                "---\nname: worker\ndescription: worker-committed-skill\n---\n",
+                encoding="utf-8",
+            )
+            with suppress(OSError, NotImplementedError):
+                (repository / "outside-link.py").symlink_to(repository / "tracked.txt")
+            _run_git(repository, "add", "-A")
+            _run_git(repository, "commit", "-qm", "worker integration fixtures")
+            head = _run_git(repository, "rev-parse", "HEAD").decode().strip()
+            (repository / "AGENTS.md").write_text(
+                "PARENT_DIRTY_INSTRUCTION\n",
+                encoding="utf-8",
+            )
+            skill_file.write_text(
+                "---\nname: worker\ndescription: parent-dirty-skill\n---\n",
+                encoding="utf-8",
+            )
             (repository / "parent-dirty.txt").write_bytes(b"parent dirty bytes\n")
             (repository / "untracked.txt").write_bytes(b"untracked parent bytes\n")
             parent_status = _run_git(repository, "status", "--porcelain=v2", "-z")
@@ -1439,8 +1726,23 @@ class WritableApplicationTests(unittest.IsolatedAsyncioTestCase):
             parent_tracked = (repository / "tracked.txt").read_bytes()
             state_dir = root / "state"
             state_dir.mkdir()
+            state_target = state_dir / "state-target.py"
+            state_target.write_bytes(b"state bytes\n")
+            lsp_command = ", ".join(
+                json.dumps(value)
+                for value in (
+                    sys.executable,
+                    str(_LSP_FIXTURE),
+                    "--mode",
+                    "worker-integration",
+                    "--outside-uri",
+                    (repository / "tracked.txt").as_uri(),
+                    "--state-uri",
+                    state_target.as_uri(),
+                )
+            )
             (state_dir / "config.toml").write_text(
-                """
+                f"""
 [web_search]
 mode = "disabled"
 
@@ -1456,11 +1758,29 @@ model = "fixture-model"
 base_url = "https://provider.invalid/v1"
 api_key_env = "FIXTURE_KEY"
 context_window_tokens = 131072
+
+[lsp.servers.fake]
+language = "python"
+command = [{lsp_command}]
+extensions = [".py", ".txt"]
 """,
                 encoding="utf-8",
             )
-            case = ["success"]
+            case = ["lsp-success-a"]
             trace: list[str] = []
+            process_sandboxes: list[_RecordingProcessSandbox] = []
+
+            def process_sandbox_factory(
+                profile: SandboxProfile,
+                workspace: Path,
+                configured_state_dir: Path,
+            ) -> LocalProcessSandbox:
+                self.assertIs(profile, SandboxProfile.OFF)
+                self.assertEqual(configured_state_dir, state_dir)
+                sandbox = _RecordingProcessSandbox(workspace)
+                process_sandboxes.append(sandbox)
+                return cast(LocalProcessSandbox, sandbox)
+
             provider_factory = _ProductionWritableProviderFactory(
                 parent=repository,
                 state_dir=state_dir,
@@ -1495,19 +1815,29 @@ context_window_tokens = 131072
                         max_steps=8,
                     ),
                     provider_factory=provider_factory,
+                    local_process_sandbox_factory=process_sandbox_factory,
                 )
                 try:
                     checkpoint_service = application.create_workspace_checkpoint_service()
                     await checkpoint_service.initialize()
-                    provider_factory.bind_runtime_services(application.store, checkpoint_service)
+                    provider_factory.bind_runtime_services(
+                        application.store,
+                        checkpoint_service,
+                        application,
+                    )
                     parent_session_id = await application.store.create_session(
                         str(repository),
                         "fixture",
                         "fixture-model",
                         sandbox_profile=SandboxProfile.OFF,
                     )
+                    parent_base_capabilities = _capability(
+                        repository,
+                        sandbox=SandboxProfile.OFF,
+                    )
                     parent_capabilities = _capability(
                         repository,
+                        tools=(*parent_base_capabilities.allowed_tool_names, "lsp"),
                         sandbox=SandboxProfile.OFF,
                     )
                     parent_config = await application.config_for_session_resume(parent_session_id)
@@ -1516,6 +1846,21 @@ context_window_tokens = 131072
                         resume_id=parent_session_id,
                         capabilities=parent_capabilities,
                     )
+                    parent_lsp = next(
+                        manager
+                        for manager in application._lsp_services
+                        if manager.workspace_root == repository
+                    )
+                    parent_hover = await parent_lsp.execute(
+                        LspRequest(
+                            LspOperation.HOVER,
+                            path=repository / "tracked.txt",
+                            line=1,
+                            column=1,
+                        )
+                    )
+                    self.assertIn("committed", parent_hover.payload["hover"])
+                    self.assertNotIn("child-edited", parent_hover.payload["hover"])
                     service = application.create_writable_subagent_service(
                         parent_binding=parent_binding,
                     )
@@ -1527,21 +1872,37 @@ context_window_tokens = 131072
                     self.assertTrue(result.workspace_changed)
                     self.assertIn("baseline_ready_before_first_tool", trace)
                     child_provider = provider_factory.providers[-1]
+                    child_base_capabilities = _capability(
+                        child_provider.cwd,
+                        sandbox=SandboxProfile.OFF,
+                    )
                     expected_tool_names = set(
                         _capability(
-                            child_provider.cwd, sandbox=SandboxProfile.OFF
+                            child_provider.cwd,
+                            tools=(*child_base_capabilities.allowed_tool_names, "lsp"),
+                            sandbox=SandboxProfile.OFF,
                         ).allowed_tool_names
                     )
                     actual_tool_names = {tool.name for tool in child_provider.calls[0]}
                     self.assertEqual(actual_tool_names, expected_tool_names)
+                    self.assertIn("lsp", actual_tool_names)
                     self.assertNotIn("bash", actual_tool_names)
                     self.assertNotIn("terminal_exec", actual_tool_names)
                     self.assertFalse(
                         actual_tool_names.intersection(
-                            {"web_search", "web_fetch", "mcp", "lsp", "git", "worktree"}
+                            {
+                                "web_search",
+                                "web_fetch",
+                                "mcp",
+                                "git",
+                                "worktree",
+                                "checkpoint",
+                                "rollback",
+                                "subagent",
+                            }
                         )
                     )
-                    self.assertEqual(len(child_provider.calls), 2)
+                    self.assertEqual(len(child_provider.calls), 3)
                     self.assertIn(
                         "search_replace",
                         {tool.name for tool in child_provider.calls[0]},
@@ -1552,7 +1913,58 @@ context_window_tokens = 131072
                     self.assertEqual(child_provider.cwd, snapshot.canonical_path)
                     self.assertEqual(
                         (snapshot.canonical_path / "tracked.txt").read_bytes(),
-                        ("child-edited" + os.linesep).encode(),
+                        ("child-edited-a" + os.linesep).encode(),
+                    )
+                    self.assertTrue(child_provider.lsp_process_alive_during_run)
+                    self.assertEqual(
+                        child_provider.lsp_document_paths,
+                        (snapshot.canonical_path / "tracked.txt",),
+                    )
+                    self.assertIsNotNone(child_provider.lsp_manager)
+                    manager_a = child_provider.lsp_manager
+                    assert manager_a is not None
+                    self.assertEqual(manager_a.workspace_root, snapshot.canonical_path)
+                    self.assertEqual(manager_a.additional_workspace_roots, ())
+                    self.assertIsNot(manager_a, parent_lsp)
+                    parent_route = parent_lsp._routes["fake"]
+                    self.assertIsNot(child_provider.lsp_client, parent_route.client)
+                    self.assertEqual(
+                        tuple(parent_route.documents),
+                        (repository / "tracked.txt",),
+                    )
+                    self.assertTrue(manager_a._closed)
+                    self.assertEqual(manager_a._routes, {})
+                    self.assertNotIn(manager_a, application._lsp_services)
+                    self.assertIn(parent_lsp, application._lsp_services)
+                    definition_a = child_provider.lsp_definition_payload
+                    assert definition_a is not None
+                    locations_a = cast(list[dict[str, object]], definition_a["locations"])
+                    self.assertEqual([item["path"] for item in locations_a], ["tracked.txt"])
+                    self.assertEqual(definition_a["omitted_count"], 5)
+
+                    child_sandbox_a = next(
+                        sandbox
+                        for sandbox in process_sandboxes
+                        if sandbox.workspace_root == snapshot.canonical_path
+                    )
+                    lsp_requests_a = [
+                        request
+                        for request in child_sandbox_a.requests
+                        if request.purpose is LocalProcessPurpose.LSP_SERVER
+                    ]
+                    self.assertEqual(len(lsp_requests_a), 1)
+                    lsp_request_a = lsp_requests_a[0]
+                    self.assertEqual(lsp_request_a.cwd, snapshot.canonical_path)
+                    self.assertIs(lsp_request_a.sandbox_profile, SandboxProfile.OFF)
+                    self.assertFalse(lsp_request_a.uses_shell)
+                    self.assertEqual(
+                        tuple(
+                            root.path for root in lsp_request_a.filesystem_policy.workspace_roots
+                        ),
+                        (snapshot.canonical_path,),
+                    )
+                    self.assertTrue(
+                        all(process.returncode is not None for process in child_sandbox_a.processes)
                     )
                     lease = (
                         await application.store.list_writable_subagent_leases(
@@ -1561,6 +1973,198 @@ context_window_tokens = 131072
                     )[0]
                     self.assertIs(lease.state, WritableSubagentWorkspaceState.PRESERVED)
                     self.assertEqual(lease.canonical_child_root, snapshot.canonical_path)
+
+                    case[0] = "lsp-success-b"
+                    trace.clear()
+                    result_b = await service.run_subagent(
+                        RunWritableSubagentRequest(parent_session_id, "edit worker B"),
+                    )
+                    provider_b = provider_factory.providers[-1]
+                    snapshot_b = await worktrees.inspect(result_b.worktree_id.value)
+                    self.assertNotEqual(snapshot_b.canonical_path, snapshot.canonical_path)
+                    self.assertEqual(
+                        (snapshot_b.canonical_path / "tracked.txt").read_bytes(),
+                        ("child-edited-b" + os.linesep).encode(),
+                    )
+                    self.assertEqual(
+                        provider_b.lsp_document_paths,
+                        (snapshot_b.canonical_path / "tracked.txt",),
+                    )
+                    manager_b = provider_b.lsp_manager
+                    assert manager_b is not None
+                    self.assertIsNot(manager_b, manager_a)
+                    self.assertIsNot(provider_b.lsp_client, child_provider.lsp_client)
+                    self.assertTrue(manager_b._closed)
+                    self.assertEqual(manager_b._routes, {})
+                    self.assertTrue(provider_b.lsp_process_alive_during_run)
+                    definition_b = provider_b.lsp_definition_payload
+                    assert definition_b is not None
+                    locations_b = cast(list[dict[str, object]], definition_b["locations"])
+                    self.assertEqual([item["path"] for item in locations_b], ["tracked.txt"])
+                    self.assertEqual(definition_b["omitted_count"], 5)
+                    self.assertEqual(
+                        (repository / "tracked.txt").read_bytes(),
+                        parent_tracked,
+                    )
+                    parent_hover_after = await parent_lsp.execute(
+                        LspRequest(
+                            LspOperation.HOVER,
+                            path=repository / "tracked.txt",
+                            line=1,
+                            column=1,
+                        )
+                    )
+                    self.assertIn("committed", parent_hover_after.payload["hover"])
+                    self.assertNotIn("child-edited", parent_hover_after.payload["hover"])
+                    parent_sandbox = next(
+                        sandbox
+                        for sandbox in process_sandboxes
+                        if sandbox.workspace_root == repository
+                    )
+                    self.assertTrue(
+                        any(
+                            request.purpose is LocalProcessPurpose.LSP_SERVER
+                            for request in parent_sandbox.requests
+                        )
+                    )
+                    self.assertTrue(
+                        any(process.returncode is None for process in parent_sandbox.processes)
+                    )
+                    leases = await application.store.list_writable_subagent_leases(
+                        parent_session_id=parent_session_id
+                    )
+                    self.assertTrue(
+                        all(
+                            item.state is WritableSubagentWorkspaceState.PRESERVED
+                            for item in leases[:2]
+                        )
+                    )
+
+                    case[0] = "lsp-config-failure"
+                    config_failure_result = await service.run_subagent(
+                        RunWritableSubagentRequest(parent_session_id, "typed LSP config failure"),
+                    )
+                    config_failure_provider = provider_factory.providers[-1]
+                    config_failure_manager = config_failure_provider.lsp_manager
+                    assert config_failure_manager is not None
+                    self.assertEqual(
+                        config_failure_provider.lsp_configuration_error,
+                        {
+                            "kind": "profile_not_found",
+                            "phase": "configuration",
+                            "message": "LSP profile is unavailable: missing",
+                            "retryable": False,
+                        },
+                    )
+                    self.assertTrue(config_failure_manager._closed)
+                    self.assertEqual(config_failure_manager._routes, {})
+                    config_failure_snapshot = await worktrees.inspect(
+                        config_failure_result.worktree_id.value
+                    )
+                    self.assertTrue(config_failure_snapshot.canonical_path.is_dir())
+                    config_failure_lease = (
+                        await application.store.list_writable_subagent_leases(
+                            parent_session_id=parent_session_id
+                        )
+                    )[-1]
+                    self.assertIs(
+                        config_failure_lease.state,
+                        WritableSubagentWorkspaceState.PRESERVED,
+                    )
+
+                    case[0] = "lsp-provider-failure"
+                    with self.assertRaisesRegex(RuntimeError, "after LSP startup"):
+                        await service.run_subagent(
+                            RunWritableSubagentRequest(parent_session_id, "fail after LSP"),
+                        )
+                    failure_provider = provider_factory.providers[-1]
+                    failure_manager = failure_provider.lsp_manager
+                    assert failure_manager is not None
+                    self.assertTrue(failure_provider.lsp_process_alive_during_run)
+                    self.assertTrue(failure_manager._closed)
+                    self.assertEqual(failure_manager._routes, {})
+                    failure_lease = (
+                        await application.store.list_writable_subagent_leases(
+                            parent_session_id=parent_session_id
+                        )
+                    )[-1]
+                    self.assertIs(
+                        failure_lease.state,
+                        WritableSubagentWorkspaceState.PRESERVED,
+                    )
+                    self.assertEqual(failure_lease.error_kind, "RuntimeError")
+
+                    case[0] = "lsp-cancel"
+                    cancelling = asyncio.create_task(
+                        service.run_subagent(
+                            RunWritableSubagentRequest(parent_session_id, "cancel after LSP"),
+                        )
+                    )
+                    for _ in range(3_000):
+                        cancel_provider = provider_factory.providers[-1]
+                        if cancel_provider.case_name == "lsp-cancel":
+                            break
+                        await asyncio.sleep(0.01)
+                    else:
+                        self.fail("cancellation worker provider was not created")
+                    await asyncio.wait_for(cancel_provider.blocking_started.wait(), timeout=20)
+                    cancelling.cancel()
+                    with self.assertRaises(asyncio.CancelledError):
+                        await cancelling
+                    cancel_manager = cancel_provider.lsp_manager
+                    assert cancel_manager is not None
+                    self.assertTrue(cancel_manager._closed)
+                    self.assertEqual(cancel_manager._routes, {})
+                    cancel_lease = (
+                        await application.store.list_writable_subagent_leases(
+                            parent_session_id=parent_session_id
+                        )
+                    )[-1]
+                    self.assertIs(
+                        cancel_lease.state,
+                        WritableSubagentWorkspaceState.PRESERVED,
+                    )
+
+                    case[0] = "lsp-timeout"
+                    service._timeout_seconds = 3.0
+                    with self.assertRaises(SubagentTimeoutError):
+                        await service.run_subagent(
+                            RunWritableSubagentRequest(parent_session_id, "timeout after LSP"),
+                        )
+                    timeout_provider = provider_factory.providers[-1]
+                    timeout_manager = timeout_provider.lsp_manager
+                    assert timeout_manager is not None
+                    self.assertTrue(timeout_provider.blocking_started.is_set())
+                    self.assertTrue(timeout_manager._closed)
+                    self.assertEqual(timeout_manager._routes, {})
+                    timeout_lease = (
+                        await application.store.list_writable_subagent_leases(
+                            parent_session_id=parent_session_id
+                        )
+                    )[-1]
+                    self.assertIs(
+                        timeout_lease.state,
+                        WritableSubagentWorkspaceState.PRESERVED,
+                    )
+                    self.assertEqual(timeout_lease.error_kind, "SubagentTimeoutError")
+                    for lifecycle_provider in (
+                        failure_provider,
+                        cancel_provider,
+                        timeout_provider,
+                    ):
+                        lifecycle_sandbox = next(
+                            sandbox
+                            for sandbox in process_sandboxes
+                            if sandbox.workspace_root == lifecycle_provider.cwd
+                        )
+                        self.assertTrue(lifecycle_sandbox.processes)
+                        self.assertTrue(
+                            all(
+                                process.returncode is not None
+                                for process in lifecycle_sandbox.processes
+                            )
+                        )
+                    service._timeout_seconds = 120.0
 
                     for escape_case in (
                         "relative-parent",
@@ -1622,6 +2226,15 @@ context_window_tokens = 131072
                         (repository / "parent-dirty.txt").read_bytes(),
                         b"parent dirty bytes\n",
                     )
+                    self.assertEqual(
+                        (repository / "AGENTS.md").read_text(encoding="utf-8"),
+                        "PARENT_DIRTY_INSTRUCTION\n",
+                    )
+                    self.assertIn(
+                        "parent-dirty-skill",
+                        skill_file.read_text(encoding="utf-8"),
+                    )
+                    self.assertEqual(state_target.read_bytes(), b"state bytes\n")
                 finally:
                     await application.close()
 

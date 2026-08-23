@@ -12,6 +12,8 @@ import json
 import os
 import sys
 import time
+from pathlib import Path
+from urllib.parse import unquote, urlsplit
 
 
 def send(message: dict[str, object]) -> None:
@@ -49,12 +51,27 @@ def location(uri: str) -> dict[str, object]:
     }
 
 
+def local_path(uri: str) -> Path | None:
+    parsed = urlsplit(uri)
+    if parsed.scheme != "file" or parsed.netloc not in {"", "localhost"}:
+        return None
+    decoded = unquote(parsed.path)
+    if os.name == "nt" and decoded.startswith("/") and len(decoded) >= 3 and decoded[2] == ":":
+        decoded = decoded[1:]
+    path = Path(decoded)
+    return path if path.is_absolute() else None
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", default="normal")
+    parser.add_argument("--outside-uri")
+    parser.add_argument("--state-uri")
     args = parser.parse_args()
     mode = args.mode
     current_uri = ""
+    current_text = ""
+    workspace_root: Path | None = None
     initialize_id: int | str | None = None
     while True:
         message = read_message()
@@ -69,6 +86,7 @@ def main() -> int:
                 value = params.get("rootUri")
                 if isinstance(value, str):
                     current_uri = value
+                    workspace_root = local_path(value)
             if mode == "stderr-spam":
                 sys.stderr.write("stderr-noise " * 20_000)
                 sys.stderr.flush()
@@ -97,7 +115,7 @@ def main() -> int:
                                 "params": {},
                             }
                         )
-            if mode == "apply-edit":
+            if mode in {"apply-edit", "worker-integration"}:
                 send(
                     {
                         "jsonrpc": "2.0",
@@ -131,6 +149,15 @@ def main() -> int:
             }
             if mode == "minimal":
                 capabilities = {"positionEncoding": "utf-16"}
+            if mode == "initialize-error":
+                send(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": initialize_id,
+                        "error": {"code": -32002, "message": "fake initialize failure"},
+                    }
+                )
+                continue
             send(
                 {
                     "jsonrpc": "2.0",
@@ -149,6 +176,14 @@ def main() -> int:
                 document = params.get("textDocument")
                 if isinstance(document, dict) and isinstance(document.get("uri"), str):
                     current_uri = document["uri"]
+                    text = document.get("text")
+                    if isinstance(text, str):
+                        current_text = text
+                changes = params.get("contentChanges")
+                if isinstance(changes, list) and changes:
+                    last_change = changes[-1]
+                    if isinstance(last_change, dict) and isinstance(last_change.get("text"), str):
+                        current_text = last_change["text"]
             if mode != "no-publish":
                 send(
                     {
@@ -207,19 +242,36 @@ def main() -> int:
             if isinstance(document, dict) and isinstance(document.get("uri"), str):
                 current_uri = document["uri"]
         if method == "textDocument/definition":
+            locations = [location(current_uri)]
+            if mode == "worker-integration" and workspace_root is not None:
+                locations.extend(
+                    location(uri)
+                    for uri in (
+                        args.outside_uri,
+                        (workspace_root.parent / "sibling-worker" / "tracked.txt").as_uri(),
+                        args.state_uri,
+                        current_uri.rsplit("/", 1)[0] + "/../lexical-escape.py",
+                        (workspace_root / "outside-link.py").as_uri(),
+                    )
+                    if isinstance(uri, str)
+                )
             send(
                 {
                     "jsonrpc": "2.0",
                     "id": request_id,
-                    "result": [
-                        location(current_uri),
-                        location("file:///outside-neuro-code.txt"),
-                    ],
+                    "result": locations
+                    if mode == "worker-integration"
+                    else [location(current_uri), location("file:///outside-neuro-code.txt")],
                 }
             )
         elif method == "textDocument/references":
             send({"jsonrpc": "2.0", "id": request_id, "result": [location(current_uri)]})
         elif method == "textDocument/hover":
+            hover_text = (
+                f"worker observed bytes: {current_text}"
+                if mode == "worker-integration"
+                else "<script>bad</script>fake hover"
+            )
             send(
                 {
                     "jsonrpc": "2.0",
@@ -227,7 +279,7 @@ def main() -> int:
                     "result": {
                         "contents": {
                             "kind": "markdown",
-                            "value": "<script>bad</script>fake hover",
+                            "value": hover_text,
                         },
                         "range": {
                             "start": {"line": 0, "character": 0},

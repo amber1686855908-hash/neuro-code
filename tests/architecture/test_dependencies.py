@@ -1212,6 +1212,7 @@ def test_canonical_session_modules_are_the_only_session_implementations() -> Non
         "neuro_code.application.sessions.binding": {
             "ConversationRunner",
             "ConversationBinding",
+            "ConversationBindingResourceScope",
         },
         "neuro_code.application.sessions.catalog": {
             "ListSessionsPageRequest",

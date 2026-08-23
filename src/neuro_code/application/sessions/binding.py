@@ -5,8 +5,9 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Awaitable, Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Protocol, TypeVar
 
@@ -33,6 +34,37 @@ from neuro_code.domain.plans import PlanComment, SessionPlan
 from neuro_code.domain.session_tasks import SessionTask
 
 _T = TypeVar("_T")
+
+
+class ConversationBindingResourceScope:
+    """Own and close ephemeral resources attached to one conversation binding.
+
+    The shared close task makes cleanup asynchronous, idempotent, and resilient
+    to cancellation of any individual caller. Durable session or workspace
+    state is deliberately outside this scope.
+    """
+
+    __slots__ = ("_close_callback", "_close_lock", "_close_task")
+
+    def __init__(self, close_callback: Callable[[], Awaitable[None]]) -> None:
+        if not callable(close_callback):
+            raise TypeError("conversation binding close callback must be callable")
+        self._close_callback = close_callback
+        self._close_lock = asyncio.Lock()
+        self._close_task: asyncio.Task[None] | None = None
+
+    async def _run_close_callback(self) -> None:
+        await self._close_callback()
+
+    async def close(self) -> None:
+        async with self._close_lock:
+            if self._close_task is None:
+                self._close_task = asyncio.create_task(
+                    self._run_close_callback(),
+                    name="conversation-binding-close",
+                )
+            close_task = self._close_task
+        await asyncio.shield(close_task)
 
 
 class ConversationRunner(Protocol):
@@ -166,6 +198,22 @@ class ConversationBinding:
     provider: ModelProvider
     background_tasks: BackgroundTaskManager | None = None
     capabilities: SubagentCapabilitySet | None = None
+    resource_scope: ConversationBindingResourceScope | None = field(
+        default=None,
+        kw_only=True,
+    )
+
+    async def close(self) -> None:
+        """Close ephemeral resources owned by this binding."""
+
+        if self.resource_scope is not None:
+            await self.resource_scope.close()
+            return
+        if self.background_tasks is not None:
+            await self.background_tasks.shutdown()
 
 
-__all__ = ["ConversationBinding", "ConversationRunner"]
+__all__ = [
+    "ConversationBinding",
+    "ConversationRunner",
+]

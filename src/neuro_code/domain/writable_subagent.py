@@ -16,7 +16,12 @@ from enum import StrEnum
 from pathlib import Path
 
 from neuro_code.domain.checkpoints import CheckpointId
-from neuro_code.domain.worktree import WorktreeHandle, WorktreeId, WorktreeRepositoryIdentity
+from neuro_code.domain.worktree import (
+    WorktreeHandle,
+    WorktreeId,
+    WorktreeRepositoryIdentity,
+    WorktreeWorkspaceBinding,
+)
 
 MAX_WRITABLE_SUBAGENT_ID_BYTES = 128
 MAX_WRITABLE_SUBAGENT_ERROR_BYTES = 1_000
@@ -185,6 +190,12 @@ class ManagedChildWorkspaceGrant:
         }
         encoded = json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+    @property
+    def workspace_binding(self) -> WorktreeWorkspaceBinding:
+        """Derive the worker workspace authority from the managed handle."""
+
+        return WorktreeWorkspaceBinding(primary_root=self.worktree.path)
 
 
 @dataclass(frozen=True, slots=True)

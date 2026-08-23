@@ -1646,7 +1646,7 @@ The existing `/subagent` capability remains read-only. The first writable
 subagent is a separate, explicit internal vertical slice constructed by
 `ApplicationComposition.create_writable_subagent_service()`. It is not wired
 to `/subagent`, CLI, TUI, ACP, automatic scheduling, writable parallel workers,
-or an LSP worker, and it does not start checkpoint/rollback orchestration.
+and it does not start checkpoint/rollback orchestration.
 
 `WritableSubagentApplicationService` serializes one child at a time. It first
 records an `ALLOCATING` lease, reads the parent's exact committed HEAD, creates
@@ -1658,14 +1658,16 @@ worktree ID/path, creation time, and baseline checkpoint. The child receives a
 fresh session and binding with exactly that worktree as cwd and sole root.
 
 The derived child has only the bounded read set (`read_file`, `read_files`,
-`list_dir`, `list_tree`, `glob`, `grep`, `grep_many`, `skill`) plus
-`search_replace` and `apply_patch`. It has no Bash, terminal, background,
-MCP, network, Git/worktree/checkpoint/rollback, subagent, or LSP authority.
-Parent and global policy must both prove write tools, write authority, and a
-writable sandbox. Generic `SubagentCapabilitySet.is_subset_of()` is unchanged;
-the typed grant is the narrow boundary that binds the child to a new managed
-workspace. The normal Permission, canonical filesystem-target, execution, and
-sandbox pipeline remains active for every child write.
+`list_dir`, `list_tree`, `glob`, `grep`, `grep_many`, `skill`, and optional
+read-only `lsp`) plus `search_replace` and `apply_patch`. `lsp` is present only
+in the actual-parent/global/worker-policy intersection. The child has no Bash,
+terminal, background, MCP, network, Git/worktree/checkpoint/rollback, or
+subagent authority. Parent and global policy must both prove write tools, write
+authority, and a writable sandbox. Generic
+`SubagentCapabilitySet.is_subset_of()` is unchanged; the typed grant is the
+narrow boundary that binds the child to a new managed workspace. The normal
+Permission, canonical filesystem-target, execution, and sandbox pipeline
+remains active for every child write.
 
 The durable lease uses `ALLOCATING`, `WORKTREE_READY`, `BASELINE_READY`,
 `ACTIVE`, `PRESERVED`, `ORPHANED`, and `FAILED`, with immutable identity,
@@ -1686,6 +1688,32 @@ deletion whenever any session in the deletion closure is referenced by a
 writable lease. Shared owner liveness uses a real POSIX probe or a Windows
 process-handle wait and treats unproven access/API failures as alive. The
 complete contract is in [ADR 0131](adr/0131-managed-writable-subagent-workspace.md).
+
+### Worker-scoped read-only LSP runtime
+
+The managed grant derives a `WorktreeWorkspaceBinding` from its immutable
+handle. Writable runtime composition rejects unless the binding cwd, effective
+capability cwd, workspace-binding primary root, LSP manager root, and canonical
+managed child root are equal and additional roots are empty. The existing
+per-binding instruction and skill trackers therefore also discover only from
+the managed child root.
+
+Each worker keeps the existing per-binding `LanguageServerManager`; managers,
+clients, routes, document/diagnostics caches, versions, and restart counters
+are not shared with the parent or another worker. The manager re-reads the
+canonical child document before a semantic request, so an explicit
+`search_replace`/`apply_patch` write is followed by `didOpen` or versioned
+`didChange` using the new child bytes. Input paths and server-returned URIs
+still pass through the LSP canonical target and visibility boundary.
+
+`ConversationBindingResourceScope` gives the binding one idempotent,
+cancellation-safe asynchronous close task. Worker success, provider failure,
+cancellation, and timeout close the LSP client/process and release its caches;
+application shutdown remains a fallback for still-open bindings. Worktree,
+checkpoint, lease, and session evidence remain durable and preserved. LSP
+process/cache state is ephemeral, is not stored in SQLite, and is reconstructed
+by a future binding. See
+[ADR 0132](adr/0132-worker-scoped-lsp-runtime-integration.md).
 
 ## Platform policy
 
@@ -2243,8 +2271,9 @@ The LSP vertical slice is an application-owned semantic read path. The stable
 The tool is never journaled as a mutation and its cross-file result projection
 does not open an approval prompt.
 
-`ApplicationComposition` creates one `LanguageServerManager` per binding and
-closes it before the application background supervisor. The manager routes by
+`ApplicationComposition` creates one `LanguageServerManager` per binding. A
+binding-owned resource scope closes short-lived worker managers immediately;
+application shutdown closes any managers that remain. The manager routes by
 canonical workspace root plus explicit `LanguageServerProfile`; it is not a
 TUI singleton and does not own a second configuration system. Profile commands
 are argv-only and are started through `LocalProcessSandbox` with
@@ -2262,7 +2291,8 @@ The implemented operations are definition, references, hover, document
 symbols, workspace symbols, diagnostics, status, and bounded restart. Rename,
 format, code actions, `workspace/applyEdit`, and arbitrary server edits remain
 outside the LSP slice. Worktree and checkpoint capabilities are application-
-owned seams described below; LSP does not bind or mutate them.
+owned seams described below. The LSP manager never mutates them; ADR 0132
+composes a read-only manager into the explicit managed-worktree worker binding.
 
 ## Application-owned managed Git worktrees
 
