@@ -1850,7 +1850,7 @@ extensions = [".py", ".txt"]
                     parent_lsp = next(
                         manager
                         for manager in application._lsp_services
-                        if manager.workspace_root == repository
+                        if workspaces_match(manager.workspace_root, repository)
                     )
                     parent_hover = await parent_lsp.execute(
                         LspRequest(
@@ -1911,27 +1911,33 @@ extensions = [".py", ".txt"]
                     worktrees = application.create_worktree_service()
                     await worktrees.initialize()
                     snapshot = await worktrees.inspect(result.worktree_id.value)
-                    self.assertEqual(child_provider.cwd, snapshot.canonical_path)
+                    self.assertTrue(workspaces_match(child_provider.cwd, snapshot.canonical_path))
                     self.assertEqual(
                         (snapshot.canonical_path / "tracked.txt").read_bytes(),
                         ("child-edited-a" + os.linesep).encode(),
                     )
                     self.assertTrue(child_provider.lsp_process_alive_during_run)
-                    self.assertEqual(
-                        child_provider.lsp_document_paths,
-                        (snapshot.canonical_path / "tracked.txt",),
+                    self.assertEqual(len(child_provider.lsp_document_paths), 1)
+                    self.assertTrue(
+                        workspaces_match(
+                            child_provider.lsp_document_paths[0],
+                            snapshot.canonical_path / "tracked.txt",
+                        )
                     )
                     self.assertIsNotNone(child_provider.lsp_manager)
                     manager_a = child_provider.lsp_manager
                     assert manager_a is not None
-                    self.assertEqual(manager_a.workspace_root, snapshot.canonical_path)
+                    self.assertTrue(
+                        workspaces_match(manager_a.workspace_root, snapshot.canonical_path)
+                    )
                     self.assertEqual(manager_a.additional_workspace_roots, ())
                     self.assertIsNot(manager_a, parent_lsp)
                     parent_route = parent_lsp._routes["fake"]
                     self.assertIsNot(child_provider.lsp_client, parent_route.client)
-                    self.assertEqual(
-                        tuple(parent_route.documents),
-                        (repository / "tracked.txt",),
+                    parent_documents = tuple(parent_route.documents)
+                    self.assertEqual(len(parent_documents), 1)
+                    self.assertTrue(
+                        workspaces_match(parent_documents[0], repository / "tracked.txt")
                     )
                     self.assertTrue(manager_a._closed)
                     self.assertEqual(manager_a._routes, {})
@@ -1946,7 +1952,10 @@ extensions = [".py", ".txt"]
                     child_sandbox_a = next(
                         sandbox
                         for sandbox in process_sandboxes
-                        if sandbox.workspace_root == snapshot.canonical_path
+                        if workspaces_match(
+                            sandbox.workspace_root,
+                            snapshot.canonical_path,
+                        )
                     )
                     lsp_requests_a = [
                         request
@@ -1955,15 +1964,14 @@ extensions = [".py", ".txt"]
                     ]
                     self.assertEqual(len(lsp_requests_a), 1)
                     lsp_request_a = lsp_requests_a[0]
-                    self.assertEqual(lsp_request_a.cwd, snapshot.canonical_path)
+                    self.assertTrue(workspaces_match(lsp_request_a.cwd, snapshot.canonical_path))
                     self.assertIs(lsp_request_a.sandbox_profile, SandboxProfile.OFF)
                     self.assertFalse(lsp_request_a.uses_shell)
-                    self.assertEqual(
-                        tuple(
-                            root.path for root in lsp_request_a.filesystem_policy.workspace_roots
-                        ),
-                        (snapshot.canonical_path,),
+                    sandbox_roots = tuple(
+                        root.path for root in lsp_request_a.filesystem_policy.workspace_roots
                     )
+                    self.assertEqual(len(sandbox_roots), 1)
+                    self.assertTrue(workspaces_match(sandbox_roots[0], snapshot.canonical_path))
                     self.assertTrue(
                         all(process.returncode is not None for process in child_sandbox_a.processes)
                     )
@@ -1973,7 +1981,12 @@ extensions = [".py", ".txt"]
                         )
                     )[0]
                     self.assertIs(lease.state, WritableSubagentWorkspaceState.PRESERVED)
-                    self.assertEqual(lease.canonical_child_root, snapshot.canonical_path)
+                    self.assertTrue(
+                        workspaces_match(
+                            lease.canonical_child_root,
+                            snapshot.canonical_path,
+                        )
+                    )
 
                     case[0] = "lsp-success-b"
                     trace.clear()
@@ -1982,14 +1995,22 @@ extensions = [".py", ".txt"]
                     )
                     provider_b = provider_factory.providers[-1]
                     snapshot_b = await worktrees.inspect(result_b.worktree_id.value)
-                    self.assertNotEqual(snapshot_b.canonical_path, snapshot.canonical_path)
+                    self.assertFalse(
+                        workspaces_match(
+                            snapshot_b.canonical_path,
+                            snapshot.canonical_path,
+                        )
+                    )
                     self.assertEqual(
                         (snapshot_b.canonical_path / "tracked.txt").read_bytes(),
                         ("child-edited-b" + os.linesep).encode(),
                     )
-                    self.assertEqual(
-                        provider_b.lsp_document_paths,
-                        (snapshot_b.canonical_path / "tracked.txt",),
+                    self.assertEqual(len(provider_b.lsp_document_paths), 1)
+                    self.assertTrue(
+                        workspaces_match(
+                            provider_b.lsp_document_paths[0],
+                            snapshot_b.canonical_path / "tracked.txt",
+                        )
                     )
                     manager_b = provider_b.lsp_manager
                     assert manager_b is not None
@@ -2020,7 +2041,7 @@ extensions = [".py", ".txt"]
                     parent_sandbox = next(
                         sandbox
                         for sandbox in process_sandboxes
-                        if sandbox.workspace_root == repository
+                        if workspaces_match(sandbox.workspace_root, repository)
                     )
                     self.assertTrue(
                         any(
@@ -2156,7 +2177,10 @@ extensions = [".py", ".txt"]
                         lifecycle_sandbox = next(
                             sandbox
                             for sandbox in process_sandboxes
-                            if sandbox.workspace_root == lifecycle_provider.cwd
+                            if workspaces_match(
+                                sandbox.workspace_root,
+                                lifecycle_provider.cwd,
+                            )
                         )
                         self.assertTrue(lifecycle_sandbox.processes)
                         self.assertTrue(
