@@ -56,6 +56,26 @@ The normal Permission → canonical filesystem target → execution → sandbox
 pipeline still runs for every child write. No child tool receives a raw grant
 path as a substitute for those checks.
 
+### Parent authority and session lifetime
+
+The composition root accepts only the actual active `ConversationBinding`.
+The writable service captures that binding's runner session ID and immutable
+`SubagentCapabilitySet`; a request may repeat the session ID only as an
+identity check, and a mismatch is rejected before lease, task, worktree, or
+checkpoint allocation. A caller-reported capability manifest is not an
+authority input. The service also holds the binding while the capability is
+live, so the parent session and capability fingerprint used in the lease come
+from the same binding that opened the conversation.
+
+Writable leases are durable workspace evidence, not disposable session
+metadata. Session-store schema 16 rebuilds the lease table from schema 15 and
+preserves populated rows while changing both parent and child session foreign
+keys to `RESTRICT`. Before deleting a session, `delete_session()` computes the
+full recursive parent/child deletion closure and refuses the operation when
+any lease references any session in that closure. This preserves the session,
+lease, managed worktree, and baseline checkpoint until a future explicit
+workspace-resolution capability is implemented.
+
 ### Lifecycle and preservation
 
 The durable lease uses `ALLOCATING`, `WORKTREE_READY`, `BASELINE_READY`,
@@ -69,6 +89,13 @@ Reconciliation inspects the managed worktree and baseline checkpoint, verifies
 identity/state, and classifies dead owners or missing evidence without deleting
 uncertain data. It is separate from `session_turn_attempts` and does not infer
 workspace recovery from an execution attempt.
+
+Owner liveness is shared by checkpoint and writable reconciliation. POSIX uses
+the non-mutating `kill(pid, 0)` probe. Windows opens the process with limited
+query/synchronization rights, observes its zero-time wait state, and closes the
+handle; only a signalled process or a proven missing PID is classified dead.
+Access-denied and unexpected API results remain conservatively alive. No
+reconciliation path kills, reclaims, or deletes data as part of this probe.
 
 ### Result projection
 
@@ -86,7 +113,8 @@ child run, merge/commit/patch integration, copy-back, branch deletion, and
 checkpoint or worktree cleanup remain explicit future capabilities.
 
 The capability requires Git 2.40.0 or newer through the existing Worktree
-filter preflight contract. Older Git fails closed at initialization.
+filter preflight contract. Git 2.39.5 is unavailable and Git 2.40.0 is
+accepted at the boundary; older Git fails closed at initialization.
 
 ## Validation boundary
 

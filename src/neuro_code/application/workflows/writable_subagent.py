@@ -16,7 +16,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 from neuro_code.application.ports.checkpoints import WorkspaceCheckpointApplication
 from neuro_code.application.ports.storage import SessionStore
@@ -26,8 +26,10 @@ from neuro_code.application.ports.writable_subagent import (
     WritableSubagentLeaseStore,
 )
 from neuro_code.application.runtime.agent import AgentRunResult, EventSink
+from neuro_code.application.runtime.process_liveness import owner_is_alive
 from neuro_code.application.workflows.subagent_capabilities import (
     MAX_SUBAGENT_STEPS,
+    WRITABLE_SUBAGENT_WRITE_TOOL_NAMES,
     SubagentCapabilitySet,
     WritableSubagentCapabilityGrant,
     resolve_writable_subagent_capability,
@@ -62,6 +64,9 @@ from neuro_code.domain.writable_subagent import (
 )
 from neuro_code.shared.errors import ConfigurationError, SubagentTimeoutError
 from neuro_code.shared.redaction import redact_sensitive_text
+
+if TYPE_CHECKING:
+    from neuro_code.application.sessions.binding import ConversationBinding
 
 MAX_WRITABLE_SUBAGENT_TIMEOUT_SECONDS = 300.0
 MAX_WRITABLE_SUBAGENT_RESULT_BYTES = 32 * 1024
@@ -262,6 +267,7 @@ class WritableSubagentApplicationService:
         checkpoints: WorkspaceCheckpointApplication,
         runtime_factory: WritableSubagentRuntimeFactory,
         *,
+        parent_binding: ConversationBinding,
         global_policy: SubagentCapabilitySet,
         timeout_seconds: float = 120.0,
         clock: Callable[[], datetime] = _now,
@@ -279,11 +285,42 @@ class WritableSubagentApplicationService:
             raise ConfigurationError("writable worktree application is invalid")
         if not isinstance(runtime_factory, WritableSubagentRuntimeFactory):
             raise ConfigurationError("writable subagent runtime factory is invalid")
+        from neuro_code.application.sessions.binding import (
+            ConversationBinding as CanonicalConversationBinding,
+        )
+
+        if not isinstance(parent_binding, CanonicalConversationBinding):
+            raise ConfigurationError("writable subagent parent binding is required")
+        parent_capabilities = parent_binding.capabilities
+        if not isinstance(parent_capabilities, SubagentCapabilitySet):
+            raise ConfigurationError(
+                "writable subagent parent binding capability metadata is missing"
+            )
+        parent_session_id = parent_binding.runner.session_id
+        if (
+            not isinstance(parent_session_id, str)
+            or not parent_session_id.strip()
+            or "\x00" in parent_session_id
+        ):
+            raise ConfigurationError("writable subagent parent binding session identity is missing")
+        if (
+            not parent_capabilities.filesystem_write
+            or not parent_capabilities.sandbox_profile.workspace_writable
+            or not WRITABLE_SUBAGENT_WRITE_TOOL_NAMES.issubset(
+                parent_capabilities.allowed_tool_names
+            )
+        ):
+            raise ConfigurationError(
+                "writable subagent parent binding does not carry writable authority"
+            )
         self._store = store
         self._lease_store = lease_store
         self._worktrees = worktrees
         self._checkpoints = checkpoints
         self._runtime_factory = runtime_factory
+        self._parent_binding = parent_binding
+        self._parent_session_id = parent_session_id
+        self._parent_capabilities = parent_capabilities
         self._global_policy = global_policy
         self._timeout_seconds = float(timeout_seconds)
         self._clock = clock
@@ -303,34 +340,37 @@ class WritableSubagentApplicationService:
         self,
         request: RunWritableSubagentRequest,
         *,
-        parent_capabilities: SubagentCapabilitySet,
         sink: EventSink | None = None,
     ) -> WritableSubagentResultProjection:
         if not isinstance(request, RunWritableSubagentRequest):
             raise ValueError("writable subagent request must be canonical")
-        if not isinstance(parent_capabilities, SubagentCapabilitySet):
-            raise ConfigurationError("parent subagent capability metadata is required")
+        if request.parent_session_id != self._parent_session_id:
+            raise ConfigurationError("writable subagent request parent session does not match")
         if not self._initialized:
             raise ConfigurationError("writable subagent service is not initialized")
-        requested = writable_subagent_request(parent_capabilities, max_steps=request.max_steps)
+        requested = writable_subagent_request(
+            self._parent_capabilities,
+            max_steps=request.max_steps,
+        )
         async with self._lock:
-            return await self._run_locked(request, parent_capabilities, requested, sink=sink)
+            return await self._run_locked(request, requested, sink=sink)
 
     async def _run_locked(
         self,
         request: RunWritableSubagentRequest,
-        parent_capabilities: SubagentCapabilitySet,
         requested: SubagentCapabilitySet,
         *,
         sink: EventSink | None,
     ) -> WritableSubagentResultProjection:
+        parent_capabilities = self._parent_capabilities
+        parent_session_id = self._parent_session_id
         parent_repository = await self._worktrees.repository_identity(parent_capabilities.cwd)
         worktree_id = WorktreeId.new()
         child_root = self._worktrees.planned_managed_path(parent_repository, worktree_id)
         now = self._clock().astimezone(UTC)
         lease = WritableSubagentWorkspaceLease(
             lease_id=f"wsl-{uuid.uuid4().hex}",
-            parent_session_id=request.parent_session_id,
+            parent_session_id=parent_session_id,
             parent_task_id=f"writable-subagent-{uuid.uuid4().hex}",
             worktree_id=worktree_id,
             parent_capability_fingerprint=parent_capabilities.fingerprint,
@@ -360,9 +400,9 @@ class WritableSubagentApplicationService:
         failure: BaseException | None = None
         task_created = False
         try:
-            await self._store.create_session_task(request.parent_session_id, task)
+            await self._store.create_session_task(parent_session_id, task)
             task_created = True
-            lease = await self._create_worktree(lease, request)
+            lease = await self._create_worktree(lease)
             snapshot = lease.worktree
             if snapshot is None:
                 raise ConfigurationError("writable worktree handle was not persisted")
@@ -413,7 +453,7 @@ class WritableSubagentApplicationService:
             )
             await self._store.save_subagent_link(
                 SubagentLink(
-                    request.parent_session_id,
+                    parent_session_id,
                     task.task_id,
                     child_session_id,
                     self._clock().astimezone(UTC),
@@ -486,7 +526,6 @@ class WritableSubagentApplicationService:
             if result is None:
                 raise ConfigurationError("writable child completed without a run result")
             return self._project_result(
-                request,
                 final_task,
                 result,
                 lease,
@@ -514,7 +553,6 @@ class WritableSubagentApplicationService:
     async def _create_worktree(
         self,
         lease: WritableSubagentWorkspaceLease,
-        request: RunWritableSubagentRequest,
     ) -> WritableSubagentWorkspaceLease:
         branch = f"neuro/writable-subagent/{lease.worktree_id.value}"
         snapshot = await self._worktrees.create(
@@ -524,7 +562,7 @@ class WritableSubagentApplicationService:
                 kind=WorktreeKind.MANAGED_BRANCH,
                 worktree_id=lease.worktree_id,
                 branch=branch,
-                created_by_session_id=request.parent_session_id,
+                created_by_session_id=lease.parent_session_id,
             )
         )
         if (
@@ -640,7 +678,6 @@ class WritableSubagentApplicationService:
 
     def _project_result(
         self,
-        request: RunWritableSubagentRequest,
         task: SessionTask,
         result: AgentRunResult,
         lease: WritableSubagentWorkspaceLease,
@@ -658,7 +695,7 @@ class WritableSubagentApplicationService:
         if lease.capability_fingerprint is None or lease.grant_fingerprint is None:
             raise ConfigurationError("writable result capability linkage is incomplete")
         return WritableSubagentResultProjection(
-            parent_session_id=request.parent_session_id,
+            parent_session_id=lease.parent_session_id,
             parent_task_id=task.task_id,
             child_session_id=lease.child_session_id,
             status=task.status,
@@ -814,18 +851,7 @@ class WritableSubagentApplicationService:
         return tuple(reconciled)
 
 
-def _owner_alive(pid: int | None) -> bool:
-    if pid is None or pid <= 0:
-        return False
-    if os.name == "nt":
-        return True
-    try:
-        os.kill(pid, 0)
-    except PermissionError:
-        return True
-    except (ProcessLookupError, OSError):
-        return False
-    return True
+_owner_alive = owner_is_alive
 
 
 __all__ = [

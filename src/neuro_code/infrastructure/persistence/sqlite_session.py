@@ -79,7 +79,7 @@ from neuro_code.domain.writable_subagent import (
 from neuro_code.shared.async_utils import run_blocking
 from neuro_code.shared.errors import SessionError
 
-SCHEMA_VERSION = 15
+SCHEMA_VERSION = 16
 _SEARCH_SNIPPET_LIMIT = 500
 _SQLITE_TIMEOUT_SECONDS = 30.0
 _SESSION_ALIAS_NAMESPACE_LIMIT = 64
@@ -225,6 +225,12 @@ class SqliteSessionStore:
                             "UPDATE schema_meta SET version = 15 WHERE singleton = 1"
                         )
                         version = (15,)
+                    if version is not None and version[0] == 15:
+                        _migrate_writable_subagent_lease_schema(connection)
+                        connection.execute(
+                            "UPDATE schema_meta SET version = 16 WHERE singleton = 1"
+                        )
+                        version = (16,)
                     if version is None or version[0] != SCHEMA_VERSION:
                         raise SessionError(
                             "unsupported session schema version: "
@@ -354,9 +360,27 @@ class SqliteSessionStore:
                         (current,),
                     ).fetchall()
                     pending.extend(str(row[0]) for row in child_rows)
-                    connection.execute("DELETE FROM sessions WHERE id = ?", (current,))
+
                 if session_id not in seen:
                     raise SessionError(f"unknown session: {session_id}")
+                if seen:
+                    placeholders = ", ".join("?" for _ in seen)
+                    parameters = tuple(seen)
+                    lease = connection.execute(
+                        f"""
+                        SELECT 1
+                        FROM writable_subagent_leases
+                        WHERE parent_session_id IN ({placeholders})
+                           OR child_session_id IN ({placeholders})
+                        LIMIT 1
+                        """,
+                        (*parameters, *parameters),
+                    ).fetchone()
+                    if lease is not None:
+                        raise SessionError("session has preserved writable workspace resources")
+
+                for current in seen:
+                    connection.execute("DELETE FROM sessions WHERE id = ?", (current,))
 
         async with self._write_lock:
             await run_blocking(delete)
@@ -2733,6 +2757,43 @@ def _ensure_subagent_link_schema(connection: sqlite3.Connection) -> None:
     )
 
 
+def _migrate_writable_subagent_lease_schema(connection: sqlite3.Connection) -> None:
+    """Rebuild the populated lease table with session-retention FKs.
+
+    SQLite does not support changing a foreign-key action with ``ALTER TABLE``.
+    Drop only the old derived indexes, rename the legacy table, create the
+    schema-16 table, copy every row, and recreate the indexes.  The caller
+    owns the surrounding transaction, so any failure rolls back the complete
+    migration without losing the durable lease rows.
+    """
+
+    table = connection.execute(
+        """
+        SELECT 1
+        FROM sqlite_master
+        WHERE type = 'table' AND name = 'writable_subagent_leases'
+        """
+    ).fetchone()
+    if table is None:
+        _ensure_writable_subagent_lease_schema(connection)
+        return
+
+    connection.execute("DROP INDEX IF EXISTS writable_subagent_active_parent")
+    connection.execute("DROP INDEX IF EXISTS writable_subagent_active_worktree")
+    connection.execute("DROP INDEX IF EXISTS writable_subagent_leases_by_state")
+    connection.execute(
+        "ALTER TABLE writable_subagent_leases RENAME TO writable_subagent_leases_v15"
+    )
+    _ensure_writable_subagent_lease_schema(connection)
+    connection.execute(
+        """
+        INSERT INTO writable_subagent_leases
+        SELECT * FROM writable_subagent_leases_v15
+        """
+    )
+    connection.execute("DROP TABLE writable_subagent_leases_v15")
+
+
 def _ensure_writable_subagent_lease_schema(connection: sqlite3.Connection) -> None:
     connection.execute(
         """
@@ -2771,8 +2832,8 @@ def _ensure_writable_subagent_lease_schema(connection: sqlite3.Connection) -> No
             version INTEGER NOT NULL DEFAULT 0,
             UNIQUE(parent_session_id, parent_task_id),
             UNIQUE(worktree_id),
-            FOREIGN KEY (parent_session_id) REFERENCES sessions(id) ON DELETE CASCADE,
-            FOREIGN KEY (child_session_id) REFERENCES sessions(id) ON DELETE SET NULL
+            FOREIGN KEY (parent_session_id) REFERENCES sessions(id) ON DELETE RESTRICT,
+            FOREIGN KEY (child_session_id) REFERENCES sessions(id) ON DELETE RESTRICT
         )
         """
     )

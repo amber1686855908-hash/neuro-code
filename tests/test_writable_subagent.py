@@ -3,18 +3,28 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import os
+import sqlite3
 import subprocess
+import sys
 import tempfile
 import unittest
+from collections.abc import AsyncIterator, Sequence
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import cast
+from unittest.mock import patch
 
-from neuro_code.application.checkpoints import WorkspaceCheckpointApplicationService
+from neuro_code.application.permissions.policy import PermissionMode
+from neuro_code.application.ports.checkpoints import WorkspaceCheckpointApplication
+from neuro_code.application.ports.model import ModelCapabilitySet, ModelProvider, ModelToolPolicy
 from neuro_code.application.ports.tools import ToolContext
 from neuro_code.application.ports.worktree import WorktreeError, WorktreeFailureKind
 from neuro_code.application.ports.writable_subagent import WritableSubagentLeaseError
 from neuro_code.application.runtime.agent import AgentRunResult, EventSink
+from neuro_code.application.runtime.process_liveness import owner_is_alive
+from neuro_code.application.sessions.binding import ConversationBinding, ConversationRunner
+from neuro_code.application.settings import ApplicationSettings
 from neuro_code.application.workflows.subagent_capabilities import (
     NetworkAccess,
     SubagentCapabilitySet,
@@ -28,7 +38,8 @@ from neuro_code.application.workflows.writable_subagent import (
     WritableSubagentApplicationService,
     WritableSubagentResultProjection,
 )
-from neuro_code.application.worktrees import WorktreeApplicationService
+from neuro_code.bootstrap.composition import ApplicationComposition
+from neuro_code.configuration.app import AppConfig
 from neuro_code.domain.checkpoints import (
     CheckpointCreateRequest,
     CheckpointId,
@@ -40,8 +51,17 @@ from neuro_code.domain.checkpoints import (
     WorkspaceProjection,
     workspace_projection_fingerprint,
 )
+from neuro_code.domain.conversation.context import ModelContext
+from neuro_code.domain.conversation.events import (
+    ModelCompleted,
+    ModelEvent,
+    ModelTextDelta,
+    ModelToolCall,
+)
+from neuro_code.domain.conversation.messages import ToolCall
 from neuro_code.domain.sandbox.models import SandboxProfile
 from neuro_code.domain.session_tasks import SessionTaskStatus
+from neuro_code.domain.tools import ToolDefinition
 from neuro_code.domain.worktree import (
     WorktreeCreateRequest,
     WorktreeHandle,
@@ -58,18 +78,36 @@ from neuro_code.domain.writable_subagent import (
     WritableSubagentWorkspaceLease,
     WritableSubagentWorkspaceState,
 )
-from neuro_code.infrastructure.git.worktree import LocalGitWorktreeAdapter
-from neuro_code.infrastructure.persistence.checkpoint_artifacts import LocalCheckpointArtifactStore
-from neuro_code.infrastructure.persistence.managed_worktrees import SqliteManagedWorktreeStore
 from neuro_code.infrastructure.persistence.sqlite_session import SqliteSessionStore
-from neuro_code.infrastructure.persistence.workspace_checkpoints import (
-    SqliteWorkspaceCheckpointStore,
-)
 from neuro_code.infrastructure.tools.filesystem import ApplyPatchTool, SearchReplaceTool
-from neuro_code.infrastructure.workspace.checkpoints import LocalWorkspaceStateAdapter
-from neuro_code.shared.errors import ConfigurationError, SubagentTimeoutError, ToolError
+from neuro_code.shared.errors import (
+    ConfigurationError,
+    SessionError,
+    SubagentTimeoutError,
+    ToolError,
+)
 
 BASE_SHA = "a" * 40
+
+
+class _ParentRunner:
+    def __init__(self, session_id: str | None) -> None:
+        self._session_id = session_id
+
+    @property
+    def session_id(self) -> str | None:
+        return self._session_id
+
+
+def _parent_binding(
+    session_id: str | None,
+    capabilities: SubagentCapabilitySet | None,
+) -> ConversationBinding:
+    return ConversationBinding(
+        cast(ConversationRunner, _ParentRunner(session_id)),
+        cast(ModelProvider, object()),
+        capabilities=capabilities,
+    )
 
 
 def _run_git(repository: Path, *arguments: str) -> bytes:
@@ -1054,47 +1092,140 @@ class _FakeRuntimeFactory:
         return self.runtime
 
 
-class _RealRuntime:
-    def __init__(self, session_id: str, capabilities) -> None:
-        self.child_session_id = session_id
-        self.capability_fingerprint = capabilities.fingerprint
-        self.cwd = capabilities.capabilities.cwd
-        self.closed = False
+class _ProductionWritableProvider:
+    provider_name = "fixture"
+    model_name = "fixture-model"
+    context_affinity = "fixture-v1"
+    capabilities = ModelCapabilitySet.all_unknown()
 
-    async def run(self, prompt: str, *, sink: EventSink | None = None) -> AgentRunResult:
-        del sink
-        (self.cwd / "child.txt").write_text(prompt, encoding="utf-8")
-        return AgentRunResult(self.child_session_id, "real child completed", (), (), (), 1)
-
-    async def close(self) -> None:
-        self.closed = True
-
-
-class _RealRuntimeFactory:
-    def __init__(self, store: SqliteSessionStore) -> None:
-        self.store = store
-        self.runtime: _RealRuntime | None = None
-
-    async def create_session(self, request: RunWritableSubagentRequest, *, capabilities):
-        del request
-        return await self.store.create_session(
-            str(capabilities.capabilities.cwd),
-            "fixture-child",
-            "model",
-            sandbox_profile=capabilities.capabilities.sandbox_profile,
-        )
-
-    async def create(
+    def __init__(
         self,
-        request: RunWritableSubagentRequest,
         *,
-        parent_task_id: str,
-        child_session_id: str,
-        capabilities,
-    ) -> _RealRuntime:
-        del request, parent_task_id
-        self.runtime = _RealRuntime(child_session_id, capabilities)
-        return self.runtime
+        cwd: Path,
+        case_name: str,
+        parent: Path,
+        state_dir: Path,
+        store: SqliteSessionStore,
+        checkpoints: WorkspaceCheckpointApplication,
+        trace: list[str],
+    ) -> None:
+        self.cwd = cwd
+        self.case_name = case_name
+        self.parent = parent
+        self.state_dir = state_dir
+        self.store = store
+        self.checkpoints = checkpoints
+        self.trace = trace
+        self.calls: list[tuple[ToolDefinition, ...]] = []
+        self.target_path: Path | None = None
+
+    async def stream(
+        self,
+        context: ModelContext,
+        tools: Sequence[ToolDefinition],
+        *,
+        tool_policy: ModelToolPolicy = ModelToolPolicy.ALLOWED,
+    ) -> AsyncIterator[ModelEvent]:
+        del context, tool_policy
+        self.calls.append(tuple(tools))
+        if len(self.calls) == 1:
+            leases = await self.store.list_writable_subagent_leases(include_terminal=False)
+            active = [
+                lease for lease in leases if lease.state is WritableSubagentWorkspaceState.ACTIVE
+            ]
+            if len(active) != 1 or active[0].baseline_checkpoint_id is None:
+                raise AssertionError("write-capable child started before active baseline state")
+            checkpoint = await self.checkpoints.get(active[0].baseline_checkpoint_id)
+            if checkpoint is None or checkpoint.state is not CheckpointState.READY:
+                raise AssertionError("first write tool was requested before READY baseline")
+            self.trace.append("baseline_ready_before_first_tool")
+            if "search_replace" not in {tool.name for tool in tools}:
+                raise AssertionError("production writable child did not receive search_replace")
+            path = self._prepare_target()
+            target = Path(path)
+            self.target_path = target if target.is_absolute() else self.cwd / target
+            yield ModelToolCall(
+                ToolCall(
+                    "writable-tool-1",
+                    "search_replace",
+                    {"path": path, "old": "committed\n", "new": "child-edited\n"},
+                )
+            )
+            yield ModelCompleted("tool_calls")
+            return
+        yield ModelTextDelta("scripted writable child completed")
+        yield ModelCompleted("stop")
+
+    def _prepare_target(self) -> str:
+        if self.case_name == "success":
+            return "tracked.txt"
+        if self.case_name == "relative-parent":
+            return os.path.relpath(self.parent / "tracked.txt", self.cwd)
+        if self.case_name == "absolute-parent":
+            return str(self.parent / "tracked.txt")
+        if self.case_name == "sibling-worktree":
+            sibling = self.cwd.parent / "sibling-worktree"
+            sibling.mkdir(parents=True, exist_ok=True)
+            (sibling / "tracked.txt").write_bytes(b"committed\n")
+            return str(sibling / "tracked.txt")
+        if self.case_name == "symlink-parent":
+            link = self.cwd / "parent-link.txt"
+            try:
+                link.symlink_to(self.parent / "tracked.txt")
+            except OSError:
+                self.trace.append("symlink_unavailable")
+                return str(self.parent / "tracked.txt")
+            return "parent-link.txt"
+        if self.case_name == "state-dir":
+            self.state_dir.mkdir(parents=True, exist_ok=True)
+            state_file = self.state_dir / "state-target.txt"
+            state_file.write_bytes(b"committed\n")
+            return str(state_file)
+        raise AssertionError(f"unknown writable provider case: {self.case_name}")
+
+
+class _ProductionWritableProviderFactory:
+    def __init__(
+        self,
+        *,
+        parent: Path,
+        state_dir: Path,
+        store: SqliteSessionStore | None,
+        checkpoints: WorkspaceCheckpointApplication | None,
+        case: list[str],
+        trace: list[str],
+    ) -> None:
+        self.parent = parent
+        self.state_dir = state_dir
+        self.store = store
+        self.checkpoints = checkpoints
+        self.case = case
+        self.trace = trace
+        self.providers: list[_ProductionWritableProvider] = []
+
+    def bind_runtime_services(
+        self,
+        store: SqliteSessionStore,
+        checkpoints: WorkspaceCheckpointApplication,
+    ) -> None:
+        self.store = store
+        self.checkpoints = checkpoints
+
+    def __call__(self, config: AppConfig, failover: bool) -> ModelProvider:
+        del failover
+        if self.store is None or self.checkpoints is None:
+            raise AssertionError("production provider factory was used before composition binding")
+        provider = _ProductionWritableProvider(
+            cwd=config.cwd,
+            case_name=self.case[0],
+            parent=self.parent,
+            state_dir=self.state_dir,
+            store=self.store,
+            checkpoints=self.checkpoints,
+            trace=self.trace,
+        )
+        self.providers.append(provider)
+        return cast(ModelProvider, provider)
 
 
 class WritableApplicationTests(unittest.IsolatedAsyncioTestCase):
@@ -1111,6 +1242,7 @@ class WritableApplicationTests(unittest.IsolatedAsyncioTestCase):
         created_session_id: str | None = None,
         response: str = "completed",
         close_error: BaseException | None = None,
+        bound_capabilities: SubagentCapabilitySet | None = None,
     ) -> tuple[
         WritableSubagentApplicationService,
         SqliteSessionStore,
@@ -1130,7 +1262,7 @@ class WritableApplicationTests(unittest.IsolatedAsyncioTestCase):
         store = SqliteSessionStore(root / "sessions.db")
         await store.initialize()
         parent_session_id = await store.create_session(str(parent), "fixture", "model")
-        parent_capabilities = _capability(parent)
+        parent_capabilities = bound_capabilities or _capability(parent)
         factory = _FakeRuntimeFactory(
             store,
             worktrees,
@@ -1149,6 +1281,7 @@ class WritableApplicationTests(unittest.IsolatedAsyncioTestCase):
             worktrees,
             checkpoints,
             factory,
+            parent_binding=_parent_binding(parent_session_id, parent_capabilities),
             global_policy=_capability(root / "global", max_steps=12),
         )
         await service.initialize()
@@ -1163,6 +1296,195 @@ class WritableApplicationTests(unittest.IsolatedAsyncioTestCase):
             parent_session_id,
         )
 
+    async def test_production_binding_runs_real_write_tool_and_denies_escape_matrix(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repository, head = _make_real_repository(root)
+            (repository / "parent-dirty.txt").write_bytes(b"parent dirty bytes\n")
+            (repository / "untracked.txt").write_bytes(b"untracked parent bytes\n")
+            parent_status = _run_git(repository, "status", "--porcelain=v2", "-z")
+            parent_index = (repository / ".git" / "index").read_bytes()
+            parent_branch = _run_git(repository, "symbolic-ref", "--short", "HEAD")
+            parent_tracked = (repository / "tracked.txt").read_bytes()
+            state_dir = root / "state"
+            state_dir.mkdir()
+            (state_dir / "config.toml").write_text(
+                """
+[web_search]
+mode = "disabled"
+
+[web_fetch]
+mode = "disabled"
+
+[routing]
+default = "fixture"
+
+[providers.fixture]
+protocol = "openai-chat"
+model = "fixture-model"
+base_url = "https://provider.invalid/v1"
+api_key_env = "FIXTURE_KEY"
+context_window_tokens = 131072
+""",
+                encoding="utf-8",
+            )
+            case = ["success"]
+            trace: list[str] = []
+            provider_factory = _ProductionWritableProviderFactory(
+                parent=repository,
+                state_dir=state_dir,
+                store=None,
+                checkpoints=None,
+                case=case,
+                trace=trace,
+            )
+            with patch.dict(
+                os.environ,
+                {
+                    "HOME": str(root),
+                    "NEURO_CODE_HOME": str(state_dir),
+                    "FIXTURE_KEY": "fixture-key",
+                },
+                clear=True,
+            ):
+                application = await ApplicationComposition.open(
+                    ApplicationSettings(
+                        cwd=repository,
+                        sandbox="off",
+                        permission_mode=PermissionMode.BYPASS,
+                        max_steps=8,
+                    ),
+                    provider_factory=provider_factory,
+                )
+                try:
+                    checkpoint_service = application.create_workspace_checkpoint_service()
+                    await checkpoint_service.initialize()
+                    provider_factory.bind_runtime_services(application.store, checkpoint_service)
+                    parent_session_id = await application.store.create_session(
+                        str(repository),
+                        "fixture",
+                        "fixture-model",
+                        sandbox_profile=SandboxProfile.OFF,
+                    )
+                    parent_capabilities = _capability(
+                        repository,
+                        sandbox=SandboxProfile.OFF,
+                    )
+                    parent_config = await application.config_for_session_resume(parent_session_id)
+                    parent_binding = await application.create_binding(
+                        config=parent_config,
+                        resume_id=parent_session_id,
+                        capabilities=parent_capabilities,
+                    )
+                    service = application.create_writable_subagent_service(
+                        parent_binding=parent_binding,
+                    )
+                    await service.initialize()
+                    result = await service.run_subagent(
+                        RunWritableSubagentRequest(parent_session_id, "edit the child file"),
+                    )
+                    self.assertEqual(result.base_commit_sha, head)
+                    self.assertTrue(result.workspace_changed)
+                    self.assertIn("baseline_ready_before_first_tool", trace)
+                    child_provider = provider_factory.providers[-1]
+                    expected_tool_names = set(
+                        _capability(
+                            child_provider.cwd, sandbox=SandboxProfile.OFF
+                        ).allowed_tool_names
+                    )
+                    actual_tool_names = {tool.name for tool in child_provider.calls[0]}
+                    self.assertEqual(actual_tool_names, expected_tool_names)
+                    self.assertNotIn("bash", actual_tool_names)
+                    self.assertNotIn("terminal_exec", actual_tool_names)
+                    self.assertFalse(
+                        actual_tool_names.intersection(
+                            {"web_search", "web_fetch", "mcp", "lsp", "git", "worktree"}
+                        )
+                    )
+                    self.assertEqual(len(child_provider.calls), 2)
+                    self.assertIn(
+                        "search_replace",
+                        {tool.name for tool in child_provider.calls[0]},
+                    )
+                    worktrees = application.create_worktree_service()
+                    await worktrees.initialize()
+                    snapshot = await worktrees.inspect(result.worktree_id.value)
+                    self.assertEqual(child_provider.cwd, snapshot.canonical_path)
+                    self.assertEqual(
+                        (snapshot.canonical_path / "tracked.txt").read_bytes(),
+                        b"child-edited\n",
+                    )
+                    lease = (
+                        await application.store.list_writable_subagent_leases(
+                            parent_session_id=parent_session_id
+                        )
+                    )[0]
+                    self.assertIs(lease.state, WritableSubagentWorkspaceState.PRESERVED)
+                    self.assertEqual(lease.canonical_child_root, snapshot.canonical_path)
+
+                    for escape_case in (
+                        "relative-parent",
+                        "absolute-parent",
+                        "sibling-worktree",
+                        "symlink-parent",
+                        "state-dir",
+                    ):
+                        case[0] = escape_case
+                        trace.clear()
+                        escaped = await service.run_subagent(
+                            RunWritableSubagentRequest(
+                                parent_session_id,
+                                f"attempt {escape_case}",
+                            ),
+                        )
+                        child_provider = provider_factory.providers[-1]
+                        if escape_case != "symlink-parent":
+                            self.assertFalse(escaped.workspace_changed, escape_case)
+                        self.assertIsNotNone(child_provider.target_path, escape_case)
+                        if escape_case in {"sibling-worktree", "state-dir"}:
+                            assert child_provider.target_path is not None
+                            self.assertEqual(
+                                child_provider.target_path.read_bytes(),
+                                b"committed\n",
+                                escape_case,
+                            )
+                        else:
+                            self.assertEqual(
+                                (repository / "tracked.txt").read_bytes(),
+                                parent_tracked,
+                                escape_case,
+                            )
+                        escape_lease = (
+                            await application.store.list_writable_subagent_leases(
+                                parent_session_id=parent_session_id
+                            )
+                        )[-1]
+                        self.assertIs(
+                            escape_lease.state,
+                            WritableSubagentWorkspaceState.PRESERVED,
+                        )
+                        if escape_case == "symlink-parent" and "symlink_unavailable" in trace:
+                            continue
+
+                    self.assertEqual(
+                        _run_git(repository, "rev-parse", "HEAD"), head.encode() + b"\n"
+                    )
+                    self.assertEqual(
+                        _run_git(repository, "status", "--porcelain=v2", "-z"),
+                        parent_status,
+                    )
+                    self.assertEqual((repository / ".git" / "index").read_bytes(), parent_index)
+                    self.assertEqual(
+                        _run_git(repository, "symbolic-ref", "--short", "HEAD"), parent_branch
+                    )
+                    self.assertEqual((repository / "tracked.txt").read_bytes(), parent_tracked)
+                    self.assertEqual(
+                        (repository / "parent-dirty.txt").read_bytes(),
+                        b"parent dirty bytes\n",
+                    )
+                finally:
+                    await application.close()
+
     async def test_run_starts_from_committed_parent_and_preserves_child_workspace(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1173,13 +1495,12 @@ class WritableApplicationTests(unittest.IsolatedAsyncioTestCase):
                 worktrees,
                 checkpoints,
                 factory,
-                parent_capabilities,
+                _parent_capabilities,
                 parent_session_id,
             ) = await self._service(root)
             parent_before = hashlib.sha256((parent / "parent.txt").read_bytes()).hexdigest()
             result = await service.run_subagent(
                 RunWritableSubagentRequest(parent_session_id, "make the child change"),
-                parent_capabilities=parent_capabilities,
             )
 
             self.assertIs(result.status, SessionTaskStatus.COMPLETED)
@@ -1201,6 +1522,22 @@ class WritableApplicationTests(unittest.IsolatedAsyncioTestCase):
             self.assertIs(task.status, SessionTaskStatus.COMPLETED)
             self.assertIsNotNone(factory.runtime)
             self.assertTrue(factory.runtime.closed)
+            lease = (
+                await store.list_writable_subagent_leases(parent_session_id=parent_session_id)
+            )[0]
+            self.assertIsNotNone(lease.child_session_id)
+            assert lease.child_session_id is not None
+            with self.assertRaisesRegex(SessionError, "writable workspace"):
+                await store.delete_session(parent_session_id)
+            with self.assertRaisesRegex(SessionError, "writable workspace"):
+                await store.delete_session(lease.child_session_id)
+            self.assertIsNotNone(await store.get_session(parent_session_id))
+            self.assertIsNotNone(await store.get_session(lease.child_session_id))
+            self.assertTrue(worktrees.snapshot.canonical_path.is_dir())
+            baseline = await checkpoints.get(CheckpointId(result.baseline_checkpoint_id))
+            self.assertIsNotNone(baseline)
+            assert baseline is not None
+            self.assertIs(baseline.state, CheckpointState.READY)
 
     async def test_provider_failure_preserves_workspace_and_durable_failure(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1212,18 +1549,68 @@ class WritableApplicationTests(unittest.IsolatedAsyncioTestCase):
                 _worktrees,
                 _checkpoints,
                 _factory,
-                parent_capabilities,
+                _parent_capabilities,
                 parent_session_id,
             ) = await self._service(root, error=RuntimeError("provider failed"))
             with self.assertRaisesRegex(RuntimeError, "provider failed"):
                 await service.run_subagent(
                     RunWritableSubagentRequest(parent_session_id, "fail"),
-                    parent_capabilities=parent_capabilities,
                 )
             leases = await store.list_writable_subagent_leases(parent_session_id=parent_session_id)
             self.assertEqual(len(leases), 1)
             self.assertIs(leases[0].state, WritableSubagentWorkspaceState.PRESERVED)
             self.assertEqual(leases[0].error_kind, "RuntimeError")
+
+    async def test_populated_schema_15_lease_migrates_to_schema_16_and_keeps_cas(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (
+                service,
+                store,
+                _parent,
+                _worktrees,
+                _checkpoints,
+                _factory,
+                _parent_capabilities,
+                parent_session_id,
+            ) = await self._service(root)
+            result = await service.run_subagent(
+                RunWritableSubagentRequest(parent_session_id, "populate the lease"),
+            )
+            before = (
+                await store.list_writable_subagent_leases(parent_session_id=parent_session_id)
+            )[0]
+            self.assertEqual(before.child_session_id, result.child_session_id)
+            connection = sqlite3.connect(store.database_path)
+            connection.execute("UPDATE schema_meta SET version = 15 WHERE singleton = 1")
+            connection.commit()
+            connection.close()
+
+            migrated = SqliteSessionStore(store.database_path)
+            await migrated.initialize()
+            connection = sqlite3.connect(store.database_path)
+            self.assertEqual(
+                connection.execute(
+                    "SELECT version FROM schema_meta WHERE singleton = 1"
+                ).fetchone(),
+                (16,),
+            )
+            foreign_keys = connection.execute(
+                "PRAGMA foreign_key_list(writable_subagent_leases)"
+            ).fetchall()
+            connection.close()
+            self.assertEqual({row[6] for row in foreign_keys}, {"RESTRICT"})
+            after = (
+                await migrated.list_writable_subagent_leases(parent_session_id=parent_session_id)
+            )[0]
+            self.assertEqual(after, before)
+            transitioned = await migrated.compare_and_transition_writable_subagent_lease(
+                replace(after, error_kind="post-migration-cas"),
+                expected_version=after.version,
+                expected_state=after.state,
+            )
+            self.assertEqual(transitioned.version, before.version + 1)
+            self.assertEqual(transitioned.error_kind, "post-migration-cas")
 
     async def test_cancellation_preserves_workspace_and_marks_task_cancelled(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1235,13 +1622,12 @@ class WritableApplicationTests(unittest.IsolatedAsyncioTestCase):
                 _worktrees,
                 _checkpoints,
                 factory,
-                parent_capabilities,
+                _parent_capabilities,
                 parent_session_id,
             ) = await self._service(root, block=True)
             running = asyncio.create_task(
                 service.run_subagent(
                     RunWritableSubagentRequest(parent_session_id, "cancel"),
-                    parent_capabilities=parent_capabilities,
                 )
             )
             for _ in range(500):
@@ -1271,7 +1657,7 @@ class WritableApplicationTests(unittest.IsolatedAsyncioTestCase):
                 _worktrees,
                 _checkpoints,
                 _factory,
-                parent_capabilities,
+                _parent_capabilities,
                 parent_session_id,
             ) = await self._service(root)
             await service.initialize()
@@ -1279,19 +1665,112 @@ class WritableApplicationTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(ConfigurationError):
                 await service.run_subagent(
                     RunWritableSubagentRequest(parent_session_id, "not initialized"),
-                    parent_capabilities=parent_capabilities,
                 )
             service._initialized = True
             with self.assertRaises(ValueError):
                 await service.run_subagent(
                     object(),  # type: ignore[arg-type]
-                    parent_capabilities=parent_capabilities,
                 )
             with self.assertRaises(ConfigurationError):
                 await service.run_subagent(
-                    RunWritableSubagentRequest(parent_session_id, "invalid parent"),
-                    parent_capabilities=object(),  # type: ignore[arg-type]
+                    RunWritableSubagentRequest("different-parent", "invalid parent"),
                 )
+
+    async def test_request_parent_session_mismatch_rejects_before_resource_allocation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (
+                service,
+                store,
+                _parent,
+                worktrees,
+                checkpoints,
+                factory,
+                _parent_capabilities,
+                parent_session_id,
+            ) = await self._service(root)
+            with self.assertRaisesRegex(ConfigurationError, "parent session"):
+                await service.run_subagent(
+                    RunWritableSubagentRequest("different-parent", "must reject"),
+                )
+            self.assertIsNone(worktrees.snapshot)
+            self.assertEqual(checkpoints.checkpoints, {})
+            self.assertIsNone(factory.runtime)
+            self.assertEqual(
+                await store.list_writable_subagent_leases(parent_session_id=parent_session_id),
+                (),
+            )
+            self.assertEqual(await store.list_session_tasks(parent_session_id), [])
+
+    async def test_read_only_parent_binding_cannot_be_forged_writable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            read_only = _capability(
+                root / "parent",
+                tools=("read_file", "grep"),
+                sandbox=SandboxProfile.READ_ONLY,
+            )
+            with self.assertRaisesRegex(ConfigurationError, "writable authority"):
+                await self._service(root, bound_capabilities=read_only)
+
+    @unittest.skipUnless(os.name == "nt", "Windows process-handle acceptance")
+    async def test_windows_real_dead_owner_is_reconciled_without_cleanup(self) -> None:
+        child = await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-c",
+            "import time; time.sleep(120)",
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        try:
+            self.assertTrue(owner_is_alive(child.pid))
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                (
+                    service,
+                    store,
+                    root_parent,
+                    worktrees,
+                    checkpoints,
+                    _factory,
+                    parent_capabilities,
+                    parent_session_id,
+                ) = await self._service(root)
+                worktree_id = WorktreeId("wt-windows-dead-owner")
+                handle = WorktreeHandle(
+                    worktree_id=worktree_id,
+                    repository=worktrees.repository,
+                    path=worktrees.planned_managed_path(worktrees.repository, worktree_id),
+                    base_commit_sha=BASE_SHA,
+                    branch="neuro/writable-subagent/wt-windows-dead-owner",
+                )
+                worktrees.snapshot = _fake_snapshot(handle)
+                checkpoint = await checkpoints.create(CheckpointCreateRequest(handle))
+                lease = _reconciliation_lease(
+                    root_parent.parent,
+                    parent_session_id,
+                    parent_capabilities,
+                    worktree_id_value=worktree_id.value,
+                    state=WritableSubagentWorkspaceState.ACTIVE,
+                    owner_pid=child.pid,
+                    worktree=handle,
+                    baseline_checkpoint_id=checkpoint.checkpoint_id,
+                )
+                await _insert_reconciliation_lease(store, lease)
+                child.terminate()
+                await asyncio.wait_for(child.wait(), timeout=20)
+                self.assertFalse(owner_is_alive(child.pid))
+                reconciled = await service.reconcile_writable_subagent_workspaces()
+                self.assertEqual(len(reconciled), 1)
+                self.assertIs(reconciled[0].state, WritableSubagentWorkspaceState.ORPHANED)
+                self.assertEqual(reconciled[0].error_kind, "dead_writable_subagent_owner")
+                self.assertTrue(handle.path.is_dir())
+                self.assertIsNotNone(await checkpoints.get(checkpoint.checkpoint_id))
+        finally:
+            if child.returncode is None:
+                child.kill()
+                await asyncio.wait_for(child.wait(), timeout=20)
 
     async def test_non_ready_baseline_fails_before_child_authority_and_preserves_worktree(
         self,
@@ -1305,13 +1784,12 @@ class WritableApplicationTests(unittest.IsolatedAsyncioTestCase):
                 worktrees,
                 _checkpoints,
                 _factory,
-                parent_capabilities,
+                _parent_capabilities,
                 parent_session_id,
             ) = await self._service(root, checkpoint_state=CheckpointState.CAPTURING)
             with self.assertRaisesRegex(ConfigurationError, "baseline checkpoint"):
                 await service.run_subagent(
                     RunWritableSubagentRequest(parent_session_id, "baseline must be ready"),
-                    parent_capabilities=parent_capabilities,
                 )
             self.assertIsNotNone(worktrees.snapshot)
             leases = await store.list_writable_subagent_leases(parent_session_id=parent_session_id)
@@ -1331,14 +1809,13 @@ class WritableApplicationTests(unittest.IsolatedAsyncioTestCase):
                 _worktrees,
                 _checkpoints,
                 factory,
-                parent_capabilities,
+                _parent_capabilities,
                 parent_session_id,
             ) = await self._service(root, block=True)
             service._timeout_seconds = 0.01
             with self.assertRaises(SubagentTimeoutError):
                 await service.run_subagent(
                     RunWritableSubagentRequest(parent_session_id, "timeout"),
-                    parent_capabilities=parent_capabilities,
                 )
             self.assertIsNotNone(factory.runtime)
             self.assertTrue(factory.runtime.closed)
@@ -1365,7 +1842,7 @@ class WritableApplicationTests(unittest.IsolatedAsyncioTestCase):
                     _worktrees,
                     _checkpoints,
                     _factory,
-                    parent_capabilities,
+                    _parent_capabilities,
                     parent_session_id,
                 ) = await self._service(
                     root, **{key: value for key, value in case.items() if key != "message"}
@@ -1373,7 +1850,6 @@ class WritableApplicationTests(unittest.IsolatedAsyncioTestCase):
                 with self.assertRaisesRegex(ConfigurationError, case["message"]):
                     await service.run_subagent(
                         RunWritableSubagentRequest(parent_session_id, f"identity {index}"),
-                        parent_capabilities=parent_capabilities,
                     )
                 leases = await store.list_writable_subagent_leases(
                     parent_session_id=parent_session_id
@@ -1390,7 +1866,7 @@ class WritableApplicationTests(unittest.IsolatedAsyncioTestCase):
                 _worktrees,
                 _checkpoints,
                 _factory,
-                parent_capabilities,
+                _parent_capabilities,
                 parent_session_id,
             ) = await self._service(
                 root,
@@ -1399,7 +1875,6 @@ class WritableApplicationTests(unittest.IsolatedAsyncioTestCase):
             )
             result = await service.run_subagent(
                 RunWritableSubagentRequest(parent_session_id, "bounded result"),
-                parent_capabilities=parent_capabilities,
             )
             self.assertIs(result.status, SessionTaskStatus.FAILED)
             self.assertTrue(result.truncated)
@@ -1417,13 +1892,12 @@ class WritableApplicationTests(unittest.IsolatedAsyncioTestCase):
                 _worktrees,
                 _checkpoints,
                 factory,
-                parent_capabilities,
+                _parent_capabilities,
                 parent_session_id,
             ) = await self._service(root, created_session_id="bad\x00child")
             with self.assertRaises(ValueError):
                 await service.run_subagent(
                     RunWritableSubagentRequest(parent_session_id, "invalid child id"),
-                    parent_capabilities=parent_capabilities,
                 )
             self.assertIsNone(factory.runtime)
             leases = await store.list_writable_subagent_leases(parent_session_id=parent_session_id)
@@ -1731,66 +2205,6 @@ class WritableApplicationTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(
                 by_id[missing_link_id.value].error_kind, "baseline_checkpoint_link_missing"
             )
-
-    async def test_real_git_worktree_keeps_dirty_parent_byte_for_byte_unchanged(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            repository, head = _make_real_repository(root)
-            (repository / "tracked.txt").write_bytes(b"dirty staged content\n")
-            _run_git(repository, "add", "tracked.txt")
-            (repository / "untracked.txt").write_bytes(b"dirty untracked content\n")
-            parent_status = _run_git(repository, "status", "--porcelain=v2", "-z")
-            parent_index = (repository / ".git" / "index").read_bytes()
-            parent_branch = _run_git(repository, "symbolic-ref", "--short", "HEAD")
-            parent_tracked = (repository / "tracked.txt").read_bytes()
-
-            session_store = SqliteSessionStore(root / "sessions.db")
-            await session_store.initialize()
-            parent_session_id = await session_store.create_session(
-                str(repository), "fixture", "model"
-            )
-            worktree_store = SqliteManagedWorktreeStore(root / "worktrees.db")
-            git = LocalGitWorktreeAdapter(hooks_directory=root / "hooks")
-            worktrees = WorktreeApplicationService(
-                git=git,
-                store=worktree_store,
-                managed_root=root / "managed-worktrees",
-            )
-            checkpoint_service = WorkspaceCheckpointApplicationService(
-                git=git,
-                workspace_git=git,
-                worktrees=worktree_store,
-                state=LocalWorkspaceStateAdapter(git=git, workspace_git=git),
-                checkpoints=SqliteWorkspaceCheckpointStore(root / "checkpoints.db"),
-                artifacts=LocalCheckpointArtifactStore(root),
-            )
-            factory = _RealRuntimeFactory(session_store)
-            service = WritableSubagentApplicationService(
-                session_store,
-                session_store,
-                worktrees,
-                checkpoint_service,
-                factory,
-                global_policy=_capability(root / "global", max_steps=12),
-            )
-            await service.initialize()
-            result = await service.run_subagent(
-                RunWritableSubagentRequest(parent_session_id, "write only in child"),
-                parent_capabilities=_capability(repository),
-            )
-
-            self.assertEqual(result.base_commit_sha, head)
-            self.assertTrue(result.workspace_changed)
-            snapshot = await worktrees.inspect(result.worktree_id.value)
-            self.assertTrue((snapshot.canonical_path / "child.txt").is_file())
-            checkpoint = await checkpoint_service.get(CheckpointId(result.baseline_checkpoint_id))
-            self.assertIsNotNone(checkpoint)
-            self.assertIs(checkpoint.state, CheckpointState.READY)
-            self.assertEqual(_run_git(repository, "status", "--porcelain=v2", "-z"), parent_status)
-            self.assertEqual((repository / ".git" / "index").read_bytes(), parent_index)
-            self.assertEqual(_run_git(repository, "symbolic-ref", "--short", "HEAD"), parent_branch)
-            self.assertEqual((repository / "tracked.txt").read_bytes(), parent_tracked)
-            self.assertTrue(factory.runtime is not None and factory.runtime.closed)
 
 
 if __name__ == "__main__":

@@ -83,6 +83,11 @@ newer is required because filter preflight uses
 `git check-attr --source=<tree-ish>`; older versions fail closed. Revision
 resolution also uses `rev-parse --end-of-options`.
 
+The compatibility boundary is explicit: a mocked Git version of 2.39.5 is
+`NOT_AVAILABLE`, while 2.40.0 is accepted. The contract is shared by worktree
+and workspace-checkpoint initialization; the filter-preflight algorithm is
+not duplicated for older Git releases.
+
 ### Creation
 
 Creation first resolves `base_revision^{commit}` to an immutable commit SHA and

@@ -3,14 +3,13 @@
 from __future__ import annotations
 
 import asyncio
-import ctypes
+import ctypes as _ctypes
 import os
 import uuid
 from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import replace
 from datetime import UTC, datetime
-from typing import cast
 
 from neuro_code.application.ports.checkpoints import (
     MAX_CHECKPOINT_CAPTURE_SECONDS,
@@ -27,6 +26,7 @@ from neuro_code.application.ports.worktree import (
     ManagedWorktreeStore,
     WorktreeError,
 )
+from neuro_code.application.runtime import process_liveness
 from neuro_code.domain.checkpoints import (
     CheckpointCreateRequest,
     CheckpointId,
@@ -49,13 +49,6 @@ from neuro_code.domain.worktree import (
 
 Clock = Callable[[], datetime]
 
-_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-_SYNCHRONIZE = 0x00100000
-_WAIT_OBJECT_0 = 0
-_WAIT_TIMEOUT = 0x102
-_ERROR_FILE_NOT_FOUND = 2
-_ERROR_INVALID_PARAMETER = 87
-
 
 def _now() -> datetime:
     return datetime.now(UTC)
@@ -72,56 +65,15 @@ def _same_repository(
     )
 
 
-def _owner_is_alive(pid: int | None) -> bool:
-    if pid is None or pid <= 0:
-        return False
-    if os.name == "nt":
-        return _windows_owner_is_alive(pid)
-    try:
-        os.kill(pid, 0)
-    except PermissionError:
-        return True
-    except (ProcessLookupError, OSError):
-        return False
-    return True
-
-
-def _windows_owner_is_alive(pid: int) -> bool:
-    """Observe a Windows PID through its signalled process object."""
-
-    loader = getattr(ctypes, "WinDLL", None)
-    get_last_error = getattr(ctypes, "get_last_error", None)
-    if loader is None or get_last_error is None:  # pragma: no cover - Windows-only runtime boundary
-        return True
-    read_last_error = cast(Callable[[], int], get_last_error)
-    try:
-        kernel32 = loader("kernel32.dll", use_last_error=True)
-        open_process = kernel32.OpenProcess
-        open_process.argtypes = [ctypes.c_uint32, ctypes.c_int32, ctypes.c_uint32]
-        open_process.restype = ctypes.c_void_p
-        wait_for_single_object = kernel32.WaitForSingleObject
-        wait_for_single_object.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
-        wait_for_single_object.restype = ctypes.c_uint32
-        close_handle = kernel32.CloseHandle
-        close_handle.argtypes = [ctypes.c_void_p]
-        close_handle.restype = ctypes.c_int32
-        handle = open_process(
-            _PROCESS_QUERY_LIMITED_INFORMATION | _SYNCHRONIZE,
-            False,
-            pid,
-        )
-    except (AttributeError, OSError):  # pragma: no cover - Windows-only fallback
-        return True
-    if not handle:
-        error = read_last_error()
-        return error not in {_ERROR_FILE_NOT_FOUND, _ERROR_INVALID_PARAMETER}
-    try:
-        result = cast(int, wait_for_single_object(handle, 0))
-        if result == _WAIT_TIMEOUT:
-            return True
-        return result != _WAIT_OBJECT_0
-    finally:
-        close_handle(handle)
+# Keep these module-level names as a compatibility seam for the existing
+# Windows checkpoint probe tests while the implementation is shared with
+# writable-subagent reconciliation.
+ctypes = _ctypes
+_ERROR_FILE_NOT_FOUND = process_liveness._ERROR_FILE_NOT_FOUND
+_ERROR_INVALID_PARAMETER = process_liveness._ERROR_INVALID_PARAMETER
+_WAIT_OBJECT_0 = process_liveness._WAIT_OBJECT_0
+_WAIT_TIMEOUT = process_liveness._WAIT_TIMEOUT
+_owner_is_alive = process_liveness.owner_is_alive
 
 
 class WorkspaceCheckpointApplicationService:
@@ -161,7 +113,7 @@ class WorkspaceCheckpointApplicationService:
         version = await self._git.git_version()
         if version < MINIMUM_GIT_VERSION:
             raise WorkspaceCheckpointError(
-                "installed Git is below the managed workspace checkpoint minimum",
+                "installed Git must be >= 2.40.0 for managed workspace checkpoint operations",
                 kind=CheckpointFailureKind.NOT_AVAILABLE,
             )
         self._initialized = True

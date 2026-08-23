@@ -1050,6 +1050,7 @@ def test_canonical_runtime_modules_are_the_only_runtime_implementations() -> Non
         "neuro_code.application.runtime.event_recorder",
         "neuro_code.application.runtime.finalization",
         "neuro_code.application.runtime.model_step",
+        "neuro_code.application.runtime.process_liveness",
         "neuro_code.application.runtime.supervision",
         "neuro_code.application.runtime.tool_scheduler",
         "neuro_code.application.runtime.tool_pipeline",

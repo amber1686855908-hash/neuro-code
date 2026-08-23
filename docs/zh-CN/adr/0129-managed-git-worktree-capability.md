@@ -71,6 +71,10 @@ pull、push、clone 或 prune。由于 revision resolution 使用 `rev-parse --e
 并且 filter preflight 使用 `git check-attr --source=<tree-ish>`，要求 Git 2.40.0 或更高版本；
 更低版本失败关闭。
 
+兼容性边界是明确的：mock Git version 2.39.5 的结果为 `NOT_AVAILABLE`，2.40.0 被接受。
+该 contract 由 worktree 和 workspace-checkpoint initialization 共享；不会为了旧 Git release
+复制一套 filter-preflight algorithm。
+
 ### 创建
 
 创建先把 `base_revision^{commit}` 解析为不可变 commit SHA，并针对精确目标 commit

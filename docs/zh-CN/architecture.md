@@ -1632,5 +1632,11 @@ Durable lease 使用 `ALLOCATING`、`WORKTREE_READY`、`BASELINE_READY`、`ACTIV
 Provider failure、取消或 final inspection 不确定时都会保留 worktree 与 baseline；没有自动移除、
 rollback、merge、commit、copy-back 或 cleanup。Crash 后的 reconciliation 验证 worktree 与 checkpoint
 证据，不删除不确定数据。Bounded result projection 只暴露生命周期/工作区 identity、脱敏 response、
-有界 outcome 与 fingerprint，不暴露 diff、transcript、raw arguments 或 file contents。完整契约见
+有界 outcome 与 fingerprint，不暴露 diff、transcript、raw arguments 或 file contents。组合根从真实
+活动的 `ConversationBinding` 捕获 parent authority，包括 runner session ID 与 capability fingerprint；
+不信任调用方报告的 parent manifest，request parent ID 与 binding 不一致时在分配前拒绝。Session
+store schema 16 会重建并保留 schema 15 lease row，两个 lease session foreign key 都使用
+`RESTRICT`；只要递归 session deletion closure 中任一 session 被 writable lease 引用，session
+删除就会拒绝。共享 owner liveness 在 POSIX 使用真实 probe，在 Windows 使用 process-handle wait，
+未能证明的 access/API failure 保守地视为 alive。完整契约见
 [ADR 0131](adr/0131-managed-writable-subagent-workspace.md)。

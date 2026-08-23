@@ -47,6 +47,22 @@ workspace-root authority。
 Child 每一次写入仍然执行 Permission → canonical filesystem target → execution → sandbox
 的正常 pipeline。Tool 不会把裸 grant path 当成这些检查的替代物。
 
+### Parent authority 与 session lifetime
+
+组合根只接受真实活动的 `ConversationBinding`。Writable service 从该 binding 捕获
+runner session ID 和不可变的 `SubagentCapabilitySet`；request 中的 session ID 只能作为
+identity check 重复出现，不一致时会在 lease、task、worktree 或 checkpoint 分配之前拒绝。
+调用方报告的 capability manifest 不再是 authority 输入。Service 在 capability 存活期间
+同时持有该 binding，因此 lease 中使用的 parent session 和 capability fingerprint 来自打开
+该 conversation 的同一个 binding。
+
+Writable lease 是持久 workspace evidence，不是可以随 session 一起丢弃的 metadata。Session
+store schema 16 从 schema 15 重建 lease table 并保留已有 row，同时把 parent 和 child session
+foreign key 都改为 `RESTRICT`。删除 session 前，`delete_session()` 先计算完整的递归 parent/child
+删除闭包；只要任一 lease 引用闭包中的任一 session，就拒绝删除。这样 session、lease、managed
+worktree 和 baseline checkpoint 会一直保留，直到未来显式的 workspace-resolution capability
+处理它们。
+
 ### Lifecycle 与保留
 
 Durable lease 使用 `ALLOCATING`、`WORKTREE_READY`、`BASELINE_READY`、`ACTIVE`、`PRESERVED`、
@@ -57,6 +73,12 @@ Child 成功或失败后不会自动移除 worktree、恢复 baseline、merge、
 Reconciliation 检查 managed worktree 和 baseline checkpoint，验证 identity/state，并在 owner
 死亡或证据缺失时分类；不删除不确定数据。它与 `session_turn_attempts` 分离，不从 execution
 attempt 推断 workspace recovery。
+
+Owner liveness 由 checkpoint 与 writable reconciliation 共享。POSIX 使用无副作用的
+`kill(pid, 0)` probe；Windows 以 limited query/synchronization 权限打开进程，观察 zero-time
+wait 状态后关闭 handle；只有 signalled process 或已证明不存在的 PID 才分类为 dead。Access
+denied 与未预期 API 结果都保守地保持 alive。该 probe 不会 kill process、reclaim owner 或删除
+任何数据。
 
 ### Result projection
 
@@ -71,8 +93,8 @@ Writable parallel workers、递归 writable subagent、自动委派、CLI/TUI/AC
 checkpoint/rollback policy、child 完成后的自动 rollback、merge/commit/patch integration、
 copy-back、branch 删除，以及 checkpoint/worktree cleanup，仍是未来独立能力。
 
-该能力继承现有 Worktree filter preflight contract，要求 Git 2.40.0 或更高版本；更低版本在
-初始化时失败关闭。
+该能力继承现有 Worktree filter preflight contract，要求 Git 2.40.0 或更高版本；边界测试明确
+Git 2.39.5 为 unavailable、Git 2.40.0 为 accepted；更低版本在初始化时失败关闭。
 
 ## 验证边界
 

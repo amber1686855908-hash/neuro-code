@@ -293,7 +293,7 @@ class SessionStoreTests(unittest.IsolatedAsyncioTestCase):
                 connection.execute(
                     "SELECT version FROM schema_meta WHERE singleton = 1"
                 ).fetchone(),
-                (15,),
+                (16,),
             )
             self.assertIn(
                 "session_compaction_items",
@@ -335,7 +335,7 @@ class SessionStoreTests(unittest.IsolatedAsyncioTestCase):
                 connection.execute(
                     "SELECT version FROM schema_meta WHERE singleton = 1"
                 ).fetchone(),
-                (15,),
+                (16,),
             )
             self.assertEqual(
                 connection.execute(
@@ -1101,7 +1101,7 @@ class SessionStoreTests(unittest.IsolatedAsyncioTestCase):
                 connection.execute(
                     "SELECT version FROM schema_meta WHERE singleton = 1"
                 ).fetchone(),
-                (15,),
+                (16,),
             )
             columns = {row[1] for row in connection.execute("PRAGMA table_info(session_tasks)")}
             tables = {
@@ -1832,7 +1832,7 @@ class SessionStoreTests(unittest.IsolatedAsyncioTestCase):
                 row[1] for row in migrated.execute("PRAGMA table_info(session_tasks)").fetchall()
             }
             migrated.close()
-            self.assertEqual(version, (15,))
+            self.assertEqual(version, (16,))
             self.assertIn("context_affinity", columns)
             self.assertIn("sandbox_profile", columns)
             self.assertIn("plan_json", columns)
@@ -1898,7 +1898,7 @@ class SessionStoreTests(unittest.IsolatedAsyncioTestCase):
             migrated = sqlite3.connect(database)
             self.assertEqual(
                 migrated.execute("SELECT version FROM schema_meta WHERE singleton = 1").fetchone(),
-                (15,),
+                (16,),
             )
             migrated.close()
 
@@ -1978,7 +1978,7 @@ class SessionStoreTests(unittest.IsolatedAsyncioTestCase):
             migrated = sqlite3.connect(database)
             self.assertEqual(
                 migrated.execute("SELECT version FROM schema_meta WHERE singleton = 1").fetchone(),
-                (15,),
+                (16,),
             )
             tables = {
                 row[0]
@@ -2021,7 +2021,7 @@ class SessionStoreTests(unittest.IsolatedAsyncioTestCase):
                 connection.execute(
                     "SELECT version FROM schema_meta WHERE singleton = 1"
                 ).fetchone(),
-                (15,),
+                (16,),
             )
             connection.close()
 
@@ -2090,7 +2090,7 @@ class SessionStoreTests(unittest.IsolatedAsyncioTestCase):
             recovered = sqlite3.connect(database)
             self.assertEqual(
                 recovered.execute("SELECT version FROM schema_meta WHERE singleton = 1").fetchone(),
-                (15,),
+                (16,),
             )
             recovered.close()
 
@@ -2114,7 +2114,7 @@ class SessionStoreTests(unittest.IsolatedAsyncioTestCase):
                 connection.execute(
                     "SELECT version FROM schema_meta WHERE singleton = 1"
                 ).fetchone(),
-                (15,),
+                (16,),
             )
             self.assertEqual(
                 connection.execute("SELECT COUNT(*) FROM session_search_documents").fetchone(),

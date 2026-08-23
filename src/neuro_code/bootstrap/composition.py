@@ -1081,16 +1081,27 @@ class ApplicationComposition:
     def create_writable_subagent_service(
         self,
         *,
+        parent_binding: ConversationBinding,
         timeout_seconds: float = 120.0,
     ) -> WritableSubagentApplicationService:
         """Create the explicit internal serialized writable-subagent slice.
 
         The returned service is not connected to CLI, TUI, ACP, or the normal
-        ``/subagent`` command.  Callers must explicitly initialize and invoke
-        it with a real parent binding capability manifest.
+        ``/subagent`` command.  Its parent authority is captured from the
+        actual active ``ConversationBinding`` at this composition boundary.
         """
 
         from neuro_code.bootstrap.subagent import CompositionWritableSubagentRuntimeFactory
+
+        if not isinstance(parent_binding, ConversationBinding):
+            raise ConfigurationError("writable subagent parent binding is required")
+        if not isinstance(parent_binding.capabilities, SubagentCapabilitySet):
+            raise ConfigurationError(
+                "writable subagent parent binding capability metadata is missing"
+            )
+        parent_session_id = parent_binding.runner.session_id
+        if not isinstance(parent_session_id, str) or not parent_session_id.strip():
+            raise ConfigurationError("writable subagent parent binding session identity is missing")
 
         worktrees = self.create_worktree_service()
         checkpoints = self.create_workspace_checkpoint_service()
@@ -1101,6 +1112,7 @@ class ApplicationComposition:
             worktrees,
             checkpoints,
             factory,
+            parent_binding=parent_binding,
             global_policy=self.subagent_global_policy(),
             timeout_seconds=timeout_seconds,
         )

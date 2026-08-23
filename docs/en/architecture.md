@@ -1676,6 +1676,15 @@ or cleanup. Reconciliation verifies worktree and checkpoint evidence after a
 crash without deleting uncertain data. The bounded result projection exposes
 only lifecycle/workspace identities, redacted response, bounded outcome and
 fingerprints, not a diff, transcript, raw arguments, or file contents. The
+composition root captures parent authority from the actual active
+`ConversationBinding`, including its runner session ID and capability
+fingerprint; a caller-reported parent manifest is not trusted, and a request
+whose parent ID differs from the binding is rejected before allocation.
+Session-store schema 16 rebuilds and preserves schema-15 lease rows, uses
+`RESTRICT` for both lease session foreign keys, and refuses recursive session
+deletion whenever any session in the deletion closure is referenced by a
+writable lease. Shared owner liveness uses a real POSIX probe or a Windows
+process-handle wait and treats unproven access/API failures as alive. The
 complete contract is in [ADR 0131](adr/0131-managed-writable-subagent-workspace.md).
 
 ## Platform policy

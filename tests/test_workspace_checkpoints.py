@@ -1905,6 +1905,7 @@ class WorkspaceCheckpointServiceBoundaryTests(unittest.TestCase):
                     with self.assertRaises(WorkspaceCheckpointError) as raised:
                         _run(service.initialize())
                     self.assertEqual(raised.exception.kind, expected_kind)
+                    self.assertIn("2.40.0", str(raised.exception))
 
     def test_service_rejects_invalid_requests_and_marks_capture_failure(self) -> None:
         fixture = _CheckpointFixture()
