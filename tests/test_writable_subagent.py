@@ -1263,6 +1263,7 @@ class WritableApplicationTests(unittest.IsolatedAsyncioTestCase):
                             parent_binding=binding,
                         )
 
+    @unittest.skipUnless(os.name != "nt", "POSIX owner probe")
     def test_posix_owner_probe_is_conservative_on_permission_error(self) -> None:
         with patch(
             "neuro_code.application.runtime.process_liveness.os.kill",
