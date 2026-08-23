@@ -179,9 +179,11 @@ Automatic checkpoint policies, model-facing checkpoint tools, TUI/ACP exposure,
 checkpoint deletion/retention, arbitrary filesystem snapshots, ignored-file
 rollback, Git history rewind, branch ref reset, patch/commit/merge/
 cherry-pick/rebase integration, conflict resolution, checkpoint merge or
-diff UI, writable subagents, automatic LSP worker binding, Relay/DAG/Leader/
-Swarm/Ultracode orchestration, and source-checkout rollback remain outside
-this slice.
+diff UI, writable parallel or recursive subagents, automatic LSP worker
+binding, Relay/DAG/Leader/Swarm/Ultracode orchestration, and source-checkout
+rollback remain outside this slice. The explicit single-child writable
+workspace slice is defined separately by
+[ADR 0131](0131-managed-writable-subagent-workspace.md).
 
 ## Compatibility and validation
 

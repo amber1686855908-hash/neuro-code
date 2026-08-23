@@ -1640,6 +1640,44 @@ duplicate embedded copies; reasoning items remain ordered and are never
 collapsed. Malformed and unknown embedded entries are counted separately
 without rejecting an otherwise valid assistant row.
 
+## Explicit serialized writable-subagent workspace
+
+The existing `/subagent` capability remains read-only. The first writable
+subagent is a separate, explicit internal vertical slice constructed by
+`ApplicationComposition.create_writable_subagent_service()`. It is not wired
+to `/subagent`, CLI, TUI, ACP, automatic scheduling, writable parallel workers,
+or an LSP worker, and it does not start checkpoint/rollback orchestration.
+
+`WritableSubagentApplicationService` serializes one child at a time. It first
+records an `ALLOCATING` lease, reads the parent's exact committed HEAD, creates
+a Neuro-owned managed branch worktree outside the parent's workspace roots, and
+captures a `READY` baseline checkpoint. Only then does it derive the typed
+`ManagedChildWorkspaceGrant`, whose fingerprint binds the parent capability,
+repository identity, exact base SHA, immutable `WorktreeHandle`, managed
+worktree ID/path, creation time, and baseline checkpoint. The child receives a
+fresh session and binding with exactly that worktree as cwd and sole root.
+
+The derived child has only the bounded read set (`read_file`, `read_files`,
+`list_dir`, `list_tree`, `glob`, `grep`, `grep_many`, `skill`) plus
+`search_replace` and `apply_patch`. It has no Bash, terminal, background,
+MCP, network, Git/worktree/checkpoint/rollback, subagent, or LSP authority.
+Parent and global policy must both prove write tools, write authority, and a
+writable sandbox. Generic `SubagentCapabilitySet.is_subset_of()` is unchanged;
+the typed grant is the narrow boundary that binds the child to a new managed
+workspace. The normal Permission, canonical filesystem-target, execution, and
+sandbox pipeline remains active for every child write.
+
+The durable lease uses `ALLOCATING`, `WORKTREE_READY`, `BASELINE_READY`,
+`ACTIVE`, `PRESERVED`, `ORPHANED`, and `FAILED`, with immutable identity,
+insert-only ownership, and generation CAS. Success, provider failure,
+cancellation, or uncertain final inspection preserve the worktree and
+baseline; there is no automatic removal, rollback, merge, commit, copy-back,
+or cleanup. Reconciliation verifies worktree and checkpoint evidence after a
+crash without deleting uncertain data. The bounded result projection exposes
+only lifecycle/workspace identities, redacted response, bounded outcome and
+fingerprints, not a diff, transcript, raw arguments, or file contents. The
+complete contract is in [ADR 0131](adr/0131-managed-writable-subagent-workspace.md).
+
 ## Platform policy
 
 Linux, macOS, and Windows are first-class CI targets. Platform-specific code is

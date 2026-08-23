@@ -17,11 +17,14 @@ import time
 import uuid
 from collections.abc import Sequence
 from contextlib import closing
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from neuro_code.application.ports.writable_subagent import WritableSubagentLeaseError
 from neuro_code.domain.background_tasks.models import BackgroundWakeState
+from neuro_code.domain.checkpoints import CheckpointId
 from neuro_code.domain.conversation.compaction import DurableCompactionItem
 from neuro_code.domain.conversation.events import AgentEvent, AgentEventKind
 from neuro_code.domain.conversation.messages import (
@@ -68,10 +71,15 @@ from neuro_code.domain.sessions.search import (
     fallback_session_title,
     searchable_session_text,
 )
+from neuro_code.domain.worktree import WorktreeHandle, WorktreeId, WorktreeRepositoryIdentity
+from neuro_code.domain.writable_subagent import (
+    WritableSubagentWorkspaceLease,
+    WritableSubagentWorkspaceState,
+)
 from neuro_code.shared.async_utils import run_blocking
 from neuro_code.shared.errors import SessionError
 
-SCHEMA_VERSION = 14
+SCHEMA_VERSION = 15
 _SEARCH_SNIPPET_LIMIT = 500
 _SQLITE_TIMEOUT_SECONDS = 30.0
 _SESSION_ALIAS_NAMESPACE_LIMIT = 64
@@ -211,6 +219,12 @@ class SqliteSessionStore:
                             "UPDATE schema_meta SET version = 14 WHERE singleton = 1"
                         )
                         version = (14,)
+                    if version is not None and version[0] == 14:
+                        _ensure_writable_subagent_lease_schema(connection)
+                        connection.execute(
+                            "UPDATE schema_meta SET version = 15 WHERE singleton = 1"
+                        )
+                        version = (15,)
                     if version is None or version[0] != SCHEMA_VERSION:
                         raise SessionError(
                             "unsupported session schema version: "
@@ -226,6 +240,7 @@ class SqliteSessionStore:
                     _ensure_subagent_link_schema(connection)
                     _ensure_session_compaction_schema(connection)
                     _ensure_session_turn_attempt_schema(connection)
+                    _ensure_writable_subagent_lease_schema(connection)
                     _backfill_search_documents(connection, missing_only=True)
                     connection.commit()
                 except BaseException:
@@ -1912,6 +1927,185 @@ class SqliteSessionStore:
 
         return await run_blocking(load)
 
+    async def insert_writable_subagent_lease(
+        self,
+        lease: WritableSubagentWorkspaceLease,
+    ) -> WritableSubagentWorkspaceLease:
+        if not isinstance(lease, WritableSubagentWorkspaceLease):
+            raise TypeError("writable subagent lease must be canonical")
+        if lease.state is not WritableSubagentWorkspaceState.ALLOCATING or lease.version != 0:
+            raise ValueError("new writable subagent lease must start allocating at version zero")
+
+        def insert() -> WritableSubagentWorkspaceLease:
+            try:
+                with closing(self._connect()) as connection, connection:
+                    connection.execute(
+                        """
+                        INSERT INTO writable_subagent_leases(
+                            lease_id, parent_session_id, parent_task_id, worktree_id,
+                            parent_capability_fingerprint, parent_workspace_root,
+                            parent_common_dir, parent_source_worktree, parent_git_dir,
+                            parent_repository_head_sha, base_commit_sha, canonical_child_root,
+                            state, created_at, updated_at, worktree_common_dir,
+                            worktree_source_worktree, worktree_git_dir, worktree_repository_head_sha,
+                            worktree_path, worktree_branch, baseline_checkpoint_id,
+                            child_session_id, capability_fingerprint, grant_fingerprint,
+                            owner_pid, owner_token, final_workspace_fingerprint,
+                            workspace_changed, changed_file_count, error_kind, version
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        _writable_lease_values(lease),
+                    )
+                return lease
+            except sqlite3.IntegrityError as error:
+                raise WritableSubagentLeaseError(
+                    "another writable subagent already owns the parent or worktree",
+                    kind="concurrent_modification",
+                ) from error
+            except sqlite3.Error as error:
+                raise WritableSubagentLeaseError(
+                    "writable subagent lease could not be persisted",
+                ) from error
+
+        async with self._write_lock:
+            return await run_blocking(insert)
+
+    async def get_writable_subagent_lease(
+        self,
+        lease_id: str,
+    ) -> WritableSubagentWorkspaceLease | None:
+        _validated_session_task_id(lease_id)
+
+        def load() -> WritableSubagentWorkspaceLease | None:
+            with closing(self._connect()) as connection:
+                row = connection.execute(
+                    _WRITABLE_LEASE_SELECT + " WHERE lease_id = ?",
+                    (lease_id,),
+                ).fetchone()
+            return _writable_lease_from_row(row) if row is not None else None
+
+        return await run_blocking(load)
+
+    async def list_writable_subagent_leases(
+        self,
+        *,
+        parent_session_id: str | None = None,
+        include_terminal: bool = True,
+    ) -> tuple[WritableSubagentWorkspaceLease, ...]:
+        if parent_session_id is not None:
+            _validated_session_task_id(parent_session_id)
+        if not isinstance(include_terminal, bool):
+            raise TypeError("include_terminal must be boolean")
+
+        def load() -> tuple[WritableSubagentWorkspaceLease, ...]:
+            clauses: list[str] = []
+            params: list[object] = []
+            if parent_session_id is not None:
+                clauses.append("parent_session_id = ?")
+                params.append(parent_session_id)
+            if not include_terminal:
+                clauses.append("state IN (?, ?, ?, ?)")
+                params.extend(
+                    state.value
+                    for state in (
+                        WritableSubagentWorkspaceState.ALLOCATING,
+                        WritableSubagentWorkspaceState.WORKTREE_READY,
+                        WritableSubagentWorkspaceState.BASELINE_READY,
+                        WritableSubagentWorkspaceState.ACTIVE,
+                    )
+                )
+            where = " WHERE " + " AND ".join(clauses) if clauses else ""
+            with closing(self._connect()) as connection:
+                rows = connection.execute(
+                    _WRITABLE_LEASE_SELECT + where + " ORDER BY created_at ASC, lease_id ASC",
+                    params,
+                ).fetchall()
+            return tuple(_writable_lease_from_row(row) for row in rows)
+
+        return await run_blocking(load)
+
+    async def compare_and_transition_writable_subagent_lease(
+        self,
+        lease: WritableSubagentWorkspaceLease,
+        *,
+        expected_version: int,
+        expected_state: WritableSubagentWorkspaceState,
+    ) -> WritableSubagentWorkspaceLease:
+        if not isinstance(lease, WritableSubagentWorkspaceLease):
+            raise TypeError("writable subagent lease must be canonical")
+        if not isinstance(expected_version, int) or isinstance(expected_version, bool):
+            raise TypeError("writable lease expected version must be an integer")
+        if expected_version < 0 or lease.version != expected_version:
+            raise WritableSubagentLeaseError(
+                "writable subagent lease version does not match the CAS claim",
+                kind="concurrent_modification",
+            )
+        if not isinstance(expected_state, WritableSubagentWorkspaceState):
+            raise TypeError("writable lease expected state must be canonical")
+
+        def transition() -> WritableSubagentWorkspaceLease:
+            try:
+                with closing(self._connect()) as connection, connection:
+                    current_row = connection.execute(
+                        _WRITABLE_LEASE_SELECT + " WHERE lease_id = ?",
+                        (lease.lease_id,),
+                    ).fetchone()
+                    if current_row is None:
+                        raise WritableSubagentLeaseError(
+                            "writable subagent lease is missing",
+                            kind="unmanaged",
+                        )
+                    current = _writable_lease_from_row(current_row)
+                    if not _same_writable_lease_identity(current, lease):
+                        raise WritableSubagentLeaseError(
+                            "writable subagent lease identity is immutable",
+                            kind="protocol",
+                        )
+                    values = _writable_lease_values(replace(lease, version=expected_version + 1))
+                    cursor = connection.execute(
+                        """
+                        UPDATE writable_subagent_leases SET
+                            parent_session_id = ?, parent_task_id = ?, worktree_id = ?,
+                            parent_capability_fingerprint = ?, parent_workspace_root = ?,
+                            parent_common_dir = ?, parent_source_worktree = ?, parent_git_dir = ?,
+                            parent_repository_head_sha = ?, base_commit_sha = ?,
+                            canonical_child_root = ?, state = ?, created_at = ?, updated_at = ?,
+                            worktree_common_dir = ?, worktree_source_worktree = ?,
+                            worktree_git_dir = ?, worktree_repository_head_sha = ?,
+                            worktree_path = ?, worktree_branch = ?, baseline_checkpoint_id = ?,
+                            child_session_id = ?, capability_fingerprint = ?, grant_fingerprint = ?,
+                            owner_pid = ?, owner_token = ?, final_workspace_fingerprint = ?,
+                            workspace_changed = ?, changed_file_count = ?, error_kind = ?, version = ?
+                        WHERE lease_id = ? AND version = ? AND state = ?
+                        """,
+                        (
+                            *values[1:],
+                            values[0],
+                            expected_version,
+                            expected_state.value,
+                        ),
+                    )
+                    if cursor.rowcount != 1:
+                        raise WritableSubagentLeaseError(
+                            "writable subagent lease was changed by another process",
+                            kind="concurrent_modification",
+                        )
+                return replace(lease, version=expected_version + 1)
+            except WritableSubagentLeaseError:
+                raise
+            except sqlite3.IntegrityError as error:
+                raise WritableSubagentLeaseError(
+                    "writable subagent lease transition conflicts with another owner",
+                    kind="concurrent_modification",
+                ) from error
+            except sqlite3.Error as error:
+                raise WritableSubagentLeaseError(
+                    "writable subagent lease transition could not be persisted",
+                ) from error
+
+        async with self._write_lock:
+            return await run_blocking(transition)
+
     async def load_session_items(self, session_id: str) -> list[SessionItem]:
         def load() -> list[SessionItem]:
             with closing(self._connect()) as connection:
@@ -2535,6 +2729,71 @@ def _ensure_subagent_link_schema(connection: sqlite3.Connection) -> None:
         """
         CREATE INDEX IF NOT EXISTS subagent_links_by_child
         ON subagent_links(child_session_id)
+        """
+    )
+
+
+def _ensure_writable_subagent_lease_schema(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS writable_subagent_leases (
+            lease_id TEXT PRIMARY KEY,
+            parent_session_id TEXT NOT NULL,
+            parent_task_id TEXT NOT NULL,
+            worktree_id TEXT NOT NULL,
+            parent_capability_fingerprint TEXT NOT NULL,
+            parent_workspace_root TEXT NOT NULL,
+            parent_common_dir TEXT NOT NULL,
+            parent_source_worktree TEXT NOT NULL,
+            parent_git_dir TEXT NOT NULL,
+            parent_repository_head_sha TEXT NOT NULL,
+            base_commit_sha TEXT NOT NULL,
+            canonical_child_root TEXT NOT NULL,
+            state TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            worktree_common_dir TEXT,
+            worktree_source_worktree TEXT,
+            worktree_git_dir TEXT,
+            worktree_repository_head_sha TEXT,
+            worktree_path TEXT,
+            worktree_branch TEXT,
+            baseline_checkpoint_id TEXT,
+            child_session_id TEXT,
+            capability_fingerprint TEXT,
+            grant_fingerprint TEXT,
+            owner_pid INTEGER,
+            owner_token TEXT NOT NULL,
+            final_workspace_fingerprint TEXT,
+            workspace_changed INTEGER,
+            changed_file_count INTEGER,
+            error_kind TEXT,
+            version INTEGER NOT NULL DEFAULT 0,
+            UNIQUE(parent_session_id, parent_task_id),
+            UNIQUE(worktree_id),
+            FOREIGN KEY (parent_session_id) REFERENCES sessions(id) ON DELETE CASCADE,
+            FOREIGN KEY (child_session_id) REFERENCES sessions(id) ON DELETE SET NULL
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS writable_subagent_active_parent
+        ON writable_subagent_leases(parent_session_id)
+        WHERE state IN ('allocating', 'worktree_ready', 'baseline_ready', 'active')
+        """
+    )
+    connection.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS writable_subagent_active_worktree
+        ON writable_subagent_leases(worktree_id)
+        WHERE state IN ('allocating', 'worktree_ready', 'baseline_ready', 'active')
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS writable_subagent_leases_by_state
+        ON writable_subagent_leases(state, updated_at, lease_id)
         """
     )
 
@@ -3473,6 +3732,218 @@ def _background_wake_state_from_row(
         raise SessionError(
             f"session {session_id} contains an invalid background wake state"
         ) from error
+
+
+_WRITABLE_LEASE_SELECT = """
+    SELECT lease_id, parent_session_id, parent_task_id, worktree_id,
+           parent_capability_fingerprint, parent_workspace_root,
+           parent_common_dir, parent_source_worktree, parent_git_dir,
+           parent_repository_head_sha, base_commit_sha, canonical_child_root,
+           state, created_at, updated_at, worktree_common_dir,
+           worktree_source_worktree, worktree_git_dir, worktree_repository_head_sha,
+           worktree_path, worktree_branch, baseline_checkpoint_id,
+           child_session_id, capability_fingerprint, grant_fingerprint,
+           owner_pid, owner_token, final_workspace_fingerprint,
+           workspace_changed, changed_file_count, error_kind, version
+    FROM writable_subagent_leases
+"""
+
+
+def _writable_lease_values(lease: WritableSubagentWorkspaceLease) -> tuple[object, ...]:
+    worktree = lease.worktree
+    repository = worktree.repository if worktree is not None else None
+    return (
+        lease.lease_id,
+        lease.parent_session_id,
+        lease.parent_task_id,
+        lease.worktree_id.value,
+        lease.parent_capability_fingerprint,
+        str(lease.parent_workspace_root),
+        str(lease.parent_repository.common_dir),
+        str(lease.parent_repository.source_worktree),
+        str(lease.parent_repository.git_dir),
+        lease.parent_repository.head_sha,
+        lease.base_commit_sha,
+        str(lease.canonical_child_root),
+        lease.state.value,
+        lease.created_at.isoformat(),
+        lease.updated_at.isoformat(),
+        str(repository.common_dir) if repository is not None else None,
+        str(repository.source_worktree) if repository is not None else None,
+        str(repository.git_dir) if repository is not None else None,
+        repository.head_sha if repository is not None else None,
+        str(worktree.path) if worktree is not None else None,
+        worktree.branch if worktree is not None else None,
+        lease.baseline_checkpoint_id.value if lease.baseline_checkpoint_id is not None else None,
+        lease.child_session_id,
+        lease.capability_fingerprint,
+        lease.grant_fingerprint,
+        lease.owner_pid,
+        lease.owner_token,
+        lease.final_workspace_fingerprint,
+        int(lease.workspace_changed) if lease.workspace_changed is not None else None,
+        lease.changed_file_count,
+        lease.error_kind,
+        lease.version,
+    )
+
+
+def _writable_lease_from_row(
+    row: Sequence[object] | None,
+) -> WritableSubagentWorkspaceLease:
+    if row is None or len(row) != 32:
+        raise SessionError("writable subagent lease record is malformed")
+    try:
+        (
+            lease_id,
+            parent_session_id,
+            parent_task_id,
+            raw_worktree_id,
+            parent_capability_fingerprint,
+            parent_workspace_root,
+            parent_common_dir,
+            parent_source_worktree,
+            parent_git_dir,
+            parent_repository_head_sha,
+            base_commit_sha,
+            canonical_child_root,
+            raw_state,
+            raw_created_at,
+            raw_updated_at,
+            worktree_common_dir,
+            worktree_source_worktree,
+            worktree_git_dir,
+            worktree_repository_head_sha,
+            worktree_path,
+            worktree_branch,
+            raw_checkpoint_id,
+            child_session_id,
+            capability_fingerprint,
+            grant_fingerprint,
+            raw_owner_pid,
+            owner_token,
+            final_workspace_fingerprint,
+            raw_workspace_changed,
+            raw_changed_file_count,
+            error_kind,
+            raw_version,
+        ) = row
+        parent_repository = WorktreeRepositoryIdentity(
+            common_dir=Path(str(parent_common_dir)),
+            source_worktree=Path(str(parent_source_worktree)),
+            git_dir=Path(str(parent_git_dir)),
+            head_sha=str(parent_repository_head_sha),
+        )
+        worktree: WorktreeHandle | None = None
+        worktree_fields = (
+            worktree_common_dir,
+            worktree_source_worktree,
+            worktree_git_dir,
+            worktree_repository_head_sha,
+            worktree_path,
+        )
+        if any(value is not None for value in worktree_fields):
+            if any(value is None for value in worktree_fields):
+                raise ValueError("writable lease worktree handle is incomplete")
+            worktree_repository = WorktreeRepositoryIdentity(
+                common_dir=Path(str(worktree_common_dir)),
+                source_worktree=Path(str(worktree_source_worktree)),
+                git_dir=Path(str(worktree_git_dir)),
+                head_sha=str(worktree_repository_head_sha),
+            )
+            worktree = WorktreeHandle(
+                worktree_id=WorktreeId(str(raw_worktree_id)),
+                repository=worktree_repository,
+                path=Path(str(worktree_path)),
+                base_commit_sha=str(base_commit_sha),
+                branch=None if worktree_branch is None else str(worktree_branch),
+            )
+        if raw_workspace_changed is not None and raw_workspace_changed not in (0, 1):
+            raise ValueError("writable lease changed flag is invalid")
+        owner_pid: int | None
+        if raw_owner_pid is None:
+            owner_pid = None
+        elif isinstance(raw_owner_pid, int) and not isinstance(raw_owner_pid, bool):
+            owner_pid = raw_owner_pid
+        else:
+            raise ValueError("writable lease owner pid is invalid")
+        changed_file_count: int | None
+        if raw_changed_file_count is None:
+            changed_file_count = None
+        elif isinstance(raw_changed_file_count, int) and not isinstance(
+            raw_changed_file_count, bool
+        ):
+            changed_file_count = raw_changed_file_count
+        else:
+            raise ValueError("writable lease changed file count is invalid")
+        if not isinstance(raw_version, int) or isinstance(raw_version, bool):
+            raise ValueError("writable lease version is invalid")
+        return WritableSubagentWorkspaceLease(
+            lease_id=str(lease_id),
+            parent_session_id=str(parent_session_id),
+            parent_task_id=str(parent_task_id),
+            worktree_id=WorktreeId(str(raw_worktree_id)),
+            parent_capability_fingerprint=str(parent_capability_fingerprint),
+            parent_workspace_root=Path(str(parent_workspace_root)),
+            parent_repository=parent_repository,
+            base_commit_sha=str(base_commit_sha),
+            canonical_child_root=Path(str(canonical_child_root)),
+            state=WritableSubagentWorkspaceState(str(raw_state)),
+            created_at=datetime.fromisoformat(str(raw_created_at)),
+            updated_at=datetime.fromisoformat(str(raw_updated_at)),
+            worktree=worktree,
+            baseline_checkpoint_id=(
+                CheckpointId(str(raw_checkpoint_id)) if raw_checkpoint_id is not None else None
+            ),
+            child_session_id=str(child_session_id) if child_session_id is not None else None,
+            capability_fingerprint=(
+                str(capability_fingerprint) if capability_fingerprint is not None else None
+            ),
+            grant_fingerprint=str(grant_fingerprint) if grant_fingerprint is not None else None,
+            owner_pid=owner_pid,
+            owner_token=str(owner_token),
+            final_workspace_fingerprint=(
+                str(final_workspace_fingerprint)
+                if final_workspace_fingerprint is not None
+                else None
+            ),
+            workspace_changed=(
+                bool(raw_workspace_changed) if raw_workspace_changed is not None else None
+            ),
+            changed_file_count=changed_file_count,
+            error_kind=str(error_kind) if error_kind is not None else None,
+            version=raw_version,
+        )
+    except (TypeError, ValueError, OverflowError) as error:
+        raise SessionError("writable subagent lease contains invalid data") from error
+
+
+def _same_writable_lease_identity(
+    current: WritableSubagentWorkspaceLease,
+    proposed: WritableSubagentWorkspaceLease,
+) -> bool:
+    if (
+        current.lease_id != proposed.lease_id
+        or current.parent_session_id != proposed.parent_session_id
+        or current.parent_task_id != proposed.parent_task_id
+        or current.worktree_id != proposed.worktree_id
+        or current.parent_capability_fingerprint != proposed.parent_capability_fingerprint
+        or current.parent_workspace_root != proposed.parent_workspace_root
+        or current.parent_repository != proposed.parent_repository
+        or current.base_commit_sha != proposed.base_commit_sha
+        or current.canonical_child_root != proposed.canonical_child_root
+    ):
+        return False
+    for current_value, proposed_value in (
+        (current.worktree, proposed.worktree),
+        (current.baseline_checkpoint_id, proposed.baseline_checkpoint_id),
+        (current.child_session_id, proposed.child_session_id),
+        (current.capability_fingerprint, proposed.capability_fingerprint),
+        (current.grant_fingerprint, proposed.grant_fingerprint),
+    ):
+        if current_value is not None and current_value != proposed_value:
+            return False
+    return True
 
 
 def _session_task_from_row(row: Sequence[object], *, session_id: str) -> SessionTask:

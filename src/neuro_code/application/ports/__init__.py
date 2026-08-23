@@ -208,6 +208,10 @@ from neuro_code.application.ports.worktree import (
     WorktreeError,
     WorktreeFailureKind,
 )
+from neuro_code.application.ports.writable_subagent import (
+    WritableSubagentLeaseError,
+    WritableSubagentLeaseStore,
+)
 
 __all__ = [
     "DEFAULT_FETCH_MAX_CHARS",
@@ -378,6 +382,8 @@ __all__ = [
     "WorktreeApplication",
     "WorktreeError",
     "WorktreeFailureKind",
+    "WritableSubagentLeaseError",
+    "WritableSubagentLeaseStore",
     "lifecycle_capability_satisfies",
     "normalize_web_fetch_url",
     "resolve_capabilities",

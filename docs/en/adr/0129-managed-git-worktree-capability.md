@@ -141,8 +141,9 @@ additional roots from a ready immutable handle. If additional roots are later
 provided, both directions of overlap with the primary root and pairwise
 additional-root overlap are rejected. The same binding can be passed to the
 existing filesystem target resolver, sandbox factory, and future
-workspace-scoped LSP manager. This slice does not create writable subagents,
-does not share source document caches, and does not implement integration.
+workspace-scoped LSP manager. Worktree creation alone does not create a
+writable subagent; the separate explicit serialized slice is defined by
+[ADR 0131](0131-managed-writable-subagent-workspace.md).
 
 ## Invariants
 
@@ -167,8 +168,9 @@ Workspace checkpoint/rollback is now a separate internal capability defined by
 [ADR 0130](0130-managed-workspace-checkpoint-rollback.md). Patch or commit
 integration, merge/cherry-pick/rebase, conflict resolution, automatic branch
 deletion, dirty-state copying, model-facing Git/worktree tools, writable
-subagents, relay/DAG/leader/swarm, and automatic Ultracode delegation remain
-outside this ADR and the current vertical slice.
+parallel-worker orchestration, relay/DAG/leader/swarm, and automatic Ultracode
+delegation remain outside this ADR. The explicit single-child writable slice
+is specified separately in [ADR 0131](0131-managed-writable-subagent-workspace.md).
 
 ## Validation
 

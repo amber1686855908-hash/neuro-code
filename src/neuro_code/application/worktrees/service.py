@@ -140,6 +140,28 @@ class WorktreeApplicationService:
         async with lock:
             return await self._create_locked(request, repository)
 
+    async def repository_identity(self, path: Path, /) -> WorktreeRepositoryIdentity:
+        """Return the canonical repository identity for an authorized source path."""
+
+        self._require_initialized()
+        if not isinstance(path, Path):
+            raise TypeError("repository identity requires a pathlib.Path")
+        return await self._git.repository_identity(path)
+
+    def planned_managed_path(
+        self,
+        repository: WorktreeRepositoryIdentity,
+        worktree_id: WorktreeId,
+    ) -> Path:
+        """Return the exact owned target used by the next create operation."""
+
+        self._require_initialized()
+        if not isinstance(repository, WorktreeRepositoryIdentity):
+            raise TypeError("repository identity must be canonical")
+        if not isinstance(worktree_id, WorktreeId):
+            raise TypeError("worktree id must be canonical")
+        return self._managed_path(repository, worktree_id)
+
     async def _create_locked(
         self,
         request: WorktreeCreateRequest,

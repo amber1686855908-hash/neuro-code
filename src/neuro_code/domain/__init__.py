@@ -116,6 +116,11 @@ from neuro_code.domain.worktree import (
     WorktreeStatus,
     WorktreeWorkspaceBinding,
 )
+from neuro_code.domain.writable_subagent import (
+    ManagedChildWorkspaceGrant,
+    WritableSubagentWorkspaceLease,
+    WritableSubagentWorkspaceState,
+)
 from neuro_code.shared.ui_language import UiLanguage
 
 __all__ = [
@@ -157,6 +162,7 @@ __all__ = [
     "ContextItemKind",
     "DurableCompactionItem",
     "InteractionMode",
+    "ManagedChildWorkspaceGrant",
     "Message",
     "ModelBackendToolCompleted",
     "ModelBackendToolStarted",
@@ -207,6 +213,8 @@ __all__ = [
     "WorktreeState",
     "WorktreeStatus",
     "WorktreeWorkspaceBinding",
+    "WritableSubagentWorkspaceLease",
+    "WritableSubagentWorkspaceState",
     "compute_compaction_source_fingerprint",
     "context_fingerprints",
     "estimate_context_tokens",

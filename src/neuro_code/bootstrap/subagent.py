@@ -25,6 +25,12 @@ from neuro_code.application.workflows.subagent import (
 from neuro_code.application.workflows.subagent_capabilities import (
     NetworkAccess,
     SubagentCapabilitySet,
+    WritableSubagentCapabilityGrant,
+)
+from neuro_code.application.workflows.writable_subagent import (
+    RunWritableSubagentRequest,
+    WritableSubagentRuntime,
+    WritableSubagentRuntimeFactory,
 )
 from neuro_code.bootstrap.composition import ApplicationComposition
 from neuro_code.shared.errors import ConfigurationError
@@ -177,6 +183,111 @@ class CompositionReadOnlySubagentRuntimeFactory(IsolatedSubagentRuntimeFactory):
         return _CompositionReadOnlySubagentRuntime(binding, child_session_id, capabilities)
 
 
+class _CompositionWritableSubagentRuntime:
+    __slots__ = ("_binding", "_capability_fingerprint", "_child_session_id", "_closed")
+
+    def __init__(
+        self,
+        binding: ConversationBinding,
+        child_session_id: str,
+        capabilities: WritableSubagentCapabilityGrant,
+    ) -> None:
+        if binding.capabilities != capabilities.capabilities:
+            raise ConfigurationError("writable child binding capability metadata is inconsistent")
+        self._binding = binding
+        self._capability_fingerprint = capabilities.fingerprint
+        self._child_session_id = child_session_id
+        self._closed = False
+
+    @property
+    def child_session_id(self) -> str:
+        return self._child_session_id
+
+    @property
+    def capability_fingerprint(self) -> str:
+        return self._capability_fingerprint
+
+    async def run(
+        self,
+        prompt: str,
+        *,
+        sink: EventSink | None = None,
+    ) -> AgentRunResult:
+        if self._closed:
+            raise ConfigurationError("writable subagent runtime is closed")
+        result = await self._binding.runner.run(prompt, sink=sink)
+        if result.session_id != self._child_session_id:
+            raise ConfigurationError("writable child runtime returned a different child session")
+        return result
+
+    async def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        background_tasks = self._binding.background_tasks
+        if background_tasks is not None:
+            await background_tasks.shutdown()
+
+
+class CompositionWritableSubagentRuntimeFactory(WritableSubagentRuntimeFactory):
+    """Assemble a fresh child binding rooted only at the managed worktree."""
+
+    __slots__ = ("_composition",)
+
+    def __init__(self, composition: ApplicationComposition) -> None:
+        self._composition = composition
+
+    async def create_session(
+        self,
+        request: RunWritableSubagentRequest,
+        *,
+        capabilities: WritableSubagentCapabilityGrant,
+    ) -> str:
+        if not isinstance(request, RunWritableSubagentRequest):
+            raise ValueError("writable subagent request must be canonical")
+        selected_config = replace(
+            _without_provider_builtin_tools(self._composition.config),
+            cwd=capabilities.capabilities.cwd,
+            sandbox_profile=capabilities.capabilities.sandbox_profile,
+        )
+        provider = selected_config.provider
+        return await self._composition.store.create_session(
+            str(selected_config.cwd),
+            provider.name,
+            provider.model,
+            provider.context_affinity,
+            selected_config.sandbox_profile,
+        )
+
+    async def create(
+        self,
+        request: RunWritableSubagentRequest,
+        *,
+        parent_task_id: str,
+        child_session_id: str,
+        capabilities: WritableSubagentCapabilityGrant,
+    ) -> WritableSubagentRuntime:
+        if not parent_task_id:
+            raise ValueError("parent task id must not be empty")
+        if not child_session_id:
+            raise ValueError("child session id must not be empty")
+        if not isinstance(capabilities, WritableSubagentCapabilityGrant):
+            raise ConfigurationError("writable child capabilities must be canonical")
+        selected_config = replace(
+            _without_provider_builtin_tools(self._composition.config),
+            cwd=capabilities.capabilities.cwd,
+            sandbox_profile=capabilities.capabilities.sandbox_profile,
+        )
+        binding = await self._composition.create_binding(
+            config=selected_config,
+            resume_id=child_session_id,
+            additional_workspace_roots=(),
+            capabilities=capabilities.capabilities,
+            enable_background_tasks=False,
+        )
+        return _CompositionWritableSubagentRuntime(binding, child_session_id, capabilities)
+
+
 def _without_provider_builtin_tools(config: AppConfig) -> AppConfig:
     providers = {
         name: replace(profile, builtin_tools=()) for name, profile in config.providers.items()
@@ -187,4 +298,5 @@ def _without_provider_builtin_tools(config: AppConfig) -> AppConfig:
 __all__ = [
     "READ_ONLY_SUBAGENT_TOOL_NAMES",
     "CompositionReadOnlySubagentRuntimeFactory",
+    "CompositionWritableSubagentRuntimeFactory",
 ]

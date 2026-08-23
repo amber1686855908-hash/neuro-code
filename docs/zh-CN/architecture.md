@@ -1604,3 +1604,33 @@ checkpoint-after path，恢复 file 与 index，并验证最终 fingerprint。�
 reset、checkout、branch-ref rewrite、history rewind 或任意 recursive deletion；ignored file 保持不变。
 Partial 或不确定 operation 持久化为 `INDETERMINATE`，可在进程退出后 reconciliation；READY checkpoint
 target 不可变并受 CAS 保护。详见 [ADR 0130](adr/0130-managed-workspace-checkpoint-rollback.md)。
+
+## 显式串行 Writable Subagent 工作区
+
+现有 `/subagent` capability 仍然只读。首个 writable subagent 是由
+`ApplicationComposition.create_writable_subagent_service()` 构造的独立、显式内部纵向切片。
+它不接入 `/subagent`、CLI、TUI、ACP、自动调度、writable parallel worker 或 LSP worker，
+也不启动 checkpoint/rollback orchestration。
+
+`WritableSubagentApplicationService` 一次只串行运行一个 child。它先记录 `ALLOCATING` lease，
+读取 parent 的 exact committed HEAD，在 parent workspace roots 之外创建 Neuro Code 拥有的 managed
+branch worktree，并捕获 `READY` baseline checkpoint。之后才派生 typed
+`ManagedChildWorkspaceGrant`；其 fingerprint 绑定 parent capability、repository identity、
+exact base SHA、不可变 `WorktreeHandle`、managed worktree ID/path、创建时间和 baseline checkpoint。
+Child 使用全新的 session 与 binding，cwd 和唯一 root 都恰好是该 worktree。
+
+Derived child 只有有界 read set（`read_file`、`read_files`、`list_dir`、`list_tree`、`glob`、
+`grep`、`grep_many`、`skill`）以及 `search_replace`、`apply_patch`。它没有 Bash、terminal、
+background、MCP、network、Git/worktree/checkpoint/rollback、subagent 或 LSP authority。Parent
+和 global policy 都必须证明 write tool、write authority 与 writable sandbox。通用
+`SubagentCapabilitySet.is_subset_of()` 保持不变；typed grant 是把 child 绑定到新 managed
+workspace 的窄边界。每一次 child write 仍执行正常的 Permission、canonical filesystem target、
+execution 与 sandbox pipeline。
+
+Durable lease 使用 `ALLOCATING`、`WORKTREE_READY`、`BASELINE_READY`、`ACTIVE`、`PRESERVED`、
+`ORPHANED`、`FAILED`，并具备不可变 identity、insert-only ownership 和 generation CAS。成功、
+Provider failure、取消或 final inspection 不确定时都会保留 worktree 与 baseline；没有自动移除、
+rollback、merge、commit、copy-back 或 cleanup。Crash 后的 reconciliation 验证 worktree 与 checkpoint
+证据，不删除不确定数据。Bounded result projection 只暴露生命周期/工作区 identity、脱敏 response、
+有界 outcome 与 fingerprint，不暴露 diff、transcript、raw arguments 或 file contents。完整契约见
+[ADR 0131](adr/0131-managed-writable-subagent-workspace.md)。

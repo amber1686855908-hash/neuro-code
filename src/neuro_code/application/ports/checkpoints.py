@@ -169,6 +169,10 @@ class WorkspaceCheckpointApplication(Protocol):
 
     async def create(self, request: CheckpointCreateRequest) -> WorkspaceCheckpoint: ...
 
+    async def inspect(self, handle: WorktreeHandle, /) -> WorkspaceProjection: ...
+
+    async def get(self, checkpoint_id: CheckpointId, /) -> WorkspaceCheckpoint | None: ...
+
     async def rollback(
         self,
         checkpoint_id: CheckpointId,

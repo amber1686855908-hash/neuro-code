@@ -156,8 +156,10 @@ durable winner。
 Automatic checkpoint policy、面向模型的 checkpoint tool、TUI/ACP exposure、checkpoint deletion/
 retention、任意 filesystem snapshot、ignored-file rollback、Git history rewind、branch ref
 reset、patch/commit/merge/cherry-pick/rebase integration、冲突解决、checkpoint merge 或 diff
-UI、writable subagent、automatic LSP worker binding、Relay/DAG/Leader/Swarm/Ultracode orchestration
-以及 source-checkout rollback 都不属于本切片。
+UI、writable parallel 或 recursive subagent、automatic LSP worker binding、
+Relay/DAG/Leader/Swarm/Ultracode orchestration 以及 source-checkout rollback 都不属于本切片。
+显式的单 child writable workspace 切片由
+[ADR 0131](0131-managed-writable-subagent-workspace.md) 单独定义。
 
 ## 兼容性与验证
 

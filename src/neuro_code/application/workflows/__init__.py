@@ -33,8 +33,14 @@ from neuro_code.application.workflows.subagent import (
     SubagentRunResult,
 )
 from neuro_code.application.workflows.subagent_capabilities import (
+    WRITABLE_SUBAGENT_FORBIDDEN_TOOL_NAMES,
+    WRITABLE_SUBAGENT_READ_TOOL_NAMES,
+    WRITABLE_SUBAGENT_WRITE_TOOL_NAMES,
     NetworkAccess,
     SubagentCapabilitySet,
+    WritableSubagentCapabilityGrant,
+    resolve_writable_subagent_capability,
+    writable_subagent_request,
 )
 from neuro_code.application.workflows.subagent_scheduler import (
     MAX_SCHEDULED_SUBAGENTS,
@@ -48,6 +54,15 @@ from neuro_code.application.workflows.subagent_scheduler import (
     SubagentScheduler,
     SubagentWorkRequest,
 )
+from neuro_code.application.workflows.writable_subagent import (
+    MAX_WRITABLE_SUBAGENT_RESULT_BYTES,
+    MAX_WRITABLE_SUBAGENT_TIMEOUT_SECONDS,
+    RunWritableSubagentRequest,
+    WritableSubagentApplicationService,
+    WritableSubagentResultProjection,
+    WritableSubagentRuntime,
+    WritableSubagentRuntimeFactory,
+)
 
 __all__ = [
     "MAX_SCHEDULED_SUBAGENTS",
@@ -55,6 +70,11 @@ __all__ = [
     "MAX_SUBAGENT_PARALLELISM",
     "MAX_SUBAGENT_RESULT_BYTES",
     "MAX_SUBAGENT_RETRIES",
+    "MAX_WRITABLE_SUBAGENT_RESULT_BYTES",
+    "MAX_WRITABLE_SUBAGENT_TIMEOUT_SECONDS",
+    "WRITABLE_SUBAGENT_FORBIDDEN_TOOL_NAMES",
+    "WRITABLE_SUBAGENT_READ_TOOL_NAMES",
+    "WRITABLE_SUBAGENT_WRITE_TOOL_NAMES",
     "ExecutePlanRequest",
     "IsolatedSubagentExecutionService",
     "IsolatedSubagentRuntime",
@@ -69,6 +89,7 @@ __all__ = [
     "ReadOnlySubagentApplicationService",
     "RunSessionTaskRequest",
     "RunSubagentRequest",
+    "RunWritableSubagentRequest",
     "SchedulePlanRequest",
     "ScheduledSubagentResult",
     "ScopedSubagentRuntime",
@@ -84,4 +105,11 @@ __all__ = [
     "SubagentRuntimeScope",
     "SubagentScheduler",
     "SubagentWorkRequest",
+    "WritableSubagentApplicationService",
+    "WritableSubagentCapabilityGrant",
+    "WritableSubagentResultProjection",
+    "WritableSubagentRuntime",
+    "WritableSubagentRuntimeFactory",
+    "resolve_writable_subagent_capability",
+    "writable_subagent_request",
 ]

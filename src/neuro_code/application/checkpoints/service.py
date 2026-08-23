@@ -219,6 +219,30 @@ class WorkspaceCheckpointApplicationService:
                 await self._artifacts.remove_temporary_capture(checkpoint_id)
                 raise
 
+    async def inspect(self, handle: WorktreeHandle, /) -> WorkspaceProjection:
+        """Inspect one owned worktree without creating or restoring a checkpoint."""
+
+        self._require_initialized()
+        if not isinstance(handle, WorktreeHandle):
+            raise TypeError("workspace inspection requires a canonical worktree handle")
+        lock = await self._worktree_lock(handle.worktree_id.value)
+        async with lock:
+            _, status = await self._prove_handle(handle, allow_lock_reason=None)
+            if status.locked:
+                raise WorkspaceCheckpointError(
+                    "locked managed worktree cannot be inspected for a writable result",
+                    kind=CheckpointFailureKind.LOCKED,
+                )
+            return await self._capture(handle)
+
+    async def get(self, checkpoint_id: CheckpointId, /) -> WorkspaceCheckpoint | None:
+        """Read one checkpoint metadata record for internal reconciliation."""
+
+        self._require_initialized()
+        if not isinstance(checkpoint_id, CheckpointId):
+            raise TypeError("checkpoint id must be canonical")
+        return await self._checkpoints.get(checkpoint_id)
+
     async def rollback(
         self,
         checkpoint_id: CheckpointId,

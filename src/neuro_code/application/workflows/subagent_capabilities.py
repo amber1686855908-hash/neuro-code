@@ -19,6 +19,7 @@ from enum import StrEnum
 from pathlib import Path
 
 from neuro_code.domain.sandbox.models import SandboxProfile
+from neuro_code.domain.writable_subagent import ManagedChildWorkspaceGrant
 from neuro_code.shared.errors import ConfigurationError
 
 MAX_SUBAGENT_STEPS = 12
@@ -62,6 +63,42 @@ _NETWORK_TOOL_NAMES = frozenset(
         "url_context",
         "x_search",
         "code_interpreter",
+    }
+)
+
+WRITABLE_SUBAGENT_READ_TOOL_NAMES = frozenset(
+    {
+        "read_file",
+        "read_files",
+        "list_dir",
+        "list_tree",
+        "glob",
+        "grep",
+        "grep_many",
+        "skill",
+    }
+)
+WRITABLE_SUBAGENT_WRITE_TOOL_NAMES = frozenset({"search_replace", "apply_patch"})
+WRITABLE_SUBAGENT_FORBIDDEN_TOOL_NAMES = frozenset(
+    {
+        "bash",
+        "terminal_exec",
+        "create_terminal",
+        "terminal_output",
+        "terminal_wait",
+        "terminal_kill",
+        "terminal_start",
+        "task_output",
+        "wait_tasks",
+        "kill_task",
+        "web_fetch",
+        "web_search",
+        "google_search",
+        "url_context",
+        "x_search",
+        "code_interpreter",
+        "subagent",
+        "lsp",
     }
 )
 
@@ -439,12 +476,172 @@ class SubagentCapabilitySet:
         return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
+def _non_workspace_axes_subset(
+    child: SubagentCapabilitySet,
+    parent: SubagentCapabilitySet,
+) -> bool:
+    """Compare every generic capability axis except filesystem roots.
+
+    This deliberately does not change ``SubagentCapabilitySet.is_subset_of``.
+    It is the narrow exception used only after a typed managed-worktree grant
+    has replaced the ordinary inherited workspace-root relation.
+    """
+
+    return (
+        child.allowed_tool_names.issubset(parent.allowed_tool_names)
+        and (not child.filesystem_read or parent.filesystem_read)
+        and (not child.filesystem_write or parent.filesystem_write)
+        and (not child.bash or parent.bash)
+        and (not child.terminal or parent.terminal)
+        and (not child.background_tasks or parent.background_tasks)
+        and child.mcp_tool_names.issubset(parent.mcp_tool_names)
+        and child.mcp_server_names.issubset(parent.mcp_server_names)
+        and _NETWORK_STRENGTH[child.network_access] <= _NETWORK_STRENGTH[parent.network_access]
+        and _sandbox_satisfies(parent.sandbox_profile, child.sandbox_profile)
+        and child.max_steps <= parent.max_steps
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class WritableSubagentCapabilityGrant:
+    """Effective child capability paired with its derived workspace authority."""
+
+    capabilities: SubagentCapabilitySet
+    workspace_grant: ManagedChildWorkspaceGrant
+    fingerprint: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.capabilities, SubagentCapabilitySet):
+            raise TypeError("writable child capabilities must be canonical")
+        if not isinstance(self.workspace_grant, ManagedChildWorkspaceGrant):
+            raise TypeError("writable child workspace grant must be canonical")
+        expected = hashlib.sha256(
+            f"{self.capabilities.fingerprint}:{self.workspace_grant.fingerprint}".encode()
+        ).hexdigest()
+        if self.fingerprint != expected:
+            raise ConfigurationError("writable child capability fingerprint is inconsistent")
+        if self.capabilities.cwd != self.workspace_grant.canonical_child_root:
+            raise ConfigurationError("writable child cwd is outside its derived workspace grant")
+        if self.capabilities.workspace_roots != (self.workspace_grant.canonical_child_root,):
+            raise ConfigurationError("writable child capability carries additional workspace roots")
+        if not self.capabilities.filesystem_write:
+            raise ConfigurationError("writable child capability has no write authority")
+        if self.capabilities.bash or self.capabilities.terminal:
+            raise ConfigurationError("writable child capability includes an unproven process tool")
+        if self.capabilities.background_tasks:
+            raise ConfigurationError("writable child capability includes background tasks")
+        if self.capabilities.network_access is not NetworkAccess.NONE:
+            raise ConfigurationError("writable child capability includes network authority")
+        if self.capabilities.mcp_tool_names or self.capabilities.mcp_server_names:
+            raise ConfigurationError("writable child capability includes MCP authority")
+
+
+def writable_subagent_request(
+    parent: SubagentCapabilitySet,
+    *,
+    max_steps: int,
+) -> SubagentCapabilitySet:
+    """Build the fixed, internal writable request without inheriting roots."""
+
+    if not isinstance(parent, SubagentCapabilitySet):
+        raise ConfigurationError("parent subagent capability metadata is required")
+    read_tools = WRITABLE_SUBAGENT_READ_TOOL_NAMES.intersection(parent.allowed_tool_names)
+    return SubagentCapabilitySet.from_runtime(
+        tool_names=tuple(sorted((*read_tools, *WRITABLE_SUBAGENT_WRITE_TOOL_NAMES))),
+        cwd=parent.cwd,
+        sandbox_profile=parent.sandbox_profile,
+        enable_background_tasks=False,
+        max_steps=min(max_steps, parent.max_steps),
+    )
+
+
+def resolve_writable_subagent_capability(
+    *,
+    parent: SubagentCapabilitySet,
+    requested: SubagentCapabilitySet,
+    global_policy: SubagentCapabilitySet,
+    workspace_grant: ManagedChildWorkspaceGrant,
+) -> WritableSubagentCapabilityGrant:
+    """Resolve a writable child only through a typed managed-worktree grant."""
+
+    if not isinstance(parent, SubagentCapabilitySet):
+        raise ConfigurationError("parent subagent capability metadata is required")
+    if not isinstance(requested, SubagentCapabilitySet):
+        raise ConfigurationError("writable subagent capability request is not canonical")
+    if not isinstance(global_policy, SubagentCapabilitySet):
+        raise ConfigurationError("global subagent capability policy is required")
+    if not isinstance(workspace_grant, ManagedChildWorkspaceGrant):
+        raise ConfigurationError("managed child workspace grant is required")
+    if workspace_grant.parent_capability_fingerprint != parent.fingerprint:
+        raise ConfigurationError("managed child workspace grant is bound to another parent")
+    if workspace_grant.parent_workspace_root != parent.cwd:
+        raise ConfigurationError("managed child workspace grant parent root is inconsistent")
+    if any(
+        workspace_grant.canonical_child_root == root
+        or workspace_grant.canonical_child_root.is_relative_to(root)
+        for root in parent.workspace_roots
+    ):
+        raise ConfigurationError("managed child workspace must be outside parent workspace roots")
+    if requested.allowed_tool_names & WRITABLE_SUBAGENT_FORBIDDEN_TOOL_NAMES:
+        raise ConfigurationError("writable subagent request contains an out-of-scope tool")
+    if requested.mcp_tool_names or requested.mcp_server_names:
+        raise ConfigurationError("writable subagent request cannot include MCP tools")
+    if requested.network_access is not NetworkAccess.NONE:
+        raise ConfigurationError("writable subagent request cannot include network access")
+    if not _non_workspace_axes_subset(requested, parent):
+        raise ConfigurationError("writable subagent capability exceeds parent capability")
+    if not _non_workspace_axes_subset(requested, global_policy):
+        raise ConfigurationError("writable subagent capability exceeds global policy")
+    if not parent.filesystem_write or not global_policy.filesystem_write:
+        raise ConfigurationError("writable subagent requires parent and global write authority")
+    if (
+        not parent.sandbox_profile.workspace_writable
+        or not global_policy.sandbox_profile.workspace_writable
+    ):
+        raise ConfigurationError("writable subagent requires writable parent and global sandboxes")
+    if not WRITABLE_SUBAGENT_WRITE_TOOL_NAMES.issubset(parent.allowed_tool_names):
+        raise ConfigurationError("parent binding does not expose all writable child tools")
+    if not WRITABLE_SUBAGENT_WRITE_TOOL_NAMES.issubset(global_policy.allowed_tool_names):
+        raise ConfigurationError("global policy does not expose all writable child tools")
+    if not _sandbox_satisfies(global_policy.sandbox_profile, parent.sandbox_profile):
+        raise ConfigurationError("parent sandbox profile exceeds the global child policy")
+
+    allowed = requested.allowed_tool_names.intersection(
+        parent.allowed_tool_names,
+        global_policy.allowed_tool_names,
+    )
+    allowed -= WRITABLE_SUBAGENT_FORBIDDEN_TOOL_NAMES
+    capabilities = SubagentCapabilitySet.from_runtime(
+        tool_names=tuple(sorted(allowed)),
+        cwd=workspace_grant.canonical_child_root,
+        sandbox_profile=parent.sandbox_profile,
+        enable_background_tasks=False,
+        max_steps=min(requested.max_steps, parent.max_steps, global_policy.max_steps),
+    )
+    if not _non_workspace_axes_subset(capabilities, parent):
+        raise ConfigurationError("effective writable child exceeds parent capability")
+    if not _non_workspace_axes_subset(capabilities, global_policy):
+        raise ConfigurationError("effective writable child exceeds global policy")
+    if not capabilities.filesystem_write:
+        raise ConfigurationError("effective writable child lost write authority")
+    fingerprint = hashlib.sha256(
+        f"{capabilities.fingerprint}:{workspace_grant.fingerprint}".encode()
+    ).hexdigest()
+    return WritableSubagentCapabilityGrant(capabilities, workspace_grant, fingerprint)
+
+
 __all__ = [
     "MAX_SUBAGENT_CAPABILITY_MCP_SERVERS",
     "MAX_SUBAGENT_CAPABILITY_ROOTS",
     "MAX_SUBAGENT_CAPABILITY_STEPS",
     "MAX_SUBAGENT_CAPABILITY_TOOLS",
     "MAX_SUBAGENT_STEPS",
+    "WRITABLE_SUBAGENT_FORBIDDEN_TOOL_NAMES",
+    "WRITABLE_SUBAGENT_READ_TOOL_NAMES",
+    "WRITABLE_SUBAGENT_WRITE_TOOL_NAMES",
     "NetworkAccess",
     "SubagentCapabilitySet",
+    "WritableSubagentCapabilityGrant",
+    "resolve_writable_subagent_capability",
+    "writable_subagent_request",
 ]

@@ -120,8 +120,9 @@ SQLite 与 Git metadata 不是同一个事务：
 `WorktreeWorkspaceBinding` 从 ready 的不可变 handle 得到一个规范 primary root，且不继承
 additional roots。如果未来提供 additional roots，则 primary root 的两个方向重叠，以及
 additional roots 之间的成对重叠，都会被拒绝。该 binding 可以交给现有 filesystem target
-resolver、sandbox factory 以及未来按工作区管理的 LSP manager。本切片不创建 writable
-subagent，不共享 source 的 document cache，也不实现 integration。
+resolver、sandbox factory 以及未来按工作区管理的 LSP manager。Worktree 创建本身不会创建
+writable subagent；独立的显式串行切片见
+[ADR 0131](0131-managed-writable-subagent-workspace.md)。
 
 ## 不变量
 
@@ -145,8 +146,9 @@ subagent，不共享 source 的 document cache，也不实现 integration。
 Workspace checkpoint/rollback 现在由独立的内部能力定义，详见
 [ADR 0130](0130-managed-workspace-checkpoint-rollback.md)。Patch 或 commit integration、
 merge/cherry-pick/rebase、冲突解决、自动删除 branch、dirty-state 复制、面向模型的
-Git/worktree tool、writable subagent、relay/DAG/leader/swarm 以及 automatic Ultracode
-delegation 仍不属于本 ADR 或当前纵向切片。
+Git/worktree tool、writable parallel-worker orchestration、relay/DAG/leader/swarm 以及
+automatic Ultracode delegation 仍不属于本 ADR。显式的单 child writable 切片由
+[ADR 0131](0131-managed-writable-subagent-workspace.md) 单独规定。
 
 ## 验证
 

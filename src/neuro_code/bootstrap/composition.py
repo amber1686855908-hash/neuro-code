@@ -9,7 +9,7 @@ import sys
 from collections.abc import Callable, Collection, Sequence
 from dataclasses import replace
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 from neuro_code.application.checkpoints import WorkspaceCheckpointApplicationService
 from neuro_code.application.execution_policy import ExecutionBudgetPolicy
@@ -56,6 +56,7 @@ from neuro_code.application.ports.web_search import (
     resolve_web_search_path,
 )
 from neuro_code.application.ports.workspace_changes import WorkspaceChangeObserver
+from neuro_code.application.ports.writable_subagent import WritableSubagentLeaseStore
 from neuro_code.application.providers.service import (
     ProviderChangeService,
     ProviderProfileController,
@@ -111,6 +112,9 @@ from neuro_code.application.workflows.subagent_scheduler import (
     MAX_SUBAGENT_PARALLELISM,
     ScopedSubagentRuntimeFactory,
     SubagentScheduler,
+)
+from neuro_code.application.workflows.writable_subagent import (
+    WritableSubagentApplicationService,
 )
 from neuro_code.application.worktrees import WorktreeApplicationService
 from neuro_code.domain.conversation.reasoning import ReasoningEffort
@@ -1071,6 +1075,33 @@ class ApplicationComposition:
             factory,
             global_policy=self.subagent_global_policy(),
             requested_capability_factory=factory.requested_capabilities,
+            timeout_seconds=timeout_seconds,
+        )
+
+    def create_writable_subagent_service(
+        self,
+        *,
+        timeout_seconds: float = 120.0,
+    ) -> WritableSubagentApplicationService:
+        """Create the explicit internal serialized writable-subagent slice.
+
+        The returned service is not connected to CLI, TUI, ACP, or the normal
+        ``/subagent`` command.  Callers must explicitly initialize and invoke
+        it with a real parent binding capability manifest.
+        """
+
+        from neuro_code.bootstrap.subagent import CompositionWritableSubagentRuntimeFactory
+
+        worktrees = self.create_worktree_service()
+        checkpoints = self.create_workspace_checkpoint_service()
+        factory = CompositionWritableSubagentRuntimeFactory(self)
+        return WritableSubagentApplicationService(
+            self.store,
+            cast(WritableSubagentLeaseStore, self.store),
+            worktrees,
+            checkpoints,
+            factory,
+            global_policy=self.subagent_global_policy(),
             timeout_seconds=timeout_seconds,
         )
 
