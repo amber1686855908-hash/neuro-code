@@ -37,6 +37,8 @@ from neuro_code.application.workflows.writable_subagent import (
     RunWritableSubagentRequest,
     WritableSubagentApplicationService,
     WritableSubagentResultProjection,
+    WritableSubagentRuntimeFactory,
+    WritableWorktreeApplication,
 )
 from neuro_code.bootstrap.composition import ApplicationComposition
 from neuro_code.configuration.app import AppConfig
@@ -707,14 +709,20 @@ class WritableContractValidationTests(unittest.TestCase):
                 replace(grant, parent_capability_fingerprint="not-a-digest")
             with self.assertRaises(TypeError):
                 replace(grant, parent_repository=object())
+            with self.assertRaises(TypeError):
+                replace(grant, parent_workspace_root=cast(Path, "not-a-path"))
             with self.assertRaises(ValueError):
                 replace(grant, parent_workspace_root=root / "outside")
             with self.assertRaises(ValueError):
                 replace(grant, base_commit_sha="not-a-commit")
             with self.assertRaises(TypeError):
                 replace(grant, worktree=object())
+            with self.assertRaises(TypeError):
+                replace(grant, managed_worktree_id=cast(WorktreeId, "not-a-worktree-id"))
             with self.assertRaises(ValueError):
                 replace(grant, managed_worktree_id=WorktreeId("different"))
+            with self.assertRaises(ValueError):
+                replace(grant, base_commit_sha="b" * 40)
             with self.assertRaises(ValueError):
                 replace(grant, canonical_child_root=root / "another-child")
             with self.assertRaises(TypeError):
@@ -737,10 +745,14 @@ class WritableContractValidationTests(unittest.TestCase):
                 created_at=now,
                 updated_at=now,
             )
+            self.assertTrue(lease.state.active)
+            self.assertFalse(WritableSubagentWorkspaceState.PRESERVED.active)
             self.assertFalse(lease.grant_ready)
             self.assertIsNone(lease.effective_fingerprint)
             with self.assertRaises(ValueError):
                 replace(lease, lease_id="")
+            with self.assertRaises(TypeError):
+                replace(lease, worktree_id=cast(WorktreeId, "not-a-worktree-id"))
             with self.assertRaises(ValueError):
                 replace(lease, parent_capability_fingerprint="bad")
             with self.assertRaises(TypeError):
@@ -760,6 +772,20 @@ class WritableContractValidationTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 replace(lease, updated_at=datetime(2026, 8, 22, tzinfo=UTC))
             with self.assertRaises(ValueError):
+                replace(lease, updated_at=datetime.fromisoformat("2026-08-23"))
+            with self.assertRaises(TypeError):
+                replace(lease, worktree=cast(WorktreeHandle, object()))
+            with self.assertRaises(ValueError):
+                replace(
+                    lease,
+                    worktree_id=WorktreeId("different"),
+                    worktree=grant.worktree,
+                )
+            with self.assertRaises(ValueError):
+                replace(lease, base_commit_sha="b" * 40, worktree=grant.worktree)
+            with self.assertRaises(TypeError):
+                replace(lease, baseline_checkpoint_id=cast(CheckpointId, "not-a-checkpoint"))
+            with self.assertRaises(ValueError):
                 replace(lease, owner_pid=0)
             with self.assertRaises(TypeError):
                 replace(lease, workspace_changed="yes")
@@ -770,6 +796,15 @@ class WritableContractValidationTests(unittest.TestCase):
 
             with self.assertRaises(ValueError):
                 _ = lease.grant
+
+            ready_lease = replace(
+                lease,
+                worktree=grant.worktree,
+                baseline_checkpoint_id=grant.baseline_checkpoint_id,
+            )
+            derived_grant = ready_lease.grant
+            self.assertEqual(derived_grant.grant_id, lease.lease_id)
+            self.assertEqual(derived_grant.worktree, grant.worktree)
 
 
 class WritableLeaseStoreTests(unittest.IsolatedAsyncioTestCase):
@@ -1229,6 +1264,60 @@ class _ProductionWritableProviderFactory:
 
 
 class WritableApplicationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_service_constructor_rejects_invalid_collaborators_and_timeout(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            parent = root / "parent"
+            parent.mkdir()
+            store = SqliteSessionStore(root / "sessions.db")
+            worktrees = _FakeWorktrees(root, _repository(root))
+            checkpoints = _FakeCheckpoints(root, worktrees)
+            factory = _FakeRuntimeFactory(store, worktrees)
+            parent_binding = _parent_binding("parent", _capability(parent))
+            global_policy = _capability(root / "global", max_steps=12)
+
+            with self.assertRaisesRegex(ConfigurationError, "global.*policy"):
+                WritableSubagentApplicationService(
+                    store,
+                    store,
+                    worktrees,
+                    checkpoints,
+                    factory,
+                    parent_binding=parent_binding,
+                    global_policy=cast(SubagentCapabilitySet, object()),
+                )
+            with self.assertRaisesRegex(ValueError, "timeout.*bounds"):
+                WritableSubagentApplicationService(
+                    store,
+                    store,
+                    worktrees,
+                    checkpoints,
+                    factory,
+                    parent_binding=parent_binding,
+                    global_policy=global_policy,
+                    timeout_seconds=True,
+                )
+            with self.assertRaisesRegex(ConfigurationError, "worktree application"):
+                WritableSubagentApplicationService(
+                    store,
+                    store,
+                    cast(WritableWorktreeApplication, object()),
+                    checkpoints,
+                    factory,
+                    parent_binding=parent_binding,
+                    global_policy=global_policy,
+                )
+            with self.assertRaisesRegex(ConfigurationError, "runtime factory"):
+                WritableSubagentApplicationService(
+                    store,
+                    store,
+                    worktrees,
+                    checkpoints,
+                    cast(WritableSubagentRuntimeFactory, object()),
+                    parent_binding=parent_binding,
+                    global_policy=global_policy,
+                )
+
     async def test_parent_binding_validation_is_canonical_at_both_boundaries(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
