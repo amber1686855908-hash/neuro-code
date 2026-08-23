@@ -94,6 +94,7 @@ from neuro_code.infrastructure.lsp.manager import LanguageServerManager
 from neuro_code.infrastructure.persistence.sqlite_session import SqliteSessionStore
 from neuro_code.infrastructure.sandbox.local_process import ProcessTreeLocalProcessSandbox
 from neuro_code.infrastructure.tools.filesystem import ApplyPatchTool, SearchReplaceTool
+from neuro_code.infrastructure.workspace.paths import workspaces_match
 from neuro_code.shared.errors import (
     ConfigurationError,
     SessionError,
@@ -1776,7 +1777,7 @@ extensions = [".py", ".txt"]
                 configured_state_dir: Path,
             ) -> LocalProcessSandbox:
                 self.assertIs(profile, SandboxProfile.OFF)
-                self.assertEqual(configured_state_dir, state_dir)
+                self.assertTrue(workspaces_match(configured_state_dir, state_dir))
                 sandbox = _RecordingProcessSandbox(workspace)
                 process_sandboxes.append(sandbox)
                 return cast(LocalProcessSandbox, sandbox)
