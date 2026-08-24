@@ -12,6 +12,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
+from unittest.mock import patch
 
 from neuro_code.application.ports.leader import LeaderStore, LeaderStoreError
 from neuro_code.application.ports.model import ModelProvider
@@ -19,6 +20,7 @@ from neuro_code.application.sessions.binding import ConversationBinding, Convers
 from neuro_code.application.workflows.leader import (
     LeaderApplicationService,
     RunLeaderRequest,
+    _bounded_redacted,
 )
 from neuro_code.application.workflows.subagent_capabilities import SubagentCapabilitySet
 from neuro_code.application.workflows.task_dag import (
@@ -75,6 +77,8 @@ class _Runner:
         self.calls = 0
         self.selection_calls = 0
         self.delay: asyncio.Event | None = None
+        self.started: asyncio.Event | None = None
+        self.release: asyncio.Event | None = None
 
     @property
     def session_id(self) -> str:
@@ -102,6 +106,10 @@ class _Runner:
         self.prompts.append(prompt)
         self.turn_ids.append(turn_id)
         self.calls += 1
+        if self.started is not None:
+            self.started.set()
+        if self.release is not None:
+            await self.release.wait()
         response = self.responses.pop(0)
         if '"action":"SELECT_NODE"' in response:
             self.selection_calls += 1
@@ -637,6 +645,399 @@ class LeaderIntegrationTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ValueError):
             await self._leader().run(cast(RunLeaderRequest, object()))
 
+    async def test_request_and_binding_contracts_fail_closed(self) -> None:
+        with self.assertRaisesRegex(ValueError, "DAG id"):
+            RunLeaderRequest("", "objective")
+        with self.assertRaisesRegex(ValueError, "must not be empty"):
+            RunLeaderRequest("dag", " ")
+        with self.assertRaisesRegex(ValueError, "control character"):
+            RunLeaderRequest("dag", "bad\x00objective")
+        with self.assertRaisesRegex(ValueError, "too large"):
+            RunLeaderRequest("dag", "x" * 4_097)
+
+        service = self._leader()
+        self.assertEqual(service.leader_session_id, self.leader_session_id)
+        self.assertTrue(service.owner_id)
+        await service.close()
+
+        with self.assertRaisesRegex(ConfigurationError, "parent binding"):
+            LeaderApplicationService(
+                cast(LeaderStore, self.store),
+                self.dag_service,
+                parent_binding=cast(ConversationBinding, object()),
+                leader_binding=self.leader_binding,
+            )
+        with self.assertRaisesRegex(ConfigurationError, "model binding"):
+            LeaderApplicationService(
+                cast(LeaderStore, self.store),
+                self.dag_service,
+                parent_binding=self.parent_binding,
+                leader_binding=cast(ConversationBinding, object()),
+            )
+        with self.assertRaisesRegex(ConfigurationError, "DAG service"):
+            LeaderApplicationService(
+                cast(LeaderStore, self.store),
+                cast(object, object()),
+                parent_binding=self.parent_binding,
+                leader_binding=self.leader_binding,
+            )
+        with self.assertRaisesRegex(ConfigurationError, "parent session"):
+            LeaderApplicationService(
+                cast(LeaderStore, self.store),
+                self.dag_service,
+                parent_binding=_binding(_Runner("", [])),
+                leader_binding=self.leader_binding,
+            )
+        with self.assertRaisesRegex(ConfigurationError, "model session"):
+            LeaderApplicationService(
+                cast(LeaderStore, self.store),
+                self.dag_service,
+                parent_binding=self.parent_binding,
+                leader_binding=_binding(_Runner("", []), zero_tools=True),
+            )
+        with self.assertRaisesRegex(ConfigurationError, "owner"):
+            LeaderApplicationService(
+                cast(LeaderStore, self.store),
+                self.dag_service,
+                parent_binding=self.parent_binding,
+                leader_binding=self.leader_binding,
+                owner_id="",
+            )
+
+    async def test_bounded_redaction_and_active_dag_return_are_fail_closed(self) -> None:
+        self.assertIsNone(
+            _bounded_redacted(
+                None,
+                limit=8,
+                field_name="test field",
+                explicit_values=(),
+            )
+        )
+        with self.assertRaisesRegex(ConfigurationError, "not text"):
+            _bounded_redacted(
+                cast(str | None, object()),
+                limit=8,
+                field_name="test field",
+                explicit_values=(),
+            )
+        self.assertEqual(
+            _bounded_redacted(
+                "abcdef",
+                limit=3,
+                field_name="test field",
+                explicit_values=(),
+            ),
+            "abc",
+        )
+        with (
+            patch(
+                "neuro_code.application.workflows.leader.redact_sensitive_text",
+                return_value="",
+            ),
+            self.assertRaisesRegex(ConfigurationError, "became empty"),
+        ):
+            _bounded_redacted(
+                "secret",
+                limit=8,
+                field_name="test field",
+                explicit_values=(),
+            )
+
+        dag = TaskDag.create(
+            dag_id="active",
+            parent_session_id=self.parent_session_id,
+            nodes=(_node("a", 0),),
+            created_at=_now(),
+        )
+        running = replace(
+            dag,
+            nodes=(
+                replace(
+                    dag.node("a"),
+                    state=TaskDagNodeState.RUNNING,
+                    parent_task_id="parent-active",
+                ),
+            ),
+            state=TaskDagState.RUNNING,
+            generation=1,
+            updated_at=_now(),
+            active_node_id="a",
+        )
+
+        class ActiveController:
+            async def prepare_task_dag_step(self, request):
+                del request
+                return running
+
+            async def run_task_dag_step(self, request, *, sink=None):
+                del request, sink
+                raise AssertionError("an active DAG must not start another worker")
+
+        active_service = LeaderApplicationService(
+            cast(LeaderStore, self.store),
+            ActiveController(),
+            parent_binding=self.parent_binding,
+            leader_binding=self.leader_binding,
+            session_store=self.store,
+        )
+        result = await active_service.run(RunLeaderRequest("active", "objective"))
+        self.assertIsNone(result.final_response)
+        self.assertFalse(result.terminal)
+
+    async def test_provider_and_durable_failures_do_not_replay(self) -> None:
+        await self.dag_service.create_task_dag(
+            CreateTaskDagRequest("provider-error", (_node("a", 0),))
+        )
+        failing_runner = _Runner(self.leader_session_id, [])
+
+        async def fail_provider(*args, **kwargs):
+            del args, kwargs
+            raise RuntimeError("provider failed")
+
+        failing_runner.run = fail_provider  # type: ignore[method-assign]
+        with self.assertRaisesRegex(ConfigurationError, "model turn failed"):
+            await self._leader(failing_runner).run(RunLeaderRequest("provider-error", "objective"))
+
+        original_lookup = self.store.get_leader_attempt_for_snapshot
+
+        async def fail_lookup(*args, **kwargs):
+            del args, kwargs
+            raise LeaderStoreError("lookup failed")
+
+        self.store.get_leader_attempt_for_snapshot = fail_lookup  # type: ignore[method-assign]
+        try:
+            await self.dag_service.create_task_dag(
+                CreateTaskDagRequest("lookup-error", (_node("a", 0),))
+            )
+            with self.assertRaisesRegex(ConfigurationError, "durable lookup"):
+                await self._leader().run(RunLeaderRequest("lookup-error", "objective"))
+        finally:
+            self.store.get_leader_attempt_for_snapshot = original_lookup  # type: ignore[method-assign]
+
+        original_claim = self.store.claim_leader_attempt
+
+        async def fail_claim(*args, **kwargs):
+            del args, kwargs
+            raise LeaderStoreError("claim failed")
+
+        self.store.claim_leader_attempt = fail_claim  # type: ignore[method-assign]
+        try:
+            await self.dag_service.create_task_dag(
+                CreateTaskDagRequest("claim-error", (_node("a", 0),))
+            )
+            with self.assertRaisesRegex(ConfigurationError, "durable claim"):
+                await self._leader().run(RunLeaderRequest("claim-error", "objective"))
+        finally:
+            self.store.claim_leader_attempt = original_claim  # type: ignore[method-assign]
+
+        original_publish = self.store.publish_leader_decision
+
+        async def fail_publish(*args, **kwargs):
+            del args, kwargs
+            raise LeaderStoreError("publish failed")
+
+        self.store.publish_leader_decision = fail_publish  # type: ignore[method-assign]
+        try:
+            await self.dag_service.create_task_dag(
+                CreateTaskDagRequest("publish-error", (_node("a", 0),))
+            )
+            runner = _Runner(
+                self.leader_session_id,
+                ['{"action":"SELECT_NODE","node_id":"a"}'],
+            )
+            with self.assertRaisesRegex(ConfigurationError, "typed decision durability"):
+                await self._leader(runner).run(RunLeaderRequest("publish-error", "objective"))
+            self.assertEqual(runner.calls, 1)
+        finally:
+            self.store.publish_leader_decision = original_publish  # type: ignore[method-assign]
+
+    async def test_recovery_helpers_fail_closed_at_each_durable_boundary(self) -> None:
+        await self.dag_service.create_task_dag(
+            CreateTaskDagRequest("helper-boundaries", (_node("a", 0),))
+        )
+        dag = await self.store.get_task_dag("helper-boundaries")
+        assert dag is not None
+        service = self._leader()
+        evidence = service._evidence("objective", dag)
+        now = _now()
+
+        def attempt(
+            suffix: str,
+            state: LeaderAttemptState,
+            *,
+            model_response: str | None = None,
+            decision_id: str | None = None,
+            lease_expires_at: datetime | None = None,
+        ) -> LeaderAttempt:
+            return LeaderAttempt(
+                attempt_id=f"leader-attempt-helper-{suffix}",
+                dag_id=dag.dag_id,
+                leader_session_id=self.leader_session_id,
+                objective_fingerprint=hashlib.sha256(b"objective").hexdigest(),
+                dag_generation=dag.generation,
+                definition_fingerprint=dag.definition_fingerprint,
+                evidence_fingerprint=evidence.fingerprint,
+                state=state,
+                owner_id="leader-owner-helper",
+                lease_expires_at=lease_expires_at or now + timedelta(seconds=30),
+                turn_id=f"leader-turn-helper-{suffix}",
+                model_response=model_response,
+                decision_id=decision_id,
+            )
+
+        with self.assertRaisesRegex(ConfigurationError, "no response"):
+            await service._reuse_durable_decision(
+                attempt("missing-response", LeaderAttemptState.MODEL_COMMITTED),
+                evidence,
+            )
+        with self.assertRaisesRegex(ConfigurationError, "cannot be reused"):
+            await service._reuse_durable_decision(
+                attempt(
+                    "bad-response",
+                    LeaderAttemptState.MODEL_COMMITTED,
+                    model_response="not-json",
+                ),
+                evidence,
+            )
+        with self.assertRaisesRegex(ConfigurationError, "owns this"):
+            await service._reuse_durable_decision(
+                attempt("claimed", LeaderAttemptState.CLAIMED),
+                evidence,
+            )
+        with self.assertRaisesRegex(ConfigurationError, "recovery is required"):
+            await service._reuse_durable_decision(
+                attempt("stale", LeaderAttemptState.STALE),
+                evidence,
+            )
+
+        with self.assertRaisesRegex(ConfigurationError, "no decision identity"):
+            await service._load_decision(
+                attempt("no-decision-id", LeaderAttemptState.DECISION_PUBLISHED),
+                evidence,
+            )
+        with self.assertRaisesRegex(ConfigurationError, "decision is missing"):
+            await service._load_decision(
+                attempt(
+                    "missing-decision",
+                    LeaderAttemptState.DECISION_PUBLISHED,
+                    decision_id="leader-decision-missing",
+                ),
+                evidence,
+            )
+        original_get_decision = self.store.get_leader_decision
+
+        async def fail_get_decision(*args, **kwargs):
+            del args, kwargs
+            raise LeaderStoreError("decision lookup failed")
+
+        self.store.get_leader_decision = fail_get_decision  # type: ignore[method-assign]
+        try:
+            with self.assertRaisesRegex(ConfigurationError, "decision lookup"):
+                await service._load_decision(
+                    attempt(
+                        "lookup-error",
+                        LeaderAttemptState.DECISION_PUBLISHED,
+                        decision_id="leader-decision-error",
+                    ),
+                    evidence,
+                )
+        finally:
+            self.store.get_leader_decision = original_get_decision  # type: ignore[method-assign]
+
+        expired = attempt(
+            "expired",
+            LeaderAttemptState.CLAIMED,
+            lease_expires_at=now - timedelta(seconds=1),
+        )
+        no_recovery_service = LeaderApplicationService(
+            cast(LeaderStore, self.store),
+            self.dag_service,
+            parent_binding=self.parent_binding,
+            leader_binding=self.leader_binding,
+        )
+        with self.assertRaisesRegex(ConfigurationError, "inspection is unavailable"):
+            await no_recovery_service._guard_existing_claim(expired, now)
+
+        original_load_turn_attempts = self.store.load_turn_attempts
+
+        async def fail_load_turn_attempts(*args, **kwargs):
+            del args, kwargs
+            raise RuntimeError("recovery inspection failed")
+
+        self.store.load_turn_attempts = fail_load_turn_attempts  # type: ignore[method-assign]
+        try:
+            with self.assertRaisesRegex(ConfigurationError, "inspection failed"):
+                await service._guard_existing_claim(expired, now)
+        finally:
+            self.store.load_turn_attempts = original_load_turn_attempts  # type: ignore[method-assign]
+
+        async def unresolved_turn(*args, **kwargs):
+            del args, kwargs
+            return (SimpleNamespace(turn_id=expired.turn_id),)
+
+        self.store.load_turn_attempts = unresolved_turn  # type: ignore[method-assign]
+        try:
+            with self.assertRaisesRegex(ConfigurationError, "unresolved provider turn"):
+                await service._guard_existing_claim(expired, now)
+        finally:
+            self.store.load_turn_attempts = original_load_turn_attempts  # type: ignore[method-assign]
+
+        await service._mark_indeterminate(
+            attempt("already-indeterminate", LeaderAttemptState.INDETERMINATE)
+        )
+        await service._mark_stale(attempt("already-stale", LeaderAttemptState.STALE))
+        await service._mark_stale(attempt("already-executed", LeaderAttemptState.EXECUTED))
+        await service._mark_executed(attempt("already-executed-again", LeaderAttemptState.EXECUTED))
+
+        original_transition = self.store.transition_leader_attempt
+
+        async def fail_transition(*args, **kwargs):
+            del args, kwargs
+            raise LeaderStoreError("transition raced", kind="concurrent_modification")
+
+        self.store.transition_leader_attempt = fail_transition  # type: ignore[method-assign]
+        try:
+            await service._mark_indeterminate(
+                attempt("indeterminate-race", LeaderAttemptState.CLAIMED)
+            )
+            await service._mark_stale(attempt("stale-race", LeaderAttemptState.CLAIMED))
+            await service._mark_executed(
+                attempt("executed-race", LeaderAttemptState.DECISION_PUBLISHED)
+            )
+        finally:
+            self.store.transition_leader_attempt = original_transition  # type: ignore[method-assign]
+
+        async def fail_transition_hard(*args, **kwargs):
+            del args, kwargs
+            raise LeaderStoreError("transition failed", kind="integrity")
+
+        self.store.transition_leader_attempt = fail_transition_hard  # type: ignore[method-assign]
+        try:
+            with self.assertRaisesRegex(ConfigurationError, "completion failed"):
+                await service._mark_executed(
+                    attempt("executed-failure", LeaderAttemptState.DECISION_PUBLISHED)
+                )
+        finally:
+            self.store.transition_leader_attempt = original_transition  # type: ignore[method-assign]
+
+        mismatched = LeaderDecisionRecord(
+            decision_id="leader-decision-mismatch",
+            attempt_id="leader-attempt-other",
+            dag_id=dag.dag_id,
+            leader_session_id=self.leader_session_id,
+            dag_generation=dag.generation,
+            definition_fingerprint=dag.definition_fingerprint,
+            evidence_fingerprint=evidence.fingerprint,
+            decision=LeaderDecision(LeaderDecisionKind.SELECT_NODE, selected_node_id="a"),
+            created_at=now,
+        )
+        with self.assertRaisesRegex(ConfigurationError, "identity"):
+            service._validate_decision(
+                mismatched,
+                attempt("identity", LeaderAttemptState.DECISION_PUBLISHED),
+                evidence,
+            )
+
     async def test_invalid_typed_decision_is_durable_stale_and_not_replayed(self) -> None:
         await self.dag_service.create_task_dag(CreateTaskDagRequest("invalid", (_node("a", 0),)))
         runner = _Runner(self.leader_session_id, ['{"action":"FINALIZE"}'])
@@ -713,13 +1114,17 @@ class LeaderIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 '{"action":"FINALIZE","summary":"done"}',
             ],
         )
+        shared.started = asyncio.Event()
+        shared.release = asyncio.Event()
         first = self._leader(shared)
         second = self._leader(_Runner(self.leader_session_id, []))
-        results = await asyncio.gather(
-            first.run(RunLeaderRequest("race", "objective")),
-            second.run(RunLeaderRequest("race", "objective")),
-            return_exceptions=True,
-        )
+        first_task = asyncio.create_task(first.run(RunLeaderRequest("race", "objective")))
+        await shared.started.wait()
+        second_task = asyncio.create_task(second.run(RunLeaderRequest("race", "objective")))
+        second_result = (await asyncio.gather(second_task, return_exceptions=True))[0]
+        shared.release.set()
+        first_result = await first_task
+        results = [first_result, second_result]
         self.assertEqual(shared.selection_calls, 1)
         self.assertEqual(len(await self.store.list_leader_decisions("race")), 2)
         self.assertTrue(any(isinstance(result, ConfigurationError) for result in results))
