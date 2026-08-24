@@ -1672,8 +1672,9 @@ Writable workflow 现在只从实际 parent `ConversationBinding` 所绑定 sess
 保留 reasoning 与保留 backend-call 的结构都会排除；assistant 可见正文可与
 `reasoning_content` 明确分离，后者绝不进入 Relay。
 
-Session schema 19 保留 schema 17 的每个 writable lease 一条一对一、insert-only READY Relay，
-以及下述持久化 Task DAG 表，并新增后文的持久化 Leader attempt/decision 投影。其 identity
+Session schema 20 保留 schema 17 的每个 writable lease 一条一对一、insert-only READY Relay，
+以及下述持久化 Task DAG 表和 schema 20 的 predecessor-result Relay 表，并保留后文的持久化
+Leader attempt/decision 投影。其 identity
 绑定 parent/task/child、lease、worktree、baseline checkpoint、base commit、
 capability/grant fingerprint 与 child-task digest。加载时校验 source、content 和完整记录
 fingerprint，不一致时 fail closed。投影和 durable 复验发生在 `SubagentLink` 之后、child
@@ -1704,16 +1705,31 @@ DAG service 只从真实的 `ConversationBinding` 推导 parent session。每个
 active-node claim 是跨进程串行闸门：两个 scheduler 不能同时执行不同的 ready 节点，DAG 也不会
 使用 `SubagentScheduler.run_many()` 或对节点进行无界 gather。
 
-Session schema 19 在 `task_dags` 与 `task_dag_nodes` 中保存不可变 DAG 定义和有界节点运行投影。
-定义是 insert-only；graph 与 node 生命周期更新使用 generation CAS。成功节点记录精确的 worker
+Session schema 20 在 `task_dags` 与 `task_dag_nodes` 中保存不可变 DAG 定义和有界节点运行投影，
+并在 `task_dag_dependency_relays` 中保存 insert-only 的 predecessor-result Relay。定义和 Relay
+发布都是 insert-only；graph 与 node 生命周期更新使用 generation CAS。成功节点记录精确的 worker
 task、child session、writable lease、worktree、baseline checkpoint、Parent Relay 和有界结果投影。
 缺失或不一致的成功关联不会被当作成功。
+
+三条编排 context channel 保持分离。Parent Context Relay 把有界 parent-session snapshot 带入一个
+child；DAG predecessor-result Relay 只把已完成的直接前置节点 projection 带入 dependent worker；
+Leader evidence envelope 把有界 DAG state 带入 zero-tool Leader。root node 不接收 predecessor
+Relay；dependent node 的 Relay 按其直接 edge 的声明顺序排列，在该 node 精确的 `RUNNING` generation
+claim 之后、child runtime 或 provider 执行之前发布。每个 entry 都绑定精确 predecessor generation、
+parent task、child session、保留中的 writable lease、worktree、baseline checkpoint 和 Parent Relay。
+Relay 限制为每个 predecessor 4 KiB UTF-8 result、合计 16 KiB source content、渲染消息 24 KiB。
+它只包含脱敏 result text 和 opaque fingerprint，不跨 edge 传递 transcript、reasoning、tool call、
+workspace bytes、capability grant、path 或 authority instruction。缺失、过期、被篡改、非 completed
+或 identity 不匹配的 evidence 会在 worker request 前失败关闭；相同 target generation 的精确重复
+发布是幂等的，不同发布会被拒绝。
 
 生命周期为 `PENDING -> READY -> RUNNING -> COMPLETED/FAILED/CANCELLED/INDETERMINATE`；因依赖被
 阻塞的后代进入 `SKIPPED`。失败或取消的依赖只阻塞其后代，独立分支继续执行。重启 reconciliation
 按精确 parent task 与 lease 查询：worker 已完成/失败/取消时映射为 DAG 相同的终态；证据缺失、
 orphan 或不确定时映射为 `INDETERMINATE`。不增加自动 retry、崩溃重跑、merge、copy-back、rollback、
-cleanup、dataflow relay、UI、Swarm 或 Ultracode 行为；有界 Leader controller 由 ADR 0135 单独规定。
+cleanup、parallel 或 dynamic dataflow execution、UI、Swarm 或 Ultracode 行为；上文所述有界直接
+predecessor-result Relay 是本切片唯一的 dataflow 行为，不传递 authority 或 workspace state；有界
+Leader controller 由 ADR 0135 单独规定。
 既有 Worktree、Checkpoint、Parent Relay 和 worker-scoped 只读 LSP 合约继续作为 authority owner。详见
 [ADR 0134](adr/0134-durable-serialized-task-dag.md)。
 
@@ -1732,7 +1748,7 @@ node definition 与 durable outcome metadata，并对 preview 脱敏、带 finge
 transcript/reasoning/tool argument/output、Relay payload、workspace bytes、checkpoint bytes、Git
 diff、secret 或 arbitrary path。
 
-当前 Session Store schema 19 新增 `leader_attempts` 与 `leader_decisions`。Attempt 绑定精确 DAG
+当前 Session Store schema 20 保留 schema 19 新增的 `leader_attempts` 与 `leader_decisions` 投影。Attempt 绑定精确 DAG
 generation、definition/evidence/objective fingerprint、Leader session、controller owner、turn
 identity 与 durable lifecycle。SQLite write transaction 和 CAS-like state transition 保证同一精确
 snapshot 只有一个 controller 拥有 model request。Controller 必须在 provider call 紧邻之前，使用

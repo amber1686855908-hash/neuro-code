@@ -48,7 +48,11 @@ from neuro_code.application.ports.parent_context_relay import (
 from neuro_code.application.ports.sandbox import LocalProcessSandbox
 from neuro_code.application.ports.skills import SkillDiscovery
 from neuro_code.application.ports.storage import SessionStore
-from neuro_code.application.ports.task_dag import TaskDagStore
+from neuro_code.application.ports.task_dag import TaskDagError, TaskDagStore
+from neuro_code.application.ports.task_dag_result_relay import (
+    TaskDagDependencyResultRelayError,
+    TaskDagDependencyResultRelayStore,
+)
 from neuro_code.application.ports.tools import Tool, ToolContext
 from neuro_code.application.ports.user_interaction import UserInteractionPort
 from neuro_code.application.ports.web_fetch import (
@@ -135,6 +139,11 @@ from neuro_code.domain.parent_context_relay import (
     render_parent_context_relay,
 )
 from neuro_code.domain.sandbox.models import SandboxProfile
+from neuro_code.domain.task_dag import TaskDagNodeState
+from neuro_code.domain.task_dag_result_relay import (
+    TaskDagDependencyResultRelay,
+    render_task_dag_dependency_relay,
+)
 from neuro_code.domain.workspace.instructions import InstructionDiscoveryResult
 from neuro_code.domain.workspace.skills import SkillDiscoveryResult
 from neuro_code.infrastructure.background_tasks import LocalBackgroundTaskManager
@@ -467,6 +476,7 @@ class ApplicationComposition:
         capabilities: SubagentCapabilitySet | None = None,
         user_interaction: UserInteractionPort | None = None,
         parent_context_relay: ParentContextRelay | None = None,
+        dag_result_relay: TaskDagDependencyResultRelay | None = None,
     ) -> ConversationBinding:
         if self._closed:
             raise RuntimeError("application composition is closed")
@@ -489,6 +499,46 @@ class ApplicationComposition:
                 ) from error
             if durable_relay != parent_context_relay:
                 raise ConfigurationError("parent context relay is not the published durable record")
+        if dag_result_relay is not None:
+            if not isinstance(dag_result_relay, TaskDagDependencyResultRelay):
+                raise ConfigurationError("DAG result relay must be canonical")
+            try:
+                durable_dag_relay = await cast(
+                    TaskDagDependencyResultRelayStore,
+                    self.store,
+                ).get_task_dag_dependency_relay(dag_result_relay.relay_id)
+            except TaskDagDependencyResultRelayError as error:
+                raise ConfigurationError(
+                    f"DAG result relay integrity verification failed: {error}"
+                ) from error
+            if durable_dag_relay != dag_result_relay:
+                raise ConfigurationError("DAG result relay is not the published durable record")
+            try:
+                durable_dag = await cast(TaskDagStore, self.store).get_task_dag(
+                    dag_result_relay.dag_id
+                )
+            except TaskDagError as error:
+                raise ConfigurationError(
+                    f"DAG result relay target verification failed: {error}"
+                ) from error
+            if durable_dag is None:
+                raise ConfigurationError("DAG result relay target DAG is missing")
+            try:
+                durable_target = durable_dag.node(dag_result_relay.target_node_id)
+            except KeyError as error:
+                raise ConfigurationError("DAG result relay target node is missing") from error
+            if (
+                durable_dag.definition_fingerprint != dag_result_relay.dag_definition_fingerprint
+                or durable_dag.active_node_id != durable_target.node_id
+                or durable_target.state is not TaskDagNodeState.RUNNING
+                or durable_target.generation != dag_result_relay.target_node_generation
+                or durable_target.definition_fingerprint
+                != dag_result_relay.target_node_definition_fingerprint
+                or durable_target.dependencies != dag_result_relay.direct_dependency_ids
+            ):
+                raise ConfigurationError(
+                    "DAG result relay target is not the active exact execution"
+                )
         if capabilities is not None:
             if not isinstance(capabilities, SubagentCapabilitySet):
                 raise ConfigurationError("child capabilities must be canonical")
@@ -867,6 +917,15 @@ class ApplicationComposition:
                     if parent_context_relay is not None
                     else None
                 ),
+                dag_result_relay_message=(
+                    Message(
+                        Role.USER,
+                        render_task_dag_dependency_relay(dag_result_relay.entries),
+                        synthetic_reason=SyntheticReason.DAG_PREDECESSOR_RESULTS,
+                    )
+                    if dag_result_relay is not None
+                    else None
+                ),
             )
             conversation = await AgentConversation.open(
                 runtime=runtime,
@@ -1191,6 +1250,8 @@ class ApplicationComposition:
             cast(WritableSubagentLeaseStore, self.store),
             cast(ParentContextRelayStore, self.store),
             parent_binding=parent_binding,
+            dependency_relay_store=cast(TaskDagDependencyResultRelayStore, self.store),
+            redaction_values=self.config.redaction_values(),
         )
 
     async def create_leader_service(

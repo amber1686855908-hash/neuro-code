@@ -52,6 +52,7 @@ from neuro_code.domain.session_tasks import (
     SessionTaskStatus,
     SubagentLink,
 )
+from neuro_code.domain.task_dag_result_relay import TaskDagDependencyResultRelay
 from neuro_code.domain.worktree import (
     WorktreeCreateRequest,
     WorktreeId,
@@ -180,6 +181,7 @@ class RunWritableSubagentRequest:
     parent_session_id: str
     prompt: str
     max_steps: int = 8
+    dependency_result_relay: TaskDagDependencyResultRelay | None = None
 
     def __post_init__(self) -> None:
         _safe_identifier(self.parent_session_id, field_name="parent_session_id")
@@ -200,6 +202,11 @@ class RunWritableSubagentRequest:
             raise ValueError(
                 f"writable subagent max_steps must be between 1 and {MAX_SUBAGENT_STEPS}"
             )
+        if self.dependency_result_relay is not None and not isinstance(
+            self.dependency_result_relay,
+            TaskDagDependencyResultRelay,
+        ):
+            raise TypeError("writable dependency result relay must be canonical")
 
 
 @dataclass(frozen=True, slots=True)
@@ -384,6 +391,10 @@ class WritableSubagentApplicationService:
             raise ValueError("writable subagent request must be canonical")
         if request.parent_session_id != self._parent_session_id:
             raise ConfigurationError("writable subagent request parent session does not match")
+        if request.dependency_result_relay is not None:
+            raise ConfigurationError(
+                "DAG dependency result relay requires an exact DAG execution identity"
+            )
         if not self._initialized:
             raise ConfigurationError("writable subagent service is not initialized")
         requested = writable_subagent_request(
@@ -413,6 +424,12 @@ class WritableSubagentApplicationService:
             raise ConfigurationError("writable execution identity must be canonical")
         if request.parent_session_id != self._parent_session_id:
             raise ConfigurationError("writable subagent request parent session does not match")
+        if request.dependency_result_relay is not None and (
+            request.dependency_result_relay.dag_id != execution_identity.dag_id
+            or request.dependency_result_relay.target_node_id != execution_identity.node_id
+            or request.dependency_result_relay.target_node_generation < 1
+        ):
+            raise ConfigurationError("writable dependency result relay identity is inconsistent")
         if not self._initialized:
             raise ConfigurationError("writable subagent service is not initialized")
         requested = writable_subagent_request(
@@ -426,6 +443,7 @@ class WritableSubagentApplicationService:
                 requested,
                 sink=sink,
                 parent_task_id=execution_identity.parent_task_id,
+                dependency_result_relay=request.dependency_result_relay,
             )
 
     async def _run_locked(
@@ -435,9 +453,12 @@ class WritableSubagentApplicationService:
         *,
         sink: EventSink | None,
         parent_task_id: str | None = None,
+        dependency_result_relay: TaskDagDependencyResultRelay | None = None,
     ) -> WritableSubagentResultProjection:
         parent_capabilities = self._parent_capabilities
         parent_session_id = self._parent_session_id
+        if dependency_result_relay != request.dependency_result_relay:
+            raise ConfigurationError("writable dependency result relay was not preserved")
         parent_repository = await self._worktrees.repository_identity(parent_capabilities.cwd)
         worktree_id = WorktreeId.new()
         child_root = self._worktrees.planned_managed_path(parent_repository, worktree_id)

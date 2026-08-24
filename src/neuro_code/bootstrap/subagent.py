@@ -294,6 +294,7 @@ class CompositionWritableSubagentRuntimeFactory(WritableSubagentRuntimeFactory):
             capabilities=capabilities.capabilities,
             enable_background_tasks=False,
             parent_context_relay=relay,
+            dag_result_relay=request.dependency_result_relay,
         )
         return _CompositionWritableSubagentRuntime(binding, child_session_id, capabilities)
 

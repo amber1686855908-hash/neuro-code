@@ -93,6 +93,7 @@ class ContextBuilder:
     """
 
     __slots__ = (
+        "_dag_result_relay_message",
         "_instruction_provider",
         "_interaction_mode",
         "_last_instruction_result",
@@ -113,6 +114,7 @@ class ContextBuilder:
         instruction_provider: Callable[[], InstructionDiscoveryResult | None] | None,
         skill_provider: Callable[[], SkillDiscoveryResult | None] | None,
         parent_relay_message: Message | None = None,
+        dag_result_relay_message: Message | None = None,
     ) -> None:
         self._reasoning_effort = reasoning_effort
         self._interaction_mode = interaction_mode
@@ -125,7 +127,14 @@ class ContextBuilder:
             or parent_relay_message.synthetic_reason is not SyntheticReason.PARENT_RELAY
         ):
             raise TypeError("parent relay message must be canonical synthetic context")
+        if dag_result_relay_message is not None and (
+            not isinstance(dag_result_relay_message, Message)
+            or dag_result_relay_message.synthetic_reason
+            is not SyntheticReason.DAG_PREDECESSOR_RESULTS
+        ):
+            raise TypeError("DAG result relay message must be canonical synthetic context")
         self._parent_relay_message = parent_relay_message
+        self._dag_result_relay_message = dag_result_relay_message
         self._last_instruction_result: InstructionDiscoveryResult | None = None
         self._last_skill_result: SkillDiscoveryResult | None = None
 
@@ -291,7 +300,12 @@ class ContextBuilder:
             item
             for item in items
             if not (
-                isinstance(item, Message) and item.synthetic_reason is SyntheticReason.PARENT_RELAY
+                isinstance(item, Message)
+                and item.synthetic_reason
+                in {
+                    SyntheticReason.PARENT_RELAY,
+                    SyntheticReason.DAG_PREDECESSOR_RESULTS,
+                }
             )
         ]
 
@@ -351,6 +365,22 @@ class ContextBuilder:
                     break
                 insert_at += 1
             rendered.insert(insert_at, self._parent_relay_message)
+
+        # The dependency relay is a separate channel from parent context.  Its
+        # canonical copy is owned by the application and replaces any caller-
+        # supplied synthetic message removed above.
+        if self._dag_result_relay_message is not None:
+            insert_at = system_index + 1
+            while insert_at < len(rendered):
+                item = rendered[insert_at]
+                if not isinstance(item, Message) or item.synthetic_reason not in {
+                    SyntheticReason.PROJECT_INSTRUCTIONS,
+                    SyntheticReason.AVAILABLE_SKILLS,
+                    SyntheticReason.PARENT_RELAY,
+                }:
+                    break
+                insert_at += 1
+            rendered.insert(insert_at, self._dag_result_relay_message)
 
         return tuple(rendered)
 

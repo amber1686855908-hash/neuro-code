@@ -1726,9 +1726,10 @@ tool-role, synthetic, tool-call-bearing, media-bearing, preserved reasoning,
 and preserved backend-call structures are excluded; assistant visible prose is
 separable from and never carries its `reasoning_content`.
 
-Session schema 19 retains the schema-17 one-to-one insert-only READY relay per
-writable lease and the durable Task DAG tables described below, and adds the
-durable Leader attempt/decision projections described after the DAG. Its
+Session schema 20 retains the schema-17 one-to-one insert-only READY relay per
+writable lease, the durable Task DAG tables described below, and the
+schema-20 predecessor-result relay table; it also retains the durable Leader
+attempt/decision projections described after the DAG. Its
 identity binds the parent/task/child, lease, worktree, baseline checkpoint,
 base commit, capability/grant fingerprints, and child-task digest. Source,
 content, and complete-record fingerprints are verified on load; inconsistent
@@ -1771,12 +1772,31 @@ application atomically claims the node with node-generation CAS plus a graph
 two schedulers cannot execute different ready nodes at once, and the DAG
 never uses `SubagentScheduler.run_many()` or an unbounded gather over nodes.
 
-Session schema 19 stores immutable DAG definitions and bounded node runtime
-projections in `task_dags` and `task_dag_nodes`. Definitions are insert-only;
-graph and node lifecycle updates use generation CAS. A successful node records
-the exact worker task, child session, writable lease, worktree, baseline
-checkpoint, Parent Relay, and bounded result projection. A missing or
+Session schema 20 stores immutable DAG definitions and bounded node runtime
+projections in `task_dags` and `task_dag_nodes`, plus insert-only
+`task_dag_dependency_relays`. Definitions and relay publications are
+insert-only; graph and node lifecycle updates use generation CAS. A successful
+node records the exact worker task, child session, writable lease, worktree,
+baseline checkpoint, Parent Relay, and bounded result projection. A missing or
 inconsistent success correlation is not treated as success.
+
+The three orchestration context channels remain separate. The Parent Context
+Relay carries a bounded parent-session snapshot into one child. The DAG
+predecessor-result relay carries only completed direct-predecessor projections
+into the dependent worker. The Leader evidence envelope carries bounded DAG
+state into the zero-tool Leader. A root node receives no predecessor relay;
+for a dependent node, the relay follows the declaration order of its direct
+edges and is published after the node's exact `RUNNING` generation claim but
+before child runtime or provider execution. Each entry is bound to the exact
+predecessor generation, parent task, child session, preserved writable lease,
+worktree, baseline checkpoint, and Parent Relay. The relay is limited to a
+4-KiB UTF-8 result per predecessor, 16 KiB of aggregate source content, and a
+24-KiB rendered message. It contains redacted result text and opaque
+fingerprints only: no transcript, reasoning, tool calls, workspace bytes,
+capability grants, paths, or authority instructions cross the edge. Missing,
+stale, tampered, non-completed, or mismatched evidence fails closed before a
+worker request; an exact duplicate publication is idempotent, while a
+different publication for the same target generation is rejected.
 
 The lifecycle is `PENDING -> READY -> RUNNING -> COMPLETED/FAILED/CANCELLED/
 INDETERMINATE`; dependency-blocked descendants become `SKIPPED`. A failed or
@@ -1784,8 +1804,10 @@ cancelled dependency blocks only its descendants while independent branches
 continue. Restart reconciliation looks up the exact parent task and lease:
 completed/failed/cancelled worker tasks map to the same DAG terminal meaning;
 missing, orphaned, or uncertain evidence maps to `INDETERMINATE`. No automatic
-retry, crash rerun, merge, copy-back, rollback, cleanup, dataflow relay, UI
-surface, Swarm, or Ultracode behavior is added. The bounded Leader controller
+retry, crash rerun, merge, copy-back, rollback, cleanup, parallel or dynamic
+dataflow execution, UI surface, Swarm, or Ultracode behavior is added. The
+bounded direct predecessor-result relay described above is the only dataflow
+behavior in this slice; it does not transfer authority or workspace state. The bounded Leader controller
 is specified separately by [ADR 0135](adr/0135-bounded-serialized-leader-controller.md).
 Existing Worktree,
 Checkpoint, Parent Relay, and worker-scoped read-only LSP contracts remain the
@@ -1810,8 +1832,8 @@ previews and fingerprints; it never carries raw transcript/reasoning/tool
 arguments/output, Relay payloads, workspace bytes, checkpoint bytes, Git diffs,
 secrets, or arbitrary paths.
 
-The current Session Store schema 19 adds `leader_attempts` and
-`leader_decisions`. An attempt binds the exact DAG generation,
+The current Session Store schema 20 retains the schema-19 `leader_attempts` and
+`leader_decisions` projections. An attempt binds the exact DAG generation,
 definition/evidence/objective fingerprints, Leader session, controller owner,
 turn identity, and durable lifecycle. SQLite write transactions and CAS-like
 state transitions ensure one controller owns a model request for one exact

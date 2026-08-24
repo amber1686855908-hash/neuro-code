@@ -95,6 +95,10 @@ from neuro_code.application.ports.sandbox import (
 )
 from neuro_code.application.ports.storage import SessionStore
 from neuro_code.application.ports.task_dag import TaskDagError, TaskDagStore
+from neuro_code.application.ports.task_dag_result_relay import (
+    TaskDagDependencyResultRelayError,
+    TaskDagDependencyResultRelayStore,
+)
 from neuro_code.application.ports.terminal import (
     InteractiveTerminalManager,
     InteractiveTerminalSession,
@@ -334,6 +338,8 @@ __all__ = [
     "RuntimeRole",
     "SandboxedProcessRequest",
     "SessionStore",
+    "TaskDagDependencyResultRelayError",
+    "TaskDagDependencyResultRelayStore",
     "TaskDagError",
     "TaskDagStore",
     "Tool",

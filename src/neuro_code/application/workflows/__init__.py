@@ -65,6 +65,9 @@ from neuro_code.application.workflows.task_dag import (
     TaskDagApplicationService,
     TaskDagWritableService,
 )
+from neuro_code.application.workflows.task_dag_result_relay import (
+    TaskDagDependencyResultRelayApplicationService,
+)
 from neuro_code.application.workflows.writable_subagent import (
     MAX_WRITABLE_SUBAGENT_RESULT_BYTES,
     MAX_WRITABLE_SUBAGENT_TIMEOUT_SECONDS,
@@ -122,6 +125,7 @@ __all__ = [
     "SubagentScheduler",
     "SubagentWorkRequest",
     "TaskDagApplicationService",
+    "TaskDagDependencyResultRelayApplicationService",
     "TaskDagWritableService",
     "WritableSubagentApplicationService",
     "WritableSubagentCapabilityGrant",

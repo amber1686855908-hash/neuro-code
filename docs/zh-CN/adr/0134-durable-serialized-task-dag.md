@@ -47,6 +47,13 @@ worker 启动前，service 原子地把一个 `READY` 节点改为 `RUNNING`，�
 baseline Checkpoint、Relay、fingerprint、changed-file count 和有界 response preview。成功节点
 必须有精确的 lease 与 Relay 证据；成功关联缺失或不一致时为 `INDETERMINATE`。
 
+ADR 0136 在不改变这一 execution authority 的前提下增加有界 predecessor-result Relay。在 dependent
+node 完成精确的 `RUNNING` generation claim 且 child runtime 启动之前，DAG service 发布一条 schema-20
+insert-only projection，只包含按声明顺序排列的 completed direct predecessor。Projection 经过脱敏，
+每个 result 最多 4 KiB、source result 合计最多 16 KiB、渲染 context 最多 24 KiB；它绑定 predecessor
+worker/lease/workspace/checkpoint/Parent Relay identity，不能携带 authority。Relay 是独立 context
+channel，不改变 dependency state machine。
+
 ## 依赖与失败语义
 
 节点生命周期为：
@@ -85,13 +92,14 @@ child session/worktree/checkpoint/relay identity，且不会重跑 worker。这�
 ## 未实现
 
 本 ADR 不增加 model 生成的 DAG 分解，也不定义 Leader controller；有界 Leader 由独立的
-[ADR 0135](0135-bounded-serialized-leader-controller.md) 规定。本 ADR 也不增加 Swarm、Ultracode、自动委派、并行执行、dataflow/
-result relay、前置 transcript 共享、共享 worktree、merge/integration、commit、rollback、cleanup、
-retry、自动崩溃重跑、CLI/TUI/ACP 暴露或新的 public orchestration protocol。
+[ADR 0135](0135-bounded-serialized-leader-controller.md) 规定。本 ADR 也不增加 Swarm、Ultracode、自动委派、并行执行、dynamic
+dataflow scheduling、前置 transcript 共享、共享 worktree、merge/integration、commit、rollback、cleanup、
+retry、自动崩溃重跑、CLI/TUI/ACP 暴露或新的 public orchestration protocol。有界 direct
+predecessor-result Relay 由独立的 [ADR 0136](0136-bounded-task-dag-predecessor-result-relay.md) 规定。
 
 ## 验证边界
 
-验收要求 domain bound/cycle 测试、带已填充 Parent Relay 的 schema 17→19 迁移、insert-only 与
+验收要求 domain bound/cycle 测试、带已填充 Parent Relay 的 schema 17→20 迁移、insert-only 与
 过期 generation 测试、跨进程 claim 和双 scheduler 竞态证据、确定性的串行 diamond 失败传播、
 精确 worker correlation、completed/failed/cancelled/uncertain 恢复、真实 `multiprocessing.spawn` 在
 worker 完成后及 active ownership 期间的进程死亡、无重跑 allocation count、真实 Relay-before-model、

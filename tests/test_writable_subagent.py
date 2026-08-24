@@ -11,7 +11,7 @@ import sys
 import tempfile
 import unittest
 import uuid
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Callable, Sequence
 from contextlib import suppress
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -35,6 +35,9 @@ from neuro_code.application.ports.sandbox import (
     SandboxedProcessRequest,
 )
 from neuro_code.application.ports.task_dag import TaskDagStore
+from neuro_code.application.ports.task_dag_result_relay import (
+    TaskDagDependencyResultRelayError,
+)
 from neuro_code.application.ports.tools import ToolContext
 from neuro_code.application.ports.worktree import WorktreeError, WorktreeFailureKind
 from neuro_code.application.ports.writable_subagent import WritableSubagentLeaseError
@@ -102,6 +105,7 @@ from neuro_code.domain.parent_context_relay import (
 from neuro_code.domain.sandbox.models import SandboxProfile
 from neuro_code.domain.session_tasks import SessionTaskStatus
 from neuro_code.domain.task_dag import TaskDag, TaskDagNode, TaskDagNodeState, TaskDagState
+from neuro_code.domain.task_dag_result_relay import TaskDagDependencyResultRelay
 from neuro_code.domain.tools import ToolDefinition
 from neuro_code.domain.worktree import (
     WorktreeCreateRequest,
@@ -1347,6 +1351,7 @@ class _FakeRuntimeFactory:
         self.close_error = close_error
         self.runtime: _FakeRuntime | None = None
         self.relay: ParentContextRelay | None = None
+        self.dependency_relays: list[object | None] = []
 
     async def create_session(self, request: RunWritableSubagentRequest, *, capabilities):
         del request
@@ -1364,7 +1369,8 @@ class _FakeRuntimeFactory:
         capabilities,
         relay: ParentContextRelay,
     ) -> _FakeRuntime:
-        del request, parent_task_id
+        del parent_task_id
+        self.dependency_relays.append(request.dependency_result_relay)
         self.relay = relay
         self.runtime = _FakeRuntime(
             child_session_id,
@@ -1407,6 +1413,37 @@ class _CrashGuardProvider:
 def _crash_guard_provider_factory(config: AppConfig, failover: bool) -> ModelProvider:
     del failover
     return cast(ModelProvider, _CrashGuardProvider(config.state_dir / "model-called"))
+
+
+class _DagRelayContextProvider:
+    provider_name = "fixture"
+    model_name = "fixture-model"
+    context_affinity = "fixture-dag-relay"
+    capabilities = ModelCapabilitySet.all_unknown()
+
+    def __init__(self, contexts: list[ModelContext]) -> None:
+        self._contexts = contexts
+
+    async def stream(
+        self,
+        context: ModelContext,
+        tools: Sequence[ToolDefinition],
+        *,
+        tool_policy: ModelToolPolicy = ModelToolPolicy.ALLOWED,
+    ) -> AsyncIterator[ModelEvent]:
+        del tools, tool_policy
+        self._contexts.append(context)
+        yield ModelCompleted("stop", response_text="completed result")
+
+
+def _dag_relay_context_provider_factory(
+    contexts: list[ModelContext],
+) -> Callable[[AppConfig, bool], ModelProvider]:
+    def factory(config: AppConfig, failover: bool) -> ModelProvider:
+        del config, failover
+        return cast(ModelProvider, _DagRelayContextProvider(contexts))
+
+    return factory
 
 
 class _ExitBeforeRuntimeFactory:
@@ -2209,6 +2246,7 @@ class WritableApplicationTests(unittest.IsolatedAsyncioTestCase):
                 store,
                 cast(ParentContextRelayStore, store),
                 parent_binding=parent_binding,
+                dependency_relay_store=store,
             )
             before_parent = (parent / "parent.txt").read_bytes()
             dag = await dag_service.create_task_dag(
@@ -2216,7 +2254,12 @@ class WritableApplicationTests(unittest.IsolatedAsyncioTestCase):
                     "writable-dag",
                     (
                         TaskDagNode(node_id="a", ordinal=0, prompt="child A"),
-                        TaskDagNode(node_id="b", ordinal=1, prompt="child B"),
+                        TaskDagNode(
+                            node_id="b",
+                            ordinal=1,
+                            prompt="child B",
+                            dependencies=("a",),
+                        ),
                     ),
                 )
             )
@@ -2236,6 +2279,21 @@ class WritableApplicationTests(unittest.IsolatedAsyncioTestCase):
                 2,
             )
             self.assertIsNotNone(factory.relay)
+            self.assertEqual(len(factory.dependency_relays), 2)
+            self.assertIsNone(factory.dependency_relays[0])
+            dependency_relay = factory.dependency_relays[1]
+            self.assertIsNotNone(dependency_relay)
+            assert dependency_relay is not None
+            self.assertEqual(dependency_relay.target_node_id, "b")
+            self.assertEqual(
+                tuple(entry.predecessor_node_id for entry in dependency_relay.entries),
+                ("a",),
+            )
+            self.assertEqual(dependency_relay.entries[0].result_text, "completed")
+            self.assertEqual(
+                await store.get_task_dag_dependency_relay(dependency_relay.relay_id),
+                dependency_relay,
+            )
             for node in result.nodes:
                 self.assertIsNotNone(node.parent_task_id)
                 assert node.parent_task_id is not None
@@ -2257,6 +2315,319 @@ class WritableApplicationTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual((parent / "parent.txt").read_bytes(), before_parent)
             self.assertEqual(len(await store.list_writable_subagent_leases()), 2)
             self.assertEqual(len(await store.list_subagent_links(parent_session_id)), 2)
+
+    async def test_task_dag_dependency_relay_is_insert_only_and_tamper_evident(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (
+                writable,
+                store,
+                _parent,
+                _worktrees,
+                _checkpoints,
+                factory,
+                _,
+                parent_session_id,
+            ) = await self._service(root, response="completed result")
+            parent_binding = _parent_binding(parent_session_id, _capability(root / "parent"))
+            dag_service = TaskDagApplicationService(
+                store,
+                cast(TaskDagStore, store),
+                writable,
+                store,
+                cast(ParentContextRelayStore, store),
+                parent_binding=parent_binding,
+                dependency_relay_store=store,
+            )
+            dag = await dag_service.create_task_dag(
+                CreateTaskDagRequest(
+                    "relay-integrity",
+                    (
+                        TaskDagNode(node_id="a", ordinal=0, prompt="A"),
+                        TaskDagNode(
+                            node_id="b",
+                            ordinal=1,
+                            prompt="B",
+                            dependencies=("a",),
+                        ),
+                    ),
+                )
+            )
+            result = await dag_service.run_task_dag(RunTaskDagRequest(dag.dag_id))
+            self.assertIs(result.state, TaskDagState.COMPLETED)
+            relay = factory.dependency_relays[1]
+            self.assertIsInstance(relay, TaskDagDependencyResultRelay)
+            assert isinstance(relay, TaskDagDependencyResultRelay)
+            self.assertEqual(await store.insert_task_dag_dependency_relay(relay), relay)
+
+            altered_entry = replace(relay.entries[0], result_text="different result")
+            altered = TaskDagDependencyResultRelay.create(
+                relay_id="tdr-mismatch",
+                dag_id=relay.dag_id,
+                dag_definition_fingerprint=relay.dag_definition_fingerprint,
+                target_node_id=relay.target_node_id,
+                target_node_generation=relay.target_node_generation,
+                target_node_definition_fingerprint=relay.target_node_definition_fingerprint,
+                direct_dependency_ids=relay.direct_dependency_ids,
+                entries=(altered_entry,),
+                truncated=altered_entry.truncated,
+                created_at=relay.created_at,
+            )
+            with self.assertRaisesRegex(
+                TaskDagDependencyResultRelayError,
+                "different payload",
+            ):
+                await store.insert_task_dag_dependency_relay(altered)
+
+            connection = sqlite3.connect(store.database_path)
+            tampered = relay.entries[0].to_dict()
+            tampered["result_text"] = "tampered"
+            connection.execute(
+                "UPDATE task_dag_dependency_relays SET entries_json = ? WHERE relay_id = ?",
+                (json.dumps([tampered], separators=(",", ":")), relay.relay_id),
+            )
+            connection.commit()
+            connection.close()
+            with self.assertRaisesRegex(
+                TaskDagDependencyResultRelayError,
+                "integrity",
+            ):
+                await store.get_task_dag_dependency_relay(relay.relay_id)
+
+    async def test_task_dag_dependency_relay_is_direct_ordered_and_chained(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (
+                writable,
+                store,
+                _parent,
+                _worktrees,
+                _checkpoints,
+                factory,
+                _,
+                parent_session_id,
+            ) = await self._service(root, response="completed result")
+            parent_binding = _parent_binding(parent_session_id, _capability(root / "parent"))
+            dag_service = TaskDagApplicationService(
+                store,
+                cast(TaskDagStore, store),
+                writable,
+                store,
+                cast(ParentContextRelayStore, store),
+                parent_binding=parent_binding,
+                dependency_relay_store=store,
+            )
+            cases = (
+                (
+                    "direct-only",
+                    (
+                        TaskDagNode(node_id="a", ordinal=0, prompt="A"),
+                        TaskDagNode(node_id="x", ordinal=1, prompt="independent"),
+                        TaskDagNode(
+                            node_id="b",
+                            ordinal=2,
+                            prompt="B",
+                            dependencies=("a",),
+                        ),
+                    ),
+                    {"b": ("a",)},
+                ),
+                (
+                    "chain",
+                    (
+                        TaskDagNode(node_id="a", ordinal=0, prompt="A"),
+                        TaskDagNode(
+                            node_id="b",
+                            ordinal=1,
+                            prompt="B",
+                            dependencies=("a",),
+                        ),
+                        TaskDagNode(
+                            node_id="c",
+                            ordinal=2,
+                            prompt="C",
+                            dependencies=("b",),
+                        ),
+                    ),
+                    {"b": ("a",), "c": ("b",)},
+                ),
+                (
+                    "fan-in-declaration-order",
+                    (
+                        TaskDagNode(node_id="a", ordinal=0, prompt="A"),
+                        TaskDagNode(node_id="b", ordinal=1, prompt="B"),
+                        TaskDagNode(
+                            node_id="c",
+                            ordinal=2,
+                            prompt="C",
+                            dependencies=("a", "b"),
+                        ),
+                    ),
+                    {"c": ("a", "b")},
+                ),
+            )
+            for case, nodes, expected in cases:
+                with self.subTest(case=case):
+                    before = len(factory.dependency_relays)
+                    dag = await dag_service.create_task_dag(
+                        CreateTaskDagRequest(f"relay-{case}", nodes)
+                    )
+                    result = await dag_service.run_task_dag(RunTaskDagRequest(dag.dag_id))
+                    self.assertIs(result.state, TaskDagState.COMPLETED)
+                    published = [
+                        relay
+                        for relay in factory.dependency_relays[before:]
+                        if isinstance(relay, TaskDagDependencyResultRelay)
+                    ]
+                    self.assertEqual(
+                        {
+                            relay.target_node_id: tuple(
+                                entry.predecessor_node_id for entry in relay.entries
+                            )
+                            for relay in published
+                        },
+                        expected,
+                    )
+
+    async def test_task_dag_dependency_relay_does_not_start_after_failed_predecessor(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (
+                writable,
+                store,
+                _parent,
+                _worktrees,
+                _checkpoints,
+                factory,
+                _,
+                parent_session_id,
+            ) = await self._service(root, error=RuntimeError("provider down"))
+            parent_binding = _parent_binding(parent_session_id, _capability(root / "parent"))
+            dag_service = TaskDagApplicationService(
+                store,
+                cast(TaskDagStore, store),
+                writable,
+                store,
+                cast(ParentContextRelayStore, store),
+                parent_binding=parent_binding,
+                dependency_relay_store=store,
+            )
+            dag = await dag_service.create_task_dag(
+                CreateTaskDagRequest(
+                    "relay-failed-predecessor",
+                    (
+                        TaskDagNode(node_id="a", ordinal=0, prompt="A"),
+                        TaskDagNode(
+                            node_id="b",
+                            ordinal=1,
+                            prompt="B",
+                            dependencies=("a",),
+                        ),
+                    ),
+                )
+            )
+            result = await dag_service.run_task_dag(RunTaskDagRequest(dag.dag_id))
+
+            self.assertIs(result.state, TaskDagState.FAILED)
+            self.assertEqual(
+                [node.state for node in result.nodes],
+                [TaskDagNodeState.FAILED, TaskDagNodeState.SKIPPED],
+            )
+            self.assertEqual(factory.dependency_relays, [None])
+
+    async def test_task_dag_dependency_relay_reaches_composed_successor_context(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repository, _head = _make_real_repository(root)
+            state_dir = root / "state"
+            state_dir.mkdir()
+            (state_dir / "config.toml").write_text(
+                """
+[routing]
+default = "fixture"
+
+[providers.fixture]
+protocol = "openai-chat"
+model = "fixture-model"
+base_url = "https://provider.invalid/v1"
+api_key_env = "FIXTURE_KEY"
+""",
+                encoding="utf-8",
+            )
+            contexts: list[ModelContext] = []
+            with patch.dict(
+                os.environ,
+                {
+                    "HOME": str(root),
+                    "NEURO_CODE_HOME": str(state_dir),
+                    "FIXTURE_KEY": "fixture-key",
+                },
+                clear=True,
+            ):
+                application = await ApplicationComposition.open(
+                    ApplicationSettings(
+                        cwd=repository,
+                        sandbox="off",
+                        permission_mode=PermissionMode.BYPASS,
+                        max_steps=8,
+                    ),
+                    provider_factory=_dag_relay_context_provider_factory(contexts),
+                )
+                try:
+                    parent_session_id = await application.store.create_session(
+                        str(repository),
+                        "fixture",
+                        "fixture-model",
+                        sandbox_profile=SandboxProfile.OFF,
+                    )
+                    parent_binding = await application.create_binding(
+                        resume_id=parent_session_id,
+                        capabilities=_capability(repository, sandbox=SandboxProfile.OFF),
+                    )
+                    dag_service = application.create_task_dag_service(
+                        parent_binding=parent_binding,
+                    )
+                    dag = await dag_service.create_task_dag(
+                        CreateTaskDagRequest(
+                            "composed-dag-relay",
+                            (
+                                TaskDagNode(node_id="a", ordinal=0, prompt="A"),
+                                TaskDagNode(
+                                    node_id="b",
+                                    ordinal=1,
+                                    prompt="B",
+                                    dependencies=("a",),
+                                ),
+                            ),
+                        )
+                    )
+                    result = await dag_service.run_task_dag(RunTaskDagRequest(dag.dag_id))
+                    self.assertIs(result.state, TaskDagState.COMPLETED)
+                    self.assertEqual(len(contexts), 2)
+                    root_relay_messages = [
+                        message
+                        for message in contexts[0].messages
+                        if message.synthetic_reason is SyntheticReason.DAG_PREDECESSOR_RESULTS
+                    ]
+                    successor_relay_messages = [
+                        message
+                        for message in contexts[1].messages
+                        if message.synthetic_reason is SyntheticReason.DAG_PREDECESSOR_RESULTS
+                    ]
+                    self.assertEqual(root_relay_messages, [])
+                    self.assertEqual(len(successor_relay_messages), 1)
+                    self.assertIn("[PREDECESSOR a ordinal=0]", successor_relay_messages[0].content)
+                    self.assertIn("completed result", successor_relay_messages[0].content)
+                    self.assertEqual(
+                        [
+                            message.synthetic_reason
+                            for message in contexts[1].messages
+                            if isinstance(message, Message)
+                        ].count(SyntheticReason.DAG_PREDECESSOR_RESULTS),
+                        1,
+                    )
+                finally:
+                    await application.close()
 
     async def _assert_real_task_dag_process_death_recovery(
         self,
@@ -2727,7 +3098,7 @@ class WritableApplicationTests(unittest.IsolatedAsyncioTestCase):
             assert leases[0].baseline_checkpoint_id is not None
             self.assertIsNotNone(await checkpoints.get(leases[0].baseline_checkpoint_id))
 
-    async def test_populated_schema_16_migrates_to_19_without_losing_worker_identity(self) -> None:
+    async def test_populated_schema_16_migrates_to_20_without_losing_worker_identity(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (
@@ -2763,7 +3134,7 @@ class WritableApplicationTests(unittest.IsolatedAsyncioTestCase):
                 "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'parent_context_relays'"
             ).fetchone()
             connection.close()
-            self.assertEqual(version, (19,))
+            self.assertEqual(version, (20,))
             self.assertEqual(table, (1,))
             self.assertEqual(
                 (await migrated.list_writable_subagent_leases(parent_session_id=parent_session_id))[
@@ -2778,7 +3149,7 @@ class WritableApplicationTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNotNone(await migrated.get_session(parent_session_id))
             self.assertIsNotNone(await migrated.get_session(result.child_session_id))
 
-    async def test_schema_17_to_19_keeps_populated_parent_relay(self) -> None:
+    async def test_schema_17_to_20_keeps_populated_parent_relay(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (
@@ -2822,7 +3193,7 @@ class WritableApplicationTests(unittest.IsolatedAsyncioTestCase):
                 "AND name IN ('task_dags', 'task_dag_nodes')"
             ).fetchone()
             connection.close()
-            self.assertEqual(version, (19,))
+            self.assertEqual(version, (20,))
             self.assertEqual(task_dag_tables, (2,))
 
     async def test_process_death_after_relay_publication_preserves_exact_worker_snapshot(
@@ -3681,7 +4052,7 @@ extensions = [".py", ".txt"]
             self.assertEqual(leases[0].error_kind, "RuntimeError")
             self.assertIsNotNone(await store.get_parent_context_relay_for_lease(leases[0].lease_id))
 
-    async def test_populated_schema_15_lease_migrates_through_schema_19_and_keeps_cas(self) -> None:
+    async def test_populated_schema_15_lease_migrates_through_schema_20_and_keeps_cas(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (
@@ -3714,7 +4085,7 @@ extensions = [".py", ".txt"]
                 connection.execute(
                     "SELECT version FROM schema_meta WHERE singleton = 1"
                 ).fetchone(),
-                (19,),
+                (20,),
             )
             foreign_keys = connection.execute(
                 "PRAGMA foreign_key_list(writable_subagent_leases)"

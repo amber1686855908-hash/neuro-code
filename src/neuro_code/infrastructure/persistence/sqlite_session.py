@@ -25,6 +25,9 @@ from typing import Any
 from neuro_code.application.ports.leader import LeaderAttemptClaim, LeaderStoreError
 from neuro_code.application.ports.parent_context_relay import ParentContextRelayError
 from neuro_code.application.ports.task_dag import TaskDagError
+from neuro_code.application.ports.task_dag_result_relay import (
+    TaskDagDependencyResultRelayError,
+)
 from neuro_code.application.ports.writable_subagent import WritableSubagentLeaseError
 from neuro_code.domain.background_tasks.models import BackgroundWakeState
 from neuro_code.domain.checkpoints import CheckpointId
@@ -89,6 +92,10 @@ from neuro_code.domain.task_dag import (
     TaskDagNodeState,
     TaskDagState,
 )
+from neuro_code.domain.task_dag_result_relay import (
+    TaskDagDependencyResultEntry,
+    TaskDagDependencyResultRelay,
+)
 from neuro_code.domain.worktree import WorktreeHandle, WorktreeId, WorktreeRepositoryIdentity
 from neuro_code.domain.writable_subagent import (
     WritableSubagentWorkspaceLease,
@@ -97,7 +104,7 @@ from neuro_code.domain.writable_subagent import (
 from neuro_code.shared.async_utils import run_blocking
 from neuro_code.shared.errors import SessionError
 
-SCHEMA_VERSION = 19
+SCHEMA_VERSION = 20
 _SEARCH_SNIPPET_LIMIT = 500
 _SQLITE_TIMEOUT_SECONDS = 30.0
 _SESSION_ALIAS_NAMESPACE_LIMIT = 64
@@ -267,6 +274,12 @@ class SqliteSessionStore:
                             "UPDATE schema_meta SET version = 19 WHERE singleton = 1"
                         )
                         version = (19,)
+                    if version is not None and version[0] == 19:
+                        _ensure_task_dag_dependency_result_relay_schema(connection)
+                        connection.execute(
+                            "UPDATE schema_meta SET version = 20 WHERE singleton = 1"
+                        )
+                        version = (20,)
                     if version is None or version[0] != SCHEMA_VERSION:
                         raise SessionError(
                             "unsupported session schema version: "
@@ -286,6 +299,7 @@ class SqliteSessionStore:
                     _ensure_parent_context_relay_schema(connection)
                     _ensure_task_dag_schema(connection)
                     _ensure_leader_schema(connection)
+                    _ensure_task_dag_dependency_result_relay_schema(connection)
                     _backfill_search_documents(connection, missing_only=True)
                     connection.commit()
                 except BaseException:
@@ -2958,6 +2972,151 @@ class SqliteSessionStore:
         async with self._write_lock:
             return await run_blocking(finish)
 
+    async def insert_task_dag_dependency_relay(
+        self,
+        relay: TaskDagDependencyResultRelay,
+    ) -> TaskDagDependencyResultRelay:
+        """Publish one immutable relay with exact DAG/worker evidence checks."""
+
+        if not isinstance(relay, TaskDagDependencyResultRelay):
+            raise TypeError("DAG dependency result relay must be canonical")
+
+        def insert() -> TaskDagDependencyResultRelay:
+            connection = self._connect()
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                dag = _load_task_dag(connection, relay.dag_id)
+                if dag is None:
+                    raise TaskDagDependencyResultRelayError(
+                        "DAG dependency relay DAG is missing",
+                        kind="unmanaged",
+                    )
+                current = _load_task_dag_dependency_result_relay(
+                    connection,
+                    relay_id=relay.relay_id,
+                )
+                by_target = _load_task_dag_dependency_result_relay_for_target(
+                    connection,
+                    relay.dag_id,
+                    relay.target_node_id,
+                    relay.target_node_generation,
+                )
+                existing = current or by_target
+                if existing is not None:
+                    if existing.publication_payload != relay.publication_payload:
+                        raise TaskDagDependencyResultRelayError(
+                            "an immutable DAG dependency relay already exists with a different payload",
+                            kind="concurrent_modification",
+                        )
+                    connection.commit()
+                    return existing
+                _verify_task_dag_dependency_relay_linkage(connection, relay, dag)
+                connection.execute(
+                    """
+                    INSERT INTO task_dag_dependency_relays(
+                        relay_id, dag_id, dag_definition_fingerprint, target_node_id,
+                        target_node_generation, target_node_definition_fingerprint,
+                        direct_dependency_ids_json, entries_json, source_fingerprint,
+                        content_fingerprint, byte_count, truncated, created_at,
+                        integrity_fingerprint, state
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ready')
+                    """,
+                    _task_dag_dependency_result_relay_values(relay),
+                )
+                persisted = _load_task_dag_dependency_result_relay(
+                    connection,
+                    relay_id=relay.relay_id,
+                )
+                if persisted is None or persisted != relay:
+                    raise TaskDagDependencyResultRelayError(
+                        "DAG dependency relay was not durably verified",
+                        kind="integrity",
+                    )
+                connection.commit()
+                return persisted
+            except TaskDagDependencyResultRelayError:
+                connection.rollback()
+                raise
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+                connection.rollback()
+                raise TaskDagDependencyResultRelayError(
+                    "DAG dependency relay integrity verification failed",
+                    kind="integrity",
+                ) from error
+            except sqlite3.IntegrityError as error:
+                connection.rollback()
+                raise TaskDagDependencyResultRelayError(
+                    "DAG dependency relay publication conflicts with existing evidence",
+                    kind="concurrent_modification",
+                ) from error
+            except sqlite3.Error as error:
+                connection.rollback()
+                raise TaskDagDependencyResultRelayError(
+                    "DAG dependency relay could not be persisted",
+                ) from error
+            finally:
+                connection.close()
+
+        async with self._write_lock:
+            return await run_blocking(insert)
+
+    async def get_task_dag_dependency_relay(
+        self,
+        relay_id: str,
+    ) -> TaskDagDependencyResultRelay | None:
+        _validated_task_dag_identifier(relay_id)
+
+        def load() -> TaskDagDependencyResultRelay | None:
+            try:
+                with closing(self._connect()) as connection:
+                    return _load_task_dag_dependency_result_relay(
+                        connection,
+                        relay_id=relay_id,
+                    )
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+                raise TaskDagDependencyResultRelayError(
+                    "DAG dependency relay integrity verification failed",
+                    kind="integrity",
+                ) from error
+            except sqlite3.Error as error:
+                raise TaskDagDependencyResultRelayError(
+                    "DAG dependency relay could not be loaded",
+                ) from error
+
+        return await run_blocking(load)
+
+    async def get_task_dag_dependency_relay_for_target(
+        self,
+        dag_id: str,
+        target_node_id: str,
+        target_node_generation: int,
+    ) -> TaskDagDependencyResultRelay | None:
+        _validated_task_dag_identifier(dag_id)
+        _validated_task_dag_identifier(target_node_id)
+        if isinstance(target_node_generation, bool) or target_node_generation < 0:
+            raise ValueError("DAG dependency relay target generation is invalid")
+
+        def load() -> TaskDagDependencyResultRelay | None:
+            try:
+                with closing(self._connect()) as connection:
+                    return _load_task_dag_dependency_result_relay_for_target(
+                        connection,
+                        dag_id,
+                        target_node_id,
+                        target_node_generation,
+                    )
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+                raise TaskDagDependencyResultRelayError(
+                    "DAG dependency relay integrity verification failed",
+                    kind="integrity",
+                ) from error
+            except sqlite3.Error as error:
+                raise TaskDagDependencyResultRelayError(
+                    "DAG dependency relay could not be loaded",
+                ) from error
+
+        return await run_blocking(load)
+
     async def insert_parent_context_relay(
         self,
         relay: ParentContextRelay,
@@ -4046,6 +4205,38 @@ def _ensure_task_dag_schema(connection: sqlite3.Connection) -> None:
         """
         CREATE INDEX IF NOT EXISTS task_dag_nodes_by_state
         ON task_dag_nodes(dag_id, state, ordinal, node_id)
+        """
+    )
+
+
+def _ensure_task_dag_dependency_result_relay_schema(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS task_dag_dependency_relays (
+            relay_id TEXT PRIMARY KEY,
+            dag_id TEXT NOT NULL,
+            dag_definition_fingerprint TEXT NOT NULL,
+            target_node_id TEXT NOT NULL,
+            target_node_generation INTEGER NOT NULL CHECK (target_node_generation >= 0),
+            target_node_definition_fingerprint TEXT NOT NULL,
+            direct_dependency_ids_json TEXT NOT NULL,
+            entries_json TEXT NOT NULL,
+            source_fingerprint TEXT NOT NULL,
+            content_fingerprint TEXT NOT NULL,
+            byte_count INTEGER NOT NULL CHECK (byte_count > 0),
+            truncated INTEGER NOT NULL CHECK (truncated IN (0, 1)),
+            created_at TEXT NOT NULL,
+            integrity_fingerprint TEXT NOT NULL,
+            state TEXT NOT NULL CHECK (state = 'ready'),
+            UNIQUE (dag_id, target_node_id, target_node_generation),
+            FOREIGN KEY (dag_id) REFERENCES task_dags(dag_id) ON DELETE RESTRICT
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS task_dag_dependency_relays_by_target
+        ON task_dag_dependency_relays(dag_id, target_node_id, target_node_generation)
         """
     )
 
@@ -5460,6 +5651,233 @@ def _task_dag_node_from_row(row: Sequence[object]) -> TaskDagNode:
     if node.prompt_fingerprint != str(prompt_fingerprint):
         raise ValueError("task DAG node prompt fingerprint is inconsistent")
     return node
+
+
+_TASK_DAG_DEPENDENCY_RESULT_RELAY_SELECT = """
+    SELECT relay_id, dag_id, dag_definition_fingerprint, target_node_id,
+           target_node_generation, target_node_definition_fingerprint,
+           direct_dependency_ids_json, entries_json, source_fingerprint,
+           content_fingerprint, byte_count, truncated, created_at,
+           integrity_fingerprint, state
+    FROM task_dag_dependency_relays
+"""
+
+
+def _task_dag_dependency_result_relay_values(
+    relay: TaskDagDependencyResultRelay,
+) -> tuple[object, ...]:
+    return (
+        relay.relay_id,
+        relay.dag_id,
+        relay.dag_definition_fingerprint,
+        relay.target_node_id,
+        relay.target_node_generation,
+        relay.target_node_definition_fingerprint,
+        json.dumps(
+            list(relay.direct_dependency_ids),
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ),
+        json.dumps(
+            [entry.to_dict() for entry in relay.entries],
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        relay.source_fingerprint,
+        relay.content_fingerprint,
+        relay.byte_count,
+        int(relay.truncated),
+        relay.created_at.isoformat(),
+        relay.integrity_fingerprint,
+    )
+
+
+def _load_task_dag_dependency_result_relay(
+    connection: sqlite3.Connection,
+    *,
+    relay_id: str,
+) -> TaskDagDependencyResultRelay | None:
+    row = connection.execute(
+        _TASK_DAG_DEPENDENCY_RESULT_RELAY_SELECT + " WHERE relay_id = ?",
+        (relay_id,),
+    ).fetchone()
+    return _task_dag_dependency_result_relay_from_row(row) if row is not None else None
+
+
+def _load_task_dag_dependency_result_relay_for_target(
+    connection: sqlite3.Connection,
+    dag_id: str,
+    target_node_id: str,
+    target_node_generation: int,
+) -> TaskDagDependencyResultRelay | None:
+    row = connection.execute(
+        _TASK_DAG_DEPENDENCY_RESULT_RELAY_SELECT
+        + " WHERE dag_id = ? AND target_node_id = ? AND target_node_generation = ?",
+        (dag_id, target_node_id, target_node_generation),
+    ).fetchone()
+    return _task_dag_dependency_result_relay_from_row(row) if row is not None else None
+
+
+def _task_dag_dependency_result_relay_from_row(
+    row: Sequence[object],
+) -> TaskDagDependencyResultRelay:
+    if len(row) != 15:
+        raise ValueError("DAG dependency relay record is malformed")
+    (
+        relay_id,
+        dag_id,
+        dag_definition_fingerprint,
+        target_node_id,
+        target_node_generation,
+        target_node_definition_fingerprint,
+        raw_dependencies,
+        raw_entries,
+        source_fingerprint,
+        content_fingerprint,
+        byte_count,
+        raw_truncated,
+        created_at,
+        integrity_fingerprint,
+        state,
+    ) = row
+    if state != "ready":
+        raise ValueError("DAG dependency relay is not READY")
+    if not isinstance(target_node_generation, int) or isinstance(target_node_generation, bool):
+        raise ValueError("DAG dependency relay target generation is invalid")
+    if not isinstance(byte_count, int) or isinstance(byte_count, bool):
+        raise ValueError("DAG dependency relay byte count is invalid")
+    if raw_truncated not in (0, 1) or isinstance(raw_truncated, bool):
+        raise ValueError("DAG dependency relay truncated flag is invalid")
+    dependencies = json.loads(str(raw_dependencies))
+    entries_payload = json.loads(str(raw_entries))
+    if not isinstance(dependencies, list) or not all(
+        isinstance(dependency, str) for dependency in dependencies
+    ):
+        raise ValueError("DAG dependency relay dependency payload is invalid")
+    if not isinstance(entries_payload, list):
+        raise ValueError("DAG dependency relay entry payload is invalid")
+    relay = TaskDagDependencyResultRelay(
+        relay_id=str(relay_id),
+        dag_id=str(dag_id),
+        dag_definition_fingerprint=str(dag_definition_fingerprint),
+        target_node_id=str(target_node_id),
+        target_node_generation=target_node_generation,
+        target_node_definition_fingerprint=str(target_node_definition_fingerprint),
+        direct_dependency_ids=tuple(dependencies),
+        entries=tuple(TaskDagDependencyResultEntry.from_dict(entry) for entry in entries_payload),
+        source_fingerprint=str(source_fingerprint),
+        content_fingerprint=str(content_fingerprint),
+        byte_count=byte_count,
+        truncated=bool(raw_truncated),
+        created_at=datetime.fromisoformat(str(created_at)),
+    )
+    if not isinstance(integrity_fingerprint, str) or (
+        relay.integrity_fingerprint != integrity_fingerprint
+    ):
+        raise ValueError("DAG dependency relay integrity fingerprint is inconsistent")
+    return relay
+
+
+def _verify_task_dag_dependency_relay_linkage(
+    connection: sqlite3.Connection,
+    relay: TaskDagDependencyResultRelay,
+    dag: TaskDag,
+) -> None:
+    if dag.definition_fingerprint != relay.dag_definition_fingerprint:
+        raise TaskDagDependencyResultRelayError(
+            "DAG dependency relay definition fingerprint does not match",
+            kind="protocol",
+        )
+    target = dag.node(relay.target_node_id)
+    if (
+        dag.active_node_id != target.node_id
+        or target.state is not TaskDagNodeState.RUNNING
+        or target.generation != relay.target_node_generation
+        or target.definition_fingerprint != relay.target_node_definition_fingerprint
+        or target.dependencies != relay.direct_dependency_ids
+    ):
+        raise TaskDagDependencyResultRelayError(
+            "DAG dependency relay target snapshot is stale",
+            kind="concurrent_modification",
+        )
+    for entry in relay.entries:
+        predecessor = dag.node(entry.predecessor_node_id)
+        if (
+            predecessor.state is not TaskDagNodeState.COMPLETED
+            or predecessor.ordinal != entry.predecessor_ordinal
+            or predecessor.generation != entry.predecessor_generation
+            or predecessor.parent_task_id != entry.parent_task_id
+            or predecessor.child_session_id != entry.child_session_id
+            or predecessor.lease_id != entry.writable_lease_id
+            or predecessor.worktree_id != entry.worktree_id.value
+            or predecessor.baseline_checkpoint_id != entry.baseline_checkpoint_id.value
+            or predecessor.relay_id != entry.parent_relay_id
+        ):
+            raise TaskDagDependencyResultRelayError(
+                "DAG dependency relay predecessor evidence is stale",
+                kind="concurrent_modification",
+            )
+        task = connection.execute(
+            "SELECT session_id, status FROM session_tasks WHERE task_id = ?",
+            (entry.parent_task_id,),
+        ).fetchone()
+        if task is None or str(task[0]) != dag.parent_session_id or str(task[1]) != "completed":
+            raise TaskDagDependencyResultRelayError(
+                "DAG dependency relay predecessor task is not durably completed",
+                kind="protocol",
+            )
+        lease = connection.execute(
+            """
+            SELECT parent_session_id, parent_task_id, child_session_id, worktree_id,
+                   baseline_checkpoint_id, state, final_workspace_fingerprint,
+                   changed_file_count
+            FROM writable_subagent_leases
+            WHERE lease_id = ?
+            """,
+            (entry.writable_lease_id,),
+        ).fetchone()
+        if lease is None or tuple(lease) != (
+            dag.parent_session_id,
+            entry.parent_task_id,
+            entry.child_session_id,
+            entry.worktree_id.value,
+            entry.baseline_checkpoint_id.value,
+            WritableSubagentWorkspaceState.PRESERVED.value,
+            entry.final_workspace_fingerprint,
+            entry.changed_file_count,
+        ):
+            raise TaskDagDependencyResultRelayError(
+                "DAG dependency relay writable lease evidence is inconsistent",
+                kind="protocol",
+            )
+        parent_relay_row = connection.execute(
+            _PARENT_CONTEXT_RELAY_SELECT + " WHERE relay_id = ?",
+            (entry.parent_relay_id,),
+        ).fetchone()
+        if parent_relay_row is None:
+            raise TaskDagDependencyResultRelayError(
+                "DAG dependency relay Parent Relay evidence is missing",
+                kind="protocol",
+            )
+        try:
+            parent_relay = _parent_context_relay_from_row(parent_relay_row)
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+            raise TaskDagDependencyResultRelayError(
+                "DAG dependency relay Parent Relay evidence is invalid",
+                kind="integrity",
+            ) from error
+        if (
+            parent_relay.lease_id != entry.writable_lease_id
+            or parent_relay.parent_task_id != entry.parent_task_id
+            or parent_relay.child_session_id != entry.child_session_id
+            or parent_relay.worktree_id != entry.worktree_id
+            or parent_relay.baseline_checkpoint_id != entry.baseline_checkpoint_id
+        ):
+            raise TaskDagDependencyResultRelayError(
+                "DAG dependency relay Parent Relay identity is inconsistent",
+                kind="protocol",
+            )
 
 
 _PARENT_CONTEXT_RELAY_SELECT = """

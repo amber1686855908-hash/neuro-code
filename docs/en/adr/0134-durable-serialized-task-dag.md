@@ -62,6 +62,16 @@ fingerprints, changed-file count, and a bounded response preview. A completed
 node requires exact lease and Relay evidence; missing or inconsistent success
 correlation is `INDETERMINATE`.
 
+ADR 0136 adds the bounded predecessor-result relay without changing this
+execution authority. After a dependent node's exact `RUNNING` generation is
+claimed and before its child runtime starts, the DAG service publishes an
+insert-only schema-20 projection containing only completed direct
+predecessors, in declaration order. The projection is redacted and bounded to
+4 KiB per result, 16 KiB of source result text, and 24 KiB rendered context;
+it is bound to predecessor worker/lease/workspace/checkpoint/Parent Relay
+identity and cannot carry authority. The relay is a separate context channel,
+not a change to the dependency state machine.
+
 ## Dependency and failure semantics
 
 The node lifecycle is:
@@ -110,14 +120,15 @@ These guarantees are bounded to the tested real `spawn`/`os._exit` seams.
 This ADR does not add model-generated DAG decomposition or define the Leader
 controller; the bounded Leader is specified separately by [ADR 0135](0135-bounded-serialized-leader-controller.md).
 It does not add Swarm,
-Ultracode, automatic delegation, parallel execution, dataflow/result relay,
-predecessor transcript sharing, shared worktrees, merge/integration, commit,
-rollback, cleanup, retries, automatic crash reruns, CLI/TUI/ACP exposure, or a
-new public orchestration protocol.
+Ultracode, automatic delegation, parallel execution, dynamic dataflow
+scheduling, predecessor transcript sharing, shared worktrees,
+merge/integration, commit, rollback, cleanup, retries, automatic crash reruns,
+CLI/TUI/ACP exposure, or a new public orchestration protocol. The bounded
+direct predecessor-result relay is specified separately by [ADR 0136](0136-bounded-task-dag-predecessor-result-relay.md).
 
 ## Validation boundary
 
-Acceptance requires domain bound/cycle tests, schema 17-to-19 migration with
+Acceptance requires domain bound/cycle tests, schema 17-to-20 migration with
 populated Parent Relay preservation, insert-only and stale-generation tests,
 cross-process claim and two-scheduler race evidence, deterministic serialized
 diamond failure propagation, exact worker correlation, completed/failed/

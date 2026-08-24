@@ -114,6 +114,15 @@ from neuro_code.domain.task_dag import (
     TaskDagNodeState,
     TaskDagState,
 )
+from neuro_code.domain.task_dag_result_relay import (
+    MAX_TASK_DAG_RESULT_RELAY_ITEM_BYTES,
+    MAX_TASK_DAG_RESULT_RELAY_PREDECESSORS,
+    MAX_TASK_DAG_RESULT_RELAY_RENDERED_BYTES,
+    MAX_TASK_DAG_RESULT_RELAY_TOTAL_BYTES,
+    TaskDagDependencyResultEntry,
+    TaskDagDependencyResultRelay,
+    render_task_dag_dependency_relay,
+)
 from neuro_code.domain.terminal.models import (
     MAX_TERMINAL_DIMENSION,
     MAX_TERMINAL_OUTPUT_BYTES,
@@ -170,6 +179,10 @@ __all__ = [
     "MAX_QUEUED_SESSION_TASKS",
     "MAX_REQUEST_SNAPSHOT_ID_BYTES",
     "MAX_SESSION_TASK_ID_BYTES",
+    "MAX_TASK_DAG_RESULT_RELAY_ITEM_BYTES",
+    "MAX_TASK_DAG_RESULT_RELAY_PREDECESSORS",
+    "MAX_TASK_DAG_RESULT_RELAY_RENDERED_BYTES",
+    "MAX_TASK_DAG_RESULT_RELAY_TOTAL_BYTES",
     "MAX_TERMINAL_DIMENSION",
     "MAX_TERMINAL_OUTPUT_BYTES",
     "MAX_TERMINAL_READ_BYTES",
@@ -234,6 +247,8 @@ __all__ = [
     "SessionTaskStatus",
     "SyntheticReason",
     "TaskDag",
+    "TaskDagDependencyResultEntry",
+    "TaskDagDependencyResultRelay",
     "TaskDagNode",
     "TaskDagNodeKind",
     "TaskDagNodeState",
@@ -267,4 +282,5 @@ __all__ = [
     "interaction_mode_guidance",
     "reasoning_guidance",
     "render_parent_context_relay",
+    "render_task_dag_dependency_relay",
 ]

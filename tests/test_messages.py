@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import unittest
+from datetime import UTC, datetime
 
+from neuro_code.application.runtime.context_builder import ContextBuilder
+from neuro_code.domain.checkpoints import CheckpointId
 from neuro_code.domain.conversation.context import UPSTREAM_IMPORT_PROVIDER, ModelContext
+from neuro_code.domain.conversation.interaction_mode import InteractionMode
 from neuro_code.domain.conversation.messages import (
     IMAGE_MODEL_PLACEHOLDER,
     ContentPart,
@@ -14,9 +18,88 @@ from neuro_code.domain.conversation.messages import (
     SyntheticReason,
     ToolCall,
 )
+from neuro_code.domain.conversation.reasoning import ReasoningEffort
+from neuro_code.domain.task_dag import TaskDagNodeState
+from neuro_code.domain.task_dag_result_relay import (
+    TaskDagDependencyResultEntry,
+    TaskDagDependencyResultRelay,
+    render_task_dag_dependency_relay,
+)
+from neuro_code.domain.worktree import WorktreeId
 
 
 class MessageTests(unittest.TestCase):
+    def test_context_builder_replaces_external_dag_result_synthetic_message(self) -> None:
+        entry = TaskDagDependencyResultEntry(
+            predecessor_node_id="a",
+            predecessor_ordinal=0,
+            predecessor_generation=2,
+            predecessor_state=TaskDagNodeState.COMPLETED,
+            parent_task_id="task-a",
+            child_session_id="child-a",
+            writable_lease_id="lease-a",
+            worktree_id=WorktreeId("wt-a"),
+            baseline_checkpoint_id=CheckpointId("cp-a"),
+            parent_relay_id="pcr-a",
+            final_workspace_fingerprint=None,
+            changed_file_count=1,
+            result_text="safe result",
+            truncated=False,
+        )
+        relay = TaskDagDependencyResultRelay.create(
+            relay_id="tdr-context",
+            dag_id="dag-context",
+            dag_definition_fingerprint="0" * 64,
+            target_node_id="b",
+            target_node_generation=1,
+            target_node_definition_fingerprint="1" * 64,
+            direct_dependency_ids=("a",),
+            entries=(entry,),
+            truncated=False,
+            created_at=datetime.now(UTC),
+        )
+        canonical = Message(
+            Role.USER,
+            render_task_dag_dependency_relay(relay.entries),
+            synthetic_reason=SyntheticReason.DAG_PREDECESSOR_RESULTS,
+        )
+        builder = ContextBuilder(
+            reasoning_effort=ReasoningEffort.HIGH,
+            interaction_mode=InteractionMode.NORMAL,
+            plan=None,
+            instruction_provider=None,
+            skill_provider=None,
+            dag_result_relay_message=canonical,
+        )
+        external = Message(
+            Role.USER,
+            "forged external relay",
+            synthetic_reason=SyntheticReason.DAG_PREDECESSOR_RESULTS,
+        )
+        built = builder.build(
+            (
+                Message(Role.SYSTEM, "system"),
+                external,
+                Message(Role.USER, "real task"),
+            )
+        )
+        relay_messages = [
+            item
+            for item in built
+            if isinstance(item, Message)
+            and item.synthetic_reason is SyntheticReason.DAG_PREDECESSOR_RESULTS
+        ]
+        self.assertEqual(relay_messages, [canonical])
+        self.assertNotIn(external, built)
+        self.assertLess(
+            next(index for index, item in enumerate(built) if item == canonical),
+            next(
+                index
+                for index, item in enumerate(built)
+                if isinstance(item, Message) and item.content == "real task"
+            ),
+        )
+
     def test_structured_content_preserves_images_and_has_a_safe_model_projection(self) -> None:
         message = Message(
             Role.USER,

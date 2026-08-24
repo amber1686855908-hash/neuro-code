@@ -572,7 +572,7 @@ class TaskDagPersistenceTests(unittest.IsolatedAsyncioTestCase):
             1,
         )
 
-    async def test_schema_17_migrates_to_19_and_creates_dag_and_leader_tables(self) -> None:
+    async def test_schema_17_migrates_to_20_and_creates_dag_leader_and_relay_tables(self) -> None:
         connection = sqlite3.connect(self._database_path)
         connection.execute("UPDATE schema_meta SET version = 17 WHERE singleton = 1")
         connection.commit()
@@ -591,9 +591,10 @@ class TaskDagPersistenceTests(unittest.IsolatedAsyncioTestCase):
             ).fetchall()
         }
         connection.close()
-        self.assertEqual(version, (19,))
+        self.assertEqual(version, (20,))
         self.assertTrue({"task_dags", "task_dag_nodes"}.issubset(tables))
         self.assertTrue({"leader_attempts", "leader_decisions"}.issubset(tables))
+        self.assertIn("task_dag_dependency_relays", tables)
         self.assertIsNotNone(await reopened.get_session(self.parent_session_id))
 
     async def test_populated_schema_18_dag_survives_leader_migration(self) -> None:
@@ -629,7 +630,7 @@ class TaskDagPersistenceTests(unittest.IsolatedAsyncioTestCase):
             ).fetchall()
         }
         connection.close()
-        self.assertEqual(version, (19,))
+        self.assertEqual(version, (20,))
         self.assertTrue({"leader_attempts", "leader_decisions"}.issubset(tables))
 
 

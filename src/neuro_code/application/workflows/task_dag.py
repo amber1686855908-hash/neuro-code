@@ -11,8 +11,14 @@ from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 from neuro_code.application.ports.parent_context_relay import ParentContextRelayStore
 from neuro_code.application.ports.task_dag import TaskDagError, TaskDagStore
+from neuro_code.application.ports.task_dag_result_relay import (
+    TaskDagDependencyResultRelayStore,
+)
 from neuro_code.application.ports.writable_subagent import WritableSubagentLeaseStore
 from neuro_code.application.runtime.agent import EventSink
+from neuro_code.application.workflows.task_dag_result_relay import (
+    TaskDagDependencyResultRelayApplicationService,
+)
 from neuro_code.application.workflows.writable_subagent import (
     RunWritableSubagentRequest,
     WritableSubagentExecutionIdentity,
@@ -127,6 +133,8 @@ class TaskDagApplicationService:
         relay_store: ParentContextRelayStore,
         *,
         parent_binding: ConversationBinding,
+        dependency_relay_store: TaskDagDependencyResultRelayStore | None = None,
+        redaction_values: tuple[str, ...] = (),
         clock: Callable[[], datetime] = _now,
     ) -> None:
         from neuro_code.application.sessions.binding import (
@@ -150,6 +158,19 @@ class TaskDagApplicationService:
         self._parent_binding = parent_binding
         self._parent_session_id = parent_session_id
         self._clock = clock
+        self._dependency_relay_service = (
+            TaskDagDependencyResultRelayApplicationService(
+                dag_store,
+                dependency_relay_store,
+                lease_store,
+                relay_store,
+                parent_session_id=parent_session_id,
+                redaction_values=redaction_values,
+                clock=clock,
+            )
+            if dependency_relay_store is not None
+            else None
+        )
 
     async def create_task_dag(self, request: CreateTaskDagRequest) -> TaskDag:
         if not isinstance(request, CreateTaskDagRequest):
@@ -259,6 +280,8 @@ class TaskDagApplicationService:
         if not isinstance(request, RunTaskDagRequest):
             raise ValueError("task DAG preparation request must be canonical")
         await self._writable_service.initialize()
+        if self._dependency_relay_service is not None:
+            await self._dependency_relay_service.initialize()
         dag = await self._load_required(request.dag_id)
         if dag.state.terminal:
             return dag
@@ -284,6 +307,28 @@ class TaskDagApplicationService:
         parent_task_id: str,
         sink: EventSink | None,
     ) -> TaskDag:
+        dependency_relay = None
+        if node.dependencies and self._dependency_relay_service is not None:
+            # The target is already claimed RUNNING here.  Publication is the
+            # last durable step before Writable Subagent may create a child
+            # runtime or issue its first model request.
+            try:
+                dependency_relay = await self._dependency_relay_service.publish_for_target(
+                    claimed,
+                    claimed_node,
+                )
+            except asyncio.CancelledError:
+                raise
+            except BaseException as error:
+                if isinstance(error, (KeyboardInterrupt, SystemExit)):
+                    raise
+                await self._finish_worker_node(
+                    claimed,
+                    claimed_node,
+                    TaskDagNodeState.INDETERMINATE,
+                    error=error,
+                )
+                return await self._load_required(claimed.dag_id)
         identity = WritableSubagentExecutionIdentity(
             dag_id=dag.dag_id,
             node_id=node.node_id,
@@ -294,6 +339,7 @@ class TaskDagApplicationService:
                 RunWritableSubagentRequest(
                     parent_session_id=self._parent_session_id,
                     prompt=node.prompt,
+                    dependency_result_relay=dependency_relay,
                 ),
                 execution_identity=identity,
                 sink=sink,

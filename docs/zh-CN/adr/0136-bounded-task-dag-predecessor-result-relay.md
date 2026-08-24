@@ -1,0 +1,78 @@
+# ADR 0136：有界 Task DAG predecessor-result Relay
+
+- 状态：作为显式内部 P0 纵向切片实现；最终评级等待 merge-ref CI
+- 日期：2026-08-24
+- 范围：一个串行 bounded Task DAG 的直接 completed-predecessor result projection
+
+## 背景
+
+ADR 0134 有意把 dependency edge 定义为 control-only。这样可以防止 worker 从 predecessor
+隐式接收 transcript、tool history、workspace state 或 authority grant，但也使 dependent worker
+缺少有界 DAG workflow 所需的少量 completed-result context。这个能力不能变成第二套 parent-context
+系统、prompt-to-authority channel 或 parallel orchestration 设计。
+
+现有系统已经有三个必须保持分离的 owner：
+
+1. Parent Context Relay 把 parent session 的有界 snapshot 带入 child worker。
+2. Task DAG predecessor-result Relay 把 completed direct-predecessor result evidence 带入
+   dependent worker。
+3. Leader evidence 把有界 DAG state 带入 zero-tool Leader。
+
+## 决策
+
+为已认领的 dependent node 增加 application-owned `TaskDagDependencyResultRelay`。只有在 target
+node 完成精确的 `RUNNING` graph/node generation claim 之后、创建 child runtime 或 provider request
+之前才能创建 Relay。root node 不接收 Relay。Dependent node 只接收其声明的 direct dependency，且按
+声明顺序排列；transitive ancestor 只能通过自己的 direct chain 逐层可见。
+
+Relay 是 immutable、insert-only projection。每个 entry 包含 predecessor node/generation、精确的
+worker task/session/lease/worktree/checkpoint/Parent Relay identity、最终 workspace fingerprint、
+changed-file count 和有界脱敏 result preview。只有 predecessor 已 durable `COMPLETED`、worker
+evidence 一致、writable lease 为 `PRESERVED`，且 Parent Relay 与 workspace/checkpoint identity
+和 DAG node projection 匹配时，entry 才会被接受。
+
+## 边界与内容约束
+
+Application 在持久化前和渲染消息前执行以下限制：
+
+- 最多 4 个 predecessor entry；
+- 每个 entry 的 UTF-8 result text 最多 4 KiB；
+- source result text 合计最多 16 KiB；
+- 渲染后的 Relay message 最多 24 KiB；
+- ID 与 fingerprint 必须有界；不允许无界 error 或 response text。
+
+跨 edge 的内容只有脱敏 result text 与 evidence metadata。Relay 不包含也不授予 transcript history、
+reasoning、tool call/result、workspace bytes、Git data、checkpoint bytes、arbitrary path、capability、
+sandbox root、network access、LSP authority 或 instruction。`ContextBuilder` 在 Parent Relay 之后、
+真实 child history 之前注入一条独立的 `SyntheticReason.DAG_PREDECESSOR_RESULTS` USER message。
+它不会写入 child history，也不会被解析为 authority source。
+
+## Durable identity、race 与失败行为
+
+Session schema 20 增加 `task_dag_dependency_relays`。Row 绑定精确 DAG definition、target node
+definition/generation、direct dependency IDs、entry fingerprint、source/content fingerprint、byte
+count 和 integrity fingerprint。Target-generation uniqueness key 使精确重复发布幂等。内容或 identity
+不同的重复发布会被拒绝；直接修改 database 后，在 reload 时完整性校验失败。
+
+Store 复用既有 SQLite transaction boundary，并在 commit 前 reload 已发布 row。并发 scheduler 不能为
+同一 target generation 发布冲突 Relay。如果 target generation、predecessor state、lease、Parent
+Relay、workspace/checkpoint evidence 或任何 identity 缺失、过期、不确定或不匹配，application 会把
+target 标为 `INDETERMINATE`，不会构造 worker/provider request。若 Relay 已 durable 发布而 worker 在
+model execution 前崩溃，recovery 复用精确 publication，不重新生成另一份 result，也不 replay
+predecessor。
+
+## 非目标
+
+本 ADR 不增加 parallel DAG execution、dynamic/model-generated graph construction、超出 direct edge 的
+transitive aggregation、retry、rerun、merge/copy-back、rollback、cleanup、shared live context、UI/ACP
+暴露、Swarm、Ultracode 或通用 inter-agent message bus。`max_parallel` 仍为 1，
+`TaskDagApplicationService` 仍是唯一 worker execution seam。
+
+## 验证边界
+
+Focused implementation tests 覆盖有界 rendering 与 redaction、synthetic message replacement、schema
+migration 与 row integrity、精确重复幂等、冲突发布拒绝、direct-dependency selection、声明顺序、
+dependency chain、失败或不确定 evidence 的 fail-closed 行为，以及通过既有 Writable Subagent
+composition path 的注入。既有 Task DAG、Leader、Writable Subagent、Parent Relay、Worktree、Checkpoint、
+worker-scoped LSP、crash recovery 和全仓库 gates 仍是必需项。本切片不宣称 parallel/dataflow scheduling
+或 live paid-provider acceptance。

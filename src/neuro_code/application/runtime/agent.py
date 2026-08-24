@@ -107,6 +107,7 @@ class AgentRuntime:
         provider_context_window: ProviderContextWindow | None = None,
         tool_hooks: Sequence[ToolPipelineHook] = (),
         parent_relay_message: Message | None = None,
+        dag_result_relay_message: Message | None = None,
     ) -> None:
         if execution_budget is not None and not isinstance(execution_budget, ExecutionBudget):
             raise TypeError("execution_budget must be an ExecutionBudget or None")
@@ -175,6 +176,7 @@ class AgentRuntime:
             instruction_provider=instruction_provider,
             skill_provider=skill_provider,
             parent_relay_message=parent_relay_message,
+            dag_result_relay_message=dag_result_relay_message,
         )
         self._context_builder.set_plan_comments(plan_comments)
         self._tool_executor = ToolExecutor(

@@ -246,6 +246,12 @@ class TaskDagNode:
             "kind": self.kind.value,
         }
 
+    @property
+    def definition_fingerprint(self) -> str:
+        """Stable identity of this immutable node declaration."""
+
+        return hashlib.sha256(_canonical_json(self.definition_payload)).hexdigest()
+
     def can_transition_to(self, state: TaskDagNodeState) -> bool:
         return state in _ALLOWED_NODE_TRANSITIONS[self.state]
 
