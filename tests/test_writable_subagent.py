@@ -2726,7 +2726,7 @@ class WritableApplicationTests(unittest.IsolatedAsyncioTestCase):
                     parent_session_id,
                 ).publish_for_target(dag, target)
 
-            self.assertEqual(capabilities.cwd, root / "parent")
+            self.assertEqual(capabilities.cwd, (root / "parent").resolve())
 
     async def test_dependency_relay_redacts_and_bounds_result_before_publication(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
