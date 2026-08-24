@@ -880,7 +880,8 @@ context_window_tokens = 131072
         self.assertEqual(child.exitcode, expected_exit)
 
     def _attempt_row(self, dag_id: str) -> tuple[str, str, str]:
-        with sqlite3.connect(self.database_path) as connection:
+        connection = sqlite3.connect(self.database_path)
+        try:
             row = connection.execute(
                 """
                 SELECT leader_session_id, turn_id, state
@@ -889,6 +890,8 @@ context_window_tokens = 131072
                 """,
                 (dag_id,),
             ).fetchone()
+        finally:
+            connection.close()
         self.assertIsNotNone(row)
         assert row is not None
         return str(row[0]), str(row[1]), str(row[2])
