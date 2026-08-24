@@ -3083,12 +3083,14 @@ api_key_env = "FIXTURE_KEY"
                 encoding="utf-8",
             )
             contexts: list[ModelContext] = []
+            git_path = os.environ.get("PATH") or os.defpath
             with patch.dict(
                 os.environ,
                 {
                     "HOME": str(root),
                     "NEURO_CODE_HOME": str(state_dir),
                     "FIXTURE_KEY": "fixture-key",
+                    "PATH": git_path,
                 },
                 clear=True,
             ):
