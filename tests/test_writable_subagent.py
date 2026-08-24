@@ -16,6 +16,7 @@ from contextlib import suppress
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import cast
 from unittest.mock import patch
 
@@ -37,10 +38,14 @@ from neuro_code.application.ports.sandbox import (
 from neuro_code.application.ports.task_dag import TaskDagStore
 from neuro_code.application.ports.task_dag_result_relay import (
     TaskDagDependencyResultRelayError,
+    TaskDagDependencyResultRelayStore,
 )
 from neuro_code.application.ports.tools import ToolContext
 from neuro_code.application.ports.worktree import WorktreeError, WorktreeFailureKind
-from neuro_code.application.ports.writable_subagent import WritableSubagentLeaseError
+from neuro_code.application.ports.writable_subagent import (
+    WritableSubagentLeaseError,
+    WritableSubagentLeaseStore,
+)
 from neuro_code.application.runtime.agent import AgentRunResult, EventSink
 from neuro_code.application.runtime.process_liveness import owner_is_alive
 from neuro_code.application.sessions.binding import ConversationBinding, ConversationRunner
@@ -57,6 +62,9 @@ from neuro_code.application.workflows.task_dag import (
     CreateTaskDagRequest,
     RunTaskDagRequest,
     TaskDagApplicationService,
+)
+from neuro_code.application.workflows.task_dag_result_relay import (
+    TaskDagDependencyResultRelayApplicationService,
 )
 from neuro_code.application.workflows.writable_subagent import (
     MAX_WRITABLE_SUBAGENT_RESULT_BYTES,
@@ -105,7 +113,12 @@ from neuro_code.domain.parent_context_relay import (
 from neuro_code.domain.sandbox.models import SandboxProfile
 from neuro_code.domain.session_tasks import SessionTaskStatus
 from neuro_code.domain.task_dag import TaskDag, TaskDagNode, TaskDagNodeState, TaskDagState
-from neuro_code.domain.task_dag_result_relay import TaskDagDependencyResultRelay
+from neuro_code.domain.task_dag_result_relay import (
+    MAX_TASK_DAG_RESULT_RELAY_ITEM_BYTES,
+    TaskDagDependencyResultEntry,
+    TaskDagDependencyResultRelay,
+    render_task_dag_dependency_relay,
+)
 from neuro_code.domain.tools import ToolDefinition
 from neuro_code.domain.worktree import (
     WorktreeCreateRequest,
@@ -237,6 +250,30 @@ def _repository(root: Path) -> WorktreeRepositoryIdentity:
     )
 
 
+def _dependency_result_entry(
+    *,
+    predecessor_node_id: str = "a",
+    result_text: str = "result",
+    truncated: bool = False,
+) -> TaskDagDependencyResultEntry:
+    return TaskDagDependencyResultEntry(
+        predecessor_node_id=predecessor_node_id,
+        predecessor_ordinal=0,
+        predecessor_generation=2,
+        predecessor_state=TaskDagNodeState.COMPLETED,
+        parent_task_id="task-a",
+        child_session_id="child-a",
+        writable_lease_id="lease-a",
+        worktree_id=WorktreeId("wt-a"),
+        baseline_checkpoint_id=CheckpointId("cp-a"),
+        parent_relay_id="relay-a",
+        final_workspace_fingerprint=None,
+        changed_file_count=1,
+        result_text=result_text,
+        truncated=truncated,
+    )
+
+
 def _grant(root: Path, parent: SubagentCapabilitySet) -> ManagedChildWorkspaceGrant:
     repository = _repository(root)
     worktree_id = WorktreeId("wt-grant")
@@ -294,6 +331,140 @@ def _reconciliation_lease(
         baseline_checkpoint_id=baseline_checkpoint_id,
         owner_pid=owner_pid,
     )
+
+
+def _dependency_relay_fixture(
+    root: Path,
+    *,
+    response: str = "result",
+) -> tuple[TaskDag, TaskDagNode, WritableSubagentWorkspaceLease, str, SubagentCapabilitySet]:
+    parent = root / "parent"
+    parent.mkdir(parents=True, exist_ok=True)
+    parent_session_id = "parent-session"
+    capabilities = _capability(parent)
+    lease = _reconciliation_lease(
+        root,
+        parent_session_id,
+        capabilities,
+        worktree_id_value="wt-relay",
+        state=WritableSubagentWorkspaceState.PRESERVED,
+        owner_pid=1,
+        worktree=None,
+        baseline_checkpoint_id=CheckpointId("cp-relay"),
+    )
+    lease = replace(lease, child_session_id="child-relay", changed_file_count=1)
+    predecessor = TaskDagNode(
+        node_id="a",
+        ordinal=0,
+        prompt="predecessor",
+        state=TaskDagNodeState.COMPLETED,
+        generation=2,
+        parent_task_id=lease.parent_task_id,
+        child_session_id=lease.child_session_id,
+        lease_id=lease.lease_id,
+        worktree_id=lease.worktree_id.value,
+        baseline_checkpoint_id=lease.baseline_checkpoint_id.value,
+        relay_id="pcr-relay",
+        response_preview=response,
+        changed_file_count=lease.changed_file_count,
+    )
+    target = TaskDagNode(
+        node_id="b",
+        ordinal=1,
+        prompt="successor",
+        dependencies=("a",),
+        state=TaskDagNodeState.RUNNING,
+        generation=1,
+        parent_task_id="task-target",
+    )
+    created_at = datetime(2026, 8, 24, tzinfo=UTC)
+    dag = TaskDag(
+        dag_id="dag-relay-boundary",
+        parent_session_id=parent_session_id,
+        nodes=(predecessor, target),
+        state=TaskDagState.RUNNING,
+        generation=3,
+        created_at=created_at,
+        updated_at=created_at,
+        active_node_id=target.node_id,
+    )
+    return dag, target, lease, parent_session_id, capabilities
+
+
+class _DependencyRelayBoundaryStore:
+    def __init__(
+        self,
+        dag: TaskDag | None,
+        lease: object | None,
+        *,
+        parent_relay_id: str = "pcr-relay",
+    ) -> None:
+        self.dag = dag
+        self.lease = lease
+        self.parent_relay_id = parent_relay_id
+        self.target_relay: TaskDagDependencyResultRelay | None = None
+        self.relay_by_id: TaskDagDependencyResultRelay | None = None
+        self.target_error: TaskDagDependencyResultRelayError | None = None
+        self.insert_error: TaskDagDependencyResultRelayError | None = None
+        self.reload_error: TaskDagDependencyResultRelayError | None = None
+        self.drop_after_insert = False
+        self.reload_missing = False
+        self.parent_relay_missing = False
+
+    async def initialize(self) -> None:
+        return None
+
+    async def get_task_dag(self, dag_id: str) -> TaskDag | None:
+        del dag_id
+        return self.dag
+
+    async def get_writable_subagent_lease_for_parent_task(
+        self,
+        parent_session_id: str,
+        parent_task_id: str,
+    ) -> object | None:
+        del parent_session_id, parent_task_id
+        return self.lease
+
+    async def get_parent_context_relay_for_lease(self, lease_id: str) -> object | None:
+        del lease_id
+        if self.parent_relay_missing:
+            return None
+        return SimpleNamespace(relay_id=self.parent_relay_id)
+
+    async def get_task_dag_dependency_relay_for_target(
+        self,
+        dag_id: str,
+        target_node_id: str,
+        target_node_generation: int,
+    ) -> TaskDagDependencyResultRelay | None:
+        del dag_id, target_node_id, target_node_generation
+        if self.target_error is not None:
+            raise self.target_error
+        if self.drop_after_insert:
+            return None
+        return self.target_relay
+
+    async def insert_task_dag_dependency_relay(
+        self,
+        relay: TaskDagDependencyResultRelay,
+    ) -> TaskDagDependencyResultRelay:
+        if self.insert_error is not None:
+            raise self.insert_error
+        self.target_relay = relay
+        self.relay_by_id = relay
+        return relay
+
+    async def get_task_dag_dependency_relay(
+        self,
+        relay_id: str,
+    ) -> TaskDagDependencyResultRelay | None:
+        del relay_id
+        if self.reload_error is not None:
+            raise self.reload_error
+        if self.reload_missing:
+            return None
+        return self.relay_by_id
 
 
 def _fake_snapshot(handle: WorktreeHandle) -> WorktreeSnapshot:
@@ -2059,6 +2230,129 @@ class _ProductionWritableProviderFactory:
         return cast(ModelProvider, provider)
 
 
+class TaskDagDependencyRelayDomainTests(unittest.TestCase):
+    def _relay(
+        self,
+        entry: TaskDagDependencyResultEntry | None = None,
+    ) -> TaskDagDependencyResultRelay:
+        source = entry or _dependency_result_entry()
+        return TaskDagDependencyResultRelay.create(
+            relay_id="tdr-domain",
+            dag_id="dag-domain",
+            dag_definition_fingerprint="a" * 64,
+            target_node_id="b",
+            target_node_generation=1,
+            target_node_definition_fingerprint="b" * 64,
+            direct_dependency_ids=(source.predecessor_node_id,),
+            entries=(source,),
+            truncated=source.truncated,
+            created_at=datetime(2026, 8, 24, tzinfo=UTC),
+        )
+
+    def test_domain_rejects_malformed_entries_and_relay_snapshots(self) -> None:
+        entry = _dependency_result_entry()
+        relay = self._relay(entry)
+        self.assertEqual(TaskDagDependencyResultEntry.from_dict(entry.to_dict()), entry)
+        self.assertIn(
+            "[empty result]", render_task_dag_dependency_relay((replace(entry, result_text=""),))
+        )
+
+        def assert_invalid(factory: Callable[[], object], pattern: str) -> None:
+            with self.assertRaisesRegex((TypeError, ValueError), pattern):
+                factory()
+
+        for value, pattern in (
+            ("", "safe identifier"),
+            ("bad\x00id", "safe identifier"),
+            ("bad\x01id", "safe identifier"),
+            ("é" * 65, "safe identifier"),
+        ):
+            assert_invalid(
+                lambda value=value: replace(entry, predecessor_node_id=value),
+                pattern,
+            )
+        assert_invalid(lambda: replace(entry, predecessor_ordinal=True), "non-negative")
+        assert_invalid(lambda: replace(entry, predecessor_ordinal=-1), "non-negative")
+        assert_invalid(lambda: replace(entry, predecessor_generation=True), "non-negative")
+        assert_invalid(lambda: replace(entry, predecessor_generation=-1), "non-negative")
+        assert_invalid(
+            lambda: replace(entry, predecessor_state=TaskDagNodeState.READY),
+            "COMPLETED",
+        )
+        assert_invalid(lambda: replace(entry, worktree_id=cast(WorktreeId, "wt-a")), "canonical")
+        assert_invalid(
+            lambda: replace(entry, baseline_checkpoint_id=cast(CheckpointId, "cp-a")),
+            "canonical",
+        )
+        assert_invalid(
+            lambda: replace(entry, final_workspace_fingerprint="not-a-digest"),
+            "SHA-256",
+        )
+        assert_invalid(lambda: replace(entry, changed_file_count=True), "non-negative")
+        assert_invalid(lambda: replace(entry, result_text="bad\x00result"), "invalid")
+        assert_invalid(lambda: replace(entry, result_text="bad\x01result"), "control")
+        assert_invalid(lambda: replace(entry, result_text="x" * 4097), "too large")
+        assert_invalid(lambda: replace(entry, truncated=1), "boolean")
+        assert_invalid(lambda: TaskDagDependencyResultEntry.from_dict([]), "payload must be")
+        malformed = entry.to_dict()
+        del malformed["result_text"]
+        assert_invalid(
+            lambda: TaskDagDependencyResultEntry.from_dict(malformed),
+            "payload is invalid",
+        )
+
+        assert_invalid(lambda: replace(relay, target_node_generation=True), "non-negative")
+        assert_invalid(lambda: replace(relay, target_node_generation=-1), "non-negative")
+        assert_invalid(
+            lambda: replace(relay, direct_dependency_ids=["a"]),
+            "dependency ids must be a tuple",
+        )
+        assert_invalid(
+            lambda: replace(relay, direct_dependency_ids=("a", "b", "c", "d", "e")),
+            "too many predecessors",
+        )
+        assert_invalid(
+            lambda: replace(relay, direct_dependency_ids=("a", "a")),
+            "must be unique",
+        )
+        assert_invalid(lambda: replace(relay, entries=[entry]), "entries must be a tuple")
+        assert_invalid(lambda: replace(relay, entries=()), "match direct dependencies")
+        entry_b = replace(entry, predecessor_node_id="b")
+        assert_invalid(
+            lambda: replace(
+                relay,
+                direct_dependency_ids=("a", "b"),
+                entries=(entry_b, entry),
+            ),
+            "declaration order",
+        )
+        assert_invalid(
+            lambda: replace(
+                relay,
+                entries=(SimpleNamespace(predecessor_node_id="a"),),
+            ),
+            "entries must be canonical",
+        )
+        oversized = _dependency_result_entry()
+        object.__setattr__(oversized, "result_text", "x" * (16 * 1024 + 1))
+        assert_invalid(
+            lambda: replace(relay, entries=(oversized,)),
+            "exceeds its byte budget",
+        )
+        assert_invalid(lambda: replace(relay, byte_count=0), "byte count")
+        assert_invalid(lambda: replace(relay, truncated=1), "boolean")
+        assert_invalid(lambda: replace(relay, truncated=True), "inconsistent")
+        assert_invalid(
+            lambda: replace(relay, created_at=datetime.fromisoformat("2026-08-24")),
+            "timezone-aware",
+        )
+        assert_invalid(lambda: replace(relay, source_fingerprint="c" * 64), "source fingerprint")
+        assert_invalid(
+            lambda: replace(relay, content_fingerprint="c" * 64),
+            "content fingerprint",
+        )
+
+
 class WritableApplicationTests(unittest.IsolatedAsyncioTestCase):
     async def test_service_constructor_rejects_invalid_collaborators_and_timeout(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -2224,6 +2518,240 @@ class WritableApplicationTests(unittest.IsolatedAsyncioTestCase):
             parent_capabilities,
             parent_session_id,
         )
+
+    def _dependency_relay_service(
+        self,
+        store: _DependencyRelayBoundaryStore,
+        parent_session_id: str,
+        *,
+        redaction_values: tuple[str, ...] = (),
+    ) -> TaskDagDependencyResultRelayApplicationService:
+        return TaskDagDependencyResultRelayApplicationService(
+            cast(TaskDagStore, store),
+            cast(TaskDagDependencyResultRelayStore, store),
+            cast(WritableSubagentLeaseStore, store),
+            cast(ParentContextRelayStore, store),
+            parent_session_id=parent_session_id,
+            redaction_values=redaction_values,
+        )
+
+    async def test_dependency_relay_application_boundaries_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            dag, target, lease, parent_session_id, capabilities = _dependency_relay_fixture(root)
+            store = _DependencyRelayBoundaryStore(dag, lease)
+            service = self._dependency_relay_service(store, parent_session_id)
+
+            with self.assertRaisesRegex(ConfigurationError, "parent session is missing"):
+                TaskDagDependencyResultRelayApplicationService(
+                    cast(TaskDagStore, store),
+                    cast(TaskDagDependencyResultRelayStore, store),
+                    cast(WritableSubagentLeaseStore, store),
+                    cast(ParentContextRelayStore, store),
+                    parent_session_id="",
+                )
+            with self.assertRaisesRegex(ConfigurationError, "inputs must be canonical"):
+                await service.publish_for_target(cast(TaskDag, object()), target)
+            self.assertIsNone(
+                await service.publish_for_target(dag, replace(target, dependencies=()))
+            )
+            with self.assertRaisesRegex(ConfigurationError, "target must be RUNNING"):
+                await service.publish_for_target(
+                    dag,
+                    replace(target, state=TaskDagNodeState.READY),
+                )
+
+            missing_dag = _DependencyRelayBoundaryStore(None, lease)
+            with self.assertRaisesRegex(ConfigurationError, "DAG is missing"):
+                await self._dependency_relay_service(
+                    missing_dag,
+                    parent_session_id,
+                ).publish_for_target(dag, target)
+
+            lookup_error = _DependencyRelayBoundaryStore(dag, lease)
+            lookup_error.target_error = TaskDagDependencyResultRelayError("lookup failed")
+            with self.assertRaisesRegex(ConfigurationError, "integrity verification failed"):
+                await self._dependency_relay_service(
+                    lookup_error,
+                    parent_session_id,
+                ).publish_for_target(dag, target)
+
+            def make_relay(snapshot: TaskDag) -> TaskDagDependencyResultRelay:
+                entry = _dependency_result_entry()
+                return TaskDagDependencyResultRelay.create(
+                    relay_id="tdr-existing",
+                    dag_id=snapshot.dag_id,
+                    dag_definition_fingerprint=snapshot.definition_fingerprint,
+                    target_node_id=target.node_id,
+                    target_node_generation=target.generation,
+                    target_node_definition_fingerprint=target.definition_fingerprint,
+                    direct_dependency_ids=target.dependencies,
+                    entries=(entry,),
+                    truncated=False,
+                    created_at=datetime(2026, 8, 24, tzinfo=UTC),
+                )
+
+            existing = make_relay(dag)
+            existing_store = _DependencyRelayBoundaryStore(dag, lease)
+            existing_store.target_relay = existing
+            existing_store.relay_by_id = existing
+            self.assertEqual(
+                await self._dependency_relay_service(
+                    existing_store,
+                    parent_session_id,
+                ).publish_for_target(dag, target),
+                existing,
+            )
+
+            identity_store = _DependencyRelayBoundaryStore(dag, lease)
+            identity_store.target_relay = TaskDagDependencyResultRelay.create(
+                relay_id="tdr-foreign",
+                dag_id="foreign-dag",
+                dag_definition_fingerprint="c" * 64,
+                target_node_id=target.node_id,
+                target_node_generation=target.generation,
+                target_node_definition_fingerprint=target.definition_fingerprint,
+                direct_dependency_ids=target.dependencies,
+                entries=(_dependency_result_entry(),),
+                truncated=False,
+                created_at=datetime(2026, 8, 24, tzinfo=UTC),
+            )
+            with self.assertRaisesRegex(ConfigurationError, "identity does not match"):
+                await self._dependency_relay_service(
+                    identity_store,
+                    parent_session_id,
+                ).publish_for_target(dag, target)
+
+            predecessor_set_store = _DependencyRelayBoundaryStore(dag, lease)
+            predecessor_set_store.target_relay = existing
+            object.__setattr__(
+                existing,
+                "entries",
+                (replace(existing.entries[0], predecessor_node_id="not-a"),),
+            )
+            with self.assertRaisesRegex(ConfigurationError, "predecessor set is not exact"):
+                await self._dependency_relay_service(
+                    predecessor_set_store,
+                    parent_session_id,
+                ).publish_for_target(dag, target)
+
+            reload_error_store = _DependencyRelayBoundaryStore(dag, lease)
+            reload_error_store.target_relay = make_relay(dag)
+            reload_error_store.relay_by_id = reload_error_store.target_relay
+            reload_error_store.reload_error = TaskDagDependencyResultRelayError("reload failed")
+            with self.assertRaisesRegex(ConfigurationError, "integrity verification failed"):
+                await self._dependency_relay_service(
+                    reload_error_store,
+                    parent_session_id,
+                ).publish_for_target(dag, target)
+
+            reload_missing_store = _DependencyRelayBoundaryStore(dag, lease)
+            reload_missing_store.target_relay = make_relay(dag)
+            reload_missing_store.relay_by_id = reload_missing_store.target_relay
+            reload_missing_store.reload_missing = True
+            with self.assertRaisesRegex(ConfigurationError, "reload did not match"):
+                await self._dependency_relay_service(
+                    reload_missing_store,
+                    parent_session_id,
+                ).publish_for_target(dag, target)
+
+            foreign_dag = replace(dag, parent_session_id="foreign-parent")
+            foreign_store = _DependencyRelayBoundaryStore(foreign_dag, lease)
+            with self.assertRaisesRegex(ConfigurationError, "parent does not match"):
+                await self._dependency_relay_service(
+                    foreign_store,
+                    parent_session_id,
+                ).publish_for_target(foreign_dag, target)
+
+            stale_store = _DependencyRelayBoundaryStore(dag, lease)
+            with self.assertRaisesRegex(ConfigurationError, "snapshot is stale"):
+                await self._dependency_relay_service(
+                    stale_store,
+                    parent_session_id,
+                ).publish_for_target(dag, replace(target, generation=2))
+
+            blocked_predecessor = replace(dag.node("a"), state=TaskDagNodeState.READY)
+            blocked_dag = replace(dag, nodes=(blocked_predecessor, target))
+            with self.assertRaisesRegex(ConfigurationError, "is not COMPLETED"):
+                await self._dependency_relay_service(
+                    _DependencyRelayBoundaryStore(blocked_dag, lease),
+                    parent_session_id,
+                ).publish_for_target(blocked_dag, target)
+
+            incomplete_predecessor = replace(dag.node("a"), parent_task_id=None)
+            incomplete_dag = replace(dag, nodes=(incomplete_predecessor, target))
+            with self.assertRaisesRegex(ConfigurationError, "evidence is incomplete"):
+                await self._dependency_relay_service(
+                    _DependencyRelayBoundaryStore(incomplete_dag, lease),
+                    parent_session_id,
+                ).publish_for_target(incomplete_dag, target)
+
+            missing_lease_store = _DependencyRelayBoundaryStore(dag, None)
+            with self.assertRaisesRegex(ConfigurationError, "lease is missing"):
+                await self._dependency_relay_service(
+                    missing_lease_store,
+                    parent_session_id,
+                ).publish_for_target(dag, target)
+
+            stale_lease = replace(lease, state=WritableSubagentWorkspaceState.ALLOCATING)
+            with self.assertRaisesRegex(ConfigurationError, "lease evidence is stale"):
+                await self._dependency_relay_service(
+                    _DependencyRelayBoundaryStore(dag, stale_lease),
+                    parent_session_id,
+                ).publish_for_target(dag, target)
+
+            missing_parent_relay_store = _DependencyRelayBoundaryStore(dag, lease)
+            missing_parent_relay_store.parent_relay_missing = True
+            with self.assertRaisesRegex(ConfigurationError, "Parent Relay is missing"):
+                await self._dependency_relay_service(
+                    missing_parent_relay_store,
+                    parent_session_id,
+                ).publish_for_target(dag, target)
+
+            publication_error_store = _DependencyRelayBoundaryStore(dag, lease)
+            publication_error_store.insert_error = TaskDagDependencyResultRelayError(
+                "publication failed"
+            )
+            with self.assertRaisesRegex(ConfigurationError, "publication failed"):
+                await self._dependency_relay_service(
+                    publication_error_store,
+                    parent_session_id,
+                ).publish_for_target(dag, target)
+
+            unverifiable_store = _DependencyRelayBoundaryStore(dag, lease)
+            unverifiable_store.drop_after_insert = True
+            with self.assertRaisesRegex(ConfigurationError, "could not be verified"):
+                await self._dependency_relay_service(
+                    unverifiable_store,
+                    parent_session_id,
+                ).publish_for_target(dag, target)
+
+            self.assertEqual(capabilities.cwd, root / "parent")
+
+    async def test_dependency_relay_redacts_and_bounds_result_before_publication(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            secret = "fixture-relay-secret"
+            response = f"{secret}\n" + ("safe-result-" * 500)
+            dag, target, lease, parent_session_id, _ = _dependency_relay_fixture(
+                root,
+                response=response,
+            )
+            store = _DependencyRelayBoundaryStore(dag, lease)
+            relay = await self._dependency_relay_service(
+                store,
+                parent_session_id,
+                redaction_values=(secret,),
+            ).publish_for_target(dag, target)
+            self.assertIsNotNone(relay)
+            assert relay is not None
+            result_text = relay.entries[0].result_text
+            self.assertTrue(relay.truncated)
+            self.assertLessEqual(
+                len(result_text.encode("utf-8")), MAX_TASK_DAG_RESULT_RELAY_ITEM_BYTES
+            )
+            self.assertNotIn(secret, result_text)
+            self.assertNotIn(secret, repr(relay))
 
     async def test_task_dag_reuses_writable_pipeline_and_keeps_parent_dirty_state(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
