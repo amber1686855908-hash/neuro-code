@@ -1735,10 +1735,15 @@ diff、secret 或 arbitrary path。
 当前 Session Store schema 19 新增 `leader_attempts` 与 `leader_decisions`。Attempt 绑定精确 DAG
 generation、definition/evidence/objective fingerprint、Leader session、controller owner、turn
 identity 与 durable lifecycle。SQLite write transaction 和 CAS-like state transition 保证同一精确
-snapshot 只有一个 controller 拥有 model request。已提交的 model response 可在重启后解析复用；在
-observable turn 后不自动 replay provider。存在未解决的 session turn 时保守转为
-`INDETERMINATE`，需要显式 recovery。decision 已发布后，即使 controller 在 DAG claim 前崩溃，另一个
-controller 也可以通过 DAG CAS 复用 decision，不会产生第二次 model request 或 worker allocation。
+snapshot 只有一个 controller 拥有 model request。Controller 必须在 provider call 紧邻之前，使用
+精确 owner/session/turn 将 `CLAIMED` durable fence 为 `PROVIDER_FENCED`，且该 session 必须等于实际
+model binding 的 session。只有没有 output、decision 和旧 session 匹配 turn evidence 时，过期 claim
+才会 rebased 到新的 session/turn；lease 到期本身不证明进程死亡。因此存活的 stale controller 会
+在 fence 处失败，fence 之后的 restart 则失败关闭，不猜测 provider 是否已经执行。已提交的 model
+response 可在重启后解析复用；历史 session/turn provenance 保留，observable turn 后不自动 replay
+provider。存在未解决的 session turn 时保守转为 `INDETERMINATE`，需要显式 recovery。decision 已发布
+后，即使 controller 在 DAG claim 前崩溃，另一个 controller 也可以通过 DAG CAS 复用 decision，不会
+产生第二次 model request 或 worker allocation。
 
 Leader loop 有界且串行：选择一个 ready node，等待既有 Writable Subagent/DAG 结果，然后构造下一份
 snapshot；one-step seam 内不会自动执行第二个 node。只有 DAG terminal 后才请求 final synthesis，且

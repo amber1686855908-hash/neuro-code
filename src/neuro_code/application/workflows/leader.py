@@ -407,6 +407,30 @@ class LeaderApplicationService:
         if not claim.acquired:
             return await self._reuse_durable_decision(attempt, evidence)
         prompt = self._prompt(evidence)
+        leader_session_id = self._leader_binding.runner.session_id
+        if attempt.leader_session_id != leader_session_id or not isinstance(leader_session_id, str):
+            raise ConfigurationError(
+                "Leader attempt session identity does not match the active model binding"
+            )
+        expected_turn_id = attempt.turn_id
+        try:
+            attempt = await self._store.fence_leader_attempt(
+                attempt.attempt_id,
+                owner_id=self._owner_id,
+                leader_session_id=leader_session_id,
+                turn_id=expected_turn_id,
+                updated_at=self._clock().astimezone(UTC),
+            )
+        except LeaderStoreError as error:
+            raise ConfigurationError(
+                "Leader provider fence was lost; automatic replay is disabled"
+            ) from error
+        if (
+            attempt.state is not LeaderAttemptState.PROVIDER_FENCED
+            or attempt.leader_session_id != leader_session_id
+            or attempt.turn_id != expected_turn_id
+        ):
+            raise ConfigurationError("Leader provider fence identity is invalid")
         try:
             result = await self._leader_binding.runner.run(
                 prompt,
@@ -435,6 +459,7 @@ class LeaderApplicationService:
             committed = await self._store.mark_leader_model_committed(
                 attempt.attempt_id,
                 owner_id=self._owner_id,
+                leader_session_id=leader_session_id,
                 turn_id=attempt.turn_id,
                 model_response=model_response,
                 updated_at=self._clock().astimezone(UTC),
@@ -492,7 +517,10 @@ class LeaderApplicationService:
                     "durable Leader model output cannot be reused safely"
                 ) from error
             return record, attempt
-        if attempt.state is LeaderAttemptState.CLAIMED:
+        if attempt.state in {
+            LeaderAttemptState.CLAIMED,
+            LeaderAttemptState.PROVIDER_FENCED,
+        }:
             raise ConfigurationError("another Leader controller owns this decision attempt")
         raise ConfigurationError(f"Leader attempt is {attempt.state.value}; recovery is required")
 
@@ -513,6 +541,25 @@ class LeaderApplicationService:
         return record, attempt
 
     async def _guard_existing_claim(self, attempt: LeaderAttempt, now: datetime) -> None:
+        if attempt.state is LeaderAttemptState.PROVIDER_FENCED:
+            if self._session_store is None:
+                raise ConfigurationError(
+                    "Leader recovery inspection is unavailable; explicit recovery is required"
+                )
+            try:
+                turn_attempts = await self._session_store.load_turn_attempts(
+                    attempt.leader_session_id
+                )
+            except Exception as error:
+                raise ConfigurationError(
+                    "Leader recovery inspection failed; automatic replay is disabled"
+                ) from error
+            if any(item.turn_id == attempt.turn_id for item in turn_attempts):
+                await self._mark_indeterminate(attempt, owner_id=attempt.owner_id)
+                raise ConfigurationError(
+                    "Leader provider fence has an unresolved provider turn; explicit recovery is required"
+                )
+            raise ConfigurationError("Leader provider fence exists; explicit recovery is required")
         if attempt.state is not LeaderAttemptState.CLAIMED:
             return
         if attempt.lease_expires_at > now:
@@ -592,7 +639,7 @@ class LeaderApplicationService:
             record.attempt_id != attempt.attempt_id
             or (attempt.decision_id is not None and attempt.decision_id != record.decision_id)
             or record.dag_id != evidence.dag_id
-            or record.leader_session_id != self._leader_session_id
+            or record.leader_session_id != attempt.leader_session_id
             or record.dag_generation != evidence.generation
             or record.definition_fingerprint != evidence.definition_fingerprint
             or record.evidence_fingerprint != evidence.fingerprint

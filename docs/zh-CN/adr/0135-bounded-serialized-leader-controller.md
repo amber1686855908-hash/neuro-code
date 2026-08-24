@@ -53,15 +53,30 @@ Session schema 19 新增 `leader_attempts` 与 `leader_decisions`。唯一 attem
 建立一个 model-request owner：
 
 ```text
-CLAIMED -> MODEL_COMMITTED -> DECISION_PUBLISHED -> EXECUTED
+CLAIMED -> PROVIDER_FENCED -> MODEL_COMMITTED -> DECISION_PUBLISHED -> EXECUTED
        \-> STALE 或 INDETERMINATE
+PROVIDER_FENCED \-> INDETERMINATE
 ```
 
+Attempt 有三个不同的 identity：durable `owner_id`、专用持久化 `leader_session_id` 和新的
+`turn_id`。在 provider call 紧邻之前，controller 必须使用这三个 identity 以及尚未过期的 lease，
+原子地执行 `CLAIMED -> PROVIDER_FENCED`。实际 `ConversationBinding.runner.session_id` 必须等于
+attempt 的 `leader_session_id`；model commit 还会重复校验 owner/session/turn CAS。失去这个 fence
+的 controller 不能调用 provider。
+
+过期的 `CLAIMED` attempt 只有在没有 committed model response、没有 decision，且旧 Leader session
+中没有匹配 turn evidence 时才可接管。SQLite takeover 原子地把 owner、lease、`leader_session_id`
+和 `turn_id` 替换成新 controller 的值。Lease 到期不等于进程已经死亡：如果旧 controller 仍存活并
+恢复，它的 provider 前置 fence 会失败。一旦 `PROVIDER_FENCED` 持久化，自动 takeover 会被有意禁用；
+restart/recovery 失败关闭并要求显式 recovery，避免第二个 controller 猜测 provider 是否已经发生。
+
 Leader 在调用 model 前写入 durable attempt，在解析前持久化有界、脱敏的 model response，然后
-insert-only 发布 typed decision。第二个 controller 复用 `MODEL_COMMITTED` 或 `DECISION_PUBLISHED`，
-不会为同一 snapshot 再调用 provider。如果已有 session turn 表示 provider attempt 未解决，Leader
-将 attempt 标记为 `INDETERMINATE` 并失败关闭；不会从 restart 推断 safe retry。这保持既有 Session
-turn recovery 规则：indeterminate provider work 永不自动 replay。
+insert-only 发布 typed decision。第二个 controller 复用 `MODEL_COMMITTED`、`DECISION_PUBLISHED`
+或 `EXECUTED`，不会为同一 snapshot 再调用 provider。model output 或 decision 一旦 durable，其历史
+`leader_session_id` 与 `turn_id` 不会被改写。Decision validation 把 record 绑定到创建它的历史
+attempt，而不是绑定到新建的 recovery service session。如果已有 session turn 表示 provider attempt
+未解决，Leader 将 attempt 标记为 `INDETERMINATE` 并失败关闭；不会从 restart 推断 safe retry。这
+保持既有 Session turn recovery 规则：indeterminate provider work 永不自动 replay。
 
 如果进程在 decision durable 后、DAG claim 前退出，restart 可以通过 DAG generation/active-node CAS
 应用同一个 decision。如果另一个 controller 赢得 DAG claim，失败方不会再分配 worker。DAG failure 与
@@ -86,8 +101,10 @@ skills 或 workspace state。
 ## 验证边界
 
 Focused suite 覆盖 deterministic evidence、strict decision、zero-tool composition、串行 diamond 顺序、
-unknown/blocked/stale selection、SQLite insert-only/CAS lifecycle、同一 snapshot controller race、
-durable model-commit reuse 与 no-provider-replay。既有 Task DAG、Writable Subagent、Worktree、
-Checkpoint、Relay、LSP 及全仓库 gates 继续是回归要求。本切片不暴露 CLI/TUI/ACP，也不宣称 parallel
-worker、Swarm、Ultracode、自动委派、model DAG creation、replan、retry、merge、rollback 或 live provider
+unknown/blocked/stale selection、SQLite insert-only/CAS lifecycle、同一 snapshot controller race、真实
+`ApplicationComposition` L1 -> L2 -> L3 restart、原子 session/turn rebind、针对仍存活过期 owner 的
+provider 前置 fencing、durable model-commit reuse、terminal decision idempotence，以及 L2 observable
+turn evidence 后的 no-provider-replay。既有 Task DAG、Writable Subagent、Worktree、Checkpoint、Relay、
+LSP 及全仓库 gates 继续是回归要求。本切片不暴露 CLI/TUI/ACP，也不宣称 parallel worker、Swarm、
+Ultracode、自动委派、model DAG creation、replan、retry、merge、rollback 或 live paid-provider
 acceptance。

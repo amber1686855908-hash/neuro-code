@@ -1815,12 +1815,20 @@ The current Session Store schema 19 adds `leader_attempts` and
 definition/evidence/objective fingerprints, Leader session, controller owner,
 turn identity, and durable lifecycle. SQLite write transactions and CAS-like
 state transitions ensure one controller owns a model request for one exact
-snapshot. A committed model response is parsed and reused after restart; the
-Leader never automatically replays a provider request after an observable
-turn. An unresolved session turn is conservatively `INDETERMINATE` and needs
-explicit recovery. A published decision may be applied through the DAG CAS by
-another controller, so a crash after decision publication does not create a
-second model request or worker allocation.
+snapshot. The controller must durably fence `CLAIMED` as
+`PROVIDER_FENCED` with the exact owner/session/turn immediately before the
+provider call, and that session must equal the actual model binding's session.
+An expired claim is rebased to a fresh session/turn only when no output,
+decision, or matching old-session turn evidence exists; lease expiry alone is
+not proof of process death. A live stale controller therefore fails its fence,
+while a post-fence restart fails closed rather than guessing whether the
+provider ran. A committed model response is parsed and reused after restart;
+historical session/turn provenance is retained and the Leader never
+automatically replays a provider request after an observable turn. An
+unresolved session turn is conservatively `INDETERMINATE` and needs explicit
+recovery. A published decision may be applied through the DAG CAS by another
+controller, so a crash after decision publication does not create a second
+model request or worker allocation.
 
 The Leader loop is bounded and serialized. It selects one ready node, waits
 for the existing Writable Subagent/DAG result, then constructs the next

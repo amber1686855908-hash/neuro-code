@@ -5,8 +5,10 @@ import hashlib
 import json
 import multiprocessing as mp
 import os
+import sqlite3
 import tempfile
 import unittest
+from collections.abc import AsyncIterator, Sequence
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -15,8 +17,9 @@ from typing import cast
 from unittest.mock import patch
 
 from neuro_code.application.ports.leader import LeaderStore, LeaderStoreError
-from neuro_code.application.ports.model import ModelProvider
+from neuro_code.application.ports.model import ModelProvider, ModelToolPolicy
 from neuro_code.application.sessions.binding import ConversationBinding, ConversationRunner
+from neuro_code.application.settings import ApplicationSettings
 from neuro_code.application.workflows.leader import (
     LeaderApplicationService,
     RunLeaderRequest,
@@ -28,6 +31,9 @@ from neuro_code.application.workflows.task_dag import (
     RunTaskDagStepRequest,
     TaskDagApplicationService,
 )
+from neuro_code.bootstrap.composition import ApplicationComposition
+from neuro_code.domain.conversation.context import ModelContext
+from neuro_code.domain.conversation.events import ModelCompleted
 from neuro_code.domain.execution import TurnSource
 from neuro_code.domain.leader import (
     LeaderAttempt,
@@ -46,6 +52,7 @@ from neuro_code.domain.task_dag import (
     TaskDagNodeState,
     TaskDagState,
 )
+from neuro_code.domain.tools import ToolDefinition
 from neuro_code.domain.worktree import WorktreeId
 from neuro_code.domain.writable_subagent import WritableSubagentWorkspaceState
 from neuro_code.infrastructure.persistence.sqlite_session import SqliteSessionStore
@@ -66,6 +73,34 @@ def _node(node_id: str, ordinal: int, dependencies: tuple[str, ...] = ()) -> Tas
         prompt=f"prompt-{node_id}",
         dependencies=dependencies,
     )
+
+
+def _append_line(path: Path, value: str) -> None:
+    with path.open("a", encoding="utf-8") as output:
+        output.write(f"{value}\n")
+
+
+class _CompositionProvider:
+    provider_name = "fixture"
+    model_name = "fixture-model"
+    context_affinity = "profile-v1:fixture"
+
+    def __init__(self, responses: Sequence[str], marker_path: str | None = None) -> None:
+        self._responses = list(responses)
+        self._marker_path = Path(marker_path) if marker_path is not None else None
+
+    async def stream(
+        self,
+        context: ModelContext,
+        tools: Sequence[ToolDefinition],
+        *,
+        tool_policy: ModelToolPolicy = ModelToolPolicy.ALLOWED,
+    ) -> AsyncIterator[ModelCompleted]:
+        del context, tools, tool_policy
+        if self._marker_path is not None:
+            await asyncio.to_thread(_append_line, self._marker_path, "provider")
+        response = self._responses.pop(0) if self._responses else "parent"
+        yield ModelCompleted("stop", response_text=response)
 
 
 class _Runner:
@@ -274,6 +309,33 @@ class _ExitBeforeProviderRunner(_Runner):
         os._exit(71)
 
 
+class _ExitAfterClaimStore:
+    def __init__(self, inner: SqliteSessionStore) -> None:
+        self.inner = inner
+
+    def __getattr__(self, name: str):
+        return getattr(self.inner, name)
+
+    async def claim_leader_attempt(self, *args, **kwargs):
+        await self.inner.claim_leader_attempt(*args, **kwargs)
+        os._exit(71)
+
+
+class _PauseBeforeFenceStore:
+    def __init__(self, inner: SqliteSessionStore) -> None:
+        self.inner = inner
+        self.before_fence = asyncio.Event()
+        self.release_fence = asyncio.Event()
+
+    def __getattr__(self, name: str):
+        return getattr(self.inner, name)
+
+    async def fence_leader_attempt(self, *args, **kwargs):
+        self.before_fence.set()
+        await self.release_fence.wait()
+        return await self.inner.fence_leader_attempt(*args, **kwargs)
+
+
 class _ExitAfterModelCommitStore:
     def __init__(self, inner: SqliteSessionStore) -> None:
         self.inner = inner
@@ -352,7 +414,9 @@ async def _leader_process_child_async(
         crash_after_worker=mode == "after_worker",
     )
     leader_store = store
-    if mode == "after_model_commit":
+    if mode == "before_model":
+        leader_store = _ExitAfterClaimStore(store)
+    elif mode == "after_model_commit":
         leader_store = _ExitAfterModelCommitStore(store)
     elif mode == "after_decision":
         leader_store = _ExitAfterDecisionStore(store)
@@ -370,6 +434,87 @@ async def _leader_process_child_async(
         lease_seconds=1.0,
     )
     await service.run(RunLeaderRequest(dag_id, "process crash objective"))
+
+
+def _production_leader_process_child(
+    mode: str,
+    cwd: str,
+    parent_session_id: str,
+    dag_id: str,
+    marker_path: str,
+    identity_path: str,
+) -> None:
+    asyncio.run(
+        _production_leader_process_child_async(
+            mode,
+            cwd,
+            parent_session_id,
+            dag_id,
+            marker_path,
+            identity_path,
+        )
+    )
+
+
+async def _production_leader_process_child_async(
+    mode: str,
+    cwd: str,
+    parent_session_id: str,
+    dag_id: str,
+    marker_path: str,
+    identity_path: str,
+) -> None:
+    root = Path(cwd)
+    provider = _CompositionProvider(
+        ['{"action":"FINALIZE","summary":"production restart"}'],
+        marker_path,
+    )
+    application = await ApplicationComposition.open(
+        ApplicationSettings(cwd=root, resume_id=parent_session_id),
+        provider_factory=lambda config, failover: provider,
+    )
+    parent_binding = await application.create_binding(resume_id=parent_session_id)
+    leader = await application.create_leader_service(parent_binding=parent_binding)
+    await asyncio.to_thread(
+        _append_line,
+        Path(identity_path),
+        f"{mode} {leader.leader_session_id}",
+    )
+    leader._clock = (  # type: ignore[method-assign]
+        lambda: (
+            _PROCESS_TEST_TIME
+            if mode in {"before_claim", "after_model_commit", "after_decision"}
+            else _PROCESS_TEST_TIME + timedelta(seconds=2)
+        )
+    )
+    leader._lease_seconds = 1.0  # type: ignore[attr-defined]
+    if mode == "before_claim":
+        leader._store = _ExitAfterClaimStore(cast(SqliteSessionStore, application.store))  # type: ignore[assignment]
+    elif mode == "after_model_commit":
+        leader._store = _ExitAfterModelCommitStore(  # type: ignore[assignment]
+            cast(SqliteSessionStore, application.store)
+        )
+    elif mode == "after_decision":
+        leader._store = _ExitAfterDecisionStore(  # type: ignore[assignment]
+            cast(SqliteSessionStore, application.store)
+        )
+    elif mode == "after_provider":
+        original_run = leader._leader_binding.runner.run
+
+        async def crash_after_provider(*args, **kwargs):
+            await original_run(*args, **kwargs)
+            os._exit(72)
+
+        leader._leader_binding.runner.run = crash_after_provider  # type: ignore[method-assign]
+    try:
+        await leader.run(RunLeaderRequest(dag_id, "production restart objective"))
+    except ConfigurationError:
+        if mode != "recover_after_provider":
+            raise
+    finally:
+        await leader.close()
+        await parent_binding.close()
+        await application.close()
 
 
 class LeaderDomainTests(unittest.TestCase):
@@ -556,6 +701,262 @@ class LeaderDomainTests(unittest.TestCase):
             )
         self.assertTrue(LeaderAttemptState.CLAIMED.can_transition_to(LeaderAttemptState.STALE))
         self.assertFalse(LeaderAttemptState.EXECUTED.can_transition_to(LeaderAttemptState.STALE))
+
+
+class LeaderCompositionRestartTests(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def _write_config(state: Path) -> None:
+        state.mkdir(exist_ok=True)
+        (state / "config.toml").write_text(
+            """
+[routing]
+default = "fixture"
+
+[providers.fixture]
+protocol = "openai-chat"
+model = "fixture-model"
+base_url = "https://provider.invalid/v1"
+api_key_env = "FIXTURE_KEY"
+context_window_tokens = 131072
+""",
+            encoding="utf-8",
+        )
+
+    async def test_fresh_composition_reopens_parent_and_allocates_new_leader_session(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / "state"
+            self._write_config(state)
+            provider = _CompositionProvider(("parent session established",))
+            with patch.dict(
+                os.environ,
+                {
+                    "HOME": str(root),
+                    "NEURO_CODE_HOME": str(state),
+                    "FIXTURE_KEY": "fixture-key",
+                },
+                clear=True,
+            ):
+                application_a = await ApplicationComposition.open(
+                    ApplicationSettings(cwd=root),
+                    provider_factory=lambda config, failover: provider,
+                )
+                parent_a = await application_a.create_binding()
+                leader_a = None
+                parent_id: str | None = None
+                try:
+                    await parent_a.runner.run("establish the actual parent session")
+                    parent_id = parent_a.runner.session_id
+                    assert parent_id is not None
+                    leader_a = await application_a.create_leader_service(
+                        parent_binding=parent_a,
+                    )
+                    leader_a_id = leader_a.leader_session_id
+                finally:
+                    if leader_a is not None:
+                        await leader_a.close()
+                    await parent_a.close()
+                    await application_a.close()
+
+                assert parent_id is not None
+                application_b = await ApplicationComposition.open(
+                    ApplicationSettings(cwd=root, resume_id=parent_id),
+                    provider_factory=lambda config, failover: provider,
+                )
+                parent_b = await application_b.create_binding(resume_id=parent_id)
+                leader_b = None
+                try:
+                    leader_b = await application_b.create_leader_service(
+                        parent_binding=parent_b,
+                    )
+                    self.assertNotEqual(leader_a_id, leader_b.leader_session_id)
+                    self.assertEqual(parent_b.runner.session_id, parent_id)
+                    self.assertNotEqual(parent_id, leader_b.leader_session_id)
+                finally:
+                    if leader_b is not None:
+                        await leader_b.close()
+                    await parent_b.close()
+                    await application_b.close()
+
+
+class LeaderProductionRestartTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self) -> None:
+        self._temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self._temporary.name)
+        self.state = self.root / "state"
+        self.state.mkdir()
+        (self.state / "config.toml").write_text(
+            """
+[routing]
+default = "fixture"
+
+[providers.fixture]
+protocol = "openai-chat"
+model = "fixture-model"
+base_url = "https://provider.invalid/v1"
+api_key_env = "FIXTURE_KEY"
+context_window_tokens = 131072
+""",
+            encoding="utf-8",
+        )
+        self.database_path = self.state / "sessions.db"
+        self.store = SqliteSessionStore(self.database_path)
+        await self.store.initialize()
+        self.parent_session_id = await self.store.create_session(
+            str(self.root),
+            "fixture",
+            "fixture-model",
+        )
+
+    async def asyncTearDown(self) -> None:
+        self._temporary.cleanup()
+
+    async def _seed_terminal_dag(self, dag_id: str) -> None:
+        base = TaskDag.create(
+            dag_id=dag_id,
+            parent_session_id=self.parent_session_id,
+            nodes=(_node("a", 0),),
+            created_at=_PROCESS_TEST_TIME,
+        )
+        completed_node = replace(
+            base.node("a"),
+            state=TaskDagNodeState.COMPLETED,
+            generation=1,
+            response_preview="worker complete",
+            final_workspace_fingerprint="a" * 64,
+            changed_file_count=0,
+        )
+        await self.store.insert_task_dag(
+            replace(
+                base,
+                nodes=(completed_node,),
+                state=TaskDagState.COMPLETED,
+                generation=1,
+                updated_at=_PROCESS_TEST_TIME + timedelta(seconds=1),
+            )
+        )
+
+    async def _run_child(
+        self,
+        mode: str,
+        dag_id: str,
+        marker_path: Path,
+        identity_path: Path,
+        expected_exit: int,
+    ) -> None:
+        context = mp.get_context("spawn")
+        child = context.Process(
+            target=_production_leader_process_child,
+            args=(
+                mode,
+                str(self.root),
+                self.parent_session_id,
+                dag_id,
+                str(marker_path),
+                str(identity_path),
+            ),
+        )
+        with patch.dict(
+            os.environ,
+            {
+                "HOME": str(self.root),
+                "NEURO_CODE_HOME": str(self.state),
+                "FIXTURE_KEY": "fixture-key",
+            },
+            clear=True,
+        ):
+            child.start()
+            await asyncio.to_thread(child.join, 30)
+        self.assertFalse(child.is_alive())
+        self.assertEqual(child.exitcode, expected_exit)
+
+    def _attempt_row(self, dag_id: str) -> tuple[str, str, str]:
+        with sqlite3.connect(self.database_path) as connection:
+            row = connection.execute(
+                """
+                SELECT leader_session_id, turn_id, state
+                FROM leader_attempts
+                WHERE dag_id = ?
+                """,
+                (dag_id,),
+            ).fetchone()
+        self.assertIsNotNone(row)
+        assert row is not None
+        return str(row[0]), str(row[1]), str(row[2])
+
+    def _identities(self, identity_path: Path) -> list[tuple[str, str]]:
+        return [
+            tuple(line.split(" ", 1))
+            for line in identity_path.read_text(encoding="utf-8").splitlines()
+        ]
+
+    async def test_fresh_composition_l1_l2_l3_no_replay_after_observable_l2_turn(self) -> None:
+        dag_id = "production-two-restarts"
+        await self._seed_terminal_dag(dag_id)
+        marker_path = self.root / "provider.log"
+        identity_path = self.root / "identities.log"
+        await self._run_child("before_claim", dag_id, marker_path, identity_path, 71)
+        await self._run_child("after_provider", dag_id, marker_path, identity_path, 72)
+        await self._run_child(
+            "recover_after_provider",
+            dag_id,
+            marker_path,
+            identity_path,
+            0,
+        )
+        identities = self._identities(identity_path)
+        self.assertEqual(
+            [label for label, _ in identities],
+            [
+                "before_claim",
+                "after_provider",
+                "recover_after_provider",
+            ],
+        )
+        sessions = [session_id for _, session_id in identities]
+        self.assertEqual(len(set(sessions)), 3)
+        self.assertEqual(marker_path.read_text(encoding="utf-8").splitlines(), ["provider"])
+        session_id, turn_id, state = self._attempt_row(dag_id)
+        self.assertEqual(session_id, sessions[1])
+        self.assertEqual(state, LeaderAttemptState.INDETERMINATE.value)
+        self.assertTrue(
+            any(
+                attempt.turn_id == turn_id
+                for attempt in await self.store.load_turn_attempts(session_id)
+            )
+        )
+
+    async def test_fresh_composition_reuses_l1_model_commit_without_provider_replay(self) -> None:
+        dag_id = "production-model-commit"
+        await self._seed_terminal_dag(dag_id)
+        marker_path = self.root / "provider-model-commit.log"
+        identity_path = self.root / "identities-model-commit.log"
+        await self._run_child("after_model_commit", dag_id, marker_path, identity_path, 72)
+        await self._run_child("recover", dag_id, marker_path, identity_path, 0)
+        identities = self._identities(identity_path)
+        self.assertEqual(len(identities), 2)
+        self.assertNotEqual(identities[0][1], identities[1][1])
+        self.assertEqual(marker_path.read_text(encoding="utf-8").splitlines(), ["provider"])
+        decisions = await self.store.list_leader_decisions(dag_id)
+        self.assertEqual(len(decisions), 1)
+        self.assertEqual(decisions[0].leader_session_id, identities[0][1])
+
+    async def test_fresh_composition_reuses_published_finalize_idempotently(self) -> None:
+        dag_id = "production-finalize"
+        await self._seed_terminal_dag(dag_id)
+        marker_path = self.root / "provider-finalize.log"
+        identity_path = self.root / "identities-finalize.log"
+        await self._run_child("after_decision", dag_id, marker_path, identity_path, 72)
+        await self._run_child("recover", dag_id, marker_path, identity_path, 0)
+        await self._run_child("recover", dag_id, marker_path, identity_path, 0)
+        identities = self._identities(identity_path)
+        self.assertEqual(len(identities), 3)
+        self.assertEqual(len({session_id for _, session_id in identities}), 3)
+        self.assertEqual(marker_path.read_text(encoding="utf-8").splitlines(), ["provider"])
+        decisions = await self.store.list_leader_decisions(dag_id)
+        self.assertEqual(len(decisions), 1)
+        _, _, state = self._attempt_row(dag_id)
+        self.assertEqual(state, LeaderAttemptState.EXECUTED.value)
 
 
 class LeaderIntegrationTests(unittest.IsolatedAsyncioTestCase):
@@ -1169,8 +1570,13 @@ class LeaderIntegrationTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(ConfigurationError, "durability failed"):
             await first.run(RunLeaderRequest("reuse", "objective"))
         self.store.mark_leader_model_committed = original_mark  # type: ignore[method-assign]
+        recovery_session_id = await self.store.create_session(
+            self._temporary.name,
+            "fixture",
+            "fixture-model",
+        )
         second_runner = _Runner(
-            self.leader_session_id,
+            recovery_session_id,
             [
                 '{"action":"FINALIZE","summary":"done"}',
             ],
@@ -1180,6 +1586,148 @@ class LeaderIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(first_runner.calls, 1)
         self.assertEqual(second_runner.calls, 1)
         self.assertEqual(self.writable.calls, ["a"])
+
+    async def test_expired_claim_rebinds_fresh_session_and_turn_before_provider(self) -> None:
+        await self.dag_service.create_task_dag(
+            CreateTaskDagRequest("fresh-takeover", (_node("a", 0),))
+        )
+        dag = await self.store.get_task_dag("fresh-takeover")
+        assert dag is not None
+        first_service = self._leader()
+        evidence = first_service._evidence("objective", dag)
+        now = _now()
+        old_attempt = LeaderAttempt(
+            attempt_id="leader-attempt-fresh-takeover",
+            dag_id=dag.dag_id,
+            leader_session_id=self.leader_session_id,
+            objective_fingerprint=hashlib.sha256(b"objective").hexdigest(),
+            dag_generation=dag.generation,
+            definition_fingerprint=dag.definition_fingerprint,
+            evidence_fingerprint=evidence.fingerprint,
+            state=LeaderAttemptState.CLAIMED,
+            owner_id="leader-owner-old",
+            lease_expires_at=now - timedelta(seconds=1),
+            turn_id="leader-turn-old",
+        )
+        await self.store.claim_leader_attempt(old_attempt, now=now - timedelta(seconds=2))
+        recovery_session_id = await self.store.create_session(
+            self._temporary.name,
+            "fixture",
+            "fixture-model",
+        )
+        recovery_runner = _Runner(
+            recovery_session_id,
+            [
+                '{"action":"SELECT_NODE","node_id":"a"}',
+                '{"action":"FINALIZE","summary":"done"}',
+            ],
+        )
+        recovery_service = LeaderApplicationService(
+            cast(LeaderStore, self.store),
+            self.dag_service,
+            parent_binding=self.parent_binding,
+            leader_binding=_binding(recovery_runner, zero_tools=True),
+            session_store=self.store,
+            clock=lambda: now,
+            lease_seconds=1.0,
+        )
+        result = await recovery_service.run(RunLeaderRequest(dag.dag_id, "objective"))
+        self.assertTrue(result.terminal)
+        self.assertEqual(recovery_runner.calls, 2)
+        self.assertNotEqual(recovery_runner.turn_ids[0], old_attempt.turn_id)
+        rebound = await self.store.get_leader_attempt(old_attempt.attempt_id)
+        assert rebound is not None
+        self.assertEqual(rebound.leader_session_id, recovery_session_id)
+        self.assertEqual(rebound.turn_id, recovery_runner.turn_ids[0])
+
+    async def test_live_expired_owner_cannot_call_provider_after_takeover(self) -> None:
+        await self.dag_service.create_task_dag(CreateTaskDagRequest("live-fence", (_node("a", 0),)))
+        now = _now()
+        old_store = _PauseBeforeFenceStore(self.store)
+        old_runner = _Runner(self.leader_session_id, [])
+        old_service = LeaderApplicationService(
+            cast(LeaderStore, old_store),
+            self.dag_service,
+            parent_binding=self.parent_binding,
+            leader_binding=_binding(old_runner, zero_tools=True),
+            session_store=self.store,
+            clock=lambda: now,
+            lease_seconds=1.0,
+        )
+        recovery_session_id = await self.store.create_session(
+            self._temporary.name,
+            "fixture",
+            "fixture-model",
+        )
+        recovery_runner = _Runner(
+            recovery_session_id,
+            [
+                '{"action":"SELECT_NODE","node_id":"a"}',
+                '{"action":"FINALIZE","summary":"done"}',
+            ],
+        )
+        recovery_service = LeaderApplicationService(
+            cast(LeaderStore, self.store),
+            self.dag_service,
+            parent_binding=self.parent_binding,
+            leader_binding=_binding(recovery_runner, zero_tools=True),
+            session_store=self.store,
+            clock=lambda: now + timedelta(seconds=2),
+            lease_seconds=1.0,
+        )
+        old_task = asyncio.create_task(old_service.run(RunLeaderRequest("live-fence", "objective")))
+        await old_store.before_fence.wait()
+        recovery_result = await recovery_service.run(RunLeaderRequest("live-fence", "objective"))
+        old_store.release_fence.set()
+        old_result = await asyncio.gather(old_task, return_exceptions=True)
+        self.assertTrue(recovery_result.terminal)
+        self.assertIsInstance(old_result[0], ConfigurationError)
+        self.assertEqual(old_runner.calls, 0)
+        self.assertEqual(recovery_runner.selection_calls, 1)
+
+    async def test_provider_fence_requires_explicit_recovery_without_replay(self) -> None:
+        await self.dag_service.create_task_dag(
+            CreateTaskDagRequest("fenced-recovery", (_node("a", 0),))
+        )
+        dag = await self.store.get_task_dag("fenced-recovery")
+        assert dag is not None
+        service = self._leader()
+        evidence = service._evidence("objective", dag)
+        now = _now()
+        attempt = LeaderAttempt(
+            attempt_id="leader-attempt-fenced-recovery",
+            dag_id=dag.dag_id,
+            leader_session_id=self.leader_session_id,
+            objective_fingerprint=hashlib.sha256(b"objective").hexdigest(),
+            dag_generation=dag.generation,
+            definition_fingerprint=dag.definition_fingerprint,
+            evidence_fingerprint=evidence.fingerprint,
+            state=LeaderAttemptState.CLAIMED,
+            owner_id="leader-owner-fenced",
+            lease_expires_at=now + timedelta(seconds=30),
+            turn_id="leader-turn-fenced",
+        )
+        await self.store.claim_leader_attempt(attempt, now=now)
+        await self.store.fence_leader_attempt(
+            attempt.attempt_id,
+            owner_id=attempt.owner_id,
+            leader_session_id=attempt.leader_session_id,
+            turn_id=attempt.turn_id,
+            updated_at=now,
+        )
+        recovery_runner = _Runner("leader-session-recovery", [])
+        recovery_service = LeaderApplicationService(
+            cast(LeaderStore, self.store),
+            self.dag_service,
+            parent_binding=self.parent_binding,
+            leader_binding=_binding(recovery_runner, zero_tools=True),
+            session_store=self.store,
+            clock=lambda: now + timedelta(seconds=2),
+            lease_seconds=1.0,
+        )
+        with self.assertRaisesRegex(ConfigurationError, "provider fence"):
+            await recovery_service.run(RunLeaderRequest(dag.dag_id, "objective"))
+        self.assertEqual(recovery_runner.calls, 0)
 
     async def test_sqlite_leader_lifecycle_is_idempotent_and_cas_bound(self) -> None:
         await self.dag_service.create_task_dag(CreateTaskDagRequest("lifecycle", (_node("a", 0),)))
@@ -1214,9 +1762,18 @@ class LeaderIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(duplicate_claim.attempt.attempt_id, attempt.attempt_id)
 
         response = '{"action":"SELECT_NODE","node_id":"a"}'
+        fenced = await self.store.fence_leader_attempt(
+            attempt.attempt_id,
+            owner_id=attempt.owner_id,
+            leader_session_id=attempt.leader_session_id,
+            turn_id=attempt.turn_id,
+            updated_at=now,
+        )
+        self.assertIs(fenced.state, LeaderAttemptState.PROVIDER_FENCED)
         committed = await self.store.mark_leader_model_committed(
             attempt.attempt_id,
             owner_id=attempt.owner_id,
+            leader_session_id=attempt.leader_session_id,
             turn_id=attempt.turn_id,
             model_response=response,
             updated_at=now,
@@ -1226,6 +1783,7 @@ class LeaderIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 await self.store.mark_leader_model_committed(
                     attempt.attempt_id,
                     owner_id=attempt.owner_id,
+                    leader_session_id=attempt.leader_session_id,
                     turn_id=attempt.turn_id,
                     model_response=response,
                     updated_at=now,
@@ -1237,6 +1795,7 @@ class LeaderIntegrationTests(unittest.IsolatedAsyncioTestCase):
             await self.store.mark_leader_model_committed(
                 attempt.attempt_id,
                 owner_id=attempt.owner_id,
+                leader_session_id=attempt.leader_session_id,
                 turn_id=attempt.turn_id,
                 model_response='{"action":"FINALIZE"}',
                 updated_at=now,
@@ -1392,8 +1951,13 @@ class LeaderProcessCrashTests(unittest.IsolatedAsyncioTestCase):
             child.exitcode, 73 if mode == "after_worker" else 72 if mode != "before_model" else 71
         )
 
+        recovery_leader_session_id = await self.store.create_session(
+            self._temporary.name,
+            "fixture",
+            "fixture-model",
+        )
         parent_runner = _MarkerRunner(
-            self.leader_session_id,
+            recovery_leader_session_id,
             (
                 ['{"action":"SELECT_NODE","node_id":"a"}', '{"action":"FINALIZE","summary":"done"}']
                 if mode == "before_model"

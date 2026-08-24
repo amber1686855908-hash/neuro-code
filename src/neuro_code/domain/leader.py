@@ -73,6 +73,7 @@ class LeaderDecisionKind(StrEnum):
 
 class LeaderAttemptState(StrEnum):
     CLAIMED = "claimed"
+    PROVIDER_FENCED = "provider_fenced"
     MODEL_COMMITTED = "model_committed"
     DECISION_PUBLISHED = "decision_published"
     EXECUTED = "executed"
@@ -82,8 +83,12 @@ class LeaderAttemptState(StrEnum):
     def can_transition_to(self, proposed: LeaderAttemptState) -> bool:
         allowed = {
             LeaderAttemptState.CLAIMED: {
-                LeaderAttemptState.MODEL_COMMITTED,
+                LeaderAttemptState.PROVIDER_FENCED,
                 LeaderAttemptState.STALE,
+                LeaderAttemptState.INDETERMINATE,
+            },
+            LeaderAttemptState.PROVIDER_FENCED: {
+                LeaderAttemptState.MODEL_COMMITTED,
                 LeaderAttemptState.INDETERMINATE,
             },
             LeaderAttemptState.MODEL_COMMITTED: {

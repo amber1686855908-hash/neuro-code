@@ -50,11 +50,22 @@ class LeaderStore(Protocol):
         objective_fingerprint: str,
     ) -> LeaderAttempt | None: ...
 
+    async def fence_leader_attempt(
+        self,
+        attempt_id: str,
+        *,
+        owner_id: str,
+        leader_session_id: str,
+        turn_id: str,
+        updated_at: datetime,
+    ) -> LeaderAttempt: ...
+
     async def mark_leader_model_committed(
         self,
         attempt_id: str,
         *,
         owner_id: str,
+        leader_session_id: str,
         turn_id: str,
         model_response: str,
         updated_at: datetime,

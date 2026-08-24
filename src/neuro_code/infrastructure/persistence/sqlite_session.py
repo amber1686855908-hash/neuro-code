@@ -2111,12 +2111,15 @@ class SqliteSessionStore:
                     cursor = connection.execute(
                         """
                         UPDATE leader_attempts
-                        SET owner_id = ?, lease_expires_at = ?, updated_at = ?
+                        SET leader_session_id = ?, owner_id = ?, lease_expires_at = ?,
+                            turn_id = ?, updated_at = ?
                         WHERE attempt_id = ? AND state = ? AND lease_expires_at <= ?
                         """,
                         (
+                            prepared.leader_session_id,
                             prepared.owner_id,
                             prepared.lease_expires_at.isoformat(),
+                            prepared.turn_id,
                             now_utc.isoformat(),
                             current.attempt_id,
                             LeaderAttemptState.CLAIMED.value,
@@ -2145,6 +2148,94 @@ class SqliteSessionStore:
 
         async with self._write_lock:
             return await run_blocking(claim)
+
+    async def fence_leader_attempt(
+        self,
+        attempt_id: str,
+        *,
+        owner_id: str,
+        leader_session_id: str,
+        turn_id: str,
+        updated_at: datetime,
+    ) -> LeaderAttempt:
+        _validated_leader_identifier(attempt_id)
+        _validated_leader_identifier(owner_id)
+        _validated_leader_identifier(leader_session_id)
+        _validated_leader_identifier(turn_id)
+        if not isinstance(updated_at, datetime) or updated_at.tzinfo is None:
+            raise TypeError("leader provider fence time must be timezone-aware")
+        updated_at_utc = updated_at.astimezone(UTC)
+
+        def fence() -> LeaderAttempt:
+            connection = self._connect()
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                current = _load_leader_attempt(connection, attempt_id)
+                if current is None:
+                    raise LeaderStoreError("leader attempt is missing", kind="unmanaged")
+                if current.state is LeaderAttemptState.PROVIDER_FENCED:
+                    if (
+                        current.owner_id == owner_id
+                        and current.leader_session_id == leader_session_id
+                        and current.turn_id == turn_id
+                    ):
+                        connection.commit()
+                        return current
+                    raise LeaderStoreError(
+                        "leader provider fence identity conflicts",
+                        kind="concurrent_modification",
+                    )
+                if (
+                    current.state is not LeaderAttemptState.CLAIMED
+                    or current.owner_id != owner_id
+                    or current.leader_session_id != leader_session_id
+                    or current.turn_id != turn_id
+                    or current.lease_expires_at <= updated_at_utc
+                ):
+                    raise LeaderStoreError(
+                        "leader attempt is no longer fenced by this controller",
+                        kind="concurrent_modification",
+                    )
+                cursor = connection.execute(
+                    """
+                    UPDATE leader_attempts
+                    SET state = ?, updated_at = ?
+                    WHERE attempt_id = ? AND state = ? AND owner_id = ?
+                      AND leader_session_id = ? AND turn_id = ?
+                      AND lease_expires_at > ?
+                    """,
+                    (
+                        LeaderAttemptState.PROVIDER_FENCED.value,
+                        updated_at_utc.isoformat(),
+                        attempt_id,
+                        LeaderAttemptState.CLAIMED.value,
+                        owner_id,
+                        leader_session_id,
+                        turn_id,
+                        updated_at_utc.isoformat(),
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise LeaderStoreError(
+                        "leader provider fence was lost",
+                        kind="concurrent_modification",
+                    )
+                connection.commit()
+                result = _load_leader_attempt(connection, attempt_id)
+                if result is None:
+                    raise LeaderStoreError("leader attempt disappeared after provider fence")
+                return result
+            except LeaderStoreError:
+                connection.rollback()
+                raise
+            except sqlite3.Error as error:
+                connection.rollback()
+                raise LeaderStoreError("leader provider fence failed") from error
+            finally:
+                connection.close()
+
+        async with self._write_lock:
+            return await run_blocking(fence)
 
     async def get_leader_attempt_for_snapshot(
         self,
@@ -2182,12 +2273,14 @@ class SqliteSessionStore:
         attempt_id: str,
         *,
         owner_id: str,
+        leader_session_id: str,
         turn_id: str,
         model_response: str,
         updated_at: datetime,
     ) -> LeaderAttempt:
         _validated_leader_identifier(attempt_id)
         _validated_leader_identifier(owner_id)
+        _validated_leader_identifier(leader_session_id)
         _validated_leader_identifier(turn_id)
         if not isinstance(model_response, str) or not model_response.strip():
             raise ValueError("leader model response must not be empty")
@@ -2202,7 +2295,11 @@ class SqliteSessionStore:
                 if current is None:
                     raise LeaderStoreError("leader attempt is missing", kind="unmanaged")
                 if current.state is LeaderAttemptState.MODEL_COMMITTED:
-                    if current.turn_id == turn_id and current.model_response == model_response:
+                    if (
+                        current.leader_session_id == leader_session_id
+                        and current.turn_id == turn_id
+                        and current.model_response == model_response
+                    ):
                         connection.commit()
                         return current
                     raise LeaderStoreError(
@@ -2210,8 +2307,9 @@ class SqliteSessionStore:
                         kind="integrity",
                     )
                 if (
-                    current.state is not LeaderAttemptState.CLAIMED
+                    current.state is not LeaderAttemptState.PROVIDER_FENCED
                     or current.owner_id != owner_id
+                    or current.leader_session_id != leader_session_id
                     or current.turn_id != turn_id
                 ):
                     raise LeaderStoreError(
@@ -2223,6 +2321,7 @@ class SqliteSessionStore:
                     UPDATE leader_attempts
                     SET state = ?, turn_id = ?, model_response = ?, updated_at = ?
                     WHERE attempt_id = ? AND state = ? AND owner_id = ?
+                      AND leader_session_id = ? AND turn_id = ?
                     """,
                     (
                         LeaderAttemptState.MODEL_COMMITTED.value,
@@ -2230,8 +2329,10 @@ class SqliteSessionStore:
                         model_response,
                         updated_at.astimezone(UTC).isoformat(),
                         attempt_id,
-                        LeaderAttemptState.CLAIMED.value,
+                        LeaderAttemptState.PROVIDER_FENCED.value,
                         owner_id,
+                        leader_session_id,
+                        turn_id,
                     ),
                 )
                 if cursor.rowcount != 1:

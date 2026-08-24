@@ -67,18 +67,39 @@ attempt key is the exact DAG snapshot plus objective fingerprint. SQLite
 owner for one exact snapshot:
 
 ```text
-CLAIMED -> MODEL_COMMITTED -> DECISION_PUBLISHED -> EXECUTED
+CLAIMED -> PROVIDER_FENCED -> MODEL_COMMITTED -> DECISION_PUBLISHED -> EXECUTED
        \-> STALE or INDETERMINATE
+PROVIDER_FENCED \-> INDETERMINATE
 ```
+
+The attempt has three distinct identities: the durable `owner_id`, the
+dedicated persisted `leader_session_id`, and the fresh `turn_id`. Immediately
+before a provider call, the controller must atomically transition
+`CLAIMED -> PROVIDER_FENCED` with all three identities and an unexpired lease.
+The actual `ConversationBinding.runner.session_id` must equal the attempt's
+`leader_session_id`; the model commit repeats that owner/session/turn CAS. A
+controller that loses this fence cannot call the provider.
+
+An expired `CLAIMED` attempt is reclaimable only when it has no committed model
+response, no decision, and no matching turn evidence in its old Leader session.
+The SQLite takeover atomically replaces owner, lease, `leader_session_id`, and
+`turn_id` with the new controller's values. Lease expiry is not proof that a
+process died: if a live old controller resumes, its pre-provider fence fails.
+Once `PROVIDER_FENCED` is durable, automatic takeover is intentionally
+disabled; restart/recovery fails closed and requires explicit recovery. This
+prevents a second controller from guessing whether a provider call occurred.
 
 The Leader writes the durable attempt before calling the model, persists the
 bounded redacted model response before parsing it, then publishes the typed
-decision insert-only. A second controller reuses `MODEL_COMMITTED` or
-`DECISION_PUBLISHED` state and never calls the provider for that snapshot. If
-the existing session turn indicates an unresolved provider attempt, the Leader
-marks the attempt `INDETERMINATE`/fails closed; it does not infer a safe retry
-from restart. This preserves the existing Session turn recovery rule that
-indeterminate provider work is never automatically replayed.
+decision insert-only. A second controller reuses `MODEL_COMMITTED`,
+`DECISION_PUBLISHED`, or `EXECUTED` state and never calls the provider for that
+snapshot. Historical `leader_session_id` and `turn_id` are never rewritten
+after model output or a decision is durable. Decision validation binds the
+record to its historical attempt, not to the fresh recovery service session.
+If the existing session turn indicates an unresolved provider attempt, the
+Leader marks the attempt `INDETERMINATE`/fails closed; it does not infer a safe
+retry from restart. This preserves the existing Session turn recovery rule
+that indeterminate provider work is never automatically replayed.
 
 If a process exits after a decision is durable but before the DAG claim, a
 restart can apply the same decision through the DAG generation/active-node
@@ -109,9 +130,12 @@ instructions, skills, or workspace state.
 
 The focused suite covers deterministic evidence, strict decisions, zero-tool
 composition, serialized diamond order, unknown/blocked/stale selection,
-SQLite insert-only/CAS lifecycle, same-snapshot controller races, durable
-model-commit reuse, and no provider replay. Existing Task DAG, Writable
-Subagent, Worktree, Checkpoint, Relay, LSP, and full repository gates remain
-regression requirements. The slice is not exposed through CLI/TUI/ACP and does
-not claim parallel workers, Swarm, Ultracode, automatic delegation, model DAG
-creation, replan, retry, merge, rollback, or live provider acceptance.
+SQLite insert-only/CAS lifecycle, same-snapshot controller races, fresh
+`ApplicationComposition` L1 -> L2 -> L3 restart, atomic session/turn rebind,
+pre-provider fencing against a live expired owner, durable model-commit reuse,
+terminal decision idempotence, and no provider replay after observable L2 turn
+evidence. Existing Task DAG, Writable Subagent, Worktree, Checkpoint, Relay,
+LSP, and full repository gates remain regression requirements. The slice is not
+exposed through CLI/TUI/ACP and does not claim parallel workers, Swarm,
+Ultracode, automatic delegation, model DAG creation, replan, retry, merge,
+rollback, or live paid-provider acceptance.
