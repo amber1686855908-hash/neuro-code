@@ -20,6 +20,7 @@ from neuro_code.application.workflows.task_dag import (
     TaskDagApplicationService,
     TaskDagWritableService,
 )
+from neuro_code.application.workflows.writable_subagent import WritableSubagentExecutionIdentity
 from neuro_code.domain.session_tasks import SessionTask, SessionTaskKind, SessionTaskStatus
 from neuro_code.domain.task_dag import (
     MAX_TASK_DAG_ERROR_BYTES,
@@ -112,6 +113,7 @@ class _FakeWritableService:
         self.started = asyncio.Event()
         self.release = asyncio.Event()
         self.calls: list[tuple[str, str, str]] = []
+        self.execution_identities: list[WritableSubagentExecutionIdentity] = []
         self.active = 0
         self.max_active = 0
 
@@ -133,6 +135,7 @@ class _FakeWritableService:
         sink=None,
     ) -> object:
         del sink
+        self.execution_identities.append(execution_identity)
         self.calls.append(
             (request.prompt, execution_identity.node_id, execution_identity.parent_task_id)
         )
@@ -1135,6 +1138,10 @@ class TaskDagSchedulerTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(0)
         self.assertEqual(writable_b.calls, [])
         _, node_id, parent_task_id = writable_a.calls[0]
+        identity = writable_a.execution_identities[0]
+        self.assertEqual(identity.dag_id, "race")
+        self.assertEqual(identity.node_id, node_id)
+        self.assertEqual(identity.parent_task_id, parent_task_id)
         self.leases.by_parent_task[parent_task_id] = self._evidence(parent_task_id, node_id)
         writable_a.release.set()
         await asyncio.gather(first, second)

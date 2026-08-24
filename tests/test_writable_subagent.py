@@ -101,7 +101,7 @@ from neuro_code.domain.parent_context_relay import (
 )
 from neuro_code.domain.sandbox.models import SandboxProfile
 from neuro_code.domain.session_tasks import SessionTaskStatus
-from neuro_code.domain.task_dag import TaskDagNode, TaskDagNodeState, TaskDagState
+from neuro_code.domain.task_dag import TaskDag, TaskDagNode, TaskDagNodeState, TaskDagState
 from neuro_code.domain.tools import ToolDefinition
 from neuro_code.domain.worktree import (
     WorktreeCreateRequest,
@@ -1498,6 +1498,263 @@ def _crash_after_relay_publication(root_value: str, repository_value: str) -> No
     asyncio.run(run())
 
 
+def _write_durable_json(path: Path, payload: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    encoded = json.dumps(payload, sort_keys=True) + "\n"
+    with path.open("w", encoding="utf-8") as stream:
+        stream.write(encoded)
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
+def _append_durable_marker(path: Path, value: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as stream:
+        stream.write(value + "\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
+def _write_task_dag_fixture_config(state_dir: Path) -> None:
+    state_dir.mkdir(parents=True, exist_ok=True)
+    (state_dir / "config.toml").write_text(
+        """
+[web_search]
+mode = "disabled"
+
+[web_fetch]
+mode = "disabled"
+
+[routing]
+default = "fixture"
+
+[providers.fixture]
+protocol = "openai-chat"
+model = "fixture-model"
+base_url = "https://provider.invalid/v1"
+api_key_env = "FIXTURE_KEY"
+context_window_tokens = 131072
+""",
+        encoding="utf-8",
+    )
+
+
+class _TaskDagCrashProvider:
+    provider_name = "fixture"
+    model_name = "fixture-model"
+    context_affinity = "fixture-v1"
+    capabilities = ModelCapabilitySet.all_unknown()
+
+    def __init__(self, marker: Path, mode: str) -> None:
+        self._marker = marker
+        self._mode = mode
+
+    async def stream(
+        self,
+        context: ModelContext,
+        tools: Sequence[ToolDefinition],
+        *,
+        tool_policy: ModelToolPolicy = ModelToolPolicy.ALLOWED,
+    ) -> AsyncIterator[ModelEvent]:
+        del context, tools, tool_policy
+        _append_durable_marker(self._marker, "model_invocation")
+        if self._mode == "active-worker-crash":
+            os._exit(74)
+        if self._mode not in {"completed-worker-crash", "none"}:
+            raise AssertionError(f"unknown Task DAG crash fixture mode: {self._mode}")
+        yield ModelTextDelta("task DAG worker completed")
+        yield ModelCompleted("stop")
+
+
+def _task_dag_crash_provider_factory(config: AppConfig, failover: bool) -> ModelProvider:
+    del failover
+    mode = os.environ.get("NEURO_CODE_TASK_DAG_CRASH_MODE", "none")
+    return cast(
+        ModelProvider,
+        _TaskDagCrashProvider(
+            config.state_dir / "task-dag-model-invocations",
+            mode,
+        ),
+    )
+
+
+class _CrashBeforeTaskDagFinishStore:
+    """Test-only seam that dies after durable worker completion evidence."""
+
+    def __init__(
+        self,
+        delegate: SqliteSessionStore,
+        *,
+        parent_session_id: str,
+        evidence_path: Path,
+    ) -> None:
+        self._delegate = delegate
+        self._parent_session_id = parent_session_id
+        self._evidence_path = evidence_path
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._delegate, name)
+
+    async def finish_task_dag_node(
+        self,
+        dag_id: str,
+        node: TaskDagNode,
+        *,
+        expected_generation: int,
+        expected_state: TaskDagNodeState,
+        updated_at: datetime,
+    ) -> TaskDag:
+        if node.state is TaskDagNodeState.COMPLETED:
+            if node.parent_task_id is None:
+                raise AssertionError("completed DAG node has no exact worker identity")
+            task = await self._delegate.get_session_task(
+                self._parent_session_id,
+                node.parent_task_id,
+            )
+            lease = await self._delegate.get_writable_subagent_lease_for_parent_task(
+                self._parent_session_id,
+                node.parent_task_id,
+            )
+            relay = (
+                await self._delegate.get_parent_context_relay_for_lease(lease.lease_id)
+                if lease is not None
+                else None
+            )
+            if (
+                task is None
+                or task.task_id != node.parent_task_id
+                or task.status is not SessionTaskStatus.COMPLETED
+                or lease is None
+                or lease.parent_session_id != self._parent_session_id
+                or lease.parent_task_id != node.parent_task_id
+                or lease.state is not WritableSubagentWorkspaceState.PRESERVED
+                or lease.child_session_id is None
+                or lease.worktree is None
+                or lease.baseline_checkpoint_id is None
+                or relay is None
+                or relay.parent_session_id != self._parent_session_id
+                or relay.parent_task_id != node.parent_task_id
+                or relay.child_session_id != lease.child_session_id
+                or relay.lease_id != lease.lease_id
+                or relay.worktree_id != lease.worktree_id
+                or relay.baseline_checkpoint_id != lease.baseline_checkpoint_id
+            ):
+                raise AssertionError("worker evidence was not durable before DAG finish")
+            _write_durable_json(
+                self._evidence_path,
+                {
+                    "boundary": "worker_completed_before_dag_finish",
+                    "dag_id": dag_id,
+                    "node_id": node.node_id,
+                    "parent_task_id": node.parent_task_id,
+                    "child_session_id": lease.child_session_id,
+                    "lease_id": lease.lease_id,
+                    "worktree_id": lease.worktree_id.value,
+                    "checkpoint_id": lease.baseline_checkpoint_id.value,
+                    "relay_id": relay.relay_id,
+                    "task_status": task.status.value,
+                    "lease_state": lease.state.value,
+                },
+            )
+            os._exit(73)
+        return await self._delegate.finish_task_dag_node(
+            dag_id,
+            node,
+            expected_generation=expected_generation,
+            expected_state=expected_state,
+            updated_at=updated_at,
+        )
+
+
+def _run_task_dag_process_death_child(
+    root_value: str,
+    repository_value: str,
+    mode: str,
+) -> None:
+    root = Path(root_value)
+    repository = Path(repository_value)
+    state_dir = root / "state"
+    os.environ.update(
+        {
+            "HOME": str(root),
+            "NEURO_CODE_HOME": str(state_dir),
+            "FIXTURE_KEY": "fixture-key",
+            "NEURO_CODE_TASK_DAG_CRASH_MODE": mode,
+        }
+    )
+    _write_task_dag_fixture_config(state_dir)
+
+    async def run() -> None:
+        application = await ApplicationComposition.open(
+            ApplicationSettings(
+                cwd=repository,
+                sandbox="off",
+                permission_mode=PermissionMode.BYPASS,
+                max_steps=8,
+            ),
+            provider_factory=_task_dag_crash_provider_factory,
+        )
+        try:
+            parent_session_id = await application.store.create_session(
+                str(repository),
+                "fixture",
+                "fixture-model",
+                sandbox_profile=SandboxProfile.OFF,
+            )
+            await application.store.save_session_items(
+                parent_session_id,
+                (Message(Role.USER, "durable Task DAG crash context"),),
+            )
+            parent_binding = await application.create_binding(
+                resume_id=parent_session_id,
+                capabilities=_capability(repository, sandbox=SandboxProfile.OFF),
+            )
+            writable = application.create_writable_subagent_service(
+                parent_binding=parent_binding,
+            )
+            dag_id = f"task-dag-process-death-{mode}"
+            node_id = "node-a"
+            dag_store: TaskDagStore = cast(TaskDagStore, application.store)
+            evidence_path = root / "task-dag-completed-before-finish.json"
+            if mode == "completed-worker-crash":
+                dag_store = cast(
+                    TaskDagStore,
+                    _CrashBeforeTaskDagFinishStore(
+                        application.store,
+                        parent_session_id=parent_session_id,
+                        evidence_path=evidence_path,
+                    ),
+                )
+            service = TaskDagApplicationService(
+                application.store,
+                dag_store,
+                writable,
+                application.store,
+                cast(ParentContextRelayStore, application.store),
+                parent_binding=parent_binding,
+            )
+            await service.create_task_dag(
+                CreateTaskDagRequest(
+                    dag_id,
+                    (TaskDagNode(node_id=node_id, ordinal=0, prompt="complete one worker"),),
+                )
+            )
+            _write_durable_json(
+                root / "task-dag-context.json",
+                {
+                    "dag_id": dag_id,
+                    "node_id": node_id,
+                    "parent_session_id": parent_session_id,
+                    "mode": mode,
+                },
+            )
+            await service.run_task_dag(RunTaskDagRequest(dag_id))
+        finally:
+            await application.close()
+
+    asyncio.run(run())
+
+
 class _ProductionWritableProvider:
     provider_name = "fixture"
     model_name = "fixture-model"
@@ -2000,6 +2257,297 @@ class WritableApplicationTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual((parent / "parent.txt").read_bytes(), before_parent)
             self.assertEqual(len(await store.list_writable_subagent_leases()), 2)
             self.assertEqual(len(await store.list_subagent_links(parent_session_id)), 2)
+
+    async def _assert_real_task_dag_process_death_recovery(
+        self,
+        *,
+        mode: str,
+        exit_code: int,
+        expected_task_status: SessionTaskStatus,
+        expected_lease_state: WritableSubagentWorkspaceState,
+        expected_node_state: TaskDagNodeState,
+        expected_graph_state: TaskDagState,
+    ) -> None:
+        with tempfile.TemporaryDirectory(prefix=f"neuro-task-dag-{mode}-") as directory:
+            root = Path(directory)
+            repository, _head = _make_real_repository(root)
+            process = multiprocessing.get_context("spawn").Process(
+                target=_run_task_dag_process_death_child,
+                args=(str(root), str(repository), mode),
+            )
+            process.start()
+            await asyncio.to_thread(process.join, 60)
+            if process.is_alive():
+                process.terminate()
+                await asyncio.to_thread(process.join, 15)
+                self.fail(f"Task DAG {mode} fixture did not reach process death")
+            self.assertEqual(process.exitcode, exit_code)
+
+            state_dir = root / "state"
+            context = cast(
+                dict[str, str],
+                json.loads((root / "task-dag-context.json").read_text(encoding="utf-8")),
+            )
+            self.assertEqual(context["mode"], mode)
+            dag_id = context["dag_id"]
+            node_id = context["node_id"]
+            parent_session_id = context["parent_session_id"]
+            invocation_marker = state_dir / "task-dag-model-invocations"
+            self.assertEqual(
+                invocation_marker.read_text(encoding="utf-8").splitlines(),
+                [
+                    "model_invocation",
+                ],
+            )
+
+            with patch.dict(
+                os.environ,
+                {
+                    "HOME": str(root),
+                    "NEURO_CODE_HOME": str(state_dir),
+                    "FIXTURE_KEY": "fixture-key",
+                    "NEURO_CODE_TASK_DAG_CRASH_MODE": "none",
+                },
+                clear=False,
+            ):
+                application = await ApplicationComposition.open(
+                    ApplicationSettings(
+                        cwd=repository,
+                        sandbox="off",
+                        permission_mode=PermissionMode.BYPASS,
+                        max_steps=8,
+                    ),
+                    provider_factory=_task_dag_crash_provider_factory,
+                )
+                try:
+                    parent_binding = await application.create_binding(
+                        resume_id=parent_session_id,
+                        capabilities=_capability(repository, sandbox=SandboxProfile.OFF),
+                    )
+                    dag_service = application.create_task_dag_service(
+                        parent_binding=parent_binding,
+                    )
+                    worktrees = application.create_worktree_service()
+                    checkpoints = application.create_workspace_checkpoint_service()
+                    await worktrees.initialize()
+                    await checkpoints.initialize()
+
+                    before = await dag_service.get_task_dag(RunTaskDagRequest(dag_id))
+                    self.assertIsNotNone(before)
+                    assert before is not None
+                    self.assertIs(before.state, TaskDagState.RUNNING)
+                    self.assertEqual(before.active_node_id, node_id)
+                    before_node = before.node(node_id)
+                    self.assertIs(before_node.state, TaskDagNodeState.RUNNING)
+                    self.assertIsNotNone(before_node.parent_task_id)
+                    assert before_node.parent_task_id is not None
+
+                    task = await application.store.get_session_task(
+                        parent_session_id,
+                        before_node.parent_task_id,
+                    )
+                    self.assertIsNotNone(task)
+                    assert task is not None
+                    self.assertEqual(task.task_id, before_node.parent_task_id)
+                    self.assertIs(task.status, expected_task_status)
+                    lease = await application.store.get_writable_subagent_lease_for_parent_task(
+                        parent_session_id,
+                        before_node.parent_task_id,
+                    )
+                    self.assertIsNotNone(lease)
+                    assert lease is not None
+                    self.assertEqual(lease.parent_session_id, parent_session_id)
+                    self.assertEqual(lease.parent_task_id, task.task_id)
+                    self.assertIs(lease.state, expected_lease_state)
+                    self.assertIsNotNone(lease.child_session_id)
+                    self.assertIsNotNone(lease.baseline_checkpoint_id)
+                    self.assertIsNotNone(lease.worktree)
+                    assert lease.child_session_id is not None
+                    assert lease.baseline_checkpoint_id is not None
+                    assert lease.worktree is not None
+
+                    link = await application.store.load_subagent_link(
+                        parent_session_id,
+                        task.task_id,
+                    )
+                    self.assertIsNotNone(link)
+                    assert link is not None
+                    self.assertEqual(link.child_session_id, lease.child_session_id)
+                    relay = await application.store.get_parent_context_relay_for_lease(
+                        lease.lease_id,
+                    )
+                    self.assertIsNotNone(relay)
+                    assert relay is not None
+                    self.assertEqual(relay.parent_task_id, task.task_id)
+                    self.assertEqual(relay.child_session_id, lease.child_session_id)
+                    self.assertEqual(relay.lease_id, lease.lease_id)
+                    self.assertEqual(relay.worktree_id, lease.worktree_id)
+                    self.assertEqual(relay.baseline_checkpoint_id, lease.baseline_checkpoint_id)
+
+                    worktree = await worktrees.inspect(lease.worktree_id.value)
+                    self.assertIs(worktree.state, WorktreeState.READY)
+                    checkpoint = await checkpoints.get(lease.baseline_checkpoint_id)
+                    self.assertIsNotNone(checkpoint)
+                    assert checkpoint is not None
+                    self.assertIs(checkpoint.state, CheckpointState.READY)
+                    self.assertEqual(worktree.worktree_id, lease.worktree_id)
+                    self.assertEqual(checkpoint.worktree_id, lease.worktree_id)
+
+                    if mode == "completed-worker-crash":
+                        evidence = cast(
+                            dict[str, str],
+                            json.loads(
+                                (root / "task-dag-completed-before-finish.json").read_text(
+                                    encoding="utf-8"
+                                )
+                            ),
+                        )
+                        self.assertEqual(evidence["dag_id"], dag_id)
+                        self.assertEqual(evidence["node_id"], node_id)
+                        self.assertEqual(evidence["parent_task_id"], task.task_id)
+                        self.assertEqual(evidence["child_session_id"], lease.child_session_id)
+                        self.assertEqual(evidence["lease_id"], lease.lease_id)
+                        self.assertEqual(evidence["worktree_id"], lease.worktree_id.value)
+                        self.assertEqual(
+                            evidence["checkpoint_id"],
+                            lease.baseline_checkpoint_id.value,
+                        )
+                        self.assertEqual(evidence["relay_id"], relay.relay_id)
+                        self.assertEqual(evidence["task_status"], SessionTaskStatus.COMPLETED.value)
+                        self.assertEqual(
+                            evidence["lease_state"],
+                            WritableSubagentWorkspaceState.PRESERVED.value,
+                        )
+
+                    reconciled = await dag_service.reconcile_task_dag(
+                        RunTaskDagRequest(dag_id),
+                    )
+                    self.assertIs(reconciled.node(node_id).state, expected_node_state)
+                    self.assertIsNone(reconciled.active_node_id)
+                    self.assertIs(reconciled.state, TaskDagState.RUNNING)
+                    reconciled_node = reconciled.node(node_id)
+                    self.assertEqual(reconciled_node.parent_task_id, task.task_id)
+                    self.assertEqual(reconciled_node.child_session_id, lease.child_session_id)
+                    self.assertEqual(reconciled_node.lease_id, lease.lease_id)
+                    self.assertEqual(reconciled_node.worktree_id, lease.worktree_id.value)
+                    self.assertEqual(
+                        reconciled_node.baseline_checkpoint_id,
+                        lease.baseline_checkpoint_id.value,
+                    )
+                    self.assertEqual(reconciled_node.relay_id, relay.relay_id)
+
+                    final = await dag_service.run_task_dag(RunTaskDagRequest(dag_id))
+                    self.assertIs(final.state, expected_graph_state)
+                    self.assertIs(final.node(node_id).state, expected_node_state)
+                    self.assertIsNone(final.active_node_id)
+                    durable_final = await dag_service.get_task_dag(RunTaskDagRequest(dag_id))
+                    self.assertIsNotNone(durable_final)
+                    assert durable_final is not None
+                    self.assertIs(durable_final.state, expected_graph_state)
+
+                    task_rows = [
+                        item
+                        for item in await application.store.list_session_tasks(
+                            parent_session_id,
+                            limit=100,
+                        )
+                        if item.task_id == task.task_id
+                    ]
+                    self.assertEqual(len(task_rows), 1)
+                    lease_rows = [
+                        item
+                        for item in await application.store.list_writable_subagent_leases(
+                            parent_session_id=parent_session_id,
+                            include_terminal=True,
+                        )
+                        if item.parent_task_id == task.task_id
+                    ]
+                    self.assertEqual(len(lease_rows), 1)
+                    link_rows = [
+                        item
+                        for item in await application.store.list_subagent_links(parent_session_id)
+                        if item.parent_task_id == task.task_id
+                    ]
+                    self.assertEqual(len(link_rows), 1)
+                    worktree_rows = [
+                        item
+                        for item in await worktrees.list_managed(reconcile=False)
+                        if item.worktree_id == lease.worktree_id
+                    ]
+                    self.assertEqual(len(worktree_rows), 1)
+                    checkpoint_connection = sqlite3.connect(state_dir / "checkpoints.db")
+                    checkpoint_count = checkpoint_connection.execute(
+                        "SELECT COUNT(*) FROM checkpoints WHERE checkpoint_id = ?",
+                        (lease.baseline_checkpoint_id.value,),
+                    ).fetchone()
+                    checkpoint_connection.close()
+                    self.assertEqual(checkpoint_count, (1,))
+                    session_connection = sqlite3.connect(state_dir / "sessions.db")
+                    child_count = session_connection.execute(
+                        "SELECT COUNT(*) FROM sessions WHERE id = ?",
+                        (lease.child_session_id,),
+                    ).fetchone()
+                    relay_count = session_connection.execute(
+                        "SELECT COUNT(*) FROM parent_context_relays WHERE lease_id = ?",
+                        (lease.lease_id,),
+                    ).fetchone()
+                    session_connection.close()
+                    self.assertEqual(child_count, (1,))
+                    self.assertEqual(relay_count, (1,))
+                    self.assertEqual(
+                        invocation_marker.read_text(encoding="utf-8").splitlines(),
+                        ["model_invocation"],
+                    )
+
+                    final_lease = await application.store.get_writable_subagent_lease(
+                        lease.lease_id,
+                    )
+                    self.assertIsNotNone(final_lease)
+                    assert final_lease is not None
+                    expected_final_lease_state = (
+                        WritableSubagentWorkspaceState.ORPHANED
+                        if mode == "active-worker-crash"
+                        else expected_lease_state
+                    )
+                    self.assertIs(final_lease.state, expected_final_lease_state)
+                    self.assertEqual(final_lease.child_session_id, lease.child_session_id)
+                    self.assertEqual(final_lease.worktree_id, lease.worktree_id)
+                    self.assertEqual(
+                        final_lease.baseline_checkpoint_id,
+                        lease.baseline_checkpoint_id,
+                    )
+                    self.assertEqual(
+                        await application.store.get_parent_context_relay_for_lease(
+                            lease.lease_id,
+                        ),
+                        relay,
+                    )
+                finally:
+                    await application.close()
+
+    async def test_real_task_dag_crash_after_completed_worker_reconciles_without_rerun(
+        self,
+    ) -> None:
+        await self._assert_real_task_dag_process_death_recovery(
+            mode="completed-worker-crash",
+            exit_code=73,
+            expected_task_status=SessionTaskStatus.COMPLETED,
+            expected_lease_state=WritableSubagentWorkspaceState.PRESERVED,
+            expected_node_state=TaskDagNodeState.COMPLETED,
+            expected_graph_state=TaskDagState.COMPLETED,
+        )
+
+    async def test_real_task_dag_active_worker_crash_becomes_indeterminate_without_rerun(
+        self,
+    ) -> None:
+        await self._assert_real_task_dag_process_death_recovery(
+            mode="active-worker-crash",
+            exit_code=74,
+            expected_task_status=SessionTaskStatus.RUNNING,
+            expected_lease_state=WritableSubagentWorkspaceState.ACTIVE,
+            expected_node_state=TaskDagNodeState.INDETERMINATE,
+            expected_graph_state=TaskDagState.INDETERMINATE,
+        )
 
     async def test_parent_relay_excludes_unsafe_structures_and_redacts_visible_text(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

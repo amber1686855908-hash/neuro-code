@@ -75,6 +75,13 @@ Reconciliation 先运行既有 Writable reconciliation，再按 active node 精�
 取消。如果进程在 worker 完成与 DAG node finish 之间退出，恢复会利用既有 worker durable evidence
 收敛，而不是 replay。
 
+真实进程死亡验收覆盖两个不同边界。如果 Writable `SessionTask` 已经是 `COMPLETED` 且 lease 已经是
+`PRESERVED`，但进程在 DAG terminal CAS 前退出，重启会将精确 node reconciliation 为 `COMPLETED` 并释放
+`active_node_id`，且不创建第二个 worker。如果 worker owner 在精确 `SessionTask` 仍为非 terminal 时退出，
+Writable reconciliation 会将 lease 标记为 `ORPHANED`；DAG reconciliation 会记录 `INDETERMINATE`，保留
+child session/worktree/checkpoint/relay identity，且不会重跑 worker。这些保证只覆盖真实
+`spawn`/`os._exit` seam 已测试的边界。
+
 ## 未实现
 
 本 ADR 不增加 model 生成的 DAG 分解、Leader、Swarm、Ultracode、自动委派、并行执行、dataflow/
@@ -85,6 +92,7 @@ retry、自动崩溃重跑、CLI/TUI/ACP 暴露或新的 public orchestration pr
 
 验收要求 domain bound/cycle 测试、带已填充 Parent Relay 的 schema 17→18 迁移、insert-only 与
 过期 generation 测试、跨进程 claim 和双 scheduler 竞态证据、确定性的串行 diamond 失败传播、
-精确 worker correlation、completed/failed/cancelled/uncertain 恢复、真实 Relay-before-model、
-真实 Writable/LSP 回归、独立 managed Worktree、parent dirty state 不变、完整本地门禁以及 stacked
-PR merge-ref 平台矩阵。
+精确 worker correlation、completed/failed/cancelled/uncertain 恢复、真实 `multiprocessing.spawn` 在
+worker 完成后及 active ownership 期间的进程死亡、无重跑 allocation count、真实 Relay-before-model、
+真实 Writable/LSP 回归、独立 managed Worktree、parent dirty state 不变、完整本地门禁以及 stacked PR
+merge-ref 平台矩阵。

@@ -95,6 +95,16 @@ ready nodes cancelled before re-raising cancellation. A process that exits
 between worker completion and DAG-node finish is therefore reconciled from the
 existing durable worker evidence rather than replayed.
 
+The real process-death acceptance covers two distinct boundaries. If the
+Writable `SessionTask` is already `COMPLETED` and its lease is already
+`PRESERVED`, but the process exits before the DAG terminal CAS, restart
+reconciles the exact node to `COMPLETED` and releases `active_node_id` without
+creating another worker. If the worker owner exits while the exact
+`SessionTask` is still non-terminal, Writable reconciliation marks the lease
+`ORPHANED`; DAG reconciliation records `INDETERMINATE`, preserves the child
+session/worktree/checkpoint/relay identities, and does not rerun the worker.
+These guarantees are bounded to the tested real `spawn`/`os._exit` seams.
+
 ## Not implemented
 
 This ADR does not add model-generated DAG decomposition, Leader, Swarm,
@@ -109,6 +119,8 @@ Acceptance requires domain bound/cycle tests, schema 17-to-18 migration with
 populated Parent Relay preservation, insert-only and stale-generation tests,
 cross-process claim and two-scheduler race evidence, deterministic serialized
 diamond failure propagation, exact worker correlation, completed/failed/
-cancelled/uncertain recovery, real Parent Relay-before-model behavior, real
-Writable/LSP regression, separate managed Worktrees, unchanged parent dirty
-state, full local gates, and the stacked PR merge-ref platform matrix.
+cancelled/uncertain recovery, real `multiprocessing.spawn` process death after
+worker completion and during active ownership, no-rerun allocation counts,
+real Parent Relay-before-model behavior, real Writable/LSP regression, separate
+managed Worktrees, unchanged parent dirty state, full local gates, and the
+stacked PR merge-ref platform matrix.
