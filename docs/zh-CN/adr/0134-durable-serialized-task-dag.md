@@ -84,13 +84,14 @@ child session/worktree/checkpoint/relay identity，且不会重跑 worker。这�
 
 ## 未实现
 
-本 ADR 不增加 model 生成的 DAG 分解、Leader、Swarm、Ultracode、自动委派、并行执行、dataflow/
+本 ADR 不增加 model 生成的 DAG 分解，也不定义 Leader controller；有界 Leader 由独立的
+[ADR 0135](0135-bounded-serialized-leader-controller.md) 规定。本 ADR 也不增加 Swarm、Ultracode、自动委派、并行执行、dataflow/
 result relay、前置 transcript 共享、共享 worktree、merge/integration、commit、rollback、cleanup、
 retry、自动崩溃重跑、CLI/TUI/ACP 暴露或新的 public orchestration protocol。
 
 ## 验证边界
 
-验收要求 domain bound/cycle 测试、带已填充 Parent Relay 的 schema 17→18 迁移、insert-only 与
+验收要求 domain bound/cycle 测试、带已填充 Parent Relay 的 schema 17→19 迁移、insert-only 与
 过期 generation 测试、跨进程 claim 和双 scheduler 竞态证据、确定性的串行 diamond 失败传播、
 精确 worker correlation、completed/failed/cancelled/uncertain 恢复、真实 `multiprocessing.spawn` 在
 worker 完成后及 active ownership 期间的进程死亡、无重跑 allocation count、真实 Relay-before-model、

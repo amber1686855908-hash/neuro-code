@@ -150,6 +150,7 @@ class AgentRunResult:
     steps: int
     plan: SessionPlan | None = None
     outcome: AgentExecutionOutcome | None = None
+    turn_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -254,6 +255,7 @@ class AgentLoopRunner:
         source_model: str | None = None,
         source_context_affinity: str | None = None,
         session_id: str | None = None,
+        turn_id: str | None = None,
         cancellation_policy: TurnCancellationPolicy = TurnCancellationPolicy.RETAIN,
         turn_source: TurnSource = TurnSource.USER,
     ) -> AgentRunResult:
@@ -357,9 +359,8 @@ class AgentLoopRunner:
                         f"plan task {plan_execution_task_id} does not match the saved plan"
                     )
 
-        turn_id: str | None = None
         if self._session_store is not None and session_id is not None:
-            turn_id = f"turn-{uuid.uuid4().hex}"
+            turn_id = turn_id or f"turn-{uuid.uuid4().hex}"
             turn_input = TurnInput(
                 prompt,
                 prompt_parts,
@@ -877,6 +878,7 @@ class AgentLoopRunner:
                 step,
                 self._context_builder.plan,
                 outcome,
+                turn_id,
             )
 
         response_parts: list[str] = []
@@ -1209,6 +1211,7 @@ class AgentLoopRunner:
                         tuple(events),
                         step,
                         self._context_builder.plan,
+                        turn_id=turn_id,
                     )
 
                 tool_batch = tuple(call.name for call in tool_calls)

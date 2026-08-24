@@ -17,6 +17,7 @@ from neuro_code.application.sessions.binding import ConversationBinding, Convers
 from neuro_code.application.workflows.task_dag import (
     CreateTaskDagRequest,
     RunTaskDagRequest,
+    RunTaskDagStepRequest,
     TaskDagApplicationService,
     TaskDagWritableService,
 )
@@ -571,7 +572,7 @@ class TaskDagPersistenceTests(unittest.IsolatedAsyncioTestCase):
             1,
         )
 
-    async def test_schema_17_migrates_to_18_and_creates_dag_tables(self) -> None:
+    async def test_schema_17_migrates_to_19_and_creates_dag_and_leader_tables(self) -> None:
         connection = sqlite3.connect(self._database_path)
         connection.execute("UPDATE schema_meta SET version = 17 WHERE singleton = 1")
         connection.commit()
@@ -590,9 +591,46 @@ class TaskDagPersistenceTests(unittest.IsolatedAsyncioTestCase):
             ).fetchall()
         }
         connection.close()
-        self.assertEqual(version, (18,))
+        self.assertEqual(version, (19,))
         self.assertTrue({"task_dags", "task_dag_nodes"}.issubset(tables))
+        self.assertTrue({"leader_attempts", "leader_decisions"}.issubset(tables))
         self.assertIsNotNone(await reopened.get_session(self.parent_session_id))
+
+    async def test_populated_schema_18_dag_survives_leader_migration(self) -> None:
+        dag = TaskDag.create(
+            dag_id="populated-schema-18",
+            parent_session_id=self.parent_session_id,
+            nodes=(_node("a", 0),),
+            created_at=_now(),
+        )
+        await self.store.insert_task_dag(dag)
+        connection = sqlite3.connect(self._database_path)
+        connection.execute("DROP TABLE leader_decisions")
+        connection.execute("DROP TABLE leader_attempts")
+        connection.execute("UPDATE schema_meta SET version = 18 WHERE singleton = 1")
+        connection.commit()
+        connection.close()
+
+        reopened = SqliteSessionStore(self._database_path)
+        await reopened.initialize()
+        preserved = await reopened.get_task_dag(dag.dag_id)
+        self.assertIsNotNone(preserved)
+        assert preserved is not None
+        self.assertEqual(preserved.definition_fingerprint, dag.definition_fingerprint)
+        self.assertEqual(preserved.node("a").prompt, "prompt-a")
+        connection = sqlite3.connect(self._database_path)
+        version = connection.execute(
+            "SELECT version FROM schema_meta WHERE singleton = 1"
+        ).fetchone()
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+        connection.close()
+        self.assertEqual(version, (19,))
+        self.assertTrue({"leader_attempts", "leader_decisions"}.issubset(tables))
 
 
 class TaskDagSchedulerTests(unittest.IsolatedAsyncioTestCase):
@@ -676,6 +714,41 @@ class TaskDagSchedulerTests(unittest.IsolatedAsyncioTestCase):
                 self.relays,
                 parent_binding=_binding(""),
             )
+
+    async def test_one_step_executes_only_the_selected_current_ready_node(self) -> None:
+        writable = _FakeWritableService(self.parent_session_id)
+        original_run = writable.run_subagent_with_execution_identity
+
+        async def run_and_publish(request, *, execution_identity, sink=None):
+            self.leases.by_parent_task[execution_identity.parent_task_id] = self._evidence(
+                execution_identity.parent_task_id,
+                execution_identity.node_id,
+            )
+            return await original_run(
+                request,
+                execution_identity=execution_identity,
+                sink=sink,
+            )
+
+        writable.run_subagent_with_execution_identity = run_and_publish
+        service = self._service(writable)
+        await service.create_task_dag(
+            CreateTaskDagRequest(
+                "one-step",
+                (_node("a", 0), _node("b", 1), _node("c", 2, ("a",))),
+            )
+        )
+        prepared = await service.prepare_task_dag_step(RunTaskDagRequest("one-step"))
+        self.assertEqual(prepared.ready_node_ids(), ("a", "b"))
+        self.assertEqual(writable.calls, [])
+
+        after_b = await service.run_task_dag_step(RunTaskDagStepRequest("one-step", "b"))
+        self.assertEqual([call[1] for call in writable.calls], ["b"])
+        self.assertIs(after_b.node("b").state, TaskDagNodeState.COMPLETED)
+        self.assertIs(after_b.node("a").state, TaskDagNodeState.READY)
+        self.assertIs(after_b.node("c").state, TaskDagNodeState.PENDING)
+        with self.assertRaisesRegex(ConfigurationError, "not currently READY"):
+            await service.run_task_dag_step(RunTaskDagStepRequest("one-step", "c"))
 
     async def test_publication_and_parent_verification_fail_closed(self) -> None:
         foreign = TaskDag.create(

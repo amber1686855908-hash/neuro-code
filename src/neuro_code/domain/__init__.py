@@ -71,6 +71,15 @@ from neuro_code.domain.conversation.request import (
     RequestContextFingerprints,
     context_fingerprints,
 )
+from neuro_code.domain.leader import (
+    LeaderAttempt,
+    LeaderAttemptState,
+    LeaderDecision,
+    LeaderDecisionKind,
+    LeaderDecisionRecord,
+    LeaderEvidenceEnvelope,
+    LeaderEvidenceNode,
+)
 from neuro_code.domain.parent_context_relay import (
     MAX_PARENT_RELAY_ITEM_BYTES,
     MAX_PARENT_RELAY_ITEMS,
@@ -183,6 +192,13 @@ __all__ = [
     "ContextItemKind",
     "DurableCompactionItem",
     "InteractionMode",
+    "LeaderAttempt",
+    "LeaderAttemptState",
+    "LeaderDecision",
+    "LeaderDecisionKind",
+    "LeaderDecisionRecord",
+    "LeaderEvidenceEnvelope",
+    "LeaderEvidenceNode",
     "ManagedChildWorkspaceGrant",
     "Message",
     "ModelBackendToolCompleted",

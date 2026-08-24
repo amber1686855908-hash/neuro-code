@@ -34,6 +34,7 @@ from neuro_code.application.ports.background_tasks import (
 from neuro_code.application.ports.client_filesystem import ClientFileSystem
 from neuro_code.application.ports.client_terminal import ClientTerminal
 from neuro_code.application.ports.instructions import InstructionDiscovery
+from neuro_code.application.ports.leader import LeaderStore
 from neuro_code.application.ports.model import (
     CapabilityStatus,
     ModelCapability,
@@ -93,6 +94,7 @@ from neuro_code.application.settings import ApplicationSettings
 from neuro_code.application.tools.service import SessionToolOutputArtifactApplicationService
 from neuro_code.application.web_fetch.service import WebFetchService
 from neuro_code.application.web_search.service import WebSearchService
+from neuro_code.application.workflows.leader import LeaderApplicationService
 from neuro_code.application.workflows.plan_execution import (
     PlanExecutionController,
     PlanExecutionService,
@@ -1190,6 +1192,66 @@ class ApplicationComposition:
             cast(ParentContextRelayStore, self.store),
             parent_binding=parent_binding,
         )
+
+    async def create_leader_service(
+        self,
+        *,
+        parent_binding: ConversationBinding,
+        timeout_seconds: float = 120.0,
+    ) -> LeaderApplicationService:
+        """Create the bounded zero-tool Leader over one existing Task DAG.
+
+        The Leader gets its own persisted session and provider route, but all
+        provider-hosted tools, local tools, background wakes, and child
+        capabilities are removed at this composition boundary.  The returned
+        service owns the dedicated binding and should be closed by its caller.
+        """
+
+        if not isinstance(parent_binding, ConversationBinding):
+            raise ConfigurationError("Leader parent binding is required")
+        leader_config = replace(
+            self.config,
+            providers={
+                name: replace(profile, builtin_tools=())
+                for name, profile in self.config.providers.items()
+            },
+        )
+        provider_profile = leader_config.provider
+        leader_session_id = await self.store.create_session(
+            str(leader_config.cwd),
+            provider_profile.name,
+            provider_profile.model,
+            provider_profile.context_affinity,
+            leader_config.sandbox_profile,
+        )
+        try:
+            leader_binding = await self.create_binding(
+                config=leader_config,
+                resume_id=leader_session_id,
+                max_steps=1,
+                allowed_tool_names=(),
+                enable_background_tasks=False,
+            )
+        except BaseException:
+            await asyncio.shield(self.store.delete_session(leader_session_id))
+            raise
+        try:
+            dag_service = self.create_task_dag_service(
+                parent_binding=parent_binding,
+                timeout_seconds=timeout_seconds,
+            )
+            return LeaderApplicationService(
+                cast(LeaderStore, self.store),
+                dag_service,
+                parent_binding=parent_binding,
+                leader_binding=leader_binding,
+                session_store=self.store,
+                redaction_values=leader_config.redaction_values(),
+            )
+        except BaseException:
+            await asyncio.shield(leader_binding.close())
+            await asyncio.shield(self.store.delete_session(leader_session_id))
+            raise
 
     def create_subagent_scheduler(
         self,

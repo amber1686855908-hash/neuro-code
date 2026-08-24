@@ -1726,8 +1726,9 @@ tool-role, synthetic, tool-call-bearing, media-bearing, preserved reasoning,
 and preserved backend-call structures are excluded; assistant visible prose is
 separable from and never carries its `reasoning_content`.
 
-Session schema 18 retains the schema-17 one-to-one insert-only READY relay per
-writable lease and adds the durable Task DAG tables described below. Its
+Session schema 19 retains the schema-17 one-to-one insert-only READY relay per
+writable lease and the durable Task DAG tables described below, and adds the
+durable Leader attempt/decision projections described after the DAG. Its
 identity binds the parent/task/child, lease, worktree, baseline checkpoint,
 base commit, capability/grant fingerprints, and child-task digest. Source,
 content, and complete-record fingerprints are verified on load; inconsistent
@@ -1744,8 +1745,8 @@ tool, and LSP steps. Relay strings are evidence only: they are not parsed into
 tools, roots, sandbox, network, LSP, worktree, or checkpoint authority. The
 existing capability intersection and child-root instruction/skill discovery
 remain the sole authority owners. Durable compaction-summary reuse, live
-context sharing, parallel workers, Leader/Swarm/Ultracode orchestration, and
-automatic delegation remain absent. The bounded serialized Task DAG slice is
+context sharing, parallel workers, Swarm/Ultracode orchestration, and automatic
+delegation remain absent. The bounded serialized Task DAG and Leader slices are
 specified separately by [ADR 0134](adr/0134-durable-serialized-task-dag.md).
 See [ADR 0133](adr/0133-bounded-parent-context-relay.md) for the relay
 boundary.
@@ -1770,7 +1771,7 @@ application atomically claims the node with node-generation CAS plus a graph
 two schedulers cannot execute different ready nodes at once, and the DAG
 never uses `SubagentScheduler.run_many()` or an unbounded gather over nodes.
 
-Session schema 18 stores immutable DAG definitions and bounded node runtime
+Session schema 19 stores immutable DAG definitions and bounded node runtime
 projections in `task_dags` and `task_dag_nodes`. Definitions are insert-only;
 graph and node lifecycle updates use generation CAS. A successful node records
 the exact worker task, child session, writable lease, worktree, baseline
@@ -1784,9 +1785,51 @@ continue. Restart reconciliation looks up the exact parent task and lease:
 completed/failed/cancelled worker tasks map to the same DAG terminal meaning;
 missing, orphaned, or uncertain evidence maps to `INDETERMINATE`. No automatic
 retry, crash rerun, merge, copy-back, rollback, cleanup, dataflow relay, UI
-surface, Leader, Swarm, or Ultracode behavior is added. Existing Worktree,
+surface, Swarm, or Ultracode behavior is added. The bounded Leader controller
+is specified separately by [ADR 0135](adr/0135-bounded-serialized-leader-controller.md).
+Existing Worktree,
 Checkpoint, Parent Relay, and worker-scoped read-only LSP contracts remain the
 authority owners. See [ADR 0134](adr/0134-durable-serialized-task-dag.md).
+
+### Bounded serialized Leader controller
+
+ADR 0135 adds one explicit Leader controller over one already-published Task
+DAG. The Leader is a decision authority only: it reconciles the current DAG,
+constructs a bounded redacted deterministic evidence envelope, asks a
+dedicated zero-tool model for one typed decision, and calls the existing
+Task-DAG one-step seam. It never creates or mutates the graph definition,
+dependencies, prompts, capabilities, roots, worker, Worktree, Checkpoint,
+Relay, LSP process, or child session directly.
+
+The only model decisions are `SELECT_NODE`, whose node ID must be in the exact
+current READY set, and terminal-only `FINALIZE`. The model response is strict
+JSON; prose, unknown actions, extra fields, blocked/stale node IDs, and
+instructions embedded in node text are data or fail closed. Evidence contains
+only bounded node definitions and durable outcome metadata, with redacted
+previews and fingerprints; it never carries raw transcript/reasoning/tool
+arguments/output, Relay payloads, workspace bytes, checkpoint bytes, Git diffs,
+secrets, or arbitrary paths.
+
+The current Session Store schema 19 adds `leader_attempts` and
+`leader_decisions`. An attempt binds the exact DAG generation,
+definition/evidence/objective fingerprints, Leader session, controller owner,
+turn identity, and durable lifecycle. SQLite write transactions and CAS-like
+state transitions ensure one controller owns a model request for one exact
+snapshot. A committed model response is parsed and reused after restart; the
+Leader never automatically replays a provider request after an observable
+turn. An unresolved session turn is conservatively `INDETERMINATE` and needs
+explicit recovery. A published decision may be applied through the DAG CAS by
+another controller, so a crash after decision publication does not create a
+second model request or worker allocation.
+
+The Leader loop is bounded and serialized. It selects one ready node, waits
+for the existing Writable Subagent/DAG result, then constructs the next
+snapshot. It does not auto-execute a second node inside the one-step seam.
+Final synthesis is requested only after a terminal DAG snapshot and is kept
+in the dedicated Leader session rather than appended to the parent transcript.
+Model-generated DAG creation, replan, retry, parallel/dataflow execution,
+merge, rollback, UI/ACP exposure, Swarm, Ultracode, and automatic delegation
+remain outside this slice. See [ADR 0135](adr/0135-bounded-serialized-leader-controller.md).
 
 ## Platform policy
 

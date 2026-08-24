@@ -290,6 +290,7 @@ class AgentConversation:
         content_parts: Sequence[ContentPart] = (),
         cancellation_policy: TurnCancellationPolicy = TurnCancellationPolicy.RETAIN,
         turn_source: TurnSource = TurnSource.USER,
+        turn_id: str | None = None,
     ) -> AgentRunResult:
         async with self._turn_lock:
 
@@ -313,6 +314,7 @@ class AgentConversation:
                     source_model=self._source_model,
                     source_context_affinity=self._source_context_affinity,
                     session_id=self._session_id,
+                    turn_id=turn_id,
                     cancellation_policy=cancellation_policy,
                     turn_source=turn_source,
                 )

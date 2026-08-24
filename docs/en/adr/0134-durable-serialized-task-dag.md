@@ -107,7 +107,9 @@ These guarantees are bounded to the tested real `spawn`/`os._exit` seams.
 
 ## Not implemented
 
-This ADR does not add model-generated DAG decomposition, Leader, Swarm,
+This ADR does not add model-generated DAG decomposition or define the Leader
+controller; the bounded Leader is specified separately by [ADR 0135](0135-bounded-serialized-leader-controller.md).
+It does not add Swarm,
 Ultracode, automatic delegation, parallel execution, dataflow/result relay,
 predecessor transcript sharing, shared worktrees, merge/integration, commit,
 rollback, cleanup, retries, automatic crash reruns, CLI/TUI/ACP exposure, or a
@@ -115,7 +117,7 @@ new public orchestration protocol.
 
 ## Validation boundary
 
-Acceptance requires domain bound/cycle tests, schema 17-to-18 migration with
+Acceptance requires domain bound/cycle tests, schema 17-to-19 migration with
 populated Parent Relay preservation, insert-only and stale-generation tests,
 cross-process claim and two-scheduler race evidence, deterministic serialized
 diamond failure propagation, exact worker correlation, completed/failed/

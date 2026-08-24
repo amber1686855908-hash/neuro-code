@@ -130,6 +130,7 @@ class ConversationRunner(Protocol):
         content_parts: Sequence[ContentPart] = (),
         cancellation_policy: TurnCancellationPolicy = TurnCancellationPolicy.RETAIN,
         turn_source: TurnSource = TurnSource.USER,
+        turn_id: str | None = None,
     ) -> AgentRunResult: ...
 
     async def trigger_context_compaction(

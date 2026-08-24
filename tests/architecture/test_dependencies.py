@@ -843,6 +843,7 @@ def test_canonical_ports_are_the_only_port_modules() -> None:
         "neuro_code.application.ports.checkpoints",
         "neuro_code.application.ports.http",
         "neuro_code.application.ports.instructions",
+        "neuro_code.application.ports.leader",
         "neuro_code.application.ports.lsp",
         "neuro_code.application.ports.mcp",
         "neuro_code.application.ports.model",

@@ -318,6 +318,7 @@ class AgentRuntime:
         source_model: str | None = None,
         source_context_affinity: str | None = None,
         session_id: str | None = None,
+        turn_id: str | None = None,
         cancellation_policy: TurnCancellationPolicy = TurnCancellationPolicy.RETAIN,
         turn_source: TurnSource = TurnSource.USER,
     ) -> AgentRunResult:
@@ -336,6 +337,7 @@ class AgentRuntime:
             source_model=source_model,
             source_context_affinity=source_context_affinity,
             session_id=session_id,
+            turn_id=turn_id,
             cancellation_policy=cancellation_policy,
             turn_source=turn_source,
         )

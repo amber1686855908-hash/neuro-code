@@ -10,6 +10,11 @@ from neuro_code.application.ports.background_tasks import (
 from neuro_code.application.ports.client_filesystem import ClientFileSystem
 from neuro_code.application.ports.client_terminal import ClientTerminal, ClientTerminalResult
 from neuro_code.application.ports.http import HttpClientPolicy
+from neuro_code.application.ports.leader import (
+    LeaderAttemptClaim,
+    LeaderStore,
+    LeaderStoreError,
+)
 from neuro_code.application.ports.lsp import (
     LanguageServerProfile,
     LanguageServerService,
@@ -269,6 +274,9 @@ __all__ = [
     "InteractiveTerminalSession",
     "LanguageServerProfile",
     "LanguageServerService",
+    "LeaderAttemptClaim",
+    "LeaderStore",
+    "LeaderStoreError",
     "LocalProcessCancellationPolicy",
     "LocalProcessEnvironmentPolicy",
     "LocalProcessFilesystemPolicy",

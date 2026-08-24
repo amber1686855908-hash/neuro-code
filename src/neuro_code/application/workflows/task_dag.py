@@ -74,6 +74,27 @@ class RunTaskDagRequest:
             raise ValueError("task DAG request id must not be empty")
 
 
+@dataclass(frozen=True, slots=True)
+class RunTaskDagStepRequest:
+    """Request one serialized DAG advancement.
+
+    ``selected_node_id`` is optional only for the existing deterministic
+    ``run_task_dag`` loop.  Leader callers must provide the exact node they
+    selected from the current READY set.
+    """
+
+    dag_id: str
+    selected_node_id: str | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.dag_id, str) or not self.dag_id.strip():
+            raise ValueError("task DAG step request id must not be empty")
+        if self.selected_node_id is not None and (
+            not isinstance(self.selected_node_id, str) or not self.selected_node_id.strip()
+        ):
+            raise ValueError("task DAG selected node id must not be empty")
+
+
 @runtime_checkable
 class TaskDagWritableService(Protocol):
     """Existing writable-subagent owner required by DAG orchestration."""
@@ -159,101 +180,162 @@ class TaskDagApplicationService:
     ) -> TaskDag:
         if not isinstance(request, RunTaskDagRequest):
             raise ValueError("task DAG run request must be canonical")
+        while True:
+            dag = await self.run_task_dag_step(
+                RunTaskDagStepRequest(request.dag_id),
+                sink=sink,
+            )
+            if dag.state.terminal or dag.active_node_id is not None:
+                return dag
+
+    async def run_task_dag_step(
+        self,
+        request: RunTaskDagStepRequest,
+        *,
+        sink: EventSink | None = None,
+    ) -> TaskDag:
+        """Reconcile and execute at most one legal DAG node.
+
+        The explicit selected-node form is the only orchestration seam exposed
+        to Leader.  Claiming, dependency propagation, worker execution, and
+        terminal persistence remain owned by the existing Task DAG service.
+        """
+
+        if not isinstance(request, RunTaskDagStepRequest):
+            raise ValueError("task DAG step request must be canonical")
+        dag = await self.prepare_task_dag_step(RunTaskDagRequest(request.dag_id))
+        if dag.state.terminal:
+            if request.selected_node_id is not None:
+                raise ConfigurationError("cannot select a node from a terminal task DAG")
+            return dag
+        if dag.active_node_id is not None:
+            if request.selected_node_id is not None:
+                raise ConfigurationError("task DAG already has an active node")
+            return dag
+        ready_node_ids = dag.ready_node_ids()
+        if not ready_node_ids:
+            if request.selected_node_id is not None:
+                raise ConfigurationError("selected task DAG node is not currently READY")
+            return await self._classify_terminal_or_uncertain(dag)
+        selected_node_id = request.selected_node_id or ready_node_ids[0]
+        if selected_node_id not in ready_node_ids:
+            raise ConfigurationError("selected task DAG node is not currently READY")
+        node = dag.node(selected_node_id)
+        parent_task_id = f"dag-worker-{uuid.uuid4().hex}"
+        running = replace(
+            node,
+            state=TaskDagNodeState.RUNNING,
+            generation=node.generation + 1,
+            parent_task_id=parent_task_id,
+            error_kind=None,
+            error_reason=None,
+        )
+        try:
+            claimed = await self._dag_store.claim_task_dag_node(
+                dag.dag_id,
+                running,
+                expected_generation=node.generation,
+                expected_state=TaskDagNodeState.READY,
+                updated_at=self._clock().astimezone(UTC),
+            )
+        except TaskDagError as error:
+            if error.kind == "concurrent_modification":
+                if request.selected_node_id is not None:
+                    raise ConfigurationError("selected task DAG node became stale") from error
+                return await self._load_required(dag.dag_id)
+            raise ConfigurationError(f"task DAG node claim failed: {error}") from error
+        return await self._execute_claimed_node(
+            dag=dag,
+            claimed=claimed,
+            claimed_node=claimed.node(node.node_id),
+            node=node,
+            parent_task_id=parent_task_id,
+            sink=sink,
+        )
+
+    async def prepare_task_dag_step(self, request: RunTaskDagRequest) -> TaskDag:
+        """Reconcile and propagate one DAG snapshot without starting a worker."""
+
+        if not isinstance(request, RunTaskDagRequest):
+            raise ValueError("task DAG preparation request must be canonical")
         await self._writable_service.initialize()
         dag = await self._load_required(request.dag_id)
-        while True:
-            if dag.state.terminal:
-                return dag
-            dag = await self._reconcile_active_node(dag)
-            if dag.state is TaskDagState.INDETERMINATE:
-                return await self._set_graph_state_if_needed(dag, TaskDagState.INDETERMINATE)
-            if dag.active_node_id is not None:
-                # Another process owns the one allowed serial slot.  It may
-                # finish later; this invocation must not start another node.
-                return dag
-            dag = await self._propagate_dependencies(dag)
-            if dag.state.terminal:
-                return dag
-            if dag.active_node_id is not None:
-                return dag
-            if not dag.ready_node_ids():
-                return await self._classify_terminal_or_uncertain(dag)
-            node = dag.node(dag.ready_node_ids()[0])
-            parent_task_id = f"dag-worker-{uuid.uuid4().hex}"
-            running = replace(
-                node,
-                state=TaskDagNodeState.RUNNING,
-                generation=node.generation + 1,
-                parent_task_id=parent_task_id,
-                error_kind=None,
-                error_reason=None,
+        if dag.state.terminal:
+            return dag
+        dag = await self._reconcile_active_node(dag)
+        if dag.state is TaskDagState.INDETERMINATE:
+            return await self._set_graph_state_if_needed(dag, TaskDagState.INDETERMINATE)
+        if dag.active_node_id is not None:
+            return dag
+        dag = await self._propagate_dependencies(dag)
+        if dag.state.terminal or dag.active_node_id is not None:
+            return dag
+        if not dag.ready_node_ids():
+            return await self._classify_terminal_or_uncertain(dag)
+        return dag
+
+    async def _execute_claimed_node(
+        self,
+        *,
+        dag: TaskDag,
+        claimed: TaskDag,
+        claimed_node: TaskDagNode,
+        node: TaskDagNode,
+        parent_task_id: str,
+        sink: EventSink | None,
+    ) -> TaskDag:
+        identity = WritableSubagentExecutionIdentity(
+            dag_id=dag.dag_id,
+            node_id=node.node_id,
+            parent_task_id=parent_task_id,
+        )
+        try:
+            result = await self._writable_service.run_subagent_with_execution_identity(
+                RunWritableSubagentRequest(
+                    parent_session_id=self._parent_session_id,
+                    prompt=node.prompt,
+                ),
+                execution_identity=identity,
+                sink=sink,
             )
-            try:
-                claimed = await self._dag_store.claim_task_dag_node(
-                    dag.dag_id,
-                    running,
-                    expected_generation=node.generation,
-                    expected_state=TaskDagNodeState.READY,
-                    updated_at=self._clock().astimezone(UTC),
-                )
-            except TaskDagError as error:
-                if error.kind == "concurrent_modification":
-                    dag = await self._load_required(dag.dag_id)
-                    continue
-                raise ConfigurationError(f"task DAG node claim failed: {error}") from error
-            claimed_node = claimed.node(node.node_id)
-            identity = WritableSubagentExecutionIdentity(
-                dag_id=dag.dag_id,
-                node_id=node.node_id,
-                parent_task_id=parent_task_id,
-            )
-            try:
-                result = await self._writable_service.run_subagent_with_execution_identity(
-                    RunWritableSubagentRequest(
-                        parent_session_id=self._parent_session_id,
-                        prompt=node.prompt,
-                    ),
-                    execution_identity=identity,
-                    sink=sink,
-                )
-            except asyncio.CancelledError as error:
-                await asyncio.shield(
-                    self._finish_worker_node(
-                        claimed,
-                        claimed_node,
-                        TaskDagNodeState.CANCELLED,
-                        error=error,
-                    )
-                )
-                await asyncio.shield(self._cancel_remaining_graph(dag.dag_id))
-                raise
-            except BaseException as error:
-                if isinstance(error, (KeyboardInterrupt, SystemExit)):
-                    raise
-                await self._finish_worker_node(
+        except asyncio.CancelledError as error:
+            await asyncio.shield(
+                self._finish_worker_node(
                     claimed,
                     claimed_node,
-                    TaskDagNodeState.FAILED,
+                    TaskDagNodeState.CANCELLED,
                     error=error,
                 )
-            else:
-                terminal_state = (
-                    TaskDagNodeState.COMPLETED
-                    if result.status is SessionTaskStatus.COMPLETED
-                    else TaskDagNodeState.FAILED
-                )
-                await self._finish_worker_node(
-                    claimed,
-                    claimed_node,
-                    terminal_state,
-                    result=result,
-                    error=(
-                        None
-                        if terminal_state is TaskDagNodeState.COMPLETED
-                        else RuntimeError("writable worker returned a non-completed result")
-                    ),
-                )
-            dag = await self._load_required(dag.dag_id)
+            )
+            await asyncio.shield(self._cancel_remaining_graph(dag.dag_id))
+            raise
+        except BaseException as error:
+            if isinstance(error, (KeyboardInterrupt, SystemExit)):
+                raise
+            await self._finish_worker_node(
+                claimed,
+                claimed_node,
+                TaskDagNodeState.FAILED,
+                error=error,
+            )
+        else:
+            terminal_state = (
+                TaskDagNodeState.COMPLETED
+                if result.status is SessionTaskStatus.COMPLETED
+                else TaskDagNodeState.FAILED
+            )
+            await self._finish_worker_node(
+                claimed,
+                claimed_node,
+                terminal_state,
+                result=result,
+                error=(
+                    None
+                    if terminal_state is TaskDagNodeState.COMPLETED
+                    else RuntimeError("writable worker returned a non-completed result")
+                ),
+            )
+        return await self._load_required(dag.dag_id)
 
     async def reconcile_task_dag(self, request: RunTaskDagRequest) -> TaskDag:
         """Reconcile durable evidence without starting any worker."""
@@ -518,6 +600,7 @@ class TaskDagApplicationService:
 __all__ = [
     "CreateTaskDagRequest",
     "RunTaskDagRequest",
+    "RunTaskDagStepRequest",
     "TaskDagApplicationService",
     "TaskDagWritableService",
 ]

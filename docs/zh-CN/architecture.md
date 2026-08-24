@@ -1672,8 +1672,8 @@ Writable workflow 现在只从实际 parent `ConversationBinding` 所绑定 sess
 保留 reasoning 与保留 backend-call 的结构都会排除；assistant 可见正文可与
 `reasoning_content` 明确分离，后者绝不进入 Relay。
 
-Session schema 18 保留 schema 17 的每个 writable lease 一条一对一、insert-only READY Relay，
-并新增下述持久化 Task DAG 表。其 identity
+Session schema 19 保留 schema 17 的每个 writable lease 一条一对一、insert-only READY Relay，
+以及下述持久化 Task DAG 表，并新增后文的持久化 Leader attempt/decision 投影。其 identity
 绑定 parent/task/child、lease、worktree、baseline checkpoint、base commit、
 capability/grant fingerprint 与 child-task digest。加载时校验 source、content 和完整记录
 fingerprint，不一致时 fail closed。投影和 durable 复验发生在 `SubagentLink` 之后、child
@@ -1685,8 +1685,9 @@ durable worker identity，而不是删除或 rollback。
 conversation history，并在模型、tool 与 LSP 多步骤间保持字节稳定。Relay 字符串只作为证据，
 不会被解析为 tool、root、sandbox、network、LSP、worktree 或 checkpoint 权限。既有 capability
 求交与 child-root instruction/skill discovery 仍是唯一权限 owner。Durable compaction summary
-复用、实时 context sharing、并行 worker、Leader/Swarm/Ultracode 编排与自动委派仍未实现。
-有界串行 Task DAG 切片由独立的 [ADR 0134](adr/0134-durable-serialized-task-dag.md) 规定；Relay
+复用、实时 context sharing、并行 worker、Swarm/Ultracode 编排与自动委派仍未实现。
+有界串行 Task DAG 与 Leader 切片由独立的 [ADR 0134](adr/0134-durable-serialized-task-dag.md) 及
+ADR 0135 规定；Relay
 边界详见 [ADR 0133](adr/0133-bounded-parent-context-relay.md)。
 
 ### 有界持久化 Task DAG
@@ -1703,7 +1704,7 @@ DAG service 只从真实的 `ConversationBinding` 推导 parent session。每个
 active-node claim 是跨进程串行闸门：两个 scheduler 不能同时执行不同的 ready 节点，DAG 也不会
 使用 `SubagentScheduler.run_many()` 或对节点进行无界 gather。
 
-Session schema 18 在 `task_dags` 与 `task_dag_nodes` 中保存不可变 DAG 定义和有界节点运行投影。
+Session schema 19 在 `task_dags` 与 `task_dag_nodes` 中保存不可变 DAG 定义和有界节点运行投影。
 定义是 insert-only；graph 与 node 生命周期更新使用 generation CAS。成功节点记录精确的 worker
 task、child session、writable lease、worktree、baseline checkpoint、Parent Relay 和有界结果投影。
 缺失或不一致的成功关联不会被当作成功。
@@ -1712,6 +1713,35 @@ task、child session、writable lease、worktree、baseline checkpoint、Parent 
 阻塞的后代进入 `SKIPPED`。失败或取消的依赖只阻塞其后代，独立分支继续执行。重启 reconciliation
 按精确 parent task 与 lease 查询：worker 已完成/失败/取消时映射为 DAG 相同的终态；证据缺失、
 orphan 或不确定时映射为 `INDETERMINATE`。不增加自动 retry、崩溃重跑、merge、copy-back、rollback、
-cleanup、dataflow relay、UI、Leader、Swarm 或 Ultracode 行为。既有 Worktree、Checkpoint、Parent
-Relay 和 worker-scoped 只读 LSP 合约继续作为 authority owner。详见
+cleanup、dataflow relay、UI、Swarm 或 Ultracode 行为；有界 Leader controller 由 ADR 0135 单独规定。
+既有 Worktree、Checkpoint、Parent Relay 和 worker-scoped 只读 LSP 合约继续作为 authority owner。详见
 [ADR 0134](adr/0134-durable-serialized-task-dag.md)。
+
+### 有界串行 Leader controller
+
+ADR 0135 在一个已经发布的 Task DAG 之上增加一个显式 Leader controller。Leader 只拥有 decision
+authority：它 reconciliation 当前 DAG，构造有界、脱敏、确定性的 evidence envelope，让专用
+zero-tool model 生成一个 typed decision，然后调用既有 Task-DAG one-step seam。它不会直接创建或
+修改 graph definition、dependency、prompt、capability、root、worker、Worktree、Checkpoint、
+Relay、LSP process 或 child session。
+
+model 只允许两种 decision：`SELECT_NODE`，其 node ID 必须属于当前精确 READY set；以及仅在 DAG
+terminal 时允许的 `FINALIZE`。model response 必须是 strict JSON；普通 prose、unknown action、额外
+字段、blocked/stale node ID 和 node text 中的指令都只是数据或失败关闭。evidence 只包含有界的
+node definition 与 durable outcome metadata，并对 preview 脱敏、带 fingerprint；不包含 raw
+transcript/reasoning/tool argument/output、Relay payload、workspace bytes、checkpoint bytes、Git
+diff、secret 或 arbitrary path。
+
+当前 Session Store schema 19 新增 `leader_attempts` 与 `leader_decisions`。Attempt 绑定精确 DAG
+generation、definition/evidence/objective fingerprint、Leader session、controller owner、turn
+identity 与 durable lifecycle。SQLite write transaction 和 CAS-like state transition 保证同一精确
+snapshot 只有一个 controller 拥有 model request。已提交的 model response 可在重启后解析复用；在
+observable turn 后不自动 replay provider。存在未解决的 session turn 时保守转为
+`INDETERMINATE`，需要显式 recovery。decision 已发布后，即使 controller 在 DAG claim 前崩溃，另一个
+controller 也可以通过 DAG CAS 复用 decision，不会产生第二次 model request 或 worker allocation。
+
+Leader loop 有界且串行：选择一个 ready node，等待既有 Writable Subagent/DAG 结果，然后构造下一份
+snapshot；one-step seam 内不会自动执行第二个 node。只有 DAG terminal 后才请求 final synthesis，且
+结果保留在专用 Leader session，不写入 parent transcript。model 生成 DAG、replan、retry、
+parallel/dataflow execution、merge、rollback、UI/ACP 暴露、Swarm、Ultracode 与自动委派仍不属于本切片。
+详见 [ADR 0135](adr/0135-bounded-serialized-leader-controller.md)。
