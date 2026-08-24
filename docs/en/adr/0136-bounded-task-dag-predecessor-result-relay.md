@@ -70,13 +70,39 @@ rejected; direct database tampering fails integrity validation on reload.
 
 The store uses the existing SQLite transaction boundary and reloads the
 published row before commit. A concurrent scheduler cannot publish a
-conflicting relay for the same target generation. If target generation,
-predecessor state, lease, Parent Relay, workspace/checkpoint evidence, or any
-identity is missing, stale, uncertain, or mismatched, the application marks
-the target `INDETERMINATE` and does not construct a worker/provider request.
-If a relay was durably published and the worker crashes before model
-execution, recovery reuses the exact publication; it does not regenerate a
-different result or replay a predecessor.
+conflicting relay for the same target generation. Recovery classifies an
+already-claimed active node without starting a worker:
+
+- `ACTIVE_WORKER` means exact non-terminal `SessionTask` and writable lease
+  ownership evidence exists; existing Writable reconciliation remains the
+  recovery owner.
+- `SAFE_NOT_STARTED` is allowed only when the exact `RUNNING` node and
+  `parent_task_id` are durable, the existing relay is loaded by
+  `(dag_id, target_node_id, target_generation)` and passes READY, definition,
+  direct-dependency, and fingerprint checks, and both the matching
+  `SessionTask` and writable lease (and subagent link) are absent. The
+  read-only reconciliation path only classifies this state. A later DAG step
+  reuses the same relay and `parent_task_id`; it does not create a new
+  generation, task identity, or relay.
+- `INDETERMINATE` covers an absent or unverifiable relay, partial evidence, a
+  link or other worker ownership evidence, stale identity, or any uncertain
+  state. It never auto-reruns a possibly-started worker.
+
+This boundary follows the production Writable ordering: repository identity
+inspection is read-only; the first durable side-effecting allocation is the
+lease insert, followed by `SessionTask`, worktree, checkpoint, child session,
+subagent link, Parent Relay, runtime creation, and model execution. Therefore
+the exact active-node plus READY-relay plus absent-task-and-lease state proves
+that this Writable allocation phase was never entered. A real `spawn` and
+`os._exit(73)` acceptance test covers that continuation, while a crash after
+ownership evidence remains fail-closed and is not replayed.
+
+If target generation, predecessor state, lease, Parent Relay, workspace/checkpoint
+evidence, or any identity is missing, stale, uncertain, or mismatched, the
+application marks the target `INDETERMINATE` and does not construct a
+worker/provider request. If a relay was durably published and the worker
+crashes before model execution, recovery reuses the exact publication; it does
+not regenerate a different result or replay a predecessor.
 
 ## Non-goals
 
@@ -93,7 +119,9 @@ The focused implementation tests cover bounded rendering and redaction,
 synthetic-message replacement, schema migration and row integrity, exact
 duplicate idempotency, conflicting publication rejection, direct-dependency
 selection, declaration ordering, dependency-chain behavior, failed or
-uncertain evidence fail-closed behavior, and injection through the existing
+uncertain evidence fail-closed behavior, the read-only recovery classification,
+real safe-not-started process death and exact-once continuation, ambiguous
+ownership process death without rerun, and injection through the existing
 Writable Subagent composition path. Existing Task DAG, Leader, Writable
 Subagent, Parent Relay, Worktree, Checkpoint, worker-scoped LSP, crash
 recovery, and full repository gates remain required. The slice is not a claim

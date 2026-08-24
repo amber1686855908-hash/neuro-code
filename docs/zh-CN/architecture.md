@@ -1726,10 +1726,17 @@ workspace bytes、capability grant、path 或 authority instruction。缺失、�
 生命周期为 `PENDING -> READY -> RUNNING -> COMPLETED/FAILED/CANCELLED/INDETERMINATE`；因依赖被
 阻塞的后代进入 `SKIPPED`。失败或取消的依赖只阻塞其后代，独立分支继续执行。重启 reconciliation
 按精确 parent task 与 lease 查询：worker 已完成/失败/取消时映射为 DAG 相同的终态；证据缺失、
-orphan 或不确定时映射为 `INDETERMINATE`。不增加自动 retry、崩溃重跑、merge、copy-back、rollback、
-cleanup、parallel 或 dynamic dataflow execution、UI、Swarm 或 Ultracode 行为；上文所述有界直接
-predecessor-result Relay 是本切片唯一的 dataflow 行为，不传递 authority 或 workspace state；有界
-Leader controller 由 ADR 0135 单独规定。
+orphan 或不确定时映射为 `INDETERMINATE`。Restart reconciliation 不启动 worker，并把 active node
+分类为 `ACTIVE_WORKER`、`SAFE_NOT_STARTED` 或 `INDETERMINATE`。`SAFE_NOT_STARTED` 要求精确 active
+`RUNNING` node 与 `parent_task_id`、按 DAG/target/generation 读取的同一 READY Relay、精确的
+definition/direct dependency/fingerprint，以及对应 `SessionTask`、writable lease 与 subagent link
+均不存在。Writable 第一个 durable side-effecting allocation 是插入 lease；此前的 repository identity
+检查是只读的。后续 DAG step 复用同一个 Relay 与 parent task identity，不产生新的 generation 或 publication。
+任何部分 ownership evidence、Relay 缺失或不确定状态仍为 `INDETERMINATE`，永不自动 rerun。worker 已
+完成/失败/取消时映射为 DAG 相同的终态。不增加自动 retry、崩溃重跑、merge、copy-back、rollback、cleanup、
+parallel 或 dynamic dataflow execution、UI、Swarm 或 Ultracode 行为；上文所述有界直接 predecessor-result
+Relay 是本切片唯一的 dataflow 行为，不传递 authority 或 workspace state；有界 Leader controller 由 ADR
+0135 单独规定。
 既有 Worktree、Checkpoint、Parent Relay 和 worker-scoped 只读 LSP 合约继续作为 authority owner。详见
 [ADR 0134](adr/0134-durable-serialized-task-dag.md)。
 

@@ -1801,14 +1801,23 @@ different publication for the same target generation is rejected.
 The lifecycle is `PENDING -> READY -> RUNNING -> COMPLETED/FAILED/CANCELLED/
 INDETERMINATE`; dependency-blocked descendants become `SKIPPED`. A failed or
 cancelled dependency blocks only its descendants while independent branches
-continue. Restart reconciliation looks up the exact parent task and lease:
-completed/failed/cancelled worker tasks map to the same DAG terminal meaning;
-missing, orphaned, or uncertain evidence maps to `INDETERMINATE`. No automatic
-retry, crash rerun, merge, copy-back, rollback, cleanup, parallel or dynamic
-dataflow execution, UI surface, Swarm, or Ultracode behavior is added. The
-bounded direct predecessor-result relay described above is the only dataflow
-behavior in this slice; it does not transfer authority or workspace state. The bounded Leader controller
-is specified separately by [ADR 0135](adr/0135-bounded-serialized-leader-controller.md).
+continue. Restart reconciliation is non-worker-starting and classifies an
+active node as `ACTIVE_WORKER`, `SAFE_NOT_STARTED`, or `INDETERMINATE`.
+`SAFE_NOT_STARTED` requires the exact active `RUNNING` node and `parent_task_id`,
+the same READY relay loaded by DAG/target/generation with exact definitions,
+direct dependencies, and fingerprints, and no matching `SessionTask`, writable
+lease, or subagent link. The first durable side-effecting Writable allocation
+is the lease insert; repository identity inspection before it is read-only.
+The next DAG step then reuses the same relay and parent task identity without a
+new generation or publication. Any partial ownership evidence, missing relay,
+or uncertainty remains `INDETERMINATE` and is never automatically rerun.
+Completed/failed/cancelled worker tasks map to the same DAG terminal meaning.
+No automatic retry, crash rerun, merge, copy-back, rollback, cleanup, parallel
+or dynamic dataflow execution, UI surface, Swarm, or Ultracode behavior is
+added. The bounded direct predecessor-result relay described above is the only
+dataflow behavior in this slice; it does not transfer authority or workspace
+state. The bounded Leader controller is specified separately by [ADR 0135]
+(adr/0135-bounded-serialized-leader-controller.md).
 Existing Worktree,
 Checkpoint, Parent Relay, and worker-scoped read-only LSP contracts remain the
 authority owners. See [ADR 0134](adr/0134-durable-serialized-task-dag.md).

@@ -55,11 +55,29 @@ count 和 integrity fingerprint。Target-generation uniqueness key 使精确重�
 不同的重复发布会被拒绝；直接修改 database 后，在 reload 时完整性校验失败。
 
 Store 复用既有 SQLite transaction boundary，并在 commit 前 reload 已发布 row。并发 scheduler 不能为
-同一 target generation 发布冲突 Relay。如果 target generation、predecessor state、lease、Parent
-Relay、workspace/checkpoint evidence 或任何 identity 缺失、过期、不确定或不匹配，application 会把
-target 标为 `INDETERMINATE`，不会构造 worker/provider request。若 Relay 已 durable 发布而 worker 在
-model execution 前崩溃，recovery 复用精确 publication，不重新生成另一份 result，也不 replay
-predecessor。
+同一 target generation 发布冲突 Relay。对已经 claim 的 active node，recovery 在不启动 worker 的前提下
+进行分类：
+
+- `ACTIVE_WORKER`：存在精确的非 terminal `SessionTask` 与 writable lease ownership evidence；继续由既有
+  Writable reconciliation 负责恢复。
+- `SAFE_NOT_STARTED`：只有在精确 `RUNNING` node 与 `parent_task_id` 已 durable、通过
+  `(dag_id, target_node_id, target_generation)` 读取到既有 READY Relay 且 definition、direct dependency
+  与 fingerprint 全部匹配，并且对应 `SessionTask`、writable lease（以及 subagent link）均不存在时才允许。
+  read-only reconciliation 只做分类；后续 DAG step 复用同一个 Relay 与 `parent_task_id`，不创建新的
+  generation、task identity 或 Relay。
+- `INDETERMINATE`：Relay 缺失或无法验证、证据不完整、存在 link 或其他 worker ownership evidence、identity
+  过期或任何状态不确定。对可能已经开始的 worker 永不自动 rerun。
+
+这个边界来自生产 Writable 的真实顺序：repository identity 检查是只读的；第一个 durable side-effecting
+allocation 是插入 lease，随后才是 `SessionTask`、worktree、checkpoint、child session、subagent link、
+Parent Relay、runtime creation 与 model execution。因此，精确 active node 加 READY Relay 且对应 task 与
+lease 均不存在，能够证明没有进入这段 Writable allocation。真实 `spawn` 与 `os._exit(73)` acceptance test
+覆盖了这一 continuation；在 ownership evidence 已存在后崩溃则继续 fail-closed，不能 replay。
+
+如果 target generation、predecessor state、lease、Parent Relay、workspace/checkpoint evidence 或任何 identity
+缺失、过期、不确定或不匹配，application 会把 target 标为 `INDETERMINATE`，不会构造 worker/provider request。
+若 Relay 已 durable 发布而 worker 在 model execution 前崩溃，recovery 复用精确 publication，不重新生成另一份
+result，也不 replay predecessor。
 
 ## 非目标
 
@@ -72,7 +90,8 @@ transitive aggregation、retry、rerun、merge/copy-back、rollback、cleanup、
 
 Focused implementation tests 覆盖有界 rendering 与 redaction、synthetic message replacement、schema
 migration 与 row integrity、精确重复幂等、冲突发布拒绝、direct-dependency selection、声明顺序、
-dependency chain、失败或不确定 evidence 的 fail-closed 行为，以及通过既有 Writable Subagent
-composition path 的注入。既有 Task DAG、Leader、Writable Subagent、Parent Relay、Worktree、Checkpoint、
-worker-scoped LSP、crash recovery 和全仓库 gates 仍是必需项。本切片不宣称 parallel/dataflow scheduling
-或 live paid-provider acceptance。
+dependency chain、失败或不确定 evidence 的 fail-closed 行为、read-only recovery classification、真实
+safe-not-started process death 与 exact-once continuation、ownership 歧义 process death 不 rerun，以及通过
+既有 Writable Subagent composition path 的注入。既有 Task DAG、Leader、Writable Subagent、Parent Relay、
+Worktree、Checkpoint、worker-scoped LSP、crash recovery 和全仓库 gates 仍是必需项。本切片不宣称
+parallel/dataflow scheduling 或 live paid-provider acceptance。

@@ -62,6 +62,7 @@ from neuro_code.application.workflows.task_dag import (
     CreateTaskDagRequest,
     RunTaskDagRequest,
     RunTaskDagStepRequest,
+    TaskDagActiveNodeRecovery,
     TaskDagApplicationService,
     TaskDagWritableService,
 )
@@ -124,6 +125,7 @@ __all__ = [
     "SubagentRuntimeScope",
     "SubagentScheduler",
     "SubagentWorkRequest",
+    "TaskDagActiveNodeRecovery",
     "TaskDagApplicationService",
     "TaskDagDependencyResultRelayApplicationService",
     "TaskDagWritableService",

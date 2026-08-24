@@ -153,6 +153,45 @@ class TaskDagDependencyResultRelayApplicationService:
         self._verify_relay(verified, current, target)
         return await self._reload_verified(verified)
 
+    async def load_existing_for_target(
+        self,
+        dag: TaskDag,
+        target: TaskDagNode,
+    ) -> TaskDagDependencyResultRelay | None:
+        """Load only the already-published relay for one target execution.
+
+        Recovery uses this read-only path after a process dies between relay
+        publication and Writable allocation.  It deliberately never projects
+        predecessors or inserts a new row: an absent relay is not safe proof
+        that the original worker invocation reached the same boundary.
+        """
+
+        if not isinstance(dag, TaskDag) or not isinstance(target, TaskDagNode):
+            raise ConfigurationError("DAG dependency relay inputs must be canonical")
+        if not target.dependencies:
+            return None
+        if target.state is not TaskDagNodeState.RUNNING:
+            raise ConfigurationError("DAG dependency relay target must be RUNNING")
+        current = await self._dag_store.get_task_dag(dag.dag_id)
+        if current is None:
+            raise ConfigurationError("DAG dependency relay target DAG is missing")
+        self._verify_target(current, target)
+        try:
+            existing = await self._relay_store.get_task_dag_dependency_relay_for_target(
+                current.dag_id,
+                target.node_id,
+                target.generation,
+            )
+        except TaskDagDependencyResultRelayError as error:
+            raise ConfigurationError(
+                f"DAG dependency relay integrity verification failed: {error}"
+            ) from error
+        if existing is None:
+            return None
+        current_target = current.node(target.node_id)
+        self._verify_relay(existing, current, current_target)
+        return await self._reload_verified(existing)
+
     async def _reload_verified(
         self,
         relay: TaskDagDependencyResultRelay,

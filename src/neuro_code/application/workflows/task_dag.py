@@ -7,6 +7,7 @@ import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
+from enum import StrEnum
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 from neuro_code.application.ports.parent_context_relay import ParentContextRelayStore
@@ -99,6 +100,14 @@ class RunTaskDagStepRequest:
             not isinstance(self.selected_node_id, str) or not self.selected_node_id.strip()
         ):
             raise ValueError("task DAG selected node id must not be empty")
+
+
+class TaskDagActiveNodeRecovery(StrEnum):
+    """Read-only classification of an already-claimed active DAG node."""
+
+    ACTIVE_WORKER = "active_worker"
+    SAFE_NOT_STARTED = "safe_not_started"
+    INDETERMINATE = "indeterminate"
 
 
 @runtime_checkable
@@ -224,7 +233,9 @@ class TaskDagApplicationService:
 
         if not isinstance(request, RunTaskDagStepRequest):
             raise ValueError("task DAG step request must be canonical")
-        dag = await self.prepare_task_dag_step(RunTaskDagRequest(request.dag_id))
+        dag, recovery = await self._prepare_task_dag_step_with_recovery(
+            RunTaskDagRequest(request.dag_id)
+        )
         if dag.state.terminal:
             if request.selected_node_id is not None:
                 raise ConfigurationError("cannot select a node from a terminal task DAG")
@@ -232,6 +243,26 @@ class TaskDagApplicationService:
         if dag.active_node_id is not None:
             if request.selected_node_id is not None:
                 raise ConfigurationError("task DAG already has an active node")
+            if recovery is TaskDagActiveNodeRecovery.SAFE_NOT_STARTED:
+                node = dag.node(dag.active_node_id)
+                if node.parent_task_id is None:
+                    return await self._finish_worker_node(
+                        dag,
+                        node,
+                        TaskDagNodeState.INDETERMINATE,
+                        error=RuntimeError(
+                            "safe-not-started DAG node lost its persisted worker identity"
+                        ),
+                    )
+                return await self._execute_claimed_node(
+                    dag=dag,
+                    claimed=dag,
+                    claimed_node=node,
+                    node=node,
+                    parent_task_id=node.parent_task_id,
+                    sink=sink,
+                    reuse_existing_dependency_relay=True,
+                )
             return dag
         ready_node_ids = dag.ready_node_ids()
         if not ready_node_ids:
@@ -277,6 +308,15 @@ class TaskDagApplicationService:
     async def prepare_task_dag_step(self, request: RunTaskDagRequest) -> TaskDag:
         """Reconcile and propagate one DAG snapshot without starting a worker."""
 
+        dag, _ = await self._prepare_task_dag_step_with_recovery(request)
+        return dag
+
+    async def _prepare_task_dag_step_with_recovery(
+        self,
+        request: RunTaskDagRequest,
+    ) -> tuple[TaskDag, TaskDagActiveNodeRecovery | None]:
+        """Prepare one step and retain the read-only active-node classification."""
+
         if not isinstance(request, RunTaskDagRequest):
             raise ValueError("task DAG preparation request must be canonical")
         await self._writable_service.initialize()
@@ -284,18 +324,18 @@ class TaskDagApplicationService:
             await self._dependency_relay_service.initialize()
         dag = await self._load_required(request.dag_id)
         if dag.state.terminal:
-            return dag
-        dag = await self._reconcile_active_node(dag)
+            return dag, None
+        dag, recovery = await self._reconcile_active_node_with_classification(dag)
         if dag.state is TaskDagState.INDETERMINATE:
-            return await self._set_graph_state_if_needed(dag, TaskDagState.INDETERMINATE)
+            return await self._set_graph_state_if_needed(dag, TaskDagState.INDETERMINATE), recovery
         if dag.active_node_id is not None:
-            return dag
+            return dag, recovery
         dag = await self._propagate_dependencies(dag)
         if dag.state.terminal or dag.active_node_id is not None:
-            return dag
+            return dag, None
         if not dag.ready_node_ids():
-            return await self._classify_terminal_or_uncertain(dag)
-        return dag
+            return await self._classify_terminal_or_uncertain(dag), None
+        return dag, None
 
     async def _execute_claimed_node(
         self,
@@ -306,6 +346,7 @@ class TaskDagApplicationService:
         node: TaskDagNode,
         parent_task_id: str,
         sink: EventSink | None,
+        reuse_existing_dependency_relay: bool = False,
     ) -> TaskDag:
         dependency_relay = None
         if node.dependencies and self._dependency_relay_service is not None:
@@ -313,10 +354,22 @@ class TaskDagApplicationService:
             # last durable step before Writable Subagent may create a child
             # runtime or issue its first model request.
             try:
-                dependency_relay = await self._dependency_relay_service.publish_for_target(
-                    claimed,
-                    claimed_node,
-                )
+                if reuse_existing_dependency_relay:
+                    dependency_relay = (
+                        await self._dependency_relay_service.load_existing_for_target(
+                            claimed,
+                            claimed_node,
+                        )
+                    )
+                    if dependency_relay is None:
+                        raise ConfigurationError(
+                            "safe-not-started DAG node has no existing dependency relay"
+                        )
+                else:
+                    dependency_relay = await self._dependency_relay_service.publish_for_target(
+                        claimed,
+                        claimed_node,
+                    )
             except asyncio.CancelledError:
                 raise
             except BaseException as error:
@@ -389,7 +442,8 @@ class TaskDagApplicationService:
         if not isinstance(request, RunTaskDagRequest):
             raise ValueError("task DAG reconciliation request must be canonical")
         dag = await self._load_required(request.dag_id)
-        return await self._reconcile_active_node(dag)
+        dag, _ = await self._reconcile_active_node_with_classification(dag)
+        return dag
 
     async def _load_required(self, dag_id: str) -> TaskDag:
         dag = await self._dag_store.get_task_dag(dag_id)
@@ -520,15 +574,25 @@ class TaskDagApplicationService:
             raise ConfigurationError(f"task DAG node finish failed: {error}") from error
 
     async def _reconcile_active_node(self, dag: TaskDag) -> TaskDag:
+        reconciled, _ = await self._reconcile_active_node_with_classification(dag)
+        return reconciled
+
+    async def _reconcile_active_node_with_classification(
+        self,
+        dag: TaskDag,
+    ) -> tuple[TaskDag, TaskDagActiveNodeRecovery | None]:
         if dag.active_node_id is None:
-            return dag
+            return dag, None
         node = dag.node(dag.active_node_id)
         if node.parent_task_id is None:
-            return await self._finish_worker_node(
-                dag,
-                node,
-                TaskDagNodeState.INDETERMINATE,
-                error=RuntimeError("running DAG node has no persisted worker identity"),
+            return (
+                await self._finish_worker_node(
+                    dag,
+                    node,
+                    TaskDagNodeState.INDETERMINATE,
+                    error=RuntimeError("running DAG node has no persisted worker identity"),
+                ),
+                TaskDagActiveNodeRecovery.INDETERMINATE,
             )
         await self._writable_service.reconcile_writable_subagent_workspaces()
         task = await self._store.get_session_task(self._parent_session_id, node.parent_task_id)
@@ -536,48 +600,102 @@ class TaskDagApplicationService:
             self._parent_session_id,
             node.parent_task_id,
         )
+        if task is None and lease is None:
+            recovery_error: BaseException | None = None
+            if node.dependencies and self._dependency_relay_service is not None:
+                try:
+                    existing_relay = await self._dependency_relay_service.load_existing_for_target(
+                        dag, node
+                    )
+                    if existing_relay is not None:
+                        link = await self._store.load_subagent_link(
+                            self._parent_session_id,
+                            node.parent_task_id,
+                        )
+                        if link is None:
+                            return dag, TaskDagActiveNodeRecovery.SAFE_NOT_STARTED
+                        recovery_error = RuntimeError(
+                            "DAG worker link exists despite missing task and lease evidence"
+                        )
+                except asyncio.CancelledError:
+                    raise
+                except BaseException as error:
+                    if isinstance(error, (KeyboardInterrupt, SystemExit)):
+                        raise
+                    recovery_error = error
+            return (
+                await self._finish_worker_node(
+                    dag,
+                    node,
+                    TaskDagNodeState.INDETERMINATE,
+                    error=(
+                        recovery_error
+                        if recovery_error is not None
+                        else RuntimeError("DAG worker evidence is incomplete after restart")
+                    ),
+                ),
+                TaskDagActiveNodeRecovery.INDETERMINATE,
+            )
         if task is None or lease is None:
-            return await self._finish_worker_node(
-                dag,
-                node,
-                TaskDagNodeState.INDETERMINATE,
-                error=RuntimeError("DAG worker evidence is incomplete after restart"),
+            return (
+                await self._finish_worker_node(
+                    dag,
+                    node,
+                    TaskDagNodeState.INDETERMINATE,
+                    error=RuntimeError("DAG worker evidence is incomplete after restart"),
+                ),
+                TaskDagActiveNodeRecovery.INDETERMINATE,
             )
         if (
             lease.parent_session_id != self._parent_session_id
             or lease.parent_task_id != node.parent_task_id
             or lease.state is WritableSubagentWorkspaceState.ORPHANED
         ):
-            return await self._finish_worker_node(
-                dag,
-                node,
-                TaskDagNodeState.INDETERMINATE,
-                error=RuntimeError("DAG worker ownership evidence is indeterminate"),
-            )
-        if task.status is SessionTaskStatus.COMPLETED:
-            if lease.state is not WritableSubagentWorkspaceState.PRESERVED:
-                return await self._finish_worker_node(
+            return (
+                await self._finish_worker_node(
                     dag,
                     node,
                     TaskDagNodeState.INDETERMINATE,
-                    error=RuntimeError("completed DAG worker workspace is not preserved"),
+                    error=RuntimeError("DAG worker ownership evidence is indeterminate"),
+                ),
+                TaskDagActiveNodeRecovery.INDETERMINATE,
+            )
+        if task.status is SessionTaskStatus.COMPLETED:
+            if lease.state is not WritableSubagentWorkspaceState.PRESERVED:
+                return (
+                    await self._finish_worker_node(
+                        dag,
+                        node,
+                        TaskDagNodeState.INDETERMINATE,
+                        error=RuntimeError("completed DAG worker workspace is not preserved"),
+                    ),
+                    TaskDagActiveNodeRecovery.INDETERMINATE,
                 )
-            return await self._finish_worker_node(dag, node, TaskDagNodeState.COMPLETED)
+            return (
+                await self._finish_worker_node(dag, node, TaskDagNodeState.COMPLETED),
+                None,
+            )
         if task.status is SessionTaskStatus.FAILED:
-            return await self._finish_worker_node(
-                dag,
-                node,
-                TaskDagNodeState.FAILED,
-                error=RuntimeError("reconciled writable SessionTask failure"),
+            return (
+                await self._finish_worker_node(
+                    dag,
+                    node,
+                    TaskDagNodeState.FAILED,
+                    error=RuntimeError("reconciled writable SessionTask failure"),
+                ),
+                None,
             )
         if task.status is SessionTaskStatus.CANCELLED:
-            return await self._finish_worker_node(
-                dag,
-                node,
-                TaskDagNodeState.CANCELLED,
-                error=RuntimeError("reconciled writable SessionTask cancellation"),
+            return (
+                await self._finish_worker_node(
+                    dag,
+                    node,
+                    TaskDagNodeState.CANCELLED,
+                    error=RuntimeError("reconciled writable SessionTask cancellation"),
+                ),
+                None,
             )
-        return dag
+        return dag, TaskDagActiveNodeRecovery.ACTIVE_WORKER
 
     async def _classify_terminal_or_uncertain(self, dag: TaskDag) -> TaskDag:
         if any(node.state is TaskDagNodeState.INDETERMINATE for node in dag.nodes):
@@ -647,6 +765,7 @@ __all__ = [
     "CreateTaskDagRequest",
     "RunTaskDagRequest",
     "RunTaskDagStepRequest",
+    "TaskDagActiveNodeRecovery",
     "TaskDagApplicationService",
     "TaskDagWritableService",
 ]
