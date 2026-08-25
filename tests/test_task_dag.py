@@ -1538,8 +1538,181 @@ class TaskDagSchedulerTests(unittest.IsolatedAsyncioTestCase):
             RunTaskDagStepRequest("dag", "")
         with self.assertRaisesRegex(ValueError, "wave selected node ids"):
             RunTaskDagWaveRequest("dag", ())
+        with self.assertRaisesRegex(ValueError, "wave request id"):
+            RunTaskDagWaveRequest("", ("a",))
+        with self.assertRaisesRegex(ValueError, "non-empty tuple"):
+            RunTaskDagWaveRequest("dag", ["a"])  # type: ignore[arg-type]
+        with self.assertRaisesRegex(ValueError, "safe text"):
+            RunTaskDagWaveRequest("dag", ("",))
+        with self.assertRaisesRegex(ValueError, "unique"):
+            RunTaskDagWaveRequest("dag", ("a", "a"))
+        with self.assertRaisesRegex(ValueError, "graph generation"):
+            RunTaskDagWaveRequest("dag", ("a",), expected_dag_generation=True)
+        with self.assertRaisesRegex(ValueError, "graph generation"):
+            RunTaskDagWaveRequest("dag", ("a",), expected_dag_generation=-1)
+        with self.assertRaisesRegex(TypeError, "node generations must be a tuple"):
+            RunTaskDagWaveRequest("dag", ("a",), expected_node_generations=[("a", 0)])  # type: ignore[arg-type]
+        for generations in (
+            (("a",),),
+            ((1, 0),),
+            (("", 0),),
+            (("a", True),),
+            (("a", "0"),),
+            (("a", -1),),
+        ):
+            with self.assertRaisesRegex(ValueError, "expected node generation"):
+                RunTaskDagWaveRequest("dag", ("a",), expected_node_generations=generations)
         with self.assertRaisesRegex(ValueError, "expected generations"):
             RunTaskDagWaveRequest("dag", ("a",), expected_node_generations=(("b", 0),))
+
+    async def test_leader_wave_rejects_stale_and_unsupported_requests(self) -> None:
+        writable = _FakeWritableService(self.parent_session_id)
+        service = self._service(writable)
+        await service.create_task_dag(
+            CreateTaskDagRequest("wave-boundary", (_node("a", 0), _node("b", 1)), 2)
+        )
+        with self.assertRaisesRegex(ValueError, "wave request must be canonical"):
+            await service.run_task_dag_wave(cast(RunTaskDagWaveRequest, object()))
+        with self.assertRaisesRegex(ConfigurationError, "graph generation"):
+            await service.run_task_dag_wave(
+                RunTaskDagWaveRequest(
+                    "wave-boundary",
+                    ("a",),
+                    expected_dag_generation=99,
+                    expected_node_generations=(("a", 0),),
+                )
+            )
+        with self.assertRaisesRegex(ConfigurationError, "node generation"):
+            await service.run_task_dag_wave(
+                RunTaskDagWaveRequest(
+                    "wave-boundary",
+                    ("a",),
+                    expected_dag_generation=0,
+                    expected_node_generations=(("a", 1),),
+                )
+            )
+        with self.assertRaisesRegex(ConfigurationError, "independent writable worker factory"):
+            await service.run_task_dag_wave(
+                RunTaskDagWaveRequest(
+                    "wave-boundary",
+                    ("a",),
+                    expected_dag_generation=0,
+                    expected_node_generations=(("a", 0),),
+                )
+            )
+
+        await service.create_task_dag(CreateTaskDagRequest("wave-terminal", (_node("a", 0),)))
+        await service.run_task_dag(RunTaskDagRequest("wave-terminal"))
+        terminal = await self.store.get_task_dag("wave-terminal")
+        self.assertIsNotNone(terminal)
+        assert terminal is not None
+        self.assertTrue(terminal.state.terminal)
+        with self.assertRaisesRegex(ConfigurationError, "terminal"):
+            await service.run_task_dag_wave(
+                RunTaskDagWaveRequest(
+                    "wave-terminal",
+                    ("a",),
+                    expected_dag_generation=terminal.generation,
+                    expected_node_generations=(("a", terminal.node("a").generation),),
+                )
+            )
+
+        applied = "wave-applied"
+        await service.create_task_dag(
+            CreateTaskDagRequest(applied, (_node("a", 0), _node("b", 1)), 2)
+        )
+        snapshot = await self.store.get_task_dag(applied)
+        self.assertIsNotNone(snapshot)
+        assert snapshot is not None
+        running = replace(
+            snapshot.node("a"),
+            state=TaskDagNodeState.RUNNING,
+            generation=1,
+            parent_task_id="worker-a",
+        )
+        claimed = await self.store.claim_task_dag_node(
+            applied,
+            running,
+            expected_generation=0,
+            expected_state=TaskDagNodeState.READY,
+            updated_at=_now(),
+        )
+        await self.store.finish_task_dag_node(
+            applied,
+            replace(claimed.node("a"), state=TaskDagNodeState.COMPLETED, generation=2),
+            expected_generation=1,
+            expected_state=TaskDagNodeState.RUNNING,
+            updated_at=_now(),
+        )
+        applied_snapshot = await self.store.get_task_dag(applied)
+        self.assertIsNotNone(applied_snapshot)
+        assert applied_snapshot is not None
+        applied_result = await service.run_task_dag_wave(
+            RunTaskDagWaveRequest(
+                applied,
+                ("a",),
+                expected_dag_generation=applied_snapshot.generation,
+                expected_node_generations=(("a", 0),),
+            )
+        )
+        self.assertIs(applied_result.node("a").state, TaskDagNodeState.COMPLETED)
+        with self.assertRaisesRegex(ConfigurationError, "independent writable worker factory"):
+            service._worker_service_for(applied_snapshot)
+
+        class SharedFactory:
+            def create(self) -> _FakeWritableService:
+                return writable
+
+        shared_service = TaskDagApplicationService(
+            self.store,
+            self.store,
+            writable,
+            self.leases,
+            self.relays,
+            parent_binding=self.binding,
+            writable_worker_factory=SharedFactory(),
+        )
+        await shared_service.create_task_dag(
+            CreateTaskDagRequest("wave-shared", (_node("a", 0), _node("b", 1)), 2)
+        )
+        with self.assertRaisesRegex(ConfigurationError, "shared writable service"):
+            await shared_service.run_task_dag_wave(
+                RunTaskDagWaveRequest(
+                    "wave-shared",
+                    ("a", "b"),
+                    expected_dag_generation=0,
+                    expected_node_generations=(("a", 0), ("b", 0)),
+                )
+            )
+
+        race_state = _ParallelRunState(set())
+        race_service, _ = self._parallel_service(race_state)
+        await race_service.create_task_dag(
+            CreateTaskDagRequest("wave-race", (_node("a", 0), _node("b", 1)), 2)
+        )
+        delegate = self.store
+
+        class AlwaysRaceStore:
+            def __getattr__(self, name: str) -> object:
+                return getattr(delegate, name)
+
+            async def claim_task_dag_node(self, *args, **kwargs):
+                del args, kwargs
+                raise TaskDagError("claim race", kind="concurrent_modification")
+
+        race_service._dag_store = AlwaysRaceStore()  # type: ignore[assignment]
+        race_result = await race_service.run_task_dag_wave(
+            RunTaskDagWaveRequest(
+                "wave-race",
+                ("a", "b"),
+                expected_dag_generation=0,
+                expected_node_generations=(("a", 0), ("b", 0)),
+            )
+        )
+        self.assertEqual(
+            tuple(node.state for node in race_result.nodes),
+            (TaskDagNodeState.READY, TaskDagNodeState.READY),
+        )
 
     async def test_parallel_scheduler_requires_independent_worker_factory(self) -> None:
         writable = _FakeWritableService(self.parent_session_id)

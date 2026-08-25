@@ -794,6 +794,35 @@ class LeaderDomainTests(unittest.TestCase):
         self.assertEqual(valid.payload["running_node_ids"], ["running"])
         self.assertEqual(valid.payload["available_capacity"], 1)
         self.assertEqual(valid.payload["completed_node_ids"], [])
+        leader_service = object.__new__(LeaderApplicationService)
+        self.assertEqual(
+            leader_service._selected_generations(
+                valid,
+                LeaderDecision(
+                    LeaderDecisionKind.SELECT_NODES,
+                    selected_node_ids=("running", "ready"),
+                ),
+            ),
+            (1, 2),
+        )
+        self.assertEqual(
+            leader_service._selected_generations(
+                valid,
+                LeaderDecision(LeaderDecisionKind.SELECT_NODE, selected_node_id="missing"),
+            ),
+            (),
+        )
+        self.assertFalse(
+            leader_service._canonical_selection(
+                LeaderDecision(LeaderDecisionKind.SELECT_NODE, selected_node_id="missing"),
+                valid,
+            )
+        )
+        with (
+            patch("neuro_code.application.workflows.leader.MAX_LEADER_PROMPT_BYTES", 1),
+            self.assertRaisesRegex(ConfigurationError, "prompt is too large"),
+        ):
+            leader_service._prompt(valid)
         with self.assertRaises(ValueError):
             LeaderEvidenceNode(
                 running.node_id,
