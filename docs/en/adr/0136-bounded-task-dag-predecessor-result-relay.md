@@ -1,6 +1,6 @@
 # ADR 0136: Bounded Task DAG predecessor-result relay
 
-- Status: implemented as an explicit internal P0 vertical slice; final rating waits for merge-ref CI
+- Status: PROVEN within current vertical-slice scope
 - Date: 2026-08-24
 - Scope: direct completed-predecessor result projection for one serialized bounded Task DAG
 

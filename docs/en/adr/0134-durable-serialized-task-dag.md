@@ -1,6 +1,6 @@
 # ADR 0134: Durable serialized Task DAG
 
-- Status: implemented as an explicit internal vertical slice; final rating waits for merge-ref CI
+- Status: PROVEN within current vertical-slice scope
 - Date: 2026-08-24
 - Scope: one bounded, caller-defined DAG whose nodes reuse the existing Writable Subagent pipeline
 

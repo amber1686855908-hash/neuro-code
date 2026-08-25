@@ -1,6 +1,6 @@
 # ADR 0134：持久化串行 Task DAG
 
-- 状态：作为显式内部纵向切片实现；最终评级等待 merge-ref CI
+- 状态：在当前纵向切片范围内 PROVEN
 - 日期：2026-08-24
 - 范围：一个由调用方定义、节点复用既有 Writable Subagent pipeline 的有界 DAG
 

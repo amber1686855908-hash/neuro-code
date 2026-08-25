@@ -1,6 +1,6 @@
 # ADR 0136：有界 Task DAG predecessor-result Relay
 
-- 状态：作为显式内部 P0 纵向切片实现；最终评级等待 merge-ref CI
+- 状态：在当前纵向切片范围内 PROVEN
 - 日期：2026-08-24
 - 范围：一个串行 bounded Task DAG 的直接 completed-predecessor result projection
 
