@@ -95,6 +95,11 @@ from neuro_code.application.ports.sandbox import (
 )
 from neuro_code.application.ports.storage import SessionStore
 from neuro_code.application.ports.task_dag import TaskDagError, TaskDagStore
+from neuro_code.application.ports.task_dag_recovery import (
+    TaskDagRecoveryClaimError,
+    TaskDagRecoveryClaimResult,
+    TaskDagRecoveryClaimStore,
+)
 from neuro_code.application.ports.task_dag_result_relay import (
     TaskDagDependencyResultRelayError,
     TaskDagDependencyResultRelayStore,
@@ -341,6 +346,9 @@ __all__ = [
     "TaskDagDependencyResultRelayError",
     "TaskDagDependencyResultRelayStore",
     "TaskDagError",
+    "TaskDagRecoveryClaimError",
+    "TaskDagRecoveryClaimResult",
+    "TaskDagRecoveryClaimStore",
     "TaskDagStore",
     "Tool",
     "ToolCollection",

@@ -572,7 +572,9 @@ class TaskDagPersistenceTests(unittest.IsolatedAsyncioTestCase):
             1,
         )
 
-    async def test_schema_17_migrates_to_20_and_creates_dag_leader_and_relay_tables(self) -> None:
+    async def test_schema_17_migrates_to_21_and_creates_dag_leader_relay_and_recovery_tables(
+        self,
+    ) -> None:
         connection = sqlite3.connect(self._database_path)
         connection.execute("UPDATE schema_meta SET version = 17 WHERE singleton = 1")
         connection.commit()
@@ -591,10 +593,11 @@ class TaskDagPersistenceTests(unittest.IsolatedAsyncioTestCase):
             ).fetchall()
         }
         connection.close()
-        self.assertEqual(version, (20,))
+        self.assertEqual(version, (21,))
         self.assertTrue({"task_dags", "task_dag_nodes"}.issubset(tables))
         self.assertTrue({"leader_attempts", "leader_decisions"}.issubset(tables))
         self.assertIn("task_dag_dependency_relays", tables)
+        self.assertIn("task_dag_recovery_claims", tables)
         self.assertIsNotNone(await reopened.get_session(self.parent_session_id))
 
     async def test_populated_schema_18_dag_survives_leader_migration(self) -> None:
@@ -630,8 +633,71 @@ class TaskDagPersistenceTests(unittest.IsolatedAsyncioTestCase):
             ).fetchall()
         }
         connection.close()
-        self.assertEqual(version, (20,))
+        self.assertEqual(version, (21,))
         self.assertTrue({"leader_attempts", "leader_decisions"}.issubset(tables))
+        self.assertIn("task_dag_recovery_claims", tables)
+
+    async def test_populated_schema_20_migrates_to_21_without_touching_dag_contract(self) -> None:
+        dag = self._dag("populated-schema-20")
+        await self.store.insert_task_dag(dag)
+        connection = sqlite3.connect(self._database_path)
+        connection.execute("DROP TABLE task_dag_recovery_claims")
+        connection.execute("UPDATE schema_meta SET version = 20 WHERE singleton = 1")
+        connection.commit()
+        connection.close()
+
+        reopened = SqliteSessionStore(self._database_path)
+        await reopened.initialize()
+        preserved = await reopened.get_task_dag(dag.dag_id)
+        self.assertEqual(preserved, dag)
+        connection = sqlite3.connect(self._database_path)
+        version = connection.execute(
+            "SELECT version FROM schema_meta WHERE singleton = 1"
+        ).fetchone()
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+        indexes = {
+            row[1]
+            for row in connection.execute("PRAGMA index_list(task_dag_recovery_claims)").fetchall()
+        }
+        foreign_keys = connection.execute(
+            "PRAGMA foreign_key_list(task_dag_recovery_claims)"
+        ).fetchall()
+        connection.close()
+        self.assertEqual(version, (21,))
+        self.assertTrue(
+            {
+                "task_dags",
+                "task_dag_nodes",
+                "task_dag_dependency_relays",
+                "leader_attempts",
+                "leader_decisions",
+                "writable_subagent_leases",
+                "parent_context_relays",
+                "task_dag_recovery_claims",
+            }.issubset(tables)
+        )
+        self.assertIn("task_dag_recovery_claims_by_execution", indexes)
+        self.assertEqual({row[6] for row in foreign_keys}, {"RESTRICT"})
+
+        running = replace(
+            dag.node("a"),
+            state=TaskDagNodeState.RUNNING,
+            generation=1,
+            parent_task_id="migration-worker-a",
+        )
+        claimed = await reopened.claim_task_dag_node(
+            dag.dag_id,
+            running,
+            expected_generation=0,
+            expected_state=TaskDagNodeState.READY,
+            updated_at=_now(),
+        )
+        self.assertEqual(claimed.node("a").parent_task_id, "migration-worker-a")
 
 
 class TaskDagSchedulerTests(unittest.IsolatedAsyncioTestCase):

@@ -49,10 +49,16 @@ sandbox root、network access、LSP authority 或 instruction。`ContextBuilder`
 
 ## Durable identity、race 与失败行为
 
-Session schema 20 增加 `task_dag_dependency_relays`。Row 绑定精确 DAG definition、target node
+Session schema 20 增加 `task_dag_dependency_relays`；schema 21 增加独立的
+`task_dag_recovery_claims` ownership fence。Relay row 绑定精确 DAG definition、target node
 definition/generation、direct dependency IDs、entry fingerprint、source/content fingerprint、byte
 count 和 integrity fingerprint。Target-generation uniqueness key 使精确重复发布幂等。内容或 identity
 不同的重复发布会被拒绝；直接修改 database 后，在 reload 时完整性校验失败。
+
+Recovery claim 不是 node-generation lock，也不复用 Leader attempt。它的不可变 execution identity 绑定
+parent session、DAG/node definition fingerprint、精确 node generation、parent task ID，以及 Relay 的
+ID 与 source/content/integrity fingerprint。只有 owner PID/token 可以变化，且只能通过精确 version CAS
+更新。`(dag_id, node_id, node_generation)` 唯一键是跨进程 durable fence。
 
 Store 复用既有 SQLite transaction boundary，并在 commit 前 reload 已发布 row。并发 scheduler 不能为
 同一 target generation 发布冲突 Relay。对已经 claim 的 active node，recovery 在不启动 worker 的前提下
@@ -60,19 +66,30 @@ Store 复用既有 SQLite transaction boundary，并在 commit 前 reload 已发
 
 - `ACTIVE_WORKER`：存在精确的非 terminal `SessionTask` 与 writable lease ownership evidence；继续由既有
   Writable reconciliation 负责恢复。
+- `RECOVERY_OWNED`：精确 recovery claim 由仍存活或未被证明死亡的 owner 持有。Reconciliation 在该状态
+  保持只读：不启动 Writable、不抢占 claim、不失败 node，也不标记为 `INDETERMINATE`。
 - `SAFE_NOT_STARTED`：只有在精确 `RUNNING` node 与 `parent_task_id` 已 durable、通过
   `(dag_id, target_node_id, target_generation)` 读取到既有 READY Relay 且 definition、direct dependency
-  与 fingerprint 全部匹配，并且对应 `SessionTask`、writable lease（以及 subagent link）均不存在时才允许。
-  read-only reconciliation 只做分类；后续 DAG step 复用同一个 Relay 与 `parent_task_id`，不创建新的
-  generation、task identity 或 Relay。
+  与 fingerprint 全部匹配，并且对应 `SessionTask`、writable lease（以及 subagent link）均不存在且没有 live
+  recovery owner 时才允许。Read-only reconciliation 只做分类；后续 DAG step 先取得精确 durable recovery
+  claim，只有 winner 可以调用 Writable。Live loser 返回 canonical active state，不产生 provider、resource、
+  lease、task 或 node terminal side effect。
 - `INDETERMINATE`：Relay 缺失或无法验证、证据不完整、存在 link 或其他 worker ownership evidence、identity
-  过期或任何状态不确定。对可能已经开始的 worker 永不自动 rerun。
+  过期或任何状态不确定。对可能已经开始的 worker 永不自动 rerun。只要精确 recovery owner 仍存活或未被
+  证明死亡，只有 lease 的 partial window 不能被标记为 `INDETERMINATE`。
+
+如果 recovery owner 在第一次 Writable lease insert 之前死亡，fresh controller 只有在证明旧 owner 已死亡后，
+才能通过 version CAS takeover 同一个 claim，并保留同一 node generation、parent task 与 Relay identity。
+如果 lease insert 已开始，recovery 永不自动 rerun worker；由既有 Writable reconciliation 决定是否可以收敛，
+否则保持 fail-closed。
 
 这个边界来自生产 Writable 的真实顺序：repository identity 检查是只读的；第一个 durable side-effecting
 allocation 是插入 lease，随后才是 `SessionTask`、worktree、checkpoint、child session、subagent link、
 Parent Relay、runtime creation 与 model execution。因此，精确 active node 加 READY Relay 且对应 task 与
-lease 均不存在，能够证明没有进入这段 Writable allocation。真实 `spawn` 与 `os._exit(73)` acceptance test
-覆盖了这一 continuation；在 ownership evidence 已存在后崩溃则继续 fail-closed，不能 replay。
+lease 均不存在，能够证明没有进入这段 Writable allocation。Durable recovery claim 关闭了这个 proof 与
+第一次 lease insert 之间的跨进程窗口。真实 `spawn` acceptance 覆盖两个 controller 从同一 pre-claim
+snapshot 竞态、live-owner partial lease window 和 dead-owner-before-lease takeover；在 ownership evidence
+已存在后崩溃则继续 fail-closed，不能 replay。
 
 如果 target generation、predecessor state、lease、Parent Relay、workspace/checkpoint evidence 或任何 identity
 缺失、过期、不确定或不匹配，application 会把 target 标为 `INDETERMINATE`，不会构造 worker/provider request。
@@ -90,8 +107,9 @@ transitive aggregation、retry、rerun、merge/copy-back、rollback、cleanup、
 
 Focused implementation tests 覆盖有界 rendering 与 redaction、synthetic message replacement、schema
 migration 与 row integrity、精确重复幂等、冲突发布拒绝、direct-dependency selection、声明顺序、
-dependency chain、失败或不确定 evidence 的 fail-closed 行为、read-only recovery classification、真实
-safe-not-started process death 与 exact-once continuation、ownership 歧义 process death 不 rerun，以及通过
-既有 Writable Subagent composition path 的注入。既有 Task DAG、Leader、Writable Subagent、Parent Relay、
+dependency chain、失败或不确定 evidence 的 fail-closed 行为、read-only recovery classification、durable
+recovery-claim insert/CAS 与 schema-20-to-21 migration、真实 safe-not-started process death 与 exact-once
+continuation、two-controller cross-process ownership 与 partial-window 行为、dead-owner-before-lease
+takeover、post-allocation ownership 歧义 process death 不 rerun，以及通过既有 Writable Subagent composition path 的注入。既有 Task DAG、Leader、Writable Subagent、Parent Relay、
 Worktree、Checkpoint、worker-scoped LSP、crash recovery 和全仓库 gates 仍是必需项。本切片不宣称
 parallel/dataflow scheduling 或 live paid-provider acceptance。

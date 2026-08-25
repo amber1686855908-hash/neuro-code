@@ -114,6 +114,7 @@ from neuro_code.domain.task_dag import (
     TaskDagNodeState,
     TaskDagState,
 )
+from neuro_code.domain.task_dag_recovery import TaskDagRecoveryClaim
 from neuro_code.domain.task_dag_result_relay import (
     MAX_TASK_DAG_RESULT_RELAY_ITEM_BYTES,
     MAX_TASK_DAG_RESULT_RELAY_PREDECESSORS,
@@ -252,6 +253,7 @@ __all__ = [
     "TaskDagNode",
     "TaskDagNodeKind",
     "TaskDagNodeState",
+    "TaskDagRecoveryClaim",
     "TaskDagState",
     "TerminalOutputChunk",
     "TerminalSignal",

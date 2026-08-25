@@ -17,7 +17,7 @@ from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
-from typing import cast
+from typing import Any, cast
 from unittest.mock import patch
 
 from neuro_code.application.permissions.policy import PermissionMode
@@ -1887,10 +1887,15 @@ class _ExitBeforeTaskDagWritableWorker:
         delegate: WritableSubagentApplicationService,
         store: SqliteSessionStore,
         evidence_path: Path,
+        *,
+        require_recovery_claim: bool = False,
+        exit_code: int = 73,
     ) -> None:
         self._delegate = delegate
         self._store = store
         self._evidence_path = evidence_path
+        self._require_recovery_claim = require_recovery_claim
+        self._exit_code = exit_code
 
     @property
     def parent_session_id(self) -> str:
@@ -1924,21 +1929,157 @@ class _ExitBeforeTaskDagWritableWorker:
         )
         if durable != relay or by_target != relay:
             raise AssertionError("DAG dependency relay was not durable before Writable")
+        evidence: dict[str, object] = {
+            "dag_id": relay.dag_id,
+            "node_id": relay.target_node_id,
+            "target_node_generation": relay.target_node_generation,
+            "parent_task_id": execution_identity.parent_task_id,
+            "relay_id": relay.relay_id,
+            "source_fingerprint": relay.source_fingerprint,
+            "content_fingerprint": relay.content_fingerprint,
+            "integrity_fingerprint": relay.integrity_fingerprint,
+            "direct_dependency_ids": list(relay.direct_dependency_ids),
+        }
+        if self._require_recovery_claim:
+            dag = await self._store.get_task_dag(relay.dag_id)
+            if dag is None:
+                raise AssertionError("DAG was not durable before recovery claim crash")
+            node = dag.node(relay.target_node_id)
+            claim = await self._store.get_task_dag_recovery_claim(
+                relay.dag_id,
+                relay.target_node_id,
+                relay.target_node_generation,
+            )
+            if claim is None:
+                raise AssertionError("DAG recovery claim was not durable before crash")
+            if (
+                await self._store.get_session_task(
+                    request.parent_session_id,
+                    execution_identity.parent_task_id,
+                )
+                is not None
+                or await self._store.get_writable_subagent_lease_for_parent_task(
+                    request.parent_session_id,
+                    execution_identity.parent_task_id,
+                )
+                is not None
+                or await self._store.load_subagent_link(
+                    request.parent_session_id,
+                    execution_identity.parent_task_id,
+                )
+                is not None
+            ):
+                raise AssertionError("Writable allocation evidence appeared before crash seam")
+            evidence.update(
+                {
+                    "node_generation": node.generation,
+                    "claim_id": claim.claim_id,
+                    "claim_owner_pid": claim.owner_pid,
+                    "claim_owner_token": claim.owner_token,
+                    "claim_version": claim.version,
+                }
+            )
+        _write_durable_json(self._evidence_path, evidence)
+        os._exit(self._exit_code)
+
+
+class _PauseAfterWritableLeaseInsertStore:
+    """Test-only lease store that freezes the winner after the first insert."""
+
+    def __init__(
+        self,
+        delegate: SqliteSessionStore,
+        *,
+        controller_id: str,
+        report_path: Path,
+        lease_inserted: Any,
+        release_allocation: Any,
+    ) -> None:
+        self._delegate = delegate
+        self._controller_id = controller_id
+        self._report_path = report_path
+        self._lease_inserted = lease_inserted
+        self._release_allocation = release_allocation
+        self.attempts = 0
+        self.successes = 0
+        self.errors = 0
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._delegate, name)
+
+    async def insert_writable_subagent_lease(
+        self,
+        lease: WritableSubagentWorkspaceLease,
+    ) -> WritableSubagentWorkspaceLease:
+        self.attempts += 1
+        try:
+            inserted = await self._delegate.insert_writable_subagent_lease(lease)
+        except BaseException as error:
+            self.errors += 1
+            _write_durable_json(
+                self._report_path,
+                {
+                    "controller_id": self._controller_id,
+                    "phase": "lease_insert_error",
+                    "error_type": type(error).__name__,
+                    "error": str(error),
+                    "cause_type": type(error.__cause__).__name__
+                    if error.__cause__ is not None
+                    else None,
+                    "cause_kind": getattr(error.__cause__, "kind", None),
+                },
+            )
+            raise
+        self.successes += 1
         _write_durable_json(
-            self._evidence_path,
+            self._report_path,
             {
-                "dag_id": relay.dag_id,
-                "node_id": relay.target_node_id,
-                "target_node_generation": relay.target_node_generation,
-                "parent_task_id": execution_identity.parent_task_id,
-                "relay_id": relay.relay_id,
-                "source_fingerprint": relay.source_fingerprint,
-                "content_fingerprint": relay.content_fingerprint,
-                "integrity_fingerprint": relay.integrity_fingerprint,
-                "direct_dependency_ids": list(relay.direct_dependency_ids),
+                "controller_id": self._controller_id,
+                "phase": "lease_inserted",
+                "lease_id": inserted.lease_id,
+                "parent_task_id": inserted.parent_task_id,
             },
         )
-        os._exit(73)
+        self._lease_inserted.set()
+        released = await asyncio.to_thread(self._release_allocation.wait, 60)
+        if not released:
+            raise AssertionError("race fixture was not released after lease insertion")
+        return inserted
+
+
+class _ReportingRecoveryWritable:
+    """Test-only call counter for the real recovery ownership boundary."""
+
+    def __init__(
+        self,
+        delegate: WritableSubagentApplicationService,
+    ) -> None:
+        self._delegate = delegate
+        self.calls = 0
+
+    @property
+    def parent_session_id(self) -> str:
+        return self._delegate.parent_session_id
+
+    async def initialize(self) -> None:
+        await self._delegate.initialize()
+
+    async def reconcile_writable_subagent_workspaces(self) -> object:
+        return await self._delegate.reconcile_writable_subagent_workspaces()
+
+    async def run_subagent_with_execution_identity(
+        self,
+        request: RunWritableSubagentRequest,
+        *,
+        execution_identity: Any,
+        sink: EventSink | None = None,
+    ) -> WritableSubagentResultProjection:
+        self.calls += 1
+        return await self._delegate.run_subagent_with_execution_identity(
+            request,
+            execution_identity=execution_identity,
+            sink=sink,
+        )
 
 
 def _run_task_dag_process_death_child(
@@ -2120,6 +2261,73 @@ def _run_task_dag_dependency_relay_process_death_child(
     asyncio.run(run())
 
 
+def _run_task_dag_recovery_claim_process_death_child(
+    root_value: str,
+    repository_value: str,
+) -> None:
+    """Acquire recovery ownership, then die before the first Writable lease."""
+
+    root = Path(root_value)
+    repository = Path(repository_value)
+    state_dir = root / "state"
+    os.environ.update(
+        {
+            "HOME": str(root),
+            "NEURO_CODE_HOME": str(state_dir),
+            "FIXTURE_KEY": "fixture-key",
+            "NEURO_CODE_TASK_DAG_CRASH_MODE": "none",
+        }
+    )
+
+    async def run() -> None:
+        application = await ApplicationComposition.open(
+            ApplicationSettings(
+                cwd=repository,
+                sandbox="off",
+                permission_mode=PermissionMode.BYPASS,
+                max_steps=8,
+            ),
+            provider_factory=_task_dag_crash_provider_factory,
+        )
+        try:
+            context = cast(
+                dict[str, str],
+                json.loads((root / "task-dag-relay-context.json").read_text(encoding="utf-8")),
+            )
+            parent_binding = await application.create_binding(
+                resume_id=context["parent_session_id"],
+                capabilities=_capability(repository, sandbox=SandboxProfile.OFF),
+            )
+            writable = application.create_writable_subagent_service(
+                parent_binding=parent_binding,
+            )
+            guarded_writable = _ExitBeforeTaskDagWritableWorker(
+                writable,
+                application.store,
+                root / "task-dag-recovery-claim-before-death.json",
+                require_recovery_claim=True,
+                exit_code=75,
+            )
+            service = TaskDagApplicationService(
+                application.store,
+                cast(TaskDagStore, application.store),
+                guarded_writable,
+                cast(WritableSubagentLeaseStore, application.store),
+                cast(ParentContextRelayStore, application.store),
+                parent_binding=parent_binding,
+                dependency_relay_store=cast(
+                    TaskDagDependencyResultRelayStore,
+                    application.store,
+                ),
+                redaction_values=application.config.redaction_values(),
+            )
+            await service.run_task_dag(RunTaskDagRequest(context["dag_id"]))
+        finally:
+            await application.close()
+
+    asyncio.run(run())
+
+
 def _run_task_dag_dependency_active_worker_crash_child(
     root_value: str,
     repository_value: str,
@@ -2186,6 +2394,115 @@ def _run_task_dag_dependency_active_worker_crash_child(
                 },
             )
             await service.run_task_dag(RunTaskDagRequest(dag_id))
+        finally:
+            await application.close()
+
+    asyncio.run(run())
+
+
+def _run_task_dag_concurrent_recovery_controller(
+    root_value: str,
+    repository_value: str,
+    controller_id: str,
+    start_barrier: Any,
+    lease_inserted: Any,
+    release_allocation: Any,
+    loser_finished: Any,
+    report_path_value: str,
+) -> None:
+    """Run one independent controller for the cross-process recovery race."""
+
+    root = Path(root_value)
+    repository = Path(repository_value)
+    state_dir = root / "state"
+    report_path = Path(report_path_value)
+    os.environ.update(
+        {
+            "HOME": str(root),
+            "NEURO_CODE_HOME": str(state_dir),
+            "FIXTURE_KEY": "fixture-key",
+            "NEURO_CODE_TASK_DAG_CRASH_MODE": "none",
+        }
+    )
+
+    async def run() -> None:
+        application = await ApplicationComposition.open(
+            ApplicationSettings(
+                cwd=repository,
+                sandbox="off",
+                permission_mode=PermissionMode.BYPASS,
+                max_steps=8,
+            ),
+            provider_factory=_task_dag_crash_provider_factory,
+        )
+        try:
+            context = cast(
+                dict[str, str],
+                json.loads((root / "task-dag-relay-context.json").read_text(encoding="utf-8")),
+            )
+            parent_session_id = context["parent_session_id"]
+            parent_binding = await application.create_binding(
+                resume_id=parent_session_id,
+                capabilities=_capability(repository, sandbox=SandboxProfile.OFF),
+            )
+            writable = application.create_writable_subagent_service(
+                parent_binding=parent_binding,
+            )
+            paused_lease_store = _PauseAfterWritableLeaseInsertStore(
+                application.store,
+                controller_id=controller_id,
+                report_path=root / f"lease-{controller_id}.json",
+                lease_inserted=lease_inserted,
+                release_allocation=release_allocation,
+            )
+            writable._lease_store = cast(WritableSubagentLeaseStore, paused_lease_store)
+            guarded_writable = _ReportingRecoveryWritable(writable)
+            service = TaskDagApplicationService(
+                application.store,
+                cast(TaskDagStore, application.store),
+                guarded_writable,
+                cast(WritableSubagentLeaseStore, paused_lease_store),
+                cast(ParentContextRelayStore, application.store),
+                parent_binding=parent_binding,
+                dependency_relay_store=cast(
+                    TaskDagDependencyResultRelayStore,
+                    application.store,
+                ),
+                redaction_values=application.config.redaction_values(),
+            )
+            snapshot = await service.reconcile_task_dag(RunTaskDagRequest(context["dag_id"]))
+            if snapshot.active_node_id != "b":
+                raise AssertionError("recovery race fixture did not remain on node b")
+            await asyncio.to_thread(start_barrier.wait, 60)
+            result = await service.run_task_dag(RunTaskDagRequest(context["dag_id"]))
+            result_node = result.node("b")
+            _write_durable_json(
+                report_path,
+                {
+                    "controller_id": controller_id,
+                    "outcome": "returned",
+                    "dag_state": result.state.value,
+                    "node_state": result_node.state.value,
+                    "node_error_kind": result_node.error_kind,
+                    "node_error_reason": result_node.error_reason,
+                    "active_node_id": result.active_node_id,
+                    "writable_calls": guarded_writable.calls,
+                    "lease_insert_attempts": paused_lease_store.attempts,
+                    "lease_insert_successes": paused_lease_store.successes,
+                    "lease_insert_errors": paused_lease_store.errors,
+                },
+            )
+            loser_finished.set()
+        except BaseException as error:
+            _write_durable_json(
+                report_path,
+                {
+                    "controller_id": controller_id,
+                    "outcome": "raised",
+                    "error_type": type(error).__name__,
+                    "error": str(error),
+                },
+            )
         finally:
             await application.close()
 
@@ -3719,6 +4036,326 @@ api_key_env = "FIXTURE_KEY"
             expected_graph_state=TaskDagState.INDETERMINATE,
         )
 
+    async def test_real_two_recovery_controllers_exclusively_own_safe_not_started_worker(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory(prefix="neuro-task-dag-relay-race-") as directory:
+            root = Path(directory)
+            repository, _head = _make_real_repository(root)
+            context = multiprocessing.get_context("spawn")
+            seed = context.Process(
+                target=_run_task_dag_dependency_relay_process_death_child,
+                args=(str(root), str(repository)),
+            )
+            seed.start()
+            await asyncio.to_thread(seed.join, 60)
+            if seed.is_alive():
+                seed.terminate()
+                await asyncio.to_thread(seed.join, 15)
+                self.fail("SAFE_NOT_STARTED seed fixture did not reach process death")
+            self.assertEqual(seed.exitcode, 73)
+
+            state_dir = root / "state"
+            context_data = cast(
+                dict[str, str],
+                json.loads((root / "task-dag-relay-context.json").read_text(encoding="utf-8")),
+            )
+            start_barrier = context.Barrier(2)
+            lease_inserted = context.Event()
+            release_allocation = context.Event()
+            loser_finished = context.Event()
+            controllers: list[multiprocessing.Process] = []
+            try:
+                for controller_id in ("c1", "c2"):
+                    controller = context.Process(
+                        target=_run_task_dag_concurrent_recovery_controller,
+                        args=(
+                            str(root),
+                            str(repository),
+                            controller_id,
+                            start_barrier,
+                            lease_inserted,
+                            release_allocation,
+                            loser_finished,
+                            str(root / f"race-{controller_id}.json"),
+                        ),
+                    )
+                    controller.start()
+                    controllers.append(controller)
+
+                self.assertTrue(
+                    await asyncio.to_thread(lease_inserted.wait, 60),
+                    "race winner did not reach the first durable lease allocation",
+                )
+                loser_returned = await asyncio.to_thread(loser_finished.wait, 60)
+                if not loser_returned:
+                    diagnostics = {
+                        controller_id: (
+                            json.loads((root / f"race-{controller_id}.json").read_text())
+                            if (root / f"race-{controller_id}.json").exists()
+                            else None
+                        )
+                        for controller_id in ("c1", "c2")
+                    }
+                    self.fail(
+                        "live-owner loser did not return without starting Writable: "
+                        f"{diagnostics!r}"
+                    )
+
+                observer = SqliteSessionStore(state_dir / "sessions.db")
+                await observer.initialize()
+                before_release = await observer.get_task_dag(context_data["dag_id"])
+                self.assertIsNotNone(before_release)
+                assert before_release is not None
+                self.assertIs(before_release.state, TaskDagState.RUNNING)
+                self.assertEqual(before_release.active_node_id, "b")
+                before_node = before_release.node("b")
+                self.assertIs(before_node.state, TaskDagNodeState.RUNNING)
+                self.assertIsNotNone(before_node.parent_task_id)
+                assert before_node.parent_task_id is not None
+                winning_lease = await observer.get_writable_subagent_lease_for_parent_task(
+                    context_data["parent_session_id"],
+                    before_node.parent_task_id,
+                )
+                self.assertIsNotNone(winning_lease)
+                assert winning_lease is not None
+                self.assertIs(winning_lease.state, WritableSubagentWorkspaceState.ALLOCATING)
+                self.assertIsNone(
+                    await observer.get_session_task(
+                        context_data["parent_session_id"],
+                        before_node.parent_task_id,
+                    )
+                )
+                recovery_claim = await observer.get_task_dag_recovery_claim(
+                    context_data["dag_id"],
+                    "b",
+                    before_node.generation,
+                )
+                self.assertIsNotNone(recovery_claim)
+                assert recovery_claim is not None
+                self.assertEqual(recovery_claim.parent_task_id, before_node.parent_task_id)
+                dependency_relay = await observer.get_task_dag_dependency_relay_for_target(
+                    context_data["dag_id"],
+                    "b",
+                    before_node.generation,
+                )
+                self.assertIsNotNone(dependency_relay)
+                assert dependency_relay is not None
+                self.assertEqual(recovery_claim.dependency_relay_id, dependency_relay.relay_id)
+                self.assertEqual(
+                    recovery_claim.dependency_relay_integrity_fingerprint,
+                    dependency_relay.integrity_fingerprint,
+                )
+                self.assertGreater(recovery_claim.owner_pid, 0)
+                self.assertGreaterEqual(recovery_claim.version, 0)
+                self.assertIsNone(
+                    await observer.load_subagent_link(
+                        context_data["parent_session_id"],
+                        before_node.parent_task_id,
+                    )
+                )
+
+                release_allocation.set()
+                for controller in controllers:
+                    await asyncio.to_thread(controller.join, 60)
+                    if controller.is_alive():
+                        controller.terminate()
+                        await asyncio.to_thread(controller.join, 15)
+                    self.assertEqual(controller.exitcode, 0)
+
+                reports = [
+                    cast(
+                        dict[str, object],
+                        json.loads(
+                            (root / f"race-{controller_id}.json").read_text(encoding="utf-8")
+                        ),
+                    )
+                    for controller_id in ("c1", "c2")
+                ]
+                self.assertEqual(
+                    {report["outcome"] for report in reports},
+                    {"returned"},
+                )
+                self.assertEqual(
+                    sorted(int(report["writable_calls"]) for report in reports),
+                    [0, 1],
+                )
+                self.assertEqual(
+                    (state_dir / "task-dag-model-invocations")
+                    .read_text(encoding="utf-8")
+                    .splitlines(),
+                    ["model_invocation", "model_invocation"],
+                )
+                after_release = await observer.get_task_dag(context_data["dag_id"])
+                self.assertIsNotNone(after_release)
+                assert after_release is not None
+                self.assertIs(after_release.state, TaskDagState.COMPLETED)
+                self.assertIs(after_release.node("b").state, TaskDagNodeState.COMPLETED)
+                self.assertIsNone(after_release.active_node_id)
+                final_claim = await observer.get_task_dag_recovery_claim(
+                    context_data["dag_id"],
+                    "b",
+                    before_node.generation,
+                )
+                self.assertEqual(final_claim, recovery_claim)
+            finally:
+                release_allocation.set()
+                for controller in controllers:
+                    if controller.is_alive():
+                        controller.terminate()
+                        await asyncio.to_thread(controller.join, 15)
+
+    async def test_real_dead_recovery_owner_before_lease_is_taken_over_once(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="neuro-task-dag-recovery-owner-") as directory:
+            root = Path(directory)
+            repository, _head = _make_real_repository(root)
+            context = multiprocessing.get_context("spawn")
+
+            seed = context.Process(
+                target=_run_task_dag_dependency_relay_process_death_child,
+                args=(str(root), str(repository)),
+            )
+            seed.start()
+            await asyncio.to_thread(seed.join, 60)
+            if seed.is_alive():
+                seed.terminate()
+                await asyncio.to_thread(seed.join, 15)
+                self.fail("SAFE_NOT_STARTED seed fixture did not reach process death")
+            self.assertEqual(seed.exitcode, 73)
+
+            owner_death = context.Process(
+                target=_run_task_dag_recovery_claim_process_death_child,
+                args=(str(root), str(repository)),
+            )
+            owner_death.start()
+            await asyncio.to_thread(owner_death.join, 60)
+            if owner_death.is_alive():
+                owner_death.terminate()
+                await asyncio.to_thread(owner_death.join, 15)
+                self.fail("recovery owner did not reach the pre-lease crash seam")
+            self.assertEqual(owner_death.exitcode, 75)
+
+            state_dir = root / "state"
+            context_data = cast(
+                dict[str, str],
+                json.loads((root / "task-dag-relay-context.json").read_text(encoding="utf-8")),
+            )
+            evidence = cast(
+                dict[str, object],
+                json.loads(
+                    (root / "task-dag-recovery-claim-before-death.json").read_text(encoding="utf-8")
+                ),
+            )
+            invocation_marker = state_dir / "task-dag-model-invocations"
+            self.assertEqual(
+                invocation_marker.read_text(encoding="utf-8").splitlines(),
+                ["model_invocation"],
+            )
+
+            with patch.dict(
+                os.environ,
+                {
+                    "HOME": str(root),
+                    "NEURO_CODE_HOME": str(state_dir),
+                    "FIXTURE_KEY": "fixture-key",
+                    "NEURO_CODE_TASK_DAG_CRASH_MODE": "none",
+                },
+                clear=False,
+            ):
+                application = await ApplicationComposition.open(
+                    ApplicationSettings(
+                        cwd=repository,
+                        sandbox="off",
+                        permission_mode=PermissionMode.BYPASS,
+                        max_steps=8,
+                    ),
+                    provider_factory=_task_dag_crash_provider_factory,
+                )
+                try:
+                    parent_session_id = context_data["parent_session_id"]
+                    parent_binding = await application.create_binding(
+                        resume_id=parent_session_id,
+                        capabilities=_capability(repository, sandbox=SandboxProfile.OFF),
+                    )
+                    service = application.create_task_dag_service(parent_binding=parent_binding)
+                    before = await service.get_task_dag(
+                        RunTaskDagRequest(context_data["dag_id"]),
+                    )
+                    self.assertIsNotNone(before)
+                    assert before is not None
+                    before_node = before.node("b")
+                    self.assertIs(before.state, TaskDagState.RUNNING)
+                    self.assertEqual(before.active_node_id, "b")
+                    self.assertIs(before_node.state, TaskDagNodeState.RUNNING)
+                    self.assertEqual(before_node.generation, evidence["node_generation"])
+                    self.assertEqual(before_node.parent_task_id, evidence["parent_task_id"])
+                    assert before_node.parent_task_id is not None
+                    self.assertIsNone(
+                        await application.store.get_session_task(
+                            parent_session_id,
+                            before_node.parent_task_id,
+                        )
+                    )
+                    self.assertIsNone(
+                        await application.store.get_writable_subagent_lease_for_parent_task(
+                            parent_session_id,
+                            before_node.parent_task_id,
+                        )
+                    )
+                    self.assertIsNone(
+                        await application.store.load_subagent_link(
+                            parent_session_id,
+                            before_node.parent_task_id,
+                        )
+                    )
+                    claim_before = await application.store.get_task_dag_recovery_claim(
+                        context_data["dag_id"],
+                        "b",
+                        before_node.generation,
+                    )
+                    self.assertIsNotNone(claim_before)
+                    assert claim_before is not None
+                    self.assertEqual(claim_before.claim_id, evidence["claim_id"])
+                    self.assertEqual(claim_before.version, evidence["claim_version"])
+                    self.assertEqual(
+                        claim_before.owner_token,
+                        evidence["claim_owner_token"],
+                    )
+                    self.assertFalse(owner_is_alive(claim_before.owner_pid))
+
+                    classified = await service.reconcile_task_dag(
+                        RunTaskDagRequest(context_data["dag_id"]),
+                    )
+                    self.assertIs(classified.node("b").state, TaskDagNodeState.RUNNING)
+                    self.assertEqual(classified.active_node_id, "b")
+
+                    final = await service.run_task_dag(
+                        RunTaskDagRequest(context_data["dag_id"]),
+                    )
+                    self.assertIs(final.state, TaskDagState.COMPLETED)
+                    self.assertIs(final.node("b").state, TaskDagNodeState.COMPLETED)
+                    self.assertIsNone(final.active_node_id)
+                    self.assertEqual(
+                        invocation_marker.read_text(encoding="utf-8").splitlines(),
+                        ["model_invocation", "model_invocation"],
+                    )
+                    claim_after = await application.store.get_task_dag_recovery_claim(
+                        context_data["dag_id"],
+                        "b",
+                        before_node.generation,
+                    )
+                    self.assertIsNotNone(claim_after)
+                    assert claim_after is not None
+                    self.assertEqual(claim_after.claim_id, claim_before.claim_id)
+                    self.assertEqual(
+                        claim_after.execution_identity, claim_before.execution_identity
+                    )
+                    self.assertEqual(claim_after.version, claim_before.version + 1)
+                    self.assertNotEqual(claim_after.owner_token, claim_before.owner_token)
+                    self.assertTrue(owner_is_alive(claim_after.owner_pid))
+                finally:
+                    await application.close()
+
     async def test_real_task_dag_dependency_relay_crash_reuses_exact_relay_and_allocates_once(
         self,
     ) -> None:
@@ -3909,6 +4546,13 @@ api_key_env = "FIXTURE_KEY"
                     ).fetchone()
                     relay_count_connection.close()
                     self.assertEqual(relay_count, ("ready", 1))
+                    self.assertIsNone(
+                        await application.store.get_task_dag_recovery_claim(
+                            context["dag_id"],
+                            "b",
+                            before_b.generation,
+                        )
+                    )
 
                     classified_dag = await dag_service.get_task_dag(
                         RunTaskDagRequest(context["dag_id"]),
@@ -3925,6 +4569,13 @@ api_key_env = "FIXTURE_KEY"
                     self.assertEqual(
                         invocation_marker.read_text(encoding="utf-8").splitlines(),
                         ["model_invocation"],
+                    )
+                    self.assertIsNone(
+                        await application.store.get_task_dag_recovery_claim(
+                            context["dag_id"],
+                            "b",
+                            before_b.generation,
+                        )
                     )
 
                     reconciled = await dag_service.reconcile_task_dag(
@@ -4351,7 +5002,7 @@ api_key_env = "FIXTURE_KEY"
             assert leases[0].baseline_checkpoint_id is not None
             self.assertIsNotNone(await checkpoints.get(leases[0].baseline_checkpoint_id))
 
-    async def test_populated_schema_16_migrates_to_20_without_losing_worker_identity(self) -> None:
+    async def test_populated_schema_16_migrates_to_21_without_losing_worker_identity(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (
@@ -4387,7 +5038,7 @@ api_key_env = "FIXTURE_KEY"
                 "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'parent_context_relays'"
             ).fetchone()
             connection.close()
-            self.assertEqual(version, (20,))
+            self.assertEqual(version, (21,))
             self.assertEqual(table, (1,))
             self.assertEqual(
                 (await migrated.list_writable_subagent_leases(parent_session_id=parent_session_id))[
@@ -4402,7 +5053,7 @@ api_key_env = "FIXTURE_KEY"
             self.assertIsNotNone(await migrated.get_session(parent_session_id))
             self.assertIsNotNone(await migrated.get_session(result.child_session_id))
 
-    async def test_schema_17_to_20_keeps_populated_parent_relay(self) -> None:
+    async def test_schema_17_to_21_keeps_populated_parent_relay(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (
@@ -4446,7 +5097,7 @@ api_key_env = "FIXTURE_KEY"
                 "AND name IN ('task_dags', 'task_dag_nodes')"
             ).fetchone()
             connection.close()
-            self.assertEqual(version, (20,))
+            self.assertEqual(version, (21,))
             self.assertEqual(task_dag_tables, (2,))
 
     async def test_process_death_after_relay_publication_preserves_exact_worker_snapshot(
@@ -5305,7 +5956,7 @@ extensions = [".py", ".txt"]
             self.assertEqual(leases[0].error_kind, "RuntimeError")
             self.assertIsNotNone(await store.get_parent_context_relay_for_lease(leases[0].lease_id))
 
-    async def test_populated_schema_15_lease_migrates_through_schema_20_and_keeps_cas(self) -> None:
+    async def test_populated_schema_15_lease_migrates_through_schema_21_and_keeps_cas(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (
@@ -5338,7 +5989,7 @@ extensions = [".py", ".txt"]
                 connection.execute(
                     "SELECT version FROM schema_meta WHERE singleton = 1"
                 ).fetchone(),
-                (20,),
+                (21,),
             )
             foreign_keys = connection.execute(
                 "PRAGMA foreign_key_list(writable_subagent_leases)"

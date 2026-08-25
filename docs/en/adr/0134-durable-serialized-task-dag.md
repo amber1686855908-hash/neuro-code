@@ -63,10 +63,12 @@ node requires exact lease and Relay evidence; missing or inconsistent success
 correlation is `INDETERMINATE`.
 
 ADR 0136 adds the bounded predecessor-result relay without changing this
-execution authority. After a dependent node's exact `RUNNING` generation is
-claimed and before its child runtime starts, the DAG service publishes an
-insert-only schema-20 projection containing only completed direct
-predecessors, in declaration order. The projection is redacted and bounded to
+execution authority. Session schema 21 retains the schema-20 relay and adds
+the separate `task_dag_recovery_claims` ownership fence. After a dependent
+node's exact `RUNNING` generation is claimed and before its child runtime
+starts, the DAG service publishes an insert-only schema-20 projection
+containing only completed direct predecessors, in declaration order. The
+projection is redacted and bounded to
 4 KiB per result, 16 KiB of source result text, and 24 KiB rendered context;
 it is bound to predecessor worker/lease/workspace/checkpoint/Parent Relay
 identity and cannot carry authority. The relay is a separate context channel,
@@ -93,12 +95,25 @@ missing reachable progress is `INDETERMINATE`.
 
 ## Crash and recovery
 
-Reconciliation first runs the existing Writable reconciliation, then looks up
-the exact parent session/task and exact lease for the active node. A completed,
-failed, or cancelled `SessionTask` maps to the same DAG node meaning. Missing
-task/lease evidence, an orphaned or uncertain lease, or an invalid correlation
-maps to `INDETERMINATE`. No worker is automatically rerun and no workspace is
+Reconciliation first looks up the exact parent session/task and exact lease for
+the active node. For a dependent node with no task and no lease, it then
+read-loads the exact predecessor-result relay and recovery claim. A live or
+unproven claim owner is classified as `RECOVERY_OWNED`; reconciliation does not
+start Writable or mutate the DAG. Only a later execution step may insert the
+exact durable recovery claim, and only its winner may begin Writable. A
+completed, failed, or cancelled `SessionTask` maps to the same DAG node
+meaning. Missing task/lease evidence without an exact safe recovery boundary,
+an orphaned or uncertain lease, or an invalid correlation maps to
+`INDETERMINATE`. No worker is automatically rerun and no workspace is
 deleted, rolled back, merged, copied back, or cleaned up.
+
+The recovery claim binds the parent session, DAG/node definition fingerprints,
+exact node generation, parent task, and relay ID plus source/content/integrity
+fingerprints. Its unique execution key is independent of node generation
+updates. A live owner is never stolen. If the owner is proven dead before the
+first Writable lease insert, a fresh controller takes over the same claim by
+version CAS; after lease ownership begins, existing Writable reconciliation
+remains fail-closed and no automatic rerun is permitted.
 
 Cancellation durably finishes the active node and marks remaining pending or
 ready nodes cancelled before re-raising cancellation. A process that exits
@@ -128,9 +143,11 @@ direct predecessor-result relay is specified separately by [ADR 0136](0136-bound
 
 ## Validation boundary
 
-Acceptance requires domain bound/cycle tests, schema 17-to-20 migration with
+Acceptance requires domain bound/cycle tests, schema 17-to-21 migration with
 populated Parent Relay preservation, insert-only and stale-generation tests,
-cross-process claim and two-scheduler race evidence, deterministic serialized
+durable recovery-claim CAS and schema-20-to-21 migration, cross-process claim
+and two-scheduler race evidence, real live-owner partial-window and
+dead-owner-before-lease takeover evidence, deterministic serialized
 diamond failure propagation, exact worker correlation, completed/failed/
 cancelled/uncertain recovery, real `multiprocessing.spawn` process death after
 worker completion and during active ownership, no-rerun allocation counts,

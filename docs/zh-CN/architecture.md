@@ -1672,8 +1672,9 @@ Writable workflow 现在只从实际 parent `ConversationBinding` 所绑定 sess
 保留 reasoning 与保留 backend-call 的结构都会排除；assistant 可见正文可与
 `reasoning_content` 明确分离，后者绝不进入 Relay。
 
-Session schema 20 保留 schema 17 的每个 writable lease 一条一对一、insert-only READY Relay，
-以及下述持久化 Task DAG 表和 schema 20 的 predecessor-result Relay 表，并保留后文的持久化
+Session schema 21 保留 schema 17 的每个 writable lease 一条一对一、insert-only READY Relay，
+以及下述持久化 Task DAG 表、schema 20 的 predecessor-result Relay 表和 schema 21 的 Task DAG
+recovery-claim fence，并保留后文的持久化
 Leader attempt/decision 投影。其 identity
 绑定 parent/task/child、lease、worktree、baseline checkpoint、base commit、
 capability/grant fingerprint 与 child-task digest。加载时校验 source、content 和完整记录
@@ -1705,11 +1706,11 @@ DAG service 只从真实的 `ConversationBinding` 推导 parent session。每个
 active-node claim 是跨进程串行闸门：两个 scheduler 不能同时执行不同的 ready 节点，DAG 也不会
 使用 `SubagentScheduler.run_many()` 或对节点进行无界 gather。
 
-Session schema 20 在 `task_dags` 与 `task_dag_nodes` 中保存不可变 DAG 定义和有界节点运行投影，
-并在 `task_dag_dependency_relays` 中保存 insert-only 的 predecessor-result Relay。定义和 Relay
-发布都是 insert-only；graph 与 node 生命周期更新使用 generation CAS。成功节点记录精确的 worker
-task、child session、writable lease、worktree、baseline checkpoint、Parent Relay 和有界结果投影。
-缺失或不一致的成功关联不会被当作成功。
+Session schema 21 在 `task_dags` 与 `task_dag_nodes` 中保存不可变 DAG 定义和有界节点运行投影，
+并在 `task_dag_dependency_relays` 中保存 insert-only 的 predecessor-result Relay，同时在独立的
+`task_dag_recovery_claims` 中保存跨进程 ownership fence。定义和 Relay 发布都是 insert-only；graph
+与 node 生命周期更新使用 generation CAS。成功节点记录精确的 worker task、child session、writable lease、
+worktree、baseline checkpoint、Parent Relay 和有界结果投影。缺失或不一致的成功关联不会被当作成功。
 
 三条编排 context channel 保持分离。Parent Context Relay 把有界 parent-session snapshot 带入一个
 child；DAG predecessor-result Relay 只把已完成的直接前置节点 projection 带入 dependent worker；
@@ -1727,12 +1728,16 @@ workspace bytes、capability grant、path 或 authority instruction。缺失、�
 阻塞的后代进入 `SKIPPED`。失败或取消的依赖只阻塞其后代，独立分支继续执行。重启 reconciliation
 按精确 parent task 与 lease 查询：worker 已完成/失败/取消时映射为 DAG 相同的终态；证据缺失、
 orphan 或不确定时映射为 `INDETERMINATE`。Restart reconciliation 不启动 worker，并把 active node
-分类为 `ACTIVE_WORKER`、`SAFE_NOT_STARTED` 或 `INDETERMINATE`。`SAFE_NOT_STARTED` 要求精确 active
+分类为 `ACTIVE_WORKER`、`SAFE_NOT_STARTED`、`RECOVERY_OWNED` 或 `INDETERMINATE`。`SAFE_NOT_STARTED` 要求精确 active
 `RUNNING` node 与 `parent_task_id`、按 DAG/target/generation 读取的同一 READY Relay、精确的
 definition/direct dependency/fingerprint，以及对应 `SessionTask`、writable lease 与 subagent link
-均不存在。Writable 第一个 durable side-effecting allocation 是插入 lease；此前的 repository identity
-检查是只读的。后续 DAG step 复用同一个 Relay 与 parent task identity，不产生新的 generation 或 publication。
-任何部分 ownership evidence、Relay 缺失或不确定状态仍为 `INDETERMINATE`，永不自动 rerun。worker 已
+均不存在且没有 live recovery owner。后续 DAG step 先取得精确 durable claim，只有 winner 可以调用 Writable。
+`RECOVERY_OWNED` 是 live 或未被证明死亡的 claim owner 的只读分类，也覆盖 lease 已存在但 `SessionTask` 尚未
+出现的 partial window。Loser 不进行 provider/resource allocation，也不写 `FAILED` 或 `INDETERMINATE`。
+Writable 第一个 durable side-effecting allocation 是插入 lease；此前的 repository identity 检查是只读的。
+若 owner 在第一次 lease insert 前被证明死亡，可用 version CAS 在同一 generation、parent task 与 Relay identity
+上 takeover；lease ownership 开始后，既有 Writable reconciliation 保持 fail-closed，永不自动 rerun worker。
+Relay 缺失、identity 过期或其他不确定状态仍为 `INDETERMINATE`，永不自动 rerun。worker 已
 完成/失败/取消时映射为 DAG 相同的终态。不增加自动 retry、崩溃重跑、merge、copy-back、rollback、cleanup、
 parallel 或 dynamic dataflow execution、UI、Swarm 或 Ultracode 行为；上文所述有界直接 predecessor-result
 Relay 是本切片唯一的 dataflow 行为，不传递 authority 或 workspace state；有界 Leader controller 由 ADR
@@ -1755,7 +1760,7 @@ node definition 与 durable outcome metadata，并对 preview 脱敏、带 finge
 transcript/reasoning/tool argument/output、Relay payload、workspace bytes、checkpoint bytes、Git
 diff、secret 或 arbitrary path。
 
-当前 Session Store schema 20 保留 schema 19 新增的 `leader_attempts` 与 `leader_decisions` 投影。Attempt 绑定精确 DAG
+当前 Session Store schema 21 保留 schema 19 新增的 `leader_attempts` 与 `leader_decisions` 投影。Attempt 绑定精确 DAG
 generation、definition/evidence/objective fingerprint、Leader session、controller owner、turn
 identity 与 durable lifecycle。SQLite write transaction 和 CAS-like state transition 保证同一精确
 snapshot 只有一个 controller 拥有 model request。Controller 必须在 provider call 紧邻之前，使用

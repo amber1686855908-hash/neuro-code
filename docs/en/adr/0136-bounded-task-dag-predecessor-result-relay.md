@@ -61,12 +61,21 @@ never parsed as an authority source.
 
 ## Durable identity, races, and failure
 
-Session schema 20 adds `task_dag_dependency_relays`. A row binds the exact DAG
-definition, target node definition and generation, direct dependency IDs,
-entry fingerprints, source/content fingerprints, byte count, and integrity
-fingerprint. The target-generation uniqueness key makes an exact duplicate
-publication idempotent. A duplicate with different content or identity is
-rejected; direct database tampering fails integrity validation on reload.
+Session schema 20 adds `task_dag_dependency_relays`; schema 21 adds the
+separate `task_dag_recovery_claims` ownership fence. A relay row binds the
+exact DAG definition, target node definition and generation, direct dependency
+IDs, entry fingerprints, source/content fingerprints, byte count, and
+integrity fingerprint. The target-generation uniqueness key makes an exact
+duplicate publication idempotent. A duplicate with different content or
+identity is rejected; direct database tampering fails integrity validation on
+reload.
+
+The recovery claim is not a node-generation lock and does not reuse Leader
+attempts. Its immutable execution identity binds the parent session, DAG and
+node definition fingerprints, exact node generation, parent task ID, and relay
+ID plus source/content/integrity fingerprints. Its owner PID/token is the only
+mutable part and changes only by exact version CAS. The unique
+`(dag_id, node_id, node_generation)` key is the durable cross-process fence.
 
 The store uses the existing SQLite transaction boundary and reloads the
 published row before commit. A concurrent scheduler cannot publish a
@@ -76,26 +85,42 @@ already-claimed active node without starting a worker:
 - `ACTIVE_WORKER` means exact non-terminal `SessionTask` and writable lease
   ownership evidence exists; existing Writable reconciliation remains the
   recovery owner.
+- `RECOVERY_OWNED` means an exact recovery claim is held by a live or
+  unproven owner. Reconciliation is read-only in this state: it does not start
+  Writable, steal the claim, fail the node, or mark it `INDETERMINATE`.
 - `SAFE_NOT_STARTED` is allowed only when the exact `RUNNING` node and
   `parent_task_id` are durable, the existing relay is loaded by
   `(dag_id, target_node_id, target_generation)` and passes READY, definition,
   direct-dependency, and fingerprint checks, and both the matching
-  `SessionTask` and writable lease (and subagent link) are absent. The
-  read-only reconciliation path only classifies this state. A later DAG step
-  reuses the same relay and `parent_task_id`; it does not create a new
-  generation, task identity, or relay.
+  `SessionTask` and writable lease (and subagent link) are absent, with no
+  live recovery owner. The read-only reconciliation path only classifies this
+  state. A later DAG step first acquires the exact durable recovery claim and
+  only its winner may call Writable. A live loser returns the canonical active
+  state without provider, resource, lease, task, or node-terminal side effects.
 - `INDETERMINATE` covers an absent or unverifiable relay, partial evidence, a
   link or other worker ownership evidence, stale identity, or any uncertain
-  state. It never auto-reruns a possibly-started worker.
+  state. It never auto-reruns a possibly-started worker. A lease-only partial
+  window is not `INDETERMINATE` while the exact recovery owner is live or
+  unproven.
+
+If the recovery owner dies before the first Writable lease insert, a fresh
+controller may prove that owner dead and take over the same claim by version
+CAS, preserving the same node generation, parent task, and relay identity. If
+the lease insert has begun, recovery never automatically reruns the worker;
+the existing Writable reconciliation decides whether the evidence is
+reconcilable or must remain fail-closed.
 
 This boundary follows the production Writable ordering: repository identity
 inspection is read-only; the first durable side-effecting allocation is the
 lease insert, followed by `SessionTask`, worktree, checkpoint, child session,
 subagent link, Parent Relay, runtime creation, and model execution. Therefore
 the exact active-node plus READY-relay plus absent-task-and-lease state proves
-that this Writable allocation phase was never entered. A real `spawn` and
-`os._exit(73)` acceptance test covers that continuation, while a crash after
-ownership evidence remains fail-closed and is not replayed.
+that this Writable allocation phase was never entered. The durable recovery
+claim closes the cross-process interval between that proof and the first lease
+insert. Real `spawn` acceptance covers two controllers racing from the same
+pre-claim snapshot, a live-owner partial lease window, and a dead-owner-before-
+lease takeover; a crash after ownership evidence remains fail-closed and is
+not replayed.
 
 If target generation, predecessor state, lease, Parent Relay, workspace/checkpoint
 evidence, or any identity is missing, stale, uncertain, or mismatched, the
@@ -120,9 +145,12 @@ synthetic-message replacement, schema migration and row integrity, exact
 duplicate idempotency, conflicting publication rejection, direct-dependency
 selection, declaration ordering, dependency-chain behavior, failed or
 uncertain evidence fail-closed behavior, the read-only recovery classification,
-real safe-not-started process death and exact-once continuation, ambiguous
-ownership process death without rerun, and injection through the existing
-Writable Subagent composition path. Existing Task DAG, Leader, Writable
+durable recovery-claim insert/CAS and schema-20-to-21 migration, real
+safe-not-started process death and exact-once continuation, two-controller
+cross-process ownership and partial-window behavior, dead-owner-before-lease
+takeover, ambiguous post-allocation ownership process death without rerun, and
+injection through the existing Writable Subagent composition path. Existing
+Task DAG, Leader, Writable
 Subagent, Parent Relay, Worktree, Checkpoint, worker-scoped LSP, crash
 recovery, and full repository gates remain required. The slice is not a claim
 of parallel/dataflow scheduling or live paid-provider acceptance.

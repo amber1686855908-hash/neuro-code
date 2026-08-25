@@ -49,6 +49,7 @@ from neuro_code.application.ports.sandbox import LocalProcessSandbox
 from neuro_code.application.ports.skills import SkillDiscovery
 from neuro_code.application.ports.storage import SessionStore
 from neuro_code.application.ports.task_dag import TaskDagError, TaskDagStore
+from neuro_code.application.ports.task_dag_recovery import TaskDagRecoveryClaimStore
 from neuro_code.application.ports.task_dag_result_relay import (
     TaskDagDependencyResultRelayError,
     TaskDagDependencyResultRelayStore,
@@ -1251,6 +1252,7 @@ class ApplicationComposition:
             cast(ParentContextRelayStore, self.store),
             parent_binding=parent_binding,
             dependency_relay_store=cast(TaskDagDependencyResultRelayStore, self.store),
+            recovery_claim_store=cast(TaskDagRecoveryClaimStore, self.store),
             redaction_values=self.config.redaction_values(),
         )
 

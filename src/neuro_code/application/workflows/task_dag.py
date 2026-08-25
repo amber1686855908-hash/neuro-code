@@ -3,20 +3,26 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import TYPE_CHECKING, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Protocol, cast, runtime_checkable
 
 from neuro_code.application.ports.parent_context_relay import ParentContextRelayStore
 from neuro_code.application.ports.task_dag import TaskDagError, TaskDagStore
+from neuro_code.application.ports.task_dag_recovery import (
+    TaskDagRecoveryClaimError,
+    TaskDagRecoveryClaimStore,
+)
 from neuro_code.application.ports.task_dag_result_relay import (
     TaskDagDependencyResultRelayStore,
 )
 from neuro_code.application.ports.writable_subagent import WritableSubagentLeaseStore
 from neuro_code.application.runtime.agent import EventSink
+from neuro_code.application.runtime.process_liveness import owner_is_alive
 from neuro_code.application.workflows.task_dag_result_relay import (
     TaskDagDependencyResultRelayApplicationService,
 )
@@ -34,6 +40,8 @@ from neuro_code.domain.task_dag import (
     TaskDagNodeState,
     TaskDagState,
 )
+from neuro_code.domain.task_dag_recovery import TaskDagRecoveryClaim
+from neuro_code.domain.task_dag_result_relay import TaskDagDependencyResultRelay
 from neuro_code.domain.writable_subagent import WritableSubagentWorkspaceState
 from neuro_code.shared.errors import ConfigurationError
 
@@ -106,6 +114,7 @@ class TaskDagActiveNodeRecovery(StrEnum):
     """Read-only classification of an already-claimed active DAG node."""
 
     ACTIVE_WORKER = "active_worker"
+    RECOVERY_OWNED = "recovery_owned"
     SAFE_NOT_STARTED = "safe_not_started"
     INDETERMINATE = "indeterminate"
 
@@ -143,6 +152,7 @@ class TaskDagApplicationService:
         *,
         parent_binding: ConversationBinding,
         dependency_relay_store: TaskDagDependencyResultRelayStore | None = None,
+        recovery_claim_store: TaskDagRecoveryClaimStore | None = None,
         redaction_values: tuple[str, ...] = (),
         clock: Callable[[], datetime] = _now,
     ) -> None:
@@ -166,6 +176,18 @@ class TaskDagApplicationService:
         self._relay_store = relay_store
         self._parent_binding = parent_binding
         self._parent_session_id = parent_session_id
+        if recovery_claim_store is None and all(
+            callable(getattr(dag_store, method, None))
+            for method in (
+                "get_task_dag_recovery_claim",
+                "insert_task_dag_recovery_claim",
+                "compare_and_takeover_task_dag_recovery_claim",
+            )
+        ):
+            recovery_claim_store = cast(TaskDagRecoveryClaimStore, dag_store)
+        self._recovery_claim_store = recovery_claim_store
+        self._recovery_owner_pid = os.getpid()
+        self._recovery_owner_token = f"dag-recovery-owner-{uuid.uuid4().hex}"
         self._clock = clock
         self._dependency_relay_service = (
             TaskDagDependencyResultRelayApplicationService(
@@ -254,6 +276,8 @@ class TaskDagApplicationService:
                             "safe-not-started DAG node lost its persisted worker identity"
                         ),
                     )
+                if not await self._acquire_recovery_ownership(dag, node):
+                    return await self._load_required(dag.dag_id)
                 return await self._execute_claimed_node(
                     dag=dag,
                     claimed=dag,
@@ -436,6 +460,167 @@ class TaskDagApplicationService:
             )
         return await self._load_required(dag.dag_id)
 
+    async def _acquire_recovery_ownership(
+        self,
+        dag: TaskDag,
+        node: TaskDagNode,
+    ) -> bool:
+        """Fence concurrent SAFE_NOT_STARTED controllers before Writable.
+
+        The method deliberately owns no DAG generation.  The durable claim is
+        a separate exact-identity row, and a dead owner may be replaced only
+        through its versioned CAS.  A live or unproven owner is observed and
+        yields the canonical current DAG without allocating a worker.
+        """
+
+        if self._recovery_claim_store is None or self._dependency_relay_service is None:
+            await self._finish_worker_node(
+                dag,
+                node,
+                TaskDagNodeState.INDETERMINATE,
+                error=RuntimeError("safe-not-started DAG recovery ownership is unavailable"),
+            )
+            return False
+        for _ in range(4):
+            current = await self._load_required(dag.dag_id)
+            if current.active_node_id != node.node_id:
+                return False
+            current_node = current.node(node.node_id)
+            if (
+                current_node.state is not TaskDagNodeState.RUNNING
+                or current_node.generation != node.generation
+                or current_node.parent_task_id != node.parent_task_id
+            ):
+                return False
+            task = await self._store.get_session_task(
+                self._parent_session_id,
+                node.parent_task_id or "",
+            )
+            lease = await self._lease_store.get_writable_subagent_lease_for_parent_task(
+                self._parent_session_id,
+                node.parent_task_id or "",
+            )
+            link = await self._store.load_subagent_link(
+                self._parent_session_id,
+                node.parent_task_id or "",
+            )
+            if task is not None or lease is not None or link is not None:
+                return False
+            relay = await self._dependency_relay_service.load_existing_for_target(
+                current,
+                current_node,
+            )
+            if relay is None:
+                await self._finish_worker_node(
+                    current,
+                    current_node,
+                    TaskDagNodeState.INDETERMINATE,
+                    error=RuntimeError("safe-not-started DAG node has no exact dependency relay"),
+                )
+                return False
+            proposed = self._new_recovery_claim(current, current_node, relay)
+            try:
+                result = await self._recovery_claim_store.insert_task_dag_recovery_claim(proposed)
+            except TaskDagRecoveryClaimError as error:
+                if error.kind == "concurrent_modification":
+                    continue
+                raise ConfigurationError(f"DAG recovery ownership failed: {error}") from error
+            if result.acquired:
+                return await self._revalidate_recovery_state(current, current_node, relay)
+            existing = result.claim
+            if not existing.same_execution(proposed):
+                await self._finish_worker_node(
+                    current,
+                    current_node,
+                    TaskDagNodeState.INDETERMINATE,
+                    error=RuntimeError("DAG recovery claim identity is inconsistent"),
+                )
+                return False
+            if owner_is_alive(existing.owner_pid):
+                return False
+            takeover = existing.with_owner(
+                owner_pid=self._recovery_owner_pid,
+                owner_token=self._recovery_owner_token,
+                version=existing.version + 1,
+                updated_at=self._clock().astimezone(UTC),
+            )
+            try:
+                await self._recovery_claim_store.compare_and_takeover_task_dag_recovery_claim(
+                    takeover,
+                    expected_version=existing.version,
+                    expected_owner_pid=existing.owner_pid,
+                    expected_owner_token=existing.owner_token,
+                )
+            except TaskDagRecoveryClaimError as error:
+                if error.kind == "concurrent_modification":
+                    continue
+                raise ConfigurationError(f"DAG recovery takeover failed: {error}") from error
+            return await self._revalidate_recovery_state(current, current_node, relay)
+        return False
+
+    def _new_recovery_claim(
+        self,
+        dag: TaskDag,
+        node: TaskDagNode,
+        relay: object,
+    ) -> TaskDagRecoveryClaim:
+        if not isinstance(relay, TaskDagDependencyResultRelay):
+            raise ConfigurationError("DAG recovery dependency relay is invalid")
+        return TaskDagRecoveryClaim.create(
+            parent_session_id=self._parent_session_id,
+            dag_id=dag.dag_id,
+            dag_definition_fingerprint=dag.definition_fingerprint,
+            node_id=node.node_id,
+            node_generation=node.generation,
+            node_definition_fingerprint=node.definition_fingerprint,
+            parent_task_id=node.parent_task_id or "",
+            dependency_relay_id=relay.relay_id,
+            dependency_relay_source_fingerprint=relay.source_fingerprint,
+            dependency_relay_content_fingerprint=relay.content_fingerprint,
+            dependency_relay_integrity_fingerprint=relay.integrity_fingerprint,
+            owner_pid=self._recovery_owner_pid,
+            owner_token=self._recovery_owner_token,
+            created_at=self._clock().astimezone(UTC),
+        )
+
+    async def _revalidate_recovery_state(
+        self,
+        dag: TaskDag,
+        node: TaskDagNode,
+        relay: TaskDagDependencyResultRelay,
+    ) -> bool:
+        """Reconfirm the exact no-allocation state after claiming the fence."""
+
+        current = await self._load_required(dag.dag_id)
+        if (
+            current.active_node_id != node.node_id
+            or current.node(node.node_id).generation != node.generation
+        ):
+            return False
+        task = await self._store.get_session_task(
+            self._parent_session_id,
+            node.parent_task_id or "",
+        )
+        lease = await self._lease_store.get_writable_subagent_lease_for_parent_task(
+            self._parent_session_id,
+            node.parent_task_id or "",
+        )
+        link = await self._store.load_subagent_link(
+            self._parent_session_id,
+            node.parent_task_id or "",
+        )
+        if task is not None or lease is not None or link is not None:
+            return False
+        exact_relay = (
+            await self._dependency_relay_service.load_existing_for_target(
+                current,
+                current.node(node.node_id),
+            )
+            if self._dependency_relay_service is not None
+            else None
+        )
+        return exact_relay == relay
+
     async def reconcile_task_dag(self, request: RunTaskDagRequest) -> TaskDag:
         """Reconcile durable evidence without starting any worker."""
 
@@ -577,6 +762,32 @@ class TaskDagApplicationService:
         reconciled, _ = await self._reconcile_active_node_with_classification(dag)
         return reconciled
 
+    async def _load_matching_recovery_claim(
+        self,
+        dag: TaskDag,
+        node: TaskDagNode,
+    ) -> TaskDagRecoveryClaim | None:
+        if (
+            self._recovery_claim_store is None
+            or self._dependency_relay_service is None
+            or not node.dependencies
+        ):
+            return None
+        relay = await self._dependency_relay_service.load_existing_for_target(dag, node)
+        if relay is None:
+            return None
+        claim = await self._recovery_claim_store.get_task_dag_recovery_claim(
+            dag.dag_id,
+            node.node_id,
+            node.generation,
+        )
+        if claim is None:
+            return None
+        expected = self._new_recovery_claim(dag, node, relay)
+        if not claim.same_execution(expected):
+            raise RuntimeError("DAG recovery claim identity is inconsistent")
+        return claim
+
     async def _reconcile_active_node_with_classification(
         self,
         dag: TaskDag,
@@ -594,35 +805,40 @@ class TaskDagApplicationService:
                 ),
                 TaskDagActiveNodeRecovery.INDETERMINATE,
             )
-        await self._writable_service.reconcile_writable_subagent_workspaces()
         task = await self._store.get_session_task(self._parent_session_id, node.parent_task_id)
         lease = await self._lease_store.get_writable_subagent_lease_for_parent_task(
             self._parent_session_id,
             node.parent_task_id,
         )
-        if task is None and lease is None:
-            recovery_error: BaseException | None = None
-            if node.dependencies and self._dependency_relay_service is not None:
-                try:
-                    existing_relay = await self._dependency_relay_service.load_existing_for_target(
-                        dag, node
+        recovery_error: BaseException | None = None
+        recovery_claim: TaskDagRecoveryClaim | None = None
+        if task is None and node.dependencies and self._dependency_relay_service is not None:
+            try:
+                existing_relay = await self._dependency_relay_service.load_existing_for_target(
+                    dag, node
+                )
+                if existing_relay is not None:
+                    link = await self._store.load_subagent_link(
+                        self._parent_session_id,
+                        node.parent_task_id,
                     )
-                    if existing_relay is not None:
-                        link = await self._store.load_subagent_link(
-                            self._parent_session_id,
-                            node.parent_task_id,
-                        )
-                        if link is None:
+                    if link is None:
+                        recovery_claim = await self._load_matching_recovery_claim(dag, node)
+                        if recovery_claim is not None and owner_is_alive(recovery_claim.owner_pid):
+                            return dag, TaskDagActiveNodeRecovery.RECOVERY_OWNED
+                        if lease is None:
                             return dag, TaskDagActiveNodeRecovery.SAFE_NOT_STARTED
+                    else:
                         recovery_error = RuntimeError(
                             "DAG worker link exists despite missing task and lease evidence"
                         )
-                except asyncio.CancelledError:
+            except asyncio.CancelledError:
+                raise
+            except BaseException as error:
+                if isinstance(error, (KeyboardInterrupt, SystemExit)):
                     raise
-                except BaseException as error:
-                    if isinstance(error, (KeyboardInterrupt, SystemExit)):
-                        raise
-                    recovery_error = error
+                recovery_error = error
+        if task is None and lease is None:
             return (
                 await self._finish_worker_node(
                     dag,
@@ -636,6 +852,19 @@ class TaskDagApplicationService:
                 ),
                 TaskDagActiveNodeRecovery.INDETERMINATE,
             )
+        if (
+            task is None
+            and lease is not None
+            and recovery_claim is not None
+            and owner_is_alive(recovery_claim.owner_pid)
+        ):
+            return dag, TaskDagActiveNodeRecovery.RECOVERY_OWNED
+        await self._writable_service.reconcile_writable_subagent_workspaces()
+        task = await self._store.get_session_task(self._parent_session_id, node.parent_task_id)
+        lease = await self._lease_store.get_writable_subagent_lease_for_parent_task(
+            self._parent_session_id,
+            node.parent_task_id,
+        )
         if task is None or lease is None:
             return (
                 await self._finish_worker_node(

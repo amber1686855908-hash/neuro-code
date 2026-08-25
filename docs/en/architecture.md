@@ -1726,9 +1726,10 @@ tool-role, synthetic, tool-call-bearing, media-bearing, preserved reasoning,
 and preserved backend-call structures are excluded; assistant visible prose is
 separable from and never carries its `reasoning_content`.
 
-Session schema 20 retains the schema-17 one-to-one insert-only READY relay per
-writable lease, the durable Task DAG tables described below, and the
-schema-20 predecessor-result relay table; it also retains the durable Leader
+Session schema 21 retains the schema-17 one-to-one insert-only READY relay per
+writable lease, the durable Task DAG tables described below, the schema-20
+predecessor-result relay table, and the schema-21 Task DAG recovery-claim
+fence; it also retains the durable Leader
 attempt/decision projections described after the DAG. Its
 identity binds the parent/task/child, lease, worktree, baseline checkpoint,
 base commit, capability/grant fingerprints, and child-task digest. Source,
@@ -1772,9 +1773,10 @@ application atomically claims the node with node-generation CAS plus a graph
 two schedulers cannot execute different ready nodes at once, and the DAG
 never uses `SubagentScheduler.run_many()` or an unbounded gather over nodes.
 
-Session schema 20 stores immutable DAG definitions and bounded node runtime
+Session schema 21 stores immutable DAG definitions and bounded node runtime
 projections in `task_dags` and `task_dag_nodes`, plus insert-only
-`task_dag_dependency_relays`. Definitions and relay publications are
+`task_dag_dependency_relays` and the separate `task_dag_recovery_claims`
+cross-process ownership fence. Definitions and relay publications are
 insert-only; graph and node lifecycle updates use generation CAS. A successful
 node records the exact worker task, child session, writable lease, worktree,
 baseline checkpoint, Parent Relay, and bounded result projection. A missing or
@@ -1802,15 +1804,22 @@ The lifecycle is `PENDING -> READY -> RUNNING -> COMPLETED/FAILED/CANCELLED/
 INDETERMINATE`; dependency-blocked descendants become `SKIPPED`. A failed or
 cancelled dependency blocks only its descendants while independent branches
 continue. Restart reconciliation is non-worker-starting and classifies an
-active node as `ACTIVE_WORKER`, `SAFE_NOT_STARTED`, or `INDETERMINATE`.
+active node as `ACTIVE_WORKER`, `SAFE_NOT_STARTED`, `RECOVERY_OWNED`, or
+`INDETERMINATE`.
 `SAFE_NOT_STARTED` requires the exact active `RUNNING` node and `parent_task_id`,
 the same READY relay loaded by DAG/target/generation with exact definitions,
-direct dependencies, and fingerprints, and no matching `SessionTask`, writable
-lease, or subagent link. The first durable side-effecting Writable allocation
-is the lease insert; repository identity inspection before it is read-only.
-The next DAG step then reuses the same relay and parent task identity without a
-new generation or publication. Any partial ownership evidence, missing relay,
-or uncertainty remains `INDETERMINATE` and is never automatically rerun.
+direct dependencies, and fingerprints, no matching `SessionTask`, writable
+lease, or subagent link, and no live recovery owner. A later DAG step first
+acquires the exact durable claim; only the winner may call Writable.
+`RECOVERY_OWNED` is the read-only classification for a live or unproven claim
+owner, including the partial window where a lease exists but `SessionTask` does
+not. The loser performs no provider/resource allocation and does not write
+`FAILED` or `INDETERMINATE`. A dead owner proven before the first lease insert
+may be replaced by version CAS with the same generation, parent task, and relay
+identity. After lease ownership begins, existing Writable reconciliation is
+fail-closed and never automatically reruns the worker. Missing relay, stale
+identity, or other uncertainty remains `INDETERMINATE` and is never
+automatically rerun.
 Completed/failed/cancelled worker tasks map to the same DAG terminal meaning.
 No automatic retry, crash rerun, merge, copy-back, rollback, cleanup, parallel
 or dynamic dataflow execution, UI surface, Swarm, or Ultracode behavior is
@@ -1841,7 +1850,7 @@ previews and fingerprints; it never carries raw transcript/reasoning/tool
 arguments/output, Relay payloads, workspace bytes, checkpoint bytes, Git diffs,
 secrets, or arbitrary paths.
 
-The current Session Store schema 20 retains the schema-19 `leader_attempts` and
+The current Session Store schema 21 retains the schema-19 `leader_attempts` and
 `leader_decisions` projections. An attempt binds the exact DAG generation,
 definition/evidence/objective fingerprints, Leader session, controller owner,
 turn identity, and durable lifecycle. SQLite write transactions and CAS-like

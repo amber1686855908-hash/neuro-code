@@ -47,9 +47,10 @@ worker 启动前，service 原子地把一个 `READY` 节点改为 `RUNNING`，�
 baseline Checkpoint、Relay、fingerprint、changed-file count 和有界 response preview。成功节点
 必须有精确的 lease 与 Relay 证据；成功关联缺失或不一致时为 `INDETERMINATE`。
 
-ADR 0136 在不改变这一 execution authority 的前提下增加有界 predecessor-result Relay。在 dependent
-node 完成精确的 `RUNNING` generation claim 且 child runtime 启动之前，DAG service 发布一条 schema-20
-insert-only projection，只包含按声明顺序排列的 completed direct predecessor。Projection 经过脱敏，
+ADR 0136 在不改变这一 execution authority 的前提下增加有界 predecessor-result Relay。Session schema 21
+保留 schema-20 Relay，并增加独立的 `task_dag_recovery_claims` ownership fence。在 dependent node 完成
+精确的 `RUNNING` generation claim 且 child runtime 启动之前，DAG service 发布一条 schema-20 insert-only
+projection，只包含按声明顺序排列的 completed direct predecessor。Projection 经过脱敏，
 每个 result 最多 4 KiB、source result 合计最多 16 KiB、渲染 context 最多 24 KiB；它绑定 predecessor
 worker/lease/workspace/checkpoint/Parent Relay identity，不能携带 authority。Relay 是独立 context
 channel，不改变 dependency state machine。
@@ -73,10 +74,18 @@ PENDING/READY -> SKIPPED
 
 ## 崩溃与恢复
 
-Reconciliation 先运行既有 Writable reconciliation，再按 active node 精确查询 parent session/task
-与精确 lease。`SessionTask` 已完成、失败或取消时，映射为 DAG 节点相同语义。task/lease 证据
-缺失、lease 为 orphan/不确定，或关联无效时，映射为 `INDETERMINATE`。不会自动重跑 worker，也
-不会删除、rollback、merge、copy-back 或 cleanup workspace。
+Reconciliation 先按 active node 精确查询 parent session/task 与精确 lease。对于没有 task 和 lease 的
+dependent node，再只读加载精确 predecessor-result Relay 与 recovery claim。Live 或未被证明死亡的 claim
+owner 分类为 `RECOVERY_OWNED`；reconciliation 不启动 Writable，也不变更 DAG。只有后续 execution step
+可以插入精确 durable recovery claim，且只有 winner 可以开始 Writable。`SessionTask` 已完成、失败或取消时，
+映射为 DAG 节点相同语义。没有精确 safe recovery boundary 的 task/lease 证据缺失、lease 为 orphan/不确定，
+或关联无效时，映射为 `INDETERMINATE`。不会自动重跑 worker，也不会删除、rollback、merge、copy-back 或
+cleanup workspace。
+
+Recovery claim 绑定 parent session、DAG/node definition fingerprint、精确 node generation、parent task，
+以及 Relay ID 与 source/content/integrity fingerprint。它的 execution key 独立于 node generation 更新。Live
+owner 永不被抢占；如果 owner 在第一次 Writable lease insert 之前被证明死亡，fresh controller 通过 version
+CAS takeover 同一 claim；lease ownership 开始后继续由既有 Writable reconciliation fail-closed，不允许自动 rerun。
 
 取消时先持久化 active node 的终态，再将剩余 pending/ready 节点标记为 cancelled，最后重新抛出
 取消。如果进程在 worker 完成与 DAG node finish 之间退出，恢复会利用既有 worker durable evidence
@@ -99,8 +108,9 @@ predecessor-result Relay 由独立的 [ADR 0136](0136-bounded-task-dag-predecess
 
 ## 验证边界
 
-验收要求 domain bound/cycle 测试、带已填充 Parent Relay 的 schema 17→20 迁移、insert-only 与
-过期 generation 测试、跨进程 claim 和双 scheduler 竞态证据、确定性的串行 diamond 失败传播、
+验收要求 domain bound/cycle 测试、带已填充 Parent Relay 的 schema 17→21 迁移、insert-only 与
+过期 generation 测试、durable recovery-claim CAS 与 schema-20→21 migration、跨进程 claim 和双 scheduler
+竞态证据、live-owner partial-window 与 dead-owner-before-lease takeover 证据、确定性的串行 diamond 失败传播、
 精确 worker correlation、completed/failed/cancelled/uncertain 恢复、真实 `multiprocessing.spawn` 在
 worker 完成后及 active ownership 期间的进程死亡、无重跑 allocation count、真实 Relay-before-model、
 真实 Writable/LSP 回归、独立 managed Worktree、parent dirty state 不变、完整本地门禁以及 stacked PR

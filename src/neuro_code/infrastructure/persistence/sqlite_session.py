@@ -25,6 +25,10 @@ from typing import Any
 from neuro_code.application.ports.leader import LeaderAttemptClaim, LeaderStoreError
 from neuro_code.application.ports.parent_context_relay import ParentContextRelayError
 from neuro_code.application.ports.task_dag import TaskDagError
+from neuro_code.application.ports.task_dag_recovery import (
+    TaskDagRecoveryClaimError,
+    TaskDagRecoveryClaimResult,
+)
 from neuro_code.application.ports.task_dag_result_relay import (
     TaskDagDependencyResultRelayError,
 )
@@ -92,6 +96,7 @@ from neuro_code.domain.task_dag import (
     TaskDagNodeState,
     TaskDagState,
 )
+from neuro_code.domain.task_dag_recovery import TaskDagRecoveryClaim
 from neuro_code.domain.task_dag_result_relay import (
     TaskDagDependencyResultEntry,
     TaskDagDependencyResultRelay,
@@ -104,7 +109,7 @@ from neuro_code.domain.writable_subagent import (
 from neuro_code.shared.async_utils import run_blocking
 from neuro_code.shared.errors import SessionError
 
-SCHEMA_VERSION = 20
+SCHEMA_VERSION = 21
 _SEARCH_SNIPPET_LIMIT = 500
 _SQLITE_TIMEOUT_SECONDS = 30.0
 _SESSION_ALIAS_NAMESPACE_LIMIT = 64
@@ -280,6 +285,12 @@ class SqliteSessionStore:
                             "UPDATE schema_meta SET version = 20 WHERE singleton = 1"
                         )
                         version = (20,)
+                    if version is not None and version[0] == 20:
+                        _ensure_task_dag_recovery_claim_schema(connection)
+                        connection.execute(
+                            "UPDATE schema_meta SET version = 21 WHERE singleton = 1"
+                        )
+                        version = (21,)
                     if version is None or version[0] != SCHEMA_VERSION:
                         raise SessionError(
                             "unsupported session schema version: "
@@ -300,6 +311,7 @@ class SqliteSessionStore:
                     _ensure_task_dag_schema(connection)
                     _ensure_leader_schema(connection)
                     _ensure_task_dag_dependency_result_relay_schema(connection)
+                    _ensure_task_dag_recovery_claim_schema(connection)
                     _backfill_search_documents(connection, missing_only=True)
                     connection.commit()
                 except BaseException:
@@ -3117,6 +3129,210 @@ class SqliteSessionStore:
 
         return await run_blocking(load)
 
+    async def get_task_dag_recovery_claim(
+        self,
+        dag_id: str,
+        node_id: str,
+        node_generation: int,
+    ) -> TaskDagRecoveryClaim | None:
+        _validated_task_dag_identifier(dag_id)
+        _validated_task_dag_identifier(node_id)
+        if isinstance(node_generation, bool) or node_generation < 0:
+            raise ValueError("DAG recovery claim node generation is invalid")
+
+        def load() -> TaskDagRecoveryClaim | None:
+            try:
+                with closing(self._connect()) as connection:
+                    return _load_task_dag_recovery_claim_for_execution(
+                        connection,
+                        dag_id=dag_id,
+                        node_id=node_id,
+                        node_generation=node_generation,
+                    )
+            except (KeyError, TypeError, ValueError) as error:
+                raise TaskDagRecoveryClaimError(
+                    "DAG recovery claim integrity verification failed",
+                    kind="integrity",
+                ) from error
+            except sqlite3.Error as error:
+                raise TaskDagRecoveryClaimError("DAG recovery claim could not be loaded") from error
+
+        return await run_blocking(load)
+
+    async def insert_task_dag_recovery_claim(
+        self,
+        claim: TaskDagRecoveryClaim,
+    ) -> TaskDagRecoveryClaimResult:
+        if not isinstance(claim, TaskDagRecoveryClaim):
+            raise TypeError("DAG recovery claim must be canonical")
+
+        def insert() -> TaskDagRecoveryClaimResult:
+            connection = self._connect()
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                _verify_task_dag_recovery_claim_linkage(connection, claim)
+                current = _load_task_dag_recovery_claim_for_execution(
+                    connection,
+                    dag_id=claim.dag_id,
+                    node_id=claim.node_id,
+                    node_generation=claim.node_generation,
+                )
+                by_id = _load_task_dag_recovery_claim(connection, claim.claim_id)
+                if by_id is not None and not by_id.same_execution(claim):
+                    raise TaskDagRecoveryClaimError(
+                        "DAG recovery claim id is already bound to another execution",
+                        kind="protocol",
+                    )
+                if current is not None:
+                    if not current.same_execution(claim):
+                        raise TaskDagRecoveryClaimError(
+                            "DAG recovery execution identity conflicts with existing claim",
+                            kind="protocol",
+                        )
+                    connection.commit()
+                    return TaskDagRecoveryClaimResult(
+                        current,
+                        acquired=(
+                            current.owner_pid == claim.owner_pid
+                            and current.owner_token == claim.owner_token
+                        ),
+                    )
+                connection.execute(
+                    """
+                    INSERT INTO task_dag_recovery_claims(
+                        claim_id, parent_session_id, dag_id,
+                        dag_definition_fingerprint, node_id, node_generation,
+                        node_definition_fingerprint, parent_task_id,
+                        dependency_relay_id, dependency_relay_source_fingerprint,
+                        dependency_relay_content_fingerprint,
+                        dependency_relay_integrity_fingerprint, owner_pid,
+                        owner_token, version, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    _task_dag_recovery_claim_values(claim),
+                )
+                persisted = _load_task_dag_recovery_claim(connection, claim.claim_id)
+                if persisted is None or persisted != claim:
+                    raise TaskDagRecoveryClaimError(
+                        "DAG recovery claim was not durably verified",
+                        kind="integrity",
+                    )
+                connection.commit()
+                return TaskDagRecoveryClaimResult(persisted, acquired=True)
+            except TaskDagRecoveryClaimError:
+                connection.rollback()
+                raise
+            except (KeyError, TypeError, ValueError) as error:
+                connection.rollback()
+                raise TaskDagRecoveryClaimError(
+                    "DAG recovery claim integrity verification failed",
+                    kind="integrity",
+                ) from error
+            except sqlite3.IntegrityError as error:
+                connection.rollback()
+                raise TaskDagRecoveryClaimError(
+                    "DAG recovery claim conflicts with existing evidence",
+                    kind="concurrent_modification",
+                ) from error
+            except sqlite3.Error as error:
+                connection.rollback()
+                raise TaskDagRecoveryClaimError(
+                    "DAG recovery claim could not be persisted"
+                ) from error
+            finally:
+                connection.close()
+
+        async with self._write_lock:
+            return await run_blocking(insert)
+
+    async def compare_and_takeover_task_dag_recovery_claim(
+        self,
+        claim: TaskDagRecoveryClaim,
+        *,
+        expected_version: int,
+        expected_owner_pid: int,
+        expected_owner_token: str,
+    ) -> TaskDagRecoveryClaim:
+        if not isinstance(claim, TaskDagRecoveryClaim):
+            raise TypeError("DAG recovery claim must be canonical")
+        if isinstance(expected_version, bool) or expected_version < 0:
+            raise TypeError("DAG recovery claim expected version must be non-negative")
+        if isinstance(expected_owner_pid, bool) or expected_owner_pid <= 0:
+            raise TypeError("DAG recovery claim expected owner PID must be positive")
+        if not isinstance(expected_owner_token, str) or not expected_owner_token.strip():
+            raise TypeError("DAG recovery claim expected owner token is invalid")
+
+        def takeover() -> TaskDagRecoveryClaim:
+            connection = self._connect()
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                _verify_task_dag_recovery_claim_linkage(connection, claim)
+                current = _load_task_dag_recovery_claim(connection, claim.claim_id)
+                if current is None:
+                    raise TaskDagRecoveryClaimError(
+                        "DAG recovery claim is missing",
+                        kind="unmanaged",
+                    )
+                if (
+                    not current.same_execution(claim)
+                    or current.version != expected_version
+                    or current.owner_pid != expected_owner_pid
+                    or current.owner_token != expected_owner_token
+                    or claim.version != expected_version + 1
+                ):
+                    raise TaskDagRecoveryClaimError(
+                        "DAG recovery claim was changed by another controller",
+                        kind="concurrent_modification",
+                    )
+                cursor = connection.execute(
+                    """
+                    UPDATE task_dag_recovery_claims
+                    SET owner_pid = ?, owner_token = ?, version = ?, updated_at = ?
+                    WHERE claim_id = ? AND version = ? AND owner_pid = ?
+                      AND owner_token = ?
+                    """,
+                    (
+                        claim.owner_pid,
+                        claim.owner_token,
+                        claim.version,
+                        claim.updated_at.isoformat(),
+                        claim.claim_id,
+                        expected_version,
+                        expected_owner_pid,
+                        expected_owner_token,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise TaskDagRecoveryClaimError(
+                        "DAG recovery claim was changed by another controller",
+                        kind="concurrent_modification",
+                    )
+                persisted = _load_task_dag_recovery_claim(connection, claim.claim_id)
+                if persisted is None or persisted != claim:
+                    raise TaskDagRecoveryClaimError(
+                        "DAG recovery takeover was not durably verified",
+                        kind="integrity",
+                    )
+                connection.commit()
+                return persisted
+            except TaskDagRecoveryClaimError:
+                connection.rollback()
+                raise
+            except (KeyError, TypeError, ValueError) as error:
+                connection.rollback()
+                raise TaskDagRecoveryClaimError(
+                    "DAG recovery takeover integrity verification failed",
+                    kind="integrity",
+                ) from error
+            except sqlite3.Error as error:
+                connection.rollback()
+                raise TaskDagRecoveryClaimError("DAG recovery claim takeover failed") from error
+            finally:
+                connection.close()
+
+        async with self._write_lock:
+            return await run_blocking(takeover)
+
     async def insert_parent_context_relay(
         self,
         relay: ParentContextRelay,
@@ -4237,6 +4453,45 @@ def _ensure_task_dag_dependency_result_relay_schema(connection: sqlite3.Connecti
         """
         CREATE INDEX IF NOT EXISTS task_dag_dependency_relays_by_target
         ON task_dag_dependency_relays(dag_id, target_node_id, target_node_generation)
+        """
+    )
+
+
+def _ensure_task_dag_recovery_claim_schema(connection: sqlite3.Connection) -> None:
+    """Create the cross-process owner fence for safe-not-started DAG recovery."""
+
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS task_dag_recovery_claims (
+            claim_id TEXT PRIMARY KEY,
+            parent_session_id TEXT NOT NULL,
+            dag_id TEXT NOT NULL,
+            dag_definition_fingerprint TEXT NOT NULL,
+            node_id TEXT NOT NULL,
+            node_generation INTEGER NOT NULL CHECK (node_generation >= 0),
+            node_definition_fingerprint TEXT NOT NULL,
+            parent_task_id TEXT NOT NULL,
+            dependency_relay_id TEXT NOT NULL,
+            dependency_relay_source_fingerprint TEXT NOT NULL,
+            dependency_relay_content_fingerprint TEXT NOT NULL,
+            dependency_relay_integrity_fingerprint TEXT NOT NULL,
+            owner_pid INTEGER NOT NULL CHECK (owner_pid > 0),
+            owner_token TEXT NOT NULL,
+            version INTEGER NOT NULL CHECK (version >= 0),
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE (dag_id, node_id, node_generation),
+            FOREIGN KEY (parent_session_id) REFERENCES sessions(id) ON DELETE RESTRICT,
+            FOREIGN KEY (dag_id) REFERENCES task_dags(dag_id) ON DELETE RESTRICT,
+            FOREIGN KEY (dependency_relay_id)
+                REFERENCES task_dag_dependency_relays(relay_id) ON DELETE RESTRICT
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS task_dag_recovery_claims_by_execution
+        ON task_dag_recovery_claims(dag_id, node_id, node_generation)
         """
     )
 
@@ -5651,6 +5906,178 @@ def _task_dag_node_from_row(row: Sequence[object]) -> TaskDagNode:
     if node.prompt_fingerprint != str(prompt_fingerprint):
         raise ValueError("task DAG node prompt fingerprint is inconsistent")
     return node
+
+
+_TASK_DAG_RECOVERY_CLAIM_SELECT = """
+    SELECT claim_id, parent_session_id, dag_id, dag_definition_fingerprint,
+           node_id, node_generation, node_definition_fingerprint, parent_task_id,
+           dependency_relay_id, dependency_relay_source_fingerprint,
+           dependency_relay_content_fingerprint,
+           dependency_relay_integrity_fingerprint, owner_pid, owner_token,
+           version, created_at, updated_at
+    FROM task_dag_recovery_claims
+"""
+
+
+def _task_dag_recovery_claim_values(claim: TaskDagRecoveryClaim) -> tuple[object, ...]:
+    return (
+        claim.claim_id,
+        claim.parent_session_id,
+        claim.dag_id,
+        claim.dag_definition_fingerprint,
+        claim.node_id,
+        claim.node_generation,
+        claim.node_definition_fingerprint,
+        claim.parent_task_id,
+        claim.dependency_relay_id,
+        claim.dependency_relay_source_fingerprint,
+        claim.dependency_relay_content_fingerprint,
+        claim.dependency_relay_integrity_fingerprint,
+        claim.owner_pid,
+        claim.owner_token,
+        claim.version,
+        claim.created_at.astimezone(UTC).isoformat(),
+        claim.updated_at.astimezone(UTC).isoformat(),
+    )
+
+
+def _load_task_dag_recovery_claim(
+    connection: sqlite3.Connection,
+    claim_id: str,
+) -> TaskDagRecoveryClaim | None:
+    row = connection.execute(
+        _TASK_DAG_RECOVERY_CLAIM_SELECT + " WHERE claim_id = ?",
+        (claim_id,),
+    ).fetchone()
+    return _task_dag_recovery_claim_from_row(row) if row is not None else None
+
+
+def _load_task_dag_recovery_claim_for_execution(
+    connection: sqlite3.Connection,
+    *,
+    dag_id: str,
+    node_id: str,
+    node_generation: int,
+) -> TaskDagRecoveryClaim | None:
+    row = connection.execute(
+        _TASK_DAG_RECOVERY_CLAIM_SELECT
+        + " WHERE dag_id = ? AND node_id = ? AND node_generation = ?",
+        (dag_id, node_id, node_generation),
+    ).fetchone()
+    return _task_dag_recovery_claim_from_row(row) if row is not None else None
+
+
+def _task_dag_recovery_claim_from_row(row: Sequence[object]) -> TaskDagRecoveryClaim:
+    if len(row) != 17:
+        raise ValueError("DAG recovery claim record is malformed")
+    (
+        claim_id,
+        parent_session_id,
+        dag_id,
+        dag_definition_fingerprint,
+        node_id,
+        node_generation,
+        node_definition_fingerprint,
+        parent_task_id,
+        dependency_relay_id,
+        dependency_relay_source_fingerprint,
+        dependency_relay_content_fingerprint,
+        dependency_relay_integrity_fingerprint,
+        owner_pid,
+        owner_token,
+        version,
+        created_at,
+        updated_at,
+    ) = row
+    if (
+        isinstance(node_generation, bool)
+        or not isinstance(node_generation, int)
+        or isinstance(owner_pid, bool)
+        or not isinstance(owner_pid, int)
+        or isinstance(version, bool)
+        or not isinstance(version, int)
+    ):
+        raise ValueError("DAG recovery claim numeric fields are invalid")
+    return TaskDagRecoveryClaim(
+        claim_id=str(claim_id),
+        parent_session_id=str(parent_session_id),
+        dag_id=str(dag_id),
+        dag_definition_fingerprint=str(dag_definition_fingerprint),
+        node_id=str(node_id),
+        node_generation=node_generation,
+        node_definition_fingerprint=str(node_definition_fingerprint),
+        parent_task_id=str(parent_task_id),
+        dependency_relay_id=str(dependency_relay_id),
+        dependency_relay_source_fingerprint=str(dependency_relay_source_fingerprint),
+        dependency_relay_content_fingerprint=str(dependency_relay_content_fingerprint),
+        dependency_relay_integrity_fingerprint=str(dependency_relay_integrity_fingerprint),
+        owner_pid=owner_pid,
+        owner_token=str(owner_token),
+        version=version,
+        created_at=datetime.fromisoformat(str(created_at)),
+        updated_at=datetime.fromisoformat(str(updated_at)),
+    )
+
+
+def _verify_task_dag_recovery_claim_linkage(
+    connection: sqlite3.Connection,
+    claim: TaskDagRecoveryClaim,
+) -> None:
+    dag = _load_task_dag(connection, claim.dag_id)
+    if dag is None:
+        raise TaskDagRecoveryClaimError(
+            "DAG recovery claim DAG is missing",
+            kind="unmanaged",
+        )
+    if (
+        dag.parent_session_id != claim.parent_session_id
+        or dag.definition_fingerprint != claim.dag_definition_fingerprint
+    ):
+        raise TaskDagRecoveryClaimError(
+            "DAG recovery claim DAG identity does not match",
+            kind="protocol",
+        )
+    try:
+        node = dag.node(claim.node_id)
+    except KeyError as error:
+        raise TaskDagRecoveryClaimError(
+            "DAG recovery claim node is missing",
+            kind="unmanaged",
+        ) from error
+    if (
+        dag.active_node_id != node.node_id
+        or node.state is not TaskDagNodeState.RUNNING
+        or node.generation != claim.node_generation
+        or node.definition_fingerprint != claim.node_definition_fingerprint
+        or node.parent_task_id != claim.parent_task_id
+    ):
+        raise TaskDagRecoveryClaimError(
+            "DAG recovery claim node identity does not match",
+            kind="protocol",
+        )
+    relay = _load_task_dag_dependency_result_relay(
+        connection,
+        relay_id=claim.dependency_relay_id,
+    )
+    if relay is None:
+        raise TaskDagRecoveryClaimError(
+            "DAG recovery claim dependency relay is missing",
+            kind="unmanaged",
+        )
+    if (
+        relay.dag_id != claim.dag_id
+        or relay.dag_definition_fingerprint != claim.dag_definition_fingerprint
+        or relay.target_node_id != claim.node_id
+        or relay.target_node_generation != claim.node_generation
+        or relay.target_node_definition_fingerprint != claim.node_definition_fingerprint
+        or relay.source_fingerprint != claim.dependency_relay_source_fingerprint
+        or relay.content_fingerprint != claim.dependency_relay_content_fingerprint
+        or relay.integrity_fingerprint != claim.dependency_relay_integrity_fingerprint
+    ):
+        raise TaskDagRecoveryClaimError(
+            "DAG recovery claim dependency relay identity does not match",
+            kind="protocol",
+        )
 
 
 _TASK_DAG_DEPENDENCY_RESULT_RELAY_SELECT = """
