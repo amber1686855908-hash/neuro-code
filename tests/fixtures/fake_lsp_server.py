@@ -67,6 +67,7 @@ def main() -> int:
     parser.add_argument("--mode", default="normal")
     parser.add_argument("--outside-uri")
     parser.add_argument("--state-uri")
+    parser.add_argument("--apply-edit-log-dir")
     args = parser.parse_args()
     mode = args.mode
     current_uri = ""
@@ -79,6 +80,15 @@ def main() -> int:
             return 0
         method = message.get("method")
         request_id = message.get("id")
+        if method is None and request_id == 701:
+            if args.apply_edit_log_dir is not None and workspace_root is not None:
+                log_dir = Path(args.apply_edit_log_dir)
+                log_dir.mkdir(parents=True, exist_ok=True)
+                (log_dir / f"{workspace_root.name}.json").write_text(
+                    json.dumps(message.get("result"), sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
+            continue
         if method == "initialize":
             initialize_id = request_id if isinstance(request_id, (int, str)) else 1
             params = message.get("params")

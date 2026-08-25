@@ -1888,6 +1888,176 @@ def _production_parallel_dag_provider_factory(
     return factory
 
 
+class _ProductionParallelDagLspState(_ProductionParallelDagState):
+    def __init__(self) -> None:
+        super().__init__()
+        self.lsp_ready = {"b": asyncio.Event(), "c": asyncio.Event()}
+        self.lsp_both_ready = asyncio.Event()
+
+
+class _ProductionParallelDagLspProvider(_ProductionParallelDagProvider):
+    def __init__(
+        self,
+        state: _ProductionParallelDagLspState,
+        application: ApplicationComposition,
+        cwd: Path,
+        apply_edit_log_dir: Path,
+    ) -> None:
+        super().__init__(state)
+        self._lsp_state = state
+        self._application = application
+        self.cwd = cwd.expanduser().resolve(strict=False)
+        self.apply_edit_log_dir = apply_edit_log_dir
+        self.node_id: str | None = None
+        self.calls: list[tuple[ToolDefinition, ...]] = []
+        self.lsp_manager: LanguageServerManager | None = None
+        self.lsp_client: object | None = None
+        self.lsp_document_paths: tuple[Path, ...] = ()
+        self.lsp_process_alive_during_run = False
+        self.lsp_hover_payload: dict[str, object] | None = None
+        self.worker_marker: str | None = None
+
+    @staticmethod
+    def _node_id(context: ModelContext) -> str:
+        contents = "\n".join(message.content for message in context.messages)
+        node_id = next(
+            (
+                candidate
+                for candidate in ("a", "b", "c", "d")
+                if f"production-node-{candidate}" in contents
+            ),
+            None,
+        )
+        if node_id is None:
+            raise AssertionError("parallel LSP provider could not identify its DAG node")
+        return node_id
+
+    async def stream(
+        self,
+        context: ModelContext,
+        tools: Sequence[ToolDefinition],
+        *,
+        tool_policy: ModelToolPolicy = ModelToolPolicy.ALLOWED,
+    ) -> AsyncIterator[ModelEvent]:
+        node_id = self._node_id(context)
+        self.node_id = node_id
+        if node_id not in {"b", "c"}:
+            async for event in super().stream(context, tools, tool_policy=tool_policy):
+                yield event
+            return
+
+        del tool_policy
+        self.calls.append(tuple(tools))
+        if len(self.calls) == 1:
+            tool_names = {tool.name for tool in tools}
+            if "lsp" not in tool_names:
+                raise AssertionError(f"parallel worker {node_id} did not receive lsp")
+            if "applyEdit" in tool_names:
+                raise AssertionError("workspace/applyEdit leaked as a model tool")
+            self.worker_marker = f"worker-{node_id}-only-uncommitted\n"
+            (self.cwd / "tracked.txt").write_text(self.worker_marker, encoding="utf-8")
+            async with self._lsp_state.lock:
+                self._lsp_state.started.append(node_id)
+                self._lsp_state.timeline.append(f"start:{node_id}")
+                self._lsp_state.active += 1
+                self._lsp_state.max_active = max(
+                    self._lsp_state.max_active,
+                    self._lsp_state.active,
+                )
+                if {"b", "c"}.issubset(self._lsp_state.started):
+                    self._lsp_state.fanout_started.set()
+            yield ModelToolCall(
+                ToolCall(
+                    f"parallel-lsp-{node_id}",
+                    "lsp",
+                    {
+                        "operation": "hover",
+                        "path": "tracked.txt",
+                        "line": 1,
+                        "column": 1,
+                    },
+                )
+            )
+            yield ModelCompleted("tool_calls")
+            return
+
+        if len(self.calls) != 2:
+            raise AssertionError(f"parallel worker {node_id} made too many model calls")
+        tool_results = {
+            message.tool_call_id: message.content
+            for message in context.messages
+            if message.role is Role.TOOL and message.tool_call_id is not None
+        }
+        raw_hover = tool_results.get(f"parallel-lsp-{node_id}")
+        if raw_hover is None:
+            raise AssertionError(f"parallel worker {node_id} did not receive an LSP result")
+        hover = json.loads(raw_hover)
+        if not isinstance(hover, dict):
+            raise AssertionError("parallel LSP hover result was not an object")
+        marker = self.worker_marker
+        if marker is None or marker.strip() not in str(hover.get("hover", "")):
+            raise AssertionError(f"parallel worker {node_id} LSP did not read its worktree")
+        self.lsp_hover_payload = hover
+        managers = [
+            manager
+            for manager in self._application._lsp_services
+            if workspaces_match(manager.workspace_root, self.cwd)
+        ]
+        if len(managers) != 1:
+            raise AssertionError(f"parallel worker {node_id} did not own one LSP manager")
+        self.lsp_manager = managers[0]
+        if self.lsp_manager.additional_workspace_roots:
+            raise AssertionError(f"parallel worker {node_id} inherited extra LSP roots")
+        route = self.lsp_manager._routes.get("fake")
+        if route is None or route.client is None:
+            raise AssertionError(f"parallel worker {node_id} LSP route was not alive")
+        self.lsp_client = route.client
+        self.lsp_document_paths = tuple(route.documents)
+        self.lsp_process_alive_during_run = route.client._process.returncode is None
+        if not self.lsp_process_alive_during_run:
+            raise AssertionError(f"parallel worker {node_id} LSP process exited too early")
+        async with self._lsp_state.lock:
+            self._lsp_state.lsp_ready[node_id].set()
+            if all(event.is_set() for event in self._lsp_state.lsp_ready.values()):
+                self._lsp_state.lsp_both_ready.set()
+        try:
+            await self._lsp_state.release_fanout.wait()
+            yield ModelCompleted("stop", response_text=f"production result {node_id}")
+        finally:
+            async with self._lsp_state.lock:
+                self._lsp_state.active -= 1
+                self._lsp_state.completed.append(node_id)
+                self._lsp_state.timeline.append(f"complete:{node_id}")
+
+
+class _ProductionParallelDagLspProviderFactory:
+    def __init__(
+        self,
+        state: _ProductionParallelDagLspState,
+        apply_edit_log_dir: Path,
+    ) -> None:
+        self.state = state
+        self.apply_edit_log_dir = apply_edit_log_dir
+        self.application: ApplicationComposition | None = None
+        self.providers: list[_ProductionParallelDagLspProvider] = []
+
+    def bind_application(self, application: ApplicationComposition) -> None:
+        self.application = application
+
+    def __call__(self, config: AppConfig, failover: bool) -> ModelProvider:
+        del failover
+        if self.application is None:
+            raise AssertionError("parallel LSP provider factory was not bound")
+        provider = _ProductionParallelDagLspProvider(
+            self.state,
+            self.application,
+            config.cwd,
+            self.apply_edit_log_dir,
+        )
+        self.providers.append(provider)
+        return cast(ModelProvider, provider)
+
+
 def _bounded_parallel_controller_provider_factory(
     config: AppConfig,
     failover: bool,
@@ -4070,6 +4240,386 @@ api_key_env = "FIXTURE_KEY"
                     self.assertEqual(_run_git(repository, "rev-parse", "HEAD"), before_head)
                     self.assertEqual(dirty_file.read_bytes(), b"parent remains dirty\n")
                 finally:
+                    await application.close()
+
+    async def test_real_production_fanout_and_fanin_use_isolated_live_lsp_workers(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="neuro-production-parallel-lsp-") as directory:
+            root = Path(directory)
+            repository, _head = _make_real_repository(root)
+            dirty_file = repository / "dirty-parent.txt"
+            dirty_file.write_bytes(b"parent remains dirty\n")
+            parent_dirty_only = repository / "parent-dirty-only.txt"
+            parent_dirty_only.write_bytes(b"parent-dirty-only-content\n")
+            before_status = _run_git(repository, "status", "--porcelain=v1")
+            before_head = _run_git(repository, "rev-parse", "HEAD")
+            before_tracked = (repository / "tracked.txt").read_bytes()
+            state_dir = root / "state"
+            state_dir.mkdir()
+            apply_edit_log_dir = state_dir / "lsp-apply-edit-results"
+            state_only = state_dir / "state-only.txt"
+            state_only.write_bytes(b"state-only-content\n")
+            lsp_command = ", ".join(
+                json.dumps(value)
+                for value in (
+                    sys.executable,
+                    str(_LSP_FIXTURE),
+                    "--mode",
+                    "worker-integration",
+                    "--outside-uri",
+                    parent_dirty_only.as_uri(),
+                    "--state-uri",
+                    state_only.as_uri(),
+                    "--apply-edit-log-dir",
+                    str(apply_edit_log_dir),
+                )
+            )
+            (state_dir / "config.toml").write_text(
+                f"""
+[web_search]
+mode = "disabled"
+
+[web_fetch]
+mode = "disabled"
+
+[routing]
+default = "fixture"
+
+[providers.fixture]
+protocol = "openai-chat"
+model = "fixture-model"
+base_url = "https://provider.invalid/v1"
+api_key_env = "FIXTURE_KEY"
+context_window_tokens = 131072
+
+[lsp.servers.fake]
+language = "python"
+command = [{lsp_command}]
+extensions = [".py", ".txt"]
+""",
+                encoding="utf-8",
+            )
+            state = _ProductionParallelDagLspState()
+            provider_factory = _ProductionParallelDagLspProviderFactory(
+                state,
+                apply_edit_log_dir,
+            )
+            process_sandboxes: list[_RecordingProcessSandbox] = []
+
+            def process_sandbox_factory(
+                profile: SandboxProfile,
+                workspace: Path,
+                configured_state_dir: Path,
+            ) -> LocalProcessSandbox:
+                self.assertIs(profile, SandboxProfile.OFF)
+                self.assertTrue(workspaces_match(configured_state_dir, state_dir))
+                sandbox = _RecordingProcessSandbox(workspace)
+                process_sandboxes.append(sandbox)
+                return cast(LocalProcessSandbox, sandbox)
+
+            runtime_environment = {"PATH": os.environ.get("PATH") or os.defpath}
+            if os.name == "nt":
+                for name in ("SystemRoot", "SystemDrive", "PATHEXT"):
+                    value = os.environ.get(name)
+                    if value:
+                        runtime_environment[name] = value
+            environment = {
+                **runtime_environment,
+                "HOME": str(root),
+                "NEURO_CODE_HOME": str(state_dir),
+                "FIXTURE_KEY": "fixture-key",
+            }
+
+            with patch.dict(os.environ, environment, clear=True):
+                application = await ApplicationComposition.open(
+                    ApplicationSettings(
+                        cwd=repository,
+                        sandbox="off",
+                        permission_mode=PermissionMode.BYPASS,
+                        max_steps=8,
+                    ),
+                    provider_factory=provider_factory,
+                    local_process_sandbox_factory=process_sandbox_factory,
+                )
+                running: asyncio.Task[TaskDag] | None = None
+                try:
+                    provider_factory.bind_application(application)
+                    parent_session_id = await application.store.create_session(
+                        str(repository),
+                        "fixture",
+                        "fixture-model",
+                        sandbox_profile=SandboxProfile.OFF,
+                    )
+                    base_capabilities = _capability(
+                        repository,
+                        sandbox=SandboxProfile.OFF,
+                    )
+                    parent_capabilities = _capability(
+                        repository,
+                        tools=(*base_capabilities.allowed_tool_names, "lsp"),
+                        sandbox=SandboxProfile.OFF,
+                    )
+                    parent_config = await application.config_for_session_resume(parent_session_id)
+                    parent_binding = await application.create_binding(
+                        config=parent_config,
+                        resume_id=parent_session_id,
+                        capabilities=parent_capabilities,
+                    )
+                    service = application.create_task_dag_service(parent_binding=parent_binding)
+                    dag = await service.create_task_dag(
+                        CreateTaskDagRequest(
+                            "production-parallel-lsp-fanout-fanin",
+                            (
+                                TaskDagNode(
+                                    node_id="a",
+                                    ordinal=0,
+                                    prompt="production-node-a",
+                                ),
+                                TaskDagNode(
+                                    node_id="b",
+                                    ordinal=1,
+                                    prompt="production-node-b",
+                                    dependencies=("a",),
+                                ),
+                                TaskDagNode(
+                                    node_id="c",
+                                    ordinal=2,
+                                    prompt="production-node-c",
+                                    dependencies=("a",),
+                                ),
+                                TaskDagNode(
+                                    node_id="d",
+                                    ordinal=3,
+                                    prompt="production-node-d",
+                                    dependencies=("b", "c"),
+                                ),
+                            ),
+                            max_parallel=2,
+                        )
+                    )
+                    running = asyncio.create_task(
+                        service.run_task_dag(RunTaskDagRequest(dag.dag_id))
+                    )
+                    await asyncio.wait_for(state.fanout_started.wait(), timeout=60)
+                    await asyncio.wait_for(state.lsp_both_ready.wait(), timeout=60)
+
+                    during = await application.store.get_task_dag(dag.dag_id)
+                    self.assertIsNotNone(during)
+                    assert during is not None
+                    self.assertEqual(during.running_node_ids, ("b", "c"))
+                    running_nodes = tuple(during.node(node_id) for node_id in ("b", "c"))
+                    self.assertTrue(
+                        all(
+                            node.execution_owner_pid is not None
+                            and node.execution_owner_pid > 0
+                            and node.execution_owner_token
+                            for node in running_nodes
+                        )
+                    )
+                    self.assertEqual(
+                        len({node.execution_owner_token for node in running_nodes}),
+                        1,
+                    )
+                    self.assertNotIn("d", state.started)
+                    self.assertEqual(state.max_active, 2)
+
+                    providers = {
+                        provider.node_id: provider
+                        for provider in provider_factory.providers
+                        if provider.node_id is not None
+                    }
+                    self.assertIn("b", providers)
+                    self.assertIn("c", providers)
+                    provider_b = providers["b"]
+                    provider_c = providers["c"]
+                    assert provider_b is not None
+                    assert provider_c is not None
+                    self.assertNotEqual(provider_b.cwd, provider_c.cwd)
+                    self.assertEqual(len(provider_b.calls), 2)
+                    self.assertEqual(len(provider_c.calls), 2)
+                    self.assertIn("lsp", {tool.name for tool in provider_b.calls[0]})
+                    self.assertIn("lsp", {tool.name for tool in provider_c.calls[0]})
+
+                    leases = await application.store.list_writable_subagent_leases(
+                        parent_session_id=parent_session_id,
+                    )
+
+                    def lease_for(
+                        provider: _ProductionParallelDagLspProvider,
+                    ) -> WritableSubagentWorkspaceLease:
+                        matches = [
+                            lease
+                            for lease in leases
+                            if workspaces_match(lease.canonical_child_root, provider.cwd)
+                        ]
+                        self.assertEqual(len(matches), 1)
+                        return matches[0]
+
+                    lease_b = lease_for(provider_b)
+                    lease_c = lease_for(provider_c)
+                    self.assertIs(lease_b.state, WritableSubagentWorkspaceState.ACTIVE)
+                    self.assertIs(lease_c.state, WritableSubagentWorkspaceState.ACTIVE)
+                    self.assertNotEqual(lease_b.worktree_id, lease_c.worktree_id)
+                    self.assertNotEqual(lease_b.owner_token, lease_c.owner_token)
+                    self.assertEqual(lease_b.owner_pid, lease_c.owner_pid)
+
+                    worktrees = application.create_worktree_service()
+                    await worktrees.initialize()
+                    snapshot_b = await worktrees.inspect(lease_b.worktree_id.value)
+                    snapshot_c = await worktrees.inspect(lease_c.worktree_id.value)
+                    manager_b = provider_b.lsp_manager
+                    manager_c = provider_c.lsp_manager
+                    assert manager_b is not None
+                    assert manager_c is not None
+                    self.assertTrue(workspaces_match(provider_b.cwd, snapshot_b.canonical_path))
+                    self.assertTrue(workspaces_match(provider_c.cwd, snapshot_c.canonical_path))
+                    self.assertFalse(
+                        workspaces_match(snapshot_b.canonical_path, snapshot_c.canonical_path)
+                    )
+                    self.assertTrue(
+                        workspaces_match(manager_b.workspace_root, snapshot_b.canonical_path)
+                    )
+                    self.assertTrue(
+                        workspaces_match(manager_c.workspace_root, snapshot_c.canonical_path)
+                    )
+                    self.assertFalse((snapshot_b.canonical_path / "parent-dirty-only.txt").exists())
+                    self.assertFalse((snapshot_c.canonical_path / "parent-dirty-only.txt").exists())
+
+                    self.assertIsNot(manager_b, manager_c)
+                    self.assertEqual(manager_b.additional_workspace_roots, ())
+                    self.assertEqual(manager_c.additional_workspace_roots, ())
+                    route_b = manager_b._routes["fake"]
+                    route_c = manager_c._routes["fake"]
+                    self.assertIsNot(route_b, route_c)
+                    self.assertIsNot(route_b.documents, route_c.documents)
+                    self.assertIsNot(provider_b.lsp_client, provider_c.lsp_client)
+                    self.assertTrue(provider_b.lsp_process_alive_during_run)
+                    self.assertTrue(provider_c.lsp_process_alive_during_run)
+                    client_b = cast(Any, provider_b.lsp_client)
+                    client_c = cast(Any, provider_c.lsp_client)
+                    self.assertIsNot(client_b._process, client_c._process)
+                    self.assertIsNone(client_b._process.returncode)
+                    self.assertIsNone(client_c._process.returncode)
+                    self.assertEqual(len(provider_b.lsp_document_paths), 1)
+                    self.assertEqual(len(provider_c.lsp_document_paths), 1)
+                    self.assertTrue(
+                        workspaces_match(
+                            provider_b.lsp_document_paths[0],
+                            snapshot_b.canonical_path / "tracked.txt",
+                        )
+                    )
+                    self.assertTrue(
+                        workspaces_match(
+                            provider_c.lsp_document_paths[0],
+                            snapshot_c.canonical_path / "tracked.txt",
+                        )
+                    )
+
+                    hover_b = provider_b.lsp_hover_payload
+                    hover_c = provider_c.lsp_hover_payload
+                    assert hover_b is not None
+                    assert hover_c is not None
+                    hover_text_b = str(hover_b["hover"])
+                    hover_text_c = str(hover_c["hover"])
+                    self.assertIn("worker-b-only-uncommitted", hover_text_b)
+                    self.assertIn("worker-c-only-uncommitted", hover_text_c)
+                    self.assertNotIn("worker-c-only-uncommitted", hover_text_b)
+                    self.assertNotIn("worker-b-only-uncommitted", hover_text_c)
+                    self.assertNotIn("parent-dirty-only-content", hover_text_b)
+                    self.assertNotIn("parent-dirty-only-content", hover_text_c)
+                    self.assertEqual(
+                        (snapshot_b.canonical_path / "tracked.txt").read_text(encoding="utf-8"),
+                        "worker-b-only-uncommitted\n",
+                    )
+                    self.assertEqual(
+                        (snapshot_c.canonical_path / "tracked.txt").read_text(encoding="utf-8"),
+                        "worker-c-only-uncommitted\n",
+                    )
+
+                    def child_sandbox(
+                        provider: _ProductionParallelDagLspProvider,
+                    ) -> _RecordingProcessSandbox:
+                        matches = [
+                            sandbox
+                            for sandbox in process_sandboxes
+                            if workspaces_match(sandbox.workspace_root, provider.cwd)
+                        ]
+                        self.assertEqual(len(matches), 1)
+                        return matches[0]
+
+                    for provider, snapshot in (
+                        (provider_b, snapshot_b),
+                        (provider_c, snapshot_c),
+                    ):
+                        sandbox = child_sandbox(provider)
+                        lsp_requests = [
+                            request
+                            for request in sandbox.requests
+                            if request.purpose is LocalProcessPurpose.LSP_SERVER
+                        ]
+                        self.assertEqual(len(lsp_requests), 1)
+                        lsp_request = lsp_requests[0]
+                        self.assertTrue(workspaces_match(lsp_request.cwd, snapshot.canonical_path))
+                        sandbox_roots = tuple(
+                            root.path for root in lsp_request.filesystem_policy.workspace_roots
+                        )
+                        self.assertEqual(len(sandbox_roots), 1)
+                        self.assertTrue(workspaces_match(sandbox_roots[0], snapshot.canonical_path))
+                        self.assertTrue(
+                            all(process.returncode is None for process in sandbox.processes)
+                        )
+
+                    state.release_fanout.set()
+                    result = await asyncio.wait_for(running, timeout=120)
+                    self.assertIs(result.state, TaskDagState.COMPLETED)
+                    self.assertEqual(
+                        [node.state for node in result.nodes],
+                        [TaskDagNodeState.COMPLETED] * 4,
+                    )
+                    leases = await application.store.list_writable_subagent_leases(
+                        parent_session_id=parent_session_id,
+                    )
+                    self.assertEqual(len(leases), 4)
+                    self.assertEqual(len({lease.owner_token for lease in leases}), 4)
+                    self.assertEqual(len({lease.worktree_id for lease in leases}), 4)
+                    self.assertEqual(
+                        _run_git(repository, "status", "--porcelain=v1"),
+                        before_status,
+                    )
+                    self.assertEqual(_run_git(repository, "rev-parse", "HEAD"), before_head)
+                    self.assertEqual(dirty_file.read_bytes(), b"parent remains dirty\n")
+                    self.assertEqual(parent_dirty_only.read_bytes(), b"parent-dirty-only-content\n")
+                    self.assertEqual((repository / "tracked.txt").read_bytes(), before_tracked)
+
+                    for provider in (provider_b, provider_c):
+                        manager = provider.lsp_manager
+                        assert manager is not None
+                        self.assertTrue(manager._closed)
+                        self.assertEqual(manager._routes, {})
+                        self.assertNotIn(manager, application._lsp_services)
+                        log_path = apply_edit_log_dir / f"{provider.cwd.name}.json"
+                        self.assertTrue(log_path.is_file())
+                        self.assertEqual(
+                            json.loads(log_path.read_text(encoding="utf-8")),
+                            {
+                                "applied": False,
+                                "failureReason": "Neuro Code LSP mode is read-only",
+                            },
+                        )
+                    self.assertTrue(
+                        all(
+                            process.returncode is not None
+                            for sandbox in process_sandboxes
+                            for process in sandbox.processes
+                        )
+                    )
+                    await application.close()
+                    self.assertEqual(application._lsp_services, set())
+                finally:
+                    state.release_fanout.set()
+                    if running is not None and not running.done():
+                        running.cancel()
+                        with suppress(asyncio.CancelledError):
+                            await running
                     await application.close()
 
     async def test_independent_compositions_never_oversubscribe_bounded_dag(self) -> None:
