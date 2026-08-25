@@ -756,6 +756,125 @@ class LeaderDomainTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             LeaderDecision.parse('{"action":"SELECT_NODE","node_id":"missing","extra":1}')
 
+    def test_parallel_domain_contract_boundaries_are_fail_closed(self) -> None:
+        prompt_fingerprint = hashlib.sha256(b"prompt").hexdigest()
+        running = LeaderEvidenceNode(
+            node_id="running",
+            ordinal=0,
+            dependencies=(),
+            state=TaskDagNodeState.RUNNING,
+            prompt="prompt-running",
+            prompt_fingerprint=prompt_fingerprint,
+            generation=1,
+        )
+        ready = LeaderEvidenceNode(
+            node_id="ready",
+            ordinal=1,
+            dependencies=("running",),
+            state=TaskDagNodeState.READY,
+            prompt="prompt-ready",
+            prompt_fingerprint=prompt_fingerprint,
+            generation=2,
+        )
+        evidence_kwargs = {
+            "objective": "objective",
+            "parent_session_id": "parent",
+            "dag_id": "dag",
+            "definition_fingerprint": "a" * 64,
+            "generation": 3,
+            "state": TaskDagState.RUNNING,
+            "active_node_id": "running",
+            "max_parallel": 2,
+            "running_node_ids": ("running",),
+            "available_capacity": 1,
+            "ready_node_ids": ("ready",),
+            "nodes": (running, ready),
+        }
+        valid = LeaderEvidenceEnvelope(**evidence_kwargs)
+        self.assertEqual(valid.payload["running_node_ids"], ["running"])
+        self.assertEqual(valid.payload["available_capacity"], 1)
+        self.assertEqual(valid.payload["completed_node_ids"], [])
+        with self.assertRaises(ValueError):
+            LeaderEvidenceNode(
+                running.node_id,
+                running.ordinal,
+                running.dependencies,
+                running.state,
+                running.prompt,
+                running.prompt_fingerprint,
+                True,
+            )
+        for changes in (
+            {"max_parallel": True},
+            {"max_parallel": 0},
+            {"max_parallel": 999},
+            {"running_node_ids": ["running"]},
+            {"running_node_ids": ("running", "running")},
+            {"available_capacity": 0},
+            {"available_capacity": 2},
+            {"nodes": (running, replace(ready, node_id="running"))},
+            {"running_node_ids": ("ready",)},
+            {
+                "nodes": tuple(
+                    replace(ready, node_id=f"node-{index}", ordinal=index) for index in range(9)
+                ),
+                "running_node_ids": (),
+                "available_capacity": 2,
+                "max_parallel": 2,
+            },
+        ):
+            with self.assertRaises(ValueError):
+                LeaderEvidenceEnvelope(**{**evidence_kwargs, **changes})
+        with (
+            patch("neuro_code.domain.leader.MAX_LEADER_EVIDENCE_BYTES", 1),
+            self.assertRaisesRegex(ValueError, "too large"),
+        ):
+            LeaderEvidenceEnvelope(**evidence_kwargs)
+
+        with self.assertRaises(ValueError):
+            LeaderDecision("SELECT_NODE")  # type: ignore[arg-type]
+        with self.assertRaises(ValueError):
+            LeaderDecision(
+                LeaderDecisionKind.SELECT_NODES,
+                selected_node_id="ready",
+                selected_node_ids=("ready",),
+            )
+        for selected_node_ids in ((), tuple(f"node-{index}" for index in range(9))):
+            with self.assertRaises(ValueError):
+                LeaderDecision(LeaderDecisionKind.SELECT_NODES, selected_node_ids=selected_node_ids)
+        with self.assertRaisesRegex(ValueError, "list"):
+            LeaderDecision.parse('{"action":"SELECT_NODES","node_ids":"ready"}')
+        with self.assertRaisesRegex(ValueError, "reason"):
+            LeaderDecision.parse('{"action":"SELECT_NODES","node_ids":["ready"],"reason":1}')
+        self.assertEqual(
+            LeaderDecision(LeaderDecisionKind.SELECT_NODE, selected_node_id="ready").to_dict(),
+            {"action": "SELECT_NODE", "node_id": "ready"},
+        )
+        self.assertEqual(
+            LeaderDecision(
+                LeaderDecisionKind.SELECT_NODES,
+                selected_node_ids=("ready",),
+                summary="parallel",
+            ).to_dict(),
+            {"action": "SELECT_NODES", "node_ids": ["ready"], "summary": "parallel"},
+        )
+        with self.assertRaisesRegex(ValueError, "generations"):
+            LeaderDecisionRecord(
+                "decision",
+                "attempt",
+                "dag",
+                "session",
+                3,
+                "b" * 64,
+                "c" * 64,
+                LeaderDecision(
+                    LeaderDecisionKind.SELECT_NODES,
+                    selected_node_ids=("running", "ready"),
+                ),
+                _now(),
+                selected_node_generations=(1,),
+            )
+
     def test_domain_bounds_and_lifecycle_values_fail_closed(self) -> None:
         prompt_fingerprint = hashlib.sha256(b"prompt-a").hexdigest()
         node = LeaderEvidenceNode(
