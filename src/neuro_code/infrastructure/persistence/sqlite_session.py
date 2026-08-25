@@ -111,7 +111,7 @@ from neuro_code.shared.async_utils import run_blocking
 from neuro_code.shared.errors import SessionError
 from neuro_code.shared.limits import MAX_SUBAGENT_PARALLELISM
 
-SCHEMA_VERSION = 23
+SCHEMA_VERSION = 24
 _SEARCH_SNIPPET_LIMIT = 500
 _SQLITE_TIMEOUT_SECONDS = 30.0
 _SESSION_ALIAS_NAMESPACE_LIMIT = 64
@@ -305,6 +305,12 @@ class SqliteSessionStore:
                             "UPDATE schema_meta SET version = 23 WHERE singleton = 1"
                         )
                         version = (23,)
+                    if version is not None and version[0] == 23:
+                        _migrate_leader_parallel_decision_schema(connection)
+                        connection.execute(
+                            "UPDATE schema_meta SET version = 24 WHERE singleton = 1"
+                        )
+                        version = (24,)
                     if version is None or version[0] != SCHEMA_VERSION:
                         raise SessionError(
                             "unsupported session schema version: "
@@ -2192,11 +2198,12 @@ class SqliteSessionStore:
                     cursor = connection.execute(
                         """
                         UPDATE leader_attempts
-                        SET leader_session_id = ?, owner_id = ?, lease_expires_at = ?,
+                        SET parent_session_id = ?, leader_session_id = ?, owner_id = ?, lease_expires_at = ?,
                             turn_id = ?, updated_at = ?
                         WHERE attempt_id = ? AND state = ? AND lease_expires_at <= ?
                         """,
                         (
+                            prepared.parent_session_id,
                             prepared.leader_session_id,
                             prepared.owner_id,
                             prepared.lease_expires_at.isoformat(),
@@ -2446,12 +2453,21 @@ class SqliteSessionStore:
         decision_id: str,
         decision: LeaderDecision,
         created_at: datetime,
+        parent_session_id: str | None = None,
+        selected_node_generations: tuple[int, ...] = (),
     ) -> LeaderDecisionRecord:
         _validated_leader_identifier(attempt_id)
         _validated_leader_identifier(owner_id)
         _validated_leader_identifier(decision_id)
         if not isinstance(decision, LeaderDecision):
             raise TypeError("leader decision must be canonical")
+        if parent_session_id is not None:
+            _validated_leader_identifier(parent_session_id)
+        if not isinstance(selected_node_generations, tuple) or any(
+            isinstance(generation, bool) or not isinstance(generation, int) or generation < 0
+            for generation in selected_node_generations
+        ):
+            raise TypeError("leader selected node generations must be non-negative")
         if not isinstance(created_at, datetime) or created_at.tzinfo is None:
             raise TypeError("leader decision time must be timezone-aware")
 
@@ -2462,6 +2478,27 @@ class SqliteSessionStore:
                 current = _load_leader_attempt(connection, attempt_id)
                 if current is None:
                     raise LeaderStoreError("leader attempt is missing", kind="unmanaged")
+                dag = _load_task_dag(connection, current.dag_id)
+                if dag is None:
+                    raise LeaderStoreError("leader decision DAG is missing", kind="unmanaged")
+                effective_parent_session_id = parent_session_id or dag.parent_session_id
+                if effective_parent_session_id != dag.parent_session_id:
+                    raise LeaderStoreError(
+                        "leader decision parent session conflicts with the DAG",
+                        kind="integrity",
+                    )
+                effective_generations = selected_node_generations
+                if decision.selected_node_ids and not effective_generations:
+                    try:
+                        effective_generations = tuple(
+                            dag.node(node_id).generation for node_id in decision.selected_node_ids
+                        )
+                    except KeyError as error:
+                        # Preserve the observable invalid model decision so
+                        # Leader validation can mark it stale without ever
+                        # replaying the provider request.
+                        del error
+                        effective_generations = ()
                 if current.state is LeaderAttemptState.DECISION_PUBLISHED:
                     if current.decision_id is None:
                         raise LeaderStoreError("published leader attempt has no decision id")
@@ -2484,12 +2521,14 @@ class SqliteSessionStore:
                     decision_id=decision_id,
                     attempt_id=current.attempt_id,
                     dag_id=current.dag_id,
+                    parent_session_id=effective_parent_session_id,
                     leader_session_id=current.leader_session_id,
                     dag_generation=current.dag_generation,
                     definition_fingerprint=current.definition_fingerprint,
                     evidence_fingerprint=current.evidence_fingerprint,
                     decision=decision,
                     created_at=created_at.astimezone(UTC),
+                    selected_node_generations=effective_generations,
                 )
                 connection.execute(
                     _LEADER_DECISION_INSERT,
@@ -2887,12 +2926,19 @@ class SqliteSessionStore:
         expected_generation: int,
         expected_state: TaskDagNodeState,
         updated_at: datetime,
+        expected_dag_generation: int | None = None,
     ) -> TaskDag:
         _validated_task_dag_identifier(dag_id)
         if not isinstance(node, TaskDagNode) or node.state is not TaskDagNodeState.RUNNING:
             raise TypeError("task DAG claim must contain a running node")
         if not isinstance(updated_at, datetime) or updated_at.tzinfo is None:
             raise TypeError("task DAG claim update time must be timezone-aware")
+        if expected_dag_generation is not None and (
+            isinstance(expected_dag_generation, bool)
+            or not isinstance(expected_dag_generation, int)
+            or expected_dag_generation < 0
+        ):
+            raise TypeError("task DAG expected graph generation must be non-negative")
 
         def claim() -> TaskDag:
             connection = self._connect()
@@ -2901,6 +2947,14 @@ class SqliteSessionStore:
                 current_dag = _load_task_dag(connection, dag_id)
                 if current_dag is None:
                     raise TaskDagError("task DAG is missing", kind="unmanaged")
+                if (
+                    expected_dag_generation is not None
+                    and current_dag.generation != expected_dag_generation
+                ):
+                    raise TaskDagError(
+                        "task DAG graph generation was changed by another scheduler",
+                        kind="concurrent_modification",
+                    )
                 if current_dag.state.terminal:
                     raise TaskDagError(
                         "task DAG is already terminal",
@@ -4660,6 +4714,84 @@ def _ensure_task_dag_recovery_claim_schema(connection: sqlite3.Connection) -> No
     )
 
 
+def _migrate_leader_parallel_decision_schema(connection: sqlite3.Connection) -> None:
+    """Add parent binding and canonical batch-selection projections."""
+
+    attempt_columns = {
+        str(row[1]) for row in connection.execute("PRAGMA table_info(leader_attempts)").fetchall()
+    }
+    if "parent_session_id" not in attempt_columns:
+        connection.execute("ALTER TABLE leader_attempts ADD COLUMN parent_session_id TEXT")
+    decision_columns = {
+        str(row[1]) for row in connection.execute("PRAGMA table_info(leader_decisions)").fetchall()
+    }
+    if "parent_session_id" not in decision_columns:
+        connection.execute("ALTER TABLE leader_decisions ADD COLUMN parent_session_id TEXT")
+    if "selected_node_ids_json" not in decision_columns:
+        connection.execute(
+            "ALTER TABLE leader_decisions ADD COLUMN selected_node_ids_json TEXT NOT NULL DEFAULT '[]'"
+        )
+    if "selected_node_generations_json" not in decision_columns:
+        connection.execute(
+            "ALTER TABLE leader_decisions ADD COLUMN selected_node_generations_json TEXT NOT NULL DEFAULT '[]'"
+        )
+    table_row = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'leader_decisions'"
+    ).fetchone()
+    if table_row is not None and "SELECT_NODES" not in str(table_row[0]):
+        connection.execute("DROP INDEX IF EXISTS leader_decisions_by_dag")
+        connection.execute("ALTER TABLE leader_decisions RENAME TO leader_decisions_legacy")
+        _ensure_leader_schema(connection)
+        connection.execute(
+            """
+            INSERT INTO leader_decisions(
+                decision_id, attempt_id, dag_id, parent_session_id, leader_session_id,
+                dag_generation, definition_fingerprint, evidence_fingerprint,
+                kind, selected_node_id, selected_node_ids_json,
+                selected_node_generations_json, summary, created_at
+            )
+            SELECT decision_id, attempt_id, dag_id, parent_session_id, leader_session_id,
+                   dag_generation, definition_fingerprint, evidence_fingerprint,
+                   kind, selected_node_id, selected_node_ids_json,
+                   selected_node_generations_json, summary, created_at
+            FROM leader_decisions_legacy
+            """
+        )
+        connection.execute("DROP TABLE leader_decisions_legacy")
+    connection.execute(
+        """
+        UPDATE leader_attempts
+        SET parent_session_id = (
+            SELECT parent_session_id FROM task_dags WHERE task_dags.dag_id = leader_attempts.dag_id
+        )
+        WHERE parent_session_id IS NULL
+        """
+    )
+    connection.execute(
+        """
+        UPDATE leader_decisions
+        SET parent_session_id = (
+            SELECT parent_session_id FROM task_dags WHERE task_dags.dag_id = leader_decisions.dag_id
+        )
+        WHERE parent_session_id IS NULL
+        """
+    )
+    rows = connection.execute(
+        "SELECT decision_id, kind, selected_node_id FROM leader_decisions"
+    ).fetchall()
+    for decision_id, raw_kind, selected_node_id in rows:
+        selected = (
+            [str(selected_node_id)]
+            if str(raw_kind) == LeaderDecisionKind.SELECT_NODE.value
+            and selected_node_id is not None
+            else []
+        )
+        connection.execute(
+            "UPDATE leader_decisions SET selected_node_ids_json = ? WHERE decision_id = ?",
+            (json.dumps(selected, ensure_ascii=False, separators=(",", ":")), decision_id),
+        )
+
+
 def _ensure_leader_schema(connection: sqlite3.Connection) -> None:
     """Create the durable Leader attempt/decision projections.
 
@@ -4672,6 +4804,7 @@ def _ensure_leader_schema(connection: sqlite3.Connection) -> None:
         CREATE TABLE IF NOT EXISTS leader_attempts (
             attempt_id TEXT PRIMARY KEY,
             dag_id TEXT NOT NULL,
+            parent_session_id TEXT,
             leader_session_id TEXT NOT NULL,
             objective_fingerprint TEXT NOT NULL,
             dag_generation INTEGER NOT NULL CHECK (dag_generation >= 0),
@@ -4703,12 +4836,15 @@ def _ensure_leader_schema(connection: sqlite3.Connection) -> None:
             decision_id TEXT PRIMARY KEY,
             attempt_id TEXT NOT NULL UNIQUE,
             dag_id TEXT NOT NULL,
+            parent_session_id TEXT,
             leader_session_id TEXT NOT NULL,
             dag_generation INTEGER NOT NULL CHECK (dag_generation >= 0),
             definition_fingerprint TEXT NOT NULL,
             evidence_fingerprint TEXT NOT NULL,
-            kind TEXT NOT NULL CHECK (kind IN ('SELECT_NODE', 'FINALIZE')),
+            kind TEXT NOT NULL CHECK (kind IN ('SELECT_NODE', 'SELECT_NODES', 'FINALIZE')),
             selected_node_id TEXT,
+            selected_node_ids_json TEXT NOT NULL DEFAULT '[]',
+            selected_node_generations_json TEXT NOT NULL DEFAULT '[]',
             summary TEXT NOT NULL,
             created_at TEXT NOT NULL,
             FOREIGN KEY (attempt_id) REFERENCES leader_attempts(attempt_id) ON DELETE RESTRICT,
@@ -5696,7 +5832,7 @@ _TASK_DAG_NODE_UPDATE = """
 """
 
 _LEADER_ATTEMPT_SELECT = """
-    SELECT attempt_id, dag_id, leader_session_id, objective_fingerprint,
+    SELECT attempt_id, dag_id, parent_session_id, leader_session_id, objective_fingerprint,
            dag_generation, definition_fingerprint, evidence_fingerprint,
            state, owner_id, lease_expires_at, turn_id, model_response,
            decision_id, created_at, updated_at
@@ -5705,26 +5841,28 @@ _LEADER_ATTEMPT_SELECT = """
 
 _LEADER_ATTEMPT_INSERT = """
     INSERT INTO leader_attempts(
-        attempt_id, dag_id, leader_session_id, objective_fingerprint,
+        attempt_id, dag_id, parent_session_id, leader_session_id, objective_fingerprint,
         dag_generation, definition_fingerprint, evidence_fingerprint,
         state, owner_id, lease_expires_at, turn_id, model_response,
         decision_id, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 """
 
 _LEADER_DECISION_SELECT = """
-    SELECT decision_id, attempt_id, dag_id, leader_session_id,
+    SELECT decision_id, attempt_id, dag_id, parent_session_id, leader_session_id,
            dag_generation, definition_fingerprint, evidence_fingerprint,
-           kind, selected_node_id, summary, created_at
+           kind, selected_node_id, selected_node_ids_json,
+           selected_node_generations_json, summary, created_at
     FROM leader_decisions
 """
 
 _LEADER_DECISION_INSERT = """
     INSERT INTO leader_decisions(
-        decision_id, attempt_id, dag_id, leader_session_id,
+        decision_id, attempt_id, dag_id, parent_session_id, leader_session_id,
         dag_generation, definition_fingerprint, evidence_fingerprint,
-        kind, selected_node_id, summary, created_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        kind, selected_node_id, selected_node_ids_json,
+        selected_node_generations_json, summary, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 """
 
 
@@ -5822,6 +5960,7 @@ def _leader_attempt_values(attempt: LeaderAttempt) -> tuple[object, ...]:
     return (
         attempt.attempt_id,
         attempt.dag_id,
+        attempt.parent_session_id,
         attempt.leader_session_id,
         attempt.objective_fingerprint,
         attempt.dag_generation,
@@ -5839,16 +5978,24 @@ def _leader_attempt_values(attempt: LeaderAttempt) -> tuple[object, ...]:
 
 
 def _leader_decision_values(record: LeaderDecisionRecord) -> tuple[object, ...]:
+    selected_node_ids = list(record.decision.selected_node_ids)
     return (
         record.decision_id,
         record.attempt_id,
         record.dag_id,
+        record.parent_session_id,
         record.leader_session_id,
         record.dag_generation,
         record.definition_fingerprint,
         record.evidence_fingerprint,
         record.decision.kind.value,
         record.decision.selected_node_id,
+        json.dumps(selected_node_ids, ensure_ascii=False, separators=(",", ":")),
+        json.dumps(
+            list(record.selected_node_generations),
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ),
         record.decision.summary,
         record.created_at.astimezone(UTC).isoformat(),
     )
@@ -5890,11 +6037,12 @@ def _load_leader_attempt_for_snapshot(
 
 
 def _leader_attempt_from_row(row: Sequence[object]) -> LeaderAttempt:
-    if len(row) != 15:
+    if len(row) != 16:
         raise ValueError("leader attempt record is malformed")
     (
         attempt_id,
         dag_id,
+        parent_session_id,
         leader_session_id,
         objective_fingerprint,
         dag_generation,
@@ -5927,6 +6075,7 @@ def _leader_attempt_from_row(row: Sequence[object]) -> LeaderAttempt:
         decision_id=str(decision_id) if decision_id is not None else None,
         created_at=datetime.fromisoformat(str(raw_created_at)),
         updated_at=datetime.fromisoformat(str(raw_updated_at)),
+        parent_session_id=(str(parent_session_id) if parent_session_id is not None else None),
     )
 
 
@@ -5942,39 +6091,67 @@ def _load_leader_decision(
 
 
 def _leader_decision_from_row(row: Sequence[object]) -> LeaderDecisionRecord:
-    if len(row) != 11:
+    if len(row) != 14:
         raise ValueError("leader decision record is malformed")
     (
         decision_id,
         attempt_id,
         dag_id,
+        parent_session_id,
         leader_session_id,
         dag_generation,
         definition_fingerprint,
         evidence_fingerprint,
         raw_kind,
         selected_node_id,
+        raw_selected_node_ids,
+        raw_selected_node_generations,
         summary,
         raw_created_at,
     ) = row
     if not isinstance(dag_generation, int):
         raise ValueError("leader decision DAG generation is invalid")
     kind = LeaderDecisionKind(str(raw_kind))
-    decision = LeaderDecision(
-        kind,
-        selected_node_id=(str(selected_node_id) if selected_node_id is not None else None),
-        summary=str(summary),
-    )
+    selected_node_ids = json.loads(str(raw_selected_node_ids))
+    selected_node_generations = json.loads(str(raw_selected_node_generations))
+    if not isinstance(selected_node_ids, list) or not all(
+        isinstance(node_id, str) for node_id in selected_node_ids
+    ):
+        raise ValueError("leader selected node ids are invalid")
+    if not isinstance(selected_node_generations, list) or not all(
+        isinstance(generation, int) and not isinstance(generation, bool) and generation >= 0
+        for generation in selected_node_generations
+    ):
+        raise ValueError("leader selected node generations are invalid")
+    if kind is LeaderDecisionKind.SELECT_NODE:
+        selected_id = str(selected_node_id) if selected_node_id is not None else None
+        if not selected_node_ids and selected_id is not None:
+            selected_node_ids = [selected_id]
+        decision = LeaderDecision(
+            kind,
+            selected_node_id=selected_id,
+            summary=str(summary),
+        )
+    elif kind is LeaderDecisionKind.SELECT_NODES:
+        decision = LeaderDecision(
+            kind,
+            selected_node_ids=tuple(selected_node_ids),
+            summary=str(summary),
+        )
+    else:
+        decision = LeaderDecision(kind, summary=str(summary))
     return LeaderDecisionRecord(
         decision_id=str(decision_id),
         attempt_id=str(attempt_id),
         dag_id=str(dag_id),
+        parent_session_id=(str(parent_session_id) if parent_session_id is not None else None),
         leader_session_id=str(leader_session_id),
         dag_generation=dag_generation,
         definition_fingerprint=str(definition_fingerprint),
         evidence_fingerprint=str(evidence_fingerprint),
         decision=decision,
         created_at=datetime.fromisoformat(str(raw_created_at)),
+        selected_node_generations=tuple(selected_node_generations),
     )
 
 

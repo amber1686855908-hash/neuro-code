@@ -53,6 +53,7 @@ class TaskDagStore(Protocol):
         expected_generation: int,
         expected_state: TaskDagNodeState,
         updated_at: datetime,
+        expected_dag_generation: int | None = None,
     ) -> TaskDag: ...
 
     async def finish_task_dag_node(

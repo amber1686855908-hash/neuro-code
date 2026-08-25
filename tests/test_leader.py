@@ -225,6 +225,69 @@ class _Writable:
         return SimpleNamespace(status=SessionTaskStatus.COMPLETED, response=request.prompt)
 
 
+class _WaveWritable:
+    """Independent fake Writable owners with a real asyncio overlap barrier."""
+
+    def __init__(self, parent_session_id: str, leases: _LeaseStore, state: object) -> None:
+        self.parent_session_id = parent_session_id
+        self.leases = leases
+        self.state = state
+
+    async def initialize(self) -> None:
+        return None
+
+    async def reconcile_writable_subagent_workspaces(self) -> tuple[object, ...]:
+        return ()
+
+    async def run_subagent_with_execution_identity(
+        self,
+        request,
+        *,
+        execution_identity,
+        sink=None,
+    ) -> object:
+        del sink
+        node_id = execution_identity.node_id
+        self.state.calls.append(node_id)
+        parent_task_id = execution_identity.parent_task_id
+        self.leases.by_parent_task[parent_task_id] = SimpleNamespace(
+            parent_session_id=self.parent_session_id,
+            parent_task_id=parent_task_id,
+            child_session_id=f"child-{node_id}",
+            lease_id=f"lease-{node_id}-{len(self.state.calls)}",
+            worktree_id=WorktreeId(f"worktree-{node_id}-{len(self.state.calls)}"),
+            baseline_checkpoint_id=None,
+            final_workspace_fingerprint=None,
+            changed_file_count=0,
+            state=WritableSubagentWorkspaceState.PRESERVED,
+        )
+        if node_id in {"b", "c"}:
+            async with self.state.lock:
+                self.state.active += 1
+                self.state.max_active = max(self.state.max_active, self.state.active)
+                if self.state.active == 2:
+                    self.state.both_started.set()
+            try:
+                await self.state.release.wait()
+            finally:
+                async with self.state.lock:
+                    self.state.active -= 1
+        return SimpleNamespace(status=SessionTaskStatus.COMPLETED, response=request.prompt)
+
+
+class _WaveFactory:
+    def __init__(self, parent_session_id: str, leases: _LeaseStore, state: object) -> None:
+        self.parent_session_id = parent_session_id
+        self.leases = leases
+        self.state = state
+        self.created: list[_WaveWritable] = []
+
+    def create(self) -> _WaveWritable:
+        worker = _WaveWritable(self.parent_session_id, self.leases, self.state)
+        self.created.append(worker)
+        return worker
+
+
 class _ProcessDagController:
     """Small durable test controller for process-death Leader boundaries."""
 
@@ -360,6 +423,62 @@ class _ExitAfterDecisionStore:
         os._exit(72)
 
 
+class _FailAfterDecisionStore:
+    def __init__(self, inner: SqliteSessionStore) -> None:
+        self.inner = inner
+
+    def __getattr__(self, name: str):
+        return getattr(self.inner, name)
+
+    async def publish_leader_decision(self, *args, **kwargs):
+        record = await self.inner.publish_leader_decision(*args, **kwargs)
+        raise LeaderStoreError(
+            f"simulated crash after decision {record.decision_id}",
+            kind="simulated_crash",
+        )
+
+
+class _FailAfterFirstClaimStore:
+    def __init__(self, inner: SqliteSessionStore) -> None:
+        self.inner = inner
+        self.claims = 0
+
+    def __getattr__(self, name: str):
+        return getattr(self.inner, name)
+
+    async def claim_task_dag_node(self, *args, **kwargs):
+        result = await self.inner.claim_task_dag_node(*args, **kwargs)
+        self.claims += 1
+        if self.claims == 1:
+            raise RuntimeError("simulated controller death after first wave claim")
+        return result
+
+
+class _ExitAfterFirstClaimDagStore:
+    def __init__(self, inner: SqliteSessionStore) -> None:
+        self.inner = inner
+        self.claims = 0
+
+    def __getattr__(self, name: str):
+        return getattr(self.inner, name)
+
+    async def claim_task_dag_node(self, *args, **kwargs):
+        result = await self.inner.claim_task_dag_node(*args, **kwargs)
+        self.claims += 1
+        if self.claims == 1:
+            os._exit(75)
+        return result
+
+
+class _ProcessParallelFactory:
+    def __init__(self, parent_session_id: str, leases: _LeaseStore) -> None:
+        self.parent_session_id = parent_session_id
+        self.leases = leases
+
+    def create(self) -> _Writable:
+        return _Writable(self.parent_session_id, self.leases)
+
+
 def _leader_process_child(
     mode: str,
     database_path: str,
@@ -434,6 +553,69 @@ async def _leader_process_child_async(
         lease_seconds=1.0,
     )
     await service.run(RunLeaderRequest(dag_id, "process crash objective"))
+
+
+def _parallel_leader_process_child(
+    mode: str,
+    database_path: str,
+    dag_id: str,
+    parent_session_id: str,
+    leader_session_id: str,
+    provider_marker_path: str,
+) -> None:
+    asyncio.run(
+        _parallel_leader_process_child_async(
+            mode,
+            database_path,
+            dag_id,
+            parent_session_id,
+            leader_session_id,
+            provider_marker_path,
+        )
+    )
+
+
+async def _parallel_leader_process_child_async(
+    mode: str,
+    database_path: str,
+    dag_id: str,
+    parent_session_id: str,
+    leader_session_id: str,
+    provider_marker_path: str,
+) -> None:
+    store = SqliteSessionStore(Path(database_path))
+    await store.initialize()
+    leases = _LeaseStore(parent_session_id)
+    writable = _Writable(parent_session_id, leases)
+    factory = _ProcessParallelFactory(parent_session_id, leases)
+    parent_binding = _binding(_Runner(parent_session_id, []))
+    dag_service = TaskDagApplicationService(
+        store,
+        store,
+        writable,
+        leases,
+        _RelayStore(),
+        parent_binding=parent_binding,
+        writable_worker_factory=factory,
+    )
+    if mode == "after_first_claim":
+        dag_service._dag_store = _ExitAfterFirstClaimDagStore(store)  # type: ignore[assignment]
+    leader_store: object = store
+    if mode == "after_decision":
+        leader_store = _ExitAfterDecisionStore(store)
+    runner = _MarkerRunner(
+        leader_session_id,
+        ['{"action":"SELECT_NODES","node_ids":["b","c"]}'],
+        provider_marker_path,
+    )
+    service = LeaderApplicationService(
+        cast(LeaderStore, leader_store),
+        dag_service,
+        parent_binding=parent_binding,
+        leader_binding=_binding(runner, zero_tools=True),
+        session_store=store,
+    )
+    await service.run(RunLeaderRequest(dag_id, "parallel process crash objective"))
 
 
 def _production_leader_process_child(
@@ -562,6 +744,13 @@ class LeaderDomainTests(unittest.TestCase):
         )
         self.assertIs(selected.kind, LeaderDecisionKind.SELECT_NODE)
         self.assertEqual(selected.selected_node_id, "b")
+        wave = LeaderDecision.parse(
+            '{"action":"SELECT_NODES","node_ids":["a","b"],"reason":"parallel"}'
+        )
+        self.assertIs(wave.kind, LeaderDecisionKind.SELECT_NODES)
+        self.assertEqual(wave.selected_node_ids, ("a", "b"))
+        with self.assertRaisesRegex(ValueError, "unique"):
+            LeaderDecision.parse('{"action":"SELECT_NODES","node_ids":["a","a"]}')
         finalized = LeaderDecision.parse('{"action":"FINALIZE","summary":"done"}')
         self.assertIs(finalized.kind, LeaderDecisionKind.FINALIZE)
         with self.assertRaises(ValueError):
@@ -1503,6 +1692,401 @@ class LeaderIntegrationTests(unittest.IsolatedAsyncioTestCase):
         assert dag is not None
         self.assertIs(dag.state, TaskDagState.COMPLETED)
 
+    async def test_parallel_leader_selects_one_canonical_wave_and_real_workers_overlap(
+        self,
+    ) -> None:
+        state = SimpleNamespace(
+            calls=[],
+            active=0,
+            max_active=0,
+            lock=asyncio.Lock(),
+            both_started=asyncio.Event(),
+            release=asyncio.Event(),
+        )
+        factory = _WaveFactory(self.parent_session_id, self.leases, state)
+        parallel_service = TaskDagApplicationService(
+            self.store,
+            self.store,
+            _WaveWritable(self.parent_session_id, self.leases, state),
+            self.leases,
+            _RelayStore(),
+            parent_binding=self.parent_binding,
+            writable_worker_factory=factory,
+        )
+        await parallel_service.create_task_dag(
+            CreateTaskDagRequest(
+                "parallel-diamond",
+                (
+                    _node("a", 0),
+                    _node("b", 1, ("a",)),
+                    _node("c", 2, ("a",)),
+                    _node("d", 3, ("b", "c")),
+                ),
+                max_parallel=2,
+            )
+        )
+        runner = _Runner(
+            self.leader_session_id,
+            [
+                '{"action":"SELECT_NODE","node_id":"a"}',
+                '{"action":"SELECT_NODES","node_ids":["b","c"]}',
+                '{"action":"SELECT_NODE","node_id":"d"}',
+                '{"action":"FINALIZE","summary":"parallel done"}',
+            ],
+        )
+        leader = LeaderApplicationService(
+            cast(LeaderStore, self.store),
+            parallel_service,
+            parent_binding=self.parent_binding,
+            leader_binding=_binding(runner, zero_tools=True),
+            session_store=self.store,
+        )
+        task = asyncio.create_task(leader.run(RunLeaderRequest("parallel-diamond", "objective")))
+        await asyncio.wait_for(state.both_started.wait(), timeout=5.0)
+        self.assertEqual(set(state.calls[:3]), {"a", "b", "c"})
+        self.assertEqual(state.max_active, 2)
+        self.assertNotIn("d", state.calls)
+        self.assertIn('"available_capacity":2', runner.prompts[1])
+        self.assertIn('"running_node_ids":[]', runner.prompts[1])
+        state.release.set()
+        result = await task
+        self.assertTrue(result.terminal)
+        self.assertEqual(result.final_response, "parallel done")
+        self.assertEqual(state.calls, ["a", "b", "c", "d"])
+        decisions = await self.store.list_leader_decisions("parallel-diamond")
+        self.assertEqual(
+            [record.decision.kind for record in decisions],
+            [
+                LeaderDecisionKind.SELECT_NODE,
+                LeaderDecisionKind.SELECT_NODES,
+                LeaderDecisionKind.SELECT_NODE,
+                LeaderDecisionKind.FINALIZE,
+            ],
+        )
+        wave = decisions[1]
+        self.assertEqual(wave.decision.selected_node_ids, ("b", "c"))
+        self.assertEqual(wave.selected_node_generations, (1, 1))
+        self.assertEqual(wave.parent_session_id, self.parent_session_id)
+
+    async def test_parallel_leader_rejects_noncanonical_duplicate_and_overflow_waves(self) -> None:
+        for index, (response, message) in enumerate(
+            (
+                (
+                    '{"action":"SELECT_NODES","node_ids":["b","a"]}',
+                    "canonical",
+                ),
+                (
+                    '{"action":"SELECT_NODES","node_ids":["a","a"]}',
+                    "valid typed decision",
+                ),
+                (
+                    '{"action":"SELECT_NODES","node_ids":["a","b","c"]}',
+                    "capacity",
+                ),
+            )
+        ):
+            dag_id = f"parallel-validation-{index}"
+            await self.dag_service.create_task_dag(
+                CreateTaskDagRequest(
+                    dag_id,
+                    (_node("a", 0), _node("b", 1), _node("c", 2)),
+                    max_parallel=2,
+                )
+            )
+            runner = _Runner(self.leader_session_id, [response])
+            with self.assertRaisesRegex(ConfigurationError, message):
+                await self._leader(runner).run(RunLeaderRequest(dag_id, "objective"))
+        self.assertEqual(self.writable.calls, [])
+
+    async def test_parallel_leader_evidence_reports_running_nodes_and_free_capacity(self) -> None:
+        dag = TaskDag.create(
+            dag_id="parallel-evidence",
+            parent_session_id=self.parent_session_id,
+            nodes=(_node("a", 0), _node("b", 1), _node("c", 2), _node("d", 3)),
+            created_at=_now(),
+            max_parallel=3,
+        )
+        running = replace(
+            dag,
+            nodes=(
+                replace(
+                    dag.node("a"),
+                    state=TaskDagNodeState.RUNNING,
+                    generation=1,
+                    parent_task_id="running-a",
+                ),
+                dag.node("b"),
+                dag.node("c"),
+                dag.node("d"),
+            ),
+            state=TaskDagState.RUNNING,
+            generation=1,
+            updated_at=_now(),
+            active_node_id="a",
+        )
+
+        class EvidenceController:
+            async def prepare_task_dag_step(self, request):
+                del request
+                return running
+
+            async def run_task_dag_step(self, request, *, sink=None):
+                del request, sink
+                raise AssertionError("evidence-only run must not start a worker")
+
+        service = LeaderApplicationService(
+            cast(LeaderStore, self.store),
+            EvidenceController(),
+            parent_binding=self.parent_binding,
+            leader_binding=self.leader_binding,
+            session_store=self.store,
+        )
+        evidence = service._evidence("objective", running)
+        self.assertEqual(evidence.max_parallel, 3)
+        self.assertEqual(evidence.running_node_ids, ("a",))
+        self.assertEqual(evidence.available_capacity, 2)
+        self.assertEqual(evidence.ready_node_ids, ("b", "c", "d"))
+        payload = evidence.to_dict()
+        self.assertEqual(payload["completed_node_ids"], [])
+        self.assertEqual(payload["failed_node_ids"], [])
+        self.assertEqual(payload["cancelled_node_ids"], [])
+        self.assertEqual(payload["skipped_node_ids"], [])
+        self.assertEqual(payload["indeterminate_node_ids"], [])
+
+    async def test_parallel_leader_rejects_finalize_while_a_node_is_running(self) -> None:
+        await self.dag_service.create_task_dag(
+            CreateTaskDagRequest(
+                "parallel-finalize-running",
+                (_node("a", 0), _node("b", 1)),
+                max_parallel=2,
+            )
+        )
+        dag = await self.store.get_task_dag("parallel-finalize-running")
+        self.assertIsNotNone(dag)
+        assert dag is not None
+        node = dag.node("a")
+        await self.store.claim_task_dag_node(
+            dag.dag_id,
+            replace(
+                node,
+                state=TaskDagNodeState.RUNNING,
+                generation=node.generation + 1,
+                parent_task_id="running-a",
+                execution_owner_pid=os.getpid(),
+                execution_owner_token="running-owner",
+            ),
+            expected_generation=node.generation,
+            expected_state=TaskDagNodeState.READY,
+            updated_at=_now(),
+        )
+        runner = _Runner(self.leader_session_id, ['{"action":"FINALIZE"}'])
+        with self.assertRaisesRegex(ConfigurationError, "terminal"):
+            await self._leader(runner).run(
+                RunLeaderRequest("parallel-finalize-running", "objective")
+            )
+        self.assertEqual(runner.calls, 1)
+        self.assertEqual(self.writable.calls, [])
+
+    async def test_parallel_leader_reuses_observable_wave_decision_without_provider_replay(
+        self,
+    ) -> None:
+        state = SimpleNamespace(
+            calls=[],
+            active=0,
+            max_active=0,
+            lock=asyncio.Lock(),
+            both_started=asyncio.Event(),
+            release=asyncio.Event(),
+        )
+        state.release.set()
+        factory = _WaveFactory(self.parent_session_id, self.leases, state)
+        parallel_service = TaskDagApplicationService(
+            self.store,
+            self.store,
+            _WaveWritable(self.parent_session_id, self.leases, state),
+            self.leases,
+            _RelayStore(),
+            parent_binding=self.parent_binding,
+            writable_worker_factory=factory,
+        )
+        await parallel_service.create_task_dag(
+            CreateTaskDagRequest(
+                "parallel-decision-recovery",
+                (_node("b", 0), _node("c", 1)),
+                max_parallel=2,
+            )
+        )
+        first_runner = _Runner(
+            self.leader_session_id,
+            ['{"action":"SELECT_NODES","node_ids":["b","c"]}'],
+        )
+        first = LeaderApplicationService(
+            cast(LeaderStore, _FailAfterDecisionStore(self.store)),
+            parallel_service,
+            parent_binding=self.parent_binding,
+            leader_binding=_binding(first_runner, zero_tools=True),
+            session_store=self.store,
+        )
+        with self.assertRaisesRegex(ConfigurationError, "typed decision durability"):
+            await first.run(RunLeaderRequest("parallel-decision-recovery", "objective"))
+
+        second_runner = _Runner(
+            self.leader_session_id,
+            ['{"action":"FINALIZE","summary":"recovered wave"}'],
+        )
+        second = LeaderApplicationService(
+            cast(LeaderStore, self.store),
+            parallel_service,
+            parent_binding=self.parent_binding,
+            leader_binding=_binding(second_runner, zero_tools=True),
+            session_store=self.store,
+        )
+        result = await second.run(RunLeaderRequest("parallel-decision-recovery", "objective"))
+        self.assertTrue(result.terminal)
+        self.assertEqual(first_runner.calls, 1)
+        self.assertEqual(second_runner.calls, 1)
+        self.assertEqual(state.calls, ["b", "c"])
+        decisions = await self.store.list_leader_decisions("parallel-decision-recovery")
+        self.assertEqual(len(decisions), 2)
+        self.assertEqual(decisions[0].decision.kind, LeaderDecisionKind.SELECT_NODES)
+
+    async def test_parallel_leader_partial_claim_recovery_does_not_duplicate_first_node(
+        self,
+    ) -> None:
+        state = SimpleNamespace(
+            calls=[],
+            active=0,
+            max_active=0,
+            lock=asyncio.Lock(),
+            both_started=asyncio.Event(),
+            release=asyncio.Event(),
+        )
+        state.release.set()
+        factory = _WaveFactory(self.parent_session_id, self.leases, state)
+        parallel_service = TaskDagApplicationService(
+            self.store,
+            self.store,
+            _WaveWritable(self.parent_session_id, self.leases, state),
+            self.leases,
+            _RelayStore(),
+            parent_binding=self.parent_binding,
+            writable_worker_factory=factory,
+        )
+        await parallel_service.create_task_dag(
+            CreateTaskDagRequest(
+                "parallel-partial-recovery",
+                (_node("b", 0), _node("c", 1)),
+                max_parallel=2,
+            )
+        )
+        crashing_dag_store = _FailAfterFirstClaimStore(self.store)
+        parallel_service._dag_store = crashing_dag_store  # type: ignore[assignment]
+        first_runner = _Runner(
+            self.leader_session_id,
+            ['{"action":"SELECT_NODES","node_ids":["b","c"]}'],
+        )
+        first = LeaderApplicationService(
+            cast(LeaderStore, self.store),
+            parallel_service,
+            parent_binding=self.parent_binding,
+            leader_binding=_binding(first_runner, zero_tools=True),
+            session_store=self.store,
+        )
+        with self.assertRaisesRegex(RuntimeError, "first wave claim"):
+            await first.run(RunLeaderRequest("parallel-partial-recovery", "objective"))
+        connection = sqlite3.connect(self.database_path)
+        connection.execute(
+            "UPDATE task_dag_nodes SET execution_owner_pid = ? WHERE dag_id = ? AND node_id = ?",
+            (999_999_999, "parallel-partial-recovery", "b"),
+        )
+        connection.commit()
+        connection.close()
+
+        second_runner = _Runner(
+            self.leader_session_id,
+            ['{"action":"FINALIZE","summary":"partial recovered"}'],
+        )
+        second = LeaderApplicationService(
+            cast(LeaderStore, self.store),
+            parallel_service,
+            parent_binding=self.parent_binding,
+            leader_binding=_binding(second_runner, zero_tools=True),
+            session_store=self.store,
+        )
+        result = await second.run(RunLeaderRequest("parallel-partial-recovery", "objective"))
+        self.assertTrue(result.terminal)
+        self.assertEqual(first_runner.calls, 1)
+        self.assertEqual(second_runner.calls, 1)
+        self.assertEqual(state.calls, ["c"])
+        dag = await self.store.get_task_dag("parallel-partial-recovery")
+        self.assertIsNotNone(dag)
+        assert dag is not None
+        self.assertEqual(dag.node("b").state, TaskDagNodeState.INDETERMINATE)
+        self.assertEqual(dag.node("c").state, TaskDagNodeState.COMPLETED)
+
+    async def test_two_parallel_leaders_share_one_durable_wave_owner(self) -> None:
+        state = SimpleNamespace(
+            calls=[],
+            active=0,
+            max_active=0,
+            lock=asyncio.Lock(),
+            both_started=asyncio.Event(),
+            release=asyncio.Event(),
+        )
+        state.release.set()
+        factory = _WaveFactory(self.parent_session_id, self.leases, state)
+        parallel_service = TaskDagApplicationService(
+            self.store,
+            self.store,
+            _WaveWritable(self.parent_session_id, self.leases, state),
+            self.leases,
+            _RelayStore(),
+            parent_binding=self.parent_binding,
+            writable_worker_factory=factory,
+        )
+        await parallel_service.create_task_dag(
+            CreateTaskDagRequest(
+                "parallel-controller-race",
+                (_node("b", 0), _node("c", 1)),
+                max_parallel=2,
+            )
+        )
+        first_runner = _Runner(
+            self.leader_session_id,
+            [
+                '{"action":"SELECT_NODES","node_ids":["b","c"]}',
+                '{"action":"FINALIZE","summary":"done"}',
+            ],
+        )
+        first_runner.started = asyncio.Event()
+        first_runner.release = asyncio.Event()
+        first = LeaderApplicationService(
+            cast(LeaderStore, self.store),
+            parallel_service,
+            parent_binding=self.parent_binding,
+            leader_binding=_binding(first_runner, zero_tools=True),
+            session_store=self.store,
+        )
+        second = LeaderApplicationService(
+            cast(LeaderStore, self.store),
+            parallel_service,
+            parent_binding=self.parent_binding,
+            leader_binding=_binding(_Runner(self.leader_session_id, []), zero_tools=True),
+            session_store=self.store,
+        )
+        first_task = asyncio.create_task(
+            first.run(RunLeaderRequest("parallel-controller-race", "objective"))
+        )
+        await first_runner.started.wait()
+        with self.assertRaisesRegex(ConfigurationError, "provider fence|decision attempt"):
+            await second.run(RunLeaderRequest("parallel-controller-race", "objective"))
+        first_runner.release.set()
+        first_result = await first_task
+        self.assertTrue(first_result.terminal)
+        self.assertEqual(first_runner.calls, 2)
+        self.assertEqual(state.calls, ["b", "c"])
+        self.assertEqual(len(await self.store.list_leader_decisions("parallel-controller-race")), 2)
+
     async def test_security_text_stays_data_and_unknown_selection_fails_closed(self) -> None:
         await self.dag_service.create_task_dag(
             CreateTaskDagRequest("security", (_node("safe", 0),))
@@ -1938,6 +2522,89 @@ class LeaderProcessCrashTests(unittest.IsolatedAsyncioTestCase):
                 created_at=_PROCESS_TEST_TIME,
             )
         )
+
+    async def _seed_parallel_dag(self, dag_id: str) -> None:
+        await self.store.insert_task_dag(
+            TaskDag.create(
+                dag_id=dag_id,
+                parent_session_id=self.parent_session_id,
+                nodes=(_node("b", 0), _node("c", 1)),
+                created_at=_PROCESS_TEST_TIME,
+                max_parallel=2,
+            )
+        )
+
+    async def _run_parallel_case(self, mode: str) -> None:
+        dag_id = f"parallel-process-{mode}"
+        await self._seed_parallel_dag(dag_id)
+        context = mp.get_context("spawn")
+        child = context.Process(
+            target=_parallel_leader_process_child,
+            args=(
+                mode,
+                str(self.database_path),
+                dag_id,
+                self.parent_session_id,
+                self.leader_session_id,
+                str(self.provider_marker_path),
+            ),
+        )
+        child.start()
+        await asyncio.to_thread(child.join, 30)
+        self.assertFalse(child.is_alive())
+        self.assertEqual(child.exitcode, 72 if mode == "after_decision" else 75)
+
+        recovery_session_id = await self.store.create_session(
+            self._temporary.name,
+            "fixture",
+            "fixture-model",
+        )
+        leases = _LeaseStore(self.parent_session_id)
+        writable = _Writable(self.parent_session_id, leases)
+        recovery_service = TaskDagApplicationService(
+            self.store,
+            self.store,
+            writable,
+            leases,
+            _RelayStore(),
+            parent_binding=_binding(_Runner(self.parent_session_id, [])),
+            writable_worker_factory=_ProcessParallelFactory(self.parent_session_id, leases),
+        )
+        recovery_runner = _MarkerRunner(
+            recovery_session_id,
+            ['{"action":"FINALIZE","summary":"parallel process recovered"}'],
+            str(self.provider_marker_path),
+        )
+        result = await LeaderApplicationService(
+            self.store,
+            recovery_service,
+            parent_binding=_binding(_Runner(self.parent_session_id, [])),
+            leader_binding=_binding(recovery_runner, zero_tools=True),
+            session_store=self.store,
+        ).run(RunLeaderRequest(dag_id, "parallel process crash objective"))
+        self.assertTrue(result.terminal)
+        self.assertEqual(recovery_runner.calls, 1)
+        actions = self.provider_marker_path.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(actions, ["SELECT_NODES", "FINALIZE"])
+        dag = await self.store.get_task_dag(dag_id)
+        self.assertIsNotNone(dag)
+        assert dag is not None
+        if mode == "after_decision":
+            self.assertEqual(
+                [dag.node(node_id).state for node_id in ("b", "c")],
+                [TaskDagNodeState.COMPLETED, TaskDagNodeState.COMPLETED],
+            )
+        else:
+            self.assertEqual(dag.node("b").state, TaskDagNodeState.INDETERMINATE)
+            self.assertEqual(dag.node("c").state, TaskDagNodeState.COMPLETED)
+
+    async def test_parallel_process_death_after_observable_wave_decision_does_not_replay(
+        self,
+    ) -> None:
+        await self._run_parallel_case("after_decision")
+
+    async def test_parallel_process_death_after_first_claim_recovers_partial_wave(self) -> None:
+        await self._run_parallel_case("after_first_claim")
 
     async def _run_case(self, mode: str) -> None:
         dag_id = f"process-{mode}"

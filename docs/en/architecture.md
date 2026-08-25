@@ -1728,11 +1728,12 @@ tool-role, synthetic, tool-call-bearing, media-bearing, preserved reasoning,
 and preserved backend-call structures are excluded; assistant visible prose is
 separable from and never carries its `reasoning_content`.
 
-Session schema 23 retains the schema-17 one-to-one insert-only READY relay per
+Session schema 24 retains the schema-17 one-to-one insert-only READY relay per
 writable lease, the durable Task DAG tables described below, the schema-20
 predecessor-result relay table, and the schema-21 Task DAG recovery-claim
 fence; schema 22 adds bounded DAG capacity and scoped Writable lease policy,
-and schema 23 adds per-node execution-owner identity. It also retains the durable Leader
+and schema 23 adds per-node execution-owner identity; schema 24 adds the
+parallel-aware Leader decision projection. It also retains the durable Leader
 attempt/decision projections described after the DAG. Its
 identity binds the parent/task/child, lease, worktree, baseline checkpoint,
 base commit, capability/grant fingerprints, and child-task digest. Source,
@@ -1751,8 +1752,10 @@ tools, roots, sandbox, network, LSP, worktree, or checkpoint authority. The
 existing capability intersection and child-root instruction/skill discovery
 remain the sole authority owners. Durable compaction-summary reuse, live
 context sharing, unbounded parallel workers, Swarm/Ultracode orchestration, and automatic
-delegation remain absent. The bounded Task DAG and serialized Leader slices are
-specified separately by [ADR 0134](adr/0134-durable-serialized-task-dag.md).
+delegation remain absent. The bounded Task DAG and Leader slices are specified
+separately by [ADR 0134](adr/0134-durable-serialized-task-dag.md), [ADR 0135]
+(adr/0135-bounded-serialized-leader-controller.md), and [ADR 0137]
+(adr/0137-parallel-aware-leader-bounded-wave-scheduling.md).
 See [ADR 0133](adr/0133-bounded-parent-context-relay.md) for the relay
 boundary.
 
@@ -1790,7 +1793,7 @@ Parallel nodes receive fresh Writable application services from a typed
 `asyncio.Lock` while giving each node independent binding, lease, worktree,
 checkpoint, child session, Parent Relay, and worker-scoped LSP state.
 
-Session schema 23 stores immutable DAG definitions and bounded node runtime
+Session schema 24 stores immutable DAG definitions and bounded node runtime
 projections in `task_dags` and `task_dag_nodes`, plus insert-only
 `task_dag_dependency_relays` and the separate `task_dag_recovery_claims`
 cross-process ownership fence. Definitions and relay publications are
@@ -1849,7 +1852,7 @@ Existing Worktree,
 Checkpoint, Parent Relay, and worker-scoped read-only LSP contracts remain the
 authority owners. See [ADR 0134](adr/0134-durable-serialized-task-dag.md).
 
-### Bounded serialized Leader controller
+### Bounded serialized Leader controller (historical compatibility path)
 
 ADR 0135 adds one explicit Leader controller over one already-published Task
 DAG. The Leader is a decision authority only: it reconciles the current DAG,
@@ -1859,16 +1862,17 @@ Task-DAG one-step seam. It never creates or mutates the graph definition,
 dependencies, prompts, capabilities, roots, worker, Worktree, Checkpoint,
 Relay, LSP process, or child session directly.
 
-The only model decisions are `SELECT_NODE`, whose node ID must be in the exact
-current READY set, and terminal-only `FINALIZE`. The model response is strict
-JSON; prose, unknown actions, extra fields, blocked/stale node IDs, and
-instructions embedded in node text are data or fail closed. Evidence contains
-only bounded node definitions and durable outcome metadata, with redacted
-previews and fingerprints; it never carries raw transcript/reasoning/tool
-arguments/output, Relay payloads, workspace bytes, checkpoint bytes, Git diffs,
-secrets, or arbitrary paths.
+The serialized compatibility path accepts `SELECT_NODE`, whose node ID must be
+in the exact current READY set, and terminal-only `FINALIZE`. The model response
+is strict JSON; prose, unknown actions, extra fields, blocked/stale node IDs,
+and instructions embedded in node text are data or fail closed. Evidence
+contains only bounded node definitions and durable outcome metadata, with
+redacted previews and fingerprints; it never carries raw
+transcript/reasoning/tool arguments/output, Relay payloads, workspace bytes,
+checkpoint bytes, Git diffs, secrets, or arbitrary paths. The current
+parallel-aware extension is specified by ADR 0137 below.
 
-The current Session Store schema 23 retains the schema-19 `leader_attempts` and
+The current Session Store schema 24 retains the schema-19 `leader_attempts` and
 `leader_decisions` projections. An attempt binds the exact DAG generation,
 definition/evidence/objective fingerprints, Leader session, controller owner,
 turn identity, and durable lifecycle. SQLite write transactions and CAS-like
@@ -1888,14 +1892,47 @@ recovery. A published decision may be applied through the DAG CAS by another
 controller, so a crash after decision publication does not create a second
 model request or worker allocation.
 
-The Leader loop is bounded and serialized. It selects one ready node, waits
+The historical Leader loop is bounded and serialized. It selects one ready node, waits
 for the existing Writable Subagent/DAG result, then constructs the next
 snapshot. It does not auto-execute a second node inside the one-step seam.
 Final synthesis is requested only after a terminal DAG snapshot and is kept
 in the dedicated Leader session rather than appended to the parent transcript.
-Model-generated DAG creation, replan, retry, parallel/dataflow execution,
+Model-generated DAG creation, replan, retry, dynamic/unbounded dataflow,
 merge, rollback, UI/ACP exposure, Swarm, Ultracode, and automatic delegation
-remain outside this slice. See [ADR 0135](adr/0135-bounded-serialized-leader-controller.md).
+remain outside this slice. Bounded parallel-aware Leader waves are implemented
+as the internal extension in [ADR 0137]
+(adr/0137-parallel-aware-leader-bounded-wave-scheduling.md).
+
+### Parallel-aware Leader / bounded wave scheduling
+
+ADR 0137 extends the zero-tool Leader without changing authority ownership. The
+Leader may publish typed `SELECT_NODE` for the serialized compatibility path or
+typed `SELECT_NODES` for one bounded wave; only a terminal DAG may receive
+`FINALIZE`. `SELECT_NODES` is non-empty, unique, bounded by immutable
+`max_parallel`, and must use canonical `(ordinal, node_id)` order. Non-canonical,
+unknown, stale-generation, overflow, and running-node finalization decisions
+fail closed; the model output is never silently reordered or replayed.
+
+The evidence envelope includes parent session, graph/definition identity,
+generation, immutable `max_parallel`, durable running IDs, available capacity,
+canonical READY IDs, node generations/dependencies, and deterministic
+completed/failed/cancelled/skipped/indeterminate state buckets. It remains
+bounded, redacted, and evidence-only. `RunTaskDagWaveRequest` carries the exact
+graph and selected node generations to the Task DAG authority. SQLite counts
+durable RUNNING rows and performs the capacity check plus graph/node CAS; the
+wave seam claims only the selected IDs, creates independent Writable services,
+and uses a structured `TaskGroup`. It never fills unused capacity with an
+unselected node. `max_parallel=1` remains compatible with the one-node path.
+
+Session schema 24 adds parent-session, selected-node, and selected-generation
+decision projections and migrates populated schema-23 rows. A durable wave
+decision can be reused after a crash only when each selected node is still at
+its recorded READY generation or has advanced durably to RUNNING/terminal;
+provider replay is never inferred. Partial claims, controller races, failure,
+cancellation, skipped descendants, and indeterminate branches retain the
+existing Task DAG recovery semantics. The Leader still never owns Writable,
+Worktree, Checkpoint, Relay, LSP, capability, or graph mutation authority.
+See [ADR 0137](adr/0137-parallel-aware-leader-bounded-wave-scheduling.md).
 
 ## Platform policy
 

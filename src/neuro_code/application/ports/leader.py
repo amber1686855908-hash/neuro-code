@@ -79,6 +79,8 @@ class LeaderStore(Protocol):
         decision_id: str,
         decision: LeaderDecision,
         created_at: datetime,
+        parent_session_id: str | None = None,
+        selected_node_generations: tuple[int, ...] = (),
     ) -> LeaderDecisionRecord: ...
 
     async def transition_leader_attempt(

@@ -62,8 +62,9 @@ claimed node 提供全新的 Writable application service；既有的、每 work
 baseline Checkpoint、Relay、fingerprint、changed-file count 和有界 response preview。成功节点
 必须有精确的 lease 与 Relay 证据；成功关联缺失或不一致时为 `INDETERMINATE`。
 
-ADR 0136 在不改变这一 execution authority 的前提下增加有界 predecessor-result Relay。Session schema 23
-保留 schema-20 Relay、schema-21 recovery fence，并增加有界 DAG capacity 与逐节点 execution-owner 字段。在 dependent node 完成
+ADR 0136 在不改变这一 execution authority 的前提下增加有界 predecessor-result Relay。Session schema 24
+保留 schema-20 Relay、schema-21 recovery fence、有界 DAG capacity、逐节点 execution-owner 字段与
+parallel-aware Leader decision projection。在 dependent node 完成
 精确的 `RUNNING` generation claim 且 child runtime 启动之前，DAG service 发布一条 schema-20 insert-only
 projection，只包含按声明顺序排列的 completed direct predecessor。Projection 经过脱敏，
 每个 result 最多 4 KiB、source result 合计最多 16 KiB、渲染 context 最多 24 KiB；它绑定 predecessor

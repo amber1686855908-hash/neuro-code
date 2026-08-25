@@ -136,7 +136,9 @@ pre-provider fencing against a live expired owner, durable model-commit reuse,
 terminal decision idempotence, and no provider replay after observable L2 turn
 evidence. Existing Task DAG, Writable Subagent, Worktree, Checkpoint, Relay,
 LSP, and full repository gates remain regression requirements. The slice is not
-exposed through CLI/TUI/ACP and does not turn the Leader into a parallel
-planner; bounded Task DAG workers are specified separately. Swarm,
+exposed through CLI/TUI/ACP and does not turn the Leader into an unbounded
+parallel planner; bounded Task DAG workers are specified separately. The
+bounded parallel-aware Leader extension is specified by [ADR 0137]
+(0137-parallel-aware-leader-bounded-wave-scheduling.md). Swarm,
 Ultracode, automatic delegation, model DAG creation, replan, retry, merge,
 rollback, or live paid-provider acceptance.

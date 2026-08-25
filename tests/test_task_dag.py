@@ -21,6 +21,7 @@ from neuro_code.application.workflows.task_dag import (
     CreateTaskDagRequest,
     RunTaskDagRequest,
     RunTaskDagStepRequest,
+    RunTaskDagWaveRequest,
     TaskDagApplicationService,
     TaskDagWritableService,
 )
@@ -977,7 +978,7 @@ class TaskDagPersistenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertLessEqual(len(current.running_node_ids), 2)
         self.assertEqual(len(current.running_node_ids), 2)
 
-    async def test_schema_17_migrates_to_23_and_creates_dag_leader_relay_and_recovery_tables(
+    async def test_schema_17_migrates_to_24_and_creates_dag_leader_relay_and_recovery_tables(
         self,
     ) -> None:
         connection = sqlite3.connect(self._database_path)
@@ -998,7 +999,7 @@ class TaskDagPersistenceTests(unittest.IsolatedAsyncioTestCase):
             ).fetchall()
         }
         connection.close()
-        self.assertEqual(version, (23,))
+        self.assertEqual(version, (24,))
         self.assertTrue({"task_dags", "task_dag_nodes"}.issubset(tables))
         self.assertTrue({"leader_attempts", "leader_decisions"}.issubset(tables))
         self.assertIn("task_dag_dependency_relays", tables)
@@ -1038,11 +1039,164 @@ class TaskDagPersistenceTests(unittest.IsolatedAsyncioTestCase):
             ).fetchall()
         }
         connection.close()
-        self.assertEqual(version, (23,))
+        self.assertEqual(version, (24,))
         self.assertTrue({"leader_attempts", "leader_decisions"}.issubset(tables))
         self.assertIn("task_dag_recovery_claims", tables)
 
-    async def test_populated_schema_20_migrates_to_23_without_touching_dag_contract(self) -> None:
+    async def test_populated_schema_23_leader_decision_migrates_to_parallel_projection(
+        self,
+    ) -> None:
+        dag = self._dag("populated-schema-23-leader")
+        await self.store.insert_task_dag(dag)
+        leader_session_id = await self.store.create_session(
+            self._temporary.name,
+            "fixture-leader",
+            "fixture-model",
+        )
+        created_at = _now().isoformat()
+        connection = sqlite3.connect(self._database_path)
+        connection.execute("PRAGMA foreign_keys = OFF")
+        connection.execute("DROP TABLE leader_decisions")
+        connection.execute("DROP TABLE leader_attempts")
+        connection.execute(
+            """
+            CREATE TABLE leader_attempts (
+                attempt_id TEXT PRIMARY KEY,
+                dag_id TEXT NOT NULL,
+                leader_session_id TEXT NOT NULL,
+                objective_fingerprint TEXT NOT NULL,
+                dag_generation INTEGER NOT NULL CHECK (dag_generation >= 0),
+                definition_fingerprint TEXT NOT NULL,
+                evidence_fingerprint TEXT NOT NULL,
+                state TEXT NOT NULL,
+                owner_id TEXT NOT NULL,
+                lease_expires_at TEXT NOT NULL,
+                turn_id TEXT NOT NULL UNIQUE,
+                model_response TEXT,
+                decision_id TEXT UNIQUE,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(
+                    dag_id,
+                    dag_generation,
+                    definition_fingerprint,
+                    evidence_fingerprint,
+                    objective_fingerprint
+                ),
+                FOREIGN KEY (dag_id) REFERENCES task_dags(dag_id) ON DELETE RESTRICT,
+                FOREIGN KEY (leader_session_id) REFERENCES sessions(id) ON DELETE RESTRICT
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE leader_decisions (
+                decision_id TEXT PRIMARY KEY,
+                attempt_id TEXT NOT NULL UNIQUE,
+                dag_id TEXT NOT NULL,
+                leader_session_id TEXT NOT NULL,
+                dag_generation INTEGER NOT NULL CHECK (dag_generation >= 0),
+                definition_fingerprint TEXT NOT NULL,
+                evidence_fingerprint TEXT NOT NULL,
+                kind TEXT NOT NULL CHECK (kind IN ('SELECT_NODE', 'FINALIZE')),
+                selected_node_id TEXT,
+                summary TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (attempt_id) REFERENCES leader_attempts(attempt_id) ON DELETE RESTRICT,
+                FOREIGN KEY (dag_id) REFERENCES task_dags(dag_id) ON DELETE RESTRICT,
+                FOREIGN KEY (leader_session_id) REFERENCES sessions(id) ON DELETE RESTRICT
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX leader_attempts_by_dag
+            ON leader_attempts(dag_id, dag_generation, created_at, attempt_id)
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX leader_decisions_by_dag
+            ON leader_decisions(dag_id, created_at, decision_id)
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO leader_attempts(
+                attempt_id, dag_id, leader_session_id, objective_fingerprint,
+                dag_generation, definition_fingerprint, evidence_fingerprint,
+                state, owner_id, lease_expires_at, turn_id, model_response,
+                decision_id, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "legacy-leader-attempt",
+                dag.dag_id,
+                leader_session_id,
+                "a" * 64,
+                dag.generation,
+                dag.definition_fingerprint,
+                "b" * 64,
+                "decision_published",
+                "legacy-owner",
+                created_at,
+                "legacy-leader-turn",
+                '{"action":"SELECT_NODE","node_id":"a"}',
+                "legacy-leader-decision",
+                created_at,
+                created_at,
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO leader_decisions(
+                decision_id, attempt_id, dag_id, leader_session_id,
+                dag_generation, definition_fingerprint, evidence_fingerprint,
+                kind, selected_node_id, summary, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "legacy-leader-decision",
+                "legacy-leader-attempt",
+                dag.dag_id,
+                leader_session_id,
+                dag.generation,
+                dag.definition_fingerprint,
+                "b" * 64,
+                "SELECT_NODE",
+                "a",
+                "legacy",
+                created_at,
+            ),
+        )
+        connection.execute("UPDATE schema_meta SET version = 23 WHERE singleton = 1")
+        connection.commit()
+        connection.close()
+
+        reopened = SqliteSessionStore(self._database_path)
+        await reopened.initialize()
+        attempt = await reopened.get_leader_attempt("legacy-leader-attempt")
+        decision = await reopened.get_leader_decision("legacy-leader-decision")
+        self.assertIsNotNone(attempt)
+        self.assertIsNotNone(decision)
+        assert attempt is not None
+        assert decision is not None
+        self.assertEqual(attempt.parent_session_id, self.parent_session_id)
+        self.assertEqual(decision.parent_session_id, self.parent_session_id)
+        self.assertEqual(decision.decision.selected_node_ids, ("a",))
+        self.assertEqual(decision.selected_node_generations, ())
+        connection = sqlite3.connect(self._database_path)
+        version = connection.execute(
+            "SELECT version FROM schema_meta WHERE singleton = 1"
+        ).fetchone()
+        decision_sql = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'leader_decisions'"
+        ).fetchone()
+        connection.close()
+        self.assertEqual(version, (24,))
+        self.assertIn("SELECT_NODES", str(decision_sql[0]))
+
+    async def test_populated_schema_20_migrates_to_24_without_touching_dag_contract(self) -> None:
         dag = self._dag("populated-schema-20")
         await self.store.insert_task_dag(dag)
         connection = sqlite3.connect(self._database_path)
@@ -1073,7 +1227,7 @@ class TaskDagPersistenceTests(unittest.IsolatedAsyncioTestCase):
             "PRAGMA foreign_key_list(task_dag_recovery_claims)"
         ).fetchall()
         connection.close()
-        self.assertEqual(version, (23,))
+        self.assertEqual(version, (24,))
         self.assertTrue(
             {
                 "task_dags",
@@ -1104,7 +1258,7 @@ class TaskDagPersistenceTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(claimed.node("a").parent_task_id, "migration-worker-a")
 
-    async def test_populated_schema_21_running_relay_and_recovery_claim_survive_schema_23(
+    async def test_populated_schema_21_running_relay_and_recovery_claim_survive_schema_24(
         self,
     ) -> None:
         dag = self._dag("populated-schema-21")
@@ -1249,7 +1403,7 @@ class TaskDagPersistenceTests(unittest.IsolatedAsyncioTestCase):
             "SELECT COUNT(*) FROM task_dag_recovery_claims WHERE claim_id = 'migration-claim'"
         ).fetchone()
         connection.close()
-        self.assertEqual(version, (23,))
+        self.assertEqual(version, (24,))
         self.assertEqual(relay_count, (1,))
         self.assertEqual(claim_count, (1,))
 
@@ -1382,6 +1536,10 @@ class TaskDagSchedulerTests(unittest.IsolatedAsyncioTestCase):
             RunTaskDagStepRequest("")
         with self.assertRaisesRegex(ValueError, "selected node id must not be empty"):
             RunTaskDagStepRequest("dag", "")
+        with self.assertRaisesRegex(ValueError, "wave selected node ids"):
+            RunTaskDagWaveRequest("dag", ())
+        with self.assertRaisesRegex(ValueError, "expected generations"):
+            RunTaskDagWaveRequest("dag", ("a",), expected_node_generations=(("b", 0),))
 
     async def test_parallel_scheduler_requires_independent_worker_factory(self) -> None:
         writable = _FakeWritableService(self.parent_session_id)
@@ -2164,6 +2322,117 @@ class TaskDagSchedulerTests(unittest.IsolatedAsyncioTestCase):
             fanin_relay,
         )
 
+    async def test_leader_wave_claims_only_selected_nodes_and_enforces_capacity(self) -> None:
+        state = _ParallelRunState({"b", "c"})
+        service, factory = self._parallel_service(state)
+        await service.create_task_dag(
+            CreateTaskDagRequest(
+                "leader-wave",
+                (_node("b", 0), _node("c", 1), _node("e", 2)),
+                max_parallel=2,
+            )
+        )
+        running = asyncio.create_task(
+            service.run_task_dag_wave(
+                RunTaskDagWaveRequest(
+                    "leader-wave",
+                    ("b", "c"),
+                    expected_dag_generation=0,
+                    expected_node_generations=(("b", 0), ("c", 0)),
+                )
+            )
+        )
+        await asyncio.wait_for(state.started_event.wait(), timeout=10)
+        snapshot = await self.store.get_task_dag("leader-wave")
+        self.assertIsNotNone(snapshot)
+        assert snapshot is not None
+        self.assertEqual(snapshot.running_node_ids, ("b", "c"))
+        self.assertNotIn("e", state.started_nodes)
+        self.assertEqual(len(factory.services), 2)
+        state.release.set()
+        result = await asyncio.wait_for(running, timeout=20)
+        self.assertEqual(
+            [node.state for node in result.nodes],
+            [TaskDagNodeState.COMPLETED, TaskDagNodeState.COMPLETED, TaskDagNodeState.READY],
+        )
+
+        await service.create_task_dag(
+            CreateTaskDagRequest(
+                "leader-wave-overflow",
+                (_node("a", 0), _node("b", 1), _node("c", 2)),
+                max_parallel=2,
+            )
+        )
+        with self.assertRaisesRegex(ConfigurationError, "exceeds"):
+            await service.run_task_dag_wave(
+                RunTaskDagWaveRequest(
+                    "leader-wave-overflow",
+                    ("a", "b", "c"),
+                    expected_dag_generation=0,
+                    expected_node_generations=(("a", 0), ("b", 0), ("c", 0)),
+                )
+            )
+
+    async def test_leader_wave_partial_claim_does_not_substitute_unselected_node(self) -> None:
+        state = _ParallelRunState({"b"})
+        service, _ = self._parallel_service(state)
+        await service.create_task_dag(
+            CreateTaskDagRequest(
+                "leader-wave-partial",
+                (_node("b", 0), _node("c", 1), _node("e", 2)),
+                max_parallel=2,
+            )
+        )
+        delegate = self.store
+
+        class RaceStore:
+            def __init__(self) -> None:
+                self.changed = False
+
+            def __getattr__(self, name: str) -> object:
+                return getattr(delegate, name)
+
+            async def claim_task_dag_node(self, *args, **kwargs):
+                result = await delegate.claim_task_dag_node(*args, **kwargs)
+                if not self.changed:
+                    self.changed = True
+                    current = await delegate.get_task_dag("leader-wave-partial")
+                    assert current is not None
+                    c = current.node("c")
+                    await delegate.compare_and_transition_task_dag_node(
+                        "leader-wave-partial",
+                        replace(
+                            c,
+                            state=TaskDagNodeState.CANCELLED,
+                            generation=c.generation + 1,
+                            error_kind="race",
+                            error_reason="selected node changed",
+                        ),
+                        expected_generation=c.generation,
+                        expected_state=TaskDagNodeState.READY,
+                    )
+                return result
+
+        service._dag_store = RaceStore()  # type: ignore[assignment]
+        running = asyncio.create_task(
+            service.run_task_dag_wave(
+                RunTaskDagWaveRequest(
+                    "leader-wave-partial",
+                    ("b", "c"),
+                    expected_dag_generation=0,
+                    expected_node_generations=(("b", 0), ("c", 0)),
+                )
+            )
+        )
+        await asyncio.wait_for(state.started_event.wait(), timeout=10)
+        self.assertEqual(state.started_nodes, ["b"])
+        self.assertNotIn("e", state.started_nodes)
+        state.release.set()
+        result = await asyncio.wait_for(running, timeout=20)
+        self.assertEqual(result.node("b").state, TaskDagNodeState.COMPLETED)
+        self.assertEqual(result.node("c").state, TaskDagNodeState.CANCELLED)
+        self.assertEqual(result.node("e").state, TaskDagNodeState.READY)
+
     async def test_parallel_capacity_does_not_start_third_ready_node_until_slot_frees(self) -> None:
         state = _ParallelRunState({"b", "c"})
         service, _ = self._parallel_service(state)
@@ -2215,6 +2484,39 @@ class TaskDagSchedulerTests(unittest.IsolatedAsyncioTestCase):
         result = await asyncio.wait_for(running, timeout=20)
         self.assertIs(result.state, TaskDagState.FAILED)
         self.assertIs(result.node("c").state, TaskDagNodeState.COMPLETED)
+
+    async def test_indeterminate_branch_does_not_block_unrelated_ready_branch(self) -> None:
+        state = _ParallelRunState()
+        service, _ = self._parallel_service(state)
+        await service.create_task_dag(
+            CreateTaskDagRequest(
+                "parallel-indeterminate-sibling",
+                (_node("b", 0), _node("c", 1)),
+                max_parallel=2,
+            )
+        )
+        snapshot = await self.store.get_task_dag("parallel-indeterminate-sibling")
+        self.assertIsNotNone(snapshot)
+        assert snapshot is not None
+        await self.store.claim_task_dag_node(
+            snapshot.dag_id,
+            replace(
+                snapshot.node("b"),
+                state=TaskDagNodeState.RUNNING,
+                generation=1,
+                parent_task_id="dead-b",
+                execution_owner_pid=999_999_999,
+                execution_owner_token="dead-b-owner",
+            ),
+            expected_generation=0,
+            expected_state=TaskDagNodeState.READY,
+            updated_at=_now(),
+        )
+        result = await service.run_task_dag(RunTaskDagRequest(snapshot.dag_id))
+        self.assertIs(result.state, TaskDagState.INDETERMINATE)
+        self.assertIs(result.node("b").state, TaskDagNodeState.INDETERMINATE)
+        self.assertIs(result.node("c").state, TaskDagNodeState.COMPLETED)
+        self.assertEqual(state.invocation_count, {"c": 1})
 
     async def test_parallel_cancellation_finishes_all_owned_nodes_structurally(self) -> None:
         state = _ParallelRunState({"b", "c"})

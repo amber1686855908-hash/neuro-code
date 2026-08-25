@@ -1672,10 +1672,11 @@ Writable workflow 现在只从实际 parent `ConversationBinding` 所绑定 sess
 保留 reasoning 与保留 backend-call 的结构都会排除；assistant 可见正文可与
 `reasoning_content` 明确分离，后者绝不进入 Relay。
 
-Session schema 23 保留 schema 17 的每个 writable lease 一条一对一、insert-only READY Relay，
+Session schema 24 保留 schema 17 的每个 writable lease 一条一对一、insert-only READY Relay，
 以及下述持久化 Task DAG 表、schema 20 的 predecessor-result Relay 表和 schema 21 的 Task DAG
 recovery-claim fence；schema 22 增加有界 DAG capacity 与 scoped Writable lease policy，schema 23
-增加逐节点 execution-owner identity，并保留后文的持久化
+增加逐节点 execution-owner identity，schema 24 增加 parallel-aware Leader decision projection，
+并保留后文的持久化
 Leader attempt/decision 投影。其 identity
 绑定 parent/task/child、lease、worktree、baseline checkpoint、base commit、
 capability/grant fingerprint 与 child-task digest。加载时校验 source、content 和完整记录
@@ -1689,8 +1690,9 @@ conversation history，并在模型、tool 与 LSP 多步骤间保持字节稳�
 不会被解析为 tool、root、sandbox、network、LSP、worktree 或 checkpoint 权限。既有 capability
 求交与 child-root instruction/skill discovery 仍是唯一权限 owner。Durable compaction summary
 复用、实时 context sharing、无界并行 worker、Swarm/Ultracode 编排与自动委派仍未实现。
-有界 Task DAG 与串行 Leader 切片由独立的 [ADR 0134](adr/0134-durable-serialized-task-dag.md) 及
-ADR 0135 规定；Relay
+有界 Task DAG 与 Leader 切片由独立的 [ADR 0134](adr/0134-durable-serialized-task-dag.md)、
+[ADR 0135](adr/0135-bounded-serialized-leader-controller.md) 与 [ADR 0137]
+(adr/0137-parallel-aware-leader-bounded-wave-scheduling.md) 规定；Relay
 边界详见 [ADR 0133](adr/0133-bounded-parent-context-relay.md)。
 
 ### 有界持久化 Task DAG
@@ -1717,7 +1719,7 @@ Parallel node 通过 typed `TaskDagWritableWorkerFactory` 获得全新的 Writab
 这样既保留冻结的每 worker `asyncio.Lock`，也使每个节点拥有独立的 binding、lease、worktree、
 checkpoint、child session、Parent Relay 和 worker-scoped LSP state。
 
-Session schema 23 在 `task_dags` 与 `task_dag_nodes` 中保存不可变 DAG 定义和有界节点运行投影，
+Session schema 24 在 `task_dags` 与 `task_dag_nodes` 中保存不可变 DAG 定义和有界节点运行投影，
 并在 `task_dag_dependency_relays` 中保存 insert-only 的 predecessor-result Relay，同时在独立的
 `task_dag_recovery_claims` 中保存跨进程 ownership fence。定义和 Relay 发布都是 insert-only；graph
 与 node 生命周期更新使用 generation CAS。成功节点记录精确的 worker task、child session、writable lease、
@@ -1756,7 +1758,7 @@ Relay 是本切片唯一的 dataflow 行为，不传递 authority 或 workspace 
 既有 Worktree、Checkpoint、Parent Relay 和 worker-scoped 只读 LSP 合约继续作为 authority owner。详见
 [ADR 0134](adr/0134-durable-serialized-task-dag.md)。
 
-### 有界串行 Leader controller
+### 有界串行 Leader controller（历史 compatibility path）
 
 ADR 0135 在一个已经发布的 Task DAG 之上增加一个显式 Leader controller。Leader 只拥有 decision
 authority：它 reconciliation 当前 DAG，构造有界、脱敏、确定性的 evidence envelope，让专用
@@ -1764,14 +1766,14 @@ zero-tool model 生成一个 typed decision，然后调用既有 Task-DAG one-st
 修改 graph definition、dependency、prompt、capability、root、worker、Worktree、Checkpoint、
 Relay、LSP process 或 child session。
 
-model 只允许两种 decision：`SELECT_NODE`，其 node ID 必须属于当前精确 READY set；以及仅在 DAG
+串行 compatibility path 接受 `SELECT_NODE`，其 node ID 必须属于当前精确 READY set；以及仅在 DAG
 terminal 时允许的 `FINALIZE`。model response 必须是 strict JSON；普通 prose、unknown action、额外
 字段、blocked/stale node ID 和 node text 中的指令都只是数据或失败关闭。evidence 只包含有界的
 node definition 与 durable outcome metadata，并对 preview 脱敏、带 fingerprint；不包含 raw
 transcript/reasoning/tool argument/output、Relay payload、workspace bytes、checkpoint bytes、Git
 diff、secret 或 arbitrary path。
 
-当前 Session Store schema 23 保留 schema 19 新增的 `leader_attempts` 与 `leader_decisions` 投影。Attempt 绑定精确 DAG
+当前 Session Store schema 24 保留 schema 19 新增的 `leader_attempts` 与 `leader_decisions` 投影。Attempt 绑定精确 DAG
 generation、definition/evidence/objective fingerprint、Leader session、controller owner、turn
 identity 与 durable lifecycle。SQLite write transaction 和 CAS-like state transition 保证同一精确
 snapshot 只有一个 controller 拥有 model request。Controller 必须在 provider call 紧邻之前，使用
@@ -1784,8 +1786,34 @@ provider。存在未解决的 session turn 时保守转为 `INDETERMINATE`，需
 后，即使 controller 在 DAG claim 前崩溃，另一个 controller 也可以通过 DAG CAS 复用 decision，不会
 产生第二次 model request 或 worker allocation。
 
-Leader loop 有界且串行：选择一个 ready node，等待既有 Writable Subagent/DAG 结果，然后构造下一份
+历史 Leader loop 有界且串行：选择一个 ready node，等待既有 Writable Subagent/DAG 结果，然后构造下一份
 snapshot；one-step seam 内不会自动执行第二个 node。只有 DAG terminal 后才请求 final synthesis，且
 结果保留在专用 Leader session，不写入 parent transcript。model 生成 DAG、replan、retry、
-parallel/dataflow execution、merge、rollback、UI/ACP 暴露、Swarm、Ultracode 与自动委派仍不属于本切片。
-详见 [ADR 0135](adr/0135-bounded-serialized-leader-controller.md)。
+dynamic/无界 dataflow、merge、rollback、UI/ACP 暴露、Swarm、Ultracode 与自动委派仍不属于本切片。
+有界 parallel-aware Leader wave 由下方 [ADR 0137]
+(adr/0137-parallel-aware-leader-bounded-wave-scheduling.md) 实现。
+
+### Parallel-aware Leader / 有界 wave scheduling
+
+ADR 0137 在不改变 authority ownership 的前提下扩展 zero-tool Leader。Leader 可以为串行
+compatibility path 发布 typed `SELECT_NODE`，也可以为一个有界 wave 发布 typed `SELECT_NODES`；
+只有 terminal DAG 才能接收 `FINALIZE`。`SELECT_NODES` 必须非空、无重复、不超过不可变
+`max_parallel`，并按 canonical `(ordinal, node_id)` 顺序排列。Non-canonical、unknown、
+stale-generation、overflow 以及 running-node finalization decision 都 fail closed；model output
+不会被静默重排或 replay。
+
+Evidence envelope 包含 parent session、graph/definition identity、generation、不可变
+`max_parallel`、durable running ID、available capacity、canonical READY ID、node generation/
+dependency，以及确定性的 completed/failed/cancelled/skipped/indeterminate state bucket。它仍然
+有界、脱敏且只是 evidence。`RunTaskDagWaveRequest` 将 exact graph 与 selected node generation
+交给 Task DAG authority。SQLite 统计 durable RUNNING row，并执行 capacity check 与 graph/node
+CAS；wave seam 只 claim selected ID，创建独立 Writable service，并使用结构化 `TaskGroup`，不会
+填充未选择的 node。`max_parallel=1` 继续兼容 one-node path。
+
+Session schema 24 增加 parent-session、selected-node 和 selected-generation decision projection，
+并迁移已填充的 schema-23 row。Crash 后只有每个 selected node 仍在记录的 READY generation，或
+已经 durable advanced 到 RUNNING/terminal 时，durable wave decision 才能复用；不会推断 provider
+replay 安全。Partial claim、controller race、failure、cancellation、skipped descendant 和
+indeterminate branch 保留既有 Task DAG recovery semantics。Leader 仍不拥有 Writable、Worktree、
+Checkpoint、Relay、LSP、capability 或 graph mutation authority。详见 [ADR 0137]
+(adr/0137-parallel-aware-leader-bounded-wave-scheduling.md)。

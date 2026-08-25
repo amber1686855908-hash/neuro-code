@@ -85,9 +85,9 @@ node requires exact lease and Relay evidence; missing or inconsistent success
 correlation is `INDETERMINATE`.
 
 ADR 0136 adds the bounded predecessor-result relay without changing this
-execution authority. Session schema 23 retains the schema-20 relay, the
-schema-21 recovery fence, and adds bounded DAG capacity plus per-node
-execution-owner fields. After a dependent
+execution authority. Session schema 24 retains the schema-20 relay, the
+schema-21 recovery fence, bounded DAG capacity, per-node execution-owner
+fields, and the parallel-aware Leader decision projection. After a dependent
 node's exact `RUNNING` generation is claimed and before its child runtime
 starts, the DAG service publishes an insert-only schema-20 projection
 containing only completed direct predecessors, in declaration order. The

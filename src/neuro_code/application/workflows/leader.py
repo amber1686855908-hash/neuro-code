@@ -27,6 +27,7 @@ from neuro_code.application.sessions.binding import ConversationBinding
 from neuro_code.application.workflows.task_dag import (
     RunTaskDagRequest,
     RunTaskDagStepRequest,
+    RunTaskDagWaveRequest,
     TaskDagApplicationService,
 )
 from neuro_code.domain.execution import TurnSource
@@ -44,7 +45,7 @@ from neuro_code.domain.leader import (
     LeaderEvidenceEnvelope,
     LeaderEvidenceNode,
 )
-from neuro_code.domain.task_dag import TaskDag, TaskDagNode
+from neuro_code.domain.task_dag import TaskDag, TaskDagNode, TaskDagNodeState
 from neuro_code.shared.errors import ConfigurationError
 from neuro_code.shared.redaction import redact_sensitive_text
 
@@ -224,10 +225,34 @@ class LeaderApplicationService:
         decisions: list[LeaderDecisionRecord] = []
         for _ in range(MAX_LEADER_DECISIONS_PER_RUN):
             dag = await self._dag_service.prepare_task_dag_step(RunTaskDagRequest(request.dag_id))
-            if dag.max_parallel != 1:
-                raise ConfigurationError("Leader only supports serialized task DAGs")
             evidence = self._evidence(objective, dag)
-            if dag.running_node_ids:
+            recovered = await self._find_recoverable_wave(objective, evidence)
+            if recovered is not None:
+                record, attempt = recovered
+                if record not in decisions:
+                    decisions.append(record)
+                next_dag, expected_generations = await self._execute_selection(
+                    request.dag_id,
+                    dag,
+                    evidence,
+                    record,
+                    sink=sink,
+                )
+                progressed = self._selection_progressed(next_dag, expected_generations)
+                if progressed:
+                    await self._mark_executed(attempt)
+                    continue
+                if next_dag.running_node_ids and (
+                    next_dag.max_parallel <= len(next_dag.running_node_ids)
+                ):
+                    return LeaderRunResult(next_dag, None, tuple(decisions))
+                await self._mark_stale(attempt)
+                raise ConfigurationError("durable Leader wave made no recoverable progress")
+            if dag.running_node_ids and evidence.available_capacity == 0:
+                return LeaderRunResult(dag, None, tuple(decisions))
+            if dag.running_node_ids and not evidence.ready_node_ids:
+                return LeaderRunResult(dag, None, tuple(decisions))
+            if not evidence.state.terminal and not evidence.ready_node_ids:
                 return LeaderRunResult(dag, None, tuple(decisions))
             record, attempt = await self._decide(evidence)
             try:
@@ -251,11 +276,12 @@ class LeaderApplicationService:
                 await self._mark_executed(attempt)
                 return LeaderRunResult(current, record.decision.summary, tuple(decisions))
 
-            selected_node_id = record.decision.selected_node_id
-            assert selected_node_id is not None
             try:
-                next_dag = await self._dag_service.run_task_dag_step(
-                    RunTaskDagStepRequest(request.dag_id, selected_node_id),
+                next_dag, expected_generations = await self._execute_selection(
+                    request.dag_id,
+                    dag,
+                    evidence,
+                    record,
                     sink=sink,
                 )
             except asyncio.CancelledError:
@@ -268,12 +294,16 @@ class LeaderApplicationService:
                     raise ConfigurationError(
                         "another Leader controller owns the selected DAG step"
                     ) from error
-                refreshed_node = refreshed.node(selected_node_id)
-                if refreshed_node.state.terminal:
+                progressed = self._selection_progressed(refreshed, expected_generations)
+                if progressed:
                     await self._mark_executed(attempt)
                     continue
                 await self._mark_stale(attempt)
-                raise ConfigurationError("Leader SELECT_NODE decision became stale") from error
+                raise ConfigurationError("Leader selected wave became stale") from error
+            progressed = self._selection_progressed(next_dag, expected_generations)
+            if not progressed:
+                await self._mark_stale(attempt)
+                raise ConfigurationError("Leader selected wave made no durable progress")
             await self._mark_executed(attempt)
             if next_dag.state.terminal and not next_dag.running_node_ids:
                 # The next loop performs the terminal-only synthesis decision.
@@ -285,11 +315,15 @@ class LeaderApplicationService:
         try:
             return LeaderEvidenceEnvelope(
                 objective=objective,
+                parent_session_id=dag.parent_session_id,
                 dag_id=dag.dag_id,
                 definition_fingerprint=dag.definition_fingerprint,
                 generation=dag.generation,
                 state=dag.state,
+                max_parallel=dag.max_parallel,
                 active_node_id=dag.active_node_id,
+                running_node_ids=dag.running_node_ids,
+                available_capacity=max(0, dag.max_parallel - len(dag.running_node_ids)),
                 ready_node_ids=dag.ready_node_ids(),
                 nodes=nodes,
             )
@@ -307,6 +341,7 @@ class LeaderApplicationService:
         return LeaderEvidenceNode(
             node_id=node.node_id,
             ordinal=node.ordinal,
+            generation=node.generation,
             dependencies=node.dependencies,
             state=node.state,
             prompt=prompt,
@@ -343,7 +378,10 @@ class LeaderApplicationService:
         phase = (
             "The DAG is terminal. Return FINALIZE only."
             if evidence.state.terminal
-            else "The DAG is not terminal. Return SELECT_NODE only."
+            else (
+                "The DAG is not terminal. Return SELECT_NODE for max_parallel=1, or "
+                "SELECT_NODES for a bounded parallel wave."
+            )
         )
         payload = json.dumps(
             evidence.to_dict(),
@@ -360,14 +398,140 @@ class LeaderApplicationService:
             f"{phase}\n"
             "Return one strict JSON object and no markdown. Allowed schemas:\n"
             '{"action":"SELECT_NODE","node_id":"<READY node id>","reason":"<bounded reason>"}\n'
+            '{"action":"SELECT_NODES","node_ids":["<READY node id>","<READY node id>"],"reason":"<bounded reason>"}\n'
             '{"action":"FINALIZE","summary":"<bounded final synthesis>"}\n'
-            "Only node ids in ready_node_ids are selectable.\n"
+            "Only node ids in ready_node_ids are selectable. For SELECT_NODES, return a non-empty "
+            "canonical ordinal/node-id order and never exceed available_capacity.\n"
             "EVIDENCE_JSON:\n"
             f"{payload}"
         )
         if len(prompt.encode("utf-8")) > MAX_LEADER_PROMPT_BYTES:
             raise ConfigurationError("Leader model prompt is too large")
         return prompt
+
+    async def _execute_selection(
+        self,
+        dag_id: str,
+        dag: TaskDag,
+        evidence: LeaderEvidenceEnvelope,
+        record: LeaderDecisionRecord,
+        *,
+        sink: EventSink | None,
+    ) -> tuple[TaskDag, tuple[tuple[str, int], ...]]:
+        selected_node_ids = record.decision.selected_node_ids
+        expected_generations = tuple(
+            (
+                node_id,
+                self._evidence_node_by_id(evidence, node_id).generation,
+            )
+            for node_id in selected_node_ids
+        )
+        if record.selected_node_generations:
+            expected_generations = tuple(
+                zip(selected_node_ids, record.selected_node_generations, strict=True)
+            )
+        wave_runner = getattr(self._dag_service, "run_task_dag_wave", None)
+        if callable(wave_runner):
+            return (
+                await wave_runner(
+                    RunTaskDagWaveRequest(
+                        dag_id,
+                        selected_node_ids,
+                        expected_dag_generation=evidence.generation,
+                        expected_node_generations=expected_generations,
+                    ),
+                    sink=sink,
+                ),
+                expected_generations,
+            )
+        if dag.max_parallel != 1 or len(selected_node_ids) != 1:
+            raise ConfigurationError("parallel Leader decisions require the Task DAG wave seam")
+        selected_node_id = selected_node_ids[0]
+        return (
+            await self._dag_service.run_task_dag_step(
+                RunTaskDagStepRequest(dag_id, selected_node_id),
+                sink=sink,
+            ),
+            expected_generations,
+        )
+
+    @staticmethod
+    def _selection_progressed(
+        dag: TaskDag,
+        expected_generations: tuple[tuple[str, int], ...],
+    ) -> bool:
+        return any(
+            (
+                dag.node(node_id).state is not TaskDagNodeState.READY
+                or dag.node(node_id).generation != expected_generation
+            )
+            for node_id, expected_generation in expected_generations
+        )
+
+    async def _find_recoverable_wave(
+        self,
+        objective: str,
+        evidence: LeaderEvidenceEnvelope,
+    ) -> tuple[LeaderDecisionRecord, LeaderAttempt] | None:
+        """Reuse a durable parallel decision after a partial claim crash.
+
+        This path never parses or calls the provider.  It only re-applies a
+        published SELECT_NODES decision when every selected node is either at
+        its exact recorded READY generation or has durably advanced from it.
+        """
+
+        if evidence.max_parallel <= 1:
+            return None
+        try:
+            records = await self._store.list_leader_decisions(evidence.dag_id)
+        except LeaderStoreError as error:
+            raise ConfigurationError(f"Leader durable wave lookup failed: {error}") from error
+        objective_fingerprint = _sha256_text(objective)
+        for record in reversed(records):
+            if record.decision.kind is not LeaderDecisionKind.SELECT_NODES:
+                continue
+            try:
+                attempt = await self._store.get_leader_attempt(record.attempt_id)
+            except LeaderStoreError as error:
+                raise ConfigurationError(f"Leader wave attempt lookup failed: {error}") from error
+            if attempt is None or attempt.state is not LeaderAttemptState.DECISION_PUBLISHED:
+                continue
+            if attempt.objective_fingerprint != objective_fingerprint:
+                continue
+            if (
+                record.dag_id != evidence.dag_id
+                or record.definition_fingerprint != evidence.definition_fingerprint
+                or record.parent_session_id not in {None, evidence.parent_session_id}
+                or attempt.parent_session_id not in {None, evidence.parent_session_id}
+                or not record.selected_node_generations
+                or len(record.selected_node_generations) != len(record.decision.selected_node_ids)
+            ):
+                continue
+            if not self._canonical_selection(record.decision, evidence):
+                continue
+            valid = True
+            for node_id, expected_generation in zip(
+                record.decision.selected_node_ids,
+                record.selected_node_generations,
+                strict=True,
+            ):
+                try:
+                    node = self._evidence_node_by_id(evidence, node_id)
+                except ConfigurationError:
+                    valid = False
+                    break
+                if node.state is TaskDagNodeState.READY:
+                    if node.generation != expected_generation:
+                        valid = False
+                        break
+                elif node.generation <= expected_generation or (
+                    not node.state.terminal and node.state is not TaskDagNodeState.RUNNING
+                ):
+                    valid = False
+                    break
+            if valid:
+                return record, attempt
+        return None
 
     async def _decide(
         self,
@@ -400,6 +564,7 @@ class LeaderApplicationService:
             owner_id=self._owner_id,
             lease_expires_at=now + timedelta(seconds=self._lease_seconds),
             turn_id=f"leader-turn-{uuid.uuid4().hex}",
+            parent_session_id=evidence.parent_session_id,
         )
         try:
             claim = await self._store.claim_leader_attempt(candidate, now=now)
@@ -482,6 +647,8 @@ class LeaderApplicationService:
                 decision_id=f"leader-decision-{uuid.uuid4().hex}",
                 decision=decision,
                 created_at=self._clock().astimezone(UTC),
+                parent_session_id=evidence.parent_session_id,
+                selected_node_generations=self._selected_generations(evidence, decision),
             )
         except LeaderStoreError as error:
             raise ConfigurationError(
@@ -512,6 +679,8 @@ class LeaderApplicationService:
                     decision_id=f"leader-decision-{uuid.uuid4().hex}",
                     decision=decision,
                     created_at=self._clock().astimezone(UTC),
+                    parent_session_id=evidence.parent_session_id,
+                    selected_node_generations=self._selected_generations(evidence, decision),
                 )
             except (LeaderStoreError, ValueError) as error:
                 await self._mark_indeterminate(attempt)
@@ -642,19 +811,86 @@ class LeaderApplicationService:
             or (attempt.decision_id is not None and attempt.decision_id != record.decision_id)
             or record.dag_id != evidence.dag_id
             or record.leader_session_id != attempt.leader_session_id
+            or (
+                record.parent_session_id is not None
+                and record.parent_session_id != evidence.parent_session_id
+            )
             or record.dag_generation != evidence.generation
             or record.definition_fingerprint != evidence.definition_fingerprint
             or record.evidence_fingerprint != evidence.fingerprint
         ):
             raise ConfigurationError("Leader decision identity does not match current evidence")
         decision = record.decision
-        if decision.kind is LeaderDecisionKind.SELECT_NODE:
-            if evidence.state.terminal or decision.selected_node_id not in evidence.ready_node_ids:
+        if decision.kind in {
+            LeaderDecisionKind.SELECT_NODE,
+            LeaderDecisionKind.SELECT_NODES,
+        }:
+            selected = decision.selected_node_ids
+            if evidence.state.terminal or not selected:
                 raise ConfigurationError("Leader selected node is not currently READY")
-        elif not evidence.state.terminal:
+            if any(node_id not in evidence.ready_node_ids for node_id in selected):
+                raise ConfigurationError("Leader selected node is not currently READY")
+            if len(selected) > evidence.available_capacity:
+                raise ConfigurationError("Leader selected wave exceeds available capacity")
+            if decision.kind is LeaderDecisionKind.SELECT_NODE and len(selected) != 1:
+                raise ConfigurationError("SELECT_NODE must contain exactly one node")
+            if decision.kind is LeaderDecisionKind.SELECT_NODES and not self._canonical_selection(
+                decision, evidence
+            ):
+                raise ConfigurationError("SELECT_NODES node order is not canonical")
+            expected_generations = self._selected_generations(evidence, decision)
+            if (
+                record.selected_node_generations
+                and record.selected_node_generations != expected_generations
+            ):
+                raise ConfigurationError("Leader selected node generations do not match evidence")
+        elif not evidence.state.terminal or evidence.running_node_ids:
             raise ConfigurationError("Leader FINALIZE decision requires a terminal DAG")
         else:
             return
+
+    @staticmethod
+    def _evidence_node_by_id(
+        evidence: LeaderEvidenceEnvelope,
+        node_id: str,
+    ) -> LeaderEvidenceNode:
+        for node in evidence.nodes:
+            if node.node_id == node_id:
+                return node
+        raise ConfigurationError("Leader selected node is absent from evidence")
+
+    def _selected_generations(
+        self,
+        evidence: LeaderEvidenceEnvelope,
+        decision: LeaderDecision,
+    ) -> tuple[int, ...]:
+        generations: list[int] = []
+        for node_id in decision.selected_node_ids:
+            try:
+                generations.append(self._evidence_node_by_id(evidence, node_id).generation)
+            except ConfigurationError:
+                # The typed decision is still durably published before
+                # evidence validation so an invalid model response is
+                # historical and cannot be replayed.
+                return ()
+        return tuple(generations)
+
+    @staticmethod
+    def _canonical_selection(
+        decision: LeaderDecision,
+        evidence: LeaderEvidenceEnvelope,
+    ) -> bool:
+        selected = decision.selected_node_ids
+        ordinals = {node.node_id: node.ordinal for node in evidence.nodes}
+        if any(node_id not in ordinals for node_id in selected):
+            return False
+        canonical = tuple(
+            sorted(
+                selected,
+                key=lambda node_id: (ordinals[node_id], node_id),
+            )
+        )
+        return selected == canonical
 
 
 __all__ = [

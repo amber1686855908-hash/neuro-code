@@ -13,7 +13,11 @@ from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
 
-from neuro_code.domain.task_dag import TaskDagNodeState, TaskDagState
+from neuro_code.domain.task_dag import (
+    MAX_TASK_DAG_PARALLELISM,
+    TaskDagNodeState,
+    TaskDagState,
+)
 
 MAX_LEADER_OBJECTIVE_BYTES = 4_096
 MAX_LEADER_REASON_BYTES = 1_024
@@ -68,6 +72,7 @@ def _sha256(value: object) -> str:
 
 class LeaderDecisionKind(StrEnum):
     SELECT_NODE = "SELECT_NODE"
+    SELECT_NODES = "SELECT_NODES"
     FINALIZE = "FINALIZE"
 
 
@@ -117,6 +122,7 @@ class LeaderEvidenceNode:
     state: TaskDagNodeState
     prompt: str
     prompt_fingerprint: str
+    generation: int = 0
     response_preview: str | None = None
     error_kind: str | None = None
     error_reason: str | None = None
@@ -133,6 +139,12 @@ class LeaderEvidenceNode:
         _identifier(self.node_id, field_name="leader evidence node id")
         if isinstance(self.ordinal, bool) or not isinstance(self.ordinal, int) or self.ordinal < 0:
             raise ValueError("leader evidence node ordinal is invalid")
+        if (
+            isinstance(self.generation, bool)
+            or not isinstance(self.generation, int)
+            or self.generation < 0
+        ):
+            raise ValueError("leader evidence node generation is invalid")
         if not isinstance(self.dependencies, tuple) or not all(
             isinstance(value, str) for value in self.dependencies
         ):
@@ -183,6 +195,7 @@ class LeaderEvidenceNode:
         return {
             "node_id": self.node_id,
             "ordinal": self.ordinal,
+            "generation": self.generation,
             "dependencies": list(self.dependencies),
             "state": self.state.value,
             "prompt": self.prompt,
@@ -213,6 +226,10 @@ class LeaderEvidenceEnvelope:
     active_node_id: str | None
     ready_node_ids: tuple[str, ...]
     nodes: tuple[LeaderEvidenceNode, ...]
+    parent_session_id: str = "legacy-parent-session"
+    max_parallel: int = 1
+    running_node_ids: tuple[str, ...] = ()
+    available_capacity: int = 1
 
     def __post_init__(self) -> None:
         _bounded_text(
@@ -221,6 +238,7 @@ class LeaderEvidenceEnvelope:
             limit=MAX_LEADER_OBJECTIVE_BYTES,
             allow_empty=False,
         )
+        _identifier(self.parent_session_id, field_name="leader evidence parent session id")
         _identifier(self.dag_id, field_name="leader evidence DAG id")
         _fingerprint(self.definition_fingerprint, field_name="leader definition fingerprint")
         if (
@@ -231,6 +249,25 @@ class LeaderEvidenceEnvelope:
             raise ValueError("leader evidence DAG generation is invalid")
         if not isinstance(self.state, TaskDagState):
             raise ValueError("leader evidence DAG state is invalid")
+        if (
+            isinstance(self.max_parallel, bool)
+            or not isinstance(self.max_parallel, int)
+            or not 1 <= self.max_parallel <= MAX_TASK_DAG_PARALLELISM
+        ):
+            raise ValueError("leader evidence max_parallel is invalid")
+        if not isinstance(self.running_node_ids, tuple) or not all(
+            isinstance(value, str) for value in self.running_node_ids
+        ):
+            raise ValueError("leader evidence running node ids are invalid")
+        if len(set(self.running_node_ids)) != len(self.running_node_ids):
+            raise ValueError("leader evidence running node ids must be unique")
+        if (
+            isinstance(self.available_capacity, bool)
+            or not isinstance(self.available_capacity, int)
+            or not 0 <= self.available_capacity <= self.max_parallel
+            or self.available_capacity != self.max_parallel - len(self.running_node_ids)
+        ):
+            raise ValueError("leader evidence available capacity is invalid")
         if self.active_node_id is not None:
             _identifier(self.active_node_id, field_name="leader evidence active node id")
         if not isinstance(self.ready_node_ids, tuple) or not all(
@@ -241,6 +278,12 @@ class LeaderEvidenceEnvelope:
             raise ValueError("leader evidence contains too many nodes")
         if tuple(node.ordinal for node in self.nodes) != tuple(range(len(self.nodes))):
             raise ValueError("leader evidence node order is not deterministic")
+        if len({node.node_id for node in self.nodes}) != len(self.nodes):
+            raise ValueError("leader evidence node ids must be unique")
+        if set(self.running_node_ids) != {
+            node.node_id for node in self.nodes if node.state is TaskDagNodeState.RUNNING
+        }:
+            raise ValueError("leader evidence running node ids do not match node state")
         if len(_canonical_json(self.payload).encode("utf-8")) > MAX_LEADER_EVIDENCE_BYTES:
             raise ValueError("leader evidence is too large")
 
@@ -248,12 +291,31 @@ class LeaderEvidenceEnvelope:
     def payload(self) -> dict[str, object]:
         return {
             "objective": self.objective,
+            "parent_session_id": self.parent_session_id,
             "dag_id": self.dag_id,
             "definition_fingerprint": self.definition_fingerprint,
             "generation": self.generation,
             "state": self.state.value,
+            "max_parallel": self.max_parallel,
             "active_node_id": self.active_node_id,
+            "running_node_ids": list(self.running_node_ids),
+            "available_capacity": self.available_capacity,
             "ready_node_ids": list(self.ready_node_ids),
+            "completed_node_ids": [
+                node.node_id for node in self.nodes if node.state is TaskDagNodeState.COMPLETED
+            ],
+            "failed_node_ids": [
+                node.node_id for node in self.nodes if node.state is TaskDagNodeState.FAILED
+            ],
+            "cancelled_node_ids": [
+                node.node_id for node in self.nodes if node.state is TaskDagNodeState.CANCELLED
+            ],
+            "skipped_node_ids": [
+                node.node_id for node in self.nodes if node.state is TaskDagNodeState.SKIPPED
+            ],
+            "indeterminate_node_ids": [
+                node.node_id for node in self.nodes if node.state is TaskDagNodeState.INDETERMINATE
+            ],
             "nodes": [node.to_dict() for node in self.nodes],
         }
 
@@ -273,17 +335,33 @@ class LeaderDecision:
 
     kind: LeaderDecisionKind
     selected_node_id: str | None = None
+    selected_node_ids: tuple[str, ...] = ()
     summary: str = ""
 
     def __post_init__(self) -> None:
         if not isinstance(self.kind, LeaderDecisionKind):
             raise ValueError("leader decision kind is invalid")
-        if self.kind is LeaderDecisionKind.SELECT_NODE and self.selected_node_id is None:
-            raise ValueError("SELECT_NODE requires a node id")
-        if self.kind is LeaderDecisionKind.FINALIZE and self.selected_node_id is not None:
-            raise ValueError("FINALIZE must not contain a node id")
+        if not isinstance(self.selected_node_ids, tuple) or not all(
+            isinstance(value, str) for value in self.selected_node_ids
+        ):
+            raise ValueError("leader selected node ids are invalid")
+        if self.kind is LeaderDecisionKind.SELECT_NODE:
+            if self.selected_node_id is None or self.selected_node_ids:
+                raise ValueError("SELECT_NODE requires exactly one node id")
+            object.__setattr__(self, "selected_node_ids", (self.selected_node_id,))
+        elif self.kind is LeaderDecisionKind.SELECT_NODES:
+            if self.selected_node_id is not None:
+                raise ValueError("SELECT_NODES must not contain node_id")
+            if not 1 <= len(self.selected_node_ids) <= MAX_LEADER_NODE_COUNT:
+                raise ValueError("SELECT_NODES requires a bounded non-empty node list")
+        elif self.selected_node_id is not None or self.selected_node_ids:
+            raise ValueError("FINALIZE must not contain node ids")
         if self.selected_node_id is not None:
             _identifier(self.selected_node_id, field_name="leader selected node id")
+        for node_id in self.selected_node_ids:
+            _identifier(node_id, field_name="leader selected node id")
+        if len(set(self.selected_node_ids)) != len(self.selected_node_ids):
+            raise ValueError("leader selected node ids must be unique")
         _bounded_text(
             self.summary, field_name="leader decision summary", limit=MAX_LEADER_REASON_BYTES
         )
@@ -312,7 +390,11 @@ class LeaderDecision:
         allowed = (
             {"action", "node_id", "reason"}
             if kind is LeaderDecisionKind.SELECT_NODE
-            else {"action", "summary", "reason"}
+            else (
+                {"action", "node_ids", "reason"}
+                if kind is LeaderDecisionKind.SELECT_NODES
+                else {"action", "summary", "reason"}
+            )
         )
         if set(value) - allowed:
             raise ValueError("leader decision contains unknown fields")
@@ -324,6 +406,16 @@ class LeaderDecision:
             if not isinstance(reason, str):
                 raise ValueError("leader decision reason is invalid")
             return cls(kind, selected_node_id=node_id, summary=reason)
+        if kind is LeaderDecisionKind.SELECT_NODES:
+            raw_node_ids = value.get("node_ids")
+            if not isinstance(raw_node_ids, list) or not all(
+                isinstance(node_id, str) for node_id in raw_node_ids
+            ):
+                raise ValueError("SELECT_NODES node_ids must be a list of strings")
+            reason = value.get("reason", "")
+            if not isinstance(reason, str):
+                raise ValueError("leader decision reason is invalid")
+            return cls(kind, selected_node_ids=tuple(raw_node_ids), summary=reason)
         summary = value.get("summary", value.get("reason", ""))
         if not isinstance(summary, str):
             raise ValueError("FINALIZE summary is invalid")
@@ -333,6 +425,8 @@ class LeaderDecision:
         result: dict[str, object] = {"action": self.kind.value}
         if self.selected_node_id is not None:
             result["node_id"] = self.selected_node_id
+        if self.kind is LeaderDecisionKind.SELECT_NODES:
+            result["node_ids"] = list(self.selected_node_ids)
         if self.summary:
             result["summary"] = self.summary
         return result
@@ -357,6 +451,7 @@ class LeaderAttempt:
     decision_id: str | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
+    parent_session_id: str | None = None
 
     def __post_init__(self) -> None:
         for identifier_value, field_name in (
@@ -367,6 +462,8 @@ class LeaderAttempt:
             (self.turn_id, "leader turn id"),
         ):
             _identifier(identifier_value, field_name=field_name)
+        if self.parent_session_id is not None:
+            _identifier(self.parent_session_id, field_name="leader parent session id")
         _fingerprint(self.objective_fingerprint, field_name="leader objective fingerprint")
         _fingerprint(self.definition_fingerprint, field_name="leader definition fingerprint")
         _fingerprint(self.evidence_fingerprint, field_name="leader evidence fingerprint")
@@ -410,6 +507,8 @@ class LeaderDecisionRecord:
     evidence_fingerprint: str
     decision: LeaderDecision
     created_at: datetime
+    parent_session_id: str | None = None
+    selected_node_generations: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
         for value, field_name in (
@@ -419,6 +518,23 @@ class LeaderDecisionRecord:
             (self.leader_session_id, "leader decision session id"),
         ):
             _identifier(value, field_name=field_name)
+        if self.parent_session_id is not None:
+            _identifier(self.parent_session_id, field_name="leader decision parent session id")
+        if not isinstance(self.selected_node_generations, tuple) or not all(
+            isinstance(value, int) and not isinstance(value, bool) and value >= 0
+            for value in self.selected_node_generations
+        ):
+            raise ValueError("leader selected node generations are invalid")
+        if (
+            self.decision.kind
+            in {
+                LeaderDecisionKind.SELECT_NODE,
+                LeaderDecisionKind.SELECT_NODES,
+            }
+            and self.selected_node_generations
+            and len(self.selected_node_generations) != len(self.decision.selected_node_ids)
+        ):
+            raise ValueError("leader selected node generations do not match selected nodes")
         _fingerprint(
             self.definition_fingerprint, field_name="leader decision definition fingerprint"
         )

@@ -51,6 +51,7 @@ from neuro_code.application.runtime.agent import AgentRunResult, EventSink
 from neuro_code.application.runtime.process_liveness import owner_is_alive
 from neuro_code.application.sessions.binding import ConversationBinding, ConversationRunner
 from neuro_code.application.settings import ApplicationSettings
+from neuro_code.application.workflows.leader import RunLeaderRequest
 from neuro_code.application.workflows.parent_context_relay import project_parent_context_items
 from neuro_code.application.workflows.subagent_capabilities import (
     NetworkAccess,
@@ -1876,6 +1877,47 @@ class _ProductionParallelDagProvider:
                 self._state.active -= 1
                 self._state.completed.append(node_id)
                 self._state.timeline.append(f"complete:{node_id}")
+
+
+class _ProductionParallelLeaderProvider(_ProductionParallelDagProvider):
+    """Real provider fixture that also supplies zero-tool Leader decisions."""
+
+    def __init__(self, state: _ProductionParallelDagState) -> None:
+        super().__init__(state)
+        self.leader_calls = 0
+
+    async def stream(
+        self,
+        context: ModelContext,
+        tools: Sequence[ToolDefinition],
+        *,
+        tool_policy: ModelToolPolicy = ModelToolPolicy.ALLOWED,
+    ) -> AsyncIterator[ModelEvent]:
+        if not tools:
+            actions = (
+                '{"action":"SELECT_NODE","node_id":"a"}',
+                '{"action":"SELECT_NODES","node_ids":["b","c"]}',
+                '{"action":"SELECT_NODE","node_id":"d"}',
+                '{"action":"FINALIZE","summary":"leader completed bounded wave"}',
+            )
+            if self.leader_calls >= len(actions):
+                raise AssertionError("parallel Leader fixture received too many decisions")
+            response = actions[self.leader_calls]
+            self.leader_calls += 1
+            yield ModelCompleted("stop", response_text=response)
+            return
+        async for event in super().stream(context, tools, tool_policy=tool_policy):
+            yield event
+
+
+def _production_parallel_leader_provider_factory(
+    state: _ProductionParallelDagState,
+) -> Callable[[AppConfig, bool], ModelProvider]:
+    def factory(config: AppConfig, failover: bool) -> ModelProvider:
+        del config, failover
+        return cast(ModelProvider, _ProductionParallelLeaderProvider(state))
+
+    return factory
 
 
 def _production_parallel_dag_provider_factory(
@@ -4242,6 +4284,139 @@ api_key_env = "FIXTURE_KEY"
                 finally:
                     await application.close()
 
+    async def test_real_production_parallel_leader_selects_bounded_wave_and_fanin(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="neuro-production-parallel-leader-") as directory:
+            root = Path(directory)
+            repository, _head = _make_real_repository(root)
+            dirty_file = repository / "dirty-parent.txt"
+            dirty_file.write_bytes(b"parent remains dirty\n")
+            before_status = _run_git(repository, "status", "--porcelain=v1")
+            before_head = _run_git(repository, "rev-parse", "HEAD")
+            state_dir = root / "state"
+            _write_task_dag_fixture_config(state_dir)
+            state = _ProductionParallelDagState()
+            environment = {
+                "HOME": str(root),
+                "NEURO_CODE_HOME": str(state_dir),
+                "FIXTURE_KEY": "fixture-key",
+            }
+            with patch.dict(os.environ, environment, clear=False):
+                application = await ApplicationComposition.open(
+                    ApplicationSettings(
+                        cwd=repository,
+                        sandbox="off",
+                        permission_mode=PermissionMode.BYPASS,
+                        max_steps=8,
+                    ),
+                    provider_factory=_production_parallel_leader_provider_factory(state),
+                )
+                leader = None
+                parent_binding = None
+                try:
+                    parent_session_id = await application.store.create_session(
+                        str(repository),
+                        "fixture",
+                        "fixture-model",
+                        sandbox_profile=SandboxProfile.OFF,
+                    )
+                    parent_binding = await application.create_binding(
+                        resume_id=parent_session_id,
+                        capabilities=_capability(repository, sandbox=SandboxProfile.OFF),
+                    )
+                    service = application.create_task_dag_service(parent_binding=parent_binding)
+                    dag = await service.create_task_dag(
+                        CreateTaskDagRequest(
+                            "production-parallel-leader",
+                            (
+                                TaskDagNode(
+                                    node_id="a",
+                                    ordinal=0,
+                                    prompt="production-node-a",
+                                ),
+                                TaskDagNode(
+                                    node_id="b",
+                                    ordinal=1,
+                                    prompt="production-node-b",
+                                    dependencies=("a",),
+                                ),
+                                TaskDagNode(
+                                    node_id="c",
+                                    ordinal=2,
+                                    prompt="production-node-c",
+                                    dependencies=("a",),
+                                ),
+                                TaskDagNode(
+                                    node_id="d",
+                                    ordinal=3,
+                                    prompt="production-node-d",
+                                    dependencies=("b", "c"),
+                                ),
+                            ),
+                            max_parallel=2,
+                        )
+                    )
+                    leader = await application.create_leader_service(
+                        parent_binding=parent_binding,
+                    )
+                    running = asyncio.create_task(
+                        leader.run(RunLeaderRequest(dag.dag_id, "coordinate bounded wave"))
+                    )
+                    await asyncio.wait_for(state.fanout_started.wait(), timeout=90)
+                    during = await application.store.get_task_dag(dag.dag_id)
+                    self.assertIsNotNone(during)
+                    assert during is not None
+                    self.assertEqual(during.running_node_ids, ("b", "c"))
+                    self.assertEqual(state.max_active, 2)
+                    self.assertEqual(set(state.started[:3]), {"a", "b", "c"})
+                    self.assertNotIn("d", state.started)
+
+                    running_nodes = tuple(during.node(node_id) for node_id in ("b", "c"))
+                    self.assertEqual(
+                        len({node.execution_owner_token for node in running_nodes}),
+                        1,
+                    )
+                    self.assertTrue(all(node.parent_task_id for node in running_nodes))
+                    state.release_fanout.set()
+                    result = await asyncio.wait_for(running, timeout=120)
+                    self.assertTrue(result.terminal)
+                    self.assertEqual(result.final_response, "leader completed bounded wave")
+                    self.assertEqual(state.started[0], "a")
+                    self.assertEqual(set(state.started[1:3]), {"b", "c"})
+                    self.assertEqual(state.started[3], "d")
+                    self.assertLess(
+                        max(
+                            state.timeline.index("complete:b"),
+                            state.timeline.index("complete:c"),
+                        ),
+                        state.timeline.index("start:d"),
+                    )
+                    self.assertLessEqual(state.max_active, 2)
+
+                    decisions = await application.store.list_leader_decisions(dag.dag_id)
+                    self.assertEqual(
+                        [record.decision.kind.value for record in decisions],
+                        ["SELECT_NODE", "SELECT_NODES", "SELECT_NODE", "FINALIZE"],
+                    )
+                    self.assertEqual(decisions[1].decision.selected_node_ids, ("b", "c"))
+                    leases = await application.store.list_writable_subagent_leases(
+                        parent_session_id=parent_session_id,
+                    )
+                    self.assertEqual(len(leases), 4)
+                    self.assertEqual(len({lease.worktree_id for lease in leases}), 4)
+                    self.assertEqual(len({lease.child_session_id for lease in leases}), 4)
+                    self.assertEqual(
+                        _run_git(repository, "status", "--porcelain=v1"),
+                        before_status,
+                    )
+                    self.assertEqual(_run_git(repository, "rev-parse", "HEAD"), before_head)
+                    self.assertEqual(dirty_file.read_bytes(), b"parent remains dirty\n")
+                finally:
+                    if leader is not None:
+                        await leader.close()
+                    if parent_binding is not None:
+                        await parent_binding.close()
+                    await application.close()
+
     async def test_real_production_fanout_and_fanin_use_isolated_live_lsp_workers(self) -> None:
         with tempfile.TemporaryDirectory(prefix="neuro-production-parallel-lsp-") as directory:
             root = Path(directory)
@@ -6111,7 +6286,7 @@ extensions = [".py", ".txt"]
             assert leases[0].baseline_checkpoint_id is not None
             self.assertIsNotNone(await checkpoints.get(leases[0].baseline_checkpoint_id))
 
-    async def test_populated_schema_16_migrates_to_23_without_losing_worker_identity(self) -> None:
+    async def test_populated_schema_16_migrates_to_24_without_losing_worker_identity(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (
@@ -6147,7 +6322,7 @@ extensions = [".py", ".txt"]
                 "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'parent_context_relays'"
             ).fetchone()
             connection.close()
-            self.assertEqual(version, (23,))
+            self.assertEqual(version, (24,))
             self.assertEqual(table, (1,))
             self.assertEqual(
                 (await migrated.list_writable_subagent_leases(parent_session_id=parent_session_id))[
@@ -6162,7 +6337,7 @@ extensions = [".py", ".txt"]
             self.assertIsNotNone(await migrated.get_session(parent_session_id))
             self.assertIsNotNone(await migrated.get_session(result.child_session_id))
 
-    async def test_schema_17_to_23_keeps_populated_parent_relay(self) -> None:
+    async def test_schema_17_to_24_keeps_populated_parent_relay(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (
@@ -6206,7 +6381,7 @@ extensions = [".py", ".txt"]
                 "AND name IN ('task_dags', 'task_dag_nodes')"
             ).fetchone()
             connection.close()
-            self.assertEqual(version, (23,))
+            self.assertEqual(version, (24,))
             self.assertEqual(task_dag_tables, (2,))
 
     async def test_process_death_after_relay_publication_preserves_exact_worker_snapshot(
@@ -7065,7 +7240,7 @@ extensions = [".py", ".txt"]
             self.assertEqual(leases[0].error_kind, "RuntimeError")
             self.assertIsNotNone(await store.get_parent_context_relay_for_lease(leases[0].lease_id))
 
-    async def test_populated_schema_15_lease_migrates_through_schema_23_and_keeps_cas(self) -> None:
+    async def test_populated_schema_15_lease_migrates_through_schema_24_and_keeps_cas(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (
@@ -7098,7 +7273,7 @@ extensions = [".py", ".txt"]
                 connection.execute(
                     "SELECT version FROM schema_meta WHERE singleton = 1"
                 ).fetchone(),
-                (23,),
+                (24,),
             )
             foreign_keys = connection.execute(
                 "PRAGMA foreign_key_list(writable_subagent_leases)"

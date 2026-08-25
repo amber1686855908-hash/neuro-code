@@ -124,6 +124,59 @@ class RunTaskDagStepRequest:
             raise ValueError("task DAG selected node id must not be empty")
 
 
+@dataclass(frozen=True, slots=True)
+class RunTaskDagWaveRequest:
+    """Apply one exact Leader-selected bounded wave through Task DAG authority.
+
+    The selected IDs are already canonicalized by the Leader.  The optional
+    generation fields make the request a recovery-safe projection: a node is
+    claimable only when its durable READY generation is the one the Leader
+    observed.  Nodes already advanced from that generation are treated as
+    already applied, never as permission to substitute another node.
+    """
+
+    dag_id: str
+    selected_node_ids: tuple[str, ...]
+    expected_dag_generation: int | None = None
+    expected_node_generations: tuple[tuple[str, int], ...] = ()
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.dag_id, str) or not self.dag_id.strip():
+            raise ValueError("task DAG wave request id must not be empty")
+        if not isinstance(self.selected_node_ids, tuple) or not self.selected_node_ids:
+            raise ValueError("task DAG wave selected node ids must be a non-empty tuple")
+        if any(
+            not isinstance(node_id, str) or not node_id.strip()
+            for node_id in self.selected_node_ids
+        ):
+            raise ValueError("task DAG wave selected node ids must be safe text")
+        if len(set(self.selected_node_ids)) != len(self.selected_node_ids):
+            raise ValueError("task DAG wave selected node ids must be unique")
+        if self.expected_dag_generation is not None and (
+            isinstance(self.expected_dag_generation, bool)
+            or not isinstance(self.expected_dag_generation, int)
+            or self.expected_dag_generation < 0
+        ):
+            raise ValueError("task DAG wave expected graph generation is invalid")
+        if not isinstance(self.expected_node_generations, tuple):
+            raise TypeError("task DAG wave expected node generations must be a tuple")
+        expected_ids: list[str] = []
+        for entry in self.expected_node_generations:
+            if (
+                not isinstance(entry, tuple)
+                or len(entry) != 2
+                or not isinstance(entry[0], str)
+                or not entry[0].strip()
+                or isinstance(entry[1], bool)
+                or not isinstance(entry[1], int)
+                or entry[1] < 0
+            ):
+                raise ValueError("task DAG wave expected node generation is invalid")
+            expected_ids.append(entry[0])
+        if tuple(expected_ids) != self.selected_node_ids:
+            raise ValueError("task DAG wave expected generations must match selected order")
+
+
 class TaskDagActiveNodeRecovery(StrEnum):
     """Read-only classification of an already-claimed active DAG node."""
 
@@ -425,6 +478,87 @@ class TaskDagApplicationService:
             sink=sink,
         )
 
+    async def run_task_dag_wave(
+        self,
+        request: RunTaskDagWaveRequest,
+        *,
+        sink: EventSink | None = None,
+    ) -> TaskDag:
+        """Execute only one Leader-selected bounded wave.
+
+        Capacity and READY legality remain owned by the durable Task DAG
+        claim path.  If a selected node was already advanced after the
+        durable decision, it is accepted as already applied; a selected node
+        that is still READY is the only kind eligible for a new claim.  The
+        method never fills unused capacity with an unselected node.
+        """
+
+        if not isinstance(request, RunTaskDagWaveRequest):
+            raise ValueError("task DAG wave request must be canonical")
+        dag, _ = await self._prepare_task_dag_for_run(RunTaskDagRequest(request.dag_id))
+        if (
+            request.expected_dag_generation is not None
+            and dag.generation != request.expected_dag_generation
+        ):
+            raise ConfigurationError("task DAG wave graph generation became stale")
+        if dag.state.terminal:
+            raise ConfigurationError("cannot select nodes from a terminal task DAG")
+        if len(request.selected_node_ids) > dag.max_parallel:
+            raise ConfigurationError("task DAG wave exceeds the immutable parallel bound")
+        expected_generations = dict(request.expected_node_generations)
+        claimable: list[str] = []
+        for node_id in request.selected_node_ids:
+            node = dag.node(node_id)
+            expected_generation = expected_generations[node_id]
+            if node.state is TaskDagNodeState.READY:
+                if node.generation != expected_generation:
+                    raise ConfigurationError("selected task DAG node generation became stale")
+                claimable.append(node_id)
+                continue
+            if node.generation <= expected_generation or (
+                not node.state.terminal and node.state is not TaskDagNodeState.RUNNING
+            ):
+                raise ConfigurationError("selected task DAG node became stale")
+
+        available_slots = max(0, dag.max_parallel - len(dag.running_node_ids))
+        # A crash or another controller may consume capacity after the
+        # decision.  Reconcile only the canonical selected prefix; the next
+        # Leader iteration observes the remaining selected READY nodes.
+        claimable = claimable[:available_slots]
+        if not claimable:
+            return dag
+        if dag.max_parallel > 1 and self._writable_worker_factory is None:
+            raise ConfigurationError(
+                "parallel task DAG requires an independent writable worker factory"
+            )
+        workers = [self._worker_service_for(dag) for _ in claimable]
+        if len({id(worker) for worker in workers}) != len(workers):
+            raise ConfigurationError(
+                "parallel task DAG worker factory returned a shared writable service"
+            )
+        _, claims = await self._claim_ready_nodes(
+            dag,
+            tuple(claimable),
+            expected_node_generations=expected_generations,
+            strict=True,
+        )
+        if not claims:
+            return await self._load_required(dag.dag_id)
+        async with asyncio.TaskGroup() as task_group:
+            for index, claim in enumerate(claims):
+                task_group.create_task(
+                    self._execute_claimed_node(
+                        dag=dag,
+                        claimed=claim[0],
+                        claimed_node=claim[1],
+                        node=claim[2],
+                        parent_task_id=claim[3],
+                        sink=sink,
+                        writable_service=workers[index],
+                    )
+                )
+        return await self._load_required(dag.dag_id)
+
     async def prepare_task_dag_step(self, request: RunTaskDagRequest) -> TaskDag:
         """Reconcile and propagate one DAG snapshot without starting a worker."""
 
@@ -463,8 +597,10 @@ class TaskDagApplicationService:
         dag = await self._propagate_dependencies(dag)
         if dag.state.terminal:
             return dag, recoveries
-        if not dag.running_node_ids and any(
-            node.state is TaskDagNodeState.INDETERMINATE for node in dag.nodes
+        if (
+            not dag.running_node_ids
+            and not dag.ready_node_ids()
+            and any(node.state is TaskDagNodeState.INDETERMINATE for node in dag.nodes)
         ):
             dag = await self._set_graph_state_if_needed(dag, TaskDagState.INDETERMINATE)
             return dag, recoveries
@@ -492,6 +628,9 @@ class TaskDagApplicationService:
         self,
         dag: TaskDag,
         node_ids: tuple[str, ...],
+        *,
+        expected_node_generations: dict[str, int] | None = None,
+        strict: bool = False,
     ) -> tuple[
         TaskDag,
         tuple[tuple[TaskDag, TaskDagNode, TaskDagNode, str], ...],
@@ -503,6 +642,15 @@ class TaskDagApplicationService:
         for node_id in node_ids:
             node = current.node(node_id)
             if node.state is not TaskDagNodeState.READY:
+                if strict:
+                    break
+                continue
+            if (
+                expected_node_generations is not None
+                and node.generation != expected_node_generations[node_id]
+            ):
+                if strict:
+                    break
                 continue
             parent_task_id = f"dag-worker-{uuid.uuid4().hex}"
             running = replace(
@@ -522,10 +670,13 @@ class TaskDagApplicationService:
                     expected_generation=node.generation,
                     expected_state=TaskDagNodeState.READY,
                     updated_at=self._clock().astimezone(UTC),
+                    expected_dag_generation=current.generation,
                 )
             except TaskDagError as error:
                 if error.kind == "concurrent_modification":
                     current = await self._load_required(current.dag_id)
+                    if strict:
+                        break
                     continue
                 raise ConfigurationError(f"task DAG node claim failed: {error}") from error
             claimed_node = claimed.node(node_id)
@@ -1230,6 +1381,7 @@ __all__ = [
     "CreateTaskDagRequest",
     "RunTaskDagRequest",
     "RunTaskDagStepRequest",
+    "RunTaskDagWaveRequest",
     "TaskDagActiveNodeRecovery",
     "TaskDagApplicationService",
     "TaskDagWritableService",
