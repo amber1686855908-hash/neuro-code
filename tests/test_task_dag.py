@@ -476,6 +476,22 @@ class TaskDagDomainTests(unittest.TestCase):
                 state=TaskDagNodeState.RUNNING,
             )
 
+        with self.assertRaisesRegex(ValueError, "execution owner pid"):
+            TaskDagNode(
+                node_id="invalid-owner-pid",
+                ordinal=0,
+                prompt="prompt",
+                execution_owner_pid=0,
+                execution_owner_token="owner",
+            )
+        with self.assertRaisesRegex(ValueError, "execution owner identity"):
+            TaskDagNode(
+                node_id="incomplete-owner",
+                ordinal=0,
+                prompt="prompt",
+                execution_owner_pid=123,
+            )
+
     def test_domain_rejects_untrusted_and_inconsistent_values(self) -> None:
         with self.assertRaisesRegex(ValueError, "safe identifier"):
             TaskDagNode(node_id="bad\x01", ordinal=0, prompt="prompt")
@@ -1353,6 +1369,92 @@ class TaskDagSchedulerTests(unittest.IsolatedAsyncioTestCase):
                 self.relays,
                 parent_binding=cast(ConversationBinding, object()),
             )
+
+    def test_scheduler_request_boundaries_are_validated(self) -> None:
+        with self.assertRaisesRegex(TypeError, "nodes must be a tuple"):
+            CreateTaskDagRequest("invalid", [_node("a", 0)])  # type: ignore[arg-type]
+        with self.assertRaisesRegex(ValueError, "max_parallel must be between"):
+            CreateTaskDagRequest("invalid", (_node("a", 0),), max_parallel=0)
+        with self.assertRaisesRegex(ValueError, "request id must not be empty"):
+            RunTaskDagRequest("")
+        with self.assertRaisesRegex(ValueError, "step request id must not be empty"):
+            RunTaskDagStepRequest("")
+        with self.assertRaisesRegex(ValueError, "selected node id must not be empty"):
+            RunTaskDagStepRequest("dag", "")
+
+    async def test_parallel_scheduler_requires_independent_worker_factory(self) -> None:
+        writable = _FakeWritableService(self.parent_session_id)
+        service = self._service(writable)
+        await service.create_task_dag(
+            CreateTaskDagRequest("missing-factory", (_node("a", 0), _node("b", 1)), 2)
+        )
+        with self.assertRaisesRegex(ConfigurationError, "independent writable worker factory"):
+            await service.run_task_dag(RunTaskDagRequest("missing-factory"))
+
+        class SharedFactory:
+            def __init__(self, worker: _FakeWritableService) -> None:
+                self.worker = worker
+
+            def create(self) -> _FakeWritableService:
+                return self.worker
+
+        shared_service = TaskDagApplicationService(
+            self.store,
+            self.store,
+            writable,
+            self.leases,
+            self.relays,
+            parent_binding=self.binding,
+            writable_worker_factory=SharedFactory(writable),
+        )
+        await shared_service.create_task_dag(
+            CreateTaskDagRequest("shared-factory", (_node("a", 0), _node("b", 1)), 2)
+        )
+        with self.assertRaisesRegex(ConfigurationError, "shared writable service"):
+            await shared_service.run_task_dag(RunTaskDagRequest("shared-factory"))
+
+        class InvalidFactory:
+            def create(self) -> object:
+                return object()
+
+        invalid_service = TaskDagApplicationService(
+            self.store,
+            self.store,
+            writable,
+            self.leases,
+            self.relays,
+            parent_binding=self.binding,
+            writable_worker_factory=InvalidFactory(),
+        )
+        invalid_dag = TaskDag.create(
+            dag_id="invalid-factory",
+            parent_session_id=self.parent_session_id,
+            nodes=(_node("a", 0),),
+            created_at=_now(),
+            max_parallel=2,
+        )
+        with self.assertRaisesRegex(ConfigurationError, "invalid service"):
+            invalid_service._worker_service_for(invalid_dag)
+
+        wrong_parent_service = TaskDagApplicationService(
+            self.store,
+            self.store,
+            writable,
+            self.leases,
+            self.relays,
+            parent_binding=self.binding,
+            writable_worker_factory=SharedFactory(_FakeWritableService("other-parent")),
+        )
+        with self.assertRaisesRegex(ConfigurationError, "does not match binding"):
+            wrong_parent_service._worker_service_for(invalid_dag)
+
+    async def test_terminal_dag_rejects_selected_step(self) -> None:
+        service = self._service(_FakeWritableService(self.parent_session_id))
+        await service.create_task_dag(CreateTaskDagRequest("terminal-step", (_node("a", 0),)))
+        terminal = await service.run_task_dag(RunTaskDagRequest("terminal-step"))
+        self.assertTrue(terminal.state.terminal)
+        with self.assertRaisesRegex(ConfigurationError, "terminal task DAG"):
+            await service.run_task_dag_step(RunTaskDagStepRequest("terminal-step", "a"))
 
     async def test_recovery_without_ownership_boundary_fails_closed(self) -> None:
         service = self._service(_FakeWritableService(self.parent_session_id))
