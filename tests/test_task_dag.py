@@ -13,6 +13,7 @@ from unittest.mock import AsyncMock
 
 from neuro_code.application.ports.model import ModelProvider
 from neuro_code.application.ports.task_dag import TaskDagError
+from neuro_code.application.ports.task_dag_recovery import TaskDagRecoveryClaimError
 from neuro_code.application.sessions.binding import ConversationBinding, ConversationRunner
 from neuro_code.application.workflows.task_dag import (
     CreateTaskDagRequest,
@@ -35,6 +36,7 @@ from neuro_code.domain.task_dag import (
     TaskDagNodeState,
     TaskDagState,
 )
+from neuro_code.domain.task_dag_recovery import TaskDagRecoveryClaim
 from neuro_code.domain.worktree import WorktreeId
 from neuro_code.domain.writable_subagent import WritableSubagentWorkspaceState
 from neuro_code.infrastructure.persistence.sqlite_session import SqliteSessionStore
@@ -159,6 +161,57 @@ class _FakeWritableService:
 
 
 class TaskDagDomainTests(unittest.TestCase):
+    def test_recovery_claim_validates_identity_and_versions(self) -> None:
+        digest = "a" * 64
+        claim = TaskDagRecoveryClaim.create(
+            parent_session_id="parent",
+            dag_id="dag",
+            dag_definition_fingerprint=digest,
+            node_id="node",
+            node_generation=1,
+            node_definition_fingerprint=digest,
+            parent_task_id="task",
+            dependency_relay_id="relay",
+            dependency_relay_source_fingerprint=digest,
+            dependency_relay_content_fingerprint=digest,
+            dependency_relay_integrity_fingerprint=digest,
+            owner_pid=123,
+            owner_token="owner",
+            created_at=_now(),
+        )
+        self.assertTrue(
+            claim.same_execution(
+                claim.with_owner(
+                    owner_pid=456,
+                    owner_token="new-owner",
+                    version=1,
+                    updated_at=claim.created_at + timedelta(seconds=1),
+                )
+            )
+        )
+        invalid_claims = (
+            ({"claim_id": ""}, "safe identifier"),
+            ({"dag_definition_fingerprint": "bad"}, "SHA-256"),
+            ({"node_generation": True}, "node generation must be an integer"),
+            ({"node_generation": -1}, "node generation must be non-negative"),
+            ({"owner_pid": True}, "owner PID must be an integer"),
+            ({"owner_pid": 0}, "owner PID must be positive"),
+            ({"version": True}, "claim version must be an integer"),
+            ({"version": -1}, "claim version must be non-negative"),
+            ({"created_at": cast(datetime, object())}, "creation time must be timezone-aware"),
+            ({"updated_at": cast(datetime, object())}, "update time must be timezone-aware"),
+            (
+                {"updated_at": claim.created_at - timedelta(seconds=1)},
+                "must not precede creation",
+            ),
+        )
+        for changes, message in invalid_claims:
+            with self.assertRaisesRegex(ValueError, message):
+                replace(claim, **changes)
+        error = TaskDagRecoveryClaimError("x" * 2_000, kind="integrity")
+        self.assertEqual(error.kind, "integrity")
+        self.assertEqual(len(str(error)), 1_000)
+
     def test_topology_and_ready_selection_are_deterministic(self) -> None:
         dag = TaskDag.create(
             dag_id="diamond",
@@ -699,6 +752,59 @@ class TaskDagPersistenceTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(claimed.node("a").parent_task_id, "migration-worker-a")
 
+    async def test_recovery_claim_store_rejects_noncanonical_arguments(self) -> None:
+        with self.assertRaises(TypeError):
+            await self.store.insert_task_dag_recovery_claim(cast(TaskDagRecoveryClaim, object()))
+        for generation in (-1, True):
+            with self.assertRaises(ValueError):
+                await self.store.get_task_dag_recovery_claim("dag", "node", generation)
+
+        digest = "b" * 64
+        claim = TaskDagRecoveryClaim.create(
+            parent_session_id=self.parent_session_id,
+            dag_id="dag",
+            dag_definition_fingerprint=digest,
+            node_id="node",
+            node_generation=1,
+            node_definition_fingerprint=digest,
+            parent_task_id="task",
+            dependency_relay_id="relay",
+            dependency_relay_source_fingerprint=digest,
+            dependency_relay_content_fingerprint=digest,
+            dependency_relay_integrity_fingerprint=digest,
+            owner_pid=123,
+            owner_token="owner",
+            created_at=_now(),
+        )
+        with self.assertRaises(TypeError):
+            await self.store.compare_and_takeover_task_dag_recovery_claim(
+                cast(TaskDagRecoveryClaim, object()),
+                expected_version=0,
+                expected_owner_pid=123,
+                expected_owner_token="owner",
+            )
+        with self.assertRaises(TypeError):
+            await self.store.compare_and_takeover_task_dag_recovery_claim(
+                claim,
+                expected_version=True,
+                expected_owner_pid=123,
+                expected_owner_token="owner",
+            )
+        with self.assertRaises(TypeError):
+            await self.store.compare_and_takeover_task_dag_recovery_claim(
+                claim,
+                expected_version=0,
+                expected_owner_pid=True,
+                expected_owner_token="owner",
+            )
+        with self.assertRaises(TypeError):
+            await self.store.compare_and_takeover_task_dag_recovery_claim(
+                claim,
+                expected_version=0,
+                expected_owner_pid=123,
+                expected_owner_token="",
+            )
+
 
 class TaskDagSchedulerTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
@@ -763,6 +869,30 @@ class TaskDagSchedulerTests(unittest.IsolatedAsyncioTestCase):
                 self.relays,
                 parent_binding=cast(ConversationBinding, object()),
             )
+
+    async def test_recovery_without_ownership_boundary_fails_closed(self) -> None:
+        service = self._service(_FakeWritableService(self.parent_session_id))
+        dag = await service.create_task_dag(
+            CreateTaskDagRequest("recovery-without-boundary", (_node("a", 0),))
+        )
+        running = replace(
+            dag.node("a"),
+            state=TaskDagNodeState.RUNNING,
+            generation=1,
+            parent_task_id="recovery-worker-a",
+        )
+        claimed = await self.store.claim_task_dag_node(
+            dag.dag_id,
+            running,
+            expected_generation=0,
+            expected_state=TaskDagNodeState.READY,
+            updated_at=_now(),
+        )
+        self.assertFalse(await service._acquire_recovery_ownership(claimed, claimed.node("a")))
+        current = await self.store.get_task_dag(dag.dag_id)
+        self.assertIsNotNone(current)
+        assert current is not None
+        self.assertIs(current.node("a").state, TaskDagNodeState.INDETERMINATE)
         with self.assertRaisesRegex(ConfigurationError, "writable service is invalid"):
             TaskDagApplicationService(
                 self.store,
