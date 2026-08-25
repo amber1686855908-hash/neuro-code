@@ -93,9 +93,12 @@ diff、transcript、raw tool arguments、凭据或 raw file contents。
 
 ## 未实现
 
-Writable parallel workers、递归 writable subagent、自动委派、CLI/TUI/ACP 暴露、自动
+无界或自动委派的 Writable parallel workers、递归 writable subagent、自动委派、CLI/TUI/ACP 暴露、自动
 checkpoint/rollback policy、child 完成后的自动 rollback、merge/commit/patch integration、
 copy-back、branch 删除，以及 checkpoint/worktree cleanup，仍是未来独立能力。
+
+有界 static Task DAG 是单独的例外：它可以为独立 claim 的节点创建新的 scoped Writable service。
+该后续切片不弱化本 standalone service 的 lock、lease、worktree、capability、checkpoint 或 cleanup contract。
 
 该能力继承现有 Worktree filter preflight contract，要求 Git 2.40.0 或更高版本；边界测试明确
 Git 2.39.5 为 unavailable、Git 2.40.0 为 accepted；更低版本在初始化时失败关闭。

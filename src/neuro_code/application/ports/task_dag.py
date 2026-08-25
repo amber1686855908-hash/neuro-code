@@ -1,4 +1,4 @@
-"""Durable persistence contract for the bounded serialized task DAG."""
+"""Durable persistence contract for the bounded task DAG."""
 
 from __future__ import annotations
 

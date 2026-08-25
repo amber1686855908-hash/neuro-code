@@ -15,6 +15,8 @@ from dataclasses import dataclass, replace
 from datetime import datetime
 from enum import StrEnum
 
+from neuro_code.shared.limits import MAX_SUBAGENT_PARALLELISM
+
 MAX_TASK_DAG_NODES = 8
 MAX_TASK_DAG_EDGES = 16
 MAX_TASK_DAG_NODE_DEPENDENCIES = 4
@@ -23,6 +25,9 @@ MAX_TASK_DAG_NODE_ID_BYTES = 128
 MAX_TASK_DAG_PROMPT_BYTES = 8 * 1024
 MAX_TASK_DAG_ERROR_BYTES = 256
 MAX_TASK_DAG_RESPONSE_PREVIEW_BYTES = 8 * 1024
+# Compatibility name for the DAG-specific validation and schema contract.
+# The value is intentionally owned by the shared application limit.
+MAX_TASK_DAG_PARALLELISM = MAX_SUBAGENT_PARALLELISM
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
@@ -146,6 +151,8 @@ class TaskDagNode:
     state: TaskDagNodeState = TaskDagNodeState.PENDING
     generation: int = 0
     parent_task_id: str | None = None
+    execution_owner_pid: int | None = None
+    execution_owner_token: str | None = None
     child_session_id: str | None = None
     lease_id: str | None = None
     worktree_id: str | None = None
@@ -194,6 +201,20 @@ class TaskDagNode:
             or self.generation < 0
         ):
             raise ValueError("task DAG node generation must be non-negative")
+        if self.execution_owner_pid is not None and (
+            isinstance(self.execution_owner_pid, bool)
+            or not isinstance(self.execution_owner_pid, int)
+            or self.execution_owner_pid <= 0
+        ):
+            raise ValueError("task DAG execution owner pid must be positive")
+        if (self.execution_owner_pid is None) != (self.execution_owner_token is None):
+            raise ValueError("task DAG execution owner identity must be complete")
+        if self.execution_owner_token is not None:
+            _safe_identifier(
+                self.execution_owner_token,
+                field_name="task DAG execution owner token",
+                limit=MAX_TASK_DAG_ID_BYTES,
+            )
         for value, field_name in (
             (self.parent_task_id, "task DAG parent task id"),
             (self.child_session_id, "task DAG child session id"),
@@ -268,6 +289,7 @@ class TaskDag:
     created_at: datetime | None = None
     updated_at: datetime | None = None
     active_node_id: str | None = None
+    max_parallel: int = 1
 
     @classmethod
     def create(
@@ -277,6 +299,7 @@ class TaskDag:
         parent_session_id: str,
         nodes: tuple[TaskDagNode, ...],
         created_at: datetime,
+        max_parallel: int = 1,
     ) -> TaskDag:
         prepared = tuple(nodes)
         for node in prepared:
@@ -287,6 +310,8 @@ class TaskDag:
                     value is not None
                     for value in (
                         node.parent_task_id,
+                        node.execution_owner_pid,
+                        node.execution_owner_token,
                         node.child_session_id,
                         node.lease_id,
                         node.worktree_id,
@@ -315,6 +340,7 @@ class TaskDag:
             created_at=created_at,
             updated_at=created_at,
             active_node_id=None,
+            max_parallel=max_parallel,
         )
 
     def __post_init__(self) -> None:
@@ -335,6 +361,14 @@ class TaskDag:
             or self.generation < 0
         ):
             raise ValueError("task DAG generation must be non-negative")
+        if (
+            isinstance(self.max_parallel, bool)
+            or not isinstance(self.max_parallel, int)
+            or not 1 <= self.max_parallel <= MAX_TASK_DAG_PARALLELISM
+        ):
+            raise ValueError(
+                f"task DAG max_parallel must be between 1 and {MAX_TASK_DAG_PARALLELISM}"
+            )
         if self.created_at is not None and (
             not isinstance(self.created_at, datetime) or self.created_at.tzinfo is None
         ):
@@ -358,8 +392,8 @@ class TaskDag:
             node = self.node(self.active_node_id)
             if node.state is not TaskDagNodeState.RUNNING:
                 raise ValueError("task DAG active node must be running")
-        elif any(node.state is TaskDagNodeState.RUNNING for node in self.nodes):
-            raise ValueError("running task DAG node requires an active node id")
+        if self.state.terminal and self.running_node_ids:
+            raise ValueError("terminal task DAG must not contain running nodes")
 
     @staticmethod
     def _validate_definition(
@@ -457,6 +491,20 @@ class TaskDag:
             if node.state is TaskDagNodeState.READY
         )
 
+    @property
+    def running_node_ids(self) -> tuple[str, ...]:
+        """Return the durable execution set in deterministic declaration order.
+
+        ``active_node_id`` is retained for schema and serialized-Leader
+        compatibility only.  Scheduling decisions must use this derived set.
+        """
+
+        return tuple(
+            node.node_id
+            for node in sorted(self.nodes, key=lambda item: (item.ordinal, item.node_id))
+            if node.state is TaskDagNodeState.RUNNING
+        )
+
     def with_nodes(self, nodes: tuple[TaskDagNode, ...]) -> TaskDag:
         return replace(self, nodes=nodes)
 
@@ -471,6 +519,7 @@ __all__ = [
     "MAX_TASK_DAG_NODES",
     "MAX_TASK_DAG_NODE_DEPENDENCIES",
     "MAX_TASK_DAG_NODE_ID_BYTES",
+    "MAX_TASK_DAG_PARALLELISM",
     "MAX_TASK_DAG_PROMPT_BYTES",
     "MAX_TASK_DAG_RESPONSE_PREVIEW_BYTES",
     "TaskDag",

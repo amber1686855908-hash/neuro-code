@@ -1,4 +1,4 @@
-"""Deterministic serialized execution of explicit durable task DAGs."""
+"""Bounded parallel execution of explicit durable task DAGs."""
 
 from __future__ import annotations
 
@@ -34,6 +34,7 @@ from neuro_code.application.workflows.writable_subagent import (
 from neuro_code.domain.session_tasks import SessionTaskStatus
 from neuro_code.domain.task_dag import (
     MAX_TASK_DAG_ERROR_BYTES,
+    MAX_TASK_DAG_PARALLELISM,
     MAX_TASK_DAG_RESPONSE_PREVIEW_BYTES,
     TaskDag,
     TaskDagNode,
@@ -54,6 +55,10 @@ def _now() -> datetime:
     return datetime.now(UTC)
 
 
+_ACTIVE_EVIDENCE_PROBE_COUNT = 8
+_ACTIVE_EVIDENCE_PROBE_DELAY_SECONDS = 0.025
+
+
 def _bounded_metadata_text(value: str, limit: int) -> str:
     """Keep durable diagnostics safe and bounded by UTF-8 bytes."""
 
@@ -72,10 +77,19 @@ class CreateTaskDagRequest:
 
     dag_id: str
     nodes: tuple[TaskDagNode, ...]
+    max_parallel: int = 1
 
     def __post_init__(self) -> None:
         if not isinstance(self.nodes, tuple):
             raise TypeError("task DAG request nodes must be a tuple")
+        if (
+            isinstance(self.max_parallel, bool)
+            or not isinstance(self.max_parallel, int)
+            or not 1 <= self.max_parallel <= MAX_TASK_DAG_PARALLELISM
+        ):
+            raise ValueError(
+                f"task DAG request max_parallel must be between 1 and {MAX_TASK_DAG_PARALLELISM}"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -139,6 +153,13 @@ class TaskDagWritableService(Protocol):
     async def reconcile_writable_subagent_workspaces(self) -> object: ...
 
 
+@runtime_checkable
+class TaskDagWritableWorkerFactory(Protocol):
+    """Create an independent Writable owner for one parallel DAG node."""
+
+    def create(self) -> TaskDagWritableService: ...
+
+
 class TaskDagApplicationService:
     """Own DAG orchestration while delegating every node to Writable Subagent."""
 
@@ -153,6 +174,7 @@ class TaskDagApplicationService:
         parent_binding: ConversationBinding,
         dependency_relay_store: TaskDagDependencyResultRelayStore | None = None,
         recovery_claim_store: TaskDagRecoveryClaimStore | None = None,
+        writable_worker_factory: TaskDagWritableWorkerFactory | None = None,
         redaction_values: tuple[str, ...] = (),
         clock: Callable[[], datetime] = _now,
     ) -> None:
@@ -169,9 +191,15 @@ class TaskDagApplicationService:
             raise ConfigurationError("task DAG parent session identity is missing")
         if writable_service.parent_session_id != parent_session_id:
             raise ConfigurationError("task DAG writable service parent does not match binding")
+        if writable_worker_factory is not None and not isinstance(
+            writable_worker_factory,
+            TaskDagWritableWorkerFactory,
+        ):
+            raise ConfigurationError("task DAG writable worker factory is invalid")
         self._store = store
         self._dag_store = dag_store
         self._writable_service = writable_service
+        self._writable_worker_factory = writable_worker_factory
         self._lease_store = lease_store
         self._relay_store = relay_store
         self._parent_binding = parent_binding
@@ -186,6 +214,8 @@ class TaskDagApplicationService:
         ):
             recovery_claim_store = cast(TaskDagRecoveryClaimStore, dag_store)
         self._recovery_claim_store = recovery_claim_store
+        self._execution_owner_pid = os.getpid()
+        self._execution_owner_token = f"dag-worker-owner-{uuid.uuid4().hex}"
         self._recovery_owner_pid = os.getpid()
         self._recovery_owner_token = f"dag-recovery-owner-{uuid.uuid4().hex}"
         self._clock = clock
@@ -211,6 +241,7 @@ class TaskDagApplicationService:
             parent_session_id=self._parent_session_id,
             nodes=request.nodes,
             created_at=self._clock().astimezone(UTC),
+            max_parallel=request.max_parallel,
         )
         try:
             return await self._dag_store.insert_task_dag(dag)
@@ -233,12 +264,76 @@ class TaskDagApplicationService:
         if not isinstance(request, RunTaskDagRequest):
             raise ValueError("task DAG run request must be canonical")
         while True:
-            dag = await self.run_task_dag_step(
-                RunTaskDagStepRequest(request.dag_id),
-                sink=sink,
-            )
-            if dag.state.terminal or dag.active_node_id is not None:
+            dag, recoveries = await self._prepare_task_dag_for_run(request)
+            if dag.state.terminal:
                 return dag
+
+            safe_nodes = tuple(
+                node_id
+                for node_id in dag.running_node_ids
+                if recoveries.get(node_id) is TaskDagActiveNodeRecovery.SAFE_NOT_STARTED
+            )
+            if safe_nodes:
+                node = dag.node(safe_nodes[0])
+                if node.parent_task_id is None:
+                    return await self._finish_worker_node(
+                        dag,
+                        node,
+                        TaskDagNodeState.INDETERMINATE,
+                        error=RuntimeError(
+                            "safe-not-started DAG node lost its persisted worker identity"
+                        ),
+                    )
+                if await self._acquire_recovery_ownership(dag, node):
+                    worker = self._worker_service_for(dag)
+                    await self._execute_claimed_node(
+                        dag=dag,
+                        claimed=dag,
+                        claimed_node=node,
+                        node=node,
+                        parent_task_id=node.parent_task_id,
+                        sink=sink,
+                        reuse_existing_dependency_relay=True,
+                        writable_service=worker,
+                    )
+                    continue
+                dag = await self._load_required(dag.dag_id)
+
+            available_slots = max(0, dag.max_parallel - len(dag.running_node_ids))
+            ready_node_ids = dag.ready_node_ids()[:available_slots]
+            if ready_node_ids:
+                if dag.max_parallel > 1 and self._writable_worker_factory is None:
+                    raise ConfigurationError(
+                        "parallel task DAG requires an independent writable worker factory"
+                    )
+                workers = [self._worker_service_for(dag) for _ in ready_node_ids]
+                if len({id(worker) for worker in workers}) != len(workers):
+                    raise ConfigurationError(
+                        "parallel task DAG worker factory returned a shared writable service"
+                    )
+                claimed_dag, claims = await self._claim_ready_nodes(dag, ready_node_ids)
+                if claims:
+                    async with asyncio.TaskGroup() as task_group:
+                        for index, claim in enumerate(claims):
+                            task_group.create_task(
+                                self._execute_claimed_node(
+                                    dag=dag,
+                                    claimed=claim[0],
+                                    claimed_node=claim[1],
+                                    node=claim[2],
+                                    parent_task_id=claim[3],
+                                    sink=sink,
+                                    writable_service=workers[index],
+                                )
+                            )
+                    continue
+                dag = claimed_dag
+                if dag.ready_node_ids():
+                    continue
+
+            if dag.running_node_ids:
+                return dag
+            return await self._classify_terminal_or_uncertain(dag)
 
     async def run_task_dag_step(
         self,
@@ -262,11 +357,11 @@ class TaskDagApplicationService:
             if request.selected_node_id is not None:
                 raise ConfigurationError("cannot select a node from a terminal task DAG")
             return dag
-        if dag.active_node_id is not None:
+        if dag.running_node_ids:
             if request.selected_node_id is not None:
-                raise ConfigurationError("task DAG already has an active node")
+                raise ConfigurationError("task DAG already has a running node")
             if recovery is TaskDagActiveNodeRecovery.SAFE_NOT_STARTED:
-                node = dag.node(dag.active_node_id)
+                node = dag.node(dag.running_node_ids[0])
                 if node.parent_task_id is None:
                     return await self._finish_worker_node(
                         dag,
@@ -286,6 +381,7 @@ class TaskDagApplicationService:
                     parent_task_id=node.parent_task_id,
                     sink=sink,
                     reuse_existing_dependency_relay=True,
+                    writable_service=self._worker_service_for(dag),
                 )
             return dag
         ready_node_ids = dag.ready_node_ids()
@@ -339,7 +435,19 @@ class TaskDagApplicationService:
         self,
         request: RunTaskDagRequest,
     ) -> tuple[TaskDag, TaskDagActiveNodeRecovery | None]:
-        """Prepare one step and retain the read-only active-node classification."""
+        """Prepare one serialized step and retain its recovery classification."""
+
+        if not isinstance(request, RunTaskDagRequest):
+            raise ValueError("task DAG preparation request must be canonical")
+        dag, recoveries = await self._prepare_task_dag_for_run(request)
+        recovery = recoveries.get(dag.running_node_ids[0]) if dag.running_node_ids else None
+        return dag, recovery
+
+    async def _prepare_task_dag_for_run(
+        self,
+        request: RunTaskDagRequest,
+    ) -> tuple[TaskDag, dict[str, TaskDagActiveNodeRecovery | None]]:
+        """Reconcile every running node and prepare deterministic scheduling."""
 
         if not isinstance(request, RunTaskDagRequest):
             raise ValueError("task DAG preparation request must be canonical")
@@ -348,18 +456,82 @@ class TaskDagApplicationService:
             await self._dependency_relay_service.initialize()
         dag = await self._load_required(request.dag_id)
         if dag.state.terminal:
-            return dag, None
-        dag, recovery = await self._reconcile_active_node_with_classification(dag)
-        if dag.state is TaskDagState.INDETERMINATE:
-            return await self._set_graph_state_if_needed(dag, TaskDagState.INDETERMINATE), recovery
-        if dag.active_node_id is not None:
-            return dag, recovery
+            return dag, {}
+        dag, recoveries = await self._reconcile_active_nodes_with_classification(dag)
+        if dag.state.terminal:
+            return dag, recoveries
         dag = await self._propagate_dependencies(dag)
-        if dag.state.terminal or dag.active_node_id is not None:
-            return dag, None
-        if not dag.ready_node_ids():
-            return await self._classify_terminal_or_uncertain(dag), None
-        return dag, None
+        if dag.state.terminal:
+            return dag, recoveries
+        if not dag.running_node_ids and any(
+            node.state is TaskDagNodeState.INDETERMINATE for node in dag.nodes
+        ):
+            dag = await self._set_graph_state_if_needed(dag, TaskDagState.INDETERMINATE)
+            return dag, recoveries
+        if not dag.running_node_ids and not dag.ready_node_ids():
+            dag = await self._classify_terminal_or_uncertain(dag)
+        return dag, recoveries
+
+    def _worker_service_for(self, dag: TaskDag) -> TaskDagWritableService:
+        """Select one owner without weakening the per-service Writable lock."""
+
+        if dag.max_parallel == 1:
+            return self._writable_service
+        if self._writable_worker_factory is None:
+            raise ConfigurationError(
+                "parallel task DAG requires an independent writable worker factory"
+            )
+        worker = self._writable_worker_factory.create()
+        if not isinstance(worker, TaskDagWritableService):
+            raise ConfigurationError("parallel task DAG worker factory returned an invalid service")
+        if worker.parent_session_id != self._parent_session_id:
+            raise ConfigurationError("parallel task DAG worker parent does not match binding")
+        return worker
+
+    async def _claim_ready_nodes(
+        self,
+        dag: TaskDag,
+        node_ids: tuple[str, ...],
+    ) -> tuple[
+        TaskDag,
+        tuple[tuple[TaskDag, TaskDagNode, TaskDagNode, str], ...],
+    ]:
+        """Claim a deterministic batch; SQLite owns the durable capacity race."""
+
+        current = dag
+        claims: list[tuple[TaskDag, TaskDagNode, TaskDagNode, str]] = []
+        for node_id in node_ids:
+            node = current.node(node_id)
+            if node.state is not TaskDagNodeState.READY:
+                continue
+            parent_task_id = f"dag-worker-{uuid.uuid4().hex}"
+            running = replace(
+                node,
+                state=TaskDagNodeState.RUNNING,
+                generation=node.generation + 1,
+                parent_task_id=parent_task_id,
+                execution_owner_pid=self._execution_owner_pid,
+                execution_owner_token=self._execution_owner_token,
+                error_kind=None,
+                error_reason=None,
+            )
+            try:
+                claimed = await self._dag_store.claim_task_dag_node(
+                    current.dag_id,
+                    running,
+                    expected_generation=node.generation,
+                    expected_state=TaskDagNodeState.READY,
+                    updated_at=self._clock().astimezone(UTC),
+                )
+            except TaskDagError as error:
+                if error.kind == "concurrent_modification":
+                    current = await self._load_required(current.dag_id)
+                    continue
+                raise ConfigurationError(f"task DAG node claim failed: {error}") from error
+            claimed_node = claimed.node(node_id)
+            claims.append((claimed, claimed_node, node, parent_task_id))
+            current = claimed
+        return current, tuple(claims)
 
     async def _execute_claimed_node(
         self,
@@ -371,7 +543,9 @@ class TaskDagApplicationService:
         parent_task_id: str,
         sink: EventSink | None,
         reuse_existing_dependency_relay: bool = False,
+        writable_service: TaskDagWritableService | None = None,
     ) -> TaskDag:
+        worker = writable_service or self._writable_service
         dependency_relay = None
         if node.dependencies and self._dependency_relay_service is not None:
             # The target is already claimed RUNNING here.  Publication is the
@@ -394,7 +568,16 @@ class TaskDagApplicationService:
                         claimed,
                         claimed_node,
                     )
-            except asyncio.CancelledError:
+            except asyncio.CancelledError as error:
+                await asyncio.shield(
+                    self._finish_worker_node(
+                        claimed,
+                        claimed_node,
+                        TaskDagNodeState.CANCELLED,
+                        error=error,
+                    )
+                )
+                await asyncio.shield(self._cancel_remaining_graph(dag.dag_id))
                 raise
             except BaseException as error:
                 if isinstance(error, (KeyboardInterrupt, SystemExit)):
@@ -412,7 +595,8 @@ class TaskDagApplicationService:
             parent_task_id=parent_task_id,
         )
         try:
-            result = await self._writable_service.run_subagent_with_execution_identity(
+            await worker.initialize()
+            result = await worker.run_subagent_with_execution_identity(
                 RunWritableSubagentRequest(
                     parent_session_id=self._parent_session_id,
                     prompt=node.prompt,
@@ -483,8 +667,6 @@ class TaskDagApplicationService:
             return False
         for _ in range(4):
             current = await self._load_required(dag.dag_id)
-            if current.active_node_id != node.node_id:
-                return False
             current_node = current.node(node.node_id)
             if (
                 current_node.state is not TaskDagNodeState.RUNNING
@@ -593,7 +775,7 @@ class TaskDagApplicationService:
 
         current = await self._load_required(dag.dag_id)
         if (
-            current.active_node_id != node.node_id
+            current.node(node.node_id).state is not TaskDagNodeState.RUNNING
             or current.node(node.node_id).generation != node.generation
         ):
             return False
@@ -627,7 +809,7 @@ class TaskDagApplicationService:
         if not isinstance(request, RunTaskDagRequest):
             raise ValueError("task DAG reconciliation request must be canonical")
         dag = await self._load_required(request.dag_id)
-        dag, _ = await self._reconcile_active_node_with_classification(dag)
+        dag, _ = await self._reconcile_active_nodes_with_classification(dag)
         return dag
 
     async def _load_required(self, dag_id: str) -> TaskDag:
@@ -762,6 +944,26 @@ class TaskDagApplicationService:
         reconciled, _ = await self._reconcile_active_node_with_classification(dag)
         return reconciled
 
+    async def _reconcile_active_nodes_with_classification(
+        self,
+        dag: TaskDag,
+    ) -> tuple[TaskDag, dict[str, TaskDagActiveNodeRecovery | None]]:
+        """Reconcile each durable RUNNING node without using the legacy scalar."""
+
+        current = dag
+        classifications: dict[str, TaskDagActiveNodeRecovery | None] = {}
+        for node_id in dag.running_node_ids:
+            current = await self._load_required(dag.dag_id)
+            node = current.node(node_id)
+            if node.state is not TaskDagNodeState.RUNNING:
+                continue
+            current, classification = await self._reconcile_one_active_node_with_classification(
+                current,
+                node,
+            )
+            classifications[node_id] = classification
+        return current, classifications
+
     async def _load_matching_recovery_claim(
         self,
         dag: TaskDag,
@@ -792,9 +994,22 @@ class TaskDagApplicationService:
         self,
         dag: TaskDag,
     ) -> tuple[TaskDag, TaskDagActiveNodeRecovery | None]:
-        if dag.active_node_id is None:
+        if not dag.running_node_ids:
             return dag, None
-        node = dag.node(dag.active_node_id)
+        node_id = dag.running_node_ids[0]
+        current = dag
+        node = current.node(node_id)
+        if node.state is not TaskDagNodeState.RUNNING:
+            return current, None
+        return await self._reconcile_one_active_node_with_classification(current, node)
+
+    async def _reconcile_one_active_node_with_classification(
+        self,
+        dag: TaskDag,
+        node: TaskDagNode,
+    ) -> tuple[TaskDag, TaskDagActiveNodeRecovery | None]:
+        if node.state is not TaskDagNodeState.RUNNING:
+            return dag, None
         if node.parent_task_id is None:
             return (
                 await self._finish_worker_node(
@@ -805,11 +1020,20 @@ class TaskDagApplicationService:
                 ),
                 TaskDagActiveNodeRecovery.INDETERMINATE,
             )
-        task = await self._store.get_session_task(self._parent_session_id, node.parent_task_id)
-        lease = await self._lease_store.get_writable_subagent_lease_for_parent_task(
-            self._parent_session_id,
-            node.parent_task_id,
-        )
+        if node.execution_owner_pid is not None and owner_is_alive(node.execution_owner_pid):
+            return dag, TaskDagActiveNodeRecovery.ACTIVE_WORKER
+        task = None
+        lease = None
+        for probe in range(_ACTIVE_EVIDENCE_PROBE_COUNT):
+            task = await self._store.get_session_task(self._parent_session_id, node.parent_task_id)
+            lease = await self._lease_store.get_writable_subagent_lease_for_parent_task(
+                self._parent_session_id,
+                node.parent_task_id,
+            )
+            if task is not None or lease is not None:
+                break
+            if probe + 1 < _ACTIVE_EVIDENCE_PROBE_COUNT:
+                await asyncio.sleep(_ACTIVE_EVIDENCE_PROBE_DELAY_SECONDS)
         recovery_error: BaseException | None = None
         recovery_claim: TaskDagRecoveryClaim | None = None
         if task is None and node.dependencies and self._dependency_relay_service is not None:
@@ -859,6 +1083,14 @@ class TaskDagApplicationService:
             and owner_is_alive(recovery_claim.owner_pid)
         ):
             return dag, TaskDagActiveNodeRecovery.RECOVERY_OWNED
+        lease_owner_pid = getattr(lease, "owner_pid", None) if lease is not None else None
+        if (
+            lease is not None
+            and lease.state is not WritableSubagentWorkspaceState.ORPHANED
+            and lease_owner_pid is not None
+            and owner_is_alive(lease_owner_pid)
+        ):
+            return dag, TaskDagActiveNodeRecovery.ACTIVE_WORKER
         await self._writable_service.reconcile_writable_subagent_workspaces()
         task = await self._store.get_session_task(self._parent_session_id, node.parent_task_id)
         lease = await self._lease_store.get_writable_subagent_lease_for_parent_task(
@@ -927,6 +1159,8 @@ class TaskDagApplicationService:
         return dag, TaskDagActiveNodeRecovery.ACTIVE_WORKER
 
     async def _classify_terminal_or_uncertain(self, dag: TaskDag) -> TaskDag:
+        if dag.running_node_ids:
+            return dag
         if any(node.state is TaskDagNodeState.INDETERMINATE for node in dag.nodes):
             return await self._set_graph_state_if_needed(dag, TaskDagState.INDETERMINATE)
         if any(
@@ -944,6 +1178,8 @@ class TaskDagApplicationService:
         dag: TaskDag,
         state: TaskDagState,
     ) -> TaskDag:
+        if dag.running_node_ids and state.terminal:
+            return dag
         if dag.state is state:
             return dag
         proposed = replace(
@@ -997,4 +1233,5 @@ __all__ = [
     "TaskDagActiveNodeRecovery",
     "TaskDagApplicationService",
     "TaskDagWritableService",
+    "TaskDagWritableWorkerFactory",
 ]

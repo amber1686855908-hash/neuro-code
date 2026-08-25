@@ -103,13 +103,15 @@ from neuro_code.domain.task_dag_result_relay import (
 )
 from neuro_code.domain.worktree import WorktreeHandle, WorktreeId, WorktreeRepositoryIdentity
 from neuro_code.domain.writable_subagent import (
+    WritableSubagentLeaseScope,
     WritableSubagentWorkspaceLease,
     WritableSubagentWorkspaceState,
 )
 from neuro_code.shared.async_utils import run_blocking
 from neuro_code.shared.errors import SessionError
+from neuro_code.shared.limits import MAX_SUBAGENT_PARALLELISM
 
-SCHEMA_VERSION = 21
+SCHEMA_VERSION = 23
 _SEARCH_SNIPPET_LIMIT = 500
 _SQLITE_TIMEOUT_SECONDS = 30.0
 _SESSION_ALIAS_NAMESPACE_LIMIT = 64
@@ -291,6 +293,18 @@ class SqliteSessionStore:
                             "UPDATE schema_meta SET version = 21 WHERE singleton = 1"
                         )
                         version = (21,)
+                    if version is not None and version[0] == 21:
+                        _migrate_task_dag_parallelism_schema(connection)
+                        connection.execute(
+                            "UPDATE schema_meta SET version = 22 WHERE singleton = 1"
+                        )
+                        version = (22,)
+                    if version is not None and version[0] == 22:
+                        _migrate_task_dag_execution_owner_schema(connection)
+                        connection.execute(
+                            "UPDATE schema_meta SET version = 23 WHERE singleton = 1"
+                        )
+                        version = (23,)
                     if version is None or version[0] != SCHEMA_VERSION:
                         raise SessionError(
                             "unsupported session schema version: "
@@ -2026,35 +2040,76 @@ class SqliteSessionStore:
             raise ValueError("new writable subagent lease must start allocating at version zero")
 
         def insert() -> WritableSubagentWorkspaceLease:
+            connection: sqlite3.Connection | None = None
             try:
-                with closing(self._connect()) as connection, connection:
-                    connection.execute(
+                connection = self._connect()
+                connection.execute("BEGIN IMMEDIATE")
+                if lease.execution_scope is WritableSubagentLeaseScope.STANDALONE:
+                    conflict = connection.execute(
                         """
-                        INSERT INTO writable_subagent_leases(
-                            lease_id, parent_session_id, parent_task_id, worktree_id,
-                            parent_capability_fingerprint, parent_workspace_root,
-                            parent_common_dir, parent_source_worktree, parent_git_dir,
-                            parent_repository_head_sha, base_commit_sha, canonical_child_root,
-                            state, created_at, updated_at, worktree_common_dir,
-                            worktree_source_worktree, worktree_git_dir, worktree_repository_head_sha,
-                            worktree_path, worktree_branch, baseline_checkpoint_id,
-                            child_session_id, capability_fingerprint, grant_fingerprint,
-                            owner_pid, owner_token, final_workspace_fingerprint,
-                            workspace_changed, changed_file_count, error_kind, version
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        SELECT 1 FROM writable_subagent_leases
+                        WHERE parent_session_id = ?
+                          AND state IN ('allocating', 'worktree_ready', 'baseline_ready', 'active')
+                        LIMIT 1
                         """,
-                        _writable_lease_values(lease),
+                        (lease.parent_session_id,),
+                    ).fetchone()
+                else:
+                    conflict = connection.execute(
+                        """
+                        SELECT 1 FROM writable_subagent_leases
+                        WHERE parent_session_id = ?
+                          AND state IN ('allocating', 'worktree_ready', 'baseline_ready', 'active')
+                          AND execution_scope = 'standalone'
+                        LIMIT 1
+                        """,
+                        (lease.parent_session_id,),
+                    ).fetchone()
+                if conflict is not None:
+                    raise WritableSubagentLeaseError(
+                        "another writable subagent already owns the parent",
+                        kind="concurrent_modification",
                     )
+                connection.execute(
+                    """
+                    INSERT INTO writable_subagent_leases(
+                        lease_id, parent_session_id, parent_task_id, worktree_id,
+                        parent_capability_fingerprint, parent_workspace_root,
+                        parent_common_dir, parent_source_worktree, parent_git_dir,
+                        parent_repository_head_sha, base_commit_sha, canonical_child_root,
+                        state, created_at, updated_at, worktree_common_dir,
+                        worktree_source_worktree, worktree_git_dir, worktree_repository_head_sha,
+                        worktree_path, worktree_branch, baseline_checkpoint_id,
+                        child_session_id, capability_fingerprint, grant_fingerprint,
+                        owner_pid, owner_token, final_workspace_fingerprint,
+                        workspace_changed, changed_file_count, error_kind, execution_scope,
+                        version
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    _writable_lease_values(lease),
+                )
+                connection.commit()
                 return lease
+            except WritableSubagentLeaseError:
+                if connection is not None:
+                    connection.rollback()
+                raise
             except sqlite3.IntegrityError as error:
+                if connection is not None:
+                    connection.rollback()
                 raise WritableSubagentLeaseError(
                     "another writable subagent already owns the parent or worktree",
                     kind="concurrent_modification",
                 ) from error
             except sqlite3.Error as error:
+                if connection is not None:
+                    connection.rollback()
                 raise WritableSubagentLeaseError(
                     "writable subagent lease could not be persisted",
                 ) from error
+            finally:
+                if connection is not None:
+                    connection.close()
 
         async with self._write_lock:
             return await run_blocking(insert)
@@ -2615,6 +2670,11 @@ class SqliteSessionStore:
                                 "task DAG identity already exists with a different definition",
                                 kind="protocol",
                             )
+                        if current.max_parallel != dag.max_parallel:
+                            raise TaskDagError(
+                                "task DAG identity already exists with a different max_parallel",
+                                kind="protocol",
+                            )
                         return current
                     if dag.created_at is None or dag.updated_at is None:
                         raise TaskDagError("task DAG timestamps are required", kind="protocol")
@@ -2622,8 +2682,8 @@ class SqliteSessionStore:
                         """
                         INSERT INTO task_dags(
                             dag_id, parent_session_id, definition_fingerprint,
-                            state, generation, created_at, updated_at, active_node_id
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                            state, generation, created_at, updated_at, active_node_id, max_parallel
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             dag.dag_id,
@@ -2634,6 +2694,7 @@ class SqliteSessionStore:
                             dag.created_at.isoformat(),
                             dag.updated_at.isoformat(),
                             dag.active_node_id,
+                            dag.max_parallel,
                         ),
                     )
                     for node in dag.nodes:
@@ -2642,10 +2703,11 @@ class SqliteSessionStore:
                             INSERT INTO task_dag_nodes(
                                 dag_id, node_id, ordinal, prompt, prompt_fingerprint,
                                 dependencies_json, kind, state, generation,
-                                parent_task_id, child_session_id, lease_id, worktree_id,
+                                parent_task_id, execution_owner_pid, execution_owner_token,
+                                child_session_id, lease_id, worktree_id,
                                 baseline_checkpoint_id, relay_id, error_kind, error_reason,
                                 response_preview, final_workspace_fingerprint, changed_file_count
-                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                             """,
                             _task_dag_node_values(dag.dag_id, node),
                         )
@@ -2700,6 +2762,7 @@ class SqliteSessionStore:
                         or current.state is not expected_state
                         or dag.generation != expected_generation + 1
                         or dag.active_node_id != current.active_node_id
+                        or dag.max_parallel != current.max_parallel
                     ):
                         raise TaskDagError(
                             "task DAG was changed by another scheduler",
@@ -2708,6 +2771,11 @@ class SqliteSessionStore:
                     if not _task_dag_state_transition_allowed(current.state, dag.state):
                         raise TaskDagError(
                             "invalid task DAG state transition",
+                            kind="protocol",
+                        )
+                    if dag.state.terminal and current.running_node_ids:
+                        raise TaskDagError(
+                            "task DAG cannot become terminal while a node is running",
                             kind="protocol",
                         )
                     if dag.updated_at is None:
@@ -2766,10 +2834,10 @@ class SqliteSessionStore:
                     current_dag = _load_task_dag(connection, dag_id)
                     if current_dag is None:
                         raise TaskDagError("task DAG is missing", kind="unmanaged")
-                    if current_dag.active_node_id is not None:
+                    if node.state is TaskDagNodeState.RUNNING:
                         raise TaskDagError(
-                            "task DAG has an active node",
-                            kind="concurrent_modification",
+                            "running task DAG nodes must use the atomic capacity claim",
+                            kind="protocol",
                         )
                     current = current_dag.node(node.node_id)
                     _verify_task_dag_node_definition(current, node)
@@ -2833,9 +2901,19 @@ class SqliteSessionStore:
                 current_dag = _load_task_dag(connection, dag_id)
                 if current_dag is None:
                     raise TaskDagError("task DAG is missing", kind="unmanaged")
-                if current_dag.active_node_id is not None:
+                if current_dag.state.terminal:
                     raise TaskDagError(
-                        "another task DAG node is already active",
+                        "task DAG is already terminal",
+                        kind="concurrent_modification",
+                    )
+                running_count_row = connection.execute(
+                    "SELECT COUNT(*) FROM task_dag_nodes WHERE dag_id = ? AND state = ?",
+                    (dag_id, TaskDagNodeState.RUNNING.value),
+                ).fetchone()
+                running_count = int(running_count_row[0]) if running_count_row is not None else 0
+                if running_count >= current_dag.max_parallel:
+                    raise TaskDagError(
+                        "task DAG parallel capacity is full",
                         kind="concurrent_modification",
                     )
                 current = current_dag.node(node.node_id)
@@ -2872,19 +2950,19 @@ class SqliteSessionStore:
                     UPDATE task_dags
                     SET state = ?, generation = generation + 1,
                         updated_at = ?, active_node_id = ?
-                    WHERE dag_id = ? AND active_node_id IS NULL AND generation = ?
+                    WHERE dag_id = ? AND generation = ?
                     """,
                     (
                         TaskDagState.RUNNING.value,
                         updated_at.isoformat(),
-                        node.node_id,
+                        node.node_id if running_count == 0 else None,
                         dag_id,
                         current_dag.generation,
                     ),
                 )
                 if graph_cursor.rowcount != 1:
                     raise TaskDagError(
-                        "task DAG active-node claim was lost",
+                        "task DAG parallel claim was lost",
                         kind="concurrent_modification",
                     )
                 connection.commit()
@@ -2923,11 +3001,6 @@ class SqliteSessionStore:
                 current_dag = _load_task_dag(connection, dag_id)
                 if current_dag is None:
                     raise TaskDagError("task DAG is missing", kind="unmanaged")
-                if current_dag.active_node_id != node.node_id:
-                    raise TaskDagError(
-                        "task DAG node is not the active node",
-                        kind="concurrent_modification",
-                    )
                 current = current_dag.node(node.node_id)
                 _verify_task_dag_node_definition(current, node)
                 if (
@@ -2957,17 +3030,31 @@ class SqliteSessionStore:
                         "task DAG node was changed by another scheduler",
                         kind="concurrent_modification",
                     )
+                running_rows = connection.execute(
+                    """
+                    SELECT node_id FROM task_dag_nodes
+                    WHERE dag_id = ? AND state = ?
+                    ORDER BY ordinal ASC, node_id ASC
+                    """,
+                    (dag_id, TaskDagNodeState.RUNNING.value),
+                ).fetchall()
+                legacy_active_node_id = str(running_rows[0][0]) if len(running_rows) == 1 else None
                 graph_cursor = connection.execute(
                     """
                     UPDATE task_dags
-                    SET generation = generation + 1, updated_at = ?, active_node_id = NULL
-                    WHERE dag_id = ? AND active_node_id = ? AND generation = ?
+                    SET generation = generation + 1, updated_at = ?, active_node_id = ?
+                    WHERE dag_id = ? AND generation = ?
                     """,
-                    (updated_at.isoformat(), dag_id, node.node_id, current_dag.generation),
+                    (
+                        updated_at.isoformat(),
+                        legacy_active_node_id,
+                        dag_id,
+                        current_dag.generation,
+                    ),
                 )
                 if graph_cursor.rowcount != 1:
                     raise TaskDagError(
-                        "task DAG active-node release was lost",
+                        "task DAG parallel finish was lost",
                         kind="concurrent_modification",
                     )
                 connection.commit()
@@ -3566,7 +3653,8 @@ class SqliteSessionStore:
                             worktree_path = ?, worktree_branch = ?, baseline_checkpoint_id = ?,
                             child_session_id = ?, capability_fingerprint = ?, grant_fingerprint = ?,
                             owner_pid = ?, owner_token = ?, final_workspace_fingerprint = ?,
-                            workspace_changed = ?, changed_file_count = ?, error_kind = ?, version = ?
+                            workspace_changed = ?, changed_file_count = ?, error_kind = ?,
+                            execution_scope = ?, version = ?
                         WHERE lease_id = ? AND version = ? AND state = ?
                         """,
                         (
@@ -4252,10 +4340,29 @@ def _migrate_writable_subagent_lease_schema(connection: sqlite3.Connection) -> N
         "ALTER TABLE writable_subagent_leases RENAME TO writable_subagent_leases_v15"
     )
     _ensure_writable_subagent_lease_schema(connection)
+    legacy_columns = {
+        str(row[1])
+        for row in connection.execute("PRAGMA table_info(writable_subagent_leases_v15)").fetchall()
+    }
+    lease_columns = (
+        "lease_id, parent_session_id, parent_task_id, worktree_id, "
+        "parent_capability_fingerprint, parent_workspace_root, parent_common_dir, "
+        "parent_source_worktree, parent_git_dir, parent_repository_head_sha, "
+        "base_commit_sha, canonical_child_root, state, created_at, updated_at, "
+        "worktree_common_dir, worktree_source_worktree, worktree_git_dir, "
+        "worktree_repository_head_sha, worktree_path, worktree_branch, "
+        "baseline_checkpoint_id, child_session_id, capability_fingerprint, "
+        "grant_fingerprint, owner_pid, owner_token, final_workspace_fingerprint, "
+        "workspace_changed, changed_file_count, error_kind"
+    )
+    source_scope = "execution_scope" if "execution_scope" in legacy_columns else "'standalone'"
     connection.execute(
-        """
-        INSERT INTO writable_subagent_leases
-        SELECT * FROM writable_subagent_leases_v15
+        f"""
+        INSERT INTO writable_subagent_leases(
+            {lease_columns}, execution_scope, version
+        )
+        SELECT {lease_columns}, {source_scope}, version
+        FROM writable_subagent_leases_v15
         """
     )
     connection.execute("DROP TABLE writable_subagent_leases_v15")
@@ -4296,6 +4403,8 @@ def _ensure_writable_subagent_lease_schema(connection: sqlite3.Connection) -> No
             workspace_changed INTEGER,
             changed_file_count INTEGER,
             error_kind TEXT,
+            execution_scope TEXT NOT NULL DEFAULT 'standalone'
+                CHECK (execution_scope IN ('standalone', 'task_dag')),
             version INTEGER NOT NULL DEFAULT 0,
             UNIQUE(parent_session_id, parent_task_id),
             UNIQUE(worktree_id),
@@ -4304,13 +4413,27 @@ def _ensure_writable_subagent_lease_schema(connection: sqlite3.Connection) -> No
         )
         """
     )
-    connection.execute(
-        """
-        CREATE UNIQUE INDEX IF NOT EXISTS writable_subagent_active_parent
-        ON writable_subagent_leases(parent_session_id)
-        WHERE state IN ('allocating', 'worktree_ready', 'baseline_ready', 'active')
-        """
-    )
+    columns = {
+        str(row[1]) for row in connection.execute("PRAGMA table_info(writable_subagent_leases)")
+    }
+    connection.execute("DROP INDEX IF EXISTS writable_subagent_active_parent")
+    if "execution_scope" in columns:
+        connection.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS writable_subagent_active_parent
+            ON writable_subagent_leases(parent_session_id)
+            WHERE state IN ('allocating', 'worktree_ready', 'baseline_ready', 'active')
+              AND execution_scope = 'standalone'
+            """
+        )
+    else:
+        connection.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS writable_subagent_active_parent
+            ON writable_subagent_leases(parent_session_id)
+            WHERE state IN ('allocating', 'worktree_ready', 'baseline_ready', 'active')
+            """
+        )
     connection.execute(
         """
         CREATE UNIQUE INDEX IF NOT EXISTS writable_subagent_active_worktree
@@ -4366,9 +4489,44 @@ def _ensure_parent_context_relay_schema(connection: sqlite3.Connection) -> None:
     )
 
 
+def _migrate_task_dag_parallelism_schema(connection: sqlite3.Connection) -> None:
+    """Add bounded DAG capacity and its scoped Writable lease policy."""
+
+    columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(task_dags)").fetchall()}
+    if "max_parallel" not in columns:
+        connection.execute(
+            "ALTER TABLE task_dags ADD COLUMN max_parallel INTEGER NOT NULL DEFAULT 1 "
+            f"CHECK (max_parallel >= 1 AND max_parallel <= {MAX_SUBAGENT_PARALLELISM})"
+        )
+    lease_columns = {
+        str(row[1])
+        for row in connection.execute("PRAGMA table_info(writable_subagent_leases)").fetchall()
+    }
+    if "execution_scope" not in lease_columns:
+        connection.execute(
+            "ALTER TABLE writable_subagent_leases ADD COLUMN execution_scope TEXT NOT NULL "
+            "DEFAULT 'standalone' CHECK (execution_scope IN ('standalone', 'task_dag'))"
+        )
+
+
+def _migrate_task_dag_execution_owner_schema(connection: sqlite3.Connection) -> None:
+    """Persist the process owner that is provisioning each running DAG node."""
+
+    columns = {
+        str(row[1]) for row in connection.execute("PRAGMA table_info(task_dag_nodes)").fetchall()
+    }
+    if "execution_owner_pid" not in columns:
+        connection.execute(
+            "ALTER TABLE task_dag_nodes ADD COLUMN execution_owner_pid INTEGER "
+            "CHECK (execution_owner_pid IS NULL OR execution_owner_pid > 0)"
+        )
+    if "execution_owner_token" not in columns:
+        connection.execute("ALTER TABLE task_dag_nodes ADD COLUMN execution_owner_token TEXT")
+
+
 def _ensure_task_dag_schema(connection: sqlite3.Connection) -> None:
     connection.execute(
-        """
+        f"""
         CREATE TABLE IF NOT EXISTS task_dags (
             dag_id TEXT PRIMARY KEY,
             parent_session_id TEXT NOT NULL,
@@ -4378,6 +4536,8 @@ def _ensure_task_dag_schema(connection: sqlite3.Connection) -> None:
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
             active_node_id TEXT,
+            max_parallel INTEGER NOT NULL DEFAULT 1
+                CHECK (max_parallel >= 1 AND max_parallel <= {MAX_SUBAGENT_PARALLELISM}),
             FOREIGN KEY (parent_session_id) REFERENCES sessions(id) ON DELETE RESTRICT
         )
         """
@@ -4395,6 +4555,10 @@ def _ensure_task_dag_schema(connection: sqlite3.Connection) -> None:
             state TEXT NOT NULL,
             generation INTEGER NOT NULL CHECK (generation >= 0),
             parent_task_id TEXT,
+            execution_owner_pid INTEGER CHECK (
+                execution_owner_pid IS NULL OR execution_owner_pid > 0
+            ),
+            execution_owner_token TEXT,
             child_session_id TEXT,
             lease_id TEXT,
             worktree_id TEXT,
@@ -5505,7 +5669,7 @@ def _background_wake_state_from_row(
 
 _TASK_DAG_SELECT = """
     SELECT dag_id, parent_session_id, definition_fingerprint,
-           state, generation, created_at, updated_at, active_node_id
+           state, generation, created_at, updated_at, active_node_id, max_parallel
     FROM task_dags
     WHERE dag_id = ?
 """
@@ -5513,7 +5677,8 @@ _TASK_DAG_SELECT = """
 _TASK_DAG_NODE_SELECT = """
     SELECT node_id, ordinal, prompt, prompt_fingerprint,
            dependencies_json, kind, state, generation,
-           parent_task_id, child_session_id, lease_id, worktree_id,
+           parent_task_id, execution_owner_pid, execution_owner_token,
+           child_session_id, lease_id, worktree_id,
            baseline_checkpoint_id, relay_id, error_kind, error_reason,
            response_preview, final_workspace_fingerprint, changed_file_count
     FROM task_dag_nodes
@@ -5523,7 +5688,8 @@ _TASK_DAG_NODE_SELECT = """
 
 _TASK_DAG_NODE_UPDATE = """
     UPDATE task_dag_nodes SET
-        state = ?, generation = ?, parent_task_id = ?, child_session_id = ?,
+        state = ?, generation = ?, parent_task_id = ?, execution_owner_pid = ?,
+        execution_owner_token = ?, child_session_id = ?,
         lease_id = ?, worktree_id = ?, baseline_checkpoint_id = ?, relay_id = ?,
         error_kind = ?, error_reason = ?, response_preview = ?,
         final_workspace_fingerprint = ?, changed_file_count = ?
@@ -5622,6 +5788,8 @@ def _task_dag_node_mutable_values(node: TaskDagNode) -> tuple[object, ...]:
         node.state.value,
         node.generation,
         node.parent_task_id,
+        node.execution_owner_pid,
+        node.execution_owner_token,
         node.child_session_id,
         node.lease_id,
         node.worktree_id,
@@ -5817,7 +5985,7 @@ def _load_task_dag(
     row = connection.execute(_TASK_DAG_SELECT, (dag_id,)).fetchone()
     if row is None:
         return None
-    if len(row) != 8:
+    if len(row) != 9:
         raise ValueError("task DAG record is malformed")
     (
         raw_dag_id,
@@ -5828,6 +5996,7 @@ def _load_task_dag(
         raw_created_at,
         raw_updated_at,
         active_node_id,
+        max_parallel,
     ) = row
     node_rows = connection.execute(_TASK_DAG_NODE_SELECT, (dag_id,)).fetchall()
     nodes = tuple(_task_dag_node_from_row(node_row) for node_row in node_rows)
@@ -5840,6 +6009,7 @@ def _load_task_dag(
         created_at=datetime.fromisoformat(str(raw_created_at)),
         updated_at=datetime.fromisoformat(str(raw_updated_at)),
         active_node_id=str(active_node_id) if active_node_id is not None else None,
+        max_parallel=int(max_parallel),
     )
     if dag.definition_fingerprint != str(definition_fingerprint):
         raise ValueError("task DAG definition fingerprint is inconsistent")
@@ -5847,7 +6017,7 @@ def _load_task_dag(
 
 
 def _task_dag_node_from_row(row: Sequence[object]) -> TaskDagNode:
-    if len(row) != 19:
+    if len(row) != 21:
         raise ValueError("task DAG node record is malformed")
     (
         node_id,
@@ -5859,6 +6029,8 @@ def _task_dag_node_from_row(row: Sequence[object]) -> TaskDagNode:
         raw_state,
         generation,
         parent_task_id,
+        execution_owner_pid,
+        execution_owner_token,
         child_session_id,
         lease_id,
         worktree_id,
@@ -5872,6 +6044,10 @@ def _task_dag_node_from_row(row: Sequence[object]) -> TaskDagNode:
     ) = row
     if not isinstance(ordinal, int) or not isinstance(generation, int):
         raise ValueError("task DAG node ordinal or generation is invalid")
+    if execution_owner_pid is not None and (
+        isinstance(execution_owner_pid, bool) or not isinstance(execution_owner_pid, int)
+    ):
+        raise ValueError("task DAG node execution owner pid is invalid")
     if changed_file_count is not None and not isinstance(changed_file_count, int):
         raise ValueError("task DAG node changed file count is invalid")
     dependencies = json.loads(str(dependencies_json))
@@ -5888,6 +6064,10 @@ def _task_dag_node_from_row(row: Sequence[object]) -> TaskDagNode:
         state=TaskDagNodeState(str(raw_state)),
         generation=generation,
         parent_task_id=str(parent_task_id) if parent_task_id is not None else None,
+        execution_owner_pid=(int(execution_owner_pid) if execution_owner_pid is not None else None),
+        execution_owner_token=(
+            str(execution_owner_token) if execution_owner_token is not None else None
+        ),
         child_session_id=str(child_session_id) if child_session_id is not None else None,
         lease_id=str(lease_id) if lease_id is not None else None,
         worktree_id=str(worktree_id) if worktree_id is not None else None,
@@ -6045,8 +6225,7 @@ def _verify_task_dag_recovery_claim_linkage(
             kind="unmanaged",
         ) from error
     if (
-        dag.active_node_id != node.node_id
-        or node.state is not TaskDagNodeState.RUNNING
+        node.state is not TaskDagNodeState.RUNNING
         or node.generation != claim.node_generation
         or node.definition_fingerprint != claim.node_definition_fingerprint
         or node.parent_task_id != claim.parent_task_id
@@ -6218,8 +6397,7 @@ def _verify_task_dag_dependency_relay_linkage(
         )
     target = dag.node(relay.target_node_id)
     if (
-        dag.active_node_id != target.node_id
-        or target.state is not TaskDagNodeState.RUNNING
+        target.state is not TaskDagNodeState.RUNNING
         or target.generation != relay.target_node_generation
         or target.definition_fingerprint != relay.target_node_definition_fingerprint
         or target.dependencies != relay.direct_dependency_ids
@@ -6420,7 +6598,7 @@ _WRITABLE_LEASE_SELECT = """
            worktree_path, worktree_branch, baseline_checkpoint_id,
            child_session_id, capability_fingerprint, grant_fingerprint,
            owner_pid, owner_token, final_workspace_fingerprint,
-           workspace_changed, changed_file_count, error_kind, version
+           workspace_changed, changed_file_count, error_kind, execution_scope, version
     FROM writable_subagent_leases
 """
 
@@ -6460,6 +6638,7 @@ def _writable_lease_values(lease: WritableSubagentWorkspaceLease) -> tuple[objec
         int(lease.workspace_changed) if lease.workspace_changed is not None else None,
         lease.changed_file_count,
         lease.error_kind,
+        lease.execution_scope.value,
         lease.version,
     )
 
@@ -6467,7 +6646,7 @@ def _writable_lease_values(lease: WritableSubagentWorkspaceLease) -> tuple[objec
 def _writable_lease_from_row(
     row: Sequence[object] | None,
 ) -> WritableSubagentWorkspaceLease:
-    if row is None or len(row) != 32:
+    if row is None or len(row) != 33:
         raise SessionError("writable subagent lease record is malformed")
     try:
         (
@@ -6502,6 +6681,7 @@ def _writable_lease_from_row(
             raw_workspace_changed,
             raw_changed_file_count,
             error_kind,
+            raw_execution_scope,
             raw_version,
         ) = row
         parent_repository = WorktreeRepositoryIdentity(
@@ -6588,6 +6768,7 @@ def _writable_lease_from_row(
             ),
             changed_file_count=changed_file_count,
             error_kind=str(error_kind) if error_kind is not None else None,
+            execution_scope=WritableSubagentLeaseScope(str(raw_execution_scope)),
             version=raw_version,
         )
     except (TypeError, ValueError, OverflowError) as error:
@@ -6608,6 +6789,7 @@ def _same_writable_lease_identity(
         or current.parent_repository != proposed.parent_repository
         or current.base_commit_sha != proposed.base_commit_sha
         or current.canonical_child_root != proposed.canonical_child_root
+        or current.execution_scope is not proposed.execution_scope
     ):
         return False
     for current_value, proposed_value in (

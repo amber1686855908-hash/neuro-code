@@ -99,7 +99,8 @@ instruction/skill discovery remain unchanged.
 
 Raw transcript reuse, hidden reasoning transfer, tool-output transfer,
 compaction-summary reuse, live parent-context streaming, long-term memory,
-shared conversation state, parallel workers, task DAGs, Leader/Swarm/Ultracode
+shared conversation state, unbounded or shared parallel workers, task DAGs beyond
+the bounded worker slice, Leader/Swarm/Ultracode
 orchestration, automatic delegation, Bash/process workers, richer child result
 relay, merge/integration, and automatic cleanup remain outside this slice.
 

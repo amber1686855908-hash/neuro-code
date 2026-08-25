@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import multiprocessing
 import sqlite3
 import tempfile
 import unittest
@@ -23,11 +24,13 @@ from neuro_code.application.workflows.task_dag import (
     TaskDagWritableService,
 )
 from neuro_code.application.workflows.writable_subagent import WritableSubagentExecutionIdentity
+from neuro_code.domain.checkpoints import CheckpointId
 from neuro_code.domain.session_tasks import SessionTask, SessionTaskKind, SessionTaskStatus
 from neuro_code.domain.task_dag import (
     MAX_TASK_DAG_ERROR_BYTES,
     MAX_TASK_DAG_NODE_DEPENDENCIES,
     MAX_TASK_DAG_NODES,
+    MAX_TASK_DAG_PARALLELISM,
     MAX_TASK_DAG_PROMPT_BYTES,
     MAX_TASK_DAG_RESPONSE_PREVIEW_BYTES,
     TaskDag,
@@ -37,8 +40,12 @@ from neuro_code.domain.task_dag import (
     TaskDagState,
 )
 from neuro_code.domain.task_dag_recovery import TaskDagRecoveryClaim
-from neuro_code.domain.worktree import WorktreeId
-from neuro_code.domain.writable_subagent import WritableSubagentWorkspaceState
+from neuro_code.domain.task_dag_result_relay import TaskDagDependencyResultRelay
+from neuro_code.domain.worktree import WorktreeId, WorktreeRepositoryIdentity
+from neuro_code.domain.writable_subagent import (
+    WritableSubagentWorkspaceLease,
+    WritableSubagentWorkspaceState,
+)
 from neuro_code.infrastructure.persistence.sqlite_session import SqliteSessionStore
 from neuro_code.shared.errors import ConfigurationError
 
@@ -84,6 +91,42 @@ class _FakeLeaseStore:
 class _FakeRelayStore:
     async def get_parent_context_relay_for_lease(self, lease_id: str) -> object:
         return SimpleNamespace(relay_id=f"relay-for-{lease_id}")
+
+
+class _FakeDependencyRelayStore:
+    def __init__(self) -> None:
+        self.by_id: dict[str, TaskDagDependencyResultRelay] = {}
+        self.by_target: dict[tuple[str, str, int], TaskDagDependencyResultRelay] = {}
+
+    async def initialize(self) -> None:
+        return None
+
+    async def insert_task_dag_dependency_relay(
+        self,
+        relay: TaskDagDependencyResultRelay,
+    ) -> TaskDagDependencyResultRelay:
+        existing = self.by_id.get(relay.relay_id) or self.by_target.get(
+            (relay.dag_id, relay.target_node_id, relay.target_node_generation)
+        )
+        if existing is not None:
+            return existing
+        self.by_id[relay.relay_id] = relay
+        self.by_target[(relay.dag_id, relay.target_node_id, relay.target_node_generation)] = relay
+        return relay
+
+    async def get_task_dag_dependency_relay(
+        self,
+        relay_id: str,
+    ) -> TaskDagDependencyResultRelay | None:
+        return self.by_id.get(relay_id)
+
+    async def get_task_dag_dependency_relay_for_target(
+        self,
+        dag_id: str,
+        target_node_id: str,
+        target_node_generation: int,
+    ) -> TaskDagDependencyResultRelay | None:
+        return self.by_target.get((dag_id, target_node_id, target_node_generation))
 
 
 class _IntermittentClaimStore:
@@ -158,6 +201,142 @@ class _FakeWritableService:
             )
         finally:
             self.active -= 1
+
+
+class _ParallelRunState:
+    def __init__(self, blocked_nodes: set[str] = ()) -> None:
+        self.blocked_nodes = set(blocked_nodes)
+        self.started_nodes: list[str] = []
+        self.completed_nodes: list[str] = []
+        self.invocation_count: dict[str, int] = {}
+        self.dependency_relays: dict[str, TaskDagDependencyResultRelay] = {}
+        self.active = 0
+        self.max_active = 0
+        self.started_event = asyncio.Event()
+        self.release = asyncio.Event()
+        self._lock = asyncio.Lock()
+
+    async def mark_started(self, node_id: str) -> None:
+        async with self._lock:
+            self.started_nodes.append(node_id)
+            self.invocation_count[node_id] = self.invocation_count.get(node_id, 0) + 1
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+            if self.blocked_nodes.issubset(self.started_nodes):
+                self.started_event.set()
+
+    async def mark_completed(self, node_id: str) -> None:
+        async with self._lock:
+            self.completed_nodes.append(node_id)
+            self.active -= 1
+
+
+class _ParallelWritableService:
+    def __init__(
+        self,
+        parent_session_id: str,
+        state: _ParallelRunState,
+        evidence_factory,
+        failures: set[str] = (),
+    ) -> None:
+        self._parent_session_id = parent_session_id
+        self._state = state
+        self._evidence_factory = evidence_factory
+        self._failures = set(failures)
+        self.service_id = object()
+
+    @property
+    def parent_session_id(self) -> str:
+        return self._parent_session_id
+
+    async def initialize(self) -> None:
+        return None
+
+    async def reconcile_writable_subagent_workspaces(self) -> tuple[object, ...]:
+        return ()
+
+    async def run_subagent_with_execution_identity(
+        self,
+        request,
+        *,
+        execution_identity,
+        sink=None,
+    ) -> object:
+        del sink
+        node_id = execution_identity.node_id
+        await self._state.mark_started(node_id)
+        self._evidence_factory(execution_identity.parent_task_id, node_id)
+        if request.dependency_result_relay is not None:
+            self._state.dependency_relays[node_id] = request.dependency_result_relay
+        if node_id in self._state.blocked_nodes:
+            await self._state.release.wait()
+        await asyncio.sleep(0)
+        await self._state.mark_completed(node_id)
+        if node_id in self._failures:
+            return SimpleNamespace(
+                status=SessionTaskStatus.FAILED,
+                response=f"failed-{node_id}",
+            )
+        return SimpleNamespace(
+            status=SessionTaskStatus.COMPLETED,
+            response=f"completed-{request.prompt}",
+        )
+
+
+class _ParallelWritableFactory:
+    def __init__(
+        self,
+        parent_session_id: str,
+        state: _ParallelRunState,
+        evidence_factory,
+        failures: set[str] = (),
+    ) -> None:
+        self.parent_session_id = parent_session_id
+        self.state = state
+        self.evidence_factory = evidence_factory
+        self.failures = set(failures)
+        self.services: list[_ParallelWritableService] = []
+
+    def create(self) -> _ParallelWritableService:
+        service = _ParallelWritableService(
+            self.parent_session_id,
+            self.state,
+            self.evidence_factory,
+            self.failures,
+        )
+        self.services.append(service)
+        return service
+
+
+def _spawn_parallel_claim_worker(
+    database_path: str, dag_id: str, node_id: str, barrier, queue
+) -> None:
+    async def claim() -> str:
+        store = SqliteSessionStore(Path(database_path))
+        await store.initialize()
+        snapshot = await store.get_task_dag(dag_id)
+        if snapshot is None:
+            return "missing"
+        proposed = replace(
+            snapshot.node(node_id),
+            state=TaskDagNodeState.RUNNING,
+            generation=snapshot.node(node_id).generation + 1,
+            parent_task_id=f"spawn-worker-{node_id}",
+        )
+        barrier.wait()
+        try:
+            await store.claim_task_dag_node(
+                dag_id,
+                proposed,
+                expected_generation=snapshot.node(node_id).generation,
+                expected_state=TaskDagNodeState.READY,
+                updated_at=_now(),
+            )
+        except TaskDagError as error:
+            return f"error:{error.kind}"
+        return "claimed"
+
+    queue.put(asyncio.run(claim()))
 
 
 class TaskDagDomainTests(unittest.TestCase):
@@ -266,6 +445,21 @@ class TaskDagDomainTests(unittest.TestCase):
                 nodes=too_many,
                 created_at=_now(),
             )
+        for max_parallel in (0, MAX_TASK_DAG_PARALLELISM + 1, True):
+            with (
+                self.subTest(max_parallel=max_parallel),
+                self.assertRaisesRegex(
+                    ValueError,
+                    "max_parallel",
+                ),
+            ):
+                TaskDag.create(
+                    dag_id="invalid-parallelism",
+                    parent_session_id="parent",
+                    nodes=(_node("a", 0),),
+                    created_at=_now(),
+                    max_parallel=max_parallel,
+                )
 
     def test_runtime_snapshot_requires_tuple_nodes_and_running_identity(self) -> None:
         with self.assertRaisesRegex(TypeError, "nodes must be a tuple"):
@@ -457,13 +651,15 @@ class TaskDagDomainTests(unittest.TestCase):
                 active_node_id="a",
             )
         running = replace(base.node("a"), state=TaskDagNodeState.RUNNING, parent_task_id="worker-a")
-        with self.assertRaisesRegex(ValueError, "requires an active node id"):
-            TaskDag(
-                dag_id=base.dag_id,
-                parent_session_id=base.parent_session_id,
-                nodes=(running, base.node("b")),
-                state=TaskDagState.RUNNING,
-            )
+        running_snapshot = TaskDag(
+            dag_id=base.dag_id,
+            parent_session_id=base.parent_session_id,
+            nodes=(running, base.node("b")),
+            state=TaskDagState.RUNNING,
+        )
+        self.assertEqual(running_snapshot.running_node_ids, ("a",))
+        with self.assertRaisesRegex(ValueError, "terminal task DAG"):
+            replace(running_snapshot, state=TaskDagState.COMPLETED)
         with self.assertRaises(KeyError):
             base.node("missing")
         self.assertEqual(base.with_nodes(base.nodes).node_states(), base.node_states())
@@ -519,6 +715,8 @@ class TaskDagPersistenceTests(unittest.IsolatedAsyncioTestCase):
         )
         with self.assertRaisesRegex(TaskDagError, "different definition"):
             await self.store.insert_task_dag(changed)
+        with self.assertRaisesRegex(TaskDagError, "different max_parallel"):
+            await self.store.insert_task_dag(replace(dag, max_parallel=2))
 
         loaded = await self.store.get_task_dag(dag.dag_id)
         self.assertIsNotNone(loaded)
@@ -536,7 +734,7 @@ class TaskDagPersistenceTests(unittest.IsolatedAsyncioTestCase):
             expected_state=TaskDagNodeState.READY,
             updated_at=_now() + timedelta(seconds=1),
         )
-        with self.assertRaisesRegex(TaskDagError, "active|changed by another scheduler"):
+        with self.assertRaisesRegex(TaskDagError, "capacity|active|changed by another scheduler"):
             await self.store.claim_task_dag_node(
                 dag.dag_id,
                 running,
@@ -625,7 +823,144 @@ class TaskDagPersistenceTests(unittest.IsolatedAsyncioTestCase):
             1,
         )
 
-    async def test_schema_17_migrates_to_21_and_creates_dag_leader_relay_and_recovery_tables(
+    async def test_atomic_capacity_claim_allows_two_and_rejects_the_third(self) -> None:
+        dag = TaskDag.create(
+            dag_id="capacity-two",
+            parent_session_id=self.parent_session_id,
+            nodes=(_node("a", 0), _node("b", 1), _node("c", 2)),
+            created_at=_now(),
+            max_parallel=2,
+        )
+        await self.store.insert_task_dag(dag)
+        claimed: list[TaskDag] = []
+        for node_id in ("a", "b"):
+            snapshot = await self.store.get_task_dag(dag.dag_id)
+            assert snapshot is not None
+            node = snapshot.node(node_id)
+            claimed.append(
+                await self.store.claim_task_dag_node(
+                    dag.dag_id,
+                    replace(
+                        node,
+                        state=TaskDagNodeState.RUNNING,
+                        generation=node.generation + 1,
+                        parent_task_id=f"worker-{node_id}",
+                    ),
+                    expected_generation=node.generation,
+                    expected_state=TaskDagNodeState.READY,
+                    updated_at=_now(),
+                )
+            )
+        self.assertEqual(len(claimed), 2)
+        snapshot = await self.store.get_task_dag(dag.dag_id)
+        assert snapshot is not None
+        c = snapshot.node("c")
+        with self.assertRaisesRegex(TaskDagError, "capacity"):
+            await self.store.claim_task_dag_node(
+                dag.dag_id,
+                replace(
+                    c,
+                    state=TaskDagNodeState.RUNNING,
+                    generation=c.generation + 1,
+                    parent_task_id="worker-c",
+                ),
+                expected_generation=c.generation,
+                expected_state=TaskDagNodeState.READY,
+                updated_at=_now(),
+            )
+        self.assertEqual(snapshot.running_node_ids, ("a", "b"))
+        self.assertIsNone(snapshot.active_node_id)
+
+        finished_a = replace(
+            snapshot.node("a"),
+            state=TaskDagNodeState.COMPLETED,
+            generation=snapshot.node("a").generation + 1,
+        )
+        await self.store.finish_task_dag_node(
+            dag.dag_id,
+            finished_a,
+            expected_generation=snapshot.node("a").generation,
+            expected_state=TaskDagNodeState.RUNNING,
+            updated_at=_now(),
+        )
+        snapshot = await self.store.get_task_dag(dag.dag_id)
+        assert snapshot is not None
+        c = snapshot.node("c")
+        after_release = await self.store.claim_task_dag_node(
+            dag.dag_id,
+            replace(
+                c,
+                state=TaskDagNodeState.RUNNING,
+                generation=c.generation + 1,
+                parent_task_id="worker-c",
+            ),
+            expected_generation=c.generation,
+            expected_state=TaskDagNodeState.READY,
+            updated_at=_now(),
+        )
+        self.assertEqual(after_release.running_node_ids, ("b", "c"))
+
+    async def test_generic_node_transition_cannot_bypass_capacity_claim(self) -> None:
+        dag = TaskDag.create(
+            dag_id="capacity-transition-guard",
+            parent_session_id=self.parent_session_id,
+            nodes=(_node("a", 0),),
+            created_at=_now(),
+        )
+        await self.store.insert_task_dag(dag)
+        snapshot = await self.store.get_task_dag(dag.dag_id)
+        assert snapshot is not None
+        node = snapshot.node("a")
+        with self.assertRaisesRegex(TaskDagError, "atomic capacity claim"):
+            await self.store.compare_and_transition_task_dag_node(
+                dag.dag_id,
+                replace(
+                    node,
+                    state=TaskDagNodeState.RUNNING,
+                    generation=node.generation + 1,
+                    parent_task_id="worker-a",
+                ),
+                expected_generation=node.generation,
+                expected_state=TaskDagNodeState.READY,
+            )
+
+    async def test_spawned_controllers_never_exceed_durable_capacity(self) -> None:
+        dag = TaskDag.create(
+            dag_id="spawn-capacity",
+            parent_session_id=self.parent_session_id,
+            nodes=(_node("a", 0), _node("b", 1), _node("c", 2)),
+            created_at=_now(),
+            max_parallel=2,
+        )
+        await self.store.insert_task_dag(dag)
+        context = multiprocessing.get_context("spawn")
+        barrier = context.Barrier(3)
+        queue = context.Queue()
+        processes = [
+            context.Process(
+                target=_spawn_parallel_claim_worker,
+                args=(str(self._database_path), dag.dag_id, node_id, barrier, queue),
+            )
+            for node_id in ("a", "b", "c")
+        ]
+        for process in processes:
+            process.start()
+        results = [queue.get(timeout=30) for _ in processes]
+        for process in processes:
+            process.join(timeout=30)
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=5)
+            self.assertEqual(process.exitcode, 0)
+        self.assertEqual(results.count("claimed"), 2)
+        self.assertEqual(sum(result.startswith("error:") for result in results), 1)
+        current = await self.store.get_task_dag(dag.dag_id)
+        self.assertIsNotNone(current)
+        assert current is not None
+        self.assertLessEqual(len(current.running_node_ids), 2)
+        self.assertEqual(len(current.running_node_ids), 2)
+
+    async def test_schema_17_migrates_to_23_and_creates_dag_leader_relay_and_recovery_tables(
         self,
     ) -> None:
         connection = sqlite3.connect(self._database_path)
@@ -646,7 +981,7 @@ class TaskDagPersistenceTests(unittest.IsolatedAsyncioTestCase):
             ).fetchall()
         }
         connection.close()
-        self.assertEqual(version, (21,))
+        self.assertEqual(version, (23,))
         self.assertTrue({"task_dags", "task_dag_nodes"}.issubset(tables))
         self.assertTrue({"leader_attempts", "leader_decisions"}.issubset(tables))
         self.assertIn("task_dag_dependency_relays", tables)
@@ -686,11 +1021,11 @@ class TaskDagPersistenceTests(unittest.IsolatedAsyncioTestCase):
             ).fetchall()
         }
         connection.close()
-        self.assertEqual(version, (21,))
+        self.assertEqual(version, (23,))
         self.assertTrue({"leader_attempts", "leader_decisions"}.issubset(tables))
         self.assertIn("task_dag_recovery_claims", tables)
 
-    async def test_populated_schema_20_migrates_to_21_without_touching_dag_contract(self) -> None:
+    async def test_populated_schema_20_migrates_to_23_without_touching_dag_contract(self) -> None:
         dag = self._dag("populated-schema-20")
         await self.store.insert_task_dag(dag)
         connection = sqlite3.connect(self._database_path)
@@ -721,7 +1056,7 @@ class TaskDagPersistenceTests(unittest.IsolatedAsyncioTestCase):
             "PRAGMA foreign_key_list(task_dag_recovery_claims)"
         ).fetchall()
         connection.close()
-        self.assertEqual(version, (21,))
+        self.assertEqual(version, (23,))
         self.assertTrue(
             {
                 "task_dags",
@@ -751,6 +1086,155 @@ class TaskDagPersistenceTests(unittest.IsolatedAsyncioTestCase):
             updated_at=_now(),
         )
         self.assertEqual(claimed.node("a").parent_task_id, "migration-worker-a")
+
+    async def test_populated_schema_21_running_relay_and_recovery_claim_survive_schema_23(
+        self,
+    ) -> None:
+        dag = self._dag("populated-schema-21")
+        await self.store.insert_task_dag(dag)
+        snapshot = await self.store.get_task_dag(dag.dag_id)
+        assert snapshot is not None
+
+        running_a = replace(
+            snapshot.node("a"),
+            state=TaskDagNodeState.RUNNING,
+            generation=1,
+            parent_task_id="migration-worker-a",
+        )
+        snapshot = await self.store.claim_task_dag_node(
+            dag.dag_id,
+            running_a,
+            expected_generation=0,
+            expected_state=TaskDagNodeState.READY,
+            updated_at=_now(),
+        )
+        finished_a = replace(
+            snapshot.node("a"),
+            state=TaskDagNodeState.COMPLETED,
+            generation=2,
+        )
+        snapshot = await self.store.finish_task_dag_node(
+            dag.dag_id,
+            finished_a,
+            expected_generation=1,
+            expected_state=TaskDagNodeState.RUNNING,
+            updated_at=_now(),
+        )
+        ready_b = replace(
+            snapshot.node("b"),
+            state=TaskDagNodeState.READY,
+            generation=snapshot.node("b").generation + 1,
+        )
+        snapshot = await self.store.compare_and_transition_task_dag_node(
+            dag.dag_id,
+            ready_b,
+            expected_generation=snapshot.node("b").generation,
+            expected_state=TaskDagNodeState.PENDING,
+        )
+        running_b = replace(
+            snapshot.node("b"),
+            state=TaskDagNodeState.RUNNING,
+            generation=snapshot.node("b").generation + 1,
+            parent_task_id="migration-worker-b",
+        )
+        snapshot = await self.store.claim_task_dag_node(
+            dag.dag_id,
+            running_b,
+            expected_generation=ready_b.generation,
+            expected_state=TaskDagNodeState.READY,
+            updated_at=_now(),
+        )
+
+        digest = "e" * 64
+        created_at = _now().isoformat()
+        connection = sqlite3.connect(self._database_path)
+        connection.execute(
+            """
+            INSERT INTO task_dag_dependency_relays(
+                relay_id, dag_id, dag_definition_fingerprint, target_node_id,
+                target_node_generation, target_node_definition_fingerprint,
+                direct_dependency_ids_json, entries_json, source_fingerprint,
+                content_fingerprint, byte_count, truncated, created_at,
+                integrity_fingerprint, state
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ready')
+            """,
+            (
+                "migration-relay",
+                dag.dag_id,
+                dag.definition_fingerprint,
+                "b",
+                snapshot.node("b").generation,
+                snapshot.node("b").definition_fingerprint,
+                '["a"]',
+                "[]",
+                digest,
+                digest,
+                1,
+                0,
+                created_at,
+                digest,
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO task_dag_recovery_claims(
+                claim_id, parent_session_id, dag_id, dag_definition_fingerprint,
+                node_id, node_generation, node_definition_fingerprint,
+                parent_task_id, dependency_relay_id,
+                dependency_relay_source_fingerprint,
+                dependency_relay_content_fingerprint,
+                dependency_relay_integrity_fingerprint, owner_pid, owner_token,
+                version, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "migration-claim",
+                self.parent_session_id,
+                dag.dag_id,
+                dag.definition_fingerprint,
+                "b",
+                snapshot.node("b").generation,
+                snapshot.node("b").definition_fingerprint,
+                "migration-worker-b",
+                "migration-relay",
+                digest,
+                digest,
+                digest,
+                999_999,
+                "migration-owner",
+                0,
+                created_at,
+                created_at,
+            ),
+        )
+        connection.execute("ALTER TABLE task_dags DROP COLUMN max_parallel")
+        connection.execute("UPDATE schema_meta SET version = 21 WHERE singleton = 1")
+        connection.commit()
+        connection.close()
+
+        reopened = SqliteSessionStore(self._database_path)
+        await reopened.initialize()
+        preserved = await reopened.get_task_dag(dag.dag_id)
+        self.assertIsNotNone(preserved)
+        assert preserved is not None
+        self.assertEqual(preserved.max_parallel, 1)
+        self.assertEqual(preserved.running_node_ids, ("b",))
+        self.assertEqual(preserved.active_node_id, "b")
+        self.assertEqual(preserved.node("b").generation, snapshot.node("b").generation)
+        connection = sqlite3.connect(self._database_path)
+        version = connection.execute(
+            "SELECT version FROM schema_meta WHERE singleton = 1"
+        ).fetchone()
+        relay_count = connection.execute(
+            "SELECT COUNT(*) FROM task_dag_dependency_relays WHERE relay_id = 'migration-relay'"
+        ).fetchone()
+        claim_count = connection.execute(
+            "SELECT COUNT(*) FROM task_dag_recovery_claims WHERE claim_id = 'migration-claim'"
+        ).fetchone()
+        connection.close()
+        self.assertEqual(version, (23,))
+        self.assertEqual(relay_count, (1,))
+        self.assertEqual(claim_count, (1,))
 
     async def test_recovery_claim_store_rejects_noncanonical_arguments(self) -> None:
         with self.assertRaises(TypeError):
@@ -1394,6 +1878,197 @@ class TaskDagSchedulerTests(unittest.IsolatedAsyncioTestCase):
             3,
         )
         self.assertTrue(all(node.parent_task_id for node in result.nodes[:3]))
+
+    def _parallel_service(
+        self,
+        state: _ParallelRunState,
+        *,
+        failures: set[str] = (),
+        dependency_relays: _FakeDependencyRelayStore | None = None,
+    ) -> tuple[TaskDagApplicationService, _ParallelWritableFactory]:
+        def record_evidence(parent_task_id: str, node_id: str) -> None:
+            root = Path(self._temporary.name)
+            parent_root = root / "parallel-parent"
+            repository = WorktreeRepositoryIdentity(
+                common_dir=root,
+                source_worktree=parent_root,
+                git_dir=root / "git",
+                head_sha="a" * 40,
+            )
+            worktree_id = WorktreeId(f"parallel-{node_id}")
+            now = _now()
+            self.leases.by_parent_task[parent_task_id] = WritableSubagentWorkspaceLease(
+                lease_id=f"lease-{node_id}",
+                parent_session_id=self.parent_session_id,
+                parent_task_id=parent_task_id,
+                worktree_id=worktree_id,
+                parent_capability_fingerprint="a" * 64,
+                parent_workspace_root=parent_root,
+                parent_repository=repository,
+                base_commit_sha="a" * 40,
+                canonical_child_root=root / "parallel-managed" / node_id,
+                state=WritableSubagentWorkspaceState.PRESERVED,
+                created_at=now,
+                updated_at=now,
+                baseline_checkpoint_id=CheckpointId(f"cp-{node_id}"),
+                child_session_id=f"child-{node_id}",
+                final_workspace_fingerprint="b" * 64,
+                changed_file_count=0,
+            )
+
+        factory = _ParallelWritableFactory(
+            self.parent_session_id,
+            state,
+            record_evidence,
+            failures,
+        )
+        base = _ParallelWritableService(
+            self.parent_session_id,
+            state,
+            record_evidence,
+            failures,
+        )
+        service = TaskDagApplicationService(
+            self.store,
+            self.store,
+            base,
+            self.leases,
+            self.relays,
+            parent_binding=self.binding,
+            writable_worker_factory=factory,
+            dependency_relay_store=dependency_relays,
+        )
+        return service, factory
+
+    async def test_parallel_fanout_has_real_overlap_and_fanin_waits_for_both(self) -> None:
+        state = _ParallelRunState({"b", "c"})
+        relay_store = _FakeDependencyRelayStore()
+        service, factory = self._parallel_service(state, dependency_relays=relay_store)
+        await service.create_task_dag(
+            CreateTaskDagRequest(
+                "parallel-fanout",
+                (
+                    _node("a", 0),
+                    _node("b", 1, ("a",)),
+                    _node("c", 2, ("a",)),
+                    _node("d", 3, ("b", "c")),
+                ),
+                max_parallel=2,
+            )
+        )
+        running = asyncio.create_task(service.run_task_dag(RunTaskDagRequest("parallel-fanout")))
+        await asyncio.wait_for(state.started_event.wait(), timeout=10)
+        snapshot = await self.store.get_task_dag("parallel-fanout")
+        self.assertIsNotNone(snapshot)
+        assert snapshot is not None
+        self.assertEqual(snapshot.running_node_ids, ("b", "c"))
+        self.assertIsNone(snapshot.active_node_id)
+        self.assertEqual(state.max_active, 2)
+        self.assertEqual(len(factory.services), 3)
+        self.assertEqual(len({service.service_id for service in factory.services}), 3)
+        self.assertEqual(state.invocation_count.get("b"), 1)
+        self.assertEqual(state.invocation_count.get("c"), 1)
+        self.assertNotIn("d", state.started_nodes)
+        state.release.set()
+        result = await asyncio.wait_for(running, timeout=20)
+        self.assertIs(result.state, TaskDagState.COMPLETED)
+        self.assertEqual(
+            [node.state for node in result.nodes],
+            [
+                TaskDagNodeState.COMPLETED,
+                TaskDagNodeState.COMPLETED,
+                TaskDagNodeState.COMPLETED,
+                TaskDagNodeState.COMPLETED,
+            ],
+        )
+        self.assertGreater(state.started_nodes.index("d"), state.started_nodes.index("b"))
+        self.assertGreater(state.started_nodes.index("d"), state.started_nodes.index("c"))
+        self.assertLessEqual(max(state.invocation_count.values()), 1)
+        fanin_relay = state.dependency_relays["d"]
+        self.assertEqual(fanin_relay.direct_dependency_ids, ("b", "c"))
+        self.assertEqual(
+            tuple(entry.predecessor_node_id for entry in fanin_relay.entries),
+            ("b", "c"),
+        )
+        self.assertEqual(
+            await relay_store.get_task_dag_dependency_relay(fanin_relay.relay_id),
+            fanin_relay,
+        )
+
+    async def test_parallel_capacity_does_not_start_third_ready_node_until_slot_frees(self) -> None:
+        state = _ParallelRunState({"b", "c"})
+        service, _ = self._parallel_service(state)
+        await service.create_task_dag(
+            CreateTaskDagRequest(
+                "parallel-capacity",
+                (_node("b", 0), _node("c", 1), _node("e", 2)),
+                max_parallel=2,
+            )
+        )
+        running = asyncio.create_task(service.run_task_dag(RunTaskDagRequest("parallel-capacity")))
+        await asyncio.wait_for(state.started_event.wait(), timeout=10)
+        self.assertEqual(set(state.started_nodes), {"b", "c"})
+        snapshot = await self.store.get_task_dag("parallel-capacity")
+        self.assertIsNotNone(snapshot)
+        assert snapshot is not None
+        self.assertEqual(len(snapshot.running_node_ids), 2)
+        self.assertNotIn("e", state.started_nodes)
+        state.release.set()
+        result = await asyncio.wait_for(running, timeout=20)
+        self.assertIs(result.state, TaskDagState.COMPLETED)
+        self.assertEqual(state.invocation_count, {"b": 1, "c": 1, "e": 1})
+        self.assertLessEqual(state.max_active, 2)
+
+    async def test_parallel_branch_failure_keeps_sibling_running(self) -> None:
+        state = _ParallelRunState({"c"})
+        service, _ = self._parallel_service(state, failures={"b"})
+        await service.create_task_dag(
+            CreateTaskDagRequest(
+                "parallel-failure",
+                (_node("b", 0), _node("c", 1)),
+                max_parallel=2,
+            )
+        )
+        running = asyncio.create_task(service.run_task_dag(RunTaskDagRequest("parallel-failure")))
+        await asyncio.wait_for(state.started_event.wait(), timeout=10)
+        snapshot = await self.store.get_task_dag("parallel-failure")
+        for _ in range(100):
+            if snapshot is not None and snapshot.node("b").state is TaskDagNodeState.FAILED:
+                break
+            await asyncio.sleep(0.01)
+            snapshot = await self.store.get_task_dag("parallel-failure")
+        self.assertIsNotNone(snapshot)
+        assert snapshot is not None
+        self.assertEqual(snapshot.running_node_ids, ("c",))
+        self.assertEqual(snapshot.node("b").state, TaskDagNodeState.FAILED)
+        self.assertNotIn("b", snapshot.running_node_ids)
+        state.release.set()
+        result = await asyncio.wait_for(running, timeout=20)
+        self.assertIs(result.state, TaskDagState.FAILED)
+        self.assertIs(result.node("c").state, TaskDagNodeState.COMPLETED)
+
+    async def test_parallel_cancellation_finishes_all_owned_nodes_structurally(self) -> None:
+        state = _ParallelRunState({"b", "c"})
+        service, _ = self._parallel_service(state)
+        await service.create_task_dag(
+            CreateTaskDagRequest(
+                "parallel-cancel",
+                (_node("b", 0), _node("c", 1), _node("e", 2)),
+                max_parallel=2,
+            )
+        )
+        running = asyncio.create_task(service.run_task_dag(RunTaskDagRequest("parallel-cancel")))
+        await asyncio.wait_for(state.started_event.wait(), timeout=10)
+        running.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await asyncio.wait_for(running, timeout=20)
+        result = await service.get_task_dag(RunTaskDagRequest("parallel-cancel"))
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(
+            [node.state for node in result.nodes],
+            [TaskDagNodeState.CANCELLED] * 3,
+        )
 
     async def test_two_scheduler_instances_do_not_duplicate_the_active_node(self) -> None:
         writable_a = _FakeWritableService(self.parent_session_id, block=True)

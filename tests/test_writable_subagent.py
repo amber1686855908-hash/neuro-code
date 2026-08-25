@@ -16,6 +16,7 @@ from contextlib import suppress
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
+from queue import Empty
 from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import patch
@@ -1789,6 +1790,163 @@ def _task_dag_crash_provider_factory(config: AppConfig, failover: bool) -> Model
             mode,
         ),
     )
+
+
+class _BoundedParallelControllerProvider:
+    """Block every real worker provider until the parent releases the race."""
+
+    provider_name = "fixture"
+    model_name = "fixture-model"
+    context_affinity = "fixture-bounded-parallel"
+    capabilities = ModelCapabilitySet.all_unknown()
+
+    def __init__(self, marker_directory: Path, release_path: Path) -> None:
+        self._marker_directory = marker_directory
+        self._release_path = release_path
+
+    async def stream(
+        self,
+        context: ModelContext,
+        tools: Sequence[ToolDefinition],
+        *,
+        tool_policy: ModelToolPolicy = ModelToolPolicy.ALLOWED,
+    ) -> AsyncIterator[ModelEvent]:
+        del context, tools, tool_policy
+        self._marker_directory.mkdir(parents=True, exist_ok=True)
+        marker = self._marker_directory / f"{os.getpid()}-{uuid.uuid4().hex}.started"
+        marker.write_text("started\n", encoding="utf-8")
+        while not self._release_path.exists():  # noqa: ASYNC110 - external process release fence
+            await asyncio.sleep(0.02)
+        yield ModelCompleted("stop", response_text="bounded parallel worker completed")
+
+
+class _ProductionParallelDagState:
+    def __init__(self) -> None:
+        self.started: list[str] = []
+        self.completed: list[str] = []
+        self.timeline: list[str] = []
+        self.active = 0
+        self.max_active = 0
+        self.lock = asyncio.Lock()
+        self.fanout_started = asyncio.Event()
+        self.release_fanout = asyncio.Event()
+
+
+class _ProductionParallelDagProvider:
+    provider_name = "fixture"
+    model_name = "fixture-model"
+    context_affinity = "fixture-production-parallel"
+    capabilities = ModelCapabilitySet.all_unknown()
+
+    def __init__(self, state: _ProductionParallelDagState) -> None:
+        self._state = state
+
+    async def stream(
+        self,
+        context: ModelContext,
+        tools: Sequence[ToolDefinition],
+        *,
+        tool_policy: ModelToolPolicy = ModelToolPolicy.ALLOWED,
+    ) -> AsyncIterator[ModelEvent]:
+        del tools, tool_policy
+        contents = "\n".join(message.content for message in context.messages)
+        node_id = next(
+            (
+                candidate
+                for candidate in ("a", "b", "c", "d")
+                if f"production-node-{candidate}" in contents
+            ),
+            None,
+        )
+        if node_id is None:
+            raise AssertionError("production parallel provider could not identify its DAG node")
+        async with self._state.lock:
+            self._state.started.append(node_id)
+            self._state.timeline.append(f"start:{node_id}")
+            self._state.active += 1
+            self._state.max_active = max(self._state.max_active, self._state.active)
+            if {"b", "c"}.issubset(self._state.started):
+                self._state.fanout_started.set()
+        try:
+            if node_id in {"b", "c"}:
+                await self._state.release_fanout.wait()
+            yield ModelCompleted("stop", response_text=f"production result {node_id}")
+        finally:
+            async with self._state.lock:
+                self._state.active -= 1
+                self._state.completed.append(node_id)
+                self._state.timeline.append(f"complete:{node_id}")
+
+
+def _production_parallel_dag_provider_factory(
+    state: _ProductionParallelDagState,
+) -> Callable[[AppConfig, bool], ModelProvider]:
+    def factory(config: AppConfig, failover: bool) -> ModelProvider:
+        del config, failover
+        return cast(ModelProvider, _ProductionParallelDagProvider(state))
+
+    return factory
+
+
+def _bounded_parallel_controller_provider_factory(
+    config: AppConfig,
+    failover: bool,
+) -> ModelProvider:
+    del failover
+    return cast(
+        ModelProvider,
+        _BoundedParallelControllerProvider(
+            config.state_dir / "bounded-parallel-model-starts",
+            config.state_dir / "bounded-parallel-release",
+        ),
+    )
+
+
+def _run_bounded_parallel_controller(
+    root_value: str,
+    repository_value: str,
+    parent_session_id: str,
+    dag_id: str,
+    barrier,
+    result_queue,
+) -> None:
+    root = Path(root_value)
+    repository = Path(repository_value)
+    state_dir = root / "state"
+    os.environ.update(
+        {
+            "HOME": str(root),
+            "NEURO_CODE_HOME": str(state_dir),
+            "FIXTURE_KEY": "fixture-key",
+        }
+    )
+
+    async def run() -> None:
+        application = await ApplicationComposition.open(
+            ApplicationSettings(
+                cwd=repository,
+                sandbox="off",
+                permission_mode=PermissionMode.BYPASS,
+                max_steps=8,
+            ),
+            provider_factory=_bounded_parallel_controller_provider_factory,
+        )
+        try:
+            parent_binding = await application.create_binding(
+                resume_id=parent_session_id,
+                capabilities=_capability(repository, sandbox=SandboxProfile.OFF),
+            )
+            service = application.create_task_dag_service(parent_binding=parent_binding)
+            await asyncio.to_thread(barrier.wait)
+            result = await service.run_task_dag(RunTaskDagRequest(dag_id))
+            result_queue.put(("completed", result.state.value))
+        except BaseException as error:
+            result_queue.put(("error", type(error).__name__, str(error)))
+            raise
+        finally:
+            await application.close()
+
+    asyncio.run(run())
 
 
 class _CrashBeforeTaskDagFinishStore:
@@ -3745,6 +3903,407 @@ api_key_env = "FIXTURE_KEY"
                 finally:
                     await application.close()
 
+    async def test_real_production_fanout_and_fanin_are_bounded_and_target_exact(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="neuro-production-parallel-dag-") as directory:
+            root = Path(directory)
+            repository, _head = _make_real_repository(root)
+            dirty_file = repository / "dirty-parent.txt"
+            dirty_file.write_bytes(b"parent remains dirty\n")
+            before_status = _run_git(repository, "status", "--porcelain=v1")
+            before_head = _run_git(repository, "rev-parse", "HEAD")
+            state_dir = root / "state"
+            _write_task_dag_fixture_config(state_dir)
+            state = _ProductionParallelDagState()
+            environment = {
+                "HOME": str(root),
+                "NEURO_CODE_HOME": str(state_dir),
+                "FIXTURE_KEY": "fixture-key",
+            }
+
+            with patch.dict(os.environ, environment, clear=False):
+                application = await ApplicationComposition.open(
+                    ApplicationSettings(
+                        cwd=repository,
+                        sandbox="off",
+                        permission_mode=PermissionMode.BYPASS,
+                        max_steps=8,
+                    ),
+                    provider_factory=_production_parallel_dag_provider_factory(state),
+                )
+                try:
+                    parent_session_id = await application.store.create_session(
+                        str(repository),
+                        "fixture",
+                        "fixture-model",
+                        sandbox_profile=SandboxProfile.OFF,
+                    )
+                    parent_binding = await application.create_binding(
+                        resume_id=parent_session_id,
+                        capabilities=_capability(repository, sandbox=SandboxProfile.OFF),
+                    )
+                    service = application.create_task_dag_service(parent_binding=parent_binding)
+                    dag = await service.create_task_dag(
+                        CreateTaskDagRequest(
+                            "production-parallel-fanout-fanin",
+                            (
+                                TaskDagNode(
+                                    node_id="a",
+                                    ordinal=0,
+                                    prompt="production-node-a",
+                                ),
+                                TaskDagNode(
+                                    node_id="b",
+                                    ordinal=1,
+                                    prompt="production-node-b",
+                                    dependencies=("a",),
+                                ),
+                                TaskDagNode(
+                                    node_id="c",
+                                    ordinal=2,
+                                    prompt="production-node-c",
+                                    dependencies=("a",),
+                                ),
+                                TaskDagNode(
+                                    node_id="d",
+                                    ordinal=3,
+                                    prompt="production-node-d",
+                                    dependencies=("b", "c"),
+                                ),
+                            ),
+                            max_parallel=2,
+                        )
+                    )
+                    running = asyncio.create_task(
+                        service.run_task_dag(RunTaskDagRequest(dag.dag_id))
+                    )
+                    await asyncio.wait_for(state.fanout_started.wait(), timeout=60)
+                    during = await application.store.get_task_dag(dag.dag_id)
+                    self.assertIsNotNone(during)
+                    assert during is not None
+                    self.assertEqual(during.running_node_ids, ("b", "c"))
+                    running_nodes = tuple(during.node(node_id) for node_id in ("b", "c"))
+                    self.assertTrue(
+                        all(
+                            node.execution_owner_pid is not None
+                            and node.execution_owner_pid > 0
+                            and node.execution_owner_token
+                            for node in running_nodes
+                        )
+                    )
+                    self.assertEqual(
+                        len({node.execution_owner_token for node in running_nodes}),
+                        1,
+                    )
+                    self.assertEqual(state.started[0], "a")
+                    self.assertEqual(set(state.started[:3]), {"a", "b", "c"})
+                    self.assertNotIn("d", state.started)
+                    self.assertEqual(state.max_active, 2)
+
+                    state.release_fanout.set()
+                    result = await asyncio.wait_for(running, timeout=90)
+                    self.assertIs(result.state, TaskDagState.COMPLETED)
+                    self.assertEqual(
+                        [node.state for node in result.nodes],
+                        [TaskDagNodeState.COMPLETED] * 4,
+                    )
+                    self.assertEqual(state.started[0], "a")
+                    self.assertEqual(set(state.started[1:3]), {"b", "c"})
+                    self.assertEqual(state.started[3], "d")
+                    self.assertLess(
+                        max(
+                            state.timeline.index("complete:b"),
+                            state.timeline.index("complete:c"),
+                        ),
+                        state.timeline.index("start:d"),
+                    )
+                    self.assertLessEqual(state.max_active, 2)
+
+                    b_node = result.node("b")
+                    c_node = result.node("c")
+                    d_node = result.node("d")
+                    self.assertIsNotNone(b_node.relay_id)
+                    self.assertIsNotNone(c_node.relay_id)
+                    self.assertIsNotNone(d_node.relay_id)
+                    assert b_node.relay_id is not None
+                    assert c_node.relay_id is not None
+                    assert d_node.relay_id is not None
+                    b_relay = await application.store.get_task_dag_dependency_relay_for_target(
+                        dag.dag_id,
+                        "b",
+                        b_node.generation - 1,
+                    )
+                    c_relay = await application.store.get_task_dag_dependency_relay_for_target(
+                        dag.dag_id,
+                        "c",
+                        c_node.generation - 1,
+                    )
+                    d_relay = await application.store.get_task_dag_dependency_relay_for_target(
+                        dag.dag_id,
+                        "d",
+                        d_node.generation - 1,
+                    )
+                    self.assertIsNotNone(b_relay)
+                    self.assertIsNotNone(c_relay)
+                    self.assertIsNotNone(d_relay)
+                    assert b_relay is not None
+                    assert c_relay is not None
+                    assert d_relay is not None
+                    self.assertEqual(b_relay.target_node_id, "b")
+                    self.assertEqual(c_relay.target_node_id, "c")
+                    self.assertNotEqual(b_relay.relay_id, c_relay.relay_id)
+                    self.assertEqual(d_relay.target_node_id, "d")
+                    self.assertEqual(
+                        tuple(entry.predecessor_node_id for entry in d_relay.entries),
+                        ("b", "c"),
+                    )
+                    leases = await application.store.list_writable_subagent_leases(
+                        parent_session_id=parent_session_id,
+                    )
+                    self.assertEqual(len(leases), 4)
+                    self.assertEqual(len({lease.worktree_id for lease in leases}), 4)
+                    self.assertEqual(len({lease.child_session_id for lease in leases}), 4)
+                    self.assertEqual(len({lease.baseline_checkpoint_id for lease in leases}), 4)
+                    self.assertEqual(len({lease.lease_id for lease in leases}), 4)
+                    self.assertEqual(
+                        _run_git(repository, "status", "--porcelain=v1"), before_status
+                    )
+                    self.assertEqual(_run_git(repository, "rev-parse", "HEAD"), before_head)
+                    self.assertEqual(dirty_file.read_bytes(), b"parent remains dirty\n")
+                finally:
+                    await application.close()
+
+    async def test_independent_compositions_never_oversubscribe_bounded_dag(self) -> None:
+        """Two spawned application controllers race through the real scheduler."""
+
+        with tempfile.TemporaryDirectory(prefix="neuro-bounded-parallel-") as directory:
+            root = Path(directory)
+            repository, _head = _make_real_repository(root)
+            dirty_file = repository / "dirty-parent.txt"
+            dirty_file.write_bytes(b"parent remains dirty\n")
+            before_status = _run_git(repository, "status", "--porcelain=v1")
+            before_head = _run_git(repository, "rev-parse", "HEAD")
+            state_dir = root / "state"
+            _write_task_dag_fixture_config(state_dir)
+            environment = {
+                "HOME": str(root),
+                "NEURO_CODE_HOME": str(state_dir),
+                "FIXTURE_KEY": "fixture-key",
+            }
+
+            with patch.dict(os.environ, environment, clear=False):
+                application = await ApplicationComposition.open(
+                    ApplicationSettings(
+                        cwd=repository,
+                        sandbox="off",
+                        permission_mode=PermissionMode.BYPASS,
+                        max_steps=8,
+                    ),
+                    provider_factory=_bounded_parallel_controller_provider_factory,
+                )
+                try:
+                    parent_session_id = await application.store.create_session(
+                        str(repository),
+                        "fixture",
+                        "fixture-model",
+                        sandbox_profile=SandboxProfile.OFF,
+                    )
+                    parent_binding = await application.create_binding(
+                        resume_id=parent_session_id,
+                        capabilities=_capability(repository, sandbox=SandboxProfile.OFF),
+                    )
+                    service = application.create_task_dag_service(parent_binding=parent_binding)
+                    dag = await service.create_task_dag(
+                        CreateTaskDagRequest(
+                            "bounded-composition-race",
+                            (
+                                TaskDagNode(node_id="a", ordinal=0, prompt="A"),
+                                TaskDagNode(node_id="b", ordinal=1, prompt="B"),
+                                TaskDagNode(node_id="c", ordinal=2, prompt="C"),
+                            ),
+                            max_parallel=2,
+                        )
+                    )
+                finally:
+                    await application.close()
+
+                context = multiprocessing.get_context("spawn")
+                barrier = context.Barrier(3)
+                result_queue = context.Queue()
+                processes = [
+                    context.Process(
+                        target=_run_bounded_parallel_controller,
+                        args=(
+                            str(root),
+                            str(repository),
+                            parent_session_id,
+                            dag.dag_id,
+                            barrier,
+                            result_queue,
+                        ),
+                    )
+                    for _ in range(2)
+                ]
+                release_path = state_dir / "bounded-parallel-release"
+                try:
+                    for process in processes:
+                        process.start()
+                    await asyncio.to_thread(barrier.wait)
+
+                    marker_directory = state_dir / "bounded-parallel-model-starts"
+                    for _ in range(600):
+                        if len(tuple(marker_directory.glob("*.started"))) >= 2:
+                            break
+                        await asyncio.sleep(0.05)
+                    if len(tuple(marker_directory.glob("*.started"))) < 2:
+                        diagnostics: list[object] = [
+                            (process.pid, process.exitcode, process.is_alive())
+                            for process in processes
+                        ]
+                        while True:
+                            try:
+                                diagnostics.append(result_queue.get_nowait())
+                            except Empty:
+                                break
+                        observer = SqliteSessionStore(state_dir / "sessions.db")
+                        await observer.initialize()
+                        current = await observer.get_task_dag(dag.dag_id)
+                        if current is not None:
+                            diagnostics.append(
+                                [
+                                    (
+                                        node.node_id,
+                                        node.state.value,
+                                        node.error_kind,
+                                        node.error_reason,
+                                    )
+                                    for node in current.nodes
+                                ]
+                            )
+                        diagnostics.append(
+                            [
+                                (lease.parent_task_id, lease.state.value, lease.owner_pid)
+                                for lease in await observer.list_writable_subagent_leases(
+                                    parent_session_id=parent_session_id,
+                                )
+                            ]
+                        )
+                        diagnostics.append(
+                            [
+                                (task.task_id, task.status.value)
+                                for task in await observer.list_session_tasks(parent_session_id)
+                            ]
+                        )
+                        self.fail(
+                            f"independent controllers did not start two workers: {diagnostics!r}"
+                        )
+
+                    observer = SqliteSessionStore(state_dir / "sessions.db")
+                    await observer.initialize()
+                    during = await observer.get_task_dag(dag.dag_id)
+                    self.assertIsNotNone(during)
+                    assert during is not None
+                    self.assertEqual(len(during.running_node_ids), 2)
+                    self.assertLessEqual(len(during.running_node_ids), during.max_parallel)
+                    self.assertEqual(
+                        during.ready_node_ids(),
+                        ("c",),
+                        [
+                            (
+                                node.node_id,
+                                node.state.value,
+                                node.parent_task_id,
+                                node.generation,
+                            )
+                            for node in during.nodes
+                        ],
+                    )
+                    self.assertEqual(len(tuple(marker_directory.glob("*.started"))), 2)
+
+                    release_path.write_text("release\n", encoding="utf-8")
+                    results = [
+                        await asyncio.to_thread(result_queue.get, True, 90) for _ in processes
+                    ]
+                    self.assertTrue(all(result[0] == "completed" for result in results), results)
+                    self.assertTrue(
+                        all(
+                            result[1] in {TaskDagState.RUNNING.value, TaskDagState.COMPLETED.value}
+                            for result in results
+                        ),
+                        results,
+                    )
+                    for process in processes:
+                        await asyncio.to_thread(process.join, 30)
+                        self.assertFalse(process.is_alive())
+                        self.assertEqual(process.exitcode, 0)
+
+                    final = await observer.get_task_dag(dag.dag_id)
+                    self.assertIsNotNone(final)
+                    assert final is not None
+                    self.assertIs(final.state, TaskDagState.COMPLETED)
+                    self.assertEqual(
+                        [node.state for node in final.nodes],
+                        [TaskDagNodeState.COMPLETED] * 3,
+                    )
+                    worktree_ids = set()
+                    child_session_ids = set()
+                    child_cwds = set()
+                    lease_ids = set()
+                    checkpoint_ids = set()
+                    links = await observer.list_subagent_links(parent_session_id)
+                    leases = await observer.list_writable_subagent_leases(
+                        parent_session_id=parent_session_id,
+                    )
+                    self.assertEqual(len(links), 3)
+                    self.assertEqual(len(leases), 3)
+                    for node in final.nodes:
+                        self.assertIsNotNone(node.parent_task_id)
+                        self.assertIsNotNone(node.child_session_id)
+                        self.assertIsNotNone(node.lease_id)
+                        self.assertIsNotNone(node.worktree_id)
+                        self.assertIsNotNone(node.baseline_checkpoint_id)
+                        assert node.parent_task_id is not None
+                        assert node.child_session_id is not None
+                        assert node.lease_id is not None
+                        assert node.worktree_id is not None
+                        assert node.baseline_checkpoint_id is not None
+                        task = await observer.get_session_task(
+                            parent_session_id,
+                            node.parent_task_id,
+                        )
+                        self.assertIsNotNone(task)
+                        assert task is not None
+                        self.assertIs(task.status, SessionTaskStatus.COMPLETED)
+                        child_session = await observer.get_session(node.child_session_id)
+                        child_cwds.add(child_session.cwd)
+                        link = await observer.load_subagent_link(
+                            parent_session_id,
+                            node.parent_task_id,
+                        )
+                        self.assertIsNotNone(link)
+                        relay = await observer.get_parent_context_relay_for_lease(node.lease_id)
+                        self.assertIsNotNone(relay)
+                        worktree_ids.add(node.worktree_id)
+                        child_session_ids.add(node.child_session_id)
+                        lease_ids.add(node.lease_id)
+                        checkpoint_ids.add(node.baseline_checkpoint_id)
+                    self.assertEqual(len(worktree_ids), 3)
+                    self.assertEqual(len(child_session_ids), 3)
+                    self.assertEqual(len(child_cwds), 3)
+                    self.assertEqual(len(lease_ids), 3)
+                    self.assertEqual(len(checkpoint_ids), 3)
+                    self.assertEqual(
+                        _run_git(repository, "status", "--porcelain=v1"), before_status
+                    )
+                    self.assertEqual(_run_git(repository, "rev-parse", "HEAD"), before_head)
+                    self.assertEqual(dirty_file.read_bytes(), b"parent remains dirty\n")
+                finally:
+                    release_path.write_text("release\n", encoding="utf-8")
+                    for process in processes:
+                        await asyncio.to_thread(process.join, 30)
+                        if process.is_alive():
+                            process.terminate()
+                            await asyncio.to_thread(process.join, 10)
+
     async def _assert_real_task_dag_process_death_recovery(
         self,
         *,
@@ -5002,7 +5561,7 @@ api_key_env = "FIXTURE_KEY"
             assert leases[0].baseline_checkpoint_id is not None
             self.assertIsNotNone(await checkpoints.get(leases[0].baseline_checkpoint_id))
 
-    async def test_populated_schema_16_migrates_to_21_without_losing_worker_identity(self) -> None:
+    async def test_populated_schema_16_migrates_to_23_without_losing_worker_identity(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (
@@ -5038,7 +5597,7 @@ api_key_env = "FIXTURE_KEY"
                 "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'parent_context_relays'"
             ).fetchone()
             connection.close()
-            self.assertEqual(version, (21,))
+            self.assertEqual(version, (23,))
             self.assertEqual(table, (1,))
             self.assertEqual(
                 (await migrated.list_writable_subagent_leases(parent_session_id=parent_session_id))[
@@ -5053,7 +5612,7 @@ api_key_env = "FIXTURE_KEY"
             self.assertIsNotNone(await migrated.get_session(parent_session_id))
             self.assertIsNotNone(await migrated.get_session(result.child_session_id))
 
-    async def test_schema_17_to_21_keeps_populated_parent_relay(self) -> None:
+    async def test_schema_17_to_23_keeps_populated_parent_relay(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (
@@ -5097,7 +5656,7 @@ api_key_env = "FIXTURE_KEY"
                 "AND name IN ('task_dags', 'task_dag_nodes')"
             ).fetchone()
             connection.close()
-            self.assertEqual(version, (21,))
+            self.assertEqual(version, (23,))
             self.assertEqual(task_dag_tables, (2,))
 
     async def test_process_death_after_relay_publication_preserves_exact_worker_snapshot(
@@ -5956,7 +6515,7 @@ extensions = [".py", ".txt"]
             self.assertEqual(leases[0].error_kind, "RuntimeError")
             self.assertIsNotNone(await store.get_parent_context_relay_for_lease(leases[0].lease_id))
 
-    async def test_populated_schema_15_lease_migrates_through_schema_21_and_keeps_cas(self) -> None:
+    async def test_populated_schema_15_lease_migrates_through_schema_23_and_keeps_cas(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (
@@ -5989,7 +6548,7 @@ extensions = [".py", ".txt"]
                 connection.execute(
                     "SELECT version FROM schema_meta WHERE singleton = 1"
                 ).fetchone(),
-                (21,),
+                (23,),
             )
             foreign_keys = connection.execute(
                 "PRAGMA foreign_key_list(writable_subagent_leases)"

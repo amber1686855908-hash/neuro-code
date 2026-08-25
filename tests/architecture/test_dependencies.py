@@ -819,6 +819,7 @@ def test_canonical_shared_modules_are_the_only_shared_implementations() -> None:
         "neuro_code.shared",
         "neuro_code.shared.async_utils",
         "neuro_code.shared.errors",
+        "neuro_code.shared.limits",
         "neuro_code.shared.redaction",
         "neuro_code.shared.ui_language",
     }

@@ -2,7 +2,7 @@
 
 - Status: PROVEN within current vertical-slice scope
 - Date: 2026-08-24
-- Scope: direct completed-predecessor result projection for one serialized bounded Task DAG
+- Scope: direct completed-predecessor result projection for one bounded static Task DAG, including bounded fan-out/fan-in execution
 
 ## Context
 
@@ -11,7 +11,9 @@ worker from receiving an implicit transcript, tool history, workspace state, or
 authority grant from a predecessor, but it also leaves a dependent worker
 without the small amount of completed-result context needed by a bounded DAG
 workflow. The missing capability must not become a second parent-context
-system, a prompt-to-authority channel, or a parallel orchestration design.
+system or a prompt-to-authority channel. Bounded independent-node execution is
+owned by ADR 0134; this Relay must remain safe when two dependent workers run
+at the same time.
 
 The existing system already has three different owners that must remain
 separate:
@@ -62,7 +64,8 @@ never parsed as an authority source.
 ## Durable identity, races, and failure
 
 Session schema 20 adds `task_dag_dependency_relays`; schema 21 adds the
-separate `task_dag_recovery_claims` ownership fence. A relay row binds the
+separate `task_dag_recovery_claims` ownership fence; schema 22/23 add the
+bounded DAG capacity and per-node execution-owner persistence. A relay row binds the
 exact DAG definition, target node definition and generation, direct dependency
 IDs, entry fingerprints, source/content fingerprints, byte count, and
 integrity fingerprint. The target-generation uniqueness key makes an exact
@@ -131,12 +134,12 @@ not regenerate a different result or replay a predecessor.
 
 ## Non-goals
 
-This ADR does not add parallel DAG execution, dynamic/model-generated graph
-construction, transitive aggregation beyond direct edges, retries, reruns,
+This ADR does not add unbounded or dynamic/model-generated graph construction,
+transitive aggregation beyond direct edges, retries, reruns,
 merge/copy-back, rollback, cleanup, shared live context, UI/ACP exposure,
-Swarm, Ultracode, or a general-purpose inter-agent message bus. `max_parallel`
-remains one, and `TaskDagApplicationService` remains the only worker execution
-seam.
+Swarm, Ultracode, or a general-purpose inter-agent message bus.
+`TaskDagApplicationService` remains the only worker execution seam, and
+parallel workers still receive separate immutable target-bound relays.
 
 ## Validation boundary
 
@@ -148,9 +151,11 @@ uncertain evidence fail-closed behavior, the read-only recovery classification,
 durable recovery-claim insert/CAS and schema-20-to-21 migration, real
 safe-not-started process death and exact-once continuation, two-controller
 cross-process ownership and partial-window behavior, dead-owner-before-lease
-takeover, ambiguous post-allocation ownership process death without rerun, and
-injection through the existing Writable Subagent composition path. Existing
+takeover, ambiguous post-allocation ownership process death without rerun,
+bounded fan-out/fan-in relay identity under concurrent workers, and injection
+through the existing Writable Subagent composition path. Existing
 Task DAG, Leader, Writable
 Subagent, Parent Relay, Worktree, Checkpoint, worker-scoped LSP, crash
 recovery, and full repository gates remain required. The slice is not a claim
-of parallel/dataflow scheduling or live paid-provider acceptance.
+of unbounded/dynamic dataflow scheduling or live paid-provider acceptance;
+bounded parallel execution is specified by ADR 0134.

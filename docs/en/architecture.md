@@ -1645,8 +1645,10 @@ without rejecting an otherwise valid assistant row.
 The existing `/subagent` capability remains read-only. The first writable
 subagent is a separate, explicit internal vertical slice constructed by
 `ApplicationComposition.create_writable_subagent_service()`. It is not wired
-to `/subagent`, CLI, TUI, ACP, automatic scheduling, writable parallel workers,
-and it does not start checkpoint/rollback orchestration.
+to `/subagent`, CLI, TUI, ACP, or automatic delegation, and it does not start
+checkpoint/rollback orchestration. The standalone service remains serialized;
+only the bounded Task DAG may create separate worker services through its
+typed factory.
 
 `WritableSubagentApplicationService` serializes one child at a time. It first
 records an `ALLOCATING` lease, reads the parent's exact committed HEAD, creates
@@ -1726,10 +1728,11 @@ tool-role, synthetic, tool-call-bearing, media-bearing, preserved reasoning,
 and preserved backend-call structures are excluded; assistant visible prose is
 separable from and never carries its `reasoning_content`.
 
-Session schema 21 retains the schema-17 one-to-one insert-only READY relay per
+Session schema 23 retains the schema-17 one-to-one insert-only READY relay per
 writable lease, the durable Task DAG tables described below, the schema-20
 predecessor-result relay table, and the schema-21 Task DAG recovery-claim
-fence; it also retains the durable Leader
+fence; schema 22 adds bounded DAG capacity and scoped Writable lease policy,
+and schema 23 adds per-node execution-owner identity. It also retains the durable Leader
 attempt/decision projections described after the DAG. Its
 identity binds the parent/task/child, lease, worktree, baseline checkpoint,
 base commit, capability/grant fingerprints, and child-task digest. Source,
@@ -1747,8 +1750,8 @@ tool, and LSP steps. Relay strings are evidence only: they are not parsed into
 tools, roots, sandbox, network, LSP, worktree, or checkpoint authority. The
 existing capability intersection and child-root instruction/skill discovery
 remain the sole authority owners. Durable compaction-summary reuse, live
-context sharing, parallel workers, Swarm/Ultracode orchestration, and automatic
-delegation remain absent. The bounded serialized Task DAG and Leader slices are
+context sharing, unbounded parallel workers, Swarm/Ultracode orchestration, and automatic
+delegation remain absent. The bounded Task DAG and serialized Leader slices are
 specified separately by [ADR 0134](adr/0134-durable-serialized-task-dag.md).
 See [ADR 0133](adr/0133-bounded-parent-context-relay.md) for the relay
 boundary.
@@ -1766,14 +1769,28 @@ forward predecessor prompts, transcripts, tool output, or workspace data.
 
 The DAG service derives the parent session only from the actual
 `ConversationBinding`. It reuses the existing `SessionTask` owner and the
-existing `WritableSubagentApplicationService` for every node. Before a worker
-starts, the node durably records one generated parent task ID and the
-application atomically claims the node with node-generation CAS plus a graph
-`active_node_id` claim. The active-node claim is the cross-process serial gate:
-two schedulers cannot execute different ready nodes at once, and the DAG
-never uses `SubagentScheduler.run_many()` or an unbounded gather over nodes.
+existing `WritableSubagentApplicationService` for every node. `max_parallel`
+is immutable, defaults to one, and is bounded by the shared application limit
+of four. Before a worker starts, the node durably records one generated parent
+task ID plus an execution owner PID/token. A single `BEGIN IMMEDIATE`
+transaction counts durable `RUNNING` node rows, checks capacity, and performs
+the exact generation CAS from `READY` to `RUNNING`. Ready selection is
+ordinal/node-ID deterministic. The DAG uses a structured `TaskGroup`, never
+`SubagentScheduler.run_many()` or an unbounded gather over nodes.
 
-Session schema 21 stores immutable DAG definitions and bounded node runtime
+The canonical active execution model is the set of node rows with
+`state=RUNNING`. The legacy `task_dags.active_node_id` column is a compatibility
+projection only: it is populated only when exactly one node is running and is
+never used for scheduling or capacity. A live per-node owner PID is observed
+during the short pre-evidence allocation window; only a dead owner enters
+per-node crash classification.
+
+Parallel nodes receive fresh Writable application services from a typed
+`TaskDagWritableWorkerFactory`. This preserves the frozen per-worker
+`asyncio.Lock` while giving each node independent binding, lease, worktree,
+checkpoint, child session, Parent Relay, and worker-scoped LSP state.
+
+Session schema 23 stores immutable DAG definitions and bounded node runtime
 projections in `task_dags` and `task_dag_nodes`, plus insert-only
 `task_dag_dependency_relays` and the separate `task_dag_recovery_claims`
 cross-process ownership fence. Definitions and relay publications are
@@ -1821,9 +1838,10 @@ fail-closed and never automatically reruns the worker. Missing relay, stale
 identity, or other uncertainty remains `INDETERMINATE` and is never
 automatically rerun.
 Completed/failed/cancelled worker tasks map to the same DAG terminal meaning.
-No automatic retry, crash rerun, merge, copy-back, rollback, cleanup, parallel
-or dynamic dataflow execution, UI surface, Swarm, or Ultracode behavior is
-added. The bounded direct predecessor-result relay described above is the only
+No automatic retry, crash rerun, merge, copy-back, rollback, cleanup, dynamic
+or unbounded dataflow execution, UI surface, Swarm, or Ultracode behavior is
+added. Bounded independent-node execution is supported; the bounded direct
+predecessor-result relay described above remains the only
 dataflow behavior in this slice; it does not transfer authority or workspace
 state. The bounded Leader controller is specified separately by [ADR 0135]
 (adr/0135-bounded-serialized-leader-controller.md).
@@ -1850,7 +1868,7 @@ previews and fingerprints; it never carries raw transcript/reasoning/tool
 arguments/output, Relay payloads, workspace bytes, checkpoint bytes, Git diffs,
 secrets, or arbitrary paths.
 
-The current Session Store schema 21 retains the schema-19 `leader_attempts` and
+The current Session Store schema 23 retains the schema-19 `leader_attempts` and
 `leader_decisions` projections. An attempt binds the exact DAG generation,
 definition/evidence/objective fingerprints, Leader session, controller owner,
 turn identity, and durable lifecycle. SQLite write transactions and CAS-like

@@ -19,9 +19,9 @@ from neuro_code.application.runtime.agent import AgentRunResult, EventSink
 from neuro_code.application.workflows.subagent import MAX_SUBAGENT_PROMPT_BYTES
 from neuro_code.application.workflows.subagent_capabilities import SubagentCapabilitySet
 from neuro_code.shared.errors import ConfigurationError
+from neuro_code.shared.limits import MAX_SUBAGENT_PARALLELISM
 
 MAX_SCHEDULED_SUBAGENTS = 16
-MAX_SUBAGENT_PARALLELISM = 4
 MAX_SUBAGENT_RETRIES = 2
 MAX_SUBAGENT_DEPTH = 4
 

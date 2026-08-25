@@ -224,8 +224,10 @@ class LeaderApplicationService:
         decisions: list[LeaderDecisionRecord] = []
         for _ in range(MAX_LEADER_DECISIONS_PER_RUN):
             dag = await self._dag_service.prepare_task_dag_step(RunTaskDagRequest(request.dag_id))
+            if dag.max_parallel != 1:
+                raise ConfigurationError("Leader only supports serialized task DAGs")
             evidence = self._evidence(objective, dag)
-            if dag.active_node_id is not None:
+            if dag.running_node_ids:
                 return LeaderRunResult(dag, None, tuple(decisions))
             record, attempt = await self._decide(evidence)
             try:
@@ -262,7 +264,7 @@ class LeaderApplicationService:
                 refreshed = await self._dag_service.prepare_task_dag_step(
                     RunTaskDagRequest(request.dag_id)
                 )
-                if refreshed.active_node_id is not None:
+                if refreshed.running_node_ids:
                     raise ConfigurationError(
                         "another Leader controller owns the selected DAG step"
                     ) from error
@@ -273,7 +275,7 @@ class LeaderApplicationService:
                 await self._mark_stale(attempt)
                 raise ConfigurationError("Leader SELECT_NODE decision became stale") from error
             await self._mark_executed(attempt)
-            if next_dag.state.terminal and next_dag.active_node_id is None:
+            if next_dag.state.terminal and not next_dag.running_node_ids:
                 # The next loop performs the terminal-only synthesis decision.
                 continue
         raise ConfigurationError("Leader exceeded its bounded decision budget")

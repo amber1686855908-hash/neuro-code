@@ -65,6 +65,7 @@ from neuro_code.application.workflows.task_dag import (
     TaskDagActiveNodeRecovery,
     TaskDagApplicationService,
     TaskDagWritableService,
+    TaskDagWritableWorkerFactory,
 )
 from neuro_code.application.workflows.task_dag_result_relay import (
     TaskDagDependencyResultRelayApplicationService,
@@ -129,6 +130,7 @@ __all__ = [
     "TaskDagApplicationService",
     "TaskDagDependencyResultRelayApplicationService",
     "TaskDagWritableService",
+    "TaskDagWritableWorkerFactory",
     "WritableSubagentApplicationService",
     "WritableSubagentCapabilityGrant",
     "WritableSubagentExecutionIdentity",

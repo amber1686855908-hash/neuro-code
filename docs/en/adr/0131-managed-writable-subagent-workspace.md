@@ -112,10 +112,15 @@ full diff, transcript, raw tool arguments, credentials, or raw file contents.
 
 ## Not implemented
 
-Writable parallel workers, recursive writable subagents, automatic delegation,
+Unbounded or automatically delegated writable parallel workers, recursive writable subagents, automatic delegation,
 CLI/TUI/ACP exposure, automatic checkpoint/rollback policy, rollback after a
 child run, merge/commit/patch integration, copy-back, branch deletion, and
 checkpoint or worktree cleanup remain explicit future capabilities.
+
+The bounded static Task DAG is the separate exception: it may create fresh
+scoped Writable services for independently claimed nodes. That later slice
+does not weaken this standalone service's lock, lease, worktree, capability,
+checkpoint, or cleanup contract.
 
 The capability requires Git 2.40.0 or newer through the existing Worktree
 filter preflight contract. Git 2.39.5 is unavailable and Git 2.40.0 is

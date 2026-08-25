@@ -212,7 +212,6 @@ class TaskDagDependencyResultRelayApplicationService:
         current = dag.node(target.node_id)
         if (
             current.state is not TaskDagNodeState.RUNNING
-            or dag.active_node_id != target.node_id
             or current.generation != target.generation
             or current.definition_fingerprint != target.definition_fingerprint
         ):

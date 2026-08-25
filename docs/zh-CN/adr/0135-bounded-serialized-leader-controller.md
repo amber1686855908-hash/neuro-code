@@ -105,6 +105,7 @@ unknown/blocked/stale selection、SQLite insert-only/CAS lifecycle、同一 snap
 `ApplicationComposition` L1 -> L2 -> L3 restart、原子 session/turn rebind、针对仍存活过期 owner 的
 provider 前置 fencing、durable model-commit reuse、terminal decision idempotence，以及 L2 observable
 turn evidence 后的 no-provider-replay。既有 Task DAG、Writable Subagent、Worktree、Checkpoint、Relay、
-LSP 及全仓库 gates 继续是回归要求。本切片不暴露 CLI/TUI/ACP，也不宣称 parallel worker、Swarm、
+LSP 及全仓库 gates 继续是回归要求。本切片不暴露 CLI/TUI/ACP，也不会把 Leader 变成 parallel planner；有界 Task DAG worker
+由独立切片规定。Swarm、
 Ultracode、自动委派、model DAG creation、replan、retry、merge、rollback 或 live paid-provider
 acceptance。

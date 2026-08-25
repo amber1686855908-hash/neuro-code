@@ -82,7 +82,7 @@ worktree 或 checkpoint 权限。parent 提到的路径和命令只是不被解�
 ## 未实现
 
 原始 transcript 复用、隐藏推理传递、tool output 传递、compaction summary 复用、
-parent 上下文实时流、长期记忆、共享会话状态、并行 worker、Task DAG、
+parent 上下文实时流、长期记忆、共享会话状态、无界或共享并行 worker、超出有界 worker 切片的 Task DAG、
 Leader/Swarm/Ultracode 编排、自动委派、Bash/process worker、更丰富的 child 结果
 Relay、合并集成与自动清理仍不在本切片范围内。
 

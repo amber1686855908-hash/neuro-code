@@ -2,14 +2,15 @@
 
 - 状态：在当前纵向切片范围内 PROVEN
 - 日期：2026-08-24
-- 范围：一个串行 bounded Task DAG 的直接 completed-predecessor result projection
+- 范围：一个 bounded static Task DAG 的直接 completed-predecessor result projection，包含有界 fan-out/fan-in 执行
 
 ## 背景
 
 ADR 0134 有意把 dependency edge 定义为 control-only。这样可以防止 worker 从 predecessor
 隐式接收 transcript、tool history、workspace state 或 authority grant，但也使 dependent worker
 缺少有界 DAG workflow 所需的少量 completed-result context。这个能力不能变成第二套 parent-context
-系统、prompt-to-authority channel 或 parallel orchestration 设计。
+系统或 prompt-to-authority channel。有界独立节点执行由 ADR 0134 负责；两个 dependent worker
+同时运行时，本 Relay 仍必须保持安全。
 
 现有系统已经有三个必须保持分离的 owner：
 
@@ -50,7 +51,8 @@ sandbox root、network access、LSP authority 或 instruction。`ContextBuilder`
 ## Durable identity、race 与失败行为
 
 Session schema 20 增加 `task_dag_dependency_relays`；schema 21 增加独立的
-`task_dag_recovery_claims` ownership fence。Relay row 绑定精确 DAG definition、target node
+`task_dag_recovery_claims` ownership fence；schema 22/23 增加有界 DAG capacity 与逐节点
+execution-owner 持久化。Relay row 绑定精确 DAG definition、target node
 definition/generation、direct dependency IDs、entry fingerprint、source/content fingerprint、byte
 count 和 integrity fingerprint。Target-generation uniqueness key 使精确重复发布幂等。内容或 identity
 不同的重复发布会被拒绝；直接修改 database 后，在 reload 时完整性校验失败。
@@ -98,10 +100,10 @@ result，也不 replay predecessor。
 
 ## 非目标
 
-本 ADR 不增加 parallel DAG execution、dynamic/model-generated graph construction、超出 direct edge 的
+本 ADR 不增加无界或 dynamic/model-generated graph construction、超出 direct edge 的
 transitive aggregation、retry、rerun、merge/copy-back、rollback、cleanup、shared live context、UI/ACP
-暴露、Swarm、Ultracode 或通用 inter-agent message bus。`max_parallel` 仍为 1，
-`TaskDagApplicationService` 仍是唯一 worker execution seam。
+暴露、Swarm、Ultracode 或通用 inter-agent message bus。`TaskDagApplicationService` 仍是唯一
+worker execution seam；parallel worker 仍分别接收 immutable、target-bound Relay。
 
 ## 验证边界
 
@@ -110,6 +112,7 @@ migration 与 row integrity、精确重复幂等、冲突发布拒绝、direct-d
 dependency chain、失败或不确定 evidence 的 fail-closed 行为、read-only recovery classification、durable
 recovery-claim insert/CAS 与 schema-20-to-21 migration、真实 safe-not-started process death 与 exact-once
 continuation、two-controller cross-process ownership 与 partial-window 行为、dead-owner-before-lease
-takeover、post-allocation ownership 歧义 process death 不 rerun，以及通过既有 Writable Subagent composition path 的注入。既有 Task DAG、Leader、Writable Subagent、Parent Relay、
+takeover、post-allocation ownership 歧义 process death 不 rerun、有界 fan-out/fan-in 并发 Relay identity
+以及通过既有 Writable Subagent composition path 的注入。既有 Task DAG、Leader、Writable Subagent、Parent Relay、
 Worktree、Checkpoint、worker-scoped LSP、crash recovery 和全仓库 gates 仍是必需项。本切片不宣称
-parallel/dataflow scheduling 或 live paid-provider acceptance。
+无界/dynamic dataflow scheduling 或 live paid-provider acceptance；有界并行执行由 ADR 0134 规定。

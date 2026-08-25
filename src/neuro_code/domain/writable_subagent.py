@@ -105,6 +105,13 @@ class WritableSubagentWorkspaceState(StrEnum):
         }
 
 
+class WritableSubagentLeaseScope(StrEnum):
+    """Durable parent-lease policy for one explicit execution owner."""
+
+    STANDALONE = "standalone"
+    TASK_DAG = "task_dag"
+
+
 @dataclass(frozen=True, slots=True)
 class ManagedChildWorkspaceGrant:
     """Typed authority derived from one READY managed worktree and checkpoint."""
@@ -225,6 +232,7 @@ class WritableSubagentWorkspaceLease:
     workspace_changed: bool | None = None
     changed_file_count: int | None = None
     error_kind: str | None = None
+    execution_scope: WritableSubagentLeaseScope = WritableSubagentLeaseScope.STANDALONE
     version: int = 0
 
     def __post_init__(self) -> None:
@@ -265,6 +273,8 @@ class WritableSubagentWorkspaceLease:
         )
         if not isinstance(self.state, WritableSubagentWorkspaceState):
             raise TypeError("writable lease state must be canonical")
+        if not isinstance(self.execution_scope, WritableSubagentLeaseScope):
+            raise TypeError("writable lease execution scope must be canonical")
         for timestamp, field_name in (
             (self.created_at, "created_at"),
             (self.updated_at, "updated_at"),
@@ -366,6 +376,7 @@ __all__ = [
     "MAX_WRITABLE_SUBAGENT_ID_BYTES",
     "MAX_WRITABLE_SUBAGENT_OWNER_TOKEN_BYTES",
     "ManagedChildWorkspaceGrant",
+    "WritableSubagentLeaseScope",
     "WritableSubagentWorkspaceLease",
     "WritableSubagentWorkspaceState",
 ]

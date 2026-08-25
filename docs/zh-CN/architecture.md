@@ -1672,9 +1672,10 @@ Writable workflow 现在只从实际 parent `ConversationBinding` 所绑定 sess
 保留 reasoning 与保留 backend-call 的结构都会排除；assistant 可见正文可与
 `reasoning_content` 明确分离，后者绝不进入 Relay。
 
-Session schema 21 保留 schema 17 的每个 writable lease 一条一对一、insert-only READY Relay，
+Session schema 23 保留 schema 17 的每个 writable lease 一条一对一、insert-only READY Relay，
 以及下述持久化 Task DAG 表、schema 20 的 predecessor-result Relay 表和 schema 21 的 Task DAG
-recovery-claim fence，并保留后文的持久化
+recovery-claim fence；schema 22 增加有界 DAG capacity 与 scoped Writable lease policy，schema 23
+增加逐节点 execution-owner identity，并保留后文的持久化
 Leader attempt/decision 投影。其 identity
 绑定 parent/task/child、lease、worktree、baseline checkpoint、base commit、
 capability/grant fingerprint 与 child-task digest。加载时校验 source、content 和完整记录
@@ -1687,8 +1688,8 @@ durable worker identity，而不是删除或 rollback。
 conversation history，并在模型、tool 与 LSP 多步骤间保持字节稳定。Relay 字符串只作为证据，
 不会被解析为 tool、root、sandbox、network、LSP、worktree 或 checkpoint 权限。既有 capability
 求交与 child-root instruction/skill discovery 仍是唯一权限 owner。Durable compaction summary
-复用、实时 context sharing、并行 worker、Swarm/Ultracode 编排与自动委派仍未实现。
-有界串行 Task DAG 与 Leader 切片由独立的 [ADR 0134](adr/0134-durable-serialized-task-dag.md) 及
+复用、实时 context sharing、无界并行 worker、Swarm/Ultracode 编排与自动委派仍未实现。
+有界 Task DAG 与串行 Leader 切片由独立的 [ADR 0134](adr/0134-durable-serialized-task-dag.md) 及
 ADR 0135 规定；Relay
 边界详见 [ADR 0133](adr/0133-bounded-parent-context-relay.md)。
 
@@ -1701,12 +1702,22 @@ ADR 0134 增加了一个显式的内部编排边界：一个有界 DAG 的节点
 tool output 或 workspace 数据。
 
 DAG service 只从真实的 `ConversationBinding` 推导 parent session。每个节点复用既有
-`SessionTask` owner 和既有 `WritableSubagentApplicationService`。worker 启动前，节点持久化一条
-生成的精确 parent task ID，并通过 node-generation CAS 与 graph `active_node_id` claim 原子认领。
-active-node claim 是跨进程串行闸门：两个 scheduler 不能同时执行不同的 ready 节点，DAG 也不会
-使用 `SubagentScheduler.run_many()` 或对节点进行无界 gather。
+`SessionTask` owner 和既有 `WritableSubagentApplicationService`。`max_parallel` 是不可变字段，
+默认 1，并受共享 application 上限 4 约束。worker 启动前，节点持久化生成的精确 parent task ID
+和 execution owner PID/token；单个 `BEGIN IMMEDIATE` 事务统计 durable `RUNNING` node rows、
+校验 capacity，并通过精确 generation CAS 将 `READY` 改为 `RUNNING`。ready slice 按 ordinal/node ID
+确定，使用结构化 `TaskGroup`，不会使用 `SubagentScheduler.run_many()` 或无界 gather。
 
-Session schema 21 在 `task_dags` 与 `task_dag_nodes` 中保存不可变 DAG 定义和有界节点运行投影，
+canonical active execution model 是 `state=RUNNING` 的 node rows 集合。旧的
+`task_dags.active_node_id` 只作为兼容 projection：只有恰好一个节点运行时才写入，不参与调度或
+capacity。逐节点 owner PID 存活时，reconciliation 会观察短暂的 evidence 分配窗口；只有 owner
+死亡后才进入逐节点 crash 分类。
+
+Parallel node 通过 typed `TaskDagWritableWorkerFactory` 获得全新的 Writable application service。
+这样既保留冻结的每 worker `asyncio.Lock`，也使每个节点拥有独立的 binding、lease、worktree、
+checkpoint、child session、Parent Relay 和 worker-scoped LSP state。
+
+Session schema 23 在 `task_dags` 与 `task_dag_nodes` 中保存不可变 DAG 定义和有界节点运行投影，
 并在 `task_dag_dependency_relays` 中保存 insert-only 的 predecessor-result Relay，同时在独立的
 `task_dag_recovery_claims` 中保存跨进程 ownership fence。定义和 Relay 发布都是 insert-only；graph
 与 node 生命周期更新使用 generation CAS。成功节点记录精确的 worker task、child session、writable lease、
@@ -1739,7 +1750,7 @@ Writable 第一个 durable side-effecting allocation 是插入 lease；此前的
 上 takeover；lease ownership 开始后，既有 Writable reconciliation 保持 fail-closed，永不自动 rerun worker。
 Relay 缺失、identity 过期或其他不确定状态仍为 `INDETERMINATE`，永不自动 rerun。worker 已
 完成/失败/取消时映射为 DAG 相同的终态。不增加自动 retry、崩溃重跑、merge、copy-back、rollback、cleanup、
-parallel 或 dynamic dataflow execution、UI、Swarm 或 Ultracode 行为；上文所述有界直接 predecessor-result
+dynamic 或无界 dataflow execution、UI、Swarm 或 Ultracode 行为；有界独立节点执行已实现，上文所述有界直接 predecessor-result
 Relay 是本切片唯一的 dataflow 行为，不传递 authority 或 workspace state；有界 Leader controller 由 ADR
 0135 单独规定。
 既有 Worktree、Checkpoint、Parent Relay 和 worker-scoped 只读 LSP 合约继续作为 authority owner。详见
@@ -1760,7 +1771,7 @@ node definition 与 durable outcome metadata，并对 preview 脱敏、带 finge
 transcript/reasoning/tool argument/output、Relay payload、workspace bytes、checkpoint bytes、Git
 diff、secret 或 arbitrary path。
 
-当前 Session Store schema 21 保留 schema 19 新增的 `leader_attempts` 与 `leader_decisions` 投影。Attempt 绑定精确 DAG
+当前 Session Store schema 23 保留 schema 19 新增的 `leader_attempts` 与 `leader_decisions` 投影。Attempt 绑定精确 DAG
 generation、definition/evidence/objective fingerprint、Leader session、controller owner、turn
 identity 与 durable lifecycle。SQLite write transaction 和 CAS-like state transition 保证同一精确
 snapshot 只有一个 controller 拥有 model request。Controller 必须在 provider call 紧邻之前，使用

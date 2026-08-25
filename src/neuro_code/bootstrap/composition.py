@@ -128,7 +128,11 @@ from neuro_code.application.workflows.subagent_scheduler import (
     ScopedSubagentRuntimeFactory,
     SubagentScheduler,
 )
-from neuro_code.application.workflows.task_dag import TaskDagApplicationService
+from neuro_code.application.workflows.task_dag import (
+    TaskDagApplicationService,
+    TaskDagWritableService,
+    TaskDagWritableWorkerFactory,
+)
 from neuro_code.application.workflows.writable_subagent import (
     WritableSubagentApplicationService,
 )
@@ -297,6 +301,28 @@ def _default_skill_discovery_factory() -> SkillDiscovery:
 
 def _default_workspace_change_observer_factory() -> WorkspaceChangeObserver:
     return FilesystemWorkspaceChangeObserver()
+
+
+class CompositionTaskDagWritableWorkerFactory(TaskDagWritableWorkerFactory):
+    """Create one fresh Writable application owner per parallel DAG node."""
+
+    __slots__ = ("_composition", "_parent_binding", "_timeout_seconds")
+
+    def __init__(
+        self,
+        composition: ApplicationComposition,
+        parent_binding: ConversationBinding,
+        timeout_seconds: float,
+    ) -> None:
+        self._composition = composition
+        self._parent_binding = parent_binding
+        self._timeout_seconds = timeout_seconds
+
+    def create(self) -> TaskDagWritableService:
+        return self._composition.create_writable_subagent_service(
+            parent_binding=self._parent_binding,
+            timeout_seconds=self._timeout_seconds,
+        )
 
 
 class ApplicationComposition:
@@ -530,7 +556,6 @@ class ApplicationComposition:
                 raise ConfigurationError("DAG result relay target node is missing") from error
             if (
                 durable_dag.definition_fingerprint != dag_result_relay.dag_definition_fingerprint
-                or durable_dag.active_node_id != durable_target.node_id
                 or durable_target.state is not TaskDagNodeState.RUNNING
                 or durable_target.generation != dag_result_relay.target_node_generation
                 or durable_target.definition_fingerprint
@@ -1236,13 +1261,18 @@ class ApplicationComposition:
         parent_binding: ConversationBinding,
         timeout_seconds: float = 120.0,
     ) -> TaskDagApplicationService:
-        """Create the explicit serialized Task DAG application slice."""
+        """Create the explicit bounded Task DAG application slice."""
 
         if not isinstance(parent_binding, ConversationBinding):
             raise ConfigurationError("task DAG parent binding is required")
         writable = self.create_writable_subagent_service(
             parent_binding=parent_binding,
             timeout_seconds=timeout_seconds,
+        )
+        writable_worker_factory = CompositionTaskDagWritableWorkerFactory(
+            self,
+            parent_binding,
+            timeout_seconds,
         )
         return TaskDagApplicationService(
             self.store,
@@ -1253,6 +1283,7 @@ class ApplicationComposition:
             parent_binding=parent_binding,
             dependency_relay_store=cast(TaskDagDependencyResultRelayStore, self.store),
             recovery_claim_store=cast(TaskDagRecoveryClaimStore, self.store),
+            writable_worker_factory=writable_worker_factory,
             redaction_values=self.config.redaction_values(),
         )
 

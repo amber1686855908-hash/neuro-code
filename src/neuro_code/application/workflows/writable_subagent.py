@@ -65,6 +65,7 @@ from neuro_code.domain.worktree import (
 )
 from neuro_code.domain.writable_subagent import (
     ManagedChildWorkspaceGrant,
+    WritableSubagentLeaseScope,
     WritableSubagentWorkspaceLease,
     WritableSubagentWorkspaceState,
 )
@@ -444,6 +445,7 @@ class WritableSubagentApplicationService:
                 sink=sink,
                 parent_task_id=execution_identity.parent_task_id,
                 dependency_result_relay=request.dependency_result_relay,
+                execution_scope=WritableSubagentLeaseScope.TASK_DAG,
             )
 
     async def _run_locked(
@@ -454,6 +456,7 @@ class WritableSubagentApplicationService:
         sink: EventSink | None,
         parent_task_id: str | None = None,
         dependency_result_relay: TaskDagDependencyResultRelay | None = None,
+        execution_scope: WritableSubagentLeaseScope = WritableSubagentLeaseScope.STANDALONE,
     ) -> WritableSubagentResultProjection:
         parent_capabilities = self._parent_capabilities
         parent_session_id = self._parent_session_id
@@ -478,6 +481,7 @@ class WritableSubagentApplicationService:
             updated_at=now,
             owner_pid=os.getpid(),
             owner_token=self._owner_token,
+            execution_scope=execution_scope,
         )
         try:
             lease = await self._lease_store.insert_writable_subagent_lease(lease)
