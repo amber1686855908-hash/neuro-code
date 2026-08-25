@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import multiprocessing
+import os
 import sqlite3
 import tempfile
 import unittest
@@ -1448,13 +1449,79 @@ class TaskDagSchedulerTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(ConfigurationError, "does not match binding"):
             wrong_parent_service._worker_service_for(invalid_dag)
 
+        with self.assertRaisesRegex(ConfigurationError, "worker factory is invalid"):
+            TaskDagApplicationService(
+                self.store,
+                self.store,
+                writable,
+                self.leases,
+                self.relays,
+                parent_binding=self.binding,
+                writable_worker_factory=cast(object, object()),
+            )
+
     async def test_terminal_dag_rejects_selected_step(self) -> None:
         service = self._service(_FakeWritableService(self.parent_session_id))
         await service.create_task_dag(CreateTaskDagRequest("terminal-step", (_node("a", 0),)))
         terminal = await service.run_task_dag(RunTaskDagRequest("terminal-step"))
         self.assertTrue(terminal.state.terminal)
+        self.assertEqual(
+            await service.run_task_dag_step(RunTaskDagStepRequest("terminal-step")),
+            terminal,
+        )
         with self.assertRaisesRegex(ConfigurationError, "terminal task DAG"):
             await service.run_task_dag_step(RunTaskDagStepRequest("terminal-step", "a"))
+
+    async def test_serial_step_observes_live_worker_before_selected_node_validation(self) -> None:
+        service = self._service(_FakeWritableService(self.parent_session_id))
+        await service.create_task_dag(CreateTaskDagRequest("live-step", (_node("a", 0),)))
+        snapshot = await self.store.get_task_dag("live-step")
+        self.assertIsNotNone(snapshot)
+        assert snapshot is not None
+        await self.store.claim_task_dag_node(
+            "live-step",
+            replace(
+                snapshot.node("a"),
+                state=TaskDagNodeState.RUNNING,
+                generation=1,
+                parent_task_id="live-worker-a",
+                execution_owner_pid=os.getpid(),
+                execution_owner_token="live-worker-owner",
+            ),
+            expected_generation=0,
+            expected_state=TaskDagNodeState.READY,
+            updated_at=_now(),
+        )
+        observed = await service.run_task_dag_step(RunTaskDagStepRequest("live-step"))
+        self.assertIs(observed.node("a").state, TaskDagNodeState.RUNNING)
+        with self.assertRaisesRegex(ConfigurationError, "already has a running node"):
+            await service.run_task_dag_step(RunTaskDagStepRequest("live-step", "a"))
+
+    async def test_serial_step_claim_races_are_bounded(self) -> None:
+        for error, message in (
+            (
+                TaskDagError("claim race", kind="concurrent_modification"),
+                "selected task DAG node became stale",
+            ),
+            (
+                TaskDagError("claim failed", kind="command_failed"),
+                "task DAG node claim failed",
+            ),
+        ):
+            with self.subTest(message=message):
+                dag_store = _IntermittentClaimStore(self.store, error)
+                service = TaskDagApplicationService(
+                    self.store,
+                    dag_store,
+                    _FakeWritableService(self.parent_session_id),
+                    self.leases,
+                    self.relays,
+                    parent_binding=self.binding,
+                )
+                dag_id = f"step-claim-{error.kind}"
+                await service.create_task_dag(CreateTaskDagRequest(dag_id, (_node("a", 0),)))
+                with self.assertRaisesRegex(ConfigurationError, message):
+                    await service.run_task_dag_step(RunTaskDagStepRequest(dag_id, "a"))
 
     async def test_recovery_without_ownership_boundary_fails_closed(self) -> None:
         service = self._service(_FakeWritableService(self.parent_session_id))
