@@ -26,6 +26,7 @@ from neuro_code.application.sessions.binding import ConversationBinding, Convers
 from neuro_code.application.settings import ApplicationSettings
 from neuro_code.application.workflows.leader import RunLeaderRequest
 from neuro_code.application.workflows.model_planning import (
+    MAX_MODEL_PLANNING_PROMPT_BYTES,
     ModelDagPlanningApplicationService,
     RunModelDagPlanningRequest,
 )
@@ -1107,6 +1108,105 @@ async def test_model_planning_context_projection_caps_items_and_projected_bytes(
         byte_capped = service._project_context(parent_id)
         assert byte_capped.truncated
         assert len(byte_capped.items) < MAX_PLANNING_CONTEXT_ITEMS
+
+
+@pytest.mark.asyncio
+async def test_model_planning_prompt_size_is_bounded() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        store, parent_id, planner_id = await _store_with_sessions(directory)
+        service = ModelDagPlanningApplicationService(
+            store,
+            _DagService(store, parent_id),
+            parent_binding=_binding(_Runner(parent_id, "unused"), zero_tools=False),
+            planner_binding=_binding(_Runner(planner_id, _proposal_json())),
+            session_store=store,
+        )
+        with pytest.raises(ConfigurationError, match="prompt exceeds its bounded size"):
+            service._prompt(
+                "x" * MAX_MODEL_PLANNING_PROMPT_BYTES,
+                PlanningContextEnvelope(parent_id, 0, ()),
+            )
+
+
+@pytest.mark.asyncio
+async def test_model_planning_rejects_a_durable_identity_conflict_without_provider_replay() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        store, parent_id, planner_id = await _store_with_sessions(directory)
+        await _prepare_committed_attempt(
+            store, parent_id, planner_id, "identity-conflict", _proposal_json()
+        )
+        runner = _Runner(planner_id, "provider must not be called")
+        service = ModelDagPlanningApplicationService(
+            store,
+            _DagService(store, parent_id),
+            parent_binding=_binding(_Runner(parent_id, "unused"), zero_tools=False),
+            planner_binding=_binding(runner),
+            session_store=store,
+        )
+        with pytest.raises(ConfigurationError, match="identity conflicts"):
+            await service.run(RunModelDagPlanningRequest("identity-conflict", "different"))
+        assert runner.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_model_planning_requires_recovery_inspection_before_expired_takeover() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        store, parent_id, planner_id = await _store_with_sessions(directory)
+        now = datetime.now(UTC)
+        expired = PlanningAttempt(
+            "inspection-unavailable",
+            parent_id,
+            _sha("objective"),
+            PlanningContextEnvelope(parent_id, 0, ()).fingerprint,
+            planner_id,
+            "expired-turn",
+            "expired-dag",
+            PlanningAttemptState.CLAIMED,
+            "expired-owner",
+            now - timedelta(seconds=1),
+        )
+        await store.claim_model_planning_attempt(expired, now=now)
+        runner = _Runner(planner_id, _proposal_json())
+        service = ModelDagPlanningApplicationService(
+            store,
+            _DagService(store, parent_id),
+            parent_binding=_binding(_Runner(parent_id, "unused"), zero_tools=False),
+            planner_binding=_binding(runner),
+        )
+        with pytest.raises(ConfigurationError, match="inspection is unavailable"):
+            await service.run(RunModelDagPlanningRequest("inspection-unavailable", "objective"))
+        assert runner.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_model_planning_rejects_mismatched_published_dag_without_provider_replay() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        store, parent_id, planner_id = await _store_with_sessions(directory)
+        dag_service = _DagService(store, parent_id)
+        runner = _Runner(planner_id, _proposal_json())
+        service = ModelDagPlanningApplicationService(
+            store,
+            dag_service,
+            parent_binding=_binding(_Runner(parent_id, "unused"), zero_tools=False),
+            planner_binding=_binding(runner),
+            session_store=store,
+        )
+
+        async def return_mismatched_dag(request: CreateTaskDagRequest) -> TaskDag:
+            return TaskDag.create(
+                dag_id="mismatched-dag",
+                parent_session_id=parent_id,
+                nodes=request.nodes,
+                created_at=datetime.now(UTC),
+                max_parallel=request.max_parallel,
+            )
+
+        with (
+            patch.object(dag_service, "create_task_dag", new=return_mismatched_dag),
+            pytest.raises(ConfigurationError, match="does not match"),
+        ):
+            await service.run(RunModelDagPlanningRequest("dag-mismatch", "objective"))
+        assert runner.calls == 1
 
 
 @pytest.mark.asyncio
