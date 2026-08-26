@@ -1870,7 +1870,7 @@ def _assert_planning_publication_counts(
     expected_proposal_count: int,
     expected_dag_count: int,
 ) -> None:
-    with sqlite3.connect(database) as connection:
+    with closing(sqlite3.connect(database)) as connection:
         attempt_count = connection.execute(
             "SELECT COUNT(*) FROM orchestration_planning_attempts"
         ).fetchone()
