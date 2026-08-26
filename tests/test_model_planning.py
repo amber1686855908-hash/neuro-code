@@ -9,6 +9,7 @@ import sqlite3
 import subprocess
 import tempfile
 from collections.abc import AsyncIterator
+from contextlib import closing
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -775,6 +776,10 @@ async def test_durable_model_output_and_proposal_recovery_do_not_replay_provider
         result2 = await service2.run(RunModelDagPlanningRequest("reuse-proposal", "objective"))
         assert result2.dag.dag_id == proposal_attempt.intended_dag_id
         assert runner2.calls == 0
+        result3 = await service2.run(RunModelDagPlanningRequest("reuse-proposal", "objective"))
+        assert result3.attempt.state is PlanningAttemptState.COMPLETED
+        assert result3.dag == result2.dag
+        assert runner2.calls == 0
 
 
 @pytest.mark.asyncio
@@ -915,7 +920,7 @@ async def test_proposal_is_insert_only_and_tamper_is_fail_closed() -> None:
         second = replace(first, proposal_id="proposal-two", created_at=datetime.now(UTC))
         persisted = await store.publish_model_planning_proposal(second, owner_id="owner-b")
         assert persisted.proposal_id == "proposal-one"
-        with sqlite3.connect(Path(directory) / "sessions.db") as connection:
+        with closing(sqlite3.connect(Path(directory) / "sessions.db")) as connection, connection:
             connection.execute(
                 "UPDATE orchestration_plan_proposals SET canonical_json = ? WHERE planning_id = ?",
                 ('{"nodes":[],"max_parallel":1,"reason":"tampered"}', committed.planning_id),
@@ -978,7 +983,7 @@ async def test_schema_24_to_25_preserves_existing_task_dag() -> None:
         )
         await store.insert_task_dag(dag)
         database = Path(directory) / "sessions.db"
-        with sqlite3.connect(database) as connection:
+        with closing(sqlite3.connect(database)) as connection, connection:
             connection.execute("DROP TABLE orchestration_plan_proposals")
             connection.execute("DROP TABLE orchestration_planning_attempts")
             connection.execute("UPDATE schema_meta SET version = 24 WHERE singleton = 1")
@@ -988,7 +993,7 @@ async def test_schema_24_to_25_preserves_existing_task_dag() -> None:
         assert (
             await store.get_task_dag("preexisting")
         ).definition_fingerprint == dag.definition_fingerprint
-        with sqlite3.connect(database) as connection:
+        with closing(sqlite3.connect(database)) as connection:
             tables = {
                 row[0]
                 for row in connection.execute(
@@ -1000,6 +1005,108 @@ async def test_schema_24_to_25_preserves_existing_task_dag() -> None:
                 "orchestration_plan_proposals",
             }.issubset(tables)
             assert connection.execute("SELECT version FROM schema_meta").fetchone() == (25,)
+
+
+@pytest.mark.asyncio
+async def test_model_planning_recovery_requires_a_durable_proposal() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        store, parent_id, planner_id = await _store_with_sessions(directory)
+        committed = await _prepare_committed_attempt(
+            store, parent_id, planner_id, "missing-proposal", _proposal_json()
+        )
+        await store.transition_model_planning_attempt(
+            committed.planning_id,
+            expected_state=PlanningAttemptState.MODEL_COMMITTED,
+            state=PlanningAttemptState.PROPOSAL_PUBLISHED,
+            updated_at=datetime.now(UTC),
+        )
+        runner = _Runner(planner_id, "provider must not be replayed")
+        service = ModelDagPlanningApplicationService(
+            store,
+            _DagService(store, parent_id),
+            parent_binding=_binding(_Runner(parent_id, "unused"), zero_tools=False),
+            planner_binding=_binding(runner),
+            session_store=store,
+        )
+        with pytest.raises(ConfigurationError, match="proposal is missing"):
+            await service.run(RunModelDagPlanningRequest("missing-proposal", "objective"))
+        assert runner.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_model_planning_provider_cancellation_is_indeterminate_without_replay() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        store, parent_id, planner_id = await _store_with_sessions(directory)
+        runner = _Runner(planner_id, "unused", error=asyncio.CancelledError())
+        service = ModelDagPlanningApplicationService(
+            store,
+            _DagService(store, parent_id),
+            parent_binding=_binding(_Runner(parent_id, "unused"), zero_tools=False),
+            planner_binding=_binding(runner),
+            session_store=store,
+        )
+        with pytest.raises(asyncio.CancelledError):
+            await service.run(RunModelDagPlanningRequest("cancelled", "objective"))
+        assert runner.calls == 1
+        attempt = await store.get_model_planning_attempt("cancelled")
+        assert attempt is not None
+        assert attempt.state is PlanningAttemptState.INDETERMINATE
+
+
+@pytest.mark.asyncio
+async def test_model_planning_output_durability_failure_does_not_replay_provider() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        store, parent_id, planner_id = await _store_with_sessions(directory)
+        runner = _Runner(planner_id, _proposal_json())
+        service = ModelDagPlanningApplicationService(
+            store,
+            _DagService(store, parent_id),
+            parent_binding=_binding(_Runner(parent_id, "unused"), zero_tools=False),
+            planner_binding=_binding(runner),
+            session_store=store,
+        )
+
+        async def fail_commit(*args: object, **kwargs: object) -> PlanningAttempt:
+            del args, kwargs
+            raise ModelPlanningStoreError("durable output unavailable")
+
+        with (
+            patch.object(store, "mark_model_planning_model_committed", new=fail_commit),
+            pytest.raises(ConfigurationError, match="output durability failed"),
+        ):
+            await service.run(RunModelDagPlanningRequest("commit-failure", "objective"))
+        assert runner.calls == 1
+        attempt = await store.get_model_planning_attempt("commit-failure")
+        assert attempt is not None
+        assert attempt.state is PlanningAttemptState.PROVIDER_FENCED
+
+
+@pytest.mark.asyncio
+async def test_model_planning_context_projection_caps_items_and_projected_bytes() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        store, parent_id, planner_id = await _store_with_sessions(directory)
+        parent_runner = _Runner(
+            parent_id,
+            "unused",
+            items=tuple(Message(Role.USER, "item") for _ in range(MAX_PLANNING_CONTEXT_ITEMS + 2)),
+        )
+        service = ModelDagPlanningApplicationService(
+            store,
+            _DagService(store, parent_id),
+            parent_binding=_binding(parent_runner, zero_tools=False),
+            planner_binding=_binding(_Runner(planner_id, _proposal_json())),
+            session_store=store,
+        )
+        item_capped = service._project_context(parent_id)
+        assert item_capped.truncated
+        assert len(item_capped.items) == MAX_PLANNING_CONTEXT_ITEMS
+
+        parent_runner.items = tuple(
+            Message(Role.USER, "large-" + "x" * 3_500) for _ in range(MAX_PLANNING_CONTEXT_ITEMS)
+        )
+        byte_capped = service._project_context(parent_id)
+        assert byte_capped.truncated
+        assert len(byte_capped.items) < MAX_PLANNING_CONTEXT_ITEMS
 
 
 @pytest.mark.asyncio

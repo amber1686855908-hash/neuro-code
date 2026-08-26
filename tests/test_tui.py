@@ -3690,6 +3690,10 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
                 await pilot.pause(0.01)
                 if runner.wake_count == 2:
                     break
+            self.assertEqual(runner.wake_count, 2)
+            # The retry is intentionally manual; disable the short test cooldown
+            # before leaving the app so teardown cannot schedule a third failure.
+            await app._apply_background_task_wake_policy("off")
 
         self.assertEqual(runner.wake_count, 2)
         self.assertEqual(tasks.wake_state.pending_task_ids, ("task-fast",))
