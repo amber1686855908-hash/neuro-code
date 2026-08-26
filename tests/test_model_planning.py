@@ -1110,6 +1110,102 @@ async def test_model_planning_context_projection_caps_items_and_projected_bytes(
 
 
 @pytest.mark.asyncio
+async def test_model_planning_rejects_task_dag_publication_without_provider_replay() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        store, parent_id, planner_id = await _store_with_sessions(directory)
+        dag_service = _DagService(store, parent_id)
+        runner = _Runner(planner_id, _proposal_json())
+        service = ModelDagPlanningApplicationService(
+            store,
+            dag_service,
+            parent_binding=_binding(_Runner(parent_id, "unused"), zero_tools=False),
+            planner_binding=_binding(runner),
+            session_store=store,
+        )
+
+        async def reject_dag(request: CreateTaskDagRequest) -> TaskDag:
+            del request
+            raise ValueError("canonical DAG rejected")
+
+        with (
+            patch.object(dag_service, "create_task_dag", new=reject_dag),
+            pytest.raises(ConfigurationError, match="canonical Task DAG validation"),
+        ):
+            await service.run(RunModelDagPlanningRequest("dag-rejected", "objective"))
+        assert runner.calls == 1
+        attempt = await store.get_model_planning_attempt("dag-rejected")
+        assert attempt is not None
+        assert attempt.state is PlanningAttemptState.STALE
+        assert await store.get_model_planning_proposal("dag-rejected") is not None
+
+
+@pytest.mark.asyncio
+async def test_model_planning_provider_fence_loss_fails_closed_before_provider_call() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        store, parent_id, planner_id = await _store_with_sessions(directory)
+        runner = _Runner(planner_id, _proposal_json())
+        service = ModelDagPlanningApplicationService(
+            store,
+            _DagService(store, parent_id),
+            parent_binding=_binding(_Runner(parent_id, "unused"), zero_tools=False),
+            planner_binding=_binding(runner),
+            session_store=store,
+        )
+
+        async def lose_fence(*args: object, **kwargs: object) -> PlanningAttempt:
+            del args, kwargs
+            raise ModelPlanningStoreError("fence changed")
+
+        with (
+            patch.object(store, "fence_model_planning_attempt", new=lose_fence),
+            pytest.raises(ConfigurationError, match="provider fence was lost"),
+        ):
+            await service.run(RunModelDagPlanningRequest("fence-loss", "objective"))
+        assert runner.calls == 0
+        attempt = await store.get_model_planning_attempt("fence-loss")
+        assert attempt is not None
+        assert attempt.state is PlanningAttemptState.CLAIMED
+
+
+@pytest.mark.asyncio
+async def test_model_planning_existing_provider_fence_requires_explicit_recovery() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        store, parent_id, planner_id = await _store_with_sessions(directory)
+        now = datetime.now(UTC)
+        attempt = PlanningAttempt(
+            "existing-fence",
+            parent_id,
+            _sha("objective"),
+            PlanningContextEnvelope(parent_id, 0, ()).fingerprint,
+            planner_id,
+            "fenced-turn",
+            "fenced-dag",
+            PlanningAttemptState.CLAIMED,
+            "owner-a",
+            now + timedelta(minutes=5),
+        )
+        await store.claim_model_planning_attempt(attempt, now=now)
+        await store.fence_model_planning_attempt(
+            attempt.planning_id,
+            owner_id="owner-a",
+            planner_session_id=planner_id,
+            planner_turn_id=attempt.planner_turn_id,
+            updated_at=now,
+        )
+        runner = _Runner(planner_id, "provider must not be replayed")
+        service = ModelDagPlanningApplicationService(
+            store,
+            _DagService(store, parent_id),
+            parent_binding=_binding(_Runner(parent_id, "unused"), zero_tools=False),
+            planner_binding=_binding(runner),
+            session_store=store,
+        )
+        with pytest.raises(ConfigurationError, match="provider fence exists"):
+            await service.run(RunModelDagPlanningRequest("existing-fence", "objective"))
+        assert runner.calls == 0
+
+
+@pytest.mark.asyncio
 async def test_crash_safe_turn_identity_is_bound_before_provider_request() -> None:
     with tempfile.TemporaryDirectory() as directory:
         store, parent_id, planner_id = await _store_with_sessions(directory)
