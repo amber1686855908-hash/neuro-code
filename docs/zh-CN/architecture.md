@@ -1672,11 +1672,12 @@ Writable workflow 现在只从实际 parent `ConversationBinding` 所绑定 sess
 保留 reasoning 与保留 backend-call 的结构都会排除；assistant 可见正文可与
 `reasoning_content` 明确分离，后者绝不进入 Relay。
 
-Session schema 25 保留 schema 17 的每个 writable lease 一条一对一、insert-only READY Relay，
+Session schema 26 保留 schema 17 的每个 writable lease 一条一对一、insert-only READY Relay，
 以及下述持久化 Task DAG 表、schema 20 的 predecessor-result Relay 表和 schema 21 的 Task DAG
 recovery-claim fence；schema 22 增加有界 DAG capacity 与 scoped Writable lease policy，schema 23
 增加逐节点 execution-owner identity，schema 24 增加 parallel-aware Leader decision projection，
-schema 25 增加下文的 bounded model-planning attempt/proposal projection，并保留后文的持久化
+schema 25 增加下文的 bounded model-planning attempt/proposal projection，schema 26 增加 bounded
+DAG replan attempt/proposal projection，并保留后文的持久化
 Leader attempt/decision 投影。其 identity
 绑定 parent/task/child、lease、worktree、baseline checkpoint、base commit、
 capability/grant fingerprint 与 child-task digest。加载时校验 source、content 和完整记录
@@ -1693,7 +1694,8 @@ conversation history，并在模型、tool 与 LSP 多步骤间保持字节稳�
 有界 Task DAG、Leader 与 model-planning 切片由独立的 [ADR 0134](adr/0134-durable-serialized-task-dag.md)、
 [ADR 0135](adr/0135-bounded-serialized-leader-controller.md) 与 [ADR 0137]
 (adr/0137-parallel-aware-leader-bounded-wave-scheduling.md) 规定，model-generated planning
-详见 [ADR 0138](adr/0138-bounded-model-generated-dag-planning.md)；Relay 边界详见
+详见 [ADR 0138](adr/0138-bounded-model-generated-dag-planning.md)，bounded DAG revision/replan
+详见 [ADR 0139](adr/0139-bounded-dag-revision-replan.md)；Relay 边界详见
 [ADR 0133](adr/0133-bounded-parent-context-relay.md)。
 
 ### 有界持久化 Task DAG
@@ -1720,7 +1722,7 @@ Parallel node 通过 typed `TaskDagWritableWorkerFactory` 获得全新的 Writab
 这样既保留冻结的每 worker `asyncio.Lock`，也使每个节点拥有独立的 binding、lease、worktree、
 checkpoint、child session、Parent Relay 和 worker-scoped LSP state。
 
-Session schema 25 在 `task_dags` 与 `task_dag_nodes` 中保存不可变 DAG 定义和有界节点运行投影，
+Session schema 26 在 `task_dags` 与 `task_dag_nodes` 中保存不可变 DAG 定义和有界节点运行投影，
 并在 `task_dag_dependency_relays` 中保存 insert-only 的 predecessor-result Relay，同时在独立的
 `task_dag_recovery_claims` 中保存跨进程 ownership fence。定义和 Relay 发布都是 insert-only；graph
 与 node 生命周期更新使用 generation CAS。成功节点记录精确的 worker task、child session、writable lease、
@@ -1774,7 +1776,7 @@ node definition 与 durable outcome metadata，并对 preview 脱敏、带 finge
 transcript/reasoning/tool argument/output、Relay payload、workspace bytes、checkpoint bytes、Git
 diff、secret 或 arbitrary path。
 
-当前 Session Store schema 25 保留 schema 19 新增的 `leader_attempts` 与 `leader_decisions` 投影。Attempt 绑定精确 DAG
+当前 Session Store schema 26 保留 schema 19 新增的 `leader_attempts` 与 `leader_decisions` 投影。Attempt 绑定精确 DAG
 generation、definition/evidence/objective fingerprint、Leader session、controller owner、turn
 identity 与 durable lifecycle。SQLite write transaction 和 CAS-like state transition 保证同一精确
 snapshot 只有一个 controller 拥有 model request。Controller 必须在 provider call 紧邻之前，使用
@@ -1790,7 +1792,8 @@ provider。存在未解决的 session turn 时保守转为 `INDETERMINATE`，需
 历史 Leader loop 有界且串行：选择一个 ready node，等待既有 Writable Subagent/DAG 结果，然后构造下一份
 snapshot；one-step seam 内不会自动执行第二个 node。只有 DAG terminal 后才请求 final synthesis，且
 结果保留在专用 Leader session，不写入 parent transcript。model 生成 DAG 由下方独立 planning
-切片处理；本历史 Leader 切片不执行 planning。replan、retry、dynamic/无界 dataflow、merge、
+切片处理；本历史 Leader 切片不执行 planning。bounded failed-DAG revision/replan 由下方独立
+切片处理；retry、recursive replan、dynamic/无界 dataflow、merge、
 rollback、UI/ACP 暴露、Swarm、Ultracode 与自动委派仍不属于本切片。
 有界 parallel-aware Leader wave 由下方 [ADR 0137]
 (adr/0137-parallel-aware-leader-bounded-wave-scheduling.md) 实现。
@@ -1813,7 +1816,7 @@ CAS；wave seam 只 claim selected ID，创建独立 Writable service，并使�
 填充未选择的 node。`max_parallel=1` 继续兼容 one-node path。
 
 Session schema 24 增加了 parent-session、selected-node 和 selected-generation decision projection，
-并迁移已填充的 schema-23 row；当前 schema 25 保留这些 projection。Crash 后只有每个 selected node 仍在记录的 READY generation，或
+并迁移已填充的 schema-23 row；当前 schema 26 保留这些 projection。Crash 后只有每个 selected node 仍在记录的 READY generation，或
 已经 durable advanced 到 RUNNING/terminal 时，durable wave decision 才能复用；不会推断 provider
 replay 安全。Partial claim、controller race、failure、cancellation、skipped descendant 和
 indeterminate branch 保留既有 Task DAG recovery semantics。Leader 仍不拥有 Writable、Worktree、
@@ -1845,7 +1848,8 @@ Parser 保留冻结的 Task DAG limits：最多 8 个 node、16 条 edge、每 n
 以及 1 到 4 的 `max_parallel`。unknown dependency、self-dependency、cycle、duplicate ID、edge overflow
 和其他 graph 规则仍由规范 Task DAG service 拒绝。Model text 只是 data，不包含 authority field。
 
-Session schema 25 新增 insert-only 的 `orchestration_planning_attempts` 与 `orchestration_plan_proposals`。
+Schema 25 新增 insert-only 的 `orchestration_planning_attempts` 与 `orchestration_plan_proposals`；当前
+schema 26 保留这些 projection。
 Planning attempt 绑定调用方精确 planning ID、真实 parent session、objective/context fingerprint、专用
 planner session/turn、预分配 intended DAG ID、provider lifecycle、proposal fingerprint 和已发布 DAG identity。
 生命周期为 `CLAIMED -> PROVIDER_FENCED -> MODEL_COMMITTED -> PROPOSAL_PUBLISHED -> DAG_PUBLISHED ->
@@ -1863,6 +1867,46 @@ Provider replay 规则沿用既有 durable turn contract：一旦 Provider turn 
 acceptance 使用 spawned process，覆盖 output committed、proposal published、DAG inserted 和
 provider-turn-evidence boundary，并在 L2 recovery 下保留 L1/T1 provenance。独立 controller race 还验证
 losing process 不会改写 winner 的 provenance。可观察到的 invalid JSON 会记录为 stale，不会再次发送给 Provider。
-Replan、DAG revision、retry、node resurrection、recursive planning、自动
-委派、dynamic/无界 dataflow、merge/copy-back、rollback、cleanup、public CLI/TUI/ACP orchestration、Swarm、
-Ultracode 和 distributed scheduling 仍不属于本切片。详见 [ADR 0138](adr/0138-bounded-model-generated-dag-planning.md)。
+Bounded failed-DAG revision/replan 由下方独立的 [ADR 0139](adr/0139-bounded-dag-revision-replan.md) 实现。
+Retry、node resurrection、recursive planning、自动委派、dynamic/无界 dataflow、merge/copy-back、
+rollback、cleanup、public CLI/TUI/ACP orchestration、Swarm、Ultracode 和 distributed scheduling
+仍不属于本切片。详见 [ADR 0138](adr/0138-bounded-model-generated-dag-planning.md)。
+
+### 有界 DAG revision / replan
+
+ADR 0139 在已发布 Task DAG 到达 quiescent `FAILED` state 后增加一个显式 revision boundary。
+Request 指定一个 source DAG 与一个 revision identity。Source 必须没有 `RUNNING` 或未解决的
+`INDETERMINATE` node，且所有 node 都是 terminal。Successful、cancelled、active、foreign-parent、
+missing 或 tampered source 会被拒绝。Source definition 与 runtime projection 保持不可变；replan
+通过既有 `TaskDagApplicationService` 创建一个 distinct successor DAG。
+
+Replan depth 由 `MAX_DAG_REPLAN_DEPTH=1` 限制，因此本切片只支持一个显式 successor。它不是
+automatic retry、recursive planning、node resurrection 或 publication-time mutation。已完成的 source
+work 只作为 evidence；successor 拥有新的 pending/ready node definition，不复用 source lease、session、
+worktree、checkpoint、relay 或 worker runtime identity。
+
+Replan model 接收确定性、脱敏、不可变的 evidence envelope，只包含 source identity、canonical node
+state/dependency projection、有界 completed-result projection、typed failure summary 与安全的有界
+metadata。它排除 transcript、tool argument/result、log、environment、secret、workspace bytes、checkpoint、
+diff、arbitrary path 与 authority instruction。UTF-8 边界为每个 completed result 4 KiB、completed-result
+evidence 合计 16 KiB、failure/state evidence 8 KiB、rendered 32 KiB；fingerprint 之前先脱敏。
+
+`ApplicationComposition.create_task_dag_replan_service()` 创建一个 fresh、持久化、one-step zero-tool
+binding。它没有 local/provider-hosted tool、filesystem、Bash、terminal、network、MCP、LSP、Worktree、
+Checkpoint、worker 或 background authority。Model 只返回既有 typed `ModelDagProposal`；revision、source、
+successor、depth 与 authority field 由 application 拥有。Schema 26 以 insert-only 方式保存
+`orchestration_dag_replan_attempts` 与 `orchestration_dag_replan_proposals`，并保留精确
+source/evidence/proposal/successor identity 及 `FOREIGN KEY ... ON DELETE RESTRICT`。
+
+Lifecycle 为 `CLAIMED -> PROVIDER_FENCED -> MODEL_COMMITTED -> PROPOSAL_PUBLISHED ->
+SUCCESSOR_DAG_PUBLISHED -> COMPLETED`，并有 typed `STALE` 与 `INDETERMINATE` terminal classification。
+在 provider invocation 前和 successor publication 前都会重复进行 source snapshot fence。一个 canonical
+source/revision identity 至多有一次 provider call、一个 proposal 和一个 successor；重复 recovery 幂等，
+不同 evidence 或 publication 被拒绝，不使用 blind upsert。
+
+Fresh composition recovery 复用 committed output、durable proposal 与已经插入的 exact successor，不 replay
+Provider。Generic provider-turn evidence 在 model commit 前可观察时，转为 explicit recovery-required
+`INDETERMINATE`，系统不会伪造 successor。独立 spawned controller 通过 durable owner/CAS 只有一个 winner，
+loser 不调用 Provider，也不修改 provenance。本切片由 fixture-provider focused tests、真实
+`ApplicationComposition` process-death tests、two-process race，以及进入既有 parallel-aware Leader 和
+Writable authority 的端到端测试覆盖；不提供 public CLI/TUI/ACP orchestration API。

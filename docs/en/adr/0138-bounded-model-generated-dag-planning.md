@@ -186,5 +186,6 @@ provider invocation count at one through output, proposal, and DAG crash
 windows. A provider-turn-evidence crash is classified as explicit recovery
 required/`INDETERMINATE`, never as an automatic retry.
 
-The next independent slice is Bounded DAG Revision / Replan. It is not part
-of this implementation.
+Bounded DAG Revision / Replan is specified as the separate internal slice in
+[ADR 0139](0139-bounded-dag-revision-replan.md); it is not part of this
+planning implementation.

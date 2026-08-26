@@ -150,4 +150,5 @@ TaskDagApplicationService、真实 parallel-aware Leader 和真实 Writable work
 invocation 恰好一次。Provider-turn-evidence crash 按 explicit recovery required/`INDETERMINATE` 分类，
 绝不自动 retry。
 
-下一个独立切片是 Bounded DAG Revision / Replan，本实现不包含该能力。
+Bounded DAG Revision / Replan 由独立的 [ADR 0139](0139-bounded-dag-revision-replan.md)
+规定；本 planning 实现不包含该能力。

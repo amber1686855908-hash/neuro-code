@@ -51,6 +51,7 @@ from neuro_code.application.ports.skills import SkillDiscovery
 from neuro_code.application.ports.storage import SessionStore
 from neuro_code.application.ports.task_dag import TaskDagError, TaskDagStore
 from neuro_code.application.ports.task_dag_recovery import TaskDagRecoveryClaimStore
+from neuro_code.application.ports.task_dag_replan import TaskDagReplanStore
 from neuro_code.application.ports.task_dag_result_relay import (
     TaskDagDependencyResultRelayError,
     TaskDagDependencyResultRelayStore,
@@ -136,6 +137,9 @@ from neuro_code.application.workflows.task_dag import (
     TaskDagApplicationService,
     TaskDagWritableService,
     TaskDagWritableWorkerFactory,
+)
+from neuro_code.application.workflows.task_dag_replan import (
+    TaskDagReplanApplicationService,
 )
 from neuro_code.application.workflows.writable_subagent import (
     WritableSubagentApplicationService,
@@ -1411,6 +1415,63 @@ class ApplicationComposition:
             raise
 
     create_planner_service = create_model_planning_service
+
+    async def create_task_dag_replan_service(
+        self,
+        *,
+        parent_binding: ConversationBinding,
+        timeout_seconds: float = 120.0,
+    ) -> TaskDagReplanApplicationService:
+        """Create the explicit zero-tool bounded failed-DAG replan service."""
+
+        if not isinstance(parent_binding, ConversationBinding):
+            raise ConfigurationError("DAG replan parent binding is required")
+        planner_config = replace(
+            self.config,
+            providers={
+                name: replace(profile, builtin_tools=())
+                for name, profile in self.config.providers.items()
+            },
+        )
+        provider_profile = planner_config.provider
+        planner_session_id = await self.store.create_session(
+            str(planner_config.cwd),
+            provider_profile.name,
+            provider_profile.model,
+            provider_profile.context_affinity,
+            planner_config.sandbox_profile,
+        )
+        try:
+            planner_binding = await self.create_binding(
+                config=planner_config,
+                resume_id=planner_session_id,
+                max_steps=1,
+                allowed_tool_names=(),
+                enable_background_tasks=False,
+            )
+        except BaseException:
+            await asyncio.shield(self.store.delete_session(planner_session_id))
+            raise
+        try:
+            dag_service = self.create_task_dag_service(
+                parent_binding=parent_binding,
+                timeout_seconds=timeout_seconds,
+            )
+            return TaskDagReplanApplicationService(
+                cast(TaskDagReplanStore, self.store),
+                cast(TaskDagStore, self.store),
+                dag_service,
+                parent_binding=parent_binding,
+                planner_binding=planner_binding,
+                session_store=self.store,
+                redaction_values=planner_config.redaction_values(),
+            )
+        except BaseException:
+            await asyncio.shield(planner_binding.close())
+            await asyncio.shield(self.store.delete_session(planner_session_id))
+            raise
+
+    create_dag_replan_service = create_task_dag_replan_service
 
     def create_subagent_scheduler(
         self,

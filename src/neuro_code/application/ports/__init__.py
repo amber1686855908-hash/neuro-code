@@ -100,6 +100,11 @@ from neuro_code.application.ports.task_dag_recovery import (
     TaskDagRecoveryClaimResult,
     TaskDagRecoveryClaimStore,
 )
+from neuro_code.application.ports.task_dag_replan import (
+    DagReplanAttemptClaim,
+    TaskDagReplanStore,
+    TaskDagReplanStoreError,
+)
 from neuro_code.application.ports.task_dag_result_relay import (
     TaskDagDependencyResultRelayError,
     TaskDagDependencyResultRelayStore,
@@ -265,6 +270,7 @@ __all__ = [
     "ClientTerminal",
     "ClientTerminalResult",
     "CredentialStyle",
+    "DagReplanAttemptClaim",
     "FilesystemAccessOperation",
     "FilesystemAccessPlan",
     "FilesystemAccessTarget",
@@ -349,6 +355,8 @@ __all__ = [
     "TaskDagRecoveryClaimError",
     "TaskDagRecoveryClaimResult",
     "TaskDagRecoveryClaimStore",
+    "TaskDagReplanStore",
+    "TaskDagReplanStoreError",
     "TaskDagStore",
     "Tool",
     "ToolCollection",
