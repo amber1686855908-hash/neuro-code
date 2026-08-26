@@ -1,6 +1,6 @@
 # ADR 0139：有界 DAG Revision / Replan
 
-- 状态：作为显式内部 P0 vertical slice 实现；最终评级等待 exact-head CI
+- 状态：作为显式内部 P0 vertical slice 已实现，并由最终 PR merge-ref CI 验证（run 32994963168，23/23 jobs 成功）；该 CI 不是 direct exact-head checkout，live/paid provider validation 仍不在范围内
 - 日期：2026-08-26
 - 范围：将一个显式失败且静默的 Task DAG revision 一次为一个不可变 successor DAG
 - 依赖：ADR 0134、ADR 0135、ADR 0136、ADR 0137 与 ADR 0138

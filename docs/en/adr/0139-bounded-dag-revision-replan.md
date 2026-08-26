@@ -1,6 +1,6 @@
 # ADR 0139: Bounded DAG Revision / Replan
 
-- Status: implemented as an explicit internal P0 vertical slice; final rating waits for exact-head CI
+- Status: implemented as an explicit internal P0 vertical slice; validated by the final PR merge-ref CI (run 32994963168, 23/23 jobs successful); this is not a direct exact-head checkout, and live/paid provider validation remains out of scope
 - Date: 2026-08-26
 - Scope: one explicit revision of one failed, quiescent Task DAG into one immutable successor DAG
 - Depends on: ADR 0134, ADR 0135, ADR 0136, ADR 0137, and ADR 0138
