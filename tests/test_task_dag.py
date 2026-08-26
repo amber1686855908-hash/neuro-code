@@ -978,7 +978,7 @@ class TaskDagPersistenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertLessEqual(len(current.running_node_ids), 2)
         self.assertEqual(len(current.running_node_ids), 2)
 
-    async def test_schema_17_migrates_to_24_and_creates_dag_leader_relay_and_recovery_tables(
+    async def test_schema_17_migrates_to_25_and_creates_dag_leader_relay_recovery_and_planning_tables(
         self,
     ) -> None:
         connection = sqlite3.connect(self._database_path)
@@ -999,11 +999,17 @@ class TaskDagPersistenceTests(unittest.IsolatedAsyncioTestCase):
             ).fetchall()
         }
         connection.close()
-        self.assertEqual(version, (24,))
+        self.assertEqual(version, (25,))
         self.assertTrue({"task_dags", "task_dag_nodes"}.issubset(tables))
         self.assertTrue({"leader_attempts", "leader_decisions"}.issubset(tables))
         self.assertIn("task_dag_dependency_relays", tables)
         self.assertIn("task_dag_recovery_claims", tables)
+        self.assertTrue(
+            {
+                "orchestration_planning_attempts",
+                "orchestration_plan_proposals",
+            }.issubset(tables)
+        )
         self.assertIsNotNone(await reopened.get_session(self.parent_session_id))
 
     async def test_populated_schema_18_dag_survives_leader_migration(self) -> None:
@@ -1039,7 +1045,7 @@ class TaskDagPersistenceTests(unittest.IsolatedAsyncioTestCase):
             ).fetchall()
         }
         connection.close()
-        self.assertEqual(version, (24,))
+        self.assertEqual(version, (25,))
         self.assertTrue({"leader_attempts", "leader_decisions"}.issubset(tables))
         self.assertIn("task_dag_recovery_claims", tables)
 
@@ -1193,10 +1199,10 @@ class TaskDagPersistenceTests(unittest.IsolatedAsyncioTestCase):
             "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'leader_decisions'"
         ).fetchone()
         connection.close()
-        self.assertEqual(version, (24,))
+        self.assertEqual(version, (25,))
         self.assertIn("SELECT_NODES", str(decision_sql[0]))
 
-    async def test_populated_schema_20_migrates_to_24_without_touching_dag_contract(self) -> None:
+    async def test_populated_schema_20_migrates_to_25_without_touching_dag_contract(self) -> None:
         dag = self._dag("populated-schema-20")
         await self.store.insert_task_dag(dag)
         connection = sqlite3.connect(self._database_path)
@@ -1227,7 +1233,7 @@ class TaskDagPersistenceTests(unittest.IsolatedAsyncioTestCase):
             "PRAGMA foreign_key_list(task_dag_recovery_claims)"
         ).fetchall()
         connection.close()
-        self.assertEqual(version, (24,))
+        self.assertEqual(version, (25,))
         self.assertTrue(
             {
                 "task_dags",
@@ -1258,7 +1264,7 @@ class TaskDagPersistenceTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(claimed.node("a").parent_task_id, "migration-worker-a")
 
-    async def test_populated_schema_21_running_relay_and_recovery_claim_survive_schema_24(
+    async def test_populated_schema_21_running_relay_and_recovery_claim_survive_schema_25(
         self,
     ) -> None:
         dag = self._dag("populated-schema-21")
@@ -1403,7 +1409,7 @@ class TaskDagPersistenceTests(unittest.IsolatedAsyncioTestCase):
             "SELECT COUNT(*) FROM task_dag_recovery_claims WHERE claim_id = 'migration-claim'"
         ).fetchone()
         connection.close()
-        self.assertEqual(version, (24,))
+        self.assertEqual(version, (25,))
         self.assertEqual(relay_count, (1,))
         self.assertEqual(claim_count, (1,))
 

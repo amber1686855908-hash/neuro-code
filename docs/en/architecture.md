@@ -1728,13 +1728,14 @@ tool-role, synthetic, tool-call-bearing, media-bearing, preserved reasoning,
 and preserved backend-call structures are excluded; assistant visible prose is
 separable from and never carries its `reasoning_content`.
 
-Session schema 24 retains the schema-17 one-to-one insert-only READY relay per
+Session schema 25 retains the schema-17 one-to-one insert-only READY relay per
 writable lease, the durable Task DAG tables described below, the schema-20
 predecessor-result relay table, and the schema-21 Task DAG recovery-claim
 fence; schema 22 adds bounded DAG capacity and scoped Writable lease policy,
 and schema 23 adds per-node execution-owner identity; schema 24 adds the
-parallel-aware Leader decision projection. It also retains the durable Leader
-attempt/decision projections described after the DAG. Its
+parallel-aware Leader decision projection; schema 25 adds the bounded model
+planning attempt/proposal projections described below. It also retains the
+durable Leader attempt/decision projections described after the DAG. Its
 identity binds the parent/task/child, lease, worktree, baseline checkpoint,
 base commit, capability/grant fingerprints, and child-task digest. Source,
 content, and complete-record fingerprints are verified on load; inconsistent
@@ -1752,10 +1753,11 @@ tools, roots, sandbox, network, LSP, worktree, or checkpoint authority. The
 existing capability intersection and child-root instruction/skill discovery
 remain the sole authority owners. Durable compaction-summary reuse, live
 context sharing, unbounded parallel workers, Swarm/Ultracode orchestration, and automatic
-delegation remain absent. The bounded Task DAG and Leader slices are specified
-separately by [ADR 0134](adr/0134-durable-serialized-task-dag.md), [ADR 0135]
+delegation remain absent. The bounded Task DAG, Leader, and model-planning
+slices are specified separately by [ADR 0134](adr/0134-durable-serialized-task-dag.md), [ADR 0135]
 (adr/0135-bounded-serialized-leader-controller.md), and [ADR 0137]
-(adr/0137-parallel-aware-leader-bounded-wave-scheduling.md).
+(adr/0137-parallel-aware-leader-bounded-wave-scheduling.md), with model-generated
+planning defined by [ADR 0138](adr/0138-bounded-model-generated-dag-planning.md).
 See [ADR 0133](adr/0133-bounded-parent-context-relay.md) for the relay
 boundary.
 
@@ -1793,7 +1795,7 @@ Parallel nodes receive fresh Writable application services from a typed
 `asyncio.Lock` while giving each node independent binding, lease, worktree,
 checkpoint, child session, Parent Relay, and worker-scoped LSP state.
 
-Session schema 24 stores immutable DAG definitions and bounded node runtime
+Session schema 25 stores immutable DAG definitions and bounded node runtime
 projections in `task_dags` and `task_dag_nodes`, plus insert-only
 `task_dag_dependency_relays` and the separate `task_dag_recovery_claims`
 cross-process ownership fence. Definitions and relay publications are
@@ -1872,7 +1874,7 @@ transcript/reasoning/tool arguments/output, Relay payloads, workspace bytes,
 checkpoint bytes, Git diffs, secrets, or arbitrary paths. The current
 parallel-aware extension is specified by ADR 0137 below.
 
-The current Session Store schema 24 retains the schema-19 `leader_attempts` and
+The current Session Store schema 25 retains the schema-19 `leader_attempts` and
 `leader_decisions` projections. An attempt binds the exact DAG generation,
 definition/evidence/objective fingerprints, Leader session, controller owner,
 turn identity, and durable lifecycle. SQLite write transactions and CAS-like
@@ -1897,7 +1899,8 @@ for the existing Writable Subagent/DAG result, then constructs the next
 snapshot. It does not auto-execute a second node inside the one-step seam.
 Final synthesis is requested only after a terminal DAG snapshot and is kept
 in the dedicated Leader session rather than appended to the parent transcript.
-Model-generated DAG creation, replan, retry, dynamic/unbounded dataflow,
+Model-generated DAG creation is handled by the separate planning slice below;
+this historical Leader slice does not perform planning. Replan, retry, dynamic/unbounded dataflow,
 merge, rollback, UI/ACP exposure, Swarm, Ultracode, and automatic delegation
 remain outside this slice. Bounded parallel-aware Leader waves are implemented
 as the internal extension in [ADR 0137]
@@ -1924,8 +1927,9 @@ wave seam claims only the selected IDs, creates independent Writable services,
 and uses a structured `TaskGroup`. It never fills unused capacity with an
 unselected node. `max_parallel=1` remains compatible with the one-node path.
 
-Session schema 24 adds parent-session, selected-node, and selected-generation
-decision projections and migrates populated schema-23 rows. A durable wave
+Session schema 24 added parent-session, selected-node, and selected-generation
+decision projections and migrated populated schema-23 rows; current schema 25
+retains them. A durable wave
 decision can be reused after a crash only when each selected node is still at
 its recorded READY generation or has advanced durably to RUNNING/terminal;
 provider replay is never inferred. Partial claims, controller races, failure,
@@ -1933,6 +1937,67 @@ cancellation, skipped descendants, and indeterminate branches retain the
 existing Task DAG recovery semantics. The Leader still never owns Writable,
 Worktree, Checkpoint, Relay, LSP, capability, or graph mutation authority.
 See [ADR 0137](adr/0137-parallel-aware-leader-bounded-wave-scheduling.md).
+
+### Bounded model-generated DAG planning
+
+ADR 0138 adds one explicit internal planning boundary: a single objective from
+the actual parent `ConversationBinding` is converted by a dedicated zero-tool
+provider-backed Planner into one immutable, bounded Task DAG proposal. The
+Planner owns proposal data only. It cannot create or claim nodes, invoke
+Writable workers, create Worktrees or Checkpoints, run LSP/Bash, modify files,
+or change capabilities, roots, sandbox policy, providers, retries, merges, or
+the graph after publication. TaskDagApplicationService remains the canonical
+owner of node, edge, dependency, acyclic, parallelism, and immutable graph
+validation and publication; the existing parallel-aware Leader remains the
+owner of READY-wave selection, and Writable remains the worker authority.
+
+The Planner binding is a dedicated persisted one-step session with no local
+or provider-hosted tools, filesystem, Bash, terminal, network, MCP, LSP,
+Worktree, Checkpoint, worker, or background capability. Its input consists of
+the explicit objective plus a separate `PlanningContextEnvelope` derived from
+the actual parent runner session. Only bounded redacted genuine USER and
+visible ASSISTANT plain text may be selected. System/tool messages, synthetic
+items, reasoning, tool calls and results, media, arbitrary workspace bytes,
+and other authority-bearing structures are excluded. The envelope is
+order-preserving, byte-bounded, rendered deterministically, and fingerprinted;
+it is evidence only and is not a Parent Context Relay because no worker lease,
+Worktree, Checkpoint, or child identity exists yet.
+
+The provider response is strict JSON with only `nodes`, `max_parallel`, and
+bounded `reason`; each node has exactly `id`, `prompt`, and `depends_on`.
+Node declaration order is canonical, dependency IDs must follow the same
+declaration order, and the proposal fingerprint is derived from canonical
+sorted-key JSON without sorting away semantic graph differences. The parser
+retains the frozen Task DAG limits: at most 8 nodes, 16 edges, 4 dependencies
+per node, 8-KiB prompts, and `max_parallel` from 1 through 4. Unknown
+dependencies, self-dependencies, cycles, duplicate IDs, edge overflow, and
+other graph rules are still rejected by the canonical Task DAG service. Model
+text is data and contains no authority fields.
+
+Session schema 25 adds insert-only `orchestration_planning_attempts` and
+`orchestration_plan_proposals`. A planning attempt binds the caller's exact
+planning ID, actual parent session, objective/context fingerprints, dedicated
+planner session and turn, a preallocated intended DAG ID, provider lifecycle,
+proposal fingerprint, and published DAG identity. Its lifecycle is
+`CLAIMED -> PROVIDER_FENCED -> MODEL_COMMITTED -> PROPOSAL_PUBLISHED ->
+DAG_PUBLISHED -> COMPLETED`, with typed stale/indeterminate terminal
+classification. Exact owner/CAS checks fence concurrent controllers; a live
+or unproven owner is not stolen. Proposal records are immutable and an exact
+duplicate is idempotent, while a conflicting record or tampered canonical JSON
+fails closed.
+
+The provider replay rule follows the existing durable turn contract. An
+observable provider turn is never automatically replayed. A fresh process
+reuses committed model output, then the exact proposal and preallocated DAG
+identity; it never changes nodes, prompts, dependencies, or `max_parallel`,
+and an insert-only Task DAG publication cannot create a second graph. Crash
+acceptance uses spawned processes and covers output-committed, proposal-
+published, and DAG-inserted boundaries. Invalid observable JSON is recorded as
+stale and is not sent to the provider again. Replan, DAG revision, retry,
+node resurrection, recursive planning, automatic delegation, dynamic or
+unbounded dataflow, merge/copy-back, rollback, cleanup, public CLI/TUI/ACP
+orchestration, Swarm, Ultracode, and distributed scheduling remain outside
+this slice. See [ADR 0138](adr/0138-bounded-model-generated-dag-planning.md).
 
 ## Platform policy
 

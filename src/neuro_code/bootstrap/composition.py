@@ -41,6 +41,7 @@ from neuro_code.application.ports.model import (
     ModelCapabilitySet,
     ModelProvider,
 )
+from neuro_code.application.ports.model_planning import ModelPlanningStore
 from neuro_code.application.ports.parent_context_relay import (
     ParentContextRelayError,
     ParentContextRelayStore,
@@ -100,6 +101,9 @@ from neuro_code.application.tools.service import SessionToolOutputArtifactApplic
 from neuro_code.application.web_fetch.service import WebFetchService
 from neuro_code.application.web_search.service import WebSearchService
 from neuro_code.application.workflows.leader import LeaderApplicationService
+from neuro_code.application.workflows.model_planning import (
+    ModelDagPlanningApplicationService,
+)
 from neuro_code.application.workflows.plan_execution import (
     PlanExecutionController,
     PlanExecutionService,
@@ -1346,6 +1350,67 @@ class ApplicationComposition:
             await asyncio.shield(leader_binding.close())
             await asyncio.shield(self.store.delete_session(leader_session_id))
             raise
+
+    async def create_model_planning_service(
+        self,
+        *,
+        parent_binding: ConversationBinding,
+        timeout_seconds: float = 120.0,
+    ) -> ModelDagPlanningApplicationService:
+        """Create the bounded zero-tool model-generated DAG planner.
+
+        The planner owns only a typed proposal.  It receives a dedicated
+        persisted one-step binding; Task DAG creation and all later execution
+        remain behind their existing application owners.
+        """
+
+        if not isinstance(parent_binding, ConversationBinding):
+            raise ConfigurationError("model planning parent binding is required")
+        planner_config = replace(
+            self.config,
+            providers={
+                name: replace(profile, builtin_tools=())
+                for name, profile in self.config.providers.items()
+            },
+        )
+        provider_profile = planner_config.provider
+        planner_session_id = await self.store.create_session(
+            str(planner_config.cwd),
+            provider_profile.name,
+            provider_profile.model,
+            provider_profile.context_affinity,
+            planner_config.sandbox_profile,
+        )
+        try:
+            planner_binding = await self.create_binding(
+                config=planner_config,
+                resume_id=planner_session_id,
+                max_steps=1,
+                allowed_tool_names=(),
+                enable_background_tasks=False,
+            )
+        except BaseException:
+            await asyncio.shield(self.store.delete_session(planner_session_id))
+            raise
+        try:
+            dag_service = self.create_task_dag_service(
+                parent_binding=parent_binding,
+                timeout_seconds=timeout_seconds,
+            )
+            return ModelDagPlanningApplicationService(
+                cast(ModelPlanningStore, self.store),
+                dag_service,
+                parent_binding=parent_binding,
+                planner_binding=planner_binding,
+                session_store=self.store,
+                redaction_values=planner_config.redaction_values(),
+            )
+        except BaseException:
+            await asyncio.shield(planner_binding.close())
+            await asyncio.shield(self.store.delete_session(planner_session_id))
+            raise
+
+    create_planner_service = create_model_planning_service
 
     def create_subagent_scheduler(
         self,

@@ -6286,7 +6286,7 @@ extensions = [".py", ".txt"]
             assert leases[0].baseline_checkpoint_id is not None
             self.assertIsNotNone(await checkpoints.get(leases[0].baseline_checkpoint_id))
 
-    async def test_populated_schema_16_migrates_to_24_without_losing_worker_identity(self) -> None:
+    async def test_populated_schema_16_migrates_to_25_without_losing_worker_identity(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (
@@ -6322,7 +6322,7 @@ extensions = [".py", ".txt"]
                 "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'parent_context_relays'"
             ).fetchone()
             connection.close()
-            self.assertEqual(version, (24,))
+            self.assertEqual(version, (25,))
             self.assertEqual(table, (1,))
             self.assertEqual(
                 (await migrated.list_writable_subagent_leases(parent_session_id=parent_session_id))[
@@ -6337,7 +6337,7 @@ extensions = [".py", ".txt"]
             self.assertIsNotNone(await migrated.get_session(parent_session_id))
             self.assertIsNotNone(await migrated.get_session(result.child_session_id))
 
-    async def test_schema_17_to_24_keeps_populated_parent_relay(self) -> None:
+    async def test_schema_17_to_25_keeps_populated_parent_relay(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (
@@ -6381,7 +6381,7 @@ extensions = [".py", ".txt"]
                 "AND name IN ('task_dags', 'task_dag_nodes')"
             ).fetchone()
             connection.close()
-            self.assertEqual(version, (24,))
+            self.assertEqual(version, (25,))
             self.assertEqual(task_dag_tables, (2,))
 
     async def test_process_death_after_relay_publication_preserves_exact_worker_snapshot(
@@ -7240,7 +7240,7 @@ extensions = [".py", ".txt"]
             self.assertEqual(leases[0].error_kind, "RuntimeError")
             self.assertIsNotNone(await store.get_parent_context_relay_for_lease(leases[0].lease_id))
 
-    async def test_populated_schema_15_lease_migrates_through_schema_24_and_keeps_cas(self) -> None:
+    async def test_populated_schema_15_lease_migrates_through_schema_25_and_keeps_cas(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (
@@ -7273,7 +7273,7 @@ extensions = [".py", ".txt"]
                 connection.execute(
                     "SELECT version FROM schema_meta WHERE singleton = 1"
                 ).fetchone(),
-                (24,),
+                (25,),
             )
             foreign_keys = connection.execute(
                 "PRAGMA foreign_key_list(writable_subagent_leases)"
