@@ -1986,14 +1986,22 @@ or unproven owner is not stolen. Proposal records are immutable and an exact
 duplicate is idempotent, while a conflicting record or tampered canonical JSON
 fails closed.
 
+Every fresh `ApplicationComposition.create_model_planning_service()` creates a
+new persisted Planner session. The service `planning_session_id` identifies the
+current recovery controller, while the attempt's historical Planner session and
+turn remain immutable provenance; recovery under L2 therefore does not rewrite
+the L1/T1 identity recorded by the original controller.
+
 The provider replay rule follows the existing durable turn contract. An
 observable provider turn is never automatically replayed. A fresh process
 reuses committed model output, then the exact proposal and preallocated DAG
 identity; it never changes nodes, prompts, dependencies, or `max_parallel`,
-and an insert-only Task DAG publication cannot create a second graph. Crash
-acceptance uses spawned processes and covers output-committed, proposal-
-published, and DAG-inserted boundaries. Invalid observable JSON is recorded as
-stale and is not sent to the provider again. Replan, DAG revision, retry,
+and an insert-only Task DAG publication cannot create a second graph. Fresh
+composition crash acceptance uses spawned processes and covers output-committed,
+proposal-published, DAG-inserted, and provider-turn-evidence boundaries while
+preserving L1/T1 provenance under L2 recovery. An independent controller race
+also verifies that the losing process does not mutate the winner's provenance.
+Invalid observable JSON is recorded as stale and is not sent to the provider again. Replan, DAG revision, retry,
 node resurrection, recursive planning, automatic delegation, dynamic or
 unbounded dataflow, merge/copy-back, rollback, cleanup, public CLI/TUI/ACP
 orchestration, Swarm, Ultracode, and distributed scheduling remain outside

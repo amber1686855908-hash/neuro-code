@@ -88,6 +88,12 @@ Schema 25 增加两个专用 projection：
 - `orchestration_plan_proposals` 保存一个 insert-only 的精确 parsed proposal，并绑定 attempt、
   parent、intended DAG、objective/context fingerprint 和 canonical proposal JSON。
 
+`ApplicationComposition.create_model_planning_service()` 每次创建 fresh service 时都会新建并
+持久化 Planner session。Service 的 `planning_session_id` 是当前 recovery controller 的 identity，
+有意不同于 attempt 上保存的历史 `planner_session_id` 和 `planner_turn_id`。因此，L1 崩溃后 fresh
+controller 可以在 L2 下运行，而 committed attempt 的 L1/T1 provenance 不会仅因使用新 composition
+恢复而被改写。
+
 Lifecycle 为：
 
 ```text
@@ -112,12 +118,14 @@ publication 时使用同一个 ID。Proposal publication 是 insert-only：精�
 2. Model output 已提交后，recovery 解析并发布同一个 durable response，不 replay Provider。
 3. Proposal 已持久化后，recovery 使用同一 proposal 与 intended DAG ID，不改变任何 definition field。
 4. Task DAG 已插入后，insert-only exact identity 返回已有 graph；recovery 校验 definition/fingerprint
-   并完成 planning attempt，不生成第二个 graph。
+   并完成 planning attempt，不生成第二个 graph。如果 generic session turn 已在 Planner-specific
+   model commit 缺失时记录 request/output evidence，recovery 仍保持 fail-closed，不 replay Provider。
 
 Live 或未被证明死亡的 owner 不能被抢占。并发 controller 使用 durable owner/CAS check，因此同一个
 exact planning identity 不能产生重复 provider call、不同 proposal、不同 intended DAG ID 或两个
-Task DAG publication。Spawned-process acceptance 覆盖 committed output、proposal publication 和
-DAG insertion crash window。
+Task DAG publication。Fresh spawned composition 覆盖 committed output、proposal publication、DAG
+insertion 和 provider-turn-evidence crash window；独立进程 controller race 也证明 losing controller
+不会改写 winner 的 provenance。
 
 ### 明确的非目标
 
@@ -130,12 +138,16 @@ orchestration API 或 user-visible workflow editor。不增加 worker capability
 
 Focused tests 覆盖 strict parsing、unknown/malformed/duplicate 与 invalid graph、冻结 bounds、canonical
 fingerprint、zero-tool composition、实际 parent identity、有界 context projection 与 redaction、insert-only
-和 tamper 行为、exact intended DAG identity、并发 ownership、spawned crash recovery、provider no-replay
-以及 schema 24→25 保留性。
+和 tamper 行为、exact intended DAG identity、并发 ownership、fresh composition 在各 durable publication
+boundary 的 L1→L2 crash recovery、provider-turn evidence fail-closed recovery、provider no-replay 以及
+schema 24→25 保留性。
 
 Production-shaped acceptance 使用真实 `ApplicationComposition`、scripted Provider、真实 Planner、真实
 TaskDagApplicationService、真实 parallel-aware Leader 和真实 Writable worker。它验证 A -> B/C -> D graph、
 `max_parallel=2`、Planner 一次调用、Planner/Leader zero-tool、B/C overlap、D 顺序、不同 managed Worktree
-和 dirty parent checkout 不变。
+和 dirty parent checkout 不变。独立的 fresh OS-process acceptance 证明 L1 != L2、保留历史 L1/T1 provenance、
+复用精确 response/proposal/intended DAG，并在 output、proposal 与 DAG crash window 中保持 provider
+invocation 恰好一次。Provider-turn-evidence crash 按 explicit recovery required/`INDETERMINATE` 分类，
+绝不自动 retry。
 
 下一个独立切片是 Bounded DAG Revision / Replan，本实现不包含该能力。

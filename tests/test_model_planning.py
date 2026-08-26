@@ -40,6 +40,7 @@ from neuro_code.domain.conversation.messages import (
     Role,
     ToolCall,
 )
+from neuro_code.domain.execution import TurnRecoveryFactKind
 from neuro_code.domain.model_planning import (
     MAX_MODEL_PLANNING_RESPONSE_BYTES,
     MAX_PLANNING_CONTEXT_ITEM_BYTES,
@@ -1430,11 +1431,749 @@ async def test_spawn_crash_matrix_reuses_output_proposal_and_dag_without_replay(
             assert result.attempt.state is PlanningAttemptState.COMPLETED
 
 
+def _write_durable_json(path: Path, payload: dict[str, object]) -> None:
+    """Write one test-process fact before an intentional os._exit boundary."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    with temporary.open("w", encoding="utf-8") as stream:
+        json.dump(payload, stream, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(temporary, path)
+
+
+def _append_durable_json_line(path: Path, payload: dict[str, object]) -> None:
+    """Append one cross-process test fact with a completed file-system flush."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+        stream.write("\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
+def _read_durable_json_lines(path: Path) -> list[dict[str, object]]:
+    if not path.exists():
+        return []
+    return [
+        cast(dict[str, object], json.loads(line))
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+
+async def _record_real_planner_snapshot(
+    application: ApplicationComposition,
+    *,
+    marker_path: Path,
+    planning_id: str,
+    provider_call_log: Path,
+    stage: str,
+) -> None:
+    attempt = await application.store.get_model_planning_attempt(planning_id)
+    assert attempt is not None
+    proposal = await application.store.get_model_planning_proposal(planning_id)
+    dag = await application.store.get_task_dag(attempt.intended_dag_id)
+    turn_attempts = await application.store.load_turn_attempts(attempt.planner_session_id)
+    turn = next(
+        (candidate for candidate in turn_attempts if candidate.turn_id == attempt.planner_turn_id),
+        None,
+    )
+    payload: dict[str, object] = {
+        "stage": stage,
+        "planning_id": attempt.planning_id,
+        "parent_session_id": attempt.parent_session_id,
+        "planner_session_id": attempt.planner_session_id,
+        "planner_turn_id": attempt.planner_turn_id,
+        "intended_dag_id": attempt.intended_dag_id,
+        "state": attempt.state.value,
+        "model_response": attempt.model_response,
+        "proposal_id": proposal.proposal_id if proposal is not None else None,
+        "proposal_fingerprint": (proposal.proposal_fingerprint if proposal is not None else None),
+        "proposal_canonical_json": (
+            proposal.proposal.canonical_json if proposal is not None else None
+        ),
+        "dag_id": dag.dag_id if dag is not None else None,
+        "dag_definition_fingerprint": (dag.definition_fingerprint if dag is not None else None),
+        "provider_call_count": len(_read_durable_json_lines(provider_call_log)),
+        "turn_id": turn.turn_id if turn is not None else None,
+        "turn_last_stage": turn.last_stage.value if turn is not None else None,
+        "turn_request_started_count": turn.request_started_count if turn is not None else None,
+        "turn_output_started": turn.output_started if turn is not None else None,
+    }
+    _write_durable_json(marker_path, payload)
+
+
+def _production_planning_settings(repository: Path) -> ApplicationSettings:
+    return ApplicationSettings(
+        cwd=repository,
+        sandbox="off",
+        permission_mode=PermissionMode.BYPASS,
+        max_steps=8,
+    )
+
+
+def _production_planning_environment(root: Path, state_dir: Path) -> dict[str, str]:
+    return {
+        "HOME": str(root),
+        "NEURO_CODE_HOME": str(state_dir),
+        "FIXTURE_KEY": "fixture-key",
+    }
+
+
+def _spawn_real_planner_crash(
+    root_directory: str,
+    repository_directory: str,
+    state_directory: str,
+    planning_id: str,
+    objective: str,
+    marker: str,
+    provider_call_log: str,
+    stage: str,
+) -> None:
+    async def run() -> None:
+        root = Path(root_directory)
+        repository = Path(repository_directory)
+        state_dir = Path(state_directory)
+        marker_path = Path(marker)
+        call_log = Path(provider_call_log)
+        state = _ProductionPlanningState(provider_call_log=call_log)
+
+        def provider_factory(_config, _failover):
+            return cast(ModelProvider, _ProductionPlanningProvider(state))
+
+        application = None
+        parent_binding = None
+        planner = None
+        with patch.dict(
+            "os.environ",
+            _production_planning_environment(root, state_dir),
+            clear=False,
+        ):
+            try:
+                application = await ApplicationComposition.open(
+                    _production_planning_settings(repository),
+                    provider_factory=provider_factory,
+                )
+                parent_session_id = await application.store.create_session(
+                    str(repository),
+                    "fixture",
+                    "fixture-model",
+                    sandbox_profile=SandboxProfile.OFF,
+                )
+                parent_binding = await application.create_binding(
+                    resume_id=parent_session_id,
+                    capabilities=_parent_capability(repository),
+                )
+                planner = await application.create_model_planning_service(
+                    parent_binding=parent_binding,
+                )
+
+                if stage == "model-committed":
+                    original = application.store.mark_model_planning_model_committed
+
+                    async def crash_after_commit(planning_key: str, **kwargs: object):
+                        await original(planning_key, **kwargs)
+                        await _record_real_planner_snapshot(
+                            application,
+                            marker_path=marker_path,
+                            planning_id=planning_id,
+                            provider_call_log=call_log,
+                            stage=stage,
+                        )
+                        os._exit(73)
+
+                    with patch.object(
+                        application.store,
+                        "mark_model_planning_model_committed",
+                        new=crash_after_commit,
+                    ):
+                        await planner.run(RunModelDagPlanningRequest(planning_id, objective))
+                elif stage == "proposal-published":
+                    original = application.store.publish_model_planning_proposal
+
+                    async def crash_after_proposal(proposal, *, owner_id: str):
+                        await original(proposal, owner_id=owner_id)
+                        await _record_real_planner_snapshot(
+                            application,
+                            marker_path=marker_path,
+                            planning_id=planning_id,
+                            provider_call_log=call_log,
+                            stage=stage,
+                        )
+                        os._exit(74)
+
+                    with patch.object(
+                        application.store,
+                        "publish_model_planning_proposal",
+                        new=crash_after_proposal,
+                    ):
+                        await planner.run(RunModelDagPlanningRequest(planning_id, objective))
+                elif stage == "dag-inserted":
+                    original = application.store.insert_task_dag
+
+                    async def crash_after_dag(dag):
+                        inserted = await original(dag)
+                        del inserted
+                        await _record_real_planner_snapshot(
+                            application,
+                            marker_path=marker_path,
+                            planning_id=planning_id,
+                            provider_call_log=call_log,
+                            stage=stage,
+                        )
+                        os._exit(74)
+
+                    with patch.object(application.store, "insert_task_dag", new=crash_after_dag):
+                        await planner.run(RunModelDagPlanningRequest(planning_id, objective))
+                elif stage == "provider-turn-evidence":
+                    original = application.store.append_turn_recovery_fact
+
+                    async def crash_after_turn_evidence(
+                        session_id: str,
+                        turn_id: str,
+                        event,
+                        fact,
+                    ):
+                        await original(session_id, turn_id, event, fact)
+                        if fact.kind is TurnRecoveryFactKind.MODEL_OUTPUT_STARTED:
+                            await _record_real_planner_snapshot(
+                                application,
+                                marker_path=marker_path,
+                                planning_id=planning_id,
+                                provider_call_log=call_log,
+                                stage=stage,
+                            )
+                            os._exit(75)
+
+                    with patch.object(
+                        application.store,
+                        "append_turn_recovery_fact",
+                        new=crash_after_turn_evidence,
+                    ):
+                        await planner.run(RunModelDagPlanningRequest(planning_id, objective))
+                else:
+                    raise AssertionError(f"unknown production planner crash stage: {stage}")
+                raise AssertionError(f"production planner did not crash at stage: {stage}")
+            finally:
+                if planner is not None:
+                    await planner.close()
+                if parent_binding is not None:
+                    await parent_binding.close()
+                if application is not None:
+                    await application.close()
+
+    asyncio.run(run())
+
+
+def _spawn_real_planner_recovery(
+    root_directory: str,
+    repository_directory: str,
+    state_directory: str,
+    planning_id: str,
+    objective: str,
+    marker: str,
+    provider_call_log: str,
+    result_path: str,
+) -> None:
+    async def run() -> None:
+        root = Path(root_directory)
+        repository = Path(repository_directory)
+        state_dir = Path(state_directory)
+        marker_data = cast(
+            dict[str, object],
+            json.loads(await asyncio.to_thread(Path(marker).read_text, encoding="utf-8")),
+        )
+        call_log = Path(provider_call_log)
+        result_file = Path(result_path)
+        state = _ProductionPlanningState(provider_call_log=call_log)
+
+        def provider_factory(_config, _failover):
+            return cast(ModelProvider, _ProductionPlanningProvider(state))
+
+        payload: dict[str, object] = {
+            "planner_session_id": None,
+            "status": "error",
+            "provider_call_count_before": len(_read_durable_json_lines(call_log)),
+        }
+        application = None
+        parent_binding = None
+        planner = None
+        with patch.dict(
+            "os.environ",
+            _production_planning_environment(root, state_dir),
+            clear=False,
+        ):
+            try:
+                application = await ApplicationComposition.open(
+                    _production_planning_settings(repository),
+                    provider_factory=provider_factory,
+                )
+                parent_binding = await application.create_binding(
+                    resume_id=str(marker_data["parent_session_id"]),
+                    capabilities=_parent_capability(repository),
+                )
+                planner = await application.create_model_planning_service(
+                    parent_binding=parent_binding,
+                )
+                payload["planner_session_id"] = planner.planning_session_id
+                try:
+                    result = await planner.run(RunModelDagPlanningRequest(planning_id, objective))
+                except Exception as error:
+                    payload.update(
+                        {
+                            "status": "error",
+                            "error_type": type(error).__name__,
+                            "error_message": str(error),
+                        }
+                    )
+                else:
+                    payload.update(
+                        {
+                            "status": "completed",
+                            "planning_id": result.planning_id,
+                            "attempt_state": result.attempt.state.value,
+                            "historical_planner_session_id": result.attempt.planner_session_id,
+                            "historical_planner_turn_id": result.attempt.planner_turn_id,
+                            "intended_dag_id": result.attempt.intended_dag_id,
+                            "attempt_dag_id": result.attempt.dag_id,
+                            "model_response": result.attempt.model_response,
+                            "proposal_id": result.proposal.proposal_id,
+                            "proposal_fingerprint": result.proposal.proposal_fingerprint,
+                            "proposal_canonical_json": result.proposal.proposal.canonical_json,
+                            "dag_id": result.dag.dag_id,
+                            "dag_definition_fingerprint": result.dag.definition_fingerprint,
+                        }
+                    )
+            except Exception as error:
+                payload.update(
+                    {
+                        "status": "error",
+                        "error_type": type(error).__name__,
+                        "error_message": str(error),
+                    }
+                )
+            finally:
+                if planner is not None:
+                    await planner.close()
+                if parent_binding is not None:
+                    await parent_binding.close()
+                if application is not None:
+                    await application.close()
+        payload["provider_call_count_after"] = len(_read_durable_json_lines(call_log))
+        _write_durable_json(result_file, payload)
+
+    asyncio.run(run())
+
+
+def _spawn_real_planner_controller(
+    root_directory: str,
+    repository_directory: str,
+    state_directory: str,
+    parent_session_id: str,
+    planning_id: str,
+    objective: str,
+    provider_call_log: str,
+    start_barrier,
+    provider_started_event,
+    release_provider_event,
+    controller_finished_event,
+    result_path: str,
+) -> None:
+    async def run() -> None:
+        root = Path(root_directory)
+        repository = Path(repository_directory)
+        state_dir = Path(state_directory)
+        call_log = Path(provider_call_log)
+        result_file = Path(result_path)
+        state = _ProductionPlanningState(
+            provider_call_log=call_log,
+            provider_started_event=provider_started_event,
+            provider_release_event=release_provider_event,
+        )
+
+        def provider_factory(_config, _failover):
+            return cast(ModelProvider, _ProductionPlanningProvider(state))
+
+        payload: dict[str, object] = {"status": "error"}
+        application = None
+        parent_binding = None
+        planner = None
+        try:
+            with patch.dict(
+                "os.environ",
+                _production_planning_environment(root, state_dir),
+                clear=False,
+            ):
+                application = await ApplicationComposition.open(
+                    _production_planning_settings(repository),
+                    provider_factory=provider_factory,
+                )
+                parent_binding = await application.create_binding(
+                    resume_id=parent_session_id,
+                    capabilities=_parent_capability(repository),
+                )
+                planner = await application.create_model_planning_service(
+                    parent_binding=parent_binding,
+                )
+                payload["planner_session_id"] = planner.planning_session_id
+                await asyncio.to_thread(start_barrier.wait, 90)
+                try:
+                    result = await planner.run(RunModelDagPlanningRequest(planning_id, objective))
+                except Exception as error:
+                    payload.update(
+                        {
+                            "status": "error",
+                            "error_type": type(error).__name__,
+                            "error_message": str(error),
+                        }
+                    )
+                else:
+                    payload.update(
+                        {
+                            "status": "completed",
+                            "attempt_state": result.attempt.state.value,
+                            "historical_planner_session_id": result.attempt.planner_session_id,
+                            "historical_planner_turn_id": result.attempt.planner_turn_id,
+                            "intended_dag_id": result.attempt.intended_dag_id,
+                            "proposal_fingerprint": result.proposal.proposal_fingerprint,
+                            "dag_id": result.dag.dag_id,
+                        }
+                    )
+        except Exception as error:
+            payload.update(
+                {
+                    "status": "error",
+                    "error_type": type(error).__name__,
+                    "error_message": str(error),
+                }
+            )
+        finally:
+            if planner is not None:
+                await planner.close()
+            if parent_binding is not None:
+                await parent_binding.close()
+            if application is not None:
+                await application.close()
+        payload["provider_call_count"] = len(_read_durable_json_lines(call_log))
+        _write_durable_json(result_file, payload)
+        controller_finished_event.set()
+
+    asyncio.run(run())
+
+
+def _assert_planning_publication_counts(
+    database: Path,
+    *,
+    expected_proposal_count: int,
+    expected_dag_count: int,
+) -> None:
+    with sqlite3.connect(database) as connection:
+        attempt_count = connection.execute(
+            "SELECT COUNT(*) FROM orchestration_planning_attempts"
+        ).fetchone()
+        proposal_count = connection.execute(
+            "SELECT COUNT(*) FROM orchestration_plan_proposals"
+        ).fetchone()
+        dag_count = connection.execute("SELECT COUNT(*) FROM task_dags").fetchone()
+    assert attempt_count == (1,)
+    assert proposal_count == (expected_proposal_count,)
+    assert dag_count == (expected_dag_count,)
+
+
+@pytest.mark.parametrize(
+    ("stage", "exit_code"),
+    [("model-committed", 73), ("proposal-published", 74), ("dag-inserted", 74)],
+)
+@pytest.mark.asyncio
+async def test_fresh_composition_restart_reuses_exact_planning_identity_without_replay(
+    stage: str,
+    exit_code: int,
+) -> None:
+    context = mp.get_context("spawn")
+    with tempfile.TemporaryDirectory(prefix=f"neuro-planning-fresh-{stage}-") as directory:
+        root = Path(directory)
+        repository = _make_repository(root)
+        state_dir = root / "state"
+        _write_fixture_config(state_dir)
+        planning_id = f"fresh-{stage}"
+        objective = "decompose this objective"
+        marker = root / "planner-a.json"
+        result_file = root / "planner-b.json"
+        call_log = root / "planner-calls.jsonl"
+        database = state_dir / "sessions.db"
+
+        process_a = context.Process(
+            target=_spawn_real_planner_crash,
+            args=(
+                str(root),
+                str(repository),
+                str(state_dir),
+                planning_id,
+                objective,
+                str(marker),
+                str(call_log),
+                stage,
+            ),
+        )
+        process_a.start()
+        await asyncio.to_thread(process_a.join, 90)
+        assert process_a.exitcode == exit_code
+        process_a.close()
+        snapshot = cast(dict[str, object], json.loads(marker.read_text(encoding="utf-8")))
+        call_records = _read_durable_json_lines(call_log)
+        assert snapshot["state"] == (
+            PlanningAttemptState.MODEL_COMMITTED.value
+            if stage == "model-committed"
+            else PlanningAttemptState.PROPOSAL_PUBLISHED.value
+        )
+        assert snapshot["planner_session_id"]
+        assert snapshot["planner_turn_id"]
+        assert snapshot["provider_call_count"] == 1
+        assert len(call_records) == 1
+        assert snapshot["model_response"] == call_records[0]["response"]
+
+        process_b = context.Process(
+            target=_spawn_real_planner_recovery,
+            args=(
+                str(root),
+                str(repository),
+                str(state_dir),
+                planning_id,
+                objective,
+                str(marker),
+                str(call_log),
+                str(result_file),
+            ),
+        )
+        process_b.start()
+        await asyncio.to_thread(process_b.join, 90)
+        assert process_b.exitcode == 0
+        process_b.close()
+        recovered = cast(dict[str, object], json.loads(result_file.read_text(encoding="utf-8")))
+        assert recovered["status"] == "completed"
+        assert recovered["planner_session_id"] != snapshot["planner_session_id"]
+        assert recovered["historical_planner_session_id"] == snapshot["planner_session_id"]
+        assert recovered["historical_planner_turn_id"] == snapshot["planner_turn_id"]
+        assert recovered["intended_dag_id"] == snapshot["intended_dag_id"]
+        assert recovered["attempt_dag_id"] == snapshot["intended_dag_id"]
+        assert recovered["model_response"] == snapshot["model_response"]
+        assert recovered["attempt_state"] == PlanningAttemptState.COMPLETED.value
+        assert recovered["provider_call_count_before"] == 1
+        assert recovered["provider_call_count_after"] == 1
+        assert len(_read_durable_json_lines(call_log)) == 1
+        assert (
+            recovered["proposal_canonical_json"]
+            == ModelDagProposal.parse(str(snapshot["model_response"])).canonical_json
+        )
+        assert (
+            recovered["proposal_fingerprint"]
+            == ModelDagProposal.parse(str(snapshot["model_response"])).fingerprint
+        )
+        if stage != "model-committed":
+            assert recovered["proposal_id"] == snapshot["proposal_id"]
+            assert recovered["proposal_fingerprint"] == snapshot["proposal_fingerprint"]
+            assert recovered["proposal_canonical_json"] == snapshot["proposal_canonical_json"]
+        if stage == "dag-inserted":
+            assert recovered["dag_id"] == snapshot["dag_id"]
+            assert recovered["dag_definition_fingerprint"] == snapshot["dag_definition_fingerprint"]
+        _assert_planning_publication_counts(
+            database,
+            expected_proposal_count=1,
+            expected_dag_count=1,
+        )
+
+
+@pytest.mark.asyncio
+async def test_fresh_composition_provider_turn_evidence_fails_closed_without_replay() -> None:
+    context = mp.get_context("spawn")
+    with tempfile.TemporaryDirectory(prefix="neuro-planning-provider-evidence-") as directory:
+        root = Path(directory)
+        repository = _make_repository(root)
+        state_dir = root / "state"
+        _write_fixture_config(state_dir)
+        planning_id = "fresh-provider-turn-evidence"
+        objective = "decompose this objective"
+        marker = root / "planner-a.json"
+        result_file = root / "planner-b.json"
+        call_log = root / "planner-calls.jsonl"
+        database = state_dir / "sessions.db"
+
+        process_a = context.Process(
+            target=_spawn_real_planner_crash,
+            args=(
+                str(root),
+                str(repository),
+                str(state_dir),
+                planning_id,
+                objective,
+                str(marker),
+                str(call_log),
+                "provider-turn-evidence",
+            ),
+        )
+        process_a.start()
+        await asyncio.to_thread(process_a.join, 90)
+        assert process_a.exitcode == 75
+        process_a.close()
+        snapshot = cast(dict[str, object], json.loads(marker.read_text(encoding="utf-8")))
+        assert snapshot["state"] == PlanningAttemptState.PROVIDER_FENCED.value
+        assert snapshot["model_response"] is None
+        assert snapshot["turn_id"] == snapshot["planner_turn_id"]
+        assert snapshot["turn_last_stage"] == "model_output_started"
+        assert snapshot["turn_request_started_count"] == 1
+        assert snapshot["turn_output_started"] is True
+        assert snapshot["provider_call_count"] == 1
+
+        process_b = context.Process(
+            target=_spawn_real_planner_recovery,
+            args=(
+                str(root),
+                str(repository),
+                str(state_dir),
+                planning_id,
+                objective,
+                str(marker),
+                str(call_log),
+                str(result_file),
+            ),
+        )
+        process_b.start()
+        await asyncio.to_thread(process_b.join, 90)
+        assert process_b.exitcode == 0
+        process_b.close()
+        recovered = cast(dict[str, object], json.loads(result_file.read_text(encoding="utf-8")))
+        assert recovered["planner_session_id"] != snapshot["planner_session_id"]
+        assert recovered["status"] == "error"
+        assert recovered["error_type"] == "ConfigurationError"
+        assert "observable provider-turn evidence" in str(recovered["error_message"])
+        assert recovered["provider_call_count_before"] == 1
+        assert recovered["provider_call_count_after"] == 1
+        assert len(_read_durable_json_lines(call_log)) == 1
+
+        observer = SqliteSessionStore(database)
+        await observer.initialize()
+        attempt = await observer.get_model_planning_attempt(planning_id)
+        assert attempt is not None
+        assert attempt.state is PlanningAttemptState.INDETERMINATE
+        assert attempt.planner_session_id == snapshot["planner_session_id"]
+        assert attempt.planner_turn_id == snapshot["planner_turn_id"]
+        turns = await observer.load_turn_attempts(str(snapshot["planner_session_id"]))
+        turn = next(item for item in turns if item.turn_id == snapshot["planner_turn_id"])
+        assert turn.output_started is True
+        assert turn.last_stage.value == "model_output_started"
+        _assert_planning_publication_counts(
+            database,
+            expected_proposal_count=0,
+            expected_dag_count=0,
+        )
+
+
+@pytest.mark.asyncio
+async def test_fresh_composition_controllers_race_without_mutating_winner() -> None:
+    context = mp.get_context("spawn")
+    with tempfile.TemporaryDirectory(prefix="neuro-planning-controller-race-") as directory:
+        root = Path(directory)
+        repository = _make_repository(root)
+        state_dir = root / "state"
+        _write_fixture_config(state_dir)
+        planning_id = "fresh-controller-race"
+        objective = "decompose this objective"
+        call_log = root / "planner-calls.jsonl"
+        database = state_dir / "sessions.db"
+
+        seed = SqliteSessionStore(database)
+        await seed.initialize()
+        parent_session_id = await seed.create_session(
+            str(repository),
+            "fixture",
+            "fixture-model",
+            sandbox_profile=SandboxProfile.OFF,
+        )
+        start_barrier = context.Barrier(3)
+        provider_started_event = context.Event()
+        release_provider_event = context.Event()
+        controller_finished_event = context.Event()
+        processes = [
+            context.Process(
+                target=_spawn_real_planner_controller,
+                args=(
+                    str(root),
+                    str(repository),
+                    str(state_dir),
+                    parent_session_id,
+                    planning_id,
+                    objective,
+                    str(call_log),
+                    start_barrier,
+                    provider_started_event,
+                    release_provider_event,
+                    controller_finished_event,
+                    str(root / f"controller-{index}.json"),
+                ),
+            )
+            for index in (1, 2)
+        ]
+        for process in processes:
+            process.start()
+        try:
+            await asyncio.to_thread(start_barrier.wait, 90)
+            assert await asyncio.to_thread(provider_started_event.wait, 90)
+            assert await asyncio.to_thread(controller_finished_event.wait, 90)
+            release_provider_event.set()
+            for process in processes:
+                await asyncio.to_thread(process.join, 90)
+                assert process.exitcode == 0
+            outcomes = [
+                cast(
+                    dict[str, object],
+                    json.loads((root / f"controller-{index}.json").read_text(encoding="utf-8")),
+                )
+                for index in (1, 2)
+            ]
+        finally:
+            release_provider_event.set()
+            for process in processes:
+                if process.is_alive():
+                    process.terminate()
+                    await asyncio.to_thread(process.join, 15)
+                process.close()
+
+        assert sum(outcome["status"] == "completed" for outcome in outcomes) == 1
+        winner = next(outcome for outcome in outcomes if outcome["status"] == "completed")
+        loser = next(outcome for outcome in outcomes if outcome["status"] == "error")
+        assert winner["attempt_state"] == PlanningAttemptState.COMPLETED.value
+        assert winner["historical_planner_session_id"] == winner["planner_session_id"]
+        assert winner["intended_dag_id"]
+        assert winner["dag_id"] == winner["intended_dag_id"]
+        assert loser["error_type"] == "ConfigurationError"
+        assert loser["planner_session_id"] != winner["planner_session_id"]
+        assert len(_read_durable_json_lines(call_log)) == 1
+        assert all(outcome["provider_call_count"] <= 1 for outcome in outcomes)
+        assert sum(outcome["provider_call_count"] == 1 for outcome in outcomes) >= 1
+        _assert_planning_publication_counts(
+            database,
+            expected_proposal_count=1,
+            expected_dag_count=1,
+        )
+
+
 class _ProductionPlanningState:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        provider_call_log: Path | None = None,
+        provider_started_event=None,
+        provider_release_event=None,
+    ) -> None:
         self.planner_calls = 0
         self.leader_calls = 0
         self.zero_tool_calls = 0
+        self.provider_call_log = provider_call_log
+        self.provider_started_event = provider_started_event
+        self.provider_release_event = provider_release_event
         self.worker_calls: list[str] = []
         self.started: list[str] = []
         self.timeline: list[str] = []
@@ -1468,24 +2207,33 @@ class _ProductionPlanningProvider:
                 raise AssertionError("Planner received tools")
             self._state.planner_calls += 1
             self._state.zero_tool_calls += 1
+            response = json.dumps(
+                {
+                    "nodes": [
+                        {"id": "a", "prompt": "planning-node-a", "depends_on": []},
+                        {"id": "b", "prompt": "planning-node-b", "depends_on": ["a"]},
+                        {"id": "c", "prompt": "planning-node-c", "depends_on": ["a"]},
+                        {
+                            "id": "d",
+                            "prompt": "planning-node-d",
+                            "depends_on": ["b", "c"],
+                        },
+                    ],
+                    "max_parallel": 2,
+                    "reason": "bounded production decomposition",
+                }
+            )
+            if self._state.provider_call_log is not None:
+                _append_durable_json_line(
+                    self._state.provider_call_log,
+                    {"response": response},
+                )
+            if self._state.provider_started_event is not None:
+                self._state.provider_started_event.set()
+                await asyncio.to_thread(self._state.provider_release_event.wait, 90)
             yield ModelCompleted(
                 "stop",
-                response_text=json.dumps(
-                    {
-                        "nodes": [
-                            {"id": "a", "prompt": "planning-node-a", "depends_on": []},
-                            {"id": "b", "prompt": "planning-node-b", "depends_on": ["a"]},
-                            {"id": "c", "prompt": "planning-node-c", "depends_on": ["a"]},
-                            {
-                                "id": "d",
-                                "prompt": "planning-node-d",
-                                "depends_on": ["b", "c"],
-                            },
-                        ],
-                        "max_parallel": 2,
-                        "reason": "bounded production decomposition",
-                    }
-                ),
+                response_text=response,
             )
             return
         if "Leader decision authority" in contents:

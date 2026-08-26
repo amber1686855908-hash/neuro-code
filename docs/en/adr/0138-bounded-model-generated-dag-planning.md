@@ -105,6 +105,14 @@ Schema 25 adds two dedicated projections:
   bound to the attempt, parent, intended DAG, objective/context fingerprints,
   and canonical proposal JSON.
 
+`ApplicationComposition.create_model_planning_service()` creates a new persisted
+Planner session for every fresh service. The service's `planning_session_id` is
+the identity of the current recovery controller; it is intentionally distinct
+from the historical `planner_session_id` and `planner_turn_id` stored on the
+attempt. A fresh controller may therefore use L2 after a crash under L1 while
+the committed attempt provenance remains L1/T1 and is never rewritten merely
+because recovery uses a new composition.
+
 The lifecycle is:
 
 ```text
@@ -135,13 +143,18 @@ The accepted recovery boundaries are:
    DAG ID without changing any definition field.
 4. After Task DAG insertion, insert-only exact identity returns the existing
    graph; recovery verifies its definition/fingerprint and completes the
-   planning attempt without a second graph.
+   planning attempt without a second graph. If a generic session turn has
+   already recorded request/output evidence while the Planner-specific model
+   commit is missing, recovery remains fail-closed and does not replay the
+   provider.
 
 A live or unproven owner cannot be stolen. Concurrent controllers use durable
-   owner/CAS checks, so one exact planning identity cannot produce duplicate
-   provider calls, divergent proposals, different intended DAG IDs, or two
-   Task DAG publications. Spawned-process acceptance covers the committed
-   output, proposal publication, and DAG insertion crash windows.
+owner/CAS checks, so one exact planning identity cannot produce duplicate
+provider calls, divergent proposals, different intended DAG IDs, or two
+Task DAG publications. Fresh spawned compositions cover the committed
+output, proposal publication, DAG insertion, and provider-turn-evidence
+crash windows; an independent-process controller race also proves the losing
+controller does not mutate the winner's provenance.
 
 ### Explicit non-goals
 
@@ -157,14 +170,21 @@ add worker capabilities or a second generic runtime.
 Focused tests cover strict parsing, unknown/malformed/duplicate and invalid
 graphs, frozen bounds, canonical fingerprints, zero-tool composition, actual
 parent identity, bounded context projection and redaction, insert-only and
-tamper behavior, exact intended DAG identity, concurrent ownership, spawned
-crash recovery, provider no-replay, and schema 24-to-25 preservation.
+tamper behavior, exact intended DAG identity, concurrent ownership, fresh
+composition L1-to-L2 crash recovery at each durable publication boundary,
+provider-turn evidence fail-closed recovery, provider no-replay, and schema
+24-to-25 preservation.
 
 A production-shaped acceptance uses a real `ApplicationComposition`, scripted
 provider, real planner, real TaskDagApplicationService, real parallel-aware
 Leader, and real Writable workers. It verifies the A -> B/C -> D graph,
 `max_parallel=2`, one planner call, zero Planner/Leader tools, B/C overlap, D
 ordering, distinct managed Worktrees, and an unchanged dirty parent checkout.
+Separate fresh OS-process acceptance proves L1 != L2, preserves historical
+L1/T1 provenance, reuses the exact response/proposal/intended DAG, and keeps
+provider invocation count at one through output, proposal, and DAG crash
+windows. A provider-turn-evidence crash is classified as explicit recovery
+required/`INDETERMINATE`, never as an automatic retry.
 
 The next independent slice is Bounded DAG Revision / Replan. It is not part
 of this implementation.

@@ -1853,10 +1853,16 @@ COMPLETED`，并有 typed stale/indeterminate terminal classification。精确 o
 controller；live 或未证明死亡的 owner 不会被抢占。Proposal record 不可变，精确重复可幂等；冲突记录或
 被篡改的 canonical JSON fail closed。
 
+每次 fresh `ApplicationComposition.create_model_planning_service()` 都会新建并持久化 Planner session。
+Service 的 `planning_session_id` 标识当前 recovery controller，而 attempt 上的历史 Planner session/turn
+保持为不可变 provenance；因此在 L2 下 recovery 不会改写原 controller 记录的 L1/T1 identity。
+
 Provider replay 规则沿用既有 durable turn contract：一旦 Provider turn 可观察，就绝不自动 replay。新进程
 复用已提交的 model output，再复用精确 proposal 和预分配 DAG identity；不会改变 node、prompt、dependency
-或 `max_parallel`，insert-only Task DAG publication 也不会生成第二个 graph。Crash acceptance 使用 spawned
-process，覆盖 output committed、proposal published 和 DAG inserted 边界。可观察到的 invalid JSON 会记录为
-stale，不会再次发送给 Provider。Replan、DAG revision、retry、node resurrection、recursive planning、自动
+或 `max_parallel`，insert-only Task DAG publication 也不会生成第二个 graph。Fresh composition crash
+acceptance 使用 spawned process，覆盖 output committed、proposal published、DAG inserted 和
+provider-turn-evidence boundary，并在 L2 recovery 下保留 L1/T1 provenance。独立 controller race 还验证
+losing process 不会改写 winner 的 provenance。可观察到的 invalid JSON 会记录为 stale，不会再次发送给 Provider。
+Replan、DAG revision、retry、node resurrection、recursive planning、自动
 委派、dynamic/无界 dataflow、merge/copy-back、rollback、cleanup、public CLI/TUI/ACP orchestration、Swarm、
 Ultracode 和 distributed scheduling 仍不属于本切片。详见 [ADR 0138](adr/0138-bounded-model-generated-dag-planning.md)。
