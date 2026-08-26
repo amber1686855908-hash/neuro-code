@@ -1075,6 +1075,7 @@ def test_replan_domain_attempt_and_proposal_invariants_are_enforced() -> None:
         ({"source_generation": -1}, "source generation"),
         ({"source_state": TaskDagState.COMPLETED}, "source state"),
         ({"revision_depth": 0}, "depth"),
+        ({"revision_depth": True}, "depth is invalid"),
         ({"evidence_fingerprint": "b" * 64}, "evidence identity"),
         ({"state": cast(Any, "claimed")}, "state must be canonical"),
         ({"lease_expires_at": datetime.now(UTC).replace(tzinfo=None)}, "lease expiry"),
@@ -1462,6 +1463,8 @@ async def test_replan_application_guards_fail_closed_at_private_boundaries() -> 
     with tempfile.TemporaryDirectory() as directory:
         store, parent_id, planner_id, source = await _store_and_failed_source(directory)
         service, _runner = await _service(store, parent_id, planner_id)
+        assert service.replan_session_id == planner_id
+        assert service.owner_id
         evidence = service._build_evidence(source)
         valid_attempt = _valid_domain_attempt(evidence=evidence)
         now = datetime.now(UTC)
@@ -1550,6 +1553,15 @@ async def test_replan_application_guards_fail_closed_at_private_boundaries() -> 
             pytest.raises(ConfigurationError, match="proposal is missing"),
         ):
             await service._publish_from_proposal(valid_attempt, evidence)
+
+        async def no_attempt(_revision_id: str) -> None:
+            return None
+
+        with (
+            patch.object(store, "get_task_dag_replan_attempt", new=no_attempt),
+            pytest.raises(ConfigurationError, match="attempt disappeared"),
+        ):
+            await service._require_attempt("missing-attempt")
 
         with pytest.raises(ConfigurationError, match="owns this attempt"):
             await service._guard_existing_attempt(valid_attempt, now)
@@ -1674,6 +1686,69 @@ async def test_replan_application_guards_fail_closed_at_private_boundaries() -> 
             service._prompt(
                 cast(Any, SimpleNamespace(render=lambda: "x" * MAX_DAG_REPLAN_PROMPT_BYTES))
             )
+
+        with pytest.raises(ConfigurationError, match="successor identity"):
+            await service._publish_from_proposal(
+                replace(
+                    result.attempt,
+                    state=DagReplanAttemptState.PROPOSAL_PUBLISHED,
+                    successor_dag_id="different-successor",
+                ),
+                result.evidence,
+                proposal_record=result.proposal,
+            )
+
+        class RejectingDagService:
+            async def create_task_dag(self, request: CreateTaskDagRequest) -> TaskDag:
+                del request
+                raise ValueError("fixture canonical rejection")
+
+        service._dag_service = cast(Any, RejectingDagService())
+        with pytest.raises(ConfigurationError, match="canonical Task DAG validation"):
+            await service._publish_from_proposal(
+                result.attempt,
+                result.evidence,
+                proposal_record=result.proposal,
+            )
+
+        class ExistingDagService:
+            async def create_task_dag(self, request: CreateTaskDagRequest) -> TaskDag:
+                del request
+                return result.successor_dag
+
+        service._dag_service = cast(Any, ExistingDagService())
+
+        async def fail_successor_publication(*args: Any, **kwargs: Any) -> Any:
+            del args, kwargs
+            raise TaskDagReplanStoreError("fixture successor publication failure")
+
+        with (
+            patch.object(
+                store,
+                "mark_task_dag_replan_successor_published",
+                new=fail_successor_publication,
+            ),
+            pytest.raises(ConfigurationError, match="durably finalized"),
+        ):
+            await service._publish_from_proposal(
+                replace(result.attempt, state=DagReplanAttemptState.PROPOSAL_PUBLISHED),
+                result.evidence,
+                proposal_record=result.proposal,
+            )
+
+        async def mismatched_claim(attempt: DagReplanAttempt, now: datetime) -> Any:
+            del now
+            return SimpleNamespace(
+                attempt=replace(attempt, planner_session_id="other-planner"),
+                acquired=True,
+            )
+
+        service._dag_service = _DagService(store, parent_id)
+        with (
+            patch.object(service, "_claim", new=mismatched_claim),
+            pytest.raises(ConfigurationError, match="model session"),
+        ):
+            await service.run(RunTaskDagReplanRequest("session-mismatch", source.dag_id))
 
 
 @pytest.mark.asyncio
