@@ -29,6 +29,8 @@ The source DAG is never mutated.  The replan produces a new `TaskDag` with a
 new DAG identity; the canonical Task DAG service remains the only graph
 validation and publication owner.  The parent identity is taken from the
 actual parent `ConversationBinding`, not from request fields or model text.
+This slice exposes the replan only through the explicit internal application
+service; no failure transition, CLI, TUI, or ACP path invokes it implicitly.
 
 Initial Planning and DAG Replan are separate capabilities.  The source DAG
 and successor DAG are separate immutable publications.  Replan evidence is

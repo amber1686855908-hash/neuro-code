@@ -26,6 +26,8 @@ Replan 需要独立的 durable identity、evidence 与 publication boundary。
 Source DAG 永不修改。Replan 产生一个新 DAG identity 的 `TaskDag`；规范 Task DAG service 仍是唯一的
 graph validation 与 publication owner。Parent identity 取自真实 parent `ConversationBinding`，不取自
 request 字段或 model text。
+本切片只通过显式的内部 application service 暴露 replan；没有 failure transition、CLI、TUI 或 ACP
+路径会隐式调用它。
 
 Initial Planning 与 DAG Replan 是两个独立 capability。Source DAG 与 successor DAG 是两个独立的不可变
 publication。Replan evidence 不是 predecessor-result relay，Replan Planner 也不是 Leader；successor 的
