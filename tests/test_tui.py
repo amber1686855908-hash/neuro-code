@@ -120,6 +120,7 @@ from neuro_code.tui import (
     AssistantMarkdown,
     AssistantMessage,
     BackgroundWakeSettingsScreen,
+    CollapsingPulseAnimation,
     ConversationMessage,
     LanguageSettingsScreen,
     NetworkProxySettingsScreen,
@@ -1218,6 +1219,86 @@ class SubagentRelationshipLifecycleTuiService:
             action=request.action,
             forked_session_id=("forked-session" if request.action.value == "fork" else None),
         )
+
+
+class CollapsingPulseAnimationTests(unittest.TestCase):
+    def test_forward_cycle_holds_collapses_and_reverses_at_right_boundary(self) -> None:
+        animation = CollapsingPulseAnimation()
+
+        for expected_position in range(1, animation.width):
+            animation.advance()
+            expected_phase = "edge-hold" if expected_position == animation.width - 1 else "moving"
+            self.assertEqual(animation.peak_position, expected_position)
+            self.assertEqual(animation.phase, expected_phase)
+            self.assertEqual(animation.merged_trail_count, 0)
+
+        animation.advance()
+        self.assertEqual(animation.phase, "collapsing")
+        self.assertEqual(animation.merged_trail_count, 1)
+
+        animation.advance()
+        self.assertEqual(animation.phase, "collapsing")
+        self.assertEqual(animation.merged_trail_count, 2)
+
+        animation.advance()
+        self.assertEqual(animation.phase, "merged-hold")
+        self.assertEqual(animation.merged_trail_count, 3)
+        self.assertEqual(animation.direction, 1)
+        self.assertEqual(animation.peak_position, animation.width - 1)
+
+        animation.advance()
+        self.assertEqual(animation.phase, "moving")
+        self.assertEqual(animation.direction, -1)
+        self.assertEqual(animation.peak_position, animation.width - 2)
+        self.assertEqual(animation.merged_trail_count, 0)
+
+        animation.advance()
+        self.assertEqual(animation.phase, "moving")
+        self.assertEqual(animation.direction, -1)
+        self.assertEqual(animation.peak_position, animation.width - 3)
+
+    def test_reverse_cycle_reaches_left_boundary_with_symmetric_phases(self) -> None:
+        animation = CollapsingPulseAnimation()
+        animation.peak_position = animation.width - 1
+        animation.direction = -1
+
+        for expected_position in reversed(range(animation.width - 1)):
+            animation.advance()
+            expected_phase = "edge-hold" if expected_position == 0 else "moving"
+            self.assertEqual(animation.peak_position, expected_position)
+            self.assertEqual(animation.phase, expected_phase)
+            self.assertEqual(animation.merged_trail_count, 0)
+
+        animation.advance()
+        self.assertEqual(animation.phase, "collapsing")
+        self.assertEqual(animation.merged_trail_count, 1)
+
+        animation.advance()
+        self.assertEqual(animation.phase, "collapsing")
+        self.assertEqual(animation.merged_trail_count, 2)
+
+        animation.advance()
+        self.assertEqual(animation.phase, "merged-hold")
+        self.assertEqual(animation.merged_trail_count, 3)
+        self.assertEqual(animation.direction, -1)
+        self.assertEqual(animation.peak_position, 0)
+
+        animation.advance()
+        self.assertEqual(animation.phase, "moving")
+        self.assertEqual(animation.direction, 1)
+        self.assertEqual(animation.peak_position, 1)
+        self.assertEqual(animation.merged_trail_count, 0)
+
+    def test_levels_render_forward_and_reverse_trails(self) -> None:
+        forward = CollapsingPulseAnimation(peak_position=3, direction=1)
+        self.assertEqual(forward.levels(), (1, 3, 5, 7, 0, 0, 0))
+        forward.merged_trail_count = 1
+        self.assertEqual(forward.levels(), (0, 1, 3, 7, 0, 0, 0))
+
+        reverse = CollapsingPulseAnimation(peak_position=3, direction=-1)
+        self.assertEqual(reverse.levels(), (0, 0, 0, 7, 5, 3, 1))
+        reverse.merged_trail_count = 1
+        self.assertEqual(reverse.levels(), (0, 0, 0, 7, 3, 1, 0))
 
 
 def background_snapshot(
