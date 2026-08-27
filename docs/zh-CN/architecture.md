@@ -1672,13 +1672,14 @@ Writable workflow 现在只从实际 parent `ConversationBinding` 所绑定 sess
 保留 reasoning 与保留 backend-call 的结构都会排除；assistant 可见正文可与
 `reasoning_content` 明确分离，后者绝不进入 Relay。
 
-Session schema 26 保留 schema 17 的每个 writable lease 一条一对一、insert-only READY Relay，
+Session schema 27 保留 schema 17 的每个 writable lease 一条一对一、insert-only READY Relay，
 以及下述持久化 Task DAG 表、schema 20 的 predecessor-result Relay 表和 schema 21 的 Task DAG
 recovery-claim fence；schema 22 增加有界 DAG capacity 与 scoped Writable lease policy，schema 23
 增加逐节点 execution-owner identity，schema 24 增加 parallel-aware Leader decision projection，
 schema 25 增加下文的 bounded model-planning attempt/proposal projection，schema 26 增加 bounded
-DAG replan attempt/proposal projection，并保留后文的持久化
-Leader attempt/decision 投影。其 identity
+DAG replan attempt/proposal projection，schema 27 增加下文描述的 bounded Agent Swarm run projection，
+并保留后文的持久化 Leader attempt/decision 投影。
+其 identity
 绑定 parent/task/child、lease、worktree、baseline checkpoint、base commit、
 capability/grant fingerprint 与 child-task digest。加载时校验 source、content 和完整记录
 fingerprint，不一致时 fail closed。投影和 durable 复验发生在 `SubagentLink` 之后、child
@@ -1722,7 +1723,7 @@ Parallel node 通过 typed `TaskDagWritableWorkerFactory` 获得全新的 Writab
 这样既保留冻结的每 worker `asyncio.Lock`，也使每个节点拥有独立的 binding、lease、worktree、
 checkpoint、child session、Parent Relay 和 worker-scoped LSP state。
 
-Session schema 26 在 `task_dags` 与 `task_dag_nodes` 中保存不可变 DAG 定义和有界节点运行投影，
+当前 Session schema 27 在 `task_dags` 与 `task_dag_nodes` 中保存不可变 DAG 定义和有界节点运行投影，
 并在 `task_dag_dependency_relays` 中保存 insert-only 的 predecessor-result Relay，同时在独立的
 `task_dag_recovery_claims` 中保存跨进程 ownership fence。定义和 Relay 发布都是 insert-only；graph
 与 node 生命周期更新使用 generation CAS。成功节点记录精确的 worker task、child session、writable lease、
@@ -1776,7 +1777,7 @@ node definition 与 durable outcome metadata，并对 preview 脱敏、带 finge
 transcript/reasoning/tool argument/output、Relay payload、workspace bytes、checkpoint bytes、Git
 diff、secret 或 arbitrary path。
 
-当前 Session Store schema 26 保留 schema 19 新增的 `leader_attempts` 与 `leader_decisions` 投影。Attempt 绑定精确 DAG
+当前 Session Store schema 27 保留 schema 19 新增的 `leader_attempts` 与 `leader_decisions` 投影。Attempt 绑定精确 DAG
 generation、definition/evidence/objective fingerprint、Leader session、controller owner、turn
 identity 与 durable lifecycle。SQLite write transaction 和 CAS-like state transition 保证同一精确
 snapshot 只有一个 controller 拥有 model request。Controller 必须在 provider call 紧邻之前，使用
@@ -1816,7 +1817,7 @@ CAS；wave seam 只 claim selected ID，创建独立 Writable service，并使�
 填充未选择的 node。`max_parallel=1` 继续兼容 one-node path。
 
 Session schema 24 增加了 parent-session、selected-node 和 selected-generation decision projection，
-并迁移已填充的 schema-23 row；当前 schema 26 保留这些 projection。Crash 后只有每个 selected node 仍在记录的 READY generation，或
+并迁移已填充的 schema-23 row；当前 schema 27 保留这些 projection。Crash 后只有每个 selected node 仍在记录的 READY generation，或
 已经 durable advanced 到 RUNNING/terminal 时，durable wave decision 才能复用；不会推断 provider
 replay 安全。Partial claim、controller race、failure、cancellation、skipped descendant 和
 indeterminate branch 保留既有 Task DAG recovery semantics。Leader 仍不拥有 Writable、Worktree、
@@ -1849,7 +1850,7 @@ Parser 保留冻结的 Task DAG limits：最多 8 个 node、16 条 edge、每 n
 和其他 graph 规则仍由规范 Task DAG service 拒绝。Model text 只是 data，不包含 authority field。
 
 Schema 25 新增 insert-only 的 `orchestration_planning_attempts` 与 `orchestration_plan_proposals`；当前
-schema 26 保留这些 projection。
+schema 27 保留这些 projection。
 Planning attempt 绑定调用方精确 planning ID、真实 parent session、objective/context fingerprint、专用
 planner session/turn、预分配 intended DAG ID、provider lifecycle、proposal fingerprint 和已发布 DAG identity。
 生命周期为 `CLAIMED -> PROVIDER_FENCED -> MODEL_COMMITTED -> PROPOSAL_PUBLISHED -> DAG_PUBLISHED ->
@@ -1910,3 +1911,35 @@ Provider。Generic provider-turn evidence 在 model commit 前可观察时，转
 loser 不调用 Provider，也不修改 provenance。本切片由 fixture-provider focused tests、真实
 `ApplicationComposition` process-death tests、two-process race，以及进入既有 parallel-aware Leader 和
 Writable authority 的端到端测试覆盖；不提供 public CLI/TUI/ACP orchestration API。
+
+### 有界 Agent Swarm / 持久化编排运行
+
+ADR 0140 在既有 Planner、parallel-aware Leader、Task DAG、Writable Subagent、Parent Context Relay、
+predecessor-result Relay、Worktree、Checkpoint、worker-scoped LSP 和 bounded Replan service 之上增加一个
+内部的有界组合层。Swarm 只拥有一个绑定 parent 的 orchestration identity、durable lifecycle 与精确 DAG
+lineage。`ApplicationComposition` 通过既有 factory 创建下层 service；Swarm 不直接创建 tool、session、
+worker、worktree、checkpoint、LSP manager 或 relay record。
+
+Durable lifecycle 为 `CLAIMED -> PLANNING -> PLANNED -> EXECUTING`，符合条件的 failed source DAG 进入
+`REPLANNING`，随后可进入 `FINALIZING`，终态为 `COMPLETED`、`FAILED` 或 `INDETERMINATE`。正常路径使用一次
+model-generated A/B,C/D DAG、真实 bounded Leader wave 让 B/C 重叠、拥有独立 managed resource 的 Writable
+worker、durable predecessor-result fan-in、B/C 完成后执行 D，以及 Leader finalization。原始 graph definition
+和每个 successor identity 都保持不可变。
+
+只有当 source DAG 为 `FAILED`、quiescent、所有 node terminal 且没有 `INDETERMINATE` node 时才允许 Replan。
+既有 Replan service 在 `MAX_DAG_REPLAN_DEPTH=1` 下创建一个精确的 immutable successor；Swarm 在恢复执行前验证
+source、evidence、proposal、revision、parent 与 successor lineage。它不会重试 worker 或 Provider、复活 source
+node、对 uncertain/cancelled DAG 重规划，也不会创建第二个 successor。
+
+Schema 27 增加 insert-once、受 foreign key 保护的 `orchestration_swarm_runs` projection。`BEGIN IMMEDIATE`、
+process-liveness ownership、generation CAS 与不可变 identity field 保证一个 controller 获得所有权。Loser 或
+仍存活的 stale controller 不执行 Provider call、DAG publication、worker allocation 或 result mutation。
+可观察的 provider-turn uncertainty 与 cancellation fail closed 为 `INDETERMINATE`；fresh controller 只复用
+durable terminal result 或下层既有 recovery contract，不推断 replay 安全。Swarm projection 和所有 Relay 都保持
+有界且脱敏：raw transcript、hidden reasoning、Provider request、tool argument、environment、credential、
+checkpoint blob 和 workspace content 不会跨越此边界。
+
+这是一个仅内部的 vertical slice，不增加 recursive Swarm、无界 agent 或 queue、generic retry、automatic
+Ultracode delegation、共享 writable worktree、merge/copy-back/cherry-pick/patch adoption、public CLI/TUI/ACP
+orchestration、remote execution、marketplace integration，也不重新实现 Checkpoint/Rollback。详见 [ADR
+0140](adr/0140-bounded-agent-swarm-durable-orchestration-run.md)。

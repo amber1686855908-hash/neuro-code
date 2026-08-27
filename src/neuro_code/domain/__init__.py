@@ -2,6 +2,19 @@
 
 与 Provider 无关的领域契约."""
 
+from neuro_code.domain.agent_swarm import (
+    MAX_SWARM_OBJECTIVE_FINGERPRINT_BYTES,
+    MAX_SWARM_RESULT_BYTES,
+    MAX_SWARM_RUN_ID_BYTES,
+    AgentSwarmResult,
+    AgentSwarmRun,
+    AgentSwarmRunState,
+    SwarmRun,
+    SwarmRunResult,
+    SwarmRunState,
+    objective_fingerprint,
+    terminal_result_fingerprint,
+)
 from neuro_code.domain.background_tasks.models import (
     DEFAULT_BACKGROUND_WAKE_COOLDOWN_SECONDS,
     DEFAULT_BACKGROUND_WAKE_MAX_PER_SESSION,
@@ -203,6 +216,9 @@ __all__ = [
     "MAX_QUEUED_SESSION_TASKS",
     "MAX_REQUEST_SNAPSHOT_ID_BYTES",
     "MAX_SESSION_TASK_ID_BYTES",
+    "MAX_SWARM_OBJECTIVE_FINGERPRINT_BYTES",
+    "MAX_SWARM_RESULT_BYTES",
+    "MAX_SWARM_RUN_ID_BYTES",
     "MAX_TASK_DAG_RESULT_RELAY_ITEM_BYTES",
     "MAX_TASK_DAG_RESULT_RELAY_PREDECESSORS",
     "MAX_TASK_DAG_RESULT_RELAY_RENDERED_BYTES",
@@ -214,6 +230,9 @@ __all__ = [
     "REQUEST_SNAPSHOT_SCHEMA_VERSION",
     "AgentEvent",
     "AgentEventKind",
+    "AgentSwarmResult",
+    "AgentSwarmRun",
+    "AgentSwarmRunState",
     "BackgroundTaskKillOutcome",
     "BackgroundTaskKillResult",
     "BackgroundTaskSnapshot",
@@ -273,6 +292,9 @@ __all__ = [
     "SessionTask",
     "SessionTaskKind",
     "SessionTaskStatus",
+    "SwarmRun",
+    "SwarmRunResult",
+    "SwarmRunState",
     "SyntheticReason",
     "TaskDag",
     "TaskDagDependencyResultEntry",
@@ -310,7 +332,9 @@ __all__ = [
     "estimate_context_tokens",
     "estimate_text_tokens",
     "interaction_mode_guidance",
+    "objective_fingerprint",
     "reasoning_guidance",
     "render_parent_context_relay",
     "render_task_dag_dependency_relay",
+    "terminal_result_fingerprint",
 ]

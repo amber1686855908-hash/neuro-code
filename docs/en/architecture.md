@@ -1728,14 +1728,15 @@ tool-role, synthetic, tool-call-bearing, media-bearing, preserved reasoning,
 and preserved backend-call structures are excluded; assistant visible prose is
 separable from and never carries its `reasoning_content`.
 
-Session schema 26 retains the schema-17 one-to-one insert-only READY relay per
+Session schema 27 retains the schema-17 one-to-one insert-only READY relay per
 writable lease, the durable Task DAG tables described below, the schema-20
 predecessor-result relay table, and the schema-21 Task DAG recovery-claim
 fence; schema 22 adds bounded DAG capacity and scoped Writable lease policy,
 and schema 23 adds per-node execution-owner identity; schema 24 adds the
 parallel-aware Leader decision projection; schema 25 adds the bounded model
-planning attempt/proposal projections described below, and schema 26 adds the
-bounded DAG replan attempt/proposal projections. It also retains the
+planning attempt/proposal projections described below, schema 26 adds the
+bounded DAG replan attempt/proposal projections, and schema 27 adds the bounded
+Agent Swarm run projection described below. It also retains the
 durable Leader attempt/decision projections described after the DAG. Its
 identity binds the parent/task/child, lease, worktree, baseline checkpoint,
 base commit, capability/grant fingerprints, and child-task digest. Source,
@@ -1797,7 +1798,7 @@ Parallel nodes receive fresh Writable application services from a typed
 `asyncio.Lock` while giving each node independent binding, lease, worktree,
 checkpoint, child session, Parent Relay, and worker-scoped LSP state.
 
-Session schema 26 stores immutable DAG definitions and bounded node runtime
+The current Session schema 27 stores immutable DAG definitions and bounded node runtime
 projections in `task_dags` and `task_dag_nodes`, plus insert-only
 `task_dag_dependency_relays` and the separate `task_dag_recovery_claims`
 cross-process ownership fence. Definitions and relay publications are
@@ -1876,7 +1877,7 @@ transcript/reasoning/tool arguments/output, Relay payloads, workspace bytes,
 checkpoint bytes, Git diffs, secrets, or arbitrary paths. The current
 parallel-aware extension is specified by ADR 0137 below.
 
-The current Session Store schema 26 retains the schema-19 `leader_attempts` and
+The current Session Store schema 27 retains the schema-19 `leader_attempts` and
 `leader_decisions` projections. An attempt binds the exact DAG generation,
 definition/evidence/objective fingerprints, Leader session, controller owner,
 turn identity, and durable lifecycle. SQLite write transactions and CAS-like
@@ -1932,7 +1933,7 @@ and uses a structured `TaskGroup`. It never fills unused capacity with an
 unselected node. `max_parallel=1` remains compatible with the one-node path.
 
 Session schema 24 added parent-session, selected-node, and selected-generation
-decision projections and migrated populated schema-23 rows; current schema 26
+decision projections and migrated populated schema-23 rows; current schema 27
 retains them. A durable wave
 decision can be reused after a crash only when each selected node is still at
 its recorded READY generation or has advanced durably to RUNNING/terminal;
@@ -1979,7 +1980,7 @@ other graph rules are still rejected by the canonical Task DAG service. Model
 text is data and contains no authority fields.
 
 Schema 25 added insert-only `orchestration_planning_attempts` and
-`orchestration_plan_proposals`; current schema 26 retains them. A planning attempt binds the caller's exact
+`orchestration_plan_proposals`; current schema 27 retains them. A planning attempt binds the caller's exact
 planning ID, actual parent session, objective/context fingerprints, dedicated
 planner session and turn, a preallocated intended DAG ID, provider lifecycle,
 proposal fingerprint, and published DAG identity. Its lifecycle is
@@ -2065,6 +2066,51 @@ provider nor changes provenance. The slice is covered by fixture-provider
 focused tests, real `ApplicationComposition` process-death tests, a two-process
 race, and an end-to-end path into the existing parallel-aware Leader and
 Writable worker authorities. It has no public CLI/TUI/ACP orchestration API.
+
+### Bounded Agent Swarm / durable orchestration run
+
+ADR 0140 adds one internal bounded composition over the existing Planner,
+parallel-aware Leader, Task DAG, Writable Subagent, Parent Context Relay,
+predecessor-result Relay, Worktree, Checkpoint, worker-scoped LSP, and bounded
+Replan services. The Swarm owns only one parent-bound orchestration identity,
+its durable lifecycle, and exact DAG lineage. `ApplicationComposition` creates
+the lower-layer services through their existing factories; the Swarm does not
+create tools, sessions, workers, worktrees, checkpoints, LSP managers, or relay
+records directly.
+
+The durable lifecycle is `CLAIMED -> PLANNING -> PLANNED -> EXECUTING`, with
+`REPLANNING` for one eligible failed source DAG, `FINALIZING`, and terminal
+`COMPLETED`, `FAILED`, or `INDETERMINATE` states. The normal path is one
+model-generated A/B,C/D DAG, a real bounded Leader wave with B and C
+overlapping, isolated Writable workers with distinct managed resources, durable
+predecessor-result fan-in, D after B and C, and Leader finalization. The
+original graph definition and every successor identity remain immutable.
+
+Replan is allowed only after a source DAG is `FAILED`, quiescent, fully
+terminal, and free of `INDETERMINATE` nodes. The existing Replan service creates
+one exact immutable successor at `MAX_DAG_REPLAN_DEPTH=1`; the Swarm verifies
+source, evidence, proposal, revision, parent, and successor lineage before
+resuming execution. It never retries a worker or provider, resurrects source
+nodes, replans an uncertain/cancelled DAG, or creates a second successor.
+
+Schema 27 adds the insert-once, foreign-key-protected
+`orchestration_swarm_runs` projection. `BEGIN IMMEDIATE`, process-liveness
+ownership, generation CAS, and immutable identity fields give one-controller
+ownership. A losing or live-stale controller performs no provider call, DAG
+publication, worker allocation, or result mutation. Observable provider-turn
+uncertainty and cancellation are fail-closed as `INDETERMINATE`; fresh
+controllers reuse only durable terminal results or the lower-layer recovery
+contracts and never infer safe replay. The Swarm projection and all relays
+remain bounded and redacted: raw transcript, hidden reasoning, provider
+requests, tool arguments, environment, credentials, checkpoint blobs, and
+workspace contents do not cross this boundary.
+
+This is an internal vertical slice only. It does not add recursive Swarms,
+unbounded agents or queues, generic retry, automatic Ultracode delegation,
+shared writable worktrees, merge/copy-back/cherry-pick/patch adoption, public
+CLI/TUI/ACP orchestration, remote execution, marketplace integration, or a new
+Checkpoint/Rollback implementation. See [ADR
+0140](adr/0140-bounded-agent-swarm-durable-orchestration-run.md).
 
 ## Platform policy
 

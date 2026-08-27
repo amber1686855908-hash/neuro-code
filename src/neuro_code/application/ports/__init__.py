@@ -2,6 +2,14 @@
 
 定义由基础设施适配器实现的规范应用端口."""
 
+from neuro_code.application.ports.agent_swarm import (
+    AgentSwarmRunClaim,
+    AgentSwarmStore,
+    AgentSwarmStoreError,
+    ProcessLivenessProbe,
+    SwarmRunStore,
+    SwarmRunStoreError,
+)
 from neuro_code.application.ports.approval import PermissionApprover
 from neuro_code.application.ports.background_tasks import (
     BackgroundTaskManager,
@@ -262,6 +270,9 @@ __all__ = [
     "MAX_TOTAL_RESULT_BYTES",
     "TOOL_OUTPUT_ARTIFACT_PRUNE_GRACE_SECONDS",
     "WINDOWS_SANDBOX_SETUP_SCHEMA_VERSION",
+    "AgentSwarmRunClaim",
+    "AgentSwarmStore",
+    "AgentSwarmStoreError",
     "BackgroundTaskManager",
     "BackgroundTaskSupervisor",
     "CapabilityResolution",
@@ -335,6 +346,7 @@ __all__ = [
     "ParentContextRelayError",
     "ParentContextRelayStore",
     "PermissionApprover",
+    "ProcessLivenessProbe",
     "ProtocolSupportStatus",
     "ProviderCatalog",
     "ProviderCatalogError",
@@ -349,6 +361,8 @@ __all__ = [
     "RuntimeRole",
     "SandboxedProcessRequest",
     "SessionStore",
+    "SwarmRunStore",
+    "SwarmRunStoreError",
     "TaskDagDependencyResultRelayError",
     "TaskDagDependencyResultRelayStore",
     "TaskDagError",

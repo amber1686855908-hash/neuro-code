@@ -978,7 +978,7 @@ class TaskDagPersistenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertLessEqual(len(current.running_node_ids), 2)
         self.assertEqual(len(current.running_node_ids), 2)
 
-    async def test_schema_17_migrates_to_26_and_creates_dag_leader_relay_recovery_planning_and_replan_tables(
+    async def test_schema_17_migrates_to_27_and_creates_dag_leader_relay_recovery_planning_replan_and_swarm_tables(
         self,
     ) -> None:
         connection = sqlite3.connect(self._database_path)
@@ -1014,6 +1014,7 @@ class TaskDagPersistenceTests(unittest.IsolatedAsyncioTestCase):
             {
                 "orchestration_dag_replan_attempts",
                 "orchestration_dag_replan_proposals",
+                "orchestration_swarm_runs",
             }.issubset(tables)
         )
         self.assertIsNotNone(await reopened.get_session(self.parent_session_id))
@@ -1208,7 +1209,7 @@ class TaskDagPersistenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(version, (SCHEMA_VERSION,))
         self.assertIn("SELECT_NODES", str(decision_sql[0]))
 
-    async def test_populated_schema_20_migrates_to_26_without_touching_dag_contract(self) -> None:
+    async def test_populated_schema_20_migrates_to_27_without_touching_dag_contract(self) -> None:
         dag = self._dag("populated-schema-20")
         await self.store.insert_task_dag(dag)
         connection = sqlite3.connect(self._database_path)
@@ -1270,7 +1271,7 @@ class TaskDagPersistenceTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(claimed.node("a").parent_task_id, "migration-worker-a")
 
-    async def test_populated_schema_21_running_relay_and_recovery_claim_survive_schema_26(
+    async def test_populated_schema_21_running_relay_and_recovery_claim_survive_schema_27(
         self,
     ) -> None:
         dag = self._dag("populated-schema-21")

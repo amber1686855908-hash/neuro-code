@@ -28,6 +28,7 @@ from neuro_code.application.ports.task_dag_replan import (
 )
 from neuro_code.application.sessions.binding import ConversationBinding, ConversationRunner
 from neuro_code.application.settings import ApplicationSettings
+from neuro_code.application.workflows.agent_swarm import RunAgentSwarmRequest
 from neuro_code.application.workflows.leader import RunLeaderRequest
 from neuro_code.application.workflows.model_planning import RunModelDagPlanningRequest
 from neuro_code.application.workflows.subagent_capabilities import SubagentCapabilitySet
@@ -38,6 +39,7 @@ from neuro_code.application.workflows.task_dag_replan import (
     TaskDagReplanApplicationService,
 )
 from neuro_code.bootstrap.composition import ApplicationComposition
+from neuro_code.domain.agent_swarm import AgentSwarmRunState
 from neuro_code.domain.conversation.events import ModelCompleted, ModelEvent
 from neuro_code.domain.execution import TurnInput, TurnRecoveryAttempt, TurnSource
 from neuro_code.domain.model_planning import ModelDagProposal
@@ -416,6 +418,7 @@ class _ReplanProductionProvider(_ProductionPlanningProvider):
             if tools:
                 raise AssertionError("Replan Planner received tools")
             self._state.replan_mode = True
+            self._state.leader_calls = 0
             self._state.planner_calls += 1
             self._state.zero_tool_calls += 1
             if self._state.provider_call_log is not None:
@@ -2425,12 +2428,12 @@ async def test_spawned_replan_controllers_have_one_winner_and_one_provider_call(
         assert attempt.state is DagReplanAttemptState.COMPLETED
 
 
-def test_schema_26_is_current_and_replan_tables_are_foreign_key_restricted() -> None:
-    assert SCHEMA_VERSION == 26
+def test_schema_27_is_current_and_replan_tables_are_foreign_key_restricted() -> None:
+    assert SCHEMA_VERSION == 27
 
 
 @pytest.mark.asyncio
-async def test_schema_25_to_26_migration_preserves_populated_dag_and_session() -> None:
+async def test_schema_25_to_27_migration_preserves_populated_dag_and_session() -> None:
     with tempfile.TemporaryDirectory() as directory:
         database = Path(directory) / "sessions.db"
         store = SqliteSessionStore(database)
@@ -2449,14 +2452,15 @@ async def test_schema_25_to_26_migration_preserves_populated_dag_and_session() -
         with closing(sqlite3.connect(database)) as connection:
             assert connection.execute(
                 "SELECT version FROM schema_meta WHERE singleton = 1"
-            ).fetchone() == (26,)
+            ).fetchone() == (27,)
             assert connection.execute(
                 "SELECT name FROM sqlite_master WHERE type = 'table' "
                 "AND name IN ('orchestration_dag_replan_attempts', "
-                "'orchestration_dag_replan_proposals') ORDER BY name"
+                "'orchestration_dag_replan_proposals', 'orchestration_swarm_runs') ORDER BY name"
             ).fetchall() == [
                 ("orchestration_dag_replan_attempts",),
                 ("orchestration_dag_replan_proposals",),
+                ("orchestration_swarm_runs",),
             ]
         assert await store.get_session(session_id) is not None
         assert await store.get_task_dag(dag.dag_id) == dag
@@ -2838,6 +2842,91 @@ async def test_real_model_generated_failure_replan_successor_leader_writable_doe
                     await replan.close()
                 if planner is not None:
                     await planner.close()
+                if parent_binding is not None:
+                    await parent_binding.close()
+                await application.close()
+
+
+@pytest.mark.asyncio
+async def test_real_agent_swarm_runs_one_bounded_failed_dag_replan() -> None:
+    with tempfile.TemporaryDirectory(prefix="neuro-agent-swarm-replan-") as directory:
+        root = Path(directory)
+        repository = _make_repository(root)
+        dirty_file = repository / "dirty-parent.txt"
+        dirty_file.write_text("parent remains dirty\n", encoding="utf-8")
+        before_status = _run_git(repository, "status", "--porcelain=v1")
+        before_head = _run_git(repository, "rev-parse", "HEAD")
+        state_dir = root / "state"
+        _write_fixture_config(state_dir)
+        state = _ProductionPlanningState(fail_source_worker_ids=frozenset({"b"}))
+
+        def provider_factory(_config, _failover):
+            return cast(ModelProvider, _ReplanProductionProvider(state))
+
+        environment = _production_planning_environment(root, state_dir)
+        with patch.dict("os.environ", environment, clear=False):
+            application = await ApplicationComposition.open(
+                _production_planning_settings(repository),
+                provider_factory=provider_factory,
+            )
+            swarm = None
+            parent_binding = None
+            try:
+                parent_session_id = await application.store.create_session(
+                    str(repository),
+                    "fixture",
+                    "fixture-model",
+                    sandbox_profile=SandboxProfile.OFF,
+                )
+                parent_binding = await application.create_binding(
+                    resume_id=parent_session_id,
+                    capabilities=_parent_capability(repository),
+                )
+                swarm = await application.create_agent_swarm_service(
+                    parent_binding=parent_binding,
+                )
+                running = asyncio.create_task(
+                    swarm.run(RunAgentSwarmRequest("swarm-replan-production", "repair objective"))
+                )
+                await asyncio.wait_for(state.fanout_started.wait(), timeout=120)
+                persisted_during = await application.store.get_swarm_run("swarm-replan-production")
+                assert persisted_during is not None
+                assert persisted_during.state is AgentSwarmRunState.EXECUTING
+                state.release_fanout.set()
+                result = await asyncio.wait_for(running, timeout=240)
+
+                assert result.run.state is AgentSwarmRunState.COMPLETED
+                assert result.final_response == "replan DAG completed"
+                assert result.run.root_dag_id != result.run.current_dag_id
+                assert result.run.successor_dag_id == result.run.current_dag_id
+                assert result.run.replan_revision_id == "swarm-replan-swarm-replan-production"
+                assert state.planner_calls == 2
+                assert state.zero_tool_calls == 8
+                source_calls = [
+                    node_id for node_id, phase in state.worker_call_phases if phase == "source"
+                ]
+                replan_calls = [
+                    node_id for node_id, phase in state.worker_call_phases if phase == "replan"
+                ]
+                assert source_calls[0] == "a"
+                assert set(source_calls[1:]) == {"b", "c"}
+                assert set(replan_calls[:2]) == {"b", "c"}
+                assert replan_calls[2] == "d"
+                assert source_calls.count("b") == 1
+                source_dag = await application.store.get_task_dag(result.run.root_dag_id or "")
+                assert source_dag is not None
+                assert source_dag.state is TaskDagState.FAILED
+                assert source_dag.node("b").state is TaskDagNodeState.FAILED
+                successor = await application.store.get_task_dag(result.run.current_dag_id or "")
+                assert successor is not None
+                assert successor.state is TaskDagState.COMPLETED
+                assert _run_git(repository, "status", "--porcelain=v1") == before_status
+                assert _run_git(repository, "rev-parse", "HEAD") == before_head
+                assert dirty_file.read_text(encoding="utf-8") == "parent remains dirty\n"
+            finally:
+                state.release_fanout.set()
+                if swarm is not None:
+                    await swarm.close()
                 if parent_binding is not None:
                     await parent_binding.close()
                 await application.close()

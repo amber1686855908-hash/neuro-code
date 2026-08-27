@@ -101,6 +101,12 @@ from neuro_code.application.settings import ApplicationSettings
 from neuro_code.application.tools.service import SessionToolOutputArtifactApplicationService
 from neuro_code.application.web_fetch.service import WebFetchService
 from neuro_code.application.web_search.service import WebSearchService
+from neuro_code.application.workflows.agent_swarm import (
+    AgentSwarmApplicationService,
+    AgentSwarmLeader,
+    AgentSwarmPlanner,
+    AgentSwarmReplanner,
+)
 from neuro_code.application.workflows.leader import LeaderApplicationService
 from neuro_code.application.workflows.model_planning import (
     ModelDagPlanningApplicationService,
@@ -1472,6 +1478,56 @@ class ApplicationComposition:
             raise
 
     create_dag_replan_service = create_task_dag_replan_service
+
+    async def create_agent_swarm_service(
+        self,
+        *,
+        parent_binding: ConversationBinding,
+        timeout_seconds: float = 120.0,
+    ) -> AgentSwarmApplicationService:
+        """Create the internal bounded Planner-to-Replan Swarm workflow.
+
+        Lower-layer services are created lazily per phase so the Swarm owns
+        only orchestration identity/lifecycle while the composition root
+        continues to own provider, workspace, capability, and LSP wiring.
+        This service is intentionally not connected to CLI, TUI, ACP, or
+        automatic delegation.
+        """
+
+        if not isinstance(parent_binding, ConversationBinding):
+            raise ConfigurationError("Swarm parent binding is required")
+
+        async def planner_factory() -> AgentSwarmPlanner:
+            return await self.create_model_planning_service(
+                parent_binding=parent_binding,
+                timeout_seconds=timeout_seconds,
+            )
+
+        async def leader_factory() -> AgentSwarmLeader:
+            return await self.create_leader_service(
+                parent_binding=parent_binding,
+                timeout_seconds=timeout_seconds,
+            )
+
+        async def replanner_factory() -> AgentSwarmReplanner:
+            return await self.create_task_dag_replan_service(
+                parent_binding=parent_binding,
+                timeout_seconds=timeout_seconds,
+            )
+
+        from neuro_code.application.ports.agent_swarm import AgentSwarmStore
+
+        return AgentSwarmApplicationService(
+            cast(AgentSwarmStore, self.store),
+            cast(TaskDagStore, self.store),
+            parent_binding=parent_binding,
+            planner_factory=planner_factory,
+            leader_factory=leader_factory,
+            replanner_factory=replanner_factory,
+            redaction_values=self.config.redaction_values(),
+        )
+
+    create_swarm_service = create_agent_swarm_service
 
     def create_subagent_scheduler(
         self,

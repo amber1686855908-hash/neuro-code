@@ -7,14 +7,16 @@ import multiprocessing as mp
 import os
 import sqlite3
 import subprocess
+import sys
 import tempfile
+import threading
 from collections.abc import AsyncIterator
-from contextlib import closing
+from contextlib import closing, suppress
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
-from typing import cast
+from typing import Any, cast
 from unittest.mock import patch
 
 import pytest
@@ -24,6 +26,7 @@ from neuro_code.application.ports.model import ModelCapabilitySet, ModelProvider
 from neuro_code.application.ports.model_planning import ModelPlanningStoreError
 from neuro_code.application.sessions.binding import ConversationBinding, ConversationRunner
 from neuro_code.application.settings import ApplicationSettings
+from neuro_code.application.workflows.agent_swarm import RunAgentSwarmRequest
 from neuro_code.application.workflows.leader import RunLeaderRequest
 from neuro_code.application.workflows.model_planning import (
     MAX_MODEL_PLANNING_PROMPT_BYTES,
@@ -33,7 +36,8 @@ from neuro_code.application.workflows.model_planning import (
 from neuro_code.application.workflows.subagent_capabilities import SubagentCapabilitySet
 from neuro_code.application.workflows.task_dag import CreateTaskDagRequest
 from neuro_code.bootstrap.composition import ApplicationComposition
-from neuro_code.domain.conversation.events import ModelCompleted, ModelEvent
+from neuro_code.domain.agent_swarm import AgentSwarmRunState
+from neuro_code.domain.conversation.events import ModelCompleted, ModelEvent, ModelToolCall
 from neuro_code.domain.conversation.messages import (
     ContentPart,
     Message,
@@ -56,7 +60,10 @@ from neuro_code.domain.model_planning import (
 from neuro_code.domain.sandbox.models import SandboxProfile
 from neuro_code.domain.task_dag import MAX_TASK_DAG_NODES, TaskDag, TaskDagNode
 from neuro_code.infrastructure.persistence.sqlite_session import SCHEMA_VERSION, SqliteSessionStore
+from neuro_code.infrastructure.workspace.paths import workspaces_match
 from neuro_code.shared.errors import ConfigurationError
+
+_LSP_FIXTURE = Path(__file__).parent / "fixtures" / "fake_lsp_server.py"
 
 
 def _sha(value: str) -> str:
@@ -82,12 +89,14 @@ class _Runner:
         *,
         items: tuple[Message, ...] = (),
         delay: asyncio.Event | None = None,
+        started: asyncio.Event | None = None,
         error: BaseException | None = None,
     ) -> None:
         self.session_id = session_id
         self.response = response
         self.items = items
         self.delay = delay
+        self.started = started
         self.error = error
         self.calls = 0
         self.prompts: list[str] = []
@@ -97,6 +106,8 @@ class _Runner:
         del kwargs
         if turn_source is not None and turn_source.value != "user":
             raise AssertionError("planner must use the user turn source")
+        if self.started is not None:
+            self.started.set()
         if self.delay is not None:
             await self.delay.wait()
         self.calls += 1
@@ -938,8 +949,14 @@ async def test_two_planning_controllers_share_one_durable_identity() -> None:
         store, parent_id, planner_id = await _store_with_sessions(directory)
         planner2_id = await store.create_session(directory, "fixture", "fixture-model")
         parent = _binding(_Runner(parent_id, "unused"), zero_tools=False)
+        first_started = asyncio.Event()
         release = asyncio.Event()
-        first_runner = _Runner(planner_id, _proposal_json(), delay=release)
+        first_runner = _Runner(
+            planner_id,
+            _proposal_json(),
+            delay=release,
+            started=first_started,
+        )
         second_runner = _Runner(planner2_id, _proposal_json())
         first = ModelDagPlanningApplicationService(
             store,
@@ -958,13 +975,12 @@ async def test_two_planning_controllers_share_one_durable_identity() -> None:
             owner_id="owner-second",
         )
         first_task = asyncio.create_task(first.run(RunModelDagPlanningRequest("race", "objective")))
-        await asyncio.sleep(0.02)
+        await asyncio.wait_for(first_started.wait(), timeout=1)
         second_task = asyncio.create_task(
             second.run(RunModelDagPlanningRequest("race", "objective"))
         )
-        await asyncio.sleep(0.02)
-        release.set()
         second_result = await asyncio.gather(second_task, return_exceptions=True)
+        release.set()
         first_result = await first_task
         assert first_runner.calls == 1
         assert second_runner.calls == 0
@@ -973,7 +989,7 @@ async def test_two_planning_controllers_share_one_durable_identity() -> None:
 
 
 @pytest.mark.asyncio
-async def test_schema_24_to_26_preserves_existing_task_dag() -> None:
+async def test_schema_24_to_27_preserves_existing_task_dag() -> None:
     with tempfile.TemporaryDirectory() as directory:
         store, parent_id, _planner_id = await _store_with_sessions(directory)
         dag = TaskDag.create(
@@ -991,7 +1007,7 @@ async def test_schema_24_to_26_preserves_existing_task_dag() -> None:
             connection.execute("UPDATE schema_meta SET version = 24 WHERE singleton = 1")
             connection.commit()
         await store.initialize()
-        assert SCHEMA_VERSION == 26
+        assert SCHEMA_VERSION == 27
         assert (
             await store.get_task_dag("preexisting")
         ).definition_fingerprint == dag.definition_fingerprint
@@ -1005,8 +1021,9 @@ async def test_schema_24_to_26_preserves_existing_task_dag() -> None:
             assert {
                 "orchestration_planning_attempts",
                 "orchestration_plan_proposals",
+                "orchestration_swarm_runs",
             }.issubset(tables)
-            assert connection.execute("SELECT version FROM schema_meta").fetchone() == (26,)
+            assert connection.execute("SELECT version FROM schema_meta").fetchone() == (27,)
 
 
 @pytest.mark.asyncio
@@ -2167,6 +2184,7 @@ class _ProductionPlanningState:
         provider_call_log: Path | None = None,
         provider_started_event=None,
         provider_release_event=None,
+        enable_lsp: bool = False,
     ) -> None:
         self.planner_calls = 0
         self.leader_calls = 0
@@ -2179,6 +2197,11 @@ class _ProductionPlanningState:
         self.timeline: list[str] = []
         self.active = 0
         self.max_active = 0
+        self.relay_seen = False
+        self.enable_lsp = enable_lsp
+        self.lsp_ready = {"b": asyncio.Event(), "c": asyncio.Event()}
+        self.lsp_both_ready = asyncio.Event()
+        self.lsp_results: dict[str, str] = {}
         self.lock = asyncio.Lock()
         self.fanout_started = asyncio.Event()
         self.release_fanout = asyncio.Event()
@@ -2263,6 +2286,12 @@ class _ProductionPlanningProvider:
             raise AssertionError("worker fixture could not identify its node")
         if not tools:
             raise AssertionError("Writable worker unexpectedly received no tools")
+        if node_id == "d":
+            if "DAG predecessor result relay" not in contents or any(
+                f"production result {predecessor}" not in contents for predecessor in ("b", "c")
+            ):
+                raise AssertionError("D worker did not receive the exact predecessor relay")
+            self._state.relay_seen = True
         self._state.worker_calls.append(node_id)
         async with self._state.lock:
             self._state.started.append(node_id)
@@ -2279,6 +2308,143 @@ class _ProductionPlanningProvider:
             async with self._state.lock:
                 self._state.active -= 1
                 self._state.timeline.append(f"complete:{node_id}")
+
+
+class _ProductionSwarmLspProvider(_ProductionPlanningProvider):
+    """Real Swarm worker fixture that exercises the production LSP tool path."""
+
+    def __init__(
+        self,
+        state: _ProductionPlanningState,
+        application: ApplicationComposition,
+        cwd: Path,
+    ) -> None:
+        super().__init__(state)
+        self.application = application
+        self.cwd = cwd.expanduser().resolve(strict=False)
+        self.calls = 0
+        self.node_id: str | None = None
+        self.lsp_manager: Any | None = None
+        self.lsp_client: Any | None = None
+        self.lsp_process: Any | None = None
+        self.lsp_payload: dict[str, object] | None = None
+
+    @staticmethod
+    def _node_id(contents: str) -> str | None:
+        return next(
+            (
+                candidate
+                for candidate in ("a", "b", "c", "d")
+                if f"planning-node-{candidate}" in contents
+            ),
+            None,
+        )
+
+    async def stream(
+        self,
+        context,
+        tools,
+        *,
+        tool_policy: ModelToolPolicy = ModelToolPolicy.ALLOWED,
+    ) -> AsyncIterator[ModelEvent]:
+        contents = "\n".join(message.content for message in context.messages)
+        node_id = self._node_id(contents)
+        self.node_id = node_id
+        if not self._state.enable_lsp or node_id not in {"b", "c"}:
+            async for event in super().stream(context, tools, tool_policy=tool_policy):
+                yield event
+            return
+
+        del tool_policy
+        if not tools:
+            raise AssertionError(f"Swarm worker {node_id} unexpectedly received no tools")
+        self.calls += 1
+        if self.calls == 1:
+            if "lsp" not in {tool.name for tool in tools}:
+                raise AssertionError(f"Swarm worker {node_id} did not receive lsp")
+            self._state.worker_calls.append(node_id)
+            async with self._state.lock:
+                self._state.started.append(node_id)
+                self._state.timeline.append(f"start:{node_id}")
+                self._state.active += 1
+                self._state.max_active = max(self._state.max_active, self._state.active)
+                if {"b", "c"}.issubset(self._state.started):
+                    self._state.fanout_started.set()
+            yield ModelToolCall(
+                ToolCall(
+                    f"swarm-lsp-{node_id}",
+                    "lsp",
+                    {
+                        "operation": "hover",
+                        "path": "tracked.txt",
+                        "line": 1,
+                        "column": 1,
+                    },
+                )
+            )
+            yield ModelCompleted("tool_calls")
+            return
+        if self.calls != 2:
+            raise AssertionError(f"Swarm worker {node_id} made too many model calls")
+
+        tool_results = {
+            message.tool_call_id: message.content
+            for message in context.messages
+            if message.role is Role.TOOL and message.tool_call_id is not None
+        }
+        raw_result = tool_results.get(f"swarm-lsp-{node_id}")
+        if raw_result is None:
+            raise AssertionError(f"Swarm worker {node_id} did not receive an LSP result")
+        payload = json.loads(raw_result)
+        if not isinstance(payload, dict) or "hover" not in payload:
+            raise AssertionError(f"Swarm worker {node_id} received an invalid LSP result")
+        self.lsp_payload = payload
+        self._state.lsp_results[node_id] = raw_result
+
+        managers = [
+            manager
+            for manager in self.application._lsp_services
+            if workspaces_match(manager.workspace_root, self.cwd)
+        ]
+        if len(managers) != 1:
+            raise AssertionError(f"Swarm worker {node_id} did not own one LSP manager")
+        manager = managers[0]
+        route = manager._routes.get("fake")
+        if route is None or route.client is None:
+            raise AssertionError(f"Swarm worker {node_id} LSP route was not alive")
+        if route.client._process.returncode is not None:
+            raise AssertionError(f"Swarm worker {node_id} LSP process exited too early")
+        self.lsp_manager = manager
+        self.lsp_client = route.client
+        self.lsp_process = route.client._process
+        self._state.lsp_ready[node_id].set()
+        if all(event.is_set() for event in self._state.lsp_ready.values()):
+            self._state.lsp_both_ready.set()
+        try:
+            await self._state.release_fanout.wait()
+            yield ModelCompleted("stop", response_text=f"production result {node_id}")
+        finally:
+            async with self._state.lock:
+                self._state.active -= 1
+                self._state.timeline.append(f"complete:{node_id}")
+
+
+class _ProductionSwarmLspProviderFactory:
+    def __init__(self, state: _ProductionPlanningState) -> None:
+        self.state = state
+        self.application: ApplicationComposition | None = None
+        self.providers: list[_ProductionSwarmLspProvider] = []
+
+    def bind_application(self, application: ApplicationComposition) -> None:
+        self.application = application
+
+    def __call__(self, config, failover: bool) -> ModelProvider:
+        del failover
+        if self.application is None:
+            raise AssertionError("Swarm LSP provider factory was not bound")
+        provider = _ProductionSwarmLspProvider(self.state, self.application, config.cwd)
+        self.providers.append(provider)
+        return cast(ModelProvider, provider)
 
 
 def _run_git(directory: Path, *arguments: str) -> bytes:
@@ -2305,10 +2471,24 @@ def _make_repository(root: Path) -> Path:
     return repository
 
 
-def _write_fixture_config(state_dir: Path) -> None:
+def _write_fixture_config(
+    state_dir: Path,
+    *,
+    lsp_command: tuple[str, ...] | None = None,
+) -> None:
     state_dir.mkdir(parents=True)
+    lsp_config = ""
+    if lsp_command is not None:
+        command = ", ".join(json.dumps(value) for value in lsp_command)
+        lsp_config = f"""
+
+[lsp.servers.fake]
+language = "python"
+command = [{command}]
+extensions = [".py", ".txt"]
+"""
     (state_dir / "config.toml").write_text(
-        """
+        f"""
 [web_search]
 mode = "disabled"
 
@@ -2324,25 +2504,33 @@ model = "fixture-model"
 base_url = "https://provider.invalid/v1"
 api_key_env = "FIXTURE_KEY"
 context_window_tokens = 131072
+{lsp_config}
 """,
         encoding="utf-8",
     )
 
 
-def _parent_capability(repository: Path) -> SubagentCapabilitySet:
+def _parent_capability(
+    repository: Path,
+    *,
+    include_lsp: bool = False,
+) -> SubagentCapabilitySet:
+    tool_names = (
+        "read_file",
+        "read_files",
+        "list_dir",
+        "list_tree",
+        "glob",
+        "grep",
+        "grep_many",
+        "skill",
+        "search_replace",
+        "apply_patch",
+    )
+    if include_lsp:
+        tool_names += ("lsp",)
     return SubagentCapabilitySet.from_runtime(
-        tool_names=(
-            "read_file",
-            "read_files",
-            "list_dir",
-            "list_tree",
-            "glob",
-            "grep",
-            "grep_many",
-            "skill",
-            "search_replace",
-            "apply_patch",
-        ),
+        tool_names=tool_names,
         cwd=repository,
         sandbox_profile=SandboxProfile.OFF,
         enable_background_tasks=False,
@@ -2443,6 +2631,227 @@ async def test_real_planner_to_parallel_leader_to_writable_workers() -> None:
                     await leader.close()
                 if planner is not None:
                     await planner.close()
+                if parent_binding is not None:
+                    await parent_binding.close()
+                await application.close()
+
+
+@pytest.mark.asyncio
+async def test_real_agent_swarm_composes_planner_leader_and_parallel_workers() -> None:
+    with tempfile.TemporaryDirectory(prefix="neuro-agent-swarm-production-") as directory:
+        root = Path(directory)
+        repository = _make_repository(root)
+        dirty_file = repository / "dirty-parent.txt"
+        dirty_file.write_text("parent remains dirty\n", encoding="utf-8")
+        before_status = _run_git(repository, "status", "--porcelain=v1")
+        before_head = _run_git(repository, "rev-parse", "HEAD")
+        state_dir = root / "state"
+        lsp_command = (
+            sys.executable,
+            str(_LSP_FIXTURE),
+            "--mode",
+            "worker-integration",
+        )
+        _write_fixture_config(state_dir, lsp_command=lsp_command)
+        state = _ProductionPlanningState(enable_lsp=True)
+        provider_factory = _ProductionSwarmLspProviderFactory(state)
+
+        environment = {
+            "HOME": str(root),
+            "NEURO_CODE_HOME": str(state_dir),
+            "FIXTURE_KEY": "fixture-key",
+        }
+        with patch.dict("os.environ", environment, clear=False):
+            application = await ApplicationComposition.open(
+                ApplicationSettings(
+                    cwd=repository,
+                    sandbox="off",
+                    permission_mode=PermissionMode.BYPASS,
+                    max_steps=8,
+                ),
+                provider_factory=provider_factory,
+            )
+            provider_factory.bind_application(application)
+            swarm = None
+            replay = None
+            parent_binding = None
+            running: asyncio.Task[Any] | None = None
+            try:
+                parent_session_id = await application.store.create_session(
+                    str(repository),
+                    "fixture",
+                    "fixture-model",
+                    sandbox_profile=SandboxProfile.OFF,
+                )
+                parent_binding = await application.create_binding(
+                    resume_id=parent_session_id,
+                    capabilities=_parent_capability(repository, include_lsp=True),
+                )
+                swarm = await application.create_agent_swarm_service(
+                    parent_binding=parent_binding,
+                )
+                running = asyncio.create_task(
+                    swarm.run(
+                        RunAgentSwarmRequest("swarm-production", "decompose and execute objective")
+                    )
+                )
+                await asyncio.wait_for(state.fanout_started.wait(), timeout=90)
+                persisted_during = await application.store.get_swarm_run("swarm-production")
+                assert persisted_during is not None
+                assert persisted_during.current_dag_id is not None
+                during = await application.store.get_task_dag(persisted_during.current_dag_id)
+                assert during is not None
+                assert set(during.running_node_ids) == {"b", "c"}
+                assert state.max_active == 2
+                await asyncio.wait_for(state.lsp_both_ready.wait(), timeout=90)
+                providers = {
+                    provider.node_id: provider
+                    for provider in provider_factory.providers
+                    if provider.node_id in {"b", "c"}
+                }
+                assert set(providers) == {"b", "c"}
+                provider_b = providers["b"]
+                provider_c = providers["c"]
+                assert provider_b.lsp_manager is not provider_c.lsp_manager
+                assert provider_b.lsp_client is not provider_c.lsp_client
+                assert provider_b.lsp_process is not provider_c.lsp_process
+                assert provider_b.cwd != provider_c.cwd
+                assert provider_b.lsp_payload is not None
+                assert provider_c.lsp_payload is not None
+                assert "worker observed bytes: committed" in str(provider_b.lsp_payload["hover"])
+                assert "worker observed bytes: committed" in str(provider_c.lsp_payload["hover"])
+                state.release_fanout.set()
+                result = await asyncio.wait_for(running, timeout=180)
+                assert result.run.state is AgentSwarmRunState.COMPLETED
+                assert result.dag.state.terminal
+                assert result.final_response == "planned DAG completed"
+                assert state.relay_seen is True
+                assert result.run.root_dag_id == result.run.current_dag_id
+                assert result.run.successor_dag_id is None
+                assert state.planner_calls == 1
+                assert state.leader_calls == 4
+                assert state.zero_tool_calls == 5
+                assert state.worker_calls[0] == "a"
+                assert set(state.worker_calls[1:3]) == {"b", "c"}
+                assert state.worker_calls[3] == "d"
+                assert state.timeline.index("complete:b") < state.timeline.index("start:d")
+                assert state.timeline.index("complete:c") < state.timeline.index("start:d")
+                leases = await application.store.list_writable_subagent_leases(
+                    parent_session_id=parent_session_id,
+                )
+                assert len(leases) == 4
+                assert len({lease.worktree_id for lease in leases}) == 4
+                assert len({lease.baseline_checkpoint_id for lease in leases}) == 4
+                persisted = await application.store.get_swarm_run("swarm-production")
+                assert persisted is not None
+                assert persisted == result.run
+                await swarm.close()
+                swarm = None
+
+                replay = await application.create_agent_swarm_service(
+                    parent_binding=parent_binding,
+                )
+                replayed = await replay.run(
+                    RunAgentSwarmRequest("swarm-production", "decompose and execute objective")
+                )
+                assert replayed == result
+                assert state.planner_calls == 1
+                assert state.leader_calls == 4
+                assert len(state.worker_calls) == 4
+                assert _run_git(repository, "status", "--porcelain=v1") == before_status
+                assert _run_git(repository, "rev-parse", "HEAD") == before_head
+                assert dirty_file.read_text(encoding="utf-8") == "parent remains dirty\n"
+            finally:
+                state.release_fanout.set()
+                if running is not None and not running.done():
+                    running.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await running
+                if replay is not None:
+                    await replay.close()
+                if swarm is not None:
+                    await swarm.close()
+                if parent_binding is not None:
+                    await parent_binding.close()
+                await application.close()
+
+
+@pytest.mark.asyncio
+async def test_real_agent_swarm_controller_race_has_one_owner_and_provider_call() -> None:
+    with tempfile.TemporaryDirectory(prefix="neuro-agent-swarm-race-") as directory:
+        root = Path(directory)
+        repository = _make_repository(root)
+        state_dir = root / "state"
+        _write_fixture_config(state_dir)
+        provider_started = threading.Event()
+        provider_release = threading.Event()
+        state = _ProductionPlanningState(
+            provider_started_event=provider_started,
+            provider_release_event=provider_release,
+        )
+
+        def provider_factory(_config, _failover):
+            return cast(ModelProvider, _ProductionPlanningProvider(state))
+
+        environment = {
+            "HOME": str(root),
+            "NEURO_CODE_HOME": str(state_dir),
+            "FIXTURE_KEY": "fixture-key",
+        }
+        with patch.dict("os.environ", environment, clear=False):
+            application = await ApplicationComposition.open(
+                _production_planning_settings(repository),
+                provider_factory=provider_factory,
+            )
+            first = None
+            second = None
+            parent_binding = None
+            try:
+                parent_session_id = await application.store.create_session(
+                    str(repository),
+                    "fixture",
+                    "fixture-model",
+                    sandbox_profile=SandboxProfile.OFF,
+                )
+                parent_binding = await application.create_binding(
+                    resume_id=parent_session_id,
+                    capabilities=_parent_capability(repository),
+                )
+                first = await application.create_agent_swarm_service(
+                    parent_binding=parent_binding,
+                )
+                first_task = asyncio.create_task(
+                    first.run(RunAgentSwarmRequest("swarm-race", "race objective"))
+                )
+                assert await asyncio.to_thread(provider_started.wait, 90)
+                during = await application.store.get_swarm_run("swarm-race")
+                assert during is not None
+                assert during.state is AgentSwarmRunState.PLANNING
+                second = await application.create_agent_swarm_service(
+                    parent_binding=parent_binding,
+                )
+                second_result = await asyncio.gather(
+                    second.run(RunAgentSwarmRequest("swarm-race", "race objective")),
+                    return_exceptions=True,
+                )
+                assert isinstance(second_result[0], ConfigurationError)
+                assert state.planner_calls == 1
+                assert state.worker_calls == []
+                provider_release.set()
+                state.release_fanout.set()
+                result = await asyncio.wait_for(first_task, timeout=180)
+                assert result.run.state is AgentSwarmRunState.COMPLETED
+                assert state.planner_calls == 1
+                assert state.leader_calls == 4
+                assert len(state.worker_calls) == 4
+                persisted = await application.store.get_swarm_run("swarm-race")
+                assert persisted == result.run
+            finally:
+                provider_release.set()
+                if second is not None:
+                    await second.close()
+                if first is not None:
+                    await first.close()
                 if parent_binding is not None:
                     await parent_binding.close()
                 await application.close()
