@@ -14,7 +14,10 @@ from typing import Any, NoReturn, cast
 
 import pytest
 
-from neuro_code.application.ports.agent_swarm import AgentSwarmStoreError
+from neuro_code.application.ports.agent_swarm import (
+    AgentSwarmRunClaim,
+    AgentSwarmStoreError,
+)
 from neuro_code.application.ports.model import ModelProvider
 from neuro_code.application.runtime.process_liveness import owner_is_alive
 from neuro_code.application.sessions.binding import ConversationBinding, ConversationRunner
@@ -27,7 +30,13 @@ from neuro_code.application.workflows.model_planning import (
     ModelDagPlanningResult,
     RunModelDagPlanningRequest,
 )
+from neuro_code.application.workflows.task_dag_replan import (
+    RunTaskDagReplanRequest,
+    TaskDagReplanResult,
+)
 from neuro_code.domain.agent_swarm import (
+    MAX_SWARM_RESULT_BYTES,
+    AgentSwarmResult,
     AgentSwarmRun,
     AgentSwarmRunState,
     objective_fingerprint,
@@ -43,6 +52,13 @@ from neuro_code.domain.model_planning import (
 )
 from neuro_code.domain.sandbox.models import SandboxProfile
 from neuro_code.domain.task_dag import TaskDag, TaskDagNode, TaskDagNodeState, TaskDagState
+from neuro_code.domain.task_dag_replan import (
+    DagReplanAttempt,
+    DagReplanAttemptState,
+    DagReplanEvidenceNode,
+    DagReplanProposalRecord,
+    TaskDagReplanEvidenceEnvelope,
+)
 from neuro_code.infrastructure.persistence.sqlite_session import SqliteSessionStore
 from neuro_code.shared.errors import ConfigurationError
 
@@ -116,6 +132,108 @@ def _dag(parent_session_id: str, dag_id: str = "swarm-dag") -> TaskDag:
         parent_session_id=parent_session_id,
         nodes=(TaskDagNode("node", 0, "run bounded work"),),
         created_at=_now(),
+    )
+
+
+def _completed_dag(parent_session_id: str, dag_id: str = "completed-swarm-dag") -> TaskDag:
+    base = _dag(parent_session_id, dag_id=dag_id)
+    completed_node = replace(
+        base.node("node"),
+        state=TaskDagNodeState.COMPLETED,
+        generation=1,
+        response_preview="completed result",
+    )
+    return replace(
+        base,
+        nodes=(completed_node,),
+        state=TaskDagState.COMPLETED,
+        generation=1,
+        updated_at=_now(),
+    )
+
+
+def _failed_dag(parent_session_id: str, dag_id: str = "failed-swarm-dag") -> TaskDag:
+    base = _dag(parent_session_id, dag_id=dag_id)
+    failed_node = replace(
+        base.node("node"),
+        state=TaskDagNodeState.FAILED,
+        generation=1,
+        error_kind="fixture_failure",
+        error_reason="bounded source failure",
+    )
+    return replace(
+        base,
+        nodes=(failed_node,),
+        state=TaskDagState.FAILED,
+        generation=1,
+        updated_at=_now(),
+    )
+
+
+def _replan_result(parent_session_id: str, source: TaskDag) -> TaskDagReplanResult:
+    successor = _dag(parent_session_id, dag_id=f"{source.dag_id}-successor")
+    evidence = TaskDagReplanEvidenceEnvelope(
+        source_dag_id=source.dag_id,
+        source_definition_fingerprint=source.definition_fingerprint,
+        source_terminal_state=TaskDagState.FAILED,
+        source_generation=source.generation,
+        nodes=(
+            DagReplanEvidenceNode(
+                node_id="node",
+                ordinal=0,
+                state=TaskDagNodeState.FAILED,
+                generation=source.node("node").generation,
+                failure_kind="fixture_failure",
+                failure_summary="bounded source failure",
+            ),
+        ),
+    )
+    proposal = ModelDagProposal(
+        nodes=(ModelDagProposalNode("node", "run bounded successor work"),),
+        max_parallel=1,
+        reason="fixture",
+    )
+    now = _now()
+    attempt = DagReplanAttempt(
+        revision_id=f"revision-{source.dag_id}",
+        parent_session_id=parent_session_id,
+        source_dag_id=source.dag_id,
+        source_definition_fingerprint=source.definition_fingerprint,
+        source_generation=source.generation,
+        source_state=TaskDagState.FAILED,
+        revision_depth=1,
+        evidence_fingerprint=evidence.fingerprint,
+        evidence_json=evidence.canonical_json,
+        planner_session_id="replan-planner",
+        planner_turn_id="replan-turn",
+        intended_successor_dag_id=successor.dag_id,
+        state=DagReplanAttemptState.COMPLETED,
+        owner_id="replan-owner",
+        lease_expires_at=now + timedelta(minutes=5),
+        model_response='{"bounded":true}',
+        proposal_fingerprint=proposal.fingerprint,
+        successor_dag_id=successor.dag_id,
+        created_at=now,
+        updated_at=now,
+    )
+    record = DagReplanProposalRecord(
+        proposal_id=f"proposal-{source.dag_id}",
+        revision_id=attempt.revision_id,
+        parent_session_id=parent_session_id,
+        source_dag_id=source.dag_id,
+        source_definition_fingerprint=source.definition_fingerprint,
+        source_generation=source.generation,
+        evidence_fingerprint=evidence.fingerprint,
+        intended_successor_dag_id=successor.dag_id,
+        proposal=proposal,
+        created_at=now,
+    )
+    return TaskDagReplanResult(
+        attempt.revision_id,
+        attempt,
+        record,
+        successor,
+        evidence,
     )
 
 
@@ -231,6 +349,28 @@ class _StaticLeaderFixture:
 
     async def run(self, request: RunLeaderRequest, *, sink=None) -> LeaderRunResult:
         del request, sink
+        self.calls += 1
+        return self._result
+
+    async def close(self) -> None:
+        self.closed += 1
+
+
+class _StaticReplannerFixture:
+    def __init__(self, result: TaskDagReplanResult) -> None:
+        self._result = result
+        self.calls = 0
+        self.closed = 0
+
+    async def run(
+        self,
+        request: RunTaskDagReplanRequest,
+        *,
+        sink=None,
+    ) -> TaskDagReplanResult:
+        del sink
+        assert request.revision_id == self._result.revision_id
+        assert request.source_dag_id == self._result.attempt.source_dag_id
         self.calls += 1
         return self._result
 
@@ -361,6 +501,69 @@ def test_swarm_domain_fingerprint_and_lifecycle_bounds() -> None:
             "0" * 64,
             "",
         )
+
+
+def test_swarm_domain_rejects_invalid_persisted_projection() -> None:
+    run = _candidate("domain-parent")
+    dag = _dag("domain-parent", dag_id="domain-lineage")
+    with pytest.raises(ValueError, match="safe identifier"):
+        replace(run, swarm_run_id="")
+    with pytest.raises(ValueError, match="bounded safe text"):
+        replace(run, final_response="\x01")
+    with pytest.raises(ValueError, match="unsafe control"):
+        objective_fingerprint("unsafe\x01objective")
+    with pytest.raises(ValueError, match="generation"):
+        terminal_result_fingerprint("run", "dag", True, "0" * 64, "result")
+    with pytest.raises(ValueError, match="state must be canonical"):
+        replace(run, state=cast(Any, "claimed"))
+    with pytest.raises(ValueError, match="generation"):
+        replace(run, generation=-1)
+    with pytest.raises(ValueError, match="owner pid"):
+        replace(run, owner_pid=0)
+    with pytest.raises(ValueError, match="planner identity"):
+        replace(run, planner_session_id="planner")
+    with pytest.raises(ValueError, match="current DAG identity"):
+        replace(run, current_dag_generation=0)
+    with pytest.raises(ValueError, match="current DAG generation"):
+        replace(
+            _candidate("domain-parent", dag=dag),
+            current_dag_generation=-1,
+        )
+    with pytest.raises(ValueError, match="without a root DAG"):
+        replace(run, current_dag_id="orphan-dag")
+    with pytest.raises(ValueError, match="requires a replan"):
+        replace(_candidate("domain-parent", dag=dag), successor_dag_id="successor")
+    with pytest.raises(ValueError, match="distinct"):
+        replace(
+            _candidate("domain-parent", dag=dag, replan_revision_id="revision"),
+            successor_dag_id=dag.dag_id,
+        )
+    with pytest.raises(ValueError, match="requires a final response"):
+        replace(
+            _candidate("domain-parent", dag=dag),
+            final_result_fingerprint="0" * 64,
+        )
+    completed = _candidate(
+        "domain-parent",
+        state=AgentSwarmRunState.COMPLETED,
+        dag=_completed_dag("domain-parent"),
+        final_response="done",
+    )
+    with pytest.raises(ValueError, match="inconsistent"):
+        replace(completed, final_result_fingerprint="0" * 64)
+    with pytest.raises(ValueError, match="pending terminal result"):
+        replace(run, state=AgentSwarmRunState.FINALIZING)
+    with pytest.raises(ValueError, match="timezone-aware"):
+        replace(run, lease_expires_at=datetime.fromtimestamp(0, UTC).replace(tzinfo=None))
+    with pytest.raises(ValueError, match="must not precede"):
+        replace(run, updated_at=run.created_at - timedelta(seconds=1))
+
+    with pytest.raises(ValueError, match="completed durable run"):
+        AgentSwarmResult(cast(Any, object()), dag)
+    with pytest.raises(ValueError, match="terminal DAG"):
+        AgentSwarmResult(completed, dag)
+    with pytest.raises(ValueError, match="does not match"):
+        AgentSwarmResult(completed, _completed_dag("domain-parent", "other-lineage"))
 
 
 @pytest.mark.parametrize(
@@ -516,6 +719,156 @@ async def test_swarm_rejects_noncanonical_lower_phase_services(tmp_path: Path) -
 
 
 @pytest.mark.asyncio
+async def test_swarm_runtime_guardrails_and_fencing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, parent_session_id = await _store_with_parent(tmp_path)
+    parent_binding = _parent_binding(parent_session_id)
+    service = AgentSwarmApplicationService(
+        store,
+        store,
+        parent_binding=parent_binding,
+        planner_factory=_forbidden_factory,
+        leader_factory=_forbidden_factory,
+        replanner_factory=_forbidden_factory,
+        owner_id="guardrail-controller",
+    )
+    assert service.owner_id == "guardrail-controller"
+    assert service.parent_session_id == parent_session_id
+    await service.close()
+
+    terminal_dag = _failed_dag(parent_session_id, dag_id="terminal-swarm-dag")
+    await store.insert_task_dag(terminal_dag)
+    terminal_run = _candidate(
+        parent_session_id,
+        run_id="terminal-swarm-run",
+        owner_id=service.owner_id,
+        state=AgentSwarmRunState.FAILED,
+        dag=terminal_dag,
+    )
+    await store.claim_swarm_run(terminal_run, now=_now(), owner_is_alive=owner_is_alive)
+    with pytest.raises(ConfigurationError, match="terminally failed"):
+        await service.run(RunAgentSwarmRequest("terminal-swarm-run", "bounded objective"))
+
+    async def fail_claim(*args: Any, **kwargs: Any) -> AgentSwarmRunClaim:
+        del args, kwargs
+        raise AgentSwarmStoreError("claim backend unavailable")
+
+    monkeypatch.setattr(store, "claim_swarm_run", fail_claim)
+    with pytest.raises(ConfigurationError, match="durable claim failed"):
+        await service.run(RunAgentSwarmRequest("claim-error", "bounded objective"))
+
+    async def conflicting_claim(*args: Any, **kwargs: Any) -> AgentSwarmRunClaim:
+        del args, kwargs
+        return AgentSwarmRunClaim(
+            _candidate(parent_session_id, run_id="other-identity", owner_id="other-owner"),
+            True,
+        )
+
+    monkeypatch.setattr(store, "claim_swarm_run", conflicting_claim)
+    with pytest.raises(ConfigurationError, match="identity conflicts"):
+        await service.run(
+            RunAgentSwarmRequest("identity-conflict", "bounded objective"),
+        )
+
+    async def dead_owner_claim(*args: Any, **kwargs: Any) -> AgentSwarmRunClaim:
+        del args, kwargs
+        return AgentSwarmRunClaim(
+            _candidate(
+                parent_session_id,
+                run_id="unreclaimable",
+                owner_id="dead-owner",
+                owner_pid=2_147_483_647,
+            ),
+            False,
+        )
+
+    monkeypatch.setattr(store, "claim_swarm_run", dead_owner_claim)
+    with pytest.raises(ConfigurationError, match="not durably reclaimable"):
+        await service.run(RunAgentSwarmRequest("unreclaimable", "bounded objective"))
+
+    ready_dag = _dag(parent_session_id, dag_id="guardrail-ready-dag")
+    executing = _candidate(
+        parent_session_id,
+        run_id="guardrail-executing",
+        state=AgentSwarmRunState.EXECUTING,
+        dag=ready_dag,
+    )
+
+    async def return_indeterminate(
+        run: AgentSwarmRun,
+        objective: str,
+        *,
+        sink: Any,
+    ) -> AgentSwarmRun:
+        del objective, sink
+        return replace(run, state=AgentSwarmRunState.INDETERMINATE)
+
+    monkeypatch.setattr(service, "_execute_dag", return_indeterminate)
+    with pytest.raises(ConfigurationError, match="execution is indeterminate"):
+        await service._drive(executing, "bounded objective", sink=None)
+    with pytest.raises(ConfigurationError, match="unsupported Swarm lifecycle"):
+        await service._drive(
+            _candidate(parent_session_id, run_id="unsupported", state=AgentSwarmRunState.FAILED),
+            "bounded objective",
+            sink=None,
+        )
+
+    completed_run = _candidate(
+        parent_session_id,
+        run_id="invalid-transition",
+        state=AgentSwarmRunState.COMPLETED,
+        dag=_completed_dag(parent_session_id),
+        final_response="done",
+    )
+    with pytest.raises(ConfigurationError, match="invalid Swarm lifecycle"):
+        await service._transition(completed_run, AgentSwarmRunState.COMPLETED)
+
+    async def fail_transition(*args: Any, **kwargs: Any) -> AgentSwarmRun:
+        del args, kwargs
+        raise AgentSwarmStoreError("lifecycle CAS lost")
+
+    monkeypatch.setattr(store, "compare_and_transition_swarm_run", fail_transition)
+    with pytest.raises(ConfigurationError, match="lifecycle fence was lost"):
+        await service._transition(
+            _candidate(parent_session_id, run_id="transition-error"),
+            AgentSwarmRunState.PLANNING,
+        )
+
+    original_get_task_dag = store.get_task_dag
+
+    async def fail_dag_lookup(*args: Any, **kwargs: Any) -> TaskDag | None:
+        del args, kwargs
+        raise RuntimeError("DAG backend unavailable")
+
+    monkeypatch.setattr(store, "get_task_dag", fail_dag_lookup)
+    with pytest.raises(ConfigurationError, match="DAG lookup failed"):
+        await service._load_current_dag(
+            _candidate(parent_session_id, dag=ready_dag),
+        )
+    monkeypatch.setattr(store, "get_task_dag", original_get_task_dag)
+
+    await store.insert_task_dag(_completed_dag(parent_session_id, "result-guard-dag"))
+    result_dag = await store.get_task_dag("result-guard-dag")
+    assert result_dag is not None
+    fake_run = SimpleNamespace(
+        swarm_run_id="result-guard",
+        state=AgentSwarmRunState.COMPLETED,
+        current_dag_id=result_dag.dag_id,
+        current_dag_generation=result_dag.generation,
+        current_dag_definition_fingerprint=result_dag.definition_fingerprint,
+        final_response=None,
+        final_result_fingerprint="0" * 64,
+    )
+    with pytest.raises(ConfigurationError, match="result is incomplete"):
+        await service._result_from_run(cast(AgentSwarmRun, fake_run))
+    fake_run.final_response = "done"
+    with pytest.raises(ConfigurationError, match="result fingerprint is invalid"):
+        await service._result_from_run(cast(AgentSwarmRun, fake_run))
+
+
+@pytest.mark.asyncio
 async def test_swarm_rejects_current_dag_and_terminal_projection_mismatches(
     tmp_path: Path,
 ) -> None:
@@ -571,6 +924,262 @@ async def test_swarm_rejects_current_dag_and_terminal_projection_mismatches(
     )
     with pytest.raises(ConfigurationError, match="non-completed DAG"):
         await service._result_from_run(completed_ready)
+
+
+@pytest.mark.asyncio
+async def test_swarm_phase_validation_and_terminal_projection_guards(tmp_path: Path) -> None:
+    store, parent_session_id = await _store_with_parent(tmp_path)
+    parent_binding = _parent_binding(parent_session_id)
+    service = AgentSwarmApplicationService(
+        store,
+        store,
+        parent_binding=parent_binding,
+        planner_factory=_forbidden_factory,
+        leader_factory=_forbidden_factory,
+        replanner_factory=_forbidden_factory,
+        owner_id="phase-guard-controller",
+    )
+
+    planning_dag = _dag(parent_session_id, dag_id="planning-guard-dag")
+    planned = _planning_result(
+        parent_session_id,
+        "planner-guard-session",
+        planning_dag,
+        "swarm-planning-planning-guard",
+    )
+    planning_run = _candidate(parent_session_id, run_id="planning-guard")
+    with pytest.raises(ConfigurationError, match="non-canonical result"):
+        service._verify_planning(planning_run, cast(Any, object()))
+    with pytest.raises(ConfigurationError, match="fresh READY DAG"):
+        service._verify_planning(
+            planning_run,
+            replace(planned, dag=_completed_dag(parent_session_id, "planning-guard-dag")),
+        )
+    with pytest.raises(ConfigurationError, match="root DAG identity"):
+        service._verify_planning(
+            replace(planning_run, root_dag_id="recovered-root"),
+            planned,
+        )
+
+    leader_dag = _dag(parent_session_id, dag_id="leader-guard-dag")
+    leader_run = _candidate(parent_session_id, run_id="leader-guard", dag=leader_dag)
+    with pytest.raises(ConfigurationError, match="non-canonical result"):
+        service._verify_leader_result(leader_run, cast(Any, object()))
+    with pytest.raises(ConfigurationError, match="outside the exact lineage"):
+        service._verify_leader_result(
+            leader_run,
+            LeaderRunResult(_dag(parent_session_id, dag_id="other-leader-dag"), None, ()),
+        )
+
+    completed_dag = _completed_dag(parent_session_id, "execute-completed-dag")
+    await store.insert_task_dag(completed_dag)
+    no_response_leader = _StaticLeaderFixture(LeaderRunResult(completed_dag, None, ()))
+
+    async def no_response_factory() -> _StaticLeaderFixture:
+        return no_response_leader
+
+    no_response_service = AgentSwarmApplicationService(
+        store,
+        store,
+        parent_binding=parent_binding,
+        planner_factory=_forbidden_factory,
+        leader_factory=no_response_factory,
+        replanner_factory=_forbidden_factory,
+        owner_id="no-response-controller",
+    )
+    with pytest.raises(ConfigurationError, match="no Leader final response"):
+        await no_response_service._execute_dag(
+            _candidate(parent_session_id, run_id="no-response", dag=completed_dag),
+            "bounded objective",
+            sink=None,
+        )
+    assert no_response_leader.closed == 1
+
+    too_long_leader = _StaticLeaderFixture(
+        LeaderRunResult(completed_dag, "x" * (MAX_SWARM_RESULT_BYTES + 1), ()),
+    )
+
+    async def too_long_factory() -> _StaticLeaderFixture:
+        return too_long_leader
+
+    too_long_service = AgentSwarmApplicationService(
+        store,
+        store,
+        parent_binding=parent_binding,
+        planner_factory=_forbidden_factory,
+        leader_factory=too_long_factory,
+        replanner_factory=_forbidden_factory,
+        owner_id="too-long-controller",
+    )
+    with pytest.raises(ConfigurationError, match="bounded result contract"):
+        await too_long_service._execute_dag(
+            _candidate(parent_session_id, run_id="too-long", dag=completed_dag),
+            "bounded objective",
+            sink=None,
+        )
+    assert too_long_leader.closed == 1
+
+    nonterminal_dag = _dag(parent_session_id, dag_id="execute-nonterminal-dag")
+    await store.insert_task_dag(nonterminal_dag)
+    nonterminal_leader = _StaticLeaderFixture(LeaderRunResult(nonterminal_dag, None, ()))
+
+    async def nonterminal_factory() -> _StaticLeaderFixture:
+        return nonterminal_leader
+
+    nonterminal_service = AgentSwarmApplicationService(
+        store,
+        store,
+        parent_binding=parent_binding,
+        planner_factory=_forbidden_factory,
+        leader_factory=nonterminal_factory,
+        replanner_factory=_forbidden_factory,
+        owner_id="nonterminal-controller",
+    )
+    with pytest.raises(ConfigurationError, match="non-terminal or uncertain"):
+        await nonterminal_service._execute_dag(
+            _candidate(parent_session_id, run_id="nonterminal", dag=nonterminal_dag),
+            "bounded objective",
+            sink=None,
+        )
+    assert nonterminal_leader.closed == 1
+
+
+@pytest.mark.asyncio
+async def test_swarm_replan_lineage_and_source_immutability_guards(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, parent_session_id = await _store_with_parent(tmp_path)
+    parent_binding = _parent_binding(parent_session_id)
+    service = AgentSwarmApplicationService(
+        store,
+        store,
+        parent_binding=parent_binding,
+        planner_factory=_forbidden_factory,
+        leader_factory=_forbidden_factory,
+        replanner_factory=_forbidden_factory,
+        owner_id="replan-guard-controller",
+    )
+    with pytest.raises(ConfigurationError, match="identity is incomplete"):
+        await service._replan(
+            _candidate(parent_session_id, state=AgentSwarmRunState.REPLANNING),
+            sink=None,
+        )
+
+    ready_source = _dag(parent_session_id, dag_id="replan-ready-source")
+    await store.insert_task_dag(ready_source)
+    with pytest.raises(ConfigurationError, match="quiescent FAILED source"):
+        await service._replan(
+            _candidate(
+                parent_session_id,
+                run_id="replan-ready",
+                state=AgentSwarmRunState.REPLANNING,
+                dag=ready_source,
+                replan_revision_id="ready-revision",
+            ),
+            sink=None,
+        )
+
+    indeterminate_base = _failed_dag(parent_session_id, dag_id="replan-indeterminate-source")
+    indeterminate_node = replace(
+        indeterminate_base.node("node"),
+        state=TaskDagNodeState.INDETERMINATE,
+        generation=2,
+    )
+    indeterminate_source = replace(
+        indeterminate_base,
+        nodes=(indeterminate_node,),
+        state=TaskDagState.FAILED,
+        generation=2,
+        updated_at=_now(),
+    )
+    await store.insert_task_dag(indeterminate_source)
+    with pytest.raises(ConfigurationError, match="indeterminate source"):
+        await service._replan(
+            _candidate(
+                parent_session_id,
+                run_id="replan-indeterminate",
+                state=AgentSwarmRunState.REPLANNING,
+                dag=indeterminate_source,
+                replan_revision_id="indeterminate-revision",
+            ),
+            sink=None,
+        )
+
+    source = _failed_dag(parent_session_id, dag_id="replan-lineage-source")
+    await store.insert_task_dag(source)
+    revised = _replan_result(parent_session_id, source)
+    replan_run = _candidate(
+        parent_session_id,
+        run_id="replan-lineage",
+        state=AgentSwarmRunState.REPLANNING,
+        dag=source,
+        replan_revision_id=revised.revision_id,
+    )
+    with pytest.raises(ConfigurationError, match="non-canonical result"):
+        service._verify_replan(replan_run, source, cast(Any, object()))
+    with pytest.raises(ConfigurationError, match="exact DAG lineage"):
+        service._verify_replan(
+            replan_run,
+            source,
+            replace(
+                revised,
+                proposal=replace(
+                    revised.proposal,
+                    source_generation=source.generation + 1,
+                ),
+            ),
+        )
+    wrong_evidence = SimpleNamespace(
+        fingerprint=revised.evidence.fingerprint,
+        source_dag_id="wrong-source",
+        source_definition_fingerprint=source.definition_fingerprint,
+        source_generation=source.generation,
+        source_terminal_state=TaskDagState.FAILED,
+    )
+    with pytest.raises(ConfigurationError, match="source identity"):
+        service._verify_replan(
+            replan_run,
+            source,
+            replace(revised, evidence=cast(Any, wrong_evidence)),
+        )
+    with pytest.raises(ConfigurationError, match="successor DAG identity"):
+        service._verify_replan(
+            replace(replan_run, successor_dag_id="other-successor"),
+            source,
+            revised,
+        )
+
+    replanner = _StaticReplannerFixture(revised)
+
+    async def replanner_factory() -> _StaticReplannerFixture:
+        return replanner
+
+    original_get_task_dag = store.get_task_dag
+    lookup_count = 0
+
+    async def changed_source_after_first_lookup(dag_id: str) -> TaskDag | None:
+        nonlocal lookup_count
+        lookup_count += 1
+        if lookup_count == 1:
+            return await original_get_task_dag(dag_id)
+        current = await original_get_task_dag(dag_id)
+        assert current is not None
+        return replace(current, generation=current.generation + 1, updated_at=_now())
+
+    monkeypatch.setattr(store, "get_task_dag", changed_source_after_first_lookup)
+    mutating_guard_service = AgentSwarmApplicationService(
+        store,
+        store,
+        parent_binding=parent_binding,
+        planner_factory=_forbidden_factory,
+        leader_factory=_forbidden_factory,
+        replanner_factory=replanner_factory,
+        owner_id="replan-mutation-guard",
+    )
+    with pytest.raises(ConfigurationError, match="immutable source DAG"):
+        await mutating_guard_service._replan(replan_run, sink=None)
+    assert replanner.calls == replanner.closed == 1
 
 
 @pytest.mark.asyncio
