@@ -49,6 +49,8 @@ from neuro_code.domain.conversation.request import context_fingerprints
 from neuro_code.domain.execution import (
     TurnCancellationPolicy,
     TurnInput,
+    TurnRecoveryAttempt,
+    TurnRecoveryResolution,
     TurnSource,
 )
 from neuro_code.domain.sandbox.models import SandboxProfile
@@ -529,12 +531,20 @@ async def test_simple_ultracode_uses_existing_main_path_once_and_replays_exact_r
 
         service = _service(store, binding, swarm_factory)
         request = RunTurnRequest("summarize this local file", turn_id="simple-turn")
-        first = await service.run_turn(request)
+        progress: list[AgentEventKind] = []
+
+        async def sink(event) -> None:
+            progress.append(event.kind)
+
+        first = await service.run_turn(request, sink=sink)
         execution_id = ultracode_execution_id(runner.session_id or "", "simple-turn")
 
         assert first.response == "main answer"
         assert runner.run_calls == 1
         assert factory_calls == 0
+        assert progress[0] is AgentEventKind.ULTRACODE_DELEGATION_PROGRESS
+        assert progress.count(AgentEventKind.ULTRACODE_DELEGATION_PROGRESS) == 2
+        assert AgentEventKind.TURN_COMPLETED in progress
         execution = await store.get_ultracode_execution(execution_id)
         assert execution is not None
         assert execution.decision is UltracodeDelegationDecision.MAIN_MAX
@@ -846,6 +856,368 @@ def test_ultracode_execution_rejects_invalid_or_incomplete_terminal_identity() -
         replace(candidate, state=UltracodeExecutionState.COMPLETED)
     with pytest.raises(ValueError, match="finalizing Ultracode execution"):
         replace(candidate, state=UltracodeExecutionState.FINALIZING)
+
+
+@pytest.mark.asyncio
+async def test_ultracode_entry_validates_configuration_and_parent_guardrails() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        cwd = Path(directory)
+        store = await _store(cwd)
+        runner = _ParentRunner(store, cwd)
+        binding = _binding(runner, cwd)
+
+        async def swarm_factory() -> _CompletedSwarm:
+            raise AssertionError("configuration tests must not start a Swarm")
+
+        with pytest.raises(ConfigurationError, match="parent binding"):
+            UltracodeDelegationApplicationService(
+                cast(UltracodeStore, store),
+                session_store=store,
+                parent_binding=cast(Any, object()),
+                swarm_factory=swarm_factory,
+            )
+        with pytest.raises(ConfigurationError, match="store is invalid"):
+            UltracodeDelegationApplicationService(
+                cast(Any, object()),
+                session_store=store,
+                parent_binding=binding,
+                swarm_factory=swarm_factory,
+            )
+        with pytest.raises(ConfigurationError, match="session store is invalid"):
+            UltracodeDelegationApplicationService(
+                cast(UltracodeStore, store),
+                session_store=cast(Any, object()),
+                parent_binding=binding,
+                swarm_factory=swarm_factory,
+            )
+        with pytest.raises(ConfigurationError, match="factory is required"):
+            UltracodeDelegationApplicationService(
+                cast(UltracodeStore, store),
+                session_store=store,
+                parent_binding=binding,
+                swarm_factory=cast(Any, object()),
+            )
+        with pytest.raises(ConfigurationError, match="lease duration"):
+            UltracodeDelegationApplicationService(
+                cast(UltracodeStore, store),
+                session_store=store,
+                parent_binding=binding,
+                swarm_factory=swarm_factory,
+                lease_seconds=0,
+            )
+        with pytest.raises(ConfigurationError, match="owner identity"):
+            UltracodeDelegationApplicationService(
+                cast(UltracodeStore, store),
+                session_store=store,
+                parent_binding=binding,
+                swarm_factory=swarm_factory,
+                owner_id=" ",
+            )
+
+        service = _service(store, binding, swarm_factory)
+        with pytest.raises(ValueError, match="canonical"):
+            await service.run_turn(cast(Any, object()))
+        with pytest.raises(ConfigurationError, match="only for user turns"):
+            await service.run_turn(
+                RunTurnRequest(
+                    "background request",
+                    turn_source=TurnSource.BACKGROUND_TASK_AUTO_WAKE,
+                )
+            )
+        runner._conversation._runtime.reasoning_effort = ReasoningEffort.MAX
+        with pytest.raises(ConfigurationError, match="effort=ultracode"):
+            await service.run_turn(RunTurnRequest("wrong effort", turn_id="wrong-effort"))
+        runner._conversation._runtime.reasoning_effort = ReasoningEffort.ULTRACODE
+        session_id = await runner.ensure_persisted_session()
+        with pytest.raises(ConfigurationError, match="does not match"):
+            await service.run_turn(
+                RunTurnRequest(
+                    "stale session request",
+                    turn_id="stale-session",
+                    expected_session_id=f"{session_id}-other",
+                )
+            )
+
+        bad_runner_binding = ConversationBinding(cast(Any, object()), binding.provider)
+        bad_service = _service(store, bad_runner_binding, swarm_factory)
+        with pytest.raises(ConfigurationError, match="required seam"):
+            await bad_service.run_turn(RunTurnRequest("missing runner seam"))
+
+
+@pytest.mark.asyncio
+async def test_ultracode_recovery_reuses_running_branch_and_fails_closed() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        cwd = Path(directory)
+        store = await _store(cwd)
+        runner = _ParentRunner(store, cwd)
+        binding = _binding(runner, cwd)
+        next_swarm: _CompletedSwarm | None = None
+
+        async def swarm_factory() -> _CompletedSwarm:
+            if next_swarm is None:
+                raise AssertionError("the recovery case has no expected Swarm")
+            return next_swarm
+
+        service = _service(store, binding, swarm_factory, owner_id="recovery-owner")
+        session_id = await runner.ensure_persisted_session()
+
+        async def seed_running(
+            turn_id: str,
+            prompt: str,
+            decision: UltracodeDelegationDecision,
+        ) -> UltracodeExecution:
+            candidate = _fresh_ultracode_candidate(session_id, turn_id, prompt, decision)
+            owned = replace(
+                candidate,
+                owner_id=service.owner_id,
+                owner_pid=os.getpid(),
+                owner_token=service._owner_token,
+            )
+            claim = await store.claim_ultracode_execution(
+                owned,
+                now=datetime.now(UTC),
+                owner_is_alive=lambda _pid: True,
+            )
+            assert claim.acquired is True
+            return await service._transition(
+                claim.execution,
+                (
+                    UltracodeExecutionState.MAIN_MAX_RUNNING
+                    if decision is UltracodeDelegationDecision.MAIN_MAX
+                    else UltracodeExecutionState.BOUNDED_SWARM_RUNNING
+                ),
+            )
+
+        main_prompt = "recover a normal main turn"
+        main_run = await seed_running(
+            "recovery-main-no-attempt",
+            main_prompt,
+            UltracodeDelegationDecision.MAIN_MAX,
+        )
+        result = await service.run_turn(
+            RunTurnRequest(main_prompt, turn_id=main_run.parent_turn_id)
+        )
+        assert result.response == "main answer"
+        assert runner.run_calls == 1
+
+        open_prompt = "recover an open main attempt"
+        open_run = await seed_running(
+            "recovery-main-open-attempt",
+            open_prompt,
+            UltracodeDelegationDecision.MAIN_MAX,
+        )
+        open_input = TurnInput(open_prompt, source=TurnSource.USER)
+        await store.start_turn_attempt(
+            TurnRecoveryAttempt.create(
+                turn_id=open_run.parent_turn_id,
+                session_id=session_id,
+                input=open_input,
+                accepted_at=datetime.now(UTC),
+            )
+        )
+        with pytest.raises(ConfigurationError, match="open parent attempt"):
+            await service.run_turn(RunTurnRequest(open_prompt, turn_id=open_run.parent_turn_id))
+        persisted_open = await store.get_ultracode_execution(open_run.execution_id)
+        assert persisted_open is not None
+        assert persisted_open.state is UltracodeExecutionState.INDETERMINATE
+        await runner._conversation.abandon_recovery(open_run.parent_turn_id)
+
+        missing_attempt_prompt = "recover a Swarm without an exact attempt"
+        missing_attempt_run = await seed_running(
+            "recovery-swarm-missing-attempt",
+            missing_attempt_prompt,
+            UltracodeDelegationDecision.BOUNDED_SWARM,
+        )
+        with pytest.raises(ConfigurationError, match="no exact parent attempt"):
+            await service.run_turn(
+                RunTurnRequest(missing_attempt_prompt, turn_id=missing_attempt_run.parent_turn_id)
+            )
+
+        no_lower_prompt = "recover a Swarm whose lower identity is absent"
+        no_lower_run = await seed_running(
+            "recovery-swarm-no-lower",
+            no_lower_prompt,
+            UltracodeDelegationDecision.BOUNDED_SWARM,
+        )
+        no_lower_input = TurnInput(no_lower_prompt, source=TurnSource.USER)
+        await store.start_turn_attempt(
+            TurnRecoveryAttempt.create(
+                turn_id=no_lower_run.parent_turn_id,
+                session_id=session_id,
+                input=no_lower_input,
+                accepted_at=datetime.now(UTC),
+            )
+        )
+        with pytest.raises(ConfigurationError, match="replay is disabled"):
+            await service.run_turn(
+                RunTurnRequest(no_lower_prompt, turn_id=no_lower_run.parent_turn_id)
+            )
+        await runner._conversation.abandon_recovery(no_lower_run.parent_turn_id)
+
+        recover_prompt = "recover an existing bounded Swarm"
+        recover_run = await seed_running(
+            "recovery-swarm-existing-lower",
+            recover_prompt,
+            UltracodeDelegationDecision.BOUNDED_SWARM,
+        )
+        recover_input = TurnInput(recover_prompt, source=TurnSource.USER)
+        await store.start_turn_attempt(
+            TurnRecoveryAttempt.create(
+                turn_id=recover_run.parent_turn_id,
+                session_id=session_id,
+                input=recover_input,
+                accepted_at=datetime.now(UTC),
+            )
+        )
+        lower_result = _completed_swarm_result(recover_run.downstream_id, session_id)
+        await _fresh_seed_completed_swarm(store, lower_result)
+        next_swarm = _CompletedSwarm(lower_result)
+        recovered = await service.run_turn(
+            RunTurnRequest(recover_prompt, turn_id=recover_run.parent_turn_id)
+        )
+        assert recovered.response == lower_result.final_response
+        assert next_swarm.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_ultracode_rejects_noncanonical_or_mismatched_swarm_results() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        cwd = Path(directory)
+        store = await _store(cwd)
+        runner = _ParentRunner(store, cwd)
+        binding = _binding(runner, cwd)
+        swarm_results: list[Any] = [object()]
+
+        class _ArbitrarySwarm:
+            def __init__(self, result: Any) -> None:
+                self.result = result
+                self.closed = False
+
+            async def run(self, request: RunAgentSwarmRequest, *, sink=None) -> Any:
+                del request, sink
+                return self.result
+
+            async def close(self) -> None:
+                self.closed = True
+
+        swarms: list[_ArbitrarySwarm] = []
+
+        async def swarm_factory() -> _ArbitrarySwarm:
+            swarm = _ArbitrarySwarm(swarm_results.pop(0))
+            swarms.append(swarm)
+            return swarm
+
+        service = _service(store, binding, swarm_factory)
+        with pytest.raises(ConfigurationError, match="non-canonical result"):
+            await service.run_turn(
+                RunTurnRequest("research independent tasks in parallel", turn_id="bad-result")
+            )
+        assert swarms[0].closed is True
+
+        session_id = runner.session_id
+        assert session_id is not None
+        await runner._conversation.abandon_recovery("bad-result")
+        swarm_results.append(_completed_swarm_result("wrong-swarm-id", session_id))
+        with pytest.raises(ConfigurationError, match="does not match"):
+            await service.run_turn(
+                RunTurnRequest("research another independent task in parallel", turn_id="bad-id")
+            )
+        assert swarms[1].closed is True
+
+
+@pytest.mark.asyncio
+async def test_ultracode_transition_and_parent_result_guards_are_fail_closed() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        cwd = Path(directory)
+        store = await _store(cwd)
+        runner = _ParentRunner(store, cwd)
+        binding = _binding(runner, cwd)
+
+        async def swarm_factory() -> _CompletedSwarm:
+            raise AssertionError("guard tests must not start a Swarm")
+
+        service = _service(store, binding, swarm_factory, owner_id="guard-owner")
+        session_id = await runner.ensure_persisted_session()
+        candidate = _fresh_ultracode_candidate(
+            session_id,
+            "guard-turn",
+            "guard input",
+            UltracodeDelegationDecision.MAIN_MAX,
+        )
+        candidate = replace(
+            candidate,
+            owner_id=service.owner_id,
+            owner_pid=os.getpid(),
+            owner_token=service._owner_token,
+        )
+        claim = await store.claim_ultracode_execution(
+            candidate,
+            now=datetime.now(UTC),
+            owner_is_alive=lambda _pid: True,
+        )
+        assert claim.acquired is True
+        running = await service._transition(
+            claim.execution, UltracodeExecutionState.MAIN_MAX_RUNNING
+        )
+        with pytest.raises(ConfigurationError, match="invalid Ultracode lifecycle transition"):
+            await service._transition(running, UltracodeExecutionState.MAIN_MAX_RUNNING)
+        with pytest.raises(ConfigurationError, match="lifecycle fence was lost"):
+            await service._transition(
+                claim.execution,
+                UltracodeExecutionState.MAIN_MAX_RUNNING,
+            )
+        with pytest.raises(ConfigurationError, match="missing its exact response"):
+            await service._require_parent_result(session_id, "missing-turn", candidate.execution_id)
+
+        open_attempt = TurnRecoveryAttempt.create(
+            turn_id="guard-open",
+            session_id=session_id,
+            input=TurnInput("different prompt", source=TurnSource.USER),
+            accepted_at=datetime.now(UTC),
+        )
+        await store.start_turn_attempt(open_attempt)
+        guard_run = replace(
+            candidate,
+            parent_turn_id="guard-other",
+            input_fingerprint=TurnInput("guard input", source=TurnSource.USER).fingerprint,
+        )
+        with pytest.raises(ConfigurationError, match="another unresolved turn"):
+            await service._ensure_parent_attempt(
+                guard_run,
+                RunTurnRequest("guard input", turn_id="guard-other"),
+            )
+
+        resolved = replace(
+            TurnRecoveryAttempt.create(
+                turn_id=candidate.parent_turn_id,
+                session_id=session_id,
+                input=TurnInput("guard input", source=TurnSource.USER),
+                accepted_at=datetime.now(UTC),
+            ),
+            resolution=TurnRecoveryResolution.ABANDONED,
+            resolution_at=datetime.now(UTC),
+        )
+
+        async def load_resolved(_session_id: str) -> list[TurnRecoveryAttempt]:
+            return [resolved]
+
+        fake_session_store = SimpleNamespace(
+            load_events=store.load_events,
+            load_turn_attempts=load_resolved,
+            start_turn_attempt=store.start_turn_attempt,
+        )
+        resolved_service = UltracodeDelegationApplicationService(
+            cast(UltracodeStore, store),
+            session_store=cast(Any, fake_session_store),
+            parent_binding=binding,
+            swarm_factory=swarm_factory,
+            owner_id="resolved-guard-owner",
+        )
+        with pytest.raises(ConfigurationError, match="already resolved"):
+            await resolved_service._ensure_parent_attempt(
+                candidate,
+                RunTurnRequest("guard input", turn_id=candidate.parent_turn_id),
+            )
 
 
 def test_policy_is_local_deterministic_and_bounded() -> None:
