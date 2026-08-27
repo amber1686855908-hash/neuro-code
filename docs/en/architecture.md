@@ -2135,14 +2135,23 @@ deepest ordinary single-agent reasoning/review policy. Only an explicit
 `high`, `xhigh`, and `max` retain the ordinary ConversationRunner path.
 
 The entry uses a bounded deterministic local policy rather than a second model
-classifier call. It makes only the typed choice `MAIN_MAX` or `BOUNDED_SWARM`.
-It cannot choose tools, worker count, DAG definitions, sandbox, workspace
-roots, network, MCP, retry, merge, or provider credentials. The `MAIN_MAX`
-branch invokes the existing parent `ConversationRunner` with its normal
-single-agent `max` semantics. The `BOUNDED_SWARM` branch invokes the existing
+classifier call. In this slice the policy is a fixed marker heuristic for
+parallel/decomposition, cross-file, and research wording; it is not semantic
+task classification or model-level routing intelligence. It makes only the
+typed choice `MAIN_MAX` or `BOUNDED_SWARM`. It cannot choose tools, worker
+count, DAG definitions, sandbox, workspace roots, network, MCP, retry, merge,
+or provider credentials. The `MAIN_MAX` branch invokes the existing parent
+`ConversationRunner` with its normal single-agent `max` semantics. The
+`BOUNDED_SWARM` branch invokes the existing
 `ApplicationComposition.create_agent_swarm_service()` with one deterministic
 `swarm_run_id`; no second Planner, Leader, DAG, Writable worker, or Swarm is
 introduced.
+
+Interactive TUI composition binds this application entry once as a dormant
+delegate. `SessionTurnService` reads the controller's current effort for every
+user turn, so a long-lived service can switch `max` → `ultracode` → `max` →
+`ultracode` without service recreation; ordinary efforts never call the
+delegate.
 
 Session schema 28 adds the insert-once
 `orchestration_ultracode_executions` projection. Its immutable identity binds
@@ -2157,13 +2166,19 @@ never switches to the other branch.
 `MAIN_MAX` and `BOUNDED_SWARM` both publish exactly one parent-visible
 assistant result through the existing conversation finalization contract.
 Committed output is matched only by exact `(session_id, turn_id,
-ultracode_execution_id)` evidence. A crash after a lower Swarm terminal result
-or parent result but before Ultracode bookkeeping reuses the exact durable
-result without another provider or Swarm execution. A crash with an open
-parent attempt fails closed unless the exact lower Swarm identity already
-exists and can be resumed by the existing Swarm service. There is no latest-row
-lookup, timestamp correlation, text matching, silent fallback, or duplicate
-assistant append.
+ultracode_execution_id)` evidence. The raw A–E matrix directly exercises
+durable lifecycle seams and is not, by itself, full composition proof. Two
+additional `multiprocessing`-spawn acceptances use fresh
+`ApplicationComposition` instances: MAIN_MAX exits after the exact parent
+`TURN_COMPLETED` result is durable but before the Ultracode terminal transition,
+while BOUNDED_SWARM exits after the existing Swarm is `COMPLETED` but before
+the parent external-turn commit. Recovery reuses the exact durable result and
+identity without another provider, Planner, Leader, Worker, or Swarm
+execution, and resource counts remain unchanged. A crash with an open parent
+attempt fails closed unless the exact lower Swarm identity already exists and
+can be resumed by the existing Swarm service. There is no latest-row lookup,
+timestamp correlation, text matching, silent fallback, or duplicate assistant
+append.
 
 The parent `ConversationBinding` remains the capability ceiling. The entry
 adds no filesystem, Bash, LSP, MCP, network, Worktree, Checkpoint, or Writable

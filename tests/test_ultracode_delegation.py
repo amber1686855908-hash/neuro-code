@@ -2,17 +2,18 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import multiprocessing as mp
 import os
 import sqlite3
 import tempfile
 from collections.abc import AsyncIterator
-from contextlib import closing
+from contextlib import closing, suppress
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, cast
+from typing import Any, NoReturn, cast
 from unittest.mock import patch
 
 import pytest
@@ -26,6 +27,10 @@ from neuro_code.application.ports.ultracode import (
 from neuro_code.application.runtime.agent import AgentRunResult
 from neuro_code.application.sessions.binding import ConversationBinding
 from neuro_code.application.sessions.conversation import AgentConversation
+from neuro_code.application.sessions.profile_conversation import (
+    ProfileConversationController,
+    ProviderOption,
+)
 from neuro_code.application.sessions.turns import RunTurnRequest, SessionTurnService
 from neuro_code.application.settings import ApplicationSettings
 from neuro_code.application.workflows.agent_swarm import RunAgentSwarmRequest
@@ -43,6 +48,7 @@ from neuro_code.domain.agent_swarm import (
     terminal_result_fingerprint,
 )
 from neuro_code.domain.conversation.events import AgentEventKind, ModelCompleted, ModelEvent
+from neuro_code.domain.conversation.interaction_mode import InteractionMode
 from neuro_code.domain.conversation.messages import Message, Role
 from neuro_code.domain.conversation.reasoning import ReasoningEffort
 from neuro_code.domain.conversation.request import context_fingerprints
@@ -89,6 +95,8 @@ class _Runtime:
         self.sandbox_profile = SandboxProfile.OFF
         self.system_prompt = "fixture system prompt"
         self.reasoning_effort = ReasoningEffort.ULTRACODE
+        self.interaction_mode = InteractionMode.NORMAL
+        self.auto_mode_unrestricted = False
         self.plan = None
         self.plan_comments = ()
 
@@ -97,6 +105,12 @@ class _Runtime:
 
     def set_plan_comments(self, comments: object) -> None:
         self.plan_comments = comments
+
+    def set_reasoning_effort(self, effort: ReasoningEffort) -> None:
+        self.reasoning_effort = effort
+
+    def set_interaction_mode(self, mode: InteractionMode) -> None:
+        self.interaction_mode = mode
 
 
 class _ParentRunner:
@@ -126,11 +140,25 @@ class _ParentRunner:
         return self._conversation.reasoning_effort
 
     @property
+    def interaction_mode(self) -> InteractionMode:
+        return self._conversation.interaction_mode
+
+    @property
+    def auto_mode_unrestricted(self) -> bool:
+        return self._conversation.auto_mode_unrestricted
+
+    @property
     def items(self):
         return self._conversation.items
 
     async def ensure_persisted_session(self) -> str:
         return await self._conversation.ensure_persisted_session()
+
+    def set_reasoning_effort(self, effort: ReasoningEffort) -> None:
+        self._conversation.set_reasoning_effort(effort)
+
+    def set_interaction_mode(self, mode: InteractionMode) -> None:
+        self._conversation.set_interaction_mode(mode)
 
     async def run(
         self,
@@ -180,6 +208,40 @@ class _ParentRunner:
             content_parts=content_parts,
             sink=sink,
         )
+
+
+class _DynamicParentRunner(_ParentRunner):
+    """Parent runner that exposes an ordinary path beside Ultracode."""
+
+    def __init__(self, store: SqliteSessionStore, cwd: Path) -> None:
+        super().__init__(store, cwd)
+        self.ordinary_prompts: list[str] = []
+
+    async def run(
+        self,
+        prompt: str,
+        *,
+        sink=None,
+        content_parts=(),
+        cancellation_policy: TurnCancellationPolicy = TurnCancellationPolicy.RETAIN,
+        turn_source: TurnSource = TurnSource.USER,
+        turn_id: str | None = None,
+        ultracode_execution_id: str | None = None,
+    ) -> AgentRunResult:
+        if ultracode_execution_id is not None:
+            return await super().run(
+                prompt,
+                sink=sink,
+                content_parts=content_parts,
+                cancellation_policy=cancellation_policy,
+                turn_source=turn_source,
+                turn_id=turn_id,
+                ultracode_execution_id=ultracode_execution_id,
+            )
+        del sink, content_parts, cancellation_policy, turn_source, turn_id
+        self.ordinary_prompts.append(prompt)
+        session_id = await self.ensure_persisted_session()
+        return AgentRunResult(session_id, f"ordinary:{prompt}", (), (), (), 0)
 
 
 def _binding(runner: _ParentRunner, cwd: Path) -> ConversationBinding:
@@ -271,6 +333,280 @@ class _ProductionMainProvider:
         yield ModelCompleted("stop", response_text="production main answer")
 
 
+class _DurableMainProvider:
+    provider_name = "fixture"
+    model_name = "fixture-model"
+    context_affinity = "fixture-production-main"
+    capabilities = ModelCapabilitySet.all_unknown()
+
+    def __init__(self, call_log: Path, phase: str) -> None:
+        self._call_log = call_log
+        self._phase = phase
+
+    async def stream(
+        self,
+        context: Any,
+        tools: Any,
+        *,
+        tool_policy: ModelToolPolicy = ModelToolPolicy.ALLOWED,
+    ) -> AsyncIterator[ModelEvent]:
+        del context, tools, tool_policy
+        _append_durable_json_line(
+            self._call_log,
+            {"branch": "main", "phase": self._phase, "pid": os.getpid()},
+        )
+        yield ModelCompleted("stop", response_text=_FRESH_MAIN_RESPONSE)
+
+
+class _DurablePlanningProvider(_ProductionPlanningProvider):
+    """Production Swarm fixture with durable provider-call provenance."""
+
+    def __init__(self, state: _ProductionPlanningState, call_log: Path, phase: str) -> None:
+        super().__init__(state)
+        self._call_log = call_log
+        self._phase = phase
+
+    async def stream(
+        self,
+        context: Any,
+        tools: Any,
+        *,
+        tool_policy: ModelToolPolicy = ModelToolPolicy.ALLOWED,
+    ) -> AsyncIterator[ModelEvent]:
+        contents = "\n".join(message.content for message in context.messages)
+        if "bounded DAG Planner" in contents:
+            kind = "planner"
+            node_id = None
+        elif "Leader decision authority" in contents:
+            kind = "leader"
+            node_id = None
+        else:
+            node_id = next(
+                (
+                    candidate
+                    for candidate in ("a", "b", "c", "d")
+                    if f"planning-node-{candidate}" in contents
+                ),
+                None,
+            )
+            kind = "worker"
+        payload: dict[str, object] = {
+            "branch": kind,
+            "phase": self._phase,
+            "pid": os.getpid(),
+        }
+        if node_id is not None:
+            payload["node_id"] = node_id
+        _append_durable_json_line(self._call_log, payload)
+
+        release_task: asyncio.Task[None] | None = None
+        if node_id in {"b", "c"}:
+
+            async def release_fanout() -> None:
+                await self._state.fanout_started.wait()
+                self._state.release_fanout.set()
+
+            release_task = asyncio.create_task(release_fanout())
+        try:
+            async for event in super().stream(context, tools, tool_policy=tool_policy):
+                yield event
+        finally:
+            if release_task is not None and not release_task.done():
+                release_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await release_task
+
+
+def _production_ultracode_settings(
+    repository: Path,
+    *,
+    resume_id: str | None = None,
+) -> ApplicationSettings:
+    return ApplicationSettings(
+        cwd=repository,
+        sandbox="off",
+        permission_mode=PermissionMode.BYPASS,
+        max_steps=8,
+        reasoning_effort=ReasoningEffort.ULTRACODE,
+        resume_id=resume_id,
+    )
+
+
+def _durable_main_provider_factory(call_log: Path, phase: str) -> Any:
+    def factory(_config: Any, _failover: bool) -> ModelProvider:
+        return cast(ModelProvider, _DurableMainProvider(call_log, phase))
+
+    return factory
+
+
+def _durable_planning_provider_factory(
+    state: _ProductionPlanningState,
+    call_log: Path,
+    phase: str,
+) -> Any:
+    def factory(_config: Any, _failover: bool) -> ModelProvider:
+        return cast(ModelProvider, _DurablePlanningProvider(state, call_log, phase))
+
+    return factory
+
+
+def _composition_environment(root: Path, state_dir: Path) -> dict[str, str]:
+    return {
+        "HOME": str(root),
+        "NEURO_CODE_HOME": str(state_dir),
+        "FIXTURE_KEY": "fixture-key",
+    }
+
+
+def _spawn_production_main_crash(
+    root_directory: str,
+    repository_directory: str,
+    state_directory: str,
+    provider_call_log: str,
+    prompt: str,
+    turn_id: str,
+) -> NoReturn:
+    async def run() -> NoReturn:
+        root = Path(root_directory)
+        repository = Path(repository_directory)
+        state_dir = Path(state_directory)
+        call_log = Path(provider_call_log)
+        application: ApplicationComposition | None = None
+        binding: ConversationBinding | None = None
+        with patch.dict("os.environ", _composition_environment(root, state_dir), clear=False):
+            try:
+                application = await ApplicationComposition.open(
+                    _production_ultracode_settings(repository),
+                    provider_factory=_durable_main_provider_factory(call_log, "l1"),
+                )
+                binding = await application.create_binding(
+                    reasoning_effort=ReasoningEffort.ULTRACODE,
+                )
+                store = cast(SqliteSessionStore, application.store)
+                service = await application.create_ultracode_delegation_service(
+                    parent_binding=binding,
+                )
+                original = store.compare_and_transition_ultracode_execution
+
+                async def hooked(
+                    proposed: UltracodeExecution,
+                    *,
+                    expected_generation: int,
+                    expected_state: UltracodeExecutionState,
+                ) -> UltracodeExecution:
+                    if (
+                        proposed.decision is UltracodeDelegationDecision.MAIN_MAX
+                        and expected_state is UltracodeExecutionState.MAIN_MAX_RUNNING
+                        and proposed.state is UltracodeExecutionState.COMPLETED
+                    ):
+                        completed = [
+                            event
+                            for event in await store.load_events(proposed.parent_session_id)
+                            if event.get("kind") == AgentEventKind.TURN_COMPLETED.value
+                            and isinstance(event.get("data"), dict)
+                            and event["data"].get("turn_id") == turn_id
+                            and event["data"].get("ultracode_execution_id") == proposed.execution_id
+                        ]
+                        assert len(completed) == 1
+                        os._exit(91)
+                    return await original(
+                        proposed,
+                        expected_generation=expected_generation,
+                        expected_state=expected_state,
+                    )
+
+                with patch.object(
+                    store,
+                    "compare_and_transition_ultracode_execution",
+                    new=hooked,
+                ):
+                    await service.run_turn(RunTurnRequest(prompt, turn_id=turn_id))
+                raise AssertionError("MAIN_MAX production process did not crash at the boundary")
+            finally:
+                if binding is not None:
+                    await binding.close()
+                if application is not None:
+                    await application.close()
+
+    asyncio.run(run())
+
+
+def _spawn_production_swarm_crash(
+    root_directory: str,
+    repository_directory: str,
+    state_directory: str,
+    provider_call_log: str,
+    prompt: str,
+    turn_id: str,
+) -> NoReturn:
+    async def run() -> NoReturn:
+        root = Path(root_directory)
+        repository = Path(repository_directory)
+        state_dir = Path(state_directory)
+        call_log = Path(provider_call_log)
+        state = _ProductionPlanningState()
+        application: ApplicationComposition | None = None
+        binding: ConversationBinding | None = None
+        with patch.dict("os.environ", _composition_environment(root, state_dir), clear=False):
+            try:
+                application = await ApplicationComposition.open(
+                    _production_ultracode_settings(repository),
+                    provider_factory=_durable_planning_provider_factory(state, call_log, "l1"),
+                )
+                binding = await application.create_binding(
+                    capabilities=_production_parent_capability(repository),
+                    reasoning_effort=ReasoningEffort.ULTRACODE,
+                )
+                store = cast(SqliteSessionStore, application.store)
+                service = await application.create_ultracode_delegation_service(
+                    parent_binding=binding,
+                )
+                original = AgentConversation.commit_external_turn
+                expected_turn_id = turn_id
+
+                async def hooked(
+                    conversation: AgentConversation,
+                    external_prompt: str,
+                    *,
+                    response: str,
+                    turn_id: str,
+                    execution_id: str,
+                    decision: UltracodeDelegationDecision,
+                    content_parts=(),
+                    sink=None,
+                ) -> AgentRunResult:
+                    if decision is UltracodeDelegationDecision.BOUNDED_SWARM:
+                        execution = await store.get_ultracode_execution(execution_id)
+                        lower = await store.get_swarm_run(ultracode_swarm_run_id(execution_id))
+                        assert execution is not None
+                        assert execution.state is UltracodeExecutionState.FINALIZING
+                        assert lower is not None
+                        assert lower.state is AgentSwarmRunState.COMPLETED
+                        assert turn_id == expected_turn_id
+                        os._exit(92)
+                    return await original(
+                        conversation,
+                        external_prompt,
+                        response=response,
+                        turn_id=turn_id,
+                        execution_id=execution_id,
+                        decision=decision,
+                        content_parts=content_parts,
+                        sink=sink,
+                    )
+
+                with patch.object(AgentConversation, "commit_external_turn", new=hooked):
+                    await service.run_turn(RunTurnRequest(prompt, turn_id=turn_id))
+                raise AssertionError("Swarm production process did not crash at the boundary")
+            finally:
+                if binding is not None:
+                    await binding.close()
+                if application is not None:
+                    await application.close()
+
+    asyncio.run(run())
+
+
 class _UnexpectedPolicy(UltracodeDelegationPolicy):
     def decide(self, prompt: str) -> UltracodeDelegationDecision:
         del prompt
@@ -334,6 +670,82 @@ def _row_count(database: Path, table: str) -> int:
     with closing(sqlite3.connect(database)) as connection:
         row = connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()
     return int(row[0]) if row is not None else 0
+
+
+def _append_durable_json_line(path: Path, payload: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+        stream.write("\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
+def _read_durable_json_lines(path: Path) -> list[dict[str, object]]:
+    if not path.exists():
+        return []
+    return [
+        cast(dict[str, object], json.loads(line))
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+
+_ULTRACODE_RESOURCE_TABLES = (
+    "session_tasks",
+    "subagent_links",
+    "writable_subagent_leases",
+    "parent_context_relays",
+    "task_dag_dependency_relays",
+    "task_dags",
+    "leader_attempts",
+    "leader_decisions",
+    "orchestration_planning_attempts",
+    "orchestration_plan_proposals",
+    "orchestration_dag_replan_attempts",
+    "orchestration_dag_replan_proposals",
+    "orchestration_swarm_runs",
+)
+
+
+def _resource_counts(state_dir: Path) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    database = state_dir / "sessions.db"
+    if database.exists():
+        with closing(sqlite3.connect(database)) as connection:
+            available = {
+                str(row[0])
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                ).fetchall()
+            }
+            for table in _ULTRACODE_RESOURCE_TABLES:
+                if table in available:
+                    row = connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()
+                    counts[table] = int(row[0]) if row is not None else 0
+    for filename, table in (
+        ("worktrees.db", "managed_worktrees"),
+        ("checkpoints.db", "checkpoints"),
+    ):
+        database = state_dir / filename
+        if not database.exists():
+            continue
+        with closing(sqlite3.connect(database)) as connection:
+            row = connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()
+            counts[table] = int(row[0]) if row is not None else 0
+    return counts
+
+
+def _ultracode_identity_by_turn(database: Path, turn_id: str) -> tuple[str, str]:
+    with closing(sqlite3.connect(database)) as connection:
+        row = connection.execute(
+            "SELECT execution_id, parent_session_id "
+            "FROM orchestration_ultracode_executions WHERE parent_turn_id = ?",
+            (turn_id,),
+        ).fetchone()
+    if row is None:
+        raise AssertionError(f"no Ultracode execution was published for {turn_id}")
+    return str(row[0]), str(row[1])
 
 
 _FRESH_MAIN_RESPONSE = "fresh-process main output"
@@ -804,6 +1216,118 @@ async def test_turn_service_requires_explicit_ultracode_entry_and_never_routes_o
         assert result.response == "normal"
         assert runner.calls == 1
         assert runner.last_kwargs["turn_id"] == "ordinary-turn"
+
+
+@pytest.mark.asyncio
+async def test_long_lived_turn_service_switches_between_max_and_ultracode_without_rebinding() -> (
+    None
+):
+    with tempfile.TemporaryDirectory() as directory:
+        cwd = Path(directory)
+        store = await _store(cwd)
+        runner = _DynamicParentRunner(store, cwd)
+        binding = _binding(runner, cwd)
+        option = ProviderOption(
+            "fixture-provider",
+            "openai-chat",
+            "fixture-model",
+            True,
+            True,
+            default=True,
+            context_window_tokens=100_000,
+        )
+        controller = ProfileConversationController(
+            options=(option,),
+            selected_profile=option.name,
+            binding=binding,
+            binding_factory=lambda _name: _unreachable_binding(),
+            reasoning_effort=ReasoningEffort.MAX,
+        )
+        delegation_calls: list[tuple[str | None, ReasoningEffort]] = []
+
+        async def delegate(request: RunTurnRequest, sink) -> AgentRunResult:
+            delegation_calls.append((request.turn_id, controller.reasoning_effort))
+            service = _service(store, controller.binding, _unexpected_swarm_factory)
+            return await service.run_turn(request, sink=sink)
+
+        turn_service = SessionTurnService(controller, ultracode_delegate=delegate)
+        service_identity = id(turn_service)
+
+        first_ordinary = await turn_service.run_turn(
+            RunTurnRequest("ordinary before Ultracode", turn_id="ordinary-before")
+        )
+        selection = await controller.set_reasoning_effort(ReasoningEffort.ULTRACODE)
+        first_ultracode = await turn_service.run_turn(
+            RunTurnRequest("fix the first local typo", turn_id="ultracode-first")
+        )
+        await controller.set_reasoning_effort(ReasoningEffort.MAX)
+        second_ordinary = await turn_service.run_turn(
+            RunTurnRequest("ordinary after Ultracode", turn_id="ordinary-after")
+        )
+        await controller.set_reasoning_effort(ReasoningEffort.ULTRACODE)
+        second_ultracode = await turn_service.run_turn(
+            RunTurnRequest("fix the second local typo", turn_id="ultracode-second")
+        )
+
+        assert id(turn_service) == service_identity
+        assert selection.workflow_orchestration_active is True
+        assert first_ordinary.response == "ordinary:ordinary before Ultracode"
+        assert second_ordinary.response == "ordinary:ordinary after Ultracode"
+        assert first_ultracode.response == second_ultracode.response == "main answer"
+        assert runner.ordinary_prompts == [
+            "ordinary before Ultracode",
+            "ordinary after Ultracode",
+        ]
+        assert runner.run_calls == 2
+        assert runner.commit_calls == 2
+        assert delegation_calls == [
+            ("ultracode-first", ReasoningEffort.ULTRACODE),
+            ("ultracode-second", ReasoningEffort.ULTRACODE),
+        ]
+
+        session_id = runner.session_id
+        assert session_id is not None
+        executions = [
+            await store.get_ultracode_execution(ultracode_execution_id(session_id, turn_id))
+            for turn_id in ("ultracode-first", "ultracode-second")
+        ]
+        assert all(execution is not None for execution in executions)
+        assert [execution.execution_id for execution in executions if execution is not None] == [
+            ultracode_execution_id(session_id, "ultracode-first"),
+            ultracode_execution_id(session_id, "ultracode-second"),
+        ]
+        assert all(
+            execution is not None
+            and execution.decision is UltracodeDelegationDecision.MAIN_MAX
+            and execution.state is UltracodeExecutionState.COMPLETED
+            for execution in executions
+        )
+        messages = await store.load_messages(session_id)
+        assert [message.content for message in messages if message.role is Role.ASSISTANT] == [
+            "main answer",
+            "main answer",
+        ]
+        completed = [
+            event
+            for event in await store.load_events(session_id)
+            if event.get("kind") == AgentEventKind.TURN_COMPLETED.value
+            and isinstance(event.get("data"), dict)
+            and event["data"].get("ultracode_execution_id")
+            in {
+                ultracode_execution_id(session_id, "ultracode-first"),
+                ultracode_execution_id(session_id, "ultracode-second"),
+            }
+        ]
+        assert len(completed) == 2
+        assert len({event["data"]["turn_id"] for event in completed}) == 2
+
+
+async def _unreachable_binding() -> ConversationBinding:
+    raise AssertionError("the dynamic effort test must not replace its binding")
+
+
+async def _unexpected_swarm_factory() -> Any:
+    raise AssertionError("MAIN_MAX dynamic turns must not construct a Swarm")
 
 
 def test_run_turn_request_rejects_noncanonical_values() -> None:
@@ -1301,6 +1825,105 @@ async def test_real_composition_ultracode_simple_task_uses_main_without_orchestr
 
 
 @pytest.mark.asyncio
+async def test_real_composition_main_max_recovers_after_parent_commit_before_terminal_projection(
+    tmp_path: Path,
+) -> None:
+    context = mp.get_context("spawn")
+    root = tmp_path
+    repository = _make_production_repository(root)
+    state_dir = root / "state"
+    _write_production_fixture_config(state_dir)
+    database = state_dir / "sessions.db"
+    call_log = root / "main-provider-calls.jsonl"
+    prompt = "fix one local typo"
+    turn_id = "production-main-process-turn"
+    process = context.Process(
+        target=_spawn_production_main_crash,
+        args=(str(root), str(repository), str(state_dir), str(call_log), prompt, turn_id),
+    )
+    process.start()
+    await _join_ultracode_process(process, 91)
+
+    execution_id, session_id = _ultracode_identity_by_turn(database, turn_id)
+    observer = SqliteSessionStore(database)
+    await observer.initialize()
+    crashed = await observer.get_ultracode_execution(execution_id)
+    assert crashed is not None
+    assert crashed.parent_session_id == session_id
+    assert crashed.parent_turn_id == turn_id
+    assert crashed.decision is UltracodeDelegationDecision.MAIN_MAX
+    assert crashed.downstream_id == turn_id
+    assert crashed.state is UltracodeExecutionState.MAIN_MAX_RUNNING
+    main_calls = _read_durable_json_lines(call_log)
+    assert len(main_calls) == 1
+    assert main_calls[0]["branch"] == "main"
+    assert main_calls[0]["phase"] == "l1"
+    events_before = [
+        event
+        for event in await observer.load_events(session_id)
+        if event.get("kind") == AgentEventKind.TURN_COMPLETED.value
+        and isinstance(event.get("data"), dict)
+        and event["data"].get("turn_id") == turn_id
+        and event["data"].get("ultracode_execution_id") == execution_id
+    ]
+    assert len(events_before) == 1
+    resources_before = _resource_counts(state_dir)
+
+    with patch.dict("os.environ", _composition_environment(root, state_dir), clear=False):
+        application = await ApplicationComposition.open(
+            _production_ultracode_settings(repository, resume_id=session_id),
+            provider_factory=_durable_main_provider_factory(call_log, "l2"),
+        )
+    binding = None
+    try:
+        binding = await application.create_binding(
+            resume_id=session_id,
+            reasoning_effort=ReasoningEffort.ULTRACODE,
+        )
+        service = await application.create_ultracode_delegation_service(
+            parent_binding=binding,
+        )
+        result = await service.run_turn(RunTurnRequest(prompt, turn_id=turn_id))
+    finally:
+        if binding is not None:
+            await binding.close()
+        await application.close()
+
+    assert result.response == _FRESH_MAIN_RESPONSE
+    assert _read_durable_json_lines(call_log)[0]["phase"] == "l1"
+    assert len(_read_durable_json_lines(call_log)) == 1
+    recovered = await observer.get_ultracode_execution(execution_id)
+    assert recovered is not None
+    assert recovered.decision is UltracodeDelegationDecision.MAIN_MAX
+    assert recovered.downstream_id == turn_id
+    assert recovered.state is UltracodeExecutionState.COMPLETED
+    assert recovered.final_response == _FRESH_MAIN_RESPONSE
+    assert recovered.final_result_fingerprint == ultracode_result_fingerprint(
+        execution_id,
+        _FRESH_MAIN_RESPONSE,
+    )
+    assert await observer.get_swarm_run(turn_id) is None
+    assert _resource_counts(state_dir) == resources_before
+    assert not (state_dir / "worktrees.db").exists()
+    assert _row_count(database, "orchestration_planning_attempts") == 0
+    assert _row_count(database, "task_dags") == 0
+    assert _row_count(database, "writable_subagent_leases") == 0
+    messages = await observer.load_messages(session_id)
+    assert [message.content for message in messages if message.role is Role.ASSISTANT] == [
+        _FRESH_MAIN_RESPONSE
+    ]
+    completed_after = [
+        event
+        for event in await observer.load_events(session_id)
+        if event.get("kind") == AgentEventKind.TURN_COMPLETED.value
+        and isinstance(event.get("data"), dict)
+        and event["data"].get("turn_id") == turn_id
+        and event["data"].get("ultracode_execution_id") == execution_id
+    ]
+    assert len(completed_after) == 1
+
+
+@pytest.mark.asyncio
 async def test_real_composition_ultracode_decomposable_task_uses_existing_bounded_swarm() -> None:
     with tempfile.TemporaryDirectory(prefix="neuro-ultracode-swarm-production-") as directory:
         root = Path(directory)
@@ -1402,6 +2025,102 @@ async def test_real_composition_ultracode_decomposable_task_uses_existing_bounde
                 if binding is not None:
                     await binding.close()
                 await application.close()
+
+
+@pytest.mark.asyncio
+async def test_real_composition_swarm_recovers_after_lower_completion_before_parent_commit(
+    tmp_path: Path,
+) -> None:
+    context = mp.get_context("spawn")
+    root = tmp_path
+    repository = _make_production_repository(root)
+    state_dir = root / "state"
+    _write_production_fixture_config(state_dir)
+    database = state_dir / "sessions.db"
+    call_log = root / "swarm-provider-calls.jsonl"
+    prompt = "research these independent tasks in parallel"
+    turn_id = "production-swarm-process-turn"
+    process = context.Process(
+        target=_spawn_production_swarm_crash,
+        args=(str(root), str(repository), str(state_dir), str(call_log), prompt, turn_id),
+    )
+    process.start()
+    await _join_ultracode_process(process, 92)
+
+    execution_id, session_id = _ultracode_identity_by_turn(database, turn_id)
+    swarm_id = ultracode_swarm_run_id(execution_id)
+    observer = SqliteSessionStore(database)
+    await observer.initialize()
+    crashed = await observer.get_ultracode_execution(execution_id)
+    assert crashed is not None
+    assert crashed.parent_session_id == session_id
+    assert crashed.parent_turn_id == turn_id
+    assert crashed.decision is UltracodeDelegationDecision.BOUNDED_SWARM
+    assert crashed.downstream_id == swarm_id
+    assert crashed.state is UltracodeExecutionState.FINALIZING
+    lower = await observer.get_swarm_run(swarm_id)
+    assert lower is not None
+    assert lower.state is AgentSwarmRunState.COMPLETED
+    l1_calls = _read_durable_json_lines(call_log)
+    assert len(l1_calls) == 9
+    assert sum(record["branch"] == "planner" for record in l1_calls) == 1
+    assert sum(record["branch"] == "leader" for record in l1_calls) == 4
+    assert sum(record["branch"] == "worker" for record in l1_calls) == 4
+    resources_before = _resource_counts(state_dir)
+
+    state = _ProductionPlanningState()
+    with patch.dict("os.environ", _composition_environment(root, state_dir), clear=False):
+        application = await ApplicationComposition.open(
+            _production_ultracode_settings(repository, resume_id=session_id),
+            provider_factory=_durable_planning_provider_factory(state, call_log, "l2"),
+        )
+    binding = None
+    try:
+        binding = await application.create_binding(
+            resume_id=session_id,
+            capabilities=_production_parent_capability(repository),
+            reasoning_effort=ReasoningEffort.ULTRACODE,
+        )
+        service = await application.create_ultracode_delegation_service(
+            parent_binding=binding,
+        )
+        result = await service.run_turn(RunTurnRequest(prompt, turn_id=turn_id))
+    finally:
+        if binding is not None:
+            await binding.close()
+        await application.close()
+
+    assert result.response == "planned DAG completed"
+    calls_after = _read_durable_json_lines(call_log)
+    assert calls_after == l1_calls
+    recovered = await observer.get_ultracode_execution(execution_id)
+    assert recovered is not None
+    assert recovered.decision is UltracodeDelegationDecision.BOUNDED_SWARM
+    assert recovered.downstream_id == swarm_id
+    assert recovered.state is UltracodeExecutionState.COMPLETED
+    assert recovered.final_response == "planned DAG completed"
+    recovered_lower = await observer.get_swarm_run(swarm_id)
+    assert recovered_lower is not None
+    assert recovered_lower.state is AgentSwarmRunState.COMPLETED
+    assert _resource_counts(state_dir) == resources_before
+    messages = await observer.load_messages(session_id)
+    assert [message.content for message in messages if message.role is Role.ASSISTANT] == [
+        "planned DAG completed"
+    ]
+    completed = [
+        event
+        for event in await observer.load_events(session_id)
+        if event.get("kind") == AgentEventKind.TURN_COMPLETED.value
+        and isinstance(event.get("data"), dict)
+        and event["data"].get("turn_id") == turn_id
+        and event["data"].get("ultracode_execution_id") == execution_id
+    ]
+    assert len(completed) == 1
+    assert _row_count(database, "orchestration_planning_attempts") == 1
+    assert _row_count(database, "orchestration_plan_proposals") == 1
+    assert _row_count(database, "task_dags") == 1
+    assert _row_count(database, "writable_subagent_leases") == 4
+    assert _row_count(database, "orchestration_swarm_runs") == 1
 
 
 @pytest.mark.asyncio

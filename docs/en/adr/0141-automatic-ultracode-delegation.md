@@ -37,6 +37,15 @@ capabilities, roots, sandbox, network, MCP, DAG definitions, retry, merge,
 checkpoint behavior, or provider credentials. It is an application strategy,
 not a provider-native reasoning level.
 
+The current policy is deliberately only a bounded deterministic heuristic: it
+matches a fixed set of parallel, decomposition, cross-file, and research
+markers in the user prompt. It is not semantic task-complexity classification
+and it does not claim model-level routing intelligence. The interactive TUI
+binds the delegate as a dormant application entry regardless of the initial
+effort; `SessionTurnService` checks the controller's current effort at each
+user turn, so runtime `max` ↔ `ultracode` switching does not rebuild the
+service or leave a stale entry seam.
+
 ## Durable identity and lifecycle
 
 Session schema 28 adds the insert-once
@@ -92,7 +101,7 @@ attempt without that lower identity fails closed. A lower terminal result or a
 parent result observed before Ultracode bookkeeping is finalized is promoted
 through `FINALIZING` and committed idempotently.
 
-The representative fresh-process matrix uses
+The raw durable-state fresh-process matrix uses
 `multiprocessing.get_context("spawn")` and `os._exit` for these boundaries:
 
 - A: durable decision before the downstream branch starts;
@@ -103,7 +112,10 @@ The representative fresh-process matrix uses
 
 Each case proves no decision replay, no branch switch, no second provider
 execution, no duplicate Swarm identity, and one parent-visible assistant
-result.
+result. This matrix exercises the durable lifecycle seams directly; it is not
+itself a full `ApplicationComposition` process-death proof. Two separate
+production-composition acceptances cover the MAIN_MAX and BOUNDED_SWARM
+boundaries through fresh compositions and the real downstream paths.
 
 ## Security, compatibility, and non-goals
 
@@ -122,7 +134,9 @@ marketplace integration, or a new Checkpoint/Rollback implementation.
 
 Focused and production-shaped tests cover both branches, provider-wire
 neutrality, insert-once/generation-fenced persistence, schema 27-to-28
-migration, exact replay, cancellation/failure no-fallback behavior, the fresh
-process A–E matrix, and the existing Planner → Leader → Task DAG → Writable
-Swarm path. The repository's full lint, type, documentation, coverage, build,
-and regression gates remain required before rating this slice proven.
+migration, exact replay, cancellation/failure no-fallback behavior, the raw
+fresh-process A–E matrix, dynamic effort switching through one long-lived turn
+service, and two representative full-composition process-death acceptances:
+one MAIN_MAX result handoff and one completed Swarm handoff. The repository's
+full lint, type, documentation, coverage, build, and regression gates remain
+required before rating this slice proven.

@@ -357,7 +357,7 @@ class ProfileConversationController:
                 requested=effort,
                 effective=effort.effective,
                 changed=changed,
-                workflow_orchestration_active=False,
+                workflow_orchestration_active=effort.requires_workflow_orchestration,
             )
 
     async def set_interaction_mode(

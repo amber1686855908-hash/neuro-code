@@ -756,13 +756,14 @@ class BootstrapCliServices:
                     )
                     return await service.run_turn(request, sink=sink)
 
-                if controller.reasoning_effort is ReasoningEffort.ULTRACODE:
-                    turn_service = application.session_service.bind_runner(
-                        controller,
-                        ultracode_delegate=ultracode_delegate,
-                    )
-                else:
-                    turn_service = application.session_service.bind_runner(controller)
+                # Keep the application-level delegation entry dormant until the
+                # long-lived controller reports ULTRACODE for a user turn.  The
+                # controller may change effort after this binding is created;
+                # rebuilding the turn service would leave a stale entry seam.
+                turn_service = application.session_service.bind_runner(
+                    controller,
+                    ultracode_delegate=ultracode_delegate,
+                )
                 tool_output_artifact_service = application.create_tool_output_artifact_service(
                     config=config
                 )

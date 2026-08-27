@@ -342,6 +342,15 @@ class TypedTuiConversation(TuiConversation):
         )
 
 
+class SwitchingTuiConversation(TypedTuiConversation):
+    def __init__(self) -> None:
+        super().__init__()
+        self.reasoning_effort = ReasoningEffort.HIGH
+
+    def set_reasoning_effort(self, effort: ReasoningEffort) -> None:
+        self.reasoning_effort = effort
+
+
 class AutoWakeTuiConversation:
     def __init__(self) -> None:
         self._session_id = "auto-wake-session"
@@ -781,6 +790,7 @@ class ProfileTuiController:
         *,
         plan_comments: tuple[PlanComment, ...] = (),
         session_tasks: tuple[SessionTask, ...] = (),
+        runner: object | None = None,
     ) -> None:
         self._selected_profile = "first"
         self.selections: list[str] = []
@@ -792,6 +802,7 @@ class ProfileTuiController:
         self._plan = plan
         self._plan_comments = plan_comments
         self._session_tasks = session_tasks
+        self._runner = runner
         self._options = (
             ProviderOption(
                 "first",
@@ -866,10 +877,15 @@ class ProfileTuiController:
         changed = effort is not self._reasoning_effort
         self.effort_selections.append(effort)
         self._reasoning_effort = effort
+        if self._runner is not None:
+            setter = getattr(self._runner, "set_reasoning_effort", None)
+            if callable(setter):
+                setter(effort)
         return ReasoningEffortSelectionResult(
             requested=effort,
             effective=effort.effective,
             changed=changed,
+            workflow_orchestration_active=effort.requires_workflow_orchestration,
         )
 
     async def set_interaction_mode(
@@ -3280,6 +3296,60 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
             await pilot.press("enter")
             await pilot.pause()
             self.assertIn("Effort: ⚡ ultracode → ◆ max", app.entries[-1].text)
+
+    async def test_tui_effort_switch_reaches_the_dormant_ultracode_entry(self) -> None:
+        runner = SwitchingTuiConversation()
+        profiles = ProfileTuiController(runner=runner)
+        delegate_started = asyncio.Event()
+        delegate_finished = asyncio.Event()
+        delegate_calls: list[str] = []
+
+        async def delegate(request, sink) -> AgentRunResult:
+            del sink
+            delegate_calls.append(request.prompt)
+            delegate_started.set()
+            result = AgentRunResult(
+                "session-fixture",
+                "delegated after runtime switch",
+                (),
+                (),
+                (),
+                1,
+            )
+            delegate_finished.set()
+            return result
+
+        turn_service = SessionTurnService(runner, ultracode_delegate=delegate)
+        app = NeuroCodeApp(
+            runner,
+            turn_service=turn_service,
+            provider_controller=profiles,
+            provider_name="first",
+            model_name="first-model",
+            cwd=Path("/workspace"),
+        )
+
+        async with app.run_test(size=(90, 24)) as pilot:
+            prompt = app.query_one("#prompt", PromptInput)
+            prompt.value = "/effort ultracode"
+            await pilot.press("enter")
+            self.assertEqual(runner.reasoning_effort, ReasoningEffort.ULTRACODE)
+            self.assertEqual(profiles.effort_selections, [ReasoningEffort.ULTRACODE])
+
+            prompt.value = "execute after the runtime switch"
+            await pilot.press("enter")
+            await asyncio.wait_for(delegate_started.wait(), timeout=1)
+            await asyncio.wait_for(delegate_finished.wait(), timeout=1)
+            await pilot.pause()
+
+            self.assertEqual(delegate_calls, ["execute after the runtime switch"])
+            self.assertEqual(runner.prompts, [])
+            self.assertNotIn(
+                "entry is not configured", "\n".join(entry.text for entry in app.entries)
+            )
+            self.assertIn(
+                "delegated after runtime switch", "\n".join(entry.text for entry in app.entries)
+            )
 
     async def test_effort_validation_and_running_turn_guard_do_not_change_policy(self) -> None:
         runner = CancellableTuiConversation()

@@ -318,13 +318,18 @@ turn is active and applies from the next model step.
 These levels are Neuro Code application policies, not claims about a
 provider's private reasoning controls. `max` remains the deepest ordinary
 single-agent policy. An explicit `ultracode` turn enters the application-owned
-bounded delegation service, which durably chooses exactly one `MAIN_MAX` or
-`BOUNDED_SWARM` branch; `MAIN_MAX` uses the existing normal Agent runtime and
-`BOUNDED_SWARM` uses the existing bounded Swarm composition. Provider adapters
-never receive an invented native `ultracode` value: the ordinary main branch
-uses the existing provider-compatible `max` projection or omission. The
-delegation decision, downstream identity, and parent-visible result are
-recovery-safe and are not automatically switched or replayed. See [ADR 0027](adr/0027-semantic-tui-and-application-reasoning-effort.md)
+bounded delegation service, whose current decision policy is a fixed marker
+heuristic for parallel/decomposition, cross-file, and research wording—not a
+semantic or model classifier—and durably chooses exactly one `MAIN_MAX` or
+`BOUNDED_SWARM` branch. `MAIN_MAX` uses the existing normal Agent runtime and
+`BOUNDED_SWARM` uses the existing bounded Swarm composition. The interactive
+TUI binds this entry once as a dormant delegate and checks the current effort
+on every user turn, so `max` ↔ `ultracode` can switch without recreating the
+turn service; ordinary efforts never delegate. Provider adapters never receive
+an invented native `ultracode` value: the ordinary main branch uses the
+existing provider-compatible `max` projection or omission. The delegation
+decision, downstream identity, and parent-visible result are recovery-safe
+and are not automatically switched or replayed. See [ADR 0027](adr/0027-semantic-tui-and-application-reasoning-effort.md)
 and [ADR 0141](adr/0141-automatic-ultracode-delegation.md).
 
 Ordinary Agent execution uses the `normal` budget profile by default (48 model

@@ -367,7 +367,7 @@ class ProfileConversationControllerTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(selection.changed)
         self.assertIs(selection.requested, ReasoningEffort.ULTRACODE)
         self.assertIs(selection.effective, ReasoningEffort.MAX)
-        self.assertFalse(selection.workflow_orchestration_active)
+        self.assertTrue(selection.workflow_orchestration_active)
         self.assertIs(first.reasoning_effort, ReasoningEffort.ULTRACODE)
         self.assertIs(second.reasoning_effort, ReasoningEffort.ULTRACODE)
         self.assertIs(controller.reasoning_effort, ReasoningEffort.ULTRACODE)

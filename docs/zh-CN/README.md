@@ -245,11 +245,14 @@ TUI 管理的供应商元数据会原子写入 `~/.neuro-code/providers.json`；
 | `ultracode` | ⚡ | 应用层有界委派，且只选择一个 `MAIN_MAX` 或 `BOUNDED_SWARM` 路径 |
 
 这些等级表示 Neuro Code 的应用层策略，并不宣称控制供应商私有的模型推理参数。
-`max` 仍然是普通单智能体最深的策略。显式的 `ultracode` 回合会进入应用层有界委派服务，
-由它持久化地在 `MAIN_MAX` 与 `BOUNDED_SWARM` 中准确选择一条路径；`MAIN_MAX` 使用既有普通
-Agent runtime，`BOUNDED_SWARM` 使用既有有界 Swarm 组合。供应商适配器永远不会收到编造的
-原生 `ultracode` 值：普通主路径继续使用既有的、兼容供应商的 `max` 投影或省略。委派决策、
-下游 identity 和 parent 可见结果都支持安全恢复，不会自动切换分支或重放。详见
+`max` 仍然是普通单智能体最深的策略。显式的 `ultracode` 回合会进入应用层有界委派服务；当前
+decision policy 是针对并行/拆分、跨文件和研究措辞的固定 marker heuristic，不是语义或 model
+classifier；它会持久化地在 `MAIN_MAX` 与 `BOUNDED_SWARM` 中准确选择一条路径。`MAIN_MAX` 使用
+既有普通 Agent runtime，`BOUNDED_SWARM` 使用既有有界 Swarm 组合。交互式 TUI 在启动时只绑定一个
+dormant entry，并在每个用户回合读取当前 effort，因此 `max` ↔ `ultracode` 切换无需重建 turn
+service；普通 effort 永远不会委派。供应商适配器永远不会收到编造的原生 `ultracode` 值：普通主
+路径继续使用既有的、兼容供应商的 `max` 投影或省略。委派决策、下游 identity 和 parent 可见结果
+都支持安全恢复，不会自动切换分支或重放。详见
 [ADR 0027](adr/0027-semantic-tui-and-application-reasoning-effort.md) 与 [ADR 0141](adr/0141-automatic-ultracode-delegation.md)。
 
 普通 Agent 执行默认使用 `normal` 预算档位（48 次模型调用、48 个工具轮次和 192 次工具

@@ -1960,12 +1960,18 @@ ADR 0141 增加第一版由应用拥有的 Ultracode 入口。`max` 仍然是普
 reasoning/review 策略；只有显式的 `ReasoningEffort.ULTRACODE` 用户回合会进入该服务，
 `low`、`medium`、`high`、`xhigh` 与 `max` 继续使用普通 ConversationRunner 路径。
 
-该入口使用有界、确定性的本地策略，不增加第二次 model classifier 调用。它只做一个 typed
-选择：`MAIN_MAX` 或 `BOUNDED_SWARM`。它不能选择 tool、worker 数量、DAG definition、sandbox、
-workspace root、network、MCP、retry、merge 或 provider credential。`MAIN_MAX` 调用现有 parent
-`ConversationRunner` 并保留普通单智能体的 `max` 语义；`BOUNDED_SWARM` 通过
-`ApplicationComposition.create_agent_swarm_service()` 调用既有 Swarm，并使用一个由 durable
-identity 推导的 `swarm_run_id`，不会增加第二个 Planner、Leader、DAG、Writable worker 或 Swarm。
+该入口使用有界、确定性的本地策略，不增加第二次 model classifier 调用。本切片中的策略是针对
+并行/拆分、跨文件和研究措辞的固定 marker heuristic；它不是语义任务分类，也不具备 model-level
+routing intelligence。它只做一个 typed 选择：`MAIN_MAX` 或 `BOUNDED_SWARM`。它不能选择 tool、
+worker 数量、DAG definition、sandbox、workspace root、network、MCP、retry、merge 或 provider
+credential。`MAIN_MAX` 调用现有 parent `ConversationRunner` 并保留普通单智能体的 `max` 语义；
+`BOUNDED_SWARM` 通过 `ApplicationComposition.create_agent_swarm_service()` 调用既有 Swarm，并使用
+一个由 durable identity 推导的 `swarm_run_id`，不会增加第二个 Planner、Leader、DAG、Writable
+worker 或 Swarm。
+
+交互式 TUI 组合只在启动时把这个 application entry 绑定为 dormant delegate。`SessionTurnService`
+在每个用户回合读取 controller 当前 effort，因此同一个长生命周期 service 可以在
+`max` → `ultracode` → `max` → `ultracode` 之间切换而无需重建；普通 effort 永远不会调用 delegate。
 
 Session schema 28 增加 insert-once 的 `orchestration_ultracode_executions` projection。不可变
 identity 绑定实际 parent session、精确 parent turn、input/context fingerprint、provider/model/context
@@ -1976,10 +1982,14 @@ provenance、一个 decision 与一个下游 identity。`BEGIN IMMEDIATE`、proc
 
 两个 branch 都通过既有 conversation finalization contract 发布一个 parent 可见的 assistant
 result。只用精确的 `(session_id, turn_id, ultracode_execution_id)` evidence 匹配已提交 output。
-如果 lower Swarm 或 parent result 已提交但 Ultracode bookkeeping 尚未完成，恢复会复用相同的
-durable result，不再调用 Provider 或重复执行 Swarm。parent attempt 仍开放时，只有同一个精确
-`swarm_run_id` 已经存在且可以由既有 Swarm 恢复，才允许继续；否则 fail closed。不存在 latest-row
-lookup、timestamp correlation、text matching、silent fallback 或重复 assistant append。
+原始 A–E matrix 直接测试 durable lifecycle seam，本身不等同于完整 composition proof。另有两个
+`multiprocessing`-spawn acceptance 使用全新的 `ApplicationComposition`：MAIN_MAX 在精确 parent
+`TURN_COMPLETED` result 已持久化但 Ultracode 终态 transition 前退出；BOUNDED_SWARM 在既有 Swarm
+已经 `COMPLETED` 但 parent external-turn commit 前退出。恢复复用精确 durable result 与 identity，
+不会再次调用 Provider、Planner、Leader、Worker 或执行第二个 Swarm，resource count 也保持不变。
+parent attempt 仍开放时，只有同一个精确 `swarm_run_id` 已经存在且可以由既有 Swarm 恢复，才允许
+继续；否则 fail closed。不存在 latest-row lookup、timestamp correlation、text matching、silent
+fallback 或重复 assistant append。
 
 Parent `ConversationBinding` 继续是 capability ceiling。入口不增加 filesystem、Bash、LSP、MCP、
 network、Worktree、Checkpoint 或 Writable authority；provider adapter 也永远不会收到编造的

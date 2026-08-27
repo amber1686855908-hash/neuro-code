@@ -30,6 +30,12 @@ Worktree、Checkpoint、Relay 与 LSP service 的 authority boundary。
 MCP、DAG definition、retry、merge、checkpoint 行为或 provider credential。它是应用层策略，
 不是供应商原生 reasoning level。
 
+当前策略明确只是有界的确定性启发式：它匹配用户提示中的固定并行、拆分、跨文件和研究标记，
+不是语义上的任务复杂度分类，也不声称具备 model-level routing intelligence。交互式 TUI 无论
+初始 effort 是什么都会绑定一个 dormant application entry；`SessionTurnService` 在每个用户回合
+检查 controller 当前 effort，因此运行时 `max` ↔ `ultracode` 切换不需要重建 service，也不会留下
+过期的 entry seam。
+
 ## Durable identity 与生命周期
 
 Session schema 28 增加 insert-once 的
@@ -78,7 +84,7 @@ durable identity，恢复可以继续该同一个 Swarm；如果 parent attempt 
 则 fail closed。若在 Ultracode bookkeeping 完成前观察到下层 terminal result 或 parent result，
 恢复会经过 `FINALIZING` 并以幂等方式完成提交。
 
-代表性的 fresh-process matrix 使用 `multiprocessing.get_context("spawn")` 与 `os._exit` 覆盖：
+原始 durable-state fresh-process matrix 使用 `multiprocessing.get_context("spawn")` 与 `os._exit` 覆盖：
 
 - A：下游 branch 启动前 decision 已持久化；
 - B：Ultracode 完成前已经观察到 `MAIN_MAX` model output；
@@ -87,7 +93,9 @@ durable identity，恢复可以继续该同一个 Swarm；如果 parent attempt 
 - E：Ultracode 终态 bookkeeping 前 parent result 已提交。
 
 每个 case 都证明不会 replay decision、切换 branch、进行第二次 Provider execution、创建重复
-Swarm identity 或写入重复的 parent-visible assistant result。
+Swarm identity 或写入重复的 parent-visible assistant result。该 matrix 直接测试 durable lifecycle
+seam，本身不等同于完整 `ApplicationComposition` process-death proof；另有两个独立的 production-
+composition acceptance，通过 fresh composition 和真实下游路径覆盖 MAIN_MAX 与 BOUNDED_SWARM 边界。
 
 ## 安全、兼容性与非目标
 
@@ -102,6 +110,7 @@ execution、marketplace integration，也不重新实现 Checkpoint/Rollback。
 ## 验证
 
 Focused 与 production-shaped tests 覆盖两个 branch、provider wire 中立性、insert-once/generation
-fenced persistence、schema 27 到 28 migration、精确 replay、取消/失败不 fallback、fresh-process
-A–E matrix，以及既有 Planner → Leader → Task DAG → Writable Swarm 路径。只有完整 lint、类型、
-文档、coverage、build 与回归 gates 都通过后，才能把本切片评级为 proven。
+fenced persistence、schema 27 到 28 migration、精确 replay、取消/失败不 fallback、原始
+fresh-process A–E matrix、同一个长生命周期 turn service 的动态 effort 切换，以及两个代表性的
+full-composition process-death acceptance：MAIN_MAX result handoff 与已完成 Swarm handoff。只有
+完整 lint、类型、文档、coverage、build 与回归 gates 都通过后，才能把本切片评级为 proven。
