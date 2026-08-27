@@ -129,6 +129,19 @@ result reuse, and a spawned controller that dies after the initial durable
 claim.  Fresh finalization recovery also proves that no lower factory is
 called when the terminal result is already durably pending.
 
+The representative fresh-process recovery matrix in
+`tests/test_agent_swarm_process_recovery.py` uses `multiprocessing` spawn and
+explicit durable state markers at four Swarm handoffs.  It proves: a completed
+Planner attempt/proposal/DAG recovered before the Swarm `PLANNED` transition;
+a terminal lower Leader/DAG result recovered before `FINALIZING`; a completed
+Replan successor recovered before the Swarm current-DAG switch while the
+failed source remains immutable; and a durably persisted `FINALIZING` result
+recovered before `COMPLETED`.  Each L1 process exits with `os._exit`, and a
+fresh `ApplicationComposition` L2 verifies exact run, Planner, DAG, Replan,
+result, provider-call, and managed-resource identities without replay.  This
+is a representative bounded matrix, not a claim about every arbitrary kill
+timing or live/paid provider behavior.
+
 Two controllers claiming one Swarm ID use SQLite `BEGIN IMMEDIATE`, insert-once
 identity, process-liveness ownership, and generation CAS.  Exactly one
 controller can own the active row.  The loser performs no provider call, DAG
@@ -157,8 +170,9 @@ capabilities and authority owners.
 
 The slice adds deterministic event/barrier synchronization to the frozen
 Planner race preflight, production-shaped normal and Replan paths, durable
-Swarm domain/store tests, SQLite migration/FK/tamper/CAS tests, spawned-process
-claim recovery, terminal-result recovery, an active-controller race, and an
-`INDETERMINATE` no-Replan test.  Full repository quality gates and PR #67
-merge-ref CI are the release evidence; this ADR does not claim live-provider
-or public-interface support.
+Swarm domain/store tests, SQLite migration/FK/tamper/CAS tests, the
+four-boundary fresh-process recovery matrix, an active-controller race, and a
+composition-level authoritative `INDETERMINATE` no-Replan test.  Full
+repository quality gates and PR #67 merge-ref CI are the release evidence;
+this ADR does not claim arbitrary crash-point coverage, live-provider, or
+public-interface support.

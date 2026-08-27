@@ -1939,6 +1939,13 @@ durable terminal result 或下层既有 recovery contract，不推断 replay 安
 有界且脱敏：raw transcript、hidden reasoning、Provider request、tool argument、environment、credential、
 checkpoint blob 和 workspace content 不会跨越此边界。
 
+代表性的 `multiprocessing`-spawn recovery matrix 证明四个明确的 process boundary：Swarm 进入 `PLANNED` 前
+Planner state 已完成、`FINALIZING` 前 lower Leader/DAG result 已终态、Swarm 切换 current DAG 前 Replan successor
+已持久化且 failed source 保持不可变，以及 `COMPLETED` 前 `FINALIZING` result 已持久化。每个 L1 process 都通过
+`os._exit` 退出；fresh composition L2 校验精确 durable identity、Provider/resource count 与 no replay。该 matrix
+是有意保持代表性的证明，不声称覆盖任意 kill timing 或 live-provider。组合层 lower-layer `INDETERMINATE` result
+会成为终态，且不会进入 Replan。
+
 这是一个仅内部的 vertical slice，不增加 recursive Swarm、无界 agent 或 queue、generic retry、automatic
 Ultracode delegation、共享 writable worktree、merge/copy-back/cherry-pick/patch adoption、public CLI/TUI/ACP
 orchestration、remote execution、marketplace integration，也不重新实现 Checkpoint/Rollback。详见 [ADR

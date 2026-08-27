@@ -2105,6 +2105,17 @@ remain bounded and redacted: raw transcript, hidden reasoning, provider
 requests, tool arguments, environment, credentials, checkpoint blobs, and
 workspace contents do not cross this boundary.
 
+This representative `multiprocessing`-spawn recovery matrix proves four
+explicit process boundaries: completed Planner state before the Swarm
+`PLANNED` transition, a terminal lower Leader/DAG result before `FINALIZING`,
+a durable Replan successor before the Swarm current-DAG switch with an
+immutable failed source, and a durable `FINALIZING` result before `COMPLETED`.
+Each L1 process exits with `os._exit`; fresh composition L2 verifies exact
+durable identities, provider/resource counts, and no replay. The matrix is
+intentionally representative and does not claim every arbitrary kill timing
+or live-provider coverage. A composition-level lower-layer `INDETERMINATE`
+result is terminal and does not enter Replan.
+
 This is an internal vertical slice only. It does not add recursive Swarms,
 unbounded agents or queues, generic retry, automatic Ultracode delegation,
 shared writable worktrees, merge/copy-back/cherry-pick/patch adoption, public

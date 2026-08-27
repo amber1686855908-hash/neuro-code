@@ -71,6 +71,8 @@ Successor 失败后，Swarm 进入 terminal `FAILED`。它不会对 `INDETERMINA
 
 在调用 Planner 前，先持久化 Swarm row。Recovery 始终委托给既有 Planner、Leader、Task DAG、Writable、Relay、Worktree、Checkpoint、LSP 与 Replan contract；Swarm 自身只 reconciliation durable phase 与 exact identity。Focused composition tests 覆盖有意义的边界：provider 执行前 identity、Planner/DAG publication、活动并行 wave、DAG 完成但尚未 finalization、failed source 但尚未 Replan、successor execution、terminal result reuse，以及 spawned controller 在首次 durable claim 后退出。Fresh finalization recovery 还证明 terminal result 已待处理时不会调用 lower factory。
 
+`tests/test_agent_swarm_process_recovery.py` 中的代表性 fresh-process recovery matrix 使用 `multiprocessing` spawn，并在四个 Swarm handoff 写入明确的 durable marker。它证明：Planner attempt/proposal/DAG 已完成但 Swarm 尚未进入 `PLANNED` 时可以恢复；lower Leader/DAG 已终态但 Swarm 尚未进入 `FINALIZING` 时可以恢复；Replan successor 已完成发布但 Swarm 尚未切换 current DAG 时可以恢复且失败 source 保持不可变；以及 `FINALIZING` result 已持久化但尚未 `COMPLETED` 时可以恢复。每个 L1 process 都通过 `os._exit` 退出，fresh `ApplicationComposition` L2 校验精确的 run、Planner、DAG、Replan、result、Provider-call 与 managed-resource identity，且不 replay。该矩阵是有界的代表性证明，不声称覆盖任意 kill timing，也不声称支持 live/paid provider。
+
 两个 controller 争抢同一个 Swarm ID 时，使用 SQLite `BEGIN IMMEDIATE`、insert-once identity、process-liveness ownership 与 generation CAS。一个 active row 只能由一个 controller 持有。Loser 不进行 provider call、DAG publication、worker allocation 或 terminal-result mutation。可观察的 provider-turn uncertainty 会 fail closed，永远不会 replay。
 
 ## Cancellation 与 bounds
@@ -83,4 +85,4 @@ Swarm phase 被当前 owner 持有时发生 cancellation，会通过 shielded du
 
 ## 验证
 
-本切片为冻结的 Planner race preflight 增加确定性 event/barrier synchronization，并增加 production-shaped 正常路径和 Replan 路径、Swarm domain/store durable test、SQLite migration/FK/tamper/CAS test、spawned-process claim recovery、terminal-result recovery、active-controller race 以及 `INDETERMINATE` no-Replan test。完整 repository quality gates 与 PR #67 merge-ref CI 是发布证据；本 ADR 不声明 live-provider 或 public-interface support。
+本切片为冻结的 Planner race preflight 增加确定性 event/barrier synchronization，并增加 production-shaped 正常路径和 Replan 路径、Swarm domain/store durable test、SQLite migration/FK/tamper/CAS test、四个边界的 fresh-process recovery matrix、active-controller race，以及组合层 authoritative `INDETERMINATE` no-Replan test。完整 repository quality gates 与 PR #67 merge-ref CI 是发布证据；本 ADR 不声明任意 crash point 覆盖、live-provider 或 public-interface support。
