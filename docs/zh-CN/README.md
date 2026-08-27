@@ -242,14 +242,15 @@ TUI 管理的供应商元数据会原子写入 `~/.neuro-code/providers.json`；
 | `high` | ● | 更深入地调查并主动检查可能的回归；默认等级 |
 | `xhigh` | ⬤ | 面向困难边界情况，主动质疑假设并执行多轮验证 |
 | `max` | ◆ | 最高普通单智能体深度，并执行广泛但有界的验证 |
-| `ultracode` | ⚡ | 当前实际采用 `max` 策略；工作流编排尚未实现 |
+| `ultracode` | ⚡ | 应用层有界委派，且只选择一个 `MAIN_MAX` 或 `BOUNDED_SWARM` 路径 |
 
-这些等级目前表示 Neuro Code 的应用层审查策略，并不宣称控制了供应商私有的模型推理
-参数。每次模型请求都会收到不持久化的策略指引，同时在 `ModelContext` 中携带有类型的
-请求等级；Kimi K3 和 GLM 5.3/5.2 的显式 dialect mapping 可以发送配置的原生 `max` 值；
-其他 dialect 会省略原生强度字段，但仍保留应用层指引。选择 `ultracode` 不会启动子代理，
-界面会明确显示其回退到 `max`。详见
-[ADR 0027](adr/0027-semantic-tui-and-application-reasoning-effort.md)。
+这些等级表示 Neuro Code 的应用层策略，并不宣称控制供应商私有的模型推理参数。
+`max` 仍然是普通单智能体最深的策略。显式的 `ultracode` 回合会进入应用层有界委派服务，
+由它持久化地在 `MAIN_MAX` 与 `BOUNDED_SWARM` 中准确选择一条路径；`MAIN_MAX` 使用既有普通
+Agent runtime，`BOUNDED_SWARM` 使用既有有界 Swarm 组合。供应商适配器永远不会收到编造的
+原生 `ultracode` 值：普通主路径继续使用既有的、兼容供应商的 `max` 投影或省略。委派决策、
+下游 identity 和 parent 可见结果都支持安全恢复，不会自动切换分支或重放。详见
+[ADR 0027](adr/0027-semantic-tui-and-application-reasoning-effort.md) 与 [ADR 0141](adr/0141-automatic-ultracode-delegation.md)。
 
 普通 Agent 执行默认使用 `normal` 预算档位（48 次模型调用、48 个工具轮次和 192 次工具
 调用）。`--execution-profile deep` 为较长调查选择有界的 96/96/384 档位。兼容选项

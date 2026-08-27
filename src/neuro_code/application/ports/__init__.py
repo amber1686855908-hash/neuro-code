@@ -138,6 +138,11 @@ from neuro_code.application.ports.tools import (
     ToolOutputArtifactStore,
 )
 from neuro_code.application.ports.ui_preferences import UiPreferencesStore
+from neuro_code.application.ports.ultracode import (
+    UltracodeExecutionClaim,
+    UltracodeStore,
+    UltracodeStoreError,
+)
 from neuro_code.application.ports.user_interaction import (
     InteractionEventSink,
     InteractionUnavailable,
@@ -383,6 +388,9 @@ __all__ = [
     "ToolOutputArtifactStore",
     "ToolPipelineHook",
     "UiPreferencesStore",
+    "UltracodeExecutionClaim",
+    "UltracodeStore",
+    "UltracodeStoreError",
     "UnavailableUserInteraction",
     "UserInputOption",
     "UserInputRequest",

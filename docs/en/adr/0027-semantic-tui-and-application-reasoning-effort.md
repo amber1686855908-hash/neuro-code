@@ -51,7 +51,7 @@ sub-agent workflow is active when only Neuro Code's own review policy exists.
 - `ReasoningEffort` defines six provider-neutral choices: `low` (`○`), `medium`
   (`◐`), `high` (`●`), `xhigh` (`⬤`), `max` (`◆`), and `ultracode` (`⚡`).
   `high` is the default. `max` is the deepest ordinary single-agent policy;
-  `ultracode` is reserved for a future orchestration capability. These values
+  `ultracode` is the explicit application-level entry for bounded orchestration. These values
   describe increasing application review depth, not a guaranteed hidden-reasoning
   token budget.
 - `Ctrl+E`, bare `/effort`, and bare `/reasoning` open the TUI picker;
@@ -76,9 +76,11 @@ sub-agent workflow is active when only Neuro Code's own review policy exists.
   `max` to their configured native `max` field; other dialects omit a native
   effort field and still receive application guidance. Every mapping remains
   provider/model-specific and testable.
-- `ultracode` has requested value `ultracode` and effective policy `max`.
-  The picker, runtime bar, and status message expose that fallback. It does not
-  start sub-agents because workflow orchestration is not implemented.
+- `ultracode` has requested value `ultracode` and provider-compatible policy
+  projection `max`. The picker and runtime bar may show that projection, while
+  an explicit user turn enters the durable application delegation service and
+  selects exactly one `MAIN_MAX` or `BOUNDED_SWARM` path. Providers never
+  receive an invented native `ultracode` value. See [ADR 0141](adr/0141-automatic-ultracode-delegation.md).
 
 ## Consequences
 

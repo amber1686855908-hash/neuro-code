@@ -44,7 +44,7 @@ TUI 已经能够安全、有界地保存工具详情，但仍把每次工具调�
   只保留 Composer 与无冗余字段名的紧凑状态行。完整快捷键栏被移除；`/help` 与 F1 继续
   提供按需发现。
 - Modal 使用小/中/大三档尺寸及统一 padding 和边框。选择列表用焦点箭头与独立已选勾号，
-  不再使用整行选中填充。Ultracode 保持 muted，并标记为即将推出。会话复制编辑器使用
+  不再使用整行选中填充。Ultracode 保持视觉区分，并显示有界委派进度。会话复制编辑器使用
   divider，而不是第二层完整边框。
 
 ## 影响
@@ -63,5 +63,5 @@ TUI 已经能够安全、有界地保存工具详情，但仍把每次工具调�
 
 Textual 无头测试覆盖聚合边界、窄终端和大型组的固定高度单选 Peek、Peek 零 artifact 读取、
 Inspector 专属的会话作用域读取、脱敏与截断提示、稳定 Transcript Copy、renderer fallback、
-Modal 复制、宽屏阅读宽度、窄屏状态 containment、Modal 档位、克制设置列表、弱化 Ultracode、
+Modal 复制、宽屏阅读宽度、窄屏状态 containment、Modal 档位、克制设置列表、独立的 Ultracode 委派状态、
 运行中 Inspector 终态更新、与焦点无关的收起，以及按组去重的计时刷新。

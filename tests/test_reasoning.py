@@ -28,12 +28,13 @@ class ReasoningEffortTests(unittest.TestCase):
         self.assertFalse(ReasoningEffort.XHIGH.requires_workflow_orchestration)
         self.assertFalse(ReasoningEffort.MAX.requires_workflow_orchestration)
 
-    def test_ultracode_guidance_discloses_missing_workflow(self) -> None:
+    def test_ultracode_guidance_discloses_application_delegation(self) -> None:
         guidance = reasoning_guidance(ReasoningEffort.ULTRACODE)
 
         self.assertIn("maximum ordinary single-agent review depth", guidance)
-        self.assertIn("workflow orchestration is not available", guidance)
-        self.assertIn("do not claim", guidance)
+        self.assertIn("application-level delegation strategy", guidance)
+        self.assertIn("exactly one bounded path", guidance)
+        self.assertIn("Never claim", guidance)
 
     def test_max_guidance_is_deep_but_remains_single_agent(self) -> None:
         guidance = reasoning_guidance(ReasoningEffort.MAX)

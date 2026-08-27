@@ -2428,12 +2428,12 @@ async def test_spawned_replan_controllers_have_one_winner_and_one_provider_call(
         assert attempt.state is DagReplanAttemptState.COMPLETED
 
 
-def test_schema_27_is_current_and_replan_tables_are_foreign_key_restricted() -> None:
-    assert SCHEMA_VERSION == 27
+def test_schema_28_is_current_and_replan_tables_are_foreign_key_restricted() -> None:
+    assert SCHEMA_VERSION == 28
 
 
 @pytest.mark.asyncio
-async def test_schema_25_to_27_migration_preserves_populated_dag_and_session() -> None:
+async def test_schema_25_to_28_migration_preserves_populated_dag_and_session() -> None:
     with tempfile.TemporaryDirectory() as directory:
         database = Path(directory) / "sessions.db"
         store = SqliteSessionStore(database)
@@ -2452,7 +2452,7 @@ async def test_schema_25_to_27_migration_preserves_populated_dag_and_session() -
         with closing(sqlite3.connect(database)) as connection:
             assert connection.execute(
                 "SELECT version FROM schema_meta WHERE singleton = 1"
-            ).fetchone() == (27,)
+            ).fetchone() == (28,)
             assert connection.execute(
                 "SELECT name FROM sqlite_master WHERE type = 'table' "
                 "AND name IN ('orchestration_dag_replan_attempts', "

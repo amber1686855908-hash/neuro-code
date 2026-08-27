@@ -53,7 +53,9 @@ no Kimi-, GLM-, or MiniMax-specific runtime exception hierarchy is introduced.
 
 Kimi uses the current model families rather than the discontinued `kimi-latest`
 alias. K3 always reasons and accepts the application-owned effort mapping
-`low → low`, `medium/high → high`, and `xhigh/ultracode → max`. K2.7 and K2.6
+`low → low`, `medium/high → high`, and `xhigh/ultracode → max`; this is the
+provider-wire compatibility projection and does not implement Ultracode branch
+selection. K2.7 and K2.6
 send thinking enabled with `keep = all`; K2.5 sends thinking enabled but is not
 advertised as preserving reasoning content. The adapter preserves the complete
 assistant `reasoning_content` when the model contract requires it. For the

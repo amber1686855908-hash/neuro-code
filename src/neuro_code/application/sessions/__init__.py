@@ -87,6 +87,7 @@ from neuro_code.application.sessions.turns import (
     RunTurnRequest,
     SessionTurnRunner,
     SessionTurnService,
+    UltracodeDelegate,
 )
 
 __all__ = [
@@ -150,4 +151,5 @@ __all__ = [
     "TurnInputForRetry",
     "TurnRecoveryInspection",
     "TurnRecoveryService",
+    "UltracodeDelegate",
 ]

@@ -57,6 +57,7 @@ from neuro_code.application.ports.task_dag_result_relay import (
     TaskDagDependencyResultRelayStore,
 )
 from neuro_code.application.ports.tools import Tool, ToolContext
+from neuro_code.application.ports.ultracode import UltracodeStore
 from neuro_code.application.ports.user_interaction import UserInteractionPort
 from neuro_code.application.ports.web_fetch import (
     WebFetchExecutionPath,
@@ -146,6 +147,9 @@ from neuro_code.application.workflows.task_dag import (
 )
 from neuro_code.application.workflows.task_dag_replan import (
     TaskDagReplanApplicationService,
+)
+from neuro_code.application.workflows.ultracode import (
+    UltracodeDelegationApplicationService,
 )
 from neuro_code.application.workflows.writable_subagent import (
     WritableSubagentApplicationService,
@@ -1490,8 +1494,9 @@ class ApplicationComposition:
         Lower-layer services are created lazily per phase so the Swarm owns
         only orchestration identity/lifecycle while the composition root
         continues to own provider, workspace, capability, and LSP wiring.
-        This service is intentionally not connected to CLI, TUI, ACP, or
-        automatic delegation.
+        This service has no direct public CLI, TUI, or ACP surface.  The
+        application-level Ultracode entry may invoke it as its one bounded
+        delegation branch.
         """
 
         if not isinstance(parent_binding, ConversationBinding):
@@ -1525,6 +1530,37 @@ class ApplicationComposition:
             leader_factory=leader_factory,
             replanner_factory=replanner_factory,
             redaction_values=self.config.redaction_values(),
+        )
+
+    async def create_ultracode_delegation_service(
+        self,
+        *,
+        parent_binding: ConversationBinding,
+        timeout_seconds: float = 120.0,
+    ) -> UltracodeDelegationApplicationService:
+        """Create the application-owned Ultracode branch router.
+
+        The router receives the composition's existing parent binding and can
+        create only the already-frozen bounded Swarm for its one typed branch.
+        It does not create tools, workers, worktrees, or provider clients.
+        """
+
+        if not isinstance(parent_binding, ConversationBinding):
+            raise ConfigurationError("Ultracode parent binding is required")
+        if parent_binding.capabilities is None:
+            raise ConfigurationError("Ultracode parent capability metadata is missing")
+
+        async def swarm_factory() -> AgentSwarmApplicationService:
+            return await self.create_agent_swarm_service(
+                parent_binding=parent_binding,
+                timeout_seconds=timeout_seconds,
+            )
+
+        return UltracodeDelegationApplicationService(
+            cast(UltracodeStore, self.store),
+            session_store=self.store,
+            parent_binding=parent_binding,
+            swarm_factory=swarm_factory,
         )
 
     create_swarm_service = create_agent_swarm_service

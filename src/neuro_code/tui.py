@@ -2993,12 +2993,12 @@ class ReasoningEffortScreen(ModalScreen[ReasoningEffort | None]):
                 effort.value,
                 secondary=(
                     f"{ui_text(self.language, f'effort.description.{effort.value}')} · "
-                    f"{ui_text(self.language, 'effort.workflow_planned')}"
+                    f"{ui_text(self.language, 'effort.workflow_delegation')}"
                     if effort is ReasoningEffort.ULTRACODE
                     else ui_text(self.language, f"effort.description.{effort.value}")
                 ),
                 selected=effort is self.selected,
-                muted=effort is ReasoningEffort.ULTRACODE,
+                muted=False,
                 primary_width=14,
                 secondary_justify="left",
                 id=f"effort-choice-{index}",
@@ -4773,6 +4773,15 @@ class NeuroCodeApp(App[None]):
             self._turn_activity_tool_name = None
             self._turn_activity_tool_started_at = None
             self._refresh_turn_activity()
+        elif event.kind is AgentEventKind.ULTRACODE_DELEGATION_PROGRESS:
+            decision = data.get("decision")
+            state = data.get("state")
+            if isinstance(decision, str) and isinstance(state, str):
+                self._turn_activity_kind = "orchestrating"
+                self._turn_activity_tool_name = None
+                self._turn_activity_tool_started_at = None
+                self._refresh_turn_activity()
+                self._write_entry("status", f"Ultracode {decision} · {state}")
         elif event.kind is AgentEventKind.REASONING_DELTA:
             text = data.get("text")
             if isinstance(text, str) and text:
@@ -6190,7 +6199,7 @@ class NeuroCodeApp(App[None]):
         if result.requested is ReasoningEffort.ULTRACODE:
             self._write_ui_entry(
                 "status",
-                "effort.changed_fallback",
+                "effort.changed_ultracode",
                 requested=result.requested.value,
                 effective=result.effective.value,
             )

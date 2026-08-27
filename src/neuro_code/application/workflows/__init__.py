@@ -70,6 +70,15 @@ from neuro_code.application.workflows.task_dag import (
 from neuro_code.application.workflows.task_dag_result_relay import (
     TaskDagDependencyResultRelayApplicationService,
 )
+from neuro_code.application.workflows.ultracode import (
+    MAX_ULTRACODE_CLASSIFIER_INPUT_BYTES,
+    MAX_ULTRACODE_LEASE_SECONDS,
+    MAX_ULTRACODE_RESULT_EVENT_BYTES,
+    UltracodeDelegationApplicationService,
+    UltracodeDelegationPolicy,
+    UltracodeParentRunner,
+    UltracodeSwarm,
+)
 from neuro_code.application.workflows.writable_subagent import (
     MAX_WRITABLE_SUBAGENT_RESULT_BYTES,
     MAX_WRITABLE_SUBAGENT_TIMEOUT_SECONDS,
@@ -87,6 +96,9 @@ __all__ = [
     "MAX_SUBAGENT_PARALLELISM",
     "MAX_SUBAGENT_RESULT_BYTES",
     "MAX_SUBAGENT_RETRIES",
+    "MAX_ULTRACODE_CLASSIFIER_INPUT_BYTES",
+    "MAX_ULTRACODE_LEASE_SECONDS",
+    "MAX_ULTRACODE_RESULT_EVENT_BYTES",
     "MAX_WRITABLE_SUBAGENT_RESULT_BYTES",
     "MAX_WRITABLE_SUBAGENT_TIMEOUT_SECONDS",
     "WRITABLE_SUBAGENT_FORBIDDEN_TOOL_NAMES",
@@ -131,6 +143,10 @@ __all__ = [
     "TaskDagDependencyResultRelayApplicationService",
     "TaskDagWritableService",
     "TaskDagWritableWorkerFactory",
+    "UltracodeDelegationApplicationService",
+    "UltracodeDelegationPolicy",
+    "UltracodeParentRunner",
+    "UltracodeSwarm",
     "WritableSubagentApplicationService",
     "WritableSubagentCapabilityGrant",
     "WritableSubagentExecutionIdentity",

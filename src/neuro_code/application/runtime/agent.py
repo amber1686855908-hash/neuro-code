@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Collection, Sequence
 from datetime import datetime
+from pathlib import Path
 
 from neuro_code.application.execution_policy import ExecutionBudgetPolicy
 from neuro_code.application.memory.compaction import ProviderContextWindow
@@ -213,6 +214,26 @@ class AgentRuntime:
         return self._tool_context.sandbox_profile
 
     @property
+    def provider_name(self) -> str:
+        return self._provider.provider_name
+
+    @property
+    def model_name(self) -> str:
+        return self._provider.model_name
+
+    @property
+    def context_affinity(self) -> str | None:
+        return getattr(self._provider, "context_affinity", None)
+
+    @property
+    def cwd(self) -> Path:
+        return self._tool_context.cwd
+
+    @property
+    def system_prompt(self) -> str:
+        return self._system_prompt
+
+    @property
     def reasoning_effort(self) -> ReasoningEffort:
         return self._context_builder.reasoning_effort
 
@@ -321,6 +342,7 @@ class AgentRuntime:
         source_context_affinity: str | None = None,
         session_id: str | None = None,
         turn_id: str | None = None,
+        ultracode_execution_id: str | None = None,
         cancellation_policy: TurnCancellationPolicy = TurnCancellationPolicy.RETAIN,
         turn_source: TurnSource = TurnSource.USER,
     ) -> AgentRunResult:
@@ -340,6 +362,7 @@ class AgentRuntime:
             source_context_affinity=source_context_affinity,
             session_id=session_id,
             turn_id=turn_id,
+            ultracode_execution_id=ultracode_execution_id,
             cancellation_policy=cancellation_policy,
             turn_source=turn_source,
         )

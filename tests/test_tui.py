@@ -3210,7 +3210,7 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
             )
             await pilot.press("ctrl+c")
 
-    async def test_effort_picker_switches_all_levels_and_marks_ultracode_fallback(
+    async def test_effort_picker_switches_all_levels_and_marks_ultracode_delegation(
         self,
     ) -> None:
         profiles = ProfileTuiController()
@@ -3247,10 +3247,10 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
             ultracode_segments = list(
                 app.console.render(ultracode.render(), app.console.options.update(width=72))
             )
-            coming_soon = next(
-                segment for segment in ultracode_segments if "coming soon" in segment.text
+            bounded_path = next(
+                segment for segment in ultracode_segments if "bounded path" in segment.text
             )
-            self.assertIn(TEXT_DISABLED.lower(), str(coming_soon.style).lower())
+            self.assertNotIn(TEXT_DISABLED.lower(), str(bounded_path.style).lower())
             clicked = await pilot.click("#effort-choice-4")
             self.assertTrue(clicked)
             for _ in range(20):
@@ -3270,7 +3270,7 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
             await pilot.press("enter")
             await pilot.pause()
             self.assertEqual(profiles.effort_selections[-1], ReasoningEffort.ULTRACODE)
-            self.assertIn("workflow orchestration is not implemented", app.entries[-1].text)
+            self.assertIn("one durable MAIN_MAX", app.entries[-1].text)
             self.assertIn(
                 "ultracode → max",
                 rendered_text(app, app.query_one("#runtime-primary", Static).renderable),

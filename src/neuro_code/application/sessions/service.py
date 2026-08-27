@@ -68,6 +68,7 @@ from neuro_code.application.sessions.turns import (
     RunTurnRequest,
     SessionTurnRunner,
     SessionTurnService,
+    UltracodeDelegate,
 )
 from neuro_code.domain.conversation.messages import SessionItem
 from neuro_code.domain.execution import SessionExecutionRecord
@@ -614,12 +615,17 @@ class SessionApplicationService:
 
         await self._lifecycle.delete_session(request)
 
-    def bind_runner(self, runner: SessionTurnRunner) -> SessionTurnService:
+    def bind_runner(
+        self,
+        runner: SessionTurnRunner,
+        *,
+        ultracode_delegate: UltracodeDelegate | None = None,
+    ) -> SessionTurnService:
         """Create a non-owning turn facade for an existing binding runner.
 
         为已有绑定运行器创建一个不拥有其生命周期的回合门面."""
 
-        return SessionTurnService(runner)
+        return SessionTurnService(runner, ultracode_delegate=ultracode_delegate)
 
 
 __all__ = [

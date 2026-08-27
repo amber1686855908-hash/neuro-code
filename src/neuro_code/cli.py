@@ -6,7 +6,7 @@ import json
 import sys
 from collections.abc import Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol, cast
 
 from neuro_code import __version__
 from neuro_code.application.execution_policy import ExecutionProfile
@@ -22,6 +22,7 @@ from neuro_code.application.ports.user_interaction import (
     UserInputRequest,
     UserInputResponse,
 )
+from neuro_code.application.runtime.agent import AgentRunResult, EventSink
 from neuro_code.application.runtime.supervision import ExecutionControlMode
 from neuro_code.application.sessions.catalog import (
     ListSessionsRequest,
@@ -647,7 +648,22 @@ async def _run_agent(args: argparse.Namespace, services: CliServices) -> int:
                 if event.kind is not AgentEventKind.MODEL_REQUEST_SNAPSHOT:
                     print(json.dumps(event.to_dict(), ensure_ascii=False), flush=True)
 
-        turn_service = application.session_service.bind_runner(binding.runner)
+        async def ultracode_delegate(
+            request: RunTurnRequest,
+            sink: EventSink | None,
+        ) -> AgentRunResult:
+            service = await application.create_ultracode_delegation_service(
+                parent_binding=binding,
+            )
+            return cast(AgentRunResult, await service.run_turn(request, sink=sink))
+
+        if getattr(binding.runner, "reasoning_effort", None) is ReasoningEffort.ULTRACODE:
+            turn_service = application.session_service.bind_runner(
+                binding.runner,
+                ultracode_delegate=ultracode_delegate,
+            )
+        else:
+            turn_service = application.session_service.bind_runner(binding.runner)
         result = await turn_service.run_turn(
             RunTurnRequest(
                 args.prompt,

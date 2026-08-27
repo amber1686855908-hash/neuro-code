@@ -32,6 +32,7 @@ from neuro_code.domain.conversation.reasoning import ReasoningEffort
 from neuro_code.domain.execution import TurnCancellationPolicy, TurnSource
 from neuro_code.domain.plans import PlanComment, SessionPlan
 from neuro_code.domain.session_tasks import SessionTask
+from neuro_code.domain.ultracode import UltracodeDelegationDecision
 
 _T = TypeVar("_T")
 
@@ -77,6 +78,9 @@ class ConversationRunner(Protocol):
     def session_id(self) -> str | None: ...
 
     @property
+    def reasoning_effort(self) -> ReasoningEffort: ...
+
+    @property
     def items(self) -> tuple[SessionItem, ...]: ...
 
     @property
@@ -109,9 +113,6 @@ class ConversationRunner(Protocol):
         sink: EventSink | None = None,
     ) -> AgentRunResult: ...
 
-    @property
-    def reasoning_effort(self) -> ReasoningEffort: ...
-
     def set_reasoning_effort(self, effort: ReasoningEffort) -> None: ...
 
     @property
@@ -131,6 +132,21 @@ class ConversationRunner(Protocol):
         cancellation_policy: TurnCancellationPolicy = TurnCancellationPolicy.RETAIN,
         turn_source: TurnSource = TurnSource.USER,
         turn_id: str | None = None,
+        ultracode_execution_id: str | None = None,
+    ) -> AgentRunResult: ...
+
+    async def ensure_persisted_session(self) -> str: ...
+
+    async def commit_external_turn(
+        self,
+        prompt: str,
+        *,
+        response: str,
+        turn_id: str,
+        execution_id: str,
+        decision: UltracodeDelegationDecision,
+        content_parts: Sequence[ContentPart] = (),
+        sink: EventSink | None = None,
     ) -> AgentRunResult: ...
 
     async def trigger_context_compaction(

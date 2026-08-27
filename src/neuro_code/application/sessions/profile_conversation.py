@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import replace
+from typing import Any
 
 from neuro_code.application.memory.compaction_runtime import ContextCompactionCommandResult
 from neuro_code.application.ports.tools import Tool
@@ -47,6 +48,7 @@ from neuro_code.domain.sandbox.models import SandboxProfile
 from neuro_code.domain.session_tasks import SessionTask
 from neuro_code.domain.sessions import SessionSummary
 from neuro_code.domain.sessions.search import SessionSearchHit
+from neuro_code.domain.ultracode import UltracodeDelegationDecision
 from neuro_code.shared.errors import ConfigurationError
 
 ConversationRunner = _ConversationRunner
@@ -121,6 +123,12 @@ class ProfileConversationController:
         return self._binding.provider.provider_name
 
     @property
+    def binding(self) -> ConversationBinding:
+        """Return the current binding for application-owned orchestration."""
+
+        return self._binding
+
+    @property
     def model_name(self) -> str:
         return self._binding.provider.model_name
 
@@ -178,19 +186,31 @@ class ProfileConversationController:
         content_parts: Sequence[ContentPart] = (),
         cancellation_policy: TurnCancellationPolicy = TurnCancellationPolicy.RETAIN,
         turn_source: TurnSource = TurnSource.USER,
+        turn_id: str | None = None,
+        ultracode_execution_id: str | None = None,
     ) -> AgentRunResult:
         async with self._turn_lock:
+            identity_kwargs: dict[str, Any] = {}
+            if turn_id is not None:
+                identity_kwargs["turn_id"] = turn_id
+            if ultracode_execution_id is not None:
+                identity_kwargs["ultracode_execution_id"] = ultracode_execution_id
             if not content_parts and (
                 cancellation_policy is TurnCancellationPolicy.RETAIN
                 and turn_source is TurnSource.USER
             ):
-                return await self._binding.runner.run(prompt, sink=sink)
+                return await self._binding.runner.run(
+                    prompt,
+                    sink=sink,
+                    **identity_kwargs,
+                )
             if not content_parts:
                 return await self._binding.runner.run(
                     prompt,
                     sink=sink,
                     cancellation_policy=cancellation_policy,
                     turn_source=turn_source,
+                    **identity_kwargs,
                 )
             return await self._binding.runner.run(
                 prompt,
@@ -198,6 +218,33 @@ class ProfileConversationController:
                 content_parts=content_parts,
                 cancellation_policy=cancellation_policy,
                 turn_source=turn_source,
+                **identity_kwargs,
+            )
+
+    async def ensure_persisted_session(self) -> str:
+        async with self._turn_lock:
+            return await self._binding.runner.ensure_persisted_session()
+
+    async def commit_external_turn(
+        self,
+        prompt: str,
+        *,
+        response: str,
+        turn_id: str,
+        execution_id: str,
+        decision: UltracodeDelegationDecision,
+        content_parts: Sequence[ContentPart] = (),
+        sink: EventSink | None = None,
+    ) -> AgentRunResult:
+        async with self._turn_lock:
+            return await self._binding.runner.commit_external_turn(
+                prompt,
+                response=response,
+                turn_id=turn_id,
+                execution_id=execution_id,
+                decision=decision,
+                content_parts=content_parts,
+                sink=sink,
             )
 
     async def run_background_wake(self, *, sink: EventSink | None = None) -> AgentRunResult:

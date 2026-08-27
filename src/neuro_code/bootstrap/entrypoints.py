@@ -43,6 +43,7 @@ from neuro_code.application.ports.sandbox import LocalProcessSandbox
 from neuro_code.application.ports.storage import SessionStore
 from neuro_code.application.ports.tools import Tool
 from neuro_code.application.providers.contracts import ProviderOption
+from neuro_code.application.runtime.agent import AgentRunResult, EventSink
 from neuro_code.application.sessions.binding import ConversationBinding
 from neuro_code.application.sessions.lifecycle import RenameSessionRequest
 from neuro_code.application.sessions.profile_conversation import (
@@ -52,6 +53,7 @@ from neuro_code.application.sessions.service import (
     ResumeSessionRequest,
     SessionApplicationService,
 )
+from neuro_code.application.sessions.turns import RunTurnRequest
 from neuro_code.application.settings import ApplicationSettings
 from neuro_code.application.tools.service import SessionToolOutputArtifactApplicationService
 from neuro_code.application.workflows.subagent_capabilities import SubagentCapabilitySet
@@ -742,7 +744,25 @@ class BootstrapCliServices:
                 queued_plan_execution_service = application.bind_queued_plan_execution_controller(
                     controller
                 )
-                turn_service = application.session_service.bind_runner(controller)
+
+                async def ultracode_delegate(
+                    request: RunTurnRequest,
+                    sink: EventSink | None,
+                    application_: ApplicationComposition = application,
+                    controller_: ProfileConversationController = controller,
+                ) -> AgentRunResult:
+                    service = await application_.create_ultracode_delegation_service(
+                        parent_binding=controller_.binding,
+                    )
+                    return await service.run_turn(request, sink=sink)
+
+                if controller.reasoning_effort is ReasoningEffort.ULTRACODE:
+                    turn_service = application.session_service.bind_runner(
+                        controller,
+                        ultracode_delegate=ultracode_delegate,
+                    )
+                else:
+                    turn_service = application.session_service.bind_runner(controller)
                 tool_output_artifact_service = application.create_tool_output_artifact_service(
                     config=config
                 )

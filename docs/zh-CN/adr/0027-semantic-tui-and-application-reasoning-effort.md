@@ -37,7 +37,7 @@ Markdown 层级。本地生命周期通知的正文起始位置也不统一，�
   第一项候选，不会替代模态框的焦点切换。
 - `ReasoningEffort` 定义六项供应商中立选择：`low`（`○`）、`medium`（`◐`）、
   `high`（`●`）、`xhigh`（`⬤`）、`max`（`◆`）与 `ultracode`（`⚡`），默认值为
-  `high`。`max` 是普通单智能体的最深策略；`ultracode` 为未来工作流编排能力保留。
+  `high`。`max` 是普通单智能体的最深策略；`ultracode` 是有界编排的显式应用层入口。
   这些值描述逐步加深的应用层审查策略，不代表能够保证模型的隐藏推理 token 预算。
 - `Ctrl+E`、不带参数的 `/effort` 和 `/reasoning` 打开 TUI 选择器；`/effort LEVEL` 与
   `/reasoning LEVEL` 可以直接选择。交互和无头组合都支持 `--effort LEVEL`。活动轮次中
@@ -52,8 +52,10 @@ Markdown 层级。本地生命周期通知的正文起始位置也不统一，�
 - 供应商适配器不会把 `ModelContext.reasoning_effort` 盲目转换成私有请求字段。显式的 Kimi K3
   与 GLM 5.3/5.2 dialect 会把 `max` 映射到已配置的原生 `max` 字段；其他 dialect 会省略
   原生强度字段，但仍收到应用层指引。每项映射都必须按供应商/模型显式声明并测试。
-- `ultracode` 的请求值是 `ultracode`，实际策略是 `max`。选择器、运行栏和状态消息都会
-  明示这项回退；由于工作流编排尚未实现，它不会启动子代理。
+- `ultracode` 的请求值是 `ultracode`，供应商兼容投影为 `max`。选择器和运行栏可以显示
+  该投影，但显式用户回合会进入 durable application delegation service，并准确选择
+  `MAIN_MAX` 或 `BOUNDED_SWARM` 中的一条路径。供应商永远不会收到编造的原生 `ultracode`
+  值。详见 [ADR 0141](adr/0141-automatic-ultracode-delegation.md)。
 
 ## 后果
 

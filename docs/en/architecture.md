@@ -1124,10 +1124,13 @@ The controller also owns one process-local `ReasoningEffort` selection and
 serializes changes with turns. It reapplies the requested value whenever a
 profile or session replacement installs a new conversation binding. `low`,
 `medium`, `high`, `xhigh`, and `max` map to application review guidance;
-`max` is the deepest ordinary single-agent policy, and `ultracode` has an
-explicit effective value of `max` until workflow orchestration exists. The TUI
-exposes the selection through `Ctrl+E`, `/effort`, and `/reasoning`; the CLI
-exposes `--effort`. Selection does not rewrite provider configuration or session
+`max` remains the deepest ordinary single-agent policy. An explicit
+`ultracode` selection enters the application-owned bounded delegation service,
+which durably selects exactly one `MAIN_MAX` or `BOUNDED_SWARM` branch. The
+provider-compatible projection remains `max` for the ordinary main path; no
+provider receives a fabricated native `ultracode` value. The TUI exposes the
+selection through `Ctrl+E`, `/effort`, and `/reasoning`; the CLI exposes
+`--effort`. Selection does not rewrite provider configuration or session
 identity.
 
 At each model step, `AgentRuntime` adds the selected guidance to a request-only
@@ -1728,7 +1731,7 @@ tool-role, synthetic, tool-call-bearing, media-bearing, preserved reasoning,
 and preserved backend-call structures are excluded; assistant visible prose is
 separable from and never carries its `reasoning_content`.
 
-Session schema 27 retains the schema-17 one-to-one insert-only READY relay per
+Session schema 28 retains the schema-17 one-to-one insert-only READY relay per
 writable lease, the durable Task DAG tables described below, the schema-20
 predecessor-result relay table, and the schema-21 Task DAG recovery-claim
 fence; schema 22 adds bounded DAG capacity and scoped Writable lease policy,
@@ -1736,7 +1739,8 @@ and schema 23 adds per-node execution-owner identity; schema 24 adds the
 parallel-aware Leader decision projection; schema 25 adds the bounded model
 planning attempt/proposal projections described below, schema 26 adds the
 bounded DAG replan attempt/proposal projections, and schema 27 adds the bounded
-Agent Swarm run projection described below. It also retains the
+Agent Swarm run projection described below; schema 28 adds the durable
+Ultracode delegation projection described below. It also retains the
 durable Leader attempt/decision projections described after the DAG. Its
 identity binds the parent/task/child, lease, worktree, baseline checkpoint,
 base commit, capability/grant fingerprints, and child-task digest. Source,
@@ -1754,8 +1758,8 @@ tool, and LSP steps. Relay strings are evidence only: they are not parsed into
 tools, roots, sandbox, network, LSP, worktree, or checkpoint authority. The
 existing capability intersection and child-root instruction/skill discovery
 remain the sole authority owners. Durable compaction-summary reuse, live
-context sharing, unbounded parallel workers, Swarm/Ultracode orchestration, and automatic
-delegation remain absent. The bounded Task DAG, Leader, and model-planning
+context sharing, and unbounded parallel workers remain absent. Bounded Swarm
+and Ultracode entry orchestration are defined below. The bounded Task DAG, Leader, and model-planning
 slices are specified separately by [ADR 0134](adr/0134-durable-serialized-task-dag.md), [ADR 0135]
 (adr/0135-bounded-serialized-leader-controller.md), and [ADR 0137]
 (adr/0137-parallel-aware-leader-bounded-wave-scheduling.md), with model-generated
@@ -1798,7 +1802,7 @@ Parallel nodes receive fresh Writable application services from a typed
 `asyncio.Lock` while giving each node independent binding, lease, worktree,
 checkpoint, child session, Parent Relay, and worker-scoped LSP state.
 
-The current Session schema 27 stores immutable DAG definitions and bounded node runtime
+The current Session schema 28 stores immutable DAG definitions and bounded node runtime
 projections in `task_dags` and `task_dag_nodes`, plus insert-only
 `task_dag_dependency_relays` and the separate `task_dag_recovery_claims`
 cross-process ownership fence. Definitions and relay publications are
@@ -1877,7 +1881,7 @@ transcript/reasoning/tool arguments/output, Relay payloads, workspace bytes,
 checkpoint bytes, Git diffs, secrets, or arbitrary paths. The current
 parallel-aware extension is specified by ADR 0137 below.
 
-The current Session Store schema 27 retains the schema-19 `leader_attempts` and
+The current Session Store schema 28 retains the schema-19 `leader_attempts` and
 `leader_decisions` projections. An attempt binds the exact DAG generation,
 definition/evidence/objective fingerprints, Leader session, controller owner,
 turn identity, and durable lifecycle. SQLite write transactions and CAS-like
@@ -1933,7 +1937,7 @@ and uses a structured `TaskGroup`. It never fills unused capacity with an
 unselected node. `max_parallel=1` remains compatible with the one-node path.
 
 Session schema 24 added parent-session, selected-node, and selected-generation
-decision projections and migrated populated schema-23 rows; current schema 27
+decision projections and migrated populated schema-23 rows; current schema 28
 retains them. A durable wave
 decision can be reused after a crash only when each selected node is still at
 its recorded READY generation or has advanced durably to RUNNING/terminal;
@@ -1980,7 +1984,7 @@ other graph rules are still rejected by the canonical Task DAG service. Model
 text is data and contains no authority fields.
 
 Schema 25 added insert-only `orchestration_planning_attempts` and
-`orchestration_plan_proposals`; current schema 27 retains them. A planning attempt binds the caller's exact
+`orchestration_plan_proposals`; current schema 28 retains them. A planning attempt binds the caller's exact
 planning ID, actual parent session, objective/context fingerprints, dedicated
 planner session and turn, a preallocated intended DAG ID, provider lifecycle,
 proposal fingerprint, and published DAG identity. Its lifecycle is
@@ -2117,11 +2121,59 @@ or live-provider coverage. A composition-level lower-layer `INDETERMINATE`
 result is terminal and does not enter Replan.
 
 This is an internal vertical slice only. It does not add recursive Swarms,
-unbounded agents or queues, generic retry, automatic Ultracode delegation,
-shared writable worktrees, merge/copy-back/cherry-pick/patch adoption, public
-CLI/TUI/ACP orchestration, remote execution, marketplace integration, or a new
-Checkpoint/Rollback implementation. See [ADR
-0140](adr/0140-bounded-agent-swarm-durable-orchestration-run.md).
+unbounded agents or queues, generic retry, shared writable worktrees,
+merge/copy-back/cherry-pick/patch adoption, public CLI/TUI/ACP orchestration,
+remote execution, marketplace integration, or a new Checkpoint/Rollback
+implementation. Automatic Ultracode delegation is the separate bounded entry
+described below. See [ADR 0140](adr/0140-bounded-agent-swarm-durable-orchestration-run.md).
+
+### Automatic Ultracode delegation / durable branch entry
+
+ADR 0141 adds the first application-owned Ultracode entry. `max` remains the
+deepest ordinary single-agent reasoning/review policy. Only an explicit
+`ReasoningEffort.ULTRACODE` user turn enters this service; `low`, `medium`,
+`high`, `xhigh`, and `max` retain the ordinary ConversationRunner path.
+
+The entry uses a bounded deterministic local policy rather than a second model
+classifier call. It makes only the typed choice `MAIN_MAX` or `BOUNDED_SWARM`.
+It cannot choose tools, worker count, DAG definitions, sandbox, workspace
+roots, network, MCP, retry, merge, or provider credentials. The `MAIN_MAX`
+branch invokes the existing parent `ConversationRunner` with its normal
+single-agent `max` semantics. The `BOUNDED_SWARM` branch invokes the existing
+`ApplicationComposition.create_agent_swarm_service()` with one deterministic
+`swarm_run_id`; no second Planner, Leader, DAG, Writable worker, or Swarm is
+introduced.
+
+Session schema 28 adds the insert-once
+`orchestration_ultracode_executions` projection. Its immutable identity binds
+the actual parent session, exact parent turn, input/context fingerprints,
+provider/model/context provenance, one decision, and one downstream identity.
+`BEGIN IMMEDIATE`, process-liveness ownership, and generation CAS protect the
+`DECIDED -> MAIN_MAX_RUNNING` or `DECIDED -> BOUNDED_SWARM_RUNNING` choice.
+The bounded lifecycle then records `FINALIZING`, `COMPLETED`, or
+`INDETERMINATE`; a failed, cancelled, fenced, or observable-uncertain branch
+never switches to the other branch.
+
+`MAIN_MAX` and `BOUNDED_SWARM` both publish exactly one parent-visible
+assistant result through the existing conversation finalization contract.
+Committed output is matched only by exact `(session_id, turn_id,
+ultracode_execution_id)` evidence. A crash after a lower Swarm terminal result
+or parent result but before Ultracode bookkeeping reuses the exact durable
+result without another provider or Swarm execution. A crash with an open
+parent attempt fails closed unless the exact lower Swarm identity already
+exists and can be resumed by the existing Swarm service. There is no latest-row
+lookup, timestamp correlation, text matching, silent fallback, or duplicate
+assistant append.
+
+The parent `ConversationBinding` remains the capability ceiling. The entry
+adds no filesystem, Bash, LSP, MCP, network, Worktree, Checkpoint, or Writable
+authority, and provider adapters never receive a fabricated native
+`ultracode` value. The CLI and TUI may enter this internal service; the first
+slice exposes only bounded orchestration progress plus the final answer and
+does not add an ACP effort surface. Recursive Ultracode, automatic delegation
+for ordinary efforts, generic retry, result adoption, merge/copy-back,
+checkpoint rollback, remote/cloud execution, and a public Swarm dashboard
+remain outside the slice. See [ADR 0141](adr/0141-automatic-ultracode-delegation.md).
 
 ## Platform policy
 

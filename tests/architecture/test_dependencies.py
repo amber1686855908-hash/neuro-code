@@ -865,6 +865,7 @@ def test_canonical_ports_are_the_only_port_modules() -> None:
         "neuro_code.application.ports.terminal",
         "neuro_code.application.ports.tool_pipeline",
         "neuro_code.application.ports.tools",
+        "neuro_code.application.ports.ultracode",
         "neuro_code.application.ports.user_interaction",
         "neuro_code.application.ports.web_fetch",
         "neuro_code.application.ports.ui_preferences",

@@ -2359,7 +2359,12 @@ def test_canonical_runtime_public_types_keep_module_paths_and_metadata() -> None
     assert conversation.AgentConversation.__module__ == conversation.__name__
 
     turns = importlib.import_module("neuro_code.application.sessions.turns")
-    assert turns.__all__ == ["RunTurnRequest", "SessionTurnRunner", "SessionTurnService"]
+    assert turns.__all__ == [
+        "RunTurnRequest",
+        "SessionTurnRunner",
+        "SessionTurnService",
+        "UltracodeDelegate",
+    ]
     assert turns.RunTurnRequest.__module__ == turns.__name__
     assert turns.SessionTurnRunner.__module__ == turns.__name__
     assert turns.SessionTurnService.__module__ == turns.__name__

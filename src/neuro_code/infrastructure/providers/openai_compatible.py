@@ -412,7 +412,10 @@ class OpenAICompatibleProvider:
 
     @staticmethod
     def _effort_name(effort: ReasoningEffort) -> str:
-        return effort.effective.value
+        # ULTRACODE is owned by the application orchestration layer.  Provider
+        # adapters receive only the neutral ordinary projection and therefore
+        # never emit ``ultracode`` as a native wire value.
+        return effort.provider_effort.value
 
     def _apply_dialect_request_fields(
         self,

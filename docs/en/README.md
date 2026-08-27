@@ -313,16 +313,19 @@ turn is active and applies from the next model step.
 | `high` | ● | Deeper investigation and proactive regression checks; the default |
 | `xhigh` | ⬤ | Difficult edge cases, challenged assumptions, and multiple validation passes |
 | `max` | ◆ | Maximum ordinary single-agent depth with broad but bounded verification |
-| `ultracode` | ⚡ | Currently uses the `max` policy; workflow orchestration is not implemented |
+| `ultracode` | ⚡ | Application-owned bounded delegation to exactly one `MAIN_MAX` or `BOUNDED_SWARM` path |
 
-These levels are currently Neuro Code review policies, not claims about a
-provider's private reasoning controls. For every model request, the runtime
-adds non-persistent policy guidance and carries the typed requested value in
-`ModelContext`. Explicit Kimi K3 and GLM 5.3/5.2 dialect mappings may send the
-configured native `max` value; other dialects omit a native effort field while
-retaining the application guidance. Selecting `ultracode` does not start
-sub-agents and explicitly reports its `max` fallback. See
-[ADR 0027](adr/0027-semantic-tui-and-application-reasoning-effort.md).
+These levels are Neuro Code application policies, not claims about a
+provider's private reasoning controls. `max` remains the deepest ordinary
+single-agent policy. An explicit `ultracode` turn enters the application-owned
+bounded delegation service, which durably chooses exactly one `MAIN_MAX` or
+`BOUNDED_SWARM` branch; `MAIN_MAX` uses the existing normal Agent runtime and
+`BOUNDED_SWARM` uses the existing bounded Swarm composition. Provider adapters
+never receive an invented native `ultracode` value: the ordinary main branch
+uses the existing provider-compatible `max` projection or omission. The
+delegation decision, downstream identity, and parent-visible result are
+recovery-safe and are not automatically switched or replayed. See [ADR 0027](adr/0027-semantic-tui-and-application-reasoning-effort.md)
+and [ADR 0141](adr/0141-automatic-ultracode-delegation.md).
 
 Ordinary Agent execution uses the `normal` budget profile by default (48 model
 calls, 48 tool rounds, and 192 tool calls). `--execution-profile deep` selects

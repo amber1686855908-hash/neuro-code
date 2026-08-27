@@ -59,8 +59,8 @@ session transcript remain authoritative. This change is presentation-only.
   removed; `/help` and F1 retain on-demand discovery.
 - Modal dialogs use small, medium, and large size classes with common padding
   and borders. Selection lists use a focus chevron and a separate selected
-  checkmark without a full-row selected fill. Ultracode remains muted and marked
-  as coming soon. The transcript-copy editor uses dividers rather than a second
+  checkmark without a full-row selected fill. Ultracode remains visually distinct
+  and reports bounded delegation progress. The transcript-copy editor uses dividers rather than a second
   complete box.
 
 ## Consequences
@@ -84,5 +84,5 @@ Headless Textual tests cover grouping boundaries, fixed-height single-selection
 Peek behavior in narrow terminals and large groups, artifact-free Peek,
 Inspector-only session-scoped reads, redaction and truncation notices, stable
 Transcript Copy, renderer fallback, modal copying, wide reading width, narrow
-status containment, modal sizes, sparse settings rows, muted Ultracode, live
+status containment, modal sizes, sparse settings rows, distinct Ultracode delegation status, live
 Inspector completion, focus-independent collapse, and per-group timer refresh.

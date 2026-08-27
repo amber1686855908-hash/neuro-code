@@ -768,10 +768,11 @@ profile 时，组合根创建不恢复任何会话的新供应商/运行时/会�
 
 该控制器还持有一项进程内 `ReasoningEffort` 选择，并让强度切换与轮次串行。profile 或
 会话切换安装新对话绑定时，会把请求等级重新应用到新绑定。`low`、`medium`、`high`、
-`xhigh` 与 `max` 对应应用层审查指引；`max` 是普通单智能体的最深策略，在工作流编排实现
-前，`ultracode` 的明确实际值是 `max`。
-TUI 通过 `Ctrl+E`、`/effort` 和 `/reasoning` 暴露选择，CLI 则使用 `--effort`。选择不会
-改写供应商配置，也不成为会话身份。
+`xhigh` 与 `max` 对应应用层审查指引；`max` 仍然是普通单智能体的最深策略。显式选择
+`ultracode` 会进入应用层有界委派服务，由它持久化地准确选择 `MAIN_MAX` 或
+`BOUNDED_SWARM` 中的一条路径。普通主路径继续使用兼容供应商的 `max` 投影；不会向任何
+供应商发送编造的原生 `ultracode` 值。TUI 通过 `Ctrl+E`、`/effort` 和 `/reasoning` 暴露选择，
+CLI 则使用 `--effort`。选择不会改写供应商配置，也不成为会话身份。
 
 每次模型步骤开始时，`AgentRuntime` 会把所选指引加入仅用于本次请求的系统消息，并将
 有类型的请求值写入 `ModelContext`；该指引不会加入规范 `SessionItem` 历史。供应商
@@ -1672,12 +1673,13 @@ Writable workflow 现在只从实际 parent `ConversationBinding` 所绑定 sess
 保留 reasoning 与保留 backend-call 的结构都会排除；assistant 可见正文可与
 `reasoning_content` 明确分离，后者绝不进入 Relay。
 
-Session schema 27 保留 schema 17 的每个 writable lease 一条一对一、insert-only READY Relay，
+Session schema 28 保留 schema 17 的每个 writable lease 一条一对一、insert-only READY Relay，
 以及下述持久化 Task DAG 表、schema 20 的 predecessor-result Relay 表和 schema 21 的 Task DAG
 recovery-claim fence；schema 22 增加有界 DAG capacity 与 scoped Writable lease policy，schema 23
 增加逐节点 execution-owner identity，schema 24 增加 parallel-aware Leader decision projection，
 schema 25 增加下文的 bounded model-planning attempt/proposal projection，schema 26 增加 bounded
-DAG replan attempt/proposal projection，schema 27 增加下文描述的 bounded Agent Swarm run projection，
+DAG replan attempt/proposal projection，schema 27 增加下文描述的 bounded Agent Swarm run projection，schema 28 增加下文描述的
+durable Ultracode delegation projection，
 并保留后文的持久化 Leader attempt/decision 投影。
 其 identity
 绑定 parent/task/child、lease、worktree、baseline checkpoint、base commit、
@@ -1691,7 +1693,8 @@ durable worker identity，而不是删除或 rollback。
 conversation history，并在模型、tool 与 LSP 多步骤间保持字节稳定。Relay 字符串只作为证据，
 不会被解析为 tool、root、sandbox、network、LSP、worktree 或 checkpoint 权限。既有 capability
 求交与 child-root instruction/skill discovery 仍是唯一权限 owner。Durable compaction summary
-复用、实时 context sharing、无界并行 worker、Swarm/Ultracode 编排与自动委派仍未实现。
+复用、实时 context sharing 和无界并行 worker 仍未实现；bounded Swarm 与 Ultracode 入口编排
+在下文定义。
 有界 Task DAG、Leader 与 model-planning 切片由独立的 [ADR 0134](adr/0134-durable-serialized-task-dag.md)、
 [ADR 0135](adr/0135-bounded-serialized-leader-controller.md) 与 [ADR 0137]
 (adr/0137-parallel-aware-leader-bounded-wave-scheduling.md) 规定，model-generated planning
@@ -1723,7 +1726,7 @@ Parallel node 通过 typed `TaskDagWritableWorkerFactory` 获得全新的 Writab
 这样既保留冻结的每 worker `asyncio.Lock`，也使每个节点拥有独立的 binding、lease、worktree、
 checkpoint、child session、Parent Relay 和 worker-scoped LSP state。
 
-当前 Session schema 27 在 `task_dags` 与 `task_dag_nodes` 中保存不可变 DAG 定义和有界节点运行投影，
+当前 Session schema 28 在 `task_dags` 与 `task_dag_nodes` 中保存不可变 DAG 定义和有界节点运行投影，
 并在 `task_dag_dependency_relays` 中保存 insert-only 的 predecessor-result Relay，同时在独立的
 `task_dag_recovery_claims` 中保存跨进程 ownership fence。定义和 Relay 发布都是 insert-only；graph
 与 node 生命周期更新使用 generation CAS。成功节点记录精确的 worker task、child session、writable lease、
@@ -1777,7 +1780,7 @@ node definition 与 durable outcome metadata，并对 preview 脱敏、带 finge
 transcript/reasoning/tool argument/output、Relay payload、workspace bytes、checkpoint bytes、Git
 diff、secret 或 arbitrary path。
 
-当前 Session Store schema 27 保留 schema 19 新增的 `leader_attempts` 与 `leader_decisions` 投影。Attempt 绑定精确 DAG
+当前 Session Store schema 28 保留 schema 19 新增的 `leader_attempts` 与 `leader_decisions` 投影。Attempt 绑定精确 DAG
 generation、definition/evidence/objective fingerprint、Leader session、controller owner、turn
 identity 与 durable lifecycle。SQLite write transaction 和 CAS-like state transition 保证同一精确
 snapshot 只有一个 controller 拥有 model request。Controller 必须在 provider call 紧邻之前，使用
@@ -1817,7 +1820,7 @@ CAS；wave seam 只 claim selected ID，创建独立 Writable service，并使�
 填充未选择的 node。`max_parallel=1` 继续兼容 one-node path。
 
 Session schema 24 增加了 parent-session、selected-node 和 selected-generation decision projection，
-并迁移已填充的 schema-23 row；当前 schema 27 保留这些 projection。Crash 后只有每个 selected node 仍在记录的 READY generation，或
+并迁移已填充的 schema-23 row；当前 schema 28 保留这些 projection。Crash 后只有每个 selected node 仍在记录的 READY generation，或
 已经 durable advanced 到 RUNNING/terminal 时，durable wave decision 才能复用；不会推断 provider
 replay 安全。Partial claim、controller race、failure、cancellation、skipped descendant 和
 indeterminate branch 保留既有 Task DAG recovery semantics。Leader 仍不拥有 Writable、Worktree、
@@ -1850,7 +1853,7 @@ Parser 保留冻结的 Task DAG limits：最多 8 个 node、16 条 edge、每 n
 和其他 graph 规则仍由规范 Task DAG service 拒绝。Model text 只是 data，不包含 authority field。
 
 Schema 25 新增 insert-only 的 `orchestration_planning_attempts` 与 `orchestration_plan_proposals`；当前
-schema 27 保留这些 projection。
+schema 28 保留这些 projection。
 Planning attempt 绑定调用方精确 planning ID、真实 parent session、objective/context fingerprint、专用
 planner session/turn、预分配 intended DAG ID、provider lifecycle、proposal fingerprint 和已发布 DAG identity。
 生命周期为 `CLAIMED -> PROVIDER_FENCED -> MODEL_COMMITTED -> PROPOSAL_PUBLISHED -> DAG_PUBLISHED ->
@@ -1950,3 +1953,37 @@ Planner state 已完成、`FINALIZING` 前 lower Leader/DAG result 已终态、S
 Ultracode delegation、共享 writable worktree、merge/copy-back/cherry-pick/patch adoption、public CLI/TUI/ACP
 orchestration、remote execution、marketplace integration，也不重新实现 Checkpoint/Rollback。详见 [ADR
 0140](adr/0140-bounded-agent-swarm-durable-orchestration-run.md)。
+
+### Automatic Ultracode delegation / durable branch entry
+
+ADR 0141 增加第一版由应用拥有的 Ultracode 入口。`max` 仍然是普通单智能体最深的
+reasoning/review 策略；只有显式的 `ReasoningEffort.ULTRACODE` 用户回合会进入该服务，
+`low`、`medium`、`high`、`xhigh` 与 `max` 继续使用普通 ConversationRunner 路径。
+
+该入口使用有界、确定性的本地策略，不增加第二次 model classifier 调用。它只做一个 typed
+选择：`MAIN_MAX` 或 `BOUNDED_SWARM`。它不能选择 tool、worker 数量、DAG definition、sandbox、
+workspace root、network、MCP、retry、merge 或 provider credential。`MAIN_MAX` 调用现有 parent
+`ConversationRunner` 并保留普通单智能体的 `max` 语义；`BOUNDED_SWARM` 通过
+`ApplicationComposition.create_agent_swarm_service()` 调用既有 Swarm，并使用一个由 durable
+identity 推导的 `swarm_run_id`，不会增加第二个 Planner、Leader、DAG、Writable worker 或 Swarm。
+
+Session schema 28 增加 insert-once 的 `orchestration_ultracode_executions` projection。不可变
+identity 绑定实际 parent session、精确 parent turn、input/context fingerprint、provider/model/context
+provenance、一个 decision 与一个下游 identity。`BEGIN IMMEDIATE`、process-liveness ownership
+和 generation CAS 保护 `DECIDED -> MAIN_MAX_RUNNING` 或 `DECIDED -> BOUNDED_SWARM_RUNNING`
+选择；随后只允许 `FINALIZING`、`COMPLETED` 或 `INDETERMINATE`。失败、取消、fence 丢失或
+可观察但不确定的 branch 永远不会切换到另一条 branch。
+
+两个 branch 都通过既有 conversation finalization contract 发布一个 parent 可见的 assistant
+result。只用精确的 `(session_id, turn_id, ultracode_execution_id)` evidence 匹配已提交 output。
+如果 lower Swarm 或 parent result 已提交但 Ultracode bookkeeping 尚未完成，恢复会复用相同的
+durable result，不再调用 Provider 或重复执行 Swarm。parent attempt 仍开放时，只有同一个精确
+`swarm_run_id` 已经存在且可以由既有 Swarm 恢复，才允许继续；否则 fail closed。不存在 latest-row
+lookup、timestamp correlation、text matching、silent fallback 或重复 assistant append。
+
+Parent `ConversationBinding` 继续是 capability ceiling。入口不增加 filesystem、Bash、LSP、MCP、
+network、Worktree、Checkpoint 或 Writable authority；provider adapter 也永远不会收到编造的
+原生 `ultracode` 值。CLI 与 TUI 可以进入这个内部服务，第一切片只显示有界 orchestration
+progress 和最终回答，不增加 ACP effort surface。Recursive Ultracode、普通 effort 的自动 Swarm、
+generic retry、result adoption、merge/copy-back、checkpoint rollback、remote/cloud execution
+和 public Swarm dashboard 仍不在范围内。详见 [ADR 0141](adr/0141-automatic-ultracode-delegation.md)。

@@ -256,10 +256,17 @@ class AgentLoopRunner:
         source_context_affinity: str | None = None,
         session_id: str | None = None,
         turn_id: str | None = None,
+        ultracode_execution_id: str | None = None,
         cancellation_policy: TurnCancellationPolicy = TurnCancellationPolicy.RETAIN,
         turn_source: TurnSource = TurnSource.USER,
     ) -> AgentRunResult:
         prompt_parts = tuple(content_parts)
+        if ultracode_execution_id is not None and (
+            not isinstance(ultracode_execution_id, str)
+            or not ultracode_execution_id.strip()
+            or len(ultracode_execution_id.encode("utf-8")) > 128
+        ):
+            raise ValueError("ultracode execution id must be a bounded non-empty identifier")
         if not isinstance(turn_source, TurnSource):
             raise TypeError("turn_source must be a TurnSource")
         if turn_source is TurnSource.USER and not prompt.strip() and not prompt_parts:
@@ -849,24 +856,32 @@ class AgentLoopRunner:
             result_items = (
                 persistent_context_items() if persist_turn_context else turn_context_prefix
             )
+            completion_data: dict[str, object] = {
+                "step": step,
+                "stop_reason": finalization.stop_reason,
+                "input_tokens": finalization.total_input_tokens,
+                "output_tokens": finalization.total_output_tokens,
+                "duration_seconds": monotonic() - turn_started_at,
+                "execution_status": outcome.status.value,
+                "execution_reason": outcome.reason_code.value
+                if outcome.reason_code is not None
+                else None,
+                "finalized": outcome.finalized,
+                "recoverable": outcome.recoverable,
+                "finalization_status": finalization.status.value,
+                "finalization_attempts": len(finalization.attempts),
+                "illegal_tool_calls": finalization.illegal_tool_calls,
+            }
+            if ultracode_execution_id is not None:
+                completion_data.update(
+                    {
+                        "ultracode_execution_id": ultracode_execution_id,
+                        "response": finalization.response,
+                    }
+                )
             await finalize_turn_completion(
                 outcome,
-                {
-                    "step": step,
-                    "stop_reason": finalization.stop_reason,
-                    "input_tokens": finalization.total_input_tokens,
-                    "output_tokens": finalization.total_output_tokens,
-                    "duration_seconds": monotonic() - turn_started_at,
-                    "execution_status": outcome.status.value,
-                    "execution_reason": outcome.reason_code.value
-                    if outcome.reason_code is not None
-                    else None,
-                    "finalized": outcome.finalized,
-                    "recoverable": outcome.recoverable,
-                    "finalization_status": finalization.status.value,
-                    "finalization_attempts": len(finalization.attempts),
-                    "illegal_tool_calls": finalization.illegal_tool_calls,
-                },
+                completion_data,
                 result_items,
             )
             return AgentRunResult(
@@ -1187,6 +1202,20 @@ class AgentLoopRunner:
                     result_items = (
                         persistent_context_items() if persist_turn_context else turn_context_prefix
                     )
+                    completion_data = {
+                        "step": step,
+                        "stop_reason": completion.stop_reason,
+                        "input_tokens": completion.input_tokens,
+                        "output_tokens": completion.output_tokens,
+                        "duration_seconds": monotonic() - turn_started_at,
+                    }
+                    if ultracode_execution_id is not None:
+                        completion_data.update(
+                            {
+                                "ultracode_execution_id": ultracode_execution_id,
+                                "response": "".join(response_parts),
+                            }
+                        )
                     await finalize_turn_completion(
                         AgentExecutionOutcome(
                             AgentExecutionStatus.COMPLETED,
@@ -1194,13 +1223,7 @@ class AgentLoopRunner:
                             finalized=False,
                             recoverable=False,
                         ),
-                        {
-                            "step": step,
-                            "stop_reason": completion.stop_reason,
-                            "input_tokens": completion.input_tokens,
-                            "output_tokens": completion.output_tokens,
-                            "duration_seconds": monotonic() - turn_started_at,
-                        },
+                        completion_data,
                         result_items,
                     )
                     return AgentRunResult(
