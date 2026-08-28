@@ -2474,6 +2474,8 @@ async def test_real_composed_writable_task_dag_and_adoption_preserve_worker_evid
     _run_git(repository_path, "init", "-q")
     _run_git(repository_path, "config", "user.email", "neuro-code-tests@example.invalid")
     _run_git(repository_path, "config", "user.name", "Neuro Code Tests")
+    _run_git(repository_path, "config", "core.autocrlf", "false")
+    _run_git(repository_path, "config", "core.eol", "lf")
     (repository_path / "A.txt").write_bytes(BASE_CONTENT_A)
     (repository_path / "B.txt").write_bytes(BASE_CONTENT_B)
     (repository_path / "U.txt").write_bytes(b"unrelated dirty\n")
