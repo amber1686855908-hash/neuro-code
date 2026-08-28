@@ -68,6 +68,7 @@ from neuro_code.domain.checkpoints import (
 from neuro_code.domain.conversation.context import ModelContext
 from neuro_code.domain.conversation.events import ModelEvent
 from neuro_code.domain.result_adoption import (
+    MAX_RESULT_ADOPTION_LEASE_SECONDS,
     ResultAdoptionOperation,
     ResultAdoptionPlan,
     ResultAdoptionRequest,
@@ -566,6 +567,87 @@ class _FailOnceMutation(_RecordingMutation):
         return await super().apply(request, session_id=session_id)
 
 
+class _PermissionDeniedMutation:
+    def __init__(self) -> None:
+        self.calls: list[WorkspaceMutationRequest] = []
+
+    async def apply(
+        self,
+        request: WorkspaceMutationRequest,
+        *,
+        session_id: str,
+    ) -> WorkspaceMutationResult:
+        assert session_id
+        self.calls.append(request)
+        raise OSError("permission denied")
+
+
+class _ApplyThenFailMutation(_RecordingMutation):
+    def __init__(self, parent: _MutableParent) -> None:
+        super().__init__(parent)
+        self.fail_after_apply = True
+
+    async def apply(
+        self,
+        request: WorkspaceMutationRequest,
+        *,
+        session_id: str,
+    ) -> WorkspaceMutationResult:
+        if self.fail_after_apply:
+            self.fail_after_apply = False
+            assert session_id
+            assert self.parent.current(request.path) == request.expected
+            self.calls.append(request)
+            self.parent.set_entry(request.desired, path=request.path)
+            raise OSError("mutation acknowledgement failed after write")
+        return await super().apply(request, session_id=session_id)
+
+
+class _NoopOnceMutation(_RecordingMutation):
+    def __init__(self, parent: _MutableParent) -> None:
+        super().__init__(parent)
+        self.noop_once = True
+
+    async def apply(
+        self,
+        request: WorkspaceMutationRequest,
+        *,
+        session_id: str,
+    ) -> WorkspaceMutationResult:
+        if self.noop_once:
+            self.noop_once = False
+            assert session_id
+            assert self.parent.current(request.path) == request.expected
+            self.calls.append(request)
+            return WorkspaceMutationResult(request.path, request.operation)
+        return await super().apply(request, session_id=session_id)
+
+
+class _FailingParentReader:
+    def __init__(self, parent: _MutableParent, *, fail_on: int) -> None:
+        self.parent = parent
+        self.fail_on = fail_on
+        self.calls = 0
+
+    async def inspect(self, root: Path, /) -> ParentWorkspaceSnapshot:
+        self.calls += 1
+        if self.calls == self.fail_on:
+            raise OSError("parent projection unavailable")
+        return await self.parent.inspect(root)
+
+
+class _FinalVerificationRaceReader:
+    def __init__(self, parent: _MutableParent) -> None:
+        self.parent = parent
+        self.calls = 0
+
+    async def inspect(self, root: Path, /) -> ParentWorkspaceSnapshot:
+        self.calls += 1
+        if self.calls == 8:
+            self.parent.set_entry(_entry("A.txt", EXTERNAL_CONTENT_A), path="A.txt")
+        return await self.parent.inspect(root)
+
+
 class _DelegatingRecordingMutation:
     def __init__(self, inner: Any) -> None:
         self._inner = inner
@@ -969,6 +1051,71 @@ async def test_result_adoption_plan_round_trips_all_durable_images(tmp_path: Pat
 
 
 @pytest.mark.asyncio
+async def test_result_adoption_rejects_invalid_runtime_configuration_and_live_owner(
+    tmp_path: Path,
+) -> None:
+    fixture = await _make_fixture(tmp_path)
+
+    def make_service(
+        *,
+        binding: Any = fixture.binding,
+        mutation: Any = fixture.mutation,
+        parent_reader: Any = fixture.parent,
+        lease_seconds: Any = MAX_RESULT_ADOPTION_LEASE_SECONDS,
+    ) -> ResultAdoptionApplicationService:
+        return ResultAdoptionApplicationService(
+            store=cast(Any, fixture.graph),
+            swarms=cast(Any, fixture.graph),
+            dags=cast(TaskDagStore, fixture.graph),
+            leases=cast(WritableSubagentLeaseStore, fixture.graph),
+            worktrees=fixture.worktrees,
+            checkpoints=fixture.checkpoints,
+            parent_reader=cast(Any, parent_reader),
+            mutation=cast(Any, mutation),
+            parent_binding=cast(ConversationBinding, binding),
+            lease_seconds=cast(float, lease_seconds),
+        )
+
+    with pytest.raises(ResultAdoptionError, match="parent binding is required"):
+        make_service(binding=object())
+    with pytest.raises(ResultAdoptionError, match="parent session is unavailable"):
+        make_service(
+            binding=replace(
+                fixture.binding,
+                runner=cast(ConversationRunner, _ParentRunner("")),
+            )
+        )
+    with pytest.raises(ResultAdoptionError, match="workspace root is unavailable"):
+        make_service(binding=replace(fixture.binding, workspace_root=None))
+    with pytest.raises(ResultAdoptionError, match="capability metadata is missing"):
+        make_service(binding=replace(fixture.binding, capabilities=None))
+    with pytest.raises(ResultAdoptionError, match="does not carry writable authority"):
+        make_service(
+            binding=replace(
+                fixture.binding,
+                capabilities=_capability(
+                    fixture.parent.repository.source_worktree,
+                    sandbox=SandboxProfile.READ_ONLY,
+                ),
+            )
+        )
+    with pytest.raises(ResultAdoptionError, match="mutation port is unavailable"):
+        make_service(mutation=object())
+    with pytest.raises(ResultAdoptionError, match="parent reader is unavailable"):
+        make_service(parent_reader=object())
+    with pytest.raises(ValueError, match="lease duration is invalid"):
+        make_service(lease_seconds=True)
+    with pytest.raises(ValueError, match="lease duration is out of bounds"):
+        make_service(lease_seconds=MAX_RESULT_ADOPTION_LEASE_SECONDS + 1)
+
+    await fixture.service.prepare(fixture.request)
+    with pytest.raises(ResultAdoptionError, match="another live controller") as busy:
+        await fixture.new_service().adopt(fixture.request)
+    assert busy.value.kind == "busy"
+    assert fixture.mutation.calls == []
+
+
+@pytest.mark.asyncio
 async def test_schema_28_to_29_result_adoption_migration_is_idempotent_and_lossless(
     tmp_path: Path,
 ) -> None:
@@ -1074,6 +1221,88 @@ async def test_result_adoption_domain_rejects_invalid_boundaries(tmp_path: Path)
         replace(prepared.plan, targets=(target, target))
     with pytest.raises(ValueError, match="timezone-aware"):
         replace(prepared.plan, created_at=datetime.fromisoformat("2026-08-28T00:00:00"))
+    with pytest.raises(ValueError, match="adopt- prefix"):
+        replace(prepared.plan, adoption_id="invalid")
+    with pytest.raises(TypeError, match="repository"):
+        replace(prepared.plan, parent_repository=object())
+    with pytest.raises(ValueError, match="source count"):
+        replace(prepared.plan, sources=(source,) * 9)
+    with pytest.raises(ValueError, match="target count"):
+        replace(prepared.plan, targets=(target,) * 65)
+    with pytest.raises(TypeError, match="sources must be canonical"):
+        replace(prepared.plan, sources=(object(),))  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="targets must be canonical"):
+        replace(prepared.plan, targets=(object(),))  # type: ignore[arg-type]
+    mismatched_source = replace(
+        source,
+        parent_repository=replace(source.parent_repository, head_sha="b" * 40),
+    )
+    with pytest.raises(ValueError, match="exact parent repository"):
+        replace(prepared.plan, sources=(mismatched_source,))
+
+    with pytest.raises(ValueError, match="plan is invalid"):
+        ResultAdoptionPlan.from_dict(None)
+    invalid_plan = prepared.plan.to_dict()
+    invalid_plan["sources"] = "not-a-list"
+    with pytest.raises(ValueError, match="source/target lists"):
+        ResultAdoptionPlan.from_dict(invalid_plan)
+    invalid_plan = prepared.plan.to_dict()
+    invalid_plan["dag_generation"] = True
+    with pytest.raises(ValueError, match="DAG generation is invalid"):
+        ResultAdoptionPlan.from_dict(invalid_plan)
+    invalid_plan = prepared.plan.to_dict()
+    invalid_plan["parent_repository"] = None
+    with pytest.raises(ValueError, match="repository identity is invalid"):
+        ResultAdoptionPlan.from_dict(invalid_plan)
+
+    with pytest.raises(ValueError, match="source is invalid"):
+        type(source).from_dict(None)
+    invalid_source = source.to_dict()
+    invalid_source["parent_repository"] = None
+    with pytest.raises(ValueError, match="repository identity is invalid"):
+        type(source).from_dict(invalid_source)
+    invalid_source = source.to_dict()
+    invalid_source["parent_repository"] = {
+        "common_dir": 1,
+        "source_worktree": str(source.parent_repository.source_worktree),
+        "git_dir": str(source.parent_repository.git_dir),
+        "head_sha": source.parent_repository.head_sha,
+    }
+    with pytest.raises(ValueError, match="repository identity fields"):
+        type(source).from_dict(invalid_source)
+
+    with pytest.raises(ValueError, match="target is invalid"):
+        type(target).from_dict(None)
+    invalid_target = target.to_dict()
+    invalid_target["operation"] = 1
+    with pytest.raises(ValueError, match="target operation is invalid"):
+        type(target).from_dict(invalid_target)
+    invalid_target = target.to_dict()
+    invalid_target["baseline"] = object()
+    with pytest.raises(ValueError, match="workspace image is invalid"):
+        type(target).from_dict(invalid_target)
+    invalid_target = target.to_dict()
+    invalid_target["baseline"] = {"path": target.path, "present": True, "mode": 0o100644}
+    with pytest.raises(ValueError, match="workspace image identity"):
+        type(target).from_dict(invalid_target)
+    invalid_target = target.to_dict()
+    baseline_payload = cast(dict[str, object], invalid_target["baseline"])
+    baseline_payload["content_b64"] = 1
+    with pytest.raises(ValueError, match="content encoding is invalid"):
+        type(target).from_dict(invalid_target)
+    invalid_target = target.to_dict()
+    baseline_payload = cast(dict[str, object], invalid_target["baseline"])
+    baseline_payload["content_b64"] = "%"
+    with pytest.raises(ValueError, match="content encoding is invalid"):
+        type(target).from_dict(invalid_target)
+
+    with pytest.raises(TypeError, match="operation"):
+        ResultAdoptionTarget(
+            target.path,
+            "update",  # type: ignore[arg-type]
+            target.baseline,
+            target.desired,
+        )
 
 
 @pytest.mark.asyncio
@@ -1586,6 +1815,71 @@ async def test_retryable_target_stays_recoverable_until_expected_image_can_be_wr
 
     assert second.state is ResultAdoptionState.COMPLETED
     assert [call.path for call in retryable.calls] == ["A.txt", "C.txt"]
+
+
+@pytest.mark.asyncio
+async def test_result_adoption_reconciles_mutation_failures_and_final_verification_races(
+    tmp_path: Path,
+) -> None:
+    denied_fixture = await _make_fixture(tmp_path / "permission-denied")
+    denied = _PermissionDeniedMutation()
+    denied_fixture.service._mutation = denied  # type: ignore[attr-defined]
+
+    failed = await denied_fixture.service.adopt(denied_fixture.request)
+
+    assert failed.state is ResultAdoptionState.FAILED
+    assert failed.error_kind == "permission_denied"
+    assert [call.path for call in denied.calls] == ["A.txt"]
+    assert denied_fixture.parent.current("A.txt") == _entry("A.txt", BASE_CONTENT_A)
+
+    applied_fixture = await _make_fixture(tmp_path / "apply-then-fail")
+    applied = _ApplyThenFailMutation(applied_fixture.parent)
+    applied_fixture.service._mutation = applied  # type: ignore[attr-defined]
+
+    applied_result = await applied_fixture.service.adopt(applied_fixture.request)
+
+    assert applied_result.state is ResultAdoptionState.COMPLETED
+    assert [call.path for call in applied.calls] == ["A.txt", "C.txt"]
+    assert applied_fixture.parent.current("A.txt") == _entry("A.txt", DESIRED_CONTENT_A)
+
+    noop_fixture = await _make_fixture(tmp_path / "noop-once")
+    noop = _NoopOnceMutation(noop_fixture.parent)
+    noop_fixture.service._mutation = noop  # type: ignore[attr-defined]
+
+    first = await noop_fixture.service.adopt(noop_fixture.request)
+    second = await noop_fixture.service.adopt(noop_fixture.request)
+
+    assert first.state is ResultAdoptionState.APPLYING
+    assert first.targets[0].state is ResultAdoptionTargetState.RETRYABLE
+    assert second.state is ResultAdoptionState.COMPLETED
+    assert [call.path for call in noop.calls] == ["A.txt", "A.txt", "C.txt"]
+
+    inspect_fixture = await _make_fixture(tmp_path / "inspect-failure")
+    inspect_reader = _FailingParentReader(inspect_fixture.parent, fail_on=3)
+    inspect_fixture.service._parent_reader = inspect_reader  # type: ignore[attr-defined]
+    inspect_fixture.service._mutation = _PermissionDeniedMutation()  # type: ignore[attr-defined]
+
+    indeterminate = await inspect_fixture.service.adopt(inspect_fixture.request)
+
+    assert indeterminate.state is ResultAdoptionState.INDETERMINATE
+    assert inspect_reader.calls == 3
+    assert inspect_fixture.parent.current("A.txt") == _entry("A.txt", BASE_CONTENT_A)
+
+    race_fixture = await _make_fixture(tmp_path / "final-verification-race")
+    race_reader = _FinalVerificationRaceReader(race_fixture.parent)
+    race_fixture.service._parent_reader = race_reader  # type: ignore[attr-defined]
+
+    raced = await race_fixture.service.adopt(race_fixture.request)
+
+    assert raced.state is ResultAdoptionState.INDETERMINATE
+    assert race_reader.calls == 8
+    raced_target = await race_fixture.store.get_result_adoption_target(
+        race_fixture.request.adoption_id,
+        0,
+    )
+    assert raced_target is not None
+    assert raced_target.state is ResultAdoptionTargetState.INDETERMINATE
+    assert race_fixture.parent.current("A.txt") == _entry("A.txt", EXTERNAL_CONTENT_A)
 
 
 @pytest.mark.asyncio
