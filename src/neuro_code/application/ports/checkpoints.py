@@ -173,6 +173,12 @@ class WorkspaceCheckpointApplication(Protocol):
 
     async def get(self, checkpoint_id: CheckpointId, /) -> WorkspaceCheckpoint | None: ...
 
+    async def load_projection(
+        self,
+        checkpoint_id: CheckpointId,
+        /,
+    ) -> WorkspaceProjection: ...
+
     async def rollback(
         self,
         checkpoint_id: CheckpointId,

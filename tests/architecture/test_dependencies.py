@@ -858,6 +858,7 @@ def test_canonical_ports_are_the_only_port_modules() -> None:
         "neuro_code.application.ports.provider_catalog",
         "neuro_code.application.ports.provider_services",
         "neuro_code.application.ports.provider_settings",
+        "neuro_code.application.ports.result_adoption",
         "neuro_code.application.ports.routing",
         "neuro_code.application.ports.sandbox",
         "neuro_code.application.ports.skills",
@@ -930,6 +931,7 @@ def test_canonical_workspace_modules_are_the_only_workspace_implementations() ->
         "neuro_code.infrastructure.workspace.checkpoints",
         "neuro_code.infrastructure.workspace.instructions",
         "neuro_code.infrastructure.workspace.paths",
+        "neuro_code.infrastructure.workspace.projection",
         "neuro_code.infrastructure.workspace.skills",
     }
     assert {

@@ -989,7 +989,7 @@ async def test_two_planning_controllers_share_one_durable_identity() -> None:
 
 
 @pytest.mark.asyncio
-async def test_schema_24_to_28_preserves_existing_task_dag() -> None:
+async def test_schema_24_to_29_preserves_existing_task_dag() -> None:
     with tempfile.TemporaryDirectory() as directory:
         store, parent_id, _planner_id = await _store_with_sessions(directory)
         dag = TaskDag.create(
@@ -1007,7 +1007,7 @@ async def test_schema_24_to_28_preserves_existing_task_dag() -> None:
             connection.execute("UPDATE schema_meta SET version = 24 WHERE singleton = 1")
             connection.commit()
         await store.initialize()
-        assert SCHEMA_VERSION == 28
+        assert SCHEMA_VERSION == 29
         assert (
             await store.get_task_dag("preexisting")
         ).definition_fingerprint == dag.definition_fingerprint
@@ -1023,7 +1023,7 @@ async def test_schema_24_to_28_preserves_existing_task_dag() -> None:
                 "orchestration_plan_proposals",
                 "orchestration_swarm_runs",
             }.issubset(tables)
-            assert connection.execute("SELECT version FROM schema_meta").fetchone() == (28,)
+            assert connection.execute("SELECT version FROM schema_meta").fetchone() == (29,)
 
 
 @pytest.mark.asyncio

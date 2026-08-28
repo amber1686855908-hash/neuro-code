@@ -26,6 +26,7 @@ from neuro_code.application.permissions.policy import (
     PermissionRuleStore,
 )
 from neuro_code.application.permissions.service import ToolApprovalService
+from neuro_code.application.ports.agent_swarm import AgentSwarmStore
 from neuro_code.application.ports.approval import PermissionApprover
 from neuro_code.application.ports.background_tasks import (
     BackgroundTaskManager,
@@ -46,6 +47,7 @@ from neuro_code.application.ports.parent_context_relay import (
     ParentContextRelayError,
     ParentContextRelayStore,
 )
+from neuro_code.application.ports.result_adoption import ResultAdoptionStore
 from neuro_code.application.ports.sandbox import LocalProcessSandbox
 from neuro_code.application.ports.skills import SkillDiscovery
 from neuro_code.application.ports.storage import SessionStore
@@ -120,6 +122,7 @@ from neuro_code.application.workflows.plan_scheduling import (
     PlanSchedulingController,
     PlanSchedulingService,
 )
+from neuro_code.application.workflows.result_adoption import ResultAdoptionApplicationService
 from neuro_code.application.workflows.session_task_execution import (
     QueuedPlanExecutionController,
     QueuedPlanExecutionService,
@@ -188,6 +191,7 @@ from neuro_code.infrastructure.sandbox.local_process import ProcessTreeLocalProc
 from neuro_code.infrastructure.sandbox.windows_native_local_process import (
     WindowsNativeLocalProcessSandbox,
 )
+from neuro_code.infrastructure.tools.filesystem import ExactWorkspaceMutationTool
 from neuro_code.infrastructure.tools.registry import ToolRegistry, default_tool_registry
 from neuro_code.infrastructure.tools.web_fetch import WebFetchTool
 from neuro_code.infrastructure.tools.web_search import WebSearchTool
@@ -200,6 +204,7 @@ from neuro_code.infrastructure.workspace.changes import (
 from neuro_code.infrastructure.workspace.checkpoints import LocalWorkspaceStateAdapter
 from neuro_code.infrastructure.workspace.instructions import FilesystemInstructionDiscovery
 from neuro_code.infrastructure.workspace.paths import FilesystemWorkspaceIdentity, workspaces_match
+from neuro_code.infrastructure.workspace.projection import LocalParentWorkspaceProjectionReader
 from neuro_code.infrastructure.workspace.skills import FilesystemSkillDiscovery
 from neuro_code.shared.errors import ConfigurationError, SandboxError
 
@@ -448,6 +453,53 @@ class ApplicationComposition:
             state=LocalWorkspaceStateAdapter(git=git, workspace_git=git),
             checkpoints=SqliteWorkspaceCheckpointStore(self.config.state_dir / "checkpoints.db"),
             artifacts=LocalCheckpointArtifactStore(self.config.state_dir),
+        )
+
+    def create_result_adoption_service(
+        self,
+        *,
+        parent_binding: ConversationBinding,
+    ) -> ResultAdoptionApplicationService:
+        """Create the explicit durable parent-result adoption capability.
+
+        The service is intentionally not wired into Ultracode, the TUI, or a
+        model-facing tool.  All source evidence, worktree/checkpoint services,
+        and the parent mutation port are bound here from the active
+        composition and conversation binding.
+        """
+
+        if not isinstance(parent_binding, ConversationBinding):
+            raise ConfigurationError("result adoption parent binding is required")
+        if parent_binding.workspace_mutation is None:
+            raise ConfigurationError("result adoption parent mutation authority is missing")
+        git = LocalGitWorktreeAdapter(hooks_directory=self.config.state_dir / "git-hooks")
+        managed_worktrees = SqliteManagedWorktreeStore(self.config.state_dir / "worktrees.db")
+        checkpoint_store = SqliteWorkspaceCheckpointStore(self.config.state_dir / "checkpoints.db")
+        state = LocalWorkspaceStateAdapter(git=git, workspace_git=git)
+        worktrees = WorktreeApplicationService(
+            git=git,
+            store=managed_worktrees,
+            managed_root=self.config.state_dir / "worktrees",
+        )
+        checkpoints = WorkspaceCheckpointApplicationService(
+            git=git,
+            workspace_git=git,
+            worktrees=managed_worktrees,
+            state=state,
+            checkpoints=checkpoint_store,
+            artifacts=LocalCheckpointArtifactStore(self.config.state_dir),
+        )
+        parent_reader = LocalParentWorkspaceProjectionReader(git=git, state=state)
+        return ResultAdoptionApplicationService(
+            store=cast(ResultAdoptionStore, self.store),
+            swarms=cast(AgentSwarmStore, self.store),
+            dags=cast(TaskDagStore, self.store),
+            leases=cast(WritableSubagentLeaseStore, self.store),
+            worktrees=worktrees,
+            checkpoints=checkpoints,
+            parent_reader=parent_reader,
+            mutation=parent_binding.workspace_mutation,
+            parent_binding=parent_binding,
         )
 
     @classmethod
@@ -936,6 +988,7 @@ class ApplicationComposition:
                 ),
                 approver=approval_service,
                 session_store=self.store,
+                workspace_mutation_tool=ExactWorkspaceMutationTool(),
                 execution_budget=selected_execution_budget,
                 reasoning_effort=reasoning_effort or self.settings.reasoning_effort,
                 execution_control_mode=self.settings.execution_control_mode,
@@ -1004,6 +1057,8 @@ class ApplicationComposition:
                 background_tasks=task_scope,
                 capabilities=binding_capabilities,
                 resource_scope=ConversationBindingResourceScope(close_binding_resources),
+                workspace_root=selected_config.cwd,
+                workspace_mutation=runtime.workspace_mutation,
             )
         except BaseException:
             self._lsp_services.discard(lsp_service)

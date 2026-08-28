@@ -9,6 +9,7 @@ import asyncio
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
+from pathlib import Path
 from typing import Protocol, TypeVar
 
 from neuro_code.application.memory.compaction import ProviderContextWindow
@@ -21,6 +22,7 @@ from neuro_code.application.memory.compaction_runtime import (
 )
 from neuro_code.application.ports.background_tasks import BackgroundTaskManager
 from neuro_code.application.ports.model import ModelProvider
+from neuro_code.application.ports.result_adoption import WorkspaceMutationPort
 from neuro_code.application.ports.tools import Tool
 from neuro_code.application.runtime.agent import AgentRunResult, EventSink
 from neuro_code.application.sessions.recovery import TurnRecoveryInspection
@@ -219,6 +221,8 @@ class ConversationBinding:
         default=None,
         kw_only=True,
     )
+    workspace_root: Path | None = field(default=None, kw_only=True)
+    workspace_mutation: WorkspaceMutationPort | None = field(default=None, kw_only=True)
 
     async def close(self) -> None:
         """Close ephemeral resources owned by this binding."""

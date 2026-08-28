@@ -37,6 +37,10 @@ from neuro_code.application.permissions.policy import (
 )
 from neuro_code.application.permissions.scopes import PermissionScopeContext
 from neuro_code.application.ports.approval import PermissionApprover
+from neuro_code.application.ports.result_adoption import (
+    WorkspaceMutationRequest,
+    WorkspaceMutationResult,
+)
 from neuro_code.application.ports.storage import SessionStore
 from neuro_code.application.ports.tool_pipeline import ToolPipelineHook
 from neuro_code.application.ports.tools import (
@@ -250,6 +254,7 @@ class ToolExecutor:
         "_tool_context",
         "_tools",
         "_workspace_change_observer",
+        "_workspace_mutation_tool",
     )
 
     def __init__(
@@ -263,6 +268,7 @@ class ToolExecutor:
         workspace_change_observer: WorkspaceChangeObserver,
         context_builder: ContextBuilder,
         hooks: Sequence[ToolPipelineHook] = (),
+        workspace_mutation_tool: Tool | None = None,
     ) -> None:
         self._tools = tools
         self._permissions = permissions
@@ -272,8 +278,94 @@ class ToolExecutor:
         self._session_store = session_store
         self._hooks = tuple(hooks)
         self._workspace_change_observer = workspace_change_observer
+        self._workspace_mutation_tool = workspace_mutation_tool
         self._context_builder = context_builder
         self._observation_builder = ToolObservationBuilder(tool_context.redaction_values)
+
+    async def apply(
+        self,
+        request: WorkspaceMutationRequest,
+        *,
+        session_id: str,
+    ) -> WorkspaceMutationResult:
+        """Apply one internal exact mutation through the normal write boundary.
+
+        This is an application port, not a model tool call: it deliberately
+        emits no conversation events and never exposes the hidden request to a
+        provider.  Canonical path resolution, target permission evaluation,
+        interactive approval, instruction checks, sandbox checks, and the
+        injected filesystem executor remain the same effective layers used by
+        ordinary workspace edits.
+        """
+
+        if not isinstance(request, WorkspaceMutationRequest):
+            raise TypeError("workspace mutation request must be canonical")
+        if not isinstance(session_id, str) or not session_id or "\x00" in session_id:
+            raise ValueError("workspace mutation session identity is invalid")
+        tool = self._workspace_mutation_tool
+        if tool is None:
+            raise ToolError("internal workspace mutation is unavailable")
+        arguments: dict[str, Any] = {
+            "path": request.path,
+            "operation": request.operation.value,
+            "_workspace_mutation_request": request,
+        }
+        if not isinstance(tool, FilesystemTargetProvider):
+            raise ToolError("internal workspace mutation has no canonical target provider")
+        try:
+            filesystem_access_plan = tool.prepare_filesystem_targets(
+                arguments,
+                self._tool_context,
+            )
+        except Exception as error:
+            raise ToolError("internal workspace mutation target preflight failed") from error
+        if (
+            filesystem_access_plan is None
+            or filesystem_access_plan.tool_name != tool.definition.name
+        ):
+            raise ToolError("internal workspace mutation target plan is invalid")
+        decision = self._permissions.decide_targets(
+            tool.definition.name,
+            filesystem_access_plan.targets,
+            side_effecting=tool.side_effecting,
+        )
+        if decision.effect is PermissionEffect.ASK:
+            scope_context = self._permission_scope_context(session_id)
+            scope_candidates = self._permissions.scope_candidates(
+                tool.definition.name,
+                arguments,
+                decision=decision,
+                targets=filesystem_access_plan.targets,
+                workspace_root=Path(scope_context.workspace_root),
+            )
+            public_arguments = {
+                "path": request.path,
+                "operation": request.operation.value,
+            }
+            approval_request = build_permission_request(
+                f"result-adoption-{uuid.uuid4().hex}",
+                tool.definition.name,
+                public_arguments,
+                decision.reason,
+                scope_candidates=scope_candidates,
+                scope_context=scope_context,
+            )
+            approval = (
+                await self._approver.request(approval_request)
+                if self._approver is not None
+                else PermissionApproval.deny("interactive approval interface is unavailable")
+            )
+            if not approval.allowed:
+                raise ToolError(f"permission denied: {approval.reason}")
+        elif not decision.allowed:
+            raise ToolError(f"permission denied: {decision.reason}")
+        result = await tool.execute(
+            arguments,
+            replace(self._tool_context, filesystem_access_plan=filesystem_access_plan),
+        )
+        if result.is_error:
+            raise ToolError(result.content)
+        return WorkspaceMutationResult(request.path, request.operation)
 
     async def execute(
         self,

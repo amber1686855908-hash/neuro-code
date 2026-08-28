@@ -15,6 +15,7 @@ from neuro_code.application.memory.compaction_runtime import (
 from neuro_code.application.permissions.policy import PermissionManager, PermissionMode
 from neuro_code.application.ports.approval import PermissionApprover
 from neuro_code.application.ports.model import ModelProvider
+from neuro_code.application.ports.result_adoption import WorkspaceMutationPort
 from neuro_code.application.ports.storage import SessionStore
 from neuro_code.application.ports.tool_pipeline import ToolPipelineHook
 from neuro_code.application.ports.tools import Tool, ToolCollection, ToolContext
@@ -107,6 +108,7 @@ class AgentRuntime:
         compaction_runtime_gate: ContextCompactionRuntimeGate | None = None,
         provider_context_window: ProviderContextWindow | None = None,
         tool_hooks: Sequence[ToolPipelineHook] = (),
+        workspace_mutation_tool: Tool | None = None,
         parent_relay_message: Message | None = None,
         dag_result_relay_message: Message | None = None,
     ) -> None:
@@ -189,6 +191,7 @@ class AgentRuntime:
             workspace_change_observer=self._workspace_change_observer,
             context_builder=self._context_builder,
             hooks=tool_hooks,
+            workspace_mutation_tool=workspace_mutation_tool,
         )
         self._loop_runner = AgentLoopRunner(
             provider=self._provider,
@@ -228,6 +231,12 @@ class AgentRuntime:
     @property
     def cwd(self) -> Path:
         return self._tool_context.cwd
+
+    @property
+    def workspace_mutation(self) -> WorkspaceMutationPort:
+        """Return the internal mutation port bound to this runtime."""
+
+        return self._tool_executor
 
     @property
     def system_prompt(self) -> str:

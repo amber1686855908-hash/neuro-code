@@ -1138,7 +1138,7 @@ async def test_ultracode_store_uses_insert_once_and_generation_owner_fence() -> 
 
 
 @pytest.mark.asyncio
-async def test_schema_27_to_28_migration_creates_ultracode_projection_without_loss() -> None:
+async def test_schema_27_to_29_migration_creates_ultracode_projection_without_loss() -> None:
     with tempfile.TemporaryDirectory() as directory:
         cwd = Path(directory)
         database = cwd / "sessions.db"
@@ -1149,12 +1149,12 @@ async def test_schema_27_to_28_migration_creates_ultracode_projection_without_lo
             connection.execute("UPDATE schema_meta SET version = 27 WHERE singleton = 1")
         await store.initialize()
 
-        assert SCHEMA_VERSION == 28
+        assert SCHEMA_VERSION == 29
         assert await store.get_session(session_id) is not None
         with closing(sqlite3.connect(database)) as connection:
             assert connection.execute(
                 "SELECT version FROM schema_meta WHERE singleton = 1"
-            ).fetchone() == (28,)
+            ).fetchone() == (29,)
             assert connection.execute(
                 "SELECT name FROM sqlite_master WHERE type = 'table' "
                 "AND name = 'orchestration_ultracode_executions'"

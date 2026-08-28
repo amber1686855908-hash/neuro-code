@@ -1684,13 +1684,13 @@ Writable workflow 现在只从实际 parent `ConversationBinding` 所绑定 sess
 保留 reasoning 与保留 backend-call 的结构都会排除；assistant 可见正文可与
 `reasoning_content` 明确分离，后者绝不进入 Relay。
 
-Session schema 28 保留 schema 17 的每个 writable lease 一条一对一、insert-only READY Relay，
+Session schema 29 保留 schema 17 的每个 writable lease 一条一对一、insert-only READY Relay，
 以及下述持久化 Task DAG 表、schema 20 的 predecessor-result Relay 表和 schema 21 的 Task DAG
 recovery-claim fence；schema 22 增加有界 DAG capacity 与 scoped Writable lease policy，schema 23
 增加逐节点 execution-owner identity，schema 24 增加 parallel-aware Leader decision projection，
 schema 25 增加下文的 bounded model-planning attempt/proposal projection，schema 26 增加 bounded
 DAG replan attempt/proposal projection，schema 27 增加下文描述的 bounded Agent Swarm run projection，schema 28 增加下文描述的
-durable Ultracode delegation projection，
+durable Ultracode delegation projection，schema 29 增加下文描述的 durable Result Adoption projection，
 并保留后文的持久化 Leader attempt/decision 投影。
 其 identity
 绑定 parent/task/child、lease、worktree、baseline checkpoint、base commit、
@@ -1737,7 +1737,7 @@ Parallel node 通过 typed `TaskDagWritableWorkerFactory` 获得全新的 Writab
 这样既保留冻结的每 worker `asyncio.Lock`，也使每个节点拥有独立的 binding、lease、worktree、
 checkpoint、child session、Parent Relay 和 worker-scoped LSP state。
 
-当前 Session schema 28 在 `task_dags` 与 `task_dag_nodes` 中保存不可变 DAG 定义和有界节点运行投影，
+当前 Session schema 29 在 `task_dags` 与 `task_dag_nodes` 中保存不可变 DAG 定义和有界节点运行投影，
 并在 `task_dag_dependency_relays` 中保存 insert-only 的 predecessor-result Relay，同时在独立的
 `task_dag_recovery_claims` 中保存跨进程 ownership fence。定义和 Relay 发布都是 insert-only；graph
 与 node 生命周期更新使用 generation CAS。成功节点记录精确的 worker task、child session、writable lease、
@@ -1791,7 +1791,7 @@ node definition 与 durable outcome metadata，并对 preview 脱敏、带 finge
 transcript/reasoning/tool argument/output、Relay payload、workspace bytes、checkpoint bytes、Git
 diff、secret 或 arbitrary path。
 
-当前 Session Store schema 28 保留 schema 19 新增的 `leader_attempts` 与 `leader_decisions` 投影。Attempt 绑定精确 DAG
+当前 Session Store schema 29 保留 schema 19 新增的 `leader_attempts` 与 `leader_decisions` 投影。Attempt 绑定精确 DAG
 generation、definition/evidence/objective fingerprint、Leader session、controller owner、turn
 identity 与 durable lifecycle。SQLite write transaction 和 CAS-like state transition 保证同一精确
 snapshot 只有一个 controller 拥有 model request。Controller 必须在 provider call 紧邻之前，使用
@@ -1831,7 +1831,7 @@ CAS；wave seam 只 claim selected ID，创建独立 Writable service，并使�
 填充未选择的 node。`max_parallel=1` 继续兼容 one-node path。
 
 Session schema 24 增加了 parent-session、selected-node 和 selected-generation decision projection，
-并迁移已填充的 schema-23 row；当前 schema 28 保留这些 projection。Crash 后只有每个 selected node 仍在记录的 READY generation，或
+并迁移已填充的 schema-23 row；当前 schema 29 保留这些 projection。Crash 后只有每个 selected node 仍在记录的 READY generation，或
 已经 durable advanced 到 RUNNING/terminal 时，durable wave decision 才能复用；不会推断 provider
 replay 安全。Partial claim、controller race、failure、cancellation、skipped descendant 和
 indeterminate branch 保留既有 Task DAG recovery semantics。Leader 仍不拥有 Writable、Worktree、
@@ -1864,7 +1864,7 @@ Parser 保留冻结的 Task DAG limits：最多 8 个 node、16 条 edge、每 n
 和其他 graph 规则仍由规范 Task DAG service 拒绝。Model text 只是 data，不包含 authority field。
 
 Schema 25 新增 insert-only 的 `orchestration_planning_attempts` 与 `orchestration_plan_proposals`；当前
-schema 28 保留这些 projection。
+schema 29 保留这些 projection。
 Planning attempt 绑定调用方精确 planning ID、真实 parent session、objective/context fingerprint、专用
 planner session/turn、预分配 intended DAG ID、provider lifecycle、proposal fingerprint 和已发布 DAG identity。
 生命周期为 `CLAIMED -> PROVIDER_FENCED -> MODEL_COMMITTED -> PROPOSAL_PUBLISHED -> DAG_PUBLISHED ->
@@ -1984,7 +1984,7 @@ worker 或 Swarm。
 在每个用户回合读取 controller 当前 effort，因此同一个长生命周期 service 可以在
 `max` → `ultracode` → `max` → `ultracode` 之间切换而无需重建；普通 effort 永远不会调用 delegate。
 
-Session schema 28 增加 insert-once 的 `orchestration_ultracode_executions` projection。不可变
+Session schema 28 增加 insert-once 的 `orchestration_ultracode_executions` projection；当前 schema 29 保留该 projection。不可变
 identity 绑定实际 parent session、精确 parent turn、input/context fingerprint、provider/model/context
 provenance、一个 decision 与一个下游 identity。`BEGIN IMMEDIATE`、process-liveness ownership
 和 generation CAS 保护 `DECIDED -> MAIN_MAX_RUNNING` 或 `DECIDED -> BOUNDED_SWARM_RUNNING`
@@ -2006,5 +2006,48 @@ Parent `ConversationBinding` 继续是 capability ceiling。入口不增加 file
 network、Worktree、Checkpoint 或 Writable authority；provider adapter 也永远不会收到编造的
 原生 `ultracode` 值。CLI 与 TUI 可以进入这个内部服务，第一切片只显示有界 orchestration
 progress 和最终回答，不增加 ACP effort surface。Recursive Ultracode、普通 effort 的自动 Swarm、
-generic retry、result adoption、merge/copy-back、checkpoint rollback、remote/cloud execution
-和 public Swarm dashboard 仍不在范围内。详见 [ADR 0141](adr/0141-automatic-ultracode-delegation.md)。
+generic retry、automatic result adoption integration、merge/copy-back、checkpoint rollback、
+remote/cloud execution 和 public Swarm dashboard 仍不在 Ultracode slice 范围内。Bounded Result
+Adoption core 在下文单独规定，不会由 Ultracode 自动进入。详见 [ADR 0141](adr/0141-automatic-ultracode-delegation.md)。
+
+### Bounded durable result adoption core
+
+ADR 0143 增加一个显式的内部 application service，把 preserved writable worker result 的有界集合采纳到实际 parent
+checkout。Worker result 只是关于自身 managed Worktree 的证据，不是修改 parent 的权限。Service 只接收 adoption
+identity 与 completed Swarm identity，然后从实际活动 parent `ConversationBinding`、completed Task DAG、preserved
+Writable lease、managed READY Worktree、READY baseline Checkpoint 与 live worker projection 生成由 application
+拥有的不可变 `ResultAdoptionPlan`。Response text、Leader 或 Relay text、`git diff`、model 提供的 path 与调用方报告的
+parent manifest 永远不是 authority source。
+
+每个 eligible source 都绑定精确 parent session/task、child session、lease、Worktree、baseline Checkpoint、base
+commit、final workspace fingerprint、capability fingerprint、grant fingerprint 与 repository identity。生成 Plan 前，
+canonical live preserved-worker fingerprint 必须同时等于 completed DAG node 与 preserved lease；parent binding 的实际
+repository 与当前 committed HEAD 必须匹配每个 source base commit，parent 无关 dirty path 保持在 target set 之外。
+
+Plan 使用保守的 three-way classification：baseline 不存在且 desired 存在为 `CREATE`；baseline 与 desired 都存在且
+不同为 `UPDATE`；baseline 存在且 desired 不存在为 `DELETE`。Parent 必须按规则不存在或精确等于 baseline。同路径 parent
+变化会在 `APPLYING` 前持久化为 `CONFLICT`；eligible worker 之间的 path overlap 会在 Plan 发布前拒绝。Symlink、
+link-like traversal、special file、仅 mode 变化、Neuro 受保护状态、credential/key path、checkpoint/worktree storage
+与 root 外 target 都 fail closed。第一版上限为 8 个 source worker、64 个 target file、target image 总计 32 MiB、
+单个 file image 8 MiB 与 relative path 4 KiB。
+
+Session schema 29 增加 insert-only 的 `result_adoptions` 与逐 target 的 `result_adoption_targets` projection。Durable
+lifecycle 为 `CLAIMED -> VERIFIED -> APPLYING -> VERIFYING -> COMPLETED`，终态包括 `CONFLICT`、`FAILED` 与
+`INDETERMINATE`。每个 target 记录 `NOT_STARTED`、`APPLYING`、`RETRYABLE`、`APPLIED`、`CONFLICT`、`FAILED` 或
+`INDETERMINATE`。在任何可观察 target mutation 前，expected pre-image、desired image、operation、path 与 fingerprint
+已经 durable。恢复只有在实际 image 仍为 expected 时才 retry；desired 已存在时只标记 `APPLIED` 而不重写；第三种 image
+绝不覆盖。多文件 filesystem mutation 不是 atomic operation；partial application forward recovery，尝试产生 effect
+后遇到外部修改则成为 `INDETERMINATE`，不 rollback。
+
+Parent write 使用活动 binding 捕获的 mutation port，并保留 canonical filesystem target、Permission/scoped approval、
+workspace/instruction、sandbox/profile 与 exact regular-file execution 层。`CREATE` 与 `UPDATE` 只有在 ordinary canonical
+rules 生成候选时才可使用既有 `WORKSPACE_EDITS` candidate；`DELETE` 绝不继承这个 broad candidate。Explicit deny、foreign
+session/root、model 或 worker text 与 memory-only grant 都不能授权 adoption。Completed adoption 在 fresh invocation 中幂等且
+零写入。Worker Worktree、lease、READY Checkpoint、DAG row 与 Swarm resource 保持 preserved。本核心不增加 automatic
+Ultracode wiring、model merge/conflict resolution、cleanup、rollback、commit/push、remote execution、TUI/ACP entrypoint 或
+通用 merge/copy-back engine。详见 [ADR 0143](adr/0143-bounded-durable-result-adoption.md)。
+
+Production-shaped acceptance 覆盖真实临时 Git 的 A/B/C/D process boundary：durable Plan 在 controller death 后保留且不重复写入；尝试写入后
+死亡时从 desired image 确认 `APPLIED`；durable `APPLYING` 后出现第三方 image 时变为 `INDETERMINATE`，保留原 bytes 且零 retry write；已完成的
+adoption 由 fresh composition 重入时返回相同 durable result，且不产生新的 filesystem、Plan、target、worker、Worktree、Checkpoint 或 approval
+副作用。Schema 28→29 migration 与重复 schema-29 initialization 会保留旧 rows 与 adoption projection。

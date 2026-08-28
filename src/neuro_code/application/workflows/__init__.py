@@ -16,6 +16,7 @@ from neuro_code.application.workflows.plan_scheduling import (
     PlanSchedulingService,
     SchedulePlanRequest,
 )
+from neuro_code.application.workflows.result_adoption import ResultAdoptionApplicationService
 from neuro_code.application.workflows.session_task_execution import (
     QueuedPlanExecutionController,
     QueuedPlanExecutionService,
@@ -118,6 +119,7 @@ __all__ = [
     "QueuedPlanExecutionController",
     "QueuedPlanExecutionService",
     "ReadOnlySubagentApplicationService",
+    "ResultAdoptionApplicationService",
     "RunSessionTaskRequest",
     "RunSubagentRequest",
     "RunTaskDagRequest",

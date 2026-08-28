@@ -1748,7 +1748,7 @@ tool-role, synthetic, tool-call-bearing, media-bearing, preserved reasoning,
 and preserved backend-call structures are excluded; assistant visible prose is
 separable from and never carries its `reasoning_content`.
 
-Session schema 28 retains the schema-17 one-to-one insert-only READY relay per
+Session schema 29 retains the schema-17 one-to-one insert-only READY relay per
 writable lease, the durable Task DAG tables described below, the schema-20
 predecessor-result relay table, and the schema-21 Task DAG recovery-claim
 fence; schema 22 adds bounded DAG capacity and scoped Writable lease policy,
@@ -1757,7 +1757,8 @@ parallel-aware Leader decision projection; schema 25 adds the bounded model
 planning attempt/proposal projections described below, schema 26 adds the
 bounded DAG replan attempt/proposal projections, and schema 27 adds the bounded
 Agent Swarm run projection described below; schema 28 adds the durable
-Ultracode delegation projection described below. It also retains the
+Ultracode delegation projection described below, and schema 29 adds the
+durable Result Adoption projection described below. It also retains the
 durable Leader attempt/decision projections described after the DAG. Its
 identity binds the parent/task/child, lease, worktree, baseline checkpoint,
 base commit, capability/grant fingerprints, and child-task digest. Source,
@@ -1819,7 +1820,7 @@ Parallel nodes receive fresh Writable application services from a typed
 `asyncio.Lock` while giving each node independent binding, lease, worktree,
 checkpoint, child session, Parent Relay, and worker-scoped LSP state.
 
-The current Session schema 28 stores immutable DAG definitions and bounded node runtime
+The current Session schema 29 stores immutable DAG definitions and bounded node runtime
 projections in `task_dags` and `task_dag_nodes`, plus insert-only
 `task_dag_dependency_relays` and the separate `task_dag_recovery_claims`
 cross-process ownership fence. Definitions and relay publications are
@@ -1898,7 +1899,7 @@ transcript/reasoning/tool arguments/output, Relay payloads, workspace bytes,
 checkpoint bytes, Git diffs, secrets, or arbitrary paths. The current
 parallel-aware extension is specified by ADR 0137 below.
 
-The current Session Store schema 28 retains the schema-19 `leader_attempts` and
+The current Session Store schema 29 retains the schema-19 `leader_attempts` and
 `leader_decisions` projections. An attempt binds the exact DAG generation,
 definition/evidence/objective fingerprints, Leader session, controller owner,
 turn identity, and durable lifecycle. SQLite write transactions and CAS-like
@@ -1954,7 +1955,7 @@ and uses a structured `TaskGroup`. It never fills unused capacity with an
 unselected node. `max_parallel=1` remains compatible with the one-node path.
 
 Session schema 24 added parent-session, selected-node, and selected-generation
-decision projections and migrated populated schema-23 rows; current schema 28
+decision projections and migrated populated schema-23 rows; current schema 29
 retains them. A durable wave
 decision can be reused after a crash only when each selected node is still at
 its recorded READY generation or has advanced durably to RUNNING/terminal;
@@ -2001,7 +2002,7 @@ other graph rules are still rejected by the canonical Task DAG service. Model
 text is data and contains no authority fields.
 
 Schema 25 added insert-only `orchestration_planning_attempts` and
-`orchestration_plan_proposals`; current schema 28 retains them. A planning attempt binds the caller's exact
+`orchestration_plan_proposals`; current schema 29 retains them. A planning attempt binds the caller's exact
 planning ID, actual parent session, objective/context fingerprints, dedicated
 planner session and turn, a preallocated intended DAG ID, provider lifecycle,
 proposal fingerprint, and published DAG identity. Its lifecycle is
@@ -2170,8 +2171,9 @@ user turn, so a long-lived service can switch `max` → `ultracode` → `max` �
 `ultracode` without service recreation; ordinary efforts never call the
 delegate.
 
-Session schema 28 adds the insert-once
-`orchestration_ultracode_executions` projection. Its immutable identity binds
+Session schema 28 added the insert-once
+`orchestration_ultracode_executions` projection; current schema 29 retains it.
+Its immutable identity binds
 the actual parent session, exact parent turn, input/context fingerprints,
 provider/model/context provenance, one decision, and one downstream identity.
 `BEGIN IMMEDIATE`, process-liveness ownership, and generation CAS protect the
@@ -2203,9 +2205,79 @@ authority, and provider adapters never receive a fabricated native
 `ultracode` value. The CLI and TUI may enter this internal service; the first
 slice exposes only bounded orchestration progress plus the final answer and
 does not add an ACP effort surface. Recursive Ultracode, automatic delegation
-for ordinary efforts, generic retry, result adoption, merge/copy-back,
-checkpoint rollback, remote/cloud execution, and a public Swarm dashboard
-remain outside the slice. See [ADR 0141](adr/0141-automatic-ultracode-delegation.md).
+for ordinary efforts, generic retry, automatic result adoption integration,
+merge/copy-back, checkpoint rollback, remote/cloud execution, and a public
+Swarm dashboard remain outside the Ultracode slice. The bounded internal
+Result Adoption core is specified separately below; it is not automatically
+entered by Ultracode. See [ADR 0141](adr/0141-automatic-ultracode-delegation.md).
+
+### Bounded durable result adoption core
+
+ADR 0143 adds an explicit internal application service for adopting a bounded
+set of preserved writable-worker results into the actual parent checkout. A
+worker result is evidence about its own managed Worktree, not permission to
+mutate the parent. The service receives only an adoption identity and a
+completed Swarm identity, then generates an immutable application-owned
+`ResultAdoptionPlan` from the actual active parent `ConversationBinding`, the
+completed Task DAG, preserved Writable leases, managed READY Worktrees, READY
+baseline Checkpoints, and live worker projections. Response text, Leader or
+Relay text, `git diff`, model-provided paths, and caller-provided parent
+manifests are never sources of authority.
+
+Every eligible source is bound to the exact parent session/task, child session,
+lease, Worktree, baseline Checkpoint, base commit, final workspace fingerprint,
+capability fingerprint, grant fingerprint, and repository identity. Before a
+plan is created, the canonical live preserved-worker fingerprint must equal
+both the completed DAG node and the preserved lease. The parent binding's
+actual repository and current committed HEAD must match every source base
+commit; unrelated parent dirty paths remain outside the target set.
+
+The plan performs conservative three-way classification: baseline absent plus
+desired present is `CREATE`, baseline and desired present with a baseline
+difference is `UPDATE`, and baseline present plus desired absent is `DELETE`.
+The parent must be absent or exactly equal to the baseline as appropriate.
+Same-path parent changes are durable `CONFLICT` before `APPLYING`; overlap
+between eligible workers is rejected before plan publication. Symlinks,
+link-like traversal, special files, mode-only changes, protected Neuro state,
+credential/key paths, checkpoint/worktree storage, and outside-root targets fail
+closed. The first slice is bounded to 8 source workers, 64 target files,
+32 MiB total target images, 8 MiB per file image, and 4 KiB per relative path.
+
+Session schema 29 adds insert-only `result_adoptions` and per-target
+`result_adoption_targets` projections. Their durable lifecycle is
+`CLAIMED -> VERIFIED -> APPLYING -> VERIFYING -> COMPLETED`, with terminal
+`CONFLICT`, `FAILED`, and `INDETERMINATE` outcomes. Each target records
+`NOT_STARTED`, `APPLYING`, `RETRYABLE`, `APPLIED`, `CONFLICT`, `FAILED`, or
+`INDETERMINATE`. Before any observable target mutation, its expected pre-image,
+desired image, operation, path, and fingerprints are durable. Recovery retries
+only when the actual image is still expected, marks `APPLIED` without rewriting
+when the desired image is already present, and never overwrites a third image.
+Multi-file filesystem mutation is not atomic; partial application recovers
+forward and external modification after an attempted effect becomes
+`INDETERMINATE` without rollback.
+
+Parent writes use the mutation port captured from the active binding and retain
+the normal canonical filesystem target, Permission/scoped-approval,
+workspace/instruction, sandbox/profile, and exact regular-file execution
+layers. `CREATE` and `UPDATE` may use the existing `WORKSPACE_EDITS` candidate
+only when ordinary canonical rules produce it; `DELETE` never inherits that
+broad candidate. Explicit deny, a foreign session/root, model or worker text,
+and memory-only grants cannot authorize adoption. Completed adoption is
+idempotent with zero writes on a fresh invocation. Worker Worktrees, leases,
+READY Checkpoints, DAG rows, and Swarm resources remain preserved. This core
+does not add automatic Ultracode wiring, model merge/conflict resolution,
+cleanup, rollback, commit/push, remote execution, TUI/ACP entrypoints, or a
+general merge/copy-back engine. See [ADR 0143](adr/0143-bounded-durable-result-adoption.md).
+
+The production-shaped acceptance covers real temporary-Git A/B/C/D process
+boundaries. A durable plan survives controller death without duplicate writes;
+an attempted write followed by death is acknowledged from the desired image;
+a third-party image after durable `APPLYING` becomes `INDETERMINATE` with its
+bytes preserved and no retry write; and a completed adoption re-entered by a
+fresh composition returns the same durable result with no new filesystem,
+plan, target, worker, Worktree, Checkpoint, or approval side effects. Schema
+28-to-29 migration and repeated schema-29 initialization preserve existing
+rows and the adoption projections.
 
 ## Platform policy
 

@@ -2310,6 +2310,8 @@ def test_canonical_runtime_public_types_keep_module_paths_and_metadata() -> None
         "background_tasks",
         "capabilities",
         "resource_scope",
+        "workspace_root",
+        "workspace_mutation",
     )
     assert profile.ConversationBinding.__dataclass_params__.frozen
     assert profile.ConversationBinding.__slots__ == (
@@ -2318,6 +2320,8 @@ def test_canonical_runtime_public_types_keep_module_paths_and_metadata() -> None
         "background_tasks",
         "capabilities",
         "resource_scope",
+        "workspace_root",
+        "workspace_mutation",
     )
     assert profile.ConversationBinding.__match_args__ == (
         "runner",

@@ -13,6 +13,7 @@ from __future__ import annotations
 import fnmatch
 import os
 import re
+import stat
 import tempfile
 from collections.abc import Mapping, Sequence
 from contextlib import suppress
@@ -21,12 +22,17 @@ from pathlib import Path
 from typing import Any
 
 from neuro_code.application.ports.client_filesystem import ClientFileSystem
+from neuro_code.application.ports.result_adoption import (
+    WorkspaceMutationRequest,
+)
 from neuro_code.application.ports.tools import ToolContext
 from neuro_code.application.ports.workspace import (
     FilesystemAccessOperation,
     FilesystemAccessPlan,
     FilesystemTargetRequest,
 )
+from neuro_code.domain.checkpoints import WorkspaceFileEntry
+from neuro_code.domain.result_adoption import ResultAdoptionOperation
 from neuro_code.domain.sandbox.models import SandboxProfile
 from neuro_code.domain.tools import ToolDefinition, ToolResult
 from neuro_code.infrastructure.workspace.paths import (
@@ -2084,6 +2090,164 @@ class ApplyPatchTool:
                 "client_delegated": False,
             },
         )
+
+
+class ExactWorkspaceMutationTool:
+    """Execute one exact regular-file mutation inside the normal file boundary.
+
+    This tool is intentionally not registered in the model tool collection.
+    Result Adoption calls it only through ``ToolExecutor`` so canonical target
+    resolution, permission policy, approval memory, instruction preflight, and
+    sandbox/profile checks remain the same effective path as ordinary edits.
+    """
+
+    definition = ToolDefinition(
+        name="apply_patch",
+        description="Apply one internal exact workspace mutation.",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "operation": {"type": "string"},
+            },
+            "required": ["path", "operation"],
+            "additionalProperties": False,
+        },
+    )
+    side_effecting = True
+
+    def prepare_filesystem_targets(
+        self,
+        arguments: Mapping[str, Any],
+        context: ToolContext,
+        /,
+    ) -> FilesystemAccessPlan | None:
+        request = arguments.get("_workspace_mutation_request")
+        if not isinstance(request, WorkspaceMutationRequest):
+            raise ToolError("internal workspace mutation request is missing")
+        operation = {
+            ResultAdoptionOperation.CREATE: FilesystemAccessOperation.CREATE,
+            ResultAdoptionOperation.UPDATE: FilesystemAccessOperation.UPDATE,
+            ResultAdoptionOperation.DELETE: FilesystemAccessOperation.DELETE,
+        }[request.operation]
+        return _prepare_local_targets(
+            self.definition.name,
+            context,
+            (
+                FilesystemTargetRequest(
+                    request.path,
+                    operation,
+                    must_exist=operation is not FilesystemAccessOperation.CREATE,
+                ),
+            ),
+        )
+
+    def workspace_target_paths(self, arguments: Mapping[str, Any]) -> tuple[str, ...]:
+        path = arguments.get("path")
+        return (path,) if isinstance(path, str) and path else ()
+
+    async def execute(self, arguments: Mapping[str, Any], context: ToolContext) -> ToolResult:
+        request = arguments.get("_workspace_mutation_request")
+        if not isinstance(request, WorkspaceMutationRequest):
+            raise ToolError("internal workspace mutation request is missing")
+        if context.client_file_system is not None:
+            raise ToolError("result adoption requires the local parent filesystem")
+        if not context.sandbox_profile.workspace_writable:
+            raise ToolError(
+                f"sandbox profile {context.sandbox_profile.value!r} prohibits workspace edits"
+            )
+        plan = self.prepare_filesystem_targets(arguments, context)
+        if plan is None:
+            raise ToolError("internal workspace mutation has no canonical target plan")
+        target = plan.target_at(0)
+        path = target.canonical_path
+        if context.instruction_tracker is not None:
+            discovered = context.instruction_tracker.check_path_for_write(path)
+            if discovered is not None:
+                raise ToolError("project instructions require review before result adoption")
+        _assert_exact_regular_image(path, request.expected)
+        if request.operation is ResultAdoptionOperation.DELETE:
+            if request.desired is not None:
+                raise ToolError("delete mutation cannot carry a desired image")
+            try:
+                path.unlink()
+            except OSError as error:
+                raise ToolError("result adoption delete failed") from error
+        else:
+            desired = request.desired
+            if desired is None or desired.content is None:
+                raise ToolError("result adoption write requires regular-file content")
+            if desired.kind.value != "regular":
+                raise ToolError("result adoption supports regular files only")
+            _write_exact_regular(path, request.expected, desired.content, desired.mode)
+        return ToolResult(
+            f"adopted {request.operation.value} {request.path}",
+            metadata={
+                "changed_files": [request.path],
+                "operation": request.operation.value,
+                "internal_result_adoption": True,
+            },
+        )
+
+
+def _assert_exact_regular_image(path: Path, expected: object) -> None:
+    """Compare one target immediately before execution without following links."""
+
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        if expected is None:
+            return
+        raise ToolError("workspace target changed before result adoption") from None
+    except OSError as error:
+        raise ToolError("workspace target could not be inspected safely") from error
+    if expected is None:
+        raise ToolError("workspace target changed before result adoption")
+    if not isinstance(expected, WorkspaceFileEntry) or expected.kind.value != "regular":
+        raise ToolError("result adoption expected image is unsupported")
+    if not stat.S_ISREG(metadata.st_mode):
+        raise ToolError("workspace target is link-like or not a regular file")
+    try:
+        content = path.read_bytes()
+    except OSError as error:
+        raise ToolError("workspace target could not be read safely") from error
+    mode = 0o100755 if metadata.st_mode & 0o111 else 0o100644
+    if content != expected.content or mode != expected.mode:
+        raise ToolError("workspace target changed before result adoption")
+
+
+def _write_exact_regular(
+    path: Path,
+    expected: WorkspaceFileEntry | None,
+    content: bytes,
+    mode: int,
+) -> None:
+    """Stage an exact regular-file image and recheck before replacement."""
+
+    if mode not in {0o100644, 0o100755}:
+        raise ToolError("result adoption file mode is unsupported")
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".adoption.tmp",
+            delete=False,
+        ) as temporary:
+            temporary.write(content)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+            temporary_path = Path(temporary.name)
+        os.chmod(temporary_path, mode)
+        _assert_exact_regular_image(path, expected)
+        os.replace(temporary_path, path)
+    except OSError as error:
+        raise ToolError("result adoption write failed") from error
+    finally:
+        if temporary_path is not None:
+            with suppress(OSError):
+                temporary_path.unlink()
 
 
 class SearchReplaceTool:

@@ -195,6 +195,28 @@ class WorkspaceCheckpointApplicationService:
             raise TypeError("checkpoint id must be canonical")
         return await self._checkpoints.get(checkpoint_id)
 
+    async def load_projection(self, checkpoint_id: CheckpointId, /) -> WorkspaceProjection:
+        """Load and integrity-check the exact READY checkpoint projection."""
+
+        self._require_initialized()
+        if not isinstance(checkpoint_id, CheckpointId):
+            raise TypeError("checkpoint id must be canonical")
+        checkpoint = await self._checkpoints.get(checkpoint_id)
+        if checkpoint is None or checkpoint.state is not CheckpointState.READY:
+            raise WorkspaceCheckpointError(
+                "checkpoint is not a ready Neuro Code-owned target",
+                kind=CheckpointFailureKind.UNMANAGED,
+            )
+        try:
+            return await self._artifacts.load(checkpoint)
+        except WorkspaceCheckpointError:
+            raise
+        except BaseException as error:
+            raise WorkspaceCheckpointError(
+                "checkpoint projection could not be loaded safely",
+                kind=CheckpointFailureKind.CHECKPOINT_CORRUPT,
+            ) from error
+
     async def rollback(
         self,
         checkpoint_id: CheckpointId,
