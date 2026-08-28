@@ -4615,6 +4615,7 @@ class SqliteSessionStore:
         def insert() -> TaskDag:
             try:
                 with closing(self._connect()) as connection, connection:
+                    connection.execute("BEGIN IMMEDIATE")
                     current = _load_task_dag(connection, dag.dag_id)
                     if current is not None:
                         if current.definition_fingerprint != dag.definition_fingerprint:
@@ -4680,7 +4681,19 @@ class SqliteSessionStore:
         def load() -> TaskDag | None:
             try:
                 with closing(self._connect()) as connection:
-                    return _load_task_dag(connection, dag_id)
+                    # The DAG row and its node rows form one logical snapshot.  A
+                    # read transaction is required because SQLite otherwise gives
+                    # each SELECT its own snapshot in WAL mode; a concurrent
+                    # finish could otherwise pair the old active_node_id with a
+                    # new terminal node and fail TaskDag.__post_init__().
+                    connection.execute("BEGIN")
+                    try:
+                        result = _load_task_dag(connection, dag_id)
+                        connection.commit()
+                        return result
+                    except BaseException:
+                        connection.rollback()
+                        raise
             except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
                 raise TaskDagError("task DAG record is invalid", kind="integrity") from error
             except sqlite3.Error as error:
@@ -4705,6 +4718,7 @@ class SqliteSessionStore:
         def transition() -> TaskDag:
             try:
                 with closing(self._connect()) as connection, connection:
+                    connection.execute("BEGIN IMMEDIATE")
                     current = _load_task_dag(connection, dag.dag_id)
                     if current is None:
                         raise TaskDagError("task DAG is missing", kind="unmanaged")
@@ -4783,6 +4797,7 @@ class SqliteSessionStore:
         def transition() -> TaskDag:
             try:
                 with closing(self._connect()) as connection, connection:
+                    connection.execute("BEGIN IMMEDIATE")
                     current_dag = _load_task_dag(connection, dag_id)
                     if current_dag is None:
                         raise TaskDagError("task DAG is missing", kind="unmanaged")

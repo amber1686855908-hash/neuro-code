@@ -5,12 +5,13 @@ import multiprocessing
 import os
 import sqlite3
 import tempfile
+import threading
 import unittest
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
-from typing import cast
+from typing import Any, cast
 from unittest.mock import AsyncMock
 
 from neuro_code.application.ports.model import ModelProvider
@@ -48,7 +49,11 @@ from neuro_code.domain.writable_subagent import (
     WritableSubagentWorkspaceLease,
     WritableSubagentWorkspaceState,
 )
-from neuro_code.infrastructure.persistence.sqlite_session import SCHEMA_VERSION, SqliteSessionStore
+from neuro_code.infrastructure.persistence.sqlite_session import (
+    _TASK_DAG_SELECT,
+    SCHEMA_VERSION,
+    SqliteSessionStore,
+)
 from neuro_code.shared.errors import ConfigurationError
 
 
@@ -145,6 +150,81 @@ class _IntermittentClaimStore:
 
     def __getattr__(self, name: str) -> object:
         return getattr(self._delegate, name)
+
+
+class _PausedDagReadCursor:
+    def __init__(
+        self,
+        delegate: sqlite3.Cursor,
+        *,
+        row_read: threading.Event,
+        release: threading.Event,
+    ) -> None:
+        self._delegate = delegate
+        self._row_read = row_read
+        self._release = release
+        self._paused = False
+
+    def fetchone(self) -> Any:
+        row = self._delegate.fetchone()
+        if not self._paused:
+            self._paused = True
+            self._row_read.set()
+            if not self._release.wait(10):
+                raise AssertionError("DAG read race fixture was not released")
+        return row
+
+    def fetchall(self) -> list[tuple[Any, ...]]:
+        return self._delegate.fetchall()
+
+
+class _PausedDagReadConnection:
+    def __init__(
+        self,
+        delegate: sqlite3.Connection,
+        *,
+        row_read: threading.Event,
+        release: threading.Event,
+    ) -> None:
+        self._delegate = delegate
+        self._row_read = row_read
+        self._release = release
+        self._pause_next_dag_row = True
+
+    def execute(self, sql: str, parameters: tuple[object, ...] = ()) -> Any:
+        cursor = self._delegate.execute(sql, parameters)
+        if self._pause_next_dag_row and sql == _TASK_DAG_SELECT:
+            self._pause_next_dag_row = False
+            return _PausedDagReadCursor(
+                cursor,
+                row_read=self._row_read,
+                release=self._release,
+            )
+        return cursor
+
+    def commit(self) -> None:
+        self._delegate.commit()
+
+    def rollback(self) -> None:
+        self._delegate.rollback()
+
+    def close(self) -> None:
+        self._delegate.close()
+
+
+class _PausedDagReadStore(SqliteSessionStore):
+    def __init__(self, database_path: Path) -> None:
+        super().__init__(database_path)
+        self.row_read = threading.Event()
+        self.release = threading.Event()
+
+    def _connect(self) -> Any:
+        connection = super()._connect()
+        return _PausedDagReadConnection(
+            connection,
+            row_read=self.row_read,
+            release=self.release,
+        )
 
 
 class _FakeWritableService:
@@ -719,6 +799,60 @@ class TaskDagPersistenceTests(unittest.IsolatedAsyncioTestCase):
             nodes=(_node("a", 0), _node("b", 1, ("a",))),
             created_at=_now(),
         )
+
+    async def test_get_task_dag_does_not_mix_atomic_finish_snapshots(self) -> None:
+        dag = self._dag("read-snapshot")
+        await self.store.insert_task_dag(dag)
+        initial = await self.store.get_task_dag(dag.dag_id)
+        self.assertIsNotNone(initial)
+        assert initial is not None
+        claimed = await self.store.claim_task_dag_node(
+            dag.dag_id,
+            replace(
+                initial.node("a"),
+                state=TaskDagNodeState.RUNNING,
+                generation=1,
+                parent_task_id="worker-a",
+            ),
+            expected_generation=0,
+            expected_state=TaskDagNodeState.READY,
+            updated_at=_now(),
+        )
+
+        observer = _PausedDagReadStore(self._database_path)
+        read_task = asyncio.create_task(observer.get_task_dag(dag.dag_id))
+        try:
+            self.assertTrue(
+                await asyncio.to_thread(observer.row_read.wait, 10),
+                "DAG read did not reach the row barrier",
+            )
+            await self.store.finish_task_dag_node(
+                dag.dag_id,
+                replace(
+                    claimed.node("a"),
+                    state=TaskDagNodeState.CANCELLED,
+                    generation=2,
+                    error_kind="cancelled",
+                    error_reason="controlled read interleaving",
+                ),
+                expected_generation=1,
+                expected_state=TaskDagNodeState.RUNNING,
+                updated_at=_now(),
+            )
+        finally:
+            observer.release.set()
+
+        observed = await read_task
+        self.assertIsNotNone(observed)
+        assert observed is not None
+        self.assertEqual(observed.active_node_id, "a")
+        self.assertEqual(observed.node("a").state, TaskDagNodeState.RUNNING)
+
+        latest = await self.store.get_task_dag(dag.dag_id)
+        self.assertIsNotNone(latest)
+        assert latest is not None
+        self.assertIsNone(latest.active_node_id)
+        self.assertEqual(latest.node("a").state, TaskDagNodeState.CANCELLED)
 
     async def test_insert_only_definition_and_generation_cas(self) -> None:
         dag = self._dag()
