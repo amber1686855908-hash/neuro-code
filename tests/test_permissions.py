@@ -182,7 +182,7 @@ class PermissionTests(unittest.TestCase):
 
         self.assertEqual(len(candidates), 1)
         self.assertEqual(candidates[0].kind, PermissionScopeKind.WORKSPACE_EDITS)
-        self.assertEqual(candidates[0].workspace_root, str(root.resolve()))
+        self.assertEqual(candidates[0].workspace_root, os.path.normcase(str(root.resolve())))
 
     def test_scope_candidates_fail_closed_for_protected_or_non_edit_targets(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

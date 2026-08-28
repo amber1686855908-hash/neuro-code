@@ -467,14 +467,18 @@ class ScopedApprovalTuiConversation(ApprovalTuiConversation):
         cancellation_policy: TurnCancellationPolicy = TurnCancellationPolicy.RETAIN,
     ) -> AgentRunResult:
         del prompt, sink, cancellation_policy
-        candidate = PermissionScopeCandidate(PermissionScopeKind.WORKSPACE_EDITS, "/workspace")
+        workspace_root = str(Path.cwd().resolve(strict=False))
+        candidate = PermissionScopeCandidate(
+            PermissionScopeKind.WORKSPACE_EDITS,
+            workspace_root,
+        )
         request = build_permission_request(
             "edit",
             "search_replace",
             {"path": "src/note.txt", "old": "private-old", "new": "private-new"},
             "interactive approval required",
             scope_candidates=(candidate,),
-            scope_context=PermissionScopeContext("approval-session", "/workspace"),
+            scope_context=PermissionScopeContext("approval-session", workspace_root),
         )
         approval = await self._broker.request(request)
         self.approvals.append(approval)
@@ -5723,7 +5727,7 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
             approval_controller=broker,
             provider_name="fixture",
             model_name="fixture-model",
-            cwd=Path("/workspace"),
+            cwd=Path.cwd(),
         )
 
         async with app.run_test(size=(110, 35)) as pilot:

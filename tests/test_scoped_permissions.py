@@ -105,22 +105,26 @@ class ScopedPermissionPipelineTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_representative_workflow_reduces_prompts_without_a_blanket_grant(self) -> None:
         broker = SessionApprovalBroker()
-        context = PermissionScopeContext("session-1", "/workspace")
+        workspace_root = str(Path.cwd().resolve(strict=False))
+        context = PermissionScopeContext("session-1", workspace_root)
         candidates = {
-            "edit": PermissionScopeCandidate(PermissionScopeKind.WORKSPACE_EDITS, "/workspace"),
+            "edit": PermissionScopeCandidate(
+                PermissionScopeKind.WORKSPACE_EDITS,
+                workspace_root,
+            ),
             "test": PermissionScopeCandidate(
                 PermissionScopeKind.COMMAND_FAMILY,
-                "/workspace",
+                workspace_root,
                 PermissionCommandFamily.TEST,
             ),
             "static": PermissionScopeCandidate(
                 PermissionScopeKind.COMMAND_FAMILY,
-                "/workspace",
+                workspace_root,
                 PermissionCommandFamily.STATIC_CHECK,
             ),
             "git": PermissionScopeCandidate(
                 PermissionScopeKind.COMMAND_FAMILY,
-                "/workspace",
+                workspace_root,
                 PermissionCommandFamily.GIT_READ,
             ),
         }

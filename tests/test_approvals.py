@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import unittest
+from pathlib import Path
 
 from neuro_code.application.permissions.broker import SessionApprovalBroker
 from neuro_code.application.permissions.contracts import (
@@ -22,11 +23,16 @@ class SessionApprovalBrokerTests(unittest.IsolatedAsyncioTestCase):
         call_id: str,
         *,
         session: str = "session-a",
-        root: str = "/workspace",
+        root: Path | None = None,
         path: str = "src/one.py",
     ) -> tuple[PermissionRequest, PermissionScopeCandidate]:
-        candidate = PermissionScopeCandidate(PermissionScopeKind.WORKSPACE_EDITS, root)
-        context = PermissionScopeContext(session, root)
+        root_path = Path.cwd() if root is None else root
+        root_text = str(root_path.resolve(strict=False))
+        candidate = PermissionScopeCandidate(
+            PermissionScopeKind.WORKSPACE_EDITS,
+            root_text,
+        )
+        context = PermissionScopeContext(session, root_text)
         request = build_permission_request(
             call_id,
             "search_replace",
@@ -157,10 +163,18 @@ class SessionApprovalBrokerTests(unittest.IsolatedAsyncioTestCase):
             return PermissionApproval.allow_scope(request.scope_candidates[0])
 
         broker.set_handler(approve)
-        first, _ = self._scoped_request("call-1", session="session-a", root="/workspace-a")
-        other_session, _ = self._scoped_request("call-2", session="session-b", root="/workspace-a")
+        workspace_a = Path.cwd() / "workspace-a"
+        workspace_b = Path.cwd() / "workspace-b"
+        first, _ = self._scoped_request("call-1", session="session-a", root=workspace_a)
+        other_session, _ = self._scoped_request(
+            "call-2",
+            session="session-b",
+            root=workspace_a,
+        )
         other_workspace, _ = self._scoped_request(
-            "call-3", session="session-a", root="/workspace-b"
+            "call-3",
+            session="session-a",
+            root=workspace_b,
         )
 
         await broker.request(first)
