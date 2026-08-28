@@ -408,6 +408,11 @@ USER 候选。按名称先见为准的去重确保 LOCAL 技能遮蔽同名 REPO
 3. 工具执行接收同一个不可变计划，并按提取索引消费规范目标，不会再次解析原始路径。因此混合
    允许/拒绝目标的 `apply_patch` 会在 journal 或任何写入前停止。
 
+审批层只有在该计划成功后才可以派生 `WORKSPACE_EDITS` 候选。该候选只覆盖主规范根中普通的
+`search_replace` 与 `apply_patch` create/update 目标，要求没有 link-like component，且目标
+不是 Neuro metadata、checkpoint/internal state 或明显的 credential/key。删除、移动、additional
+root、受保护目标以及失败或有歧义的计划都不能成为宽范围编辑 grant。
+
 该契约覆盖本地结构化工具：`read_file`、`read_files`、目录列举、glob/search、
 `search_replace` 和 `apply_patch`。工作区身份、permission、sandbox 和 execution 仍是分离
 决策；该计划不会把任意 Bash 路径解释、MCP 调用、ACP 委托执行或不透明 artifact 句柄变成
@@ -808,10 +813,14 @@ CLI 则使用 `--effort`。选择不会改写供应商配置，也不成为会�
 
 权限策略与用户交互是两个独立边界。`PermissionManager` 先返回确定性判定；`ask` 随后
 可以进入可选的异步 `PermissionApprover` 端口。运行时产生请求/结果审计事件，并且在
-收到允许结果之前不能产生 `tool_started`。TUI 会话代理只在内存中记住“精确工具/参数
-组合”的哈希；后续每次调用仍重新经过策略判定，从而保持 deny 优先级。无头组合不提供
-审批器并继续失败关闭。详见
-[ADR 0015](adr/0015-async-interactive-tool-approval.md)。
+收到允许结果之前不能产生 `tool_started`。TUI 会话代理在内存中保存精确操作 hash，以及由
+运行时生成的有类型 `WORKSPACE_EDITS` 与保守 `COMMAND_FAMILY` grant。每个 grant 都绑定可信
+session identity 与工作区主规范根，后续每次调用仍重新经过策略判定。只有普通 interactive
+默认 `ASK` 可以生成宽范围候选；显式 deny/ask、mode 决定、headless 请求、高风险操作以及
+model/provider/planner/worker 输入都不能创建宽范围候选。等价排队请求会在首个决定后重新检查
+grant；仅允许一次、拒绝和取消不会替等待者授权。无头组合不提供审批器并继续失败关闭。详见
+[ADR 0015](adr/0015-async-interactive-tool-approval.md) 与
+[ADR 0142](adr/0142-scoped-session-permission-grants.md)。
 
 ## 稳定端口
 
@@ -980,7 +989,9 @@ Runtime 与协议行为仍由 service 及其端口/适配器负责。
 - deny 规则优先于 allow 规则和绕过模式。
 - 无头执行把未解决的 `ask` 转换为拒绝。
 - 具有副作用的工具在等待审批、被拒绝或审批等待取消后都不能启动。会话批准只覆盖
-  完全相同的工具/参数摘要，仅保留在内存中，并从属于新的策略判定。
+  完全相同的工具/参数摘要；宽范围批准只覆盖同一 session、同一规范工作区中的可信有类型
+  候选。所有批准仅保留在内存中，并从属于新的策略判定；显式 deny 和显式 ask 永远不能被
+  绕过。
 - 助手消息中持久化的每个本地工具调用，在上下文再次使用之前必须恰好具有一个工具结果。
   取消会给当前调用以及同一模型批次中的所有剩余调用记录错误结果。
 - 写入前必须解析并校验目标；工作区工具不能通过 `..` 或符号链接逃逸。

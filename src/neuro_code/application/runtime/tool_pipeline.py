@@ -19,6 +19,7 @@ import asyncio
 import json
 import logging
 import os
+import uuid
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import replace
 from pathlib import Path
@@ -34,6 +35,7 @@ from neuro_code.application.permissions.policy import (
     PermissionEffect,
     PermissionManager,
 )
+from neuro_code.application.permissions.scopes import PermissionScopeContext
 from neuro_code.application.ports.approval import PermissionApprover
 from neuro_code.application.ports.storage import SessionStore
 from neuro_code.application.ports.tool_pipeline import ToolPipelineHook
@@ -239,6 +241,7 @@ class ToolExecutor:
 
     __slots__ = (
         "_approver",
+        "_binding_scope_identity",
         "_context_builder",
         "_hooks",
         "_observation_builder",
@@ -264,6 +267,7 @@ class ToolExecutor:
         self._tools = tools
         self._permissions = permissions
         self._approver = approver
+        self._binding_scope_identity = uuid.uuid4().hex
         self._tool_context = tool_context
         self._session_store = session_store
         self._hooks = tuple(hooks)
@@ -423,6 +427,7 @@ class ToolExecutor:
                         "name": call.name,
                         "effect": decision.effect.value,
                         "reason": decision.reason,
+                        "policy_source": decision.source.value,
                     },
                 )
                 result = ToolResult(f"permission denied: {decision.reason}", is_error=True)
@@ -458,14 +463,29 @@ class ToolExecutor:
                     "name": call.name,
                     "effect": decision.effect.value,
                     "reason": decision.reason,
+                    "policy_source": decision.source.value,
                 },
             )
             if decision.effect is PermissionEffect.ASK:
+                scope_context = self._permission_scope_context(session_id)
+                scope_candidates = self._permissions.scope_candidates(
+                    call.name,
+                    call.arguments,
+                    decision=decision,
+                    targets=(
+                        filesystem_access_plan.targets if filesystem_access_plan is not None else ()
+                    ),
+                    workspace_root=(
+                        Path(scope_context.workspace_root) if scope_context is not None else None
+                    ),
+                )
                 request = build_permission_request(
                     call.id,
                     call.name,
                     call.arguments,
                     decision.reason,
+                    scope_candidates=scope_candidates,
+                    scope_context=scope_context,
                 )
                 await emit(
                     AgentEventKind.TOOL_APPROVAL_REQUESTED,
@@ -474,6 +494,14 @@ class ToolExecutor:
                         "name": call.name,
                         "reason": request.reason,
                         "summary": request.summary,
+                        "scope_candidates": [
+                            candidate.audit_metadata() for candidate in request.scope_candidates
+                        ],
+                        "scope_workspace_root": (
+                            request.scope_context.workspace_root
+                            if request.scope_context is not None and request.scope_candidates
+                            else None
+                        ),
                     },
                 )
                 approval = (
@@ -491,6 +519,12 @@ class ToolExecutor:
                         "effect": effect.value,
                         "outcome": approval.kind.value,
                         "reason": approval.reason,
+                        "cache_hit": approval.cache_hit,
+                        "scope": (
+                            approval.scope_candidate.audit_metadata()
+                            if approval.scope_candidate is not None
+                            else None
+                        ),
                     },
                 )
             if not decision.allowed:
@@ -712,6 +746,23 @@ class ToolExecutor:
 
     def _workspace_roots(self) -> tuple[Path, ...]:
         return (self._tool_context.cwd, *self._tool_context.additional_workspace_roots)
+
+    def _permission_scope_context(self, session_id: str | None) -> PermissionScopeContext:
+        """Build trusted in-memory grant identity from runtime-owned values."""
+
+        identity = (
+            session_id
+            if isinstance(session_id, str)
+            and bool(session_id)
+            and "\x00" not in session_id
+            and len(session_id.encode("utf-8")) <= 512
+            else f"executor:{self._binding_scope_identity}"
+        )
+        try:
+            root = self._tool_context.cwd.expanduser().resolve(strict=False)
+        except (OSError, RuntimeError):
+            root = Path(os.path.abspath(os.fspath(self._tool_context.cwd)))
+        return PermissionScopeContext(identity, os.fspath(root))
 
     def _journal_redaction_values(self) -> tuple[str, ...]:
         protected_names = {

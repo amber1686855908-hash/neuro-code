@@ -9,11 +9,14 @@ from unittest.mock import patch
 
 from neuro_code.application.permissions.contracts import build_permission_request
 from neuro_code.application.permissions.policy import (
+    PermissionCommandFamily,
+    PermissionDecisionSource,
     PermissionEffect,
     PermissionManager,
     PermissionMode,
     PermissionRule,
     PermissionRuleStore,
+    PermissionScopeKind,
 )
 from neuro_code.application.ports.workspace import (
     FilesystemAccessOperation,
@@ -131,6 +134,162 @@ class PermissionTests(unittest.TestCase):
         manager = PermissionManager(mode=PermissionMode.DEFAULT, interactive=False)
         decision = manager.decide("bash", {"command": "touch x"}, side_effecting=True)
         self.assertEqual(decision.effect, PermissionEffect.DENY)
+
+    def test_permission_decision_source_separates_default_rules_and_modes(self) -> None:
+        default = PermissionManager(interactive=True).decide(
+            "search_replace", {}, side_effecting=True
+        )
+        explicit = PermissionManager(
+            interactive=True,
+            rules=(PermissionRule(PermissionEffect.ASK, "search_replace"),),
+        ).decide("search_replace", {}, side_effecting=True)
+        mode = PermissionManager(mode=PermissionMode.BYPASS).decide(
+            "search_replace", {}, side_effecting=True
+        )
+
+        self.assertEqual(default.source, PermissionDecisionSource.DEFAULT)
+        self.assertEqual(explicit.source, PermissionDecisionSource.EXPLICIT_RULE)
+        self.assertEqual(mode.source, PermissionDecisionSource.MODE)
+
+    def test_scope_candidates_use_only_the_canonical_ordinary_edit_plan(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            first = root / "first.py"
+            second = root / "second.py"
+            first.write_text("one\n", encoding="utf-8")
+            second.write_text("two\n", encoding="utf-8")
+            plan = resolve_filesystem_access_targets(
+                "apply_patch",
+                root,
+                (
+                    FilesystemTargetRequest(
+                        "first.py", FilesystemAccessOperation.UPDATE, must_exist=True
+                    ),
+                    FilesystemTargetRequest(
+                        "second.py", FilesystemAccessOperation.UPDATE, must_exist=True
+                    ),
+                ),
+            )
+            manager = PermissionManager(interactive=True)
+            decision = manager.decide_targets("apply_patch", plan.targets, side_effecting=True)
+            candidates = manager.scope_candidates(
+                "apply_patch",
+                {},
+                decision=decision,
+                targets=plan.targets,
+                workspace_root=root,
+            )
+
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0].kind, PermissionScopeKind.WORKSPACE_EDITS)
+        self.assertEqual(candidates[0].workspace_root, str(root.resolve()))
+
+    def test_scope_candidates_fail_closed_for_protected_or_non_edit_targets(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / ".neuro-code").mkdir()
+            (root / ".neuro-code" / "state.json").write_text("{}", encoding="utf-8")
+            manager = PermissionManager(interactive=True)
+            protected = resolve_filesystem_access_targets(
+                "search_replace",
+                root,
+                (
+                    FilesystemTargetRequest(
+                        ".neuro-code/state.json",
+                        FilesystemAccessOperation.UPDATE,
+                        must_exist=True,
+                    ),
+                ),
+            )
+            protected_decision = manager.decide_targets(
+                "search_replace", protected.targets, side_effecting=True
+            )
+            deleted = resolve_filesystem_access_targets(
+                "apply_patch",
+                root,
+                (
+                    FilesystemTargetRequest(
+                        "removed.py", FilesystemAccessOperation.DELETE, must_exist=False
+                    ),
+                ),
+            )
+            deleted_decision = manager.decide_targets(
+                "apply_patch", deleted.targets, side_effecting=True
+            )
+
+            self.assertEqual(
+                manager.scope_candidates(
+                    "search_replace",
+                    {},
+                    decision=protected_decision,
+                    targets=protected.targets,
+                    workspace_root=root,
+                ),
+                (),
+            )
+            self.assertEqual(
+                manager.scope_candidates(
+                    "apply_patch",
+                    {},
+                    decision=deleted_decision,
+                    targets=deleted.targets,
+                    workspace_root=root,
+                ),
+                (),
+            )
+
+    def test_explicit_ask_never_gets_a_broad_scope_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "note.txt"
+            target.write_text("before", encoding="utf-8")
+            plan = resolve_filesystem_access_targets(
+                "search_replace",
+                root,
+                (
+                    FilesystemTargetRequest(
+                        "note.txt", FilesystemAccessOperation.UPDATE, must_exist=True
+                    ),
+                ),
+            )
+            manager = PermissionManager(
+                interactive=True,
+                rules=(PermissionRule(PermissionEffect.ASK, "search_replace"),),
+            )
+            decision = manager.decide_targets("search_replace", plan.targets, side_effecting=True)
+            self.assertEqual(decision.source, PermissionDecisionSource.EXPLICIT_RULE)
+            self.assertEqual(
+                manager.scope_candidates(
+                    "search_replace",
+                    {},
+                    decision=decision,
+                    targets=plan.targets,
+                    workspace_root=root,
+                ),
+                (),
+            )
+
+    def test_command_family_candidate_is_typed_and_high_risk_command_has_none(self) -> None:
+        manager = PermissionManager(interactive=True)
+        test_decision = manager.decide("bash", {"command": "pytest -q tests"}, side_effecting=True)
+        test_candidates = manager.scope_candidates(
+            "bash",
+            {"command": "pytest -q tests"},
+            decision=test_decision,
+            workspace_root=Path("/tmp"),
+        )
+        high_risk_decision = manager.decide("bash", {"command": "git push"}, side_effecting=True)
+        high_risk_candidates = manager.scope_candidates(
+            "bash",
+            {"command": "git push"},
+            decision=high_risk_decision,
+            workspace_root=Path("/tmp"),
+        )
+
+        self.assertEqual(len(test_candidates), 1)
+        self.assertEqual(test_candidates[0].kind, PermissionScopeKind.COMMAND_FAMILY)
+        self.assertEqual(test_candidates[0].command_family, PermissionCommandFamily.TEST)
+        self.assertEqual(high_risk_candidates, ())
 
     def test_ask_rule_becomes_denial_when_no_ui_can_prompt(self) -> None:
         manager = PermissionManager(

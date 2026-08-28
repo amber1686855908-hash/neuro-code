@@ -1551,6 +1551,7 @@ def test_permissions_expose_policy_without_approval_contract_reexports() -> None
     approval_port = importlib.import_module("neuro_code.application.ports.approval")
     policy_names = (
         "PermissionDecision",
+        "PermissionDecisionSource",
         "PermissionEffect",
         "PermissionManager",
         "PermissionMode",

@@ -31,6 +31,10 @@ from textual.worker import Worker
 from neuro_code.application.memory.compaction_runtime import ContextCompactionCommandResult
 from neuro_code.application.permissions.broker import ApprovalHandler
 from neuro_code.application.permissions.contracts import PermissionApproval, PermissionRequest
+from neuro_code.application.permissions.scopes import (
+    PermissionScopeCandidate,
+    PermissionScopeKind,
+)
 from neuro_code.application.ports.http import HttpClientPolicy
 from neuro_code.application.ports.model import ModelCapabilitySet
 from neuro_code.application.ports.provider_catalog import (
@@ -3094,8 +3098,42 @@ class PermissionApprovalScreen(ModalScreen[PermissionApproval]):
         super().__init__()
         self.request = request
         self.language = language
+        self._scope_button_candidates: dict[str, PermissionScopeCandidate] = {}
 
     def compose(self) -> ComposeResult:
+        scope_widgets: list[Widget] = []
+        if self.request.scope_candidates:
+            scope_widgets.append(
+                Static(
+                    Text(ui_text(self.language, "approval.scope.heading")),
+                    id="approval-scope-heading",
+                )
+            )
+            for candidate in self.request.scope_candidates:
+                if candidate.kind is PermissionScopeKind.WORKSPACE_EDITS:
+                    button_id = "approval-allow-scope-workspace-edits"
+                    label_key = "approval.scope.workspace_edits"
+                    label_kwargs = {"root": candidate.workspace_root or "(unknown)"}
+                elif candidate.kind is PermissionScopeKind.COMMAND_FAMILY:
+                    family = (
+                        candidate.command_family.value if candidate.command_family else "(unknown)"
+                    )
+                    button_id = f"approval-allow-scope-command-family-{family}"
+                    label_key = "approval.scope.command_family"
+                    label_kwargs = {
+                        "family": family,
+                        "root": candidate.workspace_root or "(unknown)",
+                    }
+                else:
+                    continue
+                self._scope_button_candidates[button_id] = candidate
+                scope_widgets.append(
+                    Button(
+                        ui_text(self.language, label_key, **label_kwargs),
+                        variant="primary",
+                        id=button_id,
+                    )
+                )
         yield Vertical(
             Label(ui_text(self.language, "approval.title"), id="approval-title"),
             Static(
@@ -3118,6 +3156,7 @@ class PermissionApprovalScreen(ModalScreen[PermissionApproval]):
                 ),
                 id="approval-reason",
             ),
+            *scope_widgets,
             Horizontal(
                 Button(
                     ui_text(self.language, "approval.allow_once"),
@@ -3156,6 +3195,10 @@ class PermissionApprovalScreen(ModalScreen[PermissionApproval]):
             "approval-deny": PermissionApproval.deny(),
         }
         approval = choices.get(event.button.id or "")
+        if approval is None:
+            candidate = self._scope_button_candidates.get(event.button.id or "")
+            if candidate is not None:
+                approval = PermissionApproval.allow_scope(candidate)
         if approval is not None:
             self.dismiss(approval)
 

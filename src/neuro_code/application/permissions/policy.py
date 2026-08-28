@@ -15,11 +15,23 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
-from neuro_code.application.ports.workspace import FilesystemAccessTarget
-from neuro_code.domain.permissions.bash_commands import analyze_bash_command
+from neuro_code.application.permissions.scopes import (
+    PermissionCommandFamily,
+    PermissionScopeCandidate,
+    PermissionScopeKind,
+)
+from neuro_code.application.ports.workspace import (
+    FilesystemAccessOperation,
+    FilesystemAccessTarget,
+)
+from neuro_code.domain.permissions.bash_commands import (
+    analyze_bash_command,
+    classify_bash_command_family,
+)
 
 __all__ = [
     "PermissionDecision",
+    "PermissionDecisionSource",
     "PermissionEffect",
     "PermissionManager",
     "PermissionMode",
@@ -32,6 +44,18 @@ class PermissionEffect(StrEnum):
     ALLOW = "allow"
     ASK = "ask"
     DENY = "deny"
+
+
+class PermissionDecisionSource(StrEnum):
+    """Identify which trusted policy layer produced a decision.
+
+    标识一个权限决定由哪个可信策略层产生. 只有默认的 interactive ASK
+    才能产生本轮的候选范围;显式规则和模式决定不会被范围授权绕过.
+    """
+
+    DEFAULT = "default"
+    EXPLICIT_RULE = "explicit_rule"
+    MODE = "mode"
 
 
 class PermissionMode(StrEnum):
@@ -220,6 +244,7 @@ class PermissionRuleStore:
 class PermissionDecision:
     effect: PermissionEffect
     reason: str
+    source: PermissionDecisionSource = PermissionDecisionSource.DEFAULT
 
     @property
     def allowed(self) -> bool:
@@ -273,6 +298,77 @@ class PermissionManager:
             raise TypeError("permission mode must be a PermissionMode")
         self._mode = mode
 
+    def scope_candidates(
+        self,
+        tool_name: str,
+        arguments: Mapping[str, Any],
+        *,
+        decision: PermissionDecision,
+        targets: tuple[FilesystemAccessTarget, ...] = (),
+        workspace_root: Path | None = None,
+    ) -> tuple[PermissionScopeCandidate, ...]:
+        """Build only safe broad-scope candidates for one unresolved ASK.
+
+        Candidate generation is deliberately downstream of policy evaluation
+        and upstream of the UI.  It is never based on a model-provided scope
+        string.  Explicit rules, mode decisions, headless decisions, and
+        anything other than the ordinary interactive ASK produce no broad
+        candidate.
+
+        为一个未解决的 ASK 生成安全的宽范围候选. 候选生成发生在策略评估之后、UI
+        之前,绝不读取模型伪造的范围字符串. 显式规则、模式决定、无头决定以及非默认
+        interactive ASK 都不会产生宽范围候选.
+        """
+
+        if (
+            not isinstance(decision, PermissionDecision)
+            or decision.effect is not PermissionEffect.ASK
+            or decision.source is not PermissionDecisionSource.DEFAULT
+            or not self._interactive
+        ):
+            return ()
+
+        root = _normalized_scope_path(workspace_root)
+        if root is None:
+            return ()
+
+        if tool_name in self._EDIT_TOOLS and targets:
+            if all(
+                target.is_primary_workspace
+                and target.owning_workspace_root == root
+                and not target.contains_link_like_component
+                and target.operation
+                in {
+                    FilesystemAccessOperation.CREATE,
+                    FilesystemAccessOperation.UPDATE,
+                }
+                and not _protected_scope_path(target.policy_path)
+                for target in targets
+            ):
+                return (
+                    PermissionScopeCandidate(
+                        PermissionScopeKind.WORKSPACE_EDITS,
+                        workspace_root=os.fspath(root),
+                    ),
+                )
+            return ()
+
+        if tool_name == "bash":
+            command = arguments.get("command")
+            if not isinstance(command, str):
+                return ()
+            family = classify_bash_command_family(command)
+            if family is None:
+                return ()
+            return (
+                PermissionScopeCandidate(
+                    PermissionScopeKind.COMMAND_FAMILY,
+                    workspace_root=os.fspath(root),
+                    command_family=PermissionCommandFamily(family.value),
+                ),
+            )
+        return ()
+
     def decide(
         self,
         tool_name: str,
@@ -290,17 +386,37 @@ class PermissionManager:
         for effect in (PermissionEffect.DENY, PermissionEffect.ASK, PermissionEffect.ALLOW):
             if any(rule.effect is effect for rule in matches):
                 if effect is PermissionEffect.ASK and not self._interactive:
-                    return PermissionDecision(PermissionEffect.DENY, "headless mode cannot prompt")
-                return PermissionDecision(effect, f"matched explicit {effect.value} rule")
+                    return PermissionDecision(
+                        PermissionEffect.DENY,
+                        "headless mode cannot prompt",
+                        PermissionDecisionSource.EXPLICIT_RULE,
+                    )
+                return PermissionDecision(
+                    effect,
+                    f"matched explicit {effect.value} rule",
+                    PermissionDecisionSource.EXPLICIT_RULE,
+                )
 
         if tool_name in self._READ_ONLY_TOOLS or not side_effecting:
             return PermissionDecision(PermissionEffect.ALLOW, "built-in read-only tool")
         if self._mode is PermissionMode.BYPASS:
-            return PermissionDecision(PermissionEffect.ALLOW, "bypassPermissions mode")
+            return PermissionDecision(
+                PermissionEffect.ALLOW,
+                "bypassPermissions mode",
+                PermissionDecisionSource.MODE,
+            )
         if self._mode is PermissionMode.ACCEPT_EDITS and tool_name in self._EDIT_TOOLS:
-            return PermissionDecision(PermissionEffect.ALLOW, "acceptEdits mode")
+            return PermissionDecision(
+                PermissionEffect.ALLOW,
+                "acceptEdits mode",
+                PermissionDecisionSource.MODE,
+            )
         if self._mode is PermissionMode.DONT_ASK:
-            return PermissionDecision(PermissionEffect.DENY, "dontAsk denies unmatched actions")
+            return PermissionDecision(
+                PermissionEffect.DENY,
+                "dontAsk denies unmatched actions",
+                PermissionDecisionSource.MODE,
+            )
         if self._interactive:
             return PermissionDecision(PermissionEffect.ASK, "interactive approval required")
         return PermissionDecision(PermissionEffect.DENY, "headless approval required")
@@ -336,20 +452,24 @@ class PermissionManager:
                 return PermissionDecision(
                     PermissionEffect.DENY,
                     f"structured target authorization failed: {matching[0].reason}",
+                    _combined_source(decisions),
                 )
             if effect is PermissionEffect.ASK:
                 if not self._interactive:
                     return PermissionDecision(
                         PermissionEffect.DENY,
                         "headless mode cannot prompt for every structured target",
+                        _combined_source(decisions),
                     )
                 return PermissionDecision(
                     PermissionEffect.ASK,
                     "one or more structured targets require approval",
+                    _combined_source(decisions),
                 )
         return PermissionDecision(
             PermissionEffect.ALLOW,
             "every structured target was authorized independently",
+            _combined_source(decisions),
         )
 
     def _decide_target(
@@ -366,10 +486,12 @@ class PermissionManager:
                     return PermissionDecision(
                         PermissionEffect.DENY,
                         f"headless mode cannot prompt for target {target.policy_path!r}",
+                        PermissionDecisionSource.EXPLICIT_RULE,
                     )
                 return PermissionDecision(
                     effect,
                     f"target {target.policy_path!r} matched explicit {effect.value} rule",
+                    PermissionDecisionSource.EXPLICIT_RULE,
                 )
 
         if any(
@@ -381,17 +503,27 @@ class PermissionManager:
             return PermissionDecision(
                 PermissionEffect.DENY,
                 f"target {target.policy_path!r} is outside explicit path allow rules",
+                PermissionDecisionSource.EXPLICIT_RULE,
             )
         if not side_effecting:
             return PermissionDecision(PermissionEffect.ALLOW, "built-in read-only target")
         if self._mode is PermissionMode.BYPASS:
-            return PermissionDecision(PermissionEffect.ALLOW, "bypassPermissions mode")
+            return PermissionDecision(
+                PermissionEffect.ALLOW,
+                "bypassPermissions mode",
+                PermissionDecisionSource.MODE,
+            )
         if self._mode is PermissionMode.ACCEPT_EDITS and tool_name in self._EDIT_TOOLS:
-            return PermissionDecision(PermissionEffect.ALLOW, "acceptEdits mode")
+            return PermissionDecision(
+                PermissionEffect.ALLOW,
+                "acceptEdits mode",
+                PermissionDecisionSource.MODE,
+            )
         if self._mode is PermissionMode.DONT_ASK:
             return PermissionDecision(
                 PermissionEffect.DENY,
                 f"dontAsk denies unmatched target {target.policy_path!r}",
+                PermissionDecisionSource.MODE,
             )
         if self._interactive:
             return PermissionDecision(
@@ -420,10 +552,12 @@ class PermissionManager:
                     return PermissionDecision(
                         PermissionEffect.ASK,
                         "bash command could not be safely decomposed",
+                        PermissionDecisionSource.EXPLICIT_RULE,
                     )
                 return PermissionDecision(
                     PermissionEffect.DENY,
                     "bash command could not be safely decomposed in headless mode",
+                    PermissionDecisionSource.EXPLICIT_RULE,
                 )
             return None
 
@@ -442,13 +576,19 @@ class PermissionManager:
             return PermissionDecision(
                 PermissionEffect.DENY,
                 "matched explicit deny rule in bash command sequence",
+                PermissionDecisionSource.EXPLICIT_RULE,
             )
         if any(rule.effect is PermissionEffect.ASK for rule in all_matches):
             if not self._interactive:
-                return PermissionDecision(PermissionEffect.DENY, "headless mode cannot prompt")
+                return PermissionDecision(
+                    PermissionEffect.DENY,
+                    "headless mode cannot prompt",
+                    PermissionDecisionSource.EXPLICIT_RULE,
+                )
             return PermissionDecision(
                 PermissionEffect.ASK,
                 "matched explicit ask rule in bash command sequence",
+                PermissionDecisionSource.EXPLICIT_RULE,
             )
         if matches_by_segment and all(
             any(rule.effect is PermissionEffect.ALLOW for rule in matches)
@@ -457,6 +597,7 @@ class PermissionManager:
             return PermissionDecision(
                 PermissionEffect.ALLOW,
                 "every bash command segment matched an explicit allow rule",
+                PermissionDecisionSource.EXPLICIT_RULE,
             )
         return None
 
@@ -491,3 +632,57 @@ def _path_or_text_match(value: str, pattern: str) -> bool:
         normalized_value = normalized_value.casefold()
         normalized_pattern = normalized_pattern.casefold()
     return fnmatch.fnmatchcase(normalized_value, normalized_pattern)
+
+
+def _normalized_scope_path(value: Path | None) -> Path | None:
+    if value is None or not isinstance(value, Path):
+        return None
+    try:
+        result = value.expanduser().resolve(strict=False)
+    except (OSError, RuntimeError):
+        return None
+    return result if result.is_absolute() else None
+
+
+def _protected_scope_path(policy_path: str) -> bool:
+    """Keep broad edit grants away from Neuro and obvious secret targets."""
+
+    normalized = policy_path.replace("\\", "/")
+    parts = tuple(part.casefold() for part in normalized.split("/") if part not in {"", "."})
+    protected_components = frozenset(
+        {
+            ".git",
+            ".neuro",
+            ".neuro-code",
+            ".neuro-code-state",
+            ".neuro-state",
+            ".checkpoints",
+            "checkpoint",
+            "checkpoints",
+            "internal",
+        }
+    )
+    if any(part in protected_components for part in parts):
+        return True
+    name = parts[-1] if parts else ""
+    if name == ".env" or name.startswith(".env."):
+        return True
+    if name in {
+        ".netrc",
+        ".npmrc",
+        "credentials.json",
+        "id_dsa",
+        "id_ecdsa",
+        "id_ed25519",
+        "id_rsa",
+    }:
+        return True
+    return any(name.endswith(suffix) for suffix in (".jks", ".key", ".p12", ".pfx", ".pem"))
+
+
+def _combined_source(decisions: list[PermissionDecision]) -> PermissionDecisionSource:
+    if any(decision.source is PermissionDecisionSource.EXPLICIT_RULE for decision in decisions):
+        return PermissionDecisionSource.EXPLICIT_RULE
+    if any(decision.source is PermissionDecisionSource.MODE for decision in decisions):
+        return PermissionDecisionSource.MODE
+    return PermissionDecisionSource.DEFAULT

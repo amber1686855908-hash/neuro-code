@@ -554,6 +554,13 @@ The authority chain is deliberately ordered:
    entries by extraction index. It does not resolve the raw path again. A mixed
    allowed/denied `apply_patch` therefore stops before journaling or mutation.
 
+The approval layer may derive a `WORKSPACE_EDITS` candidate only after this
+plan succeeds. The candidate covers only ordinary `search_replace` and
+`apply_patch` create/update targets in the primary canonical root, with no
+link-like component and no Neuro metadata, checkpoint/internal state, or
+obvious credential/key target. Deletes, moves, additional roots, protected
+targets, and failed or ambiguous plans never become a broad edit grant.
+
 This contract covers local structured tools: `read_file`, `read_files`, directory
 listing, glob/search, `search_replace`, and `apply_patch`. Workspace identity,
 permission, sandbox, and execution remain separate decisions; the plan does not
@@ -1182,11 +1189,18 @@ Permission policy and user interaction are separate boundaries.
 `PermissionManager` first returns a deterministic decision. An `ask` may then
 flow through the optional asynchronous `PermissionApprover` port; the runtime
 emits request/resolution audit events and cannot emit `tool_started` before an
-allowed response. The TUI's session broker remembers only hashes of exact
-tool/argument pairs in memory, and every later call is re-evaluated by policy so
-deny precedence remains intact. Headless composition provides no approver and
-continues to fail closed. See
-[ADR 0015](adr/0015-async-interactive-tool-approval.md).
+allowed response. The TUI's session broker keeps exact-action hashes plus
+typed, runtime-generated `WORKSPACE_EDITS` and conservative `COMMAND_FAMILY`
+grants in memory. Every grant is bound to the trusted session identity and
+canonical primary workspace, and every later call is re-evaluated by policy.
+Only the ordinary interactive default `ASK` can produce a broad candidate;
+explicit deny/ask, mode decisions, headless requests, high-risk operations,
+and model/provider/planner/worker input cannot create one. Equivalent queued
+requests re-check the grant after the first decision; allow-once, denial, and
+cancellation do not authorize waiters. Headless composition provides no
+approver and continues to fail closed. See
+[ADR 0015](adr/0015-async-interactive-tool-approval.md) and
+[ADR 0142](adr/0142-scoped-session-permission-grants.md).
 
 ## Stable ports
 
@@ -1397,8 +1411,11 @@ pair from terminal backend output when intermediate events were absent.
 - Deny rules override allow rules and bypass modes.
 - Headless execution converts an unresolved `ask` into denial.
 - A side-effecting tool cannot start while approval is pending or after denial
-  or cancellation. Session approvals cover only an identical tool/argument
-  digest, remain memory-only, and are subordinate to a fresh policy decision.
+  or cancellation. Exact session approvals cover only an identical
+  tool/argument digest; broad approvals cover only a trusted typed candidate in
+  the same session and canonical workspace. All remain memory-only and
+  subordinate to a fresh policy decision; explicit deny and explicit ask are
+  never bypassed.
 - Every local tool call persisted in an assistant message has exactly one tool
   result before the context is reused. Cancellation records an error result for
   the active call and every remaining call in the same model batch.

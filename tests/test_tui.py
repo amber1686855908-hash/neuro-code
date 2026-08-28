@@ -23,6 +23,11 @@ from neuro_code.application.permissions.contracts import (
     PermissionApprovalKind,
     build_permission_request,
 )
+from neuro_code.application.permissions.scopes import (
+    PermissionScopeCandidate,
+    PermissionScopeContext,
+    PermissionScopeKind,
+)
 from neuro_code.application.ports.http import HttpClientPolicy
 from neuro_code.application.ports.provider_catalog import (
     ProviderCatalogError,
@@ -444,6 +449,32 @@ class ApprovalTuiConversation:
             "search_replace",
             {"path": "note.txt", "old": "private-old", "new": "private-new"},
             "interactive approval required",
+        )
+        approval = await self._broker.request(request)
+        self.approvals.append(approval)
+        self.executed = approval.allowed
+        self._session_id = "approval-session"
+        response = "approved" if approval.allowed else "denied"
+        return AgentRunResult(self._session_id, response, (), (), (), 1)
+
+
+class ScopedApprovalTuiConversation(ApprovalTuiConversation):
+    async def run(
+        self,
+        prompt: str,
+        *,
+        sink: EventSink | None = None,
+        cancellation_policy: TurnCancellationPolicy = TurnCancellationPolicy.RETAIN,
+    ) -> AgentRunResult:
+        del prompt, sink, cancellation_policy
+        candidate = PermissionScopeCandidate(PermissionScopeKind.WORKSPACE_EDITS, "/workspace")
+        request = build_permission_request(
+            "edit",
+            "search_replace",
+            {"path": "src/note.txt", "old": "private-old", "new": "private-new"},
+            "interactive approval required",
+            scope_candidates=(candidate,),
+            scope_context=PermissionScopeContext("approval-session", "/workspace"),
         )
         approval = await self._broker.request(request)
         self.approvals.append(approval)
@@ -5720,6 +5751,47 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertTrue(runner.executed)
             self.assertEqual(runner.approvals[0].kind, PermissionApprovalKind.ALLOW_ONCE)
+
+    async def test_permission_modal_shows_only_runtime_generated_scoped_edit_option(self) -> None:
+        broker = SessionApprovalBroker()
+        runner = ScopedApprovalTuiConversation(broker)
+        app = NeuroCodeApp(
+            runner,
+            approval_controller=broker,
+            provider_name="fixture",
+            model_name="fixture-model",
+            cwd=Path("/workspace"),
+        )
+
+        async with app.run_test(size=(120, 38)) as pilot:
+            prompt = app.query_one("#prompt", PromptInput)
+            prompt.value = "edit the file"
+            await pilot.press("enter")
+            for _ in range(20):
+                await pilot.pause(0.01)
+                if isinstance(app.screen, PermissionApprovalScreen):
+                    break
+
+            self.assertIsInstance(app.screen, PermissionApprovalScreen)
+            approval_screen = app.screen
+            assert isinstance(approval_screen, PermissionApprovalScreen)
+            self.assertEqual(app.focused.id if app.focused is not None else None, "approval-deny")
+            self.assertIsNotNone(approval_screen.query_one("#approval-allow-scope-workspace-edits"))
+            self.assertNotIn("private-old", approval_screen.request.summary)
+            self.assertNotIn("private-new", approval_screen.request.summary)
+
+            self.assertTrue(await pilot.click("#approval-allow-scope-workspace-edits"))
+            for _ in range(20):
+                await pilot.pause(0.01)
+                if runner.approvals:
+                    break
+
+            self.assertTrue(runner.executed)
+            self.assertEqual(runner.approvals[0].kind.value, "allow_scope")
+            self.assertEqual(
+                runner.approvals[0].scope_candidate is not None,
+                True,
+            )
 
     async def test_permission_modal_defaults_to_deny(self) -> None:
         broker = SessionApprovalBroker()
