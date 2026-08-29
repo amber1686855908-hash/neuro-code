@@ -71,6 +71,22 @@ applied/unresolved/conflict count，以及是否可能发生 parent partial muta
 Parent commit crash recovery 仍由既有 conversation finalization contract 负责。已提交的 parent turn 通过精确 identity
 复用。
 
+### Pre-integration `FINALIZING` compatibility
+
+ADR 0141 早于 automatic Result Adoption。在该冻结生命周期中，completed Swarm 可以先投影为 Ultracode
+`FINALIZING`，再提交 parent external turn；当时 adoption record 尚不存在。因此，缺少 adoption record 永远不等于
+adoption 已成功。
+
+- 如果精确 parent attempt 尚未提交，恢复必须验证精确 completed Swarm 与 Task DAG identity、final response 和
+  fingerprint；随后进入确定性 adoption 路径。只有 adoption 达到 `COMPLETED` 后才允许 parent success，且不重放
+  Planner、Leader、Worker、provider、Swarm、Worktree 或 Checkpoint work。
+- 如果历史 parent attempt 已为 `COMMITTED`，恢复保留其精确可见结果，并把 Ultracode projection 收口为
+  `COMPLETED`；不创建 adoption record，不追溯修改 parent workspace，也不声称历史 adoption 曾发生。
+- 如果 parent attempt、completed Swarm、Task DAG、result 或 fingerprint 证据缺失或不一致，恢复 fail closed：不提交
+  parent success，不重放 lower work，也不伪造 adoption。
+
+该兼容分类只使用既有 schema-29 durable facts；不增加 schema marker，也不改变 Result Adoption algorithm。
+
 ### Permissions and progress
 
 Adoption 使用活动 parent binding 既有的 workspace mutation、permission/scoped approval、workspace/instruction、
@@ -99,4 +115,6 @@ persistent permission grant、public ACP/TUI adoption control、recursive orches
 ## Validation
 
 验证包括 focused Ultracode、Result Adoption、Agent Swarm、Task DAG、Writable、permission、crash/conversation recovery 与
-dynamic TUI tests；真实 temporary-Git production-shaped A/B/C/D fresh-process recovery；schema 29 检查；以及仓库完整 quality gates。
+dynamic TUI tests；真实 temporary-Git production-shaped A/B/C/D fresh-process recovery；针对未提交与已提交 parent turn 的
+spawned pre-integration `FINALIZING` upgrade proof；incomplete-evidence fail-closed 检查；schema 29 检查；以及仓库完整
+quality gates。

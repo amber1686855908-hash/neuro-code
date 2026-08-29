@@ -460,13 +460,7 @@ class UltracodeDelegationApplicationService:
         if run.state is UltracodeExecutionState.BOUNDED_SWARM_RUNNING:
             return await self._recover_or_run_swarm(run, request, sink=sink)
         if run.state is UltracodeExecutionState.FINALIZING:
-            adoption = await self._load_adoption_record(run)
-            return await self._finalize_swarm(
-                run,
-                request,
-                sink=sink,
-                terminal_state=self._finalizing_terminal_state(adoption),
-            )
+            return await self._recover_finalizing_swarm(run, request, sink=sink)
         raise ConfigurationError(f"unsupported Ultracode lifecycle state: {run.state.value}")
 
     async def _run_main(
@@ -619,7 +613,7 @@ class UltracodeDelegationApplicationService:
                 run.execution_id,
             )
             adoption = await self._load_adoption_record(run)
-            terminal_state = self._finalizing_terminal_state(adoption)
+            terminal_state = self._committed_swarm_terminal_state(adoption)
             finalized = await self._transition(
                 run,
                 UltracodeExecutionState.FINALIZING,
@@ -669,6 +663,85 @@ class UltracodeDelegationApplicationService:
             return await self._run_swarm(run, request, sink=sink)
         raise ConfigurationError(
             "Ultracode BOUNDED_SWARM has observable or unresolved parent state; replay is disabled"
+        )
+
+    async def _recover_finalizing_swarm(
+        self,
+        run: UltracodeExecution,
+        request: RunTurnRequest,
+        *,
+        sink: EventSink | None,
+    ) -> AgentRunResult:
+        """Classify pre- and post-adoption ``FINALIZING`` state conservatively.
+
+        Before automatic Result Adoption existed, a completed Swarm could be
+        projected to ``FINALIZING`` before the parent result was committed.
+        Consequently, an absent adoption row is compatibility evidence to
+        classify, never evidence that adoption completed.
+        """
+
+        adoption = await self._load_adoption_record(run)
+        if adoption is not None:
+            return await self._finalize_swarm(
+                run,
+                request,
+                sink=sink,
+                terminal_state=self._finalizing_terminal_state(adoption),
+            )
+
+        attempts = await self._parent_attempts(run.parent_session_id)
+        attempt = next((item for item in attempts if item.turn_id == run.parent_turn_id), None)
+        if attempt is None:
+            raise ConfigurationError(
+                "legacy Ultracode FINALIZING has no exact parent attempt; finalization is disabled"
+            )
+        if attempt.resolution is TurnRecoveryResolution.COMMITTED:
+            response = await self._require_parent_result(
+                run.parent_session_id,
+                run.parent_turn_id,
+                run.execution_id,
+            )
+            self._validate_finalizing_response(run, response)
+            # A pre-integration parent success is historical durable output,
+            # not authority for post-hoc filesystem writes.  The idempotent
+            # parent seam recovers it while the Ultracode projection closes.
+            return await self._finalize_swarm(
+                run,
+                request,
+                sink=sink,
+                terminal_state=UltracodeExecutionState.COMPLETED,
+            )
+        if (
+            attempt.resolution is not None
+            or attempt.status is not TurnRecoveryStatus.SAFELY_RETRYABLE
+        ):
+            raise ConfigurationError(
+                "legacy Ultracode FINALIZING has observable parent state; finalization is disabled"
+            )
+
+        lower = await self._load_completed_swarm_response(
+            run.downstream_id,
+            run.parent_session_id,
+        )
+        if lower is None:
+            raise ConfigurationError(
+                "legacy Ultracode FINALIZING has no exact completed Swarm evidence; "
+                "finalization is disabled"
+            )
+        response = _response(lower.final_response)
+        self._validate_finalizing_response(run, response)
+        await self._progress(run, sink=sink, stage="swarm_completed")
+        adoption = await self._adopt_swarm_result(run, lower, sink=sink)
+        if adoption.state is not ResultAdoptionState.COMPLETED:
+            raise ConfigurationError(
+                "legacy Ultracode FINALIZING adoption did not complete; "
+                "parent finalization is disabled"
+            )
+        return await self._finalize_swarm(
+            run,
+            request,
+            sink=sink,
+            terminal_state=UltracodeExecutionState.COMPLETED,
         )
 
     async def _adopt_swarm_result(
@@ -808,13 +881,35 @@ class UltracodeDelegationApplicationService:
 
     @staticmethod
     def _finalizing_terminal_state(
-        record: ResultAdoptionRecord | None,
+        record: ResultAdoptionRecord,
     ) -> UltracodeExecutionState:
-        if record is None or record.state is ResultAdoptionState.COMPLETED:
+        if record.state is ResultAdoptionState.COMPLETED:
             return UltracodeExecutionState.COMPLETED
         if record.state.terminal:
             return UltracodeExecutionState.INDETERMINATE
         raise ConfigurationError("Ultracode Result Adoption is not terminal during finalization")
+
+    @classmethod
+    def _committed_swarm_terminal_state(
+        cls,
+        record: ResultAdoptionRecord | None,
+    ) -> UltracodeExecutionState:
+        # A missing record is accepted only under independently proven parent
+        # COMMITTED evidence from the pre-integration compatibility case.
+        if record is None:
+            return UltracodeExecutionState.COMPLETED
+        return cls._finalizing_terminal_state(record)
+
+    @staticmethod
+    def _validate_finalizing_response(run: UltracodeExecution, response: str) -> None:
+        if (
+            run.final_response != response
+            or run.final_result_fingerprint
+            != ultracode_result_fingerprint(run.execution_id, response)
+        ):
+            raise ConfigurationError(
+                "legacy Ultracode FINALIZING result integrity verification failed"
+            )
 
     async def _has_recoverable_swarm(self, swarm_run_id: str) -> bool:
         getter = getattr(self._session_store, "get_swarm_run", None)

@@ -1111,6 +1111,14 @@ def _spawn_ultracode_crash(
                 run,
                 UltracodeExecutionState.BOUNDED_SWARM_RUNNING,
             )
+            await store.start_turn_attempt(
+                TurnRecoveryAttempt.create(
+                    turn_id=run.parent_turn_id,
+                    session_id=run.parent_session_id,
+                    input=TurnInput(prompt, source=TurnSource.USER),
+                    accepted_at=datetime.now(UTC),
+                )
+            )
             result = _completed_swarm_result(run.downstream_id, run.parent_session_id)
             await _fresh_seed_completed_swarm(store, result)
             await _fresh_ultracode_transition(
@@ -2162,6 +2170,126 @@ async def _seed_bounded_recovery_case(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("case", "error_pattern"),
+    [
+        ("missing-lower", "no exact completed Swarm evidence"),
+        ("mismatched-result", "result integrity verification failed"),
+    ],
+)
+async def test_legacy_finalizing_without_adoption_fails_closed_on_incomplete_evidence(
+    tmp_path: Path,
+    case: str,
+    error_pattern: str,
+) -> None:
+    store = await _store(tmp_path)
+    runner = _ParentRunner(store, tmp_path)
+    binding = _binding(runner, tmp_path)
+    session_id = await runner.ensure_persisted_session()
+    prompt = "research these independent tasks in parallel"
+    turn_id = f"legacy-finalizing-{case}"
+    candidate = _fresh_ultracode_candidate(
+        session_id,
+        turn_id,
+        prompt,
+        UltracodeDelegationDecision.BOUNDED_SWARM,
+    )
+
+    class MissingAdoption:
+        def __init__(self) -> None:
+            self.adopt_calls = 0
+
+        async def get_result_adoption(
+            self,
+            _adoption_id: str,
+        ) -> ResultAdoptionRecord | None:
+            return None
+
+        async def adopt(
+            self,
+            _request: ResultAdoptionRequest,
+            *,
+            swarm_result: AgentSwarmResult,
+        ) -> ResultAdoptionRecord:
+            del swarm_result
+            self.adopt_calls += 1
+            raise AssertionError("incomplete legacy evidence must not start adoption")
+
+    adoption = MissingAdoption()
+    swarm_factory_calls = 0
+
+    async def forbidden_swarm_factory() -> Any:
+        nonlocal swarm_factory_calls
+        swarm_factory_calls += 1
+        raise AssertionError("legacy FINALIZING recovery must not replay the Swarm")
+
+    service = _service(
+        store,
+        binding,
+        forbidden_swarm_factory,
+        owner_id="legacy-incomplete-owner",
+        result_adoption_factory=lambda: _completed_awaitable(adoption),
+    )
+    owned = replace(
+        candidate,
+        owner_id=service.owner_id,
+        owner_pid=os.getpid(),
+        owner_token=service._owner_token,
+    )
+    claim = await store.claim_ultracode_execution(
+        owned,
+        now=datetime.now(UTC),
+        owner_is_alive=lambda _pid: True,
+    )
+    assert claim.acquired is True
+    running = await service._transition(
+        claim.execution,
+        UltracodeExecutionState.BOUNDED_SWARM_RUNNING,
+    )
+    await store.start_turn_attempt(
+        TurnRecoveryAttempt.create(
+            turn_id=turn_id,
+            session_id=session_id,
+            input=TurnInput(prompt, source=TurnSource.USER),
+            accepted_at=datetime.now(UTC),
+        )
+    )
+    if case == "mismatched-result":
+        result = _completed_swarm_result(running.downstream_id, session_id)
+        await _fresh_seed_completed_swarm(store, result)
+    projected_response = "legacy projected response"
+    await service._transition(
+        running,
+        UltracodeExecutionState.FINALIZING,
+        final_response=projected_response,
+        final_result_fingerprint=ultracode_result_fingerprint(
+            running.execution_id,
+            projected_response,
+        ),
+    )
+
+    with pytest.raises(ConfigurationError, match=error_pattern):
+        await service.run_turn(RunTurnRequest(prompt, turn_id=turn_id))
+
+    assert swarm_factory_calls == 0
+    assert adoption.adopt_calls == 0
+    assert runner.commit_calls == 0
+    persisted = await store.get_ultracode_execution(running.execution_id)
+    assert persisted is not None
+    assert persisted.state is UltracodeExecutionState.INDETERMINATE
+    messages = await store.load_messages(session_id)
+    assert [message.role for message in messages].count(Role.ASSISTANT) == 0
+    completed = [
+        event
+        for event in await store.load_events(session_id)
+        if event.get("kind") == AgentEventKind.TURN_COMPLETED.value
+        and isinstance(event.get("data"), dict)
+        and event["data"].get("turn_id") == turn_id
+    ]
+    assert completed == []
+
+
+@pytest.mark.asyncio
 async def test_completed_adoption_recovers_without_swarm_or_adoption_writes() -> None:
     with tempfile.TemporaryDirectory() as directory:
         cwd = Path(directory)
@@ -2681,6 +2809,290 @@ def _spawn_integrated_result_adoption_boundary(
                     await application.close()
 
     asyncio.run(run())
+
+
+def _spawn_legacy_pre_adoption_finalizing(
+    root_directory: str,
+    repository_directory: str,
+    state_directory: str,
+    prompt: str,
+    turn_id: str,
+    committed: bool,
+    exit_code: int,
+) -> NoReturn:
+    """Persist the exact pre-integration #71 boundary through durable APIs."""
+
+    async def run() -> NoReturn:
+        root = Path(root_directory)
+        repository = Path(repository_directory)
+        state_dir = Path(state_directory)
+        state = _ProductionPlanningState()
+        application: ApplicationComposition | None = None
+        binding: ConversationBinding | None = None
+        with patch.dict("os.environ", _composition_environment(root, state_dir), clear=False):
+            try:
+                application = await ApplicationComposition.open(
+                    _production_ultracode_settings(repository),
+                    provider_factory=_result_adoption_provider_factory(state),
+                )
+                binding = await application.create_binding(
+                    capabilities=_production_parent_capability(repository),
+                    reasoning_effort=ReasoningEffort.ULTRACODE,
+                )
+                session_id = await binding.runner.ensure_persisted_session()
+                store = cast(SqliteSessionStore, application.store)
+                candidate = _fresh_ultracode_candidate(
+                    session_id,
+                    turn_id,
+                    prompt,
+                    UltracodeDelegationDecision.BOUNDED_SWARM,
+                )
+                now = datetime.now(UTC)
+                candidate = replace(
+                    candidate,
+                    owner_id=f"legacy-ultracode-owner-{os.getpid()}",
+                    owner_pid=os.getpid(),
+                    owner_token=f"legacy-ultracode-token-{os.getpid()}",
+                    lease_expires_at=now + timedelta(minutes=5),
+                    created_at=now,
+                    updated_at=now,
+                )
+                claim = await store.claim_ultracode_execution(
+                    candidate,
+                    now=now,
+                    owner_is_alive=lambda _pid: False,
+                )
+                assert claim.acquired is True
+                execution = await _fresh_ultracode_transition(
+                    store,
+                    claim.execution,
+                    UltracodeExecutionState.BOUNDED_SWARM_RUNNING,
+                )
+                await store.start_turn_attempt(
+                    TurnRecoveryAttempt.create(
+                        turn_id=turn_id,
+                        session_id=session_id,
+                        input=TurnInput(prompt, source=TurnSource.USER),
+                        accepted_at=datetime.now(UTC),
+                    )
+                )
+
+                swarm = await application.create_agent_swarm_service(
+                    parent_binding=binding,
+                )
+                try:
+                    swarm_result = await swarm.run(
+                        RunAgentSwarmRequest(execution.downstream_id, prompt),
+                    )
+                finally:
+                    await swarm.close()
+                assert swarm_result.run.state is AgentSwarmRunState.COMPLETED
+                assert swarm_result.dag.state is TaskDagState.COMPLETED
+                execution = await _fresh_ultracode_transition(
+                    store,
+                    execution,
+                    UltracodeExecutionState.FINALIZING,
+                    final_response=swarm_result.final_response,
+                    final_result_fingerprint=ultracode_result_fingerprint(
+                        execution.execution_id,
+                        swarm_result.final_response,
+                    ),
+                )
+                adoption_id = ultracode_result_adoption_id(
+                    execution.execution_id,
+                    execution.downstream_id,
+                )
+                assert await store.get_result_adoption(adoption_id) is None
+                if committed:
+                    await binding.runner.commit_external_turn(
+                        prompt,
+                        response=swarm_result.final_response,
+                        turn_id=turn_id,
+                        execution_id=execution.execution_id,
+                        decision=UltracodeDelegationDecision.BOUNDED_SWARM,
+                    )
+                attempts = await store.load_turn_attempts(session_id)
+                exact = next(item for item in attempts if item.turn_id == turn_id)
+                assert (exact.resolution is TurnRecoveryResolution.COMMITTED) is committed
+                os._exit(exit_code)
+            finally:
+                if binding is not None:
+                    await binding.close()
+                if application is not None:
+                    await application.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("committed", "exit_code"),
+    [(False, 121), (True, 122)],
+    ids=("uncommitted-adopts-before-parent-success", "committed-preserves-history"),
+)
+async def test_real_composition_fresh_process_upgrades_legacy_finalizing_without_adoption(
+    tmp_path: Path,
+    committed: bool,
+    exit_code: int,
+) -> None:
+    context = mp.get_context("spawn")
+    root = tmp_path
+    repository = _make_production_repository(root)
+    (repository / "A.txt").write_text("base-a\n", encoding="utf-8")
+    (repository / "B.txt").write_text("base-b\n", encoding="utf-8")
+    _run_git(repository, "add", "A.txt", "B.txt")
+    _run_git(repository, "commit", "-qm", "add legacy adoption fixtures")
+    (repository / "U.txt").write_text("unrelated dirty\n", encoding="utf-8")
+    head_before = _run_git(repository, "rev-parse", "HEAD").decode().strip()
+    state_dir = root / "state"
+    _write_production_fixture_config(state_dir)
+    database = state_dir / "sessions.db"
+    prompt = "research these independent tasks in parallel"
+    turn_id = (
+        "legacy-finalizing-committed-turn" if committed else "legacy-finalizing-uncommitted-turn"
+    )
+    process = context.Process(
+        target=_spawn_legacy_pre_adoption_finalizing,
+        args=(
+            str(root),
+            str(repository),
+            str(state_dir),
+            prompt,
+            turn_id,
+            committed,
+            exit_code,
+        ),
+    )
+    process.start()
+    await _join_ultracode_process(process, exit_code)
+
+    execution_id, session_id = _ultracode_identity_by_turn(database, turn_id)
+    observer = SqliteSessionStore(database)
+    await observer.initialize()
+    execution_before = await observer.get_ultracode_execution(execution_id)
+    assert execution_before is not None
+    assert execution_before.decision is UltracodeDelegationDecision.BOUNDED_SWARM
+    assert execution_before.state is UltracodeExecutionState.FINALIZING
+    assert execution_before.final_response == "planned DAG completed"
+    swarm_before = await observer.get_swarm_run(execution_before.downstream_id)
+    assert swarm_before is not None
+    assert swarm_before.state is AgentSwarmRunState.COMPLETED
+    assert swarm_before.current_dag_id is not None
+    dag_before = await observer.get_task_dag(swarm_before.current_dag_id)
+    assert dag_before is not None
+    assert dag_before.state is TaskDagState.COMPLETED
+    adoption_id = ultracode_result_adoption_id(
+        execution_id,
+        execution_before.downstream_id,
+    )
+    assert await observer.get_result_adoption(adoption_id) is None
+    assert _row_count(database, "result_adoptions") == 0
+    attempts_before = await observer.load_turn_attempts(session_id)
+    exact_attempt = next(item for item in attempts_before if item.turn_id == turn_id)
+    assert (exact_attempt.resolution is TurnRecoveryResolution.COMMITTED) is committed
+    messages_before = await observer.load_messages(session_id)
+    assert [message.role for message in messages_before].count(Role.ASSISTANT) == int(committed)
+    events_before = await observer.load_events(session_id)
+    completed_before = [
+        event
+        for event in events_before
+        if event.get("kind") == AgentEventKind.TURN_COMPLETED.value
+        and isinstance(event.get("data"), dict)
+        and event["data"].get("turn_id") == turn_id
+        and event["data"].get("ultracode_execution_id") == execution_id
+    ]
+    assert len(completed_before) == int(committed)
+    resources_before = _resource_counts(state_dir)
+    parent_before = {
+        "A": (repository / "A.txt").read_bytes(),
+        "B": (repository / "B.txt").read_bytes(),
+        "C": (repository / "C.txt").read_bytes() if (repository / "C.txt").exists() else None,
+        "U": (repository / "U.txt").read_bytes(),
+    }
+
+    fresh_state = _ProductionPlanningState()
+    with patch.dict("os.environ", _composition_environment(root, state_dir), clear=False):
+        application = await ApplicationComposition.open(
+            _production_ultracode_settings(repository, resume_id=session_id),
+            provider_factory=_result_adoption_provider_factory(fresh_state),
+        )
+    binding = None
+    try:
+        binding = await application.create_binding(
+            resume_id=session_id,
+            capabilities=_production_parent_capability(repository),
+            reasoning_effort=ReasoningEffort.ULTRACODE,
+        )
+        delegation = await application.create_ultracode_delegation_service(
+            parent_binding=binding,
+        )
+        recovered = await delegation.run_turn(
+            RunTurnRequest(prompt, turn_id=turn_id),
+        )
+    finally:
+        if binding is not None:
+            await binding.close()
+        await application.close()
+
+    assert recovered.response == "planned DAG completed"
+    assert fresh_state.planner_calls == 0
+    assert fresh_state.leader_calls == 0
+    assert fresh_state.worker_calls == []
+    assert fresh_state.zero_tool_calls == 0
+    assert _resource_counts(state_dir) == resources_before
+    assert _run_git(repository, "rev-parse", "HEAD").decode().strip() == head_before
+    assert (repository / "B.txt").read_bytes() == parent_before["B"]
+    assert (repository / "U.txt").read_bytes() == parent_before["U"]
+    swarm_after = await observer.get_swarm_run(execution_before.downstream_id)
+    assert swarm_after == swarm_before
+    execution_after = await observer.get_ultracode_execution(execution_id)
+    assert execution_after is not None
+    assert execution_after.state is UltracodeExecutionState.COMPLETED
+    assert execution_after.final_response == "planned DAG completed"
+
+    adoption_after = await observer.get_result_adoption(adoption_id)
+    if committed:
+        assert adoption_after is None
+        assert _row_count(database, "result_adoptions") == 0
+        assert (repository / "A.txt").read_bytes() == parent_before["A"]
+        if parent_before["C"] is None:
+            assert not (repository / "C.txt").exists()
+        else:
+            assert (repository / "C.txt").read_bytes() == parent_before["C"]
+    else:
+        assert adoption_after is not None
+        assert adoption_after.state is ResultAdoptionState.COMPLETED
+        assert _row_count(database, "result_adoptions") == 1
+        assert [target.target.path for target in adoption_after.targets] == ["A.txt", "C.txt"]
+        assert all(target.state.value == "applied" for target in adoption_after.targets)
+        assert (repository / "A.txt").read_text(encoding="utf-8") == "worker-a\n"
+        assert (repository / "C.txt").read_text(encoding="utf-8") == "worker-c\n"
+
+    messages_after = await observer.load_messages(session_id)
+    assert [message.role for message in messages_after].count(Role.USER) == 1
+    assert [message.role for message in messages_after].count(Role.ASSISTANT) == 1
+    assert [message.content for message in messages_after if message.role is Role.ASSISTANT] == [
+        "planned DAG completed"
+    ]
+    events_after = await observer.load_events(session_id)
+    completed_after = [
+        event
+        for event in events_after
+        if event.get("kind") == AgentEventKind.TURN_COMPLETED.value
+        and isinstance(event.get("data"), dict)
+        and event["data"].get("turn_id") == turn_id
+        and event["data"].get("ultracode_execution_id") == execution_id
+    ]
+    assert len(completed_after) == 1
+    terminal_progress = [
+        event
+        for event in events_after
+        if event.get("kind") == AgentEventKind.ULTRACODE_DELEGATION_PROGRESS.value
+        and isinstance(event.get("data"), dict)
+        and event["data"].get("ultracode_execution_id") == execution_id
+        and event["data"].get("state") == UltracodeExecutionState.COMPLETED.value
+    ]
+    assert len(terminal_progress) == 1
 
 
 @pytest.mark.asyncio

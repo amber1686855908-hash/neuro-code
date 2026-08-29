@@ -91,6 +91,31 @@ The integration preserves the following fresh-process boundaries:
 Parent commit crash recovery remains owned by the existing conversation
 finalization contract. A committed parent turn is reused by exact identity.
 
+### Pre-integration `FINALIZING` compatibility
+
+ADR 0141 predates automatic Result Adoption. Under that frozen lifecycle, a
+completed Swarm could be projected to Ultracode `FINALIZING` before the parent
+external turn was committed, with no adoption record because that record did
+not yet exist. Therefore, a missing adoption record is never interpreted as
+successful adoption.
+
+- If the exact parent attempt is not committed, recovery requires the exact
+  completed Swarm and Task DAG identity, final response, and fingerprints. It
+  then enters the deterministic adoption path and permits parent success only
+  after adoption reaches `COMPLETED`, without replaying Planner, Leader,
+  Worker, provider, Swarm, Worktree, or Checkpoint work.
+- If the historical parent attempt is already `COMMITTED`, recovery preserves
+  its exact visible result and closes the Ultracode projection as `COMPLETED`.
+  It does not create an adoption record, retroactively mutate the parent
+  workspace, or claim that historical adoption occurred.
+- If the parent attempt, completed Swarm, Task DAG, result, or fingerprint
+  evidence is absent or inconsistent, recovery fails closed without parent
+  success, lower-work replay, or fabricated adoption.
+
+This compatibility classification uses the existing schema-29 durable facts;
+it introduces no schema marker and does not change the Result Adoption
+algorithm.
+
 ### Permissions and progress
 
 Adoption uses the active parent binding's existing workspace mutation,
@@ -130,5 +155,7 @@ existing Result Adoption algorithm.
 
 Validation includes focused Ultracode, Result Adoption, Agent Swarm, Task DAG,
 Writable, permission, crash/conversation recovery, and dynamic TUI tests;
-real temporary-Git production-shaped A/B/C/D fresh-process recovery; schema
-29 checks; and the repository's complete quality gates.
+real temporary-Git production-shaped A/B/C/D fresh-process recovery; spawned
+pre-integration `FINALIZING` upgrade proofs for both uncommitted and committed
+parent turns; incomplete-evidence fail-closed checks; schema 29 checks; and the
+repository's complete quality gates.
