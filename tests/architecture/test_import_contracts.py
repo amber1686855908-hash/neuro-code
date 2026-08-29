@@ -677,6 +677,38 @@ _COMPATIBILITY_IDENTITY_EXPORTS = (
         "neuro_code.application.sessions.terminal_sessions",
         ("LocalInteractiveTerminalManager", "LocalInteractiveTerminalSession"),
     ),
+    (
+        "neuro_code.acp",
+        "neuro_code.interfaces.acp.content",
+        (
+            "ConvertedPrompt",
+            "MAX_ANNOTATION_AUDIENCE",
+            "MAX_ANNOTATION_AUDIENCE_BYTES",
+            "MAX_ANNOTATIONS_BYTES",
+            "MAX_AUDIO_BLOCK_BYTES",
+            "MAX_AUDIO_BLOCKS",
+            "MAX_AUDIO_TOTAL_BYTES",
+            "MAX_EMBEDDED_BINARY_RESOURCE_BYTES",
+            "MAX_EMBEDDED_BINARY_TOTAL_BYTES",
+            "MAX_EMBEDDED_TEXT_RESOURCE_BYTES",
+            "MAX_EMBEDDED_TEXT_RESOURCES",
+            "MAX_EMBEDDED_TEXT_TOTAL_BYTES",
+            "MAX_IMAGE_BLOCK_BYTES",
+            "MAX_IMAGE_BLOCKS",
+            "MAX_IMAGE_TOTAL_BYTES",
+            "MAX_PROMPT_BLOCKS",
+            "MAX_PROMPT_BYTES",
+            "MAX_RESOURCE_FIELD_BYTES",
+            "MAX_RESOURCE_LINK_BYTES",
+            "MAX_RESOURCE_LINKS",
+            "MAX_RESOURCE_NAME_BYTES",
+            "MAX_RESOURCE_URI_BYTES",
+            "MAX_TEXT_BLOCK_BYTES",
+            "MAX_TEXT_BLOCKS",
+            "PromptBlock",
+            "convert_prompt_content",
+        ),
+    ),
 )
 
 # These are the remaining runtime compatibility facades. The quarantine is
@@ -2513,6 +2545,30 @@ assert not disallowed, disallowed
         text=True,
     )
     assert result.returncode == 0, result.stderr or result.stdout
+
+
+def test_acp_content_is_canonical_and_does_not_import_legacy_adapter() -> None:
+    path = _PROJECT_ROOT / "src" / "neuro_code" / "interfaces" / "acp" / "content.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    imported_modules: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported_modules.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module is not None:
+            imported_modules.add(node.module)
+    assert "neuro_code.acp" not in imported_modules
+    assert not any(
+        module == "neuro_code.bootstrap" or module.startswith("neuro_code.bootstrap.")
+        for module in imported_modules
+    )
+    assert not any(
+        module == "neuro_code.infrastructure" or module.startswith("neuro_code.infrastructure.")
+        for module in imported_modules
+    )
+
+    canonical = importlib.import_module("neuro_code.interfaces.acp.content")
+    assert canonical.convert_prompt_content.__module__ == canonical.__name__
+    assert canonical.ConvertedPrompt.__module__ == canonical.__name__
 
 
 def test_acp_uses_only_its_narrow_application_service() -> None:

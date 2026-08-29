@@ -67,6 +67,11 @@ CLI 不会加载 bootstrap、adapters 或 providers，也不会创建资源。
 `ApplicationComposition` 调用方。ACP 不再导入 MCP 或工作区实现，也不再直接读取组合根配置或存储；导入 ACP 不会
 加载 bootstrap、MCP adapter、SQLite 存储或 providers。
 
+ACP prompt/content 校验与转换现在由 `neuro_code.interfaces.acp.content` 作为 canonical owner；
+`neuro_code.acp` 为兼容性导入相同的 symbol。其余 ACP adapter 仍位于 `neuro_code.acp`，包括
+session lifecycle、update/history projection、client capability、MCP 和 transport handling。
+详见 [ADR 0145](adr/0145-acp-prompt-content-boundary.md)。
+
 Agent harness 行为现阶段位于 `neuro_code.application.runtime` 的明确 canonical 子模块：
 `background_task_reminders`、`agent`、`conversation` 以及循环、上下文、工具和终结模块。
 交互式审批协调由 `neuro_code.application.permissions.broker` 拥有；原
@@ -512,16 +517,20 @@ get-or-create 获得一个。SQLite keyset page 经过文件系统身份工作�
 位置，最多 256 个，不暴露内部 ID。list 不会打开 conversation/background scope，也不
 返回内容、provider 元数据、`_meta` 或额外目录。
 
-提示转换按照输入顺序接受 ACP 基线 Text、内嵌 Image、ResourceLink 与内嵌
-`TextResourceContents`。Text/resource 数量、单字段大小、annotations 序列化、ResourceLink
+提示转换现在由 `neuro_code.interfaces.acp.content` 作为 canonical owner，按照输入顺序接受
+ACP 基线 Text、内嵌 Image、内嵌 Audio、ResourceLink 与内嵌 `TextResourceContents` 或
+`BlobResourceContents`。Text/resource 数量、单字段大小、annotations 序列化、ResourceLink
 汇总字节和文本总字节都有上限。Image 只接受固定光栅 MIME 白名单中通过校验的 base64：最多
-八张、解码后单张 5 MiB、总计 10 MiB。其可选 URI、本地文件与远程链接绝不会被读取、下载或
-解引用。内嵌文本资源只接受已提供的文本：最多八个、单个 64 KiB、合计 128 KiB。它会成为带
-有界 URI 和可选 MIME 类型来源标签的文本 `ContentPart`；URI 绝不会被解析，block、resource
-及 annotation 的 `_meta` 都会被省略。规范的有序 `ContentPart` 会随用户消息持久化，因此
-供应商适配器可以在当前轮和恢复会话中应用自己的角色、MIME 和请求大小校验。只有 `uri`、
-`name`、`title`、`description`、`mimeType`、`size` 和标准 annotations 字段会进入模型可见的
-ResourceLink 描述；`_meta` 会被忽略。音频和内嵌 `BlobResourceContents` 提示块仍会被拒绝。
+八张、解码后单张 5 MiB、总计 10 MiB。Audio 接受通过校验的 base64 与 `audio/*` MIME type，
+最多八个、单个解码后 5 MiB、总计 10 MiB。内嵌文本或二进制 resource 只接受已提供的值：每种
+最多八个，文本单个 64 KiB 或二进制单个 5 MiB，分别合计 128 KiB 或 10 MiB。Resource 与
+embedded-resource URI、可选本地文件和远程链接绝不会被读取、下载或解引用。内嵌文本会成为
+带有界 URI 与可选 MIME 类型来源标签的文本 `ContentPart`，内嵌二进制数据则保持为 typed blob
+`ContentPart`；block、resource 及 annotation 的 `_meta` 都会被省略。规范的有序 `ContentPart`
+会随用户消息持久化，因此供应商适配器可以在当前轮和恢复会话中应用自己的角色、MIME 和请求
+大小校验。只有 `uri`、`name`、`title`、`description`、`mimeType`、`size` 和标准 annotations
+字段会进入模型可见的 ResourceLink 描述；`_meta` 会被忽略。详见
+[ADR 0145](adr/0145-acp-prompt-content-boundary.md)。
 
 load 历史使用另一组显式投影。可见用户与助手文本使用新的 UUID message ID 映射为标准
 message chunk。有序图片 part 会变成现有的安全图片占位符，绝不会变成 raw data URI、图片

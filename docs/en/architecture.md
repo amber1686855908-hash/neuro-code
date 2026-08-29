@@ -85,6 +85,13 @@ adapts an `ApplicationComposition` caller. ACP no longer imports MCP or workspac
 configuration or storage directly; importing ACP does not load bootstrap, the
 MCP adapter, SQLite storage, or providers.
 
+ACP prompt/content validation and conversion is now canonically owned by
+`neuro_code.interfaces.acp.content`; `neuro_code.acp` imports the same symbols
+for compatibility. The remaining ACP adapter still resides in
+`neuro_code.acp`, including session lifecycle, update/history projection,
+client capabilities, MCP, and transport handling. See
+[ADR 0145](adr/0145-acp-prompt-content-boundary.md).
+
 Agent harness behavior currently lives in the explicit canonical submodules of
 `neuro_code.application.runtime`: `background_task_reminders`, `agent`,
 `conversation`, and the loop/context/tool/finalization modules. Interactive
@@ -702,23 +709,28 @@ cursor tokens retain only the keyset position in memory, are capped at 256,
 and reveal no internal ID. List never opens a conversation/background scope or
 returns content, provider metadata, `_meta`, or additional directories.
 
-Prompt conversion accepts ACP baseline Text, inline Image, ResourceLink, and
-embedded `TextResourceContents` blocks in their supplied order. Text/resource
-counts, per-field sizes, annotation serialization, ResourceLink aggregate
-bytes, and total text bytes are bounded. An Image block accepts only validated
-base64 for a fixed raster MIME allowlist: at most eight images, 5 MiB decoded
-per image, and 10 MiB decoded in aggregate. Its optional URI, local files, and
-remote links are never read, downloaded, or dereferenced. An embedded text
-resource accepts only the supplied text: at most eight values, 64 KiB per
-value, and 128 KiB in aggregate. It becomes a labeled text `ContentPart` with
-a bounded URI and optional MIME type; its URI is never resolved, and block,
-resource, and annotation `_meta` values are omitted. The canonical ordered
-`ContentPart` values are persisted with the user message so provider adapters
-can apply their own role, MIME, and request-size validation on the current turn
-and a resumed session. Only `uri`, `name`, `title`, `description`, `mimeType`,
+Prompt conversion is canonically owned by `neuro_code.interfaces.acp.content`.
+It accepts ACP baseline Text, inline Image, inline Audio, ResourceLink, and
+embedded `TextResourceContents` or `BlobResourceContents` blocks in their
+supplied order. Text/resource counts, per-field sizes, annotation
+serialization, ResourceLink aggregate bytes, and total text bytes are bounded.
+An Image block accepts only validated base64 for a fixed raster MIME allowlist:
+at most eight images, 5 MiB decoded per image, and 10 MiB decoded in
+aggregate. Audio accepts validated base64 with an `audio/*` MIME type, with at
+most eight blocks, 5 MiB decoded per block, and 10 MiB decoded in aggregate.
+An embedded text or binary resource accepts only the supplied value: at most
+eight of each kind, 64 KiB per text value or 5 MiB per binary value, and 128
+KiB or 10 MiB in the respective aggregate. Resource and embedded-resource
+URIs, optional local files, and remote links are never read, downloaded, or
+dereferenced. Embedded text becomes a labeled text `ContentPart`, while
+embedded binary data remains a typed blob `ContentPart`; block, resource, and
+annotation `_meta` values are omitted. The canonical ordered `ContentPart`
+values are persisted with the user message so provider adapters can apply
+their own role, MIME, and request-size validation on the current turn and a
+resumed session. Only `uri`, `name`, `title`, `description`, `mimeType`,
 `size`, and standard annotation fields reach a model-visible ResourceLink
-description; `_meta` is ignored. Audio and embedded `BlobResourceContents`
-prompt blocks remain rejected.
+description; `_meta` is ignored. See
+[ADR 0145](adr/0145-acp-prompt-content-boundary.md).
 
 Load history uses a second explicit projection. Visible user and assistant text
 become standard message chunks with fresh UUID message IDs. Ordered image parts

@@ -49,6 +49,7 @@ from acp.schema import (
 )
 
 import neuro_code.acp as acp_module
+import neuro_code.interfaces.acp.content as content_module
 from neuro_code.acp import (
     ACP_CONTEXT_COMPACTION_EXTENSION,
     ACP_MCP_EXTENSION,
@@ -56,17 +57,7 @@ from neuro_code.acp import (
     ACP_STDIO_BUFFER_LIMIT_BYTES,
     ACP_SUBAGENT_LIFECYCLE_EXTENSION,
     ACP_TOOL_OUTPUT_ARTIFACT_EXTENSION,
-    MAX_ANNOTATION_AUDIENCE,
-    MAX_EMBEDDED_TEXT_RESOURCE_BYTES,
-    MAX_EMBEDDED_TEXT_RESOURCES,
-    MAX_IMAGE_BLOCKS,
-    MAX_PROMPT_BLOCKS,
-    MAX_PROMPT_BYTES,
-    MAX_RESOURCE_LINKS,
-    MAX_TEXT_BLOCK_BYTES,
-    MAX_TEXT_BLOCKS,
     NeuroCodeAcpAgent,
-    convert_prompt_content,
     serve_acp,
 )
 from neuro_code.application.acp.contracts import (
@@ -155,6 +146,18 @@ from neuro_code.domain.session_tasks import SessionTaskStatus
 from neuro_code.domain.sessions import SessionSummary
 from neuro_code.domain.tools import ToolDefinition, ToolResult
 from neuro_code.infrastructure.sandbox.local_process import ProcessTreeLocalProcessSandbox
+from neuro_code.interfaces.acp.content import (
+    MAX_ANNOTATION_AUDIENCE,
+    MAX_EMBEDDED_TEXT_RESOURCE_BYTES,
+    MAX_EMBEDDED_TEXT_RESOURCES,
+    MAX_IMAGE_BLOCKS,
+    MAX_PROMPT_BLOCKS,
+    MAX_PROMPT_BYTES,
+    MAX_RESOURCE_LINKS,
+    MAX_TEXT_BLOCK_BYTES,
+    MAX_TEXT_BLOCKS,
+    convert_prompt_content,
+)
 from neuro_code.interfaces.acp.serialization import (
     execution_outcome_metadata,
     execution_outcome_stop_reason,
@@ -1385,8 +1388,8 @@ class PromptContentTests(unittest.TestCase):
         self.assertEqual(count_error.exception.data["reason"], "too_many_embedded_text_resources")
 
         with (
-            patch.object(acp_module, "MAX_EMBEDDED_TEXT_RESOURCE_BYTES", 4),
-            patch.object(acp_module, "MAX_EMBEDDED_TEXT_TOTAL_BYTES", 3),
+            patch.object(content_module, "MAX_EMBEDDED_TEXT_RESOURCE_BYTES", 4),
+            patch.object(content_module, "MAX_EMBEDDED_TEXT_TOTAL_BYTES", 3),
             self.assertRaises(RequestError) as total_size_error,
         ):
             small = EmbeddedResourceContentBlock(
@@ -1604,7 +1607,7 @@ class PromptContentTests(unittest.TestCase):
             )
         self.assertEqual(empty_data_error.exception.data["reason"], "image_block_too_large")
 
-        with patch.object(acp_module, "MAX_IMAGE_BLOCK_BYTES", 1):
+        with patch.object(content_module, "MAX_IMAGE_BLOCK_BYTES", 1):
             oversized = ImageContentBlock(
                 type="image",
                 data=base64.b64encode(b"ab").decode("ascii"),
@@ -1615,8 +1618,8 @@ class PromptContentTests(unittest.TestCase):
         self.assertEqual(size_error.exception.data["reason"], "image_block_too_large")
 
         with (
-            patch.object(acp_module, "MAX_IMAGE_BLOCK_BYTES", 4),
-            patch.object(acp_module, "MAX_IMAGE_TOTAL_BYTES", 3),
+            patch.object(content_module, "MAX_IMAGE_BLOCK_BYTES", 4),
+            patch.object(content_module, "MAX_IMAGE_TOTAL_BYTES", 3),
             self.assertRaises(RequestError) as total_size_error,
         ):
             small_image = ImageContentBlock(

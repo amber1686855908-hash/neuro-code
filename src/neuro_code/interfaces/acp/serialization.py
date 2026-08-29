@@ -23,7 +23,10 @@ from neuro_code.domain.execution import (
 )
 from neuro_code.shared.redaction import redact_sensitive_text
 
+MAX_RESOURCE_FIELD_BYTES = 2 * 1024
+
 __all__ = [
+    "MAX_RESOURCE_FIELD_BYTES",
     "AcpStopReason",
     "execution_outcome_metadata",
     "execution_outcome_stop_reason",
