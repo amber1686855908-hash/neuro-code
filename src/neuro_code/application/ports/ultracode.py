@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Protocol, runtime_checkable
 
+from neuro_code.application.ports.result_adoption import ResultAdoptionRecord
+from neuro_code.domain.agent_swarm import AgentSwarmResult
+from neuro_code.domain.result_adoption import ResultAdoptionRequest
 from neuro_code.domain.ultracode import UltracodeExecution, UltracodeExecutionState
 
 ProcessLivenessProbe = Callable[[int | None], bool]
@@ -55,9 +58,32 @@ class UltracodeStore(Protocol):
     ) -> UltracodeExecution: ...
 
 
+@runtime_checkable
+class UltracodeResultAdoption(Protocol):
+    """Typed internal seam for adopting one exact completed Swarm result."""
+
+    async def get_result_adoption(
+        self,
+        adoption_id: str,
+        /,
+    ) -> ResultAdoptionRecord | None: ...
+
+    async def adopt(
+        self,
+        request: ResultAdoptionRequest,
+        *,
+        swarm_result: AgentSwarmResult,
+    ) -> ResultAdoptionRecord: ...
+
+
+ResultAdoptionFactory = Callable[[], Awaitable[UltracodeResultAdoption]]
+
+
 __all__ = [
     "ProcessLivenessProbe",
+    "ResultAdoptionFactory",
     "UltracodeExecutionClaim",
+    "UltracodeResultAdoption",
     "UltracodeStore",
     "UltracodeStoreError",
 ]

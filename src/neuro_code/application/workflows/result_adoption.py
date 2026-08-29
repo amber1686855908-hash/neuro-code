@@ -42,7 +42,7 @@ from neuro_code.application.workflows.subagent_capabilities import (
     WRITABLE_SUBAGENT_WRITE_TOOL_NAMES,
     SubagentCapabilitySet,
 )
-from neuro_code.domain.agent_swarm import AgentSwarmRunState
+from neuro_code.domain.agent_swarm import AgentSwarmResult, AgentSwarmRunState
 from neuro_code.domain.checkpoints import (
     CheckpointState,
     WorkspaceFileEntry,
@@ -293,10 +293,24 @@ class ResultAdoptionApplicationService:
         await self._checkpoints.initialize()
         self._initialized = True
 
-    async def prepare(self, request: ResultAdoptionRequest) -> ResultAdoptionRecord:
+    async def get_result_adoption(self, adoption_id: str) -> ResultAdoptionRecord | None:
+        """Read one durable adoption projection without creating or claiming it."""
+
+        await self.initialize()
+        if not isinstance(adoption_id, str) or not adoption_id.strip() or "\x00" in adoption_id:
+            raise ResultAdoptionError("adoption identity is invalid", kind="integrity")
+        return await self._store.get_result_adoption(adoption_id)
+
+    async def prepare(
+        self,
+        request: ResultAdoptionRequest,
+        *,
+        swarm_result: AgentSwarmResult | None = None,
+    ) -> ResultAdoptionRecord:
         await self.initialize()
         if not isinstance(request, ResultAdoptionRequest):
             raise TypeError("result adoption request must be canonical")
+        self._validate_swarm_result(request, swarm_result)
         existing = await self._store.get_result_adoption(request.adoption_id)
         if existing is not None:
             self._assert_existing_request(existing, request)
@@ -311,12 +325,17 @@ class ResultAdoptionApplicationService:
             lease_expires_at=now + timedelta(seconds=self._lease_seconds),
         )
 
-    async def adopt(self, request: ResultAdoptionRequest) -> ResultAdoptionRecord:
+    async def adopt(
+        self,
+        request: ResultAdoptionRequest,
+        *,
+        swarm_result: AgentSwarmResult | None = None,
+    ) -> ResultAdoptionRecord:
         """Adopt or recover one exact durable plan; never merge arbitrary text."""
 
         await self.initialize()
         async with self._lock:
-            record = await self.prepare(request)
+            record = await self.prepare(request, swarm_result=swarm_result)
             if record.state.terminal:
                 return record
             now = self._clock().astimezone(UTC)
@@ -358,6 +377,24 @@ class ResultAdoptionApplicationService:
                 except ResultAdoptionError as error:
                     return await self._terminate(record, ResultAdoptionState.INDETERMINATE, error)
             return record
+
+    @staticmethod
+    def _validate_swarm_result(
+        request: ResultAdoptionRequest,
+        swarm_result: AgentSwarmResult | None,
+    ) -> None:
+        if swarm_result is None:
+            return
+        if not isinstance(swarm_result, AgentSwarmResult):
+            raise ResultAdoptionError(
+                "result adoption requires the canonical Swarm result",
+                kind="integrity",
+            )
+        if swarm_result.swarm_run_id != request.swarm_run_id:
+            raise ResultAdoptionError(
+                "result adoption Swarm identity does not match the request",
+                kind="integrity",
+            )
 
     def _assert_existing_request(
         self,

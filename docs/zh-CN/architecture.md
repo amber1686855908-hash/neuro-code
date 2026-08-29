@@ -2006,9 +2006,10 @@ Parent `ConversationBinding` 继续是 capability ceiling。入口不增加 file
 network、Worktree、Checkpoint 或 Writable authority；provider adapter 也永远不会收到编造的
 原生 `ultracode` 值。CLI 与 TUI 可以进入这个内部服务，第一切片只显示有界 orchestration
 progress 和最终回答，不增加 ACP effort surface。Recursive Ultracode、普通 effort 的自动 Swarm、
-generic retry、automatic result adoption integration、merge/copy-back、checkpoint rollback、
-remote/cloud execution 和 public Swarm dashboard 仍不在 Ultracode slice 范围内。Bounded Result
-Adoption core 在下文单独规定，不会由 Ultracode 自动进入。详见 [ADR 0141](adr/0141-automatic-ultracode-delegation.md)。
+generic retry、merge/copy-back、checkpoint rollback、remote/cloud execution 和 public Swarm
+dashboard 仍不在 Ultracode slice 范围内。Bounded Result Adoption core 在下文单独规定，只有
+[ADR 0144](adr/0144-automatic-ultracode-result-adoption-integration.md) 定义的 stacked integration
+会把它接入 Ultracode。详见 [ADR 0141](adr/0141-automatic-ultracode-delegation.md)。
 
 ### Bounded durable result adoption core
 
@@ -2043,11 +2044,26 @@ Parent write 使用活动 binding 捕获的 mutation port，并保留 canonical 
 workspace/instruction、sandbox/profile 与 exact regular-file execution 层。`CREATE` 与 `UPDATE` 只有在 ordinary canonical
 rules 生成候选时才可使用既有 `WORKSPACE_EDITS` candidate；`DELETE` 绝不继承这个 broad candidate。Explicit deny、foreign
 session/root、model 或 worker text 与 memory-only grant 都不能授权 adoption。Completed adoption 在 fresh invocation 中幂等且
-零写入。Worker Worktree、lease、READY Checkpoint、DAG row 与 Swarm resource 保持 preserved。本核心不增加 automatic
-Ultracode wiring、model merge/conflict resolution、cleanup、rollback、commit/push、remote execution、TUI/ACP entrypoint 或
-通用 merge/copy-back engine。详见 [ADR 0143](adr/0143-bounded-durable-result-adoption.md)。
+零写入。Worker Worktree、lease、READY Checkpoint、DAG row 与 Swarm resource 保持 preserved。本核心不增加 model
+merge/conflict resolution、cleanup、rollback、commit/push、remote execution、TUI/ACP entrypoint 或通用 merge/copy-back
+engine。Automatic Ultracode wiring 只由独立的 [ADR 0144](adr/0144-automatic-ultracode-result-adoption-integration.md)
+composition slice 提供。详见 [ADR 0143](adr/0143-bounded-durable-result-adoption.md)。
 
 Production-shaped acceptance 覆盖真实临时 Git 的 A/B/C/D process boundary：durable Plan 在 controller death 后保留且不重复写入；尝试写入后
 死亡时从 desired image 确认 `APPLIED`；durable `APPLYING` 后出现第三方 image 时变为 `INDETERMINATE`，保留原 bytes 且零 retry write；已完成的
 adoption 由 fresh composition 重入时返回相同 durable result，且不产生新的 filesystem、Plan、target、worker、Worktree、Checkpoint 或 approval
 副作用。Schema 28→29 migration 与重复 schema-29 initialization 会保留旧 rows 与 adoption projection。
+
+### Automatic Ultracode 结果采纳集成
+
+[ADR 0144](adr/0144-automatic-ultracode-result-adoption-integration.md) 增加显式 `ULTRACODE` entry 与内部 Result Adoption
+core 之间唯一的有界 composition seam。`MAIN_MAX` 保持普通单智能体语义，并执行零次 adoption activity。`BOUNDED_SWARM`
+必须先产生精确的 canonical terminal `AgentSwarmResult`，再把这个 typed result 与实际 parent `ConversationBinding` 传给
+Result Adoption。只有 adoption 达到 `COMPLETED` 后才提交 parent external turn；只有 parent commit 成功后 Ultracode 才达到
+`COMPLETED`。
+
+Adoption identity 从精确的 Ultracode execution 与 Swarm run identity 确定性推导。`CONFLICT`、`FAILED` 与
+`INDETERMINATE` 保持为 parent 可见的有界结果；不存在 `MAIN_MAX` fallback、provider/Swarm replay、model merge、overwrite
+或静默 success。Fresh-process A/B/C/D recovery 复用精确 durable identity，保留 worker resource，并避免重放已完成的 lower
+work。集成复用既有 permission、workspace、sandbox 与 `ULTRACODE_DELEGATION_PROGRESS` contract，不暴露 raw patch、
+workspace bytes、secret，也不增加新的 model tool。

@@ -59,7 +59,7 @@ from neuro_code.application.ports.task_dag_result_relay import (
     TaskDagDependencyResultRelayStore,
 )
 from neuro_code.application.ports.tools import Tool, ToolContext
-from neuro_code.application.ports.ultracode import UltracodeStore
+from neuro_code.application.ports.ultracode import UltracodeResultAdoption, UltracodeStore
 from neuro_code.application.ports.user_interaction import UserInteractionPort
 from neuro_code.application.ports.web_fetch import (
     WebFetchExecutionPath,
@@ -462,10 +462,10 @@ class ApplicationComposition:
     ) -> ResultAdoptionApplicationService:
         """Create the explicit durable parent-result adoption capability.
 
-        The service is intentionally not wired into Ultracode, the TUI, or a
-        model-facing tool.  All source evidence, worktree/checkpoint services,
-        and the parent mutation port are bound here from the active
-        composition and conversation binding.
+        The service is an internal application capability. All source
+        evidence, worktree/checkpoint services, and the parent mutation port
+        are bound here from the active composition and conversation binding;
+        it is not a model-facing tool or a second provider path.
         """
 
         if not isinstance(parent_binding, ConversationBinding):
@@ -1596,8 +1596,9 @@ class ApplicationComposition:
         """Create the application-owned Ultracode branch router.
 
         The router receives the composition's existing parent binding and can
-        create only the already-frozen bounded Swarm for its one typed branch.
-        It does not create tools, workers, worktrees, or provider clients.
+        create only the already-frozen bounded Swarm plus the internal Result
+        Adoption capability for its one typed branch. It does not create
+        tools, workers, worktrees, or provider clients.
         """
 
         if not isinstance(parent_binding, ConversationBinding):
@@ -1611,11 +1612,18 @@ class ApplicationComposition:
                 timeout_seconds=timeout_seconds,
             )
 
+        async def result_adoption_factory() -> UltracodeResultAdoption:
+            return cast(
+                UltracodeResultAdoption,
+                self.create_result_adoption_service(parent_binding=parent_binding),
+            )
+
         return UltracodeDelegationApplicationService(
             cast(UltracodeStore, self.store),
             session_store=self.store,
             parent_binding=parent_binding,
             swarm_factory=swarm_factory,
+            result_adoption_factory=result_adoption_factory,
         )
 
     create_swarm_service = create_agent_swarm_service

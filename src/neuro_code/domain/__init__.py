@@ -195,6 +195,7 @@ from neuro_code.domain.ultracode import (
     UltracodeExecution,
     UltracodeExecutionState,
     ultracode_execution_id,
+    ultracode_result_adoption_id,
     ultracode_result_fingerprint,
     ultracode_swarm_run_id,
 )
@@ -392,6 +393,7 @@ __all__ = [
     "render_task_dag_dependency_relay",
     "terminal_result_fingerprint",
     "ultracode_execution_id",
+    "ultracode_result_adoption_id",
     "ultracode_result_fingerprint",
     "ultracode_swarm_run_id",
     "workspace_entry_fingerprint",

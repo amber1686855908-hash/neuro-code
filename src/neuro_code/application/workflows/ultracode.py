@@ -21,15 +21,22 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
+from neuro_code.application.ports.result_adoption import ResultAdoptionRecord
 from neuro_code.application.ports.storage import SessionStore
 from neuro_code.application.ports.ultracode import (
+    ResultAdoptionFactory,
     UltracodeStore,
     UltracodeStoreError,
 )
 from neuro_code.application.runtime.agent import AgentRunResult, EventSink
 from neuro_code.application.runtime.process_liveness import owner_is_alive
 from neuro_code.application.sessions.turns import RunTurnRequest
-from neuro_code.domain.agent_swarm import AgentSwarmResult, AgentSwarmRunState
+from neuro_code.domain.agent_swarm import (
+    AgentSwarmResult,
+    AgentSwarmRun,
+    AgentSwarmRunState,
+    terminal_result_fingerprint,
+)
 from neuro_code.domain.conversation.events import AgentEvent, AgentEventKind
 from neuro_code.domain.conversation.messages import ContentPart, SessionItem
 from neuro_code.domain.conversation.reasoning import ReasoningEffort
@@ -42,12 +49,18 @@ from neuro_code.domain.execution import (
     TurnRecoveryStatus,
     TurnSource,
 )
+from neuro_code.domain.result_adoption import (
+    ResultAdoptionRequest,
+    ResultAdoptionState,
+)
+from neuro_code.domain.task_dag import TaskDag, TaskDagState
 from neuro_code.domain.ultracode import (
     MAX_ULTRACODE_RESULT_BYTES,
     UltracodeDelegationDecision,
     UltracodeExecution,
     UltracodeExecutionState,
     ultracode_execution_id,
+    ultracode_result_adoption_id,
     ultracode_result_fingerprint,
     ultracode_swarm_run_id,
 )
@@ -85,6 +98,31 @@ def _response(value: str) -> str:
     ):
         raise ConfigurationError("Ultracode downstream result is outside its bounded contract")
     return value
+
+
+def _adoption_failure_response(record: ResultAdoptionRecord) -> str:
+    applied = sum(target.state.value == "applied" for target in record.targets)
+    unresolved = len(record.targets) - applied
+    conflicts = sum(target.state.value == "conflict" for target in record.targets)
+    partial_possible = applied > 0 or record.state is ResultAdoptionState.INDETERMINATE
+    return (
+        "Automatic Ultracode result adoption did not complete.\n"
+        f"adoption_id: {record.adoption_id}\n"
+        f"terminal_state: {record.state.value}\n"
+        f"applied_target_count: {applied}\n"
+        f"unresolved_target_count: {unresolved}\n"
+        f"conflict_target_count: {conflicts}\n"
+        f"partial_parent_mutation_possible: {str(partial_possible).lower()}"
+    )
+
+
+def _adoption_progress_stage(state: ResultAdoptionState) -> str:
+    return {
+        ResultAdoptionState.COMPLETED: "adoption_completed",
+        ResultAdoptionState.CONFLICT: "adoption_conflict",
+        ResultAdoptionState.FAILED: "adoption_failed",
+        ResultAdoptionState.INDETERMINATE: "adoption_indeterminate",
+    }.get(state, "adoption_terminal")
 
 
 def _context_fingerprint(items: Sequence[object]) -> str:
@@ -192,6 +230,7 @@ class UltracodeDelegationApplicationService:
         session_store: SessionStore,
         parent_binding: ConversationBinding,
         swarm_factory: SwarmFactory,
+        result_adoption_factory: ResultAdoptionFactory | None = None,
         policy: UltracodeDelegationPolicy | None = None,
         clock: Callable[[], datetime] = _now,
         lease_seconds: float = 300.0,
@@ -209,6 +248,8 @@ class UltracodeDelegationApplicationService:
             raise ConfigurationError("Ultracode session store is invalid")
         if not callable(swarm_factory):
             raise ConfigurationError("Ultracode Swarm factory is required")
+        if result_adoption_factory is not None and not callable(result_adoption_factory):
+            raise ConfigurationError("Ultracode Result Adoption factory is invalid")
         if (
             isinstance(lease_seconds, bool)
             or not isinstance(lease_seconds, (int, float))
@@ -221,6 +262,7 @@ class UltracodeDelegationApplicationService:
         self._session_store = session_store
         self._parent_binding = parent_binding
         self._swarm_factory = swarm_factory
+        self._result_adoption_factory = result_adoption_factory
         self._policy = policy or UltracodeDelegationPolicy()
         self._clock = clock
         self._lease_seconds = float(lease_seconds)
@@ -271,9 +313,7 @@ class UltracodeDelegationApplicationService:
             if run.state is UltracodeExecutionState.COMPLETED:
                 return await self._recover_completed(run, request, sink=sink)
             if run.state is UltracodeExecutionState.INDETERMINATE:
-                raise ConfigurationError(
-                    "Ultracode execution is indeterminate; automatic replay is disabled"
-                )
+                return await self._recover_indeterminate(run, request, sink=sink)
             if (
                 run.owner_id != self._owner_id
                 or run.owner_pid != self._owner_pid
@@ -420,7 +460,13 @@ class UltracodeDelegationApplicationService:
         if run.state is UltracodeExecutionState.BOUNDED_SWARM_RUNNING:
             return await self._recover_or_run_swarm(run, request, sink=sink)
         if run.state is UltracodeExecutionState.FINALIZING:
-            return await self._finalize_swarm(run, request, sink=sink)
+            adoption = await self._load_adoption_record(run)
+            return await self._finalize_swarm(
+                run,
+                request,
+                sink=sink,
+                terminal_state=self._finalizing_terminal_state(adoption),
+            )
         raise ConfigurationError(f"unsupported Ultracode lifecycle state: {run.state.value}")
 
     async def _run_main(
@@ -522,14 +568,26 @@ class UltracodeDelegationApplicationService:
             raise ConfigurationError("Ultracode Swarm returned a non-canonical result")
         if swarm_result.swarm_run_id != run.downstream_id:
             raise ConfigurationError("Ultracode Swarm result identity does not match the decision")
-        response = _response(swarm_result.final_response)
+        await self._progress(run, sink=sink, stage="swarm_completed")
+        adoption = await self._adopt_swarm_result(run, swarm_result, sink=sink)
+        if adoption.state is ResultAdoptionState.COMPLETED:
+            response = _response(swarm_result.final_response)
+            terminal_state = UltracodeExecutionState.COMPLETED
+        else:
+            response = _adoption_failure_response(adoption)
+            terminal_state = UltracodeExecutionState.INDETERMINATE
         finalized = await self._transition(
             run,
             UltracodeExecutionState.FINALIZING,
             final_response=response,
             final_result_fingerprint=ultracode_result_fingerprint(run.execution_id, response),
         )
-        return await self._finalize_swarm(finalized, request, sink=sink)
+        return await self._finalize_swarm(
+            finalized,
+            request,
+            sink=sink,
+            terminal_state=terminal_state,
+        )
 
     async def _recover_or_run_swarm(
         self,
@@ -560,13 +618,46 @@ class UltracodeDelegationApplicationService:
                 run.parent_turn_id,
                 run.execution_id,
             )
+            adoption = await self._load_adoption_record(run)
+            terminal_state = self._finalizing_terminal_state(adoption)
             finalized = await self._transition(
                 run,
                 UltracodeExecutionState.FINALIZING,
                 final_response=response,
                 final_result_fingerprint=ultracode_result_fingerprint(run.execution_id, response),
             )
-            return await self._finalize_swarm(finalized, request, sink=sink)
+            return await self._finalize_swarm(
+                finalized,
+                request,
+                sink=sink,
+                terminal_state=terminal_state,
+            )
+        lower = await self._load_completed_swarm_response(run.downstream_id, run.parent_session_id)
+        if lower is not None:
+            await self._progress(run, sink=sink, stage="swarm_completed")
+            adoption = await self._load_adoption_record(run)
+            if adoption is None or not adoption.state.terminal:
+                adoption = await self._adopt_swarm_result(run, lower, sink=sink)
+            else:
+                await self._progress_adoption(run, adoption, sink=sink)
+            if adoption.state is ResultAdoptionState.COMPLETED:
+                response = _response(lower.final_response)
+                terminal_state = UltracodeExecutionState.COMPLETED
+            else:
+                response = _adoption_failure_response(adoption)
+                terminal_state = UltracodeExecutionState.INDETERMINATE
+            finalized = await self._transition(
+                run,
+                UltracodeExecutionState.FINALIZING,
+                final_response=response,
+                final_result_fingerprint=ultracode_result_fingerprint(run.execution_id, response),
+            )
+            return await self._finalize_swarm(
+                finalized,
+                request,
+                sink=sink,
+                terminal_state=terminal_state,
+            )
         if (
             attempt.resolution is None
             and attempt.status is TurnRecoveryStatus.SAFELY_RETRYABLE
@@ -579,6 +670,151 @@ class UltracodeDelegationApplicationService:
         raise ConfigurationError(
             "Ultracode BOUNDED_SWARM has observable or unresolved parent state; replay is disabled"
         )
+
+    async def _adopt_swarm_result(
+        self,
+        run: UltracodeExecution,
+        swarm_result: AgentSwarmResult,
+        *,
+        sink: EventSink | None,
+    ) -> ResultAdoptionRecord:
+        if self._result_adoption_factory is None:
+            raise ConfigurationError("Ultracode Result Adoption factory is required")
+        adoption_id = ultracode_result_adoption_id(run.execution_id, swarm_result.swarm_run_id)
+        request = ResultAdoptionRequest(adoption_id, swarm_result.swarm_run_id)
+        adoption = await self._result_adoption_factory()
+        await self._progress(
+            run,
+            sink=sink,
+            stage="adoption_preparing",
+            adoption_id=adoption_id,
+        )
+        record = await adoption.get_result_adoption(adoption_id)
+        if record is not None:
+            self._validate_adoption_record(run, swarm_result, record)
+        if record is None or not record.state.terminal:
+            await self._progress(
+                run,
+                sink=sink,
+                stage="adoption_applying",
+                adoption_id=adoption_id,
+                adoption_state=(record.state.value if record is not None else None),
+                record=record,
+            )
+            record = await adoption.adopt(request, swarm_result=swarm_result)
+        self._validate_adoption_record(run, swarm_result, record)
+        if not record.state.terminal:
+            raise ConfigurationError("Ultracode Result Adoption did not reach a terminal state")
+        await self._progress_adoption(run, record, sink=sink)
+        return record
+
+    async def _load_adoption_record(
+        self,
+        run: UltracodeExecution,
+    ) -> ResultAdoptionRecord | None:
+        if self._result_adoption_factory is None:
+            raise ConfigurationError("Ultracode Result Adoption factory is required")
+        adoption_id = ultracode_result_adoption_id(run.execution_id, run.downstream_id)
+        adoption = await self._result_adoption_factory()
+        record = await adoption.get_result_adoption(adoption_id)
+        if record is not None:
+            self._validate_adoption_record(run, None, record)
+        return record
+
+    @staticmethod
+    def _validate_adoption_record(
+        run: UltracodeExecution,
+        swarm_result: AgentSwarmResult | None,
+        record: ResultAdoptionRecord,
+    ) -> None:
+        if not isinstance(record, ResultAdoptionRecord):
+            raise ConfigurationError("Ultracode Result Adoption returned a non-canonical record")
+        expected_id = ultracode_result_adoption_id(run.execution_id, run.downstream_id)
+        if (
+            record.adoption_id != expected_id
+            or record.plan.parent_session_id != run.parent_session_id
+            or record.plan.swarm_run_id != run.downstream_id
+        ):
+            raise ConfigurationError("Ultracode Result Adoption identity does not match the run")
+        if swarm_result is not None and (
+            record.plan.dag_id != swarm_result.dag.dag_id
+            or record.plan.dag_generation != swarm_result.dag.generation
+            or record.plan.dag_definition_fingerprint != swarm_result.dag.definition_fingerprint
+        ):
+            raise ConfigurationError("Ultracode Result Adoption DAG identity does not match")
+
+    async def _progress_adoption(
+        self,
+        run: UltracodeExecution,
+        record: ResultAdoptionRecord,
+        *,
+        sink: EventSink | None,
+    ) -> None:
+        await self._progress(
+            run,
+            sink=sink,
+            stage=_adoption_progress_stage(record.state),
+            adoption_id=record.adoption_id,
+            adoption_state=record.state.value,
+            record=record,
+        )
+
+    async def _load_completed_swarm_response(
+        self,
+        swarm_run_id: str,
+        parent_session_id: str,
+    ) -> AgentSwarmResult | None:
+        get_swarm_run = getattr(self._session_store, "get_swarm_run", None)
+        get_task_dag = getattr(self._session_store, "get_task_dag", None)
+        if not callable(get_swarm_run) or not callable(get_task_dag):
+            return None
+        try:
+            run = await get_swarm_run(swarm_run_id)
+            if run is None:
+                return None
+            if (
+                not isinstance(run, AgentSwarmRun)
+                or run.state is not AgentSwarmRunState.COMPLETED
+                or run.parent_session_id != parent_session_id
+                or run.current_dag_id is None
+                or run.current_dag_generation is None
+                or run.current_dag_definition_fingerprint is None
+                or run.final_response is None
+                or run.final_result_fingerprint is None
+            ):
+                raise ConfigurationError("completed Swarm identity is incomplete")
+            dag = await get_task_dag(run.current_dag_id)
+            if not isinstance(dag, TaskDag) or dag.state is not TaskDagState.COMPLETED:
+                raise ConfigurationError("completed Swarm DAG identity is incomplete")
+            if (
+                dag.parent_session_id != parent_session_id
+                or dag.generation != run.current_dag_generation
+                or dag.definition_fingerprint != run.current_dag_definition_fingerprint
+                or run.final_result_fingerprint
+                != terminal_result_fingerprint(
+                    run.swarm_run_id,
+                    dag.dag_id,
+                    dag.generation,
+                    dag.definition_fingerprint,
+                    run.final_response,
+                )
+            ):
+                raise ConfigurationError("completed Swarm result integrity verification failed")
+            return AgentSwarmResult(run, dag)
+        except ConfigurationError:
+            raise
+        except Exception as error:
+            raise ConfigurationError("completed Swarm result could not be recovered") from error
+
+    @staticmethod
+    def _finalizing_terminal_state(
+        record: ResultAdoptionRecord | None,
+    ) -> UltracodeExecutionState:
+        if record is None or record.state is ResultAdoptionState.COMPLETED:
+            return UltracodeExecutionState.COMPLETED
+        if record.state.terminal:
+            return UltracodeExecutionState.INDETERMINATE
+        raise ConfigurationError("Ultracode Result Adoption is not terminal during finalization")
 
     async def _has_recoverable_swarm(self, swarm_run_id: str) -> bool:
         getter = getattr(self._session_store, "get_swarm_run", None)
@@ -599,7 +835,13 @@ class UltracodeDelegationApplicationService:
         request: RunTurnRequest,
         *,
         sink: EventSink | None,
+        terminal_state: UltracodeExecutionState = UltracodeExecutionState.COMPLETED,
     ) -> AgentRunResult:
+        if terminal_state not in {
+            UltracodeExecutionState.COMPLETED,
+            UltracodeExecutionState.INDETERMINATE,
+        }:
+            raise ConfigurationError("invalid Ultracode terminal state")
         response = _response(run.final_response or "")
         result = await self._require_runner().commit_external_turn(
             request.prompt,
@@ -610,7 +852,7 @@ class UltracodeDelegationApplicationService:
             content_parts=request.content_parts,
             sink=sink,
         )
-        completed = await self._transition(run, UltracodeExecutionState.COMPLETED)
+        completed = await self._transition(run, terminal_state)
         await self._progress(completed, sink=sink)
         return result
 
@@ -622,6 +864,34 @@ class UltracodeDelegationApplicationService:
         sink: EventSink | None,
     ) -> AgentRunResult:
         response = _response(run.final_response or "")
+        return await self._require_runner().commit_external_turn(
+            request.prompt,
+            response=response,
+            turn_id=run.parent_turn_id,
+            execution_id=run.execution_id,
+            decision=run.decision,
+            content_parts=request.content_parts,
+            sink=sink,
+        )
+
+    async def _recover_indeterminate(
+        self,
+        run: UltracodeExecution,
+        request: RunTurnRequest,
+        *,
+        sink: EventSink | None,
+    ) -> AgentRunResult:
+        attempts = await self._parent_attempts(run.parent_session_id)
+        attempt = next((item for item in attempts if item.turn_id == run.parent_turn_id), None)
+        if attempt is None or attempt.resolution is not TurnRecoveryResolution.COMMITTED:
+            raise ConfigurationError(
+                "Ultracode execution is indeterminate; automatic replay is disabled"
+            )
+        response = await self._require_parent_result(
+            run.parent_session_id,
+            run.parent_turn_id,
+            run.execution_id,
+        )
         return await self._require_runner().commit_external_turn(
             request.prompt,
             response=response,
@@ -685,16 +955,43 @@ class UltracodeDelegationApplicationService:
                     return _response(response)
         raise ConfigurationError("Ultracode committed parent result is missing its exact response")
 
-    async def _progress(self, run: UltracodeExecution, *, sink: EventSink | None) -> None:
+    async def _progress(
+        self,
+        run: UltracodeExecution,
+        *,
+        sink: EventSink | None,
+        stage: str | None = None,
+        adoption_id: str | None = None,
+        adoption_state: str | None = None,
+        record: ResultAdoptionRecord | None = None,
+    ) -> None:
+        data: dict[str, object] = {
+            "ultracode_execution_id": run.execution_id,
+            "decision": run.decision.value,
+            "state": run.state.value,
+            "downstream_id": run.downstream_id,
+        }
+        if stage is not None:
+            data["stage"] = stage
+        if adoption_id is not None:
+            data["adoption_id"] = adoption_id
+        if adoption_state is not None:
+            data["adoption_state"] = adoption_state
+        if record is not None:
+            applied = sum(target.state.value == "applied" for target in record.targets)
+            data.update(
+                {
+                    "applied_target_count": applied,
+                    "unresolved_target_count": len(record.targets) - applied,
+                    "conflict_target_count": sum(
+                        target.state.value == "conflict" for target in record.targets
+                    ),
+                }
+            )
         event = AgentEvent.create(
             await self._session_store.next_event_sequence(run.parent_session_id),
             AgentEventKind.ULTRACODE_DELEGATION_PROGRESS,
-            {
-                "ultracode_execution_id": run.execution_id,
-                "decision": run.decision.value,
-                "state": run.state.value,
-                "downstream_id": run.downstream_id,
-            },
+            data,
         )
         await self._session_store.append_event(run.parent_session_id, event)
         if sink is not None:

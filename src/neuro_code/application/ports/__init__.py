@@ -151,7 +151,9 @@ from neuro_code.application.ports.tools import (
 )
 from neuro_code.application.ports.ui_preferences import UiPreferencesStore
 from neuro_code.application.ports.ultracode import (
+    ResultAdoptionFactory,
     UltracodeExecutionClaim,
+    UltracodeResultAdoption,
     UltracodeStore,
     UltracodeStoreError,
 )
@@ -378,6 +380,7 @@ __all__ = [
     "ProviderServiceDescriptor",
     "ProviderSettingsStore",
     "ResultAdoptionError",
+    "ResultAdoptionFactory",
     "ResultAdoptionRecord",
     "ResultAdoptionStore",
     "ResultAdoptionTargetRecord",
@@ -408,6 +411,7 @@ __all__ = [
     "ToolPipelineHook",
     "UiPreferencesStore",
     "UltracodeExecutionClaim",
+    "UltracodeResultAdoption",
     "UltracodeStore",
     "UltracodeStoreError",
     "UnavailableUserInteraction",

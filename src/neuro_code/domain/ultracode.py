@@ -104,6 +104,19 @@ def ultracode_swarm_run_id(execution_id: str) -> str:
     return result
 
 
+def ultracode_result_adoption_id(execution_id: str, swarm_run_id: str) -> str:
+    """Derive one deterministic adoption identity from both durable runs."""
+
+    _safe_identifier(
+        execution_id,
+        field_name="Ultracode execution id",
+        limit=MAX_ULTRACODE_EXECUTION_ID_BYTES,
+    )
+    _safe_identifier(swarm_run_id, field_name="Ultracode Swarm run id", limit=128)
+    digest = hashlib.sha256(f"{execution_id}\x00{swarm_run_id}".encode()).hexdigest()
+    return f"adopt-{digest[:48]}"
+
+
 class UltracodeDelegationDecision(StrEnum):
     """The only downstream authorities selectable by Ultracode."""
 
@@ -296,6 +309,7 @@ __all__ = [
     "UltracodeExecution",
     "UltracodeExecutionState",
     "ultracode_execution_id",
+    "ultracode_result_adoption_id",
     "ultracode_result_fingerprint",
     "ultracode_swarm_run_id",
 ]

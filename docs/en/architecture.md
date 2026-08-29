@@ -2205,11 +2205,12 @@ authority, and provider adapters never receive a fabricated native
 `ultracode` value. The CLI and TUI may enter this internal service; the first
 slice exposes only bounded orchestration progress plus the final answer and
 does not add an ACP effort surface. Recursive Ultracode, automatic delegation
-for ordinary efforts, generic retry, automatic result adoption integration,
-merge/copy-back, checkpoint rollback, remote/cloud execution, and a public
-Swarm dashboard remain outside the Ultracode slice. The bounded internal
-Result Adoption core is specified separately below; it is not automatically
-entered by Ultracode. See [ADR 0141](adr/0141-automatic-ultracode-delegation.md).
+for ordinary efforts, generic retry, merge/copy-back, checkpoint rollback,
+remote/cloud execution, and a public Swarm dashboard remain outside the
+Ultracode slice. The bounded internal Result Adoption core is specified
+separately below, and its only automatic composition seam is the stacked
+integration in [ADR 0144](adr/0144-automatic-ultracode-result-adoption-integration.md).
+See [ADR 0141](adr/0141-automatic-ultracode-delegation.md).
 
 ### Bounded durable result adoption core
 
@@ -2265,9 +2266,11 @@ broad candidate. Explicit deny, a foreign session/root, model or worker text,
 and memory-only grants cannot authorize adoption. Completed adoption is
 idempotent with zero writes on a fresh invocation. Worker Worktrees, leases,
 READY Checkpoints, DAG rows, and Swarm resources remain preserved. This core
-does not add automatic Ultracode wiring, model merge/conflict resolution,
-cleanup, rollback, commit/push, remote execution, TUI/ACP entrypoints, or a
-general merge/copy-back engine. See [ADR 0143](adr/0143-bounded-durable-result-adoption.md).
+does not add model merge/conflict resolution, cleanup, rollback, commit/push,
+remote execution, TUI/ACP entrypoints, or a general merge/copy-back engine.
+Automatic Ultracode wiring is provided only by the separate composition slice
+in [ADR 0144](adr/0144-automatic-ultracode-result-adoption-integration.md).
+See [ADR 0143](adr/0143-bounded-durable-result-adoption.md).
 
 The production-shaped acceptance covers real temporary-Git A/B/C/D process
 boundaries. A durable plan survives controller death without duplicate writes;
@@ -2278,6 +2281,27 @@ fresh composition returns the same durable result with no new filesystem,
 plan, target, worker, Worktree, Checkpoint, or approval side effects. Schema
 28-to-29 migration and repeated schema-29 initialization preserve existing
 rows and the adoption projections.
+
+### Automatic Ultracode result adoption integration
+
+[ADR 0144](adr/0144-automatic-ultracode-result-adoption-integration.md) adds
+the one bounded composition seam between the explicit `ULTRACODE` entry and
+the internal Result Adoption core. `MAIN_MAX` retains ordinary single-agent
+semantics and performs zero adoption activity. `BOUNDED_SWARM` must first
+produce the exact canonical terminal `AgentSwarmResult`, then passes that
+typed result and the actual parent `ConversationBinding` to Result Adoption.
+The parent external turn is committed only after adoption reaches
+`COMPLETED`; Ultracode reaches `COMPLETED` only after that parent commit.
+
+Adoption identity is derived deterministically from the exact Ultracode
+execution and Swarm run identities. `CONFLICT`, `FAILED`, and
+`INDETERMINATE` remain bounded parent-visible outcomes; there is no
+`MAIN_MAX` fallback, provider/Swarm replay, model merge, overwrite, or silent
+success. Fresh-process A/B/C/D recovery reuses exact durable identities,
+preserves worker resources, and avoids replaying completed lower work. The
+integration uses the existing permission, workspace, sandbox, and
+`ULTRACODE_DELEGATION_PROGRESS` contracts; it does not expose raw patches,
+workspace bytes, secrets, or a new model tool.
 
 ## Platform policy
 

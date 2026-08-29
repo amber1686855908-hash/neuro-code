@@ -8,18 +8,19 @@ import os
 import sqlite3
 import tempfile
 from collections.abc import AsyncIterator
-from contextlib import closing, suppress
+from contextlib import closing, nullcontext, suppress
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, NoReturn, cast
+from typing import Any, ClassVar, NoReturn, cast
 from unittest.mock import patch
 
 import pytest
 
 from neuro_code.application.permissions.policy import PermissionMode
 from neuro_code.application.ports.model import ModelCapabilitySet, ModelProvider, ModelToolPolicy
+from neuro_code.application.ports.result_adoption import ResultAdoptionRecord
 from neuro_code.application.ports.ultracode import (
     UltracodeStore,
     UltracodeStoreError,
@@ -34,6 +35,7 @@ from neuro_code.application.sessions.profile_conversation import (
 from neuro_code.application.sessions.turns import RunTurnRequest, SessionTurnService
 from neuro_code.application.settings import ApplicationSettings
 from neuro_code.application.workflows.agent_swarm import RunAgentSwarmRequest
+from neuro_code.application.workflows.result_adoption import ResultAdoptionApplicationService
 from neuro_code.application.workflows.subagent_capabilities import SubagentCapabilitySet
 from neuro_code.application.workflows.ultracode import (
     UltracodeDelegationApplicationService,
@@ -47,9 +49,15 @@ from neuro_code.domain.agent_swarm import (
     objective_fingerprint,
     terminal_result_fingerprint,
 )
-from neuro_code.domain.conversation.events import AgentEventKind, ModelCompleted, ModelEvent
+from neuro_code.domain.checkpoints import CheckpointId
+from neuro_code.domain.conversation.events import (
+    AgentEventKind,
+    ModelCompleted,
+    ModelEvent,
+    ModelToolCall,
+)
 from neuro_code.domain.conversation.interaction_mode import InteractionMode
-from neuro_code.domain.conversation.messages import Message, Role
+from neuro_code.domain.conversation.messages import Message, Role, ToolCall
 from neuro_code.domain.conversation.reasoning import ReasoningEffort
 from neuro_code.domain.conversation.request import context_fingerprints
 from neuro_code.domain.execution import (
@@ -59,6 +67,12 @@ from neuro_code.domain.execution import (
     TurnRecoveryResolution,
     TurnSource,
 )
+from neuro_code.domain.result_adoption import (
+    ResultAdoptionPlan,
+    ResultAdoptionRequest,
+    ResultAdoptionSource,
+    ResultAdoptionState,
+)
 from neuro_code.domain.sandbox.models import SandboxProfile
 from neuro_code.domain.task_dag import TaskDag, TaskDagNode, TaskDagNodeState, TaskDagState
 from neuro_code.domain.ultracode import (
@@ -66,9 +80,11 @@ from neuro_code.domain.ultracode import (
     UltracodeExecution,
     UltracodeExecutionState,
     ultracode_execution_id,
+    ultracode_result_adoption_id,
     ultracode_result_fingerprint,
     ultracode_swarm_run_id,
 )
+from neuro_code.domain.worktree import WorktreeId, WorktreeRepositoryIdentity
 from neuro_code.infrastructure.persistence.sqlite_session import SCHEMA_VERSION, SqliteSessionStore
 from neuro_code.shared.errors import ConfigurationError
 from tests.test_model_planning import (
@@ -80,6 +96,7 @@ from tests.test_model_planning import (
 from tests.test_model_planning import (
     _ProductionPlanningProvider,
     _ProductionPlanningState,
+    _run_git,
 )
 from tests.test_model_planning import (
     _write_fixture_config as _write_production_fixture_config,
@@ -260,7 +277,12 @@ def _binding(runner: _ParentRunner, cwd: Path) -> ConversationBinding:
             context_affinity="fixture-context",
         ),
     )
-    return ConversationBinding(runner, provider, capabilities=capabilities)
+    return ConversationBinding(
+        runner,
+        provider,
+        capabilities=capabilities,
+        workspace_root=cwd,
+    )
 
 
 def _service(
@@ -270,12 +292,19 @@ def _service(
     *,
     policy: UltracodeDelegationPolicy | None = None,
     owner_id: str = "fixture-ultracode-owner",
+    result_adoption_factory: Any | None = None,
 ) -> UltracodeDelegationApplicationService:
+    if result_adoption_factory is None:
+
+        async def result_adoption_factory() -> _FixtureResultAdoption:
+            return _FixtureResultAdoption(binding)
+
     return UltracodeDelegationApplicationService(
         cast(UltracodeStore, store),
         session_store=store,
         parent_binding=binding,
         swarm_factory=swarm_factory,
+        result_adoption_factory=result_adoption_factory,
         policy=policy,
         owner_id=owner_id,
     )
@@ -296,6 +325,111 @@ class _CompletedSwarm:
 
     async def close(self) -> None:
         self.close_calls += 1
+
+
+class _FixtureResultAdoption:
+    """Small canonical seam for unit tests that do not build worker evidence."""
+
+    _records: ClassVar[dict[str, ResultAdoptionRecord]] = {}
+
+    def __init__(self, binding: ConversationBinding) -> None:
+        self._binding = binding
+
+    async def get_result_adoption(self, adoption_id: str) -> ResultAdoptionRecord | None:
+        return self._records.get(adoption_id)
+
+    async def adopt(
+        self,
+        request: ResultAdoptionRequest,
+        *,
+        swarm_result: AgentSwarmResult,
+    ) -> ResultAdoptionRecord:
+        existing = self._records.get(request.adoption_id)
+        if existing is not None:
+            return existing
+        parent_session_id = self._binding.runner.session_id
+        if parent_session_id is None:
+            raise AssertionError("fixture adoption requires a persisted parent session")
+        root = self._binding.workspace_root
+        if root is None:
+            raise AssertionError("fixture adoption requires a parent root")
+        repository = WorktreeRepositoryIdentity(
+            common_dir=root,
+            source_worktree=root,
+            git_dir=root / ".git",
+            head_sha="0" * 40,
+        )
+        source = ResultAdoptionSource(
+            node_id="fixture-worker",
+            parent_task_id="fixture-task",
+            child_session_id="fixture-child",
+            lease_id="fixture-lease",
+            worktree_id=WorktreeId("fixture-worktree"),
+            baseline_checkpoint_id=CheckpointId("cp-fixture-checkpoint"),
+            base_commit_sha=repository.head_sha,
+            final_workspace_fingerprint="1" * 64,
+            capability_fingerprint="2" * 64,
+            grant_fingerprint="3" * 64,
+            parent_repository=repository,
+        )
+        now = datetime.now(UTC)
+        plan = ResultAdoptionPlan(
+            adoption_id=request.adoption_id,
+            parent_session_id=parent_session_id,
+            parent_workspace_root=root,
+            parent_repository=repository,
+            parent_head_sha=repository.head_sha,
+            swarm_run_id=swarm_result.swarm_run_id,
+            dag_id=swarm_result.dag.dag_id,
+            dag_generation=swarm_result.dag.generation,
+            dag_definition_fingerprint=swarm_result.dag.definition_fingerprint,
+            sources=(source,),
+            targets=(),
+            created_at=now,
+        )
+        record = ResultAdoptionRecord(
+            plan=plan,
+            state=ResultAdoptionState.COMPLETED,
+            owner_pid=os.getpid(),
+            owner_token="fixture-adoption-token",
+            lease_expires_at=now + timedelta(minutes=5),
+            created_at=now,
+            updated_at=now,
+            targets=(),
+        )
+        self._records[request.adoption_id] = record
+        return record
+
+
+class _RecordingResultAdoption:
+    def __init__(
+        self,
+        record: ResultAdoptionRecord,
+        events: list[str] | None = None,
+        adopt_result: ResultAdoptionRecord | None = None,
+    ) -> None:
+        self.record = record
+        self.events = events if events is not None else []
+        self.adopt_result = adopt_result or record
+        self.get_calls = 0
+        self.adopt_calls = 0
+
+    async def get_result_adoption(self, adoption_id: str) -> ResultAdoptionRecord | None:
+        self.get_calls += 1
+        self.events.append("adoption_get")
+        return self.record if adoption_id == self.record.adoption_id else None
+
+    async def adopt(
+        self,
+        request: ResultAdoptionRequest,
+        *,
+        swarm_result: AgentSwarmResult,
+    ) -> ResultAdoptionRecord:
+        self.adopt_calls += 1
+        self.events.append("adoption_adopt")
+        if request.swarm_run_id != swarm_result.swarm_run_id:
+            raise AssertionError("adoption must receive the exact Swarm result identity")
+        return self.adopt_result
 
 
 class _FailingSwarm:
@@ -417,6 +551,68 @@ class _DurablePlanningProvider(_ProductionPlanningProvider):
                     await release_task
 
 
+class _ResultAdoptionPlanningProvider(_ProductionPlanningProvider):
+    """Real DAG fixture whose preserved workers produce A.txt and C.txt."""
+
+    def _worker_node_id(self, contents: str) -> str | None:
+        return next(
+            (
+                candidate
+                for candidate in ("a", "b", "c", "d")
+                if f"planning-node-{candidate}" in contents
+            ),
+            None,
+        )
+
+    async def stream(
+        self,
+        context: Any,
+        tools: Any,
+        *,
+        tool_policy: ModelToolPolicy = ModelToolPolicy.ALLOWED,
+    ) -> AsyncIterator[ModelEvent]:
+        contents = "\n".join(message.content for message in context.messages)
+        if "bounded DAG Planner" in contents or "Leader decision authority" in contents:
+            async for event in super().stream(context, tools, tool_policy=tool_policy):
+                yield event
+            return
+        node_id = self._worker_node_id(contents)
+        if node_id not in {"a", "b"}:
+            async for event in super().stream(context, tools, tool_policy=tool_policy):
+                yield event
+            return
+        if not tools:
+            raise AssertionError(f"Result Adoption worker {node_id} received no tools")
+        tool_result_seen = any(message.role is Role.TOOL for message in context.messages)
+        if tool_result_seen:
+            yield ModelCompleted("stop", response_text=f"production result {node_id}")
+            async with self._state.lock:
+                self._state.active -= 1
+                self._state.timeline.append(f"complete:{node_id}")
+            return
+        self._state.worker_calls.append(node_id)
+        async with self._state.lock:
+            self._state.started.append(node_id)
+            self._state.timeline.append(f"start:{node_id}")
+            self._state.active += 1
+            self._state.max_active = max(self._state.max_active, self._state.active)
+            if {"b", "c"}.issubset(self._state.started):
+                self._state.fanout_started.set()
+        if node_id == "b":
+            self._state.release_fanout.set()
+            patch = "*** Begin Patch\n*** Add File: C.txt\n+worker-c\n*** End Patch"
+        else:
+            patch = "*** Begin Patch\n*** Update File: A.txt\n@@\n-base-a\n+worker-a\n*** End Patch"
+        yield ModelToolCall(
+            ToolCall(
+                f"result-adoption-{node_id}",
+                "apply_patch",
+                {"patch": patch},
+            )
+        )
+        yield ModelCompleted("tool_calls")
+
+
 def _production_ultracode_settings(
     repository: Path,
     *,
@@ -446,6 +642,13 @@ def _durable_planning_provider_factory(
 ) -> Any:
     def factory(_config: Any, _failover: bool) -> ModelProvider:
         return cast(ModelProvider, _DurablePlanningProvider(state, call_log, phase))
+
+    return factory
+
+
+def _result_adoption_provider_factory(state: _ProductionPlanningState) -> Any:
+    def factory(_config: Any, _failover: bool) -> ModelProvider:
+        return cast(ModelProvider, _ResultAdoptionPlanningProvider(state))
 
     return factory
 
@@ -658,6 +861,24 @@ def _completed_swarm_result(swarm_run_id: str, parent_session_id: str) -> AgentS
         ),
     )
     return AgentSwarmResult(run, completed_dag)
+
+
+async def _fixture_adoption_record(
+    binding: ConversationBinding,
+    result: AgentSwarmResult,
+    *,
+    execution_id: str,
+    state: ResultAdoptionState = ResultAdoptionState.COMPLETED,
+) -> ResultAdoptionRecord:
+    request = ResultAdoptionRequest(
+        ultracode_result_adoption_id(execution_id, result.swarm_run_id),
+        result.swarm_run_id,
+    )
+    record = await _FixtureResultAdoption(binding).adopt(
+        request,
+        swarm_result=result,
+    )
+    return replace(record, state=state, error_kind=(state.value if state.terminal else None))
 
 
 async def _store(tmp_path: Path) -> SqliteSessionStore:
@@ -1600,7 +1821,7 @@ async def test_ultracode_recovery_reuses_running_branch_and_fails_closed() -> No
             RunTurnRequest(recover_prompt, turn_id=recover_run.parent_turn_id)
         )
         assert recovered.response == lower_result.final_response
-        assert next_swarm.calls == 1
+        assert next_swarm.calls == 0
 
 
 @pytest.mark.asyncio
@@ -1760,6 +1981,300 @@ def test_result_identity_is_exact_and_not_text_based() -> None:
     second = ultracode_result_fingerprint(execution_id, "same text")
     assert first == second
     assert first != ultracode_result_fingerprint(execution_id, "different text")
+
+
+def test_result_adoption_identity_is_deterministic_and_bound_to_both_runs() -> None:
+    first = ultracode_result_adoption_id("execution-a", "swarm-a")
+    assert first == ultracode_result_adoption_id("execution-a", "swarm-a")
+    assert first != ultracode_result_adoption_id("execution-b", "swarm-a")
+    assert first != ultracode_result_adoption_id("execution-a", "swarm-b")
+    assert first.startswith("adopt-")
+
+
+@pytest.mark.asyncio
+async def test_main_max_performs_zero_result_adoption_activity() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        cwd = Path(directory)
+        store = await _store(cwd)
+        runner = _ParentRunner(store, cwd)
+        binding = _binding(runner, cwd)
+        adoption_calls = 0
+
+        async def forbidden_adoption_factory() -> Any:
+            nonlocal adoption_calls
+            adoption_calls += 1
+            raise AssertionError("MAIN_MAX must not construct Result Adoption")
+
+        async def forbidden_swarm_factory() -> Any:
+            raise AssertionError("MAIN_MAX must not construct a Swarm")
+
+        result = await _service(
+            store,
+            binding,
+            forbidden_swarm_factory,
+            result_adoption_factory=forbidden_adoption_factory,
+        ).run_turn(RunTurnRequest("fix one local typo", turn_id="main-only-adoption"))
+        assert result.response == "main answer"
+        assert adoption_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_bounded_swarm_adopts_exact_result_before_parent_commit() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        cwd = Path(directory)
+        store = await _store(cwd)
+        events: list[str] = []
+
+        class OrderedRunner(_ParentRunner):
+            async def commit_external_turn(self, prompt: str, **kwargs: Any) -> AgentRunResult:
+                events.append("parent_commit")
+                return await super().commit_external_turn(prompt, **kwargs)
+
+        runner = OrderedRunner(store, cwd)
+        binding = _binding(runner, cwd)
+        session_id = await runner.ensure_persisted_session()
+        turn_id = "ordered-adoption-turn"
+        execution_id = ultracode_execution_id(session_id, turn_id)
+        result = _completed_swarm_result(ultracode_swarm_run_id(execution_id), session_id)
+        record = await _fixture_adoption_record(
+            binding,
+            result,
+            execution_id=execution_id,
+            state=ResultAdoptionState.CLAIMED,
+        )
+        completed_record = replace(record, state=ResultAdoptionState.COMPLETED, error_kind=None)
+        adapter = _RecordingResultAdoption(record, events, adopt_result=completed_record)
+
+        class OrderedSwarm(_CompletedSwarm):
+            async def run(self, request: RunAgentSwarmRequest, *, sink=None) -> AgentSwarmResult:
+                events.append("swarm_completed")
+                return await super().run(request, sink=sink)
+
+        swarm = OrderedSwarm(result)
+
+        async def swarm_factory() -> OrderedSwarm:
+            return swarm
+
+        response = await _service(
+            store,
+            binding,
+            swarm_factory,
+            result_adoption_factory=lambda: _completed_awaitable(adapter),
+        ).run_turn(
+            RunTurnRequest(
+                "research these independent tasks in parallel",
+                turn_id=turn_id,
+            )
+        )
+        assert response.response == result.final_response
+        assert events == ["swarm_completed", "adoption_get", "adoption_adopt", "parent_commit"]
+        assert adapter.adopt_calls == 1
+
+
+async def _completed_awaitable(value: Any) -> Any:
+    return value
+
+
+@pytest.mark.asyncio
+async def test_adoption_conflict_is_parent_visible_and_never_falls_back() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        cwd = Path(directory)
+        store = await _store(cwd)
+        runner = _ParentRunner(store, cwd)
+        binding = _binding(runner, cwd)
+        session_id = await runner.ensure_persisted_session()
+        turn_id = "conflicting-adoption-turn"
+        execution_id = ultracode_execution_id(session_id, turn_id)
+        result = _completed_swarm_result(ultracode_swarm_run_id(execution_id), session_id)
+        record = await _fixture_adoption_record(
+            binding,
+            result,
+            execution_id=execution_id,
+            state=ResultAdoptionState.CONFLICT,
+        )
+        adapter = _RecordingResultAdoption(record)
+        swarm = _CompletedSwarm(result)
+
+        async def swarm_factory() -> _CompletedSwarm:
+            return swarm
+
+        response = await _service(
+            store,
+            binding,
+            swarm_factory,
+            result_adoption_factory=lambda: _completed_awaitable(adapter),
+        ).run_turn(
+            RunTurnRequest(
+                "research these independent tasks in parallel",
+                turn_id=turn_id,
+            )
+        )
+        assert "terminal_state: conflict" in response.response
+        assert "adoption_id:" in response.response
+        assert runner.run_calls == 0
+        assert runner.commit_calls == 1
+        assert adapter.adopt_calls == 0
+        execution = await store.get_ultracode_execution(execution_id)
+        assert execution is not None
+        assert execution.state is UltracodeExecutionState.INDETERMINATE
+
+
+async def _seed_bounded_recovery_case(
+    store: SqliteSessionStore,
+    service: UltracodeDelegationApplicationService,
+    session_id: str,
+    prompt: str,
+    turn_id: str,
+) -> tuple[UltracodeExecution, AgentSwarmResult]:
+    candidate = _fresh_ultracode_candidate(
+        session_id,
+        turn_id,
+        prompt,
+        UltracodeDelegationDecision.BOUNDED_SWARM,
+    )
+    owned = replace(
+        candidate,
+        owner_id=service.owner_id,
+        owner_pid=os.getpid(),
+        owner_token=service._owner_token,
+    )
+    claim = await store.claim_ultracode_execution(
+        owned,
+        now=datetime.now(UTC),
+        owner_is_alive=lambda _pid: True,
+    )
+    assert claim.acquired is True
+    run = await service._transition(
+        claim.execution,
+        UltracodeExecutionState.BOUNDED_SWARM_RUNNING,
+    )
+    await store.start_turn_attempt(
+        TurnRecoveryAttempt.create(
+            turn_id=turn_id,
+            session_id=session_id,
+            input=TurnInput(prompt, source=TurnSource.USER),
+            accepted_at=datetime.now(UTC),
+        )
+    )
+    result = _completed_swarm_result(run.downstream_id, session_id)
+    await _fresh_seed_completed_swarm(store, result)
+    return run, result
+
+
+@pytest.mark.asyncio
+async def test_completed_adoption_recovers_without_swarm_or_adoption_writes() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        cwd = Path(directory)
+        store = await _store(cwd)
+        runner = _ParentRunner(store, cwd)
+        binding = _binding(runner, cwd)
+        session_id = await runner.ensure_persisted_session()
+
+        async def forbidden_swarm_factory() -> Any:
+            raise AssertionError("completed Swarm recovery must not construct the lower workflow")
+
+        service = _service(store, binding, forbidden_swarm_factory)
+        run, result = await _seed_bounded_recovery_case(
+            store,
+            service,
+            session_id,
+            "recover a completed bounded result",
+            "adoption-recovery-completed",
+        )
+        record = await _fixture_adoption_record(
+            binding,
+            result,
+            execution_id=run.execution_id,
+        )
+        adapter = _RecordingResultAdoption(record)
+        recovery = _service(
+            store,
+            binding,
+            forbidden_swarm_factory,
+            result_adoption_factory=lambda: _completed_awaitable(adapter),
+            owner_id="adoption-recovery-owner",
+            policy=_UnexpectedPolicy(),
+        )
+        with patch(
+            "neuro_code.application.workflows.ultracode.owner_is_alive",
+            return_value=False,
+        ):
+            response = await recovery.run_turn(
+                RunTurnRequest(
+                    "recover a completed bounded result",
+                    turn_id=run.parent_turn_id,
+                )
+            )
+        assert response.response == result.final_response
+        assert adapter.get_calls == 1
+        assert adapter.adopt_calls == 0
+        persisted = await store.get_ultracode_execution(run.execution_id)
+        assert persisted is not None
+        assert persisted.state is UltracodeExecutionState.COMPLETED
+        assert runner.commit_calls == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "terminal_state",
+    [ResultAdoptionState.INDETERMINATE, ResultAdoptionState.CONFLICT],
+)
+async def test_terminal_adoption_recovery_is_bounded_and_never_replays_swarm(
+    terminal_state: ResultAdoptionState,
+) -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        cwd = Path(directory)
+        store = await _store(cwd)
+        runner = _ParentRunner(store, cwd)
+        binding = _binding(runner, cwd)
+        session_id = await runner.ensure_persisted_session()
+        service = _service(
+            store,
+            binding,
+            lambda: _never_construct_swarm(),
+        )
+        run, result = await _seed_bounded_recovery_case(
+            store,
+            service,
+            session_id,
+            "recover a terminal adoption result",
+            f"adoption-recovery-{terminal_state.value}",
+        )
+        record = await _fixture_adoption_record(
+            binding,
+            result,
+            execution_id=run.execution_id,
+            state=terminal_state,
+        )
+        adapter = _RecordingResultAdoption(record)
+        recovery = _service(
+            store,
+            binding,
+            lambda: _never_construct_swarm(),
+            result_adoption_factory=lambda: _completed_awaitable(adapter),
+            owner_id=f"terminal-recovery-{terminal_state.value}",
+            policy=_UnexpectedPolicy(),
+        )
+        with patch(
+            "neuro_code.application.workflows.ultracode.owner_is_alive",
+            return_value=False,
+        ):
+            response = await recovery.run_turn(
+                RunTurnRequest(
+                    "recover a terminal adoption result",
+                    turn_id=run.parent_turn_id,
+                )
+            )
+        assert f"terminal_state: {terminal_state.value}" in response.response
+        assert adapter.adopt_calls == 0
+        assert adapter.record == record
+        persisted = await store.get_ultracode_execution(run.execution_id)
+        assert persisted is not None
+        assert persisted.state is UltracodeExecutionState.INDETERMINATE
+
+
+async def _never_construct_swarm() -> Any:
+    raise AssertionError("recovery must not construct a Swarm")
 
 
 @pytest.mark.asyncio
@@ -2025,6 +2540,437 @@ async def test_real_composition_ultracode_decomposable_task_uses_existing_bounde
                 if binding is not None:
                     await binding.close()
                 await application.close()
+
+
+def _spawn_integrated_result_adoption_boundary(
+    root_directory: str,
+    repository_directory: str,
+    state_directory: str,
+    turn_id: str,
+    stage: str,
+    exit_code: int,
+) -> NoReturn:
+    async def run() -> NoReturn:
+        root = Path(root_directory)
+        repository = Path(repository_directory)
+        state_dir = Path(state_directory)
+        state = _ProductionPlanningState()
+        application: ApplicationComposition | None = None
+        binding: ConversationBinding | None = None
+        with patch.dict("os.environ", _composition_environment(root, state_dir), clear=False):
+            try:
+                application = await ApplicationComposition.open(
+                    _production_ultracode_settings(repository),
+                    provider_factory=_result_adoption_provider_factory(state),
+                )
+                binding = await application.create_binding(
+                    capabilities=_production_parent_capability(repository),
+                    reasoning_effort=ReasoningEffort.ULTRACODE,
+                )
+                store = cast(SqliteSessionStore, application.store)
+                delegation = await application.create_ultracode_delegation_service(
+                    parent_binding=binding,
+                )
+                turn_service = SessionTurnService(
+                    binding.runner,
+                    ultracode_delegate=lambda request, sink: delegation.run_turn(
+                        request,
+                        sink=sink,
+                    ),
+                )
+                if stage == "B":
+                    original_commit = AgentConversation.commit_external_turn
+
+                    async def hooked_commit(
+                        conversation: AgentConversation,
+                        external_prompt: str,
+                        *,
+                        response: str,
+                        turn_id: str,
+                        execution_id: str,
+                        decision: UltracodeDelegationDecision,
+                        content_parts=(),
+                        sink=None,
+                    ) -> AgentRunResult:
+                        if decision is UltracodeDelegationDecision.BOUNDED_SWARM:
+                            execution = await store.get_ultracode_execution(execution_id)
+                            assert execution is not None
+                            adoption = await store.get_result_adoption(
+                                ultracode_result_adoption_id(
+                                    execution_id,
+                                    execution.downstream_id,
+                                )
+                            )
+                            assert execution.state is UltracodeExecutionState.FINALIZING
+                            assert adoption is not None
+                            assert adoption.state is ResultAdoptionState.COMPLETED
+                            assert turn_id == "result-adoption-recovery-turn"
+                            os._exit(exit_code)
+                        return await original_commit(
+                            conversation,
+                            external_prompt,
+                            response=response,
+                            turn_id=turn_id,
+                            execution_id=execution_id,
+                            decision=decision,
+                            content_parts=content_parts,
+                            sink=sink,
+                        )
+
+                    commit_patch = patch.object(
+                        AgentConversation,
+                        "commit_external_turn",
+                        new=hooked_commit,
+                    )
+                else:
+                    commit_patch = nullcontext()
+                if stage in {"A", "C", "D"}:
+                    original_adopt = ResultAdoptionApplicationService.adopt
+
+                    async def hooked_adopt(
+                        adoption_service: ResultAdoptionApplicationService,
+                        request: ResultAdoptionRequest,
+                        *,
+                        swarm_result: AgentSwarmResult | None = None,
+                    ) -> ResultAdoptionRecord:
+                        prepared = await adoption_service.prepare(
+                            request,
+                            swarm_result=swarm_result,
+                        )
+                        assert prepared.state is ResultAdoptionState.CLAIMED
+                        if stage == "A":
+                            os._exit(exit_code)
+                        if stage == "C":
+                            await adoption_service._transition_adoption(
+                                prepared,
+                                ResultAdoptionState.INDETERMINATE,
+                                error_kind="process_crash",
+                            )
+                            os._exit(exit_code)
+                        (repository / "A.txt").write_text(
+                            "parent-conflict\n",
+                            encoding="utf-8",
+                        )
+                        result = await original_adopt(
+                            adoption_service,
+                            request,
+                            swarm_result=swarm_result,
+                        )
+                        assert result.state is ResultAdoptionState.CONFLICT
+                        os._exit(exit_code)
+
+                    adopt_patch = patch.object(
+                        ResultAdoptionApplicationService,
+                        "adopt",
+                        new=hooked_adopt,
+                    )
+                else:
+                    adopt_patch = nullcontext()
+                with commit_patch, adopt_patch:
+                    await turn_service.run_turn(
+                        RunTurnRequest(
+                            "research these independent tasks in parallel",
+                            turn_id=turn_id,
+                        )
+                    )
+                raise AssertionError("integrated Result Adoption process did not crash")
+            finally:
+                if binding is not None:
+                    await binding.close()
+                if application is not None:
+                    await application.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.asyncio
+async def test_real_composition_ultracode_swarm_adopts_worker_changes_safely() -> None:
+    with tempfile.TemporaryDirectory(
+        prefix="neuro-ultracode-result-adoption-production-"
+    ) as directory:
+        root = Path(directory)
+        repository = _make_production_repository(root)
+        (repository / "A.txt").write_text("base-a\n", encoding="utf-8")
+        (repository / "B.txt").write_text("base-b\n", encoding="utf-8")
+        _run_git(repository, "add", "A.txt", "B.txt")
+        _run_git(repository, "commit", "-qm", "add adoption fixtures")
+        (repository / "U.txt").write_text("unrelated dirty\n", encoding="utf-8")
+        head_before = _run_git(repository, "rev-parse", "HEAD").decode().strip()
+        state_dir = root / "state"
+        _write_production_fixture_config(state_dir)
+        state = _ProductionPlanningState()
+        environment = _composition_environment(root, state_dir)
+        progress: list[dict[str, object]] = []
+
+        with patch.dict("os.environ", environment, clear=False):
+            application = await ApplicationComposition.open(
+                _production_ultracode_settings(repository),
+                provider_factory=_result_adoption_provider_factory(state),
+            )
+        binding = None
+        try:
+            binding = await application.create_binding(
+                capabilities=_production_parent_capability(repository),
+                reasoning_effort=ReasoningEffort.ULTRACODE,
+            )
+            service = await application.create_ultracode_delegation_service(
+                parent_binding=binding,
+            )
+
+            async def sink(event: Any) -> None:
+                if event.kind is AgentEventKind.ULTRACODE_DELEGATION_PROGRESS:
+                    data = event.data
+                    if isinstance(data, dict):
+                        progress.append(dict(data))
+
+            result = await service.run_turn(
+                RunTurnRequest(
+                    "research these independent tasks in parallel",
+                    turn_id="production-result-adoption-turn",
+                ),
+                sink=sink,
+            )
+            store = cast(SqliteSessionStore, application.store)
+            session_id = result.session_id
+            execution_id = ultracode_execution_id(
+                session_id,
+                "production-result-adoption-turn",
+            )
+            execution = await store.get_ultracode_execution(execution_id)
+            assert execution is not None
+            assert execution.state is UltracodeExecutionState.COMPLETED
+            assert execution.decision is UltracodeDelegationDecision.BOUNDED_SWARM
+            adoption_id = ultracode_result_adoption_id(execution_id, execution.downstream_id)
+            adoption = await store.get_result_adoption(adoption_id)
+            assert adoption is not None
+            assert adoption.state is ResultAdoptionState.COMPLETED
+            assert [target.target.path for target in adoption.targets] == ["A.txt", "C.txt"]
+            assert all(target.state.value == "applied" for target in adoption.targets)
+            assert result.response == "planned DAG completed"
+            assert (repository / "A.txt").read_text(encoding="utf-8") == "worker-a\n"
+            assert (repository / "B.txt").read_text(encoding="utf-8") == "base-b\n"
+            assert (repository / "C.txt").read_text(encoding="utf-8") == "worker-c\n"
+            assert (repository / "U.txt").read_text(encoding="utf-8") == "unrelated dirty\n"
+            assert _run_git(repository, "rev-parse", "HEAD").decode().strip() == head_before
+
+            leases = await store.list_writable_subagent_leases(parent_session_id=session_id)
+            assert len(leases) == 4
+            assert all(lease.state.value == "preserved" for lease in leases)
+            with closing(sqlite3.connect(state_dir / "worktrees.db")) as connection:
+                worktree_states = [
+                    str(row[0])
+                    for row in connection.execute(
+                        "SELECT state FROM managed_worktrees ORDER BY worktree_id"
+                    ).fetchall()
+                ]
+            assert worktree_states == ["ready"] * 4
+            with closing(sqlite3.connect(state_dir / "checkpoints.db")) as connection:
+                checkpoint_states = [
+                    str(row[0])
+                    for row in connection.execute(
+                        "SELECT state FROM checkpoints ORDER BY checkpoint_id"
+                    ).fetchall()
+                ]
+            assert checkpoint_states == ["ready"] * 4
+
+            messages = await store.load_messages(session_id)
+            assert [message.role for message in messages].count(Role.ASSISTANT) == 1
+            completed = [
+                event
+                for event in await store.load_events(session_id)
+                if event.get("kind") == AgentEventKind.TURN_COMPLETED.value
+                and isinstance(event.get("data"), dict)
+                and event["data"].get("turn_id") == "production-result-adoption-turn"
+            ]
+            assert len(completed) == 1
+            persisted_progress = [
+                event
+                for event in await store.load_events(session_id)
+                if event.get("kind") == AgentEventKind.ULTRACODE_DELEGATION_PROGRESS.value
+                and isinstance(event.get("data"), dict)
+            ]
+            stages = [
+                str(cast(dict[str, object], event["data"]).get("stage"))
+                for event in persisted_progress
+            ]
+            assert stages.index("swarm_completed") < stages.index("adoption_preparing")
+            assert stages.index("adoption_preparing") < stages.index("adoption_applying")
+            assert stages.index("adoption_applying") < stages.index("adoption_completed")
+        finally:
+            if binding is not None:
+                await binding.close()
+            await application.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("stage", "exit_code"),
+    [("A", 101), ("B", 102), ("C", 103), ("D", 104)],
+)
+async def test_real_composition_fresh_process_result_adoption_recovery_matrix(
+    tmp_path: Path,
+    stage: str,
+    exit_code: int,
+) -> None:
+    context = mp.get_context("spawn")
+    root = tmp_path
+    repository = _make_production_repository(root)
+    (repository / "A.txt").write_text("base-a\n", encoding="utf-8")
+    (repository / "B.txt").write_text("base-b\n", encoding="utf-8")
+    _run_git(repository, "add", "A.txt", "B.txt")
+    _run_git(repository, "commit", "-qm", "add adoption recovery fixtures")
+    (repository / "U.txt").write_text("unrelated dirty\n", encoding="utf-8")
+    head_before = _run_git(repository, "rev-parse", "HEAD").decode().strip()
+    state_dir = root / "state"
+    _write_production_fixture_config(state_dir)
+    database = state_dir / "sessions.db"
+    turn_id = "result-adoption-recovery-turn"
+    process = context.Process(
+        target=_spawn_integrated_result_adoption_boundary,
+        args=(str(root), str(repository), str(state_dir), turn_id, stage, exit_code),
+    )
+    process.start()
+    await _join_ultracode_process(process, exit_code)
+
+    execution_id, session_id = _ultracode_identity_by_turn(database, turn_id)
+    observer = SqliteSessionStore(database)
+    await observer.initialize()
+    execution_before = await observer.get_ultracode_execution(execution_id)
+    assert execution_before is not None
+    assert execution_before.downstream_id == ultracode_swarm_run_id(execution_id)
+    lower_before = await observer.get_swarm_run(execution_before.downstream_id)
+    assert lower_before is not None
+    assert lower_before.state is AgentSwarmRunState.COMPLETED
+    adoption_id = ultracode_result_adoption_id(execution_id, execution_before.downstream_id)
+    adoption_before = await observer.get_result_adoption(adoption_id)
+    assert adoption_before is not None
+    expected_adoption_state = {
+        "A": ResultAdoptionState.CLAIMED,
+        "B": ResultAdoptionState.COMPLETED,
+        "C": ResultAdoptionState.INDETERMINATE,
+        "D": ResultAdoptionState.CONFLICT,
+    }[stage]
+    assert adoption_before.state is expected_adoption_state
+    expected_execution_state = (
+        UltracodeExecutionState.FINALIZING
+        if stage == "B"
+        else UltracodeExecutionState.BOUNDED_SWARM_RUNNING
+    )
+    assert execution_before.state is expected_execution_state
+    assert [target.target.path for target in adoption_before.targets] == ["A.txt", "C.txt"]
+    assert _resource_counts(state_dir)["writable_subagent_leases"] == 4
+    parent_before_recovery = {
+        "A": (repository / "A.txt").read_bytes(),
+        "B": (repository / "B.txt").read_bytes(),
+        "C": (repository / "C.txt").read_bytes() if (repository / "C.txt").exists() else None,
+        "U": (repository / "U.txt").read_bytes(),
+    }
+    resources_before_recovery = _resource_counts(state_dir)
+
+    fresh_state = _ProductionPlanningState()
+    with patch.dict("os.environ", _composition_environment(root, state_dir), clear=False):
+        application = await ApplicationComposition.open(
+            _production_ultracode_settings(repository, resume_id=session_id),
+            provider_factory=_result_adoption_provider_factory(fresh_state),
+        )
+    binding = None
+    try:
+        binding = await application.create_binding(
+            resume_id=session_id,
+            capabilities=_production_parent_capability(repository),
+            reasoning_effort=ReasoningEffort.ULTRACODE,
+        )
+        delegation = await application.create_ultracode_delegation_service(
+            parent_binding=binding,
+        )
+        turn_service = SessionTurnService(
+            binding.runner,
+            ultracode_delegate=lambda request, sink: delegation.run_turn(
+                request,
+                sink=sink,
+            ),
+        )
+        recovered = await turn_service.run_turn(
+            RunTurnRequest(
+                "research these independent tasks in parallel",
+                turn_id=turn_id,
+            )
+        )
+    finally:
+        if binding is not None:
+            await binding.close()
+        await application.close()
+
+    assert fresh_state.planner_calls == 0
+    assert fresh_state.leader_calls == 0
+    assert fresh_state.worker_calls == []
+    assert fresh_state.zero_tool_calls == 0
+    assert _resource_counts(state_dir) == resources_before_recovery
+    assert _run_git(repository, "rev-parse", "HEAD").decode().strip() == head_before
+    assert (repository / "B.txt").read_bytes() == parent_before_recovery["B"]
+    assert (repository / "U.txt").read_bytes() == parent_before_recovery["U"]
+    lower_after = await observer.get_swarm_run(execution_before.downstream_id)
+    assert lower_after == lower_before
+
+    execution_after = await observer.get_ultracode_execution(execution_id)
+    adoption_after = await observer.get_result_adoption(adoption_id)
+    assert execution_after is not None
+    assert adoption_after is not None
+    if stage == "A":
+        assert recovered.response == "planned DAG completed"
+        assert execution_after.state is UltracodeExecutionState.COMPLETED
+        assert adoption_after.state is ResultAdoptionState.COMPLETED
+        assert adoption_after.version > adoption_before.version
+        assert all(target.state.value == "applied" for target in adoption_after.targets)
+        assert (repository / "A.txt").read_bytes() == b"worker-a\n"
+        assert (repository / "C.txt").read_bytes() == b"worker-c\n"
+    elif stage == "B":
+        assert recovered.response == "planned DAG completed"
+        assert execution_after.state is UltracodeExecutionState.COMPLETED
+        assert adoption_after == adoption_before
+        assert (repository / "A.txt").read_bytes() == parent_before_recovery["A"]
+        if parent_before_recovery["C"] is None:
+            assert not (repository / "C.txt").exists()
+        else:
+            assert (repository / "C.txt").read_bytes() == parent_before_recovery["C"]
+    else:
+        assert f"terminal_state: {expected_adoption_state.value}" in recovered.response
+        assert execution_after.state is UltracodeExecutionState.INDETERMINATE
+        assert adoption_after == adoption_before
+        assert (repository / "A.txt").read_bytes() == parent_before_recovery["A"]
+        if parent_before_recovery["C"] is None:
+            assert not (repository / "C.txt").exists()
+        else:
+            assert (repository / "C.txt").read_bytes() == parent_before_recovery["C"]
+
+    leases = await observer.list_writable_subagent_leases(parent_session_id=session_id)
+    assert len(leases) == 4
+    assert all(lease.state.value == "preserved" for lease in leases)
+    with closing(sqlite3.connect(state_dir / "worktrees.db")) as connection:
+        assert [
+            str(row[0])
+            for row in connection.execute(
+                "SELECT state FROM managed_worktrees ORDER BY worktree_id"
+            ).fetchall()
+        ] == ["ready"] * 4
+    with closing(sqlite3.connect(state_dir / "checkpoints.db")) as connection:
+        assert [
+            str(row[0])
+            for row in connection.execute(
+                "SELECT state FROM checkpoints ORDER BY checkpoint_id"
+            ).fetchall()
+        ] == ["ready"] * 4
+    messages = await observer.load_messages(session_id)
+    assert [message.role for message in messages].count(Role.ASSISTANT) == 1
+    completed_events = [
+        event
+        for event in await observer.load_events(session_id)
+        if event.get("kind") == AgentEventKind.TURN_COMPLETED.value
+        and isinstance(event.get("data"), dict)
+        and event["data"].get("turn_id") == turn_id
+        and event["data"].get("ultracode_execution_id") == execution_id
+    ]
+    assert len(completed_events) == 1
 
 
 @pytest.mark.asyncio
