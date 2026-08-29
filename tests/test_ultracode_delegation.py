@@ -2922,9 +2922,8 @@ async def test_real_composition_fresh_process_result_adoption_recovery_matrix(
         assert adoption_after.state is ResultAdoptionState.COMPLETED
         assert adoption_after.version > adoption_before.version
         assert all(target.state.value == "applied" for target in adoption_after.targets)
-        line_ending = os.linesep.encode()
-        assert (repository / "A.txt").read_bytes() == b"worker-a" + line_ending
-        assert (repository / "C.txt").read_bytes() == b"worker-c" + line_ending
+        assert (repository / "A.txt").read_text(encoding="utf-8") == "worker-a\n"
+        assert (repository / "C.txt").read_text(encoding="utf-8") == "worker-c\n"
     elif stage == "B":
         assert recovered.response == "planned DAG completed"
         assert execution_after.state is UltracodeExecutionState.COMPLETED
