@@ -105,7 +105,9 @@ from neuro_code.application.sessions import (
     SubagentRelationshipActionResult,
     SubagentRelationshipLifecycleController,
 )
+from neuro_code.application.sessions.binding import ConversationBindingResourceScope
 from neuro_code.application.sessions.profile_conversation import ConversationBinding
+from neuro_code.application.settings import ApplicationSettings
 from neuro_code.application.tools import (
     ListSessionToolOutputArtifactsRequest,
     ReadSessionToolOutputArtifactRequest,
@@ -2461,6 +2463,54 @@ class AcpAgentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.stop_reason, "end_turn")
         self.assertEqual(application.session_service.bound_runners, [runner])
 
+    async def test_acp_closes_production_binding_resource_scope_and_lsp(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / "state"
+            state.mkdir()
+            (state / "config.toml").write_text(
+                """
+[routing]
+default = "fixture"
+
+[providers.fixture]
+protocol = "openai-chat"
+model = "fixture-model"
+base_url = "https://provider.invalid/v1"
+api_key_env = "FIXTURE_KEY"
+context_window_tokens = 131072
+""",
+                encoding="utf-8",
+            )
+            with patch.dict(
+                "os.environ",
+                {
+                    "HOME": str(root),
+                    "NEURO_CODE_HOME": str(state),
+                    "FIXTURE_KEY": "fixture-key",
+                },
+                clear=True,
+            ):
+                application = await ApplicationComposition.open(
+                    ApplicationSettings(cwd=root),
+                    provider_factory=lambda config, failover: ProviderFixture(),
+                )
+                try:
+                    service = BootstrapCliServices().create_acp_service(application)
+                    agent = NeuroCodeAcpAgent(service)
+                    agent.on_connect(cast(Client, AcpClientFixture()))
+                    await agent.initialize(1)
+                    created = await agent.new_session(str(root))
+
+                    self.assertEqual(len(application._lsp_services), 1)
+                    manager = next(iter(application._lsp_services))
+                    await agent.close_session(created.session_id)
+
+                    self.assertTrue(manager._closed)
+                    self.assertEqual(application._lsp_services, set())
+                finally:
+                    await application.close()
+
     async def test_initialize_declares_session_lifecycle_and_saves_client_details(
         self,
     ) -> None:
@@ -3182,6 +3232,54 @@ class AcpAgentTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(error.exception.data["reason"], "connection_closing")
         self.assertEqual(cleanup_events, ["binding", "mcp"])
+
+    async def test_session_cleanup_closes_binding_mcp_and_terminal_exactly_once(self) -> None:
+        class CountingTerminal:
+            def __init__(self) -> None:
+                self.shutdown_calls = 0
+
+            async def shutdown(self) -> None:
+                self.shutdown_calls += 1
+
+        cleanup_events: list[str] = []
+        collection = McpCollectionFixture(cleanup_events)
+        server = McpServerStdio(name="fixture", command="fixture-command", args=[], env=[])
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            agent, application, _ = await initialized_agent(root, [RunnerFixture()])
+            application.cleanup_events = cleanup_events
+            with patch(
+                "neuro_code.bootstrap.entrypoints.McpStdioToolCollection.open",
+                new=AsyncMock(return_value=collection),
+            ):
+                created = await agent.new_session(str(root), mcp_servers=[server])
+                active = agent._sessions[created.session_id]
+                binding = active.binding
+                assert binding is not None
+                background = binding.background_tasks
+                assert background is not None
+                binding_close_calls = 0
+
+                async def close_binding_resources() -> None:
+                    nonlocal binding_close_calls
+                    binding_close_calls += 1
+                    await background.shutdown()
+
+                active.binding = replace(
+                    binding,
+                    resource_scope=ConversationBindingResourceScope(close_binding_resources),
+                )
+                terminal = CountingTerminal()
+                active.client_terminal = cast(Any, terminal)
+
+                await agent._cleanup_session(active)
+                await agent._cleanup_session(active)
+
+        self.assertEqual(binding_close_calls, 1)
+        self.assertEqual(collection.close_calls, 1)
+        self.assertEqual(terminal.shutdown_calls, 1)
+        self.assertEqual(application.background_scopes[0].shutdown_calls, 1)
+        self.assertEqual(cleanup_events, ["mcp", "binding"])
 
     async def test_cancel_keeps_session_mcp_context_until_explicit_close(self) -> None:
         collection = McpCollectionFixture()

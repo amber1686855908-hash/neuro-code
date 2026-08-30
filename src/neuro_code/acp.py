@@ -685,8 +685,8 @@ class NeuroCodeAcpAgent:
             raise RequestError.internal_error({"reason": "connection_closing"})
         finally:
             await self._release_session_reservation(session_id)
-            if binding is not None and binding.background_tasks is not None:
-                await asyncio.shield(binding.background_tasks.shutdown())
+            if binding is not None:
+                await asyncio.shield(binding.close())
             if mcp_tools is not None:
                 await asyncio.shield(mcp_tools.close())
             if client_terminal is not None:
@@ -842,8 +842,8 @@ class NeuroCodeAcpAgent:
             raise RequestError.internal_error({"reason": "connection_closing"})
         finally:
             await self._release_session_reservation(external_session_id)
-            if binding is not None and binding.background_tasks is not None:
-                await asyncio.shield(binding.background_tasks.shutdown())
+            if binding is not None:
+                await asyncio.shield(binding.close())
             if mcp_tools is not None:
                 await asyncio.shield(mcp_tools.close())
             if client_terminal is not None:
@@ -1118,8 +1118,8 @@ class NeuroCodeAcpAgent:
             raise RequestError.internal_error({"reason": "connection_closing"})
         finally:
             await self._release_session_reservation(forked_external_session_id)
-            if binding is not None and binding.background_tasks is not None:
-                await asyncio.shield(binding.background_tasks.shutdown())
+            if binding is not None:
+                await asyncio.shield(binding.close())
             if mcp_tools is not None:
                 await asyncio.shield(mcp_tools.close())
             if client_terminal is not None:
@@ -1774,8 +1774,8 @@ class NeuroCodeAcpAgent:
                 await asyncio.shield(mcp_tools.close())
             if client_terminal is not None:
                 await asyncio.shield(client_terminal.shutdown())
-            if binding is not None and binding.background_tasks is not None:
-                await asyncio.shield(binding.background_tasks.shutdown())
+            if binding is not None:
+                await asyncio.shield(binding.close())
             session.binding = None
             session.mcp_tools = None
             session.client_terminal = None
