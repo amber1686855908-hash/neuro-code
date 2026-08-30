@@ -1,6 +1,6 @@
 # ADR 0151：ACP Transport 边界
 
-- 状态：Proposed
+- 状态：Accepted
 - 日期：2026-08-31
 - 范围：堆叠在 PR #78 之上的 ACP transport 结构切片
 - 依赖：ADR 0145、ADR 0146、ADR 0147、ADR 0148、ADR 0149 和 ADR 0150
@@ -167,6 +167,6 @@ application service。
 
 ## 状态与验证
 
-在 stacked pull request 的 merge-ref CI 全绿之前，本 ADR 保持 Proposed。Local focused
-test 和 repository quality gate 是必要条件，但不足以冻结该 boundary。merge-ref 全绿后，
-可将 ADR 与 slice 的最终 commit 和 PR metadata 一起标记为 Accepted。
+本 ADR 已标记为 Accepted。Stacked pull request 的 merge-ref CI 已全绿，Local focused
+test 与 repository quality gate 也已通过。该 Accepted 状态只适用于本 bounded transport
+slice，不扩大 ACP consolidation scope。

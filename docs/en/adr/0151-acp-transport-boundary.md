@@ -1,6 +1,6 @@
 # ADR 0151: ACP Transport Boundary
 
-- Status: Proposed
+- Status: Accepted
 - Date: 2026-08-31
 - Scope: the ACP transport structural slice stacked on PR #78
 - Depends on: ADR 0145, ADR 0146, ADR 0147, ADR 0148, ADR 0149, and ADR 0150
@@ -188,8 +188,7 @@ application service.
 
 ## Status and validation
 
-This ADR is Proposed until the stacked pull request's merge-ref CI is fully
-green. Local focused tests and the repository quality gates are necessary but
-not sufficient for freezing the boundary. After a green merge-ref result,
-the ADR may be marked Accepted together with the slice's final commit and
-PR metadata.
+This ADR is Accepted. The stacked pull request's merge-ref CI is fully green,
+and the local focused tests and repository quality gates also pass. The
+accepted status applies to this bounded transport slice and does not broaden
+the ACP consolidation scope.
