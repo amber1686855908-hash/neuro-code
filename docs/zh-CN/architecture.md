@@ -67,10 +67,13 @@ CLI 不会加载 bootstrap、adapters 或 providers，也不会创建资源。
 `ApplicationComposition` 调用方。ACP 不再导入 MCP 或工作区实现，也不再直接读取组合根配置或存储；导入 ACP 不会
 加载 bootstrap、MCP adapter、SQLite 存储或 providers。
 
-ACP prompt/content 校验与转换现在由 `neuro_code.interfaces.acp.content` 作为 canonical owner；
+ACP prompt/content 校验与转换由 `neuro_code.interfaces.acp.content` 作为 canonical owner，持久
+history 和实时 event projection 则由 `neuro_code.interfaces.acp.updates` 作为 canonical owner；
 `neuro_code.acp` 为兼容性导入相同的 symbol。其余 ACP adapter 仍位于 `neuro_code.acp`，包括
-session lifecycle、update/history projection、client capability、MCP 和 transport handling。
-详见 [ADR 0145](adr/0145-acp-prompt-content-boundary.md)。
+session lifecycle、prompt coordination、client capability、permission request coordination、
+MCP 和 transport handling。因此 `neuro_code.acp` 仍是混合适配器，而不是 facade。详见
+[ADR 0145](adr/0145-acp-prompt-content-boundary.md) 和
+[ADR 0146](adr/0146-acp-update-and-event-projection-boundary.md)。
 
 Agent harness 行为现阶段位于 `neuro_code.application.runtime` 的明确 canonical 子模块：
 `background_task_reminders`、`agent`、`conversation` 以及循环、上下文、工具和终结模块。
@@ -539,6 +542,11 @@ message chunk。有序图片 part 会变成现有的安全图片占位符，绝�
 reasoning、供应商保留上下文、任意参数、
 `_meta` 和 raw input/output 全部省略。发送第一条 update 前先校验完整回放，并限制持久项数、
 update 数、单字段和序列化总字节。
+
+历史投影与实时 `AgentEvent` allowlist 现在由 `neuro_code.interfaces.acp.updates` 实现。顶层
+ACP adapter 仍保留 session-bound wiring、lifecycle、client capability、MCP 和 transport
+职责，并调用这些 projection。本次提取是结构性变更，保留既有 ACP wire behavior；不增加
+event kind，也不移动权限 authority。
 
 事件投影采用显式白名单：
 

@@ -50,6 +50,7 @@ from acp.schema import (
 
 import neuro_code.acp as acp_module
 import neuro_code.interfaces.acp.content as content_module
+import neuro_code.interfaces.acp.updates as updates_module
 from neuro_code.acp import (
     ACP_CONTEXT_COMPACTION_EXTENSION,
     ACP_MCP_EXTENSION,
@@ -3705,6 +3706,136 @@ class AcpAgentTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(mismatch.exception.data["reason"], "session_identity_mismatch")
             self.assertEqual(application.store.deleted_session_ids, ["forked-1"])
             self.assertEqual(application.background_scopes[0].shutdown_calls, 1)
+
+    def test_canonical_history_projection_preserves_order_and_pending_closure(self) -> None:
+        history = (
+            Message(Role.USER, "question"),
+            Message(
+                Role.ASSISTANT,
+                "answer",
+                tool_calls=(
+                    ToolCall("read-call", "read_file", {"path": "safe.txt"}),
+                    ToolCall("pending-call", "bash", {"command": "pwd"}),
+                ),
+            ),
+            Message(
+                Role.TOOL,
+                "token=secret-value",
+                name="read_file",
+                tool_call_id="read-call",
+            ),
+            Message(Role.TOOL, "orphan output", name="grep", tool_call_id="orphan-call"),
+        )
+
+        projected = updates_module._history_updates(
+            history,
+            explicit_redactions=("secret-value",),
+        )
+
+        self.assertEqual(
+            [update.session_update for update in projected],
+            [
+                "user_message_chunk",
+                "agent_message_chunk",
+                "tool_call",
+                "tool_call",
+                "tool_call_update",
+                "tool_call",
+                "tool_call_update",
+                "tool_call_update",
+            ],
+        )
+        self.assertEqual(
+            [
+                update.status
+                for update in projected
+                if isinstance(update, (ToolCallStart, ToolCallProgress))
+            ],
+            ["pending", "pending", "completed", "pending", "completed", "failed"],
+        )
+        self.assertEqual(projected[2].locations[0].path, "safe.txt")
+        self.assertNotIn("secret-value", repr(projected))
+        self.assertEqual(projected[3].tool_call_id, "pending-call")
+        self.assertEqual(projected[5].tool_call_id, "orphan-call")
+        self.assertEqual(projected[6].tool_call_id, "orphan-call")
+
+    async def test_canonical_event_mapper_preserves_projection_sequence(self) -> None:
+        client = AcpClientFixture()
+        started_session_ids: list[str] = []
+
+        async def on_session_started(session_id: str) -> None:
+            started_session_ids.append(session_id)
+
+        mapper = updates_module._AcpEventMapper(
+            client=cast(Client, client),
+            session_id="external-session",
+            context_window_tokens=100,
+            explicit_redactions=("secret-value",),
+            on_session_started=on_session_started,
+        )
+        events = (
+            AgentEvent.create(
+                1,
+                AgentEventKind.SESSION_STARTED,
+                {"session_id": "internal-session"},
+            ),
+            AgentEvent.create(2, AgentEventKind.TEXT_DELTA, {"text": "one"}),
+            AgentEvent.create(3, AgentEventKind.TOOL_STARTED, {"id": "implicit", "name": "grep"}),
+            AgentEvent.create(
+                4,
+                AgentEventKind.TOOL_COMPLETED,
+                {"id": "implicit", "name": "grep", "content": "token=secret-value"},
+            ),
+            AgentEvent.create(
+                5,
+                AgentEventKind.CONTEXT_USAGE_UPDATED,
+                {"used_tokens": 12},
+            ),
+            AgentEvent.create(6, AgentEventKind.TEXT_DELTA, {"text": "two"}),
+            AgentEvent.create(7, AgentEventKind.TURN_COMPLETED, {"stop_reason": "length"}),
+        )
+        for event in events:
+            await mapper(event)
+
+        projected = [update for _, update in client.updates]
+        self.assertEqual(started_session_ids, ["internal-session"])
+        self.assertEqual(
+            [update.session_update for update in projected],
+            [
+                "agent_message_chunk",
+                "tool_call",
+                "tool_call_update",
+                "tool_call_update",
+                "usage_update",
+                "agent_message_chunk",
+            ],
+        )
+        chunks = [update for update in projected if isinstance(update, AgentMessageChunk)]
+        self.assertEqual([chunk.content.text for chunk in chunks], ["one", "two"])
+        self.assertEqual(len({chunk.message_id for chunk in chunks}), 1)
+        self.assertEqual(
+            [
+                update.status
+                for update in projected
+                if isinstance(update, (ToolCallStart, ToolCallProgress))
+            ],
+            ["pending", "in_progress", "completed"],
+        )
+        self.assertNotIn("secret-value", repr(projected))
+        self.assertEqual(mapper.stop_reason, "max_tokens")
+
+        permission = mapper.permission_tool_call(
+            PermissionRequest(
+                "permission-call",
+                "bash",
+                "Run shell command",
+                "secret-value",
+                "scope",
+            )
+        )
+        self.assertEqual(permission.status, "pending")
+        self.assertEqual(permission.kind, "execute")
+        self.assertNotIn("secret-value", repr(permission))
 
     async def test_event_mapping_has_stable_message_id_and_bounded_tool_fields(self) -> None:
         events = (

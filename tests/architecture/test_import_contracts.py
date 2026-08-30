@@ -2571,6 +2571,52 @@ def test_acp_content_is_canonical_and_does_not_import_legacy_adapter() -> None:
     assert canonical.ConvertedPrompt.__module__ == canonical.__name__
 
 
+def test_acp_update_projection_is_canonical_and_private_aliases_are_stable() -> None:
+    path = _PROJECT_ROOT / "src" / "neuro_code" / "interfaces" / "acp" / "updates.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    imported_modules: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported_modules.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module is not None:
+            imported_modules.add(node.module)
+    assert "neuro_code.acp" not in imported_modules
+    assert not any(
+        module == "neuro_code.bootstrap" or module.startswith("neuro_code.bootstrap.")
+        for module in imported_modules
+    )
+    assert not any(
+        module == "neuro_code.infrastructure" or module.startswith("neuro_code.infrastructure.")
+        for module in imported_modules
+    )
+
+    legacy = importlib.import_module("neuro_code.acp")
+    canonical = importlib.import_module("neuro_code.interfaces.acp.updates")
+    serialization = importlib.import_module("neuro_code.interfaces.acp.serialization")
+    assert legacy._AcpEventMapper is canonical._AcpEventMapper
+    assert legacy._history_updates is canonical._history_updates
+    assert legacy._bounded_identifier is serialization._bounded_identifier
+    assert canonical._AcpEventMapper.__module__ == canonical.__name__
+    assert canonical._history_updates.__module__ == canonical.__name__
+
+    legacy_tree = ast.parse(
+        (_PROJECT_ROOT / "src" / "neuro_code" / "acp.py").read_text(encoding="utf-8"),
+        filename=str(_PROJECT_ROOT / "src" / "neuro_code" / "acp.py"),
+    )
+    assert not any(
+        isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name in {"_AcpEventMapper", "_history_updates"}
+        for node in ast.walk(legacy_tree)
+    )
+    assert any(
+        isinstance(node, ast.ClassDef) and node.name == "_AcpEventMapper" for node in ast.walk(tree)
+    )
+    assert any(
+        isinstance(node, ast.FunctionDef) and node.name == "_history_updates"
+        for node in ast.walk(tree)
+    )
+
+
 def test_acp_uses_only_its_narrow_application_service() -> None:
     path = _PROJECT_ROOT / "src" / "neuro_code" / "acp.py"
     source = path.read_text(encoding="utf-8")

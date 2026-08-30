@@ -85,12 +85,15 @@ adapts an `ApplicationComposition` caller. ACP no longer imports MCP or workspac
 configuration or storage directly; importing ACP does not load bootstrap, the
 MCP adapter, SQLite storage, or providers.
 
-ACP prompt/content validation and conversion is now canonically owned by
-`neuro_code.interfaces.acp.content`; `neuro_code.acp` imports the same symbols
-for compatibility. The remaining ACP adapter still resides in
-`neuro_code.acp`, including session lifecycle, update/history projection,
-client capabilities, MCP, and transport handling. See
-[ADR 0145](adr/0145-acp-prompt-content-boundary.md).
+ACP prompt/content validation and conversion is canonically owned by
+`neuro_code.interfaces.acp.content`, while durable history and live event
+projection are canonically owned by `neuro_code.interfaces.acp.updates`;
+`neuro_code.acp` imports the same symbols for compatibility. The remaining
+ACP adapter still resides in `neuro_code.acp`, including session lifecycle,
+prompt coordination, client capabilities, permission request coordination,
+MCP, and transport handling. `neuro_code.acp` is therefore still a mixed
+adapter rather than a facade. See [ADR 0145](adr/0145-acp-prompt-content-boundary.md)
+and [ADR 0146](adr/0146-acp-update-and-event-projection-boundary.md).
 
 Agent harness behavior currently lives in the explicit canonical submodules of
 `neuro_code.application.runtime`: `background_task_reminders`, `agent`,
@@ -742,6 +745,13 @@ updates. System messages, reasoning, preserved provider context, arbitrary
 arguments, `_meta`, and raw input/output are omitted. The complete replay is
 validated before its first update and is bounded by stored-item, update-count,
 per-field, and aggregate serialized-byte limits.
+
+The history projection and the live `AgentEvent` allowlist are implemented in
+`neuro_code.interfaces.acp.updates`. The top-level ACP adapter retains the
+session-bound wiring, lifecycle, client-capability, MCP, and transport
+responsibilities that invoke these projections. The extraction is structural
+and preserves the existing ACP wire behavior; it does not add event kinds or
+move permission authority.
 
 The event projection is an explicit allowlist:
 
