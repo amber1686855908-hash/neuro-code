@@ -71,12 +71,15 @@ ACP prompt/content 校验与转换由 `neuro_code.interfaces.acp.content` 作为
 history 和实时 event projection 则由 `neuro_code.interfaces.acp.updates` 作为 canonical owner；
 `neuro_code.interfaces.acp.client_io` 现在作为 capability-gated client filesystem 与 terminal
 adapter 的 canonical owner，同时拥有 adapter-local bounds 和 terminal task lifecycle state。
-`neuro_code.acp` 以 private compatibility alias 导入相同的 symbol。它仍拥有 capability
-negotiation、adapter construction、session lifecycle 与 publication/cleanup、prompt coordination、
-permission request coordination、MCP 和 transport handling。因此 `neuro_code.acp` 仍是混合适配器，
-而不是 facade。详见 [ADR 0145](adr/0145-acp-prompt-content-boundary.md)、
+`neuro_code.acp` 以 private compatibility alias 导入相同的 symbol。
+`neuro_code.interfaces.acp.mcp_config` 现在作为从 ACP MCP declaration 到 application MCP
+configuration contract 的无状态有界转换 canonical owner。`neuro_code.acp` 提供 protected-environment
+集合并保留 caller、capability negotiation、session lifecycle 与 publication/cleanup、prompt
+coordination、permission request coordination、live MCP 和 transport handling。因此
+`neuro_code.acp` 仍是混合适配器，而不是 facade。详见 [ADR 0145](adr/0145-acp-prompt-content-boundary.md)、
 [ADR 0146](adr/0146-acp-update-and-event-projection-boundary.md) 和
-[ADR 0147](adr/0147-acp-client-io-adapter-boundary.md)。
+[ADR 0147](adr/0147-acp-client-io-adapter-boundary.md) 和
+[ADR 0148](adr/0148-acp-mcp-configuration-boundary.md)。
 
 Agent harness 行为现阶段位于 `neuro_code.application.runtime` 的明确 canonical 子模块：
 `background_task_reminders`、`agent`、`conversation` 以及循环、上下文、工具和终结模块。
@@ -499,6 +502,15 @@ sandbox 都不会暴露这些工具，直接调用也会失败关闭，因此客
 失败。远程 URL 必须是绝对 HTTP/HTTPS endpoint，不能包含内嵌凭据或 fragment。header
 名称、数量、值与总字节均有上限，且不能覆盖 framing 或 routing header。加载持久 ACP
 session 时可以重新提供相同的临时 MCP 配置，但它不会作为历史或授权被持久化。
+
+无状态的 MCP configuration conversion 由 `neuro_code.interfaces.acp.mcp_config` 作为 canonical owner。
+它接受现有的 stdio、Streamable HTTP 和 legacy SSE declaration，返回既有的
+`AcpMcpServerConfig` contract，并保留全部有界校验与 `RequestError.invalid_params` reason。它从 ACP
+service 接收 protected-environment 集合；不会扫描环境状态，也不会从 bootstrap、infrastructure、
+providers 或 stores 获取 authority。配置转换不执行任何 I/O。`MAX_MCP_SERVERS` 因 MCP runtime adapter
+也消费该共享 server-count bound，仍由 application contract 拥有；URL 与 serialized-configuration
+bound 可以被 live ACP projection 复用，但 live callback 或 MCP lifecycle code 不迁移。详见
+[ADR 0148](adr/0148-acp-mcp-configuration-boundary.md)。
 
 官方 `mcp>=1.28.1,<2` SDK 持有 MCP Schema、`ClientSession`、版本协商、JSON-RPC 调度
 和工具结果类型。stdio 使用项目自有的换行分隔 `ProcessTree` 桥接：官方 SDK 在 Windows

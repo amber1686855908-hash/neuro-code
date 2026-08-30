@@ -50,6 +50,7 @@ from acp.schema import (
 
 import neuro_code.acp as acp_module
 import neuro_code.interfaces.acp.content as content_module
+import neuro_code.interfaces.acp.mcp_config as mcp_config_module
 import neuro_code.interfaces.acp.updates as updates_module
 from neuro_code.acp import (
     ACP_CONTEXT_COMPACTION_EXTENSION,
@@ -1855,7 +1856,7 @@ class McpConfigurationTests(unittest.TestCase):
             with self.subTest(reason=reason):
                 self._assert_reason(servers, reason, protected=protected)
 
-        with patch.object(acp_module, "MAX_MCP_CONFIGURATION_BYTES", 1):
+        with patch.object(mcp_config_module, "MAX_MCP_CONFIGURATION_BYTES", 1):
             self._assert_reason(
                 [self._server()],
                 "mcp_configuration_too_large",

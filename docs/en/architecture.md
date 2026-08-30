@@ -91,13 +91,17 @@ projection are canonically owned by `neuro_code.interfaces.acp.updates`;
 `neuro_code.interfaces.acp.client_io` is now the canonical owner of the
 capability-gated client filesystem and terminal adapters, including their
 adapter-local bounds and terminal task lifecycle state. `neuro_code.acp`
-imports the same symbols as private compatibility aliases. It still owns
-capability negotiation and adapter construction, session lifecycle and
+imports the same symbols as private compatibility aliases.
+`neuro_code.interfaces.acp.mcp_config` is now the canonical owner of the
+stateless, bounded conversion from ACP MCP declarations to application MCP
+configuration contracts. `neuro_code.acp` supplies the protected-environment
+set and retains the caller, capability negotiation, session lifecycle and
 publication/cleanup, prompt coordination, permission request coordination,
-MCP, and transport handling. It is therefore still a mixed adapter rather
+live MCP, and transport handling. It is therefore still a mixed adapter rather
 than a facade. See [ADR 0145](adr/0145-acp-prompt-content-boundary.md),
 [ADR 0146](adr/0146-acp-update-and-event-projection-boundary.md), and
-[ADR 0147](adr/0147-acp-client-io-adapter-boundary.md).
+[ADR 0147](adr/0147-acp-client-io-adapter-boundary.md), and
+[ADR 0148](adr/0148-acp-mcp-configuration-boundary.md).
 
 Agent harness behavior currently lives in the explicit canonical submodules of
 `neuro_code.application.runtime`: `background_task_reminders`, `agent`,
@@ -682,6 +686,19 @@ without embedded credentials or fragments. Header names, counts, values, and
 total bytes are bounded; framing and routing headers cannot be overridden. The
 same ephemeral MCP configuration may be supplied when loading a durable ACP
 session, but it is not persisted as session history or authority.
+
+The stateless MCP configuration conversion is canonically owned by
+`neuro_code.interfaces.acp.mcp_config`. It accepts the existing stdio,
+Streamable HTTP, and legacy SSE declarations, returns the existing
+`AcpMcpServerConfig` contracts, and preserves all bounded validation and
+`RequestError.invalid_params` reasons. It receives the protected-environment
+set from the ACP service; it does not scan environment state or obtain
+authority from bootstrap, infrastructure, providers, or stores. Configuration
+conversion performs no I/O. `MAX_MCP_SERVERS` remains an application contract
+because the MCP runtime adapters also consume that shared server-count bound;
+the URL and serialized-configuration bounds are reused by live ACP projection
+without moving live callback or MCP lifecycle code. See
+[ADR 0148](adr/0148-acp-mcp-configuration-boundary.md).
 
 The official `mcp>=1.28.1,<2` SDK owns MCP schemas, `ClientSession`, version
 negotiation, JSON-RPC dispatch, and tool result types. Stdio uses a
