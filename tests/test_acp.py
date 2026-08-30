@@ -3021,6 +3021,9 @@ context_window_tokens = 131072
                 mcp_servers=[],
             )
             acp_id = created.session_id
+            active = agent._sessions[acp_id]
+            self.assertIs(type(active), acp_module._AcpSession)
+            self.assertEqual(type(active).__module__, "neuro_code.interfaces.acp.session")
             response = await agent.prompt(
                 acp_id,
                 [TextContentBlock(type="text", text="hello")],
@@ -3248,29 +3251,36 @@ context_window_tokens = 131072
             root = Path(directory)
             agent, application, _ = await initialized_agent(root, [RunnerFixture()])
             application.cleanup_events = cleanup_events
-            with patch(
-                "neuro_code.bootstrap.entrypoints.McpStdioToolCollection.open",
-                new=AsyncMock(return_value=collection),
-            ):
-                created = await agent.new_session(str(root), mcp_servers=[server])
-                active = agent._sessions[created.session_id]
-                binding = active.binding
-                assert binding is not None
-                background = binding.background_tasks
+            terminal = CountingTerminal()
+            binding_close_calls = 0
+            original_create_binding = application.create_binding
+
+            async def create_binding_with_scope(**kwargs: Any) -> ConversationBinding:
+                nonlocal binding_close_calls
+                created_binding = await original_create_binding(**kwargs)
+                background = created_binding.background_tasks
                 assert background is not None
-                binding_close_calls = 0
 
                 async def close_binding_resources() -> None:
                     nonlocal binding_close_calls
                     binding_close_calls += 1
                     await background.shutdown()
 
-                active.binding = replace(
-                    binding,
+                return replace(
+                    created_binding,
                     resource_scope=ConversationBindingResourceScope(close_binding_resources),
                 )
-                terminal = CountingTerminal()
-                active.client_terminal = cast(Any, terminal)
+
+            with (
+                patch(
+                    "neuro_code.bootstrap.entrypoints.McpStdioToolCollection.open",
+                    new=AsyncMock(return_value=collection),
+                ),
+                patch.object(agent, "_client_terminal", return_value=cast(Any, terminal)),
+                patch.object(application, "create_binding", new=create_binding_with_scope),
+            ):
+                created = await agent.new_session(str(root), mcp_servers=[server])
+                active = agent._sessions[created.session_id]
 
                 await agent._cleanup_session(active)
                 await agent._cleanup_session(active)

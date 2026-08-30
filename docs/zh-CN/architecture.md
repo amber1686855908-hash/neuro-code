@@ -72,14 +72,20 @@ history 和实时 event projection 则由 `neuro_code.interfaces.acp.updates` �
 `neuro_code.interfaces.acp.client_io` 现在作为 capability-gated client filesystem 与 terminal
 adapter 的 canonical owner，同时拥有 adapter-local bounds 和 terminal task lifecycle state。
 `neuro_code.acp` 以 private compatibility alias 导入相同的 symbol。
+`neuro_code.interfaces.acp.session.AcpSessionRuntime` 现在作为 per-session 可变 interface state、
+resource reference、runtime lock、prompt/cancel/approval presentation state、identity transition 和
+aggregate cleanup 的 canonical owner。`NeuroCodeAcpAgent` 继续拥有 connection、capability、registry、
+publication、外层 lifecycle routing、extension dispatch、live MCP orchestration 和 transport；
+`SessionTurnService`/`ConversationRunner` 继续拥有实际 turn 与 recovery authority。
 `neuro_code.interfaces.acp.mcp_config` 现在作为从 ACP MCP declaration 到 application MCP
 configuration contract 的无状态有界转换 canonical owner。`neuro_code.acp` 提供 protected-environment
-集合并保留 caller、capability negotiation、session lifecycle 与 publication/cleanup、prompt
-coordination、permission request coordination、live MCP 和 transport handling。因此
-`neuro_code.acp` 仍是混合适配器，而不是 facade。详见 [ADR 0145](adr/0145-acp-prompt-content-boundary.md)、
-[ADR 0146](adr/0146-acp-update-and-event-projection-boundary.md) 和
-[ADR 0147](adr/0147-acp-client-io-adapter-boundary.md) 和
-[ADR 0148](adr/0148-acp-mcp-configuration-boundary.md)。
+集合并保留 caller、capability negotiation、session registry、publication 与外层 lifecycle routing、
+permission request coordination、live MCP 和 transport handling。因此 `neuro_code.acp` 仍是混合适配器，
+而不是 facade。详见 [ADR 0145](adr/0145-acp-prompt-content-boundary.md)、
+[ADR 0146](adr/0146-acp-update-and-event-projection-boundary.md)、
+[ADR 0147](adr/0147-acp-client-io-adapter-boundary.md)、
+[ADR 0148](adr/0148-acp-mcp-configuration-boundary.md) 以及
+[ADR 0150](adr/0150-acp-session-runtime-ownership-boundary.md)。
 
 Agent harness 行为现阶段位于 `neuro_code.application.runtime` 的明确 canonical 子模块：
 `background_task_reminders`、`agent`、`conversation` 以及循环、上下文、工具和终结模块。

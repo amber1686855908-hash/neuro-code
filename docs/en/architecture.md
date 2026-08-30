@@ -92,16 +92,24 @@ projection are canonically owned by `neuro_code.interfaces.acp.updates`;
 capability-gated client filesystem and terminal adapters, including their
 adapter-local bounds and terminal task lifecycle state. `neuro_code.acp`
 imports the same symbols as private compatibility aliases.
+`neuro_code.interfaces.acp.session.AcpSessionRuntime` is now the canonical
+owner of per-session mutable interface state, resource references, runtime
+locks, prompt/cancel/approval presentation state, identity transitions, and
+aggregate cleanup. `NeuroCodeAcpAgent` retains the connection, capabilities,
+registry, publication, outer lifecycle routing, extension dispatch, live MCP
+orchestration, and transport; `SessionTurnService`/`ConversationRunner`
+remain the actual turn and recovery authorities.
 `neuro_code.interfaces.acp.mcp_config` is now the canonical owner of the
 stateless, bounded conversion from ACP MCP declarations to application MCP
 configuration contracts. `neuro_code.acp` supplies the protected-environment
-set and retains the caller, capability negotiation, session lifecycle and
-publication/cleanup, prompt coordination, permission request coordination,
-live MCP, and transport handling. It is therefore still a mixed adapter rather
-than a facade. See [ADR 0145](adr/0145-acp-prompt-content-boundary.md),
-[ADR 0146](adr/0146-acp-update-and-event-projection-boundary.md), and
-[ADR 0147](adr/0147-acp-client-io-adapter-boundary.md), and
-[ADR 0148](adr/0148-acp-mcp-configuration-boundary.md).
+set and retains the caller, capability negotiation, session registry,
+publication and outer lifecycle routing, permission request coordination, live
+MCP, and transport handling. It is therefore still a mixed adapter rather than
+a facade. See [ADR 0145](adr/0145-acp-prompt-content-boundary.md),
+[ADR 0146](adr/0146-acp-update-and-event-projection-boundary.md),
+[ADR 0147](adr/0147-acp-client-io-adapter-boundary.md),
+[ADR 0148](adr/0148-acp-mcp-configuration-boundary.md),
+[ADR 0150](adr/0150-acp-session-runtime-ownership-boundary.md).
 
 Agent harness behavior currently lives in the explicit canonical submodules of
 `neuro_code.application.runtime`: `background_task_reminders`, `agent`,

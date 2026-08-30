@@ -7,7 +7,7 @@ import re
 import uuid
 from collections import OrderedDict
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, cast
@@ -173,6 +173,14 @@ from neuro_code.interfaces.acp.serialization import (
     serialize_subagent_result,
     serialized_size_bytes,
 )
+from neuro_code.interfaces.acp.session import (
+    AcpSessionApprovalAlreadyPendingError,
+    AcpSessionIdentityConflictError,
+    AcpSessionIdentityUnavailableError,
+    AcpSessionInactiveError,
+    AcpSessionPromptAlreadyActiveError,
+    AcpSessionRuntime,
+)
 from neuro_code.interfaces.acp.updates import _AcpEventMapper, _history_updates
 from neuro_code.shared.errors import ConfigurationError, ProviderError, SessionError, ToolError
 
@@ -202,6 +210,10 @@ _SESSION_NOT_FOUND = -32002
 _SESSION_BUSY = -32003
 _ACP_SESSION_ALIAS_NAMESPACE = "acp-v1"
 _ACP_SUBAGENT_LIFECYCLE_ALIAS_ATTEMPTS = 4
+
+# Private compatibility alias retained for behavior-focused repository tests.
+# The canonical implementation lives in interfaces.acp.session.
+_AcpSession = AcpSessionRuntime
 
 
 def _invalid_params(reason: str, details: str | None = None) -> RequestError:
@@ -343,26 +355,6 @@ def _artifact_read_payload(
     }
 
 
-@dataclass(slots=True)
-class _AcpSession:
-    session_id: str
-    binding: ConversationBinding | None
-    approvals: SessionApprovalBroker
-    context_window_tokens: int | None
-    mcp_tools: AcpMcpTools | None
-    mcp_tool_names: tuple[str, ...] = ()
-    client_terminal: ClientTerminal | None = None
-    internal_session_id: str | None = None
-    prompt_task: asyncio.Task[Any] | None = None
-    mapper: _AcpEventMapper | None = None
-    pending_approval_id: str | None = None
-    cancel_requested: bool = False
-    closing: bool = False
-    closed: bool = False
-    state_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
-    cleanup_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
-
-
 @dataclass(frozen=True, slots=True)
 class _SessionListCursor:
     updated_at: datetime
@@ -381,7 +373,7 @@ class NeuroCodeAcpAgent:
         self._client_info: Implementation | None = None
         self._initialized = False
         self._initialize_lock = asyncio.Lock()
-        self._sessions: dict[str, _AcpSession] = {}
+        self._sessions: dict[str, AcpSessionRuntime] = {}
         self._pending_session_tasks: dict[str, asyncio.Task[Any]] = {}
         self._registry_lock = asyncio.Lock()
         self._list_cursors: OrderedDict[str, _SessionListCursor] = OrderedDict()
@@ -613,7 +605,7 @@ class NeuroCodeAcpAgent:
             if self._pending_session_tasks.get(session_id) is task:
                 del self._pending_session_tasks[session_id]
 
-    async def _publish_session(self, session: _AcpSession) -> bool:
+    async def _publish_session(self, session: AcpSessionRuntime) -> bool:
         task = asyncio.current_task()
         async with self._registry_lock:
             if self._pending_session_tasks.get(session.session_id) is not task:
@@ -664,7 +656,7 @@ class NeuroCodeAcpAgent:
         except Exception:
             raise RequestError.internal_error({"reason": "session_creation_failed"}) from None
         else:
-            session = _AcpSession(
+            session = AcpSessionRuntime(
                 session_id,
                 binding,
                 approvals,
@@ -820,7 +812,7 @@ class NeuroCodeAcpAgent:
                         {"reason": "session_history_replay_failed"}
                     ) from None
 
-            session = _AcpSession(
+            session = AcpSessionRuntime(
                 external_session_id,
                 binding,
                 approvals,
@@ -991,12 +983,9 @@ class NeuroCodeAcpAgent:
 
         internal_session_id: str | None = None
         if active is not None:
-            async with active.state_lock:
-                if active.closed or active.closing:
-                    raise _session_not_active(external_session_id)
-                active.closing = True
-                active.cancel_requested = True
-                internal_session_id = active.internal_session_id
+            started, internal_session_id = await active.begin_close()
+            if not started:
+                raise _session_not_active(external_session_id)
             await self._cleanup_session(active)
             async with self._registry_lock:
                 if self._sessions.get(external_session_id) is active:
@@ -1095,7 +1084,7 @@ class NeuroCodeAcpAgent:
             except SessionError:
                 raise RequestError.internal_error({"reason": "session_alias_failed"}) from None
 
-            session = _AcpSession(
+            session = AcpSessionRuntime(
                 forked_external_session_id,
                 binding,
                 approvals,
@@ -1134,13 +1123,14 @@ class NeuroCodeAcpAgent:
                 raise _session_busy(external_session_id, "session_creation_in_progress")
             active = self._sessions.get(external_session_id)
         if active is not None:
-            async with active.state_lock:
-                task = active.prompt_task
-                if task is not None and not task.done():
-                    raise _session_busy(external_session_id, "session_prompt_active")
-                if active.internal_session_id is None:
-                    raise _session_not_found(external_session_id)
-                return active.internal_session_id
+            try:
+                return await active.fork_source_identity()
+            except AcpSessionInactiveError:
+                raise _session_not_active(external_session_id) from None
+            except AcpSessionPromptAlreadyActiveError:
+                raise _session_busy(external_session_id, "session_prompt_active") from None
+            except AcpSessionIdentityUnavailableError:
+                raise _session_not_found(external_session_id) from None
         try:
             return await self._service.resolve_session_alias(
                 _ACP_SESSION_ALIAS_NAMESPACE,
@@ -1149,10 +1139,10 @@ class NeuroCodeAcpAgent:
         except SessionError:
             raise _session_not_found(external_session_id) from None
 
-    async def _active_session(self, session_id: str) -> _AcpSession:
+    async def _active_session(self, session_id: str) -> AcpSessionRuntime:
         async with self._registry_lock:
             session = self._sessions.get(session_id)
-        if session is None or session.closed or session.closing:
+        if session is None or not await session.is_active():
             raise _session_not_active(session_id)
         return session
 
@@ -1167,10 +1157,10 @@ class NeuroCodeAcpAgent:
                 raise _session_busy(external_session_id, "session_creation_in_progress")
             active = self._sessions.get(external_session_id)
         if active is not None:
-            async with active.state_lock:
-                if active.closed or active.closing:
-                    raise _session_not_active(external_session_id)
-                internal_session_id = active.internal_session_id
+            try:
+                internal_session_id = await active.active_internal_session_identity()
+            except AcpSessionInactiveError:
+                raise _session_not_active(external_session_id) from None
             if internal_session_id is None:
                 raise _session_not_found(external_session_id)
             return internal_session_id
@@ -1237,22 +1227,26 @@ class NeuroCodeAcpAgent:
     async def _mcp_extension(self, query: AcpMcpQuery) -> dict[str, object]:
         external_session_id = _validated_session_id(query.session_id)
         session = await self._active_session(external_session_id)
-        mcp_tools = session.mcp_tools
-        if mcp_tools is None:
+        mcp_snapshot = await session.mcp_snapshot()
+        if mcp_snapshot is None:
             raise RequestError.internal_error({"reason": "mcp_unavailable"})
+        mcp_tools, mcp_tool_names = mcp_snapshot
         if query.operation == "list":
             return self._mcp_list_payload(mcp_tools)
         try:
             if query.operation == "refresh":
                 await mcp_tools.refresh()
-                binding = session.binding
+                binding = await session.active_binding_snapshot()
                 if binding is None:
                     raise ConfigurationError("MCP session binding is unavailable")
                 binding.runner.replace_external_tools(
                     mcp_tools.tools,
-                    session.mcp_tool_names,
+                    mcp_tool_names,
                 )
-                session.mcp_tool_names = tuple(tool.definition.name for tool in mcp_tools.tools)
+                await session.update_mcp_tool_names(
+                    mcp_tools,
+                    tuple(tool.definition.name for tool in mcp_tools.tools),
+                )
                 payload = self._mcp_list_payload(mcp_tools)
                 payload["refreshed"] = True
                 return payload
@@ -1341,10 +1335,11 @@ class NeuroCodeAcpAgent:
             except AcpMcpQueryError as error:
                 raise _invalid_params(error.reason) from None
             session = await self._active_session(_validated_session_id(command_query.session_id))
-            if session.binding is None:
+            binding = await session.active_binding_snapshot()
+            if binding is None:
                 raise RequestError.internal_error({"reason": "session_binding_unavailable"})
             try:
-                compact_result = await session.binding.runner.compact_now()
+                compact_result = await binding.runner.compact_now()
             except asyncio.CancelledError:
                 raise
             except ProviderError:
@@ -1386,7 +1381,7 @@ class NeuroCodeAcpAgent:
             except AcpMcpQueryError as error:
                 raise _invalid_params(error.reason) from None
             session = await self._active_session(_validated_session_id(recovery_query.session_id))
-            binding = session.binding
+            binding = await session.active_binding_snapshot()
             if binding is None:
                 raise RequestError.internal_error({"reason": "session_binding_unavailable"})
             try:
@@ -1484,11 +1479,10 @@ class NeuroCodeAcpAgent:
             # The explicit child may run only while its actual ACP parent
             # binding is active and can supply immutable capability metadata.
             parent_session = await self._active_session(external_session_id)
-            async with parent_session.state_lock:
-                parent_binding = parent_session.binding
-                if parent_binding is None or parent_binding.capabilities is None:
-                    raise RequestError.internal_error({"reason": "parent_capability_unavailable"})
-                parent_capabilities = parent_binding.capabilities
+            parent_binding = await parent_session.active_binding_snapshot()
+            if parent_binding is None or parent_binding.capabilities is None:
+                raise RequestError.internal_error({"reason": "parent_capability_unavailable"})
+            parent_capabilities = parent_binding.capabilities
             internal_session_id = await self._artifact_internal_session_id(external_session_id)
             try:
                 projection = await self._service.run_read_only_subagent(
@@ -1544,24 +1538,30 @@ class NeuroCodeAcpAgent:
 
     async def _bind_internal_session(
         self,
-        session: _AcpSession,
+        session: AcpSessionRuntime,
         internal_session_id: str,
     ) -> None:
-        if (
-            session.internal_session_id is not None
-            and session.internal_session_id != internal_session_id
-        ):
-            raise SessionError("ACP session changed its internal session identity")
-        await self._service.bind_session_alias(
-            _ACP_SESSION_ALIAS_NAMESPACE,
-            session.session_id,
-            internal_session_id,
-        )
-        session.internal_session_id = internal_session_id
+        try:
+            token = await session.begin_internal_session_identity(internal_session_id)
+        except (AcpSessionIdentityConflictError, AcpSessionInactiveError) as error:
+            raise SessionError(str(error)) from None
+        try:
+            await self._service.bind_session_alias(
+                _ACP_SESSION_ALIAS_NAMESPACE,
+                session.session_id,
+                internal_session_id,
+            )
+            try:
+                await session.commit_internal_session_identity(internal_session_id, token)
+            except (AcpSessionIdentityConflictError, AcpSessionInactiveError) as error:
+                raise SessionError(str(error)) from None
+        except BaseException:
+            await session.abort_internal_session_identity(token)
+            raise
 
     async def _capture_runner_session(
         self,
-        session: _AcpSession,
+        session: AcpSessionRuntime,
         binding: ConversationBinding,
         *,
         suppress_errors: bool,
@@ -1590,29 +1590,31 @@ class NeuroCodeAcpAgent:
         client = self._client
         if client is None:
             raise RequestError.internal_error({"reason": "client_unavailable"})
+        try:
+            context_window_tokens, _internal_session_id = await session.prompt_context()
+        except AcpSessionInactiveError:
+            raise _session_not_active(session_id) from None
         mapper = _AcpEventMapper(
             client=client,
             session_id=session_id,
-            context_window_tokens=session.context_window_tokens,
+            context_window_tokens=context_window_tokens,
             explicit_redactions=self._explicit_redactions(),
             on_session_started=lambda internal_id: self._bind_internal_session(
                 session,
                 internal_id,
             ),
         )
-        async with session.state_lock:
-            if session.closed or session.closing or session.binding is None:
-                raise _session_not_active(session_id)
-            if session.prompt_task is not None:
-                raise RequestError(
-                    _SESSION_BUSY,
-                    "Session already has an active prompt",
-                    {"reason": "prompt_already_active"},
-                )
-            session.prompt_task = current_task
-            session.mapper = mapper
-            session.cancel_requested = False
-            binding = session.binding
+        try:
+            prompt_start = await session.begin_prompt(current_task, mapper)
+        except AcpSessionInactiveError:
+            raise _session_not_active(session_id) from None
+        except AcpSessionPromptAlreadyActiveError:
+            raise RequestError(
+                _SESSION_BUSY,
+                "Session already has an active prompt",
+                {"reason": "prompt_already_active"},
+            ) from None
+        binding = prompt_start.binding
 
         try:
             turn_service = self._service.bind_runner(binding.runner)
@@ -1620,14 +1622,14 @@ class NeuroCodeAcpAgent:
                 RunTurnRequest(
                     converted.content,
                     content_parts=converted.content_parts,
-                    expected_session_id=session.internal_session_id,
+                    expected_session_id=prompt_start.internal_session_id,
                 ),
                 sink=mapper,
             )
             if result.session_id is None:
                 raise RequestError.internal_error({"reason": "session_identity_unavailable"})
             await self._bind_internal_session(session, result.session_id)
-            if session.cancel_requested or session.closing:
+            if await session.prompt_should_stop():
                 return PromptResponse(stop_reason="cancelled")
             return PromptResponse(
                 stop_reason=execution_outcome_stop_reason(result.outcome) or mapper.stop_reason,
@@ -1638,14 +1640,14 @@ class NeuroCodeAcpAgent:
             return PromptResponse(stop_reason="cancelled")
         except ProviderError as error:
             await self._capture_runner_session(session, binding, suppress_errors=True)
-            if session.cancel_requested or session.closing:
+            if await session.prompt_should_stop():
                 return PromptResponse(stop_reason="cancelled")
             if "exceeded the maximum" in str(error):
                 return PromptResponse(stop_reason="max_turn_requests")
             raise RequestError.internal_error({"reason": "provider_failure"}) from None
         except ConfigurationError as error:
             await self._capture_runner_session(session, binding, suppress_errors=True)
-            if session.cancel_requested or session.closing:
+            if await session.prompt_should_stop():
                 return PromptResponse(stop_reason="cancelled")
             if "unresolved interrupted turn" in str(error):
                 raise RequestError.internal_error({"reason": "turn_recovery_required"}) from None
@@ -1654,16 +1656,11 @@ class NeuroCodeAcpAgent:
             raise
         except Exception:
             await self._capture_runner_session(session, binding, suppress_errors=True)
-            if session.cancel_requested or session.closing:
+            if await session.prompt_should_stop():
                 return PromptResponse(stop_reason="cancelled")
             raise RequestError.internal_error({"reason": "prompt_failure"}) from None
         finally:
-            async with session.state_lock:
-                if session.prompt_task is current_task:
-                    session.prompt_task = None
-                    session.mapper = None
-                    session.pending_approval_id = None
-                    session.cancel_requested = False
+            await session.finish_prompt_if_owner(current_task)
 
     async def _request_permission(
         self,
@@ -1672,13 +1669,14 @@ class NeuroCodeAcpAgent:
     ) -> PermissionApproval:
         session = await self._active_session(session_id)
         client = self._client
-        mapper = session.mapper
+        try:
+            mapper = await session.begin_approval(request.call_id)
+        except AcpSessionApprovalAlreadyPendingError:
+            return PermissionApproval.deny("another ACP approval is already pending")
         if client is None or mapper is None:
+            if mapper is not None:
+                await session.finish_approval_if_owner(request.call_id)
             return PermissionApproval.deny("ACP client approval interface is unavailable")
-        async with session.state_lock:
-            if session.pending_approval_id is not None:
-                return PermissionApproval.deny("another ACP approval is already pending")
-            session.pending_approval_id = request.call_id
         try:
             options = [
                 PermissionOption(
@@ -1719,19 +1717,14 @@ class NeuroCodeAcpAgent:
         except Exception:
             return PermissionApproval.deny("ACP client approval failed")
         finally:
-            async with session.state_lock:
-                if session.pending_approval_id == request.call_id:
-                    session.pending_approval_id = None
+            await session.finish_approval_if_owner(request.call_id)
 
     async def cancel(self, session_id: str, **_kwargs: Any) -> None:
         async with self._registry_lock:
             session = self._sessions.get(session_id)
-        if session is None or session.closed or session.closing:
+        if session is None:
             return
-        async with session.state_lock:
-            task = session.prompt_task
-            if task is not None and not task.done():
-                session.cancel_requested = True
+        task = await session.request_cancel()
         if task is not None and not task.done():
             task.cancel()
 
@@ -1745,43 +1738,17 @@ class NeuroCodeAcpAgent:
             session = self._sessions.get(session_id)
         if session is None:
             raise _session_not_active(session_id)
-        async with session.state_lock:
-            if session.closed or session.closing:
-                raise _session_not_active(session_id)
-            session.closing = True
-            session.cancel_requested = True
+        started, _internal_session_id = await session.begin_close()
+        if not started:
+            raise _session_not_active(session_id)
         await self._cleanup_session(session)
         async with self._registry_lock:
             if self._sessions.get(session_id) is session:
                 del self._sessions[session_id]
         return CloseSessionResponse()
 
-    async def _cleanup_session(self, session: _AcpSession) -> None:
-        async with session.cleanup_lock:
-            if session.closed:
-                return
-            async with session.state_lock:
-                task = session.prompt_task
-            current = asyncio.current_task()
-            if task is not None and task is not current and not task.done():
-                task.cancel()
-                with contextlib.suppress(asyncio.CancelledError, Exception):
-                    await task
-            binding = session.binding
-            mcp_tools = session.mcp_tools
-            client_terminal = session.client_terminal
-            if mcp_tools is not None:
-                await asyncio.shield(mcp_tools.close())
-            if client_terminal is not None:
-                await asyncio.shield(client_terminal.shutdown())
-            if binding is not None:
-                await asyncio.shield(binding.close())
-            session.binding = None
-            session.mcp_tools = None
-            session.client_terminal = None
-            session.mapper = None
-            session.pending_approval_id = None
-            session.closed = True
+    async def _cleanup_session(self, session: AcpSessionRuntime) -> None:
+        await session.cleanup()
 
     async def shutdown(self) -> None:
         async with self._registry_lock:
@@ -1797,9 +1764,7 @@ class NeuroCodeAcpAgent:
             if task is not current and not task.done():
                 task.cancel()
         for session in sessions:
-            async with session.state_lock:
-                session.closing = True
-                session.cancel_requested = True
+            await session.mark_closing()
         if sessions:
             await asyncio.gather(
                 *(self._cleanup_session(session) for session in sessions),
