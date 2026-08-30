@@ -69,11 +69,14 @@ CLI 不会加载 bootstrap、adapters 或 providers，也不会创建资源。
 
 ACP prompt/content 校验与转换由 `neuro_code.interfaces.acp.content` 作为 canonical owner，持久
 history 和实时 event projection 则由 `neuro_code.interfaces.acp.updates` 作为 canonical owner；
-`neuro_code.acp` 为兼容性导入相同的 symbol。其余 ACP adapter 仍位于 `neuro_code.acp`，包括
-session lifecycle、prompt coordination、client capability、permission request coordination、
-MCP 和 transport handling。因此 `neuro_code.acp` 仍是混合适配器，而不是 facade。详见
-[ADR 0145](adr/0145-acp-prompt-content-boundary.md) 和
-[ADR 0146](adr/0146-acp-update-and-event-projection-boundary.md)。
+`neuro_code.interfaces.acp.client_io` 现在作为 capability-gated client filesystem 与 terminal
+adapter 的 canonical owner，同时拥有 adapter-local bounds 和 terminal task lifecycle state。
+`neuro_code.acp` 以 private compatibility alias 导入相同的 symbol。它仍拥有 capability
+negotiation、adapter construction、session lifecycle 与 publication/cleanup、prompt coordination、
+permission request coordination、MCP 和 transport handling。因此 `neuro_code.acp` 仍是混合适配器，
+而不是 facade。详见 [ADR 0145](adr/0145-acp-prompt-content-boundary.md)、
+[ADR 0146](adr/0146-acp-update-and-event-projection-boundary.md) 和
+[ADR 0147](adr/0147-acp-client-io-adapter-boundary.md)。
 
 Agent harness 行为现阶段位于 `neuro_code.application.runtime` 的明确 canonical 子模块：
 `background_task_reminders`、`agent`、`conversation` 以及循环、上下文、工具和终结模块。
@@ -485,6 +488,9 @@ scope，释放运行时绑定，同时保留持久历史与 alias。EOF 或连�
 并会在超时或 session 清理时 kill/release 工作。普通有副作用权限仍会门禁启动和终止操作。所有启用的
 sandbox 都不会暴露这些工具，直接调用也会失败关闭，因此客户端终端不能弱化显式本地沙箱。交互式
 输入/resize、游标流式读取和 PTY framing/背压仍未支持。
+适配器实现及其 foreground/background lifecycle state 由
+`neuro_code.interfaces.acp.client_io` 作为 canonical owner；capability negotiation 与 session ownership
+仍保留在顶层 ACP adapter。详见 [ADR 0147](adr/0147-acp-client-io-adapter-boundary.md)。
 
 非空 `mcpServers` 接受 ACP stdio、Streamable HTTP（`http`）和 legacy SSE（`sse`）
 结构；ACP 传输 server 会被确定性拒绝。每个 server 都必须在 session 发布前完成初始化，

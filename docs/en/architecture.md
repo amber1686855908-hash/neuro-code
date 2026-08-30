@@ -88,12 +88,16 @@ MCP adapter, SQLite storage, or providers.
 ACP prompt/content validation and conversion is canonically owned by
 `neuro_code.interfaces.acp.content`, while durable history and live event
 projection are canonically owned by `neuro_code.interfaces.acp.updates`;
-`neuro_code.acp` imports the same symbols for compatibility. The remaining
-ACP adapter still resides in `neuro_code.acp`, including session lifecycle,
-prompt coordination, client capabilities, permission request coordination,
-MCP, and transport handling. `neuro_code.acp` is therefore still a mixed
-adapter rather than a facade. See [ADR 0145](adr/0145-acp-prompt-content-boundary.md)
-and [ADR 0146](adr/0146-acp-update-and-event-projection-boundary.md).
+`neuro_code.interfaces.acp.client_io` is now the canonical owner of the
+capability-gated client filesystem and terminal adapters, including their
+adapter-local bounds and terminal task lifecycle state. `neuro_code.acp`
+imports the same symbols as private compatibility aliases. It still owns
+capability negotiation and adapter construction, session lifecycle and
+publication/cleanup, prompt coordination, permission request coordination,
+MCP, and transport handling. It is therefore still a mixed adapter rather
+than a facade. See [ADR 0145](adr/0145-acp-prompt-content-boundary.md),
+[ADR 0146](adr/0146-acp-update-and-event-projection-boundary.md), and
+[ADR 0147](adr/0147-acp-client-io-adapter-boundary.md).
 
 Agent harness behavior currently lives in the explicit canonical submodules of
 `neuro_code.application.runtime`: `background_task_reminders`, `agent`,
@@ -662,6 +666,10 @@ timeout or session cleanup. Ordinary side-effect permissions still gate starts
 and kills. Every enabled sandbox omits the tools and direct use fails closed, so
 a client terminal cannot weaken an explicit local sandbox. Interactive
 input/resize, cursor streaming, and PTY framing/backpressure remain unsupported.
+The adapter implementation and its foreground/background lifecycle state are
+canonically owned by `neuro_code.interfaces.acp.client_io`; capability
+negotiation and session ownership remain in the top-level ACP adapter. See
+[ADR 0147](adr/0147-acp-client-io-adapter-boundary.md).
 
 Non-empty `mcpServers` accept ACP stdio, Streamable HTTP (`http`), and legacy
 SSE (`sse`) shapes; ACP-transport servers are rejected deterministically.
