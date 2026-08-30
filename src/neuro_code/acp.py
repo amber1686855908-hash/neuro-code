@@ -12,17 +12,12 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, cast
 
-from acp.agent.router import build_agent_router
-from acp.core import Connection
 from acp.exceptions import RequestError
-from acp.interfaces import Agent, Client
-from acp.meta import AGENT_METHODS, CLIENT_METHODS
-from acp.router import MessageRouter
+from acp.interfaces import Client
 from acp.schema import (
     AgentCapabilities,
     ClientCapabilities,
     CloseSessionResponse,
-    DeleteSessionRequest,
     DeleteSessionResponse,
     ForkSessionResponse,
     Implementation,
@@ -34,8 +29,6 @@ from acp.schema import (
     PermissionOption,
     PromptCapabilities,
     PromptResponse,
-    RequestPermissionRequest,
-    RequestPermissionResponse,
     ResumeSessionResponse,
     SessionCapabilities,
     SessionCloseCapabilities,
@@ -43,12 +36,8 @@ from acp.schema import (
     SessionForkCapabilities,
     SessionInfo,
     SessionListCapabilities,
-    SessionNotification,
     SessionResumeCapabilities,
-    ToolCallUpdate,
 )
-from acp.stdio import stdio_streams
-from acp.utils import normalize_result, notify_model, request_model
 
 from neuro_code import __version__
 from neuro_code.application.acp.contracts import (
@@ -181,11 +170,23 @@ from neuro_code.interfaces.acp.session import (
     AcpSessionPromptAlreadyActiveError,
     AcpSessionRuntime,
 )
+from neuro_code.interfaces.acp.transport import (  # noqa: F401 - private compatibility aliases
+    ACP_STDIO_BUFFER_LIMIT_BYTES,
+    _AcpSdkConnection,
+    _build_acp_router,
+    _WebSocketWriter,
+    stdio_streams,
+)
+from neuro_code.interfaces.acp.transport import (
+    serve_stdio as _serve_stdio,
+)
+from neuro_code.interfaces.acp.transport import (
+    serve_websocket as _serve_websocket,
+)
 from neuro_code.interfaces.acp.updates import _AcpEventMapper, _history_updates
 from neuro_code.shared.errors import ConfigurationError, ProviderError, SessionError, ToolError
 
 ACP_PROTOCOL_VERSION = 1
-ACP_STDIO_BUFFER_LIMIT_BYTES = 1024 * 1024
 
 MAX_SESSION_ID_BYTES = 512
 ACP_SESSION_LIST_PAGE_SIZE = 50
@@ -1777,182 +1778,21 @@ class NeuroCodeAcpAgent:
             )
 
 
-def _build_acp_router(agent: NeuroCodeAcpAgent) -> MessageRouter:
-    """Extend the SDK 0.11 router with its generated stable delete route.
-
-    使用生成的稳定删除路由扩展 SDK 0.11 路由器."""
-
-    router = build_agent_router(cast(Agent, agent), use_unstable_protocol=True)
-    router.route_request(
-        AGENT_METHODS["session_delete"],
-        DeleteSessionRequest,
-        agent,
-        "delete_session",
-        adapt_result=normalize_result,
-    )
-    return router
-
-
-class _AcpSdkConnection:
-    """Small SDK connection adapter until its agent router registers delete.
-
-    在 Agent 路由器注册删除操作前使用的小型 SDK 连接适配器."""
-
-    def __init__(
-        self,
-        agent: NeuroCodeAcpAgent,
-        writer: asyncio.StreamWriter,
-        reader: asyncio.StreamReader,
-    ) -> None:
-        self._connection = Connection(
-            _build_acp_router(agent),
-            writer,
-            reader,
-            listening=False,
-        )
-        agent.on_connect(cast(Client, self))
-
-    async def listen(self) -> None:
-        await self._connection.main_loop()
-
-    async def close(self) -> None:
-        await self._connection.close()
-
-    async def session_update(
-        self,
-        session_id: str,
-        update: Any,
-        **kwargs: Any,
-    ) -> None:
-        await notify_model(
-            self._connection,
-            CLIENT_METHODS["session_update"],
-            SessionNotification(
-                session_id=session_id,
-                update=update,
-                field_meta=kwargs or None,
-            ),
-        )
-
-    async def request_permission(
-        self,
-        session_id: str,
-        tool_call: ToolCallUpdate,
-        options: list[PermissionOption],
-        **kwargs: Any,
-    ) -> RequestPermissionResponse:
-        return await request_model(
-            self._connection,
-            CLIENT_METHODS["session_request_permission"],
-            RequestPermissionRequest(
-                session_id=session_id,
-                tool_call=tool_call,
-                options=options,
-                field_meta=kwargs or None,
-            ),
-            RequestPermissionResponse,
-        )
-
-
-class _WebSocketWriter:
-    """Minimal asyncio writer bridge for ACP's newline JSON sender."""
-
-    def __init__(self, websocket: Any) -> None:
-        self._websocket = websocket
-        self._pending = bytearray()
-        self._closed = False
-
-    def write(self, data: bytes) -> None:
-        if self._closed:
-            raise ConnectionError("WebSocket ACP writer is closed")
-        self._pending.extend(data)
-
-    async def drain(self) -> None:
-        if self._closed or not self._pending:
-            return
-        payload = bytes(self._pending)
-        self._pending.clear()
-        await self._websocket.send(payload)
-
-    def close(self) -> None:
-        self._closed = True
-
-    async def wait_closed(self) -> None:
-        return
-
-    def is_closing(self) -> bool:
-        return self._closed
-
-    def get_extra_info(self, name: str, default: object = None) -> object:
-        return default
-
-
 async def serve_acp_websocket(
     service: AcpApplicationService,
     *,
     host: str = "127.0.0.1",
     port: int = 0,
 ) -> None:
-    """Serve the same ACP router over bounded WebSocket JSON messages.
+    """Construct one Agent per connection and delegate to canonical transport."""
 
-    The WebSocket is only a transport bridge; ACP request validation,
-    permissions, workspace checks, and session ownership remain unchanged.
-    """
-
-    if not isinstance(host, str) or not host or "\x00" in host or len(host.encode("utf-8")) > 256:
-        raise ConfigurationError("WebSocket ACP host is invalid")
-    if isinstance(port, bool) or not isinstance(port, int) or not 0 <= port <= 65535:
-        raise ConfigurationError("WebSocket ACP port is invalid")
-    try:
-        from websockets.asyncio.server import serve
-    except ImportError:
-        raise ConfigurationError(
-            "WebSocket ACP support requires the websockets dependency"
-        ) from None
-
-    async def handle(websocket: Any) -> None:
-        agent = NeuroCodeAcpAgent(service)
-        reader = asyncio.StreamReader(limit=ACP_STDIO_BUFFER_LIMIT_BYTES)
-        writer = _WebSocketWriter(websocket)
-        connection = _AcpSdkConnection(agent, cast(asyncio.StreamWriter, writer), reader)
-        feeder: asyncio.Task[None] | None = None
-
-        async def feed_messages() -> None:
-            try:
-                async for message in websocket:
-                    if isinstance(message, str):
-                        data = message.encode("utf-8")
-                    elif isinstance(message, bytes):
-                        data = message
-                    else:
-                        raise ConnectionError("WebSocket ACP message type is unsupported")
-                    if not data or len(data) > ACP_STDIO_BUFFER_LIMIT_BYTES:
-                        raise ConnectionError("WebSocket ACP message exceeds the size limit")
-                    if not data.endswith(b"\n"):
-                        data += b"\n"
-                    reader.feed_data(data)
-            finally:
-                reader.feed_eof()
-
-        try:
-            feeder = asyncio.create_task(feed_messages(), name="neuro-code-acp-websocket-reader")
-            await connection.listen()
-        finally:
-            if feeder is not None and not feeder.done():
-                feeder.cancel()
-            if feeder is not None:
-                await asyncio.gather(feeder, return_exceptions=True)
-            await asyncio.shield(connection.close())
-            await asyncio.shield(agent.shutdown())
-
-    async with serve(
-        handle,
-        host,
-        port,
-        max_size=ACP_STDIO_BUFFER_LIMIT_BYTES,
-        max_queue=16,
-    ):
-        await asyncio.Future()
+    await _serve_websocket(
+        lambda: NeuroCodeAcpAgent(service),
+        host=host,
+        port=port,
+        connection_factory=_AcpSdkConnection,
+        writer_factory=_WebSocketWriter,
+    )
 
 
 async def serve_acp(service: AcpApplicationService) -> None:
@@ -1960,20 +1800,11 @@ async def serve_acp(service: AcpApplicationService) -> None:
 
     通过官方 SDK 帧协议和路由器在 stdio 上提供 ACP 服务."""
 
-    agent = NeuroCodeAcpAgent(service)
-    connection: _AcpSdkConnection | None = None
-    try:
-        reader, writer = await stdio_streams(limit=ACP_STDIO_BUFFER_LIMIT_BYTES)
-        connection = _AcpSdkConnection(
-            agent,
-            writer,
-            reader,
-        )
-        await connection.listen()
-    finally:
-        if connection is not None:
-            await asyncio.shield(connection.close())
-        await asyncio.shield(agent.shutdown())
+    await _serve_stdio(
+        NeuroCodeAcpAgent(service),
+        streams_factory=stdio_streams,
+        connection_factory=_AcpSdkConnection,
+    )
 
 
 __all__ = [

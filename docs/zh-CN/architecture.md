@@ -72,20 +72,28 @@ history 和实时 event projection 则由 `neuro_code.interfaces.acp.updates` �
 `neuro_code.interfaces.acp.client_io` 现在作为 capability-gated client filesystem 与 terminal
 adapter 的 canonical owner，同时拥有 adapter-local bounds 和 terminal task lifecycle state。
 `neuro_code.acp` 以 private compatibility alias 导入相同的 symbol。
+`neuro_code.interfaces.acp.transport` 现在作为 ACP SDK connection adapter、stdio framing、
+WebSocket newline-JSON bridge、transport-local bounds 以及外层 transport close/shutdown lifecycle
+的 canonical owner。Transport 接收已经构造好的 Agent 或 Agent factory；它不构造 session，也不执行
+capability negotiation。`neuro_code.acp` 保留 service-to-Agent public wrapper，并以 private
+compatibility alias 导入 transport symbol。
 `neuro_code.interfaces.acp.session.AcpSessionRuntime` 现在作为 per-session 可变 interface state、
 resource reference、runtime lock、prompt/cancel/approval presentation state、identity transition 和
-aggregate cleanup 的 canonical owner。`NeuroCodeAcpAgent` 继续拥有 connection、capability、registry、
-publication、外层 lifecycle routing、extension dispatch、live MCP orchestration 和 transport；
+aggregate cleanup 的 canonical owner。`NeuroCodeAcpAgent` 继续拥有 protocol connection attachment、
+capability、registry、
+publication、外层 lifecycle routing、extension dispatch、live MCP orchestration 和 protocol-agent
+semantics；
 `SessionTurnService`/`ConversationRunner` 继续拥有实际 turn 与 recovery authority。
 `neuro_code.interfaces.acp.mcp_config` 现在作为从 ACP MCP declaration 到 application MCP
 configuration contract 的无状态有界转换 canonical owner。`neuro_code.acp` 提供 protected-environment
 集合并保留 caller、capability negotiation、session registry、publication 与外层 lifecycle routing、
-permission request coordination、live MCP 和 transport handling。因此 `neuro_code.acp` 仍是混合适配器，
-而不是 facade。详见 [ADR 0145](adr/0145-acp-prompt-content-boundary.md)、
+permission request coordination、live MCP 以及 service-to-Agent compatibility wrapper。因此
+`neuro_code.acp` 仍是混合适配器，而不是 facade。详见 [ADR 0145](adr/0145-acp-prompt-content-boundary.md)、
 [ADR 0146](adr/0146-acp-update-and-event-projection-boundary.md)、
 [ADR 0147](adr/0147-acp-client-io-adapter-boundary.md)、
 [ADR 0148](adr/0148-acp-mcp-configuration-boundary.md) 以及
-[ADR 0150](adr/0150-acp-session-runtime-ownership-boundary.md)。
+[ADR 0150](adr/0150-acp-session-runtime-ownership-boundary.md) 和
+[ADR 0151](adr/0151-acp-transport-boundary.md)。
 
 Agent harness 行为现阶段位于 `neuro_code.application.runtime` 的明确 canonical 子模块：
 `background_task_reminders`、`agent`、`conversation` 以及循环、上下文、工具和终结模块。
@@ -444,16 +452,19 @@ root、受保护目标以及失败或有歧义的计划都不能成为宽范围�
 ## Partial ACP v1 适配器
 
 `neuro-code acp` 是位于 `ApplicationComposition` 与官方
-`agent-client-protocol` Python SDK 之上的协议适配器。生产 framing、JSON-RPC
-路由、换行分隔 stdio、`session/update` notification 和
-`session/request_permission` request 均继续由 SDK 持有。适配器声明
+`agent-client-protocol` Python SDK 之上的协议适配器。canonical 的
+`neuro_code.interfaces.acp.transport` 负责组装 SDK connection、官方 stdio stream、换行分隔的
+WebSocket bridge 以及外层 connection/Agent shutdown lifecycle；SDK 继续拥有生产环境的 JSON-RPC
+framing、dispatch、Schema 与 normalization。适配器声明
 `loadSession: true` 与 list/delete/fork/resume/close session capability，实现
 `initialize`、`session/new`、`session/list`、`session/load`、`session/delete`、
 `session/fork`、`session/resume`、`session/prompt`、`session/cancel` notification
 和 `session/close`。SDK 0.11 把 fork、resume 和 close 置于
 `use_unstable_protocol` 门后；其生成 Schema 已包含稳定 delete 模型，但 Agent router
-漏掉了该路由，因此 Neuro Code 只把生成的 delete request 加到官方 `MessageRouter`，
-SDK stream、`Connection`、dispatcher、Schema、framing 与错误规范化保持不变。
+漏掉了该路由，因此 canonical transport 只把生成的 delete request 加到官方 `MessageRouter`；
+SDK stream、`Connection`、dispatcher、Schema、framing 与错误规范化保持不变。旧的
+`neuro_code.acp` server function 继续作为 service-to-Agent 的薄 wrapper，并保留既有 private
+transport alias 供兼容调用方使用。
 
 每条 ACP 连接固定绑定到规范化后的启动工作区。每个成功 session 拥有稳定随机 ACP ID、
 一个 `AgentConversation`、一个后台任务 scope、一个活动 prompt 槽位，以及独立审批/
@@ -568,9 +579,9 @@ reasoning、供应商保留上下文、任意参数、
 update 数、单字段和序列化总字节。
 
 历史投影与实时 `AgentEvent` allowlist 现在由 `neuro_code.interfaces.acp.updates` 实现。顶层
-ACP adapter 仍保留 session-bound wiring、lifecycle、client capability、MCP 和 transport
-职责，并调用这些 projection。本次提取是结构性变更，保留既有 ACP wire behavior；不增加
-event kind，也不移动权限 authority。
+ACP adapter 仍保留调用这些 projection 所需的 session-bound wiring、lifecycle、client capability
+和 MCP 职责；canonical transport 拥有 SDK connection 与 wire framing。本次提取是结构性变更，
+保留既有 ACP wire behavior；不增加 event kind，也不移动权限 authority。
 
 事件投影采用显式白名单：
 

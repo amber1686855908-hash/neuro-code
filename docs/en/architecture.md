@@ -92,24 +92,33 @@ projection are canonically owned by `neuro_code.interfaces.acp.updates`;
 capability-gated client filesystem and terminal adapters, including their
 adapter-local bounds and terminal task lifecycle state. `neuro_code.acp`
 imports the same symbols as private compatibility aliases.
+`neuro_code.interfaces.acp.transport` is now the canonical owner of the ACP
+SDK connection adapter, stdio framing, WebSocket newline-JSON bridging,
+transport-local bounds, and outer transport close/shutdown lifecycle. The
+transport receives an already-constructed Agent or an Agent factory; it does
+not construct sessions or negotiate capabilities. `neuro_code.acp` retains
+the service-to-Agent public wrappers and imports the transport symbols as
+private compatibility aliases.
 `neuro_code.interfaces.acp.session.AcpSessionRuntime` is now the canonical
 owner of per-session mutable interface state, resource references, runtime
 locks, prompt/cancel/approval presentation state, identity transitions, and
-aggregate cleanup. `NeuroCodeAcpAgent` retains the connection, capabilities,
+aggregate cleanup. `NeuroCodeAcpAgent` retains the protocol connection
+attachment, capabilities,
 registry, publication, outer lifecycle routing, extension dispatch, live MCP
-orchestration, and transport; `SessionTurnService`/`ConversationRunner`
+orchestration, and protocol-agent semantics; `SessionTurnService`/`ConversationRunner`
 remain the actual turn and recovery authorities.
 `neuro_code.interfaces.acp.mcp_config` is now the canonical owner of the
 stateless, bounded conversion from ACP MCP declarations to application MCP
 configuration contracts. `neuro_code.acp` supplies the protected-environment
 set and retains the caller, capability negotiation, session registry,
 publication and outer lifecycle routing, permission request coordination, live
-MCP, and transport handling. It is therefore still a mixed adapter rather than
-a facade. See [ADR 0145](adr/0145-acp-prompt-content-boundary.md),
+MCP, and the service-to-Agent compatibility wrappers. It is therefore still a
+mixed adapter rather than a facade. See [ADR 0145](adr/0145-acp-prompt-content-boundary.md),
 [ADR 0146](adr/0146-acp-update-and-event-projection-boundary.md),
 [ADR 0147](adr/0147-acp-client-io-adapter-boundary.md),
 [ADR 0148](adr/0148-acp-mcp-configuration-boundary.md),
-[ADR 0150](adr/0150-acp-session-runtime-ownership-boundary.md).
+[ADR 0150](adr/0150-acp-session-runtime-ownership-boundary.md), and
+[ADR 0151](adr/0151-acp-transport-boundary.md).
 
 Agent harness behavior currently lives in the explicit canonical submodules of
 `neuro_code.application.runtime`: `background_task_reminders`, `agent`,
@@ -601,18 +610,22 @@ for every process or provider capability.
 ## Partial ACP v1 adapter
 
 `neuro-code acp` is a protocol adapter over `ApplicationComposition` and the
-official `agent-client-protocol` Python SDK. Production framing, JSON-RPC
-routing, newline-delimited stdio, `session/update` notifications, and
-`session/request_permission` requests remain SDK-owned. The adapter declares
+official `agent-client-protocol` Python SDK. The canonical
+`neuro_code.interfaces.acp.transport` boundary assembles the SDK connection,
+official stdio streams, newline-delimited WebSocket bridge, and outer
+connection/Agent shutdown lifecycle. The SDK continues to own production
+JSON-RPC framing, dispatch, schemas, and normalization. The adapter declares
 `loadSession: true` plus list/delete/fork/resume/close session capabilities and
 implements `initialize`, `session/new`, `session/list`, `session/load`,
 `session/delete`, `session/fork`, `session/resume`, `session/prompt`, the
 `session/cancel` notification, and `session/close`. SDK 0.11 gates fork,
 resume, and close behind `use_unstable_protocol`. Its generated schema includes
-stable delete models but its Agent router omits that route, so Neuro Code adds
-only the generated delete request to the official `MessageRouter`; SDK streams,
-`Connection`, dispatcher, schemas, framing, and error normalization remain
-unchanged.
+stable delete models but its Agent router omits that route, so the canonical
+transport adds only the generated delete request to the official
+`MessageRouter`; SDK streams, `Connection`, dispatcher, schemas, framing, and
+error normalization remain unchanged. The legacy `neuro_code.acp` server
+functions remain thin service-to-Agent wrappers and preserve their private
+transport aliases for existing integrations.
 
 One ACP connection is bound to the normalized launch workspace. Each accepted
 session owns a stable random ACP ID, one `AgentConversation`, one background
@@ -781,10 +794,10 @@ per-field, and aggregate serialized-byte limits.
 
 The history projection and the live `AgentEvent` allowlist are implemented in
 `neuro_code.interfaces.acp.updates`. The top-level ACP adapter retains the
-session-bound wiring, lifecycle, client-capability, MCP, and transport
-responsibilities that invoke these projections. The extraction is structural
-and preserves the existing ACP wire behavior; it does not add event kinds or
-move permission authority.
+session-bound wiring, lifecycle, client-capability, and MCP responsibilities
+that invoke these projections; canonical transport owns the SDK connection
+and wire framing. The extraction is structural and preserves the existing ACP
+wire behavior; it does not add event kinds or move permission authority.
 
 The event projection is an explicit allowlist:
 
