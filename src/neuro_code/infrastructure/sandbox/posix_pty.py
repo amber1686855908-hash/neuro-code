@@ -22,6 +22,11 @@ from neuro_code.application.ports.terminal import (
 from neuro_code.domain.terminal.models import TerminalSignal, TerminalSize
 from neuro_code.infrastructure.sandbox.linux_pidfd import LinuxPidfdOps
 
+_PTY_TERM_GRACE_SECONDS = 1.0
+_PTY_FORCE_WAIT_SECONDS = 5.0
+_PTY_TRANSIENT_EPERM_WAIT_SECONDS = 0.1
+_PTY_GROUP_POLL_SECONDS = 0.01
+
 
 class PosixPtySession:
     """Own a POSIX PTY master, session process group, and drain threads.
@@ -223,15 +228,11 @@ class PosixPtySession:
 
             errors: list[BaseException] = []
             try:
-                self._signal_boundary(signal.SIGTERM)
-                deadline = time.monotonic() + 1.0
-                while self._process.poll() is None and time.monotonic() < deadline:
-                    time.sleep(0.01)
-                self._signal_boundary(signal.SIGKILL)
+                self._close_process_boundary()
             except BaseException as error:
                 errors.append(error)
             try:
-                self._process.wait(timeout=5)
+                self._process.wait(timeout=_PTY_FORCE_WAIT_SECONDS)
             except BaseException as error:
                 errors.append(error)
             if master_fd is not None:
@@ -254,28 +255,93 @@ class PosixPtySession:
         if errors:
             raise errors[0]
 
+    def _close_process_boundary(self) -> None:
+        if self._boundary_pidfd is not None and self._pidfd_ops is not None:
+            self._close_pidfd_boundary()
+            return
+        self._close_process_group_boundary()
+
+    def _close_pidfd_boundary(self) -> None:
+        """Terminate the pidfd-owned direct child without group fallback."""
+
+        if not self._signal_boundary(signal.SIGTERM):
+            return
+        deadline = time.monotonic() + _PTY_TERM_GRACE_SECONDS
+        while self._process.poll() is None and time.monotonic() < deadline:
+            time.sleep(_PTY_GROUP_POLL_SECONDS)
+        if self._process.poll() is None:
+            self._signal_boundary(signal.SIGKILL)
+
+    def _close_process_group_boundary(self) -> None:
+        """Terminate the original process group while retaining descendant cleanup."""
+
+        if not self._signal_term_group_with_reap_retry():
+            return
+
+        deadline = time.monotonic() + _PTY_TERM_GRACE_SECONDS
+        while True:
+            if not self._process_group_exists():
+                return
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(_PTY_GROUP_POLL_SECONDS, remaining))
+        if self._process_group_exists():
+            self._signal_group(signal.SIGKILL)
+
+    def _signal_term_group_with_reap_retry(self) -> bool:
+        try:
+            return self._signal_group(signal.SIGTERM)
+        except PermissionError as error:
+            # Darwin may report EPERM while a short-lived group leader exits
+            # but has not yet been reaped. Retry once after a bounded reap;
+            # a second EPERM remains fatal so cleanup stays fail-closed.
+            if not self._wait_for_direct_exit(_PTY_TRANSIENT_EPERM_WAIT_SECONDS):
+                raise error
+            return self._signal_group(signal.SIGTERM)
+
+    def _wait_for_direct_exit(self, timeout_seconds: float) -> bool:
+        if self._process.poll() is not None:
+            return True
+        try:
+            self._process.wait(timeout=timeout_seconds)
+        except subprocess.TimeoutExpired:
+            return False
+        return True
+
     def _open_master(self) -> int:
         if self._closed or self._master_fd is None:
             raise RuntimeError("POSIX pseudoterminal is closed")
         return self._master_fd
 
-    def _signal_group(self, native_signal: signal.Signals) -> None:
+    def _signal_group(self, native_signal: signal.Signals) -> bool:
         try:
             os.killpg(self._process.pid, native_signal)
         except ProcessLookupError:
-            return
+            return False
+        return True
 
-    def _signal_boundary(self, native_signal: signal.Signals) -> None:
+    def _signal_boundary(self, native_signal: signal.Signals) -> bool:
         """Signal the sandbox supervisor without a PID-reuse race."""
 
         if self._boundary_pidfd is None or self._pidfd_ops is None:
-            self._signal_group(native_signal)
-            return
+            return self._signal_group(native_signal)
         try:
             self._pidfd_ops.send_signal(self._boundary_pidfd, native_signal)
         except OSError as error:
             if error.errno != errno.ESRCH:
                 raise
+            return False
+        return True
+
+    def _process_group_exists(self) -> bool:
+        try:
+            os.killpg(self._process.pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        return True
 
     def _drain_output(self) -> None:
         while True:
