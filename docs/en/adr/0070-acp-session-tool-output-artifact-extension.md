@@ -8,8 +8,8 @@ Accepted for Stage5BQ.
 
 Stage5BM introduced a session-scoped application service for bounded,
 redacted tool-output artifacts. Stage5BN and Stage5BO exposed that service to
-the TUI and CLI, while ACP clients still had no way to inspect the same
-diagnostic output.
+the TUI and CLI. At Stage5BQ acceptance, ACP clients still had no way to
+inspect the same diagnostic output.
 
 The ACP 0.11 protocol has no standard artifact resource or artifact listing
 operation. The SDK does, however, route methods beginning with `_` to an
@@ -37,8 +37,10 @@ Responses contain only opaque artifact IDs, byte counts, event sequence,
 truncation facts, and bounded redacted content. Paths, raw event metadata,
 tool arguments, secrets, and storage exceptions are never serialized.
 Malformed or cross-session handles fail closed with stable protocol errors.
-The extension is not advertised as a standard ACP capability; all other
-extension methods remain unsupported.
+The extension is not advertised as a standard ACP capability. Later bounded ACP
+slices define additional namespaced methods for MCP, subagent, lifecycle, and
+compaction projections; methods outside those accepted boundaries remain
+unsupported.
 
 ## Boundaries
 

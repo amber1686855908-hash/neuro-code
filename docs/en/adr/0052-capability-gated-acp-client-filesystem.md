@@ -51,6 +51,10 @@ compare-and-swap, directory enumeration, recursive search, or delete operation.
   contents for the operation.
 - Read-only clients cannot receive the mutation tool, and absent client
   capability leaves ordinary local tool behavior unchanged.
-- The capability remains deliberately narrow. Client terminal framing,
-  filesystem enumeration/search/delete, multimedia, WebSocket, and extensions
-  remain separate protocol slices.
+- The capability remains deliberately narrow. At this ADR's acceptance, client
+  terminal framing, filesystem enumeration/search/delete, multimedia, WebSocket,
+  and extensions were separate protocol slices. Later bounded slices implement
+  WebSocket and the client terminal adapter; interactive client-terminal
+  input/resize/PTY framing, filesystem enumeration/search/delete, binary
+  multimedia history replay, and broader extensions remain outside this port's
+  contract.

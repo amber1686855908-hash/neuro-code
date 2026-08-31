@@ -51,6 +51,11 @@ unsafe transport input.
 - The user receives a permission decision before every remote tool invocation,
   but cancellation remains intentionally conservative: later calls fail closed
   instead of reusing an indeterminate connection.
-- MCP ACP transport, resources, prompts, sampling, elicitation, dynamic
-  list-change refresh, configuration persistence, and multimedia/embedded
-  projection remain separate future slices.
+- At this ADR's acceptance, ACP-transport MCP servers, resources, prompts,
+  sampling, elicitation, and dynamic list-change refresh were separate future
+  slices. The current bounded ACP adapter now provides resource/resource-template
+  discovery, resource reads, prompt discovery/retrieval, sampling and elicitation
+  callbacks, and dynamic tool-list refresh through private ACP extensions.
+  ACP-transport MCP server declarations, configuration persistence, and
+  multimedia/embedded MCP result projection remain unsupported. The separate ACP
+  server stdio/WebSocket transport is covered by ADR 0151.

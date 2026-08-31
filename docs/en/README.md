@@ -143,7 +143,7 @@ not receive configured Neuro Code environment values. It also exposes the bounde
 background lifecycle (`terminal_start`, `terminal_output`, `terminal_wait`, and `terminal_kill`)
 with opaque task IDs; terminal input, resize, and PTY framing remain unavailable. This is still
 explicitly not complete ACP v1
-support: ACP MCP transport, binary multimedia history replay, client
+support: ACP-transport MCP server declarations, binary multimedia history replay, client
 interactive terminal input/resize/PTY methods, and arbitrary custom
 extensions remain unsupported. The bounded private artifact, subagent,
 lifecycle, MCP, and compaction extensions are intentionally outside the

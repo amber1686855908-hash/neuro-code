@@ -10,8 +10,8 @@ Accepted
 
 The ACP adapter already persisted ordered provider-independent `ContentPart`
 values and provider adapters already had native, provider-specific image
-projection. ACP prompt conversion nevertheless accepted only Text and
-ResourceLink blocks, so an ACP client could not send a screenshot into that
+projection. At this ADR's acceptance, ACP prompt conversion accepted only Text
+and ResourceLink blocks, so an ACP client could not send a screenshot into that
 existing safe path. Replaying raw media through `session/load` would also turn
 a visible-history API into an unbounded binary and URL disclosure channel.
 
@@ -31,9 +31,10 @@ text-placeholder behavior. Runtime events and ACP load history use the domain
 safe model projection, so they show an image placeholder but never emit a data
 URI, media bytes, or image URL.
 
-Audio and embedded binary-resource ACP prompt blocks remain explicitly
-unsupported; bounded embedded text resources are defined separately in ADR
-0055.
+Subsequent prompt-content consolidation now accepts bounded audio and embedded
+binary-resource ACP prompt blocks through the canonical content boundary;
+bounded embedded text resources are defined separately in ADR 0055. Full binary
+multimedia history replay and remote media transfer remain unsupported.
 
 ## Consequences
 
@@ -41,6 +42,6 @@ An ACP screenshot can reach compatible models on its first turn and after a
 durable resume without adding provider dependencies to the ACP interface or
 media I/O to the application. The client receives an honest history marker
 instead of a silent omission, while another client cannot recover stored media
-from replay. Full binary multimedia history, audio, remote media transfer, and
-embedded binary-resource semantics remain separate capabilities with their own
-authority, size, and lifecycle decisions.
+from replay. Full binary multimedia history replay and remote media transfer,
+including provider-specific replay semantics, remain separate capabilities with
+their own authority, size, and lifecycle decisions.

@@ -67,8 +67,11 @@ arguments, or unbounded tool output.
 - SQLite v1-v4 databases migrate forward without rewriting session content.
   JSON session export remains schema version 4 because the alias is
   interface-local metadata rather than exported conversation content.
-- The ACP surface remains partial. ADR 0037 subsequently implements
-  workspace-scoped `session/list`; `session/resume`, `session/delete`,
-  `session/fork`, non-empty MCP/additional-directory support, multimedia
-  history replay, client filesystem/terminal calls, and WebSocket transport
-  remain future slices.
+- The ACP surface remains partial. Subsequent slices implement
+  workspace-scoped `session/list`, `session/resume`, `session/delete`,
+  `session/fork`, bounded and profile-gated additional directories, ephemeral
+  stdio/Streamable HTTP/legacy SSE MCP declarations, client filesystem/terminal
+  calls, WebSocket transport, and private bounded extensions. Binary multimedia
+  history replay, ACP-transport MCP server declarations, persistent MCP
+  configuration, interactive client-terminal input/resize/PTY framing, and
+  complete conformance remain outside the supported boundary.

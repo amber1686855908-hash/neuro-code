@@ -697,7 +697,8 @@ negotiation and session ownership remain in the top-level ACP adapter. See
 [ADR 0147](adr/0147-acp-client-io-adapter-boundary.md).
 
 Non-empty `mcpServers` accept ACP stdio, Streamable HTTP (`http`), and legacy
-SSE (`sse`) shapes; ACP-transport servers are rejected deterministically.
+SSE (`sse`) shapes; ACP-transport MCP server declarations are rejected
+deterministically.
 Every server is initialized and its bounded, paginated tool catalog is
 validated before the session is published; duplicate server names, invalid tool
 names, collisions between remote tools or with built-ins, protected environment
@@ -745,8 +746,15 @@ server, cancellation closes the SDK connection and makes it unavailable for
 later calls; no local process ownership is claimed, so an indeterminate remote
 side effect is never reported as successfully cancelled. Close, load failure,
 creation failure, EOF, and disconnect close the same session-owned collection
-idempotently. MCP resources, prompts, sampling, elicitation, dynamic tool-list
-refresh, and ACP transport remain unsupported.
+idempotently. The session-scoped private ACP MCP extension provides bounded
+resource and resource-template discovery, resource reads, prompt discovery and
+retrieval, forwards sampling and elicitation callbacks when the client supports
+them, and supports bounded dynamic tool-list refresh. These are bounded
+projections with the existing redaction, permission, and lifecycle rules, not
+generic MCP feature parity. The ACP server provides the official SDK stdio
+transport and the bounded WebSocket newline-JSON bridge; ACP-transport MCP
+server declarations remain unsupported. Persistent MCP configuration and
+multimedia/embedded MCP result bodies remain unsupported.
 
 List is discovery-only and remains scoped to the connection workspace even
 when `cwd` is omitted. It returns only durable ACP ID, absolute recorded cwd,

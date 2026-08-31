@@ -72,15 +72,20 @@ terminal capability handling、MCP bridging、stdio、WebSocket、TUI、CLI、do
 persistence 或任何后续 interface boundary。它不改变 ACP wire shape、limit、accepted type、
 error semantics、permission、sandbox behavior 或 provider behavior。
 
+以上非目标描述的是本 ADR 接受时的边界。后续有界 consolidation slice 在保持上述
+prompt/content contract 的同时，分别为 update、client I/O、MCP configuration、session runtime state
+和 transport 建立了 canonical owner。
+
 ## Compatibility 与分阶段策略
 
 顶层 ACP module 仍是混合适配器。只有本 ADR 中的 prompt/content symbol 在 interface package
 中拥有 canonical owner。Compatibility import 保持 identity，architecture test 同时断言该
 方向以及不存在重复实现。
 
-未来 ACP consolidation slice 可以在各自完成 audit、compatibility proof 与 behavior-preserving
-validation 后，分别为 update、client capability、agent/server handling 和 transport 建立
-canonical owner。本 ADR 不预授权这些 slice。
+后续 ACP consolidation slice 已分别为 update（ADR 0146）、client I/O（ADR 0147）、MCP configuration
+（ADR 0148）、session runtime state（ADR 0150）和 transport（ADR 0151）建立 canonical owner；每个切片
+都有自己的 audit、compatibility proof 与 behavior-preserving validation。Client-capability negotiation
+和 agent/server protocol handling 在单独边界获接受前仍由 `NeuroCodeAcpAgent` 持有。本 ADR 不预授权更多切片。
 
 ## Validation
 

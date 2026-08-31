@@ -51,6 +51,9 @@ ADR 0035 引入了连接内稳定的 ACP ID，同时内部 SQLite session ID 仍
   load、回放、继续提示和历史保留。
 - SQLite v1-v4 数据库可前向迁移且不改写会话内容。JSON session export 仍是 schema
   version 4，因为 alias 属于界面局部元数据，不是导出的对话内容。
-- ACP 界面仍是 partial。ADR 0037 随后实现工作区范围的 `session/list`；
-  `session/resume`、`session/delete`、`session/fork`、非空 MCP/额外目录、多媒体
-  历史回放、客户端文件系统/终端调用和 WebSocket 传输仍属于后续切片。
+- ACP 界面仍是 partial。后续切片实现了工作区范围的 `session/list`、
+  `session/resume`、`session/delete`、`session/fork`、有界且按 profile 门控的额外目录、
+  stdio/Streamable HTTP/legacy SSE 的临时 MCP declaration、客户端文件系统/终端调用、
+  WebSocket 传输和私有有界 extension。二进制多媒体历史回放、ACP-transport MCP server
+  declaration、持久化 MCP 配置、交互式客户端终端 input/resize/PTY framing 与完整一致性仍
+  不属于支持边界。

@@ -545,8 +545,13 @@ in-progress 并调用 server；拒绝审批绝不会执行。stdio prompt 取消
 `cancelled` prompt 响应完成前终止整个受控 server 进程树。远程 server 的取消会关闭 SDK
 连接并让其无法再被调用；项目不声称持有远程进程，因此不会把终态不确定的远程副作用表示成
 已成功取消。close、load 失败、创建失败、EOF 与断连都幂等关闭同一 session-owned
-collection。MCP resources、prompts、sampling、elicitation、动态工具目录刷新与 ACP
-传输仍未支持。
+collection。session-scoped 私有 ACP MCP extension 提供有界的 resource 与
+resource-template 发现、resource 读取、prompt 发现与获取；在客户端支持时转发
+sampling 与 elicitation callback，并支持有界动态工具目录刷新。这些是遵守既有
+脱敏、权限和生命周期规则的有界投影，不等于通用 MCP feature parity。ACP server
+提供官方 SDK stdio 传输和有界 WebSocket newline-JSON bridge；ACP-transport MCP
+server declaration 仍不支持。持久化 MCP 配置以及 MCP 结果中的多媒体/embedded
+body 仍不支持。
 
 list 只用于发现；即使省略 `cwd`，也始终限制在连接工作区。它只返回持久 ACP ID、记录的
 绝对 cwd、有界标题和 ISO 更新时间。尚无 alias 的 session 通过 schema v5 原子

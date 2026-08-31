@@ -7,9 +7,9 @@
 
 ## 背景
 
-partial ACP v1 适配器此前拒绝所有非空 `mcpServers` 请求。ACP stdio MCP server 属于
-基线输入，而 HTTP、SSE 与 ACP 传输拥有独立的可选能力标志。支持 stdio 基线可以关闭
-当前最大的兼容缺口，同时不声明这些可选传输。
+在本 ADR 接受时，partial ACP v1 适配器此前拒绝所有非空 `mcpServers` 请求。ACP stdio MCP
+server 属于基线输入，而 HTTP、SSE 与 ACP 传输拥有独立的可选能力标志。支持 stdio 基线可以
+关闭当时最大的兼容缺口，同时不声明这些可选传输。
 
 Neuro Code 不得实现私有 MCP Schema 或 JSON-RPC 调度器，同时必须保持比官方 MCP SDK
 传输更严格的进程树保证：POSIX 子进程属于独立进程组；Windows 入口必须在创建时原子加入
@@ -22,9 +22,9 @@ stderr、取消与清理都需要显式上限和失败关闭所有权。
 
 - 把官方 MCP Python SDK 固定在 `mcp>=1.28.1,<2`。使用其 `ClientSession`、Schema、
   版本协商、JSON-RPC 调度、工具分页、调用与结果类型。
-- 只接受 ACP `McpServerStdio`。由于没有实现可选 HTTP/SSE 传输，保持 ACP
-  `agentCapabilities.mcpCapabilities` 缺省；HTTP、SSE 与 ACP 传输以
-  `mcp_transport_unsupported` 拒绝。
+- 在本 ADR 接受时，只接受 ACP `McpServerStdio`。由于当时没有实现可选 HTTP/SSE 传输，保持
+  ACP `agentCapabilities.mcpCapabilities` 缺省。后续有界切片增加了 Streamable HTTP 与 legacy
+  SSE MCP 传输；ACP-transport MCP server declaration 仍以 `mcp_transport_unsupported` 拒绝。
 - 对 server 数、名称、命令、参数、环境变量、序列化配置、工具页/数量、工具名、Schema、
   frame、JSON 复杂度、调用参数、结果与超时实施上限，并忽略 `_meta`。
 - 在连接工作区内启动 server，环境只包含 SDK 定义的少量安全继承值和有界客户端值。
@@ -52,5 +52,7 @@ stderr、取消与清理都需要显式上限和失败关闭所有权。
   Job 与 POSIX 进程组不变量。
 - 被取消或终态不确定的调用会使该 server 在本 session 的后续调用中不可用。这种保守
   行为可防止未确认的远端副作用继续运行。
-- 适配器仍属于 partial ACP v1。HTTP/SSE/ACP MCP 传输、resources、prompts、sampling、
-  elicitation、动态工具目录刷新、配置持久化与多媒体/embedded 结果投影仍是后续切片。
+- 本 ADR 记录最初仅支持 stdio 的 ACP MCP 切片；更广义的 ACP adapter 仍属于 partial ACP v1。
+  后续有界 ACP 切片现在提供 Streamable HTTP 与 legacy SSE MCP transport，以及私有有界的 resource/resource-template
+  发现、resource 读取、prompt 发现/获取、sampling/elicitation callback 和动态工具目录刷新。
+  ACP-transport MCP server declaration、配置持久化以及 MCP 多媒体/embedded 结果投影仍不支持。

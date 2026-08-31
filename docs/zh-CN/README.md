@@ -114,7 +114,7 @@ ACP 会话 resume/delete/fork 已按工作区范围持久身份、事务 fork/de
 Shell 命令，也不会收到已配置的 Neuro Code 环境值。它也暴露有界的标准后台生命周期
 （`terminal_start`、`terminal_output`、`terminal_wait` 和 `terminal_kill`），并使用不透明 task ID；
 终端输入、resize 和 PTY framing 仍不可用。这仍明确不是完整 ACP v1
-支持：ACP MCP 传输、二进制多媒体历史回放、客户端交互式终端输入/resize/PTY 方法和任意自定义
+支持：ACP-transport MCP server declaration、二进制多媒体历史回放、客户端交互式终端输入/resize/PTY 方法和任意自定义
 扩展仍不支持。artifact、subagent、lifecycle、MCP、compaction 私有扩展均有界实现，但不作为
 标准 ACP capability 声明。详见
 [兼容矩阵](compatibility-matrix.md)和

@@ -7,10 +7,11 @@
 
 ## Context
 
-The partial ACP v1 adapter rejected every non-empty `mcpServers` request. ACP
-stdio MCP servers are a baseline input, while HTTP, SSE, and ACP transports
-have separate optional capability flags. Supporting the stdio baseline closes
-the largest remaining gap without advertising those optional transports.
+At this ADR's acceptance, the partial ACP v1 adapter rejected every non-empty
+`mcpServers` request. ACP stdio MCP servers are a baseline input, while HTTP,
+SSE, and ACP transports have separate optional capability flags. Supporting the
+stdio baseline closes the largest remaining gap without advertising those
+optional transports.
 
 Neuro Code must not implement a private MCP schema or JSON-RPC dispatcher. It
 must also retain process-tree guarantees that are stricter than the official
@@ -27,10 +28,11 @@ need explicit limits and fail-closed ownership.
 - Pin the official MCP Python SDK to `mcp>=1.28.1,<2`. Use its
   `ClientSession`, schemas, version negotiation, JSON-RPC dispatch, tool
   pagination, calls, and result types.
-- Accept only ACP `McpServerStdio` values. Keep ACP
+- At this ADR's acceptance, accept only ACP `McpServerStdio` values. Keep ACP
   `agentCapabilities.mcpCapabilities` absent because no optional HTTP/SSE
-  transport is implemented. Reject HTTP, SSE, and ACP transports with
-  `mcp_transport_unsupported`.
+  transport was implemented at that time. Later bounded slices add Streamable
+  HTTP and legacy SSE MCP transports; ACP-transport MCP server declarations
+  remain rejected with `mcp_transport_unsupported`.
 - Validate bounded server counts, names, commands, arguments, environment,
   serialized configuration, tool pages/counts, tool names, schemas, frames,
   JSON complexity, call arguments, results, and timeouts. Ignore `_meta`.
@@ -69,6 +71,10 @@ need explicit limits and fail-closed ownership.
 - A cancelled or indeterminate call makes that server unavailable for later
   calls in the session. This conservative behavior prevents an unacknowledged
   remote side effect from continuing.
-- The adapter remains partial ACP v1. HTTP/SSE/ACP MCP transports, resources,
-  prompts, sampling, elicitation, dynamic tool-list refresh, configuration
-  persistence, and multimedia/embedded result projection remain future slices.
+- This ADR records the original stdio-only ACP MCP slice; the broader ACP adapter
+  remains partial ACP v1. Subsequent bounded ACP slices now provide Streamable HTTP
+  and legacy SSE MCP transports, plus private
+  bounded resource/resource-template discovery, resource reads, prompt
+  discovery/retrieval, sampling and elicitation callbacks, and dynamic tool-list
+  refresh. ACP-transport MCP server declarations, configuration persistence, and
+  multimedia/embedded MCP result projection remain unsupported.

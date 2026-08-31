@@ -34,7 +34,8 @@ Provider 切换和会话切换复用同一个组合服务，但每次读取仍�
 - 缺失、删除、损坏或跨会话 artifact 会安全降级为 UI 提示，不暴露存储细节。
 - TUI 持有一个只在 Inspector 打开后启动的小型异步 worker。ADR 0108 将 disclosure 改为
   Summary → 单调用 Peek → Inspector；会话授权的应用接缝与流式事件流保持不变。
-- CLI、ACP 和其他入站 artifact 视图仍属于后续独立切片。
+- 在本 ADR 接受时，CLI 与 ACP artifact view 仍是独立切片；后续有界切片已实现两者的只读
+  view，其他入站 artifact view 仍是独立能力。
 
 ## 被否决的方案
 

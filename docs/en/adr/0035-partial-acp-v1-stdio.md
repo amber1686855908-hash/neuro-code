@@ -11,10 +11,10 @@ Neuro Code needs a standard editor/client protocol surface without duplicating
 ACP schema generation, JSON-RPC dispatch, or stdio framing. The existing CLI
 and TUI composition lived in interface-private functions, while internal
 conversation IDs may be created only when the first prompt is persisted.
-Publishing complete ACP v1 compatibility now would also be incorrect: MCP
-servers, additional directories, session discovery/resume, client filesystem
-and terminal methods, multimedia content, and WebSocket transport are not
-implemented.
+At this ADR's acceptance, publishing complete ACP v1 compatibility would also
+be incorrect: MCP servers, additional directories, session discovery/resume,
+client filesystem and terminal methods, multimedia content, and WebSocket
+transport were not implemented.
 
 The pinned official Python SDK range is
 `agent-client-protocol>=0.11.0,<0.12`; the lock currently selects 0.11.0. That
@@ -36,14 +36,18 @@ incoming `jsonrpc` version before normalizing its response to 2.0.
   `session/load` and the truthful `loadSession: true` capability; ADR 0037 adds
   standard `session/list` and `sessionCapabilities.list = {}`.
 - Bind one connection to its normalized launch workspace. Reject relative or
-  different `cwd` values and non-empty `additionalDirectories`. This ADR's
-  original rejection of non-empty `mcpServers` is superseded for bounded stdio
-  servers by ADR 0038; HTTP, SSE, and ACP MCP transports remain rejected.
+  different `cwd` values and non-empty `additionalDirectories`. At this ADR's
+  acceptance, the original rejection of non-empty `mcpServers` was superseded
+  for bounded stdio servers by ADR 0038; later slices add Streamable HTTP and
+  legacy SSE MCP servers, while ACP-transport MCP server declarations remain
+  rejected.
 - Generate one stable ACP ID per protocol session and keep a separate mapping
   to the lazily created internal SQLite ID. ADR 0036 makes that mapping durable.
-- Accept only bounded Text and ResourceLink prompt blocks. Preserve ordering,
-  project only standard allowlisted ResourceLink fields, ignore `_meta`, and
-  never dereference a URI during conversion.
+- At this ADR's acceptance, accept only bounded Text and ResourceLink prompt
+  blocks. Preserve ordering, project only standard allowlisted ResourceLink
+  fields, ignore `_meta`, and never dereference a URI during conversion. Later
+  prompt-content slices add bounded image, audio, and embedded resource blocks
+  through the canonical content boundary.
 - Project runtime events through an explicit bounded/redacted allowlist. Keep
   reasoning private by default, use a stable `messageId` for one answer, and
   report terminal turn state only through `PromptResponse.stopReason`.
@@ -67,11 +71,15 @@ incoming `jsonrpc` version before normalizing its response to 2.0.
 - Resource links are model-visible references, not implicit I/O authority.
 - Approval and cancellation are isolated per session, and close is not
   session deletion.
-- The process remains a partial ACP v1 implementation. Complete conformance,
-  WebSocket, non-stdio MCP transports and non-tool MCP features, additional
-  directories, resume/delete/fork,
-  multimedia/embedded prompt content and history, and client
-  filesystem/terminal calls remain future slices.
+- The process remains a partial ACP v1 implementation. Subsequent bounded
+  slices implement session discovery/resume/delete/fork, bounded and
+  profile-gated additional directories, ephemeral MCP declarations for stdio,
+  Streamable HTTP, and legacy SSE, client filesystem/terminal calls, WebSocket
+  transport, bounded image/audio/embedded prompt input, and private MCP,
+  artifact, subagent, lifecycle, compaction, and recovery extensions. Complete
+  conformance, ACP-transport MCP server declarations, interactive client-terminal
+  input/resize/PTY framing, binary multimedia history replay, and persistent MCP
+  configuration remain unsupported.
 - ADR 0050 later implements the resume/delete/fork lifecycle slice without
   changing this ADR's original partial-core decision.
 - Raw stdio tests record the official 0.11 SDK's malformed-frame and JSON-RPC

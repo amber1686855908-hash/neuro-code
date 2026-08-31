@@ -59,9 +59,15 @@ additional roots and `_meta`.
   unchanged rows. Concurrent session updates may move rows between pagination
   windows, which is normal best-effort cursor behavior without a database
   snapshot.
-- The ACP implementation remains partial. Session resume/delete/fork,
-  non-stdio MCP transports and non-tool MCP features, additional directories,
-  multimedia prompt/history content, client filesystem/terminal calls,
-  WebSocket transport, and custom extensions remain unsupported.
+- The ACP implementation remains partial. Later bounded slices implement
+  session resume/delete/fork, bounded and profile-gated additional directories,
+  stdio/Streamable HTTP/legacy SSE MCP servers, and private non-tool MCP
+  projections for resource/resource-template discovery, resource reads, prompt
+  discovery/retrieval, sampling/elicitation callbacks, and dynamic refresh.
+  They also implement capability-gated client filesystem/terminal calls,
+  WebSocket transport, and other private extensions. Binary multimedia
+  history replay, ACP-transport MCP server declarations, persistent MCP
+  configuration, interactive client-terminal input/resize/PTY framing, and
+  complete conformance remain unsupported.
 - ADR 0050 later implements resume/delete/fork while preserving this ADR's
   workspace scoping, durable aliases, and bounded list behavior.

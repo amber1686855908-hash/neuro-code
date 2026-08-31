@@ -18,22 +18,24 @@ providers and durable session history.
 
 ## Decision
 
-ACP accepts only `TextResourceContents` from an embedded resource block. It
-uses the supplied text directly, never opens, resolves, downloads, or
-dereferences the associated URI. The URI and optional MIME type become a
-bounded JSON origin label before the text. The block accepts at most eight
-resources, 64 KiB of text per resource, and 128 KiB of embedded-resource text
-per prompt. Empty URI or text values, and every malformed or oversized value,
-fail closed.
+For the text-only slice defined at this ADR's acceptance, ACP accepted only
+`TextResourceContents` from an embedded resource block. It used the supplied
+text directly, never opened, resolved, downloaded, or dereferenced the
+associated URI. The URI and optional MIME type became a bounded JSON origin
+label before the text. The block accepted at most eight resources, 64 KiB of
+text per resource, and 128 KiB of embedded-resource text per prompt. Empty URI
+or text values, and every malformed or oversized value, failed closed.
 
-The resulting value is an ordered text `ContentPart`; normal conversation
-storage, provider adaptation, redaction, and visible-history projection apply.
+The resulting value for that text-only path is an ordered text `ContentPart`;
+normal conversation storage, provider adaptation, redaction, and visible-history
+projection apply.
 It is input data rather than trusted instruction. Block, resource, and
 annotation `_meta` values and annotations are not projected. No resource bytes
 are fetched or decoded.
 
-`BlobResourceContents`, audio, and other unsupported prompt blocks remain
-rejected. Binary multimedia history replay remains outside this decision.
+The current prompt-content boundary also accepts bounded `BlobResourceContents`
+and inline audio blocks; other unsupported prompt blocks remain rejected.
+Binary multimedia history replay remains outside this decision.
 
 ## Consequences
 

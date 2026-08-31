@@ -7,10 +7,10 @@
 
 ## Context
 
-Stage5BK writes local Bash artifacts outside the conversation and SQLite. A
-future interface may need to inspect one artifact, but letting TUI, CLI, or ACP
-join a state-directory path would bypass application boundaries and make
-authorization unclear.
+Stage5BK writes local Bash artifacts outside the conversation and SQLite. At
+this ADR's acceptance, a future interface might need to inspect one artifact,
+but letting TUI, CLI, or ACP join a state-directory path would bypass
+application boundaries and make authorization unclear.
 
 ## Decision
 
@@ -25,10 +25,11 @@ artifact ceiling. The file adapter confines resolved paths below its configured
 artifact root, re-applies redaction before decoding and truncation, and returns
 a frozen text projection. Missing or forged handles fail closed.
 
-The service is not yet exposed through CLI, TUI, ACP, or a new tool. Stage5BK
-did not persist a session-to-artifact association, so this slice deliberately
-does not claim session-level authorization or cross-process recovery. A
-user-facing read path must define that association and visibility policy first.
+At this ADR's acceptance, the service was not yet exposed through CLI, TUI, ACP,
+or a new tool. Stage5BK did not persist a session-to-artifact association, so
+this slice deliberately did not claim session-level authorization or
+cross-process recovery. A user-facing read path needed to define that
+association and visibility policy first.
 
 ## Non-goals
 

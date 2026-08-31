@@ -8,9 +8,9 @@
 
 ## 背景
 
-现有设计有意按窄纵向切片交付：安全工具流水线、会话拥有的 MCP 工具、
-partial ACP stdio、Provider 无关压缩，以及显式只读子代理。这些边界保证了安全性，
-但客户端仍能观察到一些集成缺口：模型请求没有紧凑的重建证据，独立只读工具总是串行，
+在本 ADR 接受时，现有设计有意按窄纵向切片交付：安全工具流水线、会话拥有的 MCP 工具、
+partial ACP stdio、Provider 无关压缩，以及显式只读子代理。这些边界保证了安全性，但客户端
+仍能观察到一些集成缺口：模型请求没有紧凑的重建证据，独立只读工具总是串行，
 MCP 能力列表只有 tools，Provider 故障没有有界重试/熔断，用户权限规则也没有持久化。
 
 实现必须保持现有的所有权规则。调度器不能绕过权限/工作区/sandbox 工具流水线执行；
@@ -42,10 +42,11 @@ MCP 仍必须由 session 持有；不可信协议内容必须有界且脱敏；P
 
 ## 兼容性边界
 
-本决策不宣称有状态 Responses `previous_response_id` 链、自动 Ultracode 委派、模型生成标题、
-任意插件或 hook 执行、ACP MCP transport、客户端交互式 PTY 输入/resize/framing，或 Provider
-原生音频/视频语义。二进制内容在 ACP/domain 边界被接受且有界，但二进制历史回放和 Provider
-原生处理仍是明确的后续能力。
+在本 ADR 接受时，本决策不宣称有状态 Responses `previous_response_id` 链、自动 Ultracode 委派、
+模型生成标题、任意插件或 hook 执行、ACP-transport MCP server declaration、客户端交互式 PTY
+输入/resize/framing，或 Provider 原生音频/视频语义。后续有界切片实现了 automatic Ultracode
+delegation/result adoption。二进制内容在 ACP/domain 边界被接受且有界，但二进制历史回放和
+Provider 原生处理仍是明确的后续能力。
 
 ## 结果
 

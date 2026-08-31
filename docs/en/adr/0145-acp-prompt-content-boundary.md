@@ -86,6 +86,11 @@ stdio, WebSocket, TUI, CLI, domain orchestration, persistence, or any later
 interface boundary. It does not change ACP wire shapes, limits, accepted
 types, error semantics, permissions, sandbox behavior, or provider behavior.
 
+Those non-goals describe the acceptance boundary of this ADR. Later bounded
+consolidation slices establish separate canonical owners for updates, client
+I/O, MCP configuration, session runtime state, and transport while preserving
+the prompt/content contract above.
+
 ## Compatibility and staged strategy
 
 The top-level ACP module remains a mixed adapter. Only the prompt/content
@@ -93,10 +98,13 @@ symbols in this ADR have a canonical owner in the interface package. The
 compatibility imports are identity-preserving, and architecture tests assert
 both that direction and the absence of a duplicate implementation.
 
-Future ACP consolidation slices may separately establish canonical owners for
-updates, client capabilities, agent/server handling, and transport only after
-each boundary has its own audit, compatibility proof, and behavior-preserving
-validation. This ADR does not pre-authorize those slices.
+Subsequent ACP consolidation slices have established canonical owners for
+updates (ADR 0146), client I/O (ADR 0147), MCP configuration (ADR 0148), session
+runtime state (ADR 0150), and transport (ADR 0151), each with its own audit,
+compatibility proof, and behavior-preserving validation. Client-capability
+negotiation and agent/server protocol handling remain in `NeuroCodeAcpAgent`
+until an independently scoped boundary is accepted. This ADR does not
+pre-authorize further slices.
 
 ## Validation
 

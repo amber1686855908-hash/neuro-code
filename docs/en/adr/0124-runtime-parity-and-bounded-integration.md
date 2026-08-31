@@ -8,10 +8,11 @@ Accepted for the current pre-alpha runtime.
 
 ## Context
 
-The existing design deliberately landed narrow vertical slices: a safe tool
-pipeline, session-owned MCP tools, partial ACP stdio, provider-neutral
-compaction, and explicit read-only subagents. That boundary made the system
-safe, but left several integration gaps visible to clients: model requests had
+At this ADR's acceptance, the existing design deliberately landed narrow
+vertical slices: a safe tool pipeline, session-owned MCP tools, partial ACP
+stdio, provider-neutral compaction, and explicit read-only subagents. That
+boundary made the system safe, but left several integration gaps visible to
+clients: model requests had
 no compact reconstruction evidence, independent read-only tool calls were
 always serialized, MCP capability lists were tool-only, provider failures had
 no bounded retry/circuit policy, and user permission rules were not durable.
@@ -58,12 +59,14 @@ The following bounded integrations are production capabilities:
 
 ## Compatibility boundary
 
-This decision does not claim stateful Responses `previous_response_id` chains,
-automatic Ultracode delegation, model-generated titles, arbitrary plugin or
-hook execution, ACP MCP transport, interactive client PTY input/resize/framing,
-or native audio/video provider semantics. Binary multimedia is accepted and
-bounded at the ACP/domain boundary, but binary history replay and provider
-native handling remain explicit future capabilities.
+At this ADR's acceptance, this decision did not claim stateful Responses
+`previous_response_id` chains, automatic Ultracode delegation, model-generated
+titles, arbitrary plugin or hook execution, ACP-transport MCP server
+declarations, interactive client PTY input/resize/framing, or native audio/video
+provider semantics. Later bounded slices implement automatic Ultracode
+delegation/result adoption. Binary multimedia is accepted and bounded at the
+ACP/domain boundary, but binary history replay and provider-native handling
+remain explicit future capabilities.
 
 ## Consequences
 

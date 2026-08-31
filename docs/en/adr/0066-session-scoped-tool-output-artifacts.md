@@ -41,9 +41,9 @@ reveal whether the handle exists in another session or on disk.
 This stage does not add a SQLite table or migration: the persisted
 `TOOL_COMPLETED`/`TOOL_FAILED` event projection is the existing association
 boundary. It does not change Runtime, Bash, permissions, sandboxing, session
-items, or event kinds. It does not expose the service through CLI, TUI, or
-ACP yet; a later inbound slice must inject this service and define its output
-presentation separately.
+items, or event kinds. At this ADR's acceptance, the service was not exposed
+through CLI, TUI, or ACP; later inbound slices define those presentations
+separately.
 
 The service does not provide artifact listing across sessions, deletion,
 pagination beyond a small bounded page, absolute paths, raw arguments, raw
@@ -56,8 +56,9 @@ tool output, or authorization based only on a caller-supplied session ID.
 - Existing event replay remains compatible and no schema migration is needed.
 - Corrupt or legacy events without valid artifact metadata remain readable;
   their artifact is simply unavailable to the projection.
-- A later UI/CLI/ACP stage still needs an explicit user-facing contract and
-  lifecycle policy for missing, expired, or deleted artifact files.
+- At this ADR's acceptance, a later UI/CLI/ACP stage still needed an explicit
+  user-facing contract and lifecycle policy for missing, expired, or deleted
+  artifact files; later bounded views define the accepted read-only contracts.
 
 ## Verification
 
