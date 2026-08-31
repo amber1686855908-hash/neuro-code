@@ -1,6 +1,6 @@
 # Neuro Code
 
-[English](README.md) · [简体中文](README.zh-CN.md)
+[English](README.md) · [简体中文](docs/zh-CN/README.md)
 
 [![CI](https://github.com/amber1686855908-hash/neuro-code/actions/workflows/ci.yml/badge.svg)](https://github.com/amber1686855908-hash/neuro-code/actions/workflows/ci.yml)
 [![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-3776AB.svg)](pyproject.toml)
