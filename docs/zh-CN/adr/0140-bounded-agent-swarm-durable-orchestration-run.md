@@ -24,7 +24,7 @@
         -> 既有 Leader final synthesis projection
 ```
 
-组合根通过既有 factory 创建每个 lower-layer service。Swarm 不直接创建 tool、session、worktree、checkpoint、LSP manager、relay 或 worker runtime。它没有连接 CLI、TUI、ACP、Ultracode、自动委派或 public orchestration protocol。
+组合根通过既有 factory 创建每个 lower-layer service。Swarm 不直接创建 tool、session、worktree、checkpoint、LSP manager、relay 或 worker runtime。在本 ADR 接受时，它没有连接 CLI、TUI、ACP、Ultracode、自动委派或 public orchestration protocol。后续 ADR 0141 与 0144 增加了一个有界的显式 Ultracode 组合 seam；它们没有把 Swarm 变成 public surface，也没有赋予它直接的 tool 或 workspace authority。
 
 ## Durable identity 与 lifecycle
 
@@ -81,7 +81,7 @@ Swarm phase 被当前 owner 持有时发生 cancellation，会通过 shielded du
 
 ## 非目标
 
-本 ADR 不增加 automatic Ultracode delegation、user-facing Ultracode behavior、recursive Swarm、无界 agent、generic retry、共享 writable worktree、merge、cherry-pick、copy-back、patch adoption、public CLI/TUI/ACP orchestration、remote/cloud execution、marketplace integration 或新的 Checkpoint/Rollback 实现。Checkpoint 与 Rollback 继续使用既有能力与 authority owner。
+在本 ADR 接受时，它没有增加 automatic Ultracode delegation、user-facing Ultracode behavior、recursive Swarm、无界 agent、generic retry、共享 writable worktree、merge、cherry-pick、copy-back、patch adoption、public CLI/TUI/ACP orchestration、remote/cloud execution、marketplace integration 或新的 Checkpoint/Rollback 实现。Checkpoint 与 Rollback 继续使用既有能力与 authority owner。后续 ADR 0141 与 0144 只增加了上文所述的有界显式 Ultracode 组合。
 
 ## 验证
 

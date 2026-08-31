@@ -1678,10 +1678,12 @@ target 不可变并受 CAS 保护。详见 [ADR 0130](adr/0130-managed-workspace
 
 ## 显式串行 Writable Subagent 工作区
 
-现有 `/subagent` capability 仍然只读。首个 writable subagent 是由
-`ApplicationComposition.create_writable_subagent_service()` 构造的独立、显式内部纵向切片。
-它不接入 `/subagent`、CLI、TUI、ACP、自动调度或 writable parallel worker，也不启动
-checkpoint/rollback orchestration。
+现有 `/subagent` capability 以及 CLI/TUI/ACP 的显式子代理入口仍然只读。Standalone
+writable-subagent service 是由 `ApplicationComposition.create_writable_subagent_service()`
+构造的独立内部纵向切片；它本身不是 public subagent surface，也不启动
+checkpoint/rollback orchestration。Standalone service 仍然串行运行；有界 Task DAG
+通过 typed factory 创建独立 worker，后续有界 `Ultracode -> Bounded Swarm` 组合也只通过既有
+Swarm、Leader 和 Task DAG factory 到达这些 worker。
 
 `WritableSubagentApplicationService` 一次只串行运行一个 child。它先记录 `ALLOCATING` lease，
 读取 parent 的 exact committed HEAD，在 parent workspace roots 之外创建 Neuro Code 拥有的 managed

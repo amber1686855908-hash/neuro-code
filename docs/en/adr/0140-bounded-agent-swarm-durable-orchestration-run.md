@@ -33,9 +33,11 @@ actual parent ConversationBinding
 
 The composition root creates each lower-layer service through its existing
 factory.  The Swarm does not create tools, sessions, worktrees, checkpoints,
-LSP managers, relays, or worker runtimes directly.  It is not connected to
-CLI, TUI, ACP, Ultracode, automatic delegation, or a public orchestration
-protocol.
+LSP managers, relays, or worker runtimes directly.  At this ADR's acceptance,
+it was not connected to CLI, TUI, ACP, Ultracode, automatic delegation, or a
+public orchestration protocol. Subsequent ADRs 0141 and 0144 add one bounded
+explicit Ultracode composition seam; they do not make the Swarm public or give
+it direct tool or workspace authority.
 
 ## Durable identity and lifecycle
 
@@ -159,12 +161,14 @@ retry, or hidden orchestration step counter.
 
 ## Non-goals
 
-This ADR does not add automatic Ultracode delegation, user-facing Ultracode
-behavior, recursive Swarms, unbounded agents, generic retry, shared writable
-worktrees, merge, cherry-pick, copy-back, patch adoption, public CLI/TUI/ACP
-orchestration, remote/cloud execution, marketplace integration, or a new
-Checkpoint/Rollback implementation.  Checkpoint and Rollback remain existing
-capabilities and authority owners.
+At this ADR's acceptance, it did not add automatic Ultracode delegation,
+user-facing Ultracode behavior, recursive Swarms, unbounded agents, generic
+retry, shared writable worktrees, merge, cherry-pick, copy-back, patch adoption,
+public CLI/TUI/ACP orchestration, remote/cloud execution, marketplace
+integration, or a new Checkpoint/Rollback implementation. Checkpoint and
+Rollback remain existing capabilities and authority owners. Subsequent ADRs
+0141 and 0144 add only the bounded explicit Ultracode composition described
+above.
 
 ## Verification
 

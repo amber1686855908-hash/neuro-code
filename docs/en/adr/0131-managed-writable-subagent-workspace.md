@@ -16,15 +16,19 @@ or process death.
 ## Decision
 
 Add an internal `WritableSubagentApplicationService` that is constructed by
-`ApplicationComposition.create_writable_subagent_service()`. It is not wired
-into `/subagent`, CLI, TUI, ACP, automatic scheduling, or any
-checkpoint/rollback orchestration. Calls are serialized in-process and the
-SQLite lease provides the cross-process active-parent and active-worktree
-uniqueness boundary.
+`ApplicationComposition.create_writable_subagent_service()`. At this ADR's
+acceptance, it was not wired into `/subagent`, CLI, TUI, ACP, automatic
+scheduling, or any checkpoint/rollback orchestration. Calls are serialized
+in-process and the SQLite lease provides the cross-process active-parent and
+active-worktree uniqueness boundary.
 
 ADR 0132 subsequently composes the existing read-only LSP capability into this
 runtime without changing its worktree, checkpoint, lease, or write-authority
 contract.
+
+Subsequent bounded Task DAG, Agent Swarm, and Ultracode slices create fresh
+scoped Writable services through composition-owned factories. They do not add
+a writable `/subagent` surface or change this service's authority contract.
 
 The service derives a typed `ManagedChildWorkspaceGrant` only after it has:
 
@@ -112,10 +116,16 @@ full diff, transcript, raw tool arguments, credentials, or raw file contents.
 
 ## Not implemented
 
-Unbounded or automatically delegated writable parallel workers, recursive writable subagents, automatic delegation,
+At this ADR's acceptance, unbounded or automatically delegated writable
+parallel workers, recursive writable subagents, automatic delegation,
 CLI/TUI/ACP exposure, automatic checkpoint/rollback policy, rollback after a
 child run, merge/commit/patch integration, copy-back, branch deletion, and
-checkpoint or worktree cleanup remain explicit future capabilities.
+checkpoint or worktree cleanup remained explicit future capabilities.
+
+Subsequent bounded Task DAG, Agent Swarm, and Ultracode slices add only
+internal, scoped worker composition; they do not add public writable
+`/subagent` exposure, unbounded parallel workers, or automatic rollback and
+integration.
 
 The bounded static Task DAG is the separate exception: it may create fresh
 scoped Writable services for independently claimed nodes. That later slice

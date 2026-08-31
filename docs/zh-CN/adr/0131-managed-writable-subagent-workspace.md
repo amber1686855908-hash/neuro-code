@@ -14,12 +14,15 @@ conversation，也不能修改 dirty source checkout。因此首个 writable 能
 ## 决策
 
 新增由 `ApplicationComposition.create_writable_subagent_service()` 构造的内部
-`WritableSubagentApplicationService`。它不接入 `/subagent`、CLI、TUI、ACP、自动调度或任何
-checkpoint/rollback orchestration。调用在进程内串行化，SQLite lease
+`WritableSubagentApplicationService`。在本 ADR 接受时，它不接入 `/subagent`、CLI、TUI、ACP、
+自动调度或任何 checkpoint/rollback orchestration。调用在进程内串行化，SQLite lease
 提供跨进程 active-parent 与 active-worktree 唯一性边界。
 
 ADR 0132 随后把现有只读 LSP capability 组合进该 runtime，但不改变其 worktree、checkpoint、
 lease 或 write-authority contract。
+
+后续有界 Task DAG、Agent Swarm 和 Ultracode 切片通过组合根拥有的 factory 创建全新的 scoped
+Writable service；它们没有增加可写 `/subagent` surface，也没有改变本 service 的 authority contract。
 
 Service 只有在以下步骤完成后，才从类型化的
 `ManagedChildWorkspaceGrant` 派生 child authority：
@@ -93,9 +96,12 @@ diff、transcript、raw tool arguments、凭据或 raw file contents。
 
 ## 未实现
 
-无界或自动委派的 Writable parallel workers、递归 writable subagent、自动委派、CLI/TUI/ACP 暴露、自动
-checkpoint/rollback policy、child 完成后的自动 rollback、merge/commit/patch integration、
-copy-back、branch 删除，以及 checkpoint/worktree cleanup，仍是未来独立能力。
+在本 ADR 接受时，无界或自动委派的 Writable parallel workers、递归 writable subagent、自动委派、
+CLI/TUI/ACP 暴露、自动 checkpoint/rollback policy、child 完成后的自动 rollback、merge/commit/patch
+integration、copy-back、branch 删除，以及 checkpoint/worktree cleanup 仍是未来独立能力。
+
+后续有界 Task DAG、Agent Swarm 和 Ultracode 切片只增加内部 scoped worker 组合；它们没有增加 public
+可写 `/subagent` 暴露、无界并行 worker，或自动 rollback/integration。
 
 有界 static Task DAG 是单独的例外：它可以为独立 claim 的节点创建新的 scoped Writable service。
 该后续切片不弱化本 standalone service 的 lock、lease、worktree、capability、checkpoint 或 cleanup contract。

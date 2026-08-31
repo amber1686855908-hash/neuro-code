@@ -1738,13 +1738,15 @@ without rejecting an otherwise valid assistant row.
 
 ## Explicit serialized writable-subagent workspace
 
-The existing `/subagent` capability remains read-only. The first writable
-subagent is a separate, explicit internal vertical slice constructed by
-`ApplicationComposition.create_writable_subagent_service()`. It is not wired
-to `/subagent`, CLI, TUI, ACP, or automatic delegation, and it does not start
-checkpoint/rollback orchestration. The standalone service remains serialized;
-only the bounded Task DAG may create separate worker services through its
-typed factory.
+The existing `/subagent` capability and the explicit CLI/TUI/ACP subagent
+entrypoints remain read-only. The standalone writable-subagent service is a
+separate internal vertical slice constructed by
+`ApplicationComposition.create_writable_subagent_service()`. It is not itself
+exposed as a public subagent surface and does not start checkpoint/rollback
+orchestration. The standalone service remains serialized; bounded Task DAG
+execution creates separate worker services through its typed factory, and the
+later bounded `Ultracode -> Bounded Swarm` composition reaches those workers
+only through the existing Swarm, Leader, and Task DAG factories.
 
 `WritableSubagentApplicationService` serializes one child at a time. It first
 records an `ALLOCATING` lease, reads the parent's exact committed HEAD, creates
