@@ -73,6 +73,19 @@ its injected `run` function is invoked by the canonical bootstrap entrypoint.
 Importing the CLI does not load bootstrap, adapters, providers, or create
 resources.
 
+The parsed `sessions` command execution boundary is now canonically owned by
+`neuro_code.interfaces.cli.sessions`. Its `run_sessions_command` entrypoint
+uses the narrow `SessionCliServices` contract for configuration, session
+storage, bounded tool-output artifacts, and an opened application. It owns the
+existing list, search, rename, compact, artifacts, and recovery operations,
+including their validation, output, bounds, and cleanup behavior. The parser
+grammar and top-level dispatch remain in `neuro_code.cli`; its private
+`_sessions_command` name is an identity-preserving alias to the canonical
+entrypoint. The canonical command reuses
+`neuro_code.interfaces.cli.serialization`. This is an execution-boundary
+extraction only: `neuro_code.cli` is not yet a complete compatibility facade,
+and its remaining commands remain in place.
+
 Stage 2C keeps `neuro_code.acp` in place as the ACP/JSON-RPC inbound adapter,
 but gives it only `application.acp` contracts and an ACP-specific application
 service. The service exposes binding creation and safe resume preparation,

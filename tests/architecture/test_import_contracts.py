@@ -2520,6 +2520,38 @@ assert not disallowed, disallowed
     assert result.returncode == 0, result.stderr or result.stdout
 
 
+def test_sessions_execution_boundary_is_canonical_and_identity_preserving() -> None:
+    cli_path = _PACKAGE_ROOT / "cli.py"
+    sessions_path = _PACKAGE_ROOT / "interfaces" / "cli" / "sessions.py"
+    cli_tree = ast.parse(cli_path.read_text(encoding="utf-8"), filename=str(cli_path))
+    sessions_tree = ast.parse(
+        sessions_path.read_text(encoding="utf-8"),
+        filename=str(sessions_path),
+    )
+
+    assert any(
+        isinstance(node, ast.AsyncFunctionDef) and node.name == "run_sessions_command"
+        for node in sessions_tree.body
+    )
+    assert not any(
+        isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == "_sessions_command"
+        for node in cli_tree.body
+    )
+    assert not any(
+        (
+            isinstance(node, ast.Import)
+            and any(alias.name == "neuro_code.cli" for alias in node.names)
+        )
+        or (isinstance(node, ast.ImportFrom) and node.module == "neuro_code.cli")
+        for node in ast.walk(sessions_tree)
+    )
+
+    cli = importlib.import_module("neuro_code.cli")
+    sessions = importlib.import_module("neuro_code.interfaces.cli.sessions")
+    assert cli._sessions_command is sessions.run_sessions_command
+
+
 def test_importing_acp_does_not_load_bootstrap_or_selected_concrete_dependencies() -> None:
     script = """
 import sys

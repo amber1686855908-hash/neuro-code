@@ -1420,10 +1420,25 @@ def test_canonical_runtime_consumers_use_explicit_submodules() -> None:
             "neuro_code.application.sessions.lifecycle",
             "neuro_code.application.sessions.service",
             "neuro_code.application.tools.service",
+            "neuro_code.interfaces.cli.sessions",
         },
         "neuro_code.interfaces.cli.serialization": {
             "neuro_code.application.sessions.catalog",
             "neuro_code.application.tools.service",
+        },
+        "neuro_code.interfaces.cli.sessions": {
+            "neuro_code.application.memory.compaction_runtime",
+            "neuro_code.application.ports.storage",
+            "neuro_code.application.ports.tools",
+            "neuro_code.application.runtime.agent",
+            "neuro_code.application.sessions.catalog",
+            "neuro_code.application.sessions.lifecycle",
+            "neuro_code.application.sessions.recovery",
+            "neuro_code.application.settings",
+            "neuro_code.application.tools.service",
+            "neuro_code.configuration.app",
+            "neuro_code.interfaces.cli.serialization",
+            "neuro_code.shared.errors",
         },
     }
 

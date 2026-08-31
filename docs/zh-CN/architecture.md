@@ -59,6 +59,16 @@ scripts 和 `python -m neuro_code` 都直接使用它。它只在相应命令实
 解析、分发、渲染和退出码处理；其注入式 `run` 函数由 canonical bootstrap entrypoint 调用。导入
 CLI 不会加载 bootstrap、adapters 或 providers，也不会创建资源。
 
+已解析的 `sessions` command execution boundary 现在由
+`neuro_code.interfaces.cli.sessions` 作为 canonical owner。其
+`run_sessions_command` entrypoint 只依赖窄的 `SessionCliServices` contract，取得配置、会话
+存储、有界 tool-output artifact service 和已打开的 application。它拥有既有的 list、search、rename、
+compact、artifacts 与 recovery operation，以及这些 operation 的 validation、output、bounds 和
+cleanup behavior。Parser grammar 与顶层 dispatch 仍保留在 `neuro_code.cli`；其 private
+`_sessions_command` name 是指向 canonical entrypoint 的 identity-preserving alias。Canonical command
+复用 `neuro_code.interfaces.cli.serialization`。这只是 execution-boundary extraction：
+`neuro_code.cli` 还不是完整的 compatibility facade，其余 command 仍保留原位置。
+
 阶段 2C 保持 `neuro_code.acp` 原位置，作为 ACP/JSON-RPC 入站适配器，但只向它提供
 `application.acp` 契约和 ACP 专用应用服务。该服务暴露绑定创建和安全恢复准备、会话别名与列表、
 工作区校验、协议元数据以及按会话惰性创建的 MCP 工具上下文。`bootstrap.entrypoints` 将
