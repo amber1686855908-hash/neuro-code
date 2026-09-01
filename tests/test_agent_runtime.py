@@ -246,6 +246,27 @@ class BlockingProvider:
             yield ModelCompleted("stop")
 
 
+class CurrentTaskCancellingProvider:
+    provider_name = "cancelling"
+    model_name = "cancelling-model"
+    context_affinity = "profile-v1:cancelling"
+
+    async def stream(
+        self,
+        context: ModelContext,
+        tools: Sequence[ToolDefinition],
+        *,
+        tool_policy: ModelToolPolicy = ModelToolPolicy.ALLOWED,
+    ) -> AsyncIterator[ModelEvent]:
+        del context, tools, tool_policy
+        task = asyncio.current_task()
+        assert task is not None
+        task.cancel()
+        await asyncio.Event().wait()
+        if False:
+            yield ModelCompleted("stop")
+
+
 class GateApprover:
     def __init__(self) -> None:
         self.requested = asyncio.Event()
@@ -1989,9 +2010,8 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
             root = Path(directory)
             store = SqliteSessionStore(root / "sessions.db")
             await store.initialize()
-            provider = BlockingProvider()
             runtime = AgentRuntime(
-                provider=provider,
+                provider=CurrentTaskCancellingProvider(),
                 tools=ToolRegistry(),
                 workspace_change_observer=EmptyWorkspaceChangeObserver(),
                 permissions=PermissionManager(),
@@ -2000,28 +2020,24 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 plan=SessionPlan((PlanStep("Try the execution"),)),
             )
 
-            turn = asyncio.create_task(
-                runtime.run("Execute the approved plan", plan_execution_requested=True)
-            )
-            try:
-                await asyncio.wait_for(provider.started.wait(), timeout=5)
-                turn.cancel()
-                with self.assertRaises(asyncio.CancelledError):
-                    await turn
-            finally:
-                if not turn.done():
-                    turn.cancel()
-                    await asyncio.gather(turn, return_exceptions=True)
+            with self.assertRaises(asyncio.CancelledError):
+                await runtime.run("Execute the approved plan", plan_execution_requested=True)
 
             session_id = (await store.list_sessions())[0].id
             tasks = await store.list_session_tasks(session_id)
             self.assertEqual(len(tasks), 1)
+            self.assertIs(tasks[0].kind, SessionTaskKind.PLAN_EXECUTION)
             self.assertIs(tasks[0].status, SessionTaskStatus.CANCELLED)
             event_kinds = [event["kind"] for event in await store.load_events(session_id)]
+            self.assertIn(AgentEventKind.SESSION_TASK_STARTED.value, event_kinds)
+            self.assertIn(AgentEventKind.MODEL_REQUEST_STARTED.value, event_kinds)
+            self.assertIn(AgentEventKind.SESSION_TASK_CANCELLED.value, event_kinds)
             self.assertLess(
                 event_kinds.index(AgentEventKind.SESSION_TASK_CANCELLED.value),
                 event_kinds.index(AgentEventKind.TURN_FAILED.value),
             )
+            self.assertNotIn(AgentEventKind.TURN_COMPLETED.value, event_kinds)
+            self.assertIsNone(await store.load_execution_record(session_id))
 
     async def test_plan_execution_without_a_saved_plan_fails_before_creating_a_session(
         self,
